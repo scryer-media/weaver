@@ -38,6 +38,10 @@ pub mod flags {
     pub const SPLIT_BEFORE: u64 = 0x0008;
     /// Data continues in next volume.
     pub const SPLIT_AFTER: u64 = 0x0010;
+    /// Service block depends on the preceding file block.
+    pub const CHILD: u64 = 0x0020;
+    /// Preserve a child block if the host file is updated.
+    pub const INHERITED: u64 = 0x0040;
 }
 
 /// RAR5 header types.

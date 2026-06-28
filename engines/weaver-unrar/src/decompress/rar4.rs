@@ -425,6 +425,11 @@ impl Rar4LzDecoder {
                     detail: format!("RAR4: invalid VM code size {code_size}"),
                 });
             }
+            if !vm_reader.has_exact_bits(code_size.saturating_mul(8))? {
+                return Err(RarError::CorruptArchive {
+                    detail: format!("RAR4: VM code size {code_size} exceeds filter packet"),
+                });
+            }
 
             let mut vm_code = Vec::with_capacity(code_size);
             for _ in 0..code_size {
@@ -1655,7 +1660,7 @@ impl Rar4LzDecoder {
         let length = Self::decode_vm_code_length(first_byte, || Ok(reader.read_bits(8)? as u8))?;
         let mut code = Vec::with_capacity(length);
         for _ in 0..length {
-            if reader.bits_remaining() < 8 {
+            if !reader.has_exact_bits(8)? {
                 return Err(RarError::CorruptArchive {
                     detail: "RAR4: truncated VM code".into(),
                 });
@@ -2657,6 +2662,20 @@ mod tests {
             decoder.pending_vm_filters[0].filter_type,
             Rar4StandardFilter::None
         );
+    }
+
+    #[test]
+    fn test_vm_program_body_must_fit_filter_packet_like_unrar() {
+        let mut decoder = Rar4LzDecoder::new(1024);
+        // Same packet shape as test_custom_vm_program_becomes_none_filter_like_unrar,
+        // but the declared one-byte program body is missing. UnRAR rejects this
+        // with VMCodeInp.InAddr + VMCodeSize > CodeSize.
+        let err = decoder
+            .add_vm_code(0xA0, &[0x00, 0x00, 0x41], 0)
+            .unwrap_err();
+
+        assert!(matches!(err, RarError::CorruptArchive { .. }));
+        assert!(decoder.pending_vm_filters.is_empty());
     }
 
     #[test]

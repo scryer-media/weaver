@@ -1257,6 +1257,109 @@ impl RarArchive {
         Ok(())
     }
 
+    #[cfg(windows)]
+    fn windows_output_path_exists(out_path: &std::path::Path) -> bool {
+        Self::get_windows_file_attributes(out_path) != u32::MAX
+    }
+
+    #[cfg(windows)]
+    fn windows_output_path_is_dir(out_path: &std::path::Path) -> bool {
+        let attributes = Self::get_windows_file_attributes(out_path);
+        attributes != u32::MAX && attributes & WINDOWS_FILE_ATTRIBUTE_DIRECTORY != 0
+    }
+
+    #[cfg(any(windows, test))]
+    fn windows_path_ends_with_dot_or_space(out_path: &std::path::Path) -> bool {
+        out_path
+            .as_os_str()
+            .to_string_lossy()
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch == '.' || ch == ' ')
+    }
+
+    fn create_output_dir(out_path: &std::path::Path) -> RarResult<()> {
+        #[cfg(windows)]
+        {
+            let special = Self::windows_path_ends_with_dot_or_space(out_path);
+            if !special {
+                let path = Self::windows_path_to_wide_nul(out_path);
+                let ok = unsafe {
+                    windows_sys::Win32::Storage::FileSystem::CreateDirectoryW(
+                        path.as_ptr(),
+                        std::ptr::null(),
+                    )
+                };
+                if ok != 0 {
+                    return Ok(());
+                }
+                let err = std::io::Error::last_os_error();
+                if Self::windows_output_path_exists(out_path) {
+                    return Err(RarError::Io(err));
+                }
+            }
+
+            let Some(long_path) = Self::windows_long_path_to_wide_nul(out_path) else {
+                return Err(RarError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "could not build long Windows path for {}",
+                        out_path.display()
+                    ),
+                )));
+            };
+            let ok = unsafe {
+                windows_sys::Win32::Storage::FileSystem::CreateDirectoryW(
+                    long_path.as_ptr(),
+                    std::ptr::null(),
+                )
+            };
+            if ok == 0 {
+                return Err(RarError::Io(std::io::Error::last_os_error()));
+            }
+            Ok(())
+        }
+
+        #[cfg(not(windows))]
+        {
+            std::fs::create_dir(out_path).map_err(RarError::Io)
+        }
+    }
+
+    fn create_output_dir_all(out_path: &std::path::Path) -> RarResult<()> {
+        #[cfg(windows)]
+        {
+            if out_path.as_os_str().is_empty() || Self::windows_output_path_is_dir(out_path) {
+                return Ok(());
+            }
+            if Self::windows_output_path_exists(out_path) {
+                return Err(RarError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "output directory path {} exists and is not a directory",
+                        out_path.display()
+                    ),
+                )));
+            }
+            if let Some(parent) = out_path.parent()
+                && !parent.as_os_str().is_empty()
+                && parent != out_path
+            {
+                Self::create_output_dir_all(parent)?;
+            }
+            match Self::create_output_dir(out_path) {
+                Ok(()) => Ok(()),
+                Err(_) if Self::windows_output_path_is_dir(out_path) => Ok(()),
+                Err(err) => Err(err),
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            std::fs::create_dir_all(out_path).map_err(RarError::Io)
+        }
+    }
+
     fn clear_windows_readonly_attribute(out_path: &std::path::Path) -> RarResult<()> {
         #[cfg(windows)]
         {
@@ -1281,7 +1384,7 @@ impl RarArchive {
         if let Some(parent) = out_path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent).map_err(RarError::Io)?;
+            Self::create_output_dir_all(parent)?;
         }
         Ok(())
     }
@@ -1297,7 +1400,7 @@ impl RarArchive {
 
         let root = Self::redirection_target_root(member_name, out_path);
         if !root.as_os_str().is_empty() {
-            std::fs::create_dir_all(&root).map_err(RarError::Io)?;
+            Self::create_output_dir_all(&root)?;
         }
 
         let Some(member_parent) = member_path.parent() else {
@@ -1313,7 +1416,7 @@ impl RarArchive {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
                     Self::clear_windows_readonly_before_delete(&current)?;
                     Self::remove_output_file(&current)?;
-                    std::fs::create_dir(&current).map_err(RarError::Io)?;
+                    Self::create_output_dir(&current)?;
                 }
                 Ok(metadata) if metadata.is_dir() => {}
                 Ok(_) => {
@@ -1326,7 +1429,7 @@ impl RarArchive {
                     )));
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::create_dir(&current).map_err(RarError::Io)?;
+                    Self::create_output_dir(&current)?;
                 }
                 Err(err) => return Err(RarError::Io(err)),
             }
@@ -1335,7 +1438,7 @@ impl RarArchive {
         Ok(())
     }
 
-    fn ensure_output_directory_for_member(
+    fn ensure_output_directory_at_member_path(
         member_name: &str,
         out_path: &std::path::Path,
     ) -> RarResult<()> {
@@ -1344,7 +1447,7 @@ impl RarArchive {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 Self::clear_windows_readonly_before_delete(out_path)?;
                 Self::remove_output_file(out_path)?;
-                std::fs::create_dir(out_path).map_err(RarError::Io)?;
+                Self::create_output_dir(out_path)?;
             }
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => {
@@ -1357,11 +1460,38 @@ impl RarArchive {
                 )));
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(out_path).map_err(RarError::Io)?;
+                Self::create_output_dir(out_path)?;
             }
             Err(err) => return Err(RarError::Io(err)),
         }
         Ok(())
+    }
+
+    fn ensure_output_directory_for_member(
+        member_name: &str,
+        out_path: &std::path::Path,
+    ) -> RarResult<std::path::PathBuf> {
+        match Self::ensure_output_directory_at_member_path(member_name, out_path) {
+            Ok(()) => Ok(out_path.to_path_buf()),
+            Err(original_err) => {
+                if let Some((fallback_member_name, fallback_path)) =
+                    Self::unix_windows_share_fallback_output_path(member_name, out_path)
+                {
+                    tracing::debug!(
+                        original = %out_path.display(),
+                        fallback = %fallback_path.display(),
+                        "retrying directory creation with UnRAR-compatible Windows-share name"
+                    );
+                    Self::ensure_output_directory_at_member_path(
+                        &fallback_member_name,
+                        &fallback_path,
+                    )?;
+                    Ok(fallback_path)
+                } else {
+                    Err(original_err)
+                }
+            }
+        }
     }
 
     fn ensure_safe_link_target(
@@ -1517,6 +1647,74 @@ impl RarArchive {
     ) -> std::path::PathBuf {
         Self::redirection_target_root(member_name, out_path)
             .join(crate::path::sanitize_file_redirection_path(target))
+    }
+
+    fn unix_windows_share_fallback_output_path(
+        member_name: &str,
+        out_path: &std::path::Path,
+    ) -> Option<(String, std::path::PathBuf)> {
+        #[cfg(unix)]
+        {
+            let fallback_member_name =
+                crate::path::make_unix_windows_share_member_name_compatible(member_name);
+            if fallback_member_name == member_name {
+                return None;
+            }
+            let member_path = std::path::Path::new(member_name);
+            if member_name.is_empty() || !out_path.ends_with(member_path) {
+                return None;
+            }
+            let fallback_path =
+                Self::redirection_target_root(member_name, out_path).join(&fallback_member_name);
+            if fallback_path == out_path {
+                None
+            } else {
+                Some((fallback_member_name, fallback_path))
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (member_name, out_path);
+            None
+        }
+    }
+
+    fn create_regular_output_file_at_member_path(
+        member_name: &str,
+        out_path: &std::path::Path,
+    ) -> RarResult<std::fs::File> {
+        Self::ensure_output_parent_dir_for_member(member_name, out_path)?;
+        Self::remove_existing_regular_output_symlink(out_path)?;
+        Self::clear_windows_readonly_before_overwrite(out_path)?;
+        std::fs::File::create(out_path).map_err(RarError::Io)
+    }
+
+    fn create_regular_output_file_for_member(
+        member_name: &str,
+        out_path: &std::path::Path,
+    ) -> RarResult<(std::fs::File, std::path::PathBuf)> {
+        match Self::create_regular_output_file_at_member_path(member_name, out_path) {
+            Ok(file) => Ok((file, out_path.to_path_buf())),
+            Err(original_err) => {
+                if let Some((fallback_member_name, fallback_path)) =
+                    Self::unix_windows_share_fallback_output_path(member_name, out_path)
+                {
+                    tracing::debug!(
+                        original = %out_path.display(),
+                        fallback = %fallback_path.display(),
+                        "retrying file creation with UnRAR-compatible Windows-share name"
+                    );
+                    let file = Self::create_regular_output_file_at_member_path(
+                        &fallback_member_name,
+                        &fallback_path,
+                    )?;
+                    Ok((file, fallback_path))
+                } else {
+                    Err(original_err)
+                }
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2188,7 +2386,13 @@ impl RarArchive {
                 | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
         );
         if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-            return Err(RarError::Io(std::io::Error::last_os_error()));
+            let error = std::io::Error::last_os_error();
+            debug!(
+                path = %out_path.display(),
+                ?error,
+                "failed to open symlink for timestamp restore"
+            );
+            return Ok(());
         }
 
         struct Handle(windows_sys::Win32::Foundation::HANDLE);
@@ -2216,7 +2420,12 @@ impl RarArchive {
             )
         };
         if ok == 0 {
-            return Err(RarError::Io(std::io::Error::last_os_error()));
+            let error = std::io::Error::last_os_error();
+            debug!(
+                path = %out_path.display(),
+                ?error,
+                "failed to restore symlink timestamps"
+            );
         }
         Ok(())
     }
@@ -2226,14 +2435,19 @@ impl RarArchive {
         {
             if let Some((atime, mtime)) =
                 Self::unix_regular_file_times(fh.mtime, fh.atime, std::time::SystemTime::now())
+                && let Err(error) = filetime::set_file_times(out_path, atime, mtime)
             {
-                filetime::set_file_times(out_path, atime, mtime).map_err(RarError::Io)?;
+                debug!(
+                    path = %out_path.display(),
+                    ?error,
+                    "failed to restore output timestamps"
+                );
             }
         }
 
         #[cfg(windows)]
         {
-            match (fh.mtime, fh.atime) {
+            let result = match (fh.mtime, fh.atime) {
                 (Some(mtime), Some(atime)) => filetime::set_file_times(
                     out_path,
                     filetime::FileTime::from_system_time(atime),
@@ -2249,7 +2463,14 @@ impl RarArchive {
                         .map_err(RarError::Io)
                 }
                 (None, None) => Ok(()),
-            }?;
+            };
+            if let Err(error) = result {
+                debug!(
+                    path = %out_path.display(),
+                    ?error,
+                    "failed to restore output timestamps"
+                );
+            }
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -2302,7 +2523,13 @@ impl RarArchive {
             windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
         );
         if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-            return Err(RarError::Io(std::io::Error::last_os_error()));
+            let error = std::io::Error::last_os_error();
+            debug!(
+                path = %out_path.display(),
+                ?error,
+                "failed to open output for creation timestamp restore"
+            );
+            return Ok(());
         }
 
         struct Handle(windows_sys::Win32::Foundation::HANDLE);
@@ -2324,7 +2551,12 @@ impl RarArchive {
             )
         };
         if ok == 0 {
-            return Err(RarError::Io(std::io::Error::last_os_error()));
+            let error = std::io::Error::last_os_error();
+            debug!(
+                path = %out_path.display(),
+                ?error,
+                "failed to restore output creation timestamp"
+            );
         }
         Ok(())
     }
@@ -2431,8 +2663,16 @@ impl RarArchive {
                 return Ok(());
             };
             let chown_follows_links = Self::unix_owner_chown_follows_links(follow_links);
-            if Self::path_owner_matches(out_path, uid, gid, chown_follows_links)? {
-                return Ok(());
+            match Self::path_owner_matches(out_path, uid, gid, chown_follows_links) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    debug!(
+                        path = %out_path.display(),
+                        error = %error,
+                        "failed to inspect Unix owner before restore"
+                    );
+                }
             }
             let original_mode = Self::unix_followed_mode(out_path);
 
@@ -2454,7 +2694,12 @@ impl RarArchive {
                 }
             };
             if result != 0 {
-                return Err(RarError::Io(std::io::Error::last_os_error()));
+                debug!(
+                    path = %out_path.display(),
+                    error = %std::io::Error::last_os_error(),
+                    "failed to restore Unix owner"
+                );
+                return Ok(());
             }
             if let Some(mode) = original_mode
                 && let Err(error) = Self::restore_unix_followed_mode(out_path, mode)
@@ -2767,6 +3012,14 @@ impl RarArchive {
                 member: raw_member_name.to_string(),
                 link_type: "self-referential file copy".to_string(),
             });
+        }
+        if source_index > index {
+            return Err(RarError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "RAR file-copy source member {target} appears after {raw_member_name} and is not available yet"
+                ),
+            )));
         }
 
         if self.members[source_index].file_header.is_directory {
@@ -4116,8 +4369,9 @@ impl RarArchive {
         }
 
         if fh.is_directory {
-            Self::ensure_output_directory_for_member(&member_name, out_path)?;
-            Self::apply_output_metadata(&fh, owner.as_ref(), options, out_path)?;
+            let resolved_out_path =
+                Self::ensure_output_directory_for_member(&member_name, out_path)?;
+            Self::apply_output_metadata(&fh, owner.as_ref(), options, &resolved_out_path)?;
             if let (Some(p), Some(mi)) = (progress, mi.as_ref()) {
                 p.on_member_progress(mi, 0);
                 p.on_member_complete(mi, &Ok(()));
@@ -4141,10 +4395,9 @@ impl RarArchive {
         }
 
         // Create output file with buffered writer.
-        Self::ensure_output_parent_dir_for_member(&member_name, out_path)?;
-        Self::remove_existing_regular_output_symlink(out_path)?;
-        Self::clear_windows_readonly_before_overwrite(out_path)?;
-        let file = std::fs::File::create(out_path).map_err(RarError::Io)?;
+        let (file, resolved_out_path) =
+            Self::create_regular_output_file_for_member(&member_name, out_path)?;
+        let out_path = resolved_out_path.as_path();
         let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
 
         if fh.compression.method == CompressionMethod::Store {
@@ -7372,6 +7625,42 @@ mod tests {
         assert_eq!(std::fs::read(outside.join("marker")).unwrap(), b"keep");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn directory_output_retries_with_unrar_windows_share_name_after_create_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("bad?dir");
+        let fallback = temp.path().join("bad_dir");
+        std::fs::write(&original, b"existing file").unwrap();
+
+        let resolved =
+            RarArchive::ensure_output_directory_for_member("bad?dir", &original).unwrap();
+
+        assert_eq!(resolved, fallback);
+        assert_eq!(std::fs::read(&original).unwrap(), b"existing file");
+        assert!(fallback.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_output_retries_with_unrar_windows_share_name_after_create_failure() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("bad?file.bin");
+        let fallback = temp.path().join("bad_file.bin");
+        std::fs::create_dir(&original).unwrap();
+
+        let (mut file, resolved) =
+            RarArchive::create_regular_output_file_for_member("bad?file.bin", &original).unwrap();
+        file.write_all(b"fallback bytes").unwrap();
+        drop(file);
+
+        assert_eq!(resolved, fallback);
+        assert!(original.is_dir());
+        assert_eq!(std::fs::read(fallback).unwrap(), b"fallback bytes");
+    }
+
     #[test]
     fn unix_owner_chown_link_following_matches_unrar_platform_branch() {
         assert!(RarArchive::unix_owner_chown_follows_links(true));
@@ -7379,6 +7668,20 @@ mod tests {
             RarArchive::unix_owner_chown_follows_links(false),
             cfg!(target_vendor = "apple")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_owner_restore_failure_is_best_effort_like_unrar() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.bin");
+        let owner = crate::types::UnixOwnerInfo {
+            uid: Some(0),
+            gid: Some(0),
+            ..Default::default()
+        };
+
+        RarArchive::apply_unix_owner(Some(&owner), &missing, true).unwrap();
     }
 
     #[test]
@@ -7403,6 +7706,17 @@ mod tests {
         assert_eq!(actual_mtime, filetime::FileTime::from_system_time(mtime));
 
         assert!(RarArchive::unix_regular_file_times(None, None, now).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_output_timestamp_failures_are_best_effort_like_unrar() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.bin");
+        let mut fh = test_rar3_symlink_header(None);
+        fh.mtime = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000));
+
+        RarArchive::apply_output_times(&fh, &missing).unwrap();
     }
 
     #[cfg(unix)]
@@ -7646,6 +7960,8 @@ mod tests {
     fn test_rar5_service(name: &str, unpacked_size: u64, data_size: u64) -> ServiceEntry {
         ServiceEntry {
             header_offset: 0,
+            is_child: false,
+            is_inherited: false,
             file_header: FileHeader {
                 name: name.to_string(),
                 name_raw: Some(name.as_bytes().to_vec()),
@@ -7831,6 +8147,22 @@ mod tests {
             RarArchive::windows_long_path_string("", "D:\\extract"),
             None
         );
+    }
+
+    #[test]
+    fn windows_create_dir_special_names_match_unrar_detection() {
+        assert!(RarArchive::windows_path_ends_with_dot_or_space(
+            std::path::Path::new("dir.")
+        ));
+        assert!(RarArchive::windows_path_ends_with_dot_or_space(
+            std::path::Path::new("dir ")
+        ));
+        assert!(!RarArchive::windows_path_ends_with_dot_or_space(
+            std::path::Path::new("dir")
+        ));
+        assert!(!RarArchive::windows_path_ends_with_dot_or_space(
+            std::path::Path::new("")
+        ));
     }
 
     #[test]

@@ -100,6 +100,48 @@ fn make_windows_component_compatible(component: &str) -> String {
     converted
 }
 
+pub(crate) fn make_unix_windows_share_member_name_compatible(path: &str) -> String {
+    let mut converted = String::with_capacity(path.len());
+    let mut parts = path.split('/').peekable();
+    while let Some(component) = parts.next() {
+        let has_following_separator = parts.peek().is_some();
+        converted.push_str(&make_unix_windows_share_component_compatible(
+            component,
+            has_following_separator,
+        ));
+        if has_following_separator {
+            converted.push('/');
+        }
+    }
+    converted
+}
+
+fn make_unix_windows_share_component_compatible(
+    component: &str,
+    has_following_separator: bool,
+) -> String {
+    let mut converted: String = component
+        .chars()
+        .map(|ch| {
+            if ch < '\u{20}' || matches!(ch, '?' | '*' | '<' | '>' | '|' | '"' | ':') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+
+    if has_following_separator
+        && !matches!(converted.as_str(), "." | "..")
+        && converted.ends_with(['.', ' '])
+        && let Some((idx, _)) = converted.char_indices().next_back()
+    {
+        converted.replace_range(idx.., "_");
+    }
+
+    converted
+}
+
 fn windows_reserved_device_component(component: &str) -> bool {
     let upper = component.to_ascii_uppercase();
     matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
@@ -552,6 +594,22 @@ mod tests {
         assert_eq!(
             make_windows_member_name_compatible("./../still"),
             "./../still"
+        );
+    }
+
+    #[test]
+    fn unix_windows_share_retry_name_matches_unrar_make_name_usable_subset() {
+        assert_eq!(
+            make_unix_windows_share_member_name_compatible("bad:name/dir./file?.txt"),
+            "bad_name/dir_/file_.txt"
+        );
+        assert_eq!(
+            make_unix_windows_share_member_name_compatible("./../final. "),
+            "./../final. "
+        );
+        assert_eq!(
+            make_unix_windows_share_member_name_compatible("double//bad|name"),
+            "double//bad_name"
         );
     }
 

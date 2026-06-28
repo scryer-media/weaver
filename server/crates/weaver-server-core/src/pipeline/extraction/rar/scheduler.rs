@@ -16,6 +16,34 @@ impl Pipeline {
         lower.contains("checksum") || lower.contains("crc mismatch")
     }
 
+    async fn normalize_extraction_output_tree(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> Result<(), String> {
+        let output_root = self
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.staging_dir.clone())
+            .unwrap_or_else(|| self.deterministic_extraction_staging_dir(job_id));
+        let output_root_for_error = output_root.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::runtime::fs::normalize_extracted_tree(&output_root)
+        })
+        .await
+        .map_err(|error| {
+            format!(
+                "extraction output permission normalization task panicked for set '{set_name}': {error}"
+            )
+        })?
+        .map_err(|error| {
+            format!(
+                "failed to normalize extraction output permissions for set '{set_name}' at {}: {error}",
+                output_root_for_error.display()
+            )
+        })
+    }
+
     fn rar_set_worker_limit(plan: &crate::pipeline::archive::rar_state::RarDerivedPlan) -> usize {
         if plan.is_solid { 1 } else { 2 }
     }
@@ -770,6 +798,19 @@ impl Pipeline {
 
                 match result {
                     Ok(outcome) => {
+                        if let Err(error) = self
+                            .normalize_extraction_output_tree(job_id, &set_name)
+                            .await
+                        {
+                            warn!(
+                                job_id = job_id.0,
+                                set_name = %set_name,
+                                error = %error,
+                                "failed to normalize extraction output permissions"
+                            );
+                            self.fail_job(job_id, error);
+                            return;
+                        }
                         let password_candidates =
                             self.archive_password_candidates_for_set(job_id, &set_name);
                         self.remember_archive_password_winner(
@@ -920,6 +961,19 @@ impl Pipeline {
                 result,
             } => match result {
                 Ok(outcome) => {
+                    if let Err(error) = self
+                        .normalize_extraction_output_tree(job_id, &set_name)
+                        .await
+                    {
+                        warn!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            error = %error,
+                            "failed to normalize extraction output permissions"
+                        );
+                        self.fail_job(job_id, error);
+                        return;
+                    }
                     let password_candidates =
                         self.archive_password_candidates_for_set(job_id, &set_name);
                     self.remember_archive_password_winner(

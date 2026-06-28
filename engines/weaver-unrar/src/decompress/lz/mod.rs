@@ -101,6 +101,7 @@ impl LzDecoder {
     pub fn try_new(dict_size: usize, version: u8) -> RarResult<Self> {
         let extra_dist = match version {
             0 => false,
+            // UnRAR stores RAR 7.0 LZ as version 1 (`VER_PACK7` minus 70).
             1 => true,
             _ => {
                 return Err(RarError::UnsupportedCompression { method: 0, version });
@@ -1527,6 +1528,17 @@ mod tests {
             LzDecoder::try_new(128 * 1024, 2),
             Err(RarError::UnsupportedCompression { version: 2, .. })
         ));
+    }
+
+    #[test]
+    fn lz_decoder_accepts_rar7_unpack_version_like_unrar() {
+        let decoder = LzDecoder::try_new(128 * 1024, 1).unwrap();
+
+        assert!(decoder.extra_dist);
+        assert_eq!(
+            decoder.code_lengths.len(),
+            huffman::HUFF_NC + huffman::HUFF_DCX + huffman::HUFF_LDC + huffman::HUFF_RC
+        );
     }
 
     #[test]

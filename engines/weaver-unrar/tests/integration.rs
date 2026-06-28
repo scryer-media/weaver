@@ -4052,7 +4052,7 @@ fn test_extract_member_to_file_extracts_archive_filecopy_source() {
 }
 
 #[test]
-fn test_extract_member_to_file_uses_later_rar5_filecopy_source_like_unrar_reflist() {
+fn test_extract_member_to_file_rejects_later_rar5_filecopy_source_like_unrar() {
     let extra = redirection_extra(5, "original.txt");
     let archive_bytes = build_two_stored_members_with_extra(
         "copy.txt",
@@ -4067,14 +4067,16 @@ fn test_extract_member_to_file_uses_later_rar5_filecopy_source_like_unrar_reflis
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("copy.txt");
 
-    // UnRAR registers the file-copy reference in RefList, extracts a later
-    // source member to a temporary file, then copies/moves it to the target.
-    let written = archive
+    // UnRAR's RefList only helps after the referenced source has been
+    // encountered in stream order. A future source is not available yet.
+    let err = archive
         .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(written, b"future archive source".len() as u64);
-    assert_eq!(std::fs::read(&out_path).unwrap(), b"future archive source");
+    assert!(
+        matches!(err, weaver_unrar::RarError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound)
+    );
+    assert!(!out_path.exists());
 }
 
 #[test]

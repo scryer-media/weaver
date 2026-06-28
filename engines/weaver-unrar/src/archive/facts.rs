@@ -130,6 +130,10 @@ pub struct RarVolumeServiceFacts {
     pub subtype: Option<u16>,
     #[serde(default)]
     pub level: Option<u8>,
+    #[serde(default)]
+    pub is_child: bool,
+    #[serde(default)]
+    pub is_inherited: bool,
     pub unpacked_size: Option<u64>,
     pub data_crc32: Option<u32>,
     #[serde(default)]
@@ -242,6 +246,8 @@ impl RarVolumeServiceFacts {
             name_raw: fh.name_raw.clone(),
             subtype: None,
             level: None,
+            is_child: false,
+            is_inherited: false,
             unpacked_size: fh.unpacked_size,
             data_crc32: Some(fh.crc32),
             data_blake2_hash: None,
@@ -277,6 +283,8 @@ impl RarVolumeServiceFacts {
             name_raw: Some(b"CMT".to_vec()),
             subtype: None,
             level: None,
+            is_child: false,
+            is_inherited: false,
             unpacked_size: Some(u64::from(comment.unpacked_size)),
             data_crc32: None,
             data_blake2_hash: None,
@@ -376,6 +384,8 @@ impl RarVolumeServiceFacts {
             name_raw: None,
             subtype: Some(service.subtype),
             level: Some(service.level),
+            is_child: false,
+            is_inherited: false,
             unpacked_size,
             data_crc32,
             data_blake2_hash: None,
@@ -419,6 +429,8 @@ impl RarVolumeServiceFacts {
             name_raw: service.header.inner.name_raw.clone(),
             subtype: None,
             level: None,
+            is_child: service.header.is_child,
+            is_inherited: service.header.is_inherited,
             unpacked_size: service.header.inner.unpacked_size,
             data_crc32: service.header.inner.data_crc32,
             data_blake2_hash: file_hash_blake2(service.hash.as_ref()),
@@ -746,6 +758,7 @@ impl RarArchive {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[derive(Serialize)]
     struct LegacyVolumeFacts {
@@ -777,6 +790,32 @@ mod tests {
         redirection_type: Option<u64>,
         redirection_target: Option<String>,
         redirection_target_is_directory: bool,
+    }
+
+    fn build_rar4_header(header_type: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+        let mut header = Vec::with_capacity(7 + body.len());
+        header.extend_from_slice(&[0, 0]);
+        header.push(header_type);
+        header.extend_from_slice(&flags.to_le_bytes());
+        header.extend_from_slice(&((7 + body.len()) as u16).to_le_bytes());
+        header.extend_from_slice(body);
+        let crc16 = (crc32fast::hash(&header[2..]) & 0xffff) as u16;
+        header[0..2].copy_from_slice(&crc16.to_le_bytes());
+        header
+    }
+
+    fn build_rar4_main_header(flags: u16, high_pos_av: u16, pos_av: u32) -> Vec<u8> {
+        let mut body = Vec::with_capacity(6);
+        body.extend_from_slice(&high_pos_av.to_le_bytes());
+        body.extend_from_slice(&pos_av.to_le_bytes());
+        build_rar4_header(0x73, flags, &body)
+    }
+
+    fn signed_rar4_archive_bytes() -> Vec<u8> {
+        let mut bytes = crate::signature::RAR4_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&build_rar4_main_header(0, 0x1234, 0x5678_9abc));
+        bytes.extend_from_slice(&build_rar4_header(0x7b, 0, &[]));
+        bytes
     }
 
     #[test]
@@ -837,5 +876,82 @@ mod tests {
         assert_eq!(decoded.members[0].packed_crc32, None);
         assert_eq!(decoded.members[0].packed_blake2_hash, None);
         assert!(!decoded.members[0].packed_hash_uses_mac);
+    }
+
+    #[test]
+    fn named_messagepack_legacy_service_facts_default_child_flags() {
+        #[derive(Serialize)]
+        struct LegacyServiceVolumeFacts {
+            format: u8,
+            volume_number: u32,
+            more_volumes: bool,
+            is_solid: bool,
+            is_encrypted: bool,
+            members: Vec<LegacyMemberFacts>,
+            services: Vec<LegacyServiceFacts>,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyServiceFacts {
+            order: u32,
+            name: String,
+            unpacked_size: Option<u64>,
+            data_crc32: Option<u32>,
+            split_before: bool,
+            split_after: bool,
+            is_encrypted: bool,
+            data_offset: u64,
+            data_size: u64,
+            compression_method: u8,
+            compression_version: u8,
+            compression_solid: bool,
+            dict_size: u64,
+            use_hash_mac: bool,
+            stream_name: Option<String>,
+            stream_name_raw: Option<Vec<u8>>,
+        }
+
+        let legacy = LegacyServiceVolumeFacts {
+            format: 5,
+            volume_number: 0,
+            more_volumes: false,
+            is_solid: false,
+            is_encrypted: false,
+            members: Vec::new(),
+            services: vec![LegacyServiceFacts {
+                order: 0,
+                name: "CMT".to_string(),
+                unpacked_size: Some(3),
+                data_crc32: None,
+                split_before: false,
+                split_after: false,
+                is_encrypted: false,
+                data_offset: 123,
+                data_size: 3,
+                compression_method: CompressionMethod::Store.code(),
+                compression_version: 0,
+                compression_solid: false,
+                dict_size: 0,
+                use_hash_mac: false,
+                stream_name: None,
+                stream_name_raw: None,
+            }],
+        };
+        let encoded = rmp_serde::to_vec_named(&legacy).unwrap();
+
+        let decoded: RarVolumeFacts = rmp_serde::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded.services.len(), 1);
+        assert!(!decoded.services[0].is_child);
+        assert!(!decoded.services[0].is_inherited);
+    }
+
+    #[test]
+    fn rar4_volume_facts_preserve_signed_main_header_like_unrar() {
+        let facts =
+            RarArchive::parse_volume_facts(Cursor::new(signed_rar4_archive_bytes()), None).unwrap();
+
+        assert_eq!(facts.format, 4);
+        assert!(facts.has_authenticity_verification);
     }
 }

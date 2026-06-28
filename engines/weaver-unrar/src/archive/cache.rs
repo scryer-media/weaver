@@ -134,6 +134,10 @@ pub struct CachedService {
     pub dict_size: u64,
     pub split_before: bool,
     pub split_after: bool,
+    #[serde(default)]
+    pub is_child: bool,
+    #[serde(default)]
+    pub is_inherited: bool,
     pub is_encrypted: bool,
     pub encryption: Option<CachedEncryption>,
     #[serde(default)]
@@ -509,6 +513,8 @@ impl RarArchive {
                     dict_size: service.file_header.compression.dict_size,
                     split_before: service.file_header.split_before,
                     split_after: service.file_header.split_after,
+                    is_child: service.is_child,
+                    is_inherited: service.is_inherited,
                     is_encrypted: service.is_encrypted,
                     encryption: service.file_encryption.as_ref().map(cached_encryption),
                     version: service.file_header.version,
@@ -640,6 +646,8 @@ impl RarArchive {
 
                 ServiceEntry {
                     header_offset: service.header_offset,
+                    is_child: service.is_child,
+                    is_inherited: service.is_inherited,
                     file_header: FileHeader {
                         name: service.name,
                         name_raw: service.name_raw,
@@ -959,6 +967,8 @@ mod tests {
                 dict_size: 0,
                 split_before: false,
                 split_after: true,
+                is_child: true,
+                is_inherited: true,
                 is_encrypted: true,
                 encryption: Some(CachedEncryption {
                     version: 0,
@@ -993,6 +1003,8 @@ mod tests {
         assert_eq!(service.header_offset, 0x1234);
         assert_eq!(service.file_header.name, "CMT");
         assert_eq!(service.file_header.name_raw.as_deref(), Some(&b"CMT"[..]));
+        assert!(service.is_child);
+        assert!(service.is_inherited);
         assert_eq!(service.file_header.unpacked_size, Some(12));
         assert_eq!(service.file_header.data_crc32, Some(0xA1B2_C3D4));
         assert_eq!(

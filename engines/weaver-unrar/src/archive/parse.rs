@@ -139,6 +139,8 @@ impl RarArchive {
                     .flatten();
                 ServiceEntry {
                     header_offset: service.header.header_offset,
+                    is_child: service.header.is_child,
+                    is_inherited: service.header.is_inherited,
                     file_header,
                     is_encrypted: service.is_encrypted,
                     file_encryption: service.file_encryption.map(Self::file_encryption_info),
@@ -258,6 +260,8 @@ impl RarArchive {
             let file_header = Self::rar4_to_file_header(fh, parsed.archive_header.is_solid);
             let entry = ServiceEntry {
                 header_offset: fh.data_offset,
+                is_child: false,
+                is_inherited: false,
                 segments: vec![DataSegment::with_packed_hash(
                     0,
                     fh.data_offset,
@@ -439,6 +443,8 @@ impl RarArchive {
     ) -> ServiceEntry {
         ServiceEntry {
             header_offset: comment.header_offset,
+            is_child: false,
+            is_inherited: false,
             file_header: FileHeader {
                 name: "CMT".to_string(),
                 name_raw: Some(b"CMT".to_vec()),
@@ -560,6 +566,8 @@ impl RarArchive {
 
         Some(ServiceEntry {
             header_offset: service.header_offset,
+            is_child: false,
+            is_inherited: false,
             file_header: FileHeader {
                 name: name.to_string(),
                 name_raw: Some(name.as_bytes().to_vec()),
@@ -689,6 +697,8 @@ mod tests {
     fn service_header(name: &str, subdata: Option<Vec<u8>>) -> ServiceHeader {
         ServiceHeader {
             header_offset: 123,
+            is_child: false,
+            is_inherited: false,
             inner: Rar5FileHeader {
                 name: name.to_string(),
                 name_raw: Some(name.as_bytes().to_vec()),

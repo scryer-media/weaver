@@ -72,6 +72,8 @@ pub(super) struct MemberEntry {
 pub(super) struct ServiceEntry {
     pub(super) header_offset: u64,
     pub(super) file_header: FileHeader,
+    pub(super) is_child: bool,
+    pub(super) is_inherited: bool,
     pub(super) is_encrypted: bool,
     pub(super) file_encryption: Option<FileEncryptionInfo>,
     pub(super) hash: Option<FileHash>,

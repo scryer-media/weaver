@@ -131,6 +131,8 @@ impl RarArchive {
                 .flatten();
             let entry = ServiceEntry {
                 header_offset: service.header.header_offset,
+                is_child: service.header.is_child,
+                is_inherited: service.header.is_inherited,
                 file_header,
                 is_encrypted: service.is_encrypted,
                 file_encryption: service.file_encryption.map(Self::file_encryption_info),
@@ -251,6 +253,8 @@ impl RarArchive {
             let file_header = Self::rar4_to_file_header(fh, parsed.archive_header.is_solid);
             let entry = ServiceEntry {
                 header_offset: fh.data_offset,
+                is_child: false,
+                is_inherited: false,
                 file_header: file_header.clone(),
                 is_encrypted: fh.is_encrypted,
                 file_encryption: None,
@@ -800,6 +804,8 @@ mod tests {
     ) -> ServiceEntry {
         ServiceEntry {
             header_offset: 100 + first_volume as u64,
+            is_child: false,
+            is_inherited: false,
             file_header: test_file_header(name, split_before, split_after, Some(0xAABB_CCDD)),
             is_encrypted: false,
             file_encryption: None,
