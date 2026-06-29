@@ -50,7 +50,10 @@ pub mod tls;
 pub mod types;
 
 // Re-export primary types for convenience.
-pub use client::{DecodedBody, DecodedBodyError, DecodedBodyTrace, NntpClient};
+pub use client::{
+    BodyLaneBatchStats, BodyLaneLease, BodyLaneMode, DecodedBody, DecodedBodyError,
+    DecodedBodyTrace, NntpClient,
+};
 pub use codec::StreamChunk;
 pub use connection::{NntpConnection, ServerConfig};
 pub use error::{NntpError, Result};

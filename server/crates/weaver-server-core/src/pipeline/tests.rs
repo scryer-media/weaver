@@ -2783,6 +2783,7 @@ async fn shutdown_drain_consumes_inflight_download_results() {
                 "shutdown test",
             )),
             attempts: Vec::new(),
+            lane_observation: None,
             source_server_idx: None,
             is_recovery: false,
             retry_count: 0,
@@ -3726,6 +3727,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
                 segment_id,
                 data: Ok(DownloadPayload::Raw(raw)),
                 attempts: Vec::new(),
+                lane_observation: None,
                 source_server_idx: None,
                 is_recovery: false,
                 retry_count: 0,
@@ -3784,6 +3786,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
             },
             data: Ok(DownloadPayload::Raw(raw)),
             attempts: Vec::new(),
+            lane_observation: None,
             source_server_idx: None,
             is_recovery: false,
             retry_count: 0,
@@ -3874,6 +3877,7 @@ async fn in_order_segments_keep_write_cursor_until_file_completes() {
                 segment_id,
                 data: Ok(DownloadPayload::Raw(raw)),
                 attempts: Vec::new(),
+                lane_observation: None,
                 source_server_idx: None,
                 is_recovery: false,
                 retry_count: 0,
@@ -3966,6 +3970,7 @@ async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
                 },
                 data: Ok(DownloadPayload::Raw(raw)),
                 attempts: Vec::new(),
+                lane_observation: None,
                 source_server_idx: None,
                 is_recovery: false,
                 retry_count: 0,
@@ -4019,6 +4024,7 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
                 "connection reset by peer",
             )),
             attempts: Vec::new(),
+            lane_observation: None,
             source_server_idx: None,
             is_recovery: false,
             retry_count: 0,
@@ -4071,6 +4077,7 @@ async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
                 "no connections available",
             )),
             attempts: Vec::new(),
+            lane_observation: None,
             source_server_idx: None,
             is_recovery: false,
             retry_count: MAX_SEGMENT_RETRIES,
@@ -4143,6 +4150,7 @@ async fn excluded_source_not_found_retries_without_marking_health_failure() {
                 "article not found",
             )),
             attempts: Vec::new(),
+            lane_observation: None,
             source_server_idx: None,
             is_recovery: false,
             retry_count: 0,
@@ -4206,6 +4214,7 @@ async fn recovery_article_not_found_does_not_mark_health_failure() {
                 "article not found",
             )),
             attempts: Vec::new(),
+            lane_observation: None,
             source_server_idx: None,
             is_recovery: true,
             retry_count: 0,
@@ -4267,6 +4276,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
                 total_size,
             ))),
             attempts: Vec::new(),
+            lane_observation: None,
             source_server_idx: None,
             is_recovery: false,
             retry_count: 0,
@@ -4303,6 +4313,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
                 "connection reset by peer",
             )),
             attempts: Vec::new(),
+            lane_observation: None,
             source_server_idx: None,
             is_recovery: false,
             retry_count: MAX_SEGMENT_RETRIES,
@@ -5349,7 +5360,7 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 3);
+    assert_eq!(pipeline.active_downloads, 2);
     assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(
         pipeline
@@ -5367,7 +5378,7 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
             .unwrap()
             .download_queue
             .len(),
-        0
+        1
     );
     assert_eq!(
         pipeline.active_downloads_by_job.get(&earlier_job_id),
@@ -5375,7 +5386,7 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
     );
     assert_eq!(
         pipeline.active_downloads_by_job.get(&later_job_id),
-        Some(&2)
+        Some(&1)
     );
     assert_eq!(pipeline.hot_dispatch_mode, DispatchShareMode::Shared);
     assert!(
@@ -5417,6 +5428,7 @@ async fn release_download_result_updates_hot_job_successes_before_heavy_processi
         segment_id,
         data: Ok(DownloadPayload::Raw(Bytes::from_static(b"article"))),
         attempts: vec![],
+        lane_observation: None,
         source_server_idx: None,
         is_recovery: false,
         retry_count: 0,
@@ -5484,11 +5496,11 @@ async fn dispatch_downloads_keeps_capacity_on_hot_job_before_same_band_spillover
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 3);
+    assert_eq!(pipeline.active_downloads, 2);
     assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(
         pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
-        0
+        1
     );
     assert_eq!(
         pipeline
@@ -5499,7 +5511,7 @@ async fn dispatch_downloads_keeps_capacity_on_hot_job_before_same_band_spillover
             .len(),
         1
     );
-    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&3));
+    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&2));
     assert!(
         !pipeline
             .active_downloads_by_job
@@ -5561,9 +5573,9 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(pipeline.active_downloads, 1);
     assert_eq!(pipeline.active_download_connections, 1);
-    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&2));
+    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&1));
     assert!(
         !pipeline
             .active_downloads_by_job
@@ -5571,7 +5583,7 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
     );
     assert_eq!(
         pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
-        1
+        2
     );
     assert_eq!(
         pipeline
@@ -5592,22 +5604,22 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
     assert!(pipeline.download_pressure_soft_dispatch_after.is_some());
 
     pipeline.dispatch_downloads();
-    assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(pipeline.active_downloads, 1);
     assert_eq!(pipeline.active_download_connections, 1);
     assert_eq!(
         pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
-        1
+        2
     );
 
     pipeline.download_pressure_soft_dispatch_after =
         Some(Instant::now() - Duration::from_millis(1));
     pipeline.dispatch_downloads();
-    assert_eq!(pipeline.active_downloads, 3);
+    assert_eq!(pipeline.active_downloads, 2);
     assert_eq!(pipeline.active_download_connections, 2);
-    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&3));
+    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&2));
     assert_eq!(
         pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
-        0
+        1
     );
 }
 
@@ -5759,7 +5771,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .unwrap()
             .download_queue
             .len(),
-        0
+        1
     );
     assert_eq!(
         pipeline
@@ -5792,7 +5804,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .unwrap()
             .download_queue
             .len(),
-        0
+        1
     );
     assert_eq!(
         pipeline
@@ -6011,6 +6023,7 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
             segment_id,
             data: Ok(DownloadPayload::Raw(raw)),
             attempts: Vec::new(),
+            lane_observation: None,
             source_server_idx: None,
             is_recovery: false,
             retry_count: 0,
@@ -6116,6 +6129,7 @@ async fn decode_failure_retries_excluding_actual_source_server() {
                 b"not a yenc article",
             ))),
             attempts: Vec::new(),
+            lane_observation: None,
             source_server_idx: Some(0),
             is_recovery: false,
             retry_count: 0,
@@ -6192,6 +6206,7 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
                 yenc_name: filename.to_string(),
             })),
             attempts: Vec::new(),
+            lane_observation: None,
             source_server_idx: Some(0),
             is_recovery: false,
             retry_count: 0,
@@ -6254,6 +6269,7 @@ async fn streamed_decode_failure_retries_excluding_actual_source_server() {
                 crc_mismatch: false,
             }),
             attempts: Vec::new(),
+            lane_observation: None,
             source_server_idx: Some(0),
             is_recovery: false,
             retry_count: 0,
@@ -9229,10 +9245,10 @@ async fn restore_job_uses_per_file_progress_floor_for_reporting() {
         .unwrap();
 
     let state = pipeline.jobs.get(&job_id).unwrap();
-    assert_eq!(state.downloaded_bytes, 100);
-    assert_eq!(state.restored_download_floor_bytes, 100);
-    assert_eq!(Pipeline::effective_downloaded_bytes(state), 100);
-    assert!((Pipeline::effective_progress(state) - 0.5).abs() < f64::EPSILON);
+    assert_eq!(state.downloaded_bytes, 200);
+    assert_eq!(state.restored_download_floor_bytes, 200);
+    assert_eq!(Pipeline::effective_downloaded_bytes(state), 200);
+    assert!((Pipeline::effective_progress(state) - 1.0).abs() < f64::EPSILON);
 }
 
 #[tokio::test]
@@ -16044,6 +16060,7 @@ async fn download_done_refunds_rate_limit_estimate_to_actual_raw_bytes() {
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from(vec![0; 500]))),
             attempts: vec![],
+            lane_observation: None,
             source_server_idx: None,
             is_recovery: false,
             retry_count: 0,
@@ -16079,6 +16096,7 @@ async fn download_done_charges_rate_limit_for_raw_bytes_above_estimate() {
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from(vec![0; 1_600]))),
             attempts: vec![],
+            lane_observation: None,
             source_server_idx: None,
             is_recovery: false,
             retry_count: 0,

@@ -48,6 +48,17 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         hot_dispatch_spillover_blocked_hot_can_use_capacity_total: 0,
         hot_dispatch_spillover_allowed_underfill_total: 0,
         hot_dispatch_spillover_reclaimed_total: 0,
+        download_lanes_active: 0,
+        download_lanes_sequential_active: 0,
+        download_lanes_depth2_active: 0,
+        download_lanes_depth4_active: 0,
+        download_lane_parks_no_work_total: 0,
+        download_lane_parks_error_total: 0,
+        download_pipeline_trial_success_total: 0,
+        download_pipeline_trial_failure_total: 0,
+        download_pipeline_proof_pass_total: 0,
+        download_pipeline_cooldown_total: 0,
+        download_pipeline_replay_items_total: 0,
         segments_downloaded: bytes_downloaded / 100,
         segments_decoded: bytes_downloaded / 200,
         segments_committed: bytes_downloaded / 300,
@@ -181,7 +192,7 @@ async fn metrics_has_expected_fields() {
     let h = TestHarness::new().await;
     let resp = h
         .execute(
-            "{ metrics { bytesDownloaded bytesDecoded bytesCommitted downloadQueueDepth segmentsDownloaded currentDownloadSpeed hotDispatchJobId hotDispatchMode hotDispatchUnderfillMs hotDispatchLentConnections hotDispatchWarmupComplete hotDispatchLastSpilloverDecision hotDispatchSpilloverBlockedWarmupTotal hotDispatchSpilloverAllowedUnderfillTotal } }",
+            "{ metrics { bytesDownloaded bytesDecoded bytesCommitted downloadQueueDepth segmentsDownloaded currentDownloadSpeed hotDispatchJobId hotDispatchMode hotDispatchUnderfillMs hotDispatchLentConnections hotDispatchWarmupComplete hotDispatchLastSpilloverDecision hotDispatchSpilloverBlockedWarmupTotal hotDispatchSpilloverAllowedUnderfillTotal downloadLanesActive downloadLanesDepth2Active downloadLaneParksNoWorkTotal downloadPipelineProofPassTotal downloadPipelineReplayItemsTotal } }",
         )
         .await;
     assert_no_errors(&resp);
@@ -199,6 +210,11 @@ async fn metrics_has_expected_fields() {
     assert!(m["hotDispatchLastSpilloverDecision"].is_string());
     assert!(m["hotDispatchSpilloverBlockedWarmupTotal"].is_number());
     assert!(m["hotDispatchSpilloverAllowedUnderfillTotal"].is_number());
+    assert!(m["downloadLanesActive"].is_number());
+    assert!(m["downloadLanesDepth2Active"].is_number());
+    assert!(m["downloadLaneParksNoWorkTotal"].is_number());
+    assert!(m["downloadPipelineProofPassTotal"].is_number());
+    assert!(m["downloadPipelineReplayItemsTotal"].is_number());
 }
 
 #[tokio::test]

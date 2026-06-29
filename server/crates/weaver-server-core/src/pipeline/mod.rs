@@ -50,6 +50,7 @@ use weaver_par2::checksum;
 use weaver_par2::par2_set::Par2FileSet;
 
 use self::archive::rar_state::{RarDerivedPlan, RarSetState};
+use self::download::{DownloadLaneMode, DownloadLaneRuntimeState, JobTransportProfile};
 
 /// Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
@@ -190,6 +191,7 @@ pub(super) struct DownloadResult {
     pub(super) segment_id: SegmentId,
     pub(super) data: std::result::Result<DownloadPayload, DownloadError>,
     pub(super) attempts: Vec<weaver_nntp::client::FetchAttemptTrace>,
+    pub(super) lane_observation: Option<DownloadLaneObservation>,
     /// Server that successfully served this payload, if known.
     pub(super) source_server_idx: Option<usize>,
     /// Whether this was a speculative recovery download.
@@ -200,6 +202,19 @@ pub(super) struct DownloadResult {
     pub(super) exclude_servers: Vec<usize>,
     /// Whether this result releases one NNTP connection dispatch slot.
     pub(super) release_connection_slot: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DownloadLaneObservation {
+    pub(super) server_idx: Option<usize>,
+    pub(super) mode: DownloadLaneMode,
+    pub(super) supports_pipelining: bool,
+    pub(super) rtt: Option<Duration>,
+    pub(super) batch_complete: bool,
+    pub(super) batch_clean: bool,
+    pub(super) batch_response_count: u64,
+    pub(super) unresolved_count: u64,
+    pub(super) connection_discarded: bool,
 }
 
 pub(super) enum DownloadPayload {
@@ -591,6 +606,10 @@ pub struct Pipeline {
     pub(super) hot_dispatch_underfill_since: Option<Instant>,
     /// Most recent spillover decision, for tick logging.
     pub(super) hot_dispatch_last_spillover_decision: SpilloverDecision,
+    /// Runtime-only article transport classification per active job.
+    pub(super) job_transport_profiles: HashMap<JobId, JobTransportProfile>,
+    /// Runtime-only lane/proof state for BODY dispatch.
+    pub(super) download_lane_runtime: DownloadLaneRuntimeState,
     /// Jobs currently inside an active article download pass.
     pub(super) active_download_passes: HashSet<JobId>,
     /// Jobs that still have decode/write pipeline work after network downloads finished.

@@ -467,7 +467,211 @@ impl Pipeline {
         }
     }
 
-    fn try_dispatch_download_for_job(&mut self, job_id: JobId) -> DispatchAttempt {
+    fn ensure_job_transport_profile(&mut self, job_id: JobId) -> Option<&JobTransportProfile> {
+        if !self.job_transport_profiles.contains_key(&job_id) {
+            let profile = self
+                .jobs
+                .get(&job_id)
+                .map(|state| JobTransportProfile::classify(&state.spec))?;
+            self.job_transport_profiles.insert(job_id, profile);
+        }
+        self.job_transport_profiles.get(&job_id)
+    }
+
+    fn choose_download_lane_mode(
+        &mut self,
+        job_id: JobId,
+        is_recovery: bool,
+        pressure: DownloadPressure,
+    ) -> DownloadLaneMode {
+        if is_recovery {
+            return DownloadLaneMode::Sequential;
+        }
+
+        let Some(profile) = self.ensure_job_transport_profile(job_id) else {
+            return DownloadLaneMode::Sequential;
+        };
+        let job_class = profile.class();
+
+        let median_body_bytes = profile.median_body_bytes();
+        let pressure_clear = pressure.state == DownloadPressureState::Clear;
+        let now = Instant::now();
+        self.download_lane_runtime
+            .server_proof
+            .iter()
+            .map(|(server_idx, proof)| {
+                let rtt = self
+                    .download_lane_runtime
+                    .server_rtt
+                    .get(server_idx)
+                    .and_then(|window| window.ewma());
+                proof.choose_mode(now, job_class, median_body_bytes, rtt, pressure_clear)
+            })
+            .max_by_key(|mode| mode.max_depth())
+            .unwrap_or(DownloadLaneMode::Sequential)
+    }
+
+    fn note_download_lane_started(&mut self, mode: DownloadLaneMode) {
+        debug_assert_eq!(
+            DownloadLaneMode::PipelineDepth2.max_depth(),
+            SAB_BODY_PIPELINE_DEPTH
+        );
+        let lane_id = DownloadLaneId(self.download_lane_runtime.next_lane_id);
+        self.download_lane_runtime.next_lane_id =
+            self.download_lane_runtime.next_lane_id.saturating_add(1);
+        debug!(lane_id = lane_id.0, mode = ?mode, "download lane started");
+        self.metrics
+            .download_lanes_active
+            .fetch_add(1, Ordering::Relaxed);
+        match mode {
+            DownloadLaneMode::Sequential => self
+                .metrics
+                .download_lanes_sequential_active
+                .fetch_add(1, Ordering::Relaxed),
+            DownloadLaneMode::PipelineDepth2 => self
+                .metrics
+                .download_lanes_depth2_active
+                .fetch_add(1, Ordering::Relaxed),
+            DownloadLaneMode::PipelineDepth4 => self
+                .metrics
+                .download_lanes_depth4_active
+                .fetch_add(1, Ordering::Relaxed),
+        };
+        *self
+            .download_lane_runtime
+            .active_by_mode
+            .entry(mode)
+            .or_default() += 1;
+        *self
+            .download_lane_runtime
+            .active_by_state
+            .entry(DownloadLaneState::Issuing)
+            .or_default() += 1;
+    }
+
+    fn note_download_lane_released(&mut self, mode: DownloadLaneMode, reason: LaneParkReason) {
+        self.metrics
+            .download_lanes_active
+            .fetch_sub(1, Ordering::Relaxed);
+        match mode {
+            DownloadLaneMode::Sequential => self
+                .metrics
+                .download_lanes_sequential_active
+                .fetch_sub(1, Ordering::Relaxed),
+            DownloadLaneMode::PipelineDepth2 => self
+                .metrics
+                .download_lanes_depth2_active
+                .fetch_sub(1, Ordering::Relaxed),
+            DownloadLaneMode::PipelineDepth4 => self
+                .metrics
+                .download_lanes_depth4_active
+                .fetch_sub(1, Ordering::Relaxed),
+        };
+        match reason {
+            LaneParkReason::NoWork => self
+                .metrics
+                .download_lane_parks_no_work_total
+                .fetch_add(1, Ordering::Relaxed),
+            LaneParkReason::Error => self
+                .metrics
+                .download_lane_parks_error_total
+                .fetch_add(1, Ordering::Relaxed),
+            _ => 0,
+        };
+        if let Some(active) = self.download_lane_runtime.active_by_mode.get_mut(&mode) {
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                self.download_lane_runtime.active_by_mode.remove(&mode);
+            }
+        }
+        if let Some(active) = self
+            .download_lane_runtime
+            .active_by_state
+            .get_mut(&DownloadLaneState::Issuing)
+        {
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                self.download_lane_runtime
+                    .active_by_state
+                    .remove(&DownloadLaneState::Issuing);
+            }
+        }
+        *self
+            .download_lane_runtime
+            .park_counts
+            .entry(reason)
+            .or_default() += 1;
+    }
+
+    fn record_download_lane_observation(&mut self, result: &DownloadResult) {
+        let Some(observation) = result.lane_observation.as_ref() else {
+            return;
+        };
+        let Some(server_idx) = observation.server_idx else {
+            return;
+        };
+
+        if let Some(rtt) = observation.rtt {
+            self.download_lane_runtime
+                .server_rtt
+                .entry(server_idx)
+                .or_default()
+                .note(rtt);
+        }
+
+        let proof = self
+            .download_lane_runtime
+            .server_proof
+            .entry(server_idx)
+            .or_default();
+        if observation.mode == DownloadLaneMode::Sequential {
+            proof.note_sequential_result(
+                matches!(result.data, Ok(_)),
+                observation.supports_pipelining,
+            );
+        } else if observation.batch_complete {
+            let now = Instant::now();
+            let transition = proof.note_pipeline_batch(
+                now,
+                observation.mode,
+                observation.batch_clean,
+                observation.batch_response_count,
+            );
+            if observation.batch_clean {
+                self.metrics
+                    .download_pipeline_trial_success_total
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.metrics
+                    .download_pipeline_trial_failure_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if observation.unresolved_count > 0 {
+                self.metrics
+                    .download_pipeline_replay_items_total
+                    .fetch_add(observation.unresolved_count, Ordering::Relaxed);
+            }
+            if matches!(
+                transition,
+                Some(ServerPipelineState::PipelineProvenDepth2)
+                    | Some(ServerPipelineState::PipelineProvenDepth4)
+            ) {
+                self.metrics
+                    .download_pipeline_proof_pass_total
+                    .fetch_add(1, Ordering::Relaxed);
+            } else if matches!(transition, Some(ServerPipelineState::PipelineBlocked)) {
+                self.metrics
+                    .download_pipeline_cooldown_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn try_dispatch_download_for_job(
+        &mut self,
+        job_id: JobId,
+        pressure: DownloadPressure,
+    ) -> DispatchAttempt {
         let Some(work) = self
             .jobs
             .get_mut(&job_id)
@@ -508,13 +712,15 @@ impl Pipeline {
         }
 
         let mut works = vec![work];
-        if works.len() < SAB_BODY_PIPELINE_DEPTH
-            && let Some(next) = self.jobs.get_mut(&job_id).and_then(|state| {
+        let lane_mode = self.choose_download_lane_mode(job_id, works[0].is_recovery, pressure);
+        while works.len() < lane_mode.max_depth() {
+            let Some(next) = self.jobs.get_mut(&job_id).and_then(|state| {
                 state
                     .download_queue
                     .pop_next_pipelining_compatible_with(&works[0])
-            })
-        {
+            }) else {
+                break;
+            };
             let reservation_estimate = Self::bandwidth_reservation_estimate(next.byte_estimate);
             match self.reserve_bandwidth_for_dispatch(next.segment_id, reservation_estimate) {
                 Ok(true) => works.push(next),
@@ -522,12 +728,14 @@ impl Pipeline {
                     if let Some(state) = self.jobs.get_mut(&job_id) {
                         state.download_queue.push(next);
                     }
+                    break;
                 }
                 Err(error) => {
                     error!(error = %error, "failed to reserve ISP bandwidth for pipelined dispatch");
                     if let Some(state) = self.jobs.get_mut(&job_id) {
                         state.download_queue.push(next);
                     }
+                    break;
                 }
             }
         }
@@ -537,7 +745,7 @@ impl Pipeline {
             .map(|work| (work.segment_id, work.byte_estimate as u64))
             .collect();
         let is_recovery = works[0].is_recovery;
-        self.spawn_download_batch(works, is_recovery);
+        self.spawn_download_batch(works, is_recovery, lane_mode);
         for (segment_id, estimate) in reservations {
             self.reserve_rate_limit_for_dispatch(segment_id, estimate);
         }
@@ -971,7 +1179,7 @@ impl Pipeline {
             && !self.rate_limiter.should_wait()
             && dispatch_budget > 0
         {
-            match self.try_dispatch_download_for_job(hot_job_id) {
+            match self.try_dispatch_download_for_job(hot_job_id, pressure) {
                 DispatchAttempt::Dispatched => dispatch_budget = dispatch_budget.saturating_sub(1),
                 DispatchAttempt::NoWork => break,
                 DispatchAttempt::StopAll => {
@@ -1029,7 +1237,7 @@ impl Pipeline {
                     && !self.rate_limiter.should_wait()
                     && dispatch_budget > 0
                 {
-                    match self.try_dispatch_download_for_job(job_id) {
+                    match self.try_dispatch_download_for_job(job_id, pressure) {
                         DispatchAttempt::Dispatched => {
                             dispatch_budget = dispatch_budget.saturating_sub(1)
                         }
@@ -1125,7 +1333,12 @@ impl Pipeline {
         (data, trace.attempts, source_server_idx)
     }
 
-    pub(crate) fn spawn_download_batch(&mut self, works: Vec<DownloadWork>, is_recovery: bool) {
+    pub(crate) fn spawn_download_batch(
+        &mut self,
+        works: Vec<DownloadWork>,
+        is_recovery: bool,
+        lane_mode: DownloadLaneMode,
+    ) {
         if works.is_empty() {
             return;
         }
@@ -1137,6 +1350,7 @@ impl Pipeline {
         let job_id = works[0].segment_id.file_id.job_id;
         self.active_downloads += works.len();
         self.active_download_connections += 1;
+        self.note_download_lane_started(lane_mode);
         if is_recovery {
             self.active_recovery += works.len();
         }
@@ -1169,57 +1383,187 @@ impl Pipeline {
             let mut works_by_index: Vec<Option<DownloadWork>> =
                 works.into_iter().map(Some).collect();
             let fetch_started = Instant::now();
-            nntp.fetch_bodies_decoded_with_groups_prefer_excluding_traced_each(
-                &message_ids,
-                &groups,
-                &exclude_servers,
-                |idx, trace| {
-                    completed += 1;
-                    let release_connection_slot = completed == total;
-                    let work = works_by_index[idx]
-                        .take()
-                        .expect("download batch result emitted once per work item");
-                    let tx = tx.clone();
-                    let exclude_servers = exclude_servers.clone();
-                    async move {
-                        let segment_id = work.segment_id;
-                        let retry_count = work.retry_count;
-                        let (data, attempts, source_server_idx) =
-                            Self::download_data_from_decoded_trace(segment_id, trace);
-                        let _ = tx
-                            .send(DownloadResult {
-                                segment_id,
-                                data,
-                                attempts,
-                                source_server_idx,
-                                is_recovery,
-                                retry_count,
-                                exclude_servers,
-                                release_connection_slot,
-                            })
-                            .await;
+            let mut unresolved_lane_observation = None;
+
+            let mut lane = None;
+            let mut acquire_error = None;
+            for server in nntp.body_server_order(&exclude_servers).await {
+                match nntp.acquire_body_lane(server, &groups).await {
+                    Ok(acquired) => {
+                        lane = Some(acquired);
+                        break;
                     }
-                },
-            )
-            .await;
+                    Err(error) => acquire_error = Some(error),
+                }
+            }
+
+            if let Some(mut lane) = lane {
+                let server_idx = lane.server_id().0;
+                let supports_pipelining = lane.supports_pipelining();
+                let actual_mode = lane_mode;
+
+                match actual_mode {
+                    DownloadLaneMode::Sequential => {
+                        for (idx, message_id) in message_ids.iter().enumerate() {
+                            let trace = lane.fetch_decoded_sequential(message_id).await;
+                            completed += 1;
+                            let release_connection_slot = completed == total;
+                            let work = works_by_index[idx]
+                                .take()
+                                .expect("download lane result emitted once per work item");
+                            let segment_id = work.segment_id;
+                            let retry_count = work.retry_count;
+                            let (data, attempts, source_server_idx) =
+                                Self::download_data_from_decoded_trace(segment_id, trace);
+                            let observation = DownloadLaneObservation {
+                                server_idx: Some(server_idx),
+                                mode: DownloadLaneMode::Sequential,
+                                supports_pipelining,
+                                rtt: lane.rtt_ewma(),
+                                batch_complete: true,
+                                batch_clean: true,
+                                batch_response_count: 1,
+                                unresolved_count: 0,
+                                connection_discarded: false,
+                            };
+                            let _ = tx
+                                .send(DownloadResult {
+                                    segment_id,
+                                    data,
+                                    attempts,
+                                    lane_observation: Some(observation),
+                                    source_server_idx,
+                                    is_recovery,
+                                    retry_count,
+                                    exclude_servers: exclude_servers.clone(),
+                                    release_connection_slot,
+                                })
+                                .await;
+                        }
+                    }
+                    DownloadLaneMode::PipelineDepth2 | DownloadLaneMode::PipelineDepth4 => {
+                        let mut traces = Vec::new();
+                        let stats = if actual_mode == DownloadLaneMode::PipelineDepth4 {
+                            lane.fetch_decoded_pipeline_depth4(&message_ids, |idx, trace| {
+                                traces.push((idx, trace));
+                                async {}
+                            })
+                            .await
+                        } else {
+                            lane.fetch_decoded_pipeline_depth2(&message_ids, |idx, trace| {
+                                traces.push((idx, trace));
+                                async {}
+                            })
+                            .await
+                        };
+
+                        let batch_clean = !stats.connection_discarded
+                            && !stats.response_order_mismatch
+                            && stats.unresolved == 0;
+                        unresolved_lane_observation = Some(DownloadLaneObservation {
+                            server_idx: Some(server_idx),
+                            mode: actual_mode,
+                            supports_pipelining,
+                            rtt: lane.rtt_ewma(),
+                            batch_complete: true,
+                            batch_clean,
+                            batch_response_count: stats.completed as u64,
+                            unresolved_count: stats.unresolved as u64,
+                            connection_discarded: stats.connection_discarded,
+                        });
+                        let mut emitted = 0usize;
+                        let trace_count = traces.len();
+                        for (idx, trace) in traces {
+                            completed += 1;
+                            emitted += 1;
+                            let release_connection_slot =
+                                completed == total && stats.unresolved == 0;
+                            let batch_complete = stats.unresolved == 0 && emitted == trace_count;
+                            let work = works_by_index[idx]
+                                .take()
+                                .expect("download lane result emitted once per work item");
+                            let segment_id = work.segment_id;
+                            let retry_count = work.retry_count;
+                            let (data, attempts, source_server_idx) =
+                                Self::download_data_from_decoded_trace(segment_id, trace);
+                            let observation = DownloadLaneObservation {
+                                server_idx: Some(server_idx),
+                                mode: actual_mode,
+                                supports_pipelining,
+                                rtt: lane.rtt_ewma(),
+                                batch_complete,
+                                batch_clean,
+                                batch_response_count: if batch_complete {
+                                    stats.completed as u64
+                                } else {
+                                    0
+                                },
+                                unresolved_count: if batch_complete {
+                                    stats.unresolved as u64
+                                } else {
+                                    0
+                                },
+                                connection_discarded: stats.connection_discarded,
+                            };
+                            let _ = tx
+                                .send(DownloadResult {
+                                    segment_id,
+                                    data,
+                                    attempts,
+                                    lane_observation: Some(observation),
+                                    source_server_idx,
+                                    is_recovery,
+                                    retry_count,
+                                    exclude_servers: exclude_servers.clone(),
+                                    release_connection_slot,
+                                })
+                                .await;
+                        }
+                    }
+                }
+                lane.park();
+            }
             crate::runtime::perf_probe::record("download.fetch_body", fetch_started.elapsed());
 
             for work in works_by_index.into_iter().flatten() {
                 let segment_id = work.segment_id;
                 let retry_count = work.retry_count;
+                let message = acquire_error
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "batch ended without result".to_string());
+                let release_connection_slot = completed + 1 == total;
+                let lane_observation = if release_connection_slot {
+                    unresolved_lane_observation.clone().or_else(|| {
+                        Some(DownloadLaneObservation {
+                            server_idx: None,
+                            mode: lane_mode,
+                            supports_pipelining: false,
+                            rtt: None,
+                            batch_complete: true,
+                            batch_clean: false,
+                            batch_response_count: 0,
+                            unresolved_count: total.saturating_sub(completed) as u64,
+                            connection_discarded: false,
+                        })
+                    })
+                } else {
+                    None
+                };
                 let _ = tx
                     .send(DownloadResult {
                         segment_id,
                         data: Err(DownloadError::Fetch(DownloadFailure {
                             kind: DownloadFailureKind::Transient,
-                            message: "batch ended without result".to_string(),
+                            message,
                         })),
                         attempts: Vec::new(),
+                        lane_observation,
                         source_server_idx: None,
                         is_recovery,
                         retry_count,
                         exclude_servers: exclude_servers.clone(),
-                        release_connection_slot: completed + 1 == total,
+                        release_connection_slot,
                     })
                     .await;
                 completed += 1;
@@ -1229,8 +1573,17 @@ impl Pipeline {
 
     /// Handle a completed download — queue for decode.
     pub(crate) fn release_download_result(&mut self, result: &DownloadResult) {
+        self.record_download_lane_observation(result);
         self.active_downloads = self.active_downloads.saturating_sub(1);
         if result.release_connection_slot {
+            if let Some(observation) = result.lane_observation.as_ref() {
+                let reason = if observation.connection_discarded || !observation.batch_clean {
+                    LaneParkReason::Error
+                } else {
+                    LaneParkReason::NoWork
+                };
+                self.note_download_lane_released(observation.mode, reason);
+            }
             self.active_download_connections = self.active_download_connections.saturating_sub(1);
             let job_id = result.segment_id.file_id.job_id;
             if let Some(in_flight) = self.active_download_connections_by_job.get_mut(&job_id) {
@@ -1267,6 +1620,14 @@ impl Pipeline {
             && matches!(&result.data, Ok(_))
         {
             self.hot_dispatch_successes = self.hot_dispatch_successes.saturating_add(1);
+        }
+        if !result.is_recovery
+            && let Ok(DownloadPayload::Decoded(decoded)) = &result.data
+        {
+            self.ensure_job_transport_profile(job_id);
+            if let Some(profile) = self.job_transport_profiles.get_mut(&job_id) {
+                profile.note_body_size(decoded.raw_size);
+            }
         }
         self.publish_active_stage_metrics();
         if let Err(error) = self.release_bandwidth_reservation(result.segment_id) {

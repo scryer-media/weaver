@@ -81,6 +81,8 @@ impl Pipeline {
             hot_dispatch_mode: DispatchShareMode::Exclusive,
             hot_dispatch_underfill_since: None,
             hot_dispatch_last_spillover_decision: SpilloverDecision::None,
+            job_transport_profiles: HashMap::new(),
+            download_lane_runtime: DownloadLaneRuntimeState::default(),
             active_download_passes: HashSet::new(),
             jobs_finalizing_download: HashSet::new(),
             active_downloads_by_job: HashMap::new(),

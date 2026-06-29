@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,6 +54,7 @@ impl NntpClientConfig {
 /// Provides a simple API for fetching articles, automatically managing
 /// connection pooling and falling back to backup servers when an article
 /// is not found on the primary server.
+#[derive(Clone)]
 pub struct NntpClient {
     pool: Arc<NntpPool>,
     max_retries_per_server: u32,
@@ -111,6 +113,33 @@ pub struct DecodedBodyTrace {
     pub result: std::result::Result<DecodedBody, DecodedBodyError>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyLaneMode {
+    Sequential,
+    PipelineDepth2,
+    PipelineDepth4,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct BodyLaneBatchStats {
+    pub requested: usize,
+    pub completed: usize,
+    pub unresolved: usize,
+    pub connection_discarded: bool,
+    pub response_order_mismatch: bool,
+    pub elapsed: Duration,
+}
+
+pub struct BodyLaneLease {
+    client: NntpClient,
+    server_id: ServerId,
+    conn: Option<PooledConnection>,
+    groups: Vec<String>,
+    mode: BodyLaneMode,
+    rtt_ewma: Option<Duration>,
+    rtt_samples: VecDeque<Duration>,
+}
+
 struct DecodedBatchItem {
     elapsed: Duration,
     result: std::result::Result<DecodedBody, DecodedBodyError>,
@@ -119,6 +148,312 @@ struct DecodedBatchItem {
 enum DecodedBatchDisposition {
     Terminal(std::result::Result<DecodedBody, DecodedBodyError>),
     Retry,
+}
+
+impl BodyLaneLease {
+    pub fn server_id(&self) -> ServerId {
+        self.server_id
+    }
+
+    pub fn mode(&self) -> BodyLaneMode {
+        self.mode
+    }
+
+    pub fn groups(&self) -> &[String] {
+        &self.groups
+    }
+
+    pub fn rtt_ewma(&self) -> Option<Duration> {
+        self.rtt_ewma
+    }
+
+    pub fn supports_pipelining(&self) -> bool {
+        self.conn
+            .as_ref()
+            .is_some_and(|conn| conn.capabilities().supports_pipelining())
+    }
+
+    pub fn park(self) {}
+
+    pub async fn discard(mut self) {
+        self.discard_current().await;
+    }
+
+    pub async fn fetch_decoded_sequential(&mut self, message_id: &str) -> DecodedBodyTrace {
+        self.mode = BodyLaneMode::Sequential;
+        let started = Instant::now();
+        let result = self.read_decoded_body(message_id).await;
+        let elapsed = started.elapsed();
+        self.observe_rtt(elapsed);
+
+        if result.as_ref().is_err_and(
+            |error| matches!(error, DecodedBodyError::Nntp(e) if is_connection_error(e)),
+        ) || self.conn.as_ref().is_some_and(|conn| conn.is_poisoned())
+        {
+            self.discard_current().await;
+        }
+
+        self.trace_item(message_id, DecodedBatchItem { elapsed, result })
+            .await
+    }
+
+    pub async fn fetch_decoded_pipeline_depth2<F, Fut>(
+        &mut self,
+        message_ids: &[String],
+        on_trace: F,
+    ) -> BodyLaneBatchStats
+    where
+        F: FnMut(usize, DecodedBodyTrace) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        self.mode = BodyLaneMode::PipelineDepth2;
+        self.fetch_decoded_pipeline(message_ids, 2, on_trace).await
+    }
+
+    pub async fn fetch_decoded_pipeline_depth4<F, Fut>(
+        &mut self,
+        message_ids: &[String],
+        on_trace: F,
+    ) -> BodyLaneBatchStats
+    where
+        F: FnMut(usize, DecodedBodyTrace) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        self.mode = BodyLaneMode::PipelineDepth4;
+        self.fetch_decoded_pipeline(message_ids, 4, on_trace).await
+    }
+
+    async fn fetch_decoded_pipeline<F, Fut>(
+        &mut self,
+        message_ids: &[String],
+        max_depth: usize,
+        mut on_trace: F,
+    ) -> BodyLaneBatchStats
+    where
+        F: FnMut(usize, DecodedBodyTrace) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let requested = message_ids.len().min(max_depth);
+        let batch_started = Instant::now();
+        let mut stats = BodyLaneBatchStats {
+            requested,
+            ..BodyLaneBatchStats::default()
+        };
+        if requested == 0 {
+            return stats;
+        }
+
+        let request_write_error = if let Some(conn) = self.conn.as_mut() {
+            let mut error = None;
+            for message_id in &message_ids[..requested] {
+                if let Err(write_error) = conn.write_body_request(message_id).await {
+                    error = Some(write_error);
+                    break;
+                }
+            }
+            if error.is_none()
+                && let Err(flush_error) = conn.flush_commands().await
+            {
+                error = Some(flush_error);
+            }
+            error
+        } else {
+            Some(NntpError::ConnectionClosed)
+        };
+
+        if let Some(error) = request_write_error {
+            let elapsed = batch_started.elapsed();
+            if is_connection_error(&error) {
+                stats.connection_discarded = true;
+                self.discard_current().await;
+            }
+            let make_error = NntpClient::batch_setup_error_factory(&error);
+            for (idx, message_id) in message_ids.iter().take(requested).enumerate() {
+                let trace = self
+                    .trace_item(
+                        message_id,
+                        DecodedBatchItem {
+                            elapsed,
+                            result: Err(DecodedBodyError::Nntp(make_error())),
+                        },
+                    )
+                    .await;
+                stats.completed += 1;
+                on_trace(idx, trace).await;
+            }
+            stats.elapsed = batch_started.elapsed();
+            return stats;
+        }
+
+        let mut closed_early = false;
+        for (response_idx, message_id) in message_ids.iter().take(requested).enumerate() {
+            let item_started = Instant::now();
+            let item_deadline = TokioInstant::now() + self.client.soft_timeout;
+            let result = match tokio::time::timeout_at(
+                item_deadline,
+                NntpClient::read_decoded_pipelined_body(
+                    self.conn
+                        .as_mut()
+                        .expect("connection is available while reading pipeline body"),
+                ),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    stats.connection_discarded = true;
+                    self.discard_current().await;
+                    closed_early = true;
+                    Err(DecodedBodyError::Nntp(self.client.soft_timeout_error()))
+                }
+            };
+            let elapsed = item_started.elapsed();
+            self.observe_rtt(elapsed);
+            let poisoned = self.conn.as_ref().is_some_and(|conn| conn.is_poisoned());
+
+            let trace = self
+                .trace_item(message_id, DecodedBatchItem { elapsed, result })
+                .await;
+            stats.completed += 1;
+            on_trace(response_idx, trace).await;
+
+            if poisoned {
+                stats.connection_discarded = true;
+                self.discard_current().await;
+                closed_early = true;
+            }
+
+            if closed_early {
+                for (unread_idx, unread_message_id) in message_ids
+                    .iter()
+                    .take(requested)
+                    .enumerate()
+                    .skip(response_idx + 1)
+                {
+                    let trace = self
+                        .trace_item(
+                            unread_message_id,
+                            DecodedBatchItem {
+                                elapsed,
+                                result: Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed)),
+                            },
+                        )
+                        .await;
+                    stats.completed += 1;
+                    stats.unresolved += 1;
+                    on_trace(unread_idx, trace).await;
+                }
+                break;
+            }
+        }
+
+        stats.elapsed = batch_started.elapsed();
+        stats
+    }
+
+    async fn read_decoded_body(
+        &mut self,
+        message_id: &str,
+    ) -> std::result::Result<DecodedBody, DecodedBodyError> {
+        let deadline = TokioInstant::now() + self.client.soft_timeout;
+        let mut decoder = StreamingArticleDecoder::new();
+        let mut output = Vec::new();
+        let mut raw_size = 0u32;
+        let mut decode_error: Option<YencError> = None;
+
+        let Some(conn) = self.conn.as_mut() else {
+            return Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed));
+        };
+
+        let stream_result = match tokio::time::timeout_at(deadline, async {
+            conn.stream_body_chunked_raw(message_id, |chunk| {
+                raw_size = raw_size.saturating_add(chunk.len() as u32);
+                if let Err(err) = decoder.feed_chunk(chunk, &mut output) {
+                    decode_error = Some(err);
+                    return Err(NntpError::MalformedResponse(
+                        "streamed yEnc decode failed".into(),
+                    ));
+                }
+                Ok(())
+            })
+            .await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.discard_current().await;
+                return Err(DecodedBodyError::Nntp(self.client.soft_timeout_error()));
+            }
+        };
+
+        match stream_result {
+            Ok(_) => {
+                if let Some(error) = decode_error.take() {
+                    return Err(DecodedBodyError::Decode { raw_size, error });
+                }
+
+                decoder
+                    .finish(output)
+                    .map(|DecodedArticle { data, result }| DecodedBody {
+                        raw_size,
+                        decoded: data,
+                        result,
+                    })
+                    .map_err(|error| DecodedBodyError::Decode { raw_size, error })
+            }
+            Err(_e) if decode_error.is_some() => Err(DecodedBodyError::Decode {
+                raw_size,
+                error: decode_error.take().expect("decode error present"),
+            }),
+            Err(error) => Err(DecodedBodyError::Nntp(error)),
+        }
+    }
+
+    async fn trace_item(&self, message_id: &str, item: DecodedBatchItem) -> DecodedBodyTrace {
+        let mut attempts = Vec::new();
+        let mut last_error = None;
+        match self
+            .client
+            .classify_decoded_batch_item(
+                self.server_id.0,
+                message_id,
+                item,
+                &mut attempts,
+                &mut last_error,
+            )
+            .await
+        {
+            DecodedBatchDisposition::Terminal(result) => DecodedBodyTrace { attempts, result },
+            DecodedBatchDisposition::Retry => DecodedBodyTrace {
+                attempts,
+                result: Err(
+                    last_error.unwrap_or(DecodedBodyError::Nntp(NntpError::ConnectionClosed))
+                ),
+            },
+        }
+    }
+
+    fn observe_rtt(&mut self, sample: Duration) {
+        let ewma = if let Some(current) = self.rtt_ewma {
+            current.mul_f64(0.75) + sample.mul_f64(0.25)
+        } else {
+            sample
+        };
+        self.rtt_ewma = Some(ewma);
+        if self.rtt_samples.len() == 16 {
+            self.rtt_samples.pop_front();
+        }
+        self.rtt_samples.push_back(sample);
+    }
+
+    async fn discard_current(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.client
+                .discard_connection_error(self.server_id.0, conn)
+                .await;
+        }
+    }
 }
 
 impl NntpClient {
@@ -145,6 +480,45 @@ impl NntpClient {
             pool,
             max_retries_per_server: 1,
             soft_timeout: Duration::from_secs(15),
+        }
+    }
+
+    pub async fn body_server_order(&self, exclude: &[usize]) -> Vec<ServerId> {
+        self.build_server_order(exclude)
+            .await
+            .into_iter()
+            .map(ServerId)
+            .collect()
+    }
+
+    pub async fn acquire_body_lane(
+        &self,
+        server: ServerId,
+        groups: &[String],
+    ) -> Result<BodyLaneLease> {
+        let deadline = TokioInstant::now() + self.soft_timeout;
+        let mut conn = self.acquire_before_deadline(server, deadline).await?;
+
+        match tokio::time::timeout_at(deadline, Self::try_select_group(&mut conn, groups)).await {
+            Ok(Ok(_)) => Ok(BodyLaneLease {
+                client: self.clone(),
+                server_id: server,
+                conn: Some(conn),
+                groups: groups.to_vec(),
+                mode: BodyLaneMode::Sequential,
+                rtt_ewma: None,
+                rtt_samples: VecDeque::with_capacity(16),
+            }),
+            Ok(Err(error)) => {
+                if is_connection_error(&error) {
+                    self.discard_connection_error(server.0, conn).await;
+                }
+                Err(error)
+            }
+            Err(_) => {
+                self.discard_connection_error(server.0, conn).await;
+                Err(self.soft_timeout_error())
+            }
         }
     }
 

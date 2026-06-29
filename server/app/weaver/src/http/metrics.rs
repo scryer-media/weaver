@@ -582,6 +582,78 @@ pub(super) fn render_prometheus_metrics(
         );
     }
 
+    out.push_str(
+        "# HELP weaver_pipeline_download_lanes_active Active article download lanes by mode.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_lanes_active gauge\n");
+    for (mode, value) in [
+        ("sequential", snapshot.download_lanes_sequential_active),
+        ("pipeline_depth2", snapshot.download_lanes_depth2_active),
+        ("pipeline_depth4", snapshot.download_lanes_depth4_active),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_lanes_active",
+            &[("mode", mode)],
+            value,
+        );
+    }
+    out.push_str(
+        "# HELP weaver_pipeline_download_lanes_active_total Total active article download lanes.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_lanes_active_total gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_download_lanes_active_total",
+        snapshot.download_lanes_active,
+    );
+
+    out.push_str(
+        "# HELP weaver_pipeline_download_lane_parks_total Article download lane parks by reason.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_lane_parks_total counter\n");
+    for (reason, value) in [
+        ("no_work", snapshot.download_lane_parks_no_work_total),
+        ("error", snapshot.download_lane_parks_error_total),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_lane_parks_total",
+            &[("reason", reason)],
+            value,
+        );
+    }
+
+    out.push_str("# HELP weaver_pipeline_body_proof_events_total BODY pipelining proof events.\n");
+    out.push_str("# TYPE weaver_pipeline_body_proof_events_total counter\n");
+    for (event, value) in [
+        (
+            "trial_success",
+            snapshot.download_pipeline_trial_success_total,
+        ),
+        (
+            "trial_failure",
+            snapshot.download_pipeline_trial_failure_total,
+        ),
+        ("proof_pass", snapshot.download_pipeline_proof_pass_total),
+        ("cooldown", snapshot.download_pipeline_cooldown_total),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_body_proof_events_total",
+            &[("event", event)],
+            value,
+        );
+    }
+
+    out.push_str("# HELP weaver_pipeline_body_replay_items_total BODY items returned unresolved after a lane reset/failure.\n");
+    out.push_str("# TYPE weaver_pipeline_body_replay_items_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_body_replay_items_total",
+        snapshot.download_pipeline_replay_items_total,
+    );
+
     out.push_str("# HELP weaver_pipeline_download_observed_limiter Observed downloader limiter derived from pressure, queue, and server permits.\n");
     out.push_str("# TYPE weaver_pipeline_download_observed_limiter gauge\n");
     let observed_limiter =

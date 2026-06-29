@@ -304,6 +304,17 @@ pub struct PipelineMetrics {
     pub hot_dispatch_spillover_blocked_hot_can_use_capacity_total: AtomicU64,
     pub hot_dispatch_spillover_allowed_underfill_total: AtomicU64,
     pub hot_dispatch_spillover_reclaimed_total: AtomicU64,
+    pub download_lanes_active: AtomicUsize,
+    pub download_lanes_sequential_active: AtomicUsize,
+    pub download_lanes_depth2_active: AtomicUsize,
+    pub download_lanes_depth4_active: AtomicUsize,
+    pub download_lane_parks_no_work_total: AtomicU64,
+    pub download_lane_parks_error_total: AtomicU64,
+    pub download_pipeline_trial_success_total: AtomicU64,
+    pub download_pipeline_trial_failure_total: AtomicU64,
+    pub download_pipeline_proof_pass_total: AtomicU64,
+    pub download_pipeline_cooldown_total: AtomicU64,
+    pub download_pipeline_replay_items_total: AtomicU64,
 
     // Counts
     pub segments_downloaded: AtomicU64,
@@ -379,6 +390,17 @@ impl PipelineMetrics {
             hot_dispatch_spillover_blocked_hot_can_use_capacity_total: AtomicU64::new(0),
             hot_dispatch_spillover_allowed_underfill_total: AtomicU64::new(0),
             hot_dispatch_spillover_reclaimed_total: AtomicU64::new(0),
+            download_lanes_active: AtomicUsize::new(0),
+            download_lanes_sequential_active: AtomicUsize::new(0),
+            download_lanes_depth2_active: AtomicUsize::new(0),
+            download_lanes_depth4_active: AtomicUsize::new(0),
+            download_lane_parks_no_work_total: AtomicU64::new(0),
+            download_lane_parks_error_total: AtomicU64::new(0),
+            download_pipeline_trial_success_total: AtomicU64::new(0),
+            download_pipeline_trial_failure_total: AtomicU64::new(0),
+            download_pipeline_proof_pass_total: AtomicU64::new(0),
+            download_pipeline_cooldown_total: AtomicU64::new(0),
+            download_pipeline_replay_items_total: AtomicU64::new(0),
             segments_downloaded: AtomicU64::new(0),
             segments_decoded: AtomicU64::new(0),
             segments_committed: AtomicU64::new(0),
@@ -520,6 +542,33 @@ impl PipelineMetrics {
             hot_dispatch_spillover_reclaimed_total: self
                 .hot_dispatch_spillover_reclaimed_total
                 .load(Ordering::Relaxed),
+            download_lanes_active: self.download_lanes_active.load(Ordering::Relaxed),
+            download_lanes_sequential_active: self
+                .download_lanes_sequential_active
+                .load(Ordering::Relaxed),
+            download_lanes_depth2_active: self.download_lanes_depth2_active.load(Ordering::Relaxed),
+            download_lanes_depth4_active: self.download_lanes_depth4_active.load(Ordering::Relaxed),
+            download_lane_parks_no_work_total: self
+                .download_lane_parks_no_work_total
+                .load(Ordering::Relaxed),
+            download_lane_parks_error_total: self
+                .download_lane_parks_error_total
+                .load(Ordering::Relaxed),
+            download_pipeline_trial_success_total: self
+                .download_pipeline_trial_success_total
+                .load(Ordering::Relaxed),
+            download_pipeline_trial_failure_total: self
+                .download_pipeline_trial_failure_total
+                .load(Ordering::Relaxed),
+            download_pipeline_proof_pass_total: self
+                .download_pipeline_proof_pass_total
+                .load(Ordering::Relaxed),
+            download_pipeline_cooldown_total: self
+                .download_pipeline_cooldown_total
+                .load(Ordering::Relaxed),
+            download_pipeline_replay_items_total: self
+                .download_pipeline_replay_items_total
+                .load(Ordering::Relaxed),
             segments_downloaded,
             segments_decoded: self.segments_decoded.load(Ordering::Relaxed),
             segments_committed: self.segments_committed.load(Ordering::Relaxed),
@@ -604,6 +653,17 @@ pub struct MetricsSnapshot {
     pub hot_dispatch_spillover_blocked_hot_can_use_capacity_total: u64,
     pub hot_dispatch_spillover_allowed_underfill_total: u64,
     pub hot_dispatch_spillover_reclaimed_total: u64,
+    pub download_lanes_active: usize,
+    pub download_lanes_sequential_active: usize,
+    pub download_lanes_depth2_active: usize,
+    pub download_lanes_depth4_active: usize,
+    pub download_lane_parks_no_work_total: u64,
+    pub download_lane_parks_error_total: u64,
+    pub download_pipeline_trial_success_total: u64,
+    pub download_pipeline_trial_failure_total: u64,
+    pub download_pipeline_proof_pass_total: u64,
+    pub download_pipeline_cooldown_total: u64,
+    pub download_pipeline_replay_items_total: u64,
     pub segments_downloaded: u64,
     pub segments_decoded: u64,
     pub segments_committed: u64,

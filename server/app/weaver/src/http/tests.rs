@@ -1312,6 +1312,17 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         hot_dispatch_spillover_blocked_hot_can_use_capacity_total: 32,
         hot_dispatch_spillover_allowed_underfill_total: 33,
         hot_dispatch_spillover_reclaimed_total: 34,
+        download_lanes_active: 3,
+        download_lanes_sequential_active: 1,
+        download_lanes_depth2_active: 2,
+        download_lanes_depth4_active: 0,
+        download_lane_parks_no_work_total: 35,
+        download_lane_parks_error_total: 36,
+        download_pipeline_trial_success_total: 37,
+        download_pipeline_trial_failure_total: 38,
+        download_pipeline_proof_pass_total: 39,
+        download_pipeline_cooldown_total: 40,
+        download_pipeline_replay_items_total: 41,
         segments_downloaded: 11,
         segments_decoded: 12,
         segments_committed: 13,
@@ -1397,6 +1408,16 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     assert!(rendered.contains(
         "weaver_pipeline_hot_dispatch_spillover_decisions_total{decision=\"allowed_underfill\"} 33"
     ));
+    assert!(rendered.contains("weaver_pipeline_download_lanes_active{mode=\"sequential\"} 1"));
+    assert!(rendered.contains("weaver_pipeline_download_lanes_active{mode=\"pipeline_depth2\"} 2"));
+    assert!(rendered.contains("weaver_pipeline_download_lanes_active_total 3"));
+    assert!(rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"no_work\"} 35"));
+    assert!(rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"error\"} 36"));
+    assert!(
+        rendered.contains("weaver_pipeline_body_proof_events_total{event=\"trial_success\"} 37")
+    );
+    assert!(rendered.contains("weaver_pipeline_body_proof_events_total{event=\"cooldown\"} 40"));
+    assert!(rendered.contains("weaver_pipeline_body_replay_items_total 41"));
     assert!(
         rendered.contains("weaver_pipeline_download_failures_total{kind=\"article_not_found\"} 24")
     );
@@ -1451,6 +1472,17 @@ fn renders_prometheus_download_observed_limiter_states() {
         hot_dispatch_spillover_blocked_hot_can_use_capacity_total: 0,
         hot_dispatch_spillover_allowed_underfill_total: 0,
         hot_dispatch_spillover_reclaimed_total: 0,
+        download_lanes_active: 0,
+        download_lanes_sequential_active: 0,
+        download_lanes_depth2_active: 0,
+        download_lanes_depth4_active: 0,
+        download_lane_parks_no_work_total: 0,
+        download_lane_parks_error_total: 0,
+        download_pipeline_trial_success_total: 0,
+        download_pipeline_trial_failure_total: 0,
+        download_pipeline_proof_pass_total: 0,
+        download_pipeline_cooldown_total: 0,
+        download_pipeline_replay_items_total: 0,
         segments_downloaded: 0,
         segments_decoded: 0,
         segments_committed: 0,

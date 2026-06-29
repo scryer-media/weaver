@@ -634,7 +634,24 @@ impl Pipeline {
             }
         };
 
+        let retain_attached_readers = !refresh_provided_volumes && archive.is_solid();
+
+        if has_cached_headers && !refresh_provided_volumes && !retain_attached_readers {
+            return Ok(archive);
+        }
+
         for (volume_number, path) in volume_paths {
+            if archive.has_volume(*volume_number as usize)
+                && !refresh_provided_volumes
+                && !retain_attached_readers
+            {
+                archive.attach_volume_reader(
+                    *volume_number as usize,
+                    Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+                );
+                continue;
+            }
+
             let file = match std::fs::File::open(path) {
                 Ok(file) => file,
                 Err(error)
@@ -665,6 +682,12 @@ impl Pipeline {
                 archive
                     .add_volume(*volume_number as usize, Box::new(file))
                     .map_err(crate::pipeline::RarPasswordAttemptError::from)?;
+            }
+            if !retain_attached_readers {
+                archive.attach_volume_reader(
+                    *volume_number as usize,
+                    Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+                );
             }
         }
 

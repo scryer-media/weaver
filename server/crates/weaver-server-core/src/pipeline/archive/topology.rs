@@ -8,8 +8,304 @@ use crate::pipeline::{
     ComputedRarSetState, Pipeline, RarRefreshDone, RarRefreshRequest, RefreshReason,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
+
+fn open_rar_volume_file(path: &Path) -> std::io::Result<Box<dyn weaver_unrar::ReadSeek>> {
+    #[cfg(test)]
+    {
+        rar_refresh_open_tracking::open(path)
+    }
+    #[cfg(not(test))]
+    {
+        Ok(Box::new(std::fs::File::open(path)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::rar_state::RarSetState;
+    use std::io::Cursor;
+    use weaver_par2::checksum;
+
+    const TEST_RAR5_SIG: [u8; 8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
+
+    fn encode_test_rar_vint(mut value: u64) -> Vec<u8> {
+        let mut result = Vec::new();
+        loop {
+            let mut byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            result.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+        result
+    }
+
+    fn build_test_rar_header(
+        header_type: u64,
+        common_flags: u64,
+        type_body: &[u8],
+        extra: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_test_rar_vint(header_type));
+
+        let mut flags = common_flags;
+        if !extra.is_empty() {
+            flags |= 0x0001;
+        }
+        body.extend_from_slice(&encode_test_rar_vint(flags));
+        if !extra.is_empty() {
+            body.extend_from_slice(&encode_test_rar_vint(extra.len() as u64));
+        }
+        body.extend_from_slice(type_body);
+        body.extend_from_slice(extra);
+
+        let header_size = body.len() as u64;
+        let header_size_bytes = encode_test_rar_vint(header_size);
+        let crc = checksum::crc32(&[header_size_bytes.as_slice(), body.as_slice()].concat());
+
+        let mut result = Vec::new();
+        result.extend_from_slice(&crc.to_le_bytes());
+        result.extend_from_slice(&header_size_bytes);
+        result.extend_from_slice(&body);
+        result
+    }
+
+    fn build_test_rar_main_header(archive_flags: u64, volume_number: Option<u64>) -> Vec<u8> {
+        let mut type_body = Vec::new();
+        type_body.extend_from_slice(&encode_test_rar_vint(archive_flags));
+        if let Some(volume_number) = volume_number {
+            type_body.extend_from_slice(&encode_test_rar_vint(volume_number));
+        }
+        build_test_rar_header(1, 0, &type_body, &[])
+    }
+
+    fn build_test_rar_end_header(more_volumes: bool) -> Vec<u8> {
+        let end_flags: u64 = if more_volumes { 0x0001 } else { 0 };
+        build_test_rar_header(5, 0, &encode_test_rar_vint(end_flags), &[])
+    }
+
+    fn build_test_rar_file_header(
+        filename: &str,
+        common_flags_extra: u64,
+        data_size: u64,
+        unpacked_size: u64,
+        data_crc: Option<u32>,
+    ) -> Vec<u8> {
+        let file_flags: u64 = if data_crc.is_some() { 0x0004 } else { 0 };
+        let mut type_body = Vec::new();
+        type_body.extend_from_slice(&encode_test_rar_vint(file_flags));
+        type_body.extend_from_slice(&encode_test_rar_vint(unpacked_size));
+        type_body.extend_from_slice(&encode_test_rar_vint(0o644));
+        if let Some(data_crc) = data_crc {
+            type_body.extend_from_slice(&data_crc.to_le_bytes());
+        }
+        type_body.extend_from_slice(&encode_test_rar_vint(0));
+        type_body.extend_from_slice(&encode_test_rar_vint(1));
+        type_body.extend_from_slice(&encode_test_rar_vint(filename.len() as u64));
+        type_body.extend_from_slice(filename.as_bytes());
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_test_rar_vint(2));
+        body.extend_from_slice(&encode_test_rar_vint(0x0002 | common_flags_extra));
+        body.extend_from_slice(&encode_test_rar_vint(data_size));
+        body.extend_from_slice(&type_body);
+
+        let header_size = body.len() as u64;
+        let header_size_bytes = encode_test_rar_vint(header_size);
+        let crc = checksum::crc32(&[header_size_bytes.as_slice(), body.as_slice()].concat());
+
+        let mut result = Vec::new();
+        result.extend_from_slice(&crc.to_le_bytes());
+        result.extend_from_slice(&header_size_bytes);
+        result.extend_from_slice(&body);
+        result
+    }
+
+    fn build_many_volume_rar_set(volume_count: usize) -> Vec<(String, Vec<u8>)> {
+        assert!(volume_count >= 2);
+        let filename = "big.bin";
+        let payload = vec![b'x'; volume_count];
+        let payload_crc = checksum::crc32(&payload);
+
+        (0..volume_count)
+            .map(|volume| {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&TEST_RAR5_SIG);
+                bytes.extend_from_slice(&build_test_rar_main_header(
+                    if volume == 0 { 0x0001 } else { 0x0001 | 0x0002 },
+                    (volume > 0).then_some(volume as u64),
+                ));
+
+                let split_flags = match volume {
+                    0 => 0x0010,
+                    v if v + 1 == volume_count => 0x0008,
+                    _ => 0x0010 | 0x0008,
+                };
+                bytes.extend_from_slice(&build_test_rar_file_header(
+                    filename,
+                    split_flags,
+                    1,
+                    payload.len() as u64,
+                    (volume + 1 == volume_count).then_some(payload_crc),
+                ));
+                bytes.push(payload[volume]);
+                bytes.extend_from_slice(&build_test_rar_end_header(volume + 1 != volume_count));
+
+                (format!("show.part{volume:03}.rar"), bytes)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rar_refresh_compute_bounds_live_source_readers_for_many_volumes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let volume_count = 260usize;
+        let files = build_many_volume_rar_set(volume_count);
+
+        let first_archive = weaver_unrar::RarArchive::open(Cursor::new(files[0].1.clone()))
+            .expect("volume 0 should parse");
+        let cached_headers = first_archive.serialize_headers();
+
+        let mut volume_map = HashMap::new();
+        let mut volume_paths = BTreeMap::new();
+        let mut facts = BTreeMap::new();
+        for (volume, (filename, bytes)) in files.iter().enumerate() {
+            let path = temp_dir.path().join(filename);
+            std::fs::write(&path, bytes).unwrap();
+            volume_map.insert(filename.clone(), volume as u32);
+            volume_paths.insert(volume as u32, path);
+            facts.insert(
+                volume as u32,
+                weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None)
+                    .expect("synthetic RAR volume facts should parse"),
+            );
+        }
+
+        let input = RarSetComputeInput {
+            job_id: JobId(99),
+            set_name: "show".to_string(),
+            existing: RarSetState::default(),
+            volume_map,
+            volume_paths,
+            password_candidates: Vec::new(),
+            extracted: HashSet::new(),
+            failed: HashSet::new(),
+            facts,
+            verified_suspect_volumes: HashSet::new(),
+            worker_active: false,
+            cached_headers: Some(cached_headers),
+            reason: RefreshReason::CoverageExpansion,
+        };
+
+        let _tracking = rar_refresh_open_tracking::start();
+        let computed = Pipeline::compute_rar_set_state_blocking(input)
+            .expect("bounded refresh compute should integrate all volumes");
+
+        assert!(
+            rar_refresh_open_tracking::peak() <= 1,
+            "refresh retained {} live source readers",
+            rar_refresh_open_tracking::peak()
+        );
+        assert_eq!(
+            computed.plan.topology.complete_volumes.len(),
+            volume_count,
+            "bounded refresh should preserve complete-volume coverage"
+        );
+        assert_eq!(
+            computed
+                .plan
+                .ready_members
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["big.bin"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod rar_refresh_open_tracking {
+    use std::cell::Cell;
+    use std::io::{Read, Seek};
+    use std::path::Path;
+
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static ACTIVE: Cell<usize> = const { Cell::new(0) };
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) struct Guard {
+        previous: bool,
+    }
+
+    pub(super) fn start() -> Guard {
+        let previous = ENABLED.with(|enabled| {
+            let previous = enabled.get();
+            enabled.set(true);
+            previous
+        });
+        ACTIVE.with(|active| active.set(0));
+        PEAK.with(|peak| peak.set(0));
+        Guard { previous }
+    }
+
+    pub(super) fn peak() -> usize {
+        PEAK.with(Cell::get)
+    }
+
+    pub(super) fn open(path: &Path) -> std::io::Result<Box<dyn weaver_unrar::ReadSeek>> {
+        let file = std::fs::File::open(path)?;
+        let counted = ENABLED.with(Cell::get);
+        if counted {
+            ACTIVE.with(|active| {
+                let next = active.get() + 1;
+                active.set(next);
+                PEAK.with(|peak| peak.set(peak.get().max(next)));
+            });
+        }
+        Ok(Box::new(TrackedReader { file, counted }))
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ENABLED.with(|enabled| enabled.set(self.previous));
+        }
+    }
+
+    struct TrackedReader {
+        file: std::fs::File,
+        counted: bool,
+    }
+
+    impl Drop for TrackedReader {
+        fn drop(&mut self) {
+            if self.counted {
+                ACTIVE.with(|active| active.set(active.get().saturating_sub(1)));
+            }
+        }
+    }
+
+    impl Read for TrackedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.file.read(buf)
+        }
+    }
+
+    impl Seek for TrackedReader {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.file.seek(pos)
+        }
+    }
+}
 
 pub(crate) type ArchiveMember = JobArchiveMember;
 pub(crate) type ArchivePendingSpan = JobArchivePendingSpan;
@@ -543,7 +839,17 @@ impl Pipeline {
                                              force_refresh_all_volumes: bool|
          -> Result<_, String> {
             for (volume_number, path) in &volume_paths {
-                let volume_file = match std::fs::File::open(path) {
+                let volume_needs_refresh =
+                    force_refresh_all_volumes || !facts.contains_key(volume_number);
+                if archive.has_volume(*volume_number as usize) && !volume_needs_refresh {
+                    archive.attach_volume_reader(
+                        *volume_number as usize,
+                        Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+                    );
+                    continue;
+                }
+
+                let volume_file = match open_rar_volume_file(path) {
                     Ok(file) => file,
                     Err(error)
                         if using_cached_headers && error.kind() == std::io::ErrorKind::NotFound =>
@@ -556,30 +862,34 @@ impl Pipeline {
                         ));
                     }
                 };
-                let volume_needs_refresh =
-                    force_refresh_all_volumes || !facts.contains_key(volume_number);
                 if using_cached_headers
                     && volume_needs_refresh
                     && archive.has_volume(*volume_number as usize)
                 {
                     archive
-                        .refresh_volume(*volume_number as usize, Box::new(volume_file))
+                        .refresh_volume(*volume_number as usize, volume_file)
                         .map_err(|e| {
                             format!(
                                 "failed to refresh cached RAR volume {volume_number} for set '{set_name_owned}': {e}"
                             )
                         })?;
                 } else if archive.has_volume(*volume_number as usize) {
-                    archive.attach_volume_reader(*volume_number as usize, Box::new(volume_file));
+                    archive.attach_volume_reader(*volume_number as usize, volume_file);
                 } else {
                     archive
-                        .add_volume(*volume_number as usize, Box::new(volume_file))
+                        .add_volume(*volume_number as usize, volume_file)
                         .map_err(|e| {
                             format!(
                                 "failed to integrate RAR volume {volume_number} for set '{set_name_owned}': {e}"
                             )
                         })?;
                 }
+                // Refresh planning is metadata-only. Keep presence visible to
+                // the planner without retaining one source FD per volume.
+                archive.attach_volume_reader(
+                    *volume_number as usize,
+                    Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+                );
             }
 
             let plan = rar_state::build_plan(
