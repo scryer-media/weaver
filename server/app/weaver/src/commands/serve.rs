@@ -175,11 +175,7 @@ pub(crate) async fn run(
     // long restore passes do not block process readiness.
     for candidate in to_restore {
         match handle.restore_job(candidate.request).await {
-            Ok(()) => info!(
-                job_id = candidate.job_id.0,
-                committed_count = candidate.committed_count,
-                "job restored"
-            ),
+            Ok(()) => info!(job_id = candidate.job_id.0, "job restored"),
             Err(e) => error!(job_id = candidate.job_id.0, error = %e, "failed to restore job"),
         }
     }

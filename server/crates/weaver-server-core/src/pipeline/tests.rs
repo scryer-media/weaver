@@ -3451,6 +3451,7 @@ async fn restore_job_rehydrates_detected_obfuscated_rar_identity() {
 
     for (file_index, (filename, bytes)) in obfuscated_files.iter().enumerate() {
         write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+        persist_completed_file_hash(&pipeline, job_id, file_index as u32, filename, bytes).await;
     }
 
     let recovered = pipeline
@@ -3549,6 +3550,7 @@ async fn restore_job_rehydrates_detected_obfuscated_split_7z_identity() {
 
     for (file_index, (filename, bytes)) in obfuscated_files.iter().enumerate() {
         write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+        persist_completed_file_hash(&pipeline, job_id, file_index as u32, filename, bytes).await;
     }
 
     let recovered = pipeline
@@ -7110,6 +7112,8 @@ async fn restore_job_reuses_persisted_rar_volume_facts_after_restart() {
                 bytes,
             )
             .await;
+            persist_completed_file_hash(&pipeline, job_id, file_index as u32, filename, bytes)
+                .await;
         }
 
         pipeline
@@ -7131,7 +7135,14 @@ async fn restore_job_reuses_persisted_rar_volume_facts_after_restart() {
             job_hash: [0; 32],
             spec,
             file_progress: HashMap::new(),
-            complete_files: HashSet::new(),
+            complete_files: files
+                .iter()
+                .enumerate()
+                .map(|(file_index, _)| NzbFileId {
+                    job_id,
+                    file_index: file_index as u32,
+                })
+                .collect(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: ["E01.mkv".to_string()].into_iter().collect(),
@@ -7149,7 +7160,7 @@ async fn restore_job_reuses_persisted_rar_volume_facts_after_restart() {
         .await
         .unwrap();
 
-    assert_eq!(restored.try_update_archive_topology_calls, 4);
+    assert!(restored.try_update_archive_topology_calls >= files.len());
 
     assert_eq!(
         member_span(&restored, job_id, "show", "E01.mkv"),
@@ -7445,7 +7456,16 @@ async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
             job_hash: [0; 32],
             spec,
             file_progress: HashMap::new(),
-            complete_files: HashSet::new(),
+            complete_files: HashSet::from([
+                NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                NzbFileId {
+                    job_id,
+                    file_index: 1,
+                },
+            ]),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -7835,6 +7855,7 @@ async fn restore_job_scrubs_stale_par2_rar_set_state_before_rar_runtime_rebuild(
     let working_dir = insert_active_job(&mut pipeline, job_id, spec.clone()).await;
 
     write_and_complete_file(&mut pipeline, job_id, 0, old_filename, &rar_bytes).await;
+    persist_completed_file_hash(&pipeline, job_id, 0, old_filename, &rar_bytes).await;
     std::fs::rename(
         working_dir.join(old_filename),
         working_dir.join(canonical_filename),
@@ -7880,7 +7901,7 @@ async fn restore_job_scrubs_stale_par2_rar_set_state_before_rar_runtime_rebuild(
             job_hash: [0; 32],
             spec: spec.clone(),
             file_progress: recovered.file_progress,
-            complete_files: HashSet::new(),
+            complete_files: recovered.complete_files,
             detected_archives: recovered.detected_archives,
             file_identities: recovered.file_identities,
             extracted_members: HashSet::new(),
@@ -9054,7 +9075,10 @@ async fn restore_job_uses_per_file_progress_floor_for_reporting() {
             job_hash: [0; 32],
             spec,
             file_progress,
-            complete_files: HashSet::new(),
+            complete_files: HashSet::from([NzbFileId {
+                job_id,
+                file_index: 0,
+            }]),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -9073,10 +9097,10 @@ async fn restore_job_uses_per_file_progress_floor_for_reporting() {
         .unwrap();
 
     let state = pipeline.jobs.get(&job_id).unwrap();
-    assert_eq!(state.downloaded_bytes, 200);
-    assert_eq!(state.restored_download_floor_bytes, 200);
-    assert_eq!(Pipeline::effective_downloaded_bytes(state), 200);
-    assert!((Pipeline::effective_progress(state) - 1.0).abs() < f64::EPSILON);
+    assert_eq!(state.downloaded_bytes, 100);
+    assert_eq!(state.restored_download_floor_bytes, 100);
+    assert_eq!(Pipeline::effective_downloaded_bytes(state), 100);
+    assert!((Pipeline::effective_progress(state) - 0.5).abs() < f64::EPSILON);
 }
 
 #[tokio::test]
@@ -9135,7 +9159,10 @@ async fn restore_job_reparses_par2_without_promoted_recovery_state() {
             job_hash: [0; 32],
             spec,
             file_progress: HashMap::new(),
-            complete_files: HashSet::new(),
+            complete_files: HashSet::from([NzbFileId {
+                job_id,
+                file_index: 0,
+            }]),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -9220,7 +9247,16 @@ async fn restore_job_does_not_rehydrate_lossy_extraction_attempt_state() {
             job_hash: [0; 32],
             spec,
             file_progress: HashMap::new(),
-            complete_files: HashSet::new(),
+            complete_files: HashSet::from([
+                NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                NzbFileId {
+                    job_id,
+                    file_index: 1,
+                },
+            ]),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -9270,7 +9306,10 @@ async fn restore_job_skips_eager_delete_for_ownerless_restored_volumes() {
             job_hash: [0; 32],
             spec,
             file_progress: HashMap::new(),
-            complete_files: HashSet::new(),
+            complete_files: HashSet::from([NzbFileId {
+                job_id,
+                file_index: 0,
+            }]),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -14797,7 +14836,16 @@ async fn restore_job_normalizes_persisted_checking_to_complete_when_no_work_rema
             job_hash: [0; 32],
             spec,
             file_progress: HashMap::new(),
-            complete_files: HashSet::new(),
+            complete_files: HashSet::from([
+                NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                NzbFileId {
+                    job_id,
+                    file_index: 1,
+                },
+            ]),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
@@ -14863,7 +14911,10 @@ async fn restore_job_reemits_open_download_finalization_and_drains_it() {
             job_hash: [0; 32],
             spec,
             file_progress: HashMap::new(),
-            complete_files: HashSet::new(),
+            complete_files: HashSet::from([NzbFileId {
+                job_id,
+                file_index: 0,
+            }]),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),

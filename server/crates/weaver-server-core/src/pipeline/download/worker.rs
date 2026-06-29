@@ -994,7 +994,7 @@ impl Pipeline {
     }
 
     /// Handle a completed download — queue for decode.
-    pub(crate) async fn handle_download_done(&mut self, result: DownloadResult) {
+    pub(crate) fn release_download_result(&mut self, result: &DownloadResult) {
         self.active_downloads = self.active_downloads.saturating_sub(1);
         if result.release_connection_slot {
             self.active_download_connections = self.active_download_connections.saturating_sub(1);
@@ -1048,6 +1048,15 @@ impl Pipeline {
                 );
             }
         }
+    }
+
+    pub(crate) async fn handle_download_done(&mut self, result: DownloadResult) {
+        self.release_download_result(&result);
+        self.process_download_done(result).await;
+    }
+
+    pub(crate) async fn process_download_done(&mut self, result: DownloadResult) {
+        let job_id = result.segment_id.file_id.job_id;
         if self
             .jobs
             .get(&job_id)

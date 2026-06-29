@@ -4,6 +4,7 @@ impl Pipeline {
     const METRICS_SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
     const STATE_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const SHUTDOWN_DRAIN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    const DOWNLOAD_COMPLETION_DRAIN_LIMIT: usize = 128;
 
     /// Create a new pipeline.
     #[allow(clippy::too_many_arguments)]
@@ -442,6 +443,7 @@ impl Pipeline {
         stalled_download_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut state_reconcile_interval = tokio::time::interval(Self::STATE_RECONCILE_INTERVAL);
         state_reconcile_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut pending_download_results = VecDeque::new();
 
         info!("pipeline started");
 
@@ -451,6 +453,7 @@ impl Pipeline {
         }
 
         'run_loop: loop {
+            self.drain_ready_download_results(&mut pending_download_results);
             self.pump_decode_queue();
 
             let pending_completion_checks = self.pending_completion_checks.len();
@@ -478,96 +481,101 @@ impl Pipeline {
                 }
             }
 
-            tokio::select! {
-                cmd = self.cmd_rx.recv() => {
-                    match cmd {
-                        Some(SchedulerCommand::Shutdown) | None => {
-                            info!("pipeline shutting down");
-                            break;
+            if let Some(result) = pending_download_results.pop_front() {
+                self.process_download_done(result).await;
+            } else {
+                tokio::select! {
+                    cmd = self.cmd_rx.recv() => {
+                        match cmd {
+                            Some(SchedulerCommand::Shutdown) | None => {
+                                info!("pipeline shutting down");
+                                break;
+                            }
+                            Some(cmd) => self.handle_command(cmd).await,
                         }
-                        Some(cmd) => self.handle_command(cmd).await,
                     }
-                }
-                Some(result) = self.download_done_rx.recv() => {
-                    self.handle_download_done(result).await;
-                }
-                Some(result) = self.decode_done_rx.recv() => {
-                    self.handle_decode_done(result).await;
-                }
-                Some(update) = self.probe_result_rx.recv() => {
-                    self.handle_probe_update(update);
-                }
-                Some(done) = self.extract_done_rx.recv() => {
-                    self.handle_extraction_done(done).await;
-                }
-                Some(done) = self.rar_refresh_done_rx.recv() => {
-                    self.handle_rar_refresh_done(done).await;
-                }
-                Some(done) = self.verified_suspect_persist_done_rx.recv() => {
-                    self.handle_verified_suspect_persist_done(done);
-                }
-                Some(done) = self.move_done_rx.recv() => {
-                    self.handle_move_to_complete_done(done);
-                }
-                Some(work) = self.retry_rx.recv() => {
-                    self.requeue_retry_work(work);
-                }
-                _ = metrics_snapshot_interval.tick() => {
-                    self.shared_state.refresh_metrics_snapshot();
-                }
-                _ = rate_sleep, if !rate_delay.is_zero() => {}
-                _ = tune_interval.tick() => {
-                    self.flush_quiescent_write_backlog().await;
-                    self.refresh_download_pressure();
-
-                    let snapshot = self.metrics.snapshot();
-                    let not_found = snapshot.articles_not_found;
-                    let min_health: Option<u32> = self.jobs.values()
-                        .filter(|s| !matches!(s.status, JobStatus::Failed { .. } | JobStatus::Complete))
-                        .filter(|s| s.spec.total_bytes > 0)
-                        .map(|s| (s.spec.total_bytes.saturating_sub(s.failed_bytes) * 1000 / s.spec.total_bytes) as u32)
-                        .min();
-                    debug!(
-                        active = self.active_downloads,
-                        queue = snapshot.download_queue_depth,
-                        speed_mbps = format!("{:.1}", snapshot.current_download_speed as f64 / (1024.0 * 1024.0)),
-                        downloaded_mb = snapshot.bytes_downloaded / (1024 * 1024),
-                        segments = snapshot.segments_downloaded,
-                        decode_pending = snapshot.decode_pending,
-                        decode_pending_mb = snapshot.decode_pending_bytes / (1024 * 1024),
-                        decode_active_mb = snapshot.decode_active_bytes / (1024 * 1024),
-                        write_backlog_mb = snapshot.write_buffered_bytes / (1024 * 1024),
-                        write_backlog_segments = snapshot.write_buffered_segments,
-                        pressure_state = snapshot.download_pressure_state.as_str(),
-                        pressure_reason = snapshot.download_pressure_reason.as_str(),
-                        direct_write_evictions = snapshot.direct_write_evictions,
-                        not_found,
-                        health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
-                        "pipeline tick"
-                    );
-
-                    let max = self.tuner.params().max_concurrent_downloads;
-                    if self.connection_ramp < max {
-                        self.connection_ramp = (self.connection_ramp + 5).min(max);
-                        info!(connection_ramp = self.connection_ramp, "ramping up connections");
+                    Some(result) = self.download_done_rx.recv() => {
+                        self.release_download_result(&result);
+                        pending_download_results.push_back(result);
                     }
+                    Some(result) = self.decode_done_rx.recv() => {
+                        self.handle_decode_done(result).await;
+                    }
+                    Some(update) = self.probe_result_rx.recv() => {
+                        self.handle_probe_update(update);
+                    }
+                    Some(done) = self.extract_done_rx.recv() => {
+                        self.handle_extraction_done(done).await;
+                    }
+                    Some(done) = self.rar_refresh_done_rx.recv() => {
+                        self.handle_rar_refresh_done(done).await;
+                    }
+                    Some(done) = self.verified_suspect_persist_done_rx.recv() => {
+                        self.handle_verified_suspect_persist_done(done);
+                    }
+                    Some(done) = self.move_done_rx.recv() => {
+                        self.handle_move_to_complete_done(done);
+                    }
+                    Some(work) = self.retry_rx.recv() => {
+                        self.requeue_retry_work(work);
+                    }
+                    _ = metrics_snapshot_interval.tick() => {
+                        self.shared_state.refresh_metrics_snapshot();
+                    }
+                    _ = rate_sleep, if !rate_delay.is_zero() => {}
+                    _ = tune_interval.tick() => {
+                        self.flush_quiescent_write_backlog().await;
+                        self.refresh_download_pressure();
 
-                    if self.tuner.adjust(&snapshot) {
-                        info!(
-                            max_downloads = self.tuner.params().max_concurrent_downloads,
-                            "tuner adjusted parameters"
+                        let snapshot = self.metrics.snapshot();
+                        let not_found = snapshot.articles_not_found;
+                        let min_health: Option<u32> = self.jobs.values()
+                            .filter(|s| !matches!(s.status, JobStatus::Failed { .. } | JobStatus::Complete))
+                            .filter(|s| s.spec.total_bytes > 0)
+                            .map(|s| (s.spec.total_bytes.saturating_sub(s.failed_bytes) * 1000 / s.spec.total_bytes) as u32)
+                            .min();
+                        debug!(
+                            active = self.active_downloads,
+                            queue = snapshot.download_queue_depth,
+                            speed_mbps = format!("{:.1}", snapshot.current_download_speed as f64 / (1024.0 * 1024.0)),
+                            downloaded_mb = snapshot.bytes_downloaded / (1024 * 1024),
+                            segments = snapshot.segments_downloaded,
+                            decode_pending = snapshot.decode_pending,
+                            decode_pending_mb = snapshot.decode_pending_bytes / (1024 * 1024),
+                            decode_active_mb = snapshot.decode_active_bytes / (1024 * 1024),
+                            write_backlog_mb = snapshot.write_buffered_bytes / (1024 * 1024),
+                            write_backlog_segments = snapshot.write_buffered_segments,
+                            pressure_state = snapshot.download_pressure_state.as_str(),
+                            pressure_reason = snapshot.download_pressure_reason.as_str(),
+                            direct_write_evictions = snapshot.direct_write_evictions,
+                            not_found,
+                            health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
+                            "pipeline tick"
                         );
+
+                        let max = self.tuner.params().max_concurrent_downloads;
+                        if self.connection_ramp < max {
+                            self.connection_ramp = (self.connection_ramp + 5).min(max);
+                            info!(connection_ramp = self.connection_ramp, "ramping up connections");
+                        }
+
+                        if self.tuner.adjust(&snapshot) {
+                            info!(
+                                max_downloads = self.tuner.params().max_concurrent_downloads,
+                                "tuner adjusted parameters"
+                            );
+                        }
                     }
-                }
-                _ = stalled_download_interval.tick() => {
-                    self.auto_pause_stalled_downloads();
-                }
-                _ = state_reconcile_interval.tick() => {
-                    let job_ids: Vec<_> = self.jobs.keys().copied().collect();
-                    for (index, job_id) in job_ids.into_iter().enumerate() {
-                        self.reconcile_job_progress(job_id).await;
-                        if index % 16 == 15 {
-                            tokio::task::yield_now().await;
+                    _ = stalled_download_interval.tick() => {
+                        self.auto_pause_stalled_downloads();
+                    }
+                    _ = state_reconcile_interval.tick() => {
+                        let job_ids: Vec<_> = self.jobs.keys().copied().collect();
+                        for (index, job_id) in job_ids.into_iter().enumerate() {
+                            self.reconcile_job_progress(job_id).await;
+                            if index % 16 == 15 {
+                                tokio::task::yield_now().await;
+                            }
                         }
                     }
                 }
@@ -584,6 +592,16 @@ impl Pipeline {
     pub(crate) fn publish_snapshot(&mut self) {
         let _ = self.refresh_bandwidth_cap_window();
         self.shared_state.publish_jobs(self.list_jobs());
+    }
+
+    fn drain_ready_download_results(&mut self, pending: &mut VecDeque<DownloadResult>) {
+        while pending.len() < Self::DOWNLOAD_COMPLETION_DRAIN_LIMIT {
+            let Ok(result) = self.download_done_rx.try_recv() else {
+                break;
+            };
+            self.release_download_result(&result);
+            pending.push_back(result);
+        }
     }
 
     pub(crate) fn requeue_retry_work(&mut self, work: DownloadWork) {
