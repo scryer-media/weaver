@@ -2162,6 +2162,7 @@ async fn submit_decoded_segment(
                 file_id,
                 segment_number,
             },
+            raw_size: data.len() as u64,
             file_offset,
             decoded_size: data.len() as u32,
             crc_valid: true,
@@ -2786,6 +2787,7 @@ async fn shutdown_drain_consumes_inflight_download_results() {
             is_recovery: false,
             retry_count: 0,
             exclude_servers: Vec::new(),
+            release_connection_slot: true,
         })
         .await
         .unwrap();
@@ -3458,8 +3460,6 @@ async fn restore_job_rehydrates_detected_obfuscated_rar_identity() {
         .remove(&job_id)
         .unwrap();
     drop(pipeline);
-    let committed_segments = Pipeline::all_segment_ids(job_id, &spec);
-
     let (mut restored, _intermediate_dir, complete_dir_restored) =
         new_direct_pipeline(&temp_dir).await;
     restored
@@ -3467,7 +3467,6 @@ async fn restore_job_rehydrates_detected_obfuscated_rar_identity() {
             job_id,
             job_hash: [0; 32],
             spec,
-            committed_segments,
             file_progress: recovered.file_progress,
             complete_files: recovered.complete_files,
             detected_archives: recovered.detected_archives,
@@ -3559,15 +3558,12 @@ async fn restore_job_rehydrates_detected_obfuscated_split_7z_identity() {
         .remove(&job_id)
         .unwrap();
     drop(pipeline);
-    let committed_segments = Pipeline::all_segment_ids(job_id, &spec);
-
     let (mut restored, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
     restored
         .restore_job(RestoreJobRequest {
             job_id,
             job_hash: [0; 32],
             spec,
-            committed_segments,
             file_progress: recovered.file_progress,
             complete_files: recovered.complete_files,
             detected_archives: recovered.detected_archives,
@@ -3732,6 +3728,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
                 is_recovery: false,
                 retry_count: 0,
                 exclude_servers: Vec::new(),
+                release_connection_slot: true,
             }),
         )
         .await
@@ -3789,6 +3786,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
             is_recovery: false,
             retry_count: 0,
             exclude_servers: Vec::new(),
+            release_connection_slot: true,
         })
         .await;
     drain_decode_results(&mut pipeline, 1).await;
@@ -3878,6 +3876,7 @@ async fn in_order_segments_keep_write_cursor_until_file_completes() {
                 is_recovery: false,
                 retry_count: 0,
                 exclude_servers: Vec::new(),
+                release_connection_slot: true,
             })
             .await;
     }
@@ -3969,6 +3968,7 @@ async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
                 is_recovery: false,
                 retry_count: 0,
                 exclude_servers: Vec::new(),
+                release_connection_slot: true,
             })
             .await;
     }
@@ -4021,6 +4021,7 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
             is_recovery: false,
             retry_count: 0,
             exclude_servers: Vec::new(),
+            release_connection_slot: true,
         })
         .await;
 
@@ -4072,6 +4073,7 @@ async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
             is_recovery: false,
             retry_count: MAX_SEGMENT_RETRIES,
             exclude_servers: vec![0],
+            release_connection_slot: true,
         })
         .await;
 
@@ -4143,6 +4145,7 @@ async fn excluded_source_not_found_retries_without_marking_health_failure() {
             is_recovery: false,
             retry_count: 0,
             exclude_servers: vec![0],
+            release_connection_slot: true,
         })
         .await;
 
@@ -4205,6 +4208,7 @@ async fn recovery_article_not_found_does_not_mark_health_failure() {
             is_recovery: true,
             retry_count: 0,
             exclude_servers: Vec::new(),
+            release_connection_slot: true,
         })
         .await;
 
@@ -4265,6 +4269,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
             is_recovery: false,
             retry_count: 0,
             exclude_servers: Vec::new(),
+            release_connection_slot: true,
         })
         .await;
     drain_decode_results(&mut pipeline, 1).await;
@@ -4300,6 +4305,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
             is_recovery: false,
             retry_count: MAX_SEGMENT_RETRIES,
             exclude_servers: Vec::new(),
+            release_connection_slot: true,
         })
         .await;
 
@@ -4497,7 +4503,113 @@ async fn skips_download_pipeline_drained_when_no_post_download_work_remains() {
 }
 
 #[tokio::test]
-async fn dispatch_downloads_respects_decode_backpressure() {
+async fn pump_decode_queue_releases_bytes_for_inactive_job() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20027);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Inactive Decode Discard",
+            &[("discard.bin".to_string(), 512u32)],
+        ),
+    )
+    .await;
+
+    let raw = Bytes::from_static(b"queued raw article");
+    let raw_size = raw.len() as u64;
+    pipeline.metrics.note_decode_work_queued(raw_size);
+    pipeline.pending_decode.push_back(PendingDecodeWork {
+        segment_id: SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number: 0,
+        },
+        raw,
+        source_server_idx: None,
+        exclude_servers: Vec::new(),
+    });
+    pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Failed {
+        error: "inactive".to_string(),
+    };
+
+    pipeline.pump_decode_queue();
+
+    assert!(pipeline.pending_decode.is_empty());
+    assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        pipeline
+            .metrics
+            .decode_pending_bytes
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        pipeline.metrics.decode_active_bytes.load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn pump_decode_queue_respects_decode_thread_limit() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20031);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Decode Thread Limit",
+            &[(("limited.bin").to_string(), 512u32)],
+        ),
+    )
+    .await;
+
+    let decode_limit = pipeline.tuner.params().decode_thread_count;
+    let raw_size = 32usize;
+    for segment_number in 0..(decode_limit + 3) {
+        let raw = Bytes::from(vec![segment_number as u8; raw_size]);
+        pipeline.metrics.note_decode_work_queued(raw.len() as u64);
+        pipeline.pending_decode.push_back(PendingDecodeWork {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                segment_number: segment_number as u32,
+            },
+            raw,
+            source_server_idx: None,
+            exclude_servers: Vec::new(),
+        });
+    }
+
+    pipeline.pump_decode_queue();
+
+    assert_eq!(
+        pipeline.active_decodes_by_job.values().sum::<usize>(),
+        decode_limit
+    );
+    assert_eq!(pipeline.pending_decode.len(), 3);
+    assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        pipeline
+            .metrics
+            .decode_pending_bytes
+            .load(Ordering::Relaxed),
+        (3 * raw_size) as u64
+    );
+    assert_eq!(
+        pipeline.metrics.decode_active_bytes.load(Ordering::Relaxed),
+        (decode_limit * raw_size) as u64
+    );
+}
+
+#[tokio::test]
+async fn dispatch_downloads_respects_hard_decode_byte_pressure() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -4511,19 +4623,71 @@ async fn dispatch_downloads_respects_decode_backpressure() {
     .await;
     let job_id = JobId(20002);
     let files = vec![("queued.bin".to_string(), 512u32)];
-    let spec = standalone_job_spec("Decode Queue Limit", &files);
+    let spec = standalone_job_spec("Decode Byte Pressure", &files);
     insert_active_job(&mut pipeline, job_id, spec).await;
 
+    pipeline.decode_backlog_budget_bytes = 1024;
     pipeline
         .metrics
-        .decode_pending
-        .store(pipeline.tuner.params().max_decode_queue, Ordering::Relaxed);
+        .decode_pending_bytes
+        .store(1024, Ordering::Relaxed);
     pipeline.dispatch_downloads();
 
     assert_eq!(pipeline.active_downloads, 0);
     assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_stalls_total
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert!(pipeline.download_pressure_hard_stall_started_at.is_some());
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Hard.as_code()
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_reason
+            .load(Ordering::Relaxed),
+        DownloadPressureReason::Decode.as_code()
+    );
+    assert_eq!(
         pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
         files.len()
+    );
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    pipeline
+        .metrics
+        .decode_pending_bytes
+        .store(0, Ordering::Relaxed);
+    pipeline.refresh_download_pressure();
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Clear.as_code()
+    );
+    assert!(pipeline.download_pressure_hard_stall_started_at.is_none());
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_current_stall_ms
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert!(
+        pipeline
+            .metrics
+            .download_pressure_stall_duration_ms
+            .load(Ordering::Relaxed)
+            > 0
     );
 }
 
@@ -4568,7 +4732,7 @@ async fn dispatch_downloads_leaves_unpromoted_recovery_queue_parked_when_primary
 }
 
 #[tokio::test]
-async fn dispatch_downloads_ignores_write_backlog_when_raw_decode_queue_is_empty() {
+async fn dispatch_downloads_respects_hard_write_byte_pressure() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -4582,7 +4746,7 @@ async fn dispatch_downloads_ignores_write_backlog_when_raw_decode_queue_is_empty
     .await;
     let job_id = JobId(20004);
     let spec = standalone_job_spec(
-        "Write Backlog Does Not Gate Dispatch",
+        "Write Backlog Gates Dispatch",
         &[("queued.bin".to_string(), 512u32)],
     );
     insert_active_job(&mut pipeline, job_id, spec).await;
@@ -4608,10 +4772,11 @@ async fn dispatch_downloads_ignores_write_backlog_when_raw_decode_queue_is_empty
         .or_insert_with(|| WriteReorderBuffer::new(4))
         .insert(4096, buffered);
     pipeline.note_write_buffered(buffered_len, 1);
+    pipeline.write_backlog_budget_bytes = buffered_len;
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.active_downloads, 0);
     assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
     assert_eq!(
         pipeline
@@ -4619,6 +4784,215 @@ async fn dispatch_downloads_ignores_write_backlog_when_raw_decode_queue_is_empty
             .write_buffered_segments
             .load(Ordering::Relaxed),
         1
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Hard.as_code()
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_reason
+            .load(Ordering::Relaxed),
+        DownloadPressureReason::Write.as_code()
+    );
+}
+
+#[tokio::test]
+async fn refresh_download_pressure_reports_combined_hard_byte_pressure() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.decode_backlog_budget_bytes = 1000;
+    pipeline.write_backlog_budget_bytes = 1000;
+    pipeline
+        .metrics
+        .decode_pending_bytes
+        .store(1000, Ordering::Relaxed);
+    pipeline
+        .metrics
+        .write_buffered_bytes
+        .store(1000, Ordering::Relaxed);
+
+    pipeline.refresh_download_pressure();
+
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Hard.as_code()
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_reason
+            .load(Ordering::Relaxed),
+        DownloadPressureReason::DecodeAndWrite.as_code()
+    );
+}
+
+#[tokio::test]
+async fn hard_decode_pressure_latches_until_soft_watermark() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.decode_backlog_budget_bytes = 1000;
+
+    pipeline
+        .metrics
+        .decode_pending_bytes
+        .store(1000, Ordering::Relaxed);
+    pipeline.refresh_download_pressure();
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Hard.as_code()
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_reason
+            .load(Ordering::Relaxed),
+        DownloadPressureReason::Decode.as_code()
+    );
+
+    pipeline
+        .metrics
+        .decode_pending_bytes
+        .store(701, Ordering::Relaxed);
+    pipeline.refresh_download_pressure();
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Hard.as_code()
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_stalls_total
+            .load(Ordering::Relaxed),
+        1
+    );
+
+    pipeline
+        .metrics
+        .decode_pending_bytes
+        .store(699, Ordering::Relaxed);
+    pipeline.refresh_download_pressure();
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Clear.as_code()
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_reason
+            .load(Ordering::Relaxed),
+        DownloadPressureReason::None.as_code()
+    );
+}
+
+#[tokio::test]
+async fn hard_write_pressure_latches_until_soft_watermark() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.write_backlog_budget_bytes = 1000;
+
+    pipeline
+        .metrics
+        .write_buffered_bytes
+        .store(1000, Ordering::Relaxed);
+    pipeline.refresh_download_pressure();
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Hard.as_code()
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_reason
+            .load(Ordering::Relaxed),
+        DownloadPressureReason::Write.as_code()
+    );
+
+    pipeline
+        .metrics
+        .write_buffered_bytes
+        .store(701, Ordering::Relaxed);
+    pipeline.refresh_download_pressure();
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Hard.as_code()
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_stalls_total
+            .load(Ordering::Relaxed),
+        1
+    );
+
+    pipeline
+        .metrics
+        .write_buffered_bytes
+        .store(699, Ordering::Relaxed);
+    pipeline.refresh_download_pressure();
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Clear.as_code()
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_reason
+            .load(Ordering::Relaxed),
+        DownloadPressureReason::None.as_code()
+    );
+}
+
+#[tokio::test]
+async fn refresh_download_pressure_counts_active_decode_bytes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.decode_backlog_budget_bytes = 1000;
+    pipeline
+        .metrics
+        .decode_active_bytes
+        .store(1000, Ordering::Relaxed);
+
+    pipeline.refresh_download_pressure();
+
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Hard.as_code()
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_reason
+            .load(Ordering::Relaxed),
+        DownloadPressureReason::Decode.as_code()
     );
 }
 
@@ -4723,12 +5097,17 @@ async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segme
             .expect("low-priority job should have an in-flight segment to drain");
     }
     pipeline.active_downloads = 1;
+    pipeline.active_download_connections = 1;
     pipeline.active_downloads_by_job.insert(low_job_id, 1);
+    pipeline
+        .active_download_connections_by_job
+        .insert(low_job_id, 1);
     pipeline.active_download_passes.insert(low_job_id);
 
     pipeline.dispatch_downloads();
 
     assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(
         pipeline.jobs.get(&low_job_id).unwrap().download_queue.len(),
         1
@@ -4895,7 +5274,8 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(pipeline.active_downloads, 3);
+    assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(
         pipeline
             .jobs
@@ -4912,7 +5292,7 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
             .unwrap()
             .download_queue
             .len(),
-        1
+        0
     );
     assert_eq!(
         pipeline.active_downloads_by_job.get(&earlier_job_id),
@@ -4920,7 +5300,7 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
     );
     assert_eq!(
         pipeline.active_downloads_by_job.get(&later_job_id),
-        Some(&1)
+        Some(&2)
     );
 }
 
@@ -4970,7 +5350,91 @@ async fn dispatch_downloads_keeps_capacity_on_hot_job_before_same_band_spillover
 
     pipeline.dispatch_downloads();
 
+    assert_eq!(pipeline.active_downloads, 3);
+    assert_eq!(pipeline.active_download_connections, 2);
+    assert_eq!(
+        pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
+        0
+    );
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&secondary_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        1
+    );
+    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&3));
+    assert!(
+        !pipeline
+            .active_downloads_by_job
+            .contains_key(&secondary_job_id)
+    );
+}
+
+#[tokio::test]
+async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    pipeline.connection_ramp = 2;
+    pipeline.decode_backlog_budget_bytes = 1000;
+    pipeline
+        .metrics
+        .decode_pending_bytes
+        .store(700, Ordering::Relaxed);
+
+    let hot_job_id = JobId(20029);
+    let secondary_job_id = JobId(20030);
+
+    insert_active_job(
+        &mut pipeline,
+        hot_job_id,
+        with_priority(
+            standalone_job_spec(
+                "Soft Pressure Hot Full",
+                &[
+                    ("hot-0.bin".to_string(), 512u32),
+                    ("hot-1.bin".to_string(), 512u32),
+                    ("hot-2.bin".to_string(), 512u32),
+                ],
+            ),
+            "NORMAL",
+        ),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        secondary_job_id,
+        with_priority(
+            standalone_job_spec(
+                "Soft Pressure Secondary Parked",
+                &[("secondary.bin".to_string(), 512u32)],
+            ),
+            "NORMAL",
+        ),
+    )
+    .await;
+
+    pipeline.dispatch_downloads();
+
     assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(pipeline.active_download_connections, 1);
+    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&2));
+    assert!(
+        !pipeline
+            .active_downloads_by_job
+            .contains_key(&secondary_job_id)
+    );
     assert_eq!(
         pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
         1
@@ -4984,11 +5448,111 @@ async fn dispatch_downloads_keeps_capacity_on_hot_job_before_same_band_spillover
             .len(),
         1
     );
-    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&2));
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Soft.as_code()
+    );
+    assert!(pipeline.download_pressure_soft_dispatch_after.is_some());
+
+    pipeline.dispatch_downloads();
+    assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(pipeline.active_download_connections, 1);
+    assert_eq!(
+        pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
+        1
+    );
+
+    pipeline.download_pressure_soft_dispatch_after =
+        Some(Instant::now() - Duration::from_millis(1));
+    pipeline.dispatch_downloads();
+    assert_eq!(pipeline.active_downloads, 3);
+    assert_eq!(pipeline.active_download_connections, 2);
+    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&3));
+    assert_eq!(
+        pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn dispatch_downloads_suppresses_spillover_under_soft_byte_pressure() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    pipeline.connection_ramp = 2;
+    pipeline.decode_backlog_budget_bytes = 1000;
+    pipeline
+        .metrics
+        .decode_pending_bytes
+        .store(700, Ordering::Relaxed);
+
+    let hot_job_id = JobId(20025);
+    let secondary_job_id = JobId(20026);
+
+    insert_active_job(
+        &mut pipeline,
+        hot_job_id,
+        with_priority(
+            standalone_job_spec("Soft Pressure Hot", &[("hot.bin".to_string(), 512u32)]),
+            "NORMAL",
+        ),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        secondary_job_id,
+        with_priority(
+            standalone_job_spec(
+                "Soft Pressure Secondary",
+                &[("secondary.bin".to_string(), 512u32)],
+            ),
+            "NORMAL",
+        ),
+    )
+    .await;
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&1));
     assert!(
         !pipeline
             .active_downloads_by_job
             .contains_key(&secondary_job_id)
+    );
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&secondary_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        1
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Soft.as_code()
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pressure_reason
+            .load(Ordering::Relaxed),
+        DownloadPressureReason::Decode.as_code()
     );
 }
 
@@ -5061,7 +5625,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .unwrap()
             .download_queue
             .len(),
-        1
+        0
     );
     assert_eq!(
         pipeline
@@ -5074,7 +5638,9 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
     );
 
     pipeline.active_downloads = 0;
+    pipeline.active_download_connections = 0;
     pipeline.active_downloads_by_job.clear();
+    pipeline.active_download_connections_by_job.clear();
     pipeline.active_download_passes.clear();
     pipeline
         .jobs
@@ -5092,7 +5658,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .unwrap()
             .download_queue
             .len(),
-        1
+        0
     );
     assert_eq!(
         pipeline
@@ -5304,21 +5870,33 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
         segment_number: 0,
     };
     pipeline.active_downloads += 1;
+    let raw = Bytes::from_static(b"not a yenc article");
+    let raw_size = raw.len() as u64;
     pipeline
         .handle_download_done(DownloadResult {
             segment_id,
-            data: Ok(DownloadPayload::Raw(Bytes::from_static(
-                b"not a yenc article",
-            ))),
+            data: Ok(DownloadPayload::Raw(raw)),
             attempts: Vec::new(),
             source_server_idx: None,
             is_recovery: false,
             retry_count: 0,
             exclude_servers: Vec::new(),
+            release_connection_slot: true,
         })
         .await;
 
-    assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 1);
+    assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        pipeline
+            .metrics
+            .decode_pending_bytes
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        pipeline.metrics.decode_active_bytes.load(Ordering::Relaxed),
+        raw_size
+    );
 
     let done = tokio::time::timeout(Duration::from_secs(2), pipeline.decode_done_rx.recv())
         .await
@@ -5326,16 +5904,29 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
         .expect("decode channel should stay open");
     let DecodeDone::Failed {
         segment_id: failed_segment,
+        raw_size: failed_raw_size,
         ..
     } = &done
     else {
         panic!("expected decode failure");
     };
     assert_eq!(*failed_segment, segment_id);
+    assert_eq!(*failed_raw_size, raw_size);
 
     pipeline.handle_decode_done(done).await;
 
     assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        pipeline
+            .metrics
+            .decode_pending_bytes
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        pipeline.metrics.decode_active_bytes.load(Ordering::Relaxed),
+        0
+    );
     assert_eq!(pipeline.metrics.decode_errors.load(Ordering::Relaxed), 1);
 
     let (reply, recv) = oneshot::channel();
@@ -5395,6 +5986,7 @@ async fn decode_failure_retries_excluding_actual_source_server() {
             is_recovery: false,
             retry_count: 0,
             exclude_servers: Vec::new(),
+            release_connection_slot: true,
         })
         .await;
 
@@ -5427,6 +6019,123 @@ async fn decode_failure_retries_excluding_actual_source_server() {
         .retry_rx
         .try_recv()
         .expect("decode failure should schedule a retry");
+    assert_eq!(work.exclude_servers, vec![0]);
+}
+
+#[tokio::test]
+async fn streamed_decoded_download_bypasses_decode_backlog() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20017);
+    let filename = "streamed.bin";
+    let payload = b"already decoded bytes".to_vec();
+    let spec = standalone_job_spec(
+        "Streamed Decode Success",
+        &[(filename.to_string(), payload.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let raw_size = 256;
+    pipeline.active_downloads += 1;
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id,
+            data: Ok(DownloadPayload::Decoded(DecodeResult {
+                segment_id,
+                raw_size,
+                file_offset: 0,
+                decoded_size: payload.len() as u32,
+                crc_valid: true,
+                expected_file_crc: None,
+                data: DecodedChunk::from(payload.clone()),
+                yenc_name: filename.to_string(),
+            })),
+            attempts: Vec::new(),
+            source_server_idx: Some(0),
+            is_recovery: false,
+            retry_count: 0,
+            exclude_servers: Vec::new(),
+            release_connection_slot: true,
+        })
+        .await;
+
+    assert_eq!(pipeline.pending_decode.len(), 0);
+    assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        pipeline
+            .metrics
+            .decode_pending_bytes
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        pipeline.metrics.bytes_downloaded.load(Ordering::Relaxed),
+        raw_size
+    );
+    assert_eq!(
+        pipeline.metrics.bytes_decoded.load(Ordering::Relaxed),
+        payload.len() as u64
+    );
+    assert_eq!(pipeline.metrics.segments_decoded.load(Ordering::Relaxed), 1);
+    assert!(pipeline.decode_done_rx.try_recv().is_err());
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .map(|state| state.downloaded_bytes),
+        Some(payload.len() as u64)
+    );
+}
+
+#[tokio::test]
+async fn streamed_decode_failure_retries_excluding_actual_source_server() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20018);
+    let files = vec![("broken-streamed.bin".to_string(), 64u32)];
+    let spec = standalone_job_spec("Streamed Decode Failure Retry", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    pipeline.active_downloads += 1;
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id,
+            data: Err(DownloadError::Decode {
+                raw_size: 19,
+                error: "missing =ybegin header".to_string(),
+                crc_mismatch: false,
+            }),
+            attempts: Vec::new(),
+            source_server_idx: Some(0),
+            is_recovery: false,
+            retry_count: 0,
+            exclude_servers: Vec::new(),
+            release_connection_slot: true,
+        })
+        .await;
+
+    assert_eq!(pipeline.metrics.decode_errors.load(Ordering::Relaxed), 1);
+    assert!(pipeline.decode_done_rx.try_recv().is_err());
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let work = pipeline
+        .retry_rx
+        .try_recv()
+        .expect("streamed decode failure should schedule a retry");
     assert_eq!(work.exclude_servers, vec![0]);
 }
 
@@ -5672,6 +6381,75 @@ fn hdd_profile_allocates_more_write_backlog_than_ssd() {
     assert!(hdd_budget > ssd_budget);
 }
 
+#[test]
+fn decode_backlog_budget_is_separate_bounded_raw_article_cache() {
+    let profile = SystemProfile {
+        cpu: CpuProfile {
+            physical_cores: 4,
+            logical_cores: 4,
+            simd: SimdSupport::default(),
+            cgroup_limit: None,
+        },
+        memory: MemoryProfile {
+            total_bytes: 8 * 1024 * 1024 * 1024,
+            available_bytes: 8 * 1024 * 1024 * 1024,
+            cgroup_limit: None,
+        },
+        disk: DiskProfile {
+            storage_class: StorageClass::Ssd,
+            filesystem: FilesystemType::Apfs,
+            sequential_write_mbps: 1000.0,
+            random_read_iops: 50_000.0,
+            same_filesystem: true,
+        },
+    };
+    let buffers = BufferPool::new(BufferPoolConfig {
+        small_count: 192,
+        medium_count: 24,
+        large_count: 6,
+    });
+
+    let write_budget = compute_write_backlog_budget_bytes(&profile, &buffers);
+    let decode_budget = compute_decode_backlog_budget_bytes(&profile, &buffers, write_budget);
+
+    assert!(decode_budget > write_budget);
+    assert_eq!(decode_budget, 432 * 1024 * 1024);
+}
+
+#[test]
+fn decode_backlog_budget_respects_effective_memory_cap() {
+    let profile = SystemProfile {
+        cpu: CpuProfile {
+            physical_cores: 2,
+            logical_cores: 2,
+            simd: SimdSupport::default(),
+            cgroup_limit: None,
+        },
+        memory: MemoryProfile {
+            total_bytes: 512 * 1024 * 1024,
+            available_bytes: 512 * 1024 * 1024,
+            cgroup_limit: Some(512 * 1024 * 1024),
+        },
+        disk: DiskProfile {
+            storage_class: StorageClass::Ssd,
+            filesystem: FilesystemType::Ext4,
+            sequential_write_mbps: 250.0,
+            random_read_iops: 5_000.0,
+            same_filesystem: true,
+        },
+    };
+    let buffers = BufferPool::new(BufferPoolConfig {
+        small_count: 32,
+        medium_count: 4,
+        large_count: 1,
+    });
+
+    let write_budget = compute_write_backlog_budget_bytes(&profile, &buffers);
+    let decode_budget = compute_decode_backlog_budget_bytes(&profile, &buffers, write_budget);
+
+    assert_eq!(decode_budget, 64 * 1024 * 1024);
+}
+
 #[tokio::test]
 async fn fail_job_clears_write_backlog_accounting() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -5743,6 +6521,7 @@ async fn disk_write_failure_fails_job_before_commit() {
                 file_id,
                 segment_number: 0,
             },
+            raw_size: 4,
             file_offset: 0,
             decoded_size: 4,
             crc_valid: true,
@@ -6346,13 +7125,11 @@ async fn restore_job_reuses_persisted_rar_volume_facts_after_restart() {
     };
 
     let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
-    let committed_segments = Pipeline::all_segment_ids(job_id, &spec);
     restored
         .restore_job(RestoreJobRequest {
             job_id,
             job_hash: [0; 32],
             spec,
-            committed_segments,
             file_progress: HashMap::new(),
             complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
@@ -6667,26 +7444,6 @@ async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
             job_id,
             job_hash: [0; 32],
             spec,
-            committed_segments: Pipeline::all_segment_ids(
-                job_id,
-                &JobSpec {
-                    name: "PAR2 Restore".to_string(),
-                    password: None,
-                    total_bytes: par2_bytes.len() as u64,
-                    category: None,
-                    metadata: vec![],
-                    files: vec![FileSpec {
-                        filename: par2_filename.to_string(),
-                        role: FileRole::from_filename(par2_filename),
-                        groups: vec!["alt.binaries.test".to_string()],
-                        segments: vec![segment_spec! {
-                            number: 0,
-                            bytes: par2_bytes.len() as u32,
-                            message_id: "par2-0@example.com".to_string(),
-                        }],
-                    }],
-                },
-            ),
             file_progress: HashMap::new(),
             complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
@@ -7122,7 +7879,6 @@ async fn restore_job_scrubs_stale_par2_rar_set_state_before_rar_runtime_rebuild(
             job_id,
             job_hash: [0; 32],
             spec: spec.clone(),
-            committed_segments: Pipeline::all_segment_ids(job_id, &spec),
             file_progress: recovered.file_progress,
             complete_files: HashSet::new(),
             detected_archives: recovered.detected_archives,
@@ -8290,13 +9046,6 @@ async fn restore_job_uses_per_file_progress_floor_for_reporting() {
         .await
         .unwrap();
 
-    let committed_segments = HashSet::from([SegmentId {
-        file_id: NzbFileId {
-            job_id,
-            file_index: 0,
-        },
-        segment_number: 0,
-    }]);
     let file_progress = HashMap::from([(0u32, 40u64), (1u32, 100u64)]);
 
     pipeline
@@ -8304,7 +9053,6 @@ async fn restore_job_uses_per_file_progress_floor_for_reporting() {
             job_id,
             job_hash: [0; 32],
             spec,
-            committed_segments,
             file_progress,
             complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
@@ -8380,23 +9128,12 @@ async fn restore_job_reparses_par2_without_promoted_recovery_state() {
         working_dir
     };
 
-    let committed_segments = [SegmentId {
-        file_id: NzbFileId {
-            job_id,
-            file_index: 0,
-        },
-        segment_number: 0,
-    }]
-    .into_iter()
-    .collect();
-
     let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
     restored
         .restore_job(RestoreJobRequest {
             job_id,
             job_hash: [0; 32],
             spec,
-            committed_segments,
             file_progress: HashMap::new(),
             complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
@@ -8482,10 +9219,6 @@ async fn restore_job_does_not_rehydrate_lossy_extraction_attempt_state() {
             job_id,
             job_hash: [0; 32],
             spec,
-            committed_segments: Pipeline::all_segment_ids(
-                job_id,
-                &rar_job_spec("RAR Restart Runtime Restore", &files),
-            ),
             file_progress: HashMap::new(),
             complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
@@ -8536,10 +9269,6 @@ async fn restore_job_skips_eager_delete_for_ownerless_restored_volumes() {
             job_id,
             job_hash: [0; 32],
             spec,
-            committed_segments: Pipeline::all_segment_ids(
-                job_id,
-                &rar_job_spec("RAR Ownerless Restore", &files),
-            ),
             file_progress: HashMap::new(),
             complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
@@ -11983,7 +12712,6 @@ async fn restore_job_rehydrates_existing_deterministic_staging_dir() {
             job_id,
             job_hash: [0; 32],
             spec,
-            committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
             complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
@@ -14022,7 +14750,6 @@ async fn restore_job_normalizes_persisted_checking_to_queued_when_work_remains()
             job_id,
             job_hash: [0; 32],
             spec,
-            committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
             complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
@@ -14061,7 +14788,6 @@ async fn restore_job_normalizes_persisted_checking_to_complete_when_no_work_rema
             ("probe-b.bin".to_string(), 100),
         ],
     );
-    let committed_segments = Pipeline::all_segment_ids(job_id, &spec);
     let working_dir = temp_dir.path().join("restore-checking-complete");
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
 
@@ -14070,7 +14796,6 @@ async fn restore_job_normalizes_persisted_checking_to_complete_when_no_work_rema
             job_id,
             job_hash: [0; 32],
             spec,
-            committed_segments,
             file_progress: HashMap::new(),
             complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
@@ -14107,7 +14832,6 @@ async fn restore_job_reemits_open_download_finalization_and_drains_it() {
         "Restore Finalizing Download",
         &[("payload.bin".to_string(), 100)],
     );
-    let committed_segments = Pipeline::all_segment_ids(job_id, &spec);
     let working_dir = temp_dir.path().join("restore-finalizing-download");
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
 
@@ -14138,7 +14862,6 @@ async fn restore_job_reemits_open_download_finalization_and_drains_it() {
             job_id,
             job_hash: [0; 32],
             spec,
-            committed_segments,
             file_progress: HashMap::new(),
             complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
@@ -14833,7 +15556,6 @@ async fn restore_queued_postprocessing_schedules_completion_check() {
             job_id,
             job_hash: [0; 32],
             spec,
-            committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
             complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
@@ -14881,7 +15603,6 @@ async fn restore_repairing_preserves_status_and_slot_ownership() {
             job_id,
             job_hash: [0; 32],
             spec,
-            committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
             complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
@@ -14937,7 +15658,6 @@ async fn restore_paused_postprocessing_target_normalizes_to_downloading() {
             job_id,
             job_hash: [0; 32],
             spec,
-            committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
             complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
@@ -15145,6 +15865,7 @@ async fn download_done_refunds_rate_limit_estimate_to_actual_raw_bytes() {
             is_recovery: false,
             retry_count: 0,
             exclude_servers: vec![],
+            release_connection_slot: true,
         })
         .await;
 
@@ -15179,6 +15900,7 @@ async fn download_done_charges_rate_limit_for_raw_bytes_above_estimate() {
             is_recovery: false,
             retry_count: 0,
             exclude_servers: vec![],
+            release_connection_slot: true,
         })
         .await;
 

@@ -1,3 +1,4 @@
+use crate::DownloadPressureReason;
 use crate::runtime::system_profile::*;
 
 use super::*;
@@ -54,11 +55,24 @@ fn empty_metrics() -> MetricsSnapshot {
         bytes_decoded: 0,
         bytes_committed: 0,
         download_queue_depth: 0,
+        active_downloads: 0,
+        active_decodes: 0,
         decode_pending: 0,
+        decode_pending_bytes: 0,
+        decode_active_bytes: 0,
         commit_pending: 0,
         write_buffered_bytes: 0,
         write_buffered_segments: 0,
         direct_write_evictions: 0,
+        decode_pressure_soft_limit_bytes: 0,
+        decode_pressure_hard_limit_bytes: 0,
+        write_pressure_soft_limit_bytes: 0,
+        write_pressure_hard_limit_bytes: 0,
+        download_pressure_state: DownloadPressureState::Clear,
+        download_pressure_reason: DownloadPressureReason::None,
+        download_pressure_stalls_total: 0,
+        download_pressure_stall_duration_ms: 0,
+        download_pressure_current_stall_ms: 0,
         segments_downloaded: 0,
         segments_decoded: 0,
         segments_committed: 0,
@@ -70,6 +84,11 @@ fn empty_metrics() -> MetricsSnapshot {
         disk_write_latency_us: 0,
         segments_retried: 0,
         segments_failed_permanent: 0,
+        download_failures_article_not_found: 0,
+        download_failures_capacity_unavailable: 0,
+        download_failures_transient: 0,
+        download_failures_auth: 0,
+        download_failures_permanent: 0,
         current_download_speed: 0,
         crc_errors: 0,
         recovery_queue_depth: 0,
@@ -86,7 +105,6 @@ fn initial_params_ssd() {
     let tuner = RuntimeTuner::with_connection_limit(ssd_profile(8), TEST_CONNECTIONS);
     let p = tuner.params();
     assert_eq!(p.max_concurrent_downloads, 20); // SSD uses all connections
-    assert_eq!(p.max_decode_queue, 160); // 20 * 8
     assert_eq!(p.max_write_queue, 40);
     assert_eq!(p.min_free_buffers, 4);
     assert_eq!(p.decode_thread_count, 8);
@@ -97,7 +115,6 @@ fn initial_params_hdd() {
     let tuner = RuntimeTuner::with_connection_limit(hdd_profile(8), TEST_CONNECTIONS);
     let p = tuner.params();
     assert_eq!(p.max_concurrent_downloads, 20); // all configured connections
-    assert_eq!(p.max_decode_queue, 160);
     assert_eq!(p.max_write_queue, 40);
     assert_eq!(p.decode_thread_count, 8);
 }
@@ -107,9 +124,9 @@ fn adjust_reduces_downloads() {
     let mut tuner = RuntimeTuner::with_connection_limit(ssd_profile(4), TEST_CONNECTIONS);
     let initial = tuner.params().max_concurrent_downloads;
 
-    // Simulate decode pressure (decode_pending > max_decode_queue).
+    // Simulate hard byte pressure.
     let mut m = empty_metrics();
-    m.decode_pending = tuner.params().max_decode_queue + 10;
+    m.download_pressure_state = DownloadPressureState::Hard;
 
     // Need 3 consecutive observations before adjustment.
     assert!(!tuner.adjust(&m));
@@ -124,7 +141,7 @@ fn adjust_increases_downloads() {
 
     // First reduce downloads so there's room to increase.
     let mut pressure = empty_metrics();
-    pressure.decode_pending = tuner.params().max_decode_queue + 10;
+    pressure.download_pressure_state = DownloadPressureState::Hard;
     for _ in 0..3 {
         tuner.adjust(&pressure);
     }
@@ -146,7 +163,7 @@ fn adjust_respects_minimums() {
     // With 1 core, 2 connections on SSD: max_concurrent_downloads = 2.
 
     let mut pressure = empty_metrics();
-    pressure.decode_pending = 1000;
+    pressure.download_pressure_state = DownloadPressureState::Hard;
 
     // Reduce from 2 to 1.
     for _ in 0..3 {
@@ -247,7 +264,6 @@ fn set_connection_limit_increases_capacity() {
     // Add a server with 20 connections.
     tuner.set_connection_limit(20);
     assert_eq!(tuner.params().max_concurrent_downloads, 20); // SSD uses all
-    assert_eq!(tuner.params().max_decode_queue, 160);
 }
 
 #[test]

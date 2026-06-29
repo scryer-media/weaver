@@ -22,7 +22,6 @@ pub struct RecoveredServerState {
 
 pub struct RestoreCandidate {
     pub job_id: crate::jobs::ids::JobId,
-    pub committed_count: usize,
     pub request: RestoreJobRequest,
 }
 
@@ -52,7 +51,6 @@ pub async fn recover_server_state(
     match db.prune_orphan_active_state() {
         Ok(counts) if counts.total_removed() > 0 => {
             info!(
-                active_segments = counts.active_segments,
                 active_file_progress = counts.active_file_progress,
                 active_files = counts.active_files,
                 active_par2 = counts.active_par2,
@@ -174,12 +172,10 @@ pub async fn recover_server_state(
                         .and_then(PostState::parse);
                     to_restore.push(RestoreCandidate {
                         job_id,
-                        committed_count: recovered.committed_segments.len(),
                         request: RestoreJobRequest {
                             job_id,
                             job_hash: recovered.nzb_hash,
                             spec,
-                            committed_segments: recovered.committed_segments,
                             complete_files: recovered.complete_files,
                             file_progress: recovered.file_progress,
                             detected_archives: recovered.detected_archives,
@@ -357,7 +353,7 @@ mod tests {
     use crate::StateError;
     use crate::jobs::working_dir::working_dir_marker_path;
     use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-    use crate::{ActiveJob, CommittedSegment, Database, JobHistoryRow, JobId, NzbFileId};
+    use crate::{ActiveJob, Database, JobHistoryRow, JobId, NzbFileId};
 
     fn sample_active_job(id: u64, nzb_path: PathBuf, output_dir: PathBuf) -> ActiveJob {
         ActiveJob {
@@ -440,25 +436,9 @@ mod tests {
 
         db.create_active_job(&sample_active_job(1, nzb_path, active_output_dir.clone()))
             .unwrap();
-        db.commit_segments(&[CommittedSegment {
-            job_id: JobId(1),
-            file_index: 0,
-            segment_number: 0,
-            file_offset: 0,
-            decoded_size: 10,
-            crc32: 42,
-        }])
-        .unwrap();
         db.complete_file(JobId(1), 0, "sample", &[0xBB; 16])
             .unwrap();
 
-        execute_sql(
-            &db,
-            "INSERT INTO active_segments
-             (job_id, file_index, segment_number, file_offset, decoded_size, crc32)
-             VALUES ({}, 0, 0, 0, 10, 99)",
-            vec![SqlArg::I64(99)],
-        );
         execute_sql(
             &db,
             "INSERT INTO active_file_progress
@@ -494,9 +474,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(count_rows(&db, "active_segments", 99), 0);
         assert_eq!(count_rows(&db, "active_file_progress", 100), 0);
-        assert_eq!(count_rows(&db, "active_segments", 1), 1);
         assert!(active_output_dir.exists());
         assert!(history_output_dir.exists());
         assert!(!orphan_output_dir.exists());

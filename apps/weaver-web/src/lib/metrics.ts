@@ -6,11 +6,24 @@ export interface MetricsSnapshot {
   bytesDecoded: number;
   bytesCommitted: number;
   downloadQueueDepth: number;
+  activeDownloads: number;
+  activeDecodes: number;
   decodePending: number;
+  decodePendingBytes: number;
+  decodeActiveBytes: number;
   commitPending: number;
   writeBufferedBytes: number;
   writeBufferedSegments: number;
   directWriteEvictions: number;
+  decodePressureSoftLimitBytes: number;
+  decodePressureHardLimitBytes: number;
+  writePressureSoftLimitBytes: number;
+  writePressureHardLimitBytes: number;
+  downloadPressureState: "CLEAR" | "SOFT" | "HARD";
+  downloadPressureReason: "NONE" | "DECODE" | "WRITE" | "DECODE_AND_WRITE";
+  downloadPressureStallsTotal: number;
+  downloadPressureStallDurationMs: number;
+  downloadPressureCurrentStallMs: number;
   segmentsDownloaded: number;
   segmentsDecoded: number;
   segmentsCommitted: number;
@@ -22,6 +35,11 @@ export interface MetricsSnapshot {
   diskWriteLatencyUs: number;
   segmentsRetried: number;
   segmentsFailedPermanent: number;
+  downloadFailuresArticleNotFound: number;
+  downloadFailuresCapacityUnavailable: number;
+  downloadFailuresTransient: number;
+  downloadFailuresAuth: number;
+  downloadFailuresPermanent: number;
   currentDownloadSpeed: number;
   crcErrors: number;
   recoveryQueueDepth: number;
@@ -140,15 +158,25 @@ export const COUNTER_HISTORY_METRIC_NAMES = [
   "weaver_pipeline_segments_committed_total",
   "weaver_pipeline_segments_retried_total",
   "weaver_pipeline_segments_failed_permanent_total",
+  "weaver_pipeline_download_failures_article_not_found_total",
+  "weaver_pipeline_download_failures_capacity_unavailable_total",
+  "weaver_pipeline_download_failures_transient_total",
+  "weaver_pipeline_download_failures_auth_total",
+  "weaver_pipeline_download_failures_permanent_total",
   "weaver_pipeline_articles_not_found_total",
   "weaver_pipeline_decode_errors_total",
   "weaver_pipeline_crc_errors_total",
+  "weaver_pipeline_download_pressure_stalls_total",
 ] as const;
 
 export const GAUGE_HISTORY_METRIC_NAMES = [
   "weaver_pipeline_current_download_speed_bytes_per_second",
   "weaver_pipeline_download_queue_depth",
+  "weaver_pipeline_active_downloads",
+  "weaver_pipeline_active_decodes",
   "weaver_pipeline_decode_pending",
+  "weaver_pipeline_decode_pending_bytes",
+  "weaver_pipeline_decode_active_bytes",
   "weaver_pipeline_commit_pending",
   "weaver_pipeline_recovery_queue_depth",
   "weaver_pipeline_verify_active",
@@ -156,6 +184,10 @@ export const GAUGE_HISTORY_METRIC_NAMES = [
   "weaver_pipeline_extract_active",
   "weaver_pipeline_write_buffered_bytes",
   "weaver_pipeline_write_buffered_segments",
+  "weaver_pipeline_decode_pressure_soft_limit_bytes",
+  "weaver_pipeline_decode_pressure_hard_limit_bytes",
+  "weaver_pipeline_write_pressure_soft_limit_bytes",
+  "weaver_pipeline_write_pressure_hard_limit_bytes",
   "weaver_pipeline_disk_write_latency_microseconds",
   "weaver_pipeline_articles_per_second",
   "weaver_pipeline_decode_rate_mebibytes_per_second",
@@ -176,9 +208,13 @@ export type GaugeHistoryMetricName = (typeof GAUGE_HISTORY_METRIC_NAMES)[number]
 export type SnapshotHistoryMetricName = (typeof SNAPSHOT_HISTORY_METRIC_NAMES)[number];
 export type HistoryMetricName = SnapshotHistoryMetricName | typeof JOB_STATUS_HISTORY_METRIC;
 
+type NumericMetricsSnapshotKey = {
+  [K in keyof MetricsSnapshot]: MetricsSnapshot[K] extends number ? K : never;
+}[keyof MetricsSnapshot];
+
 export const PROM_METRIC_TO_SNAPSHOT_FIELD: Record<
   SnapshotHistoryMetricName,
-  keyof MetricsSnapshot
+  NumericMetricsSnapshotKey
 > = {
   weaver_pipeline_bytes_downloaded_total: "bytesDownloaded",
   weaver_pipeline_bytes_decoded_total: "bytesDecoded",
@@ -188,12 +224,24 @@ export const PROM_METRIC_TO_SNAPSHOT_FIELD: Record<
   weaver_pipeline_segments_committed_total: "segmentsCommitted",
   weaver_pipeline_segments_retried_total: "segmentsRetried",
   weaver_pipeline_segments_failed_permanent_total: "segmentsFailedPermanent",
+  weaver_pipeline_download_failures_article_not_found_total:
+    "downloadFailuresArticleNotFound",
+  weaver_pipeline_download_failures_capacity_unavailable_total:
+    "downloadFailuresCapacityUnavailable",
+  weaver_pipeline_download_failures_transient_total: "downloadFailuresTransient",
+  weaver_pipeline_download_failures_auth_total: "downloadFailuresAuth",
+  weaver_pipeline_download_failures_permanent_total: "downloadFailuresPermanent",
   weaver_pipeline_articles_not_found_total: "articlesNotFound",
   weaver_pipeline_decode_errors_total: "decodeErrors",
   weaver_pipeline_crc_errors_total: "crcErrors",
+  weaver_pipeline_download_pressure_stalls_total: "downloadPressureStallsTotal",
   weaver_pipeline_current_download_speed_bytes_per_second: "currentDownloadSpeed",
   weaver_pipeline_download_queue_depth: "downloadQueueDepth",
+  weaver_pipeline_active_downloads: "activeDownloads",
+  weaver_pipeline_active_decodes: "activeDecodes",
   weaver_pipeline_decode_pending: "decodePending",
+  weaver_pipeline_decode_pending_bytes: "decodePendingBytes",
+  weaver_pipeline_decode_active_bytes: "decodeActiveBytes",
   weaver_pipeline_commit_pending: "commitPending",
   weaver_pipeline_recovery_queue_depth: "recoveryQueueDepth",
   weaver_pipeline_verify_active: "verifyActive",
@@ -201,6 +249,10 @@ export const PROM_METRIC_TO_SNAPSHOT_FIELD: Record<
   weaver_pipeline_extract_active: "extractActive",
   weaver_pipeline_write_buffered_bytes: "writeBufferedBytes",
   weaver_pipeline_write_buffered_segments: "writeBufferedSegments",
+  weaver_pipeline_decode_pressure_soft_limit_bytes: "decodePressureSoftLimitBytes",
+  weaver_pipeline_decode_pressure_hard_limit_bytes: "decodePressureHardLimitBytes",
+  weaver_pipeline_write_pressure_soft_limit_bytes: "writePressureSoftLimitBytes",
+  weaver_pipeline_write_pressure_hard_limit_bytes: "writePressureHardLimitBytes",
   weaver_pipeline_disk_write_latency_microseconds: "diskWriteLatencyUs",
   weaver_pipeline_articles_per_second: "articlesPerSec",
   weaver_pipeline_decode_rate_mebibytes_per_second: "decodeRateMbps",

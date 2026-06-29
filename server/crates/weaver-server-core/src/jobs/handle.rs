@@ -9,7 +9,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod};
 use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::DetectedArchiveIdentity;
-use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::record::ActiveFileIdentity;
 
 use crate::jobs::error::SchedulerError;
@@ -145,7 +145,6 @@ pub struct RestoreJobRequest {
     pub job_id: JobId,
     pub job_hash: [u8; 32],
     pub spec: JobSpec,
-    pub committed_segments: HashSet<SegmentId>,
     pub complete_files: HashSet<NzbFileId>,
     pub file_progress: HashMap<u32, u64>,
     pub detected_archives: HashMap<u32, DetectedArchiveIdentity>,

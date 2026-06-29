@@ -22,6 +22,6 @@ pub use model::{
     epoch_ms_now, job_status_from_persisted_str, runtime_lanes_from_status_snapshot,
 };
 pub use record::{
-    ActiveFileIdentity, ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment,
-    ExtractionChunk, FileIdentitySource, RecoveredJob,
+    ActiveFileIdentity, ActiveFileProgress, ActiveJob, ActivePar2File, ExtractionChunk,
+    FileIdentitySource, RecoveredJob,
 };

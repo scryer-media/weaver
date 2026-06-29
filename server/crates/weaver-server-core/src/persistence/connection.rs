@@ -17,8 +17,8 @@ use crate::persistence::sql_services::DatabaseServices;
 pub use crate::auth::{ApiKeyRow, AuthCredentials};
 pub use crate::history::{HistoryFilter, IntegrationEventRow, JobEvent, JobHistoryRow};
 pub use crate::jobs::{
-    ActiveFileIdentity, ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment,
-    ExtractionChunk, RecoveredJob,
+    ActiveFileIdentity, ActiveFileProgress, ActiveJob, ActivePar2File, ExtractionChunk,
+    RecoveredJob,
 };
 pub use crate::operations::{
     MetricsHistoryChunkRow, MetricsHistoryQueryData, MetricsHistoryQueryResult,

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::StateError;
 use crate::jobs::assembly::{DetectedArchiveIdentity, DetectedArchiveKind};
-use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::record::{
     ActiveFileIdentity, ActivePar2File, ExtractionChunk, FileIdentitySource, RarVolumeFactsBySet,
     RecoveredJob,
@@ -238,7 +238,6 @@ impl Database {
                     nzb_path: PathBuf::from(row.text("nzb_path")?),
                     nzb_zstd: row.opt_bytes("nzb_zstd")?,
                     output_dir: PathBuf::from(row.text("output_dir")?),
-                    committed_segments: HashSet::new(),
                     file_progress: HashMap::new(),
                     detected_archives: HashMap::new(),
                     file_identities: HashMap::new(),
@@ -259,24 +258,6 @@ impl Database {
                     metadata: metadata_from_json(row.opt_text("metadata")?),
                 };
                 jobs.insert(job_id, job);
-            }
-
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT job_id, file_index, segment_number FROM active_segments",
-                &[],
-            )
-            .await?;
-            for row in rows {
-                let job_id = JobId(row.i64("job_id")? as u64);
-                let file_index = row.i64("file_index")? as u32;
-                let segment_number = row.i64("segment_number")? as u32;
-                if let Some(job) = jobs.get_mut(&job_id) {
-                    job.committed_segments.insert(SegmentId {
-                        file_id: NzbFileId { job_id, file_index },
-                        segment_number,
-                    });
-                }
             }
 
             let rows = SqlRuntime::fetch_all(

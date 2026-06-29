@@ -131,6 +131,7 @@ impl Pipeline {
             .active_decodes_by_file
             .entry(segment_id.file_id)
             .or_default() += 1;
+        self.publish_active_stage_metrics();
     }
 
     fn note_decode_finished(&mut self, segment_id: SegmentId) {
@@ -147,6 +148,7 @@ impl Pipeline {
                 self.active_decodes_by_file.remove(&segment_id.file_id);
             }
         }
+        self.publish_active_stage_metrics();
     }
 
     pub(in crate::pipeline) fn decode_retry_exclude_servers(
@@ -241,18 +243,23 @@ impl Pipeline {
     /// Handle a completed decode — persist the segment, update assembly, journal.
     pub(crate) async fn handle_decode_done(&mut self, result: DecodeDone) {
         let _profile_scope = crate::runtime::perf_probe::scope("download.handle_decode_done");
-        self.metrics.decode_pending.fetch_sub(1, Ordering::Relaxed);
 
-        let segment_id = match &result {
-            DecodeDone::Success(result) => result.segment_id,
-            DecodeDone::Failed { segment_id, .. } => *segment_id,
+        let (segment_id, raw_size) = match &result {
+            DecodeDone::Success(result) => (result.segment_id, result.raw_size),
+            DecodeDone::Failed {
+                segment_id,
+                raw_size,
+                ..
+            } => (*segment_id, *raw_size),
         };
+        self.metrics.note_decode_task_finished(raw_size);
         self.note_decode_finished(segment_id);
 
         match result {
             DecodeDone::Success(result) => self.handle_decode_success(result).await,
             DecodeDone::Failed {
                 segment_id,
+                raw_size: _,
                 error,
                 source_server_idx,
                 exclude_servers,
@@ -376,6 +383,7 @@ impl Pipeline {
         let _profile_scope = crate::runtime::perf_probe::scope("download.handle_decode_success");
         let DecodeResult {
             segment_id,
+            raw_size: _,
             file_offset,
             decoded_size,
             crc_valid,

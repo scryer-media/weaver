@@ -5,6 +5,7 @@ pub(crate) fn is_known_migration_hook_id(hook_id: &str) -> bool {
             | "upgrade_to_schema_22"
             | "upgrade_to_schema_23"
             | "upgrade_to_schema_25"
+            | "restart_active_jobs_drop_active_segments_v28"
     )
 }
 

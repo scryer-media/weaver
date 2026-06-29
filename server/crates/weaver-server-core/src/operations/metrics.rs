@@ -7,6 +7,90 @@ use serde::{Deserialize, Serialize};
 const SPEED_WINDOW_SAMPLES: usize = 50; // ~5 seconds at 100ms snapshot rate
 const SPEED_EMA_HALF_LIFE_SECS: f64 = 1.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadPressureState {
+    Clear,
+    Soft,
+    Hard,
+}
+
+impl DownloadPressureState {
+    pub const fn as_code(self) -> usize {
+        match self {
+            Self::Clear => 0,
+            Self::Soft => 1,
+            Self::Hard => 2,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Soft => "soft",
+            Self::Hard => "hard",
+        }
+    }
+
+    pub const fn from_code(code: usize) -> Self {
+        match code {
+            1 => Self::Soft,
+            2 => Self::Hard,
+            _ => Self::Clear,
+        }
+    }
+}
+
+impl Default for DownloadPressureState {
+    fn default() -> Self {
+        Self::Clear
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadPressureReason {
+    None,
+    Decode,
+    Write,
+    DecodeAndWrite,
+}
+
+impl DownloadPressureReason {
+    pub const fn as_code(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Decode => 1,
+            Self::Write => 2,
+            Self::DecodeAndWrite => 3,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Decode => "decode",
+            Self::Write => "write",
+            Self::DecodeAndWrite => "decode_and_write",
+        }
+    }
+
+    pub const fn from_code(code: usize) -> Self {
+        match code {
+            1 => Self::Decode,
+            2 => Self::Write,
+            3 => Self::DecodeAndWrite,
+            _ => Self::None,
+        }
+    }
+}
+
+impl Default for DownloadPressureReason {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 /// Tracks download speed using a sliding window of byte samples.
 struct SpeedTracker {
     /// Ring buffer of (timestamp, cumulative_bytes) samples.
@@ -97,12 +181,25 @@ pub struct PipelineMetrics {
 
     // Queue depths
     pub download_queue_depth: AtomicUsize,
-    /// Raw article bodies waiting for decode scheduling or decode completion.
+    pub active_downloads: AtomicUsize,
+    pub active_decodes: AtomicUsize,
+    /// Raw article bodies waiting for decode scheduling.
     pub decode_pending: AtomicUsize,
+    pub decode_pending_bytes: AtomicU64,
+    pub decode_active_bytes: AtomicU64,
     pub commit_pending: AtomicUsize,
     pub write_buffered_bytes: AtomicU64,
     pub write_buffered_segments: AtomicUsize,
     pub direct_write_evictions: AtomicU64,
+    pub decode_pressure_soft_limit_bytes: AtomicU64,
+    pub decode_pressure_hard_limit_bytes: AtomicU64,
+    pub write_pressure_soft_limit_bytes: AtomicU64,
+    pub write_pressure_hard_limit_bytes: AtomicU64,
+    pub download_pressure_state: AtomicUsize,
+    pub download_pressure_reason: AtomicUsize,
+    pub download_pressure_stalls_total: AtomicU64,
+    pub download_pressure_stall_duration_ms: AtomicU64,
+    pub download_pressure_current_stall_ms: AtomicU64,
 
     // Counts
     pub segments_downloaded: AtomicU64,
@@ -120,6 +217,11 @@ pub struct PipelineMetrics {
     // Retry tracking
     pub segments_retried: AtomicU64,
     pub segments_failed_permanent: AtomicU64,
+    pub download_failures_article_not_found: AtomicU64,
+    pub download_failures_capacity_unavailable: AtomicU64,
+    pub download_failures_transient: AtomicU64,
+    pub download_failures_auth: AtomicU64,
+    pub download_failures_permanent: AtomicU64,
 
     // Speed — computed from bytes_downloaded delta, then smoothed via EMA
     speed_tracker: Mutex<SpeedTracker>,
@@ -141,11 +243,24 @@ impl PipelineMetrics {
             bytes_decoded: AtomicU64::new(0),
             bytes_committed: AtomicU64::new(0),
             download_queue_depth: AtomicUsize::new(0),
+            active_downloads: AtomicUsize::new(0),
+            active_decodes: AtomicUsize::new(0),
             decode_pending: AtomicUsize::new(0),
+            decode_pending_bytes: AtomicU64::new(0),
+            decode_active_bytes: AtomicU64::new(0),
             commit_pending: AtomicUsize::new(0),
             write_buffered_bytes: AtomicU64::new(0),
             write_buffered_segments: AtomicUsize::new(0),
             direct_write_evictions: AtomicU64::new(0),
+            decode_pressure_soft_limit_bytes: AtomicU64::new(0),
+            decode_pressure_hard_limit_bytes: AtomicU64::new(0),
+            write_pressure_soft_limit_bytes: AtomicU64::new(0),
+            write_pressure_hard_limit_bytes: AtomicU64::new(0),
+            download_pressure_state: AtomicUsize::new(DownloadPressureState::Clear.as_code()),
+            download_pressure_reason: AtomicUsize::new(DownloadPressureReason::None.as_code()),
+            download_pressure_stalls_total: AtomicU64::new(0),
+            download_pressure_stall_duration_ms: AtomicU64::new(0),
+            download_pressure_current_stall_ms: AtomicU64::new(0),
             segments_downloaded: AtomicU64::new(0),
             segments_decoded: AtomicU64::new(0),
             segments_committed: AtomicU64::new(0),
@@ -157,11 +272,52 @@ impl PipelineMetrics {
             disk_write_latency_us: AtomicU64::new(0),
             segments_retried: AtomicU64::new(0),
             segments_failed_permanent: AtomicU64::new(0),
+            download_failures_article_not_found: AtomicU64::new(0),
+            download_failures_capacity_unavailable: AtomicU64::new(0),
+            download_failures_transient: AtomicU64::new(0),
+            download_failures_auth: AtomicU64::new(0),
+            download_failures_permanent: AtomicU64::new(0),
             speed_tracker: Mutex::new(SpeedTracker::new()),
             crc_errors: AtomicU64::new(0),
             recovery_queue_depth: AtomicUsize::new(0),
             start_time: Instant::now(),
         })
+    }
+
+    fn saturating_sub_u64(counter: &AtomicU64, amount: u64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(amount))
+        });
+    }
+
+    pub fn note_decode_work_queued(&self, raw_bytes: u64) {
+        self.decode_pending.fetch_add(1, Ordering::Relaxed);
+        self.decode_pending_bytes
+            .fetch_add(raw_bytes, Ordering::Relaxed);
+    }
+
+    pub fn note_decode_work_released(&self, raw_bytes: u64) {
+        let _ = self
+            .decode_pending
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
+        Self::saturating_sub_u64(&self.decode_pending_bytes, raw_bytes);
+    }
+
+    pub fn note_decode_task_started(&self, raw_bytes: u64) {
+        let _ = self
+            .decode_pending
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
+        Self::saturating_sub_u64(&self.decode_pending_bytes, raw_bytes);
+        self.decode_active_bytes
+            .fetch_add(raw_bytes, Ordering::Relaxed);
+    }
+
+    pub fn note_decode_task_finished(&self, raw_bytes: u64) {
+        Self::saturating_sub_u64(&self.decode_active_bytes, raw_bytes);
     }
 
     fn snapshot_with_speed(
@@ -178,11 +334,42 @@ impl PipelineMetrics {
             bytes_decoded,
             bytes_committed: self.bytes_committed.load(Ordering::Relaxed),
             download_queue_depth: self.download_queue_depth.load(Ordering::Relaxed),
+            active_downloads: self.active_downloads.load(Ordering::Relaxed),
+            active_decodes: self.active_decodes.load(Ordering::Relaxed),
             decode_pending: self.decode_pending.load(Ordering::Relaxed),
+            decode_pending_bytes: self.decode_pending_bytes.load(Ordering::Relaxed),
+            decode_active_bytes: self.decode_active_bytes.load(Ordering::Relaxed),
             commit_pending: self.commit_pending.load(Ordering::Relaxed),
             write_buffered_bytes: self.write_buffered_bytes.load(Ordering::Relaxed),
             write_buffered_segments: self.write_buffered_segments.load(Ordering::Relaxed),
             direct_write_evictions: self.direct_write_evictions.load(Ordering::Relaxed),
+            decode_pressure_soft_limit_bytes: self
+                .decode_pressure_soft_limit_bytes
+                .load(Ordering::Relaxed),
+            decode_pressure_hard_limit_bytes: self
+                .decode_pressure_hard_limit_bytes
+                .load(Ordering::Relaxed),
+            write_pressure_soft_limit_bytes: self
+                .write_pressure_soft_limit_bytes
+                .load(Ordering::Relaxed),
+            write_pressure_hard_limit_bytes: self
+                .write_pressure_hard_limit_bytes
+                .load(Ordering::Relaxed),
+            download_pressure_state: DownloadPressureState::from_code(
+                self.download_pressure_state.load(Ordering::Relaxed),
+            ),
+            download_pressure_reason: DownloadPressureReason::from_code(
+                self.download_pressure_reason.load(Ordering::Relaxed),
+            ),
+            download_pressure_stalls_total: self
+                .download_pressure_stalls_total
+                .load(Ordering::Relaxed),
+            download_pressure_stall_duration_ms: self
+                .download_pressure_stall_duration_ms
+                .load(Ordering::Relaxed),
+            download_pressure_current_stall_ms: self
+                .download_pressure_current_stall_ms
+                .load(Ordering::Relaxed),
             segments_downloaded,
             segments_decoded: self.segments_decoded.load(Ordering::Relaxed),
             segments_committed: self.segments_committed.load(Ordering::Relaxed),
@@ -194,6 +381,15 @@ impl PipelineMetrics {
             disk_write_latency_us: self.disk_write_latency_us.load(Ordering::Relaxed),
             segments_retried: self.segments_retried.load(Ordering::Relaxed),
             segments_failed_permanent: self.segments_failed_permanent.load(Ordering::Relaxed),
+            download_failures_article_not_found: self
+                .download_failures_article_not_found
+                .load(Ordering::Relaxed),
+            download_failures_capacity_unavailable: self
+                .download_failures_capacity_unavailable
+                .load(Ordering::Relaxed),
+            download_failures_transient: self.download_failures_transient.load(Ordering::Relaxed),
+            download_failures_auth: self.download_failures_auth.load(Ordering::Relaxed),
+            download_failures_permanent: self.download_failures_permanent.load(Ordering::Relaxed),
             current_download_speed,
             crc_errors: self.crc_errors.load(Ordering::Relaxed),
             recovery_queue_depth: self.recovery_queue_depth.load(Ordering::Relaxed),
@@ -228,11 +424,24 @@ pub struct MetricsSnapshot {
     pub bytes_decoded: u64,
     pub bytes_committed: u64,
     pub download_queue_depth: usize,
+    pub active_downloads: usize,
+    pub active_decodes: usize,
     pub decode_pending: usize,
+    pub decode_pending_bytes: u64,
+    pub decode_active_bytes: u64,
     pub commit_pending: usize,
     pub write_buffered_bytes: u64,
     pub write_buffered_segments: usize,
     pub direct_write_evictions: u64,
+    pub decode_pressure_soft_limit_bytes: u64,
+    pub decode_pressure_hard_limit_bytes: u64,
+    pub write_pressure_soft_limit_bytes: u64,
+    pub write_pressure_hard_limit_bytes: u64,
+    pub download_pressure_state: DownloadPressureState,
+    pub download_pressure_reason: DownloadPressureReason,
+    pub download_pressure_stalls_total: u64,
+    pub download_pressure_stall_duration_ms: u64,
+    pub download_pressure_current_stall_ms: u64,
     pub segments_downloaded: u64,
     pub segments_decoded: u64,
     pub segments_committed: u64,
@@ -244,6 +453,11 @@ pub struct MetricsSnapshot {
     pub disk_write_latency_us: u64,
     pub segments_retried: u64,
     pub segments_failed_permanent: u64,
+    pub download_failures_article_not_found: u64,
+    pub download_failures_capacity_unavailable: u64,
+    pub download_failures_transient: u64,
+    pub download_failures_auth: u64,
+    pub download_failures_permanent: u64,
     pub current_download_speed: u64,
     pub crc_errors: u64,
     pub recovery_queue_depth: usize,

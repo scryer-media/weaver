@@ -93,19 +93,6 @@ fn postgres_sample_history(job_id: crate::jobs::ids::JobId) -> JobHistoryRow {
     }
 }
 
-fn postgres_sample_segments(job_id: crate::jobs::ids::JobId, count: u32) -> Vec<CommittedSegment> {
-    (0..count)
-        .map(|index| CommittedSegment {
-            job_id,
-            file_index: 0,
-            segment_number: index,
-            file_offset: u64::from(index) * 768_000,
-            decoded_size: 768_000,
-            crc32: 0x1234 + index,
-        })
-        .collect()
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct CanonicalSchema {
     tables: BTreeMap<String, CanonicalTable>,
@@ -998,10 +985,6 @@ async fn postgres_bulk_hot_paths_when_configured() {
     db.create_active_job_with_file_identities(&postgres_sample_job(job_id), &file_identities)
         .unwrap();
 
-    let segments = postgres_sample_segments(job_id, 225);
-    db.commit_segments(&segments).unwrap();
-    db.commit_segments(&segments).unwrap();
-
     let high_progress = (0..325)
         .map(|file_index| ActiveFileProgress {
             job_id,
@@ -1084,7 +1067,6 @@ async fn postgres_bulk_hot_paths_when_configured() {
     assert_eq!(job.file_identities.len(), 2);
     assert_eq!(job.file_identities.get(&0), Some(&file_identities[0]));
     assert_eq!(job.file_identities.get(&1), Some(&file_identities[1]));
-    assert_eq!(job.committed_segments.len(), 225);
     assert_eq!(job.complete_files.len(), 1);
     assert_eq!(job.file_progress.len(), 324);
     assert_eq!(job.file_progress.get(&0).copied(), None);
@@ -1141,13 +1123,10 @@ async fn postgres_waiting_active_write_noops_after_delete_when_configured() {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let writer_db = db.clone();
     std::thread::spawn(move || {
-        let result = writer_db.commit_segments(&[CommittedSegment {
+        let result = writer_db.upsert_file_progress_batch(&[ActiveFileProgress {
             job_id,
             file_index: 0,
-            segment_number: 1,
-            file_offset: 0,
-            decoded_size: 123,
-            crc32: 0x1234,
+            contiguous_bytes_written: 123,
         }]);
         let _ = done_tx.send(result);
     });
@@ -1158,7 +1137,7 @@ async fn postgres_waiting_active_write_noops_after_delete_when_configured() {
         "active-state writer should wait for the parent row lock"
     );
 
-    sqlx::query("DELETE FROM active_segments WHERE job_id = $1")
+    sqlx::query("DELETE FROM active_file_progress WHERE job_id = $1")
         .bind(job_id.0 as i64)
         .execute(&mut *lock_tx)
         .await
@@ -1178,7 +1157,7 @@ async fn postgres_waiting_active_write_noops_after_delete_when_configured() {
     assert_eq!(
         fetch_i64(
             &db,
-            "SELECT COUNT(*) AS value FROM active_segments WHERE job_id = {}",
+            "SELECT COUNT(*) AS value FROM active_file_progress WHERE job_id = {}",
             vec![SqlArg::I64(job_id.0 as i64)],
         ),
         0
@@ -1204,8 +1183,12 @@ async fn postgres_archive_and_delete_wait_on_active_job_lock_when_configured() {
         (crate::jobs::ids::JobId(602), "delete"),
     ] {
         db.create_active_job(&postgres_sample_job(job_id)).unwrap();
-        db.commit_segments(&postgres_sample_segments(job_id, 1))
-            .unwrap();
+        db.upsert_file_progress_batch(&[ActiveFileProgress {
+            job_id,
+            file_index: 0,
+            contiguous_bytes_written: 1,
+        }])
+        .unwrap();
 
         let lock_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
@@ -1255,7 +1238,7 @@ async fn postgres_archive_and_delete_wait_on_active_job_lock_when_configured() {
         assert_eq!(
             fetch_i64(
                 &db,
-                "SELECT COUNT(*) AS value FROM active_segments WHERE job_id = {}",
+                "SELECT COUNT(*) AS value FROM active_file_progress WHERE job_id = {}",
                 vec![SqlArg::I64(job_id.0 as i64)],
             ),
             0
@@ -1396,7 +1379,6 @@ async fn postgres_runtime_smoke_when_configured() {
         }),
         tuner: Some(TunerOverrides {
             max_concurrent_downloads: Some(8),
-            max_decode_queue: Some(16),
             decode_thread_count: Some(2),
             extract_thread_count: Some(1),
         }),
@@ -1549,13 +1531,10 @@ async fn postgres_runtime_smoke_when_configured() {
         metadata: vec![("engine".to_string(), "postgres".to_string())],
     })
     .unwrap();
-    db.commit_segments(&[CommittedSegment {
+    db.upsert_file_progress_batch(&[ActiveFileProgress {
         job_id,
         file_index: 0,
-        segment_number: 1,
-        file_offset: 0,
-        decoded_size: 123,
-        crc32: 0x1234,
+        contiguous_bytes_written: 123,
     }])
     .unwrap();
     assert_eq!(db.load_active_jobs().unwrap().len(), 1);

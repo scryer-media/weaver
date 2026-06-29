@@ -7,7 +7,181 @@ enum DispatchAttempt {
     StopAll,
 }
 
+const DOWNLOAD_PRESSURE_SOFT_PERCENT: u64 = 70;
+const SOFT_PRESSURE_DISPATCH_MAX_DELAY: Duration = Duration::from_millis(150);
+const SOFT_PRESSURE_DISPATCH_MIN_DELAY: Duration = Duration::from_millis(1);
+const SAB_BODY_PIPELINE_DEPTH: usize = 2;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DownloadPressure {
+    state: DownloadPressureState,
+    reason: DownloadPressureReason,
+    decode_backlog_bytes: u64,
+    write_buffered_bytes: u64,
+    decode_hard_limit_bytes: u64,
+    write_hard_limit_bytes: u64,
+}
+
+impl DownloadPressure {
+    fn is_hard(self) -> bool {
+        self.state == DownloadPressureState::Hard
+    }
+
+    fn suppresses_spillover(self) -> bool {
+        self.state == DownloadPressureState::Soft
+    }
+}
+
 impl Pipeline {
+    fn download_pressure_limits(&self) -> (u64, u64, u64, u64) {
+        let decode_hard = (self.decode_backlog_budget_bytes as u64).max(1);
+        let decode_soft = (decode_hard.saturating_mul(DOWNLOAD_PRESSURE_SOFT_PERCENT) / 100)
+            .max(1)
+            .min(decode_hard);
+        let write_hard = (self.write_backlog_budget_bytes as u64).max(1);
+        let write_soft = (write_hard.saturating_mul(DOWNLOAD_PRESSURE_SOFT_PERCENT) / 100)
+            .max(1)
+            .min(write_hard);
+        (decode_soft, decode_hard, write_soft, write_hard)
+    }
+
+    fn pressure_reason(decode_pressure: bool, write_pressure: bool) -> DownloadPressureReason {
+        match (decode_pressure, write_pressure) {
+            (true, true) => DownloadPressureReason::DecodeAndWrite,
+            (true, false) => DownloadPressureReason::Decode,
+            (false, true) => DownloadPressureReason::Write,
+            (false, false) => DownloadPressureReason::None,
+        }
+    }
+
+    fn elapsed_ms(started_at: Instant) -> u64 {
+        started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }
+
+    fn soft_pressure_dispatch_delay(&self, pressure: DownloadPressure) -> Option<Duration> {
+        if pressure.state != DownloadPressureState::Soft {
+            return None;
+        }
+
+        let (decode_soft, decode_hard, write_soft, write_hard) = self.download_pressure_limits();
+        let decode_delay =
+            Self::soft_pressure_delay_for(pressure.decode_backlog_bytes, decode_soft, decode_hard);
+        let write_delay =
+            Self::soft_pressure_delay_for(pressure.write_buffered_bytes, write_soft, write_hard);
+        decode_delay.max(write_delay)
+    }
+
+    fn soft_pressure_delay_for(bytes: u64, soft: u64, hard: u64) -> Option<Duration> {
+        if bytes < soft || hard <= soft {
+            return None;
+        }
+
+        let numerator = bytes.saturating_sub(soft).min(hard - soft);
+        let denominator = hard - soft;
+        let max_ms = SOFT_PRESSURE_DISPATCH_MAX_DELAY.as_millis() as u64;
+        let delay_ms = numerator.saturating_mul(max_ms) / denominator;
+        Some(SOFT_PRESSURE_DISPATCH_MIN_DELAY.max(Duration::from_millis(delay_ms.max(1))))
+    }
+
+    fn update_download_pressure_stall_metrics(&mut self, state: DownloadPressureState) {
+        if state == DownloadPressureState::Hard {
+            let started_at = match self.download_pressure_hard_stall_started_at {
+                Some(started_at) => started_at,
+                None => {
+                    let started_at = Instant::now();
+                    self.download_pressure_hard_stall_started_at = Some(started_at);
+                    self.metrics
+                        .download_pressure_stalls_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    started_at
+                }
+            };
+            self.metrics
+                .download_pressure_current_stall_ms
+                .store(Self::elapsed_ms(started_at), Ordering::Relaxed);
+            return;
+        }
+
+        if let Some(started_at) = self.download_pressure_hard_stall_started_at.take() {
+            let elapsed_ms = Self::elapsed_ms(started_at);
+            self.metrics
+                .download_pressure_stall_duration_ms
+                .fetch_add(elapsed_ms, Ordering::Relaxed);
+        }
+        self.metrics
+            .download_pressure_current_stall_ms
+            .store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn refresh_download_pressure(&mut self) -> DownloadPressure {
+        let (decode_soft, decode_hard, write_soft, write_hard) = self.download_pressure_limits();
+        let decode_bytes = self
+            .metrics
+            .decode_pending_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(self.metrics.decode_active_bytes.load(Ordering::Relaxed));
+        let write_bytes = self.metrics.write_buffered_bytes.load(Ordering::Relaxed);
+
+        if decode_bytes >= decode_hard {
+            self.download_decode_hard_pressure_latched = true;
+        } else if decode_bytes < decode_soft {
+            self.download_decode_hard_pressure_latched = false;
+        }
+        if write_bytes >= write_hard {
+            self.download_write_hard_pressure_latched = true;
+        } else if write_bytes < write_soft {
+            self.download_write_hard_pressure_latched = false;
+        }
+
+        let decode_hard_pressure = self.download_decode_hard_pressure_latched;
+        let write_hard_pressure = self.download_write_hard_pressure_latched;
+        let decode_soft_pressure = decode_bytes >= decode_soft;
+        let write_soft_pressure = write_bytes >= write_soft;
+
+        let (state, reason) = if decode_hard_pressure || write_hard_pressure {
+            (
+                DownloadPressureState::Hard,
+                Self::pressure_reason(decode_hard_pressure, write_hard_pressure),
+            )
+        } else if decode_soft_pressure || write_soft_pressure {
+            (
+                DownloadPressureState::Soft,
+                Self::pressure_reason(decode_soft_pressure, write_soft_pressure),
+            )
+        } else {
+            (DownloadPressureState::Clear, DownloadPressureReason::None)
+        };
+
+        self.metrics
+            .decode_pressure_soft_limit_bytes
+            .store(decode_soft, Ordering::Relaxed);
+        self.metrics
+            .decode_pressure_hard_limit_bytes
+            .store(decode_hard, Ordering::Relaxed);
+        self.metrics
+            .write_pressure_soft_limit_bytes
+            .store(write_soft, Ordering::Relaxed);
+        self.metrics
+            .write_pressure_hard_limit_bytes
+            .store(write_hard, Ordering::Relaxed);
+        self.metrics
+            .download_pressure_state
+            .store(state.as_code(), Ordering::Relaxed);
+        self.metrics
+            .download_pressure_reason
+            .store(reason.as_code(), Ordering::Relaxed);
+        self.update_download_pressure_stall_metrics(state);
+
+        DownloadPressure {
+            state,
+            reason,
+            decode_backlog_bytes: decode_bytes,
+            write_buffered_bytes: write_bytes,
+            decode_hard_limit_bytes: decode_hard,
+            write_hard_limit_bytes: write_hard,
+        }
+    }
+
     fn status_allows_download_dispatch(status: &JobStatus) -> bool {
         matches!(
             status,
@@ -131,11 +305,40 @@ impl Pipeline {
             }
         }
 
-        let estimate = work.byte_estimate as u64;
-        let segment_id = work.segment_id;
-        let is_recovery = work.is_recovery;
-        self.spawn_download(work, is_recovery);
-        self.reserve_rate_limit_for_dispatch(segment_id, estimate);
+        let mut works = vec![work];
+        if works.len() < SAB_BODY_PIPELINE_DEPTH
+            && let Some(next) = self.jobs.get_mut(&job_id).and_then(|state| {
+                state
+                    .download_queue
+                    .pop_next_pipelining_compatible_with(&works[0])
+            })
+        {
+            let reservation_estimate = Self::bandwidth_reservation_estimate(next.byte_estimate);
+            match self.reserve_bandwidth_for_dispatch(next.segment_id, reservation_estimate) {
+                Ok(true) => works.push(next),
+                Ok(false) => {
+                    if let Some(state) = self.jobs.get_mut(&job_id) {
+                        state.download_queue.push(next);
+                    }
+                }
+                Err(error) => {
+                    error!(error = %error, "failed to reserve ISP bandwidth for pipelined dispatch");
+                    if let Some(state) = self.jobs.get_mut(&job_id) {
+                        state.download_queue.push(next);
+                    }
+                }
+            }
+        }
+
+        let reservations: Vec<_> = works
+            .iter()
+            .map(|work| (work.segment_id, work.byte_estimate as u64))
+            .collect();
+        let is_recovery = works[0].is_recovery;
+        self.spawn_download_batch(works, is_recovery);
+        for (segment_id, estimate) in reservations {
+            self.reserve_rate_limit_for_dispatch(segment_id, estimate);
+        }
         DispatchAttempt::Dispatched
     }
 
@@ -191,7 +394,9 @@ impl Pipeline {
             source_server_idx,
             exclude_servers,
         } = work;
+        let raw_size = raw.len() as u64;
         let metrics = Arc::clone(&self.metrics);
+        metrics.note_decode_task_started(raw_size);
 
         tokio::task::spawn_blocking(move || {
             let _profile_scope = crate::runtime::perf_probe::scope("download.decode.task");
@@ -200,6 +405,7 @@ impl Pipeline {
             let send_decode_failure = |error: String| {
                 let _ = tx.blocking_send(DecodeDone::Failed {
                     segment_id,
+                    raw_size,
                     error,
                     source_server_idx,
                     exclude_servers: exclude_servers.clone(),
@@ -233,6 +439,7 @@ impl Pipeline {
 
                         let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
                             segment_id,
+                            raw_size,
                             file_offset,
                             decoded_size: decode_result.bytes_written as u32,
                             crc_valid: decode_result.crc_valid,
@@ -269,6 +476,7 @@ impl Pipeline {
 
                         let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
                             segment_id,
+                            raw_size,
                             file_offset,
                             decoded_size: decode_result.bytes_written as u32,
                             crc_valid: decode_result.crc_valid,
@@ -297,6 +505,9 @@ impl Pipeline {
         }
 
         let mut remaining = VecDeque::with_capacity(self.pending_decode.len());
+        let decode_limit = self.tuner.params().decode_thread_count.max(1);
+        let active_decodes = self.active_decodes_by_job.values().sum::<usize>();
+        let mut available_decode_slots = decode_limit.saturating_sub(active_decodes);
         while let Some(work) = self.pending_decode.pop_front() {
             let job_id = work.segment_id.file_id.job_id;
             if self
@@ -304,7 +515,8 @@ impl Pipeline {
                 .get(&job_id)
                 .is_none_or(|state| is_terminal_status(&state.status))
             {
-                self.metrics.decode_pending.fetch_sub(1, Ordering::Relaxed);
+                self.metrics
+                    .note_decode_work_released(work.raw.len() as u64);
                 debug!(
                     job_id = job_id.0,
                     segment = %work.segment_id,
@@ -313,9 +525,15 @@ impl Pipeline {
                 continue;
             }
 
+            if available_decode_slots == 0 {
+                remaining.push_back(work);
+                break;
+            }
+
             if work.raw.len() > crate::runtime::buffers::BufferTier::Large.size_bytes() {
                 self.note_decode_started(work.segment_id);
                 self.spawn_decode_task(work, None);
+                available_decode_slots -= 1;
                 continue;
             }
 
@@ -327,8 +545,10 @@ impl Pipeline {
 
             self.note_decode_started(work.segment_id);
             self.spawn_decode_task(work, Some(output));
+            available_decode_slots -= 1;
         }
 
+        remaining.extend(self.pending_decode.drain(..));
         self.pending_decode = remaining;
     }
 
@@ -382,20 +602,49 @@ impl Pipeline {
             return;
         }
 
-        let params = self.tuner.params();
-        let decode_pending = self.metrics.decode_pending.load(Ordering::Relaxed);
-        if decode_pending >= params.max_decode_queue {
+        let pressure = self.refresh_download_pressure();
+        if pressure.is_hard() {
             self.update_queue_metrics();
             if self.active_downloads == 0 {
                 debug!(
-                    decode_pending,
-                    max = params.max_decode_queue,
-                    "dispatch blocked: decode backpressure"
+                    pressure_state = pressure.state.as_str(),
+                    pressure_reason = pressure.reason.as_str(),
+                    decode_backlog_bytes = pressure.decode_backlog_bytes,
+                    decode_hard_limit_bytes = pressure.decode_hard_limit_bytes,
+                    write_buffered_bytes = pressure.write_buffered_bytes,
+                    write_hard_limit_bytes = pressure.write_hard_limit_bytes,
+                    "dispatch blocked: byte pressure"
                 );
             }
             return;
         }
+        let soft_dispatch_delay = self.soft_pressure_dispatch_delay(pressure);
+        let mut dispatch_budget = usize::MAX;
+        if let Some(delay) = soft_dispatch_delay {
+            let now = Instant::now();
+            if self
+                .download_pressure_soft_dispatch_after
+                .is_some_and(|ready_at| ready_at > now)
+            {
+                self.update_queue_metrics();
+                if self.active_downloads == 0 {
+                    debug!(
+                        pressure_state = pressure.state.as_str(),
+                        pressure_reason = pressure.reason.as_str(),
+                        decode_backlog_bytes = pressure.decode_backlog_bytes,
+                        write_buffered_bytes = pressure.write_buffered_bytes,
+                        "dispatch delayed: soft byte pressure"
+                    );
+                }
+                return;
+            }
+            self.download_pressure_soft_dispatch_after = Some(now + delay);
+            dispatch_budget = 1;
+        } else {
+            self.download_pressure_soft_dispatch_after = None;
+        }
 
+        let params = self.tuner.params();
         let tuner_max = params.max_concurrent_downloads;
         // Reserve one connection slot per active health probe so the probe
         // task can acquire a pool permit without being starved by downloads.
@@ -408,9 +657,12 @@ impl Pipeline {
             .min(self.connection_ramp)
             .saturating_sub(active_probes);
 
-        // When the bandwidth cap is within 15% of exhaustion, revert to
+        // Soft byte pressure keeps the current hot job moving, but avoids
+        // expanding into spillover work until memory pressure drains.
+        let suppress_spillover = pressure.suppresses_spillover();
+        // When the bandwidth cap is within 15% of exhaustion, also revert to
         // single-job dispatch so remaining quota goes to the highest-priority job.
-        let cap_tight = self.bandwidth_cap.cap_enabled()
+        let bandwidth_cap_tight = self.bandwidth_cap.cap_enabled()
             && self.bandwidth_cap.remaining_bytes() <= self.bandwidth_cap.limit_bytes() * 15 / 100;
 
         // Prefer higher submitted priority first. Within the top runnable band,
@@ -527,27 +779,38 @@ impl Pipeline {
             }
         }
 
-        while self.active_downloads < max && !self.rate_limiter.should_wait() {
+        while self.active_download_connections < max
+            && !self.rate_limiter.should_wait()
+            && dispatch_budget > 0
+        {
             match self.try_dispatch_download_for_job(hot_job_id) {
-                DispatchAttempt::Dispatched => {}
+                DispatchAttempt::Dispatched => dispatch_budget = dispatch_budget.saturating_sub(1),
                 DispatchAttempt::NoWork => break,
                 DispatchAttempt::StopAll => return,
             }
         }
 
-        if !cap_tight {
+        if !suppress_spillover && !bandwidth_cap_tight && dispatch_budget > 0 {
             for (_, _, job_id) in eligible {
                 if job_id == hot_job_id {
                     continue;
                 }
-                while self.active_downloads < max && !self.rate_limiter.should_wait() {
+                while self.active_download_connections < max
+                    && !self.rate_limiter.should_wait()
+                    && dispatch_budget > 0
+                {
                     match self.try_dispatch_download_for_job(job_id) {
-                        DispatchAttempt::Dispatched => {}
+                        DispatchAttempt::Dispatched => {
+                            dispatch_budget = dispatch_budget.saturating_sub(1)
+                        }
                         DispatchAttempt::NoWork => break,
                         DispatchAttempt::StopAll => return,
                     }
                 }
-                if self.active_downloads >= max || self.rate_limiter.should_wait() {
+                if self.active_download_connections >= max
+                    || self.rate_limiter.should_wait()
+                    || dispatch_budget == 0
+                {
                     break;
                 }
             }
@@ -570,69 +833,179 @@ impl Pipeline {
         self.metrics
             .recovery_queue_depth
             .store(recovery, Ordering::Relaxed);
+        self.publish_active_stage_metrics();
     }
 
-    /// Spawn a download task for a single segment.
-    pub(crate) fn spawn_download(&mut self, work: DownloadWork, is_recovery: bool) {
-        let job_id = work.segment_id.file_id.job_id;
-        self.active_downloads += 1;
-        if is_recovery {
-            self.active_recovery += 1;
+    fn download_data_from_decoded_trace(
+        segment_id: SegmentId,
+        trace: weaver_nntp::client::DecodedBodyTrace,
+    ) -> (
+        std::result::Result<DownloadPayload, DownloadError>,
+        Vec<weaver_nntp::client::FetchAttemptTrace>,
+        Option<usize>,
+    ) {
+        let source_server_idx = trace.attempts.iter().rev().find_map(|attempt| {
+            matches!(
+                attempt.outcome,
+                weaver_nntp::client::FetchAttemptOutcome::Success
+            )
+            .then_some(attempt.server_idx)
+        });
+        let data = match trace.result {
+            Ok(decoded) => {
+                let weaver_nntp::client::DecodedBody {
+                    raw_size,
+                    decoded,
+                    result,
+                } = decoded;
+                let file_offset = result
+                    .metadata
+                    .begin
+                    .map(|b| b.saturating_sub(1))
+                    .unwrap_or(0);
+
+                Ok(DownloadPayload::Decoded(DecodeResult {
+                    segment_id,
+                    raw_size: raw_size as u64,
+                    file_offset,
+                    decoded_size: result.bytes_written as u32,
+                    crc_valid: result.crc_valid,
+                    expected_file_crc: result.expected_file_crc,
+                    data: DecodedChunk::from(decoded),
+                    yenc_name: result.metadata.name,
+                }))
+            }
+            Err(weaver_nntp::client::DecodedBodyError::Nntp(error)) => {
+                Err(DownloadError::from_nntp(error))
+            }
+            Err(weaver_nntp::client::DecodedBodyError::Decode { raw_size, error }) => {
+                let crc_mismatch = matches!(error, weaver_yenc::YencError::CrcMismatch { .. });
+                Err(DownloadError::Decode {
+                    raw_size: raw_size as u64,
+                    error: error.to_string(),
+                    crc_mismatch,
+                })
+            }
+        };
+
+        (data, trace.attempts, source_server_idx)
+    }
+
+    pub(crate) fn spawn_download_batch(&mut self, works: Vec<DownloadWork>, is_recovery: bool) {
+        if works.is_empty() {
+            return;
         }
-        *self.active_downloads_by_job.entry(job_id).or_default() += 1;
+
+        debug_assert!(works.iter().all(|work| work.is_recovery == is_recovery
+            && work.groups == works[0].groups
+            && work.exclude_servers == works[0].exclude_servers));
+
+        let job_id = works[0].segment_id.file_id.job_id;
+        self.active_downloads += works.len();
+        self.active_download_connections += 1;
+        if is_recovery {
+            self.active_recovery += works.len();
+        }
+        *self.active_downloads_by_job.entry(job_id).or_default() += works.len();
         *self
-            .active_downloads_by_file
-            .entry(work.segment_id.file_id)
+            .active_download_connections_by_job
+            .entry(job_id)
             .or_default() += 1;
+        for work in &works {
+            *self
+                .active_downloads_by_file
+                .entry(work.segment_id.file_id)
+                .or_default() += 1;
+        }
         self.mark_download_pass_started(job_id);
+        self.publish_active_stage_metrics();
 
         let nntp = Arc::clone(&self.nntp);
         let tx = self.download_done_tx.clone();
-        let segment_id = work.segment_id;
-        let message_id = work.message_id.to_string();
-        let groups = work.groups;
-        let retry_count = work.retry_count;
-        let exclude_servers = work.exclude_servers;
+        let groups = works[0].groups.clone();
+        let exclude_servers = works[0].exclude_servers.clone();
+        let message_ids: Vec<String> = works
+            .iter()
+            .map(|work| work.message_id.to_string())
+            .collect();
 
         tokio::spawn(async move {
+            let total = works.len();
+            let mut completed = 0usize;
+            let mut works_by_index: Vec<Option<DownloadWork>> =
+                works.into_iter().map(Some).collect();
             let fetch_started = Instant::now();
-            let trace = nntp
-                .fetch_body_with_groups_prefer_excluding_traced(
-                    &message_id,
-                    &groups,
-                    &exclude_servers,
-                )
-                .await;
+            nntp.fetch_bodies_decoded_with_groups_prefer_excluding_traced_each(
+                &message_ids,
+                &groups,
+                &exclude_servers,
+                |idx, trace| {
+                    completed += 1;
+                    let release_connection_slot = completed == total;
+                    let work = works_by_index[idx]
+                        .take()
+                        .expect("download batch result emitted once per work item");
+                    let tx = tx.clone();
+                    let exclude_servers = exclude_servers.clone();
+                    async move {
+                        let segment_id = work.segment_id;
+                        let retry_count = work.retry_count;
+                        let (data, attempts, source_server_idx) =
+                            Self::download_data_from_decoded_trace(segment_id, trace);
+                        let _ = tx
+                            .send(DownloadResult {
+                                segment_id,
+                                data,
+                                attempts,
+                                source_server_idx,
+                                is_recovery,
+                                retry_count,
+                                exclude_servers,
+                                release_connection_slot,
+                            })
+                            .await;
+                    }
+                },
+            )
+            .await;
             crate::runtime::perf_probe::record("download.fetch_body", fetch_started.elapsed());
-            let source_server_idx = trace.attempts.iter().rev().find_map(|attempt| {
-                matches!(
-                    attempt.outcome,
-                    weaver_nntp::client::FetchAttemptOutcome::Success
-                )
-                .then_some(attempt.server_idx)
-            });
-            let data = trace
-                .result
-                .map(DownloadPayload::Raw)
-                .map_err(DownloadError::from_nntp);
 
-            let _ = tx
-                .send(DownloadResult {
-                    segment_id,
-                    data,
-                    attempts: trace.attempts,
-                    source_server_idx,
-                    is_recovery,
-                    retry_count,
-                    exclude_servers,
-                })
-                .await;
+            for work in works_by_index.into_iter().flatten() {
+                let segment_id = work.segment_id;
+                let retry_count = work.retry_count;
+                let _ = tx
+                    .send(DownloadResult {
+                        segment_id,
+                        data: Err(DownloadError::Fetch(DownloadFailure {
+                            kind: DownloadFailureKind::Transient,
+                            message: "batch ended without result".to_string(),
+                        })),
+                        attempts: Vec::new(),
+                        source_server_idx: None,
+                        is_recovery,
+                        retry_count,
+                        exclude_servers: exclude_servers.clone(),
+                        release_connection_slot: completed + 1 == total,
+                    })
+                    .await;
+                completed += 1;
+            }
         });
     }
 
     /// Handle a completed download — queue for decode.
     pub(crate) async fn handle_download_done(&mut self, result: DownloadResult) {
         self.active_downloads = self.active_downloads.saturating_sub(1);
+        if result.release_connection_slot {
+            self.active_download_connections = self.active_download_connections.saturating_sub(1);
+            let job_id = result.segment_id.file_id.job_id;
+            if let Some(in_flight) = self.active_download_connections_by_job.get_mut(&job_id) {
+                *in_flight = in_flight.saturating_sub(1);
+                if *in_flight == 0 {
+                    self.active_download_connections_by_job.remove(&job_id);
+                }
+            }
+        }
         if result.is_recovery {
             self.active_recovery = self.active_recovery.saturating_sub(1);
         }
@@ -655,25 +1028,25 @@ impl Pipeline {
                     .remove(&result.segment_id.file_id);
             }
         }
+        self.publish_active_stage_metrics();
         if let Err(error) = self.release_bandwidth_reservation(result.segment_id) {
             error!(error = %error, segment = %result.segment_id, "failed to release ISP bandwidth reservation");
         }
         let actual_raw_bytes = match &result.data {
             Ok(DownloadPayload::Raw(raw)) => Some(raw.len() as u64),
+            Ok(DownloadPayload::Decoded(decoded)) => Some(decoded.raw_size),
+            Err(DownloadError::Decode { raw_size, .. }) => Some(*raw_size),
             Err(_) => None,
         };
         self.reconcile_rate_limit_for_download(result.segment_id, actual_raw_bytes);
-        match &result.data {
-            Ok(DownloadPayload::Raw(raw)) => {
-                if let Err(error) = self.record_download_bandwidth_usage(raw.len() as u64) {
-                    error!(
-                        error = %error,
-                        segment = %result.segment_id,
-                        "failed to record ISP bandwidth usage"
-                    );
-                }
+        if let Some(raw_bytes) = actual_raw_bytes {
+            if let Err(error) = self.record_download_bandwidth_usage(raw_bytes) {
+                error!(
+                    error = %error,
+                    segment = %result.segment_id,
+                    "failed to record ISP bandwidth usage"
+                );
             }
-            Err(DownloadError::Fetch(_)) => {}
         }
         if self
             .jobs
@@ -722,10 +1095,11 @@ impl Pipeline {
 
         match result.data {
             Ok(DownloadPayload::Raw(raw)) => {
+                let raw_size_bytes = raw.len() as u64;
                 let raw_size = raw.len() as u32;
                 self.metrics
                     .bytes_downloaded
-                    .fetch_add(raw_size as u64, Ordering::Relaxed);
+                    .fetch_add(raw_size_bytes, Ordering::Relaxed);
                 self.metrics
                     .segments_downloaded
                     .fetch_add(1, Ordering::Relaxed);
@@ -737,7 +1111,7 @@ impl Pipeline {
                     raw_size,
                 });
 
-                self.metrics.decode_pending.fetch_add(1, Ordering::Relaxed);
+                self.metrics.note_decode_work_queued(raw_size_bytes);
                 self.pending_decode.push_back(PendingDecodeWork {
                     segment_id: result.segment_id,
                     raw,
@@ -746,7 +1120,82 @@ impl Pipeline {
                 });
                 self.pump_decode_queue();
             }
+            Ok(DownloadPayload::Decoded(decoded)) => {
+                let raw_size_bytes = decoded.raw_size;
+                let raw_size = raw_size_bytes.min(u64::from(u32::MAX)) as u32;
+                let decoded_size = decoded.decoded_size;
+                self.metrics
+                    .bytes_downloaded
+                    .fetch_add(raw_size_bytes, Ordering::Relaxed);
+                self.metrics
+                    .segments_downloaded
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .bytes_decoded
+                    .fetch_add(decoded_size as u64, Ordering::Relaxed);
+                self.metrics
+                    .segments_decoded
+                    .fetch_add(1, Ordering::Relaxed);
+
+                let _ = self.event_tx.send(PipelineEvent::ArticleDownloaded {
+                    segment_id: result.segment_id,
+                    raw_size,
+                });
+
+                self.handle_decode_success(decoded).await;
+            }
+            Err(DownloadError::Decode {
+                raw_size,
+                error,
+                crc_mismatch,
+            }) => {
+                let raw_size_for_event = raw_size.min(u64::from(u32::MAX)) as u32;
+                self.metrics
+                    .bytes_downloaded
+                    .fetch_add(raw_size, Ordering::Relaxed);
+                self.metrics
+                    .segments_downloaded
+                    .fetch_add(1, Ordering::Relaxed);
+                if crc_mismatch {
+                    self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+
+                let _ = self.event_tx.send(PipelineEvent::ArticleDownloaded {
+                    segment_id: result.segment_id,
+                    raw_size: raw_size_for_event,
+                });
+                warn!(segment = %result.segment_id, error = %error, "streamed yEnc decode failed");
+                self.handle_decode_failure(
+                    result.segment_id,
+                    &error,
+                    &excluded_servers,
+                    source_server_idx,
+                );
+            }
             Err(DownloadError::Fetch(failure)) => {
+                match &failure.kind {
+                    DownloadFailureKind::ArticleNotFound => self
+                        .metrics
+                        .download_failures_article_not_found
+                        .fetch_add(1, Ordering::Relaxed),
+                    DownloadFailureKind::CapacityUnavailable => self
+                        .metrics
+                        .download_failures_capacity_unavailable
+                        .fetch_add(1, Ordering::Relaxed),
+                    DownloadFailureKind::Transient => self
+                        .metrics
+                        .download_failures_transient
+                        .fetch_add(1, Ordering::Relaxed),
+                    DownloadFailureKind::Auth => self
+                        .metrics
+                        .download_failures_auth
+                        .fetch_add(1, Ordering::Relaxed),
+                    DownloadFailureKind::Permanent => self
+                        .metrics
+                        .download_failures_permanent
+                        .fetch_add(1, Ordering::Relaxed),
+                };
                 if failure.kind == DownloadFailureKind::ArticleNotFound
                     && excluded_servers.is_empty()
                 {

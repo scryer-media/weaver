@@ -16,7 +16,6 @@ use crate::{DownloadQueue, DownloadWork, RestoreJobRequest, with_diagnostic_meta
 
 #[derive(Debug, Default)]
 struct RestoreSkipStats {
-    legacy_segments: usize,
     complete_files: usize,
     complete_file_segments: usize,
     checkpoint_segments: usize,
@@ -464,18 +463,14 @@ impl Pipeline {
     async fn build_restore_skip_plan(
         job_id: JobId,
         spec: &JobSpec,
-        legacy_segments: &HashSet<SegmentId>,
         complete_files: &HashSet<NzbFileId>,
         recovered_file_progress: &HashMap<u32, u64>,
         file_identities: &HashMap<u32, ActiveFileIdentity>,
         working_dir: &std::path::Path,
     ) -> RestoreSkipPlan {
-        let mut skip = legacy_segments.clone();
+        let mut skip = HashSet::new();
         let mut file_progress = HashMap::new();
-        let mut stats = RestoreSkipStats {
-            legacy_segments: legacy_segments.len(),
-            ..RestoreSkipStats::default()
-        };
+        let mut stats = RestoreSkipStats::default();
 
         for (file_index, file_spec) in spec.files.iter().enumerate() {
             let file_index = file_index as u32;
@@ -1351,7 +1346,6 @@ impl Pipeline {
             job_id,
             job_hash,
             spec,
-            committed_segments,
             complete_files,
             file_progress,
             detected_archives,
@@ -1383,7 +1377,6 @@ impl Pipeline {
             );
         }
 
-        let committed_count = committed_segments.len();
         let mut file_identities = if file_identities.is_empty() {
             Self::build_initial_file_identities(&spec, &detected_archives)
         } else {
@@ -1394,7 +1387,6 @@ impl Pipeline {
         let restore_skip_plan = Self::build_restore_skip_plan(
             job_id,
             &spec,
-            &committed_segments,
             &complete_files,
             &file_progress,
             &file_identities,
@@ -1585,7 +1577,14 @@ impl Pipeline {
             }
         }
         self.reload_metadata_from_disk(job_id).await;
-        for file_index in refreshed_rar_files {
+        let mut archive_refresh_file_indices = refreshed_rar_files;
+        archive_refresh_file_indices.extend(
+            complete_files
+                .iter()
+                .filter(|file_id| file_id.job_id == job_id)
+                .map(|file_id| file_id.file_index),
+        );
+        for file_index in archive_refresh_file_indices {
             self.refresh_archive_state_for_completed_file(
                 job_id,
                 NzbFileId { job_id, file_index },
@@ -1623,7 +1622,6 @@ impl Pipeline {
 
         info!(
             job_id = job_id.0,
-            committed_count,
             downloaded_bytes,
             restored_download_floor_bytes,
             status = ?status,
@@ -1631,7 +1629,6 @@ impl Pipeline {
             queued_extract_at_epoch_ms = queued_extract_at_epoch_ms.unwrap_or(0.0),
             queue_depth,
             restore_skip_segments = restore_skip_plan.skip.len(),
-            legacy_restore_segments = restore_skip_plan.stats.legacy_segments,
             complete_restore_files = restore_skip_plan.stats.complete_files,
             complete_restore_segments = restore_skip_plan.stats.complete_file_segments,
             checkpoint_restore_segments = restore_skip_plan.stats.checkpoint_segments,
@@ -1722,7 +1719,6 @@ mod tests {
         let plan = Pipeline::build_restore_skip_plan(
             job_id,
             &spec,
-            &HashSet::new(),
             &complete_files,
             &HashMap::new(),
             &HashMap::new(),
@@ -1752,7 +1748,6 @@ mod tests {
             job_id,
             &spec,
             &HashSet::new(),
-            &HashSet::new(),
             &HashMap::from([(0u32, 30u64)]),
             &HashMap::new(),
             temp_dir.path(),
@@ -1780,7 +1775,6 @@ mod tests {
             job_id,
             &spec,
             &HashSet::new(),
-            &HashSet::new(),
             &HashMap::from([(0u32, 25u64)]),
             &HashMap::new(),
             temp_dir.path(),
@@ -1805,7 +1799,6 @@ mod tests {
             job_id,
             &spec,
             &HashSet::new(),
-            &HashSet::new(),
             &HashMap::from([(0u32, 50u64)]),
             &HashMap::new(),
             temp_dir.path(),
@@ -1826,7 +1819,6 @@ mod tests {
         let plan = Pipeline::build_restore_skip_plan(
             job_id,
             &spec,
-            &HashSet::new(),
             &HashSet::new(),
             &HashMap::from([(0u32, 50u64)]),
             &HashMap::new(),

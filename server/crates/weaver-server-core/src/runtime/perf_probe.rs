@@ -279,11 +279,6 @@ fn classify_sql(template: &str) -> String {
     if lower.contains("with active_file_complete_active") {
         return "complete_file".to_string();
     }
-    if lower.contains("with d0 as (delete from active_segments")
-        && lower.contains("d_job as (delete from active_jobs")
-    {
-        return "active_job_rows.delete".to_string();
-    }
     if lower.contains("with active_extracted_member_active") {
         return "add_extracted_member".to_string();
     }
@@ -304,11 +299,9 @@ fn classify_sql(template: &str) -> String {
     for table in [
         "active_file_progress",
         "active_file_identities",
-        "active_segments",
         "active_par2_files",
-        "active_par2_metadata",
         "active_failed_extractions",
-        "active_extracted_members",
+        "active_extracted",
         "active_extraction_chunks",
         "active_rar_verified_suspect",
         "active_rar_volume_facts",

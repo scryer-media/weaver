@@ -2,7 +2,7 @@ use std::fmt::Display;
 use std::io::Cursor;
 
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx, StoreDatastore};
@@ -27,15 +27,26 @@ pub const COUNTER_METRIC_KEYS: [&str; NUM_COUNTER_METRICS] = [
     "weaver_pipeline_segments_committed_total",
     "weaver_pipeline_segments_retried_total",
     "weaver_pipeline_segments_failed_permanent_total",
+    "weaver_pipeline_download_failures_article_not_found_total",
+    "weaver_pipeline_download_failures_capacity_unavailable_total",
+    "weaver_pipeline_download_failures_transient_total",
+    "weaver_pipeline_download_failures_auth_total",
+    "weaver_pipeline_download_failures_permanent_total",
     "weaver_pipeline_articles_not_found_total",
     "weaver_pipeline_decode_errors_total",
     "weaver_pipeline_crc_errors_total",
+    "weaver_pipeline_download_pressure_stalls_total",
+    "weaver_pipeline_download_pressure_stall_duration_seconds",
 ];
 
 pub const GAUGE_METRIC_KEYS: [&str; NUM_GAUGE_METRICS] = [
     "weaver_pipeline_current_download_speed_bytes_per_second",
     "weaver_pipeline_download_queue_depth",
+    "weaver_pipeline_active_downloads",
+    "weaver_pipeline_active_decodes",
     "weaver_pipeline_decode_pending",
+    "weaver_pipeline_decode_pending_bytes",
+    "weaver_pipeline_decode_active_bytes",
     "weaver_pipeline_commit_pending",
     "weaver_pipeline_recovery_queue_depth",
     "weaver_pipeline_verify_active",
@@ -43,6 +54,13 @@ pub const GAUGE_METRIC_KEYS: [&str; NUM_GAUGE_METRICS] = [
     "weaver_pipeline_extract_active",
     "weaver_pipeline_write_buffered_bytes",
     "weaver_pipeline_write_buffered_segments",
+    "weaver_pipeline_decode_pressure_soft_limit_bytes",
+    "weaver_pipeline_decode_pressure_hard_limit_bytes",
+    "weaver_pipeline_write_pressure_soft_limit_bytes",
+    "weaver_pipeline_write_pressure_hard_limit_bytes",
+    "weaver_pipeline_download_pressure_state",
+    "weaver_pipeline_download_pressure_reason",
+    "weaver_pipeline_download_pressure_current_stall_seconds",
     "weaver_pipeline_disk_write_latency_microseconds",
     "weaver_pipeline_articles_per_second",
     "weaver_pipeline_decode_rate_mebibytes_per_second",
@@ -63,8 +81,8 @@ pub const JOB_STATUS_KEYS: [&str; NUM_JOB_STATUS_METRICS] = [
     "complete",
 ];
 
-const NUM_COUNTER_METRICS: usize = 11;
-const NUM_GAUGE_METRICS: usize = 13;
+const NUM_COUNTER_METRICS: usize = 18;
+const NUM_GAUGE_METRICS: usize = 24;
 const NUM_JOB_STATUS_METRICS: usize = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,17 +137,67 @@ pub struct GaugeRollupValue {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RawMetricsHistoryPoint {
     pub timestamp_epoch_sec: i64,
+    #[serde(
+        serialize_with = "serialize_metric_array",
+        deserialize_with = "deserialize_padded_metric_array"
+    )]
     pub counter_values: [f64; NUM_COUNTER_METRICS],
+    #[serde(
+        serialize_with = "serialize_metric_array",
+        deserialize_with = "deserialize_padded_metric_array"
+    )]
     pub gauge_values: [f64; NUM_GAUGE_METRICS],
+    #[serde(
+        serialize_with = "serialize_metric_array",
+        deserialize_with = "deserialize_padded_metric_array"
+    )]
     pub job_status_values: [f64; NUM_JOB_STATUS_METRICS],
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RollupMetricsHistoryPoint {
     pub timestamp_epoch_sec: i64,
+    #[serde(
+        serialize_with = "serialize_metric_array",
+        deserialize_with = "deserialize_padded_metric_array"
+    )]
     pub counter_values: [CounterRollupValue; NUM_COUNTER_METRICS],
+    #[serde(
+        serialize_with = "serialize_metric_array",
+        deserialize_with = "deserialize_padded_metric_array"
+    )]
     pub gauge_values: [GaugeRollupValue; NUM_GAUGE_METRICS],
+    #[serde(
+        serialize_with = "serialize_metric_array",
+        deserialize_with = "deserialize_padded_metric_array"
+    )]
     pub job_status_values: [GaugeRollupValue; NUM_JOB_STATUS_METRICS],
+}
+
+fn serialize_metric_array<S, T, const N: usize>(
+    values: &[T; N],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Serialize,
+{
+    values.as_slice().serialize(serializer)
+}
+
+fn deserialize_padded_metric_array<'de, D, T, const N: usize>(
+    deserializer: D,
+) -> Result<[T; N], D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default + Copy,
+{
+    let values = Vec::<T>::deserialize(deserializer)?;
+    let mut padded = [T::default(); N];
+    for (slot, value) in padded.iter_mut().zip(values) {
+        *slot = value;
+    }
+    Ok(padded)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -182,14 +250,25 @@ impl RawMetricsHistoryPoint {
                 snapshot.segments_committed as f64,
                 snapshot.segments_retried as f64,
                 snapshot.segments_failed_permanent as f64,
+                snapshot.download_failures_article_not_found as f64,
+                snapshot.download_failures_capacity_unavailable as f64,
+                snapshot.download_failures_transient as f64,
+                snapshot.download_failures_auth as f64,
+                snapshot.download_failures_permanent as f64,
                 snapshot.articles_not_found as f64,
                 snapshot.decode_errors as f64,
                 snapshot.crc_errors as f64,
+                snapshot.download_pressure_stalls_total as f64,
+                snapshot.download_pressure_stall_duration_ms as f64 / 1000.0,
             ],
             gauge_values: [
                 snapshot.current_download_speed as f64,
                 snapshot.download_queue_depth as f64,
+                snapshot.active_downloads as f64,
+                snapshot.active_decodes as f64,
                 snapshot.decode_pending as f64,
+                snapshot.decode_pending_bytes as f64,
+                snapshot.decode_active_bytes as f64,
                 snapshot.commit_pending as f64,
                 snapshot.recovery_queue_depth as f64,
                 snapshot.verify_active as f64,
@@ -197,6 +276,13 @@ impl RawMetricsHistoryPoint {
                 snapshot.extract_active as f64,
                 snapshot.write_buffered_bytes as f64,
                 snapshot.write_buffered_segments as f64,
+                snapshot.decode_pressure_soft_limit_bytes as f64,
+                snapshot.decode_pressure_hard_limit_bytes as f64,
+                snapshot.write_pressure_soft_limit_bytes as f64,
+                snapshot.write_pressure_hard_limit_bytes as f64,
+                snapshot.download_pressure_state.as_code() as f64,
+                snapshot.download_pressure_reason.as_code() as f64,
+                snapshot.download_pressure_current_stall_ms as f64 / 1000.0,
                 snapshot.disk_write_latency_us as f64,
                 snapshot.articles_per_sec,
                 snapshot.decode_rate_mbps,

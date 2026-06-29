@@ -1281,11 +1281,24 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         bytes_decoded: 8,
         bytes_committed: 7,
         download_queue_depth: 5,
+        active_downloads: 6,
+        active_decodes: 2,
         decode_pending: 4,
+        decode_pending_bytes: 4096,
+        decode_active_bytes: 2048,
         commit_pending: 3,
         write_buffered_bytes: 2,
         write_buffered_segments: 1,
         direct_write_evictions: 9,
+        decode_pressure_soft_limit_bytes: 100,
+        decode_pressure_hard_limit_bytes: 200,
+        write_pressure_soft_limit_bytes: 300,
+        write_pressure_hard_limit_bytes: 400,
+        download_pressure_state: weaver_server_core::DownloadPressureState::Soft,
+        download_pressure_reason: weaver_server_core::DownloadPressureReason::Decode,
+        download_pressure_stalls_total: 24,
+        download_pressure_stall_duration_ms: 1500,
+        download_pressure_current_stall_ms: 250,
         segments_downloaded: 11,
         segments_decoded: 12,
         segments_committed: 13,
@@ -1297,6 +1310,11 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         disk_write_latency_us: 16,
         segments_retried: 17,
         segments_failed_permanent: 18,
+        download_failures_article_not_found: 24,
+        download_failures_capacity_unavailable: 25,
+        download_failures_transient: 26,
+        download_failures_auth: 27,
+        download_failures_permanent: 28,
         current_download_speed: 19,
         crc_errors: 20,
         recovery_queue_depth: 21,
@@ -1348,11 +1366,168 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
 
     assert!(rendered.contains("weaver_pipeline_paused 1"));
     assert!(rendered.contains("weaver_pipeline_current_download_speed_bytes_per_second 19"));
+    assert!(rendered.contains("weaver_pipeline_active_downloads 6"));
+    assert!(rendered.contains("weaver_pipeline_decode_pending_bytes 4096"));
+    assert!(rendered.contains("weaver_pipeline_download_pressure_state{state=\"soft\"} 1"));
+    assert!(rendered.contains("weaver_pipeline_download_pressure_reason{reason=\"decode\"} 1"));
+    assert!(rendered.contains("weaver_pipeline_download_observed_limiter{limiter=\"gated\"} 1"));
+    assert!(rendered.contains("weaver_pipeline_download_pressure_stalls_total 24"));
+    assert!(rendered.contains("weaver_pipeline_download_pressure_stall_duration_seconds 1.5"));
+    assert!(
+        rendered.contains("weaver_pipeline_download_failures_total{kind=\"article_not_found\"} 24")
+    );
+    assert!(
+        rendered
+            .contains("weaver_pipeline_download_failures_total{kind=\"capacity_unavailable\"} 25")
+    );
+    assert!(rendered.contains("weaver_pipeline_download_failures_total{kind=\"transient\"} 26"));
+    assert!(rendered.contains("weaver_pipeline_download_failures_total{kind=\"auth\"} 27"));
+    assert!(rendered.contains("weaver_pipeline_download_failures_total{kind=\"permanent\"} 28"));
     assert!(rendered.contains(
             "weaver_job_info{job_id=\"42\",job_name=\"Silver Horizon\",status=\"downloading\",category=\"tv\",has_password=\"true\"} 1"
         ));
     assert!(rendered.contains("weaver_job_progress_ratio{job_id=\"42\""));
     assert!(rendered.contains("weaver_pipeline_jobs{status=\"downloading\"} 1"));
+}
+
+#[test]
+fn renders_prometheus_download_observed_limiter_states() {
+    let mut snapshot = MetricsSnapshot {
+        bytes_downloaded: 0,
+        bytes_decoded: 0,
+        bytes_committed: 0,
+        download_queue_depth: 10,
+        active_downloads: 20,
+        active_decodes: 0,
+        decode_pending: 0,
+        decode_pending_bytes: 0,
+        decode_active_bytes: 0,
+        commit_pending: 0,
+        write_buffered_bytes: 0,
+        write_buffered_segments: 0,
+        direct_write_evictions: 0,
+        decode_pressure_soft_limit_bytes: 100,
+        decode_pressure_hard_limit_bytes: 200,
+        write_pressure_soft_limit_bytes: 100,
+        write_pressure_hard_limit_bytes: 200,
+        download_pressure_state: weaver_server_core::DownloadPressureState::Clear,
+        download_pressure_reason: weaver_server_core::DownloadPressureReason::None,
+        download_pressure_stalls_total: 0,
+        download_pressure_stall_duration_ms: 0,
+        download_pressure_current_stall_ms: 0,
+        segments_downloaded: 0,
+        segments_decoded: 0,
+        segments_committed: 0,
+        articles_not_found: 0,
+        decode_errors: 0,
+        verify_active: 0,
+        repair_active: 0,
+        extract_active: 0,
+        disk_write_latency_us: 0,
+        segments_retried: 0,
+        segments_failed_permanent: 0,
+        download_failures_article_not_found: 0,
+        download_failures_capacity_unavailable: 0,
+        download_failures_transient: 0,
+        download_failures_auth: 0,
+        download_failures_permanent: 0,
+        current_download_speed: 0,
+        crc_errors: 0,
+        recovery_queue_depth: 0,
+        articles_per_sec: 0.0,
+        decode_rate_mbps: 0.0,
+    };
+    let unblocked = DownloadBlockState {
+        kind: DownloadBlockKind::None,
+        cap_enabled: false,
+        period: None,
+        used_bytes: 0,
+        limit_bytes: 0,
+        remaining_bytes: 0,
+        reserved_bytes: 0,
+        window_starts_at_epoch_ms: None,
+        window_ends_at_epoch_ms: None,
+        timezone_name: "MDT".into(),
+        scheduled_speed_limit: 0,
+    };
+    let server_health = vec![metrics::ServerHealthInfo {
+        label: "news.example:563".into(),
+        state: "healthy",
+        success_count: 0,
+        failure_count: 0,
+        consecutive_failures: 0,
+        latency_ms: 0.0,
+        connections_available: 0,
+        connections_max: 20,
+        premature_deaths: 0,
+    }];
+
+    let rendered =
+        metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &server_health);
+    assert!(
+        rendered
+            .contains("weaver_pipeline_download_observed_limiter{limiter=\"network_limited\"} 1")
+    );
+
+    snapshot.decode_pending_bytes = 128 * 1024 * 1024;
+    snapshot.current_download_speed = 30 * 1024 * 1024;
+    snapshot.decode_rate_mbps = 5.0;
+    let rendered =
+        metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &server_health);
+    assert!(
+        rendered
+            .contains("weaver_pipeline_download_observed_limiter{limiter=\"decode_lagging\"} 1")
+    );
+    assert!(
+        rendered
+            .contains("weaver_pipeline_download_observed_limiter{limiter=\"network_limited\"} 0")
+    );
+
+    snapshot.decode_pending_bytes = 64 * 1024 * 1024;
+    snapshot.decode_active_bytes = 8 * 1024 * 1024;
+    snapshot.current_download_speed = 4 * 1024 * 1024;
+    snapshot.decode_rate_mbps = 5.0;
+    let rendered =
+        metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &server_health);
+    assert!(
+        rendered
+            .contains("weaver_pipeline_download_observed_limiter{limiter=\"decode_lagging\"} 1")
+    );
+
+    snapshot.decode_pending_bytes = 0;
+    snapshot.decode_active_bytes = 0;
+    snapshot.current_download_speed = 0;
+    snapshot.decode_rate_mbps = 0.0;
+    snapshot.download_pressure_state = weaver_server_core::DownloadPressureState::Soft;
+    snapshot.download_pressure_reason = weaver_server_core::DownloadPressureReason::Write;
+    let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[]);
+    assert!(
+        rendered
+            .contains("weaver_pipeline_download_observed_limiter{limiter=\"pressure_limited\"} 1")
+    );
+
+    snapshot.download_pressure_state = weaver_server_core::DownloadPressureState::Clear;
+    snapshot.download_pressure_reason = weaver_server_core::DownloadPressureReason::None;
+    snapshot.download_queue_depth = 0;
+    snapshot.active_downloads = 0;
+    let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[]);
+    assert!(rendered.contains("weaver_pipeline_download_observed_limiter{limiter=\"idle\"} 1"));
+
+    snapshot.download_queue_depth = 242;
+    snapshot.recovery_queue_depth = 242;
+    let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[]);
+    assert!(rendered.contains("weaver_pipeline_download_observed_limiter{limiter=\"idle\"} 1"));
+    assert!(
+        rendered
+            .contains("weaver_pipeline_download_observed_limiter{limiter=\"dispatch_limited\"} 0")
+    );
+
+    snapshot.download_queue_depth = 0;
+    snapshot.recovery_queue_depth = 0;
+    snapshot.download_pressure_state = weaver_server_core::DownloadPressureState::Soft;
+    snapshot.download_pressure_reason = weaver_server_core::DownloadPressureReason::Write;
+    let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[]);
+    assert!(rendered.contains("weaver_pipeline_download_observed_limiter{limiter=\"idle\"} 1"));
 }
 
 #[test]

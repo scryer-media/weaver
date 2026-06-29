@@ -11,7 +11,7 @@ mod repair;
 
 pub(crate) use orchestrator::check_disk_space;
 #[cfg(test)]
-use orchestrator::compute_write_backlog_budget_bytes;
+use orchestrator::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};
 use orchestrator::{is_terminal_status, write_segment_to_disk};
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -40,8 +40,9 @@ use crate::jobs::{ArchivePasswordCandidate, ArchivePasswordSource};
 use crate::runtime::buffers::{BufferHandle, BufferPool};
 use crate::runtime::system_profile::SystemProfile;
 use crate::{
-    DownloadQueue, DownloadWork, JobInfo, JobSpec, JobState, JobStatus, PipelineMetrics,
-    RuntimeTuner, SchedulerCommand, SchedulerError, SharedPipelineState, TokenBucket,
+    DownloadPressureReason, DownloadPressureState, DownloadQueue, DownloadWork, JobInfo, JobSpec,
+    JobState, JobStatus, PipelineMetrics, RuntimeTuner, SchedulerCommand, SchedulerError,
+    SharedPipelineState, TokenBucket,
 };
 use weaver_nntp::NntpClient;
 #[cfg(test)]
@@ -197,10 +198,14 @@ pub(super) struct DownloadResult {
     pub(super) retry_count: u32,
     /// Servers intentionally excluded for this fetch attempt.
     pub(super) exclude_servers: Vec<usize>,
+    /// Whether this result releases one NNTP connection dispatch slot.
+    pub(super) release_connection_slot: bool,
 }
 
 pub(super) enum DownloadPayload {
+    #[allow(dead_code)]
     Raw(Bytes),
+    Decoded(DecodeResult),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +263,11 @@ impl DownloadFailure {
 #[derive(Debug, Clone)]
 pub(super) enum DownloadError {
     Fetch(DownloadFailure),
+    Decode {
+        raw_size: u64,
+        error: String,
+        crc_mismatch: bool,
+    },
 }
 
 impl DownloadError {
@@ -443,6 +453,7 @@ pub(super) struct MoveToCompleteDone {
 /// Result of a decode task.
 pub(super) struct DecodeResult {
     pub(super) segment_id: SegmentId,
+    pub(super) raw_size: u64,
     pub(super) file_offset: u64,
     pub(super) decoded_size: u32,
     pub(super) crc_valid: bool,
@@ -458,6 +469,7 @@ pub(super) enum DecodeDone {
     Success(DecodeResult),
     Failed {
         segment_id: SegmentId,
+        raw_size: u64,
         error: String,
         source_server_idx: Option<usize>,
         exclude_servers: Vec<usize>,
@@ -557,8 +569,10 @@ pub struct Pipeline {
     pub(super) archive_password_winners: HashMap<(JobId, String), ArchivePasswordCandidate>,
     /// Job dispatch order (FIFO by submission). First Downloading job is active.
     pub(super) job_order: Vec<JobId>,
-    /// Number of in-flight downloads (primary + recovery).
+    /// Number of in-flight article downloads (primary + recovery).
     pub(super) active_downloads: usize,
+    /// Number of NNTP connection tasks currently fetching articles.
+    pub(super) active_download_connections: usize,
     /// Number of in-flight recovery downloads (subset of active_downloads).
     pub(super) active_recovery: usize,
     /// Jobs currently inside an active article download pass.
@@ -567,6 +581,8 @@ pub struct Pipeline {
     pub(super) jobs_finalizing_download: HashSet<JobId>,
     /// In-flight article download count per job.
     pub(super) active_downloads_by_job: HashMap<JobId, usize>,
+    /// In-flight NNTP connection task count per job.
+    pub(super) active_download_connections_by_job: HashMap<JobId, usize>,
     /// In-flight article download count per file.
     pub(super) active_downloads_by_file: HashMap<NzbFileId, usize>,
     /// In-flight decode task count per job.
@@ -647,8 +663,18 @@ pub struct Pipeline {
     pub(super) connection_ramp: usize,
     /// Max pending segments per write reorder buffer (memory-adaptive).
     pub(super) write_buf_max_pending: usize,
+    /// Max in-memory raw article bytes queued or active for decode.
+    pub(super) decode_backlog_budget_bytes: usize,
     /// Max in-memory decoded backlog before degrading to direct offset writes.
     pub(super) write_backlog_budget_bytes: usize,
+    /// Whether raw decode backlog is in a hard-pressure drain cycle.
+    pub(super) download_decode_hard_pressure_latched: bool,
+    /// Whether decoded write backlog is in a hard-pressure drain cycle.
+    pub(super) download_write_hard_pressure_latched: bool,
+    /// Start time of the current hard pressure stall, if downloads are blocked.
+    pub(super) download_pressure_hard_stall_started_at: Option<Instant>,
+    /// Next time soft byte pressure may issue a replacement article.
+    pub(super) download_pressure_soft_dispatch_after: Option<Instant>,
     /// Current in-memory decoded backlog retained for sequential write ordering.
     pub(super) write_buffered_bytes: usize,
     /// Current in-memory decoded segment count retained for sequential write ordering.

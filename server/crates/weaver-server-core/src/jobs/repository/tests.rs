@@ -7,8 +7,8 @@ use crate::jobs::assembly::{DetectedArchiveIdentity, DetectedArchiveKind};
 use crate::jobs::{ActiveFileIdentity, FileIdentitySource};
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::{
-    ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment, Database, ExtractionChunk,
-    HistoryFilter, HistoryMetadataEquals, JobHistoryRow, JobId,
+    ActiveFileProgress, ActiveJob, ActivePar2File, Database, ExtractionChunk, HistoryFilter,
+    HistoryMetadataEquals, JobHistoryRow, JobId,
 };
 
 fn fetch_i64(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) -> i64 {
@@ -86,19 +86,6 @@ fn sample_job(id: u64) -> ActiveJob {
     }
 }
 
-fn sample_segments(job_id: u64, count: u32) -> Vec<CommittedSegment> {
-    (0..count)
-        .map(|i| CommittedSegment {
-            job_id: JobId(job_id),
-            file_index: 0,
-            segment_number: i,
-            file_offset: i as u64 * 768000,
-            decoded_size: 768000,
-            crc32: 0xDEADBEEF,
-        })
-        .collect()
-}
-
 #[test]
 fn create_and_load_active_job() {
     let db = Database::open_in_memory().unwrap();
@@ -109,7 +96,6 @@ fn create_and_load_active_job() {
     let job = &jobs[&JobId(1)];
     assert_eq!(job.nzb_path, PathBuf::from("/tmp/test_1.nzb"));
     assert_eq!(job.status, "queued");
-    assert!(job.committed_segments.is_empty());
     assert!(job.complete_files.is_empty());
 }
 
@@ -159,16 +145,6 @@ fn create_active_job_with_file_identities_roundtrips_initial_state() {
 }
 
 #[test]
-fn commit_and_load_segments() {
-    let db = Database::open_in_memory().unwrap();
-    db.create_active_job(&sample_job(1)).unwrap();
-    db.commit_segments(&sample_segments(1, 50)).unwrap();
-
-    let jobs = db.load_active_jobs().unwrap();
-    assert_eq!(jobs[&JobId(1)].committed_segments.len(), 50);
-}
-
-#[test]
 fn upsert_and_load_file_progress() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
@@ -192,29 +168,6 @@ fn upsert_and_load_file_progress() {
         Some(8 * 1024 * 1024)
     );
     assert_eq!(jobs[&JobId(1)].file_progress.get(&1).copied(), Some(1024));
-}
-
-#[test]
-fn duplicate_segments_ignored() {
-    let db = Database::open_in_memory().unwrap();
-    db.create_active_job(&sample_job(1)).unwrap();
-    let segs = sample_segments(1, 3);
-    db.commit_segments(&segs).unwrap();
-    db.commit_segments(&segs).unwrap(); // duplicates
-
-    let jobs = db.load_active_jobs().unwrap();
-    assert_eq!(jobs[&JobId(1)].committed_segments.len(), 3);
-}
-
-#[test]
-fn bulk_segments_cross_sqlite_bind_chunk_boundary() {
-    let db = Database::open_in_memory().unwrap();
-    db.create_active_job(&sample_job(1)).unwrap();
-
-    db.commit_segments(&sample_segments(1, 225)).unwrap();
-
-    let jobs = db.load_active_jobs().unwrap();
-    assert_eq!(jobs[&JobId(1)].committed_segments.len(), 225);
 }
 
 #[test]
@@ -267,25 +220,6 @@ fn bulk_file_progress_same_batch_duplicates_keep_max() {
 
     let jobs = db.load_active_jobs().unwrap();
     assert_eq!(jobs[&JobId(1)].file_progress.get(&0).copied(), Some(2048));
-}
-
-#[test]
-#[ignore = "performance guard; run explicitly when comparing DB write throughput"]
-fn perf_commit_10k_segments() {
-    let db = Database::open_in_memory().unwrap();
-    db.create_active_job(&sample_job(1)).unwrap();
-    let segments = sample_segments(1, 10_000);
-
-    let started = Instant::now();
-    db.commit_segments(&segments).unwrap();
-    let elapsed = started.elapsed();
-
-    eprintln!(
-        "commit_segments: {} rows in {:?} ({:.0} rows/sec)",
-        segments.len(),
-        elapsed,
-        segments.len() as f64 / elapsed.as_secs_f64()
-    );
 }
 
 #[test]
@@ -433,7 +367,6 @@ fn detected_archive_identities_roundtrip() {
 fn archive_job_moves_to_history() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
-    db.commit_segments(&sample_segments(1, 10)).unwrap();
 
     let history = JobHistoryRow {
         job_id: 1,
@@ -540,7 +473,6 @@ fn archive_job_conflict_preserves_persisted_nzb_bytes_when_active_row_is_gone() 
 fn delete_active_job_cleans_all() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
-    db.commit_segments(&sample_segments(1, 5)).unwrap();
     db.upsert_file_progress_batch(&[ActiveFileProgress {
         job_id: JobId(1),
         file_index: 0,
@@ -608,14 +540,12 @@ fn multiple_jobs_isolated() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
     db.create_active_job(&sample_job(2)).unwrap();
-    db.commit_segments(&sample_segments(1, 3)).unwrap();
-    db.commit_segments(&sample_segments(2, 5)).unwrap();
 
     db.delete_active_job(JobId(1)).unwrap();
 
     let jobs = db.load_active_jobs().unwrap();
     assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[&JobId(2)].committed_segments.len(), 5);
+    assert!(jobs.contains_key(&JobId(2)));
 }
 
 #[test]
@@ -1053,7 +983,6 @@ fn late_active_state_writes_noop_after_archive() {
     )
     .unwrap();
 
-    db.commit_segments(&sample_segments(1, 3)).unwrap();
     db.upsert_file_progress_batch(&[ActiveFileProgress {
         job_id: JobId(1),
         file_index: 0,
@@ -1110,7 +1039,6 @@ fn late_active_state_writes_noop_after_archive() {
         .unwrap();
 
     for table in [
-        "active_segments",
         "active_file_progress",
         "active_files",
         "active_par2",
@@ -1133,7 +1061,6 @@ fn late_active_state_writes_noop_after_archive() {
 fn prune_orphan_active_state_removes_only_orphans() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
-    db.commit_segments(&sample_segments(1, 1)).unwrap();
     db.upsert_file_progress_batch(&[ActiveFileProgress {
         job_id: JobId(1),
         file_index: 0,
@@ -1141,13 +1068,6 @@ fn prune_orphan_active_state_removes_only_orphans() {
     }])
     .unwrap();
 
-    execute_sql(
-        &db,
-        "INSERT INTO active_segments
-         (job_id, file_index, segment_number, file_offset, decoded_size, crc32)
-         VALUES (99, 0, 0, 0, 10, 123)",
-        vec![],
-    );
     execute_sql(
         &db,
         "INSERT INTO active_file_progress
@@ -1170,22 +1090,15 @@ fn prune_orphan_active_state_removes_only_orphans() {
     );
 
     let counts = db.prune_orphan_active_state().unwrap();
-    assert_eq!(counts.active_segments, 1);
     assert_eq!(counts.active_file_progress, 1);
     assert_eq!(counts.active_archive_headers, 1);
     assert_eq!(counts.active_detected_archives, 1);
-    assert_eq!(counts.total_removed(), 4);
+    assert_eq!(counts.total_removed(), 3);
 
-    let remaining_segments = fetch_i64(
-        &db,
-        "SELECT COUNT(*) FROM active_segments WHERE job_id = 1",
-        vec![],
-    );
     let remaining_progress = fetch_i64(
         &db,
         "SELECT COUNT(*) FROM active_file_progress WHERE job_id = 1",
         vec![],
     );
-    assert_eq!(remaining_segments, 1);
     assert_eq!(remaining_progress, 1);
 }

@@ -100,6 +100,7 @@ impl Pipeline {
                     self.active_download_passes.remove(&job_id);
                     self.jobs_finalizing_download.remove(&job_id);
                     self.active_downloads_by_job.remove(&job_id);
+                    self.active_download_connections_by_job.remove(&job_id);
                     self.active_downloads_by_file
                         .retain(|file_id, _| file_id.job_id != job_id);
                     self.active_decodes_by_job.remove(&job_id);

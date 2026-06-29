@@ -48,7 +48,6 @@ const RESTORE_PRISTINE_TABLES: &[&str] = &[
     "job_history_attributes",
     "job_events",
     "active_jobs",
-    "active_segments",
     "active_file_progress",
     "active_files",
     "active_file_identities",

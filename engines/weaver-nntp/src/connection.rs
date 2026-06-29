@@ -297,7 +297,7 @@ impl NntpConnection {
     }
 
     /// Send a command and read the single-line response.
-    pub async fn send_command(&mut self, cmd: &Command) -> Result<Response> {
+    async fn write_command_frame(&mut self, cmd: &Command) -> Result<()> {
         self.last_used = Instant::now();
 
         let encoded = cmd.encode();
@@ -309,14 +309,29 @@ impl NntpConnection {
             self.current_group = None;
             NntpError::Io(e)
         })?;
+        Ok(())
+    }
+
+    pub async fn flush_commands(&mut self) -> Result<()> {
         let transport = self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
         transport.flush().await.map_err(|e| {
             self.poisoned = true;
             self.current_group = None;
             NntpError::Io(e)
         })?;
+        Ok(())
+    }
+
+    pub async fn send_command(&mut self, cmd: &Command) -> Result<Response> {
+        self.write_command_frame(cmd).await?;
+        self.flush_commands().await?;
 
         self.read_response().await
+    }
+
+    pub async fn write_body_request(&mut self, message_id: &str) -> Result<()> {
+        let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
+        self.write_command_frame(&cmd).await
     }
 
     /// Read a single response line from the server.
@@ -741,29 +756,10 @@ impl NntpConnection {
     /// Chunks retain NNTP dot-stuffing and exclude the final multiline
     /// terminator. This is the download hot path used by the streaming yEnc
     /// decoder.
-    pub async fn stream_body_chunked_raw<F>(
-        &mut self,
-        message_id: &str,
-        mut on_chunk: F,
-    ) -> Result<u64>
+    async fn stream_body_response<F>(&mut self, initial: Response, mut on_chunk: F) -> Result<u64>
     where
         F: FnMut(&[u8]) -> Result<()>,
     {
-        let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
-        let initial = self.send_command(&cmd).await?;
-        let initial = if initial.code.raw() == 480 {
-            if let Some((user, pass)) = self.credentials.clone() {
-                debug!("server requested re-authentication (480), re-authenticating");
-                self.authenticate(&user, &pass).await?;
-                self.current_group = None;
-                self.send_command(&cmd).await?
-            } else {
-                return Err(NntpError::AuthenticationRequired);
-            }
-        } else {
-            initial
-        };
-
         if initial.code.is_error() {
             return Err(NntpError::from_status(initial.code, &initial.message));
         }
@@ -818,6 +814,42 @@ impl NntpConnection {
                 Err(NntpError::TruncatedMultilineBody)
             }
         }
+    }
+
+    pub async fn stream_body_chunked_raw<F>(&mut self, message_id: &str, on_chunk: F) -> Result<u64>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
+        let initial = self.send_command(&cmd).await?;
+        let initial = if initial.code.raw() == 480 {
+            if let Some((user, pass)) = self.credentials.clone() {
+                debug!("server requested re-authentication (480), re-authenticating");
+                self.authenticate(&user, &pass).await?;
+                self.current_group = None;
+                self.send_command(&cmd).await?
+            } else {
+                return Err(NntpError::AuthenticationRequired);
+            }
+        } else {
+            initial
+        };
+
+        self.stream_body_response(initial, on_chunk).await
+    }
+
+    pub async fn stream_next_body_chunked_raw<F>(&mut self, on_chunk: F) -> Result<u64>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        let initial = self.read_response().await?;
+        if initial.code.raw() == 480 {
+            self.poisoned = true;
+            self.current_group = None;
+            return Err(NntpError::AuthenticationRequired);
+        }
+
+        self.stream_body_response(initial, on_chunk).await
     }
 
     fn trim_read_buffer(&mut self) {

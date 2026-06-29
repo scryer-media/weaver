@@ -6,8 +6,7 @@ use crate::jobs::assembly::DetectedArchiveIdentity;
 use crate::jobs::ids::JobId;
 use crate::jobs::model::{FieldUpdate, JobUpdate};
 use crate::jobs::record::{
-    ActiveExtractionChunk, ActiveFileIdentity, ActiveFileProgress, ActiveJob, CommittedSegment,
-    ExtractionChunk,
+    ActiveExtractionChunk, ActiveFileIdentity, ActiveFileProgress, ActiveJob, ExtractionChunk,
 };
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, SqlTx};
@@ -110,56 +109,6 @@ async fn active_job_ids_tx(
         }
     }
     Ok(active)
-}
-
-async fn bulk_insert_segments_tx(
-    tx: &mut SqlTx<'_>,
-    segments: &[CommittedSegment],
-) -> Result<(), StateError> {
-    if segments.is_empty() {
-        return Ok(());
-    }
-
-    let chunk_size = max_rows_for_tx(tx, 6);
-    match tx {
-        SqlTx::Sqlite(tx) => {
-            for chunk in segments.chunks(chunk_size) {
-                let mut builder = QueryBuilder::<Sqlite>::new(
-                    "INSERT INTO active_segments
-                     (job_id, file_index, segment_number, file_offset, decoded_size, crc32) ",
-                );
-                builder.push_values(chunk, |mut row, seg| {
-                    row.push_bind(seg.job_id.0 as i64)
-                        .push_bind(seg.file_index as i64)
-                        .push_bind(seg.segment_number as i64)
-                        .push_bind(seg.file_offset as i64)
-                        .push_bind(seg.decoded_size as i64)
-                        .push_bind(seg.crc32 as i64);
-                });
-                builder.push(" ON CONFLICT(job_id, file_index, segment_number) DO NOTHING");
-                builder.build().execute(&mut **tx).await.map_err(db_err)?;
-            }
-        }
-        SqlTx::Postgres(tx) => {
-            for chunk in segments.chunks(chunk_size) {
-                let mut builder = QueryBuilder::<Postgres>::new(
-                    "INSERT INTO active_segments
-                     (job_id, file_index, segment_number, file_offset, decoded_size, crc32) ",
-                );
-                builder.push_values(chunk, |mut row, seg| {
-                    row.push_bind(seg.job_id.0 as i64)
-                        .push_bind(seg.file_index as i64)
-                        .push_bind(seg.segment_number as i64)
-                        .push_bind(seg.file_offset as i64)
-                        .push_bind(seg.decoded_size as i64)
-                        .push_bind(seg.crc32 as i64);
-                });
-                builder.push(" ON CONFLICT(job_id, file_index, segment_number) DO NOTHING");
-                builder.build().execute(&mut **tx).await.map_err(db_err)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 async fn bulk_upsert_file_progress_tx(
@@ -674,34 +623,6 @@ impl Database {
         })
     }
 
-    pub fn commit_segments(&self, segments: &[CommittedSegment]) -> Result<(), StateError> {
-        if segments.is_empty() {
-            return Ok(());
-        }
-
-        let datastore = self.datastore();
-        let segments = segments.to_vec();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "commit_segments", |tx| {
-                let segments = segments.clone();
-                Box::pin(async move {
-                    let job_ids = segments
-                        .iter()
-                        .map(|segment| segment.job_id)
-                        .collect::<HashSet<_>>();
-                    let active_job_ids = active_job_ids_tx(tx, &job_ids).await?;
-                    let active_segments = segments
-                        .into_iter()
-                        .filter(|segment| active_job_ids.contains(&segment.job_id))
-                        .collect::<Vec<_>>();
-                    bulk_insert_segments_tx(tx, &active_segments).await?;
-                    Ok(())
-                })
-            })
-            .await
-        })
-    }
-
     pub fn upsert_file_progress_batch(
         &self,
         progress: &[ActiveFileProgress],
@@ -844,7 +765,6 @@ impl Database {
                 Box::pin(async move {
                     lock_active_job_for_write_tx(tx, job_id).await?;
                     for table in [
-                        "active_segments",
                         "active_file_progress",
                         "active_files",
                         "active_detected_archives",

@@ -4,20 +4,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime::system_profile::SystemProfile;
 
-use crate::operations::metrics::MetricsSnapshot;
+use crate::operations::metrics::{DownloadPressureState, MetricsSnapshot};
 
 /// IOPS threshold for "fast" storage (SSD/NVMe). Above this, disk is not the
 /// bottleneck and we can use all configured connections. Below this, we
 /// throttle to avoid disk contention.
 const FAST_STORAGE_IOPS: f64 = 1_000.0;
 const MAX_CONCURRENT_EXTRACTIONS_ENV: &str = "WEAVER_MAX_CONCURRENT_EXTRACTIONS";
-const DECODE_QUEUE_PER_CONNECTION: usize = 8;
 
 /// Runtime-tunable parameters. The tuner adjusts these based on observed performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunedParameters {
     pub max_concurrent_downloads: usize,
-    pub max_decode_queue: usize,
     pub max_write_queue: usize,
     pub min_free_buffers: usize,
     pub decode_thread_count: usize,
@@ -36,7 +34,7 @@ pub struct RuntimeTuner {
     max_concurrent_extractions_override: Option<usize>,
     /// Total connections across all configured servers (hard ceiling).
     total_connections: usize,
-    /// Number of consecutive snapshots where decode_pending > max_decode_queue.
+    /// Number of consecutive snapshots under hard byte-pressure backpressure.
     decode_pressure_streak: u32,
     /// Number of consecutive snapshots where download_queue_depth == 0.
     download_idle_streak: u32,
@@ -70,7 +68,6 @@ impl RuntimeTuner {
 
         let current = TunedParameters {
             max_concurrent_downloads,
-            max_decode_queue: max_concurrent_downloads * DECODE_QUEUE_PER_CONNECTION,
             max_write_queue: max_concurrent_downloads * 2,
             min_free_buffers: 4,
             decode_thread_count: cores,
@@ -130,8 +127,8 @@ impl RuntimeTuner {
             changed = true;
         }
 
-        // --- Decode pressure / idle streaks ---
-        if metrics.decode_pending > self.current.max_decode_queue {
+        // --- Byte-pressure / idle streaks ---
+        if metrics.download_pressure_state == DownloadPressureState::Hard {
             self.decode_pressure_streak += 1;
             self.download_idle_streak = 0;
         } else if metrics.download_queue_depth == 0 {
@@ -178,7 +175,6 @@ impl RuntimeTuner {
         // Re-derive max_concurrent_downloads the same way as initial construction,
         // so adding a server immediately makes those connections available.
         self.current.max_concurrent_downloads = limit;
-        self.current.max_decode_queue = limit * DECODE_QUEUE_PER_CONNECTION;
         self.current.max_write_queue = limit * 2;
     }
 

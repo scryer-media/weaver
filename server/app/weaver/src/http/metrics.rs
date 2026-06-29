@@ -7,7 +7,9 @@ use axum::response::IntoResponse;
 use weaver_nntp::pool::NntpPool;
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::security::RuntimeSecurityConfig;
-use weaver_server_core::{JobInfo, JobStatus, MetricsSnapshot, SchedulerHandle};
+use weaver_server_core::{
+    DownloadPressureState, JobInfo, JobStatus, MetricsSnapshot, SchedulerHandle,
+};
 
 #[derive(Clone)]
 pub(crate) struct PrometheusMetricsExporter {
@@ -67,15 +69,15 @@ pub(super) async fn metrics_handler(
 }
 
 pub(super) struct ServerHealthInfo {
-    label: String,
-    state: &'static str,
-    success_count: u64,
-    failure_count: u64,
-    consecutive_failures: u32,
-    latency_ms: f64,
-    connections_available: usize,
-    connections_max: usize,
-    premature_deaths: usize,
+    pub(super) label: String,
+    pub(super) state: &'static str,
+    pub(super) success_count: u64,
+    pub(super) failure_count: u64,
+    pub(super) consecutive_failures: u32,
+    pub(super) latency_ms: f64,
+    pub(super) connections_available: usize,
+    pub(super) connections_max: usize,
+    pub(super) premature_deaths: usize,
 }
 
 async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
@@ -298,6 +300,31 @@ pub(super) fn render_prometheus_metrics(
         snapshot.segments_failed_permanent,
     );
 
+    out.push_str(
+        "# HELP weaver_pipeline_download_failures_total Failed article download attempts by kind.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_failures_total counter\n");
+    for (kind, value) in [
+        (
+            "article_not_found",
+            snapshot.download_failures_article_not_found,
+        ),
+        (
+            "capacity_unavailable",
+            snapshot.download_failures_capacity_unavailable,
+        ),
+        ("transient", snapshot.download_failures_transient),
+        ("auth", snapshot.download_failures_auth),
+        ("permanent", snapshot.download_failures_permanent),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_failures_total",
+            &[("kind", kind)],
+            value,
+        );
+    }
+
     out.push_str("# HELP weaver_pipeline_articles_not_found_total Total articles not found.\n");
     out.push_str("# TYPE weaver_pipeline_articles_not_found_total counter\n");
     append_metric(
@@ -330,12 +357,48 @@ pub(super) fn render_prometheus_metrics(
         snapshot.download_queue_depth,
     );
 
+    out.push_str("# HELP weaver_pipeline_active_downloads Active article downloads.\n");
+    out.push_str("# TYPE weaver_pipeline_active_downloads gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_active_downloads",
+        snapshot.active_downloads,
+    );
+
+    out.push_str("# HELP weaver_pipeline_active_decodes Active decode tasks.\n");
+    out.push_str("# TYPE weaver_pipeline_active_decodes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_active_decodes",
+        snapshot.active_decodes,
+    );
+
     out.push_str("# HELP weaver_pipeline_decode_pending Decode pending queue depth.\n");
     out.push_str("# TYPE weaver_pipeline_decode_pending gauge\n");
     append_metric(
         &mut out,
         "weaver_pipeline_decode_pending",
         snapshot.decode_pending,
+    );
+
+    out.push_str(
+        "# HELP weaver_pipeline_decode_pending_bytes Raw article bytes queued for decode.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_decode_pending_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_decode_pending_bytes",
+        snapshot.decode_pending_bytes,
+    );
+
+    out.push_str(
+        "# HELP weaver_pipeline_decode_active_bytes Raw article bytes currently being decoded.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_decode_active_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_decode_active_bytes",
+        snapshot.decode_active_bytes,
     );
 
     out.push_str("# HELP weaver_pipeline_commit_pending Commit pending queue depth.\n");
@@ -368,6 +431,107 @@ pub(super) fn render_prometheus_metrics(
         &mut out,
         "weaver_pipeline_write_buffered_segments",
         snapshot.write_buffered_segments,
+    );
+
+    out.push_str("# HELP weaver_pipeline_decode_pressure_soft_limit_bytes Decode soft pressure limit in bytes.\n");
+    out.push_str("# TYPE weaver_pipeline_decode_pressure_soft_limit_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_decode_pressure_soft_limit_bytes",
+        snapshot.decode_pressure_soft_limit_bytes,
+    );
+
+    out.push_str("# HELP weaver_pipeline_decode_pressure_hard_limit_bytes Decode hard pressure limit in bytes.\n");
+    out.push_str("# TYPE weaver_pipeline_decode_pressure_hard_limit_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_decode_pressure_hard_limit_bytes",
+        snapshot.decode_pressure_hard_limit_bytes,
+    );
+
+    out.push_str("# HELP weaver_pipeline_write_pressure_soft_limit_bytes Write soft pressure limit in bytes.\n");
+    out.push_str("# TYPE weaver_pipeline_write_pressure_soft_limit_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_write_pressure_soft_limit_bytes",
+        snapshot.write_pressure_soft_limit_bytes,
+    );
+
+    out.push_str("# HELP weaver_pipeline_write_pressure_hard_limit_bytes Write hard pressure limit in bytes.\n");
+    out.push_str("# TYPE weaver_pipeline_write_pressure_hard_limit_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_write_pressure_hard_limit_bytes",
+        snapshot.write_pressure_hard_limit_bytes,
+    );
+
+    out.push_str("# HELP weaver_pipeline_download_pressure_state Download backpressure state.\n");
+    out.push_str("# TYPE weaver_pipeline_download_pressure_state gauge\n");
+    for state in ["clear", "soft", "hard"] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_pressure_state",
+            &[("state", state)],
+            u8::from(snapshot.download_pressure_state.as_str() == state),
+        );
+    }
+
+    out.push_str("# HELP weaver_pipeline_download_pressure_reason Download backpressure reason.\n");
+    out.push_str("# TYPE weaver_pipeline_download_pressure_reason gauge\n");
+    for reason in ["none", "decode", "write", "decode_and_write"] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_pressure_reason",
+            &[("reason", reason)],
+            u8::from(snapshot.download_pressure_reason.as_str() == reason),
+        );
+    }
+
+    out.push_str("# HELP weaver_pipeline_download_observed_limiter Observed downloader limiter derived from pressure, queue, and server permits.\n");
+    out.push_str("# TYPE weaver_pipeline_download_observed_limiter gauge\n");
+    let observed_limiter =
+        observed_download_limiter(snapshot, pipeline_paused, download_block, server_health);
+    for limiter in [
+        "active",
+        "decode_lagging",
+        "dispatch_limited",
+        "gated",
+        "idle",
+        "network_limited",
+        "pressure_limited",
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_observed_limiter",
+            &[("limiter", limiter)],
+            u8::from(observed_limiter == limiter),
+        );
+    }
+
+    out.push_str(
+        "# HELP weaver_pipeline_download_pressure_stalls_total Hard pressure stalls started.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_pressure_stalls_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_download_pressure_stalls_total",
+        snapshot.download_pressure_stalls_total,
+    );
+
+    out.push_str("# HELP weaver_pipeline_download_pressure_stall_duration_seconds Completed hard pressure stall duration.\n");
+    out.push_str("# TYPE weaver_pipeline_download_pressure_stall_duration_seconds counter\n");
+    append_metric_f64(
+        &mut out,
+        "weaver_pipeline_download_pressure_stall_duration_seconds",
+        snapshot.download_pressure_stall_duration_ms as f64 / 1000.0,
+    );
+
+    out.push_str("# HELP weaver_pipeline_download_pressure_current_stall_seconds Current hard pressure stall duration.\n");
+    out.push_str("# TYPE weaver_pipeline_download_pressure_current_stall_seconds gauge\n");
+    append_metric_f64(
+        &mut out,
+        "weaver_pipeline_download_pressure_current_stall_seconds",
+        snapshot.download_pressure_current_stall_ms as f64 / 1000.0,
     );
 
     out.push_str("# HELP weaver_pipeline_direct_write_evictions_total Direct write evictions.\n");
@@ -561,6 +725,60 @@ pub(super) fn render_prometheus_metrics(
     }
 
     out
+}
+
+fn observed_download_limiter(
+    snapshot: &MetricsSnapshot,
+    pipeline_paused: bool,
+    download_block: &DownloadBlockState,
+    server_health: &[ServerHealthInfo],
+) -> &'static str {
+    if pipeline_paused || !matches!(download_block.kind, DownloadBlockKind::None) {
+        return "gated";
+    }
+    let required_queue_depth = snapshot
+        .download_queue_depth
+        .saturating_sub(snapshot.recovery_queue_depth);
+    if required_queue_depth == 0 && snapshot.active_downloads == 0 {
+        return "idle";
+    }
+    if snapshot.download_pressure_state != DownloadPressureState::Clear {
+        return "pressure_limited";
+    }
+    let decode_backlog_bytes = snapshot
+        .decode_pending_bytes
+        .saturating_add(snapshot.decode_active_bytes);
+    let decode_lagging_backlog =
+        decode_backlog_bytes >= (snapshot.decode_pressure_soft_limit_bytes / 2).max(1);
+    if decode_lagging_backlog {
+        return "decode_lagging";
+    }
+    if snapshot.decode_pending_bytes > 0 && snapshot.current_download_speed > 0 {
+        let decode_bytes_per_second = snapshot.decode_rate_mbps.max(0.0) * 1024.0 * 1024.0;
+        if (snapshot.current_download_speed as f64) > decode_bytes_per_second * 1.2 {
+            return "decode_lagging";
+        }
+    }
+
+    let total_connections = server_health
+        .iter()
+        .map(|server| server.connections_max)
+        .sum::<usize>();
+    let available_connections = server_health
+        .iter()
+        .map(|server| server.connections_available)
+        .sum::<usize>();
+    if required_queue_depth > 0
+        && snapshot.active_downloads > 0
+        && total_connections > 0
+        && available_connections == 0
+    {
+        return "network_limited";
+    }
+    if snapshot.active_downloads > 0 {
+        return "active";
+    }
+    "dispatch_limited"
 }
 
 fn append_metric<T: std::fmt::Display>(out: &mut String, name: &str, value: T) {

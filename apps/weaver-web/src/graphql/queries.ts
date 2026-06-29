@@ -272,11 +272,24 @@ const METRICS_FIELDS = `
     bytesDecoded
     bytesCommitted
     downloadQueueDepth
+    activeDownloads
+    activeDecodes
     decodePending
+    decodePendingBytes
+    decodeActiveBytes
     commitPending
     writeBufferedBytes
     writeBufferedSegments
     directWriteEvictions
+    decodePressureSoftLimitBytes
+    decodePressureHardLimitBytes
+    writePressureSoftLimitBytes
+    writePressureHardLimitBytes
+    downloadPressureState
+    downloadPressureReason
+    downloadPressureStallsTotal
+    downloadPressureStallDurationMs
+    downloadPressureCurrentStallMs
     segmentsDownloaded
     segmentsDecoded
     segmentsCommitted
@@ -288,6 +301,11 @@ const METRICS_FIELDS = `
     diskWriteLatencyUs
     segmentsRetried
     segmentsFailedPermanent
+    downloadFailuresArticleNotFound
+    downloadFailuresCapacityUnavailable
+    downloadFailuresTransient
+    downloadFailuresAuth
+    downloadFailuresPermanent
     currentDownloadSpeed
     crcErrors
     recoveryQueueDepth

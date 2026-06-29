@@ -77,6 +77,19 @@ impl DownloadQueue {
         self.heap.pop().map(|Reverse(pw)| pw.work)
     }
 
+    pub fn pop_next_pipelining_compatible_with(
+        &mut self,
+        anchor: &DownloadWork,
+    ) -> Option<DownloadWork> {
+        let compatible = self.heap.peek().is_some_and(|Reverse(pw)| {
+            pw.work.priority == anchor.priority
+                && pw.work.is_recovery == anchor.is_recovery
+                && pw.work.groups == anchor.groups
+                && pw.work.exclude_servers == anchor.exclude_servers
+        });
+        compatible.then(|| self.heap.pop().map(|Reverse(pw)| pw.work))?
+    }
+
     pub fn len(&self) -> usize {
         self.heap.len()
     }

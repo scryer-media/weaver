@@ -66,11 +66,24 @@ fn sample_snapshot(
         bytes_decoded,
         bytes_committed,
         download_queue_depth: queue_depth,
+        active_downloads: 0,
+        active_decodes: 0,
         decode_pending: queue_depth / 2,
+        decode_pending_bytes: 0,
+        decode_active_bytes: 0,
         commit_pending: queue_depth / 3,
         write_buffered_bytes: current_download_speed * 2,
         write_buffered_segments: queue_depth + 1,
         direct_write_evictions: 0,
+        decode_pressure_soft_limit_bytes: 0,
+        decode_pressure_hard_limit_bytes: 0,
+        write_pressure_soft_limit_bytes: 0,
+        write_pressure_hard_limit_bytes: 0,
+        download_pressure_state: crate::DownloadPressureState::Clear,
+        download_pressure_reason: crate::DownloadPressureReason::None,
+        download_pressure_stalls_total: 0,
+        download_pressure_stall_duration_ms: 0,
+        download_pressure_current_stall_ms: 0,
         segments_downloaded: bytes_downloaded / 100,
         segments_decoded: bytes_decoded / 100,
         segments_committed: bytes_committed / 100,
@@ -82,12 +95,84 @@ fn sample_snapshot(
         disk_write_latency_us: 200,
         segments_retried: 0,
         segments_failed_permanent: 0,
+        download_failures_article_not_found: 0,
+        download_failures_capacity_unavailable: 0,
+        download_failures_transient: 0,
+        download_failures_auth: 0,
+        download_failures_permanent: 0,
         current_download_speed,
         crc_errors: 0,
         recovery_queue_depth: 0,
         articles_per_sec,
         decode_rate_mbps,
     }
+}
+
+#[test]
+fn raw_metrics_history_point_deserializes_legacy_metric_array_lengths() {
+    #[derive(serde::Serialize)]
+    struct LegacyRawMetricsHistoryPoint {
+        timestamp_epoch_sec: i64,
+        counter_values: [f64; 11],
+        gauge_values: [f64; 13],
+        job_status_values: [f64; 12],
+    }
+
+    let legacy = LegacyRawMetricsHistoryPoint {
+        timestamp_epoch_sec: 123,
+        counter_values: [1.0; 11],
+        gauge_values: [2.0; 13],
+        job_status_values: [3.0; 12],
+    };
+
+    let encoded = rmp_serde::to_vec(&legacy).unwrap();
+    let decoded: RawMetricsHistoryPoint = rmp_serde::from_slice(&encoded).unwrap();
+
+    assert_eq!(decoded.timestamp_epoch_sec, 123);
+    assert_eq!(decoded.counter_values[10], 1.0);
+    assert_eq!(decoded.counter_values[11], 0.0);
+    assert_eq!(decoded.gauge_values[12], 2.0);
+    assert_eq!(decoded.gauge_values[13], 0.0);
+    assert_eq!(decoded.job_status_values[11], 3.0);
+}
+
+#[test]
+fn rollup_metrics_history_point_deserializes_legacy_metric_array_lengths() {
+    #[derive(serde::Serialize)]
+    struct LegacyRollupMetricsHistoryPoint {
+        timestamp_epoch_sec: i64,
+        counter_values: [CounterRollupValue; 11],
+        gauge_values: [GaugeRollupValue; 13],
+        job_status_values: [GaugeRollupValue; 12],
+    }
+
+    let counter = CounterRollupValue {
+        end: 1.0,
+        avg_rate: 2.0,
+        peak_rate: 3.0,
+        avg_rate_weight_sec: 4.0,
+    };
+    let gauge = GaugeRollupValue {
+        avg: 5.0,
+        peak: 6.0,
+        sample_count: 7,
+    };
+    let legacy = LegacyRollupMetricsHistoryPoint {
+        timestamp_epoch_sec: 456,
+        counter_values: [counter; 11],
+        gauge_values: [gauge; 13],
+        job_status_values: [gauge; 12],
+    };
+
+    let encoded = rmp_serde::to_vec(&legacy).unwrap();
+    let decoded: RollupMetricsHistoryPoint = rmp_serde::from_slice(&encoded).unwrap();
+
+    assert_eq!(decoded.timestamp_epoch_sec, 456);
+    assert_eq!(decoded.counter_values[10], counter);
+    assert_eq!(decoded.counter_values[11], CounterRollupValue::default());
+    assert_eq!(decoded.gauge_values[12], gauge);
+    assert_eq!(decoded.gauge_values[13], GaugeRollupValue::default());
+    assert_eq!(decoded.job_status_values[11], gauge);
 }
 
 fn job_info(job_id: u64, status: JobStatus) -> JobInfo {

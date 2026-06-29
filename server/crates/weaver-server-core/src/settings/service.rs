@@ -99,23 +99,15 @@ impl Database {
             let max_dl = settings
                 .get("tuner.max_concurrent_downloads")
                 .and_then(|v| v.parse().ok());
-            let max_dq = settings
-                .get("tuner.max_decode_queue")
-                .and_then(|v| v.parse().ok());
             let decode_threads = settings
                 .get("tuner.decode_thread_count")
                 .and_then(|v| v.parse().ok());
             let extract_threads = settings
                 .get("tuner.extract_thread_count")
                 .and_then(|v| v.parse().ok());
-            if max_dl.is_some()
-                || max_dq.is_some()
-                || decode_threads.is_some()
-                || extract_threads.is_some()
-            {
+            if max_dl.is_some() || decode_threads.is_some() || extract_threads.is_some() {
                 Some(TunerOverrides {
                     max_concurrent_downloads: max_dl,
-                    max_decode_queue: max_dq,
                     decode_thread_count: decode_threads,
                     extract_thread_count: extract_threads,
                 })
@@ -213,9 +205,6 @@ impl Database {
         if let Some(ref tuner) = config.tuner {
             if let Some(v) = tuner.max_concurrent_downloads {
                 self.set_setting("tuner.max_concurrent_downloads", &v.to_string())?;
-            }
-            if let Some(v) = tuner.max_decode_queue {
-                self.set_setting("tuner.max_decode_queue", &v.to_string())?;
             }
             if let Some(v) = tuner.decode_thread_count {
                 self.set_setting("tuner.decode_thread_count", &v.to_string())?;

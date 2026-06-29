@@ -12,15 +12,15 @@ fn build_metrics_history_returns_raw_actual_series() {
         data: MetricsHistoryQueryData::Raw(vec![
             RawMetricsHistoryPoint {
                 timestamp_epoch_sec: 100,
-                counter_values: [1.0; 11],
-                gauge_values: [2.0; 13],
-                job_status_values: [0.0; 12],
+                counter_values: [1.0; COUNTER_METRIC_KEYS.len()],
+                gauge_values: [2.0; GAUGE_METRIC_KEYS.len()],
+                job_status_values: [0.0; JOB_STATUS_KEYS.len()],
             },
             RawMetricsHistoryPoint {
                 timestamp_epoch_sec: 110,
-                counter_values: [3.0; 11],
-                gauge_values: [4.0; 13],
-                job_status_values: [1.0; 12],
+                counter_values: [3.0; COUNTER_METRIC_KEYS.len()],
+                gauge_values: [4.0; GAUGE_METRIC_KEYS.len()],
+                job_status_values: [1.0; JOB_STATUS_KEYS.len()],
             },
         ]),
     })
@@ -54,17 +54,17 @@ fn build_metrics_history_returns_rollup_avg_and_peak_series() {
                 avg_rate: 2.5,
                 peak_rate: 4.0,
                 avg_rate_weight_sec: 290.0,
-            }; 11],
+            }; COUNTER_METRIC_KEYS.len()],
             gauge_values: [weaver_server_core::GaugeRollupValue {
                 avg: 6.0,
                 peak: 9.0,
                 sample_count: 29,
-            }; 13],
+            }; GAUGE_METRIC_KEYS.len()],
             job_status_values: [weaver_server_core::GaugeRollupValue {
                 avg: 1.5,
                 peak: 3.0,
                 sample_count: 29,
-            }; 12],
+            }; JOB_STATUS_KEYS.len()],
         }]),
     })
     .unwrap();

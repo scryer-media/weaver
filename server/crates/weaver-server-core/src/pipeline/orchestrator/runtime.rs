@@ -27,10 +27,13 @@ impl Pipeline {
         let metrics = Arc::clone(shared_state.metrics());
         initial_history.truncate(crate::jobs::FINISHED_JOBS_RUNTIME_CAP);
         let write_backlog_budget_bytes = compute_write_backlog_budget_bytes(&profile, &buffers);
+        let decode_backlog_budget_bytes =
+            compute_decode_backlog_budget_bytes(&profile, &buffers, write_backlog_budget_bytes);
         let tuner = RuntimeTuner::with_connection_limit(profile, total_connections);
         let initial_bandwidth_policy = config.read().await.isp_bandwidth_cap.clone();
         info!(
             max_downloads = tuner.params().max_concurrent_downloads,
+            decode_backlog_budget_mb = decode_backlog_budget_bytes / (1024 * 1024),
             write_backlog_budget_mb = write_backlog_budget_bytes / (1024 * 1024),
             total_connections,
             "pipeline tuner initialized"
@@ -67,10 +70,12 @@ impl Pipeline {
             archive_password_winners: HashMap::new(),
             job_order: Vec::new(),
             active_downloads: 0,
+            active_download_connections: 0,
             active_recovery: 0,
             active_download_passes: HashSet::new(),
             jobs_finalizing_download: HashSet::new(),
             active_downloads_by_job: HashMap::new(),
+            active_download_connections_by_job: HashMap::new(),
             active_downloads_by_file: HashMap::new(),
             active_decodes_by_job: HashMap::new(),
             active_decodes_by_file: HashMap::new(),
@@ -120,7 +125,12 @@ impl Pipeline {
             connection_ramp: total_connections.min(5),
             rate_limiter: TokenBucket::new(0),
             write_buf_max_pending,
+            decode_backlog_budget_bytes,
             write_backlog_budget_bytes,
+            download_decode_hard_pressure_latched: false,
+            download_write_hard_pressure_latched: false,
+            download_pressure_hard_stall_started_at: None,
+            download_pressure_soft_dispatch_after: None,
             write_buffered_bytes: 0,
             write_buffered_segments: 0,
             write_buffers: HashMap::new(),
@@ -149,6 +159,7 @@ impl Pipeline {
             pp_pool,
         };
         let _ = pipeline.refresh_bandwidth_cap_window();
+        pipeline.refresh_download_pressure();
         Ok(pipeline)
     }
 
@@ -331,7 +342,14 @@ impl Pipeline {
 
     fn release_stalled_download_runtime(&mut self, job_id: JobId) -> usize {
         let in_flight = self.active_downloads_by_job.remove(&job_id).unwrap_or(0);
+        let in_flight_connections = self
+            .active_download_connections_by_job
+            .remove(&job_id)
+            .unwrap_or(0);
         self.active_downloads = self.active_downloads.saturating_sub(in_flight);
+        self.active_download_connections = self
+            .active_download_connections
+            .saturating_sub(in_flight_connections);
         self.active_downloads_by_file
             .retain(|file_id, _| file_id.job_id != job_id);
 
@@ -500,6 +518,7 @@ impl Pipeline {
                 _ = rate_sleep, if !rate_delay.is_zero() => {}
                 _ = tune_interval.tick() => {
                     self.flush_quiescent_write_backlog().await;
+                    self.refresh_download_pressure();
 
                     let snapshot = self.metrics.snapshot();
                     let not_found = snapshot.articles_not_found;
@@ -515,8 +534,12 @@ impl Pipeline {
                         downloaded_mb = snapshot.bytes_downloaded / (1024 * 1024),
                         segments = snapshot.segments_downloaded,
                         decode_pending = snapshot.decode_pending,
+                        decode_pending_mb = snapshot.decode_pending_bytes / (1024 * 1024),
+                        decode_active_mb = snapshot.decode_active_bytes / (1024 * 1024),
                         write_backlog_mb = snapshot.write_buffered_bytes / (1024 * 1024),
                         write_backlog_segments = snapshot.write_buffered_segments,
+                        pressure_state = snapshot.download_pressure_state.as_str(),
+                        pressure_reason = snapshot.download_pressure_reason.as_str(),
                         direct_write_evictions = snapshot.direct_write_evictions,
                         not_found,
                         health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
@@ -711,13 +734,9 @@ pub(crate) fn compute_write_backlog_budget_bytes(
     profile: &SystemProfile,
     buffers: &Arc<BufferPool>,
 ) -> usize {
-    use crate::runtime::buffers::BufferTier;
     use crate::runtime::system_profile::StorageClass;
 
-    let metrics = buffers.metrics();
-    let scratch_bytes = metrics.small_total * BufferTier::Small.size_bytes()
-        + metrics.medium_total * BufferTier::Medium.size_bytes()
-        + metrics.large_total * BufferTier::Large.size_bytes();
+    let scratch_bytes = buffer_pool_total_bytes(buffers);
     let available_bytes = profile.memory.available_bytes.max(256 * 1024 * 1024) as usize;
     let base = scratch_bytes
         .max(64 * 1024 * 1024)
@@ -730,6 +749,40 @@ pub(crate) fn compute_write_backlog_budget_bytes(
             (base.saturating_mul(3) / 2).min((available_bytes / 5).max(base))
         }
     }
+}
+
+pub(crate) fn compute_decode_backlog_budget_bytes(
+    profile: &SystemProfile,
+    buffers: &Arc<BufferPool>,
+    write_backlog_budget_bytes: usize,
+) -> usize {
+    const DECODE_BACKLOG_POOL_MULTIPLIER: usize = 3;
+    const DECODE_BACKLOG_MEMORY_FRACTION: usize = 8;
+    const DECODE_BACKLOG_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+    let scratch_bytes = buffer_pool_total_bytes(buffers);
+    let effective_memory_bytes =
+        crate::runtime::buffers::BufferPoolConfig::runtime_sizing_memory_bytes(
+            profile.memory.available_bytes.max(256 * 1024 * 1024),
+            profile.memory.cgroup_limit,
+        ) as usize;
+    let memory_cap = (effective_memory_bytes / DECODE_BACKLOG_MEMORY_FRACTION)
+        .max(write_backlog_budget_bytes)
+        .min(DECODE_BACKLOG_MAX_BYTES);
+    let target = scratch_bytes
+        .saturating_mul(DECODE_BACKLOG_POOL_MULTIPLIER)
+        .max(write_backlog_budget_bytes);
+
+    target.min(memory_cap).max(1)
+}
+
+fn buffer_pool_total_bytes(buffers: &Arc<BufferPool>) -> usize {
+    use crate::runtime::buffers::BufferTier;
+
+    let metrics = buffers.metrics();
+    metrics.small_total * BufferTier::Small.size_bytes()
+        + metrics.medium_total * BufferTier::Medium.size_bytes()
+        + metrics.large_total * BufferTier::Large.size_bytes()
 }
 
 pub(crate) fn check_disk_space(output_dir: &std::path::Path, needed_bytes: u64) {

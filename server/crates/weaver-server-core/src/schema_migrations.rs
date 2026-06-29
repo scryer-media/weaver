@@ -22,7 +22,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 27;
+const CURRENT_SCHEMA_VERSION: i64 = 28;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -696,6 +696,9 @@ async fn run_rust_hook(
         "upgrade_to_schema_22" => upgrade_to_schema_22(tx).await,
         "upgrade_to_schema_23" => upgrade_to_schema_23(tx).await,
         "upgrade_to_schema_25" => upgrade_to_schema_25(tx).await,
+        "restart_active_jobs_drop_active_segments_v28" => {
+            restart_active_jobs_drop_active_segments_v28(tx).await
+        }
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"
         ))),
@@ -845,6 +848,71 @@ async fn upgrade_to_schema_25(
     Ok(())
 }
 
+async fn restart_active_jobs_drop_active_segments_v28(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StateError> {
+    for table in [
+        "active_file_progress",
+        "active_files",
+        "active_file_identities",
+        "active_par2",
+        "active_par2_files",
+        "active_extracted",
+        "active_failed_extractions",
+        "active_extraction_chunks",
+        "active_archive_headers",
+        "active_rar_volume_facts",
+        "active_detected_archives",
+        "active_volume_status",
+        "active_rar_verified_suspect",
+    ] {
+        let sql = format!("DELETE FROM {table}");
+        sqlx::query(AssertSqlSafe(sql.as_str()))
+            .execute(&mut **tx)
+            .await
+            .map_err(db_err)?;
+    }
+
+    sqlx::query(
+        "UPDATE active_jobs
+         SET download_state = 'queued',
+             post_state = 'idle',
+             error = NULL,
+             queued_repair_at_epoch_ms = NULL,
+             queued_extract_at_epoch_ms = NULL,
+             paused_resume_status = CASE
+                 WHEN status = 'paused' OR run_state = 'paused' THEN 'queued'
+                 ELSE NULL
+             END,
+             paused_resume_download_state = CASE
+                 WHEN status = 'paused' OR run_state = 'paused' THEN 'queued'
+                 ELSE NULL
+             END,
+             paused_resume_post_state = CASE
+                 WHEN status = 'paused' OR run_state = 'paused' THEN 'idle'
+                 ELSE NULL
+             END,
+             status = CASE
+                 WHEN status = 'paused' OR run_state = 'paused' THEN 'paused'
+                 ELSE 'queued'
+             END,
+             run_state = CASE
+                 WHEN status = 'paused' OR run_state = 'paused' THEN 'paused'
+                 ELSE 'active'
+             END",
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?;
+
+    sqlx::query("DROP TABLE IF EXISTS active_segments")
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,6 +935,17 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         execute_sql(&mut tx, sql).await.unwrap();
         tx.commit().await.unwrap();
+    }
+
+    async fn sqlite_table_exists(pool: &sqlx::SqlitePool, table: &str) -> bool {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        count > 0
     }
 
     #[tokio::test]
@@ -944,6 +1023,165 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(nzb_cols, 1);
+        assert!(!sqlite_table_exists(&pool, "active_segments").await);
+    }
+
+    #[tokio::test]
+    async fn sqlite_v28_restarts_active_jobs_and_drops_active_segments() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(27), true)
+            .await
+            .unwrap();
+        assert!(sqlite_table_exists(&pool, "active_segments").await);
+
+        execute_batch(
+            &pool,
+            "INSERT INTO active_jobs (
+                 job_id, nzb_hash, nzb_path, output_dir, status, download_state, post_state,
+                 run_state, error, created_at, queued_repair_at_epoch_ms,
+                 queued_extract_at_epoch_ms, paused_resume_status,
+                 paused_resume_download_state, paused_resume_post_state, nzb_zstd
+             ) VALUES
+                 (1, X'010203', '/tmp/a.nzb', '/tmp/a', 'downloading', 'fetching',
+                  'repairing', 'active', 'boom', 100, 11.0, 12.0, NULL, NULL, NULL, X'01'),
+                 (2, X'040506', '/tmp/b.nzb', '/tmp/b', 'paused', 'fetching',
+                  'extracting', 'paused', 'wait', 200, 21.0, 22.0, 'checking',
+                  'checking', 'extracting', X'02');
+             INSERT INTO active_segments VALUES (1, 0, 0, 0, 10, 123);
+             INSERT INTO active_file_progress VALUES (1, 0, 10);
+             INSERT INTO active_files VALUES (1, 0, 'payload.bin', X'01010101010101010101010101010101');
+             INSERT INTO active_par2 VALUES (1, 8, 1);
+             INSERT INTO active_par2_files VALUES (1, 0, 'repair.par2', 1, 1);
+             INSERT INTO active_extracted (job_id, member_name, output_path, output_size)
+                 VALUES (1, 'payload.bin', '/tmp/a/payload.bin', 10);
+             INSERT INTO active_failed_extractions VALUES (1, 'bad.bin');
+             INSERT INTO active_extraction_chunks (
+                 job_id, set_name, member_name, volume_index, bytes_written,
+                 temp_path, start_offset, end_offset, verified, appended
+             ) VALUES (1, 'set', 'payload.bin', 0, 10, '/tmp/chunk', 0, 10, 1, 1);
+             INSERT INTO active_archive_headers VALUES (1, 'set', X'AA');
+             INSERT INTO active_rar_volume_facts VALUES (1, 'set', 0, X'BB');
+             INSERT INTO active_detected_archives VALUES (1, 0, 'rar', 'set', 0);
+             INSERT INTO active_volume_status VALUES (1, 'set', 0, 1, 1, 0);
+             INSERT INTO active_rar_verified_suspect VALUES (1, 'set', 0);
+             INSERT INTO active_file_identities (
+                 job_id, file_index, source_filename, current_filename,
+                 classification_source
+             ) VALUES (1, 0, 'payload.bin', 'payload.bin', 'declared');",
+        )
+        .await;
+
+        run_embedded_migrations(&pool, MigrationMode::Apply)
+            .await
+            .unwrap();
+
+        let version: i64 = sqlx::query_scalar("SELECT version FROM schema_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert!(!sqlite_table_exists(&pool, "active_segments").await);
+
+        for table in [
+            "active_file_progress",
+            "active_files",
+            "active_par2",
+            "active_par2_files",
+            "active_extracted",
+            "active_failed_extractions",
+            "active_extraction_chunks",
+            "active_archive_headers",
+            "active_rar_volume_facts",
+            "active_detected_archives",
+            "active_volume_status",
+            "active_rar_verified_suspect",
+            "active_file_identities",
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            let count: i64 = sqlx::query_scalar(AssertSqlSafe(sql.as_str()))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "{table} should be cleared");
+        }
+
+        let active: (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<f64>,
+            Option<f64>,
+        ) = sqlx::query_as(
+            "SELECT status, download_state, post_state, run_state, error,
+                        queued_repair_at_epoch_ms, queued_extract_at_epoch_ms
+                 FROM active_jobs WHERE job_id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            active,
+            (
+                "queued".to_string(),
+                "queued".to_string(),
+                "idle".to_string(),
+                "active".to_string(),
+                None,
+                None,
+                None,
+            )
+        );
+
+        let paused: (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<f64>,
+            Option<f64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, download_state, post_state, run_state, error,
+                    queued_repair_at_epoch_ms, queued_extract_at_epoch_ms,
+                    paused_resume_status, paused_resume_download_state,
+                    paused_resume_post_state
+             FROM active_jobs WHERE job_id = 2",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            paused,
+            (
+                "paused".to_string(),
+                "queued".to_string(),
+                "idle".to_string(),
+                "paused".to_string(),
+                None,
+                None,
+                None,
+                Some("queued".to_string()),
+                Some("queued".to_string()),
+                Some("idle".to_string()),
+            )
+        );
+
+        let mut tx = pool.begin().await.unwrap();
+        restart_active_jobs_drop_active_segments_v28(&mut tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
     }
 
     #[tokio::test]

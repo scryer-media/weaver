@@ -468,18 +468,88 @@ async fn apply_single_migration(
 
 async fn run_postgres_rust_hook(
     hook_id: &str,
-    _tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     _version: i64,
     _install_kind: MigrationInstallKind,
 ) -> Result<(), StateError> {
     crate::migration_hook_ids::validate_migration_hook_id(hook_id).map_err(StateError::Database)?;
-    Err(StateError::Database(format!(
-        "PostgreSQL migration hook '{hook_id}' is not implemented"
-    )))
+    match hook_id {
+        "restart_active_jobs_drop_active_segments_v28" => {
+            restart_active_jobs_drop_active_segments_v28(tx).await
+        }
+        other => Err(StateError::Database(format!(
+            "PostgreSQL migration hook '{other}' is not implemented"
+        ))),
+    }
 }
 
 fn implemented_postgres_rust_hooks() -> &'static [&'static str] {
-    &[]
+    &["restart_active_jobs_drop_active_segments_v28"]
+}
+
+async fn restart_active_jobs_drop_active_segments_v28(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), StateError> {
+    for table in [
+        "active_file_progress",
+        "active_files",
+        "active_file_identities",
+        "active_par2",
+        "active_par2_files",
+        "active_extracted",
+        "active_failed_extractions",
+        "active_extraction_chunks",
+        "active_archive_headers",
+        "active_rar_volume_facts",
+        "active_detected_archives",
+        "active_volume_status",
+        "active_rar_verified_suspect",
+    ] {
+        let sql = format!("DELETE FROM {table}");
+        sqlx::query(AssertSqlSafe(sql.as_str()))
+            .execute(&mut **tx)
+            .await
+            .map_err(db_err)?;
+    }
+
+    sqlx::query(
+        "UPDATE active_jobs
+         SET download_state = 'queued',
+             post_state = 'idle',
+             error = NULL,
+             queued_repair_at_epoch_ms = NULL,
+             queued_extract_at_epoch_ms = NULL,
+             paused_resume_status = CASE
+                 WHEN status = 'paused' OR run_state = 'paused' THEN 'queued'
+                 ELSE NULL
+             END,
+             paused_resume_download_state = CASE
+                 WHEN status = 'paused' OR run_state = 'paused' THEN 'queued'
+                 ELSE NULL
+             END,
+             paused_resume_post_state = CASE
+                 WHEN status = 'paused' OR run_state = 'paused' THEN 'idle'
+                 ELSE NULL
+             END,
+             status = CASE
+                 WHEN status = 'paused' OR run_state = 'paused' THEN 'paused'
+                 ELSE 'queued'
+             END,
+             run_state = CASE
+                 WHEN status = 'paused' OR run_state = 'paused' THEN 'paused'
+                 ELSE 'active'
+             END",
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?;
+
+    sqlx::query("DROP TABLE IF EXISTS active_segments")
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+
+    Ok(())
 }
 
 async fn insert_applied_migration(

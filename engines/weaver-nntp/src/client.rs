@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -102,6 +103,22 @@ pub struct FetchAttemptTrace {
 pub struct FetchBodyTrace {
     pub attempts: Vec<FetchAttemptTrace>,
     pub result: Result<Bytes>,
+}
+
+#[derive(Debug)]
+pub struct DecodedBodyTrace {
+    pub attempts: Vec<FetchAttemptTrace>,
+    pub result: std::result::Result<DecodedBody, DecodedBodyError>,
+}
+
+struct DecodedBatchItem {
+    elapsed: Duration,
+    result: std::result::Result<DecodedBody, DecodedBodyError>,
+}
+
+enum DecodedBatchDisposition {
+    Terminal(std::result::Result<DecodedBody, DecodedBodyError>),
+    Retry,
 }
 
 impl NntpClient {
@@ -455,6 +472,425 @@ impl NntpClient {
             .await
     }
 
+    pub async fn fetch_body_decoded_with_groups_traced(
+        &self,
+        message_id: &str,
+        groups: &[String],
+    ) -> DecodedBodyTrace {
+        self.fetch_body_decoded_with_groups_excluding_traced(message_id, groups, &[])
+            .await
+    }
+
+    pub async fn fetch_body_decoded_with_groups_prefer_excluding_traced(
+        &self,
+        message_id: &str,
+        groups: &[String],
+        exclude: &[usize],
+    ) -> DecodedBodyTrace {
+        if exclude.is_empty() {
+            return self
+                .fetch_body_decoded_with_groups_traced(message_id, groups)
+                .await;
+        }
+
+        let preferred = self
+            .fetch_body_decoded_with_groups_excluding_traced(message_id, groups, exclude)
+            .await;
+
+        if preferred.attempts.is_empty()
+            && matches!(
+                preferred.result,
+                Err(DecodedBodyError::Nntp(NntpError::PoolExhausted))
+            )
+        {
+            self.fetch_body_decoded_with_groups_traced(message_id, groups)
+                .await
+        } else {
+            preferred
+        }
+    }
+
+    pub async fn fetch_bodies_decoded_with_groups_prefer_excluding_traced(
+        &self,
+        message_ids: &[String],
+        groups: &[String],
+        exclude: &[usize],
+    ) -> Vec<DecodedBodyTrace> {
+        let mut traces: Vec<Option<DecodedBodyTrace>> =
+            (0..message_ids.len()).map(|_| None).collect();
+
+        self.fetch_bodies_decoded_with_groups_prefer_excluding_traced_each(
+            message_ids,
+            groups,
+            exclude,
+            |message_idx, trace| {
+                traces[message_idx] = Some(trace);
+                std::future::ready(())
+            },
+        )
+        .await;
+
+        traces
+            .into_iter()
+            .map(|trace| {
+                trace.unwrap_or(DecodedBodyTrace {
+                    attempts: Vec::new(),
+                    result: Err(DecodedBodyError::Nntp(NntpError::PoolExhausted)),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn fetch_bodies_decoded_with_groups_prefer_excluding_traced_each<F, Fut>(
+        &self,
+        message_ids: &[String],
+        groups: &[String],
+        exclude: &[usize],
+        mut on_trace: F,
+    ) where
+        F: FnMut(usize, DecodedBodyTrace) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        if message_ids.is_empty() {
+            return;
+        }
+
+        if message_ids.len() == 1 {
+            let trace = self
+                .fetch_body_decoded_with_groups_prefer_excluding_traced(
+                    &message_ids[0],
+                    groups,
+                    exclude,
+                )
+                .await;
+            on_trace(0, trace).await;
+            return;
+        }
+
+        let mut order = self.build_server_order(exclude).await;
+        if order.is_empty() && !exclude.is_empty() {
+            order = self.build_server_order(&[]).await;
+        }
+
+        if order.is_empty() {
+            for message_idx in 0..message_ids.len() {
+                on_trace(
+                    message_idx,
+                    DecodedBodyTrace {
+                        attempts: Vec::new(),
+                        result: Err(DecodedBodyError::Nntp(NntpError::PoolExhausted)),
+                    },
+                )
+                .await;
+            }
+            return;
+        }
+
+        let mut attempts_by_index: Vec<Vec<FetchAttemptTrace>> =
+            (0..message_ids.len()).map(|_| Vec::new()).collect();
+        let mut last_errors: Vec<Option<DecodedBodyError>> =
+            (0..message_ids.len()).map(|_| None).collect();
+        let mut pending: Vec<usize> = (0..message_ids.len()).collect();
+
+        for idx in order {
+            if pending.is_empty() {
+                break;
+            }
+
+            let pending_now = std::mem::take(&mut pending);
+            let pending_ids: Vec<String> = pending_now
+                .iter()
+                .map(|message_idx| message_ids[*message_idx].clone())
+                .collect();
+
+            let setup_deadline = TokioInstant::now() + self.soft_timeout;
+            let batch_started = Instant::now();
+            let mut conn = match self
+                .acquire_before_deadline(ServerId(idx), setup_deadline)
+                .await
+            {
+                Ok(conn) => conn,
+                Err(error) => {
+                    let make_error = Self::batch_setup_error_factory(&error);
+                    for message_idx in pending_now {
+                        let item = DecodedBatchItem {
+                            elapsed: batch_started.elapsed(),
+                            result: Err(DecodedBodyError::Nntp(make_error())),
+                        };
+                        match self
+                            .classify_decoded_batch_item(
+                                idx,
+                                &message_ids[message_idx],
+                                item,
+                                &mut attempts_by_index[message_idx],
+                                &mut last_errors[message_idx],
+                            )
+                            .await
+                        {
+                            DecodedBatchDisposition::Terminal(result) => {
+                                on_trace(
+                                    message_idx,
+                                    DecodedBodyTrace {
+                                        attempts: std::mem::take(
+                                            &mut attempts_by_index[message_idx],
+                                        ),
+                                        result,
+                                    },
+                                )
+                                .await;
+                            }
+                            DecodedBatchDisposition::Retry => pending.push(message_idx),
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            let group_result = match tokio::time::timeout_at(
+                setup_deadline,
+                Self::try_select_group(&mut conn, groups),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    self.discard_connection_error(idx, conn).await;
+                    let error = self.soft_timeout_error();
+                    let make_error = Self::batch_setup_error_factory(&error);
+                    for message_idx in pending_now {
+                        let item = DecodedBatchItem {
+                            elapsed: batch_started.elapsed(),
+                            result: Err(DecodedBodyError::Nntp(make_error())),
+                        };
+                        match self
+                            .classify_decoded_batch_item(
+                                idx,
+                                &message_ids[message_idx],
+                                item,
+                                &mut attempts_by_index[message_idx],
+                                &mut last_errors[message_idx],
+                            )
+                            .await
+                        {
+                            DecodedBatchDisposition::Terminal(result) => {
+                                on_trace(
+                                    message_idx,
+                                    DecodedBodyTrace {
+                                        attempts: std::mem::take(
+                                            &mut attempts_by_index[message_idx],
+                                        ),
+                                        result,
+                                    },
+                                )
+                                .await;
+                            }
+                            DecodedBatchDisposition::Retry => pending.push(message_idx),
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            if let Err(error) = group_result {
+                if is_connection_error(&error) {
+                    self.discard_connection_error(idx, conn).await;
+                }
+                let make_error = Self::batch_setup_error_factory(&error);
+                for message_idx in pending_now {
+                    let item = DecodedBatchItem {
+                        elapsed: batch_started.elapsed(),
+                        result: Err(DecodedBodyError::Nntp(make_error())),
+                    };
+                    match self
+                        .classify_decoded_batch_item(
+                            idx,
+                            &message_ids[message_idx],
+                            item,
+                            &mut attempts_by_index[message_idx],
+                            &mut last_errors[message_idx],
+                        )
+                        .await
+                    {
+                        DecodedBatchDisposition::Terminal(result) => {
+                            on_trace(
+                                message_idx,
+                                DecodedBodyTrace {
+                                    attempts: std::mem::take(&mut attempts_by_index[message_idx]),
+                                    result,
+                                },
+                            )
+                            .await;
+                        }
+                        DecodedBatchDisposition::Retry => pending.push(message_idx),
+                    }
+                }
+                continue;
+            }
+
+            let mut request_write_error = None;
+            for message_id in &pending_ids {
+                if let Err(error) = conn.write_body_request(message_id).await {
+                    request_write_error = Some(error);
+                    break;
+                }
+            }
+
+            if request_write_error.is_none()
+                && let Err(error) = conn.flush_commands().await
+            {
+                request_write_error = Some(error);
+            }
+
+            if let Some(error) = request_write_error {
+                if is_connection_error(&error) {
+                    self.discard_connection_error(idx, conn).await;
+                }
+                let make_error = Self::batch_setup_error_factory(&error);
+                for message_idx in pending_now {
+                    let item = DecodedBatchItem {
+                        elapsed: batch_started.elapsed(),
+                        result: Err(DecodedBodyError::Nntp(make_error())),
+                    };
+                    match self
+                        .classify_decoded_batch_item(
+                            idx,
+                            &message_ids[message_idx],
+                            item,
+                            &mut attempts_by_index[message_idx],
+                            &mut last_errors[message_idx],
+                        )
+                        .await
+                    {
+                        DecodedBatchDisposition::Terminal(result) => {
+                            on_trace(
+                                message_idx,
+                                DecodedBodyTrace {
+                                    attempts: std::mem::take(&mut attempts_by_index[message_idx]),
+                                    result,
+                                },
+                            )
+                            .await;
+                        }
+                        DecodedBatchDisposition::Retry => pending.push(message_idx),
+                    }
+                }
+                continue;
+            }
+
+            let mut conn = Some(conn);
+            let mut closed_early = false;
+            for (response_idx, message_idx) in pending_now.iter().copied().enumerate() {
+                let item_started = Instant::now();
+                let item_deadline = TokioInstant::now() + self.soft_timeout;
+                let item = match tokio::time::timeout_at(
+                    item_deadline,
+                    Self::read_decoded_pipelined_body(
+                        conn.as_mut()
+                            .expect("connection is available while reading"),
+                    ),
+                )
+                .await
+                {
+                    Ok(result) => DecodedBatchItem {
+                        elapsed: item_started.elapsed(),
+                        result,
+                    },
+                    Err(_) => {
+                        self.discard_connection_error(
+                            idx,
+                            conn.take()
+                                .expect("timed out connection is still owned by batch reader"),
+                        )
+                        .await;
+                        closed_early = true;
+                        DecodedBatchItem {
+                            elapsed: item_started.elapsed(),
+                            result: Err(DecodedBodyError::Nntp(self.soft_timeout_error())),
+                        }
+                    }
+                };
+
+                let poisoned = conn.as_ref().is_some_and(|conn| conn.is_poisoned());
+                match self
+                    .classify_decoded_batch_item(
+                        idx,
+                        &message_ids[message_idx],
+                        item,
+                        &mut attempts_by_index[message_idx],
+                        &mut last_errors[message_idx],
+                    )
+                    .await
+                {
+                    DecodedBatchDisposition::Terminal(result) => {
+                        on_trace(
+                            message_idx,
+                            DecodedBodyTrace {
+                                attempts: std::mem::take(&mut attempts_by_index[message_idx]),
+                                result,
+                            },
+                        )
+                        .await;
+                    }
+                    DecodedBatchDisposition::Retry => pending.push(message_idx),
+                }
+
+                if poisoned {
+                    conn.take()
+                        .expect("poisoned connection is still owned by batch reader")
+                        .discard();
+                    closed_early = true;
+                }
+
+                if closed_early {
+                    for unread_idx in pending_now.iter().copied().skip(response_idx + 1) {
+                        let item = DecodedBatchItem {
+                            elapsed: item_started.elapsed(),
+                            result: Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed)),
+                        };
+                        match self
+                            .classify_decoded_batch_item(
+                                idx,
+                                &message_ids[unread_idx],
+                                item,
+                                &mut attempts_by_index[unread_idx],
+                                &mut last_errors[unread_idx],
+                            )
+                            .await
+                        {
+                            DecodedBatchDisposition::Terminal(result) => {
+                                on_trace(
+                                    unread_idx,
+                                    DecodedBodyTrace {
+                                        attempts: std::mem::take(
+                                            &mut attempts_by_index[unread_idx],
+                                        ),
+                                        result,
+                                    },
+                                )
+                                .await;
+                            }
+                            DecodedBatchDisposition::Retry => pending.push(unread_idx),
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        for message_idx in pending {
+            on_trace(
+                message_idx,
+                DecodedBodyTrace {
+                    attempts: std::mem::take(&mut attempts_by_index[message_idx]),
+                    result: Err(last_errors[message_idx]
+                        .take()
+                        .unwrap_or(DecodedBodyError::Nntp(NntpError::PoolExhausted))),
+                },
+            )
+            .await;
+        }
+    }
+
     /// Like [`fetch_body_decoded_with_groups`](Self::fetch_body_decoded_with_groups)
     /// but skips the specified servers.
     pub async fn fetch_body_decoded_with_groups_excluding(
@@ -463,13 +899,127 @@ impl NntpClient {
         groups: &[String],
         exclude: &[usize],
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
+        self.fetch_body_decoded_with_groups_excluding_traced(message_id, groups, exclude)
+            .await
+            .result
+    }
+
+    async fn classify_decoded_batch_item(
+        &self,
+        server_idx: usize,
+        message_id: &str,
+        item: DecodedBatchItem,
+        attempts: &mut Vec<FetchAttemptTrace>,
+        last_error: &mut Option<DecodedBodyError>,
+    ) -> DecodedBatchDisposition {
+        let elapsed = item.elapsed;
+        match item.result {
+            Ok(decoded) => {
+                self.record_server_success(server_idx, elapsed).await;
+                attempts.push(FetchAttemptTrace {
+                    server_idx,
+                    elapsed,
+                    outcome: FetchAttemptOutcome::Success,
+                    error: None,
+                });
+                DecodedBatchDisposition::Terminal(Ok(decoded))
+            }
+            Err(DecodedBodyError::Decode { raw_size, error }) => {
+                self.record_server_success(server_idx, elapsed).await;
+                attempts.push(FetchAttemptTrace {
+                    server_idx,
+                    elapsed,
+                    outcome: FetchAttemptOutcome::Success,
+                    error: None,
+                });
+                DecodedBatchDisposition::Terminal(Err(DecodedBodyError::Decode { raw_size, error }))
+            }
+            Err(DecodedBodyError::Nntp(
+                NntpError::ArticleNotFound
+                | NntpError::NoSuchArticle { .. }
+                | NntpError::NoArticleWithNumber,
+            )) => {
+                attempts.push(FetchAttemptTrace {
+                    server_idx,
+                    elapsed,
+                    outcome: FetchAttemptOutcome::NotFound,
+                    error: Some("article not found".to_string()),
+                });
+                *last_error = Some(DecodedBodyError::Nntp(NntpError::NoSuchArticle {
+                    message_id: message_id.to_string(),
+                }));
+                DecodedBatchDisposition::Retry
+            }
+            Err(DecodedBodyError::Nntp(e @ NntpError::SoftTimeout(_))) => {
+                attempts.push(FetchAttemptTrace {
+                    server_idx,
+                    elapsed,
+                    outcome: FetchAttemptOutcome::TransientFailure,
+                    error: Some(e.to_string()),
+                });
+                if let Some(reason) = cooldown_reason(&e) {
+                    self.record_server_cooldown(server_idx, reason).await;
+                }
+                *last_error = Some(DecodedBodyError::Nntp(e));
+                DecodedBatchDisposition::Retry
+            }
+            Err(DecodedBodyError::Nntp(
+                NntpError::AuthenticationFailed
+                | NntpError::AuthenticationRejected
+                | NntpError::AccessDenied,
+            )) => {
+                attempts.push(FetchAttemptTrace {
+                    server_idx,
+                    elapsed,
+                    outcome: FetchAttemptOutcome::AuthenticationFailure,
+                    error: Some("authentication/access failure".to_string()),
+                });
+                self.record_server_failure(server_idx, true).await;
+                *last_error = Some(DecodedBodyError::Nntp(NntpError::AuthenticationFailed));
+                DecodedBatchDisposition::Retry
+            }
+            Err(DecodedBodyError::Nntp(e)) if is_transient(&e) => {
+                attempts.push(FetchAttemptTrace {
+                    server_idx,
+                    elapsed,
+                    outcome: FetchAttemptOutcome::TransientFailure,
+                    error: Some(e.to_string()),
+                });
+                if let Some(reason) = cooldown_reason(&e) {
+                    self.record_server_cooldown(server_idx, reason).await;
+                }
+                *last_error = Some(DecodedBodyError::Nntp(e));
+                DecodedBatchDisposition::Retry
+            }
+            Err(other) => {
+                attempts.push(FetchAttemptTrace {
+                    server_idx,
+                    elapsed,
+                    outcome: FetchAttemptOutcome::PermanentFailure,
+                    error: Some(format!("{other:?}")),
+                });
+                DecodedBatchDisposition::Terminal(Err(other))
+            }
+        }
+    }
+
+    pub async fn fetch_body_decoded_with_groups_excluding_traced(
+        &self,
+        message_id: &str,
+        groups: &[String],
+        exclude: &[usize],
+    ) -> DecodedBodyTrace {
         let order = self.build_server_order(exclude).await;
 
         if order.is_empty() {
-            return Err(DecodedBodyError::Nntp(NntpError::PoolExhausted));
+            return DecodedBodyTrace {
+                attempts: Vec::new(),
+                result: Err(DecodedBodyError::Nntp(NntpError::PoolExhausted)),
+            };
         }
 
         let mut last_error: Option<DecodedBodyError> = None;
+        let mut attempts = Vec::new();
 
         for idx in order {
             let server = ServerId(idx);
@@ -482,22 +1032,52 @@ impl NntpClient {
                 Ok(decoded) => {
                     let elapsed = start.elapsed();
                     self.record_server_success(idx, elapsed).await;
-                    return Ok(decoded);
+                    attempts.push(FetchAttemptTrace {
+                        server_idx: idx,
+                        elapsed,
+                        outcome: FetchAttemptOutcome::Success,
+                        error: None,
+                    });
+                    return DecodedBodyTrace {
+                        attempts,
+                        result: Ok(decoded),
+                    };
                 }
                 Err(DecodedBodyError::Decode { raw_size, error }) => {
-                    return Err(DecodedBodyError::Decode { raw_size, error });
+                    attempts.push(FetchAttemptTrace {
+                        server_idx: idx,
+                        elapsed: start.elapsed(),
+                        outcome: FetchAttemptOutcome::Success,
+                        error: None,
+                    });
+                    return DecodedBodyTrace {
+                        attempts,
+                        result: Err(DecodedBodyError::Decode { raw_size, error }),
+                    };
                 }
                 Err(DecodedBodyError::Nntp(
                     NntpError::ArticleNotFound
                     | NntpError::NoSuchArticle { .. }
                     | NntpError::NoArticleWithNumber,
                 )) => {
+                    attempts.push(FetchAttemptTrace {
+                        server_idx: idx,
+                        elapsed: start.elapsed(),
+                        outcome: FetchAttemptOutcome::NotFound,
+                        error: Some("article not found".to_string()),
+                    });
                     last_error = Some(DecodedBodyError::Nntp(NntpError::NoSuchArticle {
                         message_id: message_id.to_string(),
                     }));
                     continue;
                 }
                 Err(DecodedBodyError::Nntp(e @ NntpError::SoftTimeout(_))) => {
+                    attempts.push(FetchAttemptTrace {
+                        server_idx: idx,
+                        elapsed: start.elapsed(),
+                        outcome: FetchAttemptOutcome::TransientFailure,
+                        error: Some(e.to_string()),
+                    });
                     if let Some(reason) = cooldown_reason(&e) {
                         self.record_server_cooldown(idx, reason).await;
                     }
@@ -509,22 +1089,48 @@ impl NntpClient {
                     | NntpError::AuthenticationRejected
                     | NntpError::AccessDenied,
                 )) => {
+                    attempts.push(FetchAttemptTrace {
+                        server_idx: idx,
+                        elapsed: start.elapsed(),
+                        outcome: FetchAttemptOutcome::AuthenticationFailure,
+                        error: Some("authentication/access failure".to_string()),
+                    });
                     self.record_server_failure(idx, true).await;
                     last_error = Some(DecodedBodyError::Nntp(NntpError::AuthenticationFailed));
                     continue;
                 }
                 Err(DecodedBodyError::Nntp(e)) if is_transient(&e) => {
+                    attempts.push(FetchAttemptTrace {
+                        server_idx: idx,
+                        elapsed: start.elapsed(),
+                        outcome: FetchAttemptOutcome::TransientFailure,
+                        error: Some(e.to_string()),
+                    });
                     if let Some(reason) = cooldown_reason(&e) {
                         self.record_server_cooldown(idx, reason).await;
                     }
                     last_error = Some(DecodedBodyError::Nntp(e));
                     continue;
                 }
-                Err(other) => return Err(other),
+                Err(other) => {
+                    attempts.push(FetchAttemptTrace {
+                        server_idx: idx,
+                        elapsed: start.elapsed(),
+                        outcome: FetchAttemptOutcome::PermanentFailure,
+                        error: Some(format!("{other:?}")),
+                    });
+                    return DecodedBodyTrace {
+                        attempts,
+                        result: Err(other),
+                    };
+                }
             }
         }
 
-        Err(last_error.unwrap_or(DecodedBodyError::Nntp(NntpError::PoolExhausted)))
+        DecodedBodyTrace {
+            attempts,
+            result: Err(last_error.unwrap_or(DecodedBodyError::Nntp(NntpError::PoolExhausted))),
+        }
     }
 
     /// Fetch the headers of an article by message-id, with multi-server failover.
@@ -1084,6 +1690,65 @@ impl NntpClient {
                     }
                     return Err(DecodedBodyError::Nntp(e));
                 }
+            }
+        }
+    }
+
+    async fn read_decoded_pipelined_body(
+        conn: &mut PooledConnection,
+    ) -> std::result::Result<DecodedBody, DecodedBodyError> {
+        let mut decoder = StreamingArticleDecoder::new();
+        let mut output = Vec::new();
+        let mut raw_size = 0u32;
+        let mut decode_error: Option<YencError> = None;
+
+        let stream_result = conn
+            .stream_next_body_chunked_raw(|chunk| {
+                raw_size = raw_size.saturating_add(chunk.len() as u32);
+                if let Err(err) = decoder.feed_chunk(chunk, &mut output) {
+                    decode_error = Some(err);
+                    return Err(NntpError::MalformedResponse(
+                        "streamed yEnc decode failed".into(),
+                    ));
+                }
+                Ok(())
+            })
+            .await;
+
+        match stream_result {
+            Ok(_) => {
+                if let Some(error) = decode_error.take() {
+                    return Err(DecodedBodyError::Decode { raw_size, error });
+                }
+
+                decoder
+                    .finish(output)
+                    .map(|DecodedArticle { data, result }| DecodedBody {
+                        raw_size,
+                        decoded: data,
+                        result,
+                    })
+                    .map_err(|error| DecodedBodyError::Decode { raw_size, error })
+            }
+            Err(_e) if decode_error.is_some() => Err(DecodedBodyError::Decode {
+                raw_size,
+                error: decode_error.take().expect("decode error present"),
+            }),
+            Err(error) => Err(DecodedBodyError::Nntp(error)),
+        }
+    }
+
+    fn batch_setup_error_factory(error: &NntpError) -> Box<dyn Fn() -> NntpError + Send> {
+        match error {
+            NntpError::PoolExhausted => Box::new(|| NntpError::PoolExhausted),
+            NntpError::SoftTimeout(duration) => {
+                let duration = *duration;
+                Box::new(move || NntpError::SoftTimeout(duration))
+            }
+            _ if is_transient(error) => Box::new(|| NntpError::ConnectionClosed),
+            _ => {
+                let message = error.to_string();
+                Box::new(move || NntpError::MalformedResponse(message.clone()))
             }
         }
     }

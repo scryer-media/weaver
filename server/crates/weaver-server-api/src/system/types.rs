@@ -108,11 +108,24 @@ pub struct Metrics {
     pub bytes_decoded: u64,
     pub bytes_committed: u64,
     pub download_queue_depth: u32,
+    pub active_downloads: u32,
+    pub active_decodes: u32,
     pub decode_pending: u32,
+    pub decode_pending_bytes: u64,
+    pub decode_active_bytes: u64,
     pub commit_pending: u32,
     pub write_buffered_bytes: u64,
     pub write_buffered_segments: u32,
     pub direct_write_evictions: u64,
+    pub decode_pressure_soft_limit_bytes: u64,
+    pub decode_pressure_hard_limit_bytes: u64,
+    pub write_pressure_soft_limit_bytes: u64,
+    pub write_pressure_hard_limit_bytes: u64,
+    pub download_pressure_state: DownloadPressureStateGql,
+    pub download_pressure_reason: DownloadPressureReasonGql,
+    pub download_pressure_stalls_total: u64,
+    pub download_pressure_stall_duration_ms: u64,
+    pub download_pressure_current_stall_ms: u64,
     pub segments_downloaded: u64,
     pub segments_decoded: u64,
     pub segments_committed: u64,
@@ -124,11 +137,54 @@ pub struct Metrics {
     pub disk_write_latency_us: u64,
     pub segments_retried: u64,
     pub segments_failed_permanent: u64,
+    pub download_failures_article_not_found: u64,
+    pub download_failures_capacity_unavailable: u64,
+    pub download_failures_transient: u64,
+    pub download_failures_auth: u64,
+    pub download_failures_permanent: u64,
     pub current_download_speed: u64,
     pub crc_errors: u64,
     pub recovery_queue_depth: u32,
     pub articles_per_sec: f64,
     pub decode_rate_mbps: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum DownloadPressureStateGql {
+    #[default]
+    Clear,
+    Soft,
+    Hard,
+}
+
+impl From<weaver_server_core::DownloadPressureState> for DownloadPressureStateGql {
+    fn from(value: weaver_server_core::DownloadPressureState) -> Self {
+        match value {
+            weaver_server_core::DownloadPressureState::Clear => Self::Clear,
+            weaver_server_core::DownloadPressureState::Soft => Self::Soft,
+            weaver_server_core::DownloadPressureState::Hard => Self::Hard,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum DownloadPressureReasonGql {
+    #[default]
+    None,
+    Decode,
+    Write,
+    DecodeAndWrite,
+}
+
+impl From<weaver_server_core::DownloadPressureReason> for DownloadPressureReasonGql {
+    fn from(value: weaver_server_core::DownloadPressureReason) -> Self {
+        match value {
+            weaver_server_core::DownloadPressureReason::None => Self::None,
+            weaver_server_core::DownloadPressureReason::Decode => Self::Decode,
+            weaver_server_core::DownloadPressureReason::Write => Self::Write,
+            weaver_server_core::DownloadPressureReason::DecodeAndWrite => Self::DecodeAndWrite,
+        }
+    }
 }
 
 impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
@@ -138,11 +194,24 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             bytes_decoded: m.bytes_decoded,
             bytes_committed: m.bytes_committed,
             download_queue_depth: m.download_queue_depth as u32,
+            active_downloads: m.active_downloads as u32,
+            active_decodes: m.active_decodes as u32,
             decode_pending: m.decode_pending as u32,
+            decode_pending_bytes: m.decode_pending_bytes,
+            decode_active_bytes: m.decode_active_bytes,
             commit_pending: m.commit_pending as u32,
             write_buffered_bytes: m.write_buffered_bytes,
             write_buffered_segments: m.write_buffered_segments as u32,
             direct_write_evictions: m.direct_write_evictions,
+            decode_pressure_soft_limit_bytes: m.decode_pressure_soft_limit_bytes,
+            decode_pressure_hard_limit_bytes: m.decode_pressure_hard_limit_bytes,
+            write_pressure_soft_limit_bytes: m.write_pressure_soft_limit_bytes,
+            write_pressure_hard_limit_bytes: m.write_pressure_hard_limit_bytes,
+            download_pressure_state: m.download_pressure_state.into(),
+            download_pressure_reason: m.download_pressure_reason.into(),
+            download_pressure_stalls_total: m.download_pressure_stalls_total,
+            download_pressure_stall_duration_ms: m.download_pressure_stall_duration_ms,
+            download_pressure_current_stall_ms: m.download_pressure_current_stall_ms,
             segments_downloaded: m.segments_downloaded,
             segments_decoded: m.segments_decoded,
             segments_committed: m.segments_committed,
@@ -154,6 +223,11 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             disk_write_latency_us: m.disk_write_latency_us,
             segments_retried: m.segments_retried,
             segments_failed_permanent: m.segments_failed_permanent,
+            download_failures_article_not_found: m.download_failures_article_not_found,
+            download_failures_capacity_unavailable: m.download_failures_capacity_unavailable,
+            download_failures_transient: m.download_failures_transient,
+            download_failures_auth: m.download_failures_auth,
+            download_failures_permanent: m.download_failures_permanent,
             current_download_speed: m.current_download_speed,
             crc_errors: m.crc_errors,
             recovery_queue_depth: m.recovery_queue_depth as u32,
