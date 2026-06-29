@@ -40,9 +40,9 @@ use crate::jobs::{ArchivePasswordCandidate, ArchivePasswordSource};
 use crate::runtime::buffers::{BufferHandle, BufferPool};
 use crate::runtime::system_profile::SystemProfile;
 use crate::{
-    DownloadPressureReason, DownloadPressureState, DownloadQueue, DownloadWork, JobInfo, JobSpec,
-    JobState, JobStatus, PipelineMetrics, RuntimeTuner, SchedulerCommand, SchedulerError,
-    SharedPipelineState, TokenBucket,
+    DispatchShareMode, DownloadPressureReason, DownloadPressureState, DownloadQueue, DownloadWork,
+    JobInfo, JobSpec, JobState, JobStatus, PipelineMetrics, RuntimeTuner, SchedulerCommand,
+    SchedulerError, SharedPipelineState, SpilloverDecision, TokenBucket,
 };
 use weaver_nntp::NntpClient;
 #[cfg(test)]
@@ -575,6 +575,22 @@ pub struct Pipeline {
     pub(super) active_download_connections: usize,
     /// Number of in-flight recovery downloads (subset of active_downloads).
     pub(super) active_recovery: usize,
+    /// Current hot job receiving exclusive article-dispatch preference.
+    pub(super) hot_dispatch_job: Option<JobId>,
+    /// When the current hot-dispatch ownership period began.
+    pub(super) hot_dispatch_started_at: Option<Instant>,
+    /// Successful primary BODY responses observed during the current hot period.
+    pub(super) hot_dispatch_successes: u64,
+    /// Best observed speed while the current hot job was exclusive.
+    pub(super) hot_dispatch_exclusive_peak_bps: u64,
+    /// Last time dispatch lent a reclaimable connection to spillover work.
+    pub(super) hot_dispatch_last_lend_at: Option<Instant>,
+    /// Current scheduler share mode.
+    pub(super) hot_dispatch_mode: DispatchShareMode,
+    /// Start of the current unused-capacity underfill window.
+    pub(super) hot_dispatch_underfill_since: Option<Instant>,
+    /// Most recent spillover decision, for tick logging.
+    pub(super) hot_dispatch_last_spillover_decision: SpilloverDecision,
     /// Jobs currently inside an active article download pass.
     pub(super) active_download_passes: HashSet<JobId>,
     /// Jobs that still have decode/write pipeline work after network downloads finished.

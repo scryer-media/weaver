@@ -126,6 +126,18 @@ pub struct Metrics {
     pub download_pressure_stalls_total: u64,
     pub download_pressure_stall_duration_ms: u64,
     pub download_pressure_current_stall_ms: u64,
+    pub hot_dispatch_job_id: u64,
+    pub hot_dispatch_mode: String,
+    pub hot_dispatch_underfill_ms: u64,
+    pub hot_dispatch_lent_connections: u32,
+    pub hot_dispatch_warmup_complete: bool,
+    pub hot_dispatch_last_spillover_decision: String,
+    pub hot_dispatch_spillover_blocked_warmup_total: u64,
+    pub hot_dispatch_spillover_blocked_pressure_total: u64,
+    pub hot_dispatch_spillover_blocked_near_cap_total: u64,
+    pub hot_dispatch_spillover_blocked_hot_can_use_capacity_total: u64,
+    pub hot_dispatch_spillover_allowed_underfill_total: u64,
+    pub hot_dispatch_spillover_reclaimed_total: u64,
     pub segments_downloaded: u64,
     pub segments_decoded: u64,
     pub segments_committed: u64,
@@ -212,6 +224,26 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             download_pressure_stalls_total: m.download_pressure_stalls_total,
             download_pressure_stall_duration_ms: m.download_pressure_stall_duration_ms,
             download_pressure_current_stall_ms: m.download_pressure_current_stall_ms,
+            hot_dispatch_job_id: m.hot_dispatch_job_id,
+            hot_dispatch_mode: m.hot_dispatch_mode.as_str().to_string(),
+            hot_dispatch_underfill_ms: m.hot_dispatch_underfill_ms,
+            hot_dispatch_lent_connections: m.hot_dispatch_lent_connections as u32,
+            hot_dispatch_warmup_complete: m.hot_dispatch_warmup_complete,
+            hot_dispatch_last_spillover_decision: m
+                .hot_dispatch_last_spillover_decision
+                .as_str()
+                .to_string(),
+            hot_dispatch_spillover_blocked_warmup_total: m
+                .hot_dispatch_spillover_blocked_warmup_total,
+            hot_dispatch_spillover_blocked_pressure_total: m
+                .hot_dispatch_spillover_blocked_pressure_total,
+            hot_dispatch_spillover_blocked_near_cap_total: m
+                .hot_dispatch_spillover_blocked_near_cap_total,
+            hot_dispatch_spillover_blocked_hot_can_use_capacity_total: m
+                .hot_dispatch_spillover_blocked_hot_can_use_capacity_total,
+            hot_dispatch_spillover_allowed_underfill_total: m
+                .hot_dispatch_spillover_allowed_underfill_total,
+            hot_dispatch_spillover_reclaimed_total: m.hot_dispatch_spillover_reclaimed_total,
             segments_downloaded: m.segments_downloaded,
             segments_decoded: m.segments_decoded,
             segments_committed: m.segments_committed,

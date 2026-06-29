@@ -15,6 +15,18 @@ fn metrics_snapshot() {
     m.download_failures_capacity_unavailable
         .store(3, Ordering::Relaxed);
     m.download_failures_transient.store(4, Ordering::Relaxed);
+    m.hot_dispatch_job_id.store(42, Ordering::Relaxed);
+    m.hot_dispatch_mode
+        .store(DispatchShareMode::Shared.as_code(), Ordering::Relaxed);
+    m.hot_dispatch_underfill_ms.store(2500, Ordering::Relaxed);
+    m.hot_dispatch_lent_connections.store(2, Ordering::Relaxed);
+    m.hot_dispatch_warmup_complete.store(1, Ordering::Relaxed);
+    m.hot_dispatch_last_spillover_decision.store(
+        SpilloverDecision::AllowedUnderfill.as_code(),
+        Ordering::Relaxed,
+    );
+    m.hot_dispatch_spillover_allowed_underfill_total
+        .store(7, Ordering::Relaxed);
 
     let snap = m.snapshot();
     assert_eq!(snap.bytes_downloaded, 1024);
@@ -27,6 +39,16 @@ fn metrics_snapshot() {
     assert_eq!(snap.download_failures_capacity_unavailable, 3);
     assert_eq!(snap.download_failures_transient, 4);
     assert_eq!(snap.bytes_decoded, 0);
+    assert_eq!(snap.hot_dispatch_job_id, 42);
+    assert_eq!(snap.hot_dispatch_mode, DispatchShareMode::Shared);
+    assert_eq!(snap.hot_dispatch_underfill_ms, 2500);
+    assert_eq!(snap.hot_dispatch_lent_connections, 2);
+    assert!(snap.hot_dispatch_warmup_complete);
+    assert_eq!(
+        snap.hot_dispatch_last_spillover_decision,
+        SpilloverDecision::AllowedUnderfill
+    );
+    assert_eq!(snap.hot_dispatch_spillover_allowed_underfill_total, 7);
 }
 
 #[test]

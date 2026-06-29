@@ -5039,13 +5039,27 @@ async fn dispatch_downloads_allows_postprocessing_status_with_remaining_download
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 2);
-    for (job_id, expected_status) in &cases {
-        let state = pipeline.jobs.get(job_id).unwrap();
-        assert_eq!(&state.status, expected_status);
-        assert_eq!(state.download_queue.len(), 0);
-        assert!(pipeline.active_download_passes.contains(job_id));
-    }
+    assert_eq!(pipeline.active_downloads, 1);
+    let first_job_id = cases[0].0;
+    let first_state = pipeline.jobs.get(&first_job_id).unwrap();
+    assert_eq!(&first_state.status, &cases[0].1);
+    assert_eq!(first_state.download_queue.len(), 0);
+    assert!(pipeline.active_download_passes.contains(&first_job_id));
+
+    pipeline.active_downloads = 0;
+    pipeline.active_download_connections = 0;
+    pipeline.active_downloads_by_job.clear();
+    pipeline.active_download_connections_by_job.clear();
+    pipeline.active_downloads_by_file.clear();
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.active_downloads, 1);
+    let second_job_id = cases[1].0;
+    let second_state = pipeline.jobs.get(&second_job_id).unwrap();
+    assert_eq!(&second_state.status, &cases[1].1);
+    assert_eq!(second_state.download_queue.len(), 0);
+    assert!(pipeline.active_download_passes.contains(&second_job_id));
 }
 
 #[tokio::test]
@@ -5276,6 +5290,65 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
 
     pipeline.dispatch_downloads();
 
+    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.active_download_connections, 1);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&earlier_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        0
+    );
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&later_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        2
+    );
+    assert_eq!(
+        pipeline.active_downloads_by_job.get(&earlier_job_id),
+        Some(&1)
+    );
+    assert_eq!(pipeline.active_downloads_by_job.get(&later_job_id), None);
+    assert_eq!(pipeline.hot_dispatch_job, Some(earlier_job_id));
+    assert!(
+        pipeline
+            .metrics
+            .hot_dispatch_spillover_blocked_warmup_total
+            .load(Ordering::Relaxed)
+            >= 1
+    );
+
+    let warmed = Instant::now();
+    pipeline.hot_dispatch_started_at = Some(warmed - Duration::from_secs(5));
+    pipeline.hot_dispatch_underfill_since = None;
+    pipeline.hot_dispatch_successes = 0;
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.active_download_connections, 1);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&later_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        2
+    );
+    assert!(pipeline.hot_dispatch_underfill_since.is_some());
+    assert_eq!(pipeline.hot_dispatch_mode, DispatchShareMode::Exclusive);
+
+    pipeline.hot_dispatch_underfill_since = Some(Instant::now() - Duration::from_secs(2));
+
+    pipeline.dispatch_downloads();
+
     assert_eq!(pipeline.active_downloads, 3);
     assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(
@@ -5303,6 +5376,65 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
     assert_eq!(
         pipeline.active_downloads_by_job.get(&later_job_id),
         Some(&2)
+    );
+    assert_eq!(pipeline.hot_dispatch_mode, DispatchShareMode::Shared);
+    assert!(
+        pipeline
+            .metrics
+            .hot_dispatch_spillover_allowed_underfill_total
+            .load(Ordering::Relaxed)
+            >= 1
+    );
+}
+
+#[tokio::test]
+async fn release_download_result_updates_hot_job_successes_before_heavy_processing() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20022);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+
+    pipeline.hot_dispatch_job = Some(job_id);
+    pipeline.hot_dispatch_started_at = Some(Instant::now() - Duration::from_secs(2));
+    pipeline.hot_dispatch_successes = 23;
+    pipeline.active_downloads = 1;
+    pipeline.active_download_connections = 1;
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline
+        .active_download_connections_by_job
+        .insert(job_id, 1);
+    pipeline
+        .active_downloads_by_file
+        .insert(segment_id.file_id, 1);
+
+    pipeline.release_download_result(&DownloadResult {
+        segment_id,
+        data: Ok(DownloadPayload::Raw(Bytes::from_static(b"article"))),
+        attempts: vec![],
+        source_server_idx: None,
+        is_recovery: false,
+        retry_count: 0,
+        exclude_servers: vec![],
+        release_connection_slot: true,
+    });
+
+    assert_eq!(pipeline.hot_dispatch_successes, 24);
+    assert_eq!(
+        pipeline.metrics.hot_dispatch_job_id.load(Ordering::Relaxed),
+        job_id.0
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .hot_dispatch_warmup_complete
+            .load(Ordering::Relaxed),
+        1
     );
 }
 

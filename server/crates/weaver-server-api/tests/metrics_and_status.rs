@@ -36,6 +36,18 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         download_pressure_stalls_total: 0,
         download_pressure_stall_duration_ms: 0,
         download_pressure_current_stall_ms: 0,
+        hot_dispatch_job_id: 0,
+        hot_dispatch_mode: weaver_server_core::DispatchShareMode::Exclusive,
+        hot_dispatch_underfill_ms: 0,
+        hot_dispatch_lent_connections: 0,
+        hot_dispatch_warmup_complete: false,
+        hot_dispatch_last_spillover_decision: weaver_server_core::SpilloverDecision::None,
+        hot_dispatch_spillover_blocked_warmup_total: 0,
+        hot_dispatch_spillover_blocked_pressure_total: 0,
+        hot_dispatch_spillover_blocked_near_cap_total: 0,
+        hot_dispatch_spillover_blocked_hot_can_use_capacity_total: 0,
+        hot_dispatch_spillover_allowed_underfill_total: 0,
+        hot_dispatch_spillover_reclaimed_total: 0,
         segments_downloaded: bytes_downloaded / 100,
         segments_decoded: bytes_downloaded / 200,
         segments_committed: bytes_downloaded / 300,
@@ -169,7 +181,7 @@ async fn metrics_has_expected_fields() {
     let h = TestHarness::new().await;
     let resp = h
         .execute(
-            "{ metrics { bytesDownloaded bytesDecoded bytesCommitted downloadQueueDepth segmentsDownloaded currentDownloadSpeed } }",
+            "{ metrics { bytesDownloaded bytesDecoded bytesCommitted downloadQueueDepth segmentsDownloaded currentDownloadSpeed hotDispatchJobId hotDispatchMode hotDispatchUnderfillMs hotDispatchLentConnections hotDispatchWarmupComplete hotDispatchLastSpilloverDecision hotDispatchSpilloverBlockedWarmupTotal hotDispatchSpilloverAllowedUnderfillTotal } }",
         )
         .await;
     assert_no_errors(&resp);
@@ -179,6 +191,14 @@ async fn metrics_has_expected_fields() {
     assert!(m["bytesDecoded"].is_number());
     assert!(m["downloadQueueDepth"].is_number());
     assert!(m["currentDownloadSpeed"].is_number());
+    assert!(m["hotDispatchJobId"].is_number());
+    assert!(m["hotDispatchMode"].is_string());
+    assert!(m["hotDispatchUnderfillMs"].is_number());
+    assert!(m["hotDispatchLentConnections"].is_number());
+    assert!(m["hotDispatchWarmupComplete"].is_boolean());
+    assert!(m["hotDispatchLastSpilloverDecision"].is_string());
+    assert!(m["hotDispatchSpilloverBlockedWarmupTotal"].is_number());
+    assert!(m["hotDispatchSpilloverAllowedUnderfillTotal"].is_number());
 }
 
 #[tokio::test]

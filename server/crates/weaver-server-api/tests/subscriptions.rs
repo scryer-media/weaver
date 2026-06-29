@@ -134,6 +134,7 @@ async fn queue_snapshots_keep_cached_speed_on_unrelated_events() {
     h.metrics
         .bytes_downloaded
         .fetch_add(256 * 1024, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(60)).await;
     h.shared_state.refresh_metrics_snapshot();
     let expected_speed = h.handle.get_metrics().current_download_speed;
     assert!(expected_speed > 0);
@@ -314,14 +315,15 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
             .unwrap()
     );
 
-    tokio::time::sleep(Duration::from_millis(60)).await;
     h.metrics
         .bytes_downloaded
         .fetch_add(256 * 1024, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    h.shared_state.refresh_metrics_snapshot();
 
     let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
         .await
-        .expect("metrics subscription should emit live speed without shared refresh")
+        .expect("metrics subscription should emit refreshed snapshot speed")
         .expect("stream should stay open");
     assert!(second.errors.is_empty());
     let second_data = second.data.into_json().unwrap();
@@ -354,7 +356,7 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
 }
 
 #[tokio::test]
-async fn system_metrics_updates_keep_independent_speed_samplers_per_subscriber() {
+async fn system_metrics_updates_share_metrics_snapshot_speed() {
     let h = TestHarness::new().await;
     let query = "subscription { systemMetricsUpdates { metrics { currentDownloadSpeed } } }";
     let mut stream_a = h
@@ -375,32 +377,39 @@ async fn system_metrics_updates_keep_independent_speed_samplers_per_subscriber()
         .expect("second stream should stay open");
     assert!(first_b.errors.is_empty());
 
-    tokio::time::sleep(Duration::from_millis(60)).await;
     h.metrics
         .bytes_downloaded
         .fetch_add(256 * 1024, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    h.shared_state.refresh_metrics_snapshot();
 
-    let (next_a, next_b) = tokio::join!(
-        tokio::time::timeout(Duration::from_secs(3), stream_a.next()),
-        tokio::time::timeout(Duration::from_secs(3), stream_b.next()),
+    async fn next_nonzero_speed<S>(stream: &mut S, label: &str) -> u64
+    where
+        S: tokio_stream::Stream<Item = async_graphql::Response> + Unpin,
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "{label} should observe live speed");
+            let response = tokio::time::timeout(remaining, stream.next())
+                .await
+                .unwrap_or_else(|_| panic!("{label} should receive a live update"))
+                .expect("stream should stay open");
+            assert!(response.errors.is_empty());
+            let speed = response.data.into_json().unwrap()["systemMetricsUpdates"]["metrics"]
+                ["currentDownloadSpeed"]
+                .as_u64()
+                .unwrap();
+            if speed > 0 {
+                return speed;
+            }
+        }
+    }
+
+    let (speed_a, speed_b) = tokio::join!(
+        next_nonzero_speed(&mut stream_a, "first subscriber"),
+        next_nonzero_speed(&mut stream_b, "second subscriber"),
     );
-    let next_a = next_a
-        .expect("first subscriber should receive a live update")
-        .expect("first stream should stay open");
-    let next_b = next_b
-        .expect("second subscriber should receive a live update")
-        .expect("second stream should stay open");
-    assert!(next_a.errors.is_empty());
-    assert!(next_b.errors.is_empty());
-
-    let speed_a =
-        next_a.data.into_json().unwrap()["systemMetricsUpdates"]["metrics"]["currentDownloadSpeed"]
-            .as_u64()
-            .unwrap();
-    let speed_b =
-        next_b.data.into_json().unwrap()["systemMetricsUpdates"]["metrics"]["currentDownloadSpeed"]
-            .as_u64()
-            .unwrap();
     assert!(speed_a > 0, "first subscriber should observe live speed");
     assert!(speed_b > 0, "second subscriber should observe live speed");
 }

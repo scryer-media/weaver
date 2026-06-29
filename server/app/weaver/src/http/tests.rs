@@ -1299,6 +1299,19 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         download_pressure_stalls_total: 24,
         download_pressure_stall_duration_ms: 1500,
         download_pressure_current_stall_ms: 250,
+        hot_dispatch_job_id: 42,
+        hot_dispatch_mode: weaver_server_core::DispatchShareMode::Shared,
+        hot_dispatch_underfill_ms: 2500,
+        hot_dispatch_lent_connections: 2,
+        hot_dispatch_warmup_complete: true,
+        hot_dispatch_last_spillover_decision:
+            weaver_server_core::SpilloverDecision::AllowedUnderfill,
+        hot_dispatch_spillover_blocked_warmup_total: 29,
+        hot_dispatch_spillover_blocked_pressure_total: 30,
+        hot_dispatch_spillover_blocked_near_cap_total: 31,
+        hot_dispatch_spillover_blocked_hot_can_use_capacity_total: 32,
+        hot_dispatch_spillover_allowed_underfill_total: 33,
+        hot_dispatch_spillover_reclaimed_total: 34,
         segments_downloaded: 11,
         segments_decoded: 12,
         segments_committed: 13,
@@ -1373,6 +1386,17 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     assert!(rendered.contains("weaver_pipeline_download_observed_limiter{limiter=\"gated\"} 1"));
     assert!(rendered.contains("weaver_pipeline_download_pressure_stalls_total 24"));
     assert!(rendered.contains("weaver_pipeline_download_pressure_stall_duration_seconds 1.5"));
+    assert!(rendered.contains("weaver_pipeline_hot_dispatch_job_id 42"));
+    assert!(rendered.contains("weaver_pipeline_hot_dispatch_mode{mode=\"shared\"} 1"));
+    assert!(rendered.contains("weaver_pipeline_hot_dispatch_underfill_milliseconds 2500"));
+    assert!(rendered.contains("weaver_pipeline_hot_dispatch_lent_connections 2"));
+    assert!(rendered.contains("weaver_pipeline_hot_dispatch_warmup_complete 1"));
+    assert!(rendered.contains(
+        "weaver_pipeline_hot_dispatch_last_spillover_decision{decision=\"allowed_underfill\"} 1"
+    ));
+    assert!(rendered.contains(
+        "weaver_pipeline_hot_dispatch_spillover_decisions_total{decision=\"allowed_underfill\"} 33"
+    ));
     assert!(
         rendered.contains("weaver_pipeline_download_failures_total{kind=\"article_not_found\"} 24")
     );
@@ -1415,6 +1439,18 @@ fn renders_prometheus_download_observed_limiter_states() {
         download_pressure_stalls_total: 0,
         download_pressure_stall_duration_ms: 0,
         download_pressure_current_stall_ms: 0,
+        hot_dispatch_job_id: 0,
+        hot_dispatch_mode: weaver_server_core::DispatchShareMode::Exclusive,
+        hot_dispatch_underfill_ms: 0,
+        hot_dispatch_lent_connections: 0,
+        hot_dispatch_warmup_complete: false,
+        hot_dispatch_last_spillover_decision: weaver_server_core::SpilloverDecision::None,
+        hot_dispatch_spillover_blocked_warmup_total: 0,
+        hot_dispatch_spillover_blocked_pressure_total: 0,
+        hot_dispatch_spillover_blocked_near_cap_total: 0,
+        hot_dispatch_spillover_blocked_hot_can_use_capacity_total: 0,
+        hot_dispatch_spillover_allowed_underfill_total: 0,
+        hot_dispatch_spillover_reclaimed_total: 0,
         segments_downloaded: 0,
         segments_decoded: 0,
         segments_committed: 0,

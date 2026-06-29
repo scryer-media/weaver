@@ -91,6 +91,98 @@ impl Default for DownloadPressureReason {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchShareMode {
+    Exclusive,
+    Shared,
+}
+
+impl DispatchShareMode {
+    pub const fn as_code(self) -> usize {
+        match self {
+            Self::Exclusive => 0,
+            Self::Shared => 1,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exclusive => "exclusive",
+            Self::Shared => "shared",
+        }
+    }
+
+    pub const fn from_code(code: usize) -> Self {
+        match code {
+            1 => Self::Shared,
+            _ => Self::Exclusive,
+        }
+    }
+}
+
+impl Default for DispatchShareMode {
+    fn default() -> Self {
+        Self::Exclusive
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpilloverDecision {
+    None,
+    BlockedWarmup,
+    BlockedPressure,
+    BlockedNearCap,
+    BlockedHotCanUseCapacity,
+    AllowedUnderfill,
+    Reclaimed,
+}
+
+impl SpilloverDecision {
+    pub const fn as_code(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::BlockedWarmup => 1,
+            Self::BlockedPressure => 2,
+            Self::BlockedNearCap => 3,
+            Self::BlockedHotCanUseCapacity => 4,
+            Self::AllowedUnderfill => 5,
+            Self::Reclaimed => 6,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::BlockedWarmup => "blocked_warmup",
+            Self::BlockedPressure => "blocked_pressure",
+            Self::BlockedNearCap => "blocked_near_cap",
+            Self::BlockedHotCanUseCapacity => "blocked_hot_can_use_capacity",
+            Self::AllowedUnderfill => "allowed_underfill",
+            Self::Reclaimed => "reclaimed",
+        }
+    }
+
+    pub const fn from_code(code: usize) -> Self {
+        match code {
+            1 => Self::BlockedWarmup,
+            2 => Self::BlockedPressure,
+            3 => Self::BlockedNearCap,
+            4 => Self::BlockedHotCanUseCapacity,
+            5 => Self::AllowedUnderfill,
+            6 => Self::Reclaimed,
+            _ => Self::None,
+        }
+    }
+}
+
+impl Default for SpilloverDecision {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 /// Tracks download speed using a sliding window of byte samples.
 struct SpeedTracker {
     /// Ring buffer of (timestamp, cumulative_bytes) samples.
@@ -200,6 +292,18 @@ pub struct PipelineMetrics {
     pub download_pressure_stalls_total: AtomicU64,
     pub download_pressure_stall_duration_ms: AtomicU64,
     pub download_pressure_current_stall_ms: AtomicU64,
+    pub hot_dispatch_job_id: AtomicU64,
+    pub hot_dispatch_mode: AtomicUsize,
+    pub hot_dispatch_underfill_ms: AtomicU64,
+    pub hot_dispatch_lent_connections: AtomicUsize,
+    pub hot_dispatch_warmup_complete: AtomicUsize,
+    pub hot_dispatch_last_spillover_decision: AtomicUsize,
+    pub hot_dispatch_spillover_blocked_warmup_total: AtomicU64,
+    pub hot_dispatch_spillover_blocked_pressure_total: AtomicU64,
+    pub hot_dispatch_spillover_blocked_near_cap_total: AtomicU64,
+    pub hot_dispatch_spillover_blocked_hot_can_use_capacity_total: AtomicU64,
+    pub hot_dispatch_spillover_allowed_underfill_total: AtomicU64,
+    pub hot_dispatch_spillover_reclaimed_total: AtomicU64,
 
     // Counts
     pub segments_downloaded: AtomicU64,
@@ -261,6 +365,20 @@ impl PipelineMetrics {
             download_pressure_stalls_total: AtomicU64::new(0),
             download_pressure_stall_duration_ms: AtomicU64::new(0),
             download_pressure_current_stall_ms: AtomicU64::new(0),
+            hot_dispatch_job_id: AtomicU64::new(0),
+            hot_dispatch_mode: AtomicUsize::new(DispatchShareMode::Exclusive.as_code()),
+            hot_dispatch_underfill_ms: AtomicU64::new(0),
+            hot_dispatch_lent_connections: AtomicUsize::new(0),
+            hot_dispatch_warmup_complete: AtomicUsize::new(0),
+            hot_dispatch_last_spillover_decision: AtomicUsize::new(
+                SpilloverDecision::None.as_code(),
+            ),
+            hot_dispatch_spillover_blocked_warmup_total: AtomicU64::new(0),
+            hot_dispatch_spillover_blocked_pressure_total: AtomicU64::new(0),
+            hot_dispatch_spillover_blocked_near_cap_total: AtomicU64::new(0),
+            hot_dispatch_spillover_blocked_hot_can_use_capacity_total: AtomicU64::new(0),
+            hot_dispatch_spillover_allowed_underfill_total: AtomicU64::new(0),
+            hot_dispatch_spillover_reclaimed_total: AtomicU64::new(0),
             segments_downloaded: AtomicU64::new(0),
             segments_decoded: AtomicU64::new(0),
             segments_committed: AtomicU64::new(0),
@@ -370,6 +488,38 @@ impl PipelineMetrics {
             download_pressure_current_stall_ms: self
                 .download_pressure_current_stall_ms
                 .load(Ordering::Relaxed),
+            hot_dispatch_job_id: self.hot_dispatch_job_id.load(Ordering::Relaxed),
+            hot_dispatch_mode: DispatchShareMode::from_code(
+                self.hot_dispatch_mode.load(Ordering::Relaxed),
+            ),
+            hot_dispatch_underfill_ms: self.hot_dispatch_underfill_ms.load(Ordering::Relaxed),
+            hot_dispatch_lent_connections: self
+                .hot_dispatch_lent_connections
+                .load(Ordering::Relaxed),
+            hot_dispatch_warmup_complete: self.hot_dispatch_warmup_complete.load(Ordering::Relaxed)
+                != 0,
+            hot_dispatch_last_spillover_decision: SpilloverDecision::from_code(
+                self.hot_dispatch_last_spillover_decision
+                    .load(Ordering::Relaxed),
+            ),
+            hot_dispatch_spillover_blocked_warmup_total: self
+                .hot_dispatch_spillover_blocked_warmup_total
+                .load(Ordering::Relaxed),
+            hot_dispatch_spillover_blocked_pressure_total: self
+                .hot_dispatch_spillover_blocked_pressure_total
+                .load(Ordering::Relaxed),
+            hot_dispatch_spillover_blocked_near_cap_total: self
+                .hot_dispatch_spillover_blocked_near_cap_total
+                .load(Ordering::Relaxed),
+            hot_dispatch_spillover_blocked_hot_can_use_capacity_total: self
+                .hot_dispatch_spillover_blocked_hot_can_use_capacity_total
+                .load(Ordering::Relaxed),
+            hot_dispatch_spillover_allowed_underfill_total: self
+                .hot_dispatch_spillover_allowed_underfill_total
+                .load(Ordering::Relaxed),
+            hot_dispatch_spillover_reclaimed_total: self
+                .hot_dispatch_spillover_reclaimed_total
+                .load(Ordering::Relaxed),
             segments_downloaded,
             segments_decoded: self.segments_decoded.load(Ordering::Relaxed),
             segments_committed: self.segments_committed.load(Ordering::Relaxed),
@@ -442,6 +592,18 @@ pub struct MetricsSnapshot {
     pub download_pressure_stalls_total: u64,
     pub download_pressure_stall_duration_ms: u64,
     pub download_pressure_current_stall_ms: u64,
+    pub hot_dispatch_job_id: u64,
+    pub hot_dispatch_mode: DispatchShareMode,
+    pub hot_dispatch_underfill_ms: u64,
+    pub hot_dispatch_lent_connections: usize,
+    pub hot_dispatch_warmup_complete: bool,
+    pub hot_dispatch_last_spillover_decision: SpilloverDecision,
+    pub hot_dispatch_spillover_blocked_warmup_total: u64,
+    pub hot_dispatch_spillover_blocked_pressure_total: u64,
+    pub hot_dispatch_spillover_blocked_near_cap_total: u64,
+    pub hot_dispatch_spillover_blocked_hot_can_use_capacity_total: u64,
+    pub hot_dispatch_spillover_allowed_underfill_total: u64,
+    pub hot_dispatch_spillover_reclaimed_total: u64,
     pub segments_downloaded: u64,
     pub segments_decoded: u64,
     pub segments_committed: u64,

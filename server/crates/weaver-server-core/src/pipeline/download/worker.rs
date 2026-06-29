@@ -11,6 +11,10 @@ const DOWNLOAD_PRESSURE_SOFT_PERCENT: u64 = 70;
 const SOFT_PRESSURE_DISPATCH_MAX_DELAY: Duration = Duration::from_millis(150);
 const SOFT_PRESSURE_DISPATCH_MIN_DELAY: Duration = Duration::from_millis(1);
 const SAB_BODY_PIPELINE_DEPTH: usize = 2;
+const HOT_DISPATCH_WARMUP_MIN_DURATION: Duration = Duration::from_secs(2);
+const HOT_DISPATCH_FORCE_UNDERFILL_AFTER: Duration = Duration::from_secs(5);
+const HOT_DISPATCH_MIN_SUCCESSFUL_PRIMARY_BODIES: u64 = 24;
+const HOT_DISPATCH_UNDERFILL_WINDOW: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DownloadPressure {
@@ -194,6 +198,204 @@ impl Pipeline {
                 | JobStatus::QueuedExtract
                 | JobStatus::Extracting
         )
+    }
+
+    fn hot_dispatch_job_priority(&self, job_id: JobId) -> Option<u8> {
+        self.jobs.get(&job_id).map(Self::job_dispatch_priority)
+    }
+
+    fn job_has_dispatchable_work(&self, job_id: JobId) -> bool {
+        self.jobs.get(&job_id).is_some_and(|state| {
+            !state.download_queue.is_empty() && Self::status_allows_download_dispatch(&state.status)
+        })
+    }
+
+    fn job_has_active_download_work(&self, job_id: JobId) -> bool {
+        self.active_downloads_by_job
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0)
+            > 0
+            || self
+                .active_download_connections_by_job
+                .get(&job_id)
+                .copied()
+                .unwrap_or(0)
+                > 0
+    }
+
+    fn job_can_remain_hot(&self, job_id: JobId) -> bool {
+        self.jobs.get(&job_id).is_some_and(|state| {
+            Self::status_allows_download_dispatch(&state.status)
+                && (!state.download_queue.is_empty() || self.job_has_active_download_work(job_id))
+        })
+    }
+
+    fn start_hot_dispatch_period(&mut self, job_id: JobId, now: Instant) {
+        if self.hot_dispatch_job == Some(job_id) {
+            if self.hot_dispatch_started_at.is_none() {
+                self.hot_dispatch_started_at = Some(now);
+            }
+            return;
+        }
+
+        self.hot_dispatch_job = Some(job_id);
+        self.hot_dispatch_started_at = Some(now);
+        self.hot_dispatch_successes = 0;
+        self.hot_dispatch_exclusive_peak_bps = 0;
+        self.hot_dispatch_last_lend_at = None;
+        self.hot_dispatch_mode = DispatchShareMode::Exclusive;
+        self.hot_dispatch_underfill_since = None;
+        self.hot_dispatch_last_spillover_decision = SpilloverDecision::None;
+    }
+
+    fn clear_hot_dispatch_period(&mut self) {
+        self.hot_dispatch_job = None;
+        self.hot_dispatch_started_at = None;
+        self.hot_dispatch_successes = 0;
+        self.hot_dispatch_exclusive_peak_bps = 0;
+        self.hot_dispatch_last_lend_at = None;
+        self.hot_dispatch_mode = DispatchShareMode::Exclusive;
+        self.hot_dispatch_underfill_since = None;
+        self.hot_dispatch_last_spillover_decision = SpilloverDecision::None;
+        self.publish_hot_dispatch_metrics(Instant::now());
+    }
+
+    fn select_hot_dispatch_job(
+        &mut self,
+        eligible: &[(u8, usize, JobId)],
+        now: Instant,
+    ) -> Option<(u8, JobId)> {
+        let top_eligible_priority = eligible.first().map(|(priority, _, _)| *priority);
+
+        if let Some(current_job_id) = self.hot_dispatch_job
+            && self.job_can_remain_hot(current_job_id)
+            && let Some(current_priority) = self.hot_dispatch_job_priority(current_job_id)
+            && top_eligible_priority.is_none_or(|priority| current_priority <= priority)
+        {
+            self.start_hot_dispatch_period(current_job_id, now);
+            return Some((current_priority, current_job_id));
+        }
+
+        let (priority, _, job_id) = eligible.first().copied()?;
+        self.start_hot_dispatch_period(job_id, now);
+        Some((priority, job_id))
+    }
+
+    fn hot_dispatch_warmup_complete(&self, now: Instant) -> bool {
+        let Some(started_at) = self.hot_dispatch_started_at else {
+            return false;
+        };
+        let elapsed = now.saturating_duration_since(started_at);
+        elapsed >= HOT_DISPATCH_WARMUP_MIN_DURATION
+            && (self.hot_dispatch_successes >= HOT_DISPATCH_MIN_SUCCESSFUL_PRIMARY_BODIES
+                || elapsed >= HOT_DISPATCH_FORCE_UNDERFILL_AFTER)
+    }
+
+    fn active_spillover_connections(&self) -> usize {
+        let Some(hot_job_id) = self.hot_dispatch_job else {
+            return 0;
+        };
+        let hot_connections = self
+            .active_download_connections_by_job
+            .get(&hot_job_id)
+            .copied()
+            .unwrap_or(0);
+        self.active_download_connections
+            .saturating_sub(hot_connections)
+    }
+
+    fn publish_hot_dispatch_metrics(&mut self, now: Instant) {
+        let hot_job_id = self.hot_dispatch_job.map(|id| id.0).unwrap_or(0);
+        let active_spillover_connections = self.active_spillover_connections();
+        let published_mode = if active_spillover_connections > 0 {
+            DispatchShareMode::Shared
+        } else {
+            self.hot_dispatch_mode
+        };
+        let underfill_ms = self
+            .hot_dispatch_underfill_since
+            .map(|started_at| {
+                now.saturating_duration_since(started_at)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64
+            })
+            .unwrap_or(0);
+        let warmup_complete = self.hot_dispatch_warmup_complete(now);
+
+        if hot_job_id != 0 && published_mode == DispatchShareMode::Exclusive {
+            let speed = self.shared_state.metrics_snapshot().current_download_speed;
+            self.hot_dispatch_exclusive_peak_bps = self.hot_dispatch_exclusive_peak_bps.max(speed);
+        }
+
+        self.metrics
+            .hot_dispatch_job_id
+            .store(hot_job_id, Ordering::Relaxed);
+        self.metrics
+            .hot_dispatch_mode
+            .store(published_mode.as_code(), Ordering::Relaxed);
+        self.metrics
+            .hot_dispatch_underfill_ms
+            .store(underfill_ms, Ordering::Relaxed);
+        self.metrics
+            .hot_dispatch_lent_connections
+            .store(active_spillover_connections, Ordering::Relaxed);
+        self.metrics
+            .hot_dispatch_warmup_complete
+            .store(usize::from(warmup_complete), Ordering::Relaxed);
+        self.metrics.hot_dispatch_last_spillover_decision.store(
+            self.hot_dispatch_last_spillover_decision.as_code(),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn record_spillover_decision(&mut self, decision: SpilloverDecision) {
+        self.hot_dispatch_last_spillover_decision = decision;
+        self.metrics
+            .hot_dispatch_last_spillover_decision
+            .store(decision.as_code(), Ordering::Relaxed);
+        match decision {
+            SpilloverDecision::None => {}
+            SpilloverDecision::BlockedWarmup => {
+                self.metrics
+                    .hot_dispatch_spillover_blocked_warmup_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SpilloverDecision::BlockedPressure => {
+                self.metrics
+                    .hot_dispatch_spillover_blocked_pressure_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SpilloverDecision::BlockedNearCap => {
+                self.metrics
+                    .hot_dispatch_spillover_blocked_near_cap_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SpilloverDecision::BlockedHotCanUseCapacity => {
+                self.metrics
+                    .hot_dispatch_spillover_blocked_hot_can_use_capacity_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SpilloverDecision::AllowedUnderfill => {
+                self.metrics
+                    .hot_dispatch_spillover_allowed_underfill_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SpilloverDecision::Reclaimed => {
+                self.metrics
+                    .hot_dispatch_spillover_reclaimed_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn block_or_reclaim_spillover(&mut self, decision: SpilloverDecision) {
+        if self.hot_dispatch_mode == DispatchShareMode::Shared {
+            self.record_spillover_decision(SpilloverDecision::Reclaimed);
+        } else {
+            self.record_spillover_decision(decision);
+        }
+        self.hot_dispatch_mode = DispatchShareMode::Exclusive;
     }
 
     fn job_dispatch_priority(state: &JobState) -> u8 {
@@ -570,16 +772,15 @@ impl Pipeline {
     /// `QueuedRepair`/`Repairing`) with promoted recovery segments in its
     /// download queue.
     ///
-    /// This enables two key behaviors:
-    /// - **Prefetch**: when the primary job enters extraction, the next job
-    ///   immediately inherits all connections.
-    /// - **Tail overlap**: when the primary job has fewer queued segments than
-    ///   available connections, the next job fills the spare slots.
+    /// This is hot-job-first by default. The current hot job receives usable
+    /// capacity first; same/lower-band spillover is delayed until the hot job
+    /// has completed warmup and an unused-capacity window proves underfill.
     ///
     /// When a bandwidth cap is enabled and within 15% of exhaustion, reverts
     /// to single-job dispatch to avoid wasting scarce remaining quota on
     /// lower-priority work.
     pub(crate) fn dispatch_downloads(&mut self) {
+        let now = Instant::now();
         if self.global_paused || self.rate_limiter.should_wait() {
             if self.active_downloads == 0 {
                 debug!(
@@ -588,10 +789,12 @@ impl Pipeline {
                     "dispatch blocked: paused/rate"
                 );
             }
+            self.publish_hot_dispatch_metrics(now);
             return;
         }
         if let Err(error) = self.refresh_bandwidth_cap_window() {
             error!(error = %error, "failed to refresh ISP bandwidth cap state");
+            self.publish_hot_dispatch_metrics(now);
             return;
         }
         if self.bandwidth_cap.cap_enabled() && self.bandwidth_cap.remaining_bytes() == 0 {
@@ -599,6 +802,7 @@ impl Pipeline {
             if self.active_downloads == 0 {
                 debug!("dispatch blocked: bandwidth cap exhausted");
             }
+            self.publish_hot_dispatch_metrics(now);
             return;
         }
 
@@ -616,6 +820,8 @@ impl Pipeline {
                     "dispatch blocked: byte pressure"
                 );
             }
+            self.block_or_reclaim_spillover(SpilloverDecision::BlockedPressure);
+            self.publish_hot_dispatch_metrics(now);
             return;
         }
         let soft_dispatch_delay = self.soft_pressure_dispatch_delay(pressure);
@@ -636,6 +842,8 @@ impl Pipeline {
                         "dispatch delayed: soft byte pressure"
                     );
                 }
+                self.block_or_reclaim_spillover(SpilloverDecision::BlockedPressure);
+                self.publish_hot_dispatch_metrics(now);
                 return;
             }
             self.download_pressure_soft_dispatch_after = Some(now + delay);
@@ -753,31 +961,11 @@ impl Pipeline {
             );
         }
 
-        let Some((hot_priority, _, mut hot_job_id)) = eligible.first().copied() else {
+        let Some((_hot_priority, hot_job_id)) = self.select_hot_dispatch_job(&eligible, now) else {
+            self.clear_hot_dispatch_period();
             self.update_queue_metrics();
             return;
         };
-
-        let top_band_end = eligible
-            .iter()
-            .position(|(priority, _, _)| *priority != hot_priority)
-            .unwrap_or(eligible.len());
-        let mut hot_active = self
-            .active_downloads_by_job
-            .get(&hot_job_id)
-            .copied()
-            .unwrap_or(0);
-        for (_, _, candidate_job_id) in &eligible[..top_band_end] {
-            let candidate_active = self
-                .active_downloads_by_job
-                .get(candidate_job_id)
-                .copied()
-                .unwrap_or(0);
-            if candidate_active > hot_active {
-                hot_active = candidate_active;
-                hot_job_id = *candidate_job_id;
-            }
-        }
 
         while self.active_download_connections < max
             && !self.rate_limiter.should_wait()
@@ -786,11 +974,53 @@ impl Pipeline {
             match self.try_dispatch_download_for_job(hot_job_id) {
                 DispatchAttempt::Dispatched => dispatch_budget = dispatch_budget.saturating_sub(1),
                 DispatchAttempt::NoWork => break,
-                DispatchAttempt::StopAll => return,
+                DispatchAttempt::StopAll => {
+                    self.publish_hot_dispatch_metrics(now);
+                    return;
+                }
             }
         }
 
-        if !suppress_spillover && !bandwidth_cap_tight && dispatch_budget > 0 {
+        let hot_can_use_capacity = self.job_has_dispatchable_work(hot_job_id);
+        let has_unused_capacity = self.active_download_connections < max
+            && !self.rate_limiter.should_wait()
+            && dispatch_budget > 0;
+
+        let spillover_allowed = if suppress_spillover {
+            self.hot_dispatch_underfill_since = None;
+            self.block_or_reclaim_spillover(SpilloverDecision::BlockedPressure);
+            false
+        } else if bandwidth_cap_tight {
+            self.hot_dispatch_underfill_since = None;
+            self.block_or_reclaim_spillover(SpilloverDecision::BlockedNearCap);
+            false
+        } else if hot_can_use_capacity {
+            self.hot_dispatch_underfill_since = None;
+            self.block_or_reclaim_spillover(SpilloverDecision::BlockedHotCanUseCapacity);
+            false
+        } else if !has_unused_capacity {
+            self.hot_dispatch_underfill_since = None;
+            self.hot_dispatch_mode = DispatchShareMode::Exclusive;
+            false
+        } else if !self.hot_dispatch_warmup_complete(now) {
+            self.hot_dispatch_underfill_since = None;
+            self.block_or_reclaim_spillover(SpilloverDecision::BlockedWarmup);
+            false
+        } else {
+            let underfill_started_at = *self.hot_dispatch_underfill_since.get_or_insert(now);
+            if now.saturating_duration_since(underfill_started_at) >= HOT_DISPATCH_UNDERFILL_WINDOW
+            {
+                self.hot_dispatch_mode = DispatchShareMode::Shared;
+                self.hot_dispatch_last_lend_at = Some(now);
+                self.record_spillover_decision(SpilloverDecision::AllowedUnderfill);
+                true
+            } else {
+                self.block_or_reclaim_spillover(SpilloverDecision::BlockedHotCanUseCapacity);
+                false
+            }
+        };
+
+        if spillover_allowed {
             for (_, _, job_id) in eligible {
                 if job_id == hot_job_id {
                     continue;
@@ -804,7 +1034,10 @@ impl Pipeline {
                             dispatch_budget = dispatch_budget.saturating_sub(1)
                         }
                         DispatchAttempt::NoWork => break,
-                        DispatchAttempt::StopAll => return,
+                        DispatchAttempt::StopAll => {
+                            self.publish_hot_dispatch_metrics(now);
+                            return;
+                        }
                     }
                 }
                 if self.active_download_connections >= max
@@ -817,6 +1050,7 @@ impl Pipeline {
         }
 
         self.update_queue_metrics();
+        self.publish_hot_dispatch_metrics(now);
     }
 
     /// Update shared atomic queue depth metrics from per-job queues.
@@ -1028,6 +1262,12 @@ impl Pipeline {
                     .remove(&result.segment_id.file_id);
             }
         }
+        if !result.is_recovery
+            && self.hot_dispatch_job == Some(job_id)
+            && matches!(&result.data, Ok(_))
+        {
+            self.hot_dispatch_successes = self.hot_dispatch_successes.saturating_add(1);
+        }
         self.publish_active_stage_metrics();
         if let Err(error) = self.release_bandwidth_reservation(result.segment_id) {
             error!(error = %error, segment = %result.segment_id, "failed to release ISP bandwidth reservation");
@@ -1048,6 +1288,7 @@ impl Pipeline {
                 );
             }
         }
+        self.publish_hot_dispatch_metrics(Instant::now());
     }
 
     pub(crate) async fn handle_download_done(&mut self, result: DownloadResult) {

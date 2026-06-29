@@ -487,6 +487,101 @@ pub(super) fn render_prometheus_metrics(
         );
     }
 
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_job_id Current hot-dispatch job id, or 0 when no job owns hot dispatch.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_job_id gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_job_id",
+        snapshot.hot_dispatch_job_id,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_mode Current hot-dispatch sharing mode.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_mode gauge\n");
+    for mode in ["exclusive", "shared"] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_hot_dispatch_mode",
+            &[("mode", mode)],
+            u8::from(snapshot.hot_dispatch_mode.as_str() == mode),
+        );
+    }
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_underfill_milliseconds Current hot-job unused-capacity underfill window age.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_underfill_milliseconds gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_underfill_milliseconds",
+        snapshot.hot_dispatch_underfill_ms,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_lent_connections Active NNTP connection tasks lent to spillover jobs.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_lent_connections gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_lent_connections",
+        snapshot.hot_dispatch_lent_connections,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_warmup_complete Whether the current hot-dispatch warmup gate is complete.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_warmup_complete gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_warmup_complete",
+        u8::from(snapshot.hot_dispatch_warmup_complete),
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_last_spillover_decision Last hot-dispatch spillover decision.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_last_spillover_decision gauge\n");
+    for decision in [
+        "none",
+        "blocked_warmup",
+        "blocked_pressure",
+        "blocked_near_cap",
+        "blocked_hot_can_use_capacity",
+        "allowed_underfill",
+        "reclaimed",
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_hot_dispatch_last_spillover_decision",
+            &[("decision", decision)],
+            u8::from(snapshot.hot_dispatch_last_spillover_decision.as_str() == decision),
+        );
+    }
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_spillover_decisions_total Hot-dispatch spillover decisions by reason.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_spillover_decisions_total counter\n");
+    for (decision, value) in [
+        (
+            "blocked_warmup",
+            snapshot.hot_dispatch_spillover_blocked_warmup_total,
+        ),
+        (
+            "blocked_pressure",
+            snapshot.hot_dispatch_spillover_blocked_pressure_total,
+        ),
+        (
+            "blocked_near_cap",
+            snapshot.hot_dispatch_spillover_blocked_near_cap_total,
+        ),
+        (
+            "blocked_hot_can_use_capacity",
+            snapshot.hot_dispatch_spillover_blocked_hot_can_use_capacity_total,
+        ),
+        (
+            "allowed_underfill",
+            snapshot.hot_dispatch_spillover_allowed_underfill_total,
+        ),
+        ("reclaimed", snapshot.hot_dispatch_spillover_reclaimed_total),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_hot_dispatch_spillover_decisions_total",
+            &[("decision", decision)],
+            value,
+        );
+    }
+
     out.push_str("# HELP weaver_pipeline_download_observed_limiter Observed downloader limiter derived from pressure, queue, and server permits.\n");
     out.push_str("# TYPE weaver_pipeline_download_observed_limiter gauge\n");
     let observed_limiter =

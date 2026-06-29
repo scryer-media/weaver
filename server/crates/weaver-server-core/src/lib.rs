@@ -36,7 +36,8 @@ pub use jobs::{
     runtime_lanes_from_status_snapshot,
 };
 pub use operations::metrics::{
-    DownloadPressureReason, DownloadPressureState, MetricsSnapshot, PipelineMetrics,
+    DispatchShareMode, DownloadPressureReason, DownloadPressureState, MetricsSnapshot,
+    PipelineMetrics, SpilloverDecision,
 };
 pub use operations::{
     AsyncOperationState, AsyncOperationTargetState, COUNTER_METRIC_KEYS, CounterRollupValue,
