@@ -440,6 +440,7 @@ impl Pipeline {
         }
 
         if rebound > 0 {
+            self.mark_rar_unlock_priorities_dirty(job_id);
             info!(
                 job_id = job_id.0,
                 rebound, "PAR2 canonical file identity applied"

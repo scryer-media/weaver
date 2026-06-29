@@ -1,5 +1,7 @@
 use super::*;
-use crate::pipeline::download::transport::{JobTransportClass, ServerPipelineProof};
+use crate::pipeline::download::transport::{
+    JobTransportClass, ServerPipelineProof, ServerPipelineState,
+};
 use weaver_nntp::client::FetchAttemptOutcome;
 
 enum DispatchAttempt {
@@ -16,9 +18,20 @@ const HOT_DISPATCH_WARMUP_MIN_DURATION: Duration = Duration::from_secs(2);
 const HOT_DISPATCH_FORCE_UNDERFILL_AFTER: Duration = Duration::from_secs(5);
 const HOT_DISPATCH_MIN_SUCCESSFUL_PRIMARY_BODIES: u64 = 24;
 const HOT_DISPATCH_UNDERFILL_WINDOW: Duration = Duration::from_secs(2);
+const HOT_DISPATCH_EXPANSION_HELPFUL_PERCENT: u64 = 5;
+const HOT_DISPATCH_SPILLOVER_HARM_PERCENT: u64 = 7;
 const LANE_REFILL_GRACE: Duration = Duration::from_millis(5);
 const LANE_LEASE_PREFETCH_BATCHES: usize = 8;
 const LANE_LEASE_MAX_WORK_ITEMS: usize = 32;
+const IP_REPLACEMENT_MIN_OLD_SAMPLES: u16 = 16;
+const IP_REPLACEMENT_MIN_OLD_AGE: Duration = Duration::from_secs(30);
+const IP_REPLACEMENT_BASELINE_MIN_SAMPLES: u16 = 8;
+const IP_REPLACEMENT_BASELINE_RECENT: Duration = Duration::from_secs(10 * 60);
+const IP_REPLACEMENT_OLD_SLOWER_RATIO: f64 = 1.25;
+const IP_REPLACEMENT_OLD_SLOWER_MS: f64 = 75.0;
+const IP_REPLACEMENT_TRIAL_SAMPLES: usize = 4;
+const IP_REPLACEMENT_CANDIDATE_BETTER_RATIO: f64 = 0.85;
+const IP_REPLACEMENT_CANDIDATE_BETTER_MS: f64 = 40.0;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DownloadPressure {
@@ -64,6 +77,130 @@ impl Pipeline {
 
     fn elapsed_ms(started_at: Instant) -> u64 {
         started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }
+
+    fn normal_download_connection_capacity_available(&self) -> bool {
+        let params = self.tuner.params();
+        let total = self.effective_download_connection_capacity(params.max_concurrent_downloads);
+        self.active_download_connections < self.normal_download_connection_capacity_limit(total)
+    }
+
+    fn normal_download_connection_capacity_limit(&self, effective_total: usize) -> usize {
+        let params = self.tuner.params();
+        let recovery_reserve = params
+            .recovery_slots
+            .saturating_sub(self.active_recovery)
+            .min(effective_total);
+        effective_total.saturating_sub(recovery_reserve)
+    }
+
+    fn effective_download_connection_capacity(&self, configured_max: usize) -> usize {
+        let active_probes = self
+            .jobs
+            .values()
+            .filter(|s| matches!(s.status, JobStatus::Checking))
+            .count();
+        configured_max
+            .min(self.connection_ramp)
+            .saturating_sub(active_probes)
+    }
+
+    fn observe_ip_rtt_attempts(&mut self, attempts: &[weaver_nntp::client::FetchAttemptTrace]) {
+        if self.ip_replacement_trial_extra_connections == 0 {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut changed = false;
+        for attempt in attempts {
+            if attempt.outcome != FetchAttemptOutcome::Success {
+                continue;
+            }
+            let Some(ip) = attempt.remote_ip else {
+                continue;
+            };
+            let key = ServerIpKey {
+                server_idx: attempt.server_idx,
+                ip,
+            };
+            if !self.ip_rtt_ewma.contains_key(&key)
+                && self.ip_rtt_ewma.len() >= MAX_IP_RTT_EWMA_ENTRIES
+                && let Some(oldest_key) = self
+                    .ip_rtt_ewma
+                    .iter()
+                    .min_by_key(|(_, state)| state.last_seen)
+                    .map(|(key, _)| *key)
+            {
+                self.ip_rtt_ewma.remove(&oldest_key);
+            }
+
+            self.ip_rtt_ewma
+                .entry(key)
+                .and_modify(|state| state.observe(now, attempt.elapsed))
+                .or_insert_with(|| IpRttEwma::new(now, attempt.elapsed));
+            changed = true;
+        }
+
+        if changed {
+            let slowest_ms = self
+                .ip_rtt_ewma
+                .values()
+                .map(|state| state.ewma_ms.ceil() as u64)
+                .max()
+                .unwrap_or(0);
+            self.metrics
+                .set_ip_rtt_ewma_summary(self.ip_rtt_ewma.len(), slowest_ms);
+        }
+    }
+
+    fn ip_replacement_baseline_ms(&self, key: ServerIpKey, now: Instant) -> Option<f64> {
+        self.ip_rtt_ewma
+            .iter()
+            .filter(|(candidate_key, state)| {
+                candidate_key.server_idx == key.server_idx
+                    && candidate_key.ip != key.ip
+                    && state.samples >= IP_REPLACEMENT_BASELINE_MIN_SAMPLES
+                    && now.saturating_duration_since(state.last_seen)
+                        <= IP_REPLACEMENT_BASELINE_RECENT
+            })
+            .map(|(_, state)| state.ewma_ms)
+            .min_by(|a, b| a.total_cmp(b))
+            .or_else(|| {
+                self.download_lane_runtime
+                    .server_rtt
+                    .get(&key.server_idx)
+                    .and_then(|window| window.ewma())
+                    .map(|duration| duration.as_secs_f64() * 1000.0)
+            })
+    }
+
+    fn select_ip_replacement_candidate(&self, now: Instant) -> Option<IpReplacementCandidate> {
+        if self.ip_replacement_trial_extra_connections == 0 || self.ip_replacement_burst_active {
+            return None;
+        }
+
+        self.ip_rtt_ewma
+            .iter()
+            .filter_map(|(key, state)| {
+                if state.samples < IP_REPLACEMENT_MIN_OLD_SAMPLES
+                    || now.saturating_duration_since(state.first_seen) < IP_REPLACEMENT_MIN_OLD_AGE
+                {
+                    return None;
+                }
+                let baseline_ms = self.ip_replacement_baseline_ms(*key, now)?;
+                let old_is_slow = state.ewma_ms >= baseline_ms * IP_REPLACEMENT_OLD_SLOWER_RATIO
+                    && state.ewma_ms - baseline_ms >= IP_REPLACEMENT_OLD_SLOWER_MS;
+                old_is_slow.then_some(IpReplacementCandidate {
+                    old_key: *key,
+                    old_ewma_ms: state.ewma_ms,
+                    baseline_ms,
+                })
+            })
+            .max_by(|a, b| {
+                let a_delta = a.old_ewma_ms - a.baseline_ms;
+                let b_delta = b.old_ewma_ms - b.baseline_ms;
+                a_delta.total_cmp(&b_delta)
+            })
     }
 
     fn soft_pressure_dispatch_delay(&self, pressure: DownloadPressure) -> Option<Duration> {
@@ -214,6 +351,80 @@ impl Pipeline {
         })
     }
 
+    fn hot_job_has_pending_pipeline_promotion(
+        &mut self,
+        job_id: JobId,
+        pressure: DownloadPressure,
+    ) -> bool {
+        if pressure.state != DownloadPressureState::Clear {
+            return false;
+        }
+        let Some(profile) = self.ensure_job_transport_profile(job_id) else {
+            return false;
+        };
+        let job_class = profile.class();
+        let median_body_bytes = profile.median_body_bytes();
+        let now = Instant::now();
+        let server_count = self.nntp.pool().server_count();
+        (0..server_count).any(|server_idx| {
+            let default_proof;
+            let proof =
+                if let Some(proof) = self.download_lane_runtime.server_proof.get(&server_idx) {
+                    proof
+                } else {
+                    default_proof = ServerPipelineProof::default();
+                    &default_proof
+                };
+            let current = proof.state(now);
+            let mode = self.choose_download_lane_mode_for_server(
+                now,
+                server_idx,
+                proof,
+                job_class,
+                median_body_bytes,
+                true,
+            );
+            matches!(
+                (current, mode),
+                (
+                    ServerPipelineState::Unknown | ServerPipelineState::SequentialOnly,
+                    DownloadLaneMode::PipelineDepth2
+                ) | (
+                    ServerPipelineState::PipelineProvenDepth2,
+                    DownloadLaneMode::PipelineDepth4
+                )
+            )
+        })
+    }
+
+    fn set_hot_best_mode_block_reason(&self, reason: HotBestModeBlockReason) {
+        self.metrics
+            .hot_dispatch_best_mode_block_reason
+            .store(reason.as_code(), Ordering::Relaxed);
+    }
+
+    fn hot_best_mode_block_reason(
+        &mut self,
+        hot_job_id: JobId,
+        max_connections: usize,
+        pressure: DownloadPressure,
+        recent_expansion_helped: bool,
+    ) -> HotBestModeBlockReason {
+        if self.job_has_dispatchable_work(hot_job_id) {
+            if self.active_download_connections < max_connections {
+                return HotBestModeBlockReason::LaneCapacityAvailable;
+            }
+            return HotBestModeBlockReason::HotHasQueuedPrimary;
+        }
+        if self.hot_job_has_pending_pipeline_promotion(hot_job_id, pressure) {
+            return HotBestModeBlockReason::PipelinePromotionPending;
+        }
+        if recent_expansion_helped {
+            return HotBestModeBlockReason::RecentExpansionHelped;
+        }
+        HotBestModeBlockReason::None
+    }
+
     fn job_has_active_download_work(&self, job_id: JobId) -> bool {
         self.active_downloads_by_job
             .get(&job_id)
@@ -251,6 +462,11 @@ impl Pipeline {
         self.hot_dispatch_mode = DispatchShareMode::Exclusive;
         self.hot_dispatch_underfill_since = None;
         self.hot_dispatch_last_spillover_decision = SpilloverDecision::None;
+        self.hot_dispatch_throughput_window.clear();
+        self.hot_dispatch_exclusive_window.clear();
+        self.hot_dispatch_expansion_window.clear();
+        self.hot_dispatch_spillover_loans.clear();
+        self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
     }
 
     fn clear_hot_dispatch_period(&mut self) {
@@ -262,6 +478,11 @@ impl Pipeline {
         self.hot_dispatch_mode = DispatchShareMode::Exclusive;
         self.hot_dispatch_underfill_since = None;
         self.hot_dispatch_last_spillover_decision = SpilloverDecision::None;
+        self.hot_dispatch_throughput_window.clear();
+        self.hot_dispatch_exclusive_window.clear();
+        self.hot_dispatch_expansion_window.clear();
+        self.hot_dispatch_spillover_loans.clear();
+        self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
         self.publish_hot_dispatch_metrics(Instant::now());
     }
 
@@ -309,10 +530,42 @@ impl Pipeline {
             .saturating_sub(hot_connections)
     }
 
+    fn hot_dispatch_speed_bps(&mut self, now: Instant) -> u64 {
+        self.hot_dispatch_throughput_window.bps(now)
+    }
+
+    fn update_spillover_loan_measurement(&mut self, now: Instant, hot_speed_bps: u64) {
+        if self.hot_dispatch_spillover_loans.update_speed_harm(
+            now,
+            hot_speed_bps,
+            HOT_DISPATCH_SPILLOVER_HARM_PERCENT,
+        ) {
+            self.record_spillover_decision(SpilloverDecision::ReclaimedSpeedHarm);
+        }
+    }
+
+    fn hot_spillover_reclaim_pending_for(&self, job_id: JobId) -> bool {
+        self.hot_dispatch_spillover_loans
+            .reclaim_pending_for(job_id)
+    }
+
+    fn start_spillover_loan(&mut self, job_id: JobId, now: Instant, hot_speed_bps: u64) {
+        self.hot_dispatch_spillover_loans
+            .start_or_extend(job_id, now, hot_speed_bps);
+        self.hot_dispatch_last_lend_at = Some(now);
+    }
+
+    fn clear_spillover_loan_if_idle(&mut self) {
+        if self.active_spillover_connections() == 0 {
+            self.hot_dispatch_spillover_loans.clear();
+        }
+    }
+
     fn publish_hot_dispatch_metrics(&mut self, now: Instant) {
         let hot_job_id = self.hot_dispatch_job.map(|id| id.0).unwrap_or(0);
-        let active_spillover_connections = self.active_spillover_connections();
-        let published_mode = if active_spillover_connections > 0 {
+        let active_non_hot_connections = self.active_spillover_connections();
+        let active_lent_connections = self.hot_dispatch_spillover_loans.active_lent_connections();
+        let published_mode = if active_non_hot_connections > 0 {
             DispatchShareMode::Shared
         } else {
             self.hot_dispatch_mode
@@ -326,10 +579,18 @@ impl Pipeline {
             })
             .unwrap_or(0);
         let warmup_complete = self.hot_dispatch_warmup_complete(now);
+        let hot_speed_bps = self.hot_dispatch_speed_bps(now);
+        self.hot_dispatch_expansion_window
+            .refresh(now, hot_speed_bps);
+        let recent_expansion_improvement_pct = self
+            .hot_dispatch_expansion_window
+            .recent_improvement_pct(now);
+        self.update_spillover_loan_measurement(now, hot_speed_bps);
 
         if hot_job_id != 0 && published_mode == DispatchShareMode::Exclusive {
-            let speed = self.shared_state.metrics_snapshot().current_download_speed;
-            self.hot_dispatch_exclusive_peak_bps = self.hot_dispatch_exclusive_peak_bps.max(speed);
+            self.hot_dispatch_exclusive_peak_bps =
+                self.hot_dispatch_exclusive_peak_bps.max(hot_speed_bps);
+            self.hot_dispatch_exclusive_window.record(hot_speed_bps);
         }
 
         self.metrics
@@ -343,7 +604,7 @@ impl Pipeline {
             .store(underfill_ms, Ordering::Relaxed);
         self.metrics
             .hot_dispatch_lent_connections
-            .store(active_spillover_connections, Ordering::Relaxed);
+            .store(active_lent_connections, Ordering::Relaxed);
         self.metrics
             .hot_dispatch_warmup_complete
             .store(usize::from(warmup_complete), Ordering::Relaxed);
@@ -351,6 +612,48 @@ impl Pipeline {
             self.hot_dispatch_last_spillover_decision.as_code(),
             Ordering::Relaxed,
         );
+        self.metrics
+            .hot_dispatch_hot_speed_bps
+            .store(hot_speed_bps, Ordering::Relaxed);
+        self.metrics.hot_dispatch_exclusive_peak_bps.store(
+            self.hot_dispatch_exclusive_window.peak_bps(),
+            Ordering::Relaxed,
+        );
+        let (pre_lend, post_lend, active_loans) =
+            self.hot_dispatch_spillover_loans.speed_snapshot();
+        self.metrics
+            .hot_dispatch_spillover_pre_speed_bps
+            .store(pre_lend, Ordering::Relaxed);
+        self.metrics
+            .hot_dispatch_spillover_post_speed_bps
+            .store(post_lend, Ordering::Relaxed);
+        self.metrics
+            .hot_dispatch_spillover_active_loans
+            .store(active_loans, Ordering::Relaxed);
+        self.metrics
+            .hot_dispatch_recent_expansion_improvement_pct
+            .store(recent_expansion_improvement_pct, Ordering::Relaxed);
+        if let Some(event) = self.hot_dispatch_expansion_window.last_event() {
+            self.metrics
+                .hot_dispatch_last_expansion_kind
+                .store(event.kind.as_code(), Ordering::Relaxed);
+            self.metrics
+                .hot_dispatch_last_expansion_before_bps
+                .store(event.before_bps, Ordering::Relaxed);
+            self.metrics
+                .hot_dispatch_last_expansion_after_bps
+                .store(event.after_bps.unwrap_or(0), Ordering::Relaxed);
+        } else {
+            self.metrics
+                .hot_dispatch_last_expansion_kind
+                .store(0, Ordering::Relaxed);
+            self.metrics
+                .hot_dispatch_last_expansion_before_bps
+                .store(0, Ordering::Relaxed);
+            self.metrics
+                .hot_dispatch_last_expansion_after_bps
+                .store(0, Ordering::Relaxed);
+        }
     }
 
     fn record_spillover_decision(&mut self, decision: SpilloverDecision) {
@@ -385,9 +688,34 @@ impl Pipeline {
                     .hot_dispatch_spillover_allowed_underfill_total
                     .fetch_add(1, Ordering::Relaxed);
             }
+            SpilloverDecision::AllowedMeasuredUnderfill => {
+                self.metrics
+                    .hot_dispatch_spillover_allowed_measured_underfill_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             SpilloverDecision::Reclaimed => {
                 self.metrics
                     .hot_dispatch_spillover_reclaimed_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SpilloverDecision::ReclaimedSpeedHarm => {
+                self.metrics
+                    .hot_dispatch_spillover_reclaimed_speed_harm_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SpilloverDecision::BlockedBestModePending => {
+                self.metrics
+                    .hot_dispatch_spillover_blocked_best_mode_pending_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SpilloverDecision::BlockedRecentExpansionHelped => {
+                self.metrics
+                    .hot_dispatch_spillover_blocked_recent_expansion_helped_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SpilloverDecision::BlockedCapSpeed => {
+                self.metrics
+                    .hot_dispatch_spillover_blocked_cap_speed_total
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -395,7 +723,11 @@ impl Pipeline {
 
     fn block_or_reclaim_spillover(&mut self, decision: SpilloverDecision) {
         if self.hot_dispatch_mode == DispatchShareMode::Shared {
-            self.record_spillover_decision(SpilloverDecision::Reclaimed);
+            let reclaim_decision = match decision {
+                SpilloverDecision::ReclaimedSpeedHarm => SpilloverDecision::ReclaimedSpeedHarm,
+                _ => SpilloverDecision::Reclaimed,
+            };
+            self.record_spillover_decision(reclaim_decision);
         } else {
             self.record_spillover_decision(decision);
         }
@@ -444,6 +776,46 @@ impl Pipeline {
                 self.pending_retries_by_segment.remove(&segment_id);
             }
         }
+    }
+
+    fn restore_download_result_work_without_retry(
+        &mut self,
+        segment_id: SegmentId,
+        retry_count: u32,
+        exclude_servers: Vec<usize>,
+    ) -> bool {
+        let job_id = segment_id.file_id.job_id;
+        let file_idx = segment_id.file_id.file_index as usize;
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return false;
+        };
+        let Some(file_spec) = state.spec.files.get(file_idx) else {
+            return false;
+        };
+        let Some(seg_spec) = file_spec
+            .segments
+            .iter()
+            .find(|seg| seg.ordinal == segment_id.segment_number)
+        else {
+            return false;
+        };
+        let work = DownloadWork {
+            segment_id,
+            message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
+            groups: file_spec.groups.clone(),
+            priority: file_spec.role.download_priority(),
+            byte_estimate: seg_spec.bytes,
+            retry_count,
+            is_recovery: file_spec.role.is_recovery(),
+            exclude_servers,
+        };
+        if work.is_recovery {
+            state.recovery_queue.push(work);
+        } else {
+            state.download_queue.push(work);
+        }
+        self.update_queue_metrics();
+        true
     }
 
     fn bandwidth_reservation_estimate(decoded_bytes: u32) -> u64 {
@@ -651,6 +1023,14 @@ impl Pipeline {
                 .metrics
                 .download_lane_parks_spillover_withdraw_total
                 .fetch_add(1, Ordering::Relaxed),
+            LaneParkReason::SpilloverSpeedHarm => self
+                .metrics
+                .download_lane_parks_spillover_speed_harm_total
+                .fetch_add(1, Ordering::Relaxed),
+            LaneParkReason::IpReplacementRetired => self
+                .metrics
+                .download_lane_parks_ip_replacement_retired_total
+                .fetch_add(1, Ordering::Relaxed),
             LaneParkReason::ServerTierChanged => self
                 .metrics
                 .download_lane_parks_server_tier_changed_total
@@ -696,6 +1076,16 @@ impl Pipeline {
     ) {
         if previous == next {
             return;
+        }
+
+        if next.max_depth() > previous.max_depth() {
+            let now = Instant::now();
+            let speed = self.hot_dispatch_speed_bps(now);
+            self.hot_dispatch_expansion_window.record(
+                now,
+                HotExpansionKind::PipelinePromotion,
+                speed,
+            );
         }
 
         match previous {
@@ -808,6 +1198,12 @@ impl Pipeline {
         let Some(first) = self.pop_download_work_for_batch(job_id, None) else {
             return Ok(None);
         };
+        if !first.is_recovery && !self.normal_download_connection_capacity_available() {
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                state.download_queue.push(first);
+            }
+            return Ok(None);
+        }
         let Some(first) = self.reserve_download_work_for_dispatch(job_id, first, true)? else {
             return Ok(None);
         };
@@ -844,6 +1240,70 @@ impl Pipeline {
             first,
             pressure,
         )))
+    }
+
+    fn try_lease_ip_replacement_trial_batch(
+        &mut self,
+        job_id: JobId,
+        server_idx: usize,
+    ) -> Result<Option<DownloadBatchLease>, DispatchAttempt> {
+        let Some(first) = self.pop_download_work_for_batch(job_id, None) else {
+            return Ok(None);
+        };
+        if first.is_recovery || first.exclude_servers.contains(&server_idx) {
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                state.download_queue.push(first);
+            }
+            return Ok(None);
+        }
+
+        let Some(first) = self.reserve_download_work_for_dispatch(job_id, first, true)? else {
+            return Ok(None);
+        };
+        let compatibility = DownloadBatchCompatibility::from_work(&first);
+        if compatibility.is_recovery {
+            let lease = DownloadBatchLease {
+                job_id,
+                lane_mode: DownloadLaneMode::Sequential,
+                server_modes: Vec::new(),
+                compatibility,
+                works: vec![first],
+            };
+            self.rollback_download_batch_lease(lease);
+            return Ok(None);
+        }
+
+        let mut works = vec![first];
+        while works.len() < IP_REPLACEMENT_TRIAL_SAMPLES {
+            let Some(next) = self.pop_download_work_for_batch(job_id, Some(&compatibility)) else {
+                break;
+            };
+            if next.is_recovery {
+                if let Some(state) = self.jobs.get_mut(&job_id) {
+                    state.download_queue.push(next);
+                }
+                break;
+            }
+            match self.reserve_download_work_for_dispatch(job_id, next, false) {
+                Ok(Some(next)) => works.push(next),
+                Ok(None) | Err(DispatchAttempt::StopAll) | Err(DispatchAttempt::NoWork) => break,
+                Err(DispatchAttempt::Dispatched) => unreachable!("reserve helper never dispatches"),
+            }
+        }
+
+        let lease = DownloadBatchLease {
+            job_id,
+            lane_mode: DownloadLaneMode::Sequential,
+            server_modes: Vec::new(),
+            compatibility,
+            works,
+        };
+        if lease.works.len() < IP_REPLACEMENT_TRIAL_SAMPLES {
+            self.rollback_download_batch_lease(lease);
+            return Ok(None);
+        }
+
+        Ok(Some(lease))
     }
 
     fn finish_download_batch_lease(
@@ -960,6 +1420,12 @@ impl Pipeline {
             .download_lane_lease_items_total
             .fetch_add(work_count as u64, Ordering::Relaxed);
         if starts_connection {
+            if self.hot_dispatch_job == Some(job_id) {
+                let now = Instant::now();
+                let speed = self.hot_dispatch_speed_bps(now);
+                self.hot_dispatch_expansion_window
+                    .record(now, HotExpansionKind::LaneStart, speed);
+            }
             self.active_download_connections += 1;
             self.note_download_lane_started(lane_mode);
             *self
@@ -1013,10 +1479,7 @@ impl Pipeline {
             .entry(server_idx)
             .or_default();
         if observation.mode == DownloadLaneMode::Sequential {
-            proof.note_sequential_result(
-                matches!(result.data, Ok(_)),
-                observation.supports_pipelining,
-            );
+            proof.note_sequential_result(result.data.is_ok(), observation.supports_pipelining);
         } else if observation.batch_complete {
             let now = Instant::now();
             let transition = proof.note_pipeline_batch(
@@ -1060,6 +1523,7 @@ impl Pipeline {
         job_id: JobId,
         pressure: DownloadPressure,
     ) -> DispatchAttempt {
+        self.apply_rar_unlock_priorities_if_dirty(job_id);
         let lease = match self.try_lease_initial_download_batch(job_id, pressure) {
             Ok(Some(lease)) => lease,
             Ok(None) => return DispatchAttempt::NoWork,
@@ -1069,6 +1533,90 @@ impl Pipeline {
         self.activate_download_batch_lease(&lease, &activation_items, true);
         self.spawn_download_batch(lease);
         DispatchAttempt::Dispatched
+    }
+
+    fn maybe_start_ip_replacement_trial(
+        &mut self,
+        hot_job_id: JobId,
+        pressure: DownloadPressure,
+        configured_download_capacity: usize,
+    ) {
+        if self.ip_replacement_trial_extra_connections == 0 || self.ip_replacement_burst_active {
+            return;
+        }
+        if pressure.suppresses_spillover()
+            || configured_download_capacity == 0
+            || self.active_download_connections != configured_download_capacity
+            || self.active_recovery > 0
+            || !self.job_has_dispatchable_work(hot_job_id)
+        {
+            self.metrics.note_ip_replacement_trial_blocked();
+            return;
+        }
+
+        let now = Instant::now();
+        let Some(candidate) = self.select_ip_replacement_candidate(now) else {
+            self.metrics.note_ip_replacement_trial_blocked();
+            return;
+        };
+
+        let Some(groups) =
+            self.ip_replacement_trial_groups(hot_job_id, candidate.old_key.server_idx)
+        else {
+            self.metrics.note_ip_replacement_trial_blocked();
+            return;
+        };
+
+        self.ip_replacement_burst_active = true;
+        self.metrics.set_ip_replacement_burst_active(true);
+        self.metrics.note_ip_replacement_trial_started();
+        self.spawn_ip_replacement_candidate_acquire(hot_job_id, candidate, groups);
+    }
+
+    fn ip_replacement_trial_groups(&self, job_id: JobId, server_idx: usize) -> Option<Vec<String>> {
+        self.jobs.get(&job_id).and_then(|state| {
+            state
+                .download_queue
+                .peek_next_matching(|work| {
+                    !work.is_recovery && !work.exclude_servers.contains(&server_idx)
+                })
+                .map(|work| work.groups.clone())
+        })
+    }
+
+    fn spawn_ip_replacement_candidate_acquire(
+        &self,
+        job_id: JobId,
+        candidate: IpReplacementCandidate,
+        groups: Vec<String>,
+    ) {
+        let nntp = Arc::clone(&self.nntp);
+        let trial_tx = self.ip_replacement_trial_tx.clone();
+
+        tokio::spawn(async move {
+            let server = weaver_nntp::ServerId(candidate.old_key.server_idx);
+            match nntp.acquire_extra_body_lane(server, &groups).await {
+                Ok(lane) => {
+                    let candidate_ip = lane.remote_ip();
+                    if candidate_ip == candidate.old_key.ip {
+                        lane.discard().await;
+                        let _ = trial_tx.send(IpReplacementTrialEvent::SameIpRejected).await;
+                    } else {
+                        let _ = trial_tx
+                            .send(IpReplacementTrialEvent::CandidateAcquired {
+                                job_id,
+                                candidate,
+                                candidate_ip,
+                                lane: Box::new(lane),
+                            })
+                            .await;
+                    }
+                }
+                Err(_) => {
+                    let _ = trial_tx.send(IpReplacementTrialEvent::AcquireFailed).await;
+                }
+            }
+        });
     }
 
     fn mark_download_pass_started(&mut self, job_id: JobId) {
@@ -1381,16 +1929,7 @@ impl Pipeline {
 
         let params = self.tuner.params();
         let tuner_max = params.max_concurrent_downloads;
-        // Reserve one connection slot per active health probe so the probe
-        // task can acquire a pool permit without being starved by downloads.
-        let active_probes = self
-            .jobs
-            .values()
-            .filter(|s| matches!(s.status, JobStatus::Checking))
-            .count();
-        let max = tuner_max
-            .min(self.connection_ramp)
-            .saturating_sub(active_probes);
+        let max = self.effective_download_connection_capacity(tuner_max);
 
         // Soft byte pressure keeps the current hot job moving, but avoids
         // expanding into spillover work until memory pressure drains.
@@ -1508,38 +2047,67 @@ impl Pipeline {
             }
         }
 
-        let hot_can_use_capacity = self.job_has_dispatchable_work(hot_job_id);
+        let hot_speed_bps = self.hot_dispatch_speed_bps(now);
+        self.hot_dispatch_expansion_window
+            .refresh(now, hot_speed_bps);
         let has_unused_capacity = self.active_download_connections < max
             && !self.rate_limiter.should_wait()
             && dispatch_budget > 0;
+        let recent_expansion_improvement_pct = self
+            .hot_dispatch_expansion_window
+            .recent_improvement_pct(now);
+        let recent_expansion_helped =
+            recent_expansion_improvement_pct >= HOT_DISPATCH_EXPANSION_HELPFUL_PERCENT;
+        let best_mode_block_reason =
+            self.hot_best_mode_block_reason(hot_job_id, max, pressure, recent_expansion_helped);
 
         let spillover_allowed = if suppress_spillover {
             self.hot_dispatch_underfill_since = None;
+            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
             self.block_or_reclaim_spillover(SpilloverDecision::BlockedPressure);
             false
         } else if bandwidth_cap_tight {
             self.hot_dispatch_underfill_since = None;
+            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
             self.block_or_reclaim_spillover(SpilloverDecision::BlockedNearCap);
             false
-        } else if hot_can_use_capacity {
+        } else if best_mode_block_reason == HotBestModeBlockReason::HotHasQueuedPrimary {
             self.hot_dispatch_underfill_since = None;
+            self.set_hot_best_mode_block_reason(best_mode_block_reason);
             self.block_or_reclaim_spillover(SpilloverDecision::BlockedHotCanUseCapacity);
+            false
+        } else if matches!(
+            best_mode_block_reason,
+            HotBestModeBlockReason::LaneCapacityAvailable
+                | HotBestModeBlockReason::PipelinePromotionPending
+        ) {
+            self.hot_dispatch_underfill_since = None;
+            self.set_hot_best_mode_block_reason(best_mode_block_reason);
+            self.block_or_reclaim_spillover(SpilloverDecision::BlockedBestModePending);
             false
         } else if !has_unused_capacity {
             self.hot_dispatch_underfill_since = None;
-            self.hot_dispatch_mode = DispatchShareMode::Exclusive;
+            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
+            if self.hot_dispatch_spillover_loans.active_lent_connections() == 0 {
+                self.hot_dispatch_mode = DispatchShareMode::Exclusive;
+            }
             false
         } else if !self.hot_dispatch_warmup_complete(now) {
             self.hot_dispatch_underfill_since = None;
+            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
             self.block_or_reclaim_spillover(SpilloverDecision::BlockedWarmup);
             false
+        } else if best_mode_block_reason == HotBestModeBlockReason::RecentExpansionHelped {
+            self.hot_dispatch_underfill_since = None;
+            self.set_hot_best_mode_block_reason(best_mode_block_reason);
+            self.block_or_reclaim_spillover(SpilloverDecision::BlockedRecentExpansionHelped);
+            false
         } else {
+            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
             let underfill_started_at = *self.hot_dispatch_underfill_since.get_or_insert(now);
             if now.saturating_duration_since(underfill_started_at) >= HOT_DISPATCH_UNDERFILL_WINDOW
             {
                 self.hot_dispatch_mode = DispatchShareMode::Shared;
-                self.hot_dispatch_last_lend_at = Some(now);
-                self.record_spillover_decision(SpilloverDecision::AllowedUnderfill);
                 true
             } else {
                 self.block_or_reclaim_spillover(SpilloverDecision::BlockedHotCanUseCapacity);
@@ -1548,6 +2116,7 @@ impl Pipeline {
         };
 
         if spillover_allowed {
+            dispatch_budget = dispatch_budget.min(1);
             for (_, _, job_id) in eligible {
                 if job_id == hot_job_id {
                     continue;
@@ -1558,6 +2127,10 @@ impl Pipeline {
                 {
                     match self.try_dispatch_download_for_job(job_id, pressure) {
                         DispatchAttempt::Dispatched => {
+                            self.start_spillover_loan(job_id, now, hot_speed_bps);
+                            self.record_spillover_decision(
+                                SpilloverDecision::AllowedMeasuredUnderfill,
+                            );
                             dispatch_budget = dispatch_budget.saturating_sub(1)
                         }
                         DispatchAttempt::NoWork => break,
@@ -1576,6 +2149,7 @@ impl Pipeline {
             }
         }
 
+        self.maybe_start_ip_replacement_trial(hot_job_id, pressure, max);
         self.update_queue_metrics();
         self.publish_hot_dispatch_metrics(now);
     }
@@ -1724,7 +2298,7 @@ impl Pipeline {
                                 connection_discarded: false,
                             }),
                             source_server_idx: None,
-                            is_recovery,
+                            origin: DownloadResultOrigin::from_recovery(is_recovery),
                             retry_count: work.retry_count,
                             exclude_servers: exclude_servers.clone(),
                             release_connection_slot: false,
@@ -1736,6 +2310,8 @@ impl Pipeline {
                         job_id,
                         mode,
                         reason: LaneParkReason::Error,
+                        release_connection_slot: true,
+                        release_ip_replacement_burst: false,
                     })
                     .await;
                 crate::runtime::perf_probe::record("download.fetch_body", fetch_started.elapsed());
@@ -1817,7 +2393,7 @@ impl Pipeline {
                                         attempts,
                                         lane_observation: Some(observation),
                                         source_server_idx,
-                                        is_recovery,
+                                        origin: DownloadResultOrigin::from_recovery(is_recovery),
                                         retry_count,
                                         exclude_servers: exclude_servers.clone(),
                                         release_connection_slot: false,
@@ -1884,7 +2460,7 @@ impl Pipeline {
                                         attempts,
                                         lane_observation: Some(observation),
                                         source_server_idx,
-                                        is_recovery,
+                                        origin: DownloadResultOrigin::from_recovery(is_recovery),
                                         retry_count,
                                         exclude_servers: exclude_servers.clone(),
                                         release_connection_slot: false,
@@ -1919,7 +2495,7 @@ impl Pipeline {
                                     connection_discarded: true,
                                 }),
                                 source_server_idx: None,
-                                is_recovery,
+                                origin: DownloadResultOrigin::from_recovery(is_recovery),
                                 retry_count: work.retry_count,
                                 exclude_servers: exclude_servers.clone(),
                                 release_connection_slot: false,
@@ -1956,7 +2532,7 @@ impl Pipeline {
                                     connection_discarded: true,
                                 }),
                                 source_server_idx: None,
-                                is_recovery,
+                                origin: DownloadResultOrigin::from_recovery(is_recovery),
                                 retry_count: work.retry_count,
                                 exclude_servers: exclude_servers.clone(),
                                 release_connection_slot: false,
@@ -1972,6 +2548,7 @@ impl Pipeline {
                     .send(DownloadLaneRefillRequest {
                         job_id,
                         server_idx,
+                        remote_ip: lane.remote_ip(),
                         supports_pipelining,
                         current_mode: recorded_mode,
                         compatibility,
@@ -2014,9 +2591,212 @@ impl Pipeline {
                     job_id: current_job_id,
                     mode: recorded_mode,
                     reason: park_reason,
+                    release_connection_slot: true,
+                    release_ip_replacement_burst: false,
                 })
                 .await;
             crate::runtime::perf_probe::record("download.fetch_body", fetch_started.elapsed());
+        });
+    }
+
+    pub(crate) fn handle_ip_replacement_trial_event(&mut self, event: IpReplacementTrialEvent) {
+        match event {
+            IpReplacementTrialEvent::CandidateAcquired {
+                job_id,
+                candidate,
+                candidate_ip,
+                lane,
+            } => {
+                let lease = match self
+                    .try_lease_ip_replacement_trial_batch(job_id, candidate.old_key.server_idx)
+                {
+                    Ok(Some(lease)) => lease,
+                    Ok(None) | Err(_) => {
+                        let trial_tx = self.ip_replacement_trial_tx.clone();
+                        tokio::spawn(async move {
+                            let lane = lane;
+                            lane.discard().await;
+                            let _ = trial_tx
+                                .send(IpReplacementTrialEvent::CandidateRejected)
+                                .await;
+                        });
+                        return;
+                    }
+                };
+
+                let activation_items = Self::activation_items(&lease);
+                self.activate_download_batch_lease(&lease, &activation_items, false);
+                self.spawn_ip_replacement_trial(lease, candidate, candidate_ip, *lane);
+            }
+            IpReplacementTrialEvent::AcquireFailed => {
+                self.metrics.note_ip_replacement_trial_acquire_failed();
+                self.metrics.note_ip_replacement_trial_rejected();
+                self.ip_replacement_burst_active = false;
+                self.metrics.set_ip_replacement_burst_active(false);
+            }
+            IpReplacementTrialEvent::SameIpRejected => {
+                self.metrics.note_ip_replacement_trial_same_ip_rejected();
+                self.metrics.note_ip_replacement_trial_rejected();
+                self.ip_replacement_burst_active = false;
+                self.metrics.set_ip_replacement_burst_active(false);
+            }
+            IpReplacementTrialEvent::CandidateRejected => {
+                self.metrics.note_ip_replacement_trial_rejected();
+                self.ip_replacement_burst_active = false;
+                self.metrics.set_ip_replacement_burst_active(false);
+            }
+            IpReplacementTrialEvent::CandidateAccepted { old_key, samples } => {
+                self.ip_replacement_retired_ips.insert(old_key);
+                self.observe_ip_rtt_attempts(&samples);
+            }
+        }
+    }
+
+    fn spawn_ip_replacement_trial(
+        &self,
+        lease: DownloadBatchLease,
+        candidate: IpReplacementCandidate,
+        candidate_ip: IpAddr,
+        mut lane: weaver_nntp::BodyLaneLease,
+    ) {
+        let nntp = Arc::clone(&self.nntp);
+        let metrics = Arc::clone(&self.metrics);
+        let tx = self.download_done_tx.clone();
+        let parked_tx = self.download_lane_parked_tx.clone();
+        let trial_tx = self.ip_replacement_trial_tx.clone();
+
+        tokio::spawn(async move {
+            let fetch_started = Instant::now();
+            let server = weaver_nntp::ServerId(candidate.old_key.server_idx);
+            let mode = DownloadLaneMode::Sequential;
+            let exclude_servers = lease.compatibility.exclude_servers.clone();
+            let job_id = lease.job_id;
+            let work_count = lease.works.len();
+            let mut trial_attempts = Vec::new();
+            let mut park_reason = LaneParkReason::NoWork;
+
+            let mut remaining = work_count;
+            for work in lease.works {
+                let trace = lane
+                    .fetch_decoded_sequential(&work.message_id.to_string())
+                    .await;
+                trial_attempts.extend(trace.attempts.iter().cloned());
+                let segment_id = work.segment_id;
+                let retry_count = work.retry_count;
+                let (data, attempts, source_server_idx) =
+                    Self::download_data_from_decoded_trace(segment_id, trace);
+                remaining = remaining.saturating_sub(1);
+                if data.is_err() {
+                    park_reason = LaneParkReason::Error;
+                }
+                let _ = tx
+                    .send(DownloadResult {
+                        segment_id,
+                        data,
+                        attempts,
+                        lane_observation: None,
+                        source_server_idx,
+                        origin: DownloadResultOrigin::IpReplacementTrial,
+                        retry_count,
+                        exclude_servers: exclude_servers.clone(),
+                        release_connection_slot: false,
+                    })
+                    .await;
+            }
+
+            let candidate_rtts = trial_attempts
+                .iter()
+                .filter(|attempt| {
+                    attempt.outcome == FetchAttemptOutcome::Success
+                        && attempt.server_idx == candidate.old_key.server_idx
+                        && attempt.remote_ip == Some(candidate_ip)
+                })
+                .map(|attempt| attempt.elapsed.as_secs_f64() * 1000.0)
+                .collect::<Vec<_>>();
+
+            let accepted = if candidate_rtts.len() >= IP_REPLACEMENT_TRIAL_SAMPLES {
+                let candidate_ewma_ms =
+                    candidate_rtts.iter().sum::<f64>() / candidate_rtts.len() as f64;
+                let better_by_ratio = candidate_ewma_ms
+                    <= candidate.old_ewma_ms * IP_REPLACEMENT_CANDIDATE_BETTER_RATIO;
+                let better_by_ms =
+                    candidate.old_ewma_ms - candidate_ewma_ms >= IP_REPLACEMENT_CANDIDATE_BETTER_MS;
+                if better_by_ratio && better_by_ms {
+                    nntp.retire_server_ip(server, candidate.old_key.ip).await;
+                    metrics.note_ip_replacement_trial_accepted();
+                    metrics.note_ip_replacement_old_connection_retired();
+                    debug!(
+                        server = candidate.old_key.server_idx,
+                        old_ip = %candidate.old_key.ip,
+                        candidate_ip = %candidate_ip,
+                        old_ewma_ms = candidate.old_ewma_ms,
+                        candidate_ewma_ms,
+                        baseline_ms = candidate.baseline_ms,
+                        "accepted IP replacement trial"
+                    );
+                    true
+                } else {
+                    metrics.note_ip_replacement_trial_rejected();
+                    debug!(
+                        server = candidate.old_key.server_idx,
+                        old_ip = %candidate.old_key.ip,
+                        candidate_ip = %candidate_ip,
+                        old_ewma_ms = candidate.old_ewma_ms,
+                        candidate_ewma_ms,
+                        baseline_ms = candidate.baseline_ms,
+                        "rejected IP replacement trial"
+                    );
+                    false
+                }
+            } else {
+                metrics.note_ip_replacement_trial_rejected();
+                debug!(
+                    server = candidate.old_key.server_idx,
+                    old_ip = %candidate.old_key.ip,
+                    candidate_ip = %candidate_ip,
+                    successful_samples = candidate_rtts.len(),
+                    "rejected IP replacement trial without enough distinct-IP proof"
+                );
+                false
+            };
+
+            if accepted {
+                let accepted_samples = trial_attempts
+                    .iter()
+                    .filter(|attempt| {
+                        attempt.outcome == FetchAttemptOutcome::Success
+                            && attempt.server_idx == candidate.old_key.server_idx
+                            && attempt.remote_ip == Some(candidate_ip)
+                    })
+                    .cloned()
+                    .collect();
+                let _ = trial_tx
+                    .send(IpReplacementTrialEvent::CandidateAccepted {
+                        old_key: candidate.old_key,
+                        samples: accepted_samples,
+                    })
+                    .await;
+                lane.park();
+            } else {
+                lane.discard().await;
+            }
+            let _ = parked_tx
+                .send(DownloadLaneParked {
+                    job_id,
+                    mode,
+                    reason: if accepted {
+                        park_reason
+                    } else {
+                        LaneParkReason::ProofFailure
+                    },
+                    release_connection_slot: false,
+                    release_ip_replacement_burst: true,
+                })
+                .await;
+            crate::runtime::perf_probe::record(
+                "download.ip_replacement_trial",
+                fetch_started.elapsed(),
+            );
         });
     }
 
@@ -2041,8 +2821,9 @@ impl Pipeline {
                     self.active_download_connections_by_job.remove(&job_id);
                 }
             }
+            self.clear_spillover_loan_if_idle();
         }
-        if result.is_recovery {
+        if result.origin.is_recovery() {
             self.active_recovery = self.active_recovery.saturating_sub(1);
         }
 
@@ -2064,13 +2845,13 @@ impl Pipeline {
                     .remove(&result.segment_id.file_id);
             }
         }
-        if !result.is_recovery
+        if result.origin.counts_for_hot_primary()
             && self.hot_dispatch_job == Some(job_id)
-            && matches!(&result.data, Ok(_))
+            && result.data.is_ok()
         {
             self.hot_dispatch_successes = self.hot_dispatch_successes.saturating_add(1);
         }
-        if !result.is_recovery
+        if result.origin.counts_for_hot_primary()
             && let Ok(DownloadPayload::Decoded(decoded)) = &result.data
         {
             self.ensure_job_transport_profile(job_id);
@@ -2088,31 +2869,52 @@ impl Pipeline {
             Err(DownloadError::Decode { raw_size, .. }) => Some(*raw_size),
             Err(_) => None,
         };
+        if result.origin.counts_for_hot_primary()
+            && self.hot_dispatch_job == Some(job_id)
+            && let Ok(payload) = &result.data
+        {
+            let raw_bytes = match payload {
+                DownloadPayload::Raw(raw) => raw.len() as u64,
+                DownloadPayload::Decoded(decoded) => decoded.raw_size,
+            };
+            self.hot_dispatch_throughput_window
+                .record(Instant::now(), raw_bytes);
+        }
         self.reconcile_rate_limit_for_download(result.segment_id, actual_raw_bytes);
-        if let Some(raw_bytes) = actual_raw_bytes {
-            if let Err(error) = self.record_download_bandwidth_usage(raw_bytes) {
-                error!(
-                    error = %error,
-                    segment = %result.segment_id,
-                    "failed to record ISP bandwidth usage"
-                );
-            }
+        if let Some(raw_bytes) = actual_raw_bytes
+            && let Err(error) = self.record_download_bandwidth_usage(raw_bytes)
+        {
+            error!(
+                error = %error,
+                segment = %result.segment_id,
+                "failed to record ISP bandwidth usage"
+            );
         }
         self.publish_hot_dispatch_metrics(Instant::now());
     }
 
     pub(crate) fn handle_download_lane_parked(&mut self, parked: DownloadLaneParked) {
-        self.note_download_lane_released(parked.mode, parked.reason);
-        self.active_download_connections = self.active_download_connections.saturating_sub(1);
-        if let Some(in_flight) = self
-            .active_download_connections_by_job
-            .get_mut(&parked.job_id)
-        {
-            *in_flight = in_flight.saturating_sub(1);
-            if *in_flight == 0 {
-                self.active_download_connections_by_job
-                    .remove(&parked.job_id);
+        if parked.release_connection_slot {
+            self.note_download_lane_released(parked.mode, parked.reason);
+            self.active_download_connections = self.active_download_connections.saturating_sub(1);
+            if self.hot_dispatch_job != Some(parked.job_id) {
+                self.hot_dispatch_spillover_loans.release_one(parked.job_id);
             }
+            if let Some(in_flight) = self
+                .active_download_connections_by_job
+                .get_mut(&parked.job_id)
+            {
+                *in_flight = in_flight.saturating_sub(1);
+                if *in_flight == 0 {
+                    self.active_download_connections_by_job
+                        .remove(&parked.job_id);
+                }
+            }
+            self.clear_spillover_loan_if_idle();
+        }
+        if parked.release_ip_replacement_burst {
+            self.ip_replacement_burst_active = false;
+            self.metrics.set_ip_replacement_burst_active(false);
         }
         self.publish_active_stage_metrics();
         self.publish_hot_dispatch_metrics(Instant::now());
@@ -2125,6 +2927,7 @@ impl Pipeline {
         let DownloadLaneRefillRequest {
             job_id,
             server_idx,
+            remote_ip,
             supports_pipelining,
             current_mode,
             compatibility,
@@ -2133,7 +2936,15 @@ impl Pipeline {
         let now = Instant::now();
         let mut park_reason = LaneParkReason::NoWork;
         let mut allow_refill = !self.global_paused && !self.rate_limiter.should_wait();
-        if !allow_refill {
+        let lane_ip_key = ServerIpKey {
+            server_idx,
+            ip: remote_ip,
+        };
+        if self.ip_replacement_retired_ips.contains(&lane_ip_key) {
+            allow_refill = false;
+            park_reason = LaneParkReason::IpReplacementRetired;
+        }
+        if !allow_refill && park_reason == LaneParkReason::NoWork {
             park_reason = LaneParkReason::ProbeYield;
         }
         if allow_refill && let Err(error) = self.refresh_bandwidth_cap_window() {
@@ -2150,12 +2961,14 @@ impl Pipeline {
         }
 
         let pressure = self.refresh_download_pressure();
-        if pressure.state != DownloadPressureState::Clear {
+        if allow_refill && pressure.state != DownloadPressureState::Clear {
             allow_refill = false;
             park_reason = LaneParkReason::Pressure;
         }
 
         if allow_refill {
+            self.apply_rar_unlock_priorities_if_dirty(job_id);
+
             let mut eligible = self
                 .job_order
                 .iter()
@@ -2178,25 +2991,65 @@ impl Pipeline {
             match self.select_hot_dispatch_job(&eligible, now) {
                 Some((_hot_priority, hot_job_id)) if hot_job_id == job_id => {}
                 Some((hot_priority, hot_job_id)) => {
-                    let hot_can_use_capacity = self.job_has_dispatchable_work(hot_job_id);
+                    let hot_speed_bps = self.hot_dispatch_speed_bps(now);
+                    self.hot_dispatch_expansion_window
+                        .refresh(now, hot_speed_bps);
+                    let recent_expansion_helped = self
+                        .hot_dispatch_expansion_window
+                        .recent_improvement_pct(now)
+                        >= HOT_DISPATCH_EXPANSION_HELPFUL_PERCENT;
+                    let effective_capacity = self.effective_download_connection_capacity(
+                        self.tuner.params().max_concurrent_downloads,
+                    );
+                    let best_mode_block_reason = self.hot_best_mode_block_reason(
+                        hot_job_id,
+                        effective_capacity,
+                        pressure,
+                        recent_expansion_helped,
+                    );
                     let can_keep_lent_lane = requested_priority.is_some_and(|request_priority| {
                         self.hot_dispatch_mode == DispatchShareMode::Shared
                             && request_priority >= hot_priority
-                            && !hot_can_use_capacity
+                            && best_mode_block_reason == HotBestModeBlockReason::None
+                            && !self.hot_spillover_reclaim_pending_for(job_id)
                     });
-                    if can_keep_lent_lane {
+                    if self.hot_spillover_reclaim_pending_for(job_id) {
+                        allow_refill = false;
+                        park_reason = LaneParkReason::SpilloverSpeedHarm;
+                        self.block_or_reclaim_spillover(SpilloverDecision::ReclaimedSpeedHarm);
+                    } else if can_keep_lent_lane {
                         self.hot_dispatch_last_lend_at = Some(now);
-                        self.record_spillover_decision(SpilloverDecision::AllowedUnderfill);
                     } else {
                         allow_refill = false;
-                        if hot_can_use_capacity {
+                        if best_mode_block_reason == HotBestModeBlockReason::HotHasQueuedPrimary {
+                            self.set_hot_best_mode_block_reason(best_mode_block_reason);
                             self.block_or_reclaim_spillover(
                                 SpilloverDecision::BlockedHotCanUseCapacity,
                             );
                             park_reason = LaneParkReason::SpilloverWithdraw;
+                        } else if best_mode_block_reason
+                            == HotBestModeBlockReason::RecentExpansionHelped
+                        {
+                            self.set_hot_best_mode_block_reason(best_mode_block_reason);
+                            self.block_or_reclaim_spillover(
+                                SpilloverDecision::BlockedRecentExpansionHelped,
+                            );
+                            park_reason = LaneParkReason::SpilloverWithdraw;
+                        } else if matches!(
+                            best_mode_block_reason,
+                            HotBestModeBlockReason::LaneCapacityAvailable
+                                | HotBestModeBlockReason::PipelinePromotionPending
+                        ) {
+                            self.set_hot_best_mode_block_reason(best_mode_block_reason);
+                            self.block_or_reclaim_spillover(
+                                SpilloverDecision::BlockedBestModePending,
+                            );
+                            park_reason = LaneParkReason::SpilloverWithdraw;
                         } else if requested_priority.is_none() {
+                            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
                             park_reason = LaneParkReason::NoWork;
                         } else {
+                            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
                             park_reason = LaneParkReason::HotReclaim;
                         }
                     }
@@ -2296,6 +3149,9 @@ impl Pipeline {
 
         let excluded_servers = result.exclude_servers.clone();
         let source_server_idx = result.source_server_idx;
+        if result.origin != DownloadResultOrigin::IpReplacementTrial {
+            self.observe_ip_rtt_attempts(&result.attempts);
+        }
 
         for (attempt_index, attempt) in result.attempts.iter().enumerate() {
             let outcome = match attempt.outcome {
@@ -2321,7 +3177,7 @@ impl Pipeline {
                 latency_ms: attempt.elapsed.as_millis().min(u64::MAX as u128) as u64,
                 outcome,
                 error: attempt.error.clone(),
-                is_recovery: result.is_recovery,
+                is_recovery: result.origin.is_recovery(),
             });
         }
 
@@ -2406,6 +3262,28 @@ impl Pipeline {
                 );
             }
             Err(DownloadError::Fetch(failure)) => {
+                if result.origin == DownloadResultOrigin::IpReplacementTrial
+                    && !matches!(
+                        failure.kind,
+                        DownloadFailureKind::ArticleNotFound
+                            | DownloadFailureKind::Auth
+                            | DownloadFailureKind::Permanent
+                    )
+                {
+                    if self.restore_download_result_work_without_retry(
+                        result.segment_id,
+                        result.retry_count,
+                        excluded_servers,
+                    ) {
+                        debug!(
+                            segment = %result.segment_id,
+                            error = %failure.message,
+                            "restored IP replacement trial work without consuming retry budget"
+                        );
+                    }
+                    self.maybe_finish_download_pass(job_id);
+                    return;
+                }
                 match &failure.kind {
                     DownloadFailureKind::ArticleNotFound => self
                         .metrics

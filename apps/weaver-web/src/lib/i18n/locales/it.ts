@@ -340,6 +340,8 @@ const it: LocaleDictionary = {
   "settings.cleanupDesc": "Elimina i file intermedi dopo un'estrazione riuscita",
   "settings.maxRetries": "Massimo Tentativi",
   "settings.maxRetriesDesc": "Quante volte Weaver deve riprovare un articolo prima di segnarlo come permanentemente mancante.",
+  "settings.ipReplacementTrialExtraConnections": "Burst sostituzione IP",
+  "settings.ipReplacementTrialExtraConnectionsDesc": "Consenti una connessione temporanea extra per sostituire un IP più lento comprovato.",
   "settings.storageAndBehavior": "Archiviazione e Comportamento",
   "settings.storageAndBehaviorDesc": "Questi valori controllano dove risiede lo stato dei job su disco e quanto aggressivamente Weaver pulisce e riprova i lavori.",
   "settings.save": "Salva",

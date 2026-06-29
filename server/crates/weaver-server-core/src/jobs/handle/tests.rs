@@ -310,6 +310,9 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 SchedulerCommand::SetSpeedLimit { reply, .. } => {
                     let _ = reply.send(());
                 }
+                SchedulerCommand::SetIpReplacementTrialExtraConnections { reply, .. } => {
+                    let _ = reply.send(());
+                }
                 SchedulerCommand::SetBandwidthCapPolicy { reply, .. } => {
                     let _ = reply.send(Ok(()));
                 }

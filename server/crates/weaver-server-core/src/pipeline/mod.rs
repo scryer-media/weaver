@@ -15,7 +15,8 @@ pub(crate) use orchestrator::check_disk_space;
 use orchestrator::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};
 use orchestrator::{is_terminal_status, write_segment_to_disk};
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
@@ -24,8 +25,6 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
-
-use std::collections::HashSet;
 
 use crate::ActiveFileProgress;
 #[cfg(test)]
@@ -227,6 +226,7 @@ pub(super) struct DownloadBatchLease {
 pub(super) struct DownloadLaneRefillRequest {
     pub(super) job_id: JobId,
     pub(super) server_idx: usize,
+    pub(super) remote_ip: IpAddr,
     pub(super) supports_pipelining: bool,
     pub(super) current_mode: DownloadLaneMode,
     pub(super) compatibility: DownloadBatchCompatibility,
@@ -238,10 +238,388 @@ pub(super) struct DownloadLaneRefillResponse {
     pub(super) park_reason: LaneParkReason,
 }
 
+const HOT_THROUGHPUT_WINDOW: Duration = Duration::from_secs(2);
+const HOT_THROUGHPUT_BUCKET_WIDTH: Duration = Duration::from_millis(200);
+const HOT_THROUGHPUT_BUCKETS: usize = 10;
+const HOT_EXPANSION_AFTER_WINDOW: Duration = Duration::from_secs(2);
+const HOT_EXPANSION_LOOKBACK: Duration = Duration::from_secs(4);
+
+#[derive(Debug, Default)]
+pub(super) struct HotJobThroughputWindow {
+    buckets: VecDeque<HotThroughputBucket>,
+}
+
+#[derive(Debug)]
+struct HotThroughputBucket {
+    started_at: Instant,
+    bytes: u64,
+}
+
+impl HotJobThroughputWindow {
+    pub(super) fn clear(&mut self) {
+        self.buckets.clear();
+    }
+
+    pub(super) fn record(&mut self, now: Instant, bytes: u64) {
+        self.advance_to(now);
+        if let Some(bucket) = self.buckets.back_mut() {
+            bucket.bytes = bucket.bytes.saturating_add(bytes);
+        }
+    }
+
+    pub(super) fn bps(&mut self, now: Instant) -> u64 {
+        self.advance_to(now);
+        let bytes = self.buckets.iter().map(|bucket| bucket.bytes).sum::<u64>();
+        (bytes as f64 / HOT_THROUGHPUT_WINDOW.as_secs_f64()).round() as u64
+    }
+
+    fn advance_to(&mut self, now: Instant) {
+        if self.buckets.back().is_some_and(|bucket| {
+            now.saturating_duration_since(bucket.started_at) >= HOT_THROUGHPUT_WINDOW
+        }) {
+            self.buckets.clear();
+        }
+
+        if self.buckets.is_empty() {
+            self.buckets.push_back(HotThroughputBucket {
+                started_at: now,
+                bytes: 0,
+            });
+            return;
+        }
+
+        while self.buckets.back().is_some_and(|bucket| {
+            now.saturating_duration_since(bucket.started_at) >= HOT_THROUGHPUT_BUCKET_WIDTH
+        }) {
+            let next_started_at = self
+                .buckets
+                .back()
+                .map(|bucket| bucket.started_at + HOT_THROUGHPUT_BUCKET_WIDTH)
+                .unwrap_or(now);
+            self.buckets.push_back(HotThroughputBucket {
+                started_at: next_started_at,
+                bytes: 0,
+            });
+            while self.buckets.len() > HOT_THROUGHPUT_BUCKETS {
+                self.buckets.pop_front();
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct HotExclusiveWindow {
+    peak_bps: u64,
+}
+
+impl HotExclusiveWindow {
+    pub(super) fn clear(&mut self) {
+        self.peak_bps = 0;
+    }
+
+    pub(super) fn record(&mut self, bps: u64) {
+        self.peak_bps = self.peak_bps.max(bps);
+    }
+
+    pub(super) fn peak_bps(&self) -> u64 {
+        self.peak_bps
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HotExpansionKind {
+    LaneStart,
+    PipelinePromotion,
+}
+
+impl HotExpansionKind {
+    pub(super) fn as_code(self) -> usize {
+        match self {
+            Self::LaneStart => 1,
+            Self::PipelinePromotion => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct HotExpansionEvent {
+    pub(super) at: Instant,
+    pub(super) kind: HotExpansionKind,
+    pub(super) before_bps: u64,
+    pub(super) after_bps: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct HotExpansionWindow {
+    events: VecDeque<HotExpansionEvent>,
+}
+
+impl HotExpansionWindow {
+    pub(super) fn clear(&mut self) {
+        self.events.clear();
+    }
+
+    pub(super) fn record(&mut self, now: Instant, kind: HotExpansionKind, before_bps: u64) {
+        self.events.push_back(HotExpansionEvent {
+            at: now,
+            kind,
+            before_bps,
+            after_bps: None,
+        });
+        self.prune(now);
+    }
+
+    pub(super) fn refresh(&mut self, now: Instant, current_bps: u64) {
+        for event in &mut self.events {
+            if event.after_bps.is_none()
+                && now.saturating_duration_since(event.at) >= HOT_EXPANSION_AFTER_WINDOW
+            {
+                event.after_bps = Some(current_bps);
+            }
+        }
+        self.prune(now);
+    }
+
+    pub(super) fn recent_improvement_pct(&mut self, now: Instant) -> u64 {
+        self.prune(now);
+        self.events
+            .iter()
+            .filter_map(|event| {
+                let after = event.after_bps?;
+                if event.before_bps == 0 || after <= event.before_bps {
+                    return Some(0);
+                }
+                Some(((after - event.before_bps) * 100) / event.before_bps)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(super) fn last_event(&self) -> Option<HotExpansionEvent> {
+        self.events.back().copied()
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self
+            .events
+            .front()
+            .is_some_and(|event| now.saturating_duration_since(event.at) > HOT_EXPANSION_LOOKBACK)
+        {
+            self.events.pop_front();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum SpilloverReclaimReason {
+    SpeedHarm,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SpilloverLoanState {
+    pub(super) lent_connections: usize,
+    pub(super) post_lend_bps: Option<u64>,
+    pub(super) reclaim_reason: Option<SpilloverReclaimReason>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct SpilloverLoanBook {
+    loans: HashMap<JobId, SpilloverLoanState>,
+    aggregate_pre_lend_bps: Option<u64>,
+    aggregate_lent_at: Option<Instant>,
+    aggregate_post_lend_bps: Option<u64>,
+}
+
+impl SpilloverLoanBook {
+    pub(super) fn clear(&mut self) {
+        self.loans.clear();
+        self.aggregate_pre_lend_bps = None;
+        self.aggregate_lent_at = None;
+        self.aggregate_post_lend_bps = None;
+    }
+
+    pub(super) fn start_or_extend(&mut self, job_id: JobId, now: Instant, hot_speed_bps: u64) {
+        if self.loans.is_empty() {
+            self.aggregate_pre_lend_bps = Some(hot_speed_bps);
+            self.aggregate_lent_at = Some(now);
+            self.aggregate_post_lend_bps = None;
+        }
+        self.loans
+            .entry(job_id)
+            .and_modify(|loan| {
+                loan.lent_connections = loan.lent_connections.saturating_add(1);
+            })
+            .or_insert(SpilloverLoanState {
+                lent_connections: 1,
+                post_lend_bps: None,
+                reclaim_reason: None,
+            });
+    }
+
+    pub(super) fn release_one(&mut self, job_id: JobId) {
+        let Some(loan) = self.loans.get_mut(&job_id) else {
+            return;
+        };
+        loan.lent_connections = loan.lent_connections.saturating_sub(1);
+        if loan.lent_connections == 0 {
+            self.loans.remove(&job_id);
+        }
+        if self.loans.is_empty() {
+            self.aggregate_pre_lend_bps = None;
+            self.aggregate_lent_at = None;
+            self.aggregate_post_lend_bps = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_reclaim_for_test(
+        &mut self,
+        job_id: JobId,
+        post_lend_bps: Option<u64>,
+        reason: SpilloverReclaimReason,
+    ) {
+        if let Some(loan) = self.loans.get_mut(&job_id) {
+            loan.post_lend_bps = post_lend_bps;
+            loan.reclaim_reason = Some(reason);
+        }
+    }
+
+    pub(super) fn reclaim_pending_for(&self, job_id: JobId) -> bool {
+        self.loans
+            .get(&job_id)
+            .is_some_and(|loan| loan.reclaim_reason.is_some())
+    }
+
+    pub(super) fn active_lent_connections(&self) -> usize {
+        self.loans.values().map(|loan| loan.lent_connections).sum()
+    }
+
+    pub(super) fn active_loan_count(&self) -> usize {
+        self.loans.len()
+    }
+
+    pub(super) fn speed_snapshot(&self) -> (u64, u64, usize) {
+        let pre = self.aggregate_pre_lend_bps.unwrap_or(0);
+        let post = self.aggregate_post_lend_bps.unwrap_or(0);
+        (pre, post, self.active_loan_count())
+    }
+
+    pub(super) fn update_speed_harm(
+        &mut self,
+        now: Instant,
+        hot_speed_bps: u64,
+        harm_percent: u64,
+    ) -> bool {
+        if self.loans.is_empty() || hot_speed_bps == 0 {
+            return false;
+        }
+
+        let Some(lent_at) = self.aggregate_lent_at else {
+            return false;
+        };
+        let Some(pre_lend_bps) = self.aggregate_pre_lend_bps else {
+            return false;
+        };
+        if now.saturating_duration_since(lent_at) < Duration::from_secs(2) || pre_lend_bps == 0 {
+            return false;
+        }
+
+        self.aggregate_post_lend_bps = Some(hot_speed_bps);
+        for loan in self.loans.values_mut() {
+            loan.post_lend_bps = Some(hot_speed_bps);
+        }
+
+        let harm_threshold = pre_lend_bps.saturating_mul(100 - harm_percent) / 100;
+        if hot_speed_bps >= harm_threshold {
+            return false;
+        }
+
+        let mut newly_reclaimed = false;
+        for loan in self.loans.values_mut() {
+            if loan.reclaim_reason.is_none() {
+                loan.reclaim_reason = Some(SpilloverReclaimReason::SpeedHarm);
+                newly_reclaimed = true;
+            }
+        }
+        newly_reclaimed
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HotBestModeBlockReason {
+    None,
+    HotHasQueuedPrimary,
+    LaneCapacityAvailable,
+    PipelinePromotionPending,
+    RecentExpansionHelped,
+}
+
+impl HotBestModeBlockReason {
+    pub(super) fn as_code(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::HotHasQueuedPrimary => 1,
+            Self::LaneCapacityAvailable => 2,
+            Self::PipelinePromotionPending => 3,
+            Self::RecentExpansionHelped => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct IpReplacementCandidate {
+    pub(super) old_key: ServerIpKey,
+    pub(super) old_ewma_ms: f64,
+    pub(super) baseline_ms: f64,
+}
+
+pub(super) enum IpReplacementTrialEvent {
+    CandidateAcquired {
+        job_id: JobId,
+        candidate: IpReplacementCandidate,
+        candidate_ip: IpAddr,
+        lane: Box<weaver_nntp::BodyLaneLease>,
+    },
+    AcquireFailed,
+    SameIpRejected,
+    CandidateRejected,
+    CandidateAccepted {
+        old_key: ServerIpKey,
+        samples: Vec<weaver_nntp::client::FetchAttemptTrace>,
+    },
+}
+
 pub(super) struct DownloadLaneParked {
     pub(super) job_id: JobId,
     pub(super) mode: DownloadLaneMode,
     pub(super) reason: LaneParkReason,
+    pub(super) release_connection_slot: bool,
+    pub(super) release_ip_replacement_burst: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DownloadResultOrigin {
+    NormalPrimary,
+    Recovery,
+    IpReplacementTrial,
+}
+
+impl DownloadResultOrigin {
+    pub(super) fn from_recovery(is_recovery: bool) -> Self {
+        if is_recovery {
+            Self::Recovery
+        } else {
+            Self::NormalPrimary
+        }
+    }
+
+    pub(super) fn is_recovery(self) -> bool {
+        matches!(self, Self::Recovery)
+    }
+
+    pub(super) fn counts_for_hot_primary(self) -> bool {
+        matches!(self, Self::NormalPrimary)
+    }
 }
 
 /// Result of a download task.
@@ -252,8 +630,8 @@ pub(super) struct DownloadResult {
     pub(super) lane_observation: Option<DownloadLaneObservation>,
     /// Server that successfully served this payload, if known.
     pub(super) source_server_idx: Option<usize>,
-    /// Whether this was a speculative recovery download.
-    pub(super) is_recovery: bool,
+    /// Scheduler attribution for metrics, warmup, and retry semantics.
+    pub(super) origin: DownloadResultOrigin,
     /// How many times this segment has been retried so far.
     pub(super) retry_count: u32,
     /// Servers intentionally excluded for this fetch attempt.
@@ -451,6 +829,7 @@ pub(super) struct RarRefreshDone {
     pub(super) job_id: JobId,
     pub(super) set_name: String,
     pub(super) request: RarRefreshRequest,
+    pub(super) extraction_generation: u64,
     pub(super) result: Result<ComputedRarSetState, RarRefreshError>,
 }
 
@@ -666,6 +1045,41 @@ impl BufferedChunk for BufferedDecodedSegment {
     }
 }
 
+const MAX_IP_RTT_EWMA_ENTRIES: usize = 64;
+const IP_RTT_EWMA_ALPHA: f64 = 0.20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct ServerIpKey {
+    pub(super) server_idx: usize,
+    pub(super) ip: IpAddr,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct IpRttEwma {
+    pub(super) ewma_ms: f64,
+    pub(super) samples: u16,
+    pub(super) first_seen: Instant,
+    pub(super) last_seen: Instant,
+}
+
+impl IpRttEwma {
+    pub(super) fn new(now: Instant, elapsed: Duration) -> Self {
+        Self {
+            ewma_ms: elapsed.as_secs_f64() * 1000.0,
+            samples: 1,
+            first_seen: now,
+            last_seen: now,
+        }
+    }
+
+    pub(super) fn observe(&mut self, now: Instant, elapsed: Duration) {
+        let next_ms = elapsed.as_secs_f64() * 1000.0;
+        self.ewma_ms = (IP_RTT_EWMA_ALPHA * next_ms) + ((1.0 - IP_RTT_EWMA_ALPHA) * self.ewma_ms);
+        self.samples = self.samples.saturating_add(1);
+        self.last_seen = now;
+    }
+}
+
 /// The pipeline engine. Owns the scheduler loop and drives work through
 /// download → decode → commit → verify → repair → extract stages.
 pub struct Pipeline {
@@ -709,10 +1123,26 @@ pub struct Pipeline {
     pub(super) hot_dispatch_underfill_since: Option<Instant>,
     /// Most recent spillover decision, for tick logging.
     pub(super) hot_dispatch_last_spillover_decision: SpilloverDecision,
+    /// Two-second measured throughput for successful hot-job primary BODY results.
+    pub(super) hot_dispatch_throughput_window: HotJobThroughputWindow,
+    /// Peak measured hot-job speed while no spillover lanes are active.
+    pub(super) hot_dispatch_exclusive_window: HotExclusiveWindow,
+    /// Recent lane expansion and pipeline promotion outcomes.
+    pub(super) hot_dispatch_expansion_window: HotExpansionWindow,
+    /// Active reclaimable spillover loans keyed by lent job.
+    pub(super) hot_dispatch_spillover_loans: SpilloverLoanBook,
     /// Runtime-only article transport classification per active job.
     pub(super) job_transport_profiles: HashMap<JobId, JobTransportProfile>,
     /// Runtime-only lane/proof state for BODY dispatch.
     pub(super) download_lane_runtime: DownloadLaneRuntimeState,
+    /// User-enabled over-max burst budget for latent-IP replacement trials.
+    pub(super) ip_replacement_trial_extra_connections: u8,
+    /// Bounded per-server/per-IP BODY RTT EWMA state.
+    pub(super) ip_rtt_ewma: HashMap<ServerIpKey, IpRttEwma>,
+    /// Old server/IP identities accepted for replacement; active lanes park at clean refill.
+    pub(super) ip_replacement_retired_ips: HashSet<ServerIpKey>,
+    /// Whether the single global over-max replacement burst is currently occupied.
+    pub(super) ip_replacement_burst_active: bool,
     /// Jobs currently inside an active article download pass.
     pub(super) active_download_passes: HashSet<JobId>,
     /// Jobs that still have decode/write pipeline work after network downloads finished.
@@ -770,6 +1200,8 @@ pub struct Pipeline {
     pub(super) download_refill_rx: mpsc::Receiver<DownloadLaneRefillRequest>,
     pub(super) download_lane_parked_tx: mpsc::Sender<DownloadLaneParked>,
     pub(super) download_lane_parked_rx: mpsc::Receiver<DownloadLaneParked>,
+    pub(super) ip_replacement_trial_tx: mpsc::Sender<IpReplacementTrialEvent>,
+    pub(super) ip_replacement_trial_rx: mpsc::Receiver<IpReplacementTrialEvent>,
     pub(super) decode_done_tx: mpsc::Sender<DecodeDone>,
     pub(super) decode_done_rx: mpsc::Receiver<DecodeDone>,
     /// Channel for delayed retries — segments sleep then come back here.
@@ -856,6 +1288,10 @@ pub struct Pipeline {
     rar_sets: HashMap<(JobId, String), RarSetState>,
     /// Runtime-only coalescing state for background RAR topology refreshes.
     rar_refresh_state: HashMap<(JobId, String), RarRefreshState>,
+    /// Jobs whose queued RAR volume work needs unlock-priority recomputation.
+    rar_unlock_priority_dirty_jobs: HashSet<JobId>,
+    /// Files currently boosted for opportunistic RAR member unlock scheduling.
+    rar_unlock_boosted_files: HashMap<JobId, HashSet<NzbFileId>>,
     /// Runtime-only coalescing state for delayed RAR capacity-pressure retries.
     pub(in crate::pipeline) pending_rar_capacity_retries:
         HashSet<(JobId, String, RarCapacityRetryKind)>,

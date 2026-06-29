@@ -19,6 +19,7 @@ impl Pipeline {
 
         self.rar_sets.remove(&set_key);
         self.rar_refresh_state.remove(&set_key);
+        self.mark_rar_unlock_priorities_dirty(job_id);
         self.persist_verified_suspect_volumes(job_id, set_name, &HashSet::new());
     }
 
@@ -83,6 +84,7 @@ impl Pipeline {
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.assembly.archive_topologies_mut().remove(set_name);
         }
+        self.mark_rar_unlock_priorities_dirty(job_id);
 
         if let Err(error) = self.db.clear_extraction_chunks_for_set(job_id, set_name) {
             warn!(

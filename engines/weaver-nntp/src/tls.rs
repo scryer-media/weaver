@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,9 +20,9 @@ pin_project_lite::pin_project! {
     #[project = NntpTransportProj]
     pub enum NntpTransport {
         /// Unencrypted TCP.
-        Plain { #[pin] inner: TcpStream },
+        Plain { #[pin] inner: TcpStream, remote_addr: SocketAddr },
         /// TLS-encrypted TCP.
-        Tls { #[pin] inner: TlsStream<TcpStream> },
+        Tls { #[pin] inner: TlsStream<TcpStream>, remote_addr: SocketAddr },
     }
 }
 
@@ -29,6 +30,14 @@ impl NntpTransport {
     /// Returns `true` if this transport is TLS-encrypted.
     pub fn is_tls(&self) -> bool {
         matches!(self, NntpTransport::Tls { .. })
+    }
+
+    pub fn remote_addr(&self) -> SocketAddr {
+        match self {
+            NntpTransport::Plain { remote_addr, .. } | NntpTransport::Tls { remote_addr, .. } => {
+                *remote_addr
+            }
+        }
     }
 }
 
@@ -39,8 +48,8 @@ impl AsyncRead for NntpTransport {
         buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.project() {
-            NntpTransportProj::Plain { inner } => inner.poll_read(cx, buf),
-            NntpTransportProj::Tls { inner } => inner.poll_read(cx, buf),
+            NntpTransportProj::Plain { inner, .. } => inner.poll_read(cx, buf),
+            NntpTransportProj::Tls { inner, .. } => inner.poll_read(cx, buf),
         }
     }
 }
@@ -52,8 +61,8 @@ impl AsyncWrite for NntpTransport {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         match self.project() {
-            NntpTransportProj::Plain { inner } => inner.poll_write(cx, buf),
-            NntpTransportProj::Tls { inner } => inner.poll_write(cx, buf),
+            NntpTransportProj::Plain { inner, .. } => inner.poll_write(cx, buf),
+            NntpTransportProj::Tls { inner, .. } => inner.poll_write(cx, buf),
         }
     }
 
@@ -62,8 +71,8 @@ impl AsyncWrite for NntpTransport {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.project() {
-            NntpTransportProj::Plain { inner } => inner.poll_flush(cx),
-            NntpTransportProj::Tls { inner } => inner.poll_flush(cx),
+            NntpTransportProj::Plain { inner, .. } => inner.poll_flush(cx),
+            NntpTransportProj::Tls { inner, .. } => inner.poll_flush(cx),
         }
     }
 
@@ -72,8 +81,8 @@ impl AsyncWrite for NntpTransport {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.project() {
-            NntpTransportProj::Plain { inner } => inner.poll_shutdown(cx),
-            NntpTransportProj::Tls { inner } => inner.poll_shutdown(cx),
+            NntpTransportProj::Plain { inner, .. } => inner.poll_shutdown(cx),
+            NntpTransportProj::Tls { inner, .. } => inner.poll_shutdown(cx),
         }
     }
 }
@@ -144,22 +153,30 @@ pub async fn connect_tls(
 ) -> Result<NntpTransport, NntpError> {
     let addr = format!("{host}:{port}");
     let tcp = TcpStream::connect(&addr).await?;
+    let remote_addr = tcp.peer_addr()?;
     tcp.set_nodelay(true)?;
     set_keepalive(&tcp);
     let tls_config = build_tls_config(ca_cert_path)?;
     let connector = TlsConnector::from(tls_config);
     let server_name = make_server_name(host)?;
     let tls_stream = connector.connect(server_name, tcp).await?;
-    Ok(NntpTransport::Tls { inner: tls_stream })
+    Ok(NntpTransport::Tls {
+        inner: tls_stream,
+        remote_addr,
+    })
 }
 
 /// Connect to a host with plain TCP (e.g. port 119).
 pub async fn connect_plain(host: &str, port: u16) -> Result<NntpTransport, NntpError> {
     let addr = format!("{host}:{port}");
     let tcp = TcpStream::connect(&addr).await?;
+    let remote_addr = tcp.peer_addr()?;
     tcp.set_nodelay(true)?;
     set_keepalive(&tcp);
-    Ok(NntpTransport::Plain { inner: tcp })
+    Ok(NntpTransport::Plain {
+        inner: tcp,
+        remote_addr,
+    })
 }
 
 /// Upgrade an existing plain TCP connection to TLS (STARTTLS).
@@ -171,8 +188,8 @@ pub async fn upgrade_starttls(
     host: &str,
     ca_cert_path: Option<&Path>,
 ) -> Result<NntpTransport, NntpError> {
-    let tcp = match transport {
-        NntpTransport::Plain { inner } => inner,
+    let (tcp, remote_addr) = match transport {
+        NntpTransport::Plain { inner, remote_addr } => (inner, remote_addr),
         NntpTransport::Tls { .. } => {
             return Err(NntpError::MalformedResponse(
                 "cannot STARTTLS on an already-TLS connection".into(),
@@ -184,7 +201,10 @@ pub async fn upgrade_starttls(
     let connector = TlsConnector::from(tls_config);
     let server_name = make_server_name(host)?;
     let tls_stream = connector.connect(server_name, tcp).await?;
-    Ok(NntpTransport::Tls { inner: tls_stream })
+    Ok(NntpTransport::Tls {
+        inner: tls_stream,
+        remote_addr,
+    })
 }
 
 #[cfg(test)]

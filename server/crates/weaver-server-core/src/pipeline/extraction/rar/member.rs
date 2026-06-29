@@ -32,6 +32,16 @@ pub(crate) struct RarExtractionOpenRequest<'a> {
     pub(crate) already_extracted: Option<&'a std::collections::HashSet<String>>,
 }
 
+struct RarArchiveOpenInputs<'a> {
+    set_name: &'a str,
+    volume_paths: &'a std::collections::BTreeMap<u32, PathBuf>,
+    cached_headers: Option<&'a [u8]>,
+    shared_kdf_cache: std::sync::Arc<weaver_unrar::crypto::KdfCache>,
+    open_mode: RarArchiveOpenMode,
+    requested_members: Option<&'a [String]>,
+    already_extracted: Option<&'a std::collections::HashSet<String>>,
+}
+
 pub(crate) struct RarExtractionOpenSelection {
     pub(crate) archive: weaver_unrar::RarArchive,
     pub(crate) password: Option<String>,
@@ -497,17 +507,17 @@ impl Pipeline {
         already_extracted: Option<&std::collections::HashSet<String>>,
     ) -> Result<crate::pipeline::ArchivePasswordSelection<weaver_unrar::RarArchive>, String> {
         let context = format!("failed to open RAR archive for set '{set_name}'");
+        let inputs = RarArchiveOpenInputs {
+            set_name,
+            volume_paths: &volume_paths,
+            cached_headers: cached_headers.as_deref(),
+            shared_kdf_cache,
+            open_mode,
+            requested_members,
+            already_extracted,
+        };
         Self::try_rar_password_candidates(&context, &password_candidates, |password| {
-            Self::open_rar_archive_from_snapshot_or_disk_with_password(
-                set_name,
-                &volume_paths,
-                cached_headers.as_deref(),
-                shared_kdf_cache.clone(),
-                open_mode,
-                requested_members,
-                already_extracted,
-                password,
-            )
+            Self::open_rar_archive_from_snapshot_or_disk_with_password(&inputs, password)
         })
         .and_then(|selection| {
             ensure_unique_sanitized_rar_member_paths(&selection.value)?;
@@ -548,18 +558,19 @@ impl Pipeline {
         }
 
         let context = format!("failed to validate RAR password for set '{set_name}'");
+        let inputs = RarArchiveOpenInputs {
+            set_name,
+            volume_paths: &volume_paths,
+            cached_headers: cached_headers.as_deref(),
+            shared_kdf_cache,
+            open_mode,
+            requested_members: Some(requested_members),
+            already_extracted,
+        };
         let selection =
             Self::try_rar_password_candidates(&context, &password_candidates, |password| {
-                let mut probe_archive = Self::open_rar_archive_from_snapshot_or_disk_with_password(
-                    set_name,
-                    &volume_paths,
-                    cached_headers.as_deref(),
-                    shared_kdf_cache.clone(),
-                    open_mode,
-                    Some(requested_members),
-                    already_extracted,
-                    password,
-                )?;
+                let mut probe_archive =
+                    Self::open_rar_archive_from_snapshot_or_disk_with_password(&inputs, password)?;
                 let probe = Self::select_rar_password_probe_member(
                     &probe_archive,
                     requested_members,
@@ -576,16 +587,8 @@ impl Pipeline {
                 } else {
                     false
                 };
-                let archive = Self::open_rar_archive_from_snapshot_or_disk_with_password(
-                    set_name,
-                    &volume_paths,
-                    cached_headers.as_deref(),
-                    shared_kdf_cache.clone(),
-                    open_mode,
-                    Some(requested_members),
-                    already_extracted,
-                    password,
-                )?;
+                let archive =
+                    Self::open_rar_archive_from_snapshot_or_disk_with_password(&inputs, password)?;
                 Ok((archive, password_validated))
             })?;
         let (archive, password_validated) = selection.value;
@@ -630,15 +633,15 @@ impl Pipeline {
     }
 
     fn open_rar_archive_from_snapshot_or_disk_with_password(
-        set_name: &str,
-        volume_paths: &std::collections::BTreeMap<u32, PathBuf>,
-        cached_headers: Option<&[u8]>,
-        shared_kdf_cache: std::sync::Arc<weaver_unrar::crypto::KdfCache>,
-        open_mode: RarArchiveOpenMode,
-        requested_members: Option<&[String]>,
-        already_extracted: Option<&std::collections::HashSet<String>>,
+        inputs: &RarArchiveOpenInputs<'_>,
         password: Option<&str>,
     ) -> Result<weaver_unrar::RarArchive, crate::pipeline::RarPasswordAttemptError> {
+        let set_name = inputs.set_name;
+        let volume_paths = inputs.volume_paths;
+        let cached_headers = inputs.cached_headers;
+        let open_mode = inputs.open_mode;
+        let requested_members = inputs.requested_members;
+        let already_extracted = inputs.already_extracted;
         let has_cached_headers = cached_headers.is_some();
         let refresh_provided_volumes =
             matches!(open_mode, RarArchiveOpenMode::RefreshProvidedVolumes);
@@ -649,13 +652,13 @@ impl Pipeline {
                     let _ = Self::open_rar_volume_zero_with_password(
                         first_path,
                         password,
-                        shared_kdf_cache.clone(),
+                        inputs.shared_kdf_cache.clone(),
                     )?;
                 }
                 weaver_unrar::RarArchive::deserialize_headers_with_password_and_shared_kdf_cache(
                     headers,
                     password.map(str::to_string),
-                    shared_kdf_cache.clone(),
+                    inputs.shared_kdf_cache.clone(),
                 )
                 .map_err(|error| {
                     crate::pipeline::RarPasswordAttemptError::Fatal(format!(
@@ -672,7 +675,7 @@ impl Pipeline {
                 Self::open_rar_volume_zero_with_password(
                     first_path,
                     password,
-                    shared_kdf_cache.clone(),
+                    inputs.shared_kdf_cache.clone(),
                 )?
             }
         };

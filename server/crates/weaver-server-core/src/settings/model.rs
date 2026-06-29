@@ -40,6 +40,10 @@ pub struct Config {
     /// Optional ISP bandwidth cap policy.
     #[serde(default)]
     pub isp_bandwidth_cap: Option<IspBandwidthCapConfig>,
+    /// Optional global burst for make-before-break latent-IP replacement trials.
+    /// Defaults to 0 and is capped at 1.
+    #[serde(default)]
+    pub ip_replacement_trial_extra_connections: Option<u8>,
     /// Optional override for the diagnostic upload service base URL.
     /// Defaults to https://diagnostics.scryer.media when unset.
     #[serde(default)]
@@ -73,6 +77,12 @@ impl Config {
         self.cleanup_after_extract.unwrap_or(true)
     }
 
+    pub fn ip_replacement_trial_extra_connections(&self) -> u8 {
+        self.ip_replacement_trial_extra_connections
+            .unwrap_or(0)
+            .min(1)
+    }
+
     /// Validate the configuration, returning any issues found.
     /// Empty server list is allowed (users add servers via UI).
     pub fn validate(&self) -> Result<(), Vec<String>> {
@@ -92,6 +102,10 @@ impl Config {
 
         if self.data_dir.is_empty() {
             errors.push("data_dir must not be empty".to_string());
+        }
+
+        if self.ip_replacement_trial_extra_connections.unwrap_or(0) > 1 {
+            errors.push("ip_replacement_trial_extra_connections must be 0 or 1".to_string());
         }
 
         if errors.is_empty() {

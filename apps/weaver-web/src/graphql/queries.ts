@@ -233,6 +233,7 @@ const GENERAL_SETTINGS_FIELDS = `
     cleanupAfterExtract
     maxDownloadSpeed
     maxRetries
+    ipReplacementTrialExtraConnections
     ispBandwidthCap {
       ...IspBandwidthCapFields
     }

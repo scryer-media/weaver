@@ -31,7 +31,14 @@ impl Pipeline {
         let decode_backlog_budget_bytes =
             compute_decode_backlog_budget_bytes(&profile, &buffers, write_backlog_budget_bytes);
         let tuner = RuntimeTuner::with_connection_limit(profile, total_connections);
-        let initial_bandwidth_policy = config.read().await.isp_bandwidth_cap.clone();
+        let (initial_bandwidth_policy, ip_replacement_trial_extra_connections) = {
+            let cfg = config.read().await;
+            (
+                cfg.isp_bandwidth_cap.clone(),
+                cfg.ip_replacement_trial_extra_connections(),
+            )
+        };
+        metrics.set_ip_replacement_trial_extra_connections(ip_replacement_trial_extra_connections);
         info!(
             max_downloads = tuner.params().max_concurrent_downloads,
             decode_backlog_budget_mb = decode_backlog_budget_bytes / (1024 * 1024),
@@ -47,6 +54,7 @@ impl Pipeline {
         let (download_done_tx, download_done_rx) = mpsc::channel(256);
         let (download_refill_tx, download_refill_rx) = mpsc::channel(256);
         let (download_lane_parked_tx, download_lane_parked_rx) = mpsc::channel(256);
+        let (ip_replacement_trial_tx, ip_replacement_trial_rx) = mpsc::channel(16);
         let (decode_done_tx, decode_done_rx) = mpsc::channel(256);
         let (retry_tx, retry_rx) = mpsc::channel(256);
         let (probe_result_tx, probe_result_rx) = mpsc::channel(16);
@@ -84,8 +92,16 @@ impl Pipeline {
             hot_dispatch_mode: DispatchShareMode::Exclusive,
             hot_dispatch_underfill_since: None,
             hot_dispatch_last_spillover_decision: SpilloverDecision::None,
+            hot_dispatch_throughput_window: HotJobThroughputWindow::default(),
+            hot_dispatch_exclusive_window: HotExclusiveWindow::default(),
+            hot_dispatch_expansion_window: HotExpansionWindow::default(),
+            hot_dispatch_spillover_loans: SpilloverLoanBook::default(),
             job_transport_profiles: HashMap::new(),
             download_lane_runtime: DownloadLaneRuntimeState::default(),
+            ip_replacement_trial_extra_connections,
+            ip_rtt_ewma: HashMap::new(),
+            ip_replacement_retired_ips: HashSet::new(),
+            ip_replacement_burst_active: false,
             active_download_passes: HashSet::new(),
             jobs_finalizing_download: HashSet::new(),
             active_downloads_by_job: HashMap::new(),
@@ -122,6 +138,8 @@ impl Pipeline {
             download_refill_rx,
             download_lane_parked_tx,
             download_lane_parked_rx,
+            ip_replacement_trial_tx,
+            ip_replacement_trial_rx,
             decode_done_tx,
             decode_done_rx,
             retry_tx,
@@ -165,6 +183,8 @@ impl Pipeline {
             eagerly_deleted: HashMap::new(),
             rar_sets: HashMap::new(),
             rar_refresh_state: HashMap::new(),
+            rar_unlock_priority_dirty_jobs: HashSet::new(),
+            rar_unlock_boosted_files: HashMap::new(),
             pending_rar_capacity_retries: HashSet::new(),
             verified_suspect_persist_state: HashMap::new(),
             rar_waiting_members: HashMap::new(),
@@ -528,6 +548,9 @@ impl Pipeline {
                     Some(parked) = self.download_lane_parked_rx.recv() => {
                         self.handle_download_lane_parked(parked);
                     }
+                    Some(event) = self.ip_replacement_trial_rx.recv() => {
+                        self.handle_ip_replacement_trial_event(event);
+                    }
                     Some(result) = self.decode_done_rx.recv() => {
                         self.handle_decode_done(result).await;
                     }
@@ -586,6 +609,19 @@ impl Pipeline {
                             hot_dispatch_lent_connections = snapshot.hot_dispatch_lent_connections,
                             hot_dispatch_underfill_ms = snapshot.hot_dispatch_underfill_ms,
                             hot_dispatch_warmup_complete = snapshot.hot_dispatch_warmup_complete,
+                            hot_dispatch_speed_bps = snapshot.hot_dispatch_hot_speed_bps,
+                            hot_dispatch_exclusive_peak_bps =
+                                snapshot.hot_dispatch_exclusive_peak_bps,
+                            hot_dispatch_spillover_pre_speed_bps =
+                                snapshot.hot_dispatch_spillover_pre_speed_bps,
+                            hot_dispatch_spillover_post_speed_bps =
+                                snapshot.hot_dispatch_spillover_post_speed_bps,
+                            hot_dispatch_spillover_active_loans =
+                                snapshot.hot_dispatch_spillover_active_loans,
+                            hot_dispatch_recent_expansion_improvement_pct =
+                                snapshot.hot_dispatch_recent_expansion_improvement_pct,
+                            hot_dispatch_best_mode_block_reason =
+                                snapshot.hot_dispatch_best_mode_block_reason,
                             hot_dispatch_last_spillover_decision = snapshot
                                 .hot_dispatch_last_spillover_decision
                                 .as_str(),
@@ -656,6 +692,14 @@ impl Pipeline {
         }
 
         loop {
+            match self.ip_replacement_trial_rx.try_recv() {
+                Ok(event) => self.handle_ip_replacement_trial_event(event),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        loop {
             match self.download_refill_rx.try_recv() {
                 Ok(request) => self.handle_download_lane_refill_request(request),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -670,6 +714,8 @@ impl Pipeline {
         self.note_retry_requeued(segment_id);
         let promoted_recovery = work.is_recovery
             && self.is_promoted_recovery_file(job_id, segment_id.file_id.file_index);
+        let mark_rar_unlock_dirty =
+            !promoted_recovery && self.rar_unlock_requeued_work_is_relevant(&work);
         if let Some(state) = self.jobs.get_mut(&job_id) {
             if promoted_recovery {
                 let mut work = work;
@@ -679,6 +725,9 @@ impl Pipeline {
                 state.recovery_queue.push(work);
             } else {
                 state.download_queue.push(work);
+                if mark_rar_unlock_dirty {
+                    self.mark_rar_unlock_priorities_dirty(job_id);
+                }
             }
         }
     }

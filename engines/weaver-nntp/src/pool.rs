@@ -1,4 +1,5 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,6 +41,7 @@ pub struct NntpPool {
     groups: Vec<u32>,
     /// Maximum connections per server (parallel to pools/configs).
     max_connections: Vec<usize>,
+    retired_ips: Arc<Mutex<HashSet<(usize, IpAddr)>>>,
 }
 
 /// Configuration for creating an NNTP pool.
@@ -113,6 +115,7 @@ impl NntpPool {
             stale_check_age: config.stale_check_age,
             groups,
             max_connections,
+            retired_ips: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -134,14 +137,28 @@ impl NntpPool {
             .await
             .map_err(|_| NntpError::PoolShutdown)?;
 
-        self.acquire_with_permit(idx, permit).await
+        self.acquire_with_permit(idx, Some(permit)).await
+    }
+
+    /// Acquire an explicit over-max connection from a specific server.
+    pub async fn acquire_extra(&self, server: ServerId) -> Result<PooledConnection> {
+        if self.shutdown.is_cancelled() {
+            return Err(NntpError::PoolShutdown);
+        }
+
+        let idx = server.0;
+        if idx >= self.pools.len() {
+            return Err(NntpError::PoolExhausted);
+        }
+
+        self.acquire_fresh_with_permit(idx, None).await
     }
 
     /// Internal: acquire a connection using an already-obtained permit.
     async fn acquire_with_permit(
         &self,
         idx: usize,
-        permit: tokio::sync::OwnedSemaphorePermit,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<PooledConnection> {
         // Try to get a healthy idle connection, with stale-check loop.
         let conn = loop {
@@ -216,6 +233,52 @@ impl NntpPool {
         Ok(PooledConnection {
             conn: Some(conn),
             pool: self.pools[idx].clone(),
+            retired_ips: self.retired_ips.clone(),
+            server_idx: idx,
+            _permit: permit,
+        })
+    }
+
+    async fn acquire_fresh_with_permit(
+        &self,
+        idx: usize,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<PooledConnection> {
+        {
+            let last_failure = self.last_connect_failure[idx].lock().await;
+            if let Some(ts) = *last_failure {
+                let elapsed = ts.elapsed();
+                if elapsed < self.reconnect_delay {
+                    let remaining = self.reconnect_delay - elapsed;
+                    drop(last_failure);
+                    tokio::time::sleep(remaining).await;
+                }
+            }
+        }
+
+        debug!(server = idx, "creating fresh over-max connection");
+        let conn = match NntpConnection::connect(&self.configs[idx]).await {
+            Ok(conn) => {
+                let mut last_failure = self.last_connect_failure[idx].lock().await;
+                *last_failure = None;
+                conn
+            }
+            Err(error) => {
+                let mut last_failure = self.last_connect_failure[idx].lock().await;
+                *last_failure = Some(Instant::now());
+                return Err(error);
+            }
+        };
+
+        {
+            let mut pool = self.pools[idx].lock().await;
+            pool.active_count += 1;
+        }
+
+        Ok(PooledConnection {
+            conn: Some(conn),
+            pool: self.pools[idx].clone(),
+            retired_ips: self.retired_ips.clone(),
             server_idx: idx,
             _permit: permit,
         })
@@ -237,7 +300,7 @@ impl NntpPool {
         // Try non-blocking acquire on each server in group+health order.
         for idx in &ordered {
             match self.semaphores[*idx].clone().try_acquire_owned() {
-                Ok(permit) => match self.acquire_with_permit(*idx, permit).await {
+                Ok(permit) => match self.acquire_with_permit(*idx, Some(permit)).await {
                     Ok(conn) => return Ok(conn),
                     Err(e) => {
                         warn!(server = idx, error = %e, "failed to acquire from server, trying next");
@@ -372,6 +435,19 @@ impl NntpPool {
         (available, max)
     }
 
+    pub async fn retire_ip(&self, server: ServerId, ip: IpAddr) {
+        let idx = server.0;
+        if idx >= self.pools.len() {
+            return;
+        }
+        {
+            let mut retired = self.retired_ips.lock().await;
+            retired.insert((idx, ip));
+        }
+        let mut pool = self.pools[idx].lock().await;
+        pool.idle.retain(|conn| conn.remote_ip() != ip);
+    }
+
     /// Take a healthy idle connection, evicting stale/poisoned ones.
     fn take_healthy_idle(&self, pool: &mut ServerPool) -> Option<NntpConnection> {
         while let Some(conn) = pool.idle.pop_front() {
@@ -393,11 +469,23 @@ impl NntpPool {
 pub struct PooledConnection {
     conn: Option<NntpConnection>,
     pool: Arc<Mutex<ServerPool>>,
+    retired_ips: Arc<Mutex<HashSet<(usize, IpAddr)>>>,
     server_idx: usize,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl PooledConnection {
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.conn
+            .as_ref()
+            .expect("pooled connection is present")
+            .remote_addr()
+    }
+
+    pub fn remote_ip(&self) -> IpAddr {
+        self.remote_addr().ip()
+    }
+
     /// Explicitly discard this connection instead of returning it to the pool.
     /// Use when the connection is in a bad state.
     pub fn discard(mut self) {
@@ -431,6 +519,7 @@ impl Drop for PooledConnection {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             let pool = self.pool.clone();
+            let retired_ips = self.retired_ips.clone();
             let server_idx = self.server_idx;
             let poisoned = conn.is_poisoned();
 
@@ -440,8 +529,14 @@ impl Drop for PooledConnection {
                 drop(tokio::spawn(async move {
                     let mut pool = pool.lock().await;
                     pool.active_count = pool.active_count.saturating_sub(1);
-                    pool.idle.push_back(conn);
-                    trace!(server = server_idx, "returned connection to pool");
+                    let retired = retired_ips.lock().await;
+                    if retired.contains(&(server_idx, conn.remote_ip())) {
+                        trace!(server = server_idx, "dropped retired-ip connection");
+                    } else {
+                        drop(retired);
+                        pool.idle.push_back(conn);
+                        trace!(server = server_idx, "returned connection to pool");
+                    }
                 }));
             } else {
                 drop(tokio::spawn(async move {

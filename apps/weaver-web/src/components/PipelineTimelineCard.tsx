@@ -275,16 +275,19 @@ function formatTime(ms: number) {
 }
 
 function rowTimingLabel(
-  t: ReturnType<typeof useTranslate>,
   spans: { startedAt: number; endedAt: number | null }[],
 ) {
-  const latestEndedAt = spans.reduce<number | null>(
-    (latest, span) =>
-      span.endedAt == null ? latest : latest == null || span.endedAt > latest ? span.endedAt : latest,
-    null,
-  );
+  let latestEndedAt: number | null = null;
+  for (const span of spans) {
+    if (span.endedAt == null) {
+      return "-";
+    }
+    if (latestEndedAt == null || span.endedAt > latestEndedAt) {
+      latestEndedAt = span.endedAt;
+    }
+  }
   if (latestEndedAt == null) {
-    return t("timeline.active");
+    return "-";
   }
   return formatTime(latestEndedAt);
 }
@@ -332,9 +335,9 @@ function memberName(member: string) {
 function DetailList({ items }: { items: DetailItem[] }) {
   return (
     <div className="grid gap-1.5">
-      {items.map((item) => (
+      {items.map((item, index) => (
         <div
-          key={`${item.label}:${item.value}`}
+          key={`${index}:${item.label}`}
           className="grid grid-cols-[7rem_minmax(0,1fr)] gap-3"
         >
           <div className="text-[11px] uppercase tracking-[0.12em] text-muted-foreground/80">
@@ -443,7 +446,7 @@ function TimelineSpanPopover({
             },
             {
               label: t("timeline.ended"),
-              value: formatTime(span.endedAt ?? axisEnd),
+              value: span.endedAt == null ? "-" : formatTime(span.endedAt),
             },
             {
               label: t("timeline.spanDuration"),
@@ -666,7 +669,7 @@ function memberRows(
           },
           {
             label: t("timeline.ended"),
-            value: rowTimingLabel(t, member.spans),
+            value: rowTimingLabel(member.spans),
           },
           {
             label: t("timeline.set"),
@@ -769,7 +772,7 @@ export function PipelineTimelineCard({
         },
         {
           label: t("timeline.ended"),
-          value: rowTimingLabel(t, lane.spans),
+          value: rowTimingLabel(lane.spans),
         },
         ...(detail
           ? [

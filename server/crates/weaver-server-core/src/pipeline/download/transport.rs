@@ -50,6 +50,8 @@ pub(crate) enum LaneParkReason {
     ProbeYield,
     HotReclaim,
     SpilloverWithdraw,
+    SpilloverSpeedHarm,
+    IpReplacementRetired,
     ServerTierChanged,
     ProofFailure,
     Error,
@@ -357,7 +359,7 @@ impl LaneRttWindow {
         self.samples.push_back(sample);
     }
 
-    pub(super) fn ewma(&self) -> Option<Duration> {
+    pub(crate) fn ewma(&self) -> Option<Duration> {
         self.ewma
     }
 }

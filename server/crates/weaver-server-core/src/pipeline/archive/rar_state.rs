@@ -76,6 +76,7 @@ pub(crate) struct RarSetState {
     pub(crate) verified_suspect_volumes: HashSet<u32>,
     pub(crate) active_workers: usize,
     pub(crate) in_flight_members: HashSet<String>,
+    pub(crate) extraction_generation: u64,
     pub(crate) phase: RarSetPhase,
     pub(crate) plan: Option<RarDerivedPlan>,
 }
@@ -90,6 +91,7 @@ impl Default for RarSetState {
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
+            extraction_generation: 0,
             phase: RarSetPhase::WaitingForVolumes,
             plan: None,
         }

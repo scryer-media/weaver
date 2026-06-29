@@ -76,6 +76,98 @@ fn reprioritize_job() {
 }
 
 #[test]
+fn rar_unlock_reprioritize_matching_updates_selected_work_only() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 1, 0, 11));
+    q.push(make_work(1, 2, 0, 12));
+    q.push(make_work(1, 3, 0, 13));
+
+    let changed =
+        q.reprioritize_matching(|work| (work.segment_id.file_id.file_index == 3).then_some(3));
+
+    assert_eq!(changed, 1);
+    let first = q.pop().unwrap();
+    assert_eq!(first.segment_id.file_id.file_index, 3);
+    assert_eq!(first.priority, 3);
+    assert_eq!(q.pop().unwrap().segment_id.file_id.file_index, 1);
+    assert_eq!(q.pop().unwrap().segment_id.file_id.file_index, 2);
+}
+
+#[test]
+fn rar_unlock_reprioritize_matching_preserves_equal_priority_sequence_order() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 1, 0, 11));
+    q.push(make_work(1, 2, 0, 12));
+    q.push(make_work(1, 3, 0, 13));
+
+    q.reprioritize_matching(|work| {
+        matches!(work.segment_id.file_id.file_index, 2 | 3).then_some(3)
+    });
+
+    assert_eq!(q.pop().unwrap().segment_id.file_id.file_index, 2);
+    assert_eq!(q.pop().unwrap().segment_id.file_id.file_index, 3);
+    assert_eq!(q.pop().unwrap().segment_id.file_id.file_index, 1);
+}
+
+#[test]
+fn rar_unlock_reprioritize_matching_restores_stale_boosts() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 2, 0, 3));
+    q.push(make_work(1, 3, 0, 13));
+
+    let changed =
+        q.reprioritize_matching(|work| (work.segment_id.file_id.file_index == 2).then_some(12));
+
+    assert_eq!(changed, 1);
+    let first = q.pop().unwrap();
+    assert_eq!(first.segment_id.file_id.file_index, 2);
+    assert_eq!(first.priority, 12);
+    let second = q.pop().unwrap();
+    assert_eq!(second.segment_id.file_id.file_index, 3);
+    assert_eq!(second.priority, 13);
+}
+
+#[test]
+fn rar_unlock_reprioritize_matching_keeps_promoted_recovery_ahead() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 10, 0, 2));
+    q.push(make_work(1, 3, 0, 13));
+
+    q.reprioritize_matching(|work| (work.segment_id.file_id.file_index == 3).then_some(3));
+
+    let first = q.pop().unwrap();
+    assert_eq!(first.segment_id.file_id.file_index, 10);
+    assert_eq!(first.priority, 2);
+    let second = q.pop().unwrap();
+    assert_eq!(second.segment_id.file_id.file_index, 3);
+    assert_eq!(second.priority, 3);
+}
+
+#[test]
+fn rar_unlock_reprioritize_matching_uses_rank_inside_priority_band() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 4, 0, 14));
+    q.push(make_work(1, 2, 0, 12));
+    q.push(make_work(1, 99, 0, 3));
+    q.push(make_work(1, 3, 0, 13));
+
+    q.reprioritize_matching_with_rank(|work| match work.segment_id.file_id.file_index {
+        2 => Some((3, Some(0))),
+        3 => Some((3, Some(1))),
+        4 => Some((3, Some(2))),
+        _ => None,
+    });
+
+    let popped = [
+        q.pop().unwrap().segment_id.file_id.file_index,
+        q.pop().unwrap().segment_id.file_id.file_index,
+        q.pop().unwrap().segment_id.file_id.file_index,
+        q.pop().unwrap().segment_id.file_id.file_index,
+    ];
+    assert_eq!(popped, [2, 3, 4, 99]);
+}
+
+#[test]
 fn mixed_priorities() {
     let mut q = DownloadQueue::new();
 

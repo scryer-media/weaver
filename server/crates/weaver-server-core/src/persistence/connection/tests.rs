@@ -1416,6 +1416,7 @@ async fn postgres_runtime_smoke_when_configured() {
             weekly_reset_weekday: IspBandwidthCapWeekday::Mon,
             monthly_reset_day: 7,
         }),
+        ip_replacement_trial_extra_connections: Some(1),
         diagnostic_upload_url: Some("https://diagnostics.example.test".to_string()),
         config_path: None,
     };

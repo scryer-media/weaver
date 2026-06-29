@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 const SPEED_WINDOW_SAMPLES: usize = 50; // ~5 seconds at 100ms snapshot rate
 const SPEED_EMA_HALF_LIFE_SECS: f64 = 1.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadPressureState {
+    #[default]
     Clear,
     Soft,
     Hard,
@@ -41,15 +42,10 @@ impl DownloadPressureState {
     }
 }
 
-impl Default for DownloadPressureState {
-    fn default() -> Self {
-        Self::Clear
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadPressureReason {
+    #[default]
     None,
     Decode,
     Write,
@@ -85,15 +81,10 @@ impl DownloadPressureReason {
     }
 }
 
-impl Default for DownloadPressureReason {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchShareMode {
+    #[default]
     Exclusive,
     Shared,
 }
@@ -121,15 +112,10 @@ impl DispatchShareMode {
     }
 }
 
-impl Default for DispatchShareMode {
-    fn default() -> Self {
-        Self::Exclusive
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpilloverDecision {
+    #[default]
     None,
     BlockedWarmup,
     BlockedPressure,
@@ -137,6 +123,11 @@ pub enum SpilloverDecision {
     BlockedHotCanUseCapacity,
     AllowedUnderfill,
     Reclaimed,
+    BlockedBestModePending,
+    BlockedRecentExpansionHelped,
+    BlockedCapSpeed,
+    AllowedMeasuredUnderfill,
+    ReclaimedSpeedHarm,
 }
 
 impl SpilloverDecision {
@@ -149,6 +140,11 @@ impl SpilloverDecision {
             Self::BlockedHotCanUseCapacity => 4,
             Self::AllowedUnderfill => 5,
             Self::Reclaimed => 6,
+            Self::BlockedBestModePending => 7,
+            Self::BlockedRecentExpansionHelped => 8,
+            Self::BlockedCapSpeed => 9,
+            Self::AllowedMeasuredUnderfill => 10,
+            Self::ReclaimedSpeedHarm => 11,
         }
     }
 
@@ -161,6 +157,11 @@ impl SpilloverDecision {
             Self::BlockedHotCanUseCapacity => "blocked_hot_can_use_capacity",
             Self::AllowedUnderfill => "allowed_underfill",
             Self::Reclaimed => "reclaimed",
+            Self::BlockedBestModePending => "blocked_best_mode_pending",
+            Self::BlockedRecentExpansionHelped => "blocked_recent_expansion_helped",
+            Self::BlockedCapSpeed => "blocked_cap_speed",
+            Self::AllowedMeasuredUnderfill => "allowed_measured_underfill",
+            Self::ReclaimedSpeedHarm => "reclaimed_speed_harm",
         }
     }
 
@@ -172,14 +173,13 @@ impl SpilloverDecision {
             4 => Self::BlockedHotCanUseCapacity,
             5 => Self::AllowedUnderfill,
             6 => Self::Reclaimed,
+            7 => Self::BlockedBestModePending,
+            8 => Self::BlockedRecentExpansionHelped,
+            9 => Self::BlockedCapSpeed,
+            10 => Self::AllowedMeasuredUnderfill,
+            11 => Self::ReclaimedSpeedHarm,
             _ => Self::None,
         }
-    }
-}
-
-impl Default for SpilloverDecision {
-    fn default() -> Self {
-        Self::None
     }
 }
 
@@ -302,8 +302,23 @@ pub struct PipelineMetrics {
     pub hot_dispatch_spillover_blocked_pressure_total: AtomicU64,
     pub hot_dispatch_spillover_blocked_near_cap_total: AtomicU64,
     pub hot_dispatch_spillover_blocked_hot_can_use_capacity_total: AtomicU64,
+    pub hot_dispatch_spillover_blocked_best_mode_pending_total: AtomicU64,
+    pub hot_dispatch_spillover_blocked_recent_expansion_helped_total: AtomicU64,
+    pub hot_dispatch_spillover_blocked_cap_speed_total: AtomicU64,
     pub hot_dispatch_spillover_allowed_underfill_total: AtomicU64,
+    pub hot_dispatch_spillover_allowed_measured_underfill_total: AtomicU64,
     pub hot_dispatch_spillover_reclaimed_total: AtomicU64,
+    pub hot_dispatch_hot_speed_bps: AtomicU64,
+    pub hot_dispatch_exclusive_peak_bps: AtomicU64,
+    pub hot_dispatch_spillover_pre_speed_bps: AtomicU64,
+    pub hot_dispatch_spillover_post_speed_bps: AtomicU64,
+    pub hot_dispatch_spillover_active_loans: AtomicUsize,
+    pub hot_dispatch_spillover_reclaimed_speed_harm_total: AtomicU64,
+    pub hot_dispatch_recent_expansion_improvement_pct: AtomicU64,
+    pub hot_dispatch_best_mode_block_reason: AtomicUsize,
+    pub hot_dispatch_last_expansion_kind: AtomicUsize,
+    pub hot_dispatch_last_expansion_before_bps: AtomicU64,
+    pub hot_dispatch_last_expansion_after_bps: AtomicU64,
     pub download_lanes_active: AtomicUsize,
     pub download_lanes_sequential_active: AtomicUsize,
     pub download_lanes_depth2_active: AtomicUsize,
@@ -322,6 +337,8 @@ pub struct PipelineMetrics {
     pub download_lane_parks_probe_yield_total: AtomicU64,
     pub download_lane_parks_hot_reclaim_total: AtomicU64,
     pub download_lane_parks_spillover_withdraw_total: AtomicU64,
+    pub download_lane_parks_spillover_speed_harm_total: AtomicU64,
+    pub download_lane_parks_ip_replacement_retired_total: AtomicU64,
     pub download_lane_parks_server_tier_changed_total: AtomicU64,
     pub download_lane_parks_proof_failure_total: AtomicU64,
     pub download_lane_parks_error_total: AtomicU64,
@@ -333,6 +350,18 @@ pub struct PipelineMetrics {
     pub download_pipeline_proof_pass_total: AtomicU64,
     pub download_pipeline_cooldown_total: AtomicU64,
     pub download_pipeline_replay_items_total: AtomicU64,
+    pub ip_replacement_trial_extra_connections: AtomicUsize,
+    pub ip_replacement_burst_active: AtomicUsize,
+    pub ip_replacement_over_max_connections: AtomicUsize,
+    pub ip_rtt_ewma_entries: AtomicUsize,
+    pub ip_rtt_ewma_slowest_ms: AtomicU64,
+    pub ip_replacement_trials_started_total: AtomicU64,
+    pub ip_replacement_trials_rejected_total: AtomicU64,
+    pub ip_replacement_trials_accepted_total: AtomicU64,
+    pub ip_replacement_trials_blocked_total: AtomicU64,
+    pub ip_replacement_trials_acquire_failed_total: AtomicU64,
+    pub ip_replacement_trials_same_ip_rejected_total: AtomicU64,
+    pub ip_replacement_old_connections_retired_total: AtomicU64,
 
     // Counts
     pub segments_downloaded: AtomicU64,
@@ -406,8 +435,23 @@ impl PipelineMetrics {
             hot_dispatch_spillover_blocked_pressure_total: AtomicU64::new(0),
             hot_dispatch_spillover_blocked_near_cap_total: AtomicU64::new(0),
             hot_dispatch_spillover_blocked_hot_can_use_capacity_total: AtomicU64::new(0),
+            hot_dispatch_spillover_blocked_best_mode_pending_total: AtomicU64::new(0),
+            hot_dispatch_spillover_blocked_recent_expansion_helped_total: AtomicU64::new(0),
+            hot_dispatch_spillover_blocked_cap_speed_total: AtomicU64::new(0),
             hot_dispatch_spillover_allowed_underfill_total: AtomicU64::new(0),
+            hot_dispatch_spillover_allowed_measured_underfill_total: AtomicU64::new(0),
             hot_dispatch_spillover_reclaimed_total: AtomicU64::new(0),
+            hot_dispatch_hot_speed_bps: AtomicU64::new(0),
+            hot_dispatch_exclusive_peak_bps: AtomicU64::new(0),
+            hot_dispatch_spillover_pre_speed_bps: AtomicU64::new(0),
+            hot_dispatch_spillover_post_speed_bps: AtomicU64::new(0),
+            hot_dispatch_spillover_active_loans: AtomicUsize::new(0),
+            hot_dispatch_spillover_reclaimed_speed_harm_total: AtomicU64::new(0),
+            hot_dispatch_recent_expansion_improvement_pct: AtomicU64::new(0),
+            hot_dispatch_best_mode_block_reason: AtomicUsize::new(0),
+            hot_dispatch_last_expansion_kind: AtomicUsize::new(0),
+            hot_dispatch_last_expansion_before_bps: AtomicU64::new(0),
+            hot_dispatch_last_expansion_after_bps: AtomicU64::new(0),
             download_lanes_active: AtomicUsize::new(0),
             download_lanes_sequential_active: AtomicUsize::new(0),
             download_lanes_depth2_active: AtomicUsize::new(0),
@@ -426,6 +470,8 @@ impl PipelineMetrics {
             download_lane_parks_probe_yield_total: AtomicU64::new(0),
             download_lane_parks_hot_reclaim_total: AtomicU64::new(0),
             download_lane_parks_spillover_withdraw_total: AtomicU64::new(0),
+            download_lane_parks_spillover_speed_harm_total: AtomicU64::new(0),
+            download_lane_parks_ip_replacement_retired_total: AtomicU64::new(0),
             download_lane_parks_server_tier_changed_total: AtomicU64::new(0),
             download_lane_parks_proof_failure_total: AtomicU64::new(0),
             download_lane_parks_error_total: AtomicU64::new(0),
@@ -437,6 +483,18 @@ impl PipelineMetrics {
             download_pipeline_proof_pass_total: AtomicU64::new(0),
             download_pipeline_cooldown_total: AtomicU64::new(0),
             download_pipeline_replay_items_total: AtomicU64::new(0),
+            ip_replacement_trial_extra_connections: AtomicUsize::new(0),
+            ip_replacement_burst_active: AtomicUsize::new(0),
+            ip_replacement_over_max_connections: AtomicUsize::new(0),
+            ip_rtt_ewma_entries: AtomicUsize::new(0),
+            ip_rtt_ewma_slowest_ms: AtomicU64::new(0),
+            ip_replacement_trials_started_total: AtomicU64::new(0),
+            ip_replacement_trials_rejected_total: AtomicU64::new(0),
+            ip_replacement_trials_accepted_total: AtomicU64::new(0),
+            ip_replacement_trials_blocked_total: AtomicU64::new(0),
+            ip_replacement_trials_acquire_failed_total: AtomicU64::new(0),
+            ip_replacement_trials_same_ip_rejected_total: AtomicU64::new(0),
+            ip_replacement_old_connections_retired_total: AtomicU64::new(0),
             segments_downloaded: AtomicU64::new(0),
             segments_decoded: AtomicU64::new(0),
             segments_committed: AtomicU64::new(0),
@@ -464,6 +522,59 @@ impl PipelineMetrics {
         let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_sub(amount))
         });
+    }
+
+    pub fn set_ip_replacement_trial_extra_connections(&self, value: u8) {
+        self.ip_replacement_trial_extra_connections
+            .store(value as usize, Ordering::Relaxed);
+    }
+
+    pub fn set_ip_replacement_burst_active(&self, active: bool) {
+        self.ip_replacement_burst_active
+            .store(usize::from(active), Ordering::Relaxed);
+        self.ip_replacement_over_max_connections
+            .store(usize::from(active), Ordering::Relaxed);
+    }
+
+    pub fn set_ip_rtt_ewma_summary(&self, entries: usize, slowest_ms: u64) {
+        self.ip_rtt_ewma_entries.store(entries, Ordering::Relaxed);
+        self.ip_rtt_ewma_slowest_ms
+            .store(slowest_ms, Ordering::Relaxed);
+    }
+
+    pub fn note_ip_replacement_trial_started(&self) {
+        self.ip_replacement_trials_started_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_ip_replacement_trial_rejected(&self) {
+        self.ip_replacement_trials_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_ip_replacement_trial_accepted(&self) {
+        self.ip_replacement_trials_accepted_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_ip_replacement_trial_blocked(&self) {
+        self.ip_replacement_trials_blocked_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_ip_replacement_trial_acquire_failed(&self) {
+        self.ip_replacement_trials_acquire_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_ip_replacement_trial_same_ip_rejected(&self) {
+        self.ip_replacement_trials_same_ip_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_ip_replacement_old_connection_retired(&self) {
+        self.ip_replacement_old_connections_retired_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn note_decode_work_queued(&self, raw_bytes: u64) {
@@ -572,11 +683,54 @@ impl PipelineMetrics {
             hot_dispatch_spillover_blocked_hot_can_use_capacity_total: self
                 .hot_dispatch_spillover_blocked_hot_can_use_capacity_total
                 .load(Ordering::Relaxed),
+            hot_dispatch_spillover_blocked_best_mode_pending_total: self
+                .hot_dispatch_spillover_blocked_best_mode_pending_total
+                .load(Ordering::Relaxed),
+            hot_dispatch_spillover_blocked_recent_expansion_helped_total: self
+                .hot_dispatch_spillover_blocked_recent_expansion_helped_total
+                .load(Ordering::Relaxed),
+            hot_dispatch_spillover_blocked_cap_speed_total: self
+                .hot_dispatch_spillover_blocked_cap_speed_total
+                .load(Ordering::Relaxed),
             hot_dispatch_spillover_allowed_underfill_total: self
                 .hot_dispatch_spillover_allowed_underfill_total
                 .load(Ordering::Relaxed),
+            hot_dispatch_spillover_allowed_measured_underfill_total: self
+                .hot_dispatch_spillover_allowed_measured_underfill_total
+                .load(Ordering::Relaxed),
             hot_dispatch_spillover_reclaimed_total: self
                 .hot_dispatch_spillover_reclaimed_total
+                .load(Ordering::Relaxed),
+            hot_dispatch_hot_speed_bps: self.hot_dispatch_hot_speed_bps.load(Ordering::Relaxed),
+            hot_dispatch_exclusive_peak_bps: self
+                .hot_dispatch_exclusive_peak_bps
+                .load(Ordering::Relaxed),
+            hot_dispatch_spillover_pre_speed_bps: self
+                .hot_dispatch_spillover_pre_speed_bps
+                .load(Ordering::Relaxed),
+            hot_dispatch_spillover_post_speed_bps: self
+                .hot_dispatch_spillover_post_speed_bps
+                .load(Ordering::Relaxed),
+            hot_dispatch_spillover_active_loans: self
+                .hot_dispatch_spillover_active_loans
+                .load(Ordering::Relaxed),
+            hot_dispatch_spillover_reclaimed_speed_harm_total: self
+                .hot_dispatch_spillover_reclaimed_speed_harm_total
+                .load(Ordering::Relaxed),
+            hot_dispatch_recent_expansion_improvement_pct: self
+                .hot_dispatch_recent_expansion_improvement_pct
+                .load(Ordering::Relaxed),
+            hot_dispatch_best_mode_block_reason: self
+                .hot_dispatch_best_mode_block_reason
+                .load(Ordering::Relaxed),
+            hot_dispatch_last_expansion_kind: self
+                .hot_dispatch_last_expansion_kind
+                .load(Ordering::Relaxed),
+            hot_dispatch_last_expansion_before_bps: self
+                .hot_dispatch_last_expansion_before_bps
+                .load(Ordering::Relaxed),
+            hot_dispatch_last_expansion_after_bps: self
+                .hot_dispatch_last_expansion_after_bps
                 .load(Ordering::Relaxed),
             download_lanes_active: self.download_lanes_active.load(Ordering::Relaxed),
             download_lanes_sequential_active: self
@@ -624,6 +778,12 @@ impl PipelineMetrics {
             download_lane_parks_spillover_withdraw_total: self
                 .download_lane_parks_spillover_withdraw_total
                 .load(Ordering::Relaxed),
+            download_lane_parks_spillover_speed_harm_total: self
+                .download_lane_parks_spillover_speed_harm_total
+                .load(Ordering::Relaxed),
+            download_lane_parks_ip_replacement_retired_total: self
+                .download_lane_parks_ip_replacement_retired_total
+                .load(Ordering::Relaxed),
             download_lane_parks_server_tier_changed_total: self
                 .download_lane_parks_server_tier_changed_total
                 .load(Ordering::Relaxed),
@@ -656,6 +816,37 @@ impl PipelineMetrics {
                 .load(Ordering::Relaxed),
             download_pipeline_replay_items_total: self
                 .download_pipeline_replay_items_total
+                .load(Ordering::Relaxed),
+            ip_replacement_trial_extra_connections: self
+                .ip_replacement_trial_extra_connections
+                .load(Ordering::Relaxed),
+            ip_replacement_burst_active: self.ip_replacement_burst_active.load(Ordering::Relaxed)
+                != 0,
+            ip_replacement_over_max_connections: self
+                .ip_replacement_over_max_connections
+                .load(Ordering::Relaxed),
+            ip_rtt_ewma_entries: self.ip_rtt_ewma_entries.load(Ordering::Relaxed),
+            ip_rtt_ewma_slowest_ms: self.ip_rtt_ewma_slowest_ms.load(Ordering::Relaxed),
+            ip_replacement_trials_started_total: self
+                .ip_replacement_trials_started_total
+                .load(Ordering::Relaxed),
+            ip_replacement_trials_rejected_total: self
+                .ip_replacement_trials_rejected_total
+                .load(Ordering::Relaxed),
+            ip_replacement_trials_accepted_total: self
+                .ip_replacement_trials_accepted_total
+                .load(Ordering::Relaxed),
+            ip_replacement_trials_blocked_total: self
+                .ip_replacement_trials_blocked_total
+                .load(Ordering::Relaxed),
+            ip_replacement_trials_acquire_failed_total: self
+                .ip_replacement_trials_acquire_failed_total
+                .load(Ordering::Relaxed),
+            ip_replacement_trials_same_ip_rejected_total: self
+                .ip_replacement_trials_same_ip_rejected_total
+                .load(Ordering::Relaxed),
+            ip_replacement_old_connections_retired_total: self
+                .ip_replacement_old_connections_retired_total
                 .load(Ordering::Relaxed),
             segments_downloaded,
             segments_decoded: self.segments_decoded.load(Ordering::Relaxed),
@@ -739,8 +930,23 @@ pub struct MetricsSnapshot {
     pub hot_dispatch_spillover_blocked_pressure_total: u64,
     pub hot_dispatch_spillover_blocked_near_cap_total: u64,
     pub hot_dispatch_spillover_blocked_hot_can_use_capacity_total: u64,
+    pub hot_dispatch_spillover_blocked_best_mode_pending_total: u64,
+    pub hot_dispatch_spillover_blocked_recent_expansion_helped_total: u64,
+    pub hot_dispatch_spillover_blocked_cap_speed_total: u64,
     pub hot_dispatch_spillover_allowed_underfill_total: u64,
+    pub hot_dispatch_spillover_allowed_measured_underfill_total: u64,
     pub hot_dispatch_spillover_reclaimed_total: u64,
+    pub hot_dispatch_hot_speed_bps: u64,
+    pub hot_dispatch_exclusive_peak_bps: u64,
+    pub hot_dispatch_spillover_pre_speed_bps: u64,
+    pub hot_dispatch_spillover_post_speed_bps: u64,
+    pub hot_dispatch_spillover_active_loans: usize,
+    pub hot_dispatch_spillover_reclaimed_speed_harm_total: u64,
+    pub hot_dispatch_recent_expansion_improvement_pct: u64,
+    pub hot_dispatch_best_mode_block_reason: usize,
+    pub hot_dispatch_last_expansion_kind: usize,
+    pub hot_dispatch_last_expansion_before_bps: u64,
+    pub hot_dispatch_last_expansion_after_bps: u64,
     pub download_lanes_active: usize,
     pub download_lanes_sequential_active: usize,
     pub download_lanes_depth2_active: usize,
@@ -759,6 +965,8 @@ pub struct MetricsSnapshot {
     pub download_lane_parks_probe_yield_total: u64,
     pub download_lane_parks_hot_reclaim_total: u64,
     pub download_lane_parks_spillover_withdraw_total: u64,
+    pub download_lane_parks_spillover_speed_harm_total: u64,
+    pub download_lane_parks_ip_replacement_retired_total: u64,
     pub download_lane_parks_server_tier_changed_total: u64,
     pub download_lane_parks_proof_failure_total: u64,
     pub download_lane_parks_error_total: u64,
@@ -770,6 +978,18 @@ pub struct MetricsSnapshot {
     pub download_pipeline_proof_pass_total: u64,
     pub download_pipeline_cooldown_total: u64,
     pub download_pipeline_replay_items_total: u64,
+    pub ip_replacement_trial_extra_connections: usize,
+    pub ip_replacement_burst_active: bool,
+    pub ip_replacement_over_max_connections: usize,
+    pub ip_rtt_ewma_entries: usize,
+    pub ip_rtt_ewma_slowest_ms: u64,
+    pub ip_replacement_trials_started_total: u64,
+    pub ip_replacement_trials_rejected_total: u64,
+    pub ip_replacement_trials_accepted_total: u64,
+    pub ip_replacement_trials_blocked_total: u64,
+    pub ip_replacement_trials_acquire_failed_total: u64,
+    pub ip_replacement_trials_same_ip_rejected_total: u64,
+    pub ip_replacement_old_connections_retired_total: u64,
     pub segments_downloaded: u64,
     pub segments_decoded: u64,
     pub segments_committed: u64,

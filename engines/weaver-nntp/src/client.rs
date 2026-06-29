@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::future::Future;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -96,6 +97,7 @@ pub enum FetchAttemptOutcome {
 #[derive(Debug, Clone)]
 pub struct FetchAttemptTrace {
     pub server_idx: usize,
+    pub remote_ip: Option<IpAddr>,
     pub elapsed: Duration,
     pub outcome: FetchAttemptOutcome,
     pub error: Option<String>,
@@ -134,6 +136,7 @@ pub struct BodyLaneLease {
     client: NntpClient,
     server_id: ServerId,
     conn: Option<PooledConnection>,
+    remote_ip: IpAddr,
     groups: Vec<String>,
     mode: BodyLaneMode,
     rtt_ewma: Option<Duration>,
@@ -153,6 +156,10 @@ enum DecodedBatchDisposition {
 impl BodyLaneLease {
     pub fn server_id(&self) -> ServerId {
         self.server_id
+    }
+
+    pub fn remote_ip(&self) -> IpAddr {
+        self.remote_ip
     }
 
     pub fn mode(&self) -> BodyLaneMode {
@@ -417,6 +424,7 @@ impl BodyLaneLease {
             .client
             .classify_decoded_batch_item(
                 self.server_id.0,
+                Some(self.remote_ip),
                 message_id,
                 item,
                 &mut attempts,
@@ -496,13 +504,38 @@ impl NntpClient {
         server: ServerId,
         groups: &[String],
     ) -> Result<BodyLaneLease> {
+        self.acquire_body_lane_inner(server, groups, false).await
+    }
+
+    pub async fn acquire_extra_body_lane(
+        &self,
+        server: ServerId,
+        groups: &[String],
+    ) -> Result<BodyLaneLease> {
+        self.acquire_body_lane_inner(server, groups, true).await
+    }
+
+    async fn acquire_body_lane_inner(
+        &self,
+        server: ServerId,
+        groups: &[String],
+        extra: bool,
+    ) -> Result<BodyLaneLease> {
         let deadline = TokioInstant::now() + self.soft_timeout;
-        let mut conn = self.acquire_before_deadline(server, deadline).await?;
+        let mut conn = if extra {
+            match tokio::time::timeout_at(deadline, self.pool.acquire_extra(server)).await {
+                Ok(result) => result?,
+                Err(_) => return Err(self.soft_timeout_error()),
+            }
+        } else {
+            self.acquire_before_deadline(server, deadline).await?
+        };
 
         match tokio::time::timeout_at(deadline, Self::try_select_group(&mut conn, groups)).await {
             Ok(Ok(_)) => Ok(BodyLaneLease {
                 client: self.clone(),
                 server_id: server,
+                remote_ip: conn.remote_ip(),
                 conn: Some(conn),
                 groups: groups.to_vec(),
                 mode: BodyLaneMode::Sequential,
@@ -725,11 +758,12 @@ impl NntpClient {
                 .fetch_from_server_with_groups(server, message_id, groups)
                 .await
             {
-                Ok(data) => {
+                Ok((data, remote_ip)) => {
                     let elapsed = start.elapsed();
                     self.record_server_success(idx, elapsed).await;
                     attempts.push(FetchAttemptTrace {
                         server_idx: idx,
+                        remote_ip,
                         elapsed,
                         outcome: FetchAttemptOutcome::Success,
                         error: None,
@@ -744,6 +778,7 @@ impl NntpClient {
                 | Err(NntpError::NoArticleWithNumber) => {
                     attempts.push(FetchAttemptTrace {
                         server_idx: idx,
+                        remote_ip: None,
                         elapsed: start.elapsed(),
                         outcome: FetchAttemptOutcome::NotFound,
                         error: Some("article not found".to_string()),
@@ -756,6 +791,7 @@ impl NntpClient {
                 Err(e @ NntpError::SoftTimeout(_)) => {
                     attempts.push(FetchAttemptTrace {
                         server_idx: idx,
+                        remote_ip: None,
                         elapsed: start.elapsed(),
                         outcome: FetchAttemptOutcome::TransientFailure,
                         error: Some(e.to_string()),
@@ -771,6 +807,7 @@ impl NntpClient {
                 | Err(NntpError::AccessDenied) => {
                     attempts.push(FetchAttemptTrace {
                         server_idx: idx,
+                        remote_ip: None,
                         elapsed: start.elapsed(),
                         outcome: FetchAttemptOutcome::AuthenticationFailure,
                         error: Some("authentication/access failure".to_string()),
@@ -782,6 +819,7 @@ impl NntpClient {
                 Err(e) if is_transient(&e) => {
                     attempts.push(FetchAttemptTrace {
                         server_idx: idx,
+                        remote_ip: None,
                         elapsed: start.elapsed(),
                         outcome: FetchAttemptOutcome::TransientFailure,
                         error: Some(e.to_string()),
@@ -795,6 +833,7 @@ impl NntpClient {
                 Err(e) => {
                     attempts.push(FetchAttemptTrace {
                         server_idx: idx,
+                        remote_ip: None,
                         elapsed: start.elapsed(),
                         outcome: FetchAttemptOutcome::PermanentFailure,
                         error: Some(e.to_string()),
@@ -994,6 +1033,7 @@ impl NntpClient {
                         match self
                             .classify_decoded_batch_item(
                                 idx,
+                                None,
                                 &message_ids[message_idx],
                                 item,
                                 &mut attempts_by_index[message_idx],
@@ -1019,6 +1059,7 @@ impl NntpClient {
                     continue;
                 }
             };
+            let remote_ip = Some(conn.remote_ip());
 
             let group_result = match tokio::time::timeout_at(
                 setup_deadline,
@@ -1039,6 +1080,7 @@ impl NntpClient {
                         match self
                             .classify_decoded_batch_item(
                                 idx,
+                                remote_ip,
                                 &message_ids[message_idx],
                                 item,
                                 &mut attempts_by_index[message_idx],
@@ -1078,6 +1120,7 @@ impl NntpClient {
                     match self
                         .classify_decoded_batch_item(
                             idx,
+                            remote_ip,
                             &message_ids[message_idx],
                             item,
                             &mut attempts_by_index[message_idx],
@@ -1128,6 +1171,7 @@ impl NntpClient {
                     match self
                         .classify_decoded_batch_item(
                             idx,
+                            remote_ip,
                             &message_ids[message_idx],
                             item,
                             &mut attempts_by_index[message_idx],
@@ -1188,6 +1232,7 @@ impl NntpClient {
                 match self
                     .classify_decoded_batch_item(
                         idx,
+                        remote_ip,
                         &message_ids[message_idx],
                         item,
                         &mut attempts_by_index[message_idx],
@@ -1224,6 +1269,7 @@ impl NntpClient {
                         match self
                             .classify_decoded_batch_item(
                                 idx,
+                                remote_ip,
                                 &message_ids[unread_idx],
                                 item,
                                 &mut attempts_by_index[unread_idx],
@@ -1281,6 +1327,7 @@ impl NntpClient {
     async fn classify_decoded_batch_item(
         &self,
         server_idx: usize,
+        remote_ip: Option<IpAddr>,
         message_id: &str,
         item: DecodedBatchItem,
         attempts: &mut Vec<FetchAttemptTrace>,
@@ -1292,6 +1339,7 @@ impl NntpClient {
                 self.record_server_success(server_idx, elapsed).await;
                 attempts.push(FetchAttemptTrace {
                     server_idx,
+                    remote_ip,
                     elapsed,
                     outcome: FetchAttemptOutcome::Success,
                     error: None,
@@ -1302,6 +1350,7 @@ impl NntpClient {
                 self.record_server_success(server_idx, elapsed).await;
                 attempts.push(FetchAttemptTrace {
                     server_idx,
+                    remote_ip,
                     elapsed,
                     outcome: FetchAttemptOutcome::Success,
                     error: None,
@@ -1315,6 +1364,7 @@ impl NntpClient {
             )) => {
                 attempts.push(FetchAttemptTrace {
                     server_idx,
+                    remote_ip,
                     elapsed,
                     outcome: FetchAttemptOutcome::NotFound,
                     error: Some("article not found".to_string()),
@@ -1327,6 +1377,7 @@ impl NntpClient {
             Err(DecodedBodyError::Nntp(e @ NntpError::SoftTimeout(_))) => {
                 attempts.push(FetchAttemptTrace {
                     server_idx,
+                    remote_ip,
                     elapsed,
                     outcome: FetchAttemptOutcome::TransientFailure,
                     error: Some(e.to_string()),
@@ -1344,6 +1395,7 @@ impl NntpClient {
             )) => {
                 attempts.push(FetchAttemptTrace {
                     server_idx,
+                    remote_ip,
                     elapsed,
                     outcome: FetchAttemptOutcome::AuthenticationFailure,
                     error: Some("authentication/access failure".to_string()),
@@ -1355,6 +1407,7 @@ impl NntpClient {
             Err(DecodedBodyError::Nntp(e)) if is_transient(&e) => {
                 attempts.push(FetchAttemptTrace {
                     server_idx,
+                    remote_ip,
                     elapsed,
                     outcome: FetchAttemptOutcome::TransientFailure,
                     error: Some(e.to_string()),
@@ -1368,6 +1421,7 @@ impl NntpClient {
             Err(other) => {
                 attempts.push(FetchAttemptTrace {
                     server_idx,
+                    remote_ip,
                     elapsed,
                     outcome: FetchAttemptOutcome::PermanentFailure,
                     error: Some(format!("{other:?}")),
@@ -1408,6 +1462,7 @@ impl NntpClient {
                     self.record_server_success(idx, elapsed).await;
                     attempts.push(FetchAttemptTrace {
                         server_idx: idx,
+                        remote_ip: None,
                         elapsed,
                         outcome: FetchAttemptOutcome::Success,
                         error: None,
@@ -1420,6 +1475,7 @@ impl NntpClient {
                 Err(DecodedBodyError::Decode { raw_size, error }) => {
                     attempts.push(FetchAttemptTrace {
                         server_idx: idx,
+                        remote_ip: None,
                         elapsed: start.elapsed(),
                         outcome: FetchAttemptOutcome::Success,
                         error: None,
@@ -1436,6 +1492,7 @@ impl NntpClient {
                 )) => {
                     attempts.push(FetchAttemptTrace {
                         server_idx: idx,
+                        remote_ip: None,
                         elapsed: start.elapsed(),
                         outcome: FetchAttemptOutcome::NotFound,
                         error: Some("article not found".to_string()),
@@ -1448,6 +1505,7 @@ impl NntpClient {
                 Err(DecodedBodyError::Nntp(e @ NntpError::SoftTimeout(_))) => {
                     attempts.push(FetchAttemptTrace {
                         server_idx: idx,
+                        remote_ip: None,
                         elapsed: start.elapsed(),
                         outcome: FetchAttemptOutcome::TransientFailure,
                         error: Some(e.to_string()),
@@ -1465,6 +1523,7 @@ impl NntpClient {
                 )) => {
                     attempts.push(FetchAttemptTrace {
                         server_idx: idx,
+                        remote_ip: None,
                         elapsed: start.elapsed(),
                         outcome: FetchAttemptOutcome::AuthenticationFailure,
                         error: Some("authentication/access failure".to_string()),
@@ -1476,6 +1535,7 @@ impl NntpClient {
                 Err(DecodedBodyError::Nntp(e)) if is_transient(&e) => {
                     attempts.push(FetchAttemptTrace {
                         server_idx: idx,
+                        remote_ip: None,
                         elapsed: start.elapsed(),
                         outcome: FetchAttemptOutcome::TransientFailure,
                         error: Some(e.to_string()),
@@ -1489,6 +1549,7 @@ impl NntpClient {
                 Err(other) => {
                     attempts.push(FetchAttemptTrace {
                         server_idx: idx,
+                        remote_ip: None,
                         elapsed: start.elapsed(),
                         outcome: FetchAttemptOutcome::PermanentFailure,
                         error: Some(format!("{other:?}")),
@@ -1526,6 +1587,10 @@ impl NntpClient {
     /// Access the underlying connection pool.
     pub fn pool(&self) -> &Arc<NntpPool> {
         &self.pool
+    }
+
+    pub async fn retire_server_ip(&self, server: ServerId, ip: IpAddr) {
+        self.pool.retire_ip(server, ip).await;
     }
 
     async fn record_server_success(&self, server_idx: usize, elapsed: Duration) {
@@ -1829,12 +1894,13 @@ impl NntpClient {
         server: ServerId,
         message_id: &str,
         groups: &[String],
-    ) -> Result<Bytes> {
+    ) -> Result<(Bytes, Option<IpAddr>)> {
         let deadline = TokioInstant::now() + self.soft_timeout;
         let mut attempts = 0u32;
 
         loop {
             let mut conn = self.acquire_before_deadline(server, deadline).await?;
+            let remote_ip = Some(conn.remote_ip());
 
             // Try to select a group — iterate through the list on failure.
             let group_result =
@@ -1893,7 +1959,7 @@ impl NntpClient {
                     }
                 };
             match result {
-                Ok(response) => return Ok(response.data),
+                Ok(response) => return Ok((response.data, remote_ip)),
                 Err(NntpError::ArticleNotFound)
                 | Err(NntpError::NoSuchArticle { .. })
                 | Err(NntpError::NoArticleWithNumber) => {
@@ -2819,7 +2885,101 @@ mod tests {
         assert!(trace.result.is_ok(), "traced fetch should succeed");
         assert_eq!(trace.attempts.len(), 1);
         assert_eq!(trace.attempts[0].server_idx, 0);
+        assert_eq!(
+            trace.attempts[0].remote_ip,
+            Some("127.0.0.1".parse().unwrap())
+        );
         assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn extra_body_lane_reports_remote_ip() {
+        let port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("GROUP "),
+                response: b"211 1 1 1 alt.binaries.test\r\n",
+            },
+        ])
+        .await;
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_server(port, 0)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        let lane = client
+            .acquire_extra_body_lane(ServerId(0), &[String::from("alt.binaries.test")])
+            .await
+            .expect("extra BODY lane should acquire");
+
+        assert_eq!(lane.remote_ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+        lane.park();
+    }
+
+    #[tokio::test]
+    async fn extra_body_lane_uses_fresh_connection_instead_of_idle_pool() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_task = accepted.clone();
+
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                accepted_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                socket.write_all(b"200 ready\r\n").await.unwrap();
+                socket.flush().await.unwrap();
+                let line = read_command_line(&mut socket).await;
+                assert!(line.starts_with("CAPABILITIES"));
+                socket
+                    .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+                let line = read_command_line(&mut socket).await;
+                assert!(line.starts_with("GROUP "));
+                socket
+                    .write_all(b"211 1 1 1 alt.binaries.test\r\n")
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+            }
+        });
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_server(port, 0)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        let first = client
+            .acquire_body_lane(ServerId(0), &[String::from("alt.binaries.test")])
+            .await
+            .expect("normal BODY lane should acquire");
+        first.park();
+
+        let second = client
+            .acquire_extra_body_lane(ServerId(0), &[String::from("alt.binaries.test")])
+            .await
+            .expect("extra BODY lane should acquire fresh connection");
+        second.discard().await;
+
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "extra BODY lane must create a fresh connection instead of reusing idle"
+        );
     }
 
     #[tokio::test]

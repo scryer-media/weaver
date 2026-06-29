@@ -401,6 +401,7 @@ fn build_service(
         retry: None,
         max_download_speed: None,
         isp_bandwidth_cap: None,
+        ip_replacement_trial_extra_connections: None,
         diagnostic_upload_url: None,
         cleanup_after_extract: Some(true),
         config_path: None,

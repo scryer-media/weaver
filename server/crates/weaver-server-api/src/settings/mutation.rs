@@ -33,7 +33,11 @@ impl SettingsMutation {
         let cleanup_after_extract = input.cleanup_after_extract;
         let max_download_speed = input.max_download_speed;
         let max_retries = input.max_retries;
+        let ip_replacement_trial_extra_connections = input.ip_replacement_trial_extra_connections;
         let isp_bandwidth_cap = input.isp_bandwidth_cap.clone();
+        if ip_replacement_trial_extra_connections.unwrap_or(0) > 1 {
+            return Err("ip_replacement_trial_extra_connections must be 0 or 1".into());
+        }
         let should_update_paths =
             !normalized_intermediate_dir.is_undefined() || !normalized_complete_dir.is_undefined();
 
@@ -44,6 +48,7 @@ impl SettingsMutation {
             max_download_speed,
             max_retries,
             isp_bandwidth_cap.clone(),
+            ip_replacement_trial_extra_connections,
         );
         let settings_persist = {
             let db = db.clone();
@@ -111,6 +116,12 @@ impl SettingsMutation {
                                 &cap.monthly_reset_day.to_string(),
                             )?;
                         }
+                        if let Some(v) = persist_input.6 {
+                            db.set_setting(
+                                "ip_replacement_trial_extra_connections",
+                                &v.to_string(),
+                            )?;
+                        }
                         Ok(())
                     },
                 )
@@ -156,6 +167,9 @@ impl SettingsMutation {
                 if let Some(cap) = isp_bandwidth_cap {
                     cfg.isp_bandwidth_cap = Some(cap.into());
                 }
+                if let Some(extra) = ip_replacement_trial_extra_connections {
+                    cfg.ip_replacement_trial_extra_connections = Some(extra);
+                }
 
                 let runtime_paths = should_update_paths.then(|| {
                     (
@@ -171,6 +185,8 @@ impl SettingsMutation {
                     cleanup_after_extract: cfg.cleanup_after_extract(),
                     max_download_speed: cfg.max_download_speed.unwrap_or(0),
                     max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
+                    ip_replacement_trial_extra_connections: cfg
+                        .ip_replacement_trial_extra_connections(),
                     isp_bandwidth_cap: cfg.isp_bandwidth_cap.as_ref().map(Into::into),
                 };
                 (settings, runtime_paths)
@@ -184,6 +200,11 @@ impl SettingsMutation {
         }
         if let Some(cap) = input.isp_bandwidth_cap {
             let _ = handle.set_bandwidth_cap_policy(Some(cap.into())).await;
+        }
+        if let Some(extra) = ip_replacement_trial_extra_connections {
+            let _ = handle
+                .set_ip_replacement_trial_extra_connections(extra)
+                .await;
         }
 
         // Apply directory changes immediately so new jobs use them without restart.
@@ -345,6 +366,7 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
+            ip_replacement_trial_extra_connections: None,
             diagnostic_upload_url: None,
             config_path: None,
         }))

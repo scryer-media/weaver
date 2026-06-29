@@ -540,6 +540,11 @@ pub(super) fn render_prometheus_metrics(
         "blocked_hot_can_use_capacity",
         "allowed_underfill",
         "reclaimed",
+        "blocked_best_mode_pending",
+        "blocked_recent_expansion_helped",
+        "blocked_cap_speed",
+        "allowed_measured_underfill",
+        "reclaimed_speed_harm",
     ] {
         append_labeled_metric(
             &mut out,
@@ -569,10 +574,30 @@ pub(super) fn render_prometheus_metrics(
             snapshot.hot_dispatch_spillover_blocked_hot_can_use_capacity_total,
         ),
         (
+            "blocked_best_mode_pending",
+            snapshot.hot_dispatch_spillover_blocked_best_mode_pending_total,
+        ),
+        (
+            "blocked_recent_expansion_helped",
+            snapshot.hot_dispatch_spillover_blocked_recent_expansion_helped_total,
+        ),
+        (
+            "blocked_cap_speed",
+            snapshot.hot_dispatch_spillover_blocked_cap_speed_total,
+        ),
+        (
             "allowed_underfill",
             snapshot.hot_dispatch_spillover_allowed_underfill_total,
         ),
         ("reclaimed", snapshot.hot_dispatch_spillover_reclaimed_total),
+        (
+            "allowed_measured_underfill",
+            snapshot.hot_dispatch_spillover_allowed_measured_underfill_total,
+        ),
+        (
+            "reclaimed_speed_harm",
+            snapshot.hot_dispatch_spillover_reclaimed_speed_harm_total,
+        ),
     ] {
         append_labeled_metric(
             &mut out,
@@ -581,6 +606,86 @@ pub(super) fn render_prometheus_metrics(
             value,
         );
     }
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_speed_bytes_per_second Two-second hot-job BODY throughput.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_speed_bytes_per_second gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_speed_bytes_per_second",
+        snapshot.hot_dispatch_hot_speed_bps,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_last_expansion_kind Last hot-job expansion event kind code.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_last_expansion_kind gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_last_expansion_kind",
+        snapshot.hot_dispatch_last_expansion_kind,
+    );
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_last_expansion_speed_bytes_per_second Last hot-job expansion before/after speeds.\n");
+    out.push_str(
+        "# TYPE weaver_pipeline_hot_dispatch_last_expansion_speed_bytes_per_second gauge\n",
+    );
+    append_labeled_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_last_expansion_speed_bytes_per_second",
+        &[("phase", "before")],
+        snapshot.hot_dispatch_last_expansion_before_bps,
+    );
+    append_labeled_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_last_expansion_speed_bytes_per_second",
+        &[("phase", "after")],
+        snapshot.hot_dispatch_last_expansion_after_bps,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_exclusive_peak_bytes_per_second Peak hot-job speed observed while exclusive.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_exclusive_peak_bytes_per_second gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_exclusive_peak_bytes_per_second",
+        snapshot.hot_dispatch_exclusive_peak_bps,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_spillover_speed_bytes_per_second Hot-job speed before and after current spillover loan.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_spillover_speed_bytes_per_second gauge\n");
+    for (phase, value) in [
+        ("pre_lend", snapshot.hot_dispatch_spillover_pre_speed_bps),
+        ("post_lend", snapshot.hot_dispatch_spillover_post_speed_bps),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_hot_dispatch_spillover_speed_bytes_per_second",
+            &[("phase", phase)],
+            value,
+        );
+    }
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_spillover_active_loans Active measured spillover loans.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_spillover_active_loans gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_spillover_active_loans",
+        snapshot.hot_dispatch_spillover_active_loans,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_recent_expansion_improvement_percent Best recent lane/pipeline expansion improvement percent.\n");
+    out.push_str(
+        "# TYPE weaver_pipeline_hot_dispatch_recent_expansion_improvement_percent gauge\n",
+    );
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_recent_expansion_improvement_percent",
+        snapshot.hot_dispatch_recent_expansion_improvement_pct,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_best_mode_block_reason Last best-mode spillover block reason code.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_best_mode_block_reason gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_best_mode_block_reason",
+        snapshot.hot_dispatch_best_mode_block_reason,
+    );
 
     out.push_str(
         "# HELP weaver_pipeline_download_lanes_active Active article download lanes by mode.\n",
@@ -659,6 +764,14 @@ pub(super) fn render_prometheus_metrics(
             snapshot.download_lane_parks_spillover_withdraw_total,
         ),
         (
+            "spillover_speed_harm",
+            snapshot.download_lane_parks_spillover_speed_harm_total,
+        ),
+        (
+            "ip_replacement_retired",
+            snapshot.download_lane_parks_ip_replacement_retired_total,
+        ),
+        (
             "server_tier_changed",
             snapshot.download_lane_parks_server_tier_changed_total,
         ),
@@ -731,6 +844,71 @@ pub(super) fn render_prometheus_metrics(
         "weaver_pipeline_body_replay_items_total",
         snapshot.download_pipeline_replay_items_total,
     );
+
+    out.push_str("# HELP weaver_ip_replacement_trial_extra_connections Configured over-max IP replacement trial burst budget.\\n");
+    out.push_str("# TYPE weaver_ip_replacement_trial_extra_connections gauge\\n");
+    append_metric(
+        &mut out,
+        "weaver_ip_replacement_trial_extra_connections",
+        snapshot.ip_replacement_trial_extra_connections,
+    );
+    out.push_str("# HELP weaver_ip_replacement_burst_active Whether an over-max IP replacement trial is active.\\n");
+    out.push_str("# TYPE weaver_ip_replacement_burst_active gauge\\n");
+    append_metric(
+        &mut out,
+        "weaver_ip_replacement_burst_active",
+        u64::from(snapshot.ip_replacement_burst_active),
+    );
+    out.push_str("# HELP weaver_ip_replacement_over_max_connections Current over-max IP replacement trial connections.\\n");
+    out.push_str("# TYPE weaver_ip_replacement_over_max_connections gauge\\n");
+    append_metric(
+        &mut out,
+        "weaver_ip_replacement_over_max_connections",
+        snapshot.ip_replacement_over_max_connections,
+    );
+    out.push_str(
+        "# HELP weaver_ip_rtt_ewma_entries Number of tracked per-server/per-IP BODY RTT EWMAs.\\n",
+    );
+    out.push_str("# TYPE weaver_ip_rtt_ewma_entries gauge\\n");
+    append_metric(
+        &mut out,
+        "weaver_ip_rtt_ewma_entries",
+        snapshot.ip_rtt_ewma_entries,
+    );
+    out.push_str("# HELP weaver_ip_rtt_ewma_slowest_ms Slowest tracked per-IP BODY RTT EWMA in milliseconds.\\n");
+    out.push_str("# TYPE weaver_ip_rtt_ewma_slowest_ms gauge\\n");
+    append_metric(
+        &mut out,
+        "weaver_ip_rtt_ewma_slowest_ms",
+        snapshot.ip_rtt_ewma_slowest_ms,
+    );
+    out.push_str("# HELP weaver_ip_replacement_trials_total IP replacement trial outcomes.\\n");
+    out.push_str("# TYPE weaver_ip_replacement_trials_total counter\\n");
+    for (outcome, value) in [
+        ("started", snapshot.ip_replacement_trials_started_total),
+        ("rejected", snapshot.ip_replacement_trials_rejected_total),
+        ("accepted", snapshot.ip_replacement_trials_accepted_total),
+        ("blocked", snapshot.ip_replacement_trials_blocked_total),
+        (
+            "acquire_failed",
+            snapshot.ip_replacement_trials_acquire_failed_total,
+        ),
+        (
+            "same_ip_rejected",
+            snapshot.ip_replacement_trials_same_ip_rejected_total,
+        ),
+        (
+            "old_retired",
+            snapshot.ip_replacement_old_connections_retired_total,
+        ),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_ip_replacement_trials_total",
+            &[("outcome", outcome)],
+            value,
+        );
+    }
 
     out.push_str("# HELP weaver_pipeline_download_observed_limiter Observed downloader limiter derived from pressure, queue, and server permits.\n");
     out.push_str("# TYPE weaver_pipeline_download_observed_limiter gauge\n");

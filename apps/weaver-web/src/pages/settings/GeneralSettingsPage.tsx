@@ -32,6 +32,7 @@ type GeneralSettings = {
   cleanupAfterExtract: boolean;
   maxDownloadSpeed: number;
   maxRetries: number;
+  ipReplacementTrialExtraConnections: number;
 };
 
 type StorageBehaviorDraft = {
@@ -77,12 +78,15 @@ export function GeneralSettingsPage() {
   const [completeDir, setCompleteDir] = useState("");
   const [cleanup, setCleanup] = useState(true);
   const [maxRetries, setMaxRetries] = useState(3);
+  const [ipReplacementBurst, setIpReplacementBurst] = useState(0);
   const [speedSaved, setSpeedSaved] = useState(false);
+  const [ipReplacementBurstSaved, setIpReplacementBurstSaved] = useState(false);
   const [storageSaveStatus, setStorageSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [storageSaveError, setStorageSaveError] = useState<string | null>(null);
   const [browserTarget, setBrowserTarget] = useState<"intermediate" | "complete" | null>(null);
   const [browsePath, setBrowsePath] = useState<string | null>(null);
   const speedSavedTimerRef = useRef<number | null>(null);
+  const ipReplacementBurstSavedTimerRef = useRef<number | null>(null);
   const storageSaveTimerRef = useRef<number | null>(null);
   const storageSavedTimerRef = useRef<number | null>(null);
   const pendingStorageSaveRef = useRef<StorageBehaviorDraft | null>(null);
@@ -101,6 +105,7 @@ export function GeneralSettingsPage() {
     setCompleteDir(settings.completeDir ?? "");
     setCleanup(settings.cleanupAfterExtract ?? true);
     setMaxRetries(settings.maxRetries ?? 3);
+    setIpReplacementBurst(settings.ipReplacementTrialExtraConnections ?? 0);
   }, [settings]);
 
   useEffect(() => {
@@ -110,6 +115,9 @@ export function GeneralSettingsPage() {
       }
       if (speedSavedTimerRef.current !== null) {
         window.clearTimeout(speedSavedTimerRef.current);
+      }
+      if (ipReplacementBurstSavedTimerRef.current !== null) {
+        window.clearTimeout(ipReplacementBurstSavedTimerRef.current);
       }
       if (storageSavedTimerRef.current !== null) {
         window.clearTimeout(storageSavedTimerRef.current);
@@ -131,6 +139,17 @@ export function GeneralSettingsPage() {
     }
     setSpeedSaved(true);
     speedSavedTimerRef.current = window.setTimeout(() => setSpeedSaved(false), 2000);
+  }, []);
+
+  const pulseIpReplacementBurstSaved = useCallback(() => {
+    if (ipReplacementBurstSavedTimerRef.current !== null) {
+      window.clearTimeout(ipReplacementBurstSavedTimerRef.current);
+    }
+    setIpReplacementBurstSaved(true);
+    ipReplacementBurstSavedTimerRef.current = window.setTimeout(
+      () => setIpReplacementBurstSaved(false),
+      2000,
+    );
   }, []);
 
   const currentStorageDraft = useMemo(
@@ -232,6 +251,20 @@ export function GeneralSettingsPage() {
     if (result.data?.updateSettings) {
       applyUpdatedSettings(result.data.updateSettings);
       pulseSpeedSaved();
+    }
+  };
+
+  const applyIpReplacementBurst = async () => {
+    const value = Math.max(0, Math.min(1, Math.trunc(ipReplacementBurst)));
+    const result = await updateSettings({
+      input: {
+        ipReplacementTrialExtraConnections: value,
+      },
+    });
+
+    if (result.data?.updateSettings) {
+      applyUpdatedSettings(result.data.updateSettings);
+      pulseIpReplacementBurstSaved();
     }
   };
 
@@ -372,6 +405,38 @@ export function GeneralSettingsPage() {
                   onChange={(event) => setMaxRetries(Number(event.target.value))}
                   className="max-w-32"
                 />
+              </SettingField>
+              <SettingField
+                label={t("settings.ipReplacementTrialExtraConnections")}
+                description={t("settings.ipReplacementTrialExtraConnectionsDesc")}
+              >
+                <div className="flex flex-wrap items-center gap-3">
+                  <Input
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={1}
+                    value={ipReplacementBurst}
+                    onChange={(event) => {
+                      const value = Number(event.target.value);
+                      setIpReplacementBurst(Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0);
+                    }}
+                    className="max-w-24"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => void applyIpReplacementBurst()}
+                    disabled={updateState.fetching}
+                  >
+                    {t("settings.save")}
+                  </Button>
+                  {ipReplacementBurstSaved ? (
+                    <span className="text-sm text-emerald-600 dark:text-emerald-300">
+                      {t("settings.saved")}
+                    </span>
+                  ) : null}
+                </div>
               </SettingField>
             </div>
 

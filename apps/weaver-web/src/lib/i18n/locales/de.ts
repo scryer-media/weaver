@@ -340,6 +340,8 @@ const de: LocaleDictionary = {
   "settings.cleanupDesc": "Zwischendateien nach erfolgreichem Entpacken löschen",
   "settings.maxRetries": "Maximale Wiederholungen",
   "settings.maxRetriesDesc": "Wie oft Weaver einen Artikel erneut versuchen soll, bevor er als dauerhaft fehlend markiert wird.",
+  "settings.ipReplacementTrialExtraConnections": "IP-Ersatz-Burst",
+  "settings.ipReplacementTrialExtraConnectionsDesc": "Eine temporäre Zusatzverbindung für belegten Ersatz langsamerer IPs erlauben.",
   "settings.storageAndBehavior": "Speicher und Verhalten",
   "settings.storageAndBehaviorDesc": "Diese Werte steuern, wo Auftragsdaten auf der Festplatte liegen und wie aggressiv Weaver bereinigt und Arbeit wiederholt.",
   "settings.save": "Speichern",

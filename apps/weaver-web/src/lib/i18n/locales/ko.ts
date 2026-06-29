@@ -340,6 +340,8 @@ const ko: LocaleDictionary = {
   "settings.cleanupDesc": "성공적인 추출 후 중간 파일 삭제",
   "settings.maxRetries": "최대 재시도",
   "settings.maxRetriesDesc": "아티클을 영구 누락으로 표시하기 전에 Weaver가 재시도할 횟수.",
+  "settings.ipReplacementTrialExtraConnections": "IP 교체 버스트",
+  "settings.ipReplacementTrialExtraConnectionsDesc": "느린 IP 교체가 입증된 경우 임시 추가 연결 1개를 허용합니다.",
   "settings.storageAndBehavior": "저장소 및 동작",
   "settings.storageAndBehaviorDesc": "이 값들은 작업 상태가 디스크에 저장되는 위치와 Weaver가 정리 및 재시도를 수행하는 정도를 제어합니다.",
   "settings.save": "저장",

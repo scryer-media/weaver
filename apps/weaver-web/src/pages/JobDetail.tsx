@@ -613,11 +613,16 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
   const isTerminal = status === "COMPLETE" || status === "FAILED";
   const [downloadingPath, setDownloadingPath] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [filesOpenOverride, setFilesOpenOverride] = useState<boolean | null>(null);
   const [{ data, fetching }] = useQuery<{ jobOutputFiles: OutputResult | null }>({
     query: JOB_OUTPUT_FILES_QUERY,
     variables: { jobId },
     pause: !isTerminal,
   });
+
+  useEffect(() => {
+    setFilesOpenOverride(null);
+  }, [jobId]);
 
   if (!isTerminal) return null;
 
@@ -665,34 +670,54 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
     }, 1000);
   }
 
+  const filesOpen = filesOpenOverride ?? (result.files.length <= 10);
+  const outputFilesRegionId = `job-${jobId}-output-files`;
+  const outputFileCountLabel = `${result.files.length} file${result.files.length !== 1 ? "s" : ""}`;
+
   return (
     <Card>
       <CardHeader>
-        <div className="flex items-center justify-between">
-          <CardTitle>Output Files</CardTitle>
+        <button
+          type="button"
+          className="flex w-full items-start justify-between gap-3 text-left"
+          aria-expanded={filesOpen}
+          aria-controls={outputFilesRegionId}
+          title={filesOpen ? "Collapse output files" : "Expand output files"}
+          onClick={() => setFilesOpenOverride(!filesOpen)}
+        >
+          <div className="flex min-w-0 items-center gap-2">
+            <ChevronRight
+              className={cn(
+                "size-4 shrink-0 text-muted-foreground transition-transform",
+                filesOpen && "rotate-90",
+              )}
+            />
+            <CardTitle>Output Files</CardTitle>
+          </div>
           <span className="text-xs text-muted-foreground">
-            {result.files.length} file{result.files.length !== 1 ? "s" : ""} &middot; {formatBytes(result.totalBytes)}
+            {outputFileCountLabel} &middot; {formatBytes(result.totalBytes)}
           </span>
-        </div>
+        </button>
         <div className="font-mono text-xs text-muted-foreground">{result.outputDir}</div>
         {downloadError ? <p className="text-sm text-destructive">{downloadError}</p> : null}
       </CardHeader>
-      <CardContent className="px-0 pb-0">
-        <Table>
-          <TableHeader>
-            <TableRow className="hover:bg-transparent">
-              <TableHead className="text-xs">Name</TableHead>
-              <TableHead className="w-[120px] text-right text-xs">Size</TableHead>
+      {filesOpen ? (
+        <CardContent id={outputFilesRegionId} className="px-0 pb-0">
+          <Table>
+            <TableHeader>
+              <TableRow className="hover:bg-transparent">
+                <TableHead className="text-xs">Name</TableHead>
+                <TableHead className="w-[120px] text-right text-xs">Size</TableHead>
                 <TableHead className="w-[52px] text-right text-xs">&nbsp;</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {result.files.map((file) => (
-              <TableRow key={file.path}>
-                <TableCell className="font-mono text-xs">{file.name}</TableCell>
-                <TableCell className="text-right text-xs text-muted-foreground">
-                  {formatBytes(file.sizeBytes)}
-                </TableCell>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {result.files.map((file) => (
+                <TableRow key={file.path}>
+                  <TableCell className="font-mono text-xs">{file.name}</TableCell>
+                  <TableCell className="text-right text-xs text-muted-foreground">
+                    {formatBytes(file.sizeBytes)}
+                  </TableCell>
                   <TableCell className="text-right">
                     <Button
                       type="button"
@@ -709,11 +734,12 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
                       <Download className="size-4" />
                     </Button>
                   </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      </CardContent>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </CardContent>
+      ) : null}
     </Card>
   );
 }

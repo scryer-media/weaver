@@ -21,6 +21,8 @@ pub struct DownloadWork {
 /// Lower priority number = higher scheduling priority (downloaded first).
 struct PrioritizedWork {
     priority: u32,
+    /// Optional intra-priority rank for deterministic dynamic ordering.
+    rank: Option<u32>,
     /// Tie-breaker: insertion order (lower = earlier).
     sequence: u64,
     work: DownloadWork,
@@ -28,7 +30,9 @@ struct PrioritizedWork {
 
 impl PartialEq for PrioritizedWork {
     fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority && self.sequence == other.sequence
+        self.priority == other.priority
+            && self.rank == other.rank
+            && self.sequence == other.sequence
     }
 }
 
@@ -42,8 +46,11 @@ impl PartialOrd for PrioritizedWork {
 
 impl Ord for PrioritizedWork {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let self_rank = self.rank.unwrap_or(u32::MAX);
+        let other_rank = other.rank.unwrap_or(u32::MAX);
         self.priority
             .cmp(&other.priority)
+            .then(self_rank.cmp(&other_rank))
             .then(self.sequence.cmp(&other.sequence))
     }
 }
@@ -68,6 +75,7 @@ impl DownloadQueue {
         self.next_sequence += 1;
         self.heap.push(Reverse(PrioritizedWork {
             priority,
+            rank: None,
             sequence,
             work,
         }));
@@ -97,6 +105,15 @@ impl DownloadQueue {
             .peek()
             .is_some_and(|Reverse(pw)| matches(&pw.work))
             .then(|| self.heap.pop().map(|Reverse(pw)| pw.work))?
+    }
+
+    pub fn peek_next_matching(
+        &self,
+        mut matches: impl FnMut(&DownloadWork) -> bool,
+    ) -> Option<&DownloadWork> {
+        self.heap
+            .peek()
+            .and_then(|Reverse(pw)| matches(&pw.work).then_some(&pw.work))
     }
 
     pub fn len(&self) -> usize {
@@ -158,10 +175,44 @@ impl DownloadQueue {
         for Reverse(mut pw) in items {
             if pw.work.segment_id.file_id.job_id == job_id {
                 pw.priority = new_priority_base;
+                pw.rank = None;
                 pw.work.priority = new_priority_base;
             }
             self.heap.push(Reverse(pw));
         }
+    }
+
+    /// Recompute priorities for selected queued work while preserving insertion
+    /// order for work that ends up with the same priority.
+    pub fn reprioritize_matching(
+        &mut self,
+        mut priority_for: impl FnMut(&DownloadWork) -> Option<u32>,
+    ) -> usize {
+        self.reprioritize_matching_with_rank(|work| {
+            priority_for(work).map(|priority| (priority, None))
+        })
+    }
+
+    /// Recompute priorities and optional intra-priority ranks for selected queued
+    /// work. Unranked equal-priority work remains ordered by original insertion.
+    pub fn reprioritize_matching_with_rank(
+        &mut self,
+        mut priority_for: impl FnMut(&DownloadWork) -> Option<(u32, Option<u32>)>,
+    ) -> usize {
+        let items: Vec<_> = self.heap.drain().collect();
+        let mut changed = 0;
+        for Reverse(mut pw) in items {
+            if let Some((priority, rank)) = priority_for(&pw.work)
+                && (pw.priority != priority || pw.rank != rank)
+            {
+                pw.priority = priority;
+                pw.rank = rank;
+                pw.work.priority = priority;
+                changed += 1;
+            }
+            self.heap.push(Reverse(pw));
+        }
+        changed
     }
 }
 

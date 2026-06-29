@@ -203,6 +203,7 @@ mod tests {
             verified_suspect_volumes: HashSet::new(),
             worker_active: false,
             cached_headers: Some(cached_headers),
+            extraction_generation: 0,
             reason: RefreshReason::CoverageExpansion,
         };
 
@@ -481,6 +482,7 @@ struct RarSetComputeInput {
     verified_suspect_volumes: HashSet<u32>,
     worker_active: bool,
     cached_headers: Option<Vec<u8>>,
+    extraction_generation: u64,
     reason: RefreshReason,
 }
 
@@ -726,6 +728,7 @@ impl Pipeline {
                 "RAR set entered fallback full-set mode"
             );
         }
+        self.mark_rar_unlock_priorities_dirty(job_id);
     }
 
     pub(in crate::pipeline) async fn recompute_rar_set_state(
@@ -777,6 +780,7 @@ impl Pipeline {
         let facts = existing.facts.clone();
         let verified_suspect_volumes = existing.verified_suspect_volumes.clone();
         let worker_active = existing.active_workers > 0;
+        let extraction_generation = existing.extraction_generation;
         let cached_headers = self.load_rar_snapshot(job_id, set_name);
 
         Some(RarSetComputeInput {
@@ -792,6 +796,7 @@ impl Pipeline {
             verified_suspect_volumes,
             worker_active,
             cached_headers,
+            extraction_generation,
             reason,
         })
     }
@@ -1234,14 +1239,13 @@ impl Pipeline {
     ) {
         let key = (job_id, set_name.to_string());
         let mut launch = None;
-        if let Some(state) = self.rar_refresh_state.get_mut(&key) {
-            if state.in_flight.is_none() {
-                if let Some(request) = state.queued.take() {
-                    state.in_flight = Some(request);
-                    state.last_error = None;
-                    launch = Some(request);
-                }
-            }
+        if let Some(state) = self.rar_refresh_state.get_mut(&key)
+            && state.in_flight.is_none()
+            && let Some(request) = state.queued.take()
+        {
+            state.in_flight = Some(request);
+            state.last_error = None;
+            launch = Some(request);
         }
 
         if let Some(request) = launch {
@@ -1249,7 +1253,12 @@ impl Pipeline {
         }
     }
 
-    fn spawn_rar_refresh(&mut self, job_id: JobId, set_name: String, request: RarRefreshRequest) {
+    pub(in crate::pipeline) fn spawn_rar_refresh(
+        &mut self,
+        job_id: JobId,
+        set_name: String,
+        request: RarRefreshRequest,
+    ) {
         let Some(input) = self.prepare_rar_set_compute_input(job_id, &set_name, request.reason)
         else {
             if let Some(state) = self.rar_refresh_state.get_mut(&(job_id, set_name)) {
@@ -1257,6 +1266,7 @@ impl Pipeline {
             }
             return;
         };
+        let extraction_generation = input.extraction_generation;
         let refresh_done_tx = self.rar_refresh_done_tx.clone();
         tokio::spawn(async move {
             let result = Self::run_rar_set_compute(input).await;
@@ -1265,6 +1275,7 @@ impl Pipeline {
                     job_id,
                     set_name,
                     request,
+                    extraction_generation,
                     result,
                 })
                 .await;
@@ -1273,12 +1284,29 @@ impl Pipeline {
 
     pub(in crate::pipeline) async fn handle_rar_refresh_done(&mut self, done: RarRefreshDone) {
         let key = (done.job_id, done.set_name.clone());
+        let current_generation = self
+            .rar_sets
+            .get(&key)
+            .map(|set_state| set_state.extraction_generation);
+        let stale_refresh =
+            current_generation.is_some_and(|generation| generation > done.extraction_generation);
+        if stale_refresh {
+            debug!(
+                job_id = done.job_id.0,
+                set_name = %done.set_name,
+                reason = ?done.request.reason,
+                refresh_generation = done.extraction_generation,
+                current_generation = ?current_generation,
+                "discarding stale RAR refresh result"
+            );
+        }
         let error = match done.result {
-            Ok(computed) => {
+            Ok(computed) if !stale_refresh => {
                 self.apply_computed_rar_set_state(done.job_id, &done.set_name, computed);
                 None
             }
-            Err(error) => {
+            Ok(_) => None,
+            Err(error) if !stale_refresh => {
                 warn!(
                     job_id = done.job_id.0,
                     set_name = %done.set_name,
@@ -1288,8 +1316,18 @@ impl Pipeline {
                 );
                 Some(error)
             }
+            Err(error) => {
+                debug!(
+                    job_id = done.job_id.0,
+                    set_name = %done.set_name,
+                    reason = ?done.request.reason,
+                    error = %error,
+                    "discarding stale RAR refresh error"
+                );
+                None
+            }
         };
-        let success = error.is_none();
+        let success = error.is_none() && !stale_refresh;
         let capacity_pressure = error
             .as_ref()
             .is_some_and(RarRefreshError::is_capacity_pressure);
@@ -1299,66 +1337,117 @@ impl Pipeline {
             .map(|set_state| set_state.facts.keys().copied().collect())
             .unwrap_or_default();
         let latest_live_volume = live_fact_volumes.iter().next_back().copied().unwrap_or(0);
+        let active_rar_workers = self.rar_sets.get(&key).is_some_and(|set_state| {
+            set_state.active_workers > 0 || !set_state.in_flight_members.is_empty()
+        });
 
         let mut follow_up = None;
         let mut schedule_capacity_retry = false;
         if let Some(state) = self.rar_refresh_state.get_mut(&key) {
             state.in_flight = None;
-            if let Some(error) = error.as_ref() {
-                state.last_error = Some(error.clone());
-            } else {
-                state.last_error = None;
-            }
-
-            let coverage_gap = success && !live_fact_volumes.is_subset(&state.refreshed_volumes);
-            if let Some(mut queued) = state.queued.take() {
-                if coverage_gap || capacity_pressure {
-                    queued.target_completed_volume = queued
+            if stale_refresh {
+                let mut request = state
+                    .queued
+                    .take()
+                    .filter(|queued| queued.reason != RefreshReason::PostExtraction);
+                if request.is_none() && done.request.reason != RefreshReason::PostExtraction {
+                    request = Some(RarRefreshRequest {
+                        target_completed_volume: state
+                            .latest_completed_volume
+                            .max(latest_live_volume)
+                            .max(done.request.target_completed_volume),
+                        reason: done.request.reason,
+                    });
+                }
+                if request.is_none() && state.structure_dirty {
+                    request = Some(RarRefreshRequest {
+                        target_completed_volume: state
+                            .latest_completed_volume
+                            .max(latest_live_volume)
+                            .max(done.request.target_completed_volume),
+                        reason: RefreshReason::CoverageExpansion,
+                    });
+                }
+                if let Some(mut request) = request {
+                    request.target_completed_volume = request
                         .target_completed_volume
                         .max(state.latest_completed_volume)
                         .max(latest_live_volume);
-                    queued.reason = queued.reason.max(RefreshReason::CoverageExpansion);
+                    if active_rar_workers {
+                        state.queued = Some(request);
+                    } else {
+                        state.in_flight = Some(request);
+                        follow_up = Some(request);
+                    }
                 }
-                let still_needed = coverage_gap
-                    || queued.reason > done.request.reason
-                    || state.structure_dirty
-                    || !success;
-                if capacity_pressure {
-                    state.queued = Some(queued);
-                    schedule_capacity_retry = true;
-                } else if still_needed {
-                    state.in_flight = Some(queued);
-                    follow_up = Some(queued);
+            } else {
+                if let Some(error) = error.as_ref() {
+                    state.last_error = Some(error.clone());
+                } else {
+                    state.last_error = None;
                 }
-            } else if coverage_gap {
-                let request = RarRefreshRequest {
-                    target_completed_volume: state
-                        .latest_completed_volume
-                        .max(latest_live_volume)
-                        .max(done.request.target_completed_volume),
-                    reason: RefreshReason::CoverageExpansion,
-                };
-                state.in_flight = Some(request);
-                follow_up = Some(request);
-            } else if capacity_pressure {
-                let request = RarRefreshRequest {
-                    target_completed_volume: state
-                        .latest_completed_volume
-                        .max(latest_live_volume)
-                        .max(done.request.target_completed_volume),
-                    reason: done.request.reason.max(RefreshReason::CoverageExpansion),
-                };
-                state.queued = Some(request);
-                schedule_capacity_retry = true;
-            }
 
-            if follow_up.is_none() && success {
-                state.structure_dirty = false;
+                let coverage_gap =
+                    success && !live_fact_volumes.is_subset(&state.refreshed_volumes);
+                if let Some(mut queued) = state.queued.take() {
+                    if coverage_gap || capacity_pressure {
+                        queued.target_completed_volume = queued
+                            .target_completed_volume
+                            .max(state.latest_completed_volume)
+                            .max(latest_live_volume);
+                        queued.reason = queued.reason.max(RefreshReason::CoverageExpansion);
+                    }
+                    let still_needed = coverage_gap
+                        || queued.reason > done.request.reason
+                        || state.structure_dirty
+                        || !success;
+                    if capacity_pressure {
+                        state.queued = Some(queued);
+                        schedule_capacity_retry = true;
+                    } else if still_needed {
+                        state.in_flight = Some(queued);
+                        follow_up = Some(queued);
+                    }
+                } else if coverage_gap {
+                    let request = RarRefreshRequest {
+                        target_completed_volume: state
+                            .latest_completed_volume
+                            .max(latest_live_volume)
+                            .max(done.request.target_completed_volume),
+                        reason: RefreshReason::CoverageExpansion,
+                    };
+                    state.in_flight = Some(request);
+                    follow_up = Some(request);
+                } else if capacity_pressure {
+                    let request = RarRefreshRequest {
+                        target_completed_volume: state
+                            .latest_completed_volume
+                            .max(latest_live_volume)
+                            .max(done.request.target_completed_volume),
+                        reason: done.request.reason.max(RefreshReason::CoverageExpansion),
+                    };
+                    state.queued = Some(request);
+                    schedule_capacity_retry = true;
+                }
+
+                if follow_up.is_none() && success {
+                    state.structure_dirty = false;
+                }
             }
         }
 
         if let Some(request) = follow_up {
-            self.spawn_rar_refresh(done.job_id, done.set_name, request);
+            let can_extract_covered_spans =
+                success && request.reason <= RefreshReason::CoverageExpansion;
+            self.spawn_rar_refresh(done.job_id, done.set_name.clone(), request);
+            if can_extract_covered_spans {
+                self.purge_empty_rar_set_if_idle(done.job_id, &done.set_name);
+                self.try_rar_extraction(done.job_id).await;
+                if self.rar_sets.contains_key(&key) {
+                    self.try_delete_volumes(done.job_id, &done.set_name);
+                }
+                self.check_job_completion(done.job_id).await;
+            }
             return;
         }
 

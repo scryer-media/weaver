@@ -24,6 +24,9 @@ impl Database {
         let max_download_speed = settings
             .get("max_download_speed")
             .and_then(|v| v.parse().ok());
+        let ip_replacement_trial_extra_connections = settings
+            .get("ip_replacement_trial_extra_connections")
+            .and_then(|v| v.parse().ok());
         let cleanup_after_extract = settings
             .get("cleanup_after_extract")
             .and_then(|v| v.parse().ok());
@@ -149,6 +152,7 @@ impl Database {
             max_download_speed,
             cleanup_after_extract,
             isp_bandwidth_cap,
+            ip_replacement_trial_extra_connections,
             diagnostic_upload_url,
             config_path: None,
         })
@@ -168,6 +172,9 @@ impl Database {
         }
         if let Some(cleanup) = config.cleanup_after_extract {
             self.set_setting("cleanup_after_extract", &cleanup.to_string())?;
+        }
+        if let Some(extra) = config.ip_replacement_trial_extra_connections {
+            self.set_setting("ip_replacement_trial_extra_connections", &extra.to_string())?;
         }
         if let Some(ref diagnostic_upload_url) = config.diagnostic_upload_url {
             self.set_setting("diagnostic_upload_url", diagnostic_upload_url)?;

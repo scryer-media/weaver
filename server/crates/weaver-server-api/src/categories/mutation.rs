@@ -245,6 +245,7 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
+            ip_replacement_trial_extra_connections: None,
             diagnostic_upload_url: None,
             config_path: None,
         }))

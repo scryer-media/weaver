@@ -11,6 +11,13 @@ struct ReadyRarExtraction {
     is_solid: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RarExtractionSettle {
+    Idle,
+    ActiveWorkersRemain,
+    RefreshLaunched,
+}
+
 impl Pipeline {
     fn is_recoverable_full_set_extraction_error(error: &str) -> bool {
         let lower = error.to_ascii_lowercase();
@@ -117,6 +124,13 @@ impl Pipeline {
         set_name: &str,
         member_name: &str,
     ) -> bool {
+        if self
+            .extracted_members
+            .get(&job_id)
+            .is_some_and(|members| members.contains(member_name))
+        {
+            return false;
+        }
         self.rar_sets
             .get(&(job_id, set_name.to_string()))
             .and_then(|state| state.plan.as_ref())
@@ -378,6 +392,13 @@ impl Pipeline {
                         continue;
                     }
                     if set_state.in_flight_members.contains(&ready_member.name) {
+                        continue;
+                    }
+                    if self
+                        .extracted_members
+                        .get(&job_id)
+                        .is_some_and(|extracted| extracted.contains(&ready_member.name))
+                    {
                         continue;
                     }
                     if plan
@@ -848,19 +869,13 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         set_name: &str,
-    ) -> bool {
+    ) -> RarExtractionSettle {
         let key = (job_id, set_name.to_string());
         let Some(set_state) = self.rar_sets.get(&key) else {
-            return false;
+            return RarExtractionSettle::Idle;
         };
         if set_state.active_workers > 0 || !set_state.in_flight_members.is_empty() {
-            self.enqueue_rar_set_refresh(
-                job_id,
-                set_name,
-                self.latest_completed_rar_volume(job_id, set_name),
-                RefreshReason::PostExtraction,
-            );
-            return true;
+            return RarExtractionSettle::ActiveWorkersRemain;
         }
 
         // UnRAR keeps volume readers owned by the extraction call and switches
@@ -874,12 +889,32 @@ impl Pipeline {
                 error = %error,
                 "failed to recompute RAR set after extraction worker completed"
             );
-            return false;
+            return RarExtractionSettle::Idle;
+        }
+        let mut follow_up = None;
+        if let Some(refresh_state) = self.rar_refresh_state.get_mut(&key)
+            && refresh_state.in_flight.is_none()
+        {
+            if refresh_state
+                .queued
+                .as_ref()
+                .is_some_and(|request| request.reason == RefreshReason::PostExtraction)
+            {
+                refresh_state.queued = None;
+            } else if let Some(request) = refresh_state.queued.take() {
+                refresh_state.in_flight = Some(request);
+                follow_up = Some(request);
+            }
         }
         if self.rar_sets.contains_key(&key) {
             self.try_delete_volumes(job_id, set_name);
         }
-        false
+        if let Some(request) = follow_up {
+            self.spawn_rar_refresh(job_id, set_name.to_string(), request);
+            RarExtractionSettle::RefreshLaunched
+        } else {
+            RarExtractionSettle::Idle
+        }
     }
 
     pub(crate) async fn handle_extraction_done(&mut self, done: ExtractionDone) {
@@ -895,7 +930,10 @@ impl Pipeline {
                     for member in &attempted {
                         set_state.in_flight_members.remove(member);
                     }
+                    set_state.extraction_generation =
+                        set_state.extraction_generation.saturating_add(1);
                 }
+                self.mark_rar_unlock_priorities_dirty(job_id);
 
                 let mut capacity_retry = false;
                 match result {
@@ -1075,7 +1113,7 @@ impl Pipeline {
                 }
 
                 self.purge_empty_rar_set_if_idle(job_id, &set_name);
-                let queued_post_extraction_refresh = self
+                let settle_result = self
                     .settle_rar_set_after_extraction_worker(job_id, &set_name)
                     .await;
                 if self.rar_sets.contains_key(&(job_id, set_name.clone())) {
@@ -1091,10 +1129,19 @@ impl Pipeline {
                         &set_name,
                         RarCapacityRetryKind::Extraction,
                     );
-                } else if all_downloaded && !queued_post_extraction_refresh {
-                    self.check_job_completion(job_id).await;
-                } else if !all_downloaded {
-                    self.try_rar_extraction(job_id).await;
+                } else {
+                    match settle_result {
+                        RarExtractionSettle::ActiveWorkersRemain => {
+                            self.try_rar_extraction(job_id).await;
+                        }
+                        RarExtractionSettle::RefreshLaunched => {}
+                        RarExtractionSettle::Idle if all_downloaded => {
+                            self.check_job_completion(job_id).await;
+                        }
+                        RarExtractionSettle::Idle => {
+                            self.try_rar_extraction(job_id).await;
+                        }
+                    }
                 }
             }
             ExtractionDone::FullSet {
@@ -1127,7 +1174,10 @@ impl Pipeline {
                     if let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
                         set_state.active_workers = 0;
                         set_state.in_flight_members.clear();
+                        set_state.extraction_generation =
+                            set_state.extraction_generation.saturating_add(1);
                     }
+                    self.mark_rar_unlock_priorities_dirty(job_id);
                     for member in &outcome.extracted {
                         self.extracted_members
                             .entry(job_id)
@@ -1216,12 +1266,18 @@ impl Pipeline {
                         }
                     }
                     self.purge_empty_rar_set_if_idle(job_id, &set_name);
-                    let queued_post_extraction_refresh = self
+                    let settle_result = self
                         .settle_rar_set_after_extraction_worker(job_id, &set_name)
                         .await;
                     self.reconcile_job_progress(job_id).await;
-                    if !queued_post_extraction_refresh {
-                        self.check_job_completion(job_id).await;
+                    match settle_result {
+                        RarExtractionSettle::Idle => {
+                            self.check_job_completion(job_id).await;
+                        }
+                        RarExtractionSettle::ActiveWorkersRemain => {
+                            self.try_rar_extraction(job_id).await;
+                        }
+                        RarExtractionSettle::RefreshLaunched => {}
                     }
                 }
                 Err(e) => {
@@ -1237,6 +1293,8 @@ impl Pipeline {
                     if let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
                         set_state.active_workers = 0;
                         set_state.in_flight_members.clear();
+                        set_state.extraction_generation =
+                            set_state.extraction_generation.saturating_add(1);
                         if rar_capacity_pressure {
                             let fallback_phase =
                                 crate::pipeline::archive::rar_state::RarSetPhase::FallbackFullSet;
@@ -1246,6 +1304,7 @@ impl Pipeline {
                             }
                         }
                     }
+                    self.mark_rar_unlock_priorities_dirty(job_id);
                     if let Some(sets) = self.inflight_extractions.get_mut(&job_id) {
                         sets.remove(&set_name);
                     }

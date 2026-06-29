@@ -12,6 +12,7 @@ pub struct GeneralSettings {
     pub cleanup_after_extract: bool,
     pub max_download_speed: u64,
     pub max_retries: u32,
+    pub ip_replacement_trial_extra_connections: u8,
     pub isp_bandwidth_cap: Option<IspBandwidthCapSettings>,
 }
 
@@ -22,6 +23,7 @@ pub struct GeneralSettingsInput {
     pub cleanup_after_extract: Option<bool>,
     pub max_download_speed: Option<u64>,
     pub max_retries: Option<u32>,
+    pub ip_replacement_trial_extra_connections: Option<u8>,
     pub isp_bandwidth_cap: Option<IspBandwidthCapSettingsInput>,
 }
 

@@ -1,3 +1,4 @@
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -119,6 +120,7 @@ pub struct NntpConnection {
     state: ConnectionState,
     capabilities: Capabilities,
     host: String,
+    remote_addr: SocketAddr,
     created_at: Instant,
     last_used: Instant,
     command_timeout: Duration,
@@ -158,6 +160,7 @@ impl NntpConnection {
         };
 
         let now = Instant::now();
+        let remote_addr = transport.remote_addr();
         let read_buf_capacity = config.buffer_profile.read_buf_capacity.max(64 * 1024);
         let mut conn = NntpConnection {
             transport: Some(transport),
@@ -167,6 +170,7 @@ impl NntpConnection {
             state: ConnectionState::Greeting,
             capabilities: Capabilities::default(),
             host: config.host.clone(),
+            remote_addr,
             created_at: now,
             last_used: now,
             command_timeout: config.command_timeout.max(MIN_TIMEOUT),
@@ -922,6 +926,14 @@ impl NntpConnection {
     /// The server's advertised capabilities.
     pub fn capabilities(&self) -> &Capabilities {
         &self.capabilities
+    }
+
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
+    }
+
+    pub fn remote_ip(&self) -> IpAddr {
+        self.remote_addr.ip()
     }
 }
 

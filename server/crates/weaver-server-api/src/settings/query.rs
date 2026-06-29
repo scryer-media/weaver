@@ -18,6 +18,8 @@ impl SettingsQuery {
                 cleanup_after_extract: cfg.cleanup_after_extract(),
                 max_download_speed: cfg.max_download_speed.unwrap_or(0),
                 max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
+                ip_replacement_trial_extra_connections: cfg
+                    .ip_replacement_trial_extra_connections(),
                 isp_bandwidth_cap: cfg.isp_bandwidth_cap.as_ref().map(Into::into),
             })
             .await,

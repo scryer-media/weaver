@@ -340,6 +340,8 @@ const zh: LocaleDictionary = {
   "settings.cleanupDesc": "解压成功后删除中间文件",
   "settings.maxRetries": "最大重试次数",
   "settings.maxRetriesDesc": "Weaver 将文章标记为永久缺失前的重试次数。",
+  "settings.ipReplacementTrialExtraConnections": "IP 替换突发连接",
+  "settings.ipReplacementTrialExtraConnectionsDesc": "允许 1 个临时额外连接来替换已证明较慢的 IP。",
   "settings.storageAndBehavior": "存储与行为",
   "settings.storageAndBehaviorDesc": "这些选项控制任务状态在磁盘上的存储位置，以及 Weaver 清理和重试工作的策略。",
   "settings.save": "保存",

@@ -96,7 +96,7 @@ impl BoundedRarSourceInner {
     }
 
     fn ensure_open(&mut self, id: usize, path: &Path, position: u64) -> io::Result<()> {
-        if !self.open.as_ref().is_some_and(|open| open.id == id) {
+        if self.open.as_ref().is_none_or(|open| open.id != id) {
             self.open = None;
             let mut file = File::open(path).map_err(|error| {
                 io::Error::new(
