@@ -308,8 +308,26 @@ pub struct PipelineMetrics {
     pub download_lanes_sequential_active: AtomicUsize,
     pub download_lanes_depth2_active: AtomicUsize,
     pub download_lanes_depth4_active: AtomicUsize,
+    pub download_lanes_idle_active: AtomicUsize,
+    pub download_lanes_awaiting_work_active: AtomicUsize,
+    pub download_lanes_binding_server_active: AtomicUsize,
+    pub download_lanes_acquired_active: AtomicUsize,
+    pub download_lanes_issuing_active: AtomicUsize,
+    pub download_lanes_draining_active: AtomicUsize,
+    pub download_lanes_yield_after_batch_active: AtomicUsize,
+    pub download_lanes_parking_active: AtomicUsize,
+    pub download_lanes_recovering_active: AtomicUsize,
     pub download_lane_parks_no_work_total: AtomicU64,
+    pub download_lane_parks_pressure_total: AtomicU64,
+    pub download_lane_parks_probe_yield_total: AtomicU64,
+    pub download_lane_parks_hot_reclaim_total: AtomicU64,
+    pub download_lane_parks_spillover_withdraw_total: AtomicU64,
+    pub download_lane_parks_server_tier_changed_total: AtomicU64,
+    pub download_lane_parks_proof_failure_total: AtomicU64,
     pub download_lane_parks_error_total: AtomicU64,
+    pub download_lane_lease_items_total: AtomicU64,
+    pub download_lane_refill_granted_total: AtomicU64,
+    pub download_lane_refill_parked_total: AtomicU64,
     pub download_pipeline_trial_success_total: AtomicU64,
     pub download_pipeline_trial_failure_total: AtomicU64,
     pub download_pipeline_proof_pass_total: AtomicU64,
@@ -394,8 +412,26 @@ impl PipelineMetrics {
             download_lanes_sequential_active: AtomicUsize::new(0),
             download_lanes_depth2_active: AtomicUsize::new(0),
             download_lanes_depth4_active: AtomicUsize::new(0),
+            download_lanes_idle_active: AtomicUsize::new(0),
+            download_lanes_awaiting_work_active: AtomicUsize::new(0),
+            download_lanes_binding_server_active: AtomicUsize::new(0),
+            download_lanes_acquired_active: AtomicUsize::new(0),
+            download_lanes_issuing_active: AtomicUsize::new(0),
+            download_lanes_draining_active: AtomicUsize::new(0),
+            download_lanes_yield_after_batch_active: AtomicUsize::new(0),
+            download_lanes_parking_active: AtomicUsize::new(0),
+            download_lanes_recovering_active: AtomicUsize::new(0),
             download_lane_parks_no_work_total: AtomicU64::new(0),
+            download_lane_parks_pressure_total: AtomicU64::new(0),
+            download_lane_parks_probe_yield_total: AtomicU64::new(0),
+            download_lane_parks_hot_reclaim_total: AtomicU64::new(0),
+            download_lane_parks_spillover_withdraw_total: AtomicU64::new(0),
+            download_lane_parks_server_tier_changed_total: AtomicU64::new(0),
+            download_lane_parks_proof_failure_total: AtomicU64::new(0),
             download_lane_parks_error_total: AtomicU64::new(0),
+            download_lane_lease_items_total: AtomicU64::new(0),
+            download_lane_refill_granted_total: AtomicU64::new(0),
+            download_lane_refill_parked_total: AtomicU64::new(0),
             download_pipeline_trial_success_total: AtomicU64::new(0),
             download_pipeline_trial_failure_total: AtomicU64::new(0),
             download_pipeline_proof_pass_total: AtomicU64::new(0),
@@ -548,11 +584,63 @@ impl PipelineMetrics {
                 .load(Ordering::Relaxed),
             download_lanes_depth2_active: self.download_lanes_depth2_active.load(Ordering::Relaxed),
             download_lanes_depth4_active: self.download_lanes_depth4_active.load(Ordering::Relaxed),
+            download_lanes_idle_active: self.download_lanes_idle_active.load(Ordering::Relaxed),
+            download_lanes_awaiting_work_active: self
+                .download_lanes_awaiting_work_active
+                .load(Ordering::Relaxed),
+            download_lanes_binding_server_active: self
+                .download_lanes_binding_server_active
+                .load(Ordering::Relaxed),
+            download_lanes_acquired_active: self
+                .download_lanes_acquired_active
+                .load(Ordering::Relaxed),
+            download_lanes_issuing_active: self
+                .download_lanes_issuing_active
+                .load(Ordering::Relaxed),
+            download_lanes_draining_active: self
+                .download_lanes_draining_active
+                .load(Ordering::Relaxed),
+            download_lanes_yield_after_batch_active: self
+                .download_lanes_yield_after_batch_active
+                .load(Ordering::Relaxed),
+            download_lanes_parking_active: self
+                .download_lanes_parking_active
+                .load(Ordering::Relaxed),
+            download_lanes_recovering_active: self
+                .download_lanes_recovering_active
+                .load(Ordering::Relaxed),
             download_lane_parks_no_work_total: self
                 .download_lane_parks_no_work_total
                 .load(Ordering::Relaxed),
+            download_lane_parks_pressure_total: self
+                .download_lane_parks_pressure_total
+                .load(Ordering::Relaxed),
+            download_lane_parks_probe_yield_total: self
+                .download_lane_parks_probe_yield_total
+                .load(Ordering::Relaxed),
+            download_lane_parks_hot_reclaim_total: self
+                .download_lane_parks_hot_reclaim_total
+                .load(Ordering::Relaxed),
+            download_lane_parks_spillover_withdraw_total: self
+                .download_lane_parks_spillover_withdraw_total
+                .load(Ordering::Relaxed),
+            download_lane_parks_server_tier_changed_total: self
+                .download_lane_parks_server_tier_changed_total
+                .load(Ordering::Relaxed),
+            download_lane_parks_proof_failure_total: self
+                .download_lane_parks_proof_failure_total
+                .load(Ordering::Relaxed),
             download_lane_parks_error_total: self
                 .download_lane_parks_error_total
+                .load(Ordering::Relaxed),
+            download_lane_lease_items_total: self
+                .download_lane_lease_items_total
+                .load(Ordering::Relaxed),
+            download_lane_refill_granted_total: self
+                .download_lane_refill_granted_total
+                .load(Ordering::Relaxed),
+            download_lane_refill_parked_total: self
+                .download_lane_refill_parked_total
                 .load(Ordering::Relaxed),
             download_pipeline_trial_success_total: self
                 .download_pipeline_trial_success_total
@@ -657,8 +745,26 @@ pub struct MetricsSnapshot {
     pub download_lanes_sequential_active: usize,
     pub download_lanes_depth2_active: usize,
     pub download_lanes_depth4_active: usize,
+    pub download_lanes_idle_active: usize,
+    pub download_lanes_awaiting_work_active: usize,
+    pub download_lanes_binding_server_active: usize,
+    pub download_lanes_acquired_active: usize,
+    pub download_lanes_issuing_active: usize,
+    pub download_lanes_draining_active: usize,
+    pub download_lanes_yield_after_batch_active: usize,
+    pub download_lanes_parking_active: usize,
+    pub download_lanes_recovering_active: usize,
     pub download_lane_parks_no_work_total: u64,
+    pub download_lane_parks_pressure_total: u64,
+    pub download_lane_parks_probe_yield_total: u64,
+    pub download_lane_parks_hot_reclaim_total: u64,
+    pub download_lane_parks_spillover_withdraw_total: u64,
+    pub download_lane_parks_server_tier_changed_total: u64,
+    pub download_lane_parks_proof_failure_total: u64,
     pub download_lane_parks_error_total: u64,
+    pub download_lane_lease_items_total: u64,
+    pub download_lane_refill_granted_total: u64,
+    pub download_lane_refill_parked_total: u64,
     pub download_pipeline_trial_success_total: u64,
     pub download_pipeline_trial_failure_total: u64,
     pub download_pipeline_proof_pass_total: u64,

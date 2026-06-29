@@ -45,11 +45,14 @@ impl Pipeline {
         tokio::fs::create_dir_all(&complete_dir).await?;
 
         let (download_done_tx, download_done_rx) = mpsc::channel(256);
+        let (download_refill_tx, download_refill_rx) = mpsc::channel(256);
+        let (download_lane_parked_tx, download_lane_parked_rx) = mpsc::channel(256);
         let (decode_done_tx, decode_done_rx) = mpsc::channel(256);
         let (retry_tx, retry_rx) = mpsc::channel(256);
         let (probe_result_tx, probe_result_rx) = mpsc::channel(16);
         let (extract_done_tx, extract_done_rx) = mpsc::channel(32);
         let (rar_refresh_done_tx, rar_refresh_done_rx) = mpsc::channel(32);
+        let (rar_capacity_retry_tx, rar_capacity_retry_rx) = mpsc::channel(32);
         let (verified_suspect_persist_done_tx, verified_suspect_persist_done_rx) =
             mpsc::channel(32);
         let (move_done_tx, move_done_rx) = mpsc::channel(32);
@@ -115,6 +118,10 @@ impl Pipeline {
             pending_completion_checks: VecDeque::new(),
             download_done_tx,
             download_done_rx,
+            download_refill_tx,
+            download_refill_rx,
+            download_lane_parked_tx,
+            download_lane_parked_rx,
             decode_done_tx,
             decode_done_rx,
             retry_tx,
@@ -125,6 +132,8 @@ impl Pipeline {
             extract_done_rx,
             rar_refresh_done_tx,
             rar_refresh_done_rx,
+            rar_capacity_retry_tx,
+            rar_capacity_retry_rx,
             verified_suspect_persist_done_tx,
             verified_suspect_persist_done_rx,
             move_done_tx,
@@ -156,6 +165,7 @@ impl Pipeline {
             eagerly_deleted: HashMap::new(),
             rar_sets: HashMap::new(),
             rar_refresh_state: HashMap::new(),
+            pending_rar_capacity_retries: HashSet::new(),
             verified_suspect_persist_state: HashMap::new(),
             rar_waiting_members: HashMap::new(),
             normalization_retried: HashSet::new(),
@@ -464,6 +474,7 @@ impl Pipeline {
 
         'run_loop: loop {
             self.drain_ready_download_results(&mut pending_download_results);
+            self.drain_ready_lane_control_messages();
             self.pump_decode_queue();
 
             let pending_completion_checks = self.pending_completion_checks.len();
@@ -491,6 +502,8 @@ impl Pipeline {
                 }
             }
 
+            self.drain_ready_lane_control_messages();
+
             if let Some(result) = pending_download_results.pop_front() {
                 self.process_download_done(result).await;
             } else {
@@ -508,6 +521,13 @@ impl Pipeline {
                         self.release_download_result(&result);
                         pending_download_results.push_back(result);
                     }
+                    Some(request) = self.download_refill_rx.recv() => {
+                        self.drain_ready_download_results(&mut pending_download_results);
+                        self.handle_download_lane_refill_request(request);
+                    }
+                    Some(parked) = self.download_lane_parked_rx.recv() => {
+                        self.handle_download_lane_parked(parked);
+                    }
                     Some(result) = self.decode_done_rx.recv() => {
                         self.handle_decode_done(result).await;
                     }
@@ -519,6 +539,9 @@ impl Pipeline {
                     }
                     Some(done) = self.rar_refresh_done_rx.recv() => {
                         self.handle_rar_refresh_done(done).await;
+                    }
+                    Some(retry) = self.rar_capacity_retry_rx.recv() => {
+                        self.handle_rar_capacity_retry(retry).await;
                     }
                     Some(done) = self.verified_suspect_persist_done_rx.recv() => {
                         self.handle_verified_suspect_persist_done(done);
@@ -619,6 +642,25 @@ impl Pipeline {
             };
             self.release_download_result(&result);
             pending.push_back(result);
+            self.drain_ready_lane_control_messages();
+        }
+    }
+
+    fn drain_ready_lane_control_messages(&mut self) {
+        loop {
+            match self.download_lane_parked_rx.try_recv() {
+                Ok(parked) => self.handle_download_lane_parked(parked),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        loop {
+            match self.download_refill_rx.try_recv() {
+                Ok(request) => self.handle_download_lane_refill_request(request),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
         }
     }
 

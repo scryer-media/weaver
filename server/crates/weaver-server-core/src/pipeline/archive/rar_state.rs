@@ -5,7 +5,7 @@ use super::topology::{ArchiveMember, ArchivePendingSpan, ArchiveTopology};
 use crate::jobs::assembly::ArchiveType;
 use weaver_unrar::{
     MemberInfo, RarArchive, RarVolumeFacts, archive::MemberPlannerState, crypto::KdfCache,
-    sanitize_path,
+    path::sanitize_file_redirection_path, sanitize_path,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +37,13 @@ pub(crate) struct RarReadyMember {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RarMemberDependency {
+    pub(crate) source_member: String,
+    pub(crate) source_first_volume: u32,
+    pub(crate) source_last_volume: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RarVolumeDeleteDecision {
     pub(crate) owners: Vec<String>,
     pub(crate) clean_owners: Vec<String>,
@@ -52,6 +59,7 @@ pub(crate) struct RarDerivedPlan {
     pub(crate) is_solid: bool,
     pub(crate) ready_members: Vec<RarReadyMember>,
     pub(crate) member_names: Vec<String>,
+    pub(crate) member_dependencies: HashMap<String, RarMemberDependency>,
     pub(crate) waiting_on_volumes: HashSet<u32>,
     pub(crate) deletion_eligible: HashSet<u32>,
     pub(crate) delete_decisions: BTreeMap<u32, RarVolumeDeleteDecision>,
@@ -184,6 +192,7 @@ pub(crate) fn build_plan(
             is_solid: false,
             ready_members: Vec::new(),
             member_names: Vec::new(),
+            member_dependencies: HashMap::new(),
             waiting_on_volumes,
             deletion_eligible: HashSet::new(),
             delete_decisions: BTreeMap::new(),
@@ -254,6 +263,20 @@ pub(crate) fn build_plan(
     };
     let mut member_names = Vec::new();
     let mut member_claims: HashMap<String, HashSet<u32>> = HashMap::new();
+    let mut default_member_indexes = HashMap::<String, usize>::new();
+    let mut default_member_spans = HashMap::<String, (u32, u32)>::new();
+    for (index, member) in metadata.members.iter().enumerate() {
+        if !is_default_extract_member(member) {
+            continue;
+        }
+        default_member_indexes
+            .entry(member.name.clone())
+            .or_insert(index);
+        default_member_spans.entry(member.name.clone()).or_insert((
+            member.volumes.first_volume as u32,
+            member.volumes.last_volume as u32,
+        ));
+    }
     for member in &topology_members {
         if member.is_directory || !member.missing_start {
             continue;
@@ -308,6 +331,39 @@ pub(crate) fn build_plan(
             .extend(claims);
     }
 
+    let mut member_dependencies = HashMap::new();
+    for (index, member) in metadata.members.iter().enumerate() {
+        if !is_default_extract_member(member) || !(member.is_hardlink || member.is_file_copy) {
+            continue;
+        }
+        let Some(target) = member.link_target.as_deref() else {
+            continue;
+        };
+        let source_member = sanitize_file_redirection_path(target);
+        if source_member == member.name {
+            continue;
+        }
+        let Some(&source_index) = default_member_indexes.get(&source_member) else {
+            continue;
+        };
+        if source_index >= index {
+            continue;
+        }
+        let Some(&(source_first_volume, source_last_volume)) =
+            default_member_spans.get(&source_member)
+        else {
+            continue;
+        };
+        member_dependencies.insert(
+            member.name.clone(),
+            RarMemberDependency {
+                source_member,
+                source_first_volume,
+                source_last_volume,
+            },
+        );
+    }
+
     // Supplemental claims from topology members. This covers orphan
     // continuation entries (split_before=true, single segment) that
     // metadata() filters out. Without this, boundary volumes between
@@ -348,10 +404,18 @@ pub(crate) fn build_plan(
 
     let mut ready_members = Vec::new();
     let mut ready_member_names = HashSet::new();
+    let dependency_satisfied = |member: &MemberInfo| {
+        member_dependencies
+            .get(&member.name)
+            .is_none_or(|dependency| extracted.contains(&dependency.source_member))
+    };
     if metadata.is_solid {
         for member in &metadata.members {
             if !is_default_extract_member(member) || extracted.contains(&member.name) {
                 continue;
+            }
+            if !dependency_satisfied(member) {
+                break;
             }
             let extractable = planner_states
                 .get(&member.name)
@@ -377,6 +441,9 @@ pub(crate) fn build_plan(
                 || extracted.contains(&member.name)
                 || failed.contains(&member.name)
             {
+                continue;
+            }
+            if !dependency_satisfied(member) {
                 continue;
             }
             let extractable = planner_states
@@ -530,6 +597,7 @@ pub(crate) fn build_plan(
         is_solid: metadata.is_solid,
         ready_members,
         member_names,
+        member_dependencies,
         waiting_on_volumes,
         deletion_eligible,
         delete_decisions,

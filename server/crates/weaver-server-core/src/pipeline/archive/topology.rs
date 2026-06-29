@@ -5,7 +5,8 @@ use crate::jobs::assembly::{
 };
 use crate::jobs::ids::{JobId, NzbFileId};
 use crate::pipeline::{
-    ComputedRarSetState, Pipeline, RarRefreshDone, RarRefreshRequest, RefreshReason,
+    ComputedRarSetState, Pipeline, RarCapacityRetryKind, RarRefreshDone, RarRefreshError,
+    RarRefreshRequest, RefreshReason,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -743,7 +744,9 @@ impl Pipeline {
                 self.apply_computed_rar_set_state(job_id, set_name, computed);
                 Ok(())
             }
-            Err(error) => self.apply_failed_rar_set_compute(job_id, set_name, existing, error),
+            Err(error) => {
+                self.apply_failed_rar_set_compute(job_id, set_name, existing, error.to_string())
+            }
         }
     }
 
@@ -793,10 +796,13 @@ impl Pipeline {
         })
     }
 
-    async fn run_rar_set_compute(input: RarSetComputeInput) -> Result<ComputedRarSetState, String> {
+    async fn run_rar_set_compute(
+        input: RarSetComputeInput,
+    ) -> Result<ComputedRarSetState, RarRefreshError> {
         tokio::task::spawn_blocking(move || Self::compute_rar_set_state_blocking(input))
             .await
-            .map_err(|e| format!("RAR plan task panicked: {e}"))?
+            .map_err(|e| RarRefreshError::Other(format!("RAR plan task panicked: {e}")))?
+            .map_err(RarRefreshError::from_message)
     }
 
     fn compute_rar_set_state_blocking(
@@ -857,8 +863,11 @@ impl Pipeline {
                         continue;
                     }
                     Err(error) => {
-                        return Err(format!(
-                            "failed to open RAR volume {volume_number} for set '{set_name_owned}': {error}"
+                        let context = format!(
+                            "failed to open RAR volume {volume_number} for set '{set_name_owned}'"
+                        );
+                        return Err(crate::pipeline::capacity::format_fd_capacity_error(
+                            &context, &error,
                         ));
                     }
                 };
@@ -1129,6 +1138,7 @@ impl Pipeline {
             is_solid: false,
             ready_members: Vec::new(),
             member_names: Vec::new(),
+            member_dependencies: HashMap::new(),
             waiting_on_volumes: HashSet::new(),
             deletion_eligible: HashSet::new(),
             delete_decisions: BTreeMap::new(),
@@ -1201,9 +1211,36 @@ impl Pipeline {
                     "coalesced RAR refresh request"
                 );
             } else {
-                state.in_flight = Some(request);
+                let mut launch_request = request;
+                if let Some(mut queued) = state.queued.take() {
+                    queued.merge(launch_request);
+                    launch_request = queued;
+                }
+                state.in_flight = Some(launch_request);
                 state.last_error = None;
-                launch = Some(request);
+                launch = Some(launch_request);
+            }
+        }
+
+        if let Some(request) = launch {
+            self.spawn_rar_refresh(job_id, set_name.to_string(), request);
+        }
+    }
+
+    pub(in crate::pipeline) fn launch_queued_rar_capacity_refresh(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+    ) {
+        let key = (job_id, set_name.to_string());
+        let mut launch = None;
+        if let Some(state) = self.rar_refresh_state.get_mut(&key) {
+            if state.in_flight.is_none() {
+                if let Some(request) = state.queued.take() {
+                    state.in_flight = Some(request);
+                    state.last_error = None;
+                    launch = Some(request);
+                }
             }
         }
 
@@ -1253,6 +1290,9 @@ impl Pipeline {
             }
         };
         let success = error.is_none();
+        let capacity_pressure = error
+            .as_ref()
+            .is_some_and(RarRefreshError::is_capacity_pressure);
         let live_fact_volumes: BTreeSet<u32> = self
             .rar_sets
             .get(&key)
@@ -1261,6 +1301,7 @@ impl Pipeline {
         let latest_live_volume = live_fact_volumes.iter().next_back().copied().unwrap_or(0);
 
         let mut follow_up = None;
+        let mut schedule_capacity_retry = false;
         if let Some(state) = self.rar_refresh_state.get_mut(&key) {
             state.in_flight = None;
             if let Some(error) = error.as_ref() {
@@ -1271,7 +1312,7 @@ impl Pipeline {
 
             let coverage_gap = success && !live_fact_volumes.is_subset(&state.refreshed_volumes);
             if let Some(mut queued) = state.queued.take() {
-                if coverage_gap {
+                if coverage_gap || capacity_pressure {
                     queued.target_completed_volume = queued
                         .target_completed_volume
                         .max(state.latest_completed_volume)
@@ -1282,7 +1323,10 @@ impl Pipeline {
                     || queued.reason > done.request.reason
                     || state.structure_dirty
                     || !success;
-                if still_needed {
+                if capacity_pressure {
+                    state.queued = Some(queued);
+                    schedule_capacity_retry = true;
+                } else if still_needed {
                     state.in_flight = Some(queued);
                     follow_up = Some(queued);
                 }
@@ -1296,6 +1340,16 @@ impl Pipeline {
                 };
                 state.in_flight = Some(request);
                 follow_up = Some(request);
+            } else if capacity_pressure {
+                let request = RarRefreshRequest {
+                    target_completed_volume: state
+                        .latest_completed_volume
+                        .max(latest_live_volume)
+                        .max(done.request.target_completed_volume),
+                    reason: done.request.reason.max(RefreshReason::CoverageExpansion),
+                };
+                state.queued = Some(request);
+                schedule_capacity_retry = true;
             }
 
             if follow_up.is_none() && success {
@@ -1305,6 +1359,15 @@ impl Pipeline {
 
         if let Some(request) = follow_up {
             self.spawn_rar_refresh(done.job_id, done.set_name, request);
+            return;
+        }
+
+        if schedule_capacity_retry {
+            self.schedule_rar_capacity_retry(
+                done.job_id,
+                &done.set_name,
+                RarCapacityRetryKind::Refresh,
+            );
             return;
         }
 

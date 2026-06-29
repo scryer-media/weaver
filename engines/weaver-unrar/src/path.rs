@@ -24,7 +24,7 @@ pub fn sanitize_path(raw: &str) -> String {
     normalized[start..].to_string()
 }
 
-pub(crate) fn sanitize_file_redirection_path(raw: &str) -> String {
+pub fn sanitize_file_redirection_path(raw: &str) -> String {
     let cleaned = raw.split_once('\0').map_or(raw, |(prefix, _)| prefix);
     let normalized = cleaned.replace('\\', "/");
 

@@ -52,8 +52,26 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         download_lanes_sequential_active: 0,
         download_lanes_depth2_active: 0,
         download_lanes_depth4_active: 0,
+        download_lanes_idle_active: 0,
+        download_lanes_awaiting_work_active: 0,
+        download_lanes_binding_server_active: 0,
+        download_lanes_acquired_active: 0,
+        download_lanes_issuing_active: 0,
+        download_lanes_draining_active: 0,
+        download_lanes_yield_after_batch_active: 0,
+        download_lanes_parking_active: 0,
+        download_lanes_recovering_active: 0,
         download_lane_parks_no_work_total: 0,
+        download_lane_parks_pressure_total: 0,
+        download_lane_parks_probe_yield_total: 0,
+        download_lane_parks_hot_reclaim_total: 0,
+        download_lane_parks_spillover_withdraw_total: 0,
+        download_lane_parks_server_tier_changed_total: 0,
+        download_lane_parks_proof_failure_total: 0,
         download_lane_parks_error_total: 0,
+        download_lane_lease_items_total: 0,
+        download_lane_refill_granted_total: 0,
+        download_lane_refill_parked_total: 0,
         download_pipeline_trial_success_total: 0,
         download_pipeline_trial_failure_total: 0,
         download_pipeline_proof_pass_total: 0,
@@ -192,7 +210,7 @@ async fn metrics_has_expected_fields() {
     let h = TestHarness::new().await;
     let resp = h
         .execute(
-            "{ metrics { bytesDownloaded bytesDecoded bytesCommitted downloadQueueDepth segmentsDownloaded currentDownloadSpeed hotDispatchJobId hotDispatchMode hotDispatchUnderfillMs hotDispatchLentConnections hotDispatchWarmupComplete hotDispatchLastSpilloverDecision hotDispatchSpilloverBlockedWarmupTotal hotDispatchSpilloverAllowedUnderfillTotal downloadLanesActive downloadLanesDepth2Active downloadLaneParksNoWorkTotal downloadPipelineProofPassTotal downloadPipelineReplayItemsTotal } }",
+            "{ metrics { bytesDownloaded bytesDecoded bytesCommitted downloadQueueDepth segmentsDownloaded currentDownloadSpeed hotDispatchJobId hotDispatchMode hotDispatchUnderfillMs hotDispatchLentConnections hotDispatchWarmupComplete hotDispatchLastSpilloverDecision hotDispatchSpilloverBlockedWarmupTotal hotDispatchSpilloverAllowedUnderfillTotal downloadLanesActive downloadLanesDepth2Active downloadLanesIssuingActive downloadLanesAwaitingWorkActive downloadLaneParksNoWorkTotal downloadPipelineProofPassTotal downloadPipelineReplayItemsTotal } }",
         )
         .await;
     assert_no_errors(&resp);
@@ -212,6 +230,8 @@ async fn metrics_has_expected_fields() {
     assert!(m["hotDispatchSpilloverAllowedUnderfillTotal"].is_number());
     assert!(m["downloadLanesActive"].is_number());
     assert!(m["downloadLanesDepth2Active"].is_number());
+    assert!(m["downloadLanesIssuingActive"].is_number());
+    assert!(m["downloadLanesAwaitingWorkActive"].is_number());
     assert!(m["downloadLaneParksNoWorkTotal"].is_number());
     assert!(m["downloadPipelineProofPassTotal"].is_number());
     assert!(m["downloadPipelineReplayItemsTotal"].is_number());

@@ -639,6 +639,8 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
         Some(stale_headers.clone()),
         std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
         crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
+        None,
+        None,
     )
     .unwrap()
     .value;
@@ -675,6 +677,8 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
         Some(stale_headers),
         std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
         crate::pipeline::extraction::RarArchiveOpenMode::RefreshProvidedVolumes,
+        None,
+        None,
     )
     .unwrap()
     .value;
@@ -2390,7 +2394,7 @@ async fn rar_member_refresh_request_retries_after_refresh_error() {
             latest_completed_volume: 1,
             refreshed_volumes: BTreeSet::from([0, 1]),
             structure_dirty: false,
-            last_error: Some("refresh failed".to_string()),
+            last_error: Some(RarRefreshError::Other("refresh failed".to_string())),
         },
     );
 
@@ -2399,6 +2403,128 @@ async fn rar_member_refresh_request_retries_after_refresh_error() {
         .expect("refresh failure should keep the member blocked");
     assert_eq!(request.reason, RefreshReason::ValidationFailure);
     assert_eq!(request.target_completed_volume, 1);
+}
+
+#[tokio::test]
+async fn rar_refresh_capacity_pressure_requeues_without_validation_escalation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40125);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Refresh Capacity Retry", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, (filename, bytes)) in files.iter().take(2).enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let key = (job_id, "show".to_string());
+    let request = RarRefreshRequest {
+        target_completed_volume: 1,
+        reason: RefreshReason::CoverageExpansion,
+    };
+    pipeline.rar_refresh_state.insert(
+        key.clone(),
+        RarRefreshState {
+            in_flight: Some(request),
+            queued: None,
+            latest_completed_volume: 1,
+            refreshed_volumes: BTreeSet::from([0]),
+            structure_dirty: false,
+            last_error: None,
+        },
+    );
+
+    let capacity_error = RarRefreshError::CapacityPressure(format!(
+        "{}: synthetic EMFILE",
+        crate::pipeline::capacity::FD_CAPACITY_ERROR_MARKER
+    ));
+    pipeline
+        .handle_rar_refresh_done(RarRefreshDone {
+            job_id,
+            set_name: "show".to_string(),
+            request,
+            result: Err(capacity_error),
+        })
+        .await;
+
+    let refresh = pipeline
+        .rar_refresh_state
+        .get(&key)
+        .expect("refresh state should remain queued after capacity pressure");
+    assert!(
+        refresh
+            .last_error
+            .as_ref()
+            .is_some_and(RarRefreshError::is_capacity_pressure)
+    );
+    assert!(refresh.in_flight.is_none());
+    assert_eq!(
+        refresh.queued.as_ref().map(|request| request.reason),
+        Some(RefreshReason::CoverageExpansion)
+    );
+    let pending_key = (job_id, "show".to_string(), RarCapacityRetryKind::Refresh);
+    assert!(pipeline.pending_rar_capacity_retries.contains(&pending_key));
+    assert_eq!(
+        pipeline
+            .pending_rar_capacity_retries
+            .iter()
+            .filter(|key| **key == pending_key)
+            .count(),
+        1
+    );
+
+    let member_request = pipeline
+        .rar_member_refresh_request(job_id, "show", "E01.mkv")
+        .expect("capacity pressure should keep member waiting on refresh");
+    assert_eq!(member_request.reason, RefreshReason::CoverageExpansion);
+
+    pipeline.try_rar_extraction(job_id).await;
+    let refresh = pipeline
+        .rar_refresh_state
+        .get(&key)
+        .expect("pending capacity retry should keep refresh queued");
+    assert!(refresh.in_flight.is_none());
+    assert!(refresh.queued.is_some());
+
+    pipeline.schedule_rar_capacity_retry(job_id, "show", RarCapacityRetryKind::Refresh);
+    assert_eq!(
+        pipeline
+            .pending_rar_capacity_retries
+            .iter()
+            .filter(|key| **key == pending_key)
+            .count(),
+        1
+    );
+
+    pipeline
+        .rar_sets
+        .get_mut(&key)
+        .expect("RAR set should remain available for retry")
+        .plan = None;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+    pipeline
+        .handle_rar_capacity_retry(RarCapacityRetry {
+            job_id,
+            set_name: "show".to_string(),
+            kind: RarCapacityRetryKind::Refresh,
+        })
+        .await;
+
+    assert!(!pipeline.pending_rar_capacity_retries.contains(&pending_key));
+    let refresh = pipeline
+        .rar_refresh_state
+        .get(&key)
+        .expect("refresh state should launch queued retry");
+    assert_eq!(
+        refresh.in_flight.map(|request| request.reason),
+        Some(RefreshReason::CoverageExpansion)
+    );
+    assert!(refresh.queued.is_none());
+    assert!(refresh.last_error.is_none());
+
+    drain_rar_refreshes(&mut pipeline).await;
 }
 
 #[tokio::test]
@@ -5360,7 +5486,7 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(pipeline.active_downloads, 3);
     assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(
         pipeline
@@ -5378,7 +5504,7 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
             .unwrap()
             .download_queue
             .len(),
-        1
+        0
     );
     assert_eq!(
         pipeline.active_downloads_by_job.get(&earlier_job_id),
@@ -5386,7 +5512,7 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
     );
     assert_eq!(
         pipeline.active_downloads_by_job.get(&later_job_id),
-        Some(&1)
+        Some(&2)
     );
     assert_eq!(pipeline.hot_dispatch_mode, DispatchShareMode::Shared);
     assert!(
@@ -5395,6 +5521,108 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
             .hot_dispatch_spillover_allowed_underfill_total
             .load(Ordering::Relaxed)
             >= 1
+    );
+}
+
+#[tokio::test]
+async fn lane_refill_preserves_same_band_spillover_after_underfill() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    pipeline.connection_ramp = 2;
+
+    let hot_job_id = JobId(20025);
+    let spillover_job_id = JobId(20026);
+    let spillover_files = (0..17)
+        .map(|idx| (format!("spillover-{idx}.bin"), 512u32))
+        .collect::<Vec<_>>();
+
+    insert_active_job(
+        &mut pipeline,
+        hot_job_id,
+        with_priority(
+            standalone_job_spec("Hot Refill Normal", &[("hot.bin".to_string(), 512u32)]),
+            "NORMAL",
+        ),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        spillover_job_id,
+        with_priority(
+            standalone_job_spec("Spillover Refill Normal", &spillover_files),
+            "NORMAL",
+        ),
+    )
+    .await;
+
+    pipeline.dispatch_downloads();
+    pipeline.hot_dispatch_started_at = Some(Instant::now() - Duration::from_secs(5));
+    pipeline.hot_dispatch_successes = 24;
+    pipeline.hot_dispatch_underfill_since = Some(Instant::now() - Duration::from_secs(2));
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.hot_dispatch_job, Some(hot_job_id));
+    assert_eq!(pipeline.hot_dispatch_mode, DispatchShareMode::Shared);
+    assert_eq!(pipeline.active_download_connections, 2);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&spillover_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        9
+    );
+
+    let refill_compatibility = {
+        let state = pipeline.jobs.get_mut(&spillover_job_id).unwrap();
+        let sample = state.download_queue.pop().unwrap();
+        let compatibility = DownloadBatchCompatibility::from_work(&sample);
+        state.download_queue.push(sample);
+        compatibility
+    };
+    let (response_tx, response_rx) = oneshot::channel();
+    pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        job_id: spillover_job_id,
+        server_idx: 0,
+        supports_pipelining: false,
+        current_mode: DownloadLaneMode::Sequential,
+        compatibility: refill_compatibility,
+        response_tx,
+    });
+
+    let response = response_rx.await.unwrap();
+    let lease = response.lease.expect("shared spillover lane should refill");
+    assert_eq!(lease.job_id, spillover_job_id);
+    assert_eq!(lease.works.len(), 8);
+    assert_eq!(pipeline.hot_dispatch_job, Some(hot_job_id));
+    assert_eq!(pipeline.hot_dispatch_mode, DispatchShareMode::Shared);
+    assert_eq!(pipeline.active_download_connections, 2);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&spillover_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        1
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_lane_refill_granted_total
+            .load(Ordering::Relaxed),
+        1
     );
 }
 
@@ -5496,11 +5724,11 @@ async fn dispatch_downloads_keeps_capacity_on_hot_job_before_same_band_spillover
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 2);
-    assert_eq!(pipeline.active_download_connections, 2);
+    assert_eq!(pipeline.active_downloads, 3);
+    assert_eq!(pipeline.active_download_connections, 1);
     assert_eq!(
         pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
-        1
+        0
     );
     assert_eq!(
         pipeline
@@ -5511,7 +5739,7 @@ async fn dispatch_downloads_keeps_capacity_on_hot_job_before_same_band_spillover
             .len(),
         1
     );
-    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&2));
+    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&3));
     assert!(
         !pipeline
             .active_downloads_by_job
@@ -5719,19 +5947,15 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
 
     let leading_job_id = JobId(20021);
     let promoted_job_id = JobId(20022);
+    let leading_files = (0..10)
+        .map(|idx| (format!("lead-{idx}.bin"), 512u32))
+        .collect::<Vec<_>>();
 
     insert_active_job(
         &mut pipeline,
         leading_job_id,
         with_priority(
-            standalone_job_spec(
-                "Leading Low Priority",
-                &[
-                    ("lead-0.bin".to_string(), 512u32),
-                    ("lead-1.bin".to_string(), 512u32),
-                    ("lead-2.bin".to_string(), 512u32),
-                ],
-            ),
+            standalone_job_spec("Leading Low Priority", &leading_files),
             "LOW",
         ),
     )
@@ -7926,6 +8150,7 @@ async fn authoritative_par2_identity_clears_preexisting_stale_rar_set_state() {
                 is_solid: false,
                 ready_members: Vec::new(),
                 member_names: vec!["E01.mkv".to_string()],
+                member_dependencies: HashMap::new(),
                 waiting_on_volumes: HashSet::from([1u32]),
                 deletion_eligible: HashSet::new(),
                 delete_decisions: std::collections::BTreeMap::new(),
@@ -8407,6 +8632,7 @@ async fn waiting_for_missing_volumes_ignores_stale_noncurrent_rar_set() {
                 is_solid: false,
                 ready_members: Vec::new(),
                 member_names: Vec::new(),
+                member_dependencies: HashMap::new(),
                 waiting_on_volumes: HashSet::from([1u32]),
                 deletion_eligible: HashSet::new(),
                 delete_decisions: std::collections::BTreeMap::new(),
@@ -8476,6 +8702,7 @@ async fn waiting_for_missing_volumes_still_tracks_current_rar_set() {
                 is_solid: false,
                 ready_members: Vec::new(),
                 member_names: Vec::new(),
+                member_dependencies: HashMap::new(),
                 waiting_on_volumes: HashSet::from([1u32]),
                 deletion_eligible: HashSet::new(),
                 delete_decisions: std::collections::BTreeMap::new(),
@@ -9965,6 +10192,132 @@ async fn non_solid_rar_scheduler_skips_duplicate_ready_members() {
 }
 
 #[tokio::test]
+async fn non_solid_rar_scheduler_waits_for_link_dependency_source() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.tuner = RuntimeTuner::with_connection_limit(
+        crate::runtime::system_profile::SystemProfile {
+            cpu: crate::runtime::system_profile::CpuProfile {
+                physical_cores: 8,
+                logical_cores: 8,
+                simd: crate::runtime::system_profile::SimdSupport::default(),
+                cgroup_limit: None,
+            },
+            memory: crate::runtime::system_profile::MemoryProfile {
+                total_bytes: 8 * 1024 * 1024 * 1024,
+                available_bytes: 8 * 1024 * 1024 * 1024,
+                cgroup_limit: None,
+            },
+            disk: crate::runtime::system_profile::DiskProfile {
+                storage_class: crate::runtime::system_profile::StorageClass::Ssd,
+                filesystem: crate::runtime::system_profile::FilesystemType::Apfs,
+                sequential_write_mbps: 2000.0,
+                random_read_iops: 50_000.0,
+                same_filesystem: true,
+            },
+        },
+        4,
+    );
+
+    let job_id = JobId(30011);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Link Dependency Source", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let set_key = (job_id, "show".to_string());
+    let (source_member, dependent_member, source_first_volume, source_last_volume) = {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&set_key)
+            .expect("set state should exist");
+        let plan = set_state
+            .plan
+            .as_mut()
+            .expect("ready plan should exist after all volumes complete");
+        let source_member = plan.ready_members[0].name.clone();
+        let dependent_member = plan.ready_members[1].name.clone();
+        let source = plan
+            .topology
+            .members
+            .iter()
+            .find(|member| member.name == source_member)
+            .expect("source member should be present in topology");
+        let source_first_volume = source.first_volume;
+        let source_last_volume = source.last_volume;
+        plan.member_dependencies.insert(
+            dependent_member.clone(),
+            crate::pipeline::rar_state::RarMemberDependency {
+                source_member: source_member.clone(),
+                source_first_volume,
+                source_last_volume,
+            },
+        );
+        plan.ready_members = vec![
+            crate::pipeline::rar_state::RarReadyMember {
+                name: source_member.clone(),
+            },
+            crate::pipeline::rar_state::RarReadyMember {
+                name: dependent_member.clone(),
+            },
+        ];
+        (
+            source_member,
+            dependent_member,
+            source_first_volume,
+            source_last_volume,
+        )
+    };
+    pipeline.extracted_members.insert(job_id, HashSet::new());
+    resume_job_downloading_for_test(&mut pipeline, job_id);
+    assert_eq!(
+        pipeline
+            .rar_sets
+            .get(&set_key)
+            .and_then(|set| set.plan.as_ref())
+            .and_then(|plan| plan.member_dependencies.get(&dependent_member))
+            .map(|dependency| {
+                (
+                    dependency.source_first_volume,
+                    dependency.source_last_volume,
+                )
+            }),
+        Some((source_first_volume, source_last_volume))
+    );
+
+    pipeline.try_rar_extraction(job_id).await;
+
+    let set_state = pipeline
+        .rar_sets
+        .get(&set_key)
+        .expect("set state should exist");
+    assert_eq!(set_state.active_workers, 1);
+    assert_eq!(
+        set_state.in_flight_members,
+        [source_member.clone()].into_iter().collect()
+    );
+
+    let source_done = next_extraction_done(&mut pipeline).await;
+    pipeline.handle_extraction_done(source_done).await;
+    pipeline.try_rar_extraction(job_id).await;
+
+    let set_state = pipeline
+        .rar_sets
+        .get(&set_key)
+        .expect("set state should still exist");
+    assert_eq!(set_state.active_workers, 1);
+    assert_eq!(
+        set_state.in_flight_members,
+        [dependent_member].into_iter().collect()
+    );
+}
+
+#[tokio::test]
 async fn rar_identity_rebind_preserves_in_flight_workers() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -10164,6 +10517,341 @@ async fn non_solid_rar_incremental_requires_member_chain_not_download_activity()
         _ => panic!("expected incremental batch extraction"),
     }
     pipeline.handle_extraction_done(done).await;
+}
+
+#[tokio::test]
+async fn rar_extraction_capacity_pressure_keeps_member_waiting_without_repair_promotion() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30014);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Extraction Capacity Retry", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    write_and_complete_rar_volume(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+    write_and_complete_rar_volume(&mut pipeline, job_id, 1, &files[1].0, &files[1].1).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    let key = (job_id, "show".to_string());
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&key)
+            .expect("set state should exist after ready RAR member");
+        set_state.active_workers = 1;
+        set_state.in_flight_members.insert("E01.mkv".to_string());
+    }
+
+    let capacity_error = format!(
+        "{}: synthetic EMFILE",
+        crate::pipeline::capacity::FD_CAPACITY_ERROR_MARKER
+    );
+    pipeline
+        .handle_extraction_done(ExtractionDone::Batch {
+            job_id,
+            set_name: "show".to_string(),
+            attempted: vec!["E01.mkv".to_string()],
+            result: Err(capacity_error.clone()),
+        })
+        .await;
+
+    let set_state = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("set state should remain after capacity pressure");
+    assert_eq!(set_state.active_workers, 0);
+    assert!(!set_state.in_flight_members.contains("E01.mkv"));
+    assert!(
+        !pipeline
+            .failed_extractions
+            .get(&job_id)
+            .is_some_and(|members| members.contains("E01.mkv")),
+        "capacity pressure must not mark the member failed"
+    );
+    let pending_key = (job_id, "show".to_string(), RarCapacityRetryKind::Extraction);
+    assert!(pipeline.pending_rar_capacity_retries.contains(&pending_key));
+
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&key)
+            .expect("set state should exist for duplicate capacity retry");
+        set_state.active_workers = 1;
+        set_state.in_flight_members.insert("E01.mkv".to_string());
+    }
+    pipeline
+        .handle_extraction_done(ExtractionDone::Batch {
+            job_id,
+            set_name: "show".to_string(),
+            attempted: vec!["E01.mkv".to_string()],
+            result: Err(capacity_error),
+        })
+        .await;
+    assert_eq!(
+        pipeline
+            .pending_rar_capacity_retries
+            .iter()
+            .filter(|key| **key == pending_key)
+            .count(),
+        1
+    );
+
+    resume_job_downloading_for_test(&mut pipeline, job_id);
+    pipeline.try_rar_extraction(job_id).await;
+    let set_state = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("set state should remain blocked by pending capacity retry");
+    assert_eq!(set_state.active_workers, 0);
+    assert!(!set_state.in_flight_members.contains("E01.mkv"));
+
+    pipeline
+        .handle_rar_capacity_retry(RarCapacityRetry {
+            job_id,
+            set_name: "show".to_string(),
+            kind: RarCapacityRetryKind::Extraction,
+        })
+        .await;
+    assert!(!pipeline.pending_rar_capacity_retries.contains(&pending_key));
+    let set_state = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("set state should remain after extraction retry wakeup");
+    assert_eq!(set_state.active_workers, 1);
+    assert!(set_state.in_flight_members.contains("E01.mkv"));
+
+    let done = next_extraction_done(&mut pipeline).await;
+    pipeline.handle_extraction_done(done).await;
+}
+
+async fn setup_extracting_rar_full_set(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    title: &str,
+) -> String {
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec(title, &files);
+    insert_active_job(pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+
+    let set_name = "show".to_string();
+    let key = (job_id, set_name.clone());
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&key)
+            .expect("set state should exist after RAR volumes complete");
+        set_state.active_workers = 1;
+        set_state.in_flight_members.clear();
+        set_state.phase = crate::pipeline::rar_state::RarSetPhase::Extracting;
+        let plan = set_state
+            .plan
+            .as_mut()
+            .expect("RAR plan should exist after volume facts are built");
+        plan.phase = crate::pipeline::rar_state::RarSetPhase::Extracting;
+    }
+    pipeline
+        .inflight_extractions
+        .entry(job_id)
+        .or_default()
+        .insert(set_name.clone());
+    set_name
+}
+
+#[tokio::test]
+async fn rar_full_set_capacity_pressure_retries_without_failing_job() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30025);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Full Set Capacity Retry", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let set_name = "show".to_string();
+    let key = (job_id, set_name.clone());
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&key)
+            .expect("set state should exist after RAR volumes complete");
+        set_state.active_workers = 1;
+        set_state.in_flight_members.clear();
+        set_state.phase = crate::pipeline::rar_state::RarSetPhase::Extracting;
+        let plan = set_state
+            .plan
+            .as_mut()
+            .expect("RAR plan should exist after volume facts are built");
+        plan.phase = crate::pipeline::rar_state::RarSetPhase::Extracting;
+    }
+    pipeline
+        .inflight_extractions
+        .entry(job_id)
+        .or_default()
+        .insert(set_name.clone());
+
+    let capacity_error = format!(
+        "{}: synthetic EMFILE",
+        crate::pipeline::capacity::FD_CAPACITY_ERROR_MARKER
+    );
+    pipeline
+        .handle_extraction_done(ExtractionDone::FullSet {
+            job_id,
+            set_name: set_name.clone(),
+            result: Err(capacity_error),
+        })
+        .await;
+
+    assert!(!matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+    assert!(!pipeline.failed_extractions.contains_key(&job_id));
+    assert!(
+        pipeline
+            .inflight_extractions
+            .get(&job_id)
+            .is_none_or(|sets| !sets.contains(&set_name))
+    );
+    let set_state = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("RAR set should remain after full-set capacity pressure");
+    assert_eq!(set_state.active_workers, 0);
+    assert!(matches!(
+        set_state.phase,
+        crate::pipeline::rar_state::RarSetPhase::FallbackFullSet
+    ));
+    assert!(matches!(
+        set_state.plan.as_ref().map(|plan| plan.phase),
+        Some(crate::pipeline::rar_state::RarSetPhase::FallbackFullSet)
+    ));
+    let pending_key = (
+        job_id,
+        set_name.clone(),
+        RarCapacityRetryKind::FullSetExtraction,
+    );
+    assert!(pipeline.pending_rar_capacity_retries.contains(&pending_key));
+
+    resume_job_downloading_for_test(&mut pipeline, job_id);
+    pipeline
+        .handle_rar_capacity_retry(RarCapacityRetry {
+            job_id,
+            set_name: set_name.clone(),
+            kind: RarCapacityRetryKind::FullSetExtraction,
+        })
+        .await;
+    assert!(!pipeline.pending_rar_capacity_retries.contains(&pending_key));
+    let set_state = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("RAR set should be extracting after full-set retry wakeup");
+    assert_eq!(set_state.active_workers, 1);
+    assert!(matches!(
+        set_state.phase,
+        crate::pipeline::rar_state::RarSetPhase::Extracting
+    ));
+
+    let done = next_extraction_done(&mut pipeline).await;
+    pipeline.handle_extraction_done(done).await;
+}
+
+#[tokio::test]
+async fn rar_full_set_member_capacity_pressure_retries_without_repair_promotion() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40127);
+    let set_name =
+        setup_extracting_rar_full_set(&mut pipeline, job_id, "RAR Full Set Member Capacity Retry")
+            .await;
+    let capacity_error = format!(
+        "{}: synthetic EMFILE during read",
+        crate::pipeline::capacity::FD_CAPACITY_ERROR_MARKER
+    );
+
+    pipeline
+        .handle_extraction_done(ExtractionDone::FullSet {
+            job_id,
+            set_name: set_name.clone(),
+            result: Ok(FullSetExtractionOutcome {
+                extracted: vec!["E01.mkv".to_string()],
+                failed: vec![("E02.mkv".to_string(), capacity_error)],
+                selected_password: None,
+            }),
+        })
+        .await;
+
+    assert!(!matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+    assert!(
+        !pipeline
+            .failed_extractions
+            .get(&job_id)
+            .is_some_and(|members| members.contains("E02.mkv")),
+        "capacity pressure must not mark the failed member for repair"
+    );
+    let pending_key = (
+        job_id,
+        set_name.clone(),
+        RarCapacityRetryKind::FullSetExtraction,
+    );
+    assert!(pipeline.pending_rar_capacity_retries.contains(&pending_key));
+    let set_state = pipeline
+        .rar_sets
+        .get(&(job_id, set_name))
+        .expect("RAR set should remain after member capacity pressure");
+    assert_eq!(set_state.active_workers, 0);
+    assert!(matches!(
+        set_state.phase,
+        crate::pipeline::rar_state::RarSetPhase::FallbackFullSet
+    ));
+}
+
+#[tokio::test]
+async fn rar_full_set_mixed_failures_defer_repair_when_capacity_pressure_is_present() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40128);
+    let set_name =
+        setup_extracting_rar_full_set(&mut pipeline, job_id, "RAR Full Set Mixed Capacity Retry")
+            .await;
+    let capacity_error = format!(
+        "{}: synthetic EMFILE during read",
+        crate::pipeline::capacity::FD_CAPACITY_ERROR_MARKER
+    );
+
+    pipeline
+        .handle_extraction_done(ExtractionDone::FullSet {
+            job_id,
+            set_name: set_name.clone(),
+            result: Ok(FullSetExtractionOutcome {
+                extracted: Vec::new(),
+                failed: vec![
+                    ("E01.mkv".to_string(), capacity_error),
+                    ("E02.mkv".to_string(), "Invalid checksum".to_string()),
+                ],
+                selected_password: None,
+            }),
+        })
+        .await;
+
+    assert!(
+        !pipeline.failed_extractions.contains_key(&job_id),
+        "mixed capacity passes must not promote any member until a capacity-free retry confirms it"
+    );
+    let pending_key = (job_id, set_name, RarCapacityRetryKind::FullSetExtraction);
+    assert!(pipeline.pending_rar_capacity_retries.contains(&pending_key));
 }
 
 #[tokio::test]
@@ -10768,6 +11456,40 @@ async fn nonrecoverable_full_set_extraction_error_fails_job() {
 }
 
 #[tokio::test]
+async fn non_rar_full_set_capacity_pressure_still_fails_job() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30026);
+    let spec = standalone_job_spec(
+        "Non-RAR Capacity Pressure Still Fails",
+        &[("sample.bin".to_string(), 100)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline
+        .inflight_extractions
+        .entry(job_id)
+        .or_default()
+        .insert("archive.zip".to_string());
+
+    pipeline
+        .handle_extraction_done(ExtractionDone::FullSet {
+            job_id,
+            set_name: "archive.zip".to_string(),
+            result: Err(format!(
+                "{}: synthetic EMFILE",
+                crate::pipeline::capacity::FD_CAPACITY_ERROR_MARKER
+            )),
+        })
+        .await;
+
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+    assert!(pipeline.pending_rar_capacity_retries.is_empty());
+}
+
+#[tokio::test]
 async fn clean_verify_retries_non_rar_full_set_extraction() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -10897,6 +11619,34 @@ async fn incremental_rar_member_extraction_uses_member_span_volume_window() {
         false,
     );
     assert_eq!(member_paths.keys().copied().collect::<Vec<_>>(), vec![2, 3]);
+
+    {
+        let plan = pipeline
+            .rar_sets
+            .get_mut(&(job_id, "show".to_string()))
+            .and_then(|state| state.plan.as_mut())
+            .expect("RAR plan should exist");
+        plan.member_dependencies.insert(
+            "E02.mkv".to_string(),
+            crate::pipeline::rar_state::RarMemberDependency {
+                source_member: "E01.mkv".to_string(),
+                source_first_volume: 0,
+                source_last_volume: 1,
+            },
+        );
+    }
+    let filecopy_paths = pipeline.volume_paths_for_rar_members(
+        job_id,
+        "show",
+        &["E02.mkv".to_string()],
+        &all_paths,
+        true,
+        false,
+    );
+    assert_eq!(
+        filecopy_paths.keys().copied().collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
 
     let without_cached_headers = pipeline.volume_paths_for_rar_members(
         job_id,
@@ -13369,6 +14119,7 @@ async fn no_par2_runtime_rar_failure_requeues_owner_volumes() {
                 is_solid: false,
                 ready_members: Vec::new(),
                 member_names: vec![member_name.clone()],
+                member_dependencies: HashMap::new(),
                 waiting_on_volumes: HashSet::new(),
                 deletion_eligible: HashSet::new(),
                 delete_decisions: std::collections::BTreeMap::new(),
@@ -13488,6 +14239,7 @@ async fn rar_waiting_for_missing_volumes_without_par2_fails_after_download_compl
                 is_solid: false,
                 ready_members: Vec::new(),
                 member_names: vec!["work/sample.mkv".to_string()],
+                member_dependencies: HashMap::new(),
                 waiting_on_volumes: HashSet::from([2u32, 3u32]),
                 deletion_eligible: HashSet::new(),
                 delete_decisions: std::collections::BTreeMap::new(),
@@ -13559,6 +14311,7 @@ async fn legacy_reconcile_schedules_waiting_rar_completion_check() {
                 is_solid: false,
                 ready_members: Vec::new(),
                 member_names: vec!["work/sample.mkv".to_string()],
+                member_dependencies: HashMap::new(),
                 waiting_on_volumes: HashSet::from([2u32, 3u32]),
                 deletion_eligible: HashSet::new(),
                 delete_decisions: std::collections::BTreeMap::new(),
@@ -13636,6 +14389,7 @@ async fn rar_completion_waiting_for_volumes_does_not_requeue_itself() {
                 is_solid: false,
                 ready_members: Vec::new(),
                 member_names: vec!["work/sample.mkv".to_string()],
+                member_dependencies: HashMap::new(),
                 waiting_on_volumes: HashSet::from([2u32, 3u32]),
                 deletion_eligible: HashSet::new(),
                 delete_decisions: std::collections::BTreeMap::new(),
@@ -13721,6 +14475,7 @@ async fn clean_member_keeps_failed_neighbor_boundary_volume_suspect() {
                 is_solid: false,
                 ready_members: Vec::new(),
                 member_names: vec!["E10.mkv".to_string(), "E11.mkv".to_string()],
+                member_dependencies: HashMap::new(),
                 waiting_on_volumes: std::collections::HashSet::new(),
                 deletion_eligible: std::collections::HashSet::new(),
                 delete_decisions: std::collections::BTreeMap::from([(
@@ -14097,6 +14852,7 @@ async fn ownerless_live_rar_plan_error_requires_named_member_facts() {
                 is_solid: false,
                 ready_members: Vec::new(),
                 member_names: Vec::new(),
+                member_dependencies: HashMap::new(),
                 waiting_on_volumes: HashSet::new(),
                 deletion_eligible: HashSet::new(),
                 delete_decisions: BTreeMap::from([(
@@ -14169,6 +14925,7 @@ async fn rar_completion_waits_for_pending_refresh_before_terminal_decision() {
             is_solid: false,
             ready_members: Vec::new(),
             member_names: Vec::new(),
+            member_dependencies: HashMap::new(),
             waiting_on_volumes: HashSet::new(),
             deletion_eligible: HashSet::new(),
             delete_decisions: BTreeMap::new(),
@@ -14270,6 +15027,7 @@ async fn incoherent_rar_waiting_state_heals_before_reverification() {
             is_solid: false,
             ready_members: Vec::new(),
             member_names: Vec::new(),
+            member_dependencies: HashMap::new(),
             waiting_on_volumes: HashSet::new(),
             deletion_eligible: HashSet::new(),
             delete_decisions: BTreeMap::new(),
@@ -14391,6 +15149,7 @@ async fn retry_archive_extraction_after_verify_or_repair_heals_incoherent_rar_st
             is_solid: false,
             ready_members: Vec::new(),
             member_names: Vec::new(),
+            member_dependencies: HashMap::new(),
             waiting_on_volumes: HashSet::new(),
             deletion_eligible: HashSet::new(),
             delete_decisions: BTreeMap::new(),
@@ -14606,6 +15365,7 @@ async fn eager_delete_retains_volume_with_failed_member_claim() {
                 is_solid: false,
                 ready_members: Vec::new(),
                 member_names: vec!["E10.mkv".to_string(), "E11.mkv".to_string()],
+                member_dependencies: HashMap::new(),
                 waiting_on_volumes: std::collections::HashSet::new(),
                 deletion_eligible: [1u32].into_iter().collect(),
                 delete_decisions: std::collections::BTreeMap::from([(
@@ -15226,6 +15986,7 @@ async fn exhausted_incomplete_rar_member_is_not_scheduled_for_extraction() {
                     name: member_name,
                 }],
                 member_names: vec!["work/sample.mkv".to_string()],
+                member_dependencies: HashMap::new(),
                 waiting_on_volumes: HashSet::new(),
                 deletion_eligible: HashSet::new(),
                 delete_decisions: std::collections::BTreeMap::new(),
@@ -15397,6 +16158,7 @@ async fn impossible_rar_state_fails_loudly_after_forced_recompute() {
                 is_solid: false,
                 ready_members: Vec::new(),
                 member_names: vec!["E10.mkv".to_string()],
+                member_dependencies: HashMap::new(),
                 waiting_on_volumes: HashSet::new(),
                 deletion_eligible: HashSet::new(),
                 delete_decisions: std::collections::BTreeMap::new(),
@@ -16212,6 +16974,7 @@ async fn reconcile_job_progress_marks_waiting_for_rar_volumes_without_clobbering
                 is_solid: false,
                 ready_members: Vec::new(),
                 member_names: vec!["E01.mkv".to_string()],
+                member_dependencies: HashMap::new(),
                 waiting_on_volumes: std::collections::HashSet::from([2u32]),
                 deletion_eligible: std::collections::HashSet::new(),
                 delete_decisions: std::collections::BTreeMap::new(),

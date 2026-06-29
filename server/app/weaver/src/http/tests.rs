@@ -1316,13 +1316,31 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         download_lanes_sequential_active: 1,
         download_lanes_depth2_active: 2,
         download_lanes_depth4_active: 0,
+        download_lanes_idle_active: 0,
+        download_lanes_awaiting_work_active: 0,
+        download_lanes_binding_server_active: 0,
+        download_lanes_acquired_active: 0,
+        download_lanes_issuing_active: 3,
+        download_lanes_draining_active: 0,
+        download_lanes_yield_after_batch_active: 0,
+        download_lanes_parking_active: 0,
+        download_lanes_recovering_active: 0,
         download_lane_parks_no_work_total: 35,
-        download_lane_parks_error_total: 36,
-        download_pipeline_trial_success_total: 37,
-        download_pipeline_trial_failure_total: 38,
-        download_pipeline_proof_pass_total: 39,
-        download_pipeline_cooldown_total: 40,
-        download_pipeline_replay_items_total: 41,
+        download_lane_parks_pressure_total: 36,
+        download_lane_parks_probe_yield_total: 37,
+        download_lane_parks_hot_reclaim_total: 38,
+        download_lane_parks_spillover_withdraw_total: 39,
+        download_lane_parks_server_tier_changed_total: 40,
+        download_lane_parks_proof_failure_total: 41,
+        download_lane_parks_error_total: 42,
+        download_lane_lease_items_total: 43,
+        download_lane_refill_granted_total: 44,
+        download_lane_refill_parked_total: 45,
+        download_pipeline_trial_success_total: 46,
+        download_pipeline_trial_failure_total: 47,
+        download_pipeline_proof_pass_total: 48,
+        download_pipeline_cooldown_total: 49,
+        download_pipeline_replay_items_total: 50,
         segments_downloaded: 11,
         segments_decoded: 12,
         segments_committed: 13,
@@ -1410,14 +1428,43 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     ));
     assert!(rendered.contains("weaver_pipeline_download_lanes_active{mode=\"sequential\"} 1"));
     assert!(rendered.contains("weaver_pipeline_download_lanes_active{mode=\"pipeline_depth2\"} 2"));
+    assert!(rendered.contains("weaver_pipeline_download_lane_states_active{state=\"issuing\"} 3"));
+    assert!(
+        rendered.contains("weaver_pipeline_download_lane_states_active{state=\"awaiting_work\"} 0")
+    );
     assert!(rendered.contains("weaver_pipeline_download_lanes_active_total 3"));
     assert!(rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"no_work\"} 35"));
-    assert!(rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"error\"} 36"));
+    assert!(rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"pressure\"} 36"));
     assert!(
-        rendered.contains("weaver_pipeline_body_proof_events_total{event=\"trial_success\"} 37")
+        rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"probe_yield\"} 37")
     );
-    assert!(rendered.contains("weaver_pipeline_body_proof_events_total{event=\"cooldown\"} 40"));
-    assert!(rendered.contains("weaver_pipeline_body_replay_items_total 41"));
+    assert!(
+        rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"hot_reclaim\"} 38")
+    );
+    assert!(
+        rendered.contains(
+            "weaver_pipeline_download_lane_parks_total{reason=\"spillover_withdraw\"} 39"
+        )
+    );
+    assert!(
+        rendered.contains(
+            "weaver_pipeline_download_lane_parks_total{reason=\"server_tier_changed\"} 40"
+        )
+    );
+    assert!(
+        rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"proof_failure\"} 41")
+    );
+    assert!(rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"error\"} 42"));
+    assert!(rendered.contains("weaver_pipeline_download_lane_lease_items_total 43"));
+    assert!(
+        rendered.contains("weaver_pipeline_download_lane_refills_total{result=\"granted\"} 44")
+    );
+    assert!(rendered.contains("weaver_pipeline_download_lane_refills_total{result=\"parked\"} 45"));
+    assert!(
+        rendered.contains("weaver_pipeline_body_proof_events_total{event=\"trial_success\"} 46")
+    );
+    assert!(rendered.contains("weaver_pipeline_body_proof_events_total{event=\"cooldown\"} 49"));
+    assert!(rendered.contains("weaver_pipeline_body_replay_items_total 50"));
     assert!(
         rendered.contains("weaver_pipeline_download_failures_total{kind=\"article_not_found\"} 24")
     );
@@ -1476,8 +1523,26 @@ fn renders_prometheus_download_observed_limiter_states() {
         download_lanes_sequential_active: 0,
         download_lanes_depth2_active: 0,
         download_lanes_depth4_active: 0,
+        download_lanes_idle_active: 0,
+        download_lanes_awaiting_work_active: 0,
+        download_lanes_binding_server_active: 0,
+        download_lanes_acquired_active: 0,
+        download_lanes_issuing_active: 0,
+        download_lanes_draining_active: 0,
+        download_lanes_yield_after_batch_active: 0,
+        download_lanes_parking_active: 0,
+        download_lanes_recovering_active: 0,
         download_lane_parks_no_work_total: 0,
+        download_lane_parks_pressure_total: 0,
+        download_lane_parks_probe_yield_total: 0,
+        download_lane_parks_hot_reclaim_total: 0,
+        download_lane_parks_spillover_withdraw_total: 0,
+        download_lane_parks_server_tier_changed_total: 0,
+        download_lane_parks_proof_failure_total: 0,
         download_lane_parks_error_total: 0,
+        download_lane_lease_items_total: 0,
+        download_lane_refill_granted_total: 0,
+        download_lane_refill_parked_total: 0,
         download_pipeline_trial_success_total: 0,
         download_pipeline_trial_failure_total: 0,
         download_pipeline_proof_pass_total: 0,

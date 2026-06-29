@@ -599,6 +599,37 @@ pub(super) fn render_prometheus_metrics(
         );
     }
     out.push_str(
+        "# HELP weaver_pipeline_download_lane_states_active Active article download lanes by scheduler state.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_lane_states_active gauge\n");
+    for (state, value) in [
+        ("idle", snapshot.download_lanes_idle_active),
+        (
+            "awaiting_work",
+            snapshot.download_lanes_awaiting_work_active,
+        ),
+        (
+            "binding_server",
+            snapshot.download_lanes_binding_server_active,
+        ),
+        ("acquired", snapshot.download_lanes_acquired_active),
+        ("issuing", snapshot.download_lanes_issuing_active),
+        ("draining", snapshot.download_lanes_draining_active),
+        (
+            "yield_after_batch",
+            snapshot.download_lanes_yield_after_batch_active,
+        ),
+        ("parking", snapshot.download_lanes_parking_active),
+        ("recovering", snapshot.download_lanes_recovering_active),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_lane_states_active",
+            &[("state", state)],
+            value,
+        );
+    }
+    out.push_str(
         "# HELP weaver_pipeline_download_lanes_active_total Total active article download lanes.\n",
     );
     out.push_str("# TYPE weaver_pipeline_download_lanes_active_total gauge\n");
@@ -614,12 +645,59 @@ pub(super) fn render_prometheus_metrics(
     out.push_str("# TYPE weaver_pipeline_download_lane_parks_total counter\n");
     for (reason, value) in [
         ("no_work", snapshot.download_lane_parks_no_work_total),
+        ("pressure", snapshot.download_lane_parks_pressure_total),
+        (
+            "probe_yield",
+            snapshot.download_lane_parks_probe_yield_total,
+        ),
+        (
+            "hot_reclaim",
+            snapshot.download_lane_parks_hot_reclaim_total,
+        ),
+        (
+            "spillover_withdraw",
+            snapshot.download_lane_parks_spillover_withdraw_total,
+        ),
+        (
+            "server_tier_changed",
+            snapshot.download_lane_parks_server_tier_changed_total,
+        ),
+        (
+            "proof_failure",
+            snapshot.download_lane_parks_proof_failure_total,
+        ),
         ("error", snapshot.download_lane_parks_error_total),
     ] {
         append_labeled_metric(
             &mut out,
             "weaver_pipeline_download_lane_parks_total",
             &[("reason", reason)],
+            value,
+        );
+    }
+
+    out.push_str(
+        "# HELP weaver_pipeline_download_lane_lease_items_total Article work items leased to download lanes.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_lane_lease_items_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_download_lane_lease_items_total",
+        snapshot.download_lane_lease_items_total,
+    );
+
+    out.push_str(
+        "# HELP weaver_pipeline_download_lane_refills_total Lane refill scheduler decisions.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_lane_refills_total counter\n");
+    for (result, value) in [
+        ("granted", snapshot.download_lane_refill_granted_total),
+        ("parked", snapshot.download_lane_refill_parked_total),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_lane_refills_total",
+            &[("result", result)],
             value,
         );
     }

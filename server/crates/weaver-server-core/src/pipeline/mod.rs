@@ -1,6 +1,7 @@
 pub mod archive;
 #[cfg(test)]
 pub(crate) use archive::rar_state;
+mod capacity;
 mod completion;
 mod decode;
 pub mod download;
@@ -21,7 +22,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use std::collections::HashSet;
@@ -50,13 +51,16 @@ use weaver_par2::checksum;
 use weaver_par2::par2_set::Par2FileSet;
 
 use self::archive::rar_state::{RarDerivedPlan, RarSetState};
-use self::download::{DownloadLaneMode, DownloadLaneRuntimeState, JobTransportProfile};
+use self::download::{
+    DownloadLaneMode, DownloadLaneRuntimeState, JobTransportProfile, LaneParkReason,
+};
 
 /// Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
 const DOWNLOAD_RESTART_CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
 const STALLED_DOWNLOAD_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const STALLED_DOWNLOAD_IDLE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
+pub(in crate::pipeline) const RAR_CAPACITY_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 fn download_restart_checkpoint_bytes() -> u64 {
     static CHECKPOINT_BYTES: OnceLock<u64> = OnceLock::new();
@@ -184,6 +188,60 @@ impl Pipeline {
         self.archive_password_winners
             .insert((job_id, set_name.to_string()), candidate);
     }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DownloadBatchCompatibility {
+    pub(super) priority: u32,
+    pub(super) is_recovery: bool,
+    pub(super) groups: Vec<String>,
+    pub(super) exclude_servers: Vec<usize>,
+}
+
+impl DownloadBatchCompatibility {
+    fn from_work(work: &DownloadWork) -> Self {
+        Self {
+            priority: work.priority,
+            is_recovery: work.is_recovery,
+            groups: work.groups.clone(),
+            exclude_servers: work.exclude_servers.clone(),
+        }
+    }
+
+    fn matches(&self, work: &DownloadWork) -> bool {
+        work.priority == self.priority
+            && work.is_recovery == self.is_recovery
+            && work.groups == self.groups
+            && work.exclude_servers == self.exclude_servers
+    }
+}
+
+pub(super) struct DownloadBatchLease {
+    pub(super) job_id: JobId,
+    pub(super) lane_mode: DownloadLaneMode,
+    pub(super) server_modes: Vec<(usize, DownloadLaneMode)>,
+    pub(super) compatibility: DownloadBatchCompatibility,
+    pub(super) works: Vec<DownloadWork>,
+}
+
+pub(super) struct DownloadLaneRefillRequest {
+    pub(super) job_id: JobId,
+    pub(super) server_idx: usize,
+    pub(super) supports_pipelining: bool,
+    pub(super) current_mode: DownloadLaneMode,
+    pub(super) compatibility: DownloadBatchCompatibility,
+    pub(super) response_tx: oneshot::Sender<DownloadLaneRefillResponse>,
+}
+
+pub(super) struct DownloadLaneRefillResponse {
+    pub(super) lease: Option<DownloadBatchLease>,
+    pub(super) park_reason: LaneParkReason,
+}
+
+pub(super) struct DownloadLaneParked {
+    pub(super) job_id: JobId,
+    pub(super) mode: DownloadLaneMode,
+    pub(super) reason: LaneParkReason,
 }
 
 /// Result of a download task.
@@ -341,6 +399,38 @@ impl RarRefreshRequest {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(super) enum RarRefreshError {
+    CapacityPressure(String),
+    Other(String),
+}
+
+impl RarRefreshError {
+    fn from_message(message: String) -> Self {
+        if capacity::is_fd_capacity_error_message(&message) {
+            Self::CapacityPressure(message)
+        } else {
+            Self::Other(message)
+        }
+    }
+
+    fn is_capacity_pressure(&self) -> bool {
+        matches!(self, Self::CapacityPressure(_))
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::CapacityPressure(message) | Self::Other(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for RarRefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct RarRefreshState {
     pub(super) in_flight: Option<RarRefreshRequest>,
@@ -348,7 +438,7 @@ pub(super) struct RarRefreshState {
     pub(super) latest_completed_volume: u32,
     pub(super) refreshed_volumes: BTreeSet<u32>,
     pub(super) structure_dirty: bool,
-    pub(super) last_error: Option<String>,
+    pub(super) last_error: Option<RarRefreshError>,
 }
 
 pub(super) struct ComputedRarSetState {
@@ -361,7 +451,20 @@ pub(super) struct RarRefreshDone {
     pub(super) job_id: JobId,
     pub(super) set_name: String,
     pub(super) request: RarRefreshRequest,
-    pub(super) result: Result<ComputedRarSetState, String>,
+    pub(super) result: Result<ComputedRarSetState, RarRefreshError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::pipeline) enum RarCapacityRetryKind {
+    Refresh,
+    Extraction,
+    FullSetExtraction,
+}
+
+pub(in crate::pipeline) struct RarCapacityRetry {
+    pub(super) job_id: JobId,
+    pub(super) set_name: String,
+    pub(super) kind: RarCapacityRetryKind,
 }
 
 pub(super) struct VerifiedSuspectPersistDone {
@@ -422,7 +525,7 @@ pub(super) struct BatchExtractionOutcome {
 
 pub(super) struct FullSetExtractionOutcome {
     pub(super) extracted: Vec<String>,
-    pub(super) failed: Vec<String>,
+    pub(super) failed: Vec<(String, String)>,
     pub(super) selected_password: Option<String>,
 }
 
@@ -663,6 +766,10 @@ pub struct Pipeline {
     /// Channels for pipeline stage results.
     pub(super) download_done_tx: mpsc::Sender<DownloadResult>,
     pub(super) download_done_rx: mpsc::Receiver<DownloadResult>,
+    pub(super) download_refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
+    pub(super) download_refill_rx: mpsc::Receiver<DownloadLaneRefillRequest>,
+    pub(super) download_lane_parked_tx: mpsc::Sender<DownloadLaneParked>,
+    pub(super) download_lane_parked_rx: mpsc::Receiver<DownloadLaneParked>,
     pub(super) decode_done_tx: mpsc::Sender<DecodeDone>,
     pub(super) decode_done_rx: mpsc::Receiver<DecodeDone>,
     /// Channel for delayed retries — segments sleep then come back here.
@@ -677,6 +784,9 @@ pub struct Pipeline {
     /// Channel for background RAR topology refresh results.
     pub(super) rar_refresh_done_tx: mpsc::Sender<RarRefreshDone>,
     pub(super) rar_refresh_done_rx: mpsc::Receiver<RarRefreshDone>,
+    /// Channel for delayed RAR capacity-pressure refresh/extraction wakeups.
+    pub(in crate::pipeline) rar_capacity_retry_tx: mpsc::Sender<RarCapacityRetry>,
+    pub(in crate::pipeline) rar_capacity_retry_rx: mpsc::Receiver<RarCapacityRetry>,
     /// Channel for serialized verified-suspect persistence completions.
     pub(super) verified_suspect_persist_done_tx: mpsc::Sender<VerifiedSuspectPersistDone>,
     pub(super) verified_suspect_persist_done_rx: mpsc::Receiver<VerifiedSuspectPersistDone>,
@@ -746,6 +856,9 @@ pub struct Pipeline {
     rar_sets: HashMap<(JobId, String), RarSetState>,
     /// Runtime-only coalescing state for background RAR topology refreshes.
     rar_refresh_state: HashMap<(JobId, String), RarRefreshState>,
+    /// Runtime-only coalescing state for delayed RAR capacity-pressure retries.
+    pub(in crate::pipeline) pending_rar_capacity_retries:
+        HashSet<(JobId, String, RarCapacityRetryKind)>,
     /// Runtime-only serialized persistence state for verified suspect volumes.
     verified_suspect_persist_state: HashMap<(JobId, String), VerifiedSuspectPersistState>,
     /// Members currently blocked on future RAR volumes. Used to emit stable

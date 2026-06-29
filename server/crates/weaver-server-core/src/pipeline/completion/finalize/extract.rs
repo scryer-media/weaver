@@ -534,7 +534,7 @@ impl Pipeline {
                 let is_solid = archive.is_solid();
 
                 let mut extracted_members = Vec::new();
-                let mut failed_members: Vec<String> = Vec::new();
+                let mut failed_members: Vec<(String, String)> = Vec::new();
                 let mut validated_password = selection.validated_password;
                 for (idx, member) in meta.members.iter().enumerate() {
                     if already_extracted.contains(&member.name) {
@@ -573,14 +573,15 @@ impl Pipeline {
                             extracted_members.push(member_name);
                         }
                         Err(e) => {
+                            let error = e.to_string();
                             let _ = event_tx.send(PipelineEvent::ExtractionMemberFailed {
                                 job_id,
                                 set_name: set_name_for_task.clone(),
                                 member: member.name.clone(),
-                                error: e.to_string(),
+                                error: error.clone(),
                             });
                             tracing::warn!(member = %member.name, error = %e, "member extraction failed, continuing with remaining members");
-                            failed_members.push(member.name.clone());
+                            failed_members.push((member.name.clone(), error));
                             if is_solid {
                                 break;
                             }

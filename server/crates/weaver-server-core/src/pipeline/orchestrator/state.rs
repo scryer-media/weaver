@@ -94,6 +94,8 @@ impl Pipeline {
     pub(crate) fn clear_job_rar_runtime(&mut self, job_id: JobId) {
         self.eagerly_deleted.remove(&job_id);
         self.rar_sets.retain(|(jid, _), _| *jid != job_id);
+        self.pending_rar_capacity_retries
+            .retain(|(jid, _, _)| *jid != job_id);
         self.rar_waiting_members
             .retain(|(jid, _, _), _| *jid != job_id);
         self.normalization_retried.remove(&job_id);

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 mod checkpoint;
 mod member;
 mod scheduler;
+mod source;
 
 pub(crate) use member::{RarArchiveOpenMode, RarExtractionContext, RarExtractionOpenRequest};
 

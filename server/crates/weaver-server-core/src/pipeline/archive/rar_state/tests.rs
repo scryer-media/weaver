@@ -128,6 +128,15 @@ fn build_test_file_version_extra(version: u64) -> Vec<u8> {
     build_test_extra_record(0x04, &body)
 }
 
+fn build_test_redirection_extra(redir_type: u64, target: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&encode_test_rar_vint(redir_type));
+    body.extend_from_slice(&encode_test_rar_vint(0));
+    body.extend_from_slice(&encode_test_rar_vint(target.len() as u64));
+    body.extend_from_slice(target.as_bytes());
+    build_test_extra_record(0x05, &body)
+}
+
 fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     let episode_a = b"episode-a-payload";
     let episode_b = b"episode-b-payload";
@@ -283,6 +292,160 @@ fn build_plan_skips_versioned_members_like_unrar_default_extraction() {
             .map(|member| member.name.as_str())
             .collect::<Vec<_>>(),
         vec!["bin/2to3"]
+    );
+}
+
+#[test]
+fn build_plan_records_file_copy_dependency_and_waits_for_source() {
+    let source_payload = b"source";
+    let source_crc = checksum::crc32(source_payload);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&TEST_RAR5_SIG);
+    bytes.extend_from_slice(&build_test_rar_main_header(0, None));
+    bytes.extend_from_slice(&build_test_rar_file_header(
+        "source.bin",
+        0,
+        source_payload.len() as u64,
+        source_payload.len() as u64,
+        Some(source_crc),
+    ));
+    bytes.extend_from_slice(source_payload);
+    bytes.extend_from_slice(&build_test_rar_file_header_with_extra(
+        "copy.bin",
+        0,
+        0,
+        0,
+        Some(checksum::crc32(&[])),
+        &build_test_redirection_extra(5, "source.bin"),
+    ));
+    bytes.extend_from_slice(&build_test_rar_end_header(false));
+
+    let archive = RarArchive::open(Cursor::new(bytes.clone())).unwrap();
+    let facts = BTreeMap::from([(
+        0,
+        RarArchive::parse_volume_facts(Cursor::new(bytes), None).unwrap(),
+    )]);
+    let volume_map = HashMap::from([("filecopy.rar".to_string(), 0)]);
+    let plan = build_plan(
+        volume_map.clone(),
+        &facts,
+        &archive,
+        &HashSet::new(),
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(
+        plan.member_dependencies.get("copy.bin"),
+        Some(&RarMemberDependency {
+            source_member: "source.bin".to_string(),
+            source_first_volume: 0,
+            source_last_volume: 0,
+        })
+    );
+    assert_eq!(
+        plan.ready_members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["source.bin"]
+    );
+
+    let plan_after_source = build_plan(
+        volume_map,
+        &facts,
+        &archive,
+        &HashSet::from(["source.bin".to_string()]),
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        plan_after_source
+            .ready_members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["copy.bin"]
+    );
+}
+
+#[test]
+fn build_plan_file_copy_dependency_uses_first_duplicate_source_like_unrar() {
+    let first_payload = b"first";
+    let second_payload = b"second";
+
+    let mut part01 = Vec::new();
+    part01.extend_from_slice(&TEST_RAR5_SIG);
+    part01.extend_from_slice(&build_test_rar_main_header(0x0001, None));
+    part01.extend_from_slice(&build_test_rar_file_header(
+        "source.bin",
+        0,
+        first_payload.len() as u64,
+        first_payload.len() as u64,
+        Some(checksum::crc32(first_payload)),
+    ));
+    part01.extend_from_slice(first_payload);
+    part01.extend_from_slice(&build_test_rar_end_header(true));
+
+    let mut part02 = Vec::new();
+    part02.extend_from_slice(&TEST_RAR5_SIG);
+    part02.extend_from_slice(&build_test_rar_main_header(0x0001 | 0x0002, Some(1)));
+    part02.extend_from_slice(&build_test_rar_file_header(
+        "source.bin",
+        0,
+        second_payload.len() as u64,
+        second_payload.len() as u64,
+        Some(checksum::crc32(second_payload)),
+    ));
+    part02.extend_from_slice(second_payload);
+    part02.extend_from_slice(&build_test_rar_file_header_with_extra(
+        "copy.bin",
+        0,
+        0,
+        0,
+        Some(checksum::crc32(&[])),
+        &build_test_redirection_extra(5, "source.bin"),
+    ));
+    part02.extend_from_slice(&build_test_rar_end_header(false));
+
+    let mut archive = RarArchive::open(Cursor::new(part01.clone())).unwrap();
+    archive
+        .add_volume(1, Box::new(Cursor::new(part02.clone())))
+        .unwrap();
+    let facts = BTreeMap::from([
+        (
+            0,
+            RarArchive::parse_volume_facts(Cursor::new(part01), None).unwrap(),
+        ),
+        (
+            1,
+            RarArchive::parse_volume_facts(Cursor::new(part02), None).unwrap(),
+        ),
+    ]);
+    let volume_map = HashMap::from([
+        ("dup.part01.rar".to_string(), 0),
+        ("dup.part02.rar".to_string(), 1),
+    ]);
+
+    let plan = build_plan(
+        volume_map,
+        &facts,
+        &archive,
+        &HashSet::new(),
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(
+        plan.member_dependencies.get("copy.bin"),
+        Some(&RarMemberDependency {
+            source_member: "source.bin".to_string(),
+            source_first_volume: 0,
+            source_last_volume: 0,
+        })
     );
 }
 

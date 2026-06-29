@@ -1,4 +1,5 @@
 use super::*;
+use crate::pipeline::{RAR_CAPACITY_RETRY_DELAY, RarCapacityRetry, RarCapacityRetryKind};
 
 struct ReadyRarExtraction {
     set_name: String,
@@ -56,6 +57,60 @@ impl Pipeline {
             || lower.contains("no on-disk rar volumes")
     }
 
+    fn is_capacity_pressure_batch_extraction_error(error: &str) -> bool {
+        crate::pipeline::capacity::is_fd_capacity_error_message(error)
+    }
+
+    pub(in crate::pipeline) fn schedule_rar_capacity_retry(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        kind: RarCapacityRetryKind,
+    ) {
+        let set_name = set_name.to_string();
+        let key = (job_id, set_name.clone(), kind);
+        if !self.pending_rar_capacity_retries.insert(key) {
+            return;
+        }
+
+        let retry_tx = self.rar_capacity_retry_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(RAR_CAPACITY_RETRY_DELAY).await;
+            let _ = retry_tx
+                .send(RarCapacityRetry {
+                    job_id,
+                    set_name,
+                    kind,
+                })
+                .await;
+        });
+    }
+
+    pub(in crate::pipeline) async fn handle_rar_capacity_retry(&mut self, retry: RarCapacityRetry) {
+        let key = (retry.job_id, retry.set_name.clone(), retry.kind);
+        self.pending_rar_capacity_retries.remove(&key);
+
+        if !self.jobs.contains_key(&retry.job_id)
+            || !self
+                .rar_sets
+                .contains_key(&(retry.job_id, retry.set_name.clone()))
+        {
+            return;
+        }
+
+        match retry.kind {
+            RarCapacityRetryKind::Refresh => {
+                self.launch_queued_rar_capacity_refresh(retry.job_id, &retry.set_name);
+            }
+            RarCapacityRetryKind::Extraction => {
+                self.try_rar_extraction(retry.job_id).await;
+            }
+            RarCapacityRetryKind::FullSetExtraction => {
+                self.check_job_completion(retry.job_id).await;
+            }
+        }
+    }
+
     pub(crate) fn rar_member_can_start_extraction(
         &self,
         job_id: JobId,
@@ -83,10 +138,14 @@ impl Pipeline {
             .rar_refresh_state
             .get(&(job_id, set_name.to_string()))?;
         let target_completed_volume = state.latest_completed_volume.max(last_volume);
-        if state.last_error.is_some() {
+        if let Some(last_error) = state.last_error.as_ref() {
             return Some(RarRefreshRequest {
                 target_completed_volume,
-                reason: RefreshReason::ValidationFailure,
+                reason: if last_error.is_capacity_pressure() {
+                    RefreshReason::CoverageExpansion
+                } else {
+                    RefreshReason::ValidationFailure
+                },
             });
         }
         if state.structure_dirty {
@@ -157,6 +216,18 @@ impl Pipeline {
             for volume in first_volume..=last_volume {
                 if let Some(path) = volume_paths.get(&volume) {
                     selected.insert(volume, path.clone());
+                }
+            }
+            if let Some(dependency) = self
+                .rar_sets
+                .get(&(job_id, set_name.to_string()))
+                .and_then(|set| set.plan.as_ref())
+                .and_then(|plan| plan.member_dependencies.get(member))
+            {
+                for volume in dependency.source_first_volume..=dependency.source_last_volume {
+                    if let Some(path) = volume_paths.get(&volume) {
+                        selected.insert(volume, path.clone());
+                    }
                 }
             }
         }
@@ -285,6 +356,13 @@ impl Pipeline {
             .iter()
             .filter(|((jid, _), _)| *jid == job_id)
             .filter(|((_, set_name), _)| !generic_full_set_inflight.contains(set_name))
+            .filter(|((_, set_name), _)| {
+                !self.pending_rar_capacity_retries.contains(&(
+                    job_id,
+                    (*set_name).clone(),
+                    RarCapacityRetryKind::Extraction,
+                ))
+            })
             .filter_map(|((_, set_name), set_state)| {
                 let plan = set_state.plan.as_ref()?;
                 let is_solid = plan.is_solid;
@@ -300,6 +378,20 @@ impl Pipeline {
                         continue;
                     }
                     if set_state.in_flight_members.contains(&ready_member.name) {
+                        continue;
+                    }
+                    if plan
+                        .member_dependencies
+                        .get(&ready_member.name)
+                        .is_some_and(|dependency| {
+                            !self
+                                .extracted_members
+                                .get(&job_id)
+                                .is_some_and(|extracted| {
+                                    extracted.contains(&dependency.source_member)
+                                })
+                        })
+                    {
                         continue;
                     }
                     if !self.rar_member_can_start_extraction(job_id, set_name, &ready_member.name) {
@@ -322,7 +414,16 @@ impl Pipeline {
         for (set_name, candidate_members, is_solid) in candidate_sets {
             let mut gated_members = Vec::new();
             let mut blocked_members = Vec::new();
+            let refresh_retry_pending = self.pending_rar_capacity_retries.contains(&(
+                job_id,
+                set_name.clone(),
+                RarCapacityRetryKind::Refresh,
+            ));
             for member in candidate_members {
+                if refresh_retry_pending {
+                    blocked_members.push(member);
+                    continue;
+                }
                 if let Some(request) = self.rar_member_refresh_request(job_id, &set_name, &member) {
                     self.enqueue_rar_set_refresh(
                         job_id,
@@ -796,6 +897,7 @@ impl Pipeline {
                     }
                 }
 
+                let mut capacity_retry = false;
                 match result {
                     Ok(outcome) => {
                         if let Err(error) = self
@@ -870,6 +972,14 @@ impl Pipeline {
                                     error = %error,
                                     "RAR batch member hit stale topology; queueing validation refresh"
                                 );
+                            } else if Self::is_capacity_pressure_batch_extraction_error(error) {
+                                warn!(
+                                    job_id = job_id.0,
+                                    set_name = %set_name,
+                                    member = %member,
+                                    error = %error,
+                                    "RAR batch member hit FD capacity pressure; keeping member waiting"
+                                );
                             } else {
                                 warn!(
                                     job_id = job_id.0,
@@ -891,6 +1001,14 @@ impl Pipeline {
                                     .then_some(member.clone())
                             })
                             .collect::<Vec<_>>();
+                        let capacity_retry_members = outcome
+                            .failed
+                            .iter()
+                            .filter_map(|(member, error)| {
+                                Self::is_capacity_pressure_batch_extraction_error(error)
+                                    .then_some(member.clone())
+                            })
+                            .collect::<Vec<_>>();
                         if !refresh_retry_members.is_empty() {
                             self.enqueue_rar_set_refresh(
                                 job_id,
@@ -902,6 +1020,14 @@ impl Pipeline {
                                 job_id,
                                 &set_name,
                                 &refresh_retry_members,
+                            );
+                        }
+                        if !capacity_retry_members.is_empty() {
+                            capacity_retry = true;
+                            self.reconcile_waiting_members_for_set(
+                                job_id,
+                                &set_name,
+                                &capacity_retry_members,
                             );
                         }
                     }
@@ -919,6 +1045,16 @@ impl Pipeline {
                                 &set_name,
                                 self.latest_completed_rar_volume(job_id, &set_name),
                                 RefreshReason::ValidationFailure,
+                            );
+                            self.reconcile_waiting_members_for_set(job_id, &set_name, &attempted);
+                        } else if Self::is_capacity_pressure_batch_extraction_error(&error) {
+                            capacity_retry = true;
+                            warn!(
+                                job_id = job_id.0,
+                                set_name = %set_name,
+                                attempted = ?attempted,
+                                error = %error,
+                                "RAR batch extraction worker hit FD capacity pressure; keeping members waiting"
                             );
                             self.reconcile_waiting_members_for_set(job_id, &set_name, &attempted);
                         } else {
@@ -949,7 +1085,13 @@ impl Pipeline {
                 let all_downloaded = self.jobs.get(&job_id).is_some_and(|state| {
                     state.assembly.complete_data_file_count() >= state.assembly.data_file_count()
                 });
-                if all_downloaded && !queued_post_extraction_refresh {
+                if capacity_retry {
+                    self.schedule_rar_capacity_retry(
+                        job_id,
+                        &set_name,
+                        RarCapacityRetryKind::Extraction,
+                    );
+                } else if all_downloaded && !queued_post_extraction_refresh {
                     self.check_job_completion(job_id).await;
                 } else if !all_downloaded {
                     self.try_rar_extraction(job_id).await;
@@ -1005,6 +1147,40 @@ impl Pipeline {
                         self.clear_failed_extraction_member(job_id, member);
                     }
 
+                    let full_set_capacity_pressure = outcome
+                        .failed
+                        .iter()
+                        .any(|(_, error)| Self::is_capacity_pressure_batch_extraction_error(error));
+                    if full_set_capacity_pressure {
+                        warn!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            succeeded = outcome.extracted.len(),
+                            failed = ?outcome.failed,
+                            "RAR full-set extraction hit FD capacity pressure; retrying without repair promotion"
+                        );
+                        if let Some(sets) = self.inflight_extractions.get_mut(&job_id) {
+                            sets.remove(&set_name);
+                        }
+                        if let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.clone()))
+                        {
+                            let fallback_phase =
+                                crate::pipeline::archive::rar_state::RarSetPhase::FallbackFullSet;
+                            set_state.active_workers = 0;
+                            set_state.in_flight_members.clear();
+                            set_state.phase = fallback_phase;
+                            if let Some(plan) = set_state.plan.as_mut() {
+                                plan.phase = fallback_phase;
+                            }
+                        }
+                        self.schedule_rar_capacity_retry(
+                            job_id,
+                            &set_name,
+                            RarCapacityRetryKind::FullSetExtraction,
+                        );
+                        return;
+                    }
+
                     if outcome.failed.is_empty() {
                         info!(
                             job_id = job_id.0,
@@ -1027,7 +1203,7 @@ impl Pipeline {
                             failed = ?outcome.failed,
                             "set extraction completed with failures"
                         );
-                        for member in &outcome.failed {
+                        for (member, _error) in &outcome.failed {
                             if let Some(members) = self.extracted_members.get_mut(&job_id) {
                                 members.remove(member);
                             }
@@ -1055,12 +1231,31 @@ impl Pipeline {
                         error = %e,
                         "set extraction failed"
                     );
+                    let rar_capacity_pressure =
+                        self.rar_sets.contains_key(&(job_id, set_name.clone()))
+                            && Self::is_capacity_pressure_batch_extraction_error(&e);
                     if let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
                         set_state.active_workers = 0;
                         set_state.in_flight_members.clear();
+                        if rar_capacity_pressure {
+                            let fallback_phase =
+                                crate::pipeline::archive::rar_state::RarSetPhase::FallbackFullSet;
+                            set_state.phase = fallback_phase;
+                            if let Some(plan) = set_state.plan.as_mut() {
+                                plan.phase = fallback_phase;
+                            }
+                        }
                     }
                     if let Some(sets) = self.inflight_extractions.get_mut(&job_id) {
                         sets.remove(&set_name);
+                    }
+                    if rar_capacity_pressure {
+                        self.schedule_rar_capacity_retry(
+                            job_id,
+                            &set_name,
+                            RarCapacityRetryKind::FullSetExtraction,
+                        );
+                        return;
                     }
                     self.purge_empty_rar_set_if_idle(job_id, &set_name);
                     if Self::is_recoverable_full_set_extraction_error(&e) {

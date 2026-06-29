@@ -81,13 +81,22 @@ impl DownloadQueue {
         &mut self,
         anchor: &DownloadWork,
     ) -> Option<DownloadWork> {
-        let compatible = self.heap.peek().is_some_and(|Reverse(pw)| {
-            pw.work.priority == anchor.priority
-                && pw.work.is_recovery == anchor.is_recovery
-                && pw.work.groups == anchor.groups
-                && pw.work.exclude_servers == anchor.exclude_servers
-        });
-        compatible.then(|| self.heap.pop().map(|Reverse(pw)| pw.work))?
+        self.pop_next_matching(|work| {
+            work.priority == anchor.priority
+                && work.is_recovery == anchor.is_recovery
+                && work.groups == anchor.groups
+                && work.exclude_servers == anchor.exclude_servers
+        })
+    }
+
+    pub fn pop_next_matching(
+        &mut self,
+        mut matches: impl FnMut(&DownloadWork) -> bool,
+    ) -> Option<DownloadWork> {
+        self.heap
+            .peek()
+            .is_some_and(|Reverse(pw)| matches(&pw.work))
+            .then(|| self.heap.pop().map(|Reverse(pw)| pw.work))?
     }
 
     pub fn len(&self) -> usize {

@@ -10,14 +10,17 @@ pub const UNRAR_UNPACK_MAX_DICT_SIZE: u64 = 0x1000000000;
 /// Maximum RAR5 header body size accepted by official UnRAR.
 pub const UNRAR_RAR5_MAX_HEADER_BODY: u64 = 0x200000;
 
+/// Weaver's finite anti-abuse ceiling for a single packed or unpacked member.
+pub const WEAVER_MAX_MEMBER_DATA_SIZE: u64 = 500 * 1024 * 1024 * 1024;
+
 /// Configurable limits for archive processing to prevent resource exhaustion.
 #[derive(Debug, Clone)]
 pub struct Limits {
     /// Maximum header body size in bytes (default 2 MiB, matching UnRAR).
     pub max_header_size: u64,
-    /// Maximum single data segment size in bytes (default 2 GB).
+    /// Maximum single data segment size in bytes.
     pub max_data_segment: u64,
-    /// Maximum unpacked output size in bytes (default 4 GB).
+    /// Maximum unpacked output size in bytes.
     pub max_unpacked_size: u64,
     /// Maximum dictionary size in bytes (default 256 MB).
     pub max_dict_size: u64,
@@ -27,9 +30,9 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_header_size: UNRAR_RAR5_MAX_HEADER_BODY,
-            max_data_segment: 2 * 1024 * 1024 * 1024, // 2 GB
-            max_unpacked_size: 4 * 1024 * 1024 * 1024, // 4 GB
-            max_dict_size: 256 * 1024 * 1024,         // 256 MB
+            max_data_segment: WEAVER_MAX_MEMBER_DATA_SIZE,
+            max_unpacked_size: WEAVER_MAX_MEMBER_DATA_SIZE,
+            max_dict_size: 256 * 1024 * 1024, // 256 MB
         }
     }
 }
@@ -42,9 +45,16 @@ mod tests {
     fn test_default_limits() {
         let limits = Limits::default();
         assert_eq!(limits.max_header_size, UNRAR_RAR5_MAX_HEADER_BODY);
-        assert_eq!(limits.max_data_segment, 2 * 1024 * 1024 * 1024);
-        assert_eq!(limits.max_unpacked_size, 4 * 1024 * 1024 * 1024);
+        assert_eq!(limits.max_data_segment, WEAVER_MAX_MEMBER_DATA_SIZE);
+        assert_eq!(limits.max_unpacked_size, WEAVER_MAX_MEMBER_DATA_SIZE);
         assert_eq!(limits.max_dict_size, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn default_member_data_limit_covers_large_media_members() {
+        let observed_bluray_member_size = 68_325_814_272;
+        assert!(observed_bluray_member_size <= Limits::default().max_unpacked_size);
+        assert_eq!(WEAVER_MAX_MEMBER_DATA_SIZE, 500 * 1024 * 1024 * 1024);
     }
 
     #[test]

@@ -45,6 +45,7 @@ const COPY_BUF_SIZE: usize = 64 * 1024;
 /// Keep the default threshold low so `extract_member()` does not retain large
 /// heap buffers by default on archives that are better served by file-backed output.
 const DEFAULT_SPOOL_THRESHOLD_BYTES: usize = 1024 * 1024;
+const MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES: usize = 512 * 1024 * 1024;
 
 fn spool_threshold_bytes() -> usize {
     std::env::var("WEAVER_RAR_SPOOL_THRESHOLD_BYTES")
@@ -52,6 +53,51 @@ fn spool_threshold_bytes() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_SPOOL_THRESHOLD_BYTES)
+}
+
+fn enforce_memory_extract_member_buffer_limit(file_header: &FileHeader) -> RarResult<()> {
+    if file_header.data_size > MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES as u64 {
+        return Err(RarError::ResourceLimit {
+            detail: format!(
+                "member {} compressed data size {} exceeds memory extraction limit {}",
+                file_header.name, file_header.data_size, MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES
+            ),
+        });
+    }
+
+    if let Some(unpacked_size) = file_header.unpacked_size
+        && unpacked_size > MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES as u64
+    {
+        return Err(RarError::ResourceLimit {
+            detail: format!(
+                "member {} unpacked size {} exceeds memory extraction limit {}",
+                file_header.name, unpacked_size, MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn enforce_memory_materialization_limit(member_name: &str, len: usize) -> RarResult<()> {
+    if len > MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES {
+        return Err(RarError::ResourceLimit {
+            detail: format!(
+                "member {member_name} extracted size {len} exceeds memory materialization limit {}",
+                MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn output_capacity_hint(file_header: &FileHeader, limits: &Limits) -> usize {
+    file_header
+        .unpacked_size
+        .unwrap_or(0)
+        .min(limits.max_unpacked_size)
+        .min(usize::MAX as u64) as usize
 }
 
 fn enforce_member_limits(file_header: &FileHeader, limits: &Limits) -> RarResult<()> {
@@ -115,8 +161,12 @@ impl ExtractedMember {
 
     pub fn to_bytes(&self) -> RarResult<Vec<u8>> {
         match self {
-            Self::InMemory(data) => Ok(data.clone()),
+            Self::InMemory(data) => {
+                enforce_memory_materialization_limit("in-memory member", data.len())?;
+                Ok(data.clone())
+            }
             Self::TempFile { file, len } => {
+                enforce_memory_materialization_limit("tempfile-backed member", *len)?;
                 let mut reopened = file.reopen().map_err(RarError::Io)?;
                 reopened.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
                 let mut data = Vec::with_capacity(*len);
@@ -130,6 +180,7 @@ impl ExtractedMember {
         match self {
             Self::InMemory(data) => Ok(data),
             Self::TempFile { file, len } => {
+                enforce_memory_materialization_limit("tempfile-backed member", len)?;
                 let mut reopened = file.reopen().map_err(RarError::Io)?;
                 reopened.seek(SeekFrom::Start(0)).map_err(RarError::Io)?;
                 let mut data = Vec::with_capacity(len);
@@ -195,7 +246,7 @@ enum ExtractedMemberSinkStorage {
 
 impl ExtractedMemberSink {
     pub fn with_capacity_hint(capacity_hint: usize) -> RarResult<Self> {
-        let threshold = spool_threshold_bytes();
+        let threshold = spool_threshold_bytes().min(MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES);
         let storage = if capacity_hint > threshold {
             ExtractedMemberSinkStorage::TempFile(NamedTempFile::new().map_err(RarError::Io)?)
         } else {
@@ -457,27 +508,6 @@ pub fn extract_member_with_limits<R: Read + Seek>(
         .seek(SeekFrom::Start(file_header.data_offset))
         .map_err(RarError::Io)?;
 
-    // Read the compressed data area.
-    let data_size =
-        usize::try_from(file_header.data_size).map_err(|_| RarError::ResourceLimit {
-            detail: format!(
-                "member {} compressed data size {} exceeds platform capacity",
-                file_header.name, file_header.data_size
-            ),
-        })?;
-    let mut compressed = vec![0u8; data_size];
-    if data_size > 0 {
-        reader.read_exact(&mut compressed).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                RarError::TruncatedData {
-                    offset: file_header.data_offset,
-                }
-            } else {
-                RarError::Io(e)
-            }
-        })?;
-    }
-
     // Determine unpacked size.
     let unpacked_size = file_header.unpacked_size.unwrap_or(0);
 
@@ -486,26 +516,43 @@ pub fn extract_member_with_limits<R: Read + Seek>(
         p.on_member_start(mi);
     }
 
-    // Dispatch to decompressor.
-    let expected_crc = if options.verify {
-        file_header.data_crc32
-    } else {
-        None
-    };
-
     let output = match file_header.compression.method {
         CompressionMethod::Store => {
-            // For store, the CRC is verified inside decompress.
-            let data = decompress::decompress_with_limits(
-                &compressed,
-                unpacked_size,
-                &file_header.compression,
-                expected_crc,
+            let mut output =
+                ExtractedMemberSink::with_capacity_hint(output_capacity_hint(file_header, limits))?;
+            extract_stored_with_limits(
+                reader,
+                &mut output,
+                file_header,
+                options,
+                progress,
+                member_info,
                 limits,
             )?;
-            ExtractedMember::InMemory(data)
+            output.into_extracted()?
         }
         _ => {
+            enforce_memory_extract_member_buffer_limit(file_header)?;
+            let data_size =
+                usize::try_from(file_header.data_size).map_err(|_| RarError::ResourceLimit {
+                    detail: format!(
+                        "member {} compressed data size {} exceeds platform capacity",
+                        file_header.name, file_header.data_size
+                    ),
+                })?;
+            let mut compressed = vec![0u8; data_size];
+            if data_size > 0 {
+                reader.read_exact(&mut compressed).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        RarError::TruncatedData {
+                            offset: file_header.data_offset,
+                        }
+                    } else {
+                        RarError::Io(e)
+                    }
+                })?;
+            }
+
             // For compressed data, decompress first then verify CRC.
             let decompressed = decompress::decompress_with_limits(
                 &compressed,
@@ -943,5 +990,101 @@ mod tests {
                 max: 131_072
             })
         ));
+    }
+
+    #[test]
+    fn stored_member_with_large_unpacked_size_spools_instead_of_allocating() {
+        let mut fh = make_stored_file_header("BDMV/STREAM/00042.m2ts", b"", 0);
+        fh.unpacked_size = Some(68_325_814_272);
+
+        let mut reader = std::io::Cursor::new(Vec::new());
+        let result = extract_member(
+            &mut reader,
+            &fh,
+            &ExtractOptions::default(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(result, ExtractedMember::TempFile { len: 0, .. }));
+    }
+
+    #[test]
+    fn temp_backed_member_refuses_large_memory_materialization() {
+        let member = ExtractedMember::TempFile {
+            file: tempfile::NamedTempFile::new().unwrap(),
+            len: MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES + 1,
+        };
+
+        assert!(matches!(
+            member.to_bytes(),
+            Err(RarError::ResourceLimit { .. })
+        ));
+        assert!(matches!(
+            member.into_bytes(),
+            Err(RarError::ResourceLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn default_limits_accept_500_gib_members_and_reject_larger_members() {
+        let mut fh = make_stored_file_header("boundary.bin", b"", 0);
+        fh.data_size = crate::limits::WEAVER_MAX_MEMBER_DATA_SIZE;
+        fh.unpacked_size = Some(crate::limits::WEAVER_MAX_MEMBER_DATA_SIZE);
+        enforce_member_limits(&fh, &Limits::default()).unwrap();
+
+        fh.data_size = crate::limits::WEAVER_MAX_MEMBER_DATA_SIZE + 1;
+        assert!(matches!(
+            enforce_member_limits(&fh, &Limits::default()),
+            Err(RarError::ResourceLimit { .. })
+        ));
+
+        fh.data_size = 0;
+        fh.unpacked_size = Some(crate::limits::WEAVER_MAX_MEMBER_DATA_SIZE + 1);
+        assert!(matches!(
+            enforce_member_limits(&fh, &Limits::default()),
+            Err(RarError::ResourceLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn compressed_memory_extraction_rejects_huge_packed_size_before_allocation() {
+        let mut fh = make_stored_file_header("huge-packed-compressed.bin", b"small", 0);
+        fh.compression.method = CompressionMethod::Normal;
+        fh.data_size = MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES as u64 + 1;
+        fh.unpacked_size = Some(1);
+
+        let mut reader = std::io::Cursor::new(Vec::new());
+        let result = extract_member(
+            &mut reader,
+            &fh,
+            &ExtractOptions::default(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(matches!(result, Err(RarError::ResourceLimit { .. })));
+    }
+
+    #[test]
+    fn compressed_memory_extraction_rejects_huge_unpacked_size_before_allocation() {
+        let mut fh = make_stored_file_header("huge-unpacked-compressed.bin", b"small", 0);
+        fh.compression.method = CompressionMethod::Normal;
+        fh.unpacked_size = Some(MEMORY_EXTRACT_MEMBER_MAX_BUFFERED_BYTES as u64 + 1);
+
+        let mut reader = std::io::Cursor::new(Vec::new());
+        let result = extract_member(
+            &mut reader,
+            &fh,
+            &ExtractOptions::default(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(matches!(result, Err(RarError::ResourceLimit { .. })));
     }
 }
