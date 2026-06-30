@@ -317,10 +317,10 @@ mod tests {
         let keepalive = sock_ref.keepalive().unwrap();
         assert!(keepalive, "TCP keepalive should be enabled");
 
-        let ka_time = sock_ref.keepalive_time().unwrap();
+        let ka_time = sock_ref.tcp_keepalive_time().unwrap();
         assert_eq!(ka_time, Duration::from_mins(1));
 
-        let ka_interval = sock_ref.keepalive_interval().unwrap();
+        let ka_interval = sock_ref.tcp_keepalive_interval().unwrap();
         assert_eq!(ka_interval, Duration::from_secs(15));
     }
 }

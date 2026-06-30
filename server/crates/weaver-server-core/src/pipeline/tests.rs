@@ -5937,7 +5937,7 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 3);
+    assert_eq!(pipeline.active_downloads, 2);
     assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(
         pipeline
@@ -5955,7 +5955,7 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
             .unwrap()
             .download_queue
             .len(),
-        0
+        1
     );
     assert_eq!(
         pipeline.active_downloads_by_job.get(&earlier_job_id),
@@ -5963,7 +5963,7 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
     );
     assert_eq!(
         pipeline.active_downloads_by_job.get(&later_job_id),
-        Some(&2)
+        Some(&1)
     );
     assert_eq!(pipeline.hot_dispatch_mode, DispatchShareMode::Shared);
     assert!(
@@ -6050,7 +6050,7 @@ async fn lane_refill_preserves_same_band_spillover_after_underfill() {
             .unwrap()
             .download_queue
             .len(),
-        9
+        16
     );
 
     let refill_compatibility = {
@@ -6074,7 +6074,7 @@ async fn lane_refill_preserves_same_band_spillover_after_underfill() {
     let response = response_rx.await.unwrap();
     let lease = response.lease.expect("shared spillover lane should refill");
     assert_eq!(lease.job_id, spillover_job_id);
-    assert_eq!(lease.works.len(), 8);
+    assert_eq!(lease.works.len(), 1);
     assert_eq!(pipeline.hot_dispatch_job, Some(hot_job_id));
     assert_eq!(pipeline.hot_dispatch_mode, DispatchShareMode::Shared);
     assert_eq!(pipeline.active_download_connections, 2);
@@ -6085,7 +6085,7 @@ async fn lane_refill_preserves_same_band_spillover_after_underfill() {
             .unwrap()
             .download_queue
             .len(),
-        1
+        15
     );
     assert_eq!(
         pipeline
@@ -6689,11 +6689,11 @@ async fn dispatch_downloads_keeps_capacity_on_hot_job_before_same_band_spillover
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 3);
-    assert_eq!(pipeline.active_download_connections, 1);
+    assert_eq!(pipeline.active_downloads, 2);
+    assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(
         pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
-        0
+        1
     );
     assert_eq!(
         pipeline
@@ -6704,7 +6704,7 @@ async fn dispatch_downloads_keeps_capacity_on_hot_job_before_same_band_spillover
             .len(),
         1
     );
-    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&3));
+    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&2));
     assert!(
         !pipeline
             .active_downloads_by_job
@@ -6960,7 +6960,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .unwrap()
             .download_queue
             .len(),
-        1
+        8
     );
     assert_eq!(
         pipeline
@@ -6993,7 +6993,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .unwrap()
             .download_queue
             .len(),
-        1
+        8
     );
     assert_eq!(
         pipeline
