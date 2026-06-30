@@ -57,6 +57,7 @@ use self::download::{
 /// Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
 const DOWNLOAD_RESTART_CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
+const DOWNLOAD_RESTART_MAX_DURABLE_LEAD_MULTIPLIER: u64 = 4;
 const STALLED_DOWNLOAD_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const STALLED_DOWNLOAD_IDLE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 pub(in crate::pipeline) const RAR_CAPACITY_RETRY_DELAY: Duration = Duration::from_millis(500);

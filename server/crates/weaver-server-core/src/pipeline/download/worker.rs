@@ -83,6 +83,72 @@ impl Pipeline {
         self.active_download_connections < self.normal_download_connection_capacity_limit(total)
     }
 
+    pub(crate) fn restart_durable_lead_limit_bytes() -> u64 {
+        download_restart_checkpoint_bytes()
+            .saturating_mul(DOWNLOAD_RESTART_MAX_DURABLE_LEAD_MULTIPLIER)
+    }
+
+    fn durable_download_floor_bytes_for_job(&self, job_id: JobId) -> u64 {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return 0;
+        };
+        let floor = state
+            .assembly
+            .files()
+            .map(|file| {
+                self.persisted_file_progress
+                    .get(&file.file_id())
+                    .copied()
+                    .unwrap_or(0)
+                    .min(file.total_bytes())
+            })
+            .sum::<u64>();
+        floor.max(state.restored_download_floor_bytes)
+    }
+
+    fn estimated_undurable_download_bytes_for_job(&self, job_id: JobId) -> u64 {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return 0;
+        };
+        let durable_floor = self.durable_download_floor_bytes_for_job(job_id);
+        let accepted_bytes = state.downloaded_bytes.saturating_sub(durable_floor);
+        let active_items = self
+            .active_downloads_by_job
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(
+                self.pending_released_download_results_by_job
+                    .get(&job_id)
+                    .copied()
+                    .unwrap_or(0),
+            )
+            .saturating_add(
+                self.active_decodes_by_job
+                    .get(&job_id)
+                    .copied()
+                    .unwrap_or(0),
+            );
+        accepted_bytes.saturating_add((active_items as u64).saturating_mul(1024 * 1024))
+    }
+
+    pub(crate) fn primary_download_within_restart_durable_lead(
+        &self,
+        job_id: JobId,
+        work: &DownloadWork,
+    ) -> bool {
+        if work.is_recovery {
+            return true;
+        }
+        let limit = Self::restart_durable_lead_limit_bytes();
+        if limit == 0 {
+            return true;
+        }
+        self.estimated_undurable_download_bytes_for_job(job_id)
+            .saturating_add(work.byte_estimate as u64)
+            <= limit
+    }
+
     fn normal_download_connection_capacity_limit(&self, effective_total: usize) -> usize {
         let params = self.tuner.params();
         let recovery_reserve = params
@@ -1134,6 +1200,14 @@ impl Pipeline {
         work: DownloadWork,
         stop_on_cap_block: bool,
     ) -> Result<Option<DownloadWork>, DispatchAttempt> {
+        if !self.primary_download_within_restart_durable_lead(job_id, &work) {
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                state.download_queue.push(work);
+            }
+            self.update_queue_metrics();
+            return Ok(None);
+        }
+
         let reservation_estimate = Self::bandwidth_reservation_estimate(work.byte_estimate);
         match self.reserve_bandwidth_for_dispatch(work.segment_id, reservation_estimate) {
             Ok(true) => Ok(Some(work)),

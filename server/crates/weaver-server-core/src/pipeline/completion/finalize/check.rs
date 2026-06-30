@@ -891,13 +891,6 @@ impl Pipeline {
     }
 
     fn emit_job_verification_started(&self, job_id: JobId) {
-        #[cfg(test)]
-        eprintln!(
-            "emit_job_verification_started job={} status={:?}\n{:?}",
-            job_id.0,
-            self.jobs.get(&job_id).map(|state| &state.status),
-            std::backtrace::Backtrace::force_capture()
-        );
         let _ = self
             .event_tx
             .send(PipelineEvent::JobVerificationStarted { job_id });
@@ -1648,10 +1641,11 @@ impl Pipeline {
             self.emit_download_pipeline_drained_if_pending(job_id);
         }
         let only_rar_archives = self.job_has_only_rar_archives(job_id);
+        let par2_primary_payload_ready = !has_incomplete_data_files || download_pipeline_exhausted;
         let par2_validation_needed = par2_loaded
             && !par2_bypassed
             && !self.par2_verified.contains(&job_id)
-            && download_pipeline_exhausted
+            && par2_primary_payload_ready
             && !self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id);
         let rar_waiting_for_missing_volumes = download_pipeline_exhausted
             && only_rar_archives
@@ -1673,7 +1667,11 @@ impl Pipeline {
             && (has_crc_failures
                 || (has_incomplete_data_files && download_pipeline_exhausted)
                 || rar_waiting_for_missing_volumes
-                || matches!(current_status, JobStatus::Repairing));
+                || matches!(current_status, JobStatus::Repairing)
+                || matches!(
+                    clean_par2_integrity_gate,
+                    CleanPar2IntegrityGate::WeakTransform | CleanPar2IntegrityGate::None
+                ));
         let quick_par2_verification_allowed = par2_validation_needed
             && !matches!(current_status, JobStatus::Repairing)
             && !(has_incomplete_data_files && download_pipeline_exhausted)

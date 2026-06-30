@@ -5348,6 +5348,73 @@ async fn dispatch_downloads_respects_hard_decode_byte_pressure() {
 }
 
 #[tokio::test]
+async fn dispatch_downloads_pauses_when_restart_durable_lead_is_too_large() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20003);
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let durable_lead_limit = Pipeline::restart_durable_lead_limit_bytes();
+    let segment_bytes = 1024 * 1024u32;
+    let segment_count = (durable_lead_limit / u64::from(segment_bytes) + 2) as u32;
+    let segments = (0..segment_count)
+        .map(|segment| {
+            segment_spec! {
+                number: segment,
+                bytes: segment_bytes,
+                message_id: format!("restart-lead-{segment}@example.com"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let spec = JobSpec {
+        name: "Restart Durable Lead".to_string(),
+        password: None,
+        total_bytes: u64::from(segment_count) * u64::from(segment_bytes),
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: "large.bin".to_string(),
+            role: FileRole::Standalone,
+            groups: vec!["alt.binaries.test".to_string()],
+            segments,
+        }],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes = durable_lead_limit;
+    let next_work = DownloadWork {
+        segment_id: SegmentId {
+            file_id,
+            segment_number: 0,
+        },
+        message_id: MessageId::new("restart-lead-0@example.com"),
+        groups: vec!["alt.binaries.test".to_string()],
+        priority: FileRole::Standalone.download_priority(),
+        byte_estimate: segment_bytes,
+        retry_count: 0,
+        is_recovery: false,
+        exclude_servers: vec![],
+    };
+
+    assert!(!pipeline.primary_download_within_restart_durable_lead(job_id, &next_work));
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        segment_count as usize
+    );
+
+    pipeline
+        .persisted_file_progress
+        .insert(file_id, durable_lead_limit);
+
+    assert!(pipeline.primary_download_within_restart_durable_lead(job_id, &next_work));
+}
+
+#[tokio::test]
 async fn dispatch_downloads_leaves_unpromoted_recovery_queue_parked_when_primary_queue_is_empty() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
@@ -13459,7 +13526,7 @@ async fn direct_payload_par2_repair_verifies_complete_corrupt_payload() {
     );
     assert_eq!(
         drain_job_verification_started(&mut verify_events, job_id),
-        2
+        1
     );
     assert_eq!(drain_job_repair_complete(&mut repair_events, job_id), 1);
     let output_dir = pipeline
@@ -13710,6 +13777,141 @@ async fn complete_payload_finalizes_while_optional_recovery_is_parked() {
         "Optional Recovery Completion Guard",
     ));
     assert!(output_dir.join(payload_filename).exists());
+}
+
+#[tokio::test]
+async fn complete_direct_payload_with_loaded_par2_does_not_finalize_with_parked_recovery() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let mut verify_events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30093);
+    let payload_filename = "payload.mkv";
+    let index_filename = "repair.par2";
+    let recovery_filename = "repair.vol00+01.par2";
+    let original_payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let mut damaged_payload = original_payload.clone();
+    for byte in &mut damaged_payload[64..128] {
+        *byte = 0;
+    }
+    let par2_bytes = build_test_par2_index(payload_filename, &original_payload, 64);
+    let spec = JobSpec {
+        name: "Loaded PAR2 Parked Recovery Guard".to_string(),
+        password: None,
+        total_bytes: (original_payload.len() + par2_bytes.len() + 64) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: "loaded-par2-payload-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: 64,
+                        message_id: "loaded-par2-payload-1@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::from_filename(index_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: par2_bytes.len() as u32,
+                    message_id: "loaded-par2-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: recovery_filename.to_string(),
+                role: FileRole::from_filename(recovery_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "loaded-par2-recovery@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    tokio::fs::write(working_dir.join(payload_filename), &damaged_payload)
+        .await
+        .unwrap();
+    {
+        let payload_file_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state
+            .assembly
+            .file_mut(payload_file_id)
+            .unwrap()
+            .commit_segment(0, 64)
+            .unwrap();
+        state
+            .assembly
+            .file_mut(payload_file_id)
+            .unwrap()
+            .commit_segment(1, 64)
+            .unwrap();
+        state.recovery_queue.push(DownloadWork {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 2,
+                },
+                segment_number: 0,
+            },
+            message_id: MessageId::new("loaded-par2-recovery@example.com"),
+            groups: vec!["alt.binaries.test".to_string()],
+            priority: 1000,
+            byte_estimate: 64,
+            retry_count: 0,
+            is_recovery: true,
+            exclude_servers: Vec::new(),
+        });
+    }
+    write_and_complete_file(&mut pipeline, job_id, 1, index_filename, &par2_bytes).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &original_payload, 64, 1),
+        &[
+            (1, index_filename, 0, false),
+            (2, recovery_filename, 1, false),
+        ],
+    );
+
+    pipeline.check_job_completion(job_id).await;
+    settle_inflight_moves(&mut pipeline).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Downloading)
+    );
+    assert_eq!(
+        drain_job_verification_started(&mut verify_events, job_id),
+        1
+    );
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert!(state.download_queue.has_recovery_work() || state.recovery_queue.has_recovery_work());
+    assert!(
+        !complete_dir
+            .join(crate::jobs::working_dir::sanitize_dirname(
+                "Loaded PAR2 Parked Recovery Guard",
+            ))
+            .exists()
+    );
 }
 
 #[tokio::test]
