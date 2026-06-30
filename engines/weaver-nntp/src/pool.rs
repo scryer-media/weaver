@@ -2,6 +2,7 @@ use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Semaphore};
@@ -42,6 +43,7 @@ pub struct NntpPool {
     /// Maximum connections per server (parallel to pools/configs).
     max_connections: Vec<usize>,
     retired_ips: Arc<Mutex<HashSet<(usize, IpAddr)>>>,
+    connect_cursors: Vec<AtomicUsize>,
 }
 
 /// Configuration for creating an NNTP pool.
@@ -83,10 +85,12 @@ impl NntpPool {
         let mut last_connect_failure = Vec::with_capacity(server_count);
         let mut groups = Vec::with_capacity(server_count);
         let mut max_connections = Vec::with_capacity(server_count);
+        let mut connect_cursors = Vec::with_capacity(server_count);
 
         for spc in &config.servers {
             groups.push(spc.group);
             max_connections.push(spc.max_connections);
+            connect_cursors.push(AtomicUsize::new(0));
             semaphores.push(Arc::new(Semaphore::new(spc.max_connections)));
             configs.push(spc.server.clone());
             pools.push(Arc::new(Mutex::new(ServerPool {
@@ -116,7 +120,34 @@ impl NntpPool {
             groups,
             max_connections,
             retired_ips: Arc::new(Mutex::new(HashSet::new())),
+            connect_cursors,
         }
+    }
+
+    fn next_connect_offset(&self, idx: usize) -> usize {
+        self.connect_cursors[idx].fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn retired_ips_for_server(&self, idx: usize) -> Vec<IpAddr> {
+        self.retired_ips
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(server_idx, ip)| (*server_idx == idx).then_some(*ip))
+            .collect()
+    }
+
+    async fn connect_server_excluding(
+        &self,
+        idx: usize,
+        excluded_ips: &[IpAddr],
+    ) -> Result<NntpConnection> {
+        let mut exclusions = self.retired_ips_for_server(idx).await;
+        exclusions.extend(excluded_ips.iter().copied());
+        exclusions.sort_unstable();
+        exclusions.dedup();
+        let offset = self.next_connect_offset(idx);
+        NntpConnection::connect_with_ip_policy(&self.configs[idx], &exclusions, offset).await
     }
 
     /// Acquire a connection from a specific server.
@@ -142,6 +173,15 @@ impl NntpPool {
 
     /// Acquire an explicit over-max connection from a specific server.
     pub async fn acquire_extra(&self, server: ServerId) -> Result<PooledConnection> {
+        self.acquire_extra_excluding(server, &[]).await
+    }
+
+    /// Acquire an explicit over-max connection, excluding specific remote IPs.
+    pub async fn acquire_extra_excluding(
+        &self,
+        server: ServerId,
+        excluded_ips: &[IpAddr],
+    ) -> Result<PooledConnection> {
         if self.shutdown.is_cancelled() {
             return Err(NntpError::PoolShutdown);
         }
@@ -151,7 +191,8 @@ impl NntpPool {
             return Err(NntpError::PoolExhausted);
         }
 
-        self.acquire_fresh_with_permit(idx, None).await
+        self.acquire_fresh_with_permit(idx, None, excluded_ips)
+            .await
     }
 
     /// Internal: acquire a connection using an already-obtained permit.
@@ -207,7 +248,7 @@ impl NntpPool {
                     }
 
                     debug!(server = idx, "creating new connection");
-                    match NntpConnection::connect(&self.configs[idx]).await {
+                    match self.connect_server_excluding(idx, &[]).await {
                         Ok(c) => {
                             // Clear the failure timestamp on success.
                             let mut last_failure = self.last_connect_failure[idx].lock().await;
@@ -235,6 +276,7 @@ impl NntpPool {
             pool: self.pools[idx].clone(),
             retired_ips: self.retired_ips.clone(),
             server_idx: idx,
+            return_to_pool: permit.is_some(),
             _permit: permit,
         })
     }
@@ -243,6 +285,7 @@ impl NntpPool {
         &self,
         idx: usize,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        excluded_ips: &[IpAddr],
     ) -> Result<PooledConnection> {
         {
             let last_failure = self.last_connect_failure[idx].lock().await;
@@ -257,7 +300,7 @@ impl NntpPool {
         }
 
         debug!(server = idx, "creating fresh over-max connection");
-        let conn = match NntpConnection::connect(&self.configs[idx]).await {
+        let conn = match self.connect_server_excluding(idx, excluded_ips).await {
             Ok(conn) => {
                 let mut last_failure = self.last_connect_failure[idx].lock().await;
                 *last_failure = None;
@@ -280,6 +323,7 @@ impl NntpPool {
             pool: self.pools[idx].clone(),
             retired_ips: self.retired_ips.clone(),
             server_idx: idx,
+            return_to_pool: permit.is_some(),
             _permit: permit,
         })
     }
@@ -471,6 +515,7 @@ pub struct PooledConnection {
     pool: Arc<Mutex<ServerPool>>,
     retired_ips: Arc<Mutex<HashSet<(usize, IpAddr)>>>,
     server_idx: usize,
+    return_to_pool: bool,
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -522,8 +567,9 @@ impl Drop for PooledConnection {
             let retired_ips = self.retired_ips.clone();
             let server_idx = self.server_idx;
             let poisoned = conn.is_poisoned();
+            let return_to_pool = self.return_to_pool;
 
-            if conn.is_healthy() {
+            if conn.is_healthy() && return_to_pool {
                 // tokio::spawn can fail during runtime shutdown; if so, the
                 // connection is simply dropped (permit released by _permit).
                 drop(tokio::spawn(async move {
@@ -542,7 +588,9 @@ impl Drop for PooledConnection {
                 drop(tokio::spawn(async move {
                     let mut pool = pool.lock().await;
                     pool.active_count = pool.active_count.saturating_sub(1);
-                    if poisoned {
+                    if conn.is_healthy() {
+                        trace!(server = server_idx, "dropped non-poolable connection");
+                    } else if poisoned {
                         trace!(server = server_idx, "dropped poisoned connection");
                     } else {
                         trace!(server = server_idx, "dropped unhealthy connection");

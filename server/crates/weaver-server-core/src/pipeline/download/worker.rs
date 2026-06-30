@@ -1544,9 +1544,11 @@ impl Pipeline {
         if self.ip_replacement_trial_extra_connections == 0 || self.ip_replacement_burst_active {
             return;
         }
+        let normal_download_capacity =
+            self.normal_download_connection_capacity_limit(configured_download_capacity);
         if pressure.suppresses_spillover()
             || configured_download_capacity == 0
-            || self.active_download_connections != configured_download_capacity
+            || self.active_download_connections != normal_download_capacity
             || self.active_recovery > 0
             || !self.job_has_dispatchable_work(hot_job_id)
         {
@@ -1595,7 +1597,10 @@ impl Pipeline {
 
         tokio::spawn(async move {
             let server = weaver_nntp::ServerId(candidate.old_key.server_idx);
-            match nntp.acquire_extra_body_lane(server, &groups).await {
+            match nntp
+                .acquire_extra_body_lane_excluding(server, &groups, &[candidate.old_key.ip])
+                .await
+            {
                 Ok(lane) => {
                     let candidate_ip = lane.remote_ip();
                     if candidate_ip == candidate.old_key.ip {
@@ -2402,17 +2407,91 @@ impl Pipeline {
                             }
                         }
                         DownloadLaneMode::PipelineDepth2 | DownloadLaneMode::PipelineDepth4 => {
-                            let mut traces = Vec::new();
+                            let rtt = lane.rtt_ewma();
+                            let tx_for_trace = tx.clone();
+                            let exclude_servers_for_trace = exclude_servers.clone();
                             let stats = if actual_mode == DownloadLaneMode::PipelineDepth4 {
-                                lane.fetch_decoded_pipeline_depth4(&message_ids, |idx, trace| {
-                                    traces.push((idx, trace));
-                                    async {}
+                                lane.fetch_decoded_pipeline_depth4(&message_ids, |idx, trace, meta| {
+                                    completed += 1;
+                                    let work = works_by_index[idx]
+                                        .take()
+                                        .expect("download lane result emitted once per work item");
+                                    let segment_id = work.segment_id;
+                                    let retry_count = work.retry_count;
+                                    let (data, attempts, source_server_idx) =
+                                        Self::download_data_from_decoded_trace(segment_id, trace);
+                                    let observation = DownloadLaneObservation {
+                                        server_idx: Some(server_idx),
+                                        mode: actual_mode,
+                                        supports_pipelining,
+                                        rtt,
+                                        batch_complete: meta.batch_complete,
+                                        batch_clean: meta.batch_clean,
+                                        batch_response_count: meta.batch_response_count,
+                                        unresolved_count: meta.unresolved_count,
+                                        connection_discarded: meta.connection_discarded,
+                                    };
+                                    let tx = tx_for_trace.clone();
+                                    let exclude_servers = exclude_servers_for_trace.clone();
+                                    async move {
+                                        let _ = tx
+                                            .send(DownloadResult {
+                                                segment_id,
+                                                data,
+                                                attempts,
+                                                lane_observation: Some(observation),
+                                                source_server_idx,
+                                                origin: DownloadResultOrigin::from_recovery(
+                                                    is_recovery,
+                                                ),
+                                                retry_count,
+                                                exclude_servers,
+                                                release_connection_slot: false,
+                                            })
+                                            .await;
+                                    }
                                 })
                                 .await
                             } else {
-                                lane.fetch_decoded_pipeline_depth2(&message_ids, |idx, trace| {
-                                    traces.push((idx, trace));
-                                    async {}
+                                lane.fetch_decoded_pipeline_depth2(&message_ids, |idx, trace, meta| {
+                                    completed += 1;
+                                    let work = works_by_index[idx]
+                                        .take()
+                                        .expect("download lane result emitted once per work item");
+                                    let segment_id = work.segment_id;
+                                    let retry_count = work.retry_count;
+                                    let (data, attempts, source_server_idx) =
+                                        Self::download_data_from_decoded_trace(segment_id, trace);
+                                    let observation = DownloadLaneObservation {
+                                        server_idx: Some(server_idx),
+                                        mode: actual_mode,
+                                        supports_pipelining,
+                                        rtt,
+                                        batch_complete: meta.batch_complete,
+                                        batch_clean: meta.batch_clean,
+                                        batch_response_count: meta.batch_response_count,
+                                        unresolved_count: meta.unresolved_count,
+                                        connection_discarded: meta.connection_discarded,
+                                    };
+                                    let tx = tx_for_trace.clone();
+                                    let exclude_servers = exclude_servers_for_trace.clone();
+                                    async move {
+                                        let _ = tx
+                                            .send(DownloadResult {
+                                                segment_id,
+                                                data,
+                                                attempts,
+                                                lane_observation: Some(observation),
+                                                source_server_idx,
+                                                origin: DownloadResultOrigin::from_recovery(
+                                                    is_recovery,
+                                                ),
+                                                retry_count,
+                                                exclude_servers,
+                                                release_connection_slot: false,
+                                            })
+                                            .await;
+                                    }
                                 })
                                 .await
                             };
@@ -2421,52 +2500,6 @@ impl Pipeline {
                                 && !stats.response_order_mismatch
                                 && stats.unresolved == 0;
                             batch_clean_for_refill &= batch_clean;
-                            let mut emitted = 0usize;
-                            let trace_count = traces.len();
-                            for (idx, trace) in traces {
-                                completed += 1;
-                                emitted += 1;
-                                let batch_complete = emitted == trace_count;
-                                let work = works_by_index[idx]
-                                    .take()
-                                    .expect("download lane result emitted once per work item");
-                                let segment_id = work.segment_id;
-                                let retry_count = work.retry_count;
-                                let (data, attempts, source_server_idx) =
-                                    Self::download_data_from_decoded_trace(segment_id, trace);
-                                let observation = DownloadLaneObservation {
-                                    server_idx: Some(server_idx),
-                                    mode: actual_mode,
-                                    supports_pipelining,
-                                    rtt: lane.rtt_ewma(),
-                                    batch_complete,
-                                    batch_clean,
-                                    batch_response_count: if batch_complete {
-                                        stats.completed as u64
-                                    } else {
-                                        0
-                                    },
-                                    unresolved_count: if batch_complete {
-                                        stats.unresolved as u64
-                                    } else {
-                                        0
-                                    },
-                                    connection_discarded: stats.connection_discarded,
-                                };
-                                let _ = tx
-                                    .send(DownloadResult {
-                                        segment_id,
-                                        data,
-                                        attempts,
-                                        lane_observation: Some(observation),
-                                        source_server_idx,
-                                        origin: DownloadResultOrigin::from_recovery(is_recovery),
-                                        retry_count,
-                                        exclude_servers: exclude_servers.clone(),
-                                        release_connection_slot: false,
-                                    })
-                                    .await;
-                            }
                         }
                     }
 
@@ -2607,6 +2640,18 @@ impl Pipeline {
                 candidate_ip,
                 lane,
             } => {
+                if self.ip_replacement_trial_extra_connections == 0
+                    || !self.ip_replacement_burst_active
+                {
+                    tokio::spawn(async move {
+                        lane.discard().await;
+                    });
+                    self.metrics.note_ip_replacement_trial_rejected();
+                    self.ip_replacement_burst_active = false;
+                    self.metrics.set_ip_replacement_burst_active(false);
+                    return;
+                }
+
                 let lease = match self
                     .try_lease_ip_replacement_trial_batch(job_id, candidate.old_key.server_idx)
                 {
@@ -2646,6 +2691,11 @@ impl Pipeline {
                 self.metrics.set_ip_replacement_burst_active(false);
             }
             IpReplacementTrialEvent::CandidateAccepted { old_key, samples } => {
+                if self.ip_replacement_trial_extra_connections == 0
+                    || !self.ip_replacement_burst_active
+                {
+                    return;
+                }
                 self.ip_replacement_retired_ips.insert(old_key);
                 self.observe_ip_rtt_attempts(&samples);
             }

@@ -32,6 +32,17 @@ pub(crate) struct RarExtractionOpenRequest<'a> {
     pub(crate) already_extracted: Option<&'a std::collections::HashSet<String>>,
 }
 
+pub(crate) struct RarArchiveSnapshotOpenRequest<'a> {
+    pub(crate) set_name: &'a str,
+    pub(crate) volume_paths: std::collections::BTreeMap<u32, PathBuf>,
+    pub(crate) password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
+    pub(crate) cached_headers: Option<Vec<u8>>,
+    pub(crate) shared_kdf_cache: std::sync::Arc<weaver_unrar::crypto::KdfCache>,
+    pub(crate) open_mode: RarArchiveOpenMode,
+    pub(crate) requested_members: Option<&'a [String]>,
+    pub(crate) already_extracted: Option<&'a std::collections::HashSet<String>>,
+}
+
 struct RarArchiveOpenInputs<'a> {
     set_name: &'a str,
     volume_paths: &'a std::collections::BTreeMap<u32, PathBuf>,
@@ -497,15 +508,18 @@ impl Pipeline {
     }
 
     pub(crate) fn open_rar_archive_from_snapshot_or_disk(
-        set_name: &str,
-        volume_paths: std::collections::BTreeMap<u32, PathBuf>,
-        password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
-        cached_headers: Option<Vec<u8>>,
-        shared_kdf_cache: std::sync::Arc<weaver_unrar::crypto::KdfCache>,
-        open_mode: RarArchiveOpenMode,
-        requested_members: Option<&[String]>,
-        already_extracted: Option<&std::collections::HashSet<String>>,
+        request: RarArchiveSnapshotOpenRequest<'_>,
     ) -> Result<crate::pipeline::ArchivePasswordSelection<weaver_unrar::RarArchive>, String> {
+        let RarArchiveSnapshotOpenRequest {
+            set_name,
+            volume_paths,
+            password_candidates,
+            cached_headers,
+            shared_kdf_cache,
+            open_mode,
+            requested_members,
+            already_extracted,
+        } = request;
         let context = format!("failed to open RAR archive for set '{set_name}'");
         let inputs = RarArchiveOpenInputs {
             set_name,
@@ -540,16 +554,17 @@ impl Pipeline {
         } = request;
 
         if password_candidates.len() <= 1 {
-            let selection = Self::open_rar_archive_from_snapshot_or_disk(
-                set_name,
-                volume_paths,
-                password_candidates,
-                cached_headers,
-                shared_kdf_cache,
-                open_mode,
-                Some(requested_members),
-                already_extracted,
-            )?;
+            let selection =
+                Self::open_rar_archive_from_snapshot_or_disk(RarArchiveSnapshotOpenRequest {
+                    set_name,
+                    volume_paths,
+                    password_candidates,
+                    cached_headers,
+                    shared_kdf_cache,
+                    open_mode,
+                    requested_members: Some(requested_members),
+                    already_extracted,
+                })?;
             return Ok(RarExtractionOpenSelection {
                 archive: selection.value,
                 password: selection.selected_password,
@@ -1363,18 +1378,19 @@ mod tests {
             .collect::<std::collections::BTreeMap<_, _>>();
 
         let requested = vec!["big.bin".to_string()];
-        let mut archive = Pipeline::open_rar_archive_from_snapshot_or_disk(
-            "solid",
-            volume_paths.clone(),
-            Vec::new(),
-            Some(cached_headers),
-            std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
-            RarArchiveOpenMode::AttachOnly,
-            Some(&requested),
-            None,
-        )
-        .unwrap()
-        .value;
+        let mut archive =
+            Pipeline::open_rar_archive_from_snapshot_or_disk(RarArchiveSnapshotOpenRequest {
+                set_name: "solid",
+                volume_paths: volume_paths.clone(),
+                password_candidates: Vec::new(),
+                cached_headers: Some(cached_headers),
+                shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+                open_mode: RarArchiveOpenMode::AttachOnly,
+                requested_members: Some(&requested),
+                already_extracted: None,
+            })
+            .unwrap()
+            .value;
         assert!(archive.is_solid());
 
         let output_dir = temp.path().join("out");

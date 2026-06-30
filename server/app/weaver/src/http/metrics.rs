@@ -897,10 +897,6 @@ pub(super) fn render_prometheus_metrics(
             "same_ip_rejected",
             snapshot.ip_replacement_trials_same_ip_rejected_total,
         ),
-        (
-            "old_retired",
-            snapshot.ip_replacement_old_connections_retired_total,
-        ),
     ] {
         append_labeled_metric(
             &mut out,
@@ -909,6 +905,13 @@ pub(super) fn render_prometheus_metrics(
             value,
         );
     }
+    out.push_str("# HELP weaver_ip_replacement_old_connections_retired_total Old-IP connections retired after accepted replacement trials.\\n");
+    out.push_str("# TYPE weaver_ip_replacement_old_connections_retired_total counter\\n");
+    append_metric(
+        &mut out,
+        "weaver_ip_replacement_old_connections_retired_total",
+        snapshot.ip_replacement_old_connections_retired_total,
+    );
 
     out.push_str("# HELP weaver_pipeline_download_observed_limiter Observed downloader limiter derived from pressure, queue, and server permits.\n");
     out.push_str("# TYPE weaver_pipeline_download_observed_limiter gauge\n");

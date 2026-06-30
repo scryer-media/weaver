@@ -622,6 +622,12 @@ impl Pipeline {
                                 snapshot.hot_dispatch_recent_expansion_improvement_pct,
                             hot_dispatch_best_mode_block_reason =
                                 snapshot.hot_dispatch_best_mode_block_reason,
+                            hot_dispatch_last_expansion_kind =
+                                snapshot.hot_dispatch_last_expansion_kind,
+                            hot_dispatch_last_expansion_before_bps =
+                                snapshot.hot_dispatch_last_expansion_before_bps,
+                            hot_dispatch_last_expansion_after_bps =
+                                snapshot.hot_dispatch_last_expansion_after_bps,
                             hot_dispatch_last_spillover_decision = snapshot
                                 .hot_dispatch_last_spillover_decision
                                 .as_str(),

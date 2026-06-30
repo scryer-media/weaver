@@ -635,14 +635,16 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
     let output_dir_without_refresh = temp_dir.path().join("without-refresh");
     std::fs::create_dir_all(&output_dir_without_refresh).unwrap();
     let mut archive_without_refresh = Pipeline::open_rar_archive_from_snapshot_or_disk(
-        "show",
-        volume_paths.clone(),
-        Vec::new(),
-        Some(stale_headers.clone()),
-        std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
-        crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
-        None,
-        None,
+        crate::pipeline::extraction::RarArchiveSnapshotOpenRequest {
+            set_name: "show",
+            volume_paths: volume_paths.clone(),
+            password_candidates: Vec::new(),
+            cached_headers: Some(stale_headers.clone()),
+            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
+            requested_members: None,
+            already_extracted: None,
+        },
     )
     .unwrap()
     .value;
@@ -673,14 +675,16 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
     let output_dir_with_refresh = temp_dir.path().join("with-refresh");
     std::fs::create_dir_all(&output_dir_with_refresh).unwrap();
     let mut archive_with_refresh = Pipeline::open_rar_archive_from_snapshot_or_disk(
-        "show",
-        volume_paths.clone(),
-        Vec::new(),
-        Some(stale_headers),
-        std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
-        crate::pipeline::extraction::RarArchiveOpenMode::RefreshProvidedVolumes,
-        None,
-        None,
+        crate::pipeline::extraction::RarArchiveSnapshotOpenRequest {
+            set_name: "show",
+            volume_paths: volume_paths.clone(),
+            password_candidates: Vec::new(),
+            cached_headers: Some(stale_headers),
+            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            open_mode: crate::pipeline::extraction::RarArchiveOpenMode::RefreshProvidedVolumes,
+            requested_members: None,
+            already_extracted: None,
+        },
     )
     .unwrap()
     .value;
@@ -2741,6 +2745,81 @@ async fn idle_rar_worker_drain_recomputes_and_clears_obsolete_post_refresh() {
         ),
         "obsolete post-extraction refresh should be cleared after idle recompute"
     );
+}
+
+#[tokio::test]
+async fn idle_rar_worker_drain_keeps_extracting_when_coverage_refresh_launches() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40130);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Idle Drain Coverage Refresh", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+    resume_job_downloading_for_test(&mut pipeline, job_id);
+
+    let key = (job_id, "show".to_string());
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&key)
+            .expect("RAR set should exist");
+        set_state.active_workers = 1;
+        set_state.in_flight_members = ["E01.mkv".to_string()].into_iter().collect();
+        set_state.extraction_generation = 11;
+        set_state.phase = crate::pipeline::archive::rar_state::RarSetPhase::Extracting;
+    }
+    let queued = RarRefreshRequest {
+        target_completed_volume: 3,
+        reason: RefreshReason::CoverageExpansion,
+    };
+    pipeline.rar_refresh_state.insert(
+        key.clone(),
+        RarRefreshState {
+            in_flight: None,
+            queued: Some(queued),
+            latest_completed_volume: 3,
+            refreshed_volumes: BTreeSet::from([0, 1, 2, 3]),
+            structure_dirty: false,
+            last_error: None,
+        },
+    );
+
+    pipeline
+        .handle_extraction_done(ExtractionDone::Batch {
+            job_id,
+            set_name: "show".to_string(),
+            attempted: vec!["E01.mkv".to_string()],
+            result: Ok(BatchExtractionOutcome {
+                extracted: vec!["E01.mkv".to_string()],
+                failed: Vec::new(),
+                selected_password: None,
+            }),
+        })
+        .await;
+
+    let set_state = pipeline.rar_sets.get(&key).expect("RAR set should remain");
+    assert_eq!(set_state.extraction_generation, 12);
+    assert_eq!(set_state.active_workers, 1);
+    assert!(set_state.in_flight_members.contains("E02.mkv"));
+    assert!(!set_state.in_flight_members.contains("E01.mkv"));
+    let refresh = pipeline
+        .rar_refresh_state
+        .get(&key)
+        .expect("refresh state should remain");
+    assert!(matches!(
+        refresh.in_flight,
+        Some(RarRefreshRequest {
+            reason: RefreshReason::CoverageExpansion,
+            ..
+        })
+    ));
+    assert!(refresh.queued.is_none());
 }
 
 #[tokio::test]
@@ -6374,6 +6453,7 @@ async fn accepted_ip_replacement_trial_samples_update_per_ip_ewma() {
     };
 
     pipeline.ip_replacement_trial_extra_connections = 1;
+    pipeline.ip_replacement_burst_active = true;
     pipeline.handle_ip_replacement_trial_event(IpReplacementTrialEvent::CandidateAccepted {
         old_key,
         samples: vec![weaver_nntp::client::FetchAttemptTrace {
@@ -6409,6 +6489,44 @@ async fn accepted_ip_replacement_trial_samples_update_per_ip_ewma() {
 }
 
 #[tokio::test]
+async fn disabled_ip_replacement_ignores_late_candidate_acceptance() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let candidate_ip = "203.0.113.42".parse().unwrap();
+    let old_key = ServerIpKey {
+        server_idx: 0,
+        ip: "203.0.113.7".parse().unwrap(),
+    };
+
+    pipeline.ip_replacement_trial_extra_connections = 0;
+    pipeline.ip_replacement_burst_active = false;
+    pipeline.handle_ip_replacement_trial_event(IpReplacementTrialEvent::CandidateAccepted {
+        old_key,
+        samples: vec![weaver_nntp::client::FetchAttemptTrace {
+            server_idx: 0,
+            remote_ip: Some(candidate_ip),
+            elapsed: Duration::from_millis(25),
+            outcome: weaver_nntp::client::FetchAttemptOutcome::Success,
+            error: None,
+        }],
+    });
+
+    assert!(pipeline.ip_replacement_retired_ips.is_empty());
+    assert!(pipeline.ip_rtt_ewma.is_empty());
+    assert_eq!(
+        pipeline.metrics.ip_rtt_ewma_entries.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .ip_rtt_ewma_slowest_ms
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
 async fn retired_ip_replacement_lane_parks_at_refill_boundary() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -6437,6 +6555,92 @@ async fn retired_ip_replacement_lane_parks_at_refill_boundary() {
     let response = response_rx.await.unwrap();
     assert!(response.lease.is_none());
     assert_eq!(response.park_reason, LaneParkReason::IpReplacementRetired);
+}
+
+#[tokio::test]
+async fn ip_replacement_trial_starts_when_recovery_reserve_leaves_normal_capacity_full() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let configured_download_capacity = 4;
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: configured_download_capacity,
+            medium_count: 1,
+            large_count: 1,
+        },
+        configured_download_capacity,
+    )
+    .await;
+    pipeline.connection_ramp = configured_download_capacity;
+    pipeline.ip_replacement_trial_extra_connections = 1;
+
+    let mut snapshot = pipeline.metrics.raw_snapshot();
+    snapshot.current_download_speed = 200 * 1024 * 1024;
+    assert!(pipeline.tuner.adjust(&snapshot));
+    let params = pipeline.tuner.params();
+    let normal_download_capacity = configured_download_capacity
+        .saturating_sub(params.recovery_slots.min(configured_download_capacity));
+    assert!(normal_download_capacity > 0);
+    assert!(normal_download_capacity < configured_download_capacity);
+
+    let job_id = JobId(21005);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec(
+            "IP Replacement Hot Job",
+            "ip-replacement.bin",
+            &[512, 512, 512, 512],
+        ),
+    )
+    .await;
+
+    let now = Instant::now();
+    let slow_key = ServerIpKey {
+        server_idx: 0,
+        ip: "203.0.113.7".parse().unwrap(),
+    };
+    let baseline_key = ServerIpKey {
+        server_idx: 0,
+        ip: "203.0.113.8".parse().unwrap(),
+    };
+    pipeline.ip_rtt_ewma.insert(
+        slow_key,
+        IpRttEwma {
+            ewma_ms: 250.0,
+            samples: 16,
+            first_seen: now - Duration::from_secs(31),
+            last_seen: now,
+        },
+    );
+    pipeline.ip_rtt_ewma.insert(
+        baseline_key,
+        IpRttEwma {
+            ewma_ms: 100.0,
+            samples: 8,
+            first_seen: now - Duration::from_secs(31),
+            last_seen: now,
+        },
+    );
+
+    pipeline.active_download_connections = normal_download_capacity;
+    pipeline.dispatch_downloads();
+
+    assert!(pipeline.ip_replacement_burst_active);
+    assert_eq!(
+        pipeline
+            .metrics
+            .ip_replacement_trials_started_total
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .ip_replacement_trials_blocked_total
+            .load(Ordering::Relaxed),
+        0
+    );
 }
 
 #[tokio::test]

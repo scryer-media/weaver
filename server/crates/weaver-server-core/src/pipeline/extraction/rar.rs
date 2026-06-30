@@ -14,4 +14,7 @@ mod source;
 pub(crate) use member::{RarArchiveOpenMode, RarExtractionContext, RarExtractionOpenRequest};
 
 #[cfg(test)]
+pub(crate) use member::RarArchiveSnapshotOpenRequest;
+
+#[cfg(test)]
 mod tests;

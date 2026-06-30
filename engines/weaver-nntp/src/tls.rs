@@ -1,11 +1,11 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, lookup_host};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
@@ -141,6 +141,63 @@ fn set_keepalive(tcp: &TcpStream) {
     let _ = sock_ref.set_tcp_keepalive(&ka);
 }
 
+async fn resolve_connect_addrs(
+    host: &str,
+    port: u16,
+    excluded_ips: &[IpAddr],
+    address_offset: usize,
+) -> Result<Vec<SocketAddr>, NntpError> {
+    let addrs: Vec<SocketAddr> = lookup_host((host, port)).await?.collect();
+    filter_and_rotate_addrs(addrs, excluded_ips, address_offset).map_err(|_| {
+        NntpError::Io(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("no resolved addresses for {host}:{port} after IP exclusions"),
+        ))
+    })
+}
+
+fn filter_and_rotate_addrs(
+    mut addrs: Vec<SocketAddr>,
+    excluded_ips: &[IpAddr],
+    address_offset: usize,
+) -> std::result::Result<Vec<SocketAddr>, ()> {
+    addrs.retain(|addr| !excluded_ips.contains(&addr.ip()));
+
+    if addrs.is_empty() {
+        return Err(());
+    }
+
+    let offset = address_offset % addrs.len();
+    addrs.rotate_left(offset);
+    Ok(addrs)
+}
+
+async fn connect_tcp_from_resolved(
+    addrs: &[SocketAddr],
+) -> Result<(TcpStream, SocketAddr), NntpError> {
+    let mut last_error = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(tcp) => {
+                let remote_addr = tcp.peer_addr()?;
+                tcp.set_nodelay(true)?;
+                set_keepalive(&tcp);
+                return Ok((tcp, remote_addr));
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(NntpError::Io(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "no resolved addresses",
+        )
+    })))
+}
+
 /// Connect to a host with implicit TLS (e.g. port 563).
 ///
 /// Performs TCP connect followed by an immediate TLS handshake.
@@ -151,11 +208,18 @@ pub async fn connect_tls(
     port: u16,
     ca_cert_path: Option<&Path>,
 ) -> Result<NntpTransport, NntpError> {
-    let addr = format!("{host}:{port}");
-    let tcp = TcpStream::connect(&addr).await?;
-    let remote_addr = tcp.peer_addr()?;
-    tcp.set_nodelay(true)?;
-    set_keepalive(&tcp);
+    connect_tls_with_ip_policy(host, port, ca_cert_path, &[], 0).await
+}
+
+pub async fn connect_tls_with_ip_policy(
+    host: &str,
+    port: u16,
+    ca_cert_path: Option<&Path>,
+    excluded_ips: &[IpAddr],
+    address_offset: usize,
+) -> Result<NntpTransport, NntpError> {
+    let addrs = resolve_connect_addrs(host, port, excluded_ips, address_offset).await?;
+    let (tcp, remote_addr) = connect_tcp_from_resolved(&addrs).await?;
     let tls_config = build_tls_config(ca_cert_path)?;
     let connector = TlsConnector::from(tls_config);
     let server_name = make_server_name(host)?;
@@ -168,11 +232,17 @@ pub async fn connect_tls(
 
 /// Connect to a host with plain TCP (e.g. port 119).
 pub async fn connect_plain(host: &str, port: u16) -> Result<NntpTransport, NntpError> {
-    let addr = format!("{host}:{port}");
-    let tcp = TcpStream::connect(&addr).await?;
-    let remote_addr = tcp.peer_addr()?;
-    tcp.set_nodelay(true)?;
-    set_keepalive(&tcp);
+    connect_plain_with_ip_policy(host, port, &[], 0).await
+}
+
+pub async fn connect_plain_with_ip_policy(
+    host: &str,
+    port: u16,
+    excluded_ips: &[IpAddr],
+    address_offset: usize,
+) -> Result<NntpTransport, NntpError> {
+    let addrs = resolve_connect_addrs(host, port, excluded_ips, address_offset).await?;
+    let (tcp, remote_addr) = connect_tcp_from_resolved(&addrs).await?;
     Ok(NntpTransport::Plain {
         inner: tcp,
         remote_addr,
@@ -211,6 +281,25 @@ pub async fn upgrade_starttls(
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn filter_and_rotate_addrs_excludes_ips_before_rotation() {
+        let a: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let b: SocketAddr = "127.0.0.2:443".parse().unwrap();
+        let c: SocketAddr = "127.0.0.3:443".parse().unwrap();
+
+        let ordered =
+            filter_and_rotate_addrs(vec![a, b, c], &[a.ip()], 1).expect("alternate addresses");
+
+        assert_eq!(ordered, vec![c, b]);
+    }
+
+    #[test]
+    fn filter_and_rotate_addrs_errors_when_all_ips_excluded() {
+        let a: SocketAddr = "127.0.0.1:443".parse().unwrap();
+
+        assert!(filter_and_rotate_addrs(vec![a], &[a.ip()], 0).is_err());
+    }
 
     #[tokio::test]
     async fn tcp_keepalive_is_configured() {

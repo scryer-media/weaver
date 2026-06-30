@@ -132,6 +132,15 @@ pub struct BodyLaneBatchStats {
     pub elapsed: Duration,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BodyLaneTraceMeta {
+    pub batch_complete: bool,
+    pub batch_clean: bool,
+    pub batch_response_count: u64,
+    pub unresolved_count: u64,
+    pub connection_discarded: bool,
+}
+
 pub struct BodyLaneLease {
     client: NntpClient,
     server_id: ServerId,
@@ -210,7 +219,7 @@ impl BodyLaneLease {
         on_trace: F,
     ) -> BodyLaneBatchStats
     where
-        F: FnMut(usize, DecodedBodyTrace) -> Fut,
+        F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
         Fut: Future<Output = ()>,
     {
         self.mode = BodyLaneMode::PipelineDepth2;
@@ -223,7 +232,7 @@ impl BodyLaneLease {
         on_trace: F,
     ) -> BodyLaneBatchStats
     where
-        F: FnMut(usize, DecodedBodyTrace) -> Fut,
+        F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
         Fut: Future<Output = ()>,
     {
         self.mode = BodyLaneMode::PipelineDepth4;
@@ -237,7 +246,7 @@ impl BodyLaneLease {
         mut on_trace: F,
     ) -> BodyLaneBatchStats
     where
-        F: FnMut(usize, DecodedBodyTrace) -> Fut,
+        F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
         Fut: Future<Output = ()>,
     {
         let requested = message_ids.len().min(max_depth);
@@ -276,6 +285,7 @@ impl BodyLaneLease {
             }
             let make_error = NntpClient::batch_setup_error_factory(&error);
             for (idx, message_id) in message_ids.iter().take(requested).enumerate() {
+                let is_last = idx + 1 == requested;
                 let trace = self
                     .trace_item(
                         message_id,
@@ -286,13 +296,25 @@ impl BodyLaneLease {
                     )
                     .await;
                 stats.completed += 1;
-                on_trace(idx, trace).await;
+                on_trace(
+                    idx,
+                    trace,
+                    BodyLaneTraceMeta {
+                        batch_complete: is_last,
+                        batch_clean: false,
+                        batch_response_count: if is_last { stats.completed as u64 } else { 0 },
+                        unresolved_count: if is_last { 0 } else { 0 },
+                        connection_discarded: stats.connection_discarded,
+                    },
+                )
+                .await;
             }
             stats.elapsed = batch_started.elapsed();
             return stats;
         }
 
         let mut closed_early = false;
+        let mut batch_clean_so_far = true;
         for (response_idx, message_id) in message_ids.iter().take(requested).enumerate() {
             let item_started = Instant::now();
             let item_deadline = TokioInstant::now() + self.client.soft_timeout;
@@ -322,13 +344,36 @@ impl BodyLaneLease {
                 .trace_item(message_id, DecodedBatchItem { elapsed, result })
                 .await;
             stats.completed += 1;
-            on_trace(response_idx, trace).await;
+            batch_clean_so_far &= trace.result.is_ok();
 
             if poisoned {
                 stats.connection_discarded = true;
                 self.discard_current().await;
                 closed_early = true;
             }
+
+            let terminal_unresolved = if closed_early {
+                requested.saturating_sub(response_idx + 1)
+            } else {
+                0
+            };
+            let is_batch_complete = closed_early || response_idx + 1 == requested;
+            let meta = BodyLaneTraceMeta {
+                batch_complete: is_batch_complete,
+                batch_clean: batch_clean_so_far && !closed_early,
+                batch_response_count: if is_batch_complete {
+                    stats.completed as u64
+                } else {
+                    0
+                },
+                unresolved_count: if is_batch_complete {
+                    terminal_unresolved as u64
+                } else {
+                    0
+                },
+                connection_discarded: stats.connection_discarded,
+            };
+            on_trace(response_idx, trace, meta).await;
 
             if closed_early {
                 for (unread_idx, unread_message_id) in message_ids
@@ -348,7 +393,18 @@ impl BodyLaneLease {
                         .await;
                     stats.completed += 1;
                     stats.unresolved += 1;
-                    on_trace(unread_idx, trace).await;
+                    on_trace(
+                        unread_idx,
+                        trace,
+                        BodyLaneTraceMeta {
+                            batch_complete: false,
+                            batch_clean: false,
+                            batch_response_count: 0,
+                            unresolved_count: 0,
+                            connection_discarded: true,
+                        },
+                    )
+                    .await;
                 }
                 break;
             }
@@ -504,7 +560,8 @@ impl NntpClient {
         server: ServerId,
         groups: &[String],
     ) -> Result<BodyLaneLease> {
-        self.acquire_body_lane_inner(server, groups, false).await
+        self.acquire_body_lane_inner(server, groups, false, &[])
+            .await
     }
 
     pub async fn acquire_extra_body_lane(
@@ -512,7 +569,18 @@ impl NntpClient {
         server: ServerId,
         groups: &[String],
     ) -> Result<BodyLaneLease> {
-        self.acquire_body_lane_inner(server, groups, true).await
+        self.acquire_body_lane_inner(server, groups, true, &[])
+            .await
+    }
+
+    pub async fn acquire_extra_body_lane_excluding(
+        &self,
+        server: ServerId,
+        groups: &[String],
+        excluded_ips: &[IpAddr],
+    ) -> Result<BodyLaneLease> {
+        self.acquire_body_lane_inner(server, groups, true, excluded_ips)
+            .await
     }
 
     async fn acquire_body_lane_inner(
@@ -520,10 +588,16 @@ impl NntpClient {
         server: ServerId,
         groups: &[String],
         extra: bool,
+        excluded_ips: &[IpAddr],
     ) -> Result<BodyLaneLease> {
         let deadline = TokioInstant::now() + self.soft_timeout;
         let mut conn = if extra {
-            match tokio::time::timeout_at(deadline, self.pool.acquire_extra(server)).await {
+            match tokio::time::timeout_at(
+                deadline,
+                self.pool.acquire_extra_excluding(server, excluded_ips),
+            )
+            .await
+            {
                 Ok(result) => result?,
                 Err(_) => return Err(self.soft_timeout_error()),
             }
@@ -2927,6 +3001,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extra_body_lane_excluding_only_ip_fails_before_group_selection() {
+        let port = spawn_scripted_server(vec![]).await;
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_server(port, 0)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        let result = client
+            .acquire_extra_body_lane_excluding(
+                ServerId(0),
+                &[String::from("alt.binaries.test")],
+                &["127.0.0.1".parse().unwrap()],
+            )
+            .await;
+
+        assert!(result.is_err(), "excluded only IP should not connect");
+    }
+
+    #[tokio::test]
     async fn extra_body_lane_uses_fresh_connection_instead_of_idle_pool() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2979,6 +3075,63 @@ mod tests {
             accepted.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "extra BODY lane must create a fresh connection instead of reusing idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn parked_extra_body_lane_is_not_returned_to_normal_idle_pool() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_task = accepted.clone();
+
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                accepted_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                socket.write_all(b"200 ready\r\n").await.unwrap();
+                socket.flush().await.unwrap();
+                let line = read_command_line(&mut socket).await;
+                assert!(line.starts_with("CAPABILITIES"));
+                socket
+                    .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+                let line = read_command_line(&mut socket).await;
+                assert!(line.starts_with("GROUP "));
+                socket
+                    .write_all(b"211 1 1 1 alt.binaries.test\r\n")
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+            }
+        });
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_server(port, 0)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        let extra = client
+            .acquire_extra_body_lane(ServerId(0), &[String::from("alt.binaries.test")])
+            .await
+            .expect("extra BODY lane should acquire");
+        extra.park();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let normal = client
+            .acquire_body_lane(ServerId(0), &[String::from("alt.binaries.test")])
+            .await
+            .expect("normal BODY lane should not reuse parked extra connection");
+        normal.discard().await;
+
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "parked over-max BODY lane must close instead of entering normal idle pool"
         );
     }
 

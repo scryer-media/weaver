@@ -15,7 +15,7 @@ struct ReadyRarExtraction {
 enum RarExtractionSettle {
     Idle,
     ActiveWorkersRemain,
-    RefreshLaunched,
+    RefreshLaunched { allows_extraction: bool },
 }
 
 impl Pipeline {
@@ -910,8 +910,9 @@ impl Pipeline {
             self.try_delete_volumes(job_id, set_name);
         }
         if let Some(request) = follow_up {
+            let allows_extraction = request.reason == RefreshReason::CoverageExpansion;
             self.spawn_rar_refresh(job_id, set_name.to_string(), request);
-            RarExtractionSettle::RefreshLaunched
+            RarExtractionSettle::RefreshLaunched { allows_extraction }
         } else {
             RarExtractionSettle::Idle
         }
@@ -1134,7 +1135,14 @@ impl Pipeline {
                         RarExtractionSettle::ActiveWorkersRemain => {
                             self.try_rar_extraction(job_id).await;
                         }
-                        RarExtractionSettle::RefreshLaunched => {}
+                        RarExtractionSettle::RefreshLaunched {
+                            allows_extraction: true,
+                        } => {
+                            self.try_rar_extraction(job_id).await;
+                        }
+                        RarExtractionSettle::RefreshLaunched {
+                            allows_extraction: false,
+                        } => {}
                         RarExtractionSettle::Idle if all_downloaded => {
                             self.check_job_completion(job_id).await;
                         }
@@ -1277,7 +1285,14 @@ impl Pipeline {
                         RarExtractionSettle::ActiveWorkersRemain => {
                             self.try_rar_extraction(job_id).await;
                         }
-                        RarExtractionSettle::RefreshLaunched => {}
+                        RarExtractionSettle::RefreshLaunched {
+                            allows_extraction: true,
+                        } => {
+                            self.try_rar_extraction(job_id).await;
+                        }
+                        RarExtractionSettle::RefreshLaunched {
+                            allows_extraction: false,
+                        } => {}
                     }
                 }
                 Err(e) => {

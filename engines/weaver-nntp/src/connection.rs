@@ -137,10 +137,19 @@ pub struct NntpConnection {
 impl NntpConnection {
     /// Connect to an NNTP server, perform TLS negotiation and authentication.
     pub async fn connect(config: &ServerConfig) -> Result<Self> {
+        Self::connect_with_ip_policy(config, &[], 0).await
+    }
+
+    pub(crate) async fn connect_with_ip_policy(
+        config: &ServerConfig,
+        excluded_ips: &[IpAddr],
+        address_offset: usize,
+    ) -> Result<Self> {
         let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT);
-        let result =
-            tokio::time::timeout(connect_timeout, async { Self::connect_inner(config).await })
-                .await;
+        let result = tokio::time::timeout(connect_timeout, async {
+            Self::connect_inner(config, excluded_ips, address_offset).await
+        })
+        .await;
 
         match result {
             Ok(inner) => inner,
@@ -148,15 +157,31 @@ impl NntpConnection {
         }
     }
 
-    async fn connect_inner(config: &ServerConfig) -> Result<Self> {
+    async fn connect_inner(
+        config: &ServerConfig,
+        excluded_ips: &[IpAddr],
+        address_offset: usize,
+    ) -> Result<Self> {
         debug!(host = %config.host, port = config.port, tls = config.tls, "connecting to NNTP server");
 
         // 1. Establish transport
         let transport = if config.tls {
-            crate::tls::connect_tls(&config.host, config.port, config.tls_ca_cert.as_deref())
-                .await?
+            crate::tls::connect_tls_with_ip_policy(
+                &config.host,
+                config.port,
+                config.tls_ca_cert.as_deref(),
+                excluded_ips,
+                address_offset,
+            )
+            .await?
         } else {
-            crate::tls::connect_plain(&config.host, config.port).await?
+            crate::tls::connect_plain_with_ip_policy(
+                &config.host,
+                config.port,
+                excluded_ips,
+                address_offset,
+            )
+            .await?
         };
 
         let now = Instant::now();

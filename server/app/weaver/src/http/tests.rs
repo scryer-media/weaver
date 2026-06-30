@@ -1495,6 +1495,9 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     );
     assert!(rendered.contains("weaver_pipeline_body_proof_events_total{event=\"cooldown\"} 49"));
     assert!(rendered.contains("weaver_pipeline_body_replay_items_total 50"));
+    assert!(rendered.contains("weaver_ip_replacement_trials_total{outcome=\"accepted\"} 53"));
+    assert!(!rendered.contains("weaver_ip_replacement_trials_total{outcome=\"old_retired\"}"));
+    assert!(rendered.contains("weaver_ip_replacement_old_connections_retired_total 55"));
     assert!(
         rendered.contains("weaver_pipeline_download_failures_total{kind=\"article_not_found\"} 24")
     );
