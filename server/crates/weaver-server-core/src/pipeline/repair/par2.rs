@@ -938,6 +938,158 @@ impl Pipeline {
             .sum()
     }
 
+    pub(crate) fn promote_par2_metadata(&mut self, job_id: JobId) -> bool {
+        if self.par2_set(job_id).is_some() {
+            return false;
+        }
+
+        let queued = {
+            let Some(state) = self.jobs.get_mut(&job_id) else {
+                return false;
+            };
+            state.recovery_queue.drain_all()
+        };
+
+        let mut work_by_file: HashMap<u32, Vec<DownloadWork>> = HashMap::new();
+        for work in queued {
+            work_by_file
+                .entry(work.segment_id.file_id.file_index)
+                .or_default()
+                .push(work);
+        }
+
+        let selected_file = self.jobs.get(&job_id).and_then(|state| {
+            let candidate_available = |file_index: u32| {
+                state
+                    .spec
+                    .files
+                    .get(file_index as usize)
+                    .is_some_and(|file| {
+                        file.segments.iter().any(|segment| {
+                            let segment_id = SegmentId {
+                                file_id: NzbFileId { job_id, file_index },
+                                segment_number: segment.ordinal,
+                            };
+                            !self
+                                .unavailable_promoted_recovery_segments
+                                .contains(&segment_id)
+                        })
+                    })
+            };
+
+            let mut index_candidates = state
+                .spec
+                .files
+                .iter()
+                .enumerate()
+                .filter_map(|(file_index, file)| {
+                    matches!(
+                        file.role,
+                        weaver_model::files::FileRole::Par2 { is_index: true, .. }
+                    )
+                    .then_some(file_index as u32)
+                })
+                .filter(|file_index| candidate_available(*file_index))
+                .collect::<Vec<_>>();
+            index_candidates.sort_unstable();
+            if let Some(file_index) = index_candidates.into_iter().next() {
+                return Some(file_index);
+            }
+
+            let mut par2_candidates = state
+                .spec
+                .files
+                .iter()
+                .enumerate()
+                .filter_map(|(file_index, file)| {
+                    matches!(file.role, weaver_model::files::FileRole::Par2 { .. })
+                        .then_some(file_index as u32)
+                })
+                .filter(|file_index| candidate_available(*file_index))
+                .collect::<Vec<_>>();
+            par2_candidates.sort_unstable();
+            par2_candidates.into_iter().next()
+        });
+
+        let Some(selected_file) = selected_file else {
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                for (_, works) in work_by_file {
+                    for work in works {
+                        state.recovery_queue.push(work);
+                    }
+                }
+            }
+            return false;
+        };
+
+        let (filename, promoted_segments) = {
+            let Some(state) = self.jobs.get_mut(&job_id) else {
+                return false;
+            };
+            let filename = state
+                .spec
+                .files
+                .get(selected_file as usize)
+                .map(|file| file.filename.clone())
+                .unwrap_or_default();
+            let mut promoted_segments = 0usize;
+            if let Some(file_spec) = state.spec.files.get(selected_file as usize) {
+                for segment_spec in &file_spec.segments {
+                    let segment_id = SegmentId {
+                        file_id: NzbFileId {
+                            job_id,
+                            file_index: selected_file,
+                        },
+                        segment_number: segment_spec.ordinal,
+                    };
+                    if self
+                        .unavailable_promoted_recovery_segments
+                        .contains(&segment_id)
+                    {
+                        continue;
+                    }
+                    state.download_queue.push(DownloadWork {
+                        segment_id,
+                        message_id: crate::jobs::ids::MessageId::new(&segment_spec.message_id),
+                        groups: file_spec.groups.clone(),
+                        priority: PROMOTED_RECOVERY_PRIORITY,
+                        byte_estimate: segment_spec.bytes,
+                        retry_count: 0,
+                        is_recovery: true,
+                        exclude_servers: Vec::new(),
+                    });
+                    promoted_segments += 1;
+                }
+            }
+            for (file_index, works) in work_by_file {
+                if file_index != selected_file {
+                    for work in works {
+                        state.recovery_queue.push(work);
+                    }
+                }
+            }
+            (filename, promoted_segments)
+        };
+
+        {
+            let runtime = self.ensure_par2_runtime(job_id);
+            let entry = runtime.files.entry(selected_file).or_default();
+            entry.filename = filename.clone();
+            entry.recovery_blocks = 0;
+            entry.promoted = true;
+        }
+
+        info!(
+            job_id = job_id.0,
+            file_index = selected_file,
+            filename = %filename,
+            promoted_segments,
+            "promoted PAR2 metadata file"
+        );
+        self.update_queue_metrics();
+        true
+    }
+
     /// Promote the smallest byte set of recovery files needed to cover the requested block count.
     ///
     /// Returns the number of recovery blocks newly promoted by this call.

@@ -2175,13 +2175,20 @@ impl Pipeline {
         Vec<weaver_nntp::client::FetchAttemptTrace>,
         Option<usize>,
     ) {
-        let source_server_idx = trace.attempts.iter().rev().find_map(|attempt| {
+        let successful_server_idx = trace.attempts.iter().rev().find_map(|attempt| {
             matches!(
                 attempt.outcome,
                 weaver_nntp::client::FetchAttemptOutcome::Success
             )
             .then_some(attempt.server_idx)
         });
+        let attempted_server_idx = trace
+            .attempts
+            .iter()
+            .rev()
+            .map(|attempt| attempt.server_idx)
+            .next();
+        let source_server_idx = successful_server_idx.or(attempted_server_idx);
         let data = match trace.result {
             Ok(decoded) => {
                 let weaver_nntp::client::DecodedBody {
@@ -3182,6 +3189,35 @@ impl Pipeline {
         self.process_download_done(result).await;
     }
 
+    pub(crate) fn note_released_download_result_pending(&mut self, job_id: JobId) {
+        *self
+            .pending_released_download_results_by_job
+            .entry(job_id)
+            .or_insert(0) += 1;
+    }
+
+    pub(crate) fn finish_released_download_result_processing(&mut self, job_id: JobId) {
+        let remove = if let Some(pending) = self
+            .pending_released_download_results_by_job
+            .get_mut(&job_id)
+        {
+            *pending = pending.saturating_sub(1);
+            *pending == 0
+        } else {
+            false
+        };
+        if remove {
+            self.pending_released_download_results_by_job
+                .remove(&job_id);
+        }
+    }
+
+    pub(crate) async fn process_released_download_done(&mut self, result: DownloadResult) {
+        let job_id = result.segment_id.file_id.job_id;
+        self.process_download_done(result).await;
+        self.finish_released_download_result_processing(job_id);
+    }
+
     pub(crate) async fn process_download_done(&mut self, result: DownloadResult) {
         let job_id = result.segment_id.file_id.job_id;
         if self
@@ -3357,9 +3393,39 @@ impl Pipeline {
                         .download_failures_permanent
                         .fetch_add(1, Ordering::Relaxed),
                 };
-                if failure.kind == DownloadFailureKind::ArticleNotFound
-                    && excluded_servers.is_empty()
+                let article_not_found_server_idx =
+                    if failure.kind == DownloadFailureKind::ArticleNotFound {
+                        source_server_idx.or_else(|| {
+                            result.attempts.iter().rev().find_map(|attempt| {
+                                matches!(
+                                    attempt.outcome,
+                                    weaver_nntp::client::FetchAttemptOutcome::NotFound
+                                )
+                                .then_some(attempt.server_idx)
+                            })
+                        })
+                    } else {
+                        source_server_idx
+                    };
+                let source_not_found = failure.kind == DownloadFailureKind::ArticleNotFound
+                    && article_not_found_server_idx.is_some();
+                let retry_exclude_servers = if failure.kind == DownloadFailureKind::ArticleNotFound
                 {
+                    Self::decode_retry_exclude_servers(
+                        &excluded_servers,
+                        article_not_found_server_idx,
+                    )
+                } else {
+                    excluded_servers.clone()
+                };
+                let article_not_found_exhausted = failure.kind
+                    == DownloadFailureKind::ArticleNotFound
+                    && (retry_exclude_servers.is_empty() || {
+                        let server_count = self.nntp.pool().server_count();
+                        server_count > 0 && retry_exclude_servers.len() >= server_count
+                    });
+
+                if article_not_found_exhausted {
                     self.metrics
                         .articles_not_found
                         .fetch_add(1, Ordering::Relaxed);
@@ -3387,7 +3453,7 @@ impl Pipeline {
                     let seg_id = result.segment_id;
                     let capacity_unavailable =
                         failure.kind == DownloadFailureKind::CapacityUnavailable;
-                    let next_retry = if capacity_unavailable {
+                    let next_retry = if capacity_unavailable || source_not_found {
                         result.retry_count
                     } else {
                         result.retry_count + 1
@@ -3420,13 +3486,15 @@ impl Pipeline {
                                 byte_estimate: seg_spec.bytes,
                                 retry_count: next_retry,
                                 is_recovery: file_spec.role.is_recovery(),
-                                exclude_servers: excluded_servers.clone(),
+                                exclude_servers: retry_exclude_servers.clone(),
                             };
                             self.metrics
                                 .segments_retried
                                 .fetch_add(1, Ordering::Relaxed);
                             let delay = if capacity_unavailable {
                                 std::time::Duration::from_secs(1)
+                            } else if source_not_found {
+                                std::time::Duration::ZERO
                             } else {
                                 std::time::Duration::from_secs(1 << (next_retry - 1))
                             };

@@ -106,7 +106,7 @@ impl Pipeline {
     pub(super) fn check_health(&mut self, job_id: JobId) {
         // Extract all needed values upfront so the borrow on self.jobs is dropped
         // before we call activate_health_probes or mutate state.
-        let (health, critical, failed_bytes, total, needs_probes) = {
+        let (health, critical, failed_bytes, total, par2_bytes, needs_probes) = {
             let state = match self.jobs.get(&job_id) {
                 Some(s) => s,
                 None => return,
@@ -130,8 +130,29 @@ impl Pipeline {
             let needs_probes = health < 980
                 && !state.health_probing
                 && state.failed_bytes >= state.next_health_probe_failed_bytes;
-            (health, critical, state.failed_bytes, total, needs_probes)
+            (
+                health,
+                critical,
+                state.failed_bytes,
+                total,
+                par2_bytes,
+                needs_probes,
+            )
         };
+
+        if health <= critical && par2_bytes > 0 {
+            info!(
+                job_id = job_id.0,
+                health_pct = health as f64 / 10.0,
+                critical_pct = critical as f64 / 10.0,
+                failed_bytes,
+                total_bytes = total,
+                par2_bytes,
+                "deferring health failure to PAR2 recovery evaluation"
+            );
+            self.schedule_job_completion_check(job_id);
+            return;
+        }
 
         // Activate health probes when health drops 2% — sample segments across the
         // NZB to get a fast overall health estimate instead of waiting for sequential
@@ -190,7 +211,12 @@ impl Pipeline {
         }
 
         // All probes missed → release is completely gone.
-        if done && !inconclusive && missed == total && total > 0 {
+        let par2_recovery_potential = self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| state.par2_bytes > 0);
+
+        if done && !inconclusive && missed == total && total > 0 && !par2_recovery_potential {
             let error = format!(
                 "health probe: all {} samples missing — release is unavailable",
                 total
@@ -290,6 +316,8 @@ impl Pipeline {
         self.pending_concat.remove(&job_id);
         self.active_download_passes.remove(&job_id);
         self.jobs_finalizing_download.remove(&job_id);
+        self.pending_released_download_results_by_job
+            .remove(&job_id);
         self.active_downloads_by_job.remove(&job_id);
         self.active_download_connections_by_job.remove(&job_id);
         self.active_downloads_by_file

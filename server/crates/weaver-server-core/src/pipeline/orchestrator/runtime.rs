@@ -104,6 +104,7 @@ impl Pipeline {
             ip_replacement_burst_active: false,
             active_download_passes: HashSet::new(),
             jobs_finalizing_download: HashSet::new(),
+            pending_released_download_results_by_job: HashMap::new(),
             active_downloads_by_job: HashMap::new(),
             active_download_connections_by_job: HashMap::new(),
             active_downloads_by_file: HashMap::new(),
@@ -525,7 +526,7 @@ impl Pipeline {
             self.drain_ready_lane_control_messages();
 
             if let Some(result) = pending_download_results.pop_front() {
-                self.process_download_done(result).await;
+                self.process_released_download_done(result).await;
             } else {
                 tokio::select! {
                     cmd = self.cmd_rx.recv() => {
@@ -539,6 +540,7 @@ impl Pipeline {
                     }
                     Some(result) = self.download_done_rx.recv() => {
                         self.release_download_result(&result);
+                        self.note_released_download_result_pending(result.segment_id.file_id.job_id);
                         pending_download_results.push_back(result);
                     }
                     Some(request) = self.download_refill_rx.recv() => {
@@ -683,6 +685,7 @@ impl Pipeline {
                 break;
             };
             self.release_download_result(&result);
+            self.note_released_download_result_pending(result.segment_id.file_id.job_id);
             pending.push_back(result);
             self.drain_ready_lane_control_messages();
         }

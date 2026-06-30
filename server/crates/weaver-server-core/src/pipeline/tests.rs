@@ -4760,6 +4760,72 @@ async fn excluded_source_not_found_retries_without_marking_health_failure() {
 }
 
 #[tokio::test]
+async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20013);
+    let spec = segmented_job_spec("Source Not Found", "retry.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                segment_number: 0,
+            },
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::ArticleNotFound,
+                "article not found on source server",
+            )),
+            attempts: vec![weaver_nntp::client::FetchAttemptTrace {
+                server_idx: 0,
+                remote_ip: None,
+                elapsed: Duration::from_millis(5),
+                outcome: weaver_nntp::client::FetchAttemptOutcome::NotFound,
+                error: Some("article not found".to_string()),
+            }],
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: Vec::new(),
+            release_connection_slot: true,
+        })
+        .await;
+
+    assert_eq!(
+        pipeline.pending_retries_by_job.get(&job_id).copied(),
+        Some(1)
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(0)
+    );
+    assert!(pipeline.pending_completion_checks.is_empty());
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let work = pipeline
+        .retry_rx
+        .try_recv()
+        .expect("source miss should requeue against another server");
+    assert_eq!(work.exclude_servers, vec![0]);
+    assert_eq!(work.retry_count, 0);
+}
+
+#[tokio::test]
 async fn recovery_article_not_found_does_not_mark_health_failure() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -6341,6 +6407,40 @@ async fn release_download_result_updates_hot_job_successes_before_heavy_processi
             .load(Ordering::Relaxed),
         1
     );
+}
+
+#[tokio::test]
+async fn released_download_result_fences_completion_until_processed() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20023);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+
+    assert!(!pipeline.job_has_pending_download_pipeline_work(job_id));
+    pipeline.note_released_download_result_pending(job_id);
+    assert!(pipeline.job_has_pending_download_pipeline_work(job_id));
+
+    pipeline
+        .process_released_download_done(DownloadResult {
+            segment_id,
+            data: Ok(DownloadPayload::Raw(Bytes::from_static(b"discarded"))),
+            attempts: vec![],
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: vec![],
+            release_connection_slot: false,
+        })
+        .await;
+
+    assert!(!pipeline.job_has_pending_download_pipeline_work(job_id));
 }
 
 #[test]
@@ -12969,6 +13069,77 @@ async fn par2_verified_complete_archive_refreshes_missing_existing_topology_only
 }
 
 #[tokio::test]
+async fn incomplete_download_promotes_parked_par2_metadata_before_failing() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30079);
+    let payload_filename = "payload.mkv";
+    let index_filename = "repair.par2";
+    let spec = JobSpec {
+        name: "Promote Parked PAR2 Metadata".to_string(),
+        password: None,
+        total_bytes: 164,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 100,
+                    message_id: "parked-par2-payload@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::from_filename(index_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "parked-par2-index@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        let queued = state.download_queue.drain_all();
+        state.download_queue = DownloadQueue::new();
+        for work in queued {
+            if work.segment_id.file_id.file_index == 1 {
+                state.recovery_queue.push(work);
+            }
+        }
+        state.failed_bytes = 100;
+    }
+
+    pipeline.check_job_completion(job_id).await;
+
+    assert!(!matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert!(
+        state
+            .download_queue
+            .count_matching(|work| work.segment_id.file_id.file_index == 1)
+            > 0
+    );
+    assert_eq!(
+        pipeline
+            .par2_runtime(job_id)
+            .and_then(|runtime| runtime.files.get(&1))
+            .map(|file| file.promoted),
+        Some(true)
+    );
+}
+
+#[tokio::test]
 async fn direct_payload_par2_repair_completes_after_download_exhaustion() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -14286,6 +14457,18 @@ async fn direct_payload_par2_repair_fails_when_recovery_is_insufficient() {
         ],
     );
 
+    pipeline.note_released_download_result_pending(job_id);
+    pipeline.check_job_completion(job_id).await;
+
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Failed { .. })
+        ),
+        "pending released download results must defer PAR2 fail-fast"
+    );
+
+    pipeline.finish_released_download_result_processing(job_id);
     pipeline.check_job_completion(job_id).await;
 
     let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) else {
@@ -18016,6 +18199,90 @@ async fn missed_probe_rearms_on_next_failed_byte() {
     let state = pipeline.jobs.get(&job_id).unwrap();
     assert!(state.health_probing);
     assert!(matches!(state.status, JobStatus::Checking));
+}
+
+#[tokio::test]
+async fn health_below_critical_without_par2_still_fails() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30024);
+    let spec = standalone_job_spec("No PAR2 Health Fail", &[("payload.bin".to_string(), 100)]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.failed_bytes = 20;
+    }
+
+    pipeline.check_health(job_id);
+
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+}
+
+#[tokio::test]
+async fn health_below_critical_with_par2_defers_to_completion() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30025);
+    let spec = JobSpec {
+        name: "PAR2 Health Defers".to_string(),
+        password: None,
+        total_bytes: 300,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: "payload-a.bin".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 100,
+                    message_id: "par2-health-a@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "payload-b.bin".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 100,
+                    message_id: "par2-health-b@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "repair.vol00+01.par2".to_string(),
+                role: FileRole::Par2 {
+                    is_index: false,
+                    recovery_block_count: 1,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 100,
+                    message_id: "par2-health-repair@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.failed_bytes = 200;
+    }
+
+    pipeline.check_health(job_id);
+
+    assert!(!matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+    assert!(pipeline.pending_completion_checks.contains(&job_id));
 }
 
 #[tokio::test]

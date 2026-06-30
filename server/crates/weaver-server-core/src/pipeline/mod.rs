@@ -1147,6 +1147,8 @@ pub struct Pipeline {
     pub(super) active_download_passes: HashSet<JobId>,
     /// Jobs that still have decode/write pipeline work after network downloads finished.
     pub(super) jobs_finalizing_download: HashSet<JobId>,
+    /// Released download results waiting to be committed into decode/write state.
+    pub(super) pending_released_download_results_by_job: HashMap<JobId, usize>,
     /// In-flight article download count per job.
     pub(super) active_downloads_by_job: HashMap<JobId, usize>,
     /// In-flight NNTP connection task count per job.

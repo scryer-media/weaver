@@ -264,6 +264,12 @@ impl Pipeline {
             .copied()
             .unwrap_or(0)
             > 0;
+        let has_released_download_results = self
+            .pending_released_download_results_by_job
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0)
+            > 0;
         let has_pending_decode = self
             .pending_decode
             .iter()
@@ -277,6 +283,7 @@ impl Pipeline {
             || has_inflight_downloads
             || has_inflight_decodes
             || has_delayed_retries
+            || has_released_download_results
             || has_pending_decode
             || has_buffered_segments
     }
@@ -2098,8 +2105,13 @@ impl Pipeline {
                     if recovery_now < blocks_needed {
                         let promoted = self.promote_recovery_targeted(job_id, blocks_needed);
                         let targeted_total = self.recovery_blocks_available_or_targeted(job_id);
+                        let recovery_still_settling = promoted > 0
+                            || self.job_has_pending_download_pipeline_work(job_id)
+                            || self
+                                .promoted_recovery_pipeline_state(job_id)
+                                .has_pending_work();
 
-                        if targeted_total < blocks_needed {
+                        if targeted_total < blocks_needed && !recovery_still_settling {
                             let msg = format!(
                                 "not repairable: {blocks_needed} damaged slices, \
                                  only {targeted_total} recovery blocks available in NZB"
@@ -2447,11 +2459,16 @@ impl Pipeline {
                     if recovery_now < damaged {
                         let promoted = self.promote_recovery_targeted(job_id, damaged);
                         let targeted_total = self.recovery_blocks_available_or_targeted(job_id);
+                        let recovery_still_settling = promoted > 0
+                            || self.job_has_pending_download_pipeline_work(job_id)
+                            || self
+                                .promoted_recovery_pipeline_state(job_id)
+                                .has_pending_work();
 
                         // If all available/targeted recovery is still insufficient,
                         // fail immediately instead of waiting for downloads that
                         // won't help.
-                        if targeted_total < damaged {
+                        if targeted_total < damaged && !recovery_still_settling {
                             let msg = format!(
                                 "not repairable: {damaged} damaged slices, \
                                  only {targeted_total} recovery blocks available in NZB"
@@ -2610,6 +2627,18 @@ impl Pipeline {
                     }
                 }
             } else {
+                if !par2_bypassed && self.promote_par2_metadata(job_id) {
+                    info!(
+                        job_id = job_id.0,
+                        "waiting for PAR2 metadata download before repair evaluation"
+                    );
+                    self.transition_postprocessing_status(
+                        job_id,
+                        JobStatus::Downloading,
+                        Some("downloading"),
+                    );
+                    return;
+                }
                 if has_incomplete_data_files {
                     let msg = format!(
                         "download incomplete after exhausting retries: {complete_data_files}/{total_data_files} data files complete and no PAR2 metadata is available for repair"
@@ -2664,6 +2693,18 @@ impl Pipeline {
             }
         } else if has_incomplete_data_files {
             if !download_pipeline_exhausted || self.job_has_active_extraction_tasks(job_id) {
+                return;
+            }
+            if !par2_bypassed && self.promote_par2_metadata(job_id) {
+                info!(
+                    job_id = job_id.0,
+                    "waiting for PAR2 metadata download before incomplete-download failure"
+                );
+                self.transition_postprocessing_status(
+                    job_id,
+                    JobStatus::Downloading,
+                    Some("downloading"),
+                );
                 return;
             }
             let repair_context = if par2_bypassed {
@@ -2847,6 +2888,15 @@ impl Pipeline {
                 }
             }
             ExtractionReadiness::Blocked { reason } => {
+                if reason.starts_with("archive topology not yet available") {
+                    info!(
+                        job_id = job_id.0,
+                        reason = %reason,
+                        "deferring completion until archive topology is available"
+                    );
+                    self.schedule_job_completion_check(job_id);
+                    return;
+                }
                 self.fail_job(job_id, reason);
             }
             ExtractionReadiness::Partial {
