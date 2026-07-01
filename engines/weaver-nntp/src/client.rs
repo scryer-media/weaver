@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
+#[cfg(unix)]
+use std::mem::MaybeUninit;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -69,6 +71,13 @@ pub struct DecodedBody {
     pub raw_size: u32,
     pub decoded: Vec<u8>,
     pub result: YencDecodeResult,
+    pub cpu: DecodedBodyCpu,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DecodedBodyCpu {
+    pub feed: Duration,
+    pub finish: Duration,
 }
 
 /// Errors from the streamed BODY decode path.
@@ -76,6 +85,34 @@ pub struct DecodedBody {
 pub enum DecodedBodyError {
     Nntp(NntpError),
     Decode { raw_size: u32, error: YencError },
+}
+
+#[cfg(unix)]
+fn thread_cpu_time() -> Option<Duration> {
+    let mut timespec = MaybeUninit::<libc::timespec>::uninit();
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, timespec.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let timespec = unsafe { timespec.assume_init() };
+    let seconds = u64::try_from(timespec.tv_sec).ok()?;
+    let nanos = u32::try_from(timespec.tv_nsec).ok()?.min(999_999_999);
+    Some(Duration::new(seconds, nanos))
+}
+
+#[cfg(not(unix))]
+fn thread_cpu_time() -> Option<Duration> {
+    None
+}
+
+fn add_cpu_delta(accumulator: &mut Duration, started: Option<Duration>) {
+    let Some(started) = started else {
+        return;
+    };
+    let Some(current) = thread_cpu_time() else {
+        return;
+    };
+    *accumulator = accumulator.saturating_add(current.saturating_sub(started));
 }
 
 /// Existence results used by the health probe pipeline.
@@ -422,6 +459,7 @@ impl BodyLaneLease {
         let mut decoder = StreamingArticleDecoder::new();
         let mut output = Vec::new();
         let mut raw_size = 0u32;
+        let mut cpu = DecodedBodyCpu::default();
         let mut decode_error: Option<YencError> = None;
 
         let Some(conn) = self.conn.as_mut() else {
@@ -431,7 +469,10 @@ impl BodyLaneLease {
         let stream_result = match tokio::time::timeout_at(deadline, async {
             conn.stream_body_chunked_raw(message_id, |chunk| {
                 raw_size = raw_size.saturating_add(chunk.len() as u32);
-                if let Err(err) = decoder.feed_chunk(chunk, &mut output) {
+                let cpu_started = thread_cpu_time();
+                let result = decoder.feed_chunk(chunk, &mut output);
+                add_cpu_delta(&mut cpu.feed, cpu_started);
+                if let Err(err) = result {
                     decode_error = Some(err);
                     return Err(NntpError::MalformedResponse(
                         "streamed yEnc decode failed".into(),
@@ -456,12 +497,15 @@ impl BodyLaneLease {
                     return Err(DecodedBodyError::Decode { raw_size, error });
                 }
 
-                decoder
-                    .finish(output)
+                let cpu_started = thread_cpu_time();
+                let finish = decoder.finish(output);
+                add_cpu_delta(&mut cpu.finish, cpu_started);
+                finish
                     .map(|DecodedArticle { data, result }| DecodedBody {
                         raw_size,
                         decoded: data,
                         result,
+                        cpu,
                     })
                     .map_err(|error| DecodedBodyError::Decode { raw_size, error })
             }
@@ -650,6 +694,7 @@ impl NntpClient {
         let mut remaining: Vec<usize> = (0..message_ids.len()).collect();
         let mut had_success = false;
         let mut last_error: Option<NntpError> = None;
+        let mut had_retryable_uncertainty = false;
 
         for idx in order {
             if remaining.is_empty() {
@@ -684,13 +729,18 @@ impl NntpClient {
                     if let Some(reason) = stat_cooldown_reason(&e) {
                         self.record_server_cooldown(idx, reason).await;
                     }
+                    had_retryable_uncertainty = true;
                     last_error = Some(e);
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        if remaining.is_empty() || had_success {
+        if remaining.is_empty() {
+            Ok(found)
+        } else if had_retryable_uncertainty {
+            Err(last_error.unwrap_or(NntpError::ServiceUnavailable))
+        } else if had_success {
             Ok(found)
         } else {
             Err(last_error.unwrap_or(NntpError::ServiceUnavailable))
@@ -823,6 +873,7 @@ impl NntpClient {
 
         let mut attempts = Vec::new();
         let mut last_error: Option<NntpError> = None;
+        let mut last_retryable_error: Option<NntpError> = None;
 
         for idx in order {
             let server = ServerId(idx);
@@ -873,7 +924,7 @@ impl NntpClient {
                     if let Some(reason) = cooldown_reason(&e) {
                         self.record_server_cooldown(idx, reason).await;
                     }
-                    last_error = Some(e);
+                    last_retryable_error = Some(e);
                     continue;
                 }
                 Err(NntpError::AuthenticationFailed)
@@ -901,7 +952,7 @@ impl NntpClient {
                     if let Some(reason) = cooldown_reason(&e) {
                         self.record_server_cooldown(idx, reason).await;
                     }
-                    last_error = Some(e);
+                    last_retryable_error = Some(e);
                     continue;
                 }
                 Err(e) => {
@@ -922,7 +973,9 @@ impl NntpClient {
 
         FetchBodyTrace {
             attempts,
-            result: Err(last_error.unwrap_or(NntpError::PoolExhausted)),
+            result: Err(last_retryable_error
+                .or(last_error)
+                .unwrap_or(NntpError::PoolExhausted)),
         }
     }
 
@@ -1521,6 +1574,7 @@ impl NntpClient {
         }
 
         let mut last_error: Option<DecodedBodyError> = None;
+        let mut last_retryable_error: Option<DecodedBodyError> = None;
         let mut attempts = Vec::new();
 
         for idx in order {
@@ -1587,7 +1641,7 @@ impl NntpClient {
                     if let Some(reason) = cooldown_reason(&e) {
                         self.record_server_cooldown(idx, reason).await;
                     }
-                    last_error = Some(DecodedBodyError::Nntp(e));
+                    last_retryable_error = Some(DecodedBodyError::Nntp(e));
                     continue;
                 }
                 Err(DecodedBodyError::Nntp(
@@ -1617,7 +1671,7 @@ impl NntpClient {
                     if let Some(reason) = cooldown_reason(&e) {
                         self.record_server_cooldown(idx, reason).await;
                     }
-                    last_error = Some(DecodedBodyError::Nntp(e));
+                    last_retryable_error = Some(DecodedBodyError::Nntp(e));
                     continue;
                 }
                 Err(other) => {
@@ -1638,7 +1692,9 @@ impl NntpClient {
 
         DecodedBodyTrace {
             attempts,
-            result: Err(last_error.unwrap_or(DecodedBodyError::Nntp(NntpError::PoolExhausted))),
+            result: Err(last_retryable_error
+                .or(last_error)
+                .unwrap_or(DecodedBodyError::Nntp(NntpError::PoolExhausted))),
         }
     }
 
@@ -1868,6 +1924,7 @@ impl NntpClient {
     ) -> Result<Bytes> {
         let order = self.build_server_order(exclude).await;
         let mut last_error: Option<NntpError> = None;
+        let mut last_retryable_error: Option<NntpError> = None;
 
         for idx in order {
             let server = ServerId(idx);
@@ -1901,7 +1958,7 @@ impl NntpClient {
                     if let Some(reason) = cooldown_reason(&e) {
                         self.record_server_cooldown(idx, reason).await;
                     }
-                    last_error = Some(e);
+                    last_retryable_error = Some(e);
                     continue;
                 }
                 Err(NntpError::AuthenticationFailed)
@@ -1925,7 +1982,7 @@ impl NntpClient {
                     if let Some(reason) = cooldown_reason(&e) {
                         self.record_server_cooldown(idx, reason).await;
                     }
-                    last_error = Some(e);
+                    last_retryable_error = Some(e);
                     continue;
                 }
                 Err(e) => {
@@ -1936,7 +1993,9 @@ impl NntpClient {
         }
 
         // All servers exhausted.
-        Err(last_error.unwrap_or(NntpError::PoolExhausted))
+        Err(last_retryable_error
+            .or(last_error)
+            .unwrap_or(NntpError::PoolExhausted))
     }
 
     /// Try to select one of the given groups on the connection.
@@ -2122,12 +2181,16 @@ impl NntpClient {
             let mut decoder = StreamingArticleDecoder::new();
             let mut output = Vec::new();
             let mut raw_size = 0u32;
+            let mut cpu = DecodedBodyCpu::default();
             let mut decode_error: Option<YencError> = None;
 
             let stream_result = match tokio::time::timeout_at(deadline, async {
                 conn.stream_body_chunked_raw(message_id, |chunk| {
                     raw_size = raw_size.saturating_add(chunk.len() as u32);
-                    if let Err(err) = decoder.feed_chunk(chunk, &mut output) {
+                    let cpu_started = thread_cpu_time();
+                    let result = decoder.feed_chunk(chunk, &mut output);
+                    add_cpu_delta(&mut cpu.feed, cpu_started);
+                    if let Err(err) = result {
                         decode_error = Some(err);
                         return Err(NntpError::MalformedResponse(
                             "streamed yEnc decode failed".into(),
@@ -2155,12 +2218,16 @@ impl NntpClient {
                         });
                     }
 
-                    match decoder.finish(output) {
+                    let cpu_started = thread_cpu_time();
+                    let finish = decoder.finish(output);
+                    add_cpu_delta(&mut cpu.finish, cpu_started);
+                    match finish {
                         Ok(DecodedArticle { data, result }) => {
                             return Ok(DecodedBody {
                                 raw_size,
                                 decoded: data,
                                 result,
+                                cpu,
                             });
                         }
                         Err(err) => {
@@ -2214,12 +2281,16 @@ impl NntpClient {
         let mut decoder = StreamingArticleDecoder::new();
         let mut output = Vec::new();
         let mut raw_size = 0u32;
+        let mut cpu = DecodedBodyCpu::default();
         let mut decode_error: Option<YencError> = None;
 
         let stream_result = conn
             .stream_next_body_chunked_raw(|chunk| {
                 raw_size = raw_size.saturating_add(chunk.len() as u32);
-                if let Err(err) = decoder.feed_chunk(chunk, &mut output) {
+                let cpu_started = thread_cpu_time();
+                let result = decoder.feed_chunk(chunk, &mut output);
+                add_cpu_delta(&mut cpu.feed, cpu_started);
+                if let Err(err) = result {
                     decode_error = Some(err);
                     return Err(NntpError::MalformedResponse(
                         "streamed yEnc decode failed".into(),
@@ -2235,12 +2306,15 @@ impl NntpClient {
                     return Err(DecodedBodyError::Decode { raw_size, error });
                 }
 
-                decoder
-                    .finish(output)
+                let cpu_started = thread_cpu_time();
+                let finish = decoder.finish(output);
+                add_cpu_delta(&mut cpu.finish, cpu_started);
+                finish
                     .map(|DecodedArticle { data, result }| DecodedBody {
                         raw_size,
                         decoded: data,
                         result,
+                        cpu,
                     })
                     .map_err(|error| DecodedBodyError::Decode { raw_size, error })
             }
@@ -2967,6 +3041,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grouped_body_missing_plus_transport_uncertainty_is_not_authoritative_not_found() {
+        let primary_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("GROUP "),
+                response: b"211 1 1 1 alt.binaries.test\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: b"430 No such article\r\n",
+            },
+        ])
+        .await;
+
+        let backup_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("GROUP "),
+                response: b"211 1 1 1 alt.binaries.test\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: b"",
+            },
+        ])
+        .await;
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![
+                scripted_server(primary_port, 0),
+                scripted_server(backup_port, 1),
+            ],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        let trace = client
+            .fetch_body_with_groups_traced(
+                "<maybe@example.com>",
+                &[String::from("alt.binaries.test")],
+            )
+            .await;
+
+        assert_eq!(trace.attempts.len(), 2);
+        assert!(matches!(
+            trace.result,
+            Err(NntpError::ConnectionClosed) | Err(NntpError::SoftTimeout(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn extra_body_lane_reports_remote_ip() {
         let port = spawn_scripted_server(vec![
             ScriptStep {
@@ -3350,7 +3490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stat_many_fails_over_after_malformed_pipelined_response() {
+    async fn stat_many_fails_over_after_malformed_pipelined_response_when_article_is_confirmed() {
         let primary_port = spawn_scripted_server(vec![
             ScriptStep {
                 expect_prefix: None,
@@ -3363,10 +3503,6 @@ mod tests {
             ScriptStep {
                 expect_prefix: Some("STAT "),
                 response: b"2\xff3 malformed\r\n",
-            },
-            ScriptStep {
-                expect_prefix: Some("STAT "),
-                response: b"430 No such article\r\n",
             },
         ])
         .await;
@@ -3383,6 +3519,53 @@ mod tests {
             ScriptStep {
                 expect_prefix: Some("STAT "),
                 response: b"223 0 <exists@example.com>\r\n",
+            },
+        ])
+        .await;
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![
+                scripted_server(primary_port, 0),
+                scripted_server(backup_port, 1),
+            ],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        let results = client
+            .stat_many(&["<exists@example.com>"])
+            .await
+            .expect("stat_many should fail over");
+        assert_eq!(results, vec![true]);
+    }
+
+    #[tokio::test]
+    async fn stat_many_is_inconclusive_when_malformed_response_precedes_clean_missing() {
+        let primary_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("STAT "),
+                response: b"2\xff3 malformed\r\n",
+            },
+        ])
+        .await;
+
+        let backup_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
             },
             ScriptStep {
                 expect_prefix: Some("STAT "),
@@ -3401,11 +3584,11 @@ mod tests {
             soft_timeout: Duration::from_secs(5),
         });
 
-        let results = client
-            .stat_many(&["<exists@example.com>", "<missing@example.com>"])
+        let err = client
+            .stat_many(&["<missing@example.com>"])
             .await
-            .expect("stat_many should fail over");
-        assert_eq!(results, vec![true, false]);
+            .expect_err("malformed STAT plus clean missing must be inconclusive");
+        assert!(matches!(err, NntpError::MalformedResponse(_)));
     }
 
     #[tokio::test]
@@ -3447,6 +3630,62 @@ mod tests {
 
         let result = client
             .confirm_exists_for_probe(&["<exists@example.com>"])
+            .await;
+        assert_eq!(
+            result,
+            ProbeBatchResult {
+                exists: vec![false],
+                inconclusive: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_exists_for_probe_marks_malformed_stat_with_clean_missing_inconclusive() {
+        let primary_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("STAT "),
+                response: b"2\xff3 malformed\r\n",
+            },
+        ])
+        .await;
+
+        let backup_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("STAT "),
+                response: b"430 No such article\r\n",
+            },
+        ])
+        .await;
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![
+                scripted_server(primary_port, 0),
+                scripted_server(backup_port, 1),
+            ],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(5),
+        });
+
+        let result = client
+            .confirm_exists_for_probe(&["<missing@example.com>"])
             .await;
         assert_eq!(
             result,

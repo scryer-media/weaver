@@ -944,6 +944,16 @@ pub(super) fn render_prometheus_metrics(
         snapshot.download_pressure_stalls_total,
     );
 
+    out.push_str(
+        "# HELP weaver_pipeline_download_restart_durable_lead_blocked_total Restart durable lead dispatch blocks.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_restart_durable_lead_blocked_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_download_restart_durable_lead_blocked_total",
+        snapshot.download_restart_durable_lead_blocked_total,
+    );
+
     out.push_str("# HELP weaver_pipeline_download_pressure_stall_duration_seconds Completed hard pressure stall duration.\n");
     out.push_str("# TYPE weaver_pipeline_download_pressure_stall_duration_seconds counter\n");
     append_metric_f64(

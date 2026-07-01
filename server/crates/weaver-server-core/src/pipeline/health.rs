@@ -106,7 +106,7 @@ impl Pipeline {
     pub(super) fn check_health(&mut self, job_id: JobId) {
         // Extract all needed values upfront so the borrow on self.jobs is dropped
         // before we call activate_health_probes or mutate state.
-        let (health, critical, failed_bytes, total, par2_bytes, needs_probes) = {
+        let (health, critical, failed_bytes, total, par2_bytes, needs_probes, health_probing) = {
             let state = match self.jobs.get(&job_id) {
                 Some(s) => s,
                 None => return,
@@ -137,6 +137,7 @@ impl Pipeline {
                 total,
                 par2_bytes,
                 needs_probes,
+                state.health_probing,
             )
         };
 
@@ -157,8 +158,20 @@ impl Pipeline {
         // Activate health probes when health drops 2% — sample segments across the
         // NZB to get a fast overall health estimate instead of waiting for sequential
         // processing to naturally reach damaged areas.
-        if needs_probes {
-            self.activate_health_probes(job_id);
+        if needs_probes && self.activate_health_probes(job_id) {
+            return;
+        }
+
+        if health_probing && health <= critical {
+            info!(
+                job_id = job_id.0,
+                health_pct = health as f64 / 10.0,
+                critical_pct = critical as f64 / 10.0,
+                failed_bytes,
+                total_bytes = total,
+                "deferring health failure while probe confirmation is pending"
+            );
+            return;
         }
 
         if health <= critical {
@@ -364,7 +377,7 @@ impl Pipeline {
     /// e.g. 150k segs × 8% = ~12k probes / 50 per batch = ~240 batched checks.
     /// If every single probe returns 430 across the usable server set, the job
     /// is failed immediately.
-    pub(super) fn activate_health_probes(&mut self, job_id: JobId) {
+    pub(super) fn activate_health_probes(&mut self, job_id: JobId) -> bool {
         // Set the flag and status, then collect probes separately to avoid borrow conflicts.
         let probe_round = match self.jobs.get_mut(&job_id) {
             Some(s) => {
@@ -373,7 +386,7 @@ impl Pipeline {
                 s.health_probe_round = s.health_probe_round.wrapping_add(1);
                 probe_round
             }
-            None => return,
+            None => return false,
         };
         self.transition_postprocessing_status(job_id, JobStatus::Checking, Some("checking"));
 
@@ -404,7 +417,7 @@ impl Pipeline {
             if !self.job_has_pending_download_pipeline_work(job_id) {
                 self.schedule_job_completion_check(job_id);
             }
-            return;
+            return false;
         }
 
         // Rotate evenly strided samples across rounds so repeat probes widen
@@ -502,5 +515,6 @@ impl Pipeline {
                 })
                 .await;
         });
+        true
     }
 }

@@ -2166,6 +2166,29 @@ async fn submit_decoded_segment(
     filename: &str,
     expected_file_crc: Option<u32>,
 ) {
+    submit_decoded_segment_with_part_crc_verified(
+        pipeline,
+        file_id,
+        segment_number,
+        file_offset,
+        data,
+        filename,
+        expected_file_crc,
+        true,
+    )
+    .await;
+}
+
+async fn submit_decoded_segment_with_part_crc_verified(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    segment_number: u32,
+    file_offset: u64,
+    data: &[u8],
+    filename: &str,
+    expected_file_crc: Option<u32>,
+    part_crc_verified: bool,
+) {
     pipeline
         .handle_decode_success(DecodeResult {
             segment_id: SegmentId {
@@ -2176,6 +2199,8 @@ async fn submit_decoded_segment(
             file_offset,
             decoded_size: data.len() as u32,
             crc_valid: true,
+            part_crc_verified,
+            part_crc: weaver_par2::checksum::crc32(data),
             expected_file_crc,
             data: DecodedChunk::from(data.to_vec()),
             yenc_name: filename.to_string(),
@@ -4621,6 +4646,25 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
     );
 }
 
+#[test]
+fn lane_acquire_failure_without_body_request_is_lane_unavailable() {
+    let unavailable = DownloadFailure::from_lane_acquire_failure(None);
+    assert_eq!(unavailable.kind, DownloadFailureKind::LaneUnavailable);
+
+    let pool_miss =
+        DownloadFailure::from_lane_acquire_failure(Some(&weaver_nntp::NntpError::PoolExhausted));
+    assert_eq!(pool_miss.kind, DownloadFailureKind::LaneUnavailable);
+
+    let auth_failure = DownloadFailure::from_lane_acquire_failure(Some(
+        &weaver_nntp::NntpError::AuthenticationFailed,
+    ));
+    assert_eq!(auth_failure.kind, DownloadFailureKind::Auth);
+
+    let setup_failure =
+        DownloadFailure::from_lane_acquire_failure(Some(&weaver_nntp::NntpError::NoSuchGroup));
+    assert_eq!(setup_failure.kind, DownloadFailureKind::Permanent);
+}
+
 #[tokio::test]
 async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -4693,6 +4737,80 @@ async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
     assert_eq!(work.segment_id, segment_id);
     assert_eq!(work.retry_count, MAX_SEGMENT_RETRIES);
     assert_eq!(work.exclude_servers, vec![0]);
+}
+
+#[tokio::test]
+async fn body_lane_unavailable_at_retry_limit_requeues_without_article_failure() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20014);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Lane Acquire Guard", "retry.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id,
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::LaneUnavailable,
+                "failed to acquire BODY lane",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: MAX_SEGMENT_RETRIES + 1,
+            exclude_servers: vec![0, 1],
+            release_connection_slot: false,
+        })
+        .await;
+
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Downloading)
+    );
+    assert_eq!(
+        pipeline.pending_retries_by_job.get(&job_id).copied(),
+        Some(1)
+    );
+    assert!(pipeline.pending_completion_checks.is_empty());
+    assert!(pipeline.unavailable_promoted_recovery_segments.is_empty());
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        0
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let work = pipeline
+        .retry_rx
+        .try_recv()
+        .expect("pre-BODY lane miss should requeue without consuming article retry budget");
+    assert_eq!(work.segment_id, segment_id);
+    assert_eq!(work.retry_count, MAX_SEGMENT_RETRIES + 1);
+    assert_eq!(work.exclude_servers, vec![0, 1]);
 }
 
 #[tokio::test]
@@ -5350,7 +5468,16 @@ async fn dispatch_downloads_respects_hard_decode_byte_pressure() {
 #[tokio::test]
 async fn dispatch_downloads_pauses_when_restart_durable_lead_is_too_large() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        2,
+    )
+    .await;
     let job_id = JobId(20003);
     let file_id = NzbFileId {
         job_id,
@@ -5406,12 +5533,149 @@ async fn dispatch_downloads_pauses_when_restart_durable_lead_is_too_large() {
         pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
         segment_count as usize
     );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_restart_durable_lead_blocked_total
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert!(
+        pipeline.last_download_dispatch_stall_log_at.is_some(),
+        "durable-lead parking with queued work and no active downloads should emit a liveness diagnostic"
+    );
+    assert!(
+        pipeline
+            .download_restart_durable_lead_retry_after
+            .get(&job_id)
+            .is_some_and(|ready_at| *ready_at > Instant::now())
+    );
+    let retry_delay = pipeline
+        .next_restart_durable_lead_retry_delay()
+        .expect("durable lead block should expose a retry wakeup");
+    assert!(retry_delay <= Duration::from_millis(250));
+
+    pipeline.dispatch_downloads();
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_restart_durable_lead_blocked_total
+            .load(Ordering::Relaxed),
+        1
+    );
 
     pipeline
         .persisted_file_progress
         .insert(file_id, durable_lead_limit);
 
     assert!(pipeline.primary_download_within_restart_durable_lead(job_id, &next_work));
+    pipeline
+        .download_restart_durable_lead_retry_after
+        .insert(job_id, Instant::now() - Duration::from_millis(1));
+    pipeline.dispatch_downloads();
+
+    assert!(pipeline.active_downloads > 0);
+    assert!(
+        !pipeline
+            .download_restart_durable_lead_retry_after
+            .contains_key(&job_id)
+    );
+}
+
+#[tokio::test]
+async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        2,
+    )
+    .await;
+    let job_id = JobId(20004);
+    let complete_files = 17u32;
+    let file_bytes = 64 * 1024 * 1024u32;
+    let mut files = Vec::new();
+    for file_index in 0..=complete_files {
+        files.push(FileSpec {
+            filename: format!("part{file_index:02}.rar"),
+            role: FileRole::RarVolume {
+                volume_number: file_index,
+            },
+            groups: vec!["alt.binaries.test".to_string()],
+            segments: vec![segment_spec! {
+                number: 0,
+                bytes: file_bytes,
+                message_id: format!("small-complete-{file_index}@example.com"),
+            }],
+        });
+    }
+    let spec = JobSpec {
+        name: "Restart Durable Lead Completed Files".to_string(),
+        password: None,
+        total_bytes: u64::from(complete_files + 1) * u64::from(file_bytes),
+        category: None,
+        metadata: vec![],
+        files,
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        for file_index in 0..complete_files {
+            let file_id = NzbFileId { job_id, file_index };
+            state
+                .assembly
+                .file_mut(file_id)
+                .unwrap()
+                .commit_segment(0, file_bytes)
+                .unwrap();
+        }
+        state.downloaded_bytes = u64::from(complete_files) * u64::from(file_bytes);
+    }
+
+    let next_file_id = NzbFileId {
+        job_id,
+        file_index: complete_files,
+    };
+    let next_work = DownloadWork {
+        segment_id: SegmentId {
+            file_id: next_file_id,
+            segment_number: 0,
+        },
+        message_id: MessageId::new("small-complete-next@example.com"),
+        groups: vec!["alt.binaries.test".to_string()],
+        priority: FileRole::RarVolume {
+            volume_number: complete_files,
+        }
+        .download_priority(),
+        byte_estimate: file_bytes,
+        retry_count: 0,
+        is_recovery: false,
+        exclude_servers: vec![],
+    };
+    assert!(pipeline.primary_download_within_restart_durable_lead(job_id, &next_work));
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .push(next_work);
+
+    pipeline.dispatch_downloads();
+
+    assert!(pipeline.active_downloads > 0);
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_restart_durable_lead_blocked_total
+            .load(Ordering::Relaxed),
+        0
+    );
 }
 
 #[tokio::test]
@@ -5486,6 +5750,8 @@ async fn dispatch_downloads_respects_hard_write_byte_pressure() {
         },
         decoded_size: 4096,
         data: DecodedChunk::from(vec![7u8; 4096]),
+        part_crc: weaver_par2::checksum::crc32(&vec![7u8; 4096]),
+        part_crc_verified: true,
         yenc_name: "queued.bin".to_string(),
     };
     let buffered_len = buffered.len_bytes();
@@ -7557,6 +7823,8 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
                 file_offset: 0,
                 decoded_size: payload.len() as u32,
                 crc_valid: true,
+                part_crc_verified: true,
+                part_crc: weaver_par2::checksum::crc32(&payload),
                 expected_file_crc: None,
                 data: DecodedChunk::from(payload.clone()),
                 yenc_name: filename.to_string(),
@@ -7975,6 +8243,8 @@ async fn fail_job_clears_write_backlog_accounting() {
         },
         decoded_size: 4096,
         data: DecodedChunk::from(vec![3u8; 4096]),
+        part_crc: weaver_par2::checksum::crc32(&vec![3u8; 4096]),
+        part_crc_verified: true,
         yenc_name: "stalled.bin".to_string(),
     };
     let buffered_len = buffered.len_bytes();
@@ -8031,6 +8301,8 @@ async fn disk_write_failure_fails_job_before_commit() {
             file_offset: 0,
             decoded_size: 4,
             crc_valid: true,
+            part_crc_verified: true,
+            part_crc: weaver_par2::checksum::crc32(b"fail"),
             expected_file_crc: None,
             data: DecodedChunk::from(b"fail".to_vec()),
             yenc_name: "blocked.bin".to_string(),
@@ -8081,6 +8353,149 @@ async fn completed_file_crc32_match_persists_completion() {
         hashes.get(&0).copied(),
         Some(weaver_par2::checksum::md5(payload))
     );
+}
+
+#[tokio::test]
+async fn completed_rar_with_par2_metadata_and_verified_yenc_crc_uses_expected_hash() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20020);
+    let filename = "show.part01.rar";
+    let payload = b"verified rar volume";
+    let expected_hash = [0xAB; 16];
+    assert_ne!(expected_hash, weaver_par2::checksum::md5(payload));
+    let spec = rar_job_spec(
+        "RAR Expected Hash Fast Path",
+        &[(filename.to_string(), payload.to_vec())],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let par2_file_id = weaver_par2::FileId::from_bytes([0x42; 16]);
+    let mut par2_set = minimal_par2_file_set();
+    par2_set.recovery_file_ids.push(par2_file_id);
+    par2_set.files.insert(
+        par2_file_id,
+        weaver_par2::FileDescription {
+            file_id: par2_file_id,
+            hash_full: expected_hash,
+            hash_16k: [0xCD; 16],
+            length: payload.len() as u64,
+            par2_name: filename.to_string(),
+            filename: filename.to_string(),
+        },
+    );
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_decoded_segment(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        payload,
+        filename,
+        Some(weaver_par2::checksum::crc32(payload)),
+    )
+    .await;
+
+    let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert_eq!(hashes.get(&0).copied(), Some(expected_hash));
+}
+
+#[tokio::test]
+async fn completed_rar_without_whole_file_crc_uses_expected_hash_when_parts_verified() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20021);
+    let filename = "show.part02.rar";
+    let payload = b"verified rar volume without whole crc";
+    let expected_hash = [0xBC; 16];
+    assert_ne!(expected_hash, weaver_par2::checksum::md5(payload));
+    let spec = rar_job_spec(
+        "RAR Expected Hash Missing CRC Fast Path",
+        &[(filename.to_string(), payload.to_vec())],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let par2_file_id = weaver_par2::FileId::from_bytes([0x43; 16]);
+    let mut par2_set = minimal_par2_file_set();
+    par2_set.recovery_file_ids.push(par2_file_id);
+    par2_set.files.insert(
+        par2_file_id,
+        weaver_par2::FileDescription {
+            file_id: par2_file_id,
+            hash_full: expected_hash,
+            hash_16k: [0xDE; 16],
+            length: payload.len() as u64,
+            par2_name: filename.to_string(),
+            filename: filename.to_string(),
+        },
+    );
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_decoded_segment(&mut pipeline, file_id, 0, 0, payload, filename, None).await;
+
+    let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert_eq!(hashes.get(&0).copied(), Some(expected_hash));
+}
+
+#[tokio::test]
+async fn completed_rar_without_verified_part_crc_falls_back_to_actual_hash() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20022);
+    let filename = "show.part03.rar";
+    let payload = b"rar volume without verified part crc";
+    let expected_hash = [0xBD; 16];
+    let actual_hash = weaver_par2::checksum::md5(payload);
+    assert_ne!(expected_hash, actual_hash);
+    let spec = rar_job_spec(
+        "RAR Expected Hash Missing Part CRC Fallback",
+        &[(filename.to_string(), payload.to_vec())],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let par2_file_id = weaver_par2::FileId::from_bytes([0x44; 16]);
+    let mut par2_set = minimal_par2_file_set();
+    par2_set.recovery_file_ids.push(par2_file_id);
+    par2_set.files.insert(
+        par2_file_id,
+        weaver_par2::FileDescription {
+            file_id: par2_file_id,
+            hash_full: expected_hash,
+            hash_16k: [0xEF; 16],
+            length: payload.len() as u64,
+            par2_name: filename.to_string(),
+            filename: filename.to_string(),
+        },
+    );
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_decoded_segment_with_part_crc_verified(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        payload,
+        filename,
+        None,
+        false,
+    )
+    .await;
+
+    let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert_eq!(hashes.get(&0).copied(), Some(actual_hash));
 }
 
 #[tokio::test]
@@ -8244,6 +8659,8 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
         },
         decoded_size: 64,
         data: DecodedChunk::from(vec![9u8; 64]),
+        part_crc: weaver_par2::checksum::crc32(&vec![9u8; 64]),
+        part_crc_verified: true,
         yenc_name: "episode.bin".to_string(),
     };
     let buffered_len = buffered.len_bytes();
@@ -8361,6 +8778,8 @@ async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() 
         },
         decoded_size: 64,
         data: DecodedChunk::from(original_payload[64..].to_vec()),
+        part_crc: weaver_par2::checksum::crc32(&original_payload[64..]),
+        part_crc_verified: true,
         yenc_name: payload_filename.to_string(),
     };
     let buffered_len = buffered.len_bytes();
@@ -10353,11 +10772,29 @@ async fn finalize_completed_file_hash_falls_back_to_disk_after_out_of_order_stre
     let file_path = temp_dir.path().join(payload_filename);
     tokio::fs::write(&file_path, payload).await.unwrap();
 
-    pipeline.note_file_hash_chunk(file_id, 4, &payload[4..8]);
-    pipeline.note_file_hash_chunk(file_id, 0, &payload[0..4]);
+    pipeline.note_file_hash_chunk(
+        file_id,
+        4,
+        &payload[4..8],
+        weaver_par2::checksum::crc32(&payload[4..8]),
+        true,
+    );
+    pipeline.note_file_hash_chunk(
+        file_id,
+        0,
+        &payload[0..4],
+        weaver_par2::checksum::crc32(&payload[0..4]),
+        true,
+    );
 
     let checksum = pipeline
-        .finalize_completed_file_hash(file_id, file_path, payload.len() as u64)
+        .finalize_completed_file_hash(
+            file_id,
+            payload_filename,
+            file_path,
+            payload.len() as u64,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(checksum.md5, weaver_par2::checksum::md5(payload));
@@ -16792,6 +17229,41 @@ async fn probe_activation_keeps_queues_live_and_completion_clears_health_probing
     assert!(state.held_segments.is_empty());
     assert_eq!(state.download_queue.len(), 3);
     assert_eq!(state.recovery_queue.len(), 0);
+}
+
+#[tokio::test]
+async fn critical_health_starts_probe_without_immediate_fail_fast() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30025);
+    let spec = standalone_job_spec(
+        "Critical Probe Fence",
+        &[
+            ("probe-a.bin".to_string(), 100),
+            ("probe-b.bin".to_string(), 100),
+            ("probe-c.bin".to_string(), 100),
+        ],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.failed_bytes = 46;
+    }
+
+    pipeline.check_health(job_id);
+
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert!(state.health_probing);
+        assert!(matches!(state.status, JobStatus::Checking));
+    }
+
+    pipeline.check_health(job_id);
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert!(state.health_probing);
+    assert!(matches!(state.status, JobStatus::Checking));
 }
 
 #[tokio::test]

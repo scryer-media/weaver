@@ -30,6 +30,9 @@ const IP_REPLACEMENT_OLD_SLOWER_MS: f64 = 75.0;
 const IP_REPLACEMENT_TRIAL_SAMPLES: usize = 4;
 const IP_REPLACEMENT_CANDIDATE_BETTER_RATIO: f64 = 0.85;
 const IP_REPLACEMENT_CANDIDATE_BETTER_MS: f64 = 40.0;
+const DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY: Duration = Duration::from_millis(250);
+const BODY_LANE_UNAVAILABLE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DownloadPressure {
@@ -96,10 +99,20 @@ impl Pipeline {
             .assembly
             .files()
             .map(|file| {
+                if file.is_complete() {
+                    return file.total_bytes();
+                }
+                let file_id = file.file_id();
                 self.persisted_file_progress
-                    .get(&file.file_id())
+                    .get(&file_id)
                     .copied()
                     .unwrap_or(0)
+                    .max(
+                        self.pending_file_progress
+                            .get(&file_id)
+                            .copied()
+                            .unwrap_or(0),
+                    )
                     .min(file.total_bytes())
             })
             .sum::<u64>();
@@ -137,16 +150,21 @@ impl Pipeline {
         job_id: JobId,
         work: &DownloadWork,
     ) -> bool {
+        self.restart_durable_lead_block(job_id, work).is_none()
+    }
+
+    fn restart_durable_lead_block(&self, job_id: JobId, work: &DownloadWork) -> Option<(u64, u64)> {
         if work.is_recovery {
-            return true;
+            return None;
         }
         let limit = Self::restart_durable_lead_limit_bytes();
         if limit == 0 {
-            return true;
+            return None;
         }
-        self.estimated_undurable_download_bytes_for_job(job_id)
-            .saturating_add(work.byte_estimate as u64)
-            <= limit
+        let projected = self
+            .estimated_undurable_download_bytes_for_job(job_id)
+            .saturating_add(work.byte_estimate as u64);
+        (projected > limit).then_some((projected, limit))
     }
 
     fn normal_download_connection_capacity_limit(&self, effective_total: usize) -> usize {
@@ -882,6 +900,47 @@ impl Pipeline {
         true
     }
 
+    fn schedule_download_work_without_retry_budget(
+        &mut self,
+        segment_id: SegmentId,
+        retry_count: u32,
+        exclude_servers: Vec<usize>,
+        delay: Duration,
+    ) -> bool {
+        let job_id = segment_id.file_id.job_id;
+        let file_idx = segment_id.file_id.file_index as usize;
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let Some(file_spec) = state.spec.files.get(file_idx) else {
+            return false;
+        };
+        let Some(seg_spec) = file_spec
+            .segments
+            .iter()
+            .find(|seg| seg.ordinal == segment_id.segment_number)
+        else {
+            return false;
+        };
+        let work = DownloadWork {
+            segment_id,
+            message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
+            groups: file_spec.groups.clone(),
+            priority: file_spec.role.download_priority(),
+            byte_estimate: seg_spec.bytes,
+            retry_count,
+            is_recovery: file_spec.role.is_recovery(),
+            exclude_servers,
+        };
+        self.note_retry_scheduled(segment_id);
+        let retry_tx = self.retry_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = retry_tx.send(work).await;
+        });
+        true
+    }
+
     fn bandwidth_reservation_estimate(decoded_bytes: u32) -> u64 {
         let decoded = decoded_bytes as u64;
         decoded.saturating_add(decoded / 16).saturating_add(1024)
@@ -1201,12 +1260,36 @@ impl Pipeline {
         stop_on_cap_block: bool,
     ) -> Result<Option<DownloadWork>, DispatchAttempt> {
         if !self.primary_download_within_restart_durable_lead(job_id, &work) {
-            if let Some(state) = self.jobs.get_mut(&job_id) {
-                state.download_queue.push(work);
+            let (projected_before_flush, limit) = self
+                .restart_durable_lead_block(job_id, &work)
+                .expect("blocked durable lead must include projected bytes");
+            self.flush_file_progress_batch("download.file_progress.flush.restart_durable_lead");
+            if let Some((projected_after_flush, _)) = self.restart_durable_lead_block(job_id, &work)
+            {
+                self.metrics
+                    .download_restart_durable_lead_blocked_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.download_restart_durable_lead_retry_after.insert(
+                    job_id,
+                    Instant::now() + DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY,
+                );
+                debug!(
+                    job_id = job_id.0,
+                    segment = ?work.segment_id,
+                    projected_before_flush,
+                    projected_after_flush,
+                    limit,
+                    "dispatch delayed: restart durable lead"
+                );
+                if let Some(state) = self.jobs.get_mut(&job_id) {
+                    state.download_queue.push(work);
+                }
+                self.update_queue_metrics();
+                return Ok(None);
             }
-            self.update_queue_metrics();
-            return Ok(None);
         }
+        self.download_restart_durable_lead_retry_after
+            .remove(&job_id);
 
         let reservation_estimate = Self::bandwidth_reservation_estimate(work.byte_estimate);
         match self.reserve_bandwidth_for_dispatch(work.segment_id, reservation_estimate) {
@@ -1588,6 +1671,14 @@ impl Pipeline {
         job_id: JobId,
         pressure: DownloadPressure,
     ) -> DispatchAttempt {
+        if self
+            .download_restart_durable_lead_retry_after
+            .get(&job_id)
+            .is_some_and(|ready_at| *ready_at > Instant::now())
+        {
+            self.update_queue_metrics();
+            return DispatchAttempt::NoWork;
+        }
         self.apply_rar_unlock_priorities_if_dirty(job_id);
         let lease = match self.try_lease_initial_download_batch(job_id, pressure) {
             Ok(Some(lease)) => lease,
@@ -1746,10 +1837,19 @@ impl Pipeline {
         metrics.note_decode_task_started(raw_size);
 
         tokio::task::spawn_blocking(move || {
+            crate::runtime::perf_probe::record(
+                "download.decode.task.enter",
+                Duration::from_nanos(1),
+            );
             let _profile_scope = crate::runtime::perf_probe::scope("download.decode.task");
+            let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.task");
             crate::runtime::affinity::pin_current_thread_for_hot_download_path();
 
             let send_decode_failure = |error: String| {
+                let _profile_scope =
+                    crate::runtime::perf_probe::scope("download.decode.send_failure");
+                let _cpu_scope =
+                    crate::runtime::perf_probe::cpu_scope("download.decode.send_failure");
                 let _ = tx.blocking_send(DecodeDone::Failed {
                     segment_id,
                     raw_size,
@@ -1768,7 +1868,11 @@ impl Pipeline {
                     return;
                 };
 
-                match weaver_yenc::decode_nntp(&raw, output_buf) {
+                let decode_result = {
+                    let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.yenc");
+                    weaver_yenc::decode_nntp(&raw, output_buf)
+                };
+                match decode_result {
                     Ok(decode_result) => {
                         output.set_len(decode_result.bytes_written);
                         metrics
@@ -1782,14 +1886,26 @@ impl Pipeline {
                             .map(|b| b.saturating_sub(1))
                             .unwrap_or(0);
 
-                        let decoded = DecodedChunk::from(output.as_slice().to_vec());
+                        let decoded = {
+                            let _cpu_scope = crate::runtime::perf_probe::cpu_scope(
+                                "download.decode.copy_to_owned",
+                            );
+                            DecodedChunk::from(output.as_slice().to_vec())
+                        };
 
+                        let _profile_scope =
+                            crate::runtime::perf_probe::scope("download.decode.send_success");
+                        let _cpu_scope =
+                            crate::runtime::perf_probe::cpu_scope("download.decode.send_success");
                         let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
                             segment_id,
                             raw_size,
                             file_offset,
                             decoded_size: decode_result.bytes_written as u32,
                             crc_valid: decode_result.crc_valid,
+                            part_crc_verified: decode_result.expected_part_crc.is_some()
+                                && decode_result.crc_valid,
+                            part_crc: decode_result.part_crc,
                             expected_file_crc: decode_result.expected_file_crc,
                             data: decoded,
                             yenc_name: decode_result.metadata.name,
@@ -1806,8 +1922,16 @@ impl Pipeline {
                     }
                 }
             } else {
-                let mut output = vec![0u8; raw.len()];
-                match weaver_yenc::decode_nntp(&raw, &mut output) {
+                let mut output = {
+                    let _cpu_scope =
+                        crate::runtime::perf_probe::cpu_scope("download.decode.alloc_vec");
+                    vec![0u8; raw.len()]
+                };
+                let decode_result = {
+                    let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.yenc");
+                    weaver_yenc::decode_nntp(&raw, &mut output)
+                };
+                match decode_result {
                     Ok(decode_result) => {
                         output.truncate(decode_result.bytes_written);
                         metrics
@@ -1821,12 +1945,19 @@ impl Pipeline {
                             .map(|b| b.saturating_sub(1))
                             .unwrap_or(0);
 
+                        let _profile_scope =
+                            crate::runtime::perf_probe::scope("download.decode.send_success");
+                        let _cpu_scope =
+                            crate::runtime::perf_probe::cpu_scope("download.decode.send_success");
                         let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
                             segment_id,
                             raw_size,
                             file_offset,
                             decoded_size: decode_result.bytes_written as u32,
                             crc_valid: decode_result.crc_valid,
+                            part_crc_verified: decode_result.expected_part_crc.is_some()
+                                && decode_result.crc_valid,
+                            part_crc: decode_result.part_crc,
                             expected_file_crc: decode_result.expected_file_crc,
                             data: DecodedChunk::from(output),
                             yenc_name: decode_result.metadata.name,
@@ -1897,6 +2028,83 @@ impl Pipeline {
 
         remaining.extend(self.pending_decode.drain(..));
         self.pending_decode = remaining;
+    }
+
+    fn log_download_dispatch_liveness_stall(
+        &mut self,
+        now: Instant,
+        pressure: DownloadPressure,
+        max_connections: usize,
+        eligible_count: usize,
+    ) {
+        if self.active_downloads != 0 || self.active_download_connections != 0 {
+            return;
+        }
+
+        let queue_depth = self
+            .jobs
+            .values()
+            .map(|state| state.download_queue.len() + state.recovery_queue.len())
+            .sum::<usize>();
+        if queue_depth == 0 {
+            self.last_download_dispatch_stall_log_at = None;
+            return;
+        }
+        if self
+            .last_download_dispatch_stall_log_at
+            .is_some_and(|last| {
+                now.saturating_duration_since(last) < DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL
+            })
+        {
+            return;
+        }
+
+        self.last_download_dispatch_stall_log_at = Some(now);
+        let hot_job_id = self.hot_dispatch_job.map(|id| id.0).unwrap_or_default();
+        if let Some(job_id) = self.job_order.iter().copied().find(|job_id| {
+            self.jobs.get(job_id).is_some_and(|state| {
+                !state.download_queue.is_empty() || !state.recovery_queue.is_empty()
+            })
+        }) {
+            let state = self
+                .jobs
+                .get(&job_id)
+                .expect("job from job_order must exist while logging dispatch stall");
+            let durable_retry_ms = self
+                .download_restart_durable_lead_retry_after
+                .get(&job_id)
+                .map(|ready_at| ready_at.saturating_duration_since(now).as_millis() as u64)
+                .unwrap_or_default();
+            warn!(
+                job_id = job_id.0,
+                status = ?state.status,
+                download_queue_len = state.download_queue.len(),
+                recovery_queue_len = state.recovery_queue.len(),
+                status_allows_dispatch = Self::status_allows_download_dispatch(&state.status),
+                eligible_count,
+                queue_depth,
+                active_downloads = self.active_downloads,
+                active_connections = self.active_download_connections,
+                max_connections,
+                pressure_state = pressure.state.as_str(),
+                pressure_reason = pressure.reason.as_str(),
+                hot_job_id,
+                restart_durable_lead_retry_ms = durable_retry_ms,
+                "download dispatch liveness stall: queued work but no active downloads"
+            );
+        } else {
+            warn!(
+                eligible_count,
+                queue_depth,
+                active_downloads = self.active_downloads,
+                active_connections = self.active_download_connections,
+                max_connections,
+                pressure_state = pressure.state.as_str(),
+                pressure_reason = pressure.reason.as_str(),
+                hot_job_id,
+                "download dispatch liveness stall: queued work but no active downloads"
+            );
+        }
     }
 
     /// Dispatch downloads across eligible jobs with hot-job-first ordering.
@@ -2097,12 +2305,14 @@ impl Pipeline {
             );
         }
 
+        let eligible_count = eligible.len();
         let Some((_hot_priority, hot_job_id)) = self.select_hot_dispatch_job(&eligible, now) else {
             self.clear_hot_dispatch_period();
             self.update_queue_metrics();
             return;
         };
 
+        let active_connections_before_dispatch = self.active_download_connections;
         while self.active_download_connections < max
             && !self.rate_limiter.should_wait()
             && dispatch_budget > 0
@@ -2219,6 +2429,10 @@ impl Pipeline {
             }
         }
 
+        if active_connections_before_dispatch == 0 && self.active_download_connections == 0 {
+            self.log_download_dispatch_liveness_stall(now, pressure, max, eligible_count);
+        }
+
         self.maybe_start_ip_replacement_trial(hot_job_id, pressure, max);
         self.update_queue_metrics();
         self.publish_hot_dispatch_metrics(now);
@@ -2269,12 +2483,27 @@ impl Pipeline {
                     raw_size,
                     decoded,
                     result,
+                    cpu,
                 } = decoded;
+                crate::runtime::perf_probe::record_cpu_sample(
+                    "download.inline_decode.feed",
+                    cpu.feed,
+                );
+                crate::runtime::perf_probe::record_cpu_sample(
+                    "download.inline_decode.finish",
+                    cpu.finish,
+                );
                 let file_offset = result
                     .metadata
                     .begin
                     .map(|b| b.saturating_sub(1))
                     .unwrap_or(0);
+
+                let data = {
+                    let _cpu =
+                        crate::runtime::perf_probe::cpu_scope("download.inline_decode.into_chunk");
+                    DecodedChunk::from(decoded)
+                };
 
                 Ok(DownloadPayload::Decoded(DecodeResult {
                     segment_id,
@@ -2282,8 +2511,10 @@ impl Pipeline {
                     file_offset,
                     decoded_size: result.bytes_written as u32,
                     crc_valid: result.crc_valid,
+                    part_crc_verified: result.expected_part_crc.is_some() && result.crc_valid,
+                    part_crc: result.part_crc,
                     expected_file_crc: result.expected_file_crc,
-                    data: DecodedChunk::from(decoded),
+                    data,
                     yenc_name: result.metadata.name,
                 }))
             }
@@ -2346,10 +2577,7 @@ impl Pipeline {
             }
 
             let Some(mut lane) = lane else {
-                let message = acquire_error
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "failed to acquire BODY lane".to_string());
+                let failure = DownloadFailure::from_lane_acquire_failure(acquire_error.as_ref());
                 let is_recovery = lease.compatibility.is_recovery;
                 let exclude_servers = lease.compatibility.exclude_servers.clone();
                 let mode = lease.lane_mode;
@@ -2358,10 +2586,7 @@ impl Pipeline {
                     let _ = tx
                         .send(DownloadResult {
                             segment_id: work.segment_id,
-                            data: Err(DownloadError::Fetch(DownloadFailure {
-                                kind: DownloadFailureKind::Transient,
-                                message: message.clone(),
-                            })),
+                            data: Err(DownloadError::Fetch(failure.clone())),
                             attempts: Vec::new(),
                             lane_observation: Some(DownloadLaneObservation {
                                 server_idx: None,
@@ -3445,12 +3670,42 @@ impl Pipeline {
                     self.maybe_finish_download_pass(job_id);
                     return;
                 }
+                if failure.kind == DownloadFailureKind::LaneUnavailable {
+                    self.metrics
+                        .download_failures_capacity_unavailable
+                        .fetch_add(1, Ordering::Relaxed);
+                    if self.schedule_download_work_without_retry_budget(
+                        result.segment_id,
+                        result.retry_count,
+                        excluded_servers,
+                        BODY_LANE_UNAVAILABLE_RETRY_DELAY,
+                    ) {
+                        debug!(
+                            job_id = job_id.0,
+                            segment = %result.segment_id,
+                            retry_count = result.retry_count,
+                            retry_delay_ms = BODY_LANE_UNAVAILABLE_RETRY_DELAY.as_millis() as u64,
+                            error = %failure.message,
+                            "body lane unavailable; requeued without consuming article retry budget"
+                        );
+                    } else {
+                        warn!(
+                            job_id = job_id.0,
+                            segment = %result.segment_id,
+                            error = %failure.message,
+                            "body lane unavailable (job gone, not retrying)"
+                        );
+                    }
+                    self.maybe_finish_download_pass(job_id);
+                    return;
+                }
                 match &failure.kind {
                     DownloadFailureKind::ArticleNotFound => self
                         .metrics
                         .download_failures_article_not_found
                         .fetch_add(1, Ordering::Relaxed),
-                    DownloadFailureKind::CapacityUnavailable => self
+                    DownloadFailureKind::CapacityUnavailable
+                    | DownloadFailureKind::LaneUnavailable => self
                         .metrics
                         .download_failures_capacity_unavailable
                         .fetch_add(1, Ordering::Relaxed),

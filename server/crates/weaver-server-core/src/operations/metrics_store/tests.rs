@@ -84,6 +84,7 @@ fn sample_snapshot(
         download_pressure_stalls_total: 0,
         download_pressure_stall_duration_ms: 0,
         download_pressure_current_stall_ms: 0,
+        download_restart_durable_lead_blocked_total: 0,
         hot_dispatch_job_id: 0,
         hot_dispatch_mode: crate::DispatchShareMode::Exclusive,
         hot_dispatch_underfill_ms: 0,

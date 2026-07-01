@@ -4841,6 +4841,7 @@ version = "0.6.9"
 dependencies = [
  "bytes",
  "criterion",
+ "libc",
  "memchr",
  "pin-project-lite",
  "rand 0.10.1",

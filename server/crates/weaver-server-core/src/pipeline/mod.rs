@@ -15,7 +15,7 @@ pub(crate) use orchestrator::check_disk_space;
 use orchestrator::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};
 use orchestrator::{is_terminal_status, write_segment_to_disk};
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -664,6 +664,7 @@ pub(super) enum DownloadPayload {
 pub(super) enum DownloadFailureKind {
     ArticleNotFound,
     CapacityUnavailable,
+    LaneUnavailable,
     Transient,
     Auth,
     Permanent,
@@ -681,6 +682,33 @@ impl DownloadFailure {
             kind,
             message: message.into(),
         }
+    }
+
+    pub(super) fn from_lane_acquire_failure(error: Option<&weaver_nntp::NntpError>) -> Self {
+        use weaver_nntp::NntpError;
+
+        let Some(error) = error else {
+            return Self::new(
+                DownloadFailureKind::LaneUnavailable,
+                "failed to acquire BODY lane",
+            );
+        };
+
+        let kind = match error {
+            NntpError::AuthenticationFailed
+            | NntpError::AuthenticationRejected
+            | NntpError::AuthenticationRequired
+            | NntpError::AccessDenied => DownloadFailureKind::Auth,
+            NntpError::NoSuchGroup
+            | NntpError::NoGroupSelected
+            | NntpError::CommandNotRecognized
+            | NntpError::TlsRequired
+            | NntpError::UnexpectedResponse { .. }
+            | NntpError::MalformedResponse(_) => DownloadFailureKind::Permanent,
+            _ => DownloadFailureKind::LaneUnavailable,
+        };
+
+        Self::new(kind, error.to_string())
     }
 
     pub(super) fn from_nntp(error: weaver_nntp::NntpError) -> Self {
@@ -955,6 +983,8 @@ pub(super) struct DecodeResult {
     pub(super) file_offset: u64,
     pub(super) decoded_size: u32,
     pub(super) crc_valid: bool,
+    pub(super) part_crc_verified: bool,
+    pub(super) part_crc: u32,
     pub(super) expected_file_crc: Option<u32>,
     pub(super) data: DecodedChunk,
     /// Original filename from the yEnc header (for swap detection observability).
@@ -979,32 +1009,68 @@ pub(super) struct CompletedFileChecksum {
     pub(super) crc32: u32,
 }
 
+pub(super) struct StreamedCompletedFileChecksum {
+    pub(super) md5: Option<[u8; 16]>,
+    pub(super) crc32: u32,
+    pub(super) all_parts_crc_verified: bool,
+}
+
 pub(super) struct CompletedFileChecksumState {
-    md5: weaver_par2::checksum::FileHashState,
-    crc32: crc32fast::Hasher,
+    md5: Option<weaver_par2::checksum::FileHashState>,
+    crc32: u32,
+    bytes_fed: u64,
+    all_parts_crc_verified: bool,
 }
 
 impl CompletedFileChecksumState {
     pub(super) fn new() -> Self {
         Self {
-            md5: weaver_par2::checksum::FileHashState::new(),
-            crc32: crc32fast::Hasher::new(),
+            md5: Some(weaver_par2::checksum::FileHashState::new()),
+            crc32: 0,
+            bytes_fed: 0,
+            all_parts_crc_verified: true,
         }
     }
 
-    pub(super) fn update(&mut self, data: &[u8]) {
-        self.md5.update(data);
-        self.crc32.update(data);
+    pub(super) fn update(
+        &mut self,
+        data: &[u8],
+        part_crc: u32,
+        part_crc_verified: bool,
+        track_md5: bool,
+    ) {
+        if !part_crc_verified {
+            self.all_parts_crc_verified = false;
+        }
+        if track_md5 {
+            let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.file_hash.update.md5");
+            if let Some(md5) = self.md5.as_mut() {
+                md5.update(data);
+            }
+        } else if self.md5.take().is_some() {
+            crate::runtime::perf_probe::record(
+                "download.file_hash.update.md5.disabled",
+                Duration::from_nanos(1),
+            );
+        }
+        {
+            let _cpu_scope =
+                crate::runtime::perf_probe::cpu_scope("download.file_hash.update.crc32_combine");
+            self.crc32 =
+                weaver_par2::checksum::crc32_combine(self.crc32, part_crc, data.len() as u64);
+        }
+        self.bytes_fed += data.len() as u64;
     }
 
     pub(super) fn bytes_fed(&self) -> u64 {
-        self.md5.bytes_fed()
+        self.bytes_fed
     }
 
-    pub(super) fn finalize(self) -> CompletedFileChecksum {
-        CompletedFileChecksum {
-            md5: self.md5.finalize(),
-            crc32: self.crc32.finalize(),
+    pub(super) fn finalize(self) -> StreamedCompletedFileChecksum {
+        StreamedCompletedFileChecksum {
+            md5: self.md5.map(weaver_par2::checksum::FileHashState::finalize),
+            crc32: self.crc32,
+            all_parts_crc_verified: self.all_parts_crc_verified,
         }
     }
 }
@@ -1037,11 +1103,25 @@ pub(super) struct BufferedDecodedSegment {
     pub(super) segment_id: SegmentId,
     pub(super) decoded_size: u32,
     pub(super) data: DecodedChunk,
+    pub(super) part_crc: u32,
+    pub(super) part_crc_verified: bool,
     pub(super) yenc_name: String,
 }
 
 impl BufferedChunk for BufferedDecodedSegment {
     fn len_bytes(&self) -> usize {
+        self.data.len_bytes()
+    }
+}
+
+pub(super) struct DeferredFileHashChunk {
+    pub(super) data: DecodedChunk,
+    pub(super) part_crc: u32,
+    pub(super) part_crc_verified: bool,
+}
+
+impl DeferredFileHashChunk {
+    pub(super) fn len_bytes(&self) -> usize {
         self.data.len_bytes()
     }
 }
@@ -1178,6 +1258,11 @@ pub struct Pipeline {
     pub(super) persisted_file_progress: HashMap<NzbFileId, u64>,
     /// Streaming checksum state for files whose decoded bytes have been observed in order.
     pub(super) file_hash_states: HashMap<NzbFileId, CompletedFileChecksumState>,
+    /// Decoded bytes for out-of-order persisted ranges waiting to be replayed into the streaming checksum.
+    pub(super) deferred_file_hash_data: HashMap<NzbFileId, BTreeMap<u64, DeferredFileHashChunk>>,
+    pub(super) deferred_file_hash_data_bytes: usize,
+    /// Out-of-order persisted ranges waiting to be replayed into the streaming checksum.
+    pub(super) deferred_file_hash_ranges: HashMap<NzbFileId, BTreeMap<u64, usize>>,
     /// Expected whole-file yEnc CRC32 values observed from multipart `=yend crc32`.
     pub(super) expected_file_crcs: HashMap<NzbFileId, u32>,
     /// Files that need a one-time disk reread because out-of-order persistence broke the stream.
@@ -1255,6 +1340,10 @@ pub struct Pipeline {
     pub(super) download_pressure_hard_stall_started_at: Option<Instant>,
     /// Next time soft byte pressure may issue a replacement article.
     pub(super) download_pressure_soft_dispatch_after: Option<Instant>,
+    /// Per-job delay after restart-durable-lead throttling parks primary work.
+    pub(super) download_restart_durable_lead_retry_after: HashMap<JobId, Instant>,
+    /// Last time we logged a queued/no-active-download liveness stall.
+    pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
     /// Current in-memory decoded backlog retained for sequential write ordering.
     pub(super) write_buffered_bytes: usize,
     /// Current in-memory decoded segment count retained for sequential write ordering.

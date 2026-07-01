@@ -1,9 +1,35 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::time::Instant;
 
 use super::*;
+
+const MAX_DEFERRED_FILE_HASH_DATA_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+enum SegmentHashMode {
+    UpdateNow,
+    DeferRange,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum OutOfOrderPersistReason {
+    PerFileMaxPending,
+    GlobalWriteBacklog,
+    QuiescentFlush,
+}
+
+impl OutOfOrderPersistReason {
+    fn profile_bucket(self) -> &'static str {
+        match self {
+            Self::PerFileMaxPending => "download.write_buffer.out_of_order.per_file_max_pending",
+            Self::GlobalWriteBacklog => "download.write_buffer.out_of_order.global_write_backlog",
+            Self::QuiescentFlush => "download.write_buffer.out_of_order.quiescent_flush",
+        }
+    }
+}
 
 #[derive(Debug)]
 struct SegmentWriteError {
@@ -49,7 +75,10 @@ impl Pipeline {
         file_id: NzbFileId,
         file_offset: u64,
         data: &[u8],
+        part_crc: u32,
+        part_crc_verified: bool,
     ) {
+        let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.file_hash.update");
         if self.file_hash_reread_required.contains(&file_id) {
             return;
         }
@@ -60,14 +89,213 @@ impl Pipeline {
             .map(|state| state.bytes_fed())
             .unwrap_or(0);
         if expected_offset != file_offset {
-            self.mark_file_hash_reread_required(file_id);
+            self.mark_file_hash_reread_required_for(file_id, "offset_mismatch");
             return;
         }
 
-        self.file_hash_states
+        let track_md5 = self.should_stream_md5_for_file(file_id);
+        self.file_hash_states.entry(file_id).or_default().update(
+            data,
+            part_crc,
+            part_crc_verified,
+            track_md5,
+        );
+    }
+
+    fn defer_file_hash_chunk(
+        &mut self,
+        file_id: NzbFileId,
+        file_offset: u64,
+        data: DecodedChunk,
+        part_crc: u32,
+        part_crc_verified: bool,
+    ) {
+        let len = data.len_bytes();
+        if len == 0 || self.file_hash_reread_required.contains(&file_id) {
+            return;
+        }
+        crate::runtime::perf_probe::record(
+            "download.file_hash.deferred_range",
+            std::time::Duration::from_nanos(1),
+        );
+        self.deferred_file_hash_ranges
             .entry(file_id)
             .or_default()
-            .update(data);
+            .insert(file_offset, len);
+
+        if self.deferred_file_hash_data_bytes.saturating_add(len)
+            <= MAX_DEFERRED_FILE_HASH_DATA_BYTES
+        {
+            let previous = self
+                .deferred_file_hash_data
+                .entry(file_id)
+                .or_default()
+                .insert(
+                    file_offset,
+                    DeferredFileHashChunk {
+                        data,
+                        part_crc,
+                        part_crc_verified,
+                    },
+                );
+            if let Some(previous) = previous {
+                self.deferred_file_hash_data_bytes = self
+                    .deferred_file_hash_data_bytes
+                    .saturating_sub(previous.len_bytes());
+            }
+            self.deferred_file_hash_data_bytes += len;
+            crate::runtime::perf_probe::record(
+                "download.file_hash.deferred_data_stored",
+                std::time::Duration::from_nanos(1),
+            );
+        } else {
+            crate::runtime::perf_probe::record(
+                "download.file_hash.deferred_data_skipped_capacity",
+                std::time::Duration::from_nanos(1),
+            );
+        }
+    }
+
+    fn take_deferred_file_hash_data(
+        &mut self,
+        file_id: NzbFileId,
+        file_offset: u64,
+    ) -> Option<DeferredFileHashChunk> {
+        let chunk = self
+            .deferred_file_hash_data
+            .get_mut(&file_id)
+            .and_then(|chunks| chunks.remove(&file_offset))?;
+        if self
+            .deferred_file_hash_data
+            .get(&file_id)
+            .is_some_and(BTreeMap::is_empty)
+        {
+            self.deferred_file_hash_data.remove(&file_id);
+        }
+        self.deferred_file_hash_data_bytes = self
+            .deferred_file_hash_data_bytes
+            .saturating_sub(chunk.len_bytes());
+        Some(chunk)
+    }
+
+    fn drop_deferred_file_hash_data_for(&mut self, file_id: NzbFileId) {
+        let Some(chunks) = self.deferred_file_hash_data.remove(&file_id) else {
+            return;
+        };
+        let removed = chunks
+            .into_values()
+            .map(|chunk| chunk.len_bytes())
+            .sum::<usize>();
+        self.deferred_file_hash_data_bytes =
+            self.deferred_file_hash_data_bytes.saturating_sub(removed);
+    }
+
+    async fn drain_deferred_file_hash_ranges(
+        &mut self,
+        file_id: NzbFileId,
+        file_path: &std::path::Path,
+    ) {
+        loop {
+            if self.file_hash_reread_required.contains(&file_id) {
+                return;
+            }
+
+            let expected_offset = self
+                .file_hash_states
+                .get(&file_id)
+                .map(|state| state.bytes_fed())
+                .unwrap_or(0);
+            let Some(len) = self
+                .deferred_file_hash_ranges
+                .get(&file_id)
+                .and_then(|ranges| ranges.get(&expected_offset).copied())
+            else {
+                return;
+            };
+
+            if let Some(ranges) = self.deferred_file_hash_ranges.get_mut(&file_id) {
+                ranges.remove(&expected_offset);
+                if ranges.is_empty() {
+                    self.deferred_file_hash_ranges.remove(&file_id);
+                }
+            }
+            crate::runtime::perf_probe::record(
+                "download.file_hash.deferred_range_replayed",
+                std::time::Duration::from_nanos(1),
+            );
+
+            if let Some(chunk) = self.take_deferred_file_hash_data(file_id, expected_offset) {
+                if chunk.len_bytes() != len {
+                    self.mark_file_hash_reread_required_for(file_id, "deferred_data_len_mismatch");
+                    return;
+                }
+                crate::runtime::perf_probe::record(
+                    "download.file_hash.deferred_data_replayed",
+                    std::time::Duration::from_nanos(1),
+                );
+                self.note_file_hash_chunk(
+                    file_id,
+                    expected_offset,
+                    chunk.data.as_slice(),
+                    chunk.part_crc,
+                    chunk.part_crc_verified,
+                );
+                continue;
+            }
+
+            let path = file_path.to_path_buf();
+            let read_result = tokio::task::spawn_blocking(move || {
+                let _cpu_scope =
+                    crate::runtime::perf_probe::cpu_scope("download.file_hash.deferred_range_read");
+                read_file_range(&path, expected_offset, len)
+            })
+            .await;
+
+            let bytes = match read_result {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(error)) => {
+                    warn!(
+                        file_id = %file_id,
+                        offset = expected_offset,
+                        len,
+                        error = %error,
+                        "failed to read deferred file hash range; falling back to full-file checksum"
+                    );
+                    self.mark_file_hash_reread_required_for(file_id, "deferred_range_read_failed");
+                    return;
+                }
+                Err(error) => {
+                    warn!(
+                        file_id = %file_id,
+                        offset = expected_offset,
+                        len,
+                        error = %error,
+                        "deferred file hash range task panicked; falling back to full-file checksum"
+                    );
+                    self.mark_file_hash_reread_required_for(file_id, "deferred_range_task_failed");
+                    return;
+                }
+            };
+
+            let part_crc = weaver_par2::checksum::crc32(&bytes);
+            self.note_file_hash_chunk(file_id, expected_offset, &bytes, part_crc, false);
+        }
+    }
+
+    fn should_stream_md5_for_file(&self, file_id: NzbFileId) -> bool {
+        let Some(state) = self.jobs.get(&file_id.job_id) else {
+            return true;
+        };
+        let Some(file) = state.assembly.file(file_id) else {
+            return true;
+        };
+        if !matches!(
+            self.classified_role_for_file(file_id.job_id, file),
+            weaver_model::files::FileRole::RarVolume { .. }
+        ) {
+            return true;
+        }
+        self.par2_set(file_id.job_id).is_none()
     }
 
     pub(crate) fn note_expected_file_crc(
@@ -98,30 +326,186 @@ impl Pipeline {
         }
     }
 
-    pub(crate) fn mark_file_hash_reread_required(&mut self, file_id: NzbFileId) {
+    fn mark_file_hash_reread_required_for(&mut self, file_id: NzbFileId, reason: &'static str) {
         self.file_hash_states.remove(&file_id);
-        self.file_hash_reread_required.insert(file_id);
+        self.drop_deferred_file_hash_data_for(file_id);
+        if self.file_hash_reread_required.insert(file_id) {
+            crate::runtime::perf_probe::record_owned(
+                format!("download.file_hash.reread_required.{reason}"),
+                std::time::Duration::from_nanos(1),
+            );
+        }
     }
 
     pub(crate) async fn finalize_completed_file_hash(
         &mut self,
         file_id: NzbFileId,
+        filename: &str,
         file_path: std::path::PathBuf,
         total_bytes: u64,
+        expected_file_crc: Option<u32>,
     ) -> Result<CompletedFileChecksum, String> {
+        self.drain_deferred_file_hash_ranges(file_id, &file_path)
+            .await;
         let hash_state = self.file_hash_states.remove(&file_id);
+        self.deferred_file_hash_ranges.remove(&file_id);
+        self.drop_deferred_file_hash_data_for(file_id);
         let reread_required = self.file_hash_reread_required.remove(&file_id);
-        if !reread_required
-            && let Some(hash_state) = hash_state
-            && hash_state.bytes_fed() == total_bytes
-        {
-            return Ok(hash_state.finalize());
+        if reread_required {
+            crate::runtime::perf_probe::record(
+                "download.file_hash.reread_fallback.marked_required",
+                std::time::Duration::from_nanos(1),
+            );
+        } else {
+            match hash_state {
+                Some(hash_state) if hash_state.bytes_fed() == total_bytes => {
+                    let streamed = hash_state.finalize();
+                    if let Some(md5) = streamed.md5 {
+                        return Ok(CompletedFileChecksum {
+                            md5,
+                            crc32: streamed.crc32,
+                        });
+                    }
+                    if let Some(md5) = self.expected_par2_hash_for_fast_verified_rar_file(
+                        file_id,
+                        filename,
+                        total_bytes,
+                        expected_file_crc,
+                        &streamed,
+                    ) {
+                        crate::runtime::perf_probe::record(
+                            "download.file_hash.md5.par2_expected_fast_path",
+                            std::time::Duration::from_nanos(1),
+                        );
+                        return Ok(CompletedFileChecksum {
+                            md5,
+                            crc32: streamed.crc32,
+                        });
+                    }
+                    crate::runtime::perf_probe::record(
+                        "download.file_hash.reread_fallback.md5_disabled_not_eligible",
+                        std::time::Duration::from_nanos(1),
+                    );
+                }
+                Some(_) => crate::runtime::perf_probe::record(
+                    "download.file_hash.reread_fallback.incomplete_stream_state",
+                    std::time::Duration::from_nanos(1),
+                ),
+                None => crate::runtime::perf_probe::record(
+                    "download.file_hash.reread_fallback.no_stream_state",
+                    std::time::Duration::from_nanos(1),
+                ),
+            }
         }
 
         tokio::task::spawn_blocking(move || checksum_completed_file(&file_path))
             .await
             .map_err(|error| format!("file checksum task panicked: {error}"))?
             .map_err(|error| format!("failed to checksum completed file: {error}"))
+    }
+
+    fn expected_par2_hash_for_fast_verified_rar_file(
+        &self,
+        file_id: NzbFileId,
+        filename: &str,
+        total_bytes: u64,
+        expected_file_crc: Option<u32>,
+        streamed: &StreamedCompletedFileChecksum,
+    ) -> Option<[u8; 16]> {
+        if let Some(expected_file_crc) = expected_file_crc {
+            if streamed.crc32 != expected_file_crc {
+                crate::runtime::perf_probe::record(
+                    "download.file_hash.md5.fast_path_reject.file_crc_mismatch",
+                    std::time::Duration::from_nanos(1),
+                );
+                return None;
+            }
+        } else {
+            crate::runtime::perf_probe::record(
+                "download.file_hash.md5.fast_path_without_file_crc",
+                std::time::Duration::from_nanos(1),
+            );
+        }
+        if !streamed.all_parts_crc_verified {
+            crate::runtime::perf_probe::record(
+                "download.file_hash.md5.fast_path_reject.unverified_part_crc",
+                std::time::Duration::from_nanos(1),
+            );
+            return None;
+        }
+
+        let job_id = file_id.job_id;
+        let Some(state) = self.jobs.get(&job_id) else {
+            return None;
+        };
+        let Some(file) = state.assembly.file(file_id) else {
+            return None;
+        };
+        if !matches!(
+            self.classified_role_for_file(job_id, file),
+            weaver_model::files::FileRole::RarVolume { .. }
+        ) {
+            crate::runtime::perf_probe::record(
+                "download.file_hash.md5.fast_path_reject.not_rar",
+                std::time::Duration::from_nanos(1),
+            );
+            return None;
+        }
+        let Some(par2_set) = self.par2_set(job_id) else {
+            crate::runtime::perf_probe::record(
+                "download.file_hash.md5.fast_path_reject.no_par2_metadata",
+                std::time::Duration::from_nanos(1),
+            );
+            return None;
+        };
+
+        let mut candidate_names = BTreeSet::new();
+        candidate_names.insert(weaver_model::files::sanitize_download_filename(filename));
+        candidate_names.insert(weaver_model::files::sanitize_download_filename(
+            file.filename(),
+        ));
+        if let Some(identity) = self.effective_file_identity(job_id, file_id) {
+            candidate_names.insert(weaver_model::files::sanitize_download_filename(
+                &identity.source_filename,
+            ));
+            candidate_names.insert(weaver_model::files::sanitize_download_filename(
+                &identity.current_filename,
+            ));
+            if let Some(canonical) = identity.canonical_filename.as_ref() {
+                candidate_names.insert(weaver_model::files::sanitize_download_filename(canonical));
+            }
+        }
+
+        let mut hashes = par2_set
+            .files
+            .values()
+            .filter(|desc| desc.length == total_bytes)
+            .filter(|desc| {
+                candidate_names.contains(&weaver_model::files::sanitize_download_filename(
+                    &desc.filename,
+                ))
+            })
+            .map(|desc| desc.hash_full)
+            .collect::<Vec<_>>();
+        hashes.sort_unstable();
+        hashes.dedup();
+        match hashes.as_slice() {
+            [hash] => Some(*hash),
+            [] => {
+                crate::runtime::perf_probe::record(
+                    "download.file_hash.md5.fast_path_reject.no_par2_match",
+                    std::time::Duration::from_nanos(1),
+                );
+                None
+            }
+            _ => {
+                crate::runtime::perf_probe::record(
+                    "download.file_hash.md5.fast_path_reject.ambiguous_par2_match",
+                    std::time::Duration::from_nanos(1),
+                );
+                None
+            }
+        }
     }
 
     pub(crate) fn note_decode_started(&mut self, segment_id: SegmentId) {
@@ -218,7 +602,12 @@ impl Pipeline {
                     };
 
                     if let Err(error) = self
-                        .persist_out_of_order_segment(file_id, offset, segment)
+                        .persist_out_of_order_segment(
+                            file_id,
+                            offset,
+                            segment,
+                            OutOfOrderPersistReason::QuiescentFlush,
+                        )
                         .await
                     {
                         self.fail_job_for_disk_write(
@@ -387,6 +776,8 @@ impl Pipeline {
             file_offset,
             decoded_size,
             crc_valid,
+            part_crc_verified,
+            part_crc,
             expected_file_crc,
             data,
             yenc_name,
@@ -418,6 +809,43 @@ impl Pipeline {
         if !crc_valid {
             self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
         }
+        if part_crc_verified {
+            crate::runtime::perf_probe::record(
+                "download.yenc_part_crc.verified",
+                std::time::Duration::from_nanos(1),
+            );
+        } else {
+            crate::runtime::perf_probe::record(
+                "download.yenc_part_crc.not_verified",
+                std::time::Duration::from_nanos(1),
+            );
+            let yenc_name_lower = yenc_name.to_ascii_lowercase();
+            let is_rar_volume = yenc_name_lower.ends_with(".rar")
+                || yenc_name_lower.rsplit_once('.').is_some_and(|(_, ext)| {
+                    ext.len() == 3
+                        && ext.starts_with('r')
+                        && ext.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+                });
+            let unverified_bucket = if yenc_name_lower.ends_with(".par2") {
+                "download.yenc_part_crc.not_verified.par2"
+            } else if is_rar_volume {
+                "download.yenc_part_crc.not_verified.rar"
+            } else {
+                "download.yenc_part_crc.not_verified.other"
+            };
+            crate::runtime::perf_probe::record(
+                unverified_bucket,
+                std::time::Duration::from_nanos(1),
+            );
+            info!(
+                job_id = job_id.0,
+                file_id = %file_id,
+                segment = %segment_id,
+                file_index = file_id.file_index,
+                yenc_name = %yenc_name,
+                "yEnc part CRC was not independently verified"
+            );
+        }
 
         let _ = self.event_tx.send(PipelineEvent::SegmentDecoded {
             segment_id,
@@ -435,11 +863,15 @@ impl Pipeline {
             segment_id,
             decoded_size,
             data,
+            part_crc,
+            part_crc_verified,
             yenc_name,
         };
         let buffered_len = buffered_segment.len_bytes();
 
         let ready = {
+            let _cpu_scope =
+                crate::runtime::perf_probe::cpu_scope("download.write_buffer.insert_drain");
             let write_buf = self
                 .write_buffers
                 .entry(file_id)
@@ -506,7 +938,8 @@ impl Pipeline {
         }
         let _profile_scope = crate::runtime::perf_probe::scope("download.persist_ready_segments");
 
-        let Some((_job_id, filename, working_dir, file_path)) = self.write_target_for_file(file_id)
+        let Some((_job_id, filename, _working_dir, file_path)) =
+            self.write_target_for_file(file_id)
         else {
             let released_bytes = ready.iter().map(|(_, segment)| segment.len_bytes()).sum();
             self.release_write_buffered(released_bytes, ready.len());
@@ -518,16 +951,24 @@ impl Pipeline {
         let mut ready = ready.into_iter();
         while let Some((offset, segment)) = ready.next() {
             let segment_bytes = segment.len_bytes();
-            let write_result =
-                write_segment_to_disk(&file_path, offset, segment.data.as_slice()).await;
+            let write_result = write_segment_to_disk(&file_path, offset, segment).await;
             self.release_write_buffered(segment_bytes, 1);
-            if let Err(source) = write_result {
-                self.release_unwritten_segments(ready);
-                return Err(SegmentWriteError::new(file_id, source));
-            }
+            let segment = match write_result {
+                Ok(segment) => segment,
+                Err(source) => {
+                    self.release_unwritten_segments(ready);
+                    return Err(SegmentWriteError::new(file_id, source));
+                }
+            };
             crate::e2e_failpoint::maybe_trip("download.after_disk_write_before_commit");
-            self.commit_persisted_segment(offset, segment, &filename, &working_dir)
-                .await;
+            self.commit_persisted_segment(
+                offset,
+                segment,
+                &filename,
+                &file_path,
+                SegmentHashMode::UpdateNow,
+            )
+            .await;
         }
         self.note_file_progress_floor(file_id, contiguous_end_after_ready, false);
         let write_us = write_start.elapsed().as_micros() as u64;
@@ -558,8 +999,13 @@ impl Pipeline {
                 self.remove_empty_write_buffer(file_id);
                 return Ok(());
             };
-            self.persist_out_of_order_segment(file_id, offset, segment)
-                .await?;
+            self.persist_out_of_order_segment(
+                file_id,
+                offset,
+                segment,
+                OutOfOrderPersistReason::PerFileMaxPending,
+            )
+            .await?;
         }
     }
 
@@ -585,8 +1031,13 @@ impl Pipeline {
                 continue;
             };
 
-            self.persist_out_of_order_segment(file_id, offset, segment)
-                .await?;
+            self.persist_out_of_order_segment(
+                file_id,
+                offset,
+                segment,
+                OutOfOrderPersistReason::GlobalWriteBacklog,
+            )
+            .await?;
         }
 
         Ok(())
@@ -597,9 +1048,15 @@ impl Pipeline {
         file_id: NzbFileId,
         offset: u64,
         segment: BufferedDecodedSegment,
+        reason: OutOfOrderPersistReason,
     ) -> Result<(), SegmentWriteError> {
+        crate::runtime::perf_probe::record(
+            reason.profile_bucket(),
+            std::time::Duration::from_nanos(1),
+        );
         let segment_bytes = segment.len_bytes();
-        let Some((_job_id, filename, working_dir, file_path)) = self.write_target_for_file(file_id)
+        let Some((_job_id, filename, _working_dir, file_path)) =
+            self.write_target_for_file(file_id)
         else {
             self.release_write_buffered(segment_bytes, 1);
             self.remove_empty_write_buffer(file_id);
@@ -607,15 +1064,13 @@ impl Pipeline {
         };
 
         let write_start = Instant::now();
-        let write_result = write_segment_to_disk(&file_path, offset, segment.data.as_slice()).await;
+        let write_result = write_segment_to_disk(&file_path, offset, segment).await;
         let write_us = write_start.elapsed().as_micros() as u64;
         self.metrics
             .disk_write_latency_us
             .store(write_us, Ordering::Relaxed);
         self.release_write_buffered(segment_bytes, 1);
-        if let Err(source) = write_result {
-            return Err(SegmentWriteError::new(file_id, source));
-        }
+        let segment = write_result.map_err(|source| SegmentWriteError::new(file_id, source))?;
         crate::e2e_failpoint::maybe_trip("download.after_disk_write_before_commit");
 
         if let Some(write_buf) = self.write_buffers.get_mut(&file_id) {
@@ -625,8 +1080,14 @@ impl Pipeline {
             .direct_write_evictions
             .fetch_add(1, Ordering::Relaxed);
 
-        self.commit_persisted_segment(offset, segment, &filename, &working_dir)
-            .await;
+        self.commit_persisted_segment(
+            offset,
+            segment,
+            &filename,
+            &file_path,
+            SegmentHashMode::DeferRange,
+        )
+        .await;
         self.remove_empty_write_buffer(file_id);
         Ok(())
     }
@@ -660,13 +1121,23 @@ impl Pipeline {
         file_offset: u64,
         segment: BufferedDecodedSegment,
         filename: &str,
-        working_dir: &std::path::Path,
+        file_path: &std::path::Path,
+        hash_mode: SegmentHashMode,
     ) {
         let _profile_scope = crate::runtime::perf_probe::scope("download.commit_persisted_segment");
-        let job_id = segment.segment_id.file_id.job_id;
-        let file_id = segment.segment_id.file_id;
+        let BufferedDecodedSegment {
+            segment_id,
+            decoded_size,
+            data,
+            part_crc,
+            part_crc_verified,
+            yenc_name,
+        } = segment;
+        let job_id = segment_id.file_id.job_id;
+        let file_id = segment_id.file_id;
 
         let commit_result = {
+            let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.assembly.commit");
             let Some(state) = self.jobs.get_mut(&job_id) else {
                 return;
             };
@@ -674,7 +1145,7 @@ impl Pipeline {
                 return;
             };
 
-            match file_asm.commit_segment(segment.segment_id.segment_number, segment.decoded_size) {
+            match file_asm.commit_segment(segment_id.segment_number, decoded_size) {
                 Ok(commit) => Ok((commit.file_complete, file_asm.total_bytes())),
                 Err(e) => Err(e),
             }
@@ -684,16 +1155,39 @@ impl Pipeline {
             Ok((file_complete, total_bytes)) => {
                 self.metrics
                     .bytes_committed
-                    .fetch_add(segment.decoded_size as u64, Ordering::Relaxed);
+                    .fetch_add(decoded_size as u64, Ordering::Relaxed);
                 self.metrics
                     .segments_committed
                     .fetch_add(1, Ordering::Relaxed);
 
-                let _ = self.event_tx.send(PipelineEvent::SegmentCommitted {
-                    segment_id: segment.segment_id,
-                });
+                let _ = self
+                    .event_tx
+                    .send(PipelineEvent::SegmentCommitted { segment_id });
 
-                self.note_file_hash_chunk(file_id, file_offset, segment.data.as_slice());
+                match hash_mode {
+                    SegmentHashMode::UpdateNow => {
+                        self.drain_deferred_file_hash_ranges(file_id, file_path)
+                            .await;
+                        self.note_file_hash_chunk(
+                            file_id,
+                            file_offset,
+                            data.as_slice(),
+                            part_crc,
+                            part_crc_verified,
+                        );
+                        self.drain_deferred_file_hash_ranges(file_id, file_path)
+                            .await;
+                    }
+                    SegmentHashMode::DeferRange => {
+                        self.defer_file_hash_chunk(
+                            file_id,
+                            file_offset,
+                            data,
+                            part_crc,
+                            part_crc_verified,
+                        );
+                    }
+                }
 
                 if file_complete {
                     crate::runtime::perf_probe::record(
@@ -702,11 +1196,10 @@ impl Pipeline {
                     );
                     self.unavailable_promoted_recovery_segments
                         .retain(|segment_id| segment_id.file_id != file_id);
-                    let file_path = working_dir.join(filename);
                     if let Some(mut write_buf) = self.write_buffers.remove(&file_id) {
                         let leftovers = write_buf.flush_all();
                         if !leftovers.is_empty() {
-                            self.mark_file_hash_reread_required(file_id);
+                            self.mark_file_hash_reread_required_for(file_id, "final_buffer_flush");
                             warn!(
                                 file_id = %file_id,
                                 leftover_segments = leftovers.len(),
@@ -715,12 +1208,8 @@ impl Pipeline {
                             let mut leftovers = leftovers.into_iter();
                             while let Some((offset, buffered)) = leftovers.next() {
                                 let buffered_bytes = buffered.len_bytes();
-                                if let Err(e) = write_segment_to_disk(
-                                    &file_path,
-                                    offset,
-                                    buffered.data.as_slice(),
-                                )
-                                .await
+                                if let Err(e) =
+                                    write_segment_to_disk(file_path, offset, buffered).await
                                 {
                                     warn!(
                                         file = %filename,
@@ -743,7 +1232,13 @@ impl Pipeline {
 
                     let expected_file_crc = self.expected_file_crcs.get(&file_id).copied();
                     let file_checksum = match self
-                        .finalize_completed_file_hash(file_id, file_path.clone(), total_bytes)
+                        .finalize_completed_file_hash(
+                            file_id,
+                            filename,
+                            file_path.to_path_buf(),
+                            total_bytes,
+                            expected_file_crc,
+                        )
                         .await
                     {
                         Ok(checksum) => checksum,
@@ -779,24 +1274,21 @@ impl Pipeline {
                     }
                     let file_hash = file_checksum.md5;
 
-                    if !segment.yenc_name.is_empty() && segment.yenc_name != filename {
+                    if !yenc_name.is_empty() && yenc_name != filename {
                         if self.yenc_name_matches_rewritten_source(
-                            job_id,
-                            file_id,
-                            &segment.yenc_name,
-                            filename,
+                            job_id, file_id, &yenc_name, filename,
                         ) {
                             debug!(
                                 job_id = job_id.0,
                                 current = %filename,
-                                yenc = %segment.yenc_name,
+                                yenc = %yenc_name,
                                 "yEnc name differs from current filename after file identity rewrite"
                             );
                         } else {
                             warn!(
                                 job_id = job_id.0,
                                 assembly = %filename,
-                                yenc = %segment.yenc_name,
+                                yenc = %yenc_name,
                                 "yEnc name disagrees with assembly filename"
                             );
                         }
@@ -908,15 +1400,29 @@ impl Pipeline {
 }
 
 fn checksum_completed_file(path: &std::path::Path) -> io::Result<CompletedFileChecksum> {
+    let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.file_hash.reread");
     let mut file = File::open(path)?;
-    let mut checksum = CompletedFileChecksumState::new();
+    let mut md5 = weaver_par2::checksum::FileHashState::new();
+    let mut crc32 = crc32fast::Hasher::new();
     let mut buffer = [0u8; 256 * 1024];
     loop {
         let bytes_read = file.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
         }
-        checksum.update(&buffer[..bytes_read]);
+        md5.update(&buffer[..bytes_read]);
+        crc32.update(&buffer[..bytes_read]);
     }
-    Ok(checksum.finalize())
+    Ok(CompletedFileChecksum {
+        md5: md5.finalize(),
+        crc32: crc32.finalize(),
+    })
+}
+
+fn read_file_range(path: &std::path::Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = vec![0u8; len];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
 }

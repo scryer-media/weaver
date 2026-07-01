@@ -20,6 +20,7 @@ pin-project-lite = { workspace = true, default-features = false }
 socket2 = { workspace = true }
 memchr = { workspace = true }
 rand = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"

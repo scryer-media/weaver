@@ -224,7 +224,6 @@ pub struct StreamingArticleDecoder {
     metadata: Option<YencMetadata>,
     yend_line: Option<Vec<u8>>,
     decode_state: DecodeState,
-    decode_buf: Vec<u8>,
 }
 
 impl StreamingArticleDecoder {
@@ -236,7 +235,6 @@ impl StreamingArticleDecoder {
             metadata: None,
             yend_line: None,
             decode_state: DecodeState::new(),
-            decode_buf: Vec::new(),
         }
     }
 
@@ -255,7 +253,20 @@ impl StreamingArticleDecoder {
             });
         }
 
-        self.pending.extend_from_slice(input);
+        if self.stage == StreamingStage::Body && self.pending.is_empty() {
+            if let Some(marker_start) = find_line_start(input, b"=yend ") {
+                if marker_start > 0 {
+                    decode_body_chunk(&mut self.decode_state, &input[..marker_start], output)?;
+                }
+                self.pending.extend_from_slice(&input[marker_start..]);
+                self.stage = StreamingStage::Trailer;
+            } else {
+                decode_body_chunk(&mut self.decode_state, input, output)?;
+                return Ok(());
+            }
+        } else {
+            self.pending.extend_from_slice(input);
+        }
 
         loop {
             let progressed = match self.stage {
@@ -366,9 +377,11 @@ impl StreamingArticleDecoder {
 
         if let Some(marker_start) = find_line_start(&self.pending, b"=yend ") {
             if marker_start > 0 {
-                let body_len = marker_start;
-                let body = self.pending[..body_len].to_vec();
-                self.decode_body_chunk(&body, output)?;
+                decode_body_chunk(
+                    &mut self.decode_state,
+                    &self.pending[..marker_start],
+                    output,
+                )?;
             }
             let rest = self.pending.split_off(marker_start);
             self.pending = rest;
@@ -376,8 +389,8 @@ impl StreamingArticleDecoder {
             return Ok(true);
         }
 
-        let body = std::mem::take(&mut self.pending);
-        self.decode_body_chunk(&body, output)?;
+        decode_body_chunk(&mut self.decode_state, &self.pending, output)?;
+        self.pending.clear();
         Ok(false)
     }
 
@@ -399,27 +412,38 @@ impl StreamingArticleDecoder {
 
         Ok(true)
     }
+}
 
-    fn decode_body_chunk(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), YencError> {
-        if input.is_empty() {
-            return Ok(());
-        }
-
-        if self.decode_buf.len() < input.len() {
-            self.decode_buf.resize(input.len(), 0);
-        }
-
-        let written = decode_chunk(
-            input,
-            &mut self.decode_buf[..input.len()],
-            &mut self.decode_state,
-            DecodeOptions {
-                dot_unstuffing: true,
-            },
-        )?;
-        output.extend_from_slice(&self.decode_buf[..written]);
-        Ok(())
+fn decode_body_chunk(
+    decode_state: &mut DecodeState,
+    input: &[u8],
+    output: &mut Vec<u8>,
+) -> Result<(), YencError> {
+    if input.is_empty() {
+        return Ok(());
     }
+
+    let start = output.len();
+    output.reserve(input.len());
+    let spare = output.spare_capacity_mut();
+    // SAFETY: `decode_chunk` writes at most `input.len()` initialized bytes into
+    // this spare region and reports exactly how many bytes were written.
+    let out =
+        unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), input.len()) };
+    let written = decode_chunk(
+        input,
+        out,
+        decode_state,
+        DecodeOptions {
+            dot_unstuffing: true,
+        },
+    )?;
+    // SAFETY: The first `written` bytes of the spare region were initialized by
+    // `decode_chunk`, and `written <= input.len()`.
+    unsafe {
+        output.set_len(start + written);
+    }
+    Ok(())
 }
 
 impl Default for StreamingArticleDecoder {

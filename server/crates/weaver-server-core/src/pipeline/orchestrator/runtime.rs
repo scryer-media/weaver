@@ -119,6 +119,9 @@ impl Pipeline {
             pending_file_progress: HashMap::new(),
             persisted_file_progress: HashMap::new(),
             file_hash_states: HashMap::new(),
+            deferred_file_hash_data: HashMap::new(),
+            deferred_file_hash_data_bytes: 0,
+            deferred_file_hash_ranges: HashMap::new(),
             expected_file_crcs: HashMap::new(),
             file_hash_reread_required: HashSet::new(),
             #[cfg(test)]
@@ -170,6 +173,8 @@ impl Pipeline {
             download_write_hard_pressure_latched: false,
             download_pressure_hard_stall_started_at: None,
             download_pressure_soft_dispatch_after: None,
+            download_restart_durable_lead_retry_after: HashMap::new(),
+            last_download_dispatch_stall_log_at: None,
             write_buffered_bytes: 0,
             write_buffered_segments: 0,
             write_buffers: HashMap::new(),
@@ -352,6 +357,8 @@ impl Pipeline {
             .retain(|file_id, _| file_id.job_id != job_id);
         self.file_hash_reread_required
             .retain(|file_id| file_id.job_id != job_id);
+        self.download_restart_durable_lead_retry_after
+            .remove(&job_id);
     }
 
     pub(crate) fn note_download_activity(&mut self, job_id: JobId) {
@@ -511,6 +518,10 @@ impl Pipeline {
 
             let rate_delay = self.rate_limiter.time_until_ready();
             let rate_sleep = tokio::time::sleep(rate_delay);
+            let durable_lead_retry_delay = self.next_restart_durable_lead_retry_delay();
+            let durable_lead_retry_sleep = tokio::time::sleep(
+                durable_lead_retry_delay.unwrap_or_else(|| std::time::Duration::from_secs(3600)),
+            );
 
             loop {
                 match self.cmd_rx.try_recv() {
@@ -581,6 +592,7 @@ impl Pipeline {
                         self.shared_state.refresh_metrics_snapshot();
                     }
                     _ = rate_sleep, if !rate_delay.is_zero() => {}
+                    _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {}
                     _ = tune_interval.tick() => {
                         self.flush_quiescent_write_backlog().await;
                         self.refresh_download_pressure();
@@ -672,6 +684,15 @@ impl Pipeline {
 
         self.drain().await;
         info!("pipeline stopped");
+    }
+
+    pub(crate) fn next_restart_durable_lead_retry_delay(&self) -> Option<std::time::Duration> {
+        let now = Instant::now();
+        self.download_restart_durable_lead_retry_after
+            .values()
+            .copied()
+            .min()
+            .map(|ready_at| ready_at.saturating_duration_since(now))
     }
 
     pub(crate) fn publish_snapshot(&mut self) {
@@ -838,13 +859,13 @@ enum ShutdownDrainEvent {
 pub(crate) async fn write_segment_to_disk(
     path: &std::path::Path,
     offset: u64,
-    data: &[u8],
-) -> Result<(), std::io::Error> {
+    segment: BufferedDecodedSegment,
+) -> Result<BufferedDecodedSegment, std::io::Error> {
     let path = path.to_owned();
-    let data = data.to_vec();
     let started = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
         let task_started = Instant::now();
+        let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.disk_write.task");
         crate::runtime::affinity::pin_current_thread_for_hot_download_path();
 
         use std::io::{Seek, Write};
@@ -854,9 +875,8 @@ pub(crate) async fn write_segment_to_disk(
             .write(true)
             .open(&path)?;
         file.seek(std::io::SeekFrom::Start(offset))?;
-        file.write_all(&data)?;
-        file.sync_data()?;
-        let result = Ok::<(), std::io::Error>(());
+        file.write_all(segment.data.as_slice())?;
+        let result = Ok::<BufferedDecodedSegment, std::io::Error>(segment);
         crate::runtime::perf_probe::record("download.disk_write.task", task_started.elapsed());
         result
     })

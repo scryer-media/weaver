@@ -36,6 +36,7 @@ pub const COUNTER_METRIC_KEYS: [&str; NUM_COUNTER_METRICS] = [
     "weaver_pipeline_decode_errors_total",
     "weaver_pipeline_crc_errors_total",
     "weaver_pipeline_download_pressure_stalls_total",
+    "weaver_pipeline_download_restart_durable_lead_blocked_total",
     "weaver_pipeline_download_pressure_stall_duration_seconds",
 ];
 
@@ -81,7 +82,7 @@ pub const JOB_STATUS_KEYS: [&str; NUM_JOB_STATUS_METRICS] = [
     "complete",
 ];
 
-const NUM_COUNTER_METRICS: usize = 18;
+const NUM_COUNTER_METRICS: usize = 19;
 const NUM_GAUGE_METRICS: usize = 24;
 const NUM_JOB_STATUS_METRICS: usize = 12;
 
@@ -259,6 +260,7 @@ impl RawMetricsHistoryPoint {
                 snapshot.decode_errors as f64,
                 snapshot.crc_errors as f64,
                 snapshot.download_pressure_stalls_total as f64,
+                snapshot.download_restart_durable_lead_blocked_total as f64,
                 snapshot.download_pressure_stall_duration_ms as f64 / 1000.0,
             ],
             gauge_values: [

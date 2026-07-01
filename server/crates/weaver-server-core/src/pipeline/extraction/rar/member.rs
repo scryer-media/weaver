@@ -252,6 +252,7 @@ impl Pipeline {
         ctx: RarExtractionContext<'_>,
         idx: usize,
     ) -> Result<(String, u64, u64), String> {
+        let _cpu_scope = crate::runtime::perf_probe::cpu_scope("rar.extract_member");
         let RarExtractionContext {
             volume_paths,
             event_tx,

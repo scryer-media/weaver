@@ -292,6 +292,7 @@ pub struct PipelineMetrics {
     pub download_pressure_stalls_total: AtomicU64,
     pub download_pressure_stall_duration_ms: AtomicU64,
     pub download_pressure_current_stall_ms: AtomicU64,
+    pub download_restart_durable_lead_blocked_total: AtomicU64,
     pub hot_dispatch_job_id: AtomicU64,
     pub hot_dispatch_mode: AtomicUsize,
     pub hot_dispatch_underfill_ms: AtomicU64,
@@ -423,6 +424,7 @@ impl PipelineMetrics {
             download_pressure_stalls_total: AtomicU64::new(0),
             download_pressure_stall_duration_ms: AtomicU64::new(0),
             download_pressure_current_stall_ms: AtomicU64::new(0),
+            download_restart_durable_lead_blocked_total: AtomicU64::new(0),
             hot_dispatch_job_id: AtomicU64::new(0),
             hot_dispatch_mode: AtomicUsize::new(DispatchShareMode::Exclusive.as_code()),
             hot_dispatch_underfill_ms: AtomicU64::new(0),
@@ -656,6 +658,9 @@ impl PipelineMetrics {
                 .load(Ordering::Relaxed),
             download_pressure_current_stall_ms: self
                 .download_pressure_current_stall_ms
+                .load(Ordering::Relaxed),
+            download_restart_durable_lead_blocked_total: self
+                .download_restart_durable_lead_blocked_total
                 .load(Ordering::Relaxed),
             hot_dispatch_job_id: self.hot_dispatch_job_id.load(Ordering::Relaxed),
             hot_dispatch_mode: DispatchShareMode::from_code(
@@ -920,6 +925,7 @@ pub struct MetricsSnapshot {
     pub download_pressure_stalls_total: u64,
     pub download_pressure_stall_duration_ms: u64,
     pub download_pressure_current_stall_ms: u64,
+    pub download_restart_durable_lead_blocked_total: u64,
     pub hot_dispatch_job_id: u64,
     pub hot_dispatch_mode: DispatchShareMode,
     pub hot_dispatch_underfill_ms: u64,
