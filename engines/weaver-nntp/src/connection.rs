@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -12,6 +13,78 @@ use crate::error::{NntpError, Result};
 use crate::response::{is_multiline_status, parse_response};
 use crate::tls::NntpTransport;
 use crate::types::{ArticleId, Capabilities, MultiLineResponse, Response};
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BodyStreamStats {
+    pub bytes: u64,
+    pub raw_decode_cpu: Duration,
+    pub read_poll_cpu: Duration,
+}
+
+#[cfg(unix)]
+fn thread_cpu_time() -> Option<Duration> {
+    let mut timespec = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, timespec.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let timespec = unsafe { timespec.assume_init() };
+    let seconds = u64::try_from(timespec.tv_sec).ok()?;
+    let nanos = u32::try_from(timespec.tv_nsec).ok()?.min(999_999_999);
+    Some(Duration::new(seconds, nanos))
+}
+
+#[cfg(not(unix))]
+fn thread_cpu_time() -> Option<Duration> {
+    None
+}
+
+fn add_cpu_delta(total: &mut Duration, started: Option<Duration>) {
+    let Some(started) = started else {
+        return;
+    };
+    let Some(current) = thread_cpu_time() else {
+        return;
+    };
+    if let Some(delta) = current.checked_sub(started) {
+        *total += delta;
+    }
+}
+
+fn profile_cpu_timings_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        env_truthy("WEAVER_PROFILE_NNTP_CPU") || env_truthy("WEAVER_PROFILE_HOT_PATHS")
+    })
+}
+
+fn env_truthy(key: &str) -> bool {
+    matches!(
+        std::env::var(key)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+async fn measure_poll_cpu<F>(future: F) -> (F::Output, Duration)
+where
+    F: std::future::Future,
+{
+    let mut future = std::pin::pin!(future);
+    let mut cpu = Duration::ZERO;
+    let output = std::future::poll_fn(|cx| {
+        let started = thread_cpu_time();
+        let polled = future.as_mut().poll(cx);
+        add_cpu_delta(&mut cpu, started);
+        polled
+    })
+    .await;
+    (output, cpu)
+}
 
 /// State of a single NNTP connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -785,7 +858,11 @@ impl NntpConnection {
     /// Chunks retain NNTP dot-stuffing and exclude the final multiline
     /// terminator. This is the download hot path used by the streaming yEnc
     /// decoder.
-    async fn stream_body_response<F>(&mut self, initial: Response, mut on_chunk: F) -> Result<u64>
+    async fn stream_body_response<F>(
+        &mut self,
+        initial: Response,
+        mut on_chunk: F,
+    ) -> Result<BodyStreamStats>
     where
         F: FnMut(&[u8]) -> Result<()>,
     {
@@ -799,14 +876,18 @@ impl NntpConnection {
 
         self.codec.set_streaming_multiline(true);
         self.codec.set_raw_multiline(true);
-        let mut total_bytes = 0u64;
+        let mut stats = BodyStreamStats::default();
         let timeout = self.command_timeout;
+        let profile_cpu = profile_cpu_timings_enabled();
 
         let result = tokio::time::timeout(timeout, async {
             loop {
-                match self.codec.decode_streaming_raw_chunk(&mut self.read_buf)? {
+                let cpu_started = profile_cpu.then(thread_cpu_time).flatten();
+                let decoded = self.codec.decode_streaming_raw_chunk(&mut self.read_buf);
+                add_cpu_delta(&mut stats.raw_decode_cpu, cpu_started);
+                match decoded? {
                     Some(StreamChunk::Data(data)) => {
-                        total_bytes += data.len() as u64;
+                        stats.bytes += data.len() as u64;
                         if let Err(err) = on_chunk(&data) {
                             self.poisoned = true;
                             self.current_group = None;
@@ -815,11 +896,17 @@ impl NntpConnection {
                         }
                         continue;
                     }
-                    Some(StreamChunk::End) => return Ok::<u64, NntpError>(total_bytes),
+                    Some(StreamChunk::End) => return Ok::<BodyStreamStats, NntpError>(stats),
                     None => {}
                 }
 
-                self.read_into_buffer().await?;
+                if profile_cpu {
+                    let (read_result, read_cpu) = measure_poll_cpu(self.read_into_buffer()).await;
+                    stats.read_poll_cpu += read_cpu;
+                    read_result?;
+                } else {
+                    self.read_into_buffer().await?;
+                }
             }
         })
         .await;
@@ -845,7 +932,11 @@ impl NntpConnection {
         }
     }
 
-    pub async fn stream_body_chunked_raw<F>(&mut self, message_id: &str, on_chunk: F) -> Result<u64>
+    pub async fn stream_body_chunked_raw<F>(
+        &mut self,
+        message_id: &str,
+        on_chunk: F,
+    ) -> Result<BodyStreamStats>
     where
         F: FnMut(&[u8]) -> Result<()>,
     {
@@ -867,7 +958,7 @@ impl NntpConnection {
         self.stream_body_response(initial, on_chunk).await
     }
 
-    pub async fn stream_next_body_chunked_raw<F>(&mut self, on_chunk: F) -> Result<u64>
+    pub async fn stream_next_body_chunked_raw<F>(&mut self, on_chunk: F) -> Result<BodyStreamStats>
     where
         F: FnMut(&[u8]) -> Result<()>,
     {
@@ -1261,7 +1352,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(total, b"hello\r\n".len() as u64);
+        assert_eq!(total.bytes, b"hello\r\n".len() as u64);
         assert_eq!(chunks, vec![b"hello\r\n".to_vec()]);
     }
 
@@ -1434,7 +1525,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(total, b"line one\r\nline two\r\n".len() as u64);
+        assert_eq!(total.bytes, b"line one\r\nline two\r\n".len() as u64);
         assert_eq!(chunks, vec![b"line one\r\nline two\r\n".to_vec()]);
     }
 

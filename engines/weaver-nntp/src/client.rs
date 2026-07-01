@@ -3,7 +3,7 @@ use std::future::Future;
 #[cfg(unix)]
 use std::mem::MaybeUninit;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -76,6 +76,8 @@ pub struct DecodedBody {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DecodedBodyCpu {
+    pub raw_decode: Duration,
+    pub read_poll: Duration,
     pub feed: Duration,
     pub finish: Duration,
 }
@@ -113,6 +115,25 @@ fn add_cpu_delta(accumulator: &mut Duration, started: Option<Duration>) {
         return;
     };
     *accumulator = accumulator.saturating_add(current.saturating_sub(started));
+}
+
+fn profile_cpu_timings_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        env_truthy("WEAVER_PROFILE_NNTP_CPU") || env_truthy("WEAVER_PROFILE_HOT_PATHS")
+    })
+}
+
+fn env_truthy(key: &str) -> bool {
+    matches!(
+        std::env::var(key)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 /// Existence results used by the health probe pipeline.
@@ -461,6 +482,7 @@ impl BodyLaneLease {
         let mut raw_size = 0u32;
         let mut cpu = DecodedBodyCpu::default();
         let mut decode_error: Option<YencError> = None;
+        let profile_cpu = profile_cpu_timings_enabled();
 
         let Some(conn) = self.conn.as_mut() else {
             return Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed));
@@ -469,7 +491,7 @@ impl BodyLaneLease {
         let stream_result = match tokio::time::timeout_at(deadline, async {
             conn.stream_body_chunked_raw(message_id, |chunk| {
                 raw_size = raw_size.saturating_add(chunk.len() as u32);
-                let cpu_started = thread_cpu_time();
+                let cpu_started = profile_cpu.then(thread_cpu_time).flatten();
                 let result = decoder.feed_chunk(chunk, &mut output);
                 add_cpu_delta(&mut cpu.feed, cpu_started);
                 if let Err(err) = result {
@@ -492,12 +514,14 @@ impl BodyLaneLease {
         };
 
         match stream_result {
-            Ok(_) => {
+            Ok(stream_stats) => {
+                cpu.raw_decode += stream_stats.raw_decode_cpu;
+                cpu.read_poll += stream_stats.read_poll_cpu;
                 if let Some(error) = decode_error.take() {
                     return Err(DecodedBodyError::Decode { raw_size, error });
                 }
 
-                let cpu_started = thread_cpu_time();
+                let cpu_started = profile_cpu.then(thread_cpu_time).flatten();
                 let finish = decoder.finish(output);
                 add_cpu_delta(&mut cpu.finish, cpu_started);
                 finish
@@ -2210,7 +2234,9 @@ impl NntpClient {
             };
 
             match stream_result {
-                Ok(_) => {
+                Ok(stream_stats) => {
+                    cpu.raw_decode += stream_stats.raw_decode_cpu;
+                    cpu.read_poll += stream_stats.read_poll_cpu;
                     if let Some(err) = decode_error.take() {
                         return Err(DecodedBodyError::Decode {
                             raw_size,
@@ -2301,7 +2327,9 @@ impl NntpClient {
             .await;
 
         match stream_result {
-            Ok(_) => {
+            Ok(stream_stats) => {
+                cpu.raw_decode += stream_stats.raw_decode_cpu;
+                cpu.read_poll += stream_stats.read_poll_cpu;
                 if let Some(error) = decode_error.take() {
                     return Err(DecodedBodyError::Decode { raw_size, error });
                 }

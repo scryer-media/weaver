@@ -2463,6 +2463,7 @@ impl Pipeline {
         Vec<weaver_nntp::client::FetchAttemptTrace>,
         Option<usize>,
     ) {
+        let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.result.translate");
         let successful_server_idx = trace.attempts.iter().rev().find_map(|attempt| {
             matches!(
                 attempt.outcome,
@@ -2485,6 +2486,14 @@ impl Pipeline {
                     result,
                     cpu,
                 } = decoded;
+                crate::runtime::perf_probe::record_cpu_sample(
+                    "download.nntp.raw_decode",
+                    cpu.raw_decode,
+                );
+                crate::runtime::perf_probe::record_cpu_sample(
+                    "download.nntp.read_poll",
+                    cpu.read_poll,
+                );
                 crate::runtime::perf_probe::record_cpu_sample(
                     "download.inline_decode.feed",
                     cpu.feed,
@@ -3159,6 +3168,7 @@ impl Pipeline {
 
     /// Handle a completed download — queue for decode.
     pub(crate) fn release_download_result(&mut self, result: &DownloadResult) {
+        let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.release_result");
         self.record_download_lane_observation(result);
         self.active_downloads = self.active_downloads.saturating_sub(1);
         if result.release_connection_slot {
@@ -3533,39 +3543,47 @@ impl Pipeline {
             return;
         }
 
-        let excluded_servers = result.exclude_servers.clone();
-        let source_server_idx = result.source_server_idx;
-        if result.origin != DownloadResultOrigin::IpReplacementTrial {
-            self.observe_ip_rtt_attempts(&result.attempts);
-        }
+        let (excluded_servers, source_server_idx) = {
+            let _cpu_scope =
+                crate::runtime::perf_probe::cpu_scope("download.process_done.pre_match");
+            let excluded_servers = result.exclude_servers.clone();
+            let source_server_idx = result.source_server_idx;
+            if result.origin != DownloadResultOrigin::IpReplacementTrial {
+                self.observe_ip_rtt_attempts(&result.attempts);
+            }
 
-        for (attempt_index, attempt) in result.attempts.iter().enumerate() {
-            let outcome = match attempt.outcome {
-                FetchAttemptOutcome::Success => crate::events::model::ServerAttemptOutcome::Success,
-                FetchAttemptOutcome::NotFound => {
-                    crate::events::model::ServerAttemptOutcome::NotFound
-                }
-                FetchAttemptOutcome::AuthenticationFailure => {
-                    crate::events::model::ServerAttemptOutcome::AuthenticationFailure
-                }
-                FetchAttemptOutcome::TransientFailure => {
-                    crate::events::model::ServerAttemptOutcome::TransientFailure
-                }
-                FetchAttemptOutcome::PermanentFailure => {
-                    crate::events::model::ServerAttemptOutcome::PermanentFailure
-                }
-            };
-            let _ = self.event_tx.send(PipelineEvent::ServerAttempt {
-                segment_id: result.segment_id,
-                server_id: crate::ServerId(attempt.server_idx as u16),
-                attempt: (attempt_index as u32) + 1,
-                retry_count: result.retry_count,
-                latency_ms: attempt.elapsed.as_millis().min(u64::MAX as u128) as u64,
-                outcome,
-                error: attempt.error.clone(),
-                is_recovery: result.origin.is_recovery(),
-            });
-        }
+            for (attempt_index, attempt) in result.attempts.iter().enumerate() {
+                let outcome = match attempt.outcome {
+                    FetchAttemptOutcome::Success => {
+                        crate::events::model::ServerAttemptOutcome::Success
+                    }
+                    FetchAttemptOutcome::NotFound => {
+                        crate::events::model::ServerAttemptOutcome::NotFound
+                    }
+                    FetchAttemptOutcome::AuthenticationFailure => {
+                        crate::events::model::ServerAttemptOutcome::AuthenticationFailure
+                    }
+                    FetchAttemptOutcome::TransientFailure => {
+                        crate::events::model::ServerAttemptOutcome::TransientFailure
+                    }
+                    FetchAttemptOutcome::PermanentFailure => {
+                        crate::events::model::ServerAttemptOutcome::PermanentFailure
+                    }
+                };
+                let _ = self.event_tx.send(PipelineEvent::ServerAttempt {
+                    segment_id: result.segment_id,
+                    server_id: crate::ServerId(attempt.server_idx as u16),
+                    attempt: (attempt_index as u32) + 1,
+                    retry_count: result.retry_count,
+                    latency_ms: attempt.elapsed.as_millis().min(u64::MAX as u128) as u64,
+                    outcome,
+                    error: attempt.error.clone(),
+                    is_recovery: result.origin.is_recovery(),
+                });
+            }
+
+            (excluded_servers, source_server_idx)
+        };
 
         match result.data {
             Ok(DownloadPayload::Raw(raw)) => {
@@ -3598,23 +3616,28 @@ impl Pipeline {
                 let raw_size_bytes = decoded.raw_size;
                 let raw_size = raw_size_bytes.min(u64::from(u32::MAX)) as u32;
                 let decoded_size = decoded.decoded_size;
-                self.metrics
-                    .bytes_downloaded
-                    .fetch_add(raw_size_bytes, Ordering::Relaxed);
-                self.metrics
-                    .segments_downloaded
-                    .fetch_add(1, Ordering::Relaxed);
-                self.metrics
-                    .bytes_decoded
-                    .fetch_add(decoded_size as u64, Ordering::Relaxed);
-                self.metrics
-                    .segments_decoded
-                    .fetch_add(1, Ordering::Relaxed);
+                {
+                    let _cpu_scope = crate::runtime::perf_probe::cpu_scope(
+                        "download.process_done.decoded_pre_success",
+                    );
+                    self.metrics
+                        .bytes_downloaded
+                        .fetch_add(raw_size_bytes, Ordering::Relaxed);
+                    self.metrics
+                        .segments_downloaded
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .bytes_decoded
+                        .fetch_add(decoded_size as u64, Ordering::Relaxed);
+                    self.metrics
+                        .segments_decoded
+                        .fetch_add(1, Ordering::Relaxed);
 
-                let _ = self.event_tx.send(PipelineEvent::ArticleDownloaded {
-                    segment_id: result.segment_id,
-                    raw_size,
-                });
+                    let _ = self.event_tx.send(PipelineEvent::ArticleDownloaded {
+                        segment_id: result.segment_id,
+                        raw_size,
+                    });
+                }
 
                 self.handle_decode_success(decoded).await;
             }

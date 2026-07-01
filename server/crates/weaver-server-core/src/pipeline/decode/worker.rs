@@ -786,100 +786,105 @@ impl Pipeline {
         let job_id = segment_id.file_id.job_id;
         let file_id = segment_id.file_id;
 
-        if self
-            .jobs
-            .get(&job_id)
-            .is_none_or(|state| is_terminal_status(&state.status))
-        {
-            debug!(
-                job_id = job_id.0,
-                segment = %segment_id,
-                "discarding decode result for inactive job"
-            );
-            return;
-        }
-
-        self.note_recovery_count_from_yenc_name(job_id, file_id.file_index, &yenc_name);
-        if let Err(error) = self.note_expected_file_crc(file_id, expected_file_crc) {
-            self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
-            self.fail_job(job_id, error);
-            return;
-        }
-
-        if !crc_valid {
-            self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
-        }
-        if part_crc_verified {
-            crate::runtime::perf_probe::record(
-                "download.yenc_part_crc.verified",
-                std::time::Duration::from_nanos(1),
-            );
-        } else {
-            crate::runtime::perf_probe::record(
-                "download.yenc_part_crc.not_verified",
-                std::time::Duration::from_nanos(1),
-            );
-            let yenc_name_lower = yenc_name.to_ascii_lowercase();
-            let is_rar_volume = yenc_name_lower.ends_with(".rar")
-                || yenc_name_lower.rsplit_once('.').is_some_and(|(_, ext)| {
-                    ext.len() == 3
-                        && ext.starts_with('r')
-                        && ext.as_bytes()[1..].iter().all(u8::is_ascii_digit)
-                });
-            let unverified_bucket = if yenc_name_lower.ends_with(".par2") {
-                "download.yenc_part_crc.not_verified.par2"
-            } else if is_rar_volume {
-                "download.yenc_part_crc.not_verified.rar"
-            } else {
-                "download.yenc_part_crc.not_verified.other"
-            };
-            crate::runtime::perf_probe::record(
-                unverified_bucket,
-                std::time::Duration::from_nanos(1),
-            );
-            info!(
-                job_id = job_id.0,
-                file_id = %file_id,
-                segment = %segment_id,
-                file_index = file_id.file_index,
-                yenc_name = %yenc_name,
-                "yEnc part CRC was not independently verified"
-            );
-        }
-
-        let _ = self.event_tx.send(PipelineEvent::SegmentDecoded {
-            segment_id,
-            decoded_size,
-            file_offset,
-            crc_valid,
-        });
-
-        // Track decoded (not raw/yEnc-encoded) bytes so progress never exceeds 100%.
-        if let Some(state) = self.jobs.get_mut(&job_id) {
-            state.downloaded_bytes += decoded_size as u64;
-        }
-
-        let buffered_segment = BufferedDecodedSegment {
-            segment_id,
-            decoded_size,
-            data,
-            part_crc,
-            part_crc_verified,
-            yenc_name,
-        };
-        let buffered_len = buffered_segment.len_bytes();
-
         let ready = {
             let _cpu_scope =
-                crate::runtime::perf_probe::cpu_scope("download.write_buffer.insert_drain");
-            let write_buf = self
-                .write_buffers
-                .entry(file_id)
-                .or_insert_with(|| WriteReorderBuffer::new(self.write_buf_max_pending));
-            write_buf.insert(file_offset, buffered_segment);
-            write_buf.drain_ready_with_contiguous_end()
+                crate::runtime::perf_probe::cpu_scope("download.handle_decode_success.pre_persist");
+            if self
+                .jobs
+                .get(&job_id)
+                .is_none_or(|state| is_terminal_status(&state.status))
+            {
+                debug!(
+                    job_id = job_id.0,
+                    segment = %segment_id,
+                    "discarding decode result for inactive job"
+                );
+                return;
+            }
+
+            self.note_recovery_count_from_yenc_name(job_id, file_id.file_index, &yenc_name);
+            if let Err(error) = self.note_expected_file_crc(file_id, expected_file_crc) {
+                self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
+                self.fail_job(job_id, error);
+                return;
+            }
+
+            if !crc_valid {
+                self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            if part_crc_verified {
+                crate::runtime::perf_probe::record(
+                    "download.yenc_part_crc.verified",
+                    std::time::Duration::from_nanos(1),
+                );
+            } else {
+                crate::runtime::perf_probe::record(
+                    "download.yenc_part_crc.not_verified",
+                    std::time::Duration::from_nanos(1),
+                );
+                let yenc_name_lower = yenc_name.to_ascii_lowercase();
+                let is_rar_volume = yenc_name_lower.ends_with(".rar")
+                    || yenc_name_lower.rsplit_once('.').is_some_and(|(_, ext)| {
+                        ext.len() == 3
+                            && ext.starts_with('r')
+                            && ext.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+                    });
+                let unverified_bucket = if yenc_name_lower.ends_with(".par2") {
+                    "download.yenc_part_crc.not_verified.par2"
+                } else if is_rar_volume {
+                    "download.yenc_part_crc.not_verified.rar"
+                } else {
+                    "download.yenc_part_crc.not_verified.other"
+                };
+                crate::runtime::perf_probe::record(
+                    unverified_bucket,
+                    std::time::Duration::from_nanos(1),
+                );
+                info!(
+                    job_id = job_id.0,
+                    file_id = %file_id,
+                    segment = %segment_id,
+                    file_index = file_id.file_index,
+                    yenc_name = %yenc_name,
+                    "yEnc part CRC was not independently verified"
+                );
+            }
+
+            let _ = self.event_tx.send(PipelineEvent::SegmentDecoded {
+                segment_id,
+                decoded_size,
+                file_offset,
+                crc_valid,
+            });
+
+            // Track decoded (not raw/yEnc-encoded) bytes so progress never exceeds 100%.
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                state.downloaded_bytes += decoded_size as u64;
+            }
+
+            let buffered_segment = BufferedDecodedSegment {
+                segment_id,
+                decoded_size,
+                data,
+                part_crc,
+                part_crc_verified,
+                yenc_name,
+            };
+            let buffered_len = buffered_segment.len_bytes();
+
+            let ready = {
+                let _cpu_scope =
+                    crate::runtime::perf_probe::cpu_scope("download.write_buffer.insert_drain");
+                let write_buf = self
+                    .write_buffers
+                    .entry(file_id)
+                    .or_insert_with(|| WriteReorderBuffer::new(self.write_buf_max_pending));
+                write_buf.insert(file_offset, buffered_segment);
+                write_buf.drain_ready_with_contiguous_end()
+            };
+            self.note_write_buffered(buffered_len, 1);
+            ready
         };
-        self.note_write_buffered(buffered_len, 1);
 
         if let Err(error) = self.persist_ready_segments(file_id, ready.0, ready.1).await {
             self.fail_job_for_disk_write(
