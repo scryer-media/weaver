@@ -13,7 +13,7 @@ mod repair;
 pub(crate) use orchestrator::check_disk_space;
 #[cfg(test)]
 use orchestrator::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};
-use orchestrator::{is_terminal_status, write_segment_to_disk};
+use orchestrator::{is_terminal_status, write_segment_to_disk, write_segments_to_disk};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;

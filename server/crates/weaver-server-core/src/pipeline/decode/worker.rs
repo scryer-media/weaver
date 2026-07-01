@@ -953,18 +953,22 @@ impl Pipeline {
         };
 
         let write_start = Instant::now();
-        let mut ready = ready.into_iter();
-        while let Some((offset, segment)) = ready.next() {
-            let segment_bytes = segment.len_bytes();
-            let write_result = write_segment_to_disk(&file_path, offset, segment).await;
-            self.release_write_buffered(segment_bytes, 1);
-            let segment = match write_result {
-                Ok(segment) => segment,
-                Err(source) => {
-                    self.release_unwritten_segments(ready);
-                    return Err(SegmentWriteError::new(file_id, source));
-                }
-            };
+        let ready_bytes = ready.iter().map(|(_, segment)| segment.len_bytes()).sum();
+        let ready_count = ready.len();
+        let write_result = write_segments_to_disk(&file_path, ready).await;
+        self.release_write_buffered(ready_bytes, ready_count);
+
+        let (written, write_error) = match write_result {
+            Ok(written) => (written, None),
+            Err(error) => {
+                let source = error.source;
+                let written = error.written;
+                drop(error.unwritten);
+                (written, Some(source))
+            }
+        };
+
+        for (offset, segment) in written {
             crate::e2e_failpoint::maybe_trip("download.after_disk_write_before_commit");
             self.commit_persisted_segment(
                 offset,
@@ -974,6 +978,9 @@ impl Pipeline {
                 SegmentHashMode::UpdateNow,
             )
             .await;
+        }
+        if let Some(source) = write_error {
+            return Err(SegmentWriteError::new(file_id, source));
         }
         self.note_file_progress_floor(file_id, contiguous_end_after_ready, false);
         let write_us = write_start.elapsed().as_micros() as u64;

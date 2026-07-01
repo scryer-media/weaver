@@ -9,4 +9,4 @@ pub(crate) use runtime::check_disk_space;
 pub(super) use runtime::timestamp_secs;
 #[cfg(test)]
 pub(crate) use runtime::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};
-pub(crate) use runtime::{is_terminal_status, write_segment_to_disk};
+pub(crate) use runtime::{is_terminal_status, write_segment_to_disk, write_segments_to_disk};

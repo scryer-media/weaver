@@ -886,6 +886,86 @@ pub(crate) async fn write_segment_to_disk(
     result
 }
 
+pub(crate) struct SegmentWriteBatchError {
+    pub(crate) source: std::io::Error,
+    pub(crate) written: Vec<(u64, BufferedDecodedSegment)>,
+    pub(crate) unwritten: Vec<(u64, BufferedDecodedSegment)>,
+}
+
+pub(crate) async fn write_segments_to_disk(
+    path: &std::path::Path,
+    segments: Vec<(u64, BufferedDecodedSegment)>,
+) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
+    let path = path.to_owned();
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        let task_started = Instant::now();
+        let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.disk_write.task");
+        crate::runtime::affinity::pin_current_thread_for_hot_download_path();
+
+        use std::io::{Seek, Write};
+        let mut file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(source) => {
+                return Err(SegmentWriteBatchError {
+                    source,
+                    written: Vec::new(),
+                    unwritten: segments,
+                });
+            }
+        };
+
+        let mut written = Vec::with_capacity(segments.len());
+        let mut next_file_offset = None;
+        let mut remaining = segments.into_iter();
+        while let Some((offset, segment)) = remaining.next() {
+            let segment_len = segment.data.as_slice().len() as u64;
+            if next_file_offset != Some(offset) {
+                if let Err(source) = file.seek(std::io::SeekFrom::Start(offset)) {
+                    let mut unwritten = Vec::with_capacity(1 + remaining.size_hint().0);
+                    unwritten.push((offset, segment));
+                    unwritten.extend(remaining);
+                    return Err(SegmentWriteBatchError {
+                        source,
+                        written,
+                        unwritten,
+                    });
+                }
+            }
+            if let Err(source) = file.write_all(segment.data.as_slice()) {
+                let mut unwritten = Vec::with_capacity(1 + remaining.size_hint().0);
+                unwritten.push((offset, segment));
+                unwritten.extend(remaining);
+                return Err(SegmentWriteBatchError {
+                    source,
+                    written,
+                    unwritten,
+                });
+            }
+            next_file_offset = Some(offset + segment_len);
+            written.push((offset, segment));
+        }
+
+        crate::runtime::perf_probe::record("download.disk_write.task", task_started.elapsed());
+        Ok(written)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Err(SegmentWriteBatchError {
+            source: std::io::Error::other(e),
+            written: Vec::new(),
+            unwritten: Vec::new(),
+        })
+    });
+    crate::runtime::perf_probe::record("download.disk_write.await", started.elapsed());
+    result
+}
+
 pub(crate) fn compute_write_backlog_budget_bytes(
     profile: &SystemProfile,
     buffers: &Arc<BufferPool>,

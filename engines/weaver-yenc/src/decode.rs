@@ -224,6 +224,7 @@ pub struct StreamingArticleDecoder {
     metadata: Option<YencMetadata>,
     yend_line: Option<Vec<u8>>,
     decode_state: DecodeState,
+    output_reserved: bool,
 }
 
 impl StreamingArticleDecoder {
@@ -235,6 +236,7 @@ impl StreamingArticleDecoder {
             metadata: None,
             yend_line: None,
             decode_state: DecodeState::new(),
+            output_reserved: false,
         }
     }
 
@@ -254,6 +256,7 @@ impl StreamingArticleDecoder {
         }
 
         if self.stage == StreamingStage::Body && self.pending.is_empty() {
+            self.reserve_output_if_known(output);
             if let Some(marker_start) = find_line_start(input, b"=yend ") {
                 if marker_start > 0 {
                     decode_body_chunk(&mut self.decode_state, &input[..marker_start], output)?;
@@ -282,6 +285,34 @@ impl StreamingArticleDecoder {
         }
 
         Ok(())
+    }
+
+    fn reserve_output_if_known(&mut self, output: &mut Vec<u8>) {
+        const MAX_ARTICLE_RESERVE: usize = 16 * 1024 * 1024;
+
+        if self.output_reserved {
+            return;
+        }
+        self.output_reserved = true;
+
+        let Some(metadata) = self.metadata.as_ref() else {
+            return;
+        };
+
+        let expected = match (metadata.begin, metadata.end) {
+            (Some(begin), Some(end)) if end >= begin => end - begin + 1,
+            (Some(_), Some(_)) => return,
+            _ if metadata.part.is_none() => metadata.size,
+            _ => return,
+        };
+        let Ok(expected) = usize::try_from(expected) else {
+            return;
+        };
+        if expected == 0 || expected > MAX_ARTICLE_RESERVE || expected <= output.capacity() {
+            return;
+        }
+
+        output.reserve_exact(expected - output.capacity());
     }
 
     pub fn finish(mut self, output: Vec<u8>) -> Result<DecodedArticle, YencError> {
@@ -374,6 +405,7 @@ impl StreamingArticleDecoder {
         if self.pending.is_empty() {
             return Ok(false);
         }
+        self.reserve_output_if_known(output);
 
         if let Some(marker_start) = find_line_start(&self.pending, b"=yend ") {
             if marker_start > 0 {
