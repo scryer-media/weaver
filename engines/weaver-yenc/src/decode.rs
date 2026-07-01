@@ -257,14 +257,13 @@ impl StreamingArticleDecoder {
 
         if self.stage == StreamingStage::Body && self.pending.is_empty() {
             self.reserve_output_if_known(output);
-            if let Some(marker_start) = find_line_start(input, b"=yend ") {
-                if marker_start > 0 {
-                    decode_body_chunk(&mut self.decode_state, &input[..marker_start], output)?;
-                }
-                self.pending.extend_from_slice(&input[marker_start..]);
+            let progress = decode_body_chunk_until_end(&mut self.decode_state, input, output)?;
+            if progress.end == RapidyencDecodeEnd::Control {
+                self.pending.extend_from_slice(b"=y");
+                self.pending
+                    .extend_from_slice(&input[progress.source_consumed..]);
                 self.stage = StreamingStage::Trailer;
             } else {
-                decode_body_chunk(&mut self.decode_state, input, output)?;
                 return Ok(());
             }
         } else {
@@ -407,21 +406,16 @@ impl StreamingArticleDecoder {
         }
         self.reserve_output_if_known(output);
 
-        if let Some(marker_start) = find_line_start(&self.pending, b"=yend ") {
-            if marker_start > 0 {
-                decode_body_chunk(
-                    &mut self.decode_state,
-                    &self.pending[..marker_start],
-                    output,
-                )?;
-            }
-            let rest = self.pending.split_off(marker_start);
-            self.pending = rest;
+        let progress = decode_body_chunk_until_end(&mut self.decode_state, &self.pending, output)?;
+        if progress.end == RapidyencDecodeEnd::Control {
+            let rest = self.pending.split_off(progress.source_consumed);
+            self.pending.clear();
+            self.pending.extend_from_slice(b"=y");
+            self.pending.extend_from_slice(&rest);
             self.stage = StreamingStage::Trailer;
             return Ok(true);
         }
 
-        decode_body_chunk(&mut self.decode_state, &self.pending, output)?;
         self.pending.clear();
         Ok(false)
     }
@@ -446,23 +440,28 @@ impl StreamingArticleDecoder {
     }
 }
 
-fn decode_body_chunk(
+fn decode_body_chunk_until_end(
     decode_state: &mut DecodeState,
     input: &[u8],
     output: &mut Vec<u8>,
-) -> Result<(), YencError> {
+) -> Result<RapidyencDecodeProgress, YencError> {
     if input.is_empty() {
-        return Ok(());
+        return Ok(RapidyencDecodeProgress {
+            source_consumed: 0,
+            bytes_written: 0,
+            end: RapidyencDecodeEnd::None,
+        });
     }
 
     let start = output.len();
     output.reserve(input.len());
     let spare = output.spare_capacity_mut();
-    // SAFETY: `decode_chunk` writes at most `input.len()` initialized bytes into
-    // this spare region and reports exactly how many bytes were written.
+    // SAFETY: `decode_chunk_until_end` writes at most `input.len()` initialized
+    // bytes into this spare region and reports exactly how many bytes were
+    // written.
     let out =
         unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), input.len()) };
-    let written = decode_chunk(
+    let progress = decode_chunk_until_end(
         input,
         out,
         decode_state,
@@ -470,12 +469,12 @@ fn decode_body_chunk(
             dot_unstuffing: true,
         },
     )?;
-    // SAFETY: The first `written` bytes of the spare region were initialized by
-    // `decode_chunk`, and `written <= input.len()`.
+    // SAFETY: The first `bytes_written` bytes of the spare region were
+    // initialized by `decode_chunk_until_end`, and `bytes_written <= input.len()`.
     unsafe {
-        output.set_len(start + written);
+        output.set_len(start + progress.bytes_written);
     }
-    Ok(())
+    Ok(progress)
 }
 
 impl Default for StreamingArticleDecoder {
@@ -486,26 +485,6 @@ impl Default for StreamingArticleDecoder {
 
 fn next_line_len(buf: &[u8]) -> Option<usize> {
     memchr::memchr(b'\n', buf).map(|idx| idx + 1)
-}
-
-fn find_line_start(buf: &[u8], prefix: &[u8]) -> Option<usize> {
-    if buf.starts_with(prefix) {
-        return Some(0);
-    }
-
-    let mut pos = 0usize;
-    while pos < buf.len() {
-        let Some(rel) = memchr::memchr(b'\n', &buf[pos..]) else {
-            break;
-        };
-        let abs = pos + rel + 1;
-        if abs < buf.len() && buf[abs..].starts_with(prefix) {
-            return Some(abs);
-        }
-        pos = abs;
-    }
-
-    None
 }
 
 /// Decode raw yEnc-encoded data (no headers/trailers) from `input` into `output`.
@@ -604,6 +583,27 @@ pub fn decode_chunk(
 
     state.bytes_decoded += written as u64;
     Ok(written)
+}
+
+fn decode_chunk_until_end(
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut DecodeState,
+    options: DecodeOptions,
+) -> Result<RapidyencDecodeProgress, YencError> {
+    let outcome =
+        crate::simd::decode_chunk_until_end_into(input, output, state, options.dot_unstuffing)?;
+
+    if outcome.written > 0 {
+        state.crc.update(&output[..outcome.written]);
+    }
+
+    state.bytes_decoded += outcome.written as u64;
+    Ok(RapidyencDecodeProgress {
+        source_consumed: outcome.consumed,
+        bytes_written: outcome.written,
+        end: outcome.end,
+    })
 }
 
 #[cfg(test)]

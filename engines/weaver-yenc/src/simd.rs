@@ -165,6 +165,18 @@ pub(crate) fn decode_chunk_into(
     Ok(written)
 }
 
+pub(crate) fn decode_chunk_until_end_into(
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut DecodeState,
+    dot_unstuffing: bool,
+) -> Result<KernelOutcome, YencError> {
+    let mut kernel_state = KernelState::from_decode_state(state);
+    let outcome = decode_kernel(input, output, &mut kernel_state, dot_unstuffing, true, true)?;
+    kernel_state.write_back(state);
+    Ok(outcome)
+}
+
 /// Decode with rapidyenc's `decode_ex` semantics.
 pub(crate) fn decode_rapidyenc_into(
     input: &[u8],
@@ -1272,17 +1284,15 @@ unsafe fn compact_store_32_avx512_vbmi2(
     use std::arch::x86_64::*;
 
     let keep = keep_mask.count_ones() as usize;
-    if output.len().saturating_sub(*dst) < keep {
+    if output.len().saturating_sub(*dst) < 32 {
         return Err(YencError::BufferTooSmall {
-            needed: *dst + keep,
+            needed: *dst + 32,
             available: output.len(),
         });
     }
 
     let packed = _mm256_maskz_compress_epi8(keep_mask, decoded);
-    let mut tmp = [0u8; 32];
-    unsafe { _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, packed) };
-    output[*dst..*dst + keep].copy_from_slice(&tmp[..keep]);
+    unsafe { _mm256_storeu_si256(output.as_mut_ptr().add(*dst) as *mut __m256i, packed) };
     *dst += keep;
     Ok(())
 }
@@ -2006,9 +2016,7 @@ unsafe fn compact_store_16_ssse3(
         _mm_loadu_si128(compact_table_16()[(skip_mask & 0x7fff) as usize].as_ptr() as *const __m128i)
     };
     let packed = _mm_shuffle_epi8(decoded, shuffle);
-    let mut tmp = [0u8; 16];
-    unsafe { _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, packed) };
-    output[*dst..*dst + keep].copy_from_slice(&tmp[..keep]);
+    unsafe { _mm_storeu_si128(output.as_mut_ptr().add(*dst) as *mut __m128i, packed) };
     *dst += keep;
     Ok(())
 }
@@ -2041,10 +2049,12 @@ unsafe fn compact_store_16_avx2(
         _mm256_castsi128_si256(shuffle)
     };
     let packed = _mm256_shuffle_epi8(decoded, shuffle);
-    let mut tmp = [0u8; 32];
-    unsafe { _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, packed) };
-    let offset = if high_lane { 16 } else { 0 };
-    output[*dst..*dst + keep].copy_from_slice(&tmp[offset..offset + keep]);
+    let packed_lane = if high_lane {
+        _mm256_extracti128_si256::<1>(packed)
+    } else {
+        _mm256_castsi256_si128(packed)
+    };
+    unsafe { _mm_storeu_si128(output.as_mut_ptr().add(*dst) as *mut __m128i, packed_lane) };
     *dst += keep;
     Ok(())
 }
@@ -2059,18 +2069,16 @@ unsafe fn compact_store_16(
     use std::arch::aarch64::*;
 
     let keep = 16 - skip_mask.count_ones() as usize;
-    if output.len().saturating_sub(*dst) < keep {
+    if output.len().saturating_sub(*dst) < 16 {
         return Err(YencError::BufferTooSmall {
-            needed: *dst + keep,
+            needed: *dst + 16,
             available: output.len(),
         });
     }
 
     let shuffle = unsafe { vld1q_u8(compact_table_16()[(skip_mask & 0x7fff) as usize].as_ptr()) };
     let packed = unsafe { vqtbl1q_u8(decoded, shuffle) };
-    let mut tmp = [0u8; 16];
-    unsafe { vst1q_u8(tmp.as_mut_ptr(), packed) };
-    output[*dst..*dst + keep].copy_from_slice(&tmp[..keep]);
+    unsafe { vst1q_u8(output.as_mut_ptr().add(*dst), packed) };
     *dst += keep;
     Ok(())
 }
