@@ -102,6 +102,37 @@ impl Pipeline {
         );
     }
 
+    fn note_file_hash_decoded_chunk(
+        &mut self,
+        file_id: NzbFileId,
+        file_offset: u64,
+        data: &DecodedChunk,
+        part_crc: u32,
+        part_crc_verified: bool,
+    ) {
+        let total_len = data.len_bytes();
+        if total_len == 0 {
+            return;
+        }
+
+        let end_offset = file_offset.saturating_add(total_len as u64);
+        let mut next_offset = file_offset;
+        data.for_each_slice(|slice| {
+            if slice.is_empty() {
+                return;
+            }
+            let slice_end = next_offset.saturating_add(slice.len() as u64);
+            self.note_file_hash_chunk(
+                file_id,
+                next_offset,
+                slice,
+                part_crc,
+                part_crc_verified && slice_end == end_offset,
+            );
+            next_offset = slice_end;
+        });
+    }
+
     fn defer_file_hash_chunk(
         &mut self,
         file_id: NzbFileId,
@@ -233,10 +264,10 @@ impl Pipeline {
                     "download.file_hash.deferred_data_replayed",
                     std::time::Duration::from_nanos(1),
                 );
-                self.note_file_hash_chunk(
+                self.note_file_hash_decoded_chunk(
                     file_id,
                     expected_offset,
-                    chunk.data.as_slice(),
+                    &chunk.data,
                     chunk.part_crc,
                     chunk.part_crc_verified,
                 );
@@ -1180,10 +1211,10 @@ impl Pipeline {
                     SegmentHashMode::UpdateNow => {
                         self.drain_deferred_file_hash_ranges(file_id, file_path)
                             .await;
-                        self.note_file_hash_chunk(
+                        self.note_file_hash_decoded_chunk(
                             file_id,
                             file_offset,
-                            data.as_slice(),
+                            &data,
                             part_crc,
                             part_crc_verified,
                         );

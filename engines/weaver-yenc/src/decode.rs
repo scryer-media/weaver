@@ -104,6 +104,21 @@ pub fn decode_rapidyenc_incremental(
     })
 }
 
+/// Decode a raw NNTP yEnc body chunk into `output`, stopping at the next yEnc
+/// control line.
+///
+/// This is the lower-level streaming hook used when an outer NNTP parser owns
+/// response-boundary handling. It appends decoded bytes to `output`, updates
+/// `decode_state` and CRC, performs NNTP dot-unstuffing, and reports exact
+/// source bytes consumed.
+pub fn decode_body_chunk_until_control(
+    decode_state: &mut DecodeState,
+    input: &[u8],
+    output: &mut Vec<u8>,
+) -> Result<RapidyencDecodeProgress, YencError> {
+    decode_body_chunk_until_end(decode_state, input, output)
+}
+
 fn validate_ypart_decoded_size(
     metadata: &YencMetadata,
     bytes_written: usize,
@@ -202,6 +217,82 @@ pub fn decode_with_options(
 pub struct DecodedArticle {
     pub data: Vec<u8>,
     pub result: DecodeResult,
+}
+
+/// Finalize a caller-owned streaming yEnc decode using the same validation
+/// rules as [`StreamingArticleDecoder`].
+pub fn finish_streaming_article(
+    metadata: YencMetadata,
+    yend: Option<header::YendFields>,
+    decode_state: DecodeState,
+    output: Vec<u8>,
+) -> Result<DecodedArticle, YencError> {
+    let result = finish_streaming_result(metadata, yend, decode_state)?;
+
+    Ok(DecodedArticle {
+        data: output,
+        result,
+    })
+}
+
+pub fn finish_streaming_result(
+    metadata: YencMetadata,
+    yend: Option<header::YendFields>,
+    decode_state: DecodeState,
+) -> Result<DecodeResult, YencError> {
+    let bytes_written = decode_state.bytes_decoded as usize;
+    let part_crc = decode_state.finalize_crc();
+
+    let (expected_part_crc, expected_file_crc, yend_size, has_trailer) = if let Some(yend) = yend {
+        (yend.pcrc32, yend.crc32, yend.size, true)
+    } else {
+        (None, None, None, false)
+    };
+
+    if let Some(expected_size) = yend_size
+        && bytes_written as u64 != expected_size
+    {
+        return Err(YencError::SizeMismatch {
+            expected: expected_size,
+            actual: bytes_written as u64,
+        });
+    }
+
+    validate_ypart_decoded_size(&metadata, bytes_written)?;
+
+    if metadata.part.is_none()
+        && let Some(expected_size) = yend_size
+        && metadata.size != expected_size
+    {
+        return Err(YencError::SizeMismatch {
+            expected: metadata.size,
+            actual: expected_size,
+        });
+    }
+
+    let expected_crc_to_check = if metadata.part.is_some() {
+        expected_part_crc
+    } else {
+        expected_file_crc
+    };
+    if let Some(expected) = expected_crc_to_check
+        && part_crc != expected
+    {
+        return Err(YencError::CrcMismatch {
+            expected,
+            actual: part_crc,
+        });
+    }
+
+    Ok(DecodeResult {
+        metadata,
+        bytes_written,
+        part_crc,
+        expected_part_crc,
+        expected_file_crc,
+        crc_valid: true,
+        has_trailer,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,68 +407,18 @@ impl StreamingArticleDecoder {
 
     pub fn finish(mut self, output: Vec<u8>) -> Result<DecodedArticle, YencError> {
         let metadata = self.metadata.take().ok_or(YencError::MissingHeader)?;
-        let bytes_written = self.decode_state.bytes_decoded as usize;
-        let part_crc = self.decode_state.finalize_crc();
 
-        let (expected_part_crc, expected_file_crc, yend_size, has_trailer) =
-            if let Some(yend_line) = self.yend_line.take() {
-                let mut scratch = self.header_bytes;
-                scratch.extend_from_slice(b"x\r\n");
-                scratch.extend_from_slice(&yend_line);
-                let parsed = header::parse_headers(&scratch)?;
-                let yend = parsed.yend.ok_or(YencError::MissingTrailer)?;
-                (yend.pcrc32, yend.crc32, yend.size, true)
-            } else {
-                (None, None, None, false)
-            };
-
-        if let Some(expected_size) = yend_size
-            && bytes_written as u64 != expected_size
-        {
-            return Err(YencError::SizeMismatch {
-                expected: expected_size,
-                actual: bytes_written as u64,
-            });
-        }
-
-        validate_ypart_decoded_size(&metadata, bytes_written)?;
-
-        if metadata.part.is_none()
-            && let Some(expected_size) = yend_size
-            && metadata.size != expected_size
-        {
-            return Err(YencError::SizeMismatch {
-                expected: metadata.size,
-                actual: expected_size,
-            });
-        }
-
-        let expected_crc_to_check = if metadata.part.is_some() {
-            expected_part_crc
+        let yend = if let Some(yend_line) = self.yend_line.take() {
+            let mut scratch = self.header_bytes;
+            scratch.extend_from_slice(b"x\r\n");
+            scratch.extend_from_slice(&yend_line);
+            let parsed = header::parse_headers(&scratch)?;
+            Some(parsed.yend.ok_or(YencError::MissingTrailer)?)
         } else {
-            expected_file_crc
+            None
         };
-        if let Some(expected) = expected_crc_to_check
-            && part_crc != expected
-        {
-            return Err(YencError::CrcMismatch {
-                expected,
-                actual: part_crc,
-            });
-        }
 
-        Ok(DecodedArticle {
-            data: output,
-            result: DecodeResult {
-                metadata,
-                bytes_written,
-                part_crc,
-                expected_part_crc,
-                expected_file_crc,
-                crc_valid: true,
-                has_trailer,
-            },
-        })
+        finish_streaming_article(metadata, yend, self.decode_state, output)
     }
 
     fn process_header(&mut self) -> Result<bool, YencError> {
@@ -528,6 +569,8 @@ pub struct DecodeState {
     pub(crate) crc: crc32fast::Hasher,
     /// Total bytes decoded so far across all chunks.
     pub bytes_decoded: u64,
+    /// Number of CRC update calls made while streaming this body.
+    pub crc_update_calls: u64,
 }
 
 impl DecodeState {
@@ -540,6 +583,7 @@ impl DecodeState {
             cr_pending: false,
             crc: crc32fast::Hasher::new(),
             bytes_decoded: 0,
+            crc_update_calls: 0,
         }
     }
 
@@ -579,6 +623,7 @@ pub fn decode_chunk(
     // Final CRC update for any remaining decoded bytes in this chunk.
     if written > 0 {
         state.crc.update(&output[..written]);
+        state.crc_update_calls += 1;
     }
 
     state.bytes_decoded += written as u64;
@@ -596,6 +641,7 @@ fn decode_chunk_until_end(
 
     if outcome.written > 0 {
         state.crc.update(&output[..outcome.written]);
+        state.crc_update_calls += 1;
     }
 
     state.bytes_decoded += outcome.written as u64;

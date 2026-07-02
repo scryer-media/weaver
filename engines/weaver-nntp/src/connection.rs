@@ -10,6 +10,7 @@ use tracing::{debug, trace, warn};
 use crate::codec::{NntpCodec, NntpFrame, StreamChunk};
 use crate::commands::Command;
 use crate::error::{NntpError, Result};
+use crate::fused_yenc::{FusedYencArticle, FusedYencArticleDecoder, FusedYencError};
 use crate::response::{is_multiline_status, parse_response};
 use crate::tls::NntpTransport;
 use crate::types::{ArticleId, Capabilities, MultiLineResponse, Response};
@@ -958,6 +959,128 @@ impl NntpConnection {
         self.stream_body_response(initial, on_chunk).await
     }
 
+    pub async fn stream_yenc_article<F>(
+        &mut self,
+        message_id: &str,
+        on_chunk: F,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
+        let initial = self.send_command(&cmd).await?;
+        let initial = if initial.code.raw() == 480 {
+            if let Some((user, pass)) = self.credentials.clone() {
+                debug!("server requested re-authentication (480), re-authenticating");
+                self.authenticate(&user, &pass).await?;
+                self.current_group = None;
+                self.send_command(&cmd).await?
+            } else {
+                return Err(NntpError::AuthenticationRequired.into());
+            }
+        } else {
+            initial
+        };
+
+        self.stream_yenc_article_response(initial, on_chunk).await
+    }
+
+    async fn stream_yenc_article_response<F>(
+        &mut self,
+        initial: Response,
+        mut on_chunk: F,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        let timeout = self.command_timeout;
+        let profile_cpu = profile_cpu_timings_enabled();
+        let mut decoder = FusedYencArticleDecoder::from_body_response(initial)?;
+        let mut read_calls = 0u64;
+        let mut read_bytes = 0u64;
+        let mut read_poll_cpu = Duration::ZERO;
+        let mut fused_decode_cpu = Duration::ZERO;
+        let mut output_callback_cpu = Duration::ZERO;
+        let mut article_chunks = Vec::new();
+
+        let result = tokio::time::timeout(timeout, async {
+            loop {
+                let cpu_started = profile_cpu.then(thread_cpu_time).flatten();
+                let decoded = decoder.decode_available(&mut self.read_buf);
+                add_cpu_delta(&mut fused_decode_cpu, cpu_started);
+                match decoded? {
+                    Some(mut article) => {
+                        article_chunks.append(&mut article.chunks);
+                        article.stats.read_calls = read_calls;
+                        article.stats.read_bytes = read_bytes;
+                        article.stats.read_poll_cpu = read_poll_cpu;
+                        article.stats.fused_decode_cpu = fused_decode_cpu;
+                        article.stats.leftover_bytes_after_terminator = self.read_buf.len() as u64;
+
+                        let cpu_started = profile_cpu.then(thread_cpu_time).flatten();
+                        for chunk in &article_chunks {
+                            if let Err(err) = on_chunk(chunk) {
+                                add_cpu_delta(&mut output_callback_cpu, cpu_started);
+                                self.poisoned = true;
+                                self.current_group = None;
+                                return Err(err.into());
+                            }
+                        }
+                        add_cpu_delta(&mut output_callback_cpu, cpu_started);
+                        article.stats.output_batches = article_chunks.len() as u64;
+                        article.stats.output_callback_cpu = output_callback_cpu;
+                        article.chunks = article_chunks;
+                        return Ok::<FusedYencArticle, FusedYencError>(article);
+                    }
+                    None => {
+                        article_chunks.extend(decoder.drain_output_chunks());
+                    }
+                }
+
+                if profile_cpu {
+                    let (read_result, read_cpu) = measure_poll_cpu(self.read_into_buffer()).await;
+                    read_poll_cpu += read_cpu;
+                    let n = read_result?;
+                    read_calls += 1;
+                    read_bytes += n as u64;
+                } else {
+                    let n = self.read_into_buffer().await?;
+                    read_calls += 1;
+                    read_bytes += n as u64;
+                }
+            }
+        })
+        .await;
+
+        match result {
+            Ok(inner) => {
+                let read_buf_capacity_before_trim = self.read_buf.capacity();
+                self.trim_read_buffer();
+                match inner {
+                    Ok(mut article) => {
+                        if self.read_buf.capacity() < read_buf_capacity_before_trim {
+                            article.stats.buffer_compactions += 1;
+                        }
+                        Ok(article)
+                    }
+                    Err(err) => {
+                        self.poisoned = true;
+                        self.current_group = None;
+                        match err {
+                            FusedYencError::Nntp(err) => Err(classify_fused_body_error(err).into()),
+                            other => Err(other),
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                self.poisoned = true;
+                self.current_group = None;
+                Err(NntpError::TruncatedMultilineBody.into())
+            }
+        }
+    }
+
     pub async fn stream_next_body_chunked_raw<F>(&mut self, on_chunk: F) -> Result<BodyStreamStats>
     where
         F: FnMut(&[u8]) -> Result<()>,
@@ -970,6 +1093,23 @@ impl NntpConnection {
         }
 
         self.stream_body_response(initial, on_chunk).await
+    }
+
+    pub async fn stream_next_yenc_article<F>(
+        &mut self,
+        on_chunk: F,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        let initial = self.read_response().await?;
+        if initial.code.raw() == 480 {
+            self.poisoned = true;
+            self.current_group = None;
+            return Err(NntpError::AuthenticationRequired.into());
+        }
+
+        self.stream_yenc_article_response(initial, on_chunk).await
     }
 
     fn trim_read_buffer(&mut self) {
@@ -987,10 +1127,7 @@ impl NntpConnection {
 
     async fn read_into_buffer(&mut self) -> Result<usize> {
         let socket_read_size = self.buffer_profile.socket_read_size.max(64 * 1024);
-        let spare = self.read_buf.capacity().saturating_sub(self.read_buf.len());
-        if spare < socket_read_size {
-            self.read_buf.reserve(socket_read_size - spare);
-        }
+        self.read_buf.reserve(socket_read_size);
         let transport = self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
         let n = transport.read_buf(&mut self.read_buf).await.map_err(|e| {
             self.poisoned = true;
@@ -1053,6 +1190,14 @@ impl NntpConnection {
     }
 }
 
+fn classify_fused_body_error(err: NntpError) -> NntpError {
+    match err {
+        NntpError::ConnectionClosed => NntpError::ServerDisconnectedMidBody,
+        NntpError::Timeout => NntpError::TruncatedMultilineBody,
+        other => other,
+    }
+}
+
 fn pending_multiline_terminator(buf: &[u8]) -> bool {
     buf.ends_with(b"\r.")
         || buf.ends_with(b"\n.")
@@ -1065,6 +1210,9 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use weaver_yenc::encode;
+
+    const FUSED_YENC_OUTPUT_BATCH_TARGET: usize = 512 * 1024;
 
     struct ScriptStep {
         expect_prefix: Option<&'static str>,
@@ -1125,6 +1273,20 @@ mod tests {
             command_timeout: Duration::from_millis(100),
             ..Default::default()
         }
+    }
+
+    fn leaked_response(bytes: Vec<u8>) -> &'static [u8] {
+        Box::leak(bytes.into_boxed_slice())
+    }
+
+    fn yenc_body_response(decoded: &[u8], terminator: &[u8]) -> &'static [u8] {
+        let mut article = Vec::new();
+        encode(decoded, &mut article, 128, "test.bin").unwrap();
+
+        let mut response = b"222 body follows\r\n".to_vec();
+        response.extend_from_slice(&article);
+        response.extend_from_slice(terminator);
+        leaked_response(response)
     }
 
     #[test]
@@ -1527,6 +1689,261 @@ mod tests {
 
         assert_eq!(total.bytes, b"line one\r\nline two\r\n".len() as u64);
         assert_eq!(chunks, vec![b"line one\r\nline two\r\n".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn stream_yenc_article_decodes_body_and_keeps_connection_usable() {
+        let original = b"hello fused connection";
+        let port = spawn_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"200 ready\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: yenc_body_response(original, b".\r\n"),
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: b"222 body follows\r\nraw body\r\n.\r\n",
+                    delay: Duration::ZERO,
+                },
+            ],
+            Duration::ZERO,
+        )
+        .await;
+
+        let mut conn = NntpConnection::connect(&scripted_plain_config(port))
+            .await
+            .unwrap();
+        let mut chunks = Vec::new();
+        let article = conn
+            .stream_yenc_article("<test@example.com>", |chunk| {
+                chunks.push(chunk.to_vec());
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(chunks, vec![original.to_vec()]);
+        assert_eq!(article.stats.decoded_bytes_written, original.len() as u64);
+        assert_eq!(article.stats.yenc_size_actual, original.len() as u64);
+        assert_eq!(article.stats.yenc_control_hits, 1);
+        assert_eq!(article.stats.nntp_terminator_hits, 1);
+        assert_eq!(article.stats.nntp_terminator_bytes, b".\r\n".len() as u64);
+        assert_eq!(article.stats.leftover_bytes_after_terminator, 0);
+
+        let response = conn.body_by_id_raw("<next@example.com>").await.unwrap();
+        assert_eq!(&response.data[..], b"raw body\r\n");
+    }
+
+    #[tokio::test]
+    async fn stream_yenc_article_reauthenticates_on_mid_session_480() {
+        let original = b"reauth fused";
+        let port = spawn_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"200 ready\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO USER"),
+                    response: b"381 password required\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO PASS"),
+                    response: b"281 authentication accepted\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: b"480 authentication required\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO USER"),
+                    response: b"381 password required\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("AUTHINFO PASS"),
+                    response: b"281 authentication accepted\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: yenc_body_response(original, b".\r\n"),
+                    delay: Duration::ZERO,
+                },
+            ],
+            Duration::ZERO,
+        )
+        .await;
+
+        let mut config = scripted_plain_config(port);
+        config.username = Some("user".into());
+        config.password = Some("pass".into());
+
+        let mut conn = NntpConnection::connect(&config).await.unwrap();
+        let mut chunks = Vec::new();
+        conn.stream_yenc_article("<test@example.com>", |chunk| {
+            chunks.push(chunk.to_vec());
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(chunks, vec![original.to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn stream_yenc_article_batches_large_decoded_output() {
+        let mut original = Vec::with_capacity(FUSED_YENC_OUTPUT_BATCH_TARGET + 123);
+        for idx in 0..(FUSED_YENC_OUTPUT_BATCH_TARGET + 123) {
+            original.push((idx % 251) as u8);
+        }
+
+        let port = spawn_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"200 ready\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: yenc_body_response(&original, b".\r\n"),
+                    delay: Duration::ZERO,
+                },
+            ],
+            Duration::ZERO,
+        )
+        .await;
+
+        let mut conn = NntpConnection::connect(&scripted_plain_config(port))
+            .await
+            .unwrap();
+        let mut chunk_lens = Vec::new();
+        let article = conn
+            .stream_yenc_article("<test@example.com>", |chunk| {
+                chunk_lens.push(chunk.len());
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(article.to_data(), original);
+        assert_eq!(chunk_lens, vec![FUSED_YENC_OUTPUT_BATCH_TARGET + 123]);
+        assert_eq!(article.stats.output_batches, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_yenc_article_reports_malformed_terminator_and_poisons_connection() {
+        let port = spawn_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"200 ready\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: yenc_body_response(b"bad terminator", b"..\r\n"),
+                    delay: Duration::ZERO,
+                },
+            ],
+            Duration::ZERO,
+        )
+        .await;
+
+        let mut conn = NntpConnection::connect(&scripted_plain_config(port))
+            .await
+            .unwrap();
+        let err = conn
+            .stream_yenc_article("<test@example.com>", |_| Ok(()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            FusedYencError::Nntp(NntpError::MalformedMultilineTerminator)
+        ));
+        assert!(conn.is_poisoned());
+    }
+
+    #[tokio::test]
+    async fn stream_next_yenc_article_decodes_queued_body_response() {
+        let original = b"queued fused response";
+        let port = spawn_scripted_server(
+            vec![
+                ScriptStep {
+                    expect_prefix: None,
+                    response: b"200 ready\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("CAPABILITIES"),
+                    response: b"500 unknown\r\n",
+                    delay: Duration::ZERO,
+                },
+                ScriptStep {
+                    expect_prefix: Some("BODY "),
+                    response: yenc_body_response(original, b".\r\n"),
+                    delay: Duration::ZERO,
+                },
+            ],
+            Duration::ZERO,
+        )
+        .await;
+
+        let mut conn = NntpConnection::connect(&scripted_plain_config(port))
+            .await
+            .unwrap();
+        conn.write_body_request("<test@example.com>").await.unwrap();
+        conn.flush_commands().await.unwrap();
+
+        let mut chunks = Vec::new();
+        let article = conn
+            .stream_next_yenc_article(|chunk| {
+                chunks.push(chunk.to_vec());
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(chunks, vec![original.to_vec()]);
+        assert_eq!(article.to_data(), original);
+        assert_eq!(article.result.bytes_written, original.len());
     }
 
     #[tokio::test]

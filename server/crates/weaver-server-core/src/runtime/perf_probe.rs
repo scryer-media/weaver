@@ -21,6 +21,7 @@ struct Profiler {
     last_emit: Mutex<Instant>,
     buckets: Mutex<BTreeMap<String, Bucket>>,
     cpu_buckets: Mutex<BTreeMap<String, Bucket>>,
+    value_buckets: Mutex<BTreeMap<String, Bucket>>,
     interval: Duration,
     top_n: usize,
 }
@@ -60,6 +61,13 @@ pub(crate) fn record_cpu_sample(label: &'static str, elapsed: Duration) {
         return;
     }
     profiler().record_cpu(label.to_string(), elapsed);
+}
+
+pub(crate) fn record_value(label: &'static str, value: u64) {
+    if !enabled() {
+        return;
+    }
+    profiler().record_value(label.to_string(), value);
 }
 
 pub(crate) fn scope(label: &'static str) -> Scope {
@@ -155,6 +163,7 @@ fn profiler() -> &'static Profiler {
             last_emit: Mutex::new(now),
             buckets: Mutex::new(BTreeMap::new()),
             cpu_buckets: Mutex::new(BTreeMap::new()),
+            value_buckets: Mutex::new(BTreeMap::new()),
             interval,
             top_n,
         }
@@ -185,6 +194,21 @@ impl Profiler {
             bucket.count = bucket.count.saturating_add(1);
             bucket.total_ns = bucket.total_ns.saturating_add(elapsed_ns);
             bucket.max_ns = bucket.max_ns.max(elapsed_ns);
+        }
+        self.emit_if_due();
+    }
+
+    fn record_value(&self, label: String, value: u64) {
+        {
+            let mut buckets = self
+                .value_buckets
+                .lock()
+                .expect("perf probe value buckets poisoned");
+            let bucket = buckets.entry(label).or_default();
+            let value = u128::from(value);
+            bucket.count = bucket.count.saturating_add(1);
+            bucket.total_ns = bucket.total_ns.saturating_add(value);
+            bucket.max_ns = bucket.max_ns.max(value);
         }
         self.emit_if_due();
     }
@@ -288,6 +312,39 @@ impl Profiler {
                 cpu_avg_us = ns_to_us(avg_ns),
                 cpu_max_ms = ns_to_ms(bucket.max_ns),
                 "weaver hot-path CPU bucket"
+            );
+        }
+
+        let mut value_rows = {
+            let buckets = self
+                .value_buckets
+                .lock()
+                .expect("perf probe value buckets poisoned");
+            buckets
+                .iter()
+                .map(|(label, bucket)| (label.clone(), bucket.clone()))
+                .collect::<Vec<_>>()
+        };
+        value_rows.sort_by(|(_, left), (_, right)| {
+            right
+                .total_ns
+                .cmp(&left.total_ns)
+                .then_with(|| right.max_ns.cmp(&left.max_ns))
+        });
+        for (label, bucket) in value_rows.into_iter().take(self.top_n) {
+            let avg = if bucket.count == 0 {
+                0
+            } else {
+                bucket.total_ns / u128::from(bucket.count)
+            };
+            tracing::info!(
+                target: "weaver::perf_probe",
+                bucket = %label,
+                count = bucket.count,
+                total = bucket.total_ns,
+                avg = avg,
+                max = bucket.max_ns,
+                "weaver hot-path value bucket"
             );
         }
     }

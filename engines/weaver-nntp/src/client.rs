@@ -1,9 +1,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
-#[cfg(unix)]
-use std::mem::MaybeUninit;
 use std::net::IpAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -11,12 +9,11 @@ use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, warn};
-use weaver_yenc::{
-    DecodeResult as YencDecodeResult, DecodedArticle, StreamingArticleDecoder, YencError,
-};
+use weaver_yenc::{DecodeResult as YencDecodeResult, YencError};
 
 use crate::connection::ServerConfig;
 use crate::error::{NntpError, Result};
+use crate::fused_yenc::{FusedYencArticleStats, FusedYencError};
 use crate::health::{CooldownReason, ServerState};
 use crate::pool::{NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig};
 
@@ -69,9 +66,10 @@ pub struct NntpClient {
 #[derive(Debug)]
 pub struct DecodedBody {
     pub raw_size: u32,
-    pub decoded: Vec<u8>,
+    pub decoded: Vec<Box<[u8]>>,
     pub result: YencDecodeResult,
     pub cpu: DecodedBodyCpu,
+    pub io: DecodedBodyIo,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -82,6 +80,20 @@ pub struct DecodedBodyCpu {
     pub finish: Duration,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DecodedBodyIo {
+    pub read_calls: u64,
+    pub read_bytes: u64,
+    pub input_chunks: u64,
+    pub decode_calls: u64,
+    pub crc_update_calls: u64,
+    pub output_batches: u64,
+    pub leftover_bytes_after_terminator: u64,
+    pub buffer_compactions: u64,
+    pub encoded_bytes_consumed: u64,
+    pub decoded_bytes_written: u64,
+}
+
 /// Errors from the streamed BODY decode path.
 #[derive(Debug)]
 pub enum DecodedBodyError {
@@ -89,50 +101,39 @@ pub enum DecodedBodyError {
     Decode { raw_size: u32, error: YencError },
 }
 
-#[cfg(unix)]
-fn thread_cpu_time() -> Option<Duration> {
-    let mut timespec = MaybeUninit::<libc::timespec>::uninit();
-    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, timespec.as_mut_ptr()) };
-    if rc != 0 {
-        return None;
+fn saturating_u32(value: u64) -> u32 {
+    value.min(u32::MAX as u64) as u32
+}
+
+fn decoded_cpu_from_fused_stats(stats: &FusedYencArticleStats) -> DecodedBodyCpu {
+    DecodedBodyCpu {
+        raw_decode: stats.fused_decode_cpu,
+        read_poll: stats.read_poll_cpu,
+        feed: stats.output_callback_cpu,
+        finish: Duration::ZERO,
     }
-    let timespec = unsafe { timespec.assume_init() };
-    let seconds = u64::try_from(timespec.tv_sec).ok()?;
-    let nanos = u32::try_from(timespec.tv_nsec).ok()?.min(999_999_999);
-    Some(Duration::new(seconds, nanos))
 }
 
-#[cfg(not(unix))]
-fn thread_cpu_time() -> Option<Duration> {
-    None
+fn decoded_io_from_fused_stats(stats: &FusedYencArticleStats) -> DecodedBodyIo {
+    DecodedBodyIo {
+        read_calls: stats.read_calls,
+        read_bytes: stats.read_bytes,
+        input_chunks: stats.input_chunks,
+        decode_calls: stats.decode_calls,
+        crc_update_calls: stats.crc_update_calls,
+        output_batches: stats.output_batches,
+        leftover_bytes_after_terminator: stats.leftover_bytes_after_terminator,
+        buffer_compactions: stats.buffer_compactions,
+        encoded_bytes_consumed: stats.encoded_bytes_consumed,
+        decoded_bytes_written: stats.decoded_bytes_written,
+    }
 }
 
-fn add_cpu_delta(accumulator: &mut Duration, started: Option<Duration>) {
-    let Some(started) = started else {
-        return;
-    };
-    let Some(current) = thread_cpu_time() else {
-        return;
-    };
-    *accumulator = accumulator.saturating_add(current.saturating_sub(started));
-}
-
-fn profile_cpu_timings_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        env_truthy("WEAVER_PROFILE_NNTP_CPU") || env_truthy("WEAVER_PROFILE_HOT_PATHS")
-    })
-}
-
-fn env_truthy(key: &str) -> bool {
-    matches!(
-        std::env::var(key)
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
+fn decoded_raw_size_from_fused_stats(stats: &FusedYencArticleStats) -> u32 {
+    saturating_u32(
+        stats
+            .encoded_bytes_consumed
+            .saturating_sub(stats.nntp_terminator_bytes),
     )
 }
 
@@ -477,32 +478,13 @@ impl BodyLaneLease {
         message_id: &str,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
         let deadline = TokioInstant::now() + self.client.soft_timeout;
-        let mut decoder = StreamingArticleDecoder::new();
-        let mut output = Vec::new();
-        let mut raw_size = 0u32;
-        let mut cpu = DecodedBodyCpu::default();
-        let mut decode_error: Option<YencError> = None;
-        let profile_cpu = profile_cpu_timings_enabled();
 
         let Some(conn) = self.conn.as_mut() else {
             return Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed));
         };
 
         let stream_result = match tokio::time::timeout_at(deadline, async {
-            conn.stream_body_chunked_raw(message_id, |chunk| {
-                raw_size = raw_size.saturating_add(chunk.len() as u32);
-                let cpu_started = profile_cpu.then(thread_cpu_time).flatten();
-                let result = decoder.feed_chunk(chunk, &mut output);
-                add_cpu_delta(&mut cpu.feed, cpu_started);
-                if let Err(err) = result {
-                    decode_error = Some(err);
-                    return Err(NntpError::MalformedResponse(
-                        "streamed yEnc decode failed".into(),
-                    ));
-                }
-                Ok(())
-            })
-            .await
+            conn.stream_yenc_article(message_id, |_| Ok(())).await
         })
         .await
         {
@@ -514,30 +496,17 @@ impl BodyLaneLease {
         };
 
         match stream_result {
-            Ok(stream_stats) => {
-                cpu.raw_decode += stream_stats.raw_decode_cpu;
-                cpu.read_poll += stream_stats.read_poll_cpu;
-                if let Some(error) = decode_error.take() {
-                    return Err(DecodedBodyError::Decode { raw_size, error });
-                }
-
-                let cpu_started = profile_cpu.then(thread_cpu_time).flatten();
-                let finish = decoder.finish(output);
-                add_cpu_delta(&mut cpu.finish, cpu_started);
-                finish
-                    .map(|DecodedArticle { data, result }| DecodedBody {
-                        raw_size,
-                        decoded: data,
-                        result,
-                        cpu,
-                    })
-                    .map_err(|error| DecodedBodyError::Decode { raw_size, error })
-            }
-            Err(_e) if decode_error.is_some() => Err(DecodedBodyError::Decode {
-                raw_size,
-                error: decode_error.take().expect("decode error present"),
+            Ok(article) => Ok(DecodedBody {
+                raw_size: decoded_raw_size_from_fused_stats(&article.stats),
+                cpu: decoded_cpu_from_fused_stats(&article.stats),
+                io: decoded_io_from_fused_stats(&article.stats),
+                decoded: article.chunks,
+                result: article.result,
             }),
-            Err(error) => Err(DecodedBodyError::Nntp(error)),
+            Err(FusedYencError::Yenc(error)) => {
+                Err(DecodedBodyError::Decode { raw_size: 0, error })
+            }
+            Err(FusedYencError::Nntp(error)) => Err(DecodedBodyError::Nntp(error)),
         }
     }
 
@@ -2202,27 +2171,8 @@ impl NntpClient {
                 Ok(true) => {}
             }
 
-            let mut decoder = StreamingArticleDecoder::new();
-            let mut output = Vec::new();
-            let mut raw_size = 0u32;
-            let mut cpu = DecodedBodyCpu::default();
-            let mut decode_error: Option<YencError> = None;
-
             let stream_result = match tokio::time::timeout_at(deadline, async {
-                conn.stream_body_chunked_raw(message_id, |chunk| {
-                    raw_size = raw_size.saturating_add(chunk.len() as u32);
-                    let cpu_started = thread_cpu_time();
-                    let result = decoder.feed_chunk(chunk, &mut output);
-                    add_cpu_delta(&mut cpu.feed, cpu_started);
-                    if let Err(err) = result {
-                        decode_error = Some(err);
-                        return Err(NntpError::MalformedResponse(
-                            "streamed yEnc decode failed".into(),
-                        ));
-                    }
-                    Ok(())
-                })
-                .await
+                conn.stream_yenc_article(message_id, |_| Ok(())).await
             })
             .await
             {
@@ -2234,48 +2184,26 @@ impl NntpClient {
             };
 
             match stream_result {
-                Ok(stream_stats) => {
-                    cpu.raw_decode += stream_stats.raw_decode_cpu;
-                    cpu.read_poll += stream_stats.read_poll_cpu;
-                    if let Some(err) = decode_error.take() {
-                        return Err(DecodedBodyError::Decode {
-                            raw_size,
-                            error: err,
-                        });
-                    }
-
-                    let cpu_started = thread_cpu_time();
-                    let finish = decoder.finish(output);
-                    add_cpu_delta(&mut cpu.finish, cpu_started);
-                    match finish {
-                        Ok(DecodedArticle { data, result }) => {
-                            return Ok(DecodedBody {
-                                raw_size,
-                                decoded: data,
-                                result,
-                                cpu,
-                            });
-                        }
-                        Err(err) => {
-                            return Err(DecodedBodyError::Decode {
-                                raw_size,
-                                error: err,
-                            });
-                        }
-                    }
-                }
-                Err(_e) if decode_error.is_some() => {
-                    return Err(DecodedBodyError::Decode {
-                        raw_size,
-                        error: decode_error.take().expect("decode error present"),
+                Ok(article) => {
+                    return Ok(DecodedBody {
+                        raw_size: decoded_raw_size_from_fused_stats(&article.stats),
+                        cpu: decoded_cpu_from_fused_stats(&article.stats),
+                        io: decoded_io_from_fused_stats(&article.stats),
+                        decoded: article.chunks,
+                        result: article.result,
                     });
                 }
-                Err(e @ NntpError::ArticleNotFound)
-                | Err(e @ NntpError::NoSuchArticle { .. })
-                | Err(e @ NntpError::NoArticleWithNumber) => {
+                Err(FusedYencError::Yenc(error)) => {
+                    return Err(DecodedBodyError::Decode { raw_size: 0, error });
+                }
+                Err(FusedYencError::Nntp(
+                    e @ (NntpError::ArticleNotFound
+                    | NntpError::NoSuchArticle { .. }
+                    | NntpError::NoArticleWithNumber),
+                )) => {
                     return Err(DecodedBodyError::Nntp(e));
                 }
-                Err(e) if is_transient(&e) => {
+                Err(FusedYencError::Nntp(e)) if is_transient(&e) => {
                     if is_connection_error(&e) {
                         self.discard_connection_error(server.0, conn).await;
                     }
@@ -2291,7 +2219,7 @@ impl NntpClient {
                     }
                     return Err(DecodedBodyError::Nntp(e));
                 }
-                Err(e) => {
+                Err(FusedYencError::Nntp(e)) => {
                     if is_connection_error(&e) {
                         self.discard_connection_error(server.0, conn).await;
                     }
@@ -2304,53 +2232,20 @@ impl NntpClient {
     async fn read_decoded_pipelined_body(
         conn: &mut PooledConnection,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        let mut decoder = StreamingArticleDecoder::new();
-        let mut output = Vec::new();
-        let mut raw_size = 0u32;
-        let mut cpu = DecodedBodyCpu::default();
-        let mut decode_error: Option<YencError> = None;
-
-        let stream_result = conn
-            .stream_next_body_chunked_raw(|chunk| {
-                raw_size = raw_size.saturating_add(chunk.len() as u32);
-                let cpu_started = thread_cpu_time();
-                let result = decoder.feed_chunk(chunk, &mut output);
-                add_cpu_delta(&mut cpu.feed, cpu_started);
-                if let Err(err) = result {
-                    decode_error = Some(err);
-                    return Err(NntpError::MalformedResponse(
-                        "streamed yEnc decode failed".into(),
-                    ));
-                }
-                Ok(())
-            })
-            .await;
+        let stream_result = conn.stream_next_yenc_article(|_| Ok(())).await;
 
         match stream_result {
-            Ok(stream_stats) => {
-                cpu.raw_decode += stream_stats.raw_decode_cpu;
-                cpu.read_poll += stream_stats.read_poll_cpu;
-                if let Some(error) = decode_error.take() {
-                    return Err(DecodedBodyError::Decode { raw_size, error });
-                }
-
-                let cpu_started = thread_cpu_time();
-                let finish = decoder.finish(output);
-                add_cpu_delta(&mut cpu.finish, cpu_started);
-                finish
-                    .map(|DecodedArticle { data, result }| DecodedBody {
-                        raw_size,
-                        decoded: data,
-                        result,
-                        cpu,
-                    })
-                    .map_err(|error| DecodedBodyError::Decode { raw_size, error })
-            }
-            Err(_e) if decode_error.is_some() => Err(DecodedBodyError::Decode {
-                raw_size,
-                error: decode_error.take().expect("decode error present"),
+            Ok(article) => Ok(DecodedBody {
+                raw_size: decoded_raw_size_from_fused_stats(&article.stats),
+                cpu: decoded_cpu_from_fused_stats(&article.stats),
+                io: decoded_io_from_fused_stats(&article.stats),
+                decoded: article.chunks,
+                result: article.result,
             }),
-            Err(error) => Err(DecodedBodyError::Nntp(error)),
+            Err(FusedYencError::Yenc(error)) => {
+                Err(DecodedBodyError::Decode { raw_size: 0, error })
+            }
+            Err(FusedYencError::Nntp(error)) => Err(DecodedBodyError::Nntp(error)),
         }
     }
 

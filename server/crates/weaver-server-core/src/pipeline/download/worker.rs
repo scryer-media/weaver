@@ -2485,9 +2485,10 @@ impl Pipeline {
                     decoded,
                     result,
                     cpu,
+                    io,
                 } = decoded;
                 crate::runtime::perf_probe::record_cpu_sample(
-                    "download.nntp.raw_decode",
+                    "download.fused.parse_decode",
                     cpu.raw_decode,
                 );
                 crate::runtime::perf_probe::record_cpu_sample(
@@ -2495,12 +2496,51 @@ impl Pipeline {
                     cpu.read_poll,
                 );
                 crate::runtime::perf_probe::record_cpu_sample(
-                    "download.inline_decode.feed",
+                    "download.fused.output_callback",
                     cpu.feed,
                 );
-                crate::runtime::perf_probe::record_cpu_sample(
-                    "download.inline_decode.finish",
-                    cpu.finish,
+                crate::runtime::perf_probe::record_cpu_sample("download.fused.finish", cpu.finish);
+                crate::runtime::perf_probe::record_value("download.nntp.read.bytes", io.read_bytes);
+                crate::runtime::perf_probe::record_value("download.nntp.read.calls", io.read_calls);
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.read.bytes_per_call",
+                    if io.read_calls == 0 {
+                        0
+                    } else {
+                        io.read_bytes / io.read_calls
+                    },
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.buffer.leftover_after_terminator",
+                    io.leftover_bytes_after_terminator,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.buffer.compactions",
+                    io.buffer_compactions,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.fused.decode.calls",
+                    io.decode_calls,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.fused.input.chunks",
+                    io.input_chunks,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.fused.crc.update_calls",
+                    io.crc_update_calls,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.fused.output.batches",
+                    io.output_batches,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.fused.encoded.bytes",
+                    io.encoded_bytes_consumed,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.fused.decoded.bytes",
+                    io.decoded_bytes_written,
                 );
                 let file_offset = result
                     .metadata

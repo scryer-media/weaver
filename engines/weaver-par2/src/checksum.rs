@@ -210,15 +210,14 @@ impl Default for FileHashState {
 const CRC32_COMBINE_POLY: u32 = 0xEDB8_8320;
 
 #[derive(Debug, Clone)]
-pub(crate) struct Crc32CombineOp {
+pub struct Crc32CombineOp {
     op: Option<[u32; 32]>,
-    crc2: u32,
 }
 
 impl Crc32CombineOp {
-    pub(crate) fn new(len2: u64, crc2: u32) -> Self {
+    pub fn new(len2: u64) -> Self {
         if len2 == 0 {
-            return Self { op: None, crc2 };
+            return Self { op: None };
         }
 
         let mut op = [0u32; 32];
@@ -252,15 +251,12 @@ impl Crc32CombineOp {
             }
         }
 
-        Self {
-            op: Some(combined),
-            crc2,
-        }
+        Self { op: Some(combined) }
     }
 
-    pub(crate) fn combine(&self, crc1: u32) -> u32 {
+    pub fn combine(&self, crc1: u32, crc2: u32) -> u32 {
         match &self.op {
-            Some(op) => crc32_mat_vec(op, crc1) ^ self.crc2,
+            Some(op) => crc32_mat_vec(op, crc1) ^ crc2,
             None => crc1,
         }
     }
@@ -288,7 +284,7 @@ fn crc32_mat_square(square: &mut [u32; 32], mat: &[u32; 32]) {
 }
 
 pub fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
-    Crc32CombineOp::new(len2, crc2).combine(crc1)
+    Crc32CombineOp::new(len2).combine(crc1, crc2)
 }
 
 /// Compute CRC32 of a byte slice.
@@ -354,8 +350,8 @@ mod tests {
         let mut concatenated = b"short-tail".to_vec();
         concatenated.extend_from_slice(&padding);
 
-        let op = Crc32CombineOp::new(padding.len() as u64, second);
-        assert_eq!(op.combine(first), crc32_combine(first, second, 17));
-        assert_eq!(op.combine(first), crc32(&concatenated));
+        let op = Crc32CombineOp::new(padding.len() as u64);
+        assert_eq!(op.combine(first, second), crc32_combine(first, second, 17));
+        assert_eq!(op.combine(first, second), crc32(&concatenated));
     }
 }

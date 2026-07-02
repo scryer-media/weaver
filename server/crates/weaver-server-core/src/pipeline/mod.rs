@@ -1018,6 +1018,7 @@ pub(super) struct StreamedCompletedFileChecksum {
 pub(super) struct CompletedFileChecksumState {
     md5: Option<weaver_par2::checksum::FileHashState>,
     crc32: u32,
+    crc32_combine_op: Option<(u64, weaver_par2::checksum::Crc32CombineOp)>,
     bytes_fed: u64,
     all_parts_crc_verified: bool,
 }
@@ -1027,6 +1028,7 @@ impl CompletedFileChecksumState {
         Self {
             md5: Some(weaver_par2::checksum::FileHashState::new()),
             crc32: 0,
+            crc32_combine_op: None,
             bytes_fed: 0,
             all_parts_crc_verified: true,
         }
@@ -1056,8 +1058,18 @@ impl CompletedFileChecksumState {
         {
             let _cpu_scope =
                 crate::runtime::perf_probe::cpu_scope("download.file_hash.update.crc32_combine");
-            self.crc32 =
-                weaver_par2::checksum::crc32_combine(self.crc32, part_crc, data.len() as u64);
+            let len = data.len() as u64;
+            if !matches!(self.crc32_combine_op.as_ref(), Some((cached_len, _)) if *cached_len == len)
+            {
+                self.crc32_combine_op =
+                    Some((len, weaver_par2::checksum::Crc32CombineOp::new(len)));
+            }
+            let op = &self
+                .crc32_combine_op
+                .as_ref()
+                .expect("crc32 combine op initialized")
+                .1;
+            self.crc32 = op.combine(self.crc32, part_crc);
         }
         self.bytes_fed += data.len() as u64;
     }
@@ -1081,21 +1093,66 @@ impl Default for CompletedFileChecksumState {
     }
 }
 
-pub(super) struct DecodedChunk(Box<[u8]>);
+pub(super) enum DecodedChunk {
+    Contiguous(Box<[u8]>),
+    Batches { chunks: Vec<Box<[u8]>>, len: usize },
+}
 
 impl DecodedChunk {
-    pub(super) fn as_slice(&self) -> &[u8] {
-        &self.0
+    pub(super) fn len_bytes(&self) -> usize {
+        match self {
+            Self::Contiguous(bytes) => bytes.len(),
+            Self::Batches { len, .. } => *len,
+        }
     }
 
-    pub(super) fn len_bytes(&self) -> usize {
-        self.0.len()
+    pub(super) fn for_each_slice<F>(&self, mut f: F)
+    where
+        F: FnMut(&[u8]),
+    {
+        match self {
+            Self::Contiguous(bytes) => f(bytes),
+            Self::Batches { chunks, .. } => {
+                for chunk in chunks {
+                    f(chunk.as_ref());
+                }
+            }
+        }
+    }
+
+    pub(super) fn write_to<W>(&self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: std::io::Write,
+    {
+        match self {
+            Self::Contiguous(bytes) => writer.write_all(bytes),
+            Self::Batches { chunks, .. } => {
+                for chunk in chunks {
+                    writer.write_all(chunk.as_ref())?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
 impl From<Vec<u8>> for DecodedChunk {
     fn from(value: Vec<u8>) -> Self {
-        Self(value.into_boxed_slice())
+        Self::Contiguous(value.into_boxed_slice())
+    }
+}
+
+impl From<Vec<Box<[u8]>>> for DecodedChunk {
+    fn from(mut chunks: Vec<Box<[u8]>>) -> Self {
+        chunks.retain(|chunk| !chunk.is_empty());
+        match chunks.len() {
+            0 => Self::Contiguous(Vec::new().into_boxed_slice()),
+            1 => Self::Contiguous(chunks.pop().expect("single chunk")),
+            _ => {
+                let len = chunks.iter().map(|chunk| chunk.len()).sum();
+                Self::Batches { chunks, len }
+            }
+        }
     }
 }
 

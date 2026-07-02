@@ -43,6 +43,7 @@ pub mod codec;
 pub mod commands;
 pub mod connection;
 pub mod error;
+pub mod fused_yenc;
 pub mod health;
 pub mod pool;
 pub mod response;

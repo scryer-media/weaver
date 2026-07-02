@@ -3180,7 +3180,7 @@ fn scan_shifted_short_len_from_file(
     let window_table = generate_window_table(short_len as u64);
     let pad_len = table.slice_size.saturating_sub(short_len as u64);
     let zero_crc = crc32_zeros(pad_len);
-    let zero_combine = checksum::Crc32CombineOp::new(pad_len, zero_crc);
+    let zero_combine = checksum::Crc32CombineOp::new(pad_len);
 
     loop {
         if valid_len == buffer.len() {
@@ -3204,6 +3204,7 @@ fn scan_shifted_short_len_from_file(
             blocks,
             short_len,
             &zero_combine,
+            zero_crc,
             &window_table,
         );
 
@@ -3230,7 +3231,7 @@ fn scan_shifted_short_len_from_slice(
 
     let pad_len = table.slice_size.saturating_sub(short_len as u64);
     let zero_crc = crc32_zeros(pad_len);
-    let zero_combine = checksum::Crc32CombineOp::new(pad_len, zero_crc);
+    let zero_combine = checksum::Crc32CombineOp::new(pad_len);
     let window_table = generate_window_table(short_len as u64);
     let mut next_unscanned_offset = 0usize;
     scan_shifted_short_windows(
@@ -3243,6 +3244,7 @@ fn scan_shifted_short_len_from_slice(
         blocks,
         short_len,
         &zero_combine,
+        zero_crc,
         &window_table,
     );
 }
@@ -3258,6 +3260,7 @@ fn scan_shifted_short_windows(
     blocks: &mut ScanBlockState<'_>,
     short_len: usize,
     zero_combine: &checksum::Crc32CombineOp,
+    zero_crc: u32,
     window_table: &[u32; 256],
 ) {
     if short_len == 0 || buffer.len() < short_len {
@@ -3272,7 +3275,7 @@ fn scan_shifted_short_windows(
 
     let mut crc = checksum::crc32(&buffer[local_offset..local_offset + short_len]);
     loop {
-        let padded_crc = zero_combine.combine(crc);
+        let padded_crc = zero_combine.combine(crc, zero_crc);
         if let Some(candidates) = table.by_crc.get(&padded_crc) {
             let data = &buffer[local_offset..local_offset + short_len];
             let absolute_offset = (base_offset + local_offset) as u64;

@@ -868,14 +868,14 @@ pub(crate) async fn write_segment_to_disk(
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.disk_write.task");
         crate::runtime::affinity::pin_current_thread_for_hot_download_path();
 
-        use std::io::{Seek, Write};
+        use std::io::Seek;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&path)?;
         file.seek(std::io::SeekFrom::Start(offset))?;
-        file.write_all(segment.data.as_slice())?;
+        segment.data.write_to(&mut file)?;
         let result = Ok::<BufferedDecodedSegment, std::io::Error>(segment);
         crate::runtime::perf_probe::record("download.disk_write.task", task_started.elapsed());
         result
@@ -903,7 +903,7 @@ pub(crate) async fn write_segments_to_disk(
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.disk_write.task");
         crate::runtime::affinity::pin_current_thread_for_hot_download_path();
 
-        use std::io::{Seek, Write};
+        use std::io::Seek;
         let mut file = match std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -924,7 +924,7 @@ pub(crate) async fn write_segments_to_disk(
         let mut next_file_offset = None;
         let mut remaining = segments.into_iter();
         while let Some((offset, segment)) = remaining.next() {
-            let segment_len = segment.data.as_slice().len() as u64;
+            let segment_len = segment.data.len_bytes() as u64;
             if next_file_offset != Some(offset) {
                 if let Err(source) = file.seek(std::io::SeekFrom::Start(offset)) {
                     let mut unwritten = Vec::with_capacity(1 + remaining.size_hint().0);
@@ -937,7 +937,7 @@ pub(crate) async fn write_segments_to_disk(
                     });
                 }
             }
-            if let Err(source) = file.write_all(segment.data.as_slice()) {
+            if let Err(source) = segment.data.write_to(&mut file) {
                 let mut unwritten = Vec::with_capacity(1 + remaining.size_hint().0);
                 unwritten.push((offset, segment));
                 unwritten.extend(remaining);

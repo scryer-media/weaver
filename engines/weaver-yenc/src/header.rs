@@ -10,6 +10,112 @@ pub struct YendFields {
     pub crc32: Option<u32>,
 }
 
+pub fn parse_ybegin_line(line: &[u8]) -> Result<YencMetadata, YencError> {
+    let content = line
+        .strip_prefix(b"=ybegin ")
+        .ok_or_else(|| YencError::InvalidHeader {
+            field: "=ybegin".to_string(),
+            reason: "missing =ybegin prefix".to_string(),
+        })?;
+    let content = trim_line_end(content);
+    let mut fields = YbeginFieldRefs::default();
+    visit_fields(content, |key, value| {
+        if key_eq_ascii_ignore_case(key, b"name") {
+            fields.name = Some(value);
+        } else if key_eq_ascii_ignore_case(key, b"size") {
+            fields.size = Some(value);
+        } else if key_eq_ascii_ignore_case(key, b"line") {
+            fields.line = Some(value);
+        } else if key_eq_ascii_ignore_case(key, b"part") {
+            fields.part = Some(value);
+        } else if key_eq_ascii_ignore_case(key, b"total") {
+            fields.total = Some(value);
+        }
+    });
+
+    Ok(YencMetadata {
+        name: bytes_to_string(required_field(fields.name, "name")?),
+        size: required_u64_field(fields.size, "size")?,
+        line_length: required_u64_field(fields.line, "line")? as u32,
+        part: optional_u64_field(fields.part, "part")?.map(|v| v as u32),
+        total: optional_u64_field(fields.total, "total")?.map(|v| v as u32),
+        begin: None,
+        end: None,
+    })
+}
+
+pub fn apply_ypart_line(line: &[u8], metadata: &mut YencMetadata) -> Result<(), YencError> {
+    let content = line
+        .strip_prefix(b"=ypart ")
+        .ok_or_else(|| YencError::InvalidHeader {
+            field: "=ypart".to_string(),
+            reason: "missing =ypart prefix".to_string(),
+        })?;
+    let content = trim_line_end(content);
+    let mut fields = YpartFieldRefs::default();
+    visit_fields(content, |key, value| {
+        if key_eq_ascii_ignore_case(key, b"begin") {
+            fields.begin = Some(value);
+        } else if key_eq_ascii_ignore_case(key, b"end") {
+            fields.end = Some(value);
+        }
+    });
+    let begin = required_u64_field(fields.begin, "begin")?;
+    let end = required_u64_field(fields.end, "end")?;
+
+    if end < begin {
+        return Err(YencError::InvalidHeader {
+            field: "end".to_string(),
+            reason: format!("end ({end}) < begin ({begin})"),
+        });
+    }
+    if end > metadata.size {
+        return Err(YencError::InvalidHeader {
+            field: "end".to_string(),
+            reason: format!("end ({end}) > file size ({})", metadata.size),
+        });
+    }
+
+    metadata.begin = Some(begin);
+    metadata.end = Some(end);
+    Ok(())
+}
+
+pub fn parse_yend_line(line: &[u8]) -> Result<YendFields, YencError> {
+    let content = line
+        .strip_prefix(b"=yend ")
+        .ok_or_else(|| YencError::InvalidHeader {
+            field: "=yend".to_string(),
+            reason: "missing =yend prefix".to_string(),
+        })?;
+    let content = trim_line_end(content);
+    let mut fields = YendFieldRefs::default();
+    visit_fields(content, |key, value| {
+        if key_eq_ascii_ignore_case(key, b"size") {
+            fields.size = Some(value);
+        } else if key_eq_ascii_ignore_case(key, b"part") {
+            fields.part = Some(value);
+        } else if key_eq_ascii_ignore_case(key, b"pcrc32") {
+            fields.pcrc32 = Some(value);
+        } else if key_eq_ascii_ignore_case(key, b"crc32") {
+            fields.crc32 = Some(value);
+        }
+    });
+
+    Ok(YendFields {
+        size: optional_u64_field(fields.size, "size")?,
+        part: optional_u64_field(fields.part, "part")?.map(|v| v as u32),
+        pcrc32: fields
+            .pcrc32
+            .map(|s| parse_crc_hex_bytes(s, "pcrc32"))
+            .transpose()?,
+        crc32: fields
+            .crc32
+            .map(|s| parse_crc_hex_bytes(s, "crc32"))
+            .transpose()?,
+    })
+}
+
 /// Result of parsing all yEnc headers from an article.
 #[derive(Debug)]
 pub struct ParsedHeaders {
@@ -72,6 +178,127 @@ fn bytes_to_string(bytes: &[u8]) -> String {
             bytes.iter().map(|&b| b as char).collect()
         }
     }
+}
+
+fn trim_line_end(bytes: &[u8]) -> &[u8] {
+    bytes.trim_ascii_end()
+}
+
+#[derive(Default)]
+struct YbeginFieldRefs<'a> {
+    name: Option<&'a [u8]>,
+    size: Option<&'a [u8]>,
+    line: Option<&'a [u8]>,
+    part: Option<&'a [u8]>,
+    total: Option<&'a [u8]>,
+}
+
+#[derive(Default)]
+struct YpartFieldRefs<'a> {
+    begin: Option<&'a [u8]>,
+    end: Option<&'a [u8]>,
+}
+
+#[derive(Default)]
+struct YendFieldRefs<'a> {
+    size: Option<&'a [u8]>,
+    part: Option<&'a [u8]>,
+    pcrc32: Option<&'a [u8]>,
+    crc32: Option<&'a [u8]>,
+}
+
+fn visit_fields<'a>(line: &'a [u8], mut visit: impl FnMut(&[u8], &'a [u8])) {
+    let mut remaining = line;
+
+    loop {
+        remaining = remaining.trim_ascii_start();
+        if remaining.is_empty() {
+            return;
+        }
+
+        let Some(eq_pos) = remaining.iter().position(|&b| b == b'=') else {
+            return;
+        };
+        let key = &remaining[..eq_pos];
+        let value_start = eq_pos + 1;
+
+        if key_eq_ascii_ignore_case(key, b"name") {
+            let value = trim_line_end(&remaining[value_start..]);
+            visit(key, value);
+            return;
+        }
+
+        let value_end = remaining[value_start..]
+            .iter()
+            .position(|b| b.is_ascii_whitespace())
+            .map(|offset| value_start + offset)
+            .unwrap_or(remaining.len());
+        let value = &remaining[value_start..value_end];
+        visit(key, value);
+
+        remaining = &remaining[value_end..];
+    }
+}
+
+fn required_field<'a>(field: Option<&'a [u8]>, label: &str) -> Result<&'a [u8], YencError> {
+    field.ok_or_else(|| YencError::MissingField(label.to_string()))
+}
+
+fn optional_u64_field(field: Option<&[u8]>, label: &str) -> Result<Option<u64>, YencError> {
+    field.map(|value| parse_u64_bytes(value, label)).transpose()
+}
+
+fn required_u64_field(field: Option<&[u8]>, label: &str) -> Result<u64, YencError> {
+    parse_u64_bytes(required_field(field, label)?, label)
+}
+
+fn parse_u64_bytes(value: &[u8], label: &str) -> Result<u64, YencError> {
+    let value = value.trim_ascii();
+    if value.is_empty() {
+        return Err(YencError::InvalidHeader {
+            field: label.to_string(),
+            reason: "invalid integer: ".to_string(),
+        });
+    }
+
+    let mut parsed = 0u64;
+    for &byte in value {
+        if !byte.is_ascii_digit() {
+            return Err(YencError::InvalidHeader {
+                field: label.to_string(),
+                reason: format!("invalid integer: {}", bytes_to_string(value)),
+            });
+        }
+        parsed = parsed
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(u64::from(byte - b'0')))
+            .ok_or_else(|| YencError::InvalidHeader {
+                field: label.to_string(),
+                reason: format!("invalid integer: {}", bytes_to_string(value)),
+            })?;
+    }
+
+    Ok(parsed)
+}
+
+fn parse_crc_hex_bytes(value: &[u8], label: &str) -> Result<u32, YencError> {
+    let value = value.trim_ascii();
+    let value_str = std::str::from_utf8(value).map_err(|_| YencError::InvalidHeader {
+        field: label.to_string(),
+        reason: format!("invalid hex value: {}", bytes_to_string(value)),
+    })?;
+    u32::from_str_radix(value_str, 16).map_err(|_| YencError::InvalidHeader {
+        field: label.to_string(),
+        reason: format!("invalid hex value: {value_str}"),
+    })
+}
+
+fn key_eq_ascii_ignore_case(actual: &[u8], expected: &[u8]) -> bool {
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected)
+            .all(|(&a, &b)| a.eq_ignore_ascii_case(&b))
 }
 
 /// Parse key=value fields from a header line's content (after the keyword like `=ybegin `).
@@ -319,6 +546,60 @@ fn get_optional_field_u64(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_ybegin_line_extracts_metadata() {
+        let metadata =
+            parse_ybegin_line(b"=ybegin part=3 total=5 line=128 size=4096 name=test.bin\r\n")
+                .unwrap();
+
+        assert_eq!(metadata.name, "test.bin");
+        assert_eq!(metadata.size, 4096);
+        assert_eq!(metadata.line_length, 128);
+        assert_eq!(metadata.part, Some(3));
+        assert_eq!(metadata.total, Some(5));
+        assert_eq!(metadata.begin, None);
+        assert_eq!(metadata.end, None);
+    }
+
+    #[test]
+    fn apply_ypart_line_updates_metadata() {
+        let mut metadata =
+            parse_ybegin_line(b"=ybegin part=1 total=2 line=128 size=4096 name=test.bin\r\n")
+                .unwrap();
+
+        apply_ypart_line(b"=ypart begin=257 end=512\r\n", &mut metadata).unwrap();
+
+        assert_eq!(metadata.begin, Some(257));
+        assert_eq!(metadata.end, Some(512));
+    }
+
+    #[test]
+    fn apply_ypart_line_validates_range_against_size() {
+        let mut metadata =
+            parse_ybegin_line(b"=ybegin part=1 total=2 line=128 size=4096 name=test.bin\r\n")
+                .unwrap();
+        let err = apply_ypart_line(b"=ypart begin=1 end=4097\r\n", &mut metadata).unwrap_err();
+
+        assert!(matches!(err, YencError::InvalidHeader { field, .. } if field == "end"));
+    }
+
+    #[test]
+    fn parse_yend_line_extracts_trailer_fields() {
+        let yend =
+            parse_yend_line(b"=yend size=1234 part=2 pcrc32=ABCDEF12 crc32=01234567\r\n").unwrap();
+
+        assert_eq!(yend.size, Some(1234));
+        assert_eq!(yend.part, Some(2));
+        assert_eq!(yend.pcrc32, Some(0xABCDEF12));
+        assert_eq!(yend.crc32, Some(0x01234567));
+    }
+
+    #[test]
+    fn parse_yend_line_rejects_non_yend_line() {
+        let err = parse_yend_line(b"=ypart begin=1 end=10\r\n").unwrap_err();
+        assert!(matches!(err, YencError::InvalidHeader { field, .. } if field == "=yend"));
+    }
 
     #[test]
     fn parse_single_part_article() {
