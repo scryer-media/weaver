@@ -77,6 +77,11 @@ pub struct DecodedBody {
 pub struct DecodedBodyCpu {
     pub raw_decode: Duration,
     pub read_poll: Duration,
+    pub response_line: Duration,
+    pub yenc_header: Duration,
+    pub body_decode: Duration,
+    pub yend_line: Duration,
+    pub nntp_terminator: Duration,
     pub feed: Duration,
     pub finish: Duration,
 }
@@ -111,8 +116,13 @@ fn decoded_cpu_from_fused_stats(stats: &FusedYencArticleStats) -> DecodedBodyCpu
     DecodedBodyCpu {
         raw_decode: stats.fused_decode_cpu,
         read_poll: stats.read_poll_cpu,
+        response_line: stats.response_line_cpu,
+        yenc_header: stats.yenc_header_cpu,
+        body_decode: stats.body_decode_cpu,
+        yend_line: stats.yend_line_cpu,
+        nntp_terminator: stats.nntp_terminator_cpu,
         feed: stats.output_callback_cpu,
-        finish: Duration::ZERO,
+        finish: stats.article_finish_cpu,
     }
 }
 

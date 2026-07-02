@@ -3297,7 +3297,6 @@ fn debug_job_state(pipeline: &Pipeline, job_id: JobId) -> String {
 
 async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
     pipeline.pump_decode_queue();
-
     while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
         pipeline.check_job_completion(queued_job).await;
         pipeline.pump_decode_queue();
@@ -8471,6 +8470,26 @@ async fn completed_standalone_file_crc32_match_persists_completion_without_md5()
     assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
     let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
     assert!(hashes.get(&0).is_none());
+}
+
+#[test]
+fn completed_file_checksum_combines_batched_decoded_crc_once() {
+    let decoded = DecodedChunk::from(vec![
+        b"verified-".to_vec().into_boxed_slice(),
+        b"payload".to_vec().into_boxed_slice(),
+    ]);
+    assert!(matches!(decoded, DecodedChunk::Batches { .. }));
+
+    let payload = b"verified-payload";
+    let part_crc = checksum::crc32(payload);
+    let mut state = CompletedFileChecksumState::new();
+
+    state.update_decoded_chunk(&decoded, part_crc, true, false);
+
+    let checksum = state.finalize();
+    assert_eq!(checksum.crc32, part_crc);
+    assert!(checksum.all_parts_crc_verified);
+    assert!(checksum.md5.is_none());
 }
 
 #[tokio::test]

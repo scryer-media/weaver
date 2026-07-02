@@ -1058,6 +1058,31 @@ impl CompletedFileChecksumState {
         self.update_crc32(data.len() as u64, part_crc, part_crc_verified);
     }
 
+    pub(super) fn update_decoded_chunk(
+        &mut self,
+        data: &DecodedChunk,
+        part_crc: u32,
+        part_crc_verified: bool,
+        track_md5: bool,
+    ) {
+        let total_len = data.len_bytes();
+        if total_len == 0 {
+            return;
+        }
+        if track_md5 {
+            let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.file_hash.update.md5");
+            if let Some(md5) = self.md5.as_mut() {
+                data.for_each_slice(|slice| md5.update(slice));
+            }
+        } else if self.md5.take().is_some() {
+            crate::runtime::perf_probe::record(
+                "download.file_hash.update.md5.disabled",
+                Duration::from_nanos(1),
+            );
+        }
+        self.update_crc32(total_len as u64, part_crc, part_crc_verified);
+    }
+
     fn update_crc32(&mut self, len: u64, part_crc: u32, part_crc_verified: bool) {
         if !part_crc_verified {
             self.all_parts_crc_verified = false;

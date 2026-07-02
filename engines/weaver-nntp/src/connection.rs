@@ -87,6 +87,32 @@ where
     (output, cpu)
 }
 
+fn deliver_fused_output_chunks<F>(
+    chunks: Vec<Box<[u8]>>,
+    article_chunks: &mut Vec<Box<[u8]>>,
+    on_chunk: &mut F,
+    output_callback_cpu: &mut Duration,
+    profile_cpu: bool,
+) -> std::result::Result<(), FusedYencError>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
+    if chunks.is_empty() {
+        return Ok(());
+    }
+
+    let cpu_started = profile_cpu.then(thread_cpu_time).flatten();
+    for chunk in chunks {
+        if let Err(err) = on_chunk(&chunk) {
+            add_cpu_delta(output_callback_cpu, cpu_started);
+            return Err(err.into());
+        }
+        article_chunks.push(chunk);
+    }
+    add_cpu_delta(output_callback_cpu, cpu_started);
+    Ok(())
+}
+
 /// State of a single NNTP connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -996,6 +1022,7 @@ impl NntpConnection {
         let timeout = self.command_timeout;
         let profile_cpu = profile_cpu_timings_enabled();
         let mut decoder = FusedYencArticleDecoder::from_body_response(initial)?;
+        decoder.set_profile_cpu(profile_cpu);
         let mut read_calls = 0u64;
         let mut read_bytes = 0u64;
         let mut transport_read = TransportReadStats::default();
@@ -1011,31 +1038,41 @@ impl NntpConnection {
                 add_cpu_delta(&mut fused_decode_cpu, cpu_started);
                 match decoded? {
                     Some(mut article) => {
-                        article_chunks.append(&mut article.chunks);
+                        let chunks = std::mem::take(&mut article.chunks);
+                        if let Err(err) = deliver_fused_output_chunks(
+                            chunks,
+                            &mut article_chunks,
+                            &mut on_chunk,
+                            &mut output_callback_cpu,
+                            profile_cpu,
+                        ) {
+                            self.poisoned = true;
+                            self.current_group = None;
+                            return Err(err);
+                        }
                         article.stats.read_calls = read_calls;
                         article.stats.read_bytes = read_bytes;
                         article.stats.transport_read = transport_read;
                         article.stats.read_poll_cpu = read_poll_cpu;
                         article.stats.fused_decode_cpu = fused_decode_cpu;
                         article.stats.leftover_bytes_after_terminator = self.read_buf.len() as u64;
-
-                        let cpu_started = profile_cpu.then(thread_cpu_time).flatten();
-                        for chunk in &article_chunks {
-                            if let Err(err) = on_chunk(chunk) {
-                                add_cpu_delta(&mut output_callback_cpu, cpu_started);
-                                self.poisoned = true;
-                                self.current_group = None;
-                                return Err(err.into());
-                            }
-                        }
-                        add_cpu_delta(&mut output_callback_cpu, cpu_started);
                         article.stats.output_batches = article_chunks.len() as u64;
                         article.stats.output_callback_cpu = output_callback_cpu;
                         article.chunks = article_chunks;
                         return Ok::<FusedYencArticle, FusedYencError>(article);
                     }
                     None => {
-                        article_chunks.extend(decoder.drain_output_chunks());
+                        if let Err(err) = deliver_fused_output_chunks(
+                            decoder.drain_output_chunks(),
+                            &mut article_chunks,
+                            &mut on_chunk,
+                            &mut output_callback_cpu,
+                            profile_cpu,
+                        ) {
+                            self.poisoned = true;
+                            self.current_group = None;
+                            return Err(err);
+                        }
                     }
                 }
 
@@ -1237,12 +1274,15 @@ fn pending_multiline_terminator(buf: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use std::io::{self, Cursor, Read};
+    #[cfg(feature = "openssl-probe")]
     use std::net::TcpStream as StdTcpStream;
     use std::sync::Arc;
 
     use super::*;
     use crate::tls::ManualTlsStream;
+    #[cfg(feature = "openssl-probe")]
     use openssl::ssl::{ErrorCode as OpensslErrorCode, SslConnector, SslMethod, SslVersion};
+    #[cfg(feature = "openssl-probe")]
     use openssl::x509::X509;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -1319,6 +1359,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "openssl-probe")]
     fn openssl_connector_from_cert_der(cert_der: &[u8]) -> SslConnector {
         let x509 = X509::from_der(cert_der).expect("OpenSSL test root certificate");
         let mut builder = SslConnector::builder(SslMethod::tls_client()).expect("OpenSSL builder");
@@ -1335,6 +1376,7 @@ mod tests {
         builder.build()
     }
 
+    #[cfg(feature = "openssl-probe")]
     #[derive(Clone, Copy, Debug, Default)]
     struct OpensslDrainStats {
         ssl_read_calls: usize,
@@ -1343,6 +1385,7 @@ mod tests {
         plaintext_bytes: usize,
     }
 
+    #[cfg(feature = "openssl-probe")]
     fn openssl_drain_payload(addr: SocketAddr, cert_der: Vec<u8>) -> (Vec<u8>, OpensslDrainStats) {
         let connector = openssl_connector_from_cert_der(&cert_der);
         let tcp = StdTcpStream::connect(addr).expect("OpenSSL client connect");
@@ -1967,6 +2010,7 @@ mod tests {
         assert_eq!(read_buf.len(), TLS_DRAIN_PAYLOAD_BYTES);
     }
 
+    #[cfg(feature = "openssl-probe")]
     #[tokio::test]
     async fn openssl_bulk_drain_probe() {
         let (_, server_config, cert_der) = test_tls_configs_with_cert_der();
@@ -2610,8 +2654,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(article.to_data(), original);
-        assert_eq!(chunk_lens, vec![FUSED_YENC_OUTPUT_BATCH_TARGET + 123]);
-        assert_eq!(article.stats.output_batches, 1);
+        assert_eq!(chunk_lens, vec![FUSED_YENC_OUTPUT_BATCH_TARGET, 123]);
+        assert_eq!(article.stats.output_batches, 2);
     }
 
     #[tokio::test]

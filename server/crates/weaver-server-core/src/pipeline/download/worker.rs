@@ -2597,6 +2597,26 @@ impl Pipeline {
                     cpu.raw_decode,
                 );
                 crate::runtime::perf_probe::record_cpu_sample(
+                    "download.fused.response_line",
+                    cpu.response_line,
+                );
+                crate::runtime::perf_probe::record_cpu_sample(
+                    "download.fused.yenc_header",
+                    cpu.yenc_header,
+                );
+                crate::runtime::perf_probe::record_cpu_sample(
+                    "download.fused.body_decode",
+                    cpu.body_decode,
+                );
+                crate::runtime::perf_probe::record_cpu_sample(
+                    "download.fused.yend_line",
+                    cpu.yend_line,
+                );
+                crate::runtime::perf_probe::record_cpu_sample(
+                    "download.fused.nntp_terminator",
+                    cpu.nntp_terminator,
+                );
+                crate::runtime::perf_probe::record_cpu_sample(
                     "download.nntp.read_poll",
                     cpu.read_poll,
                 );
@@ -2685,6 +2705,38 @@ impl Pipeline {
                         0
                     } else {
                         io.transport_read.s2n_read_bytes / io.transport_read.s2n_read_calls
+                    },
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.boring.read_calls",
+                    io.transport_read.boring_read_calls,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.boring.read_bytes",
+                    io.transport_read.boring_read_bytes,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.boring.target_full_returns",
+                    io.transport_read.boring_target_full_returns,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.boring.pending_empty_returns",
+                    io.transport_read.boring_pending_empty_returns,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.boring.pending_after_bytes_returns",
+                    io.transport_read.boring_pending_after_bytes_returns,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.boring.zero_returns",
+                    io.transport_read.boring_zero_returns,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.boring.bytes_per_read_call",
+                    if io.transport_read.boring_read_calls == 0 {
+                        0
+                    } else {
+                        io.transport_read.boring_read_bytes / io.transport_read.boring_read_calls
                     },
                 );
                 crate::runtime::perf_probe::record_value(

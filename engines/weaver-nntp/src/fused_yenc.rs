@@ -14,6 +14,37 @@ use crate::types::Response;
 
 const MAX_CONTROL_LINE: usize = 16 * 1024;
 const MAX_ARTICLE_RESERVE: usize = 16 * 1024 * 1024;
+const OUTPUT_BATCH_TARGET: usize = 512 * 1024;
+
+#[cfg(unix)]
+fn thread_cpu_time() -> Option<Duration> {
+    let mut timespec = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, timespec.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let timespec = unsafe { timespec.assume_init() };
+    let seconds = u64::try_from(timespec.tv_sec).ok()?;
+    let nanos = u32::try_from(timespec.tv_nsec).ok()?.min(999_999_999);
+    Some(Duration::new(seconds, nanos))
+}
+
+#[cfg(not(unix))]
+fn thread_cpu_time() -> Option<Duration> {
+    None
+}
+
+fn add_cpu_delta(total: &mut Duration, started: Option<Duration>) {
+    let Some(started) = started else {
+        return;
+    };
+    let Some(current) = thread_cpu_time() else {
+        return;
+    };
+    if let Some(delta) = current.checked_sub(started) {
+        *total += delta;
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum FusedYencError {
@@ -85,6 +116,12 @@ pub struct FusedYencArticleStats {
     pub transport_read: TransportReadStats,
     pub read_poll_cpu: Duration,
     pub fused_decode_cpu: Duration,
+    pub response_line_cpu: Duration,
+    pub yenc_header_cpu: Duration,
+    pub body_decode_cpu: Duration,
+    pub yend_line_cpu: Duration,
+    pub nntp_terminator_cpu: Duration,
+    pub article_finish_cpu: Duration,
     pub output_callback_cpu: Duration,
 }
 
@@ -114,6 +151,7 @@ pub struct FusedYencArticleDecoder {
     output: Vec<u8>,
     output_chunks: Vec<Box<[u8]>>,
     output_reserved: bool,
+    profile_cpu: bool,
     stats: FusedYencArticleStats,
 }
 
@@ -129,6 +167,7 @@ impl FusedYencArticleDecoder {
             output: Vec::new(),
             output_chunks: Vec::new(),
             output_reserved: false,
+            profile_cpu: false,
             stats: FusedYencArticleStats::default(),
         }
     }
@@ -145,12 +184,18 @@ impl FusedYencArticleDecoder {
         loop {
             match self.state {
                 FusedArticleState::ResponseLine => {
-                    if !self.process_response_line(src)? {
+                    let cpu_started = self.phase_cpu_started();
+                    let result = self.process_response_line(src);
+                    add_cpu_delta(&mut self.stats.response_line_cpu, cpu_started);
+                    if !result? {
                         return Ok(None);
                     }
                 }
                 FusedArticleState::YencHeader => {
-                    if !self.process_yenc_header(src)? {
+                    let cpu_started = self.phase_cpu_started();
+                    let result = self.process_yenc_header(src);
+                    add_cpu_delta(&mut self.stats.yenc_header_cpu, cpu_started);
+                    if !result? {
                         return Ok(None);
                     }
                 }
@@ -158,17 +203,26 @@ impl FusedYencArticleDecoder {
                     if src.is_empty() {
                         return Ok(None);
                     }
-                    if let Some(article) = self.process_body(src)? {
+                    let cpu_started = self.phase_cpu_started();
+                    let result = self.process_body(src);
+                    add_cpu_delta(&mut self.stats.body_decode_cpu, cpu_started);
+                    if let Some(article) = result? {
                         return Ok(Some(article));
                     }
                 }
                 FusedArticleState::YEndLine => {
-                    if !self.process_yend_line(src)? {
+                    let cpu_started = self.phase_cpu_started();
+                    let result = self.process_yend_line(src);
+                    add_cpu_delta(&mut self.stats.yend_line_cpu, cpu_started);
+                    if !result? {
                         return Ok(None);
                     }
                 }
                 FusedArticleState::NntpTerminator => {
-                    if !self.process_nntp_terminator(src)? {
+                    let cpu_started = self.phase_cpu_started();
+                    let result = self.process_nntp_terminator(src);
+                    add_cpu_delta(&mut self.stats.nntp_terminator_cpu, cpu_started);
+                    if !result? {
                         return Ok(None);
                     }
                     self.stats.leftover_bytes_after_terminator = src.len() as u64;
@@ -183,8 +237,16 @@ impl FusedYencArticleDecoder {
         self.state == FusedArticleState::Done
     }
 
+    pub fn set_profile_cpu(&mut self, enabled: bool) {
+        self.profile_cpu = enabled;
+    }
+
     pub(crate) fn drain_output_chunks(&mut self) -> Vec<Box<[u8]>> {
         std::mem::take(&mut self.output_chunks)
+    }
+
+    fn phase_cpu_started(&self) -> Option<Duration> {
+        self.profile_cpu.then(thread_cpu_time).flatten()
     }
 
     fn process_response_line(&mut self, src: &mut BytesMut) -> Result<bool> {
@@ -253,6 +315,7 @@ impl FusedYencArticleDecoder {
         let progress =
             decode_body_chunk_until_control(&mut self.decode_state, src, &mut self.output)?;
         self.advance_src(src, progress.source_consumed);
+        self.flush_ready_output();
 
         match progress.end {
             RapidyencDecodeEnd::None => Ok(None),
@@ -309,6 +372,7 @@ impl FusedYencArticleDecoder {
     }
 
     fn finish_article(&mut self) -> Result<FusedYencArticle> {
+        let cpu_started = self.phase_cpu_started();
         let response = self.response.take().ok_or_else(|| {
             NntpError::MalformedResponse("missing BODY response line".to_string())
         })?;
@@ -337,6 +401,7 @@ impl FusedYencArticleDecoder {
         stats.crc_update_calls = crc_update_calls;
         stats.output_batches = chunks.len() as u64;
         stats.input_bytes_consumed = stats.encoded_bytes_consumed;
+        add_cpu_delta(&mut stats.article_finish_cpu, cpu_started);
 
         self.state = FusedArticleState::Done;
 
@@ -402,6 +467,14 @@ impl FusedYencArticleDecoder {
         }
         self.output_chunks
             .push(std::mem::take(&mut self.output).into_boxed_slice());
+    }
+
+    fn flush_ready_output(&mut self) {
+        while self.output.len() >= OUTPUT_BATCH_TARGET {
+            let remainder = self.output.split_off(OUTPUT_BATCH_TARGET);
+            let full_batch = std::mem::replace(&mut self.output, remainder);
+            self.output_chunks.push(full_batch.into_boxed_slice());
+        }
     }
 
     fn advance_src(&mut self, src: &mut BytesMut, count: usize) {
@@ -653,6 +726,32 @@ mod tests {
                 "chunk length {chunk_len}"
             );
         }
+    }
+
+    #[test]
+    fn fused_flushes_decoded_batches_before_article_finish() {
+        let mut original = Vec::with_capacity(OUTPUT_BATCH_TARGET + 123);
+        for idx in 0..(OUTPUT_BATCH_TARGET + 123) {
+            original.push((idx % 251) as u8);
+        }
+
+        let mut article = Vec::new();
+        encode(&original, &mut article, 128, "batch.bin").unwrap();
+        let yend_offset = article
+            .windows(b"=yend ".len())
+            .position(|window| window == b"=yend ")
+            .expect("encoded article has yend trailer");
+
+        let mut prefix = b"222 <test@local> body follows\r\n".to_vec();
+        prefix.extend_from_slice(&article[..yend_offset]);
+
+        let mut src = BytesMut::from(prefix.as_slice());
+        let mut decoder = FusedYencArticleDecoder::new();
+        assert!(decoder.decode_available(&mut src).unwrap().is_none());
+
+        let chunks = decoder.drain_output_chunks();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), OUTPUT_BATCH_TARGET);
     }
 
     #[test]

@@ -3,14 +3,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static PREFERRED_CPUS: OnceLock<Vec<usize>> = OnceLock::new();
 static NEXT_CPU: AtomicUsize = AtomicUsize::new(0);
+const TOKIO_WORKER_THREADS_ENV: &str = "WEAVER_TOKIO_WORKER_THREADS";
 
 pub fn install_tokio_worker_affinity(builder: &mut tokio::runtime::Builder) {
     let cpus = preferred_cpus();
+    if let Some(worker_threads) = tokio_worker_threads_override() {
+        builder.worker_threads(worker_threads);
+    } else if !cpus.is_empty() {
+        builder.worker_threads(cpus.len());
+    }
+
     if cpus.is_empty() {
         return;
     }
-
-    builder.worker_threads(cpus.len());
 
     let cpus_for_threads = cpus.to_vec();
     builder.on_thread_start(move || {
@@ -28,6 +33,18 @@ pub fn pin_current_thread_for_hot_download_path() {
 
 fn preferred_cpus() -> &'static [usize] {
     PREFERRED_CPUS.get_or_init(detect_preferred_cpus).as_slice()
+}
+
+fn tokio_worker_threads_override() -> Option<usize> {
+    match std::env::var(TOKIO_WORKER_THREADS_ENV) {
+        Ok(value) if value.trim().is_empty() => None,
+        Ok(value) => match value.parse::<usize>() {
+            Ok(threads) if threads > 0 => Some(threads),
+            _ => panic!("{TOKIO_WORKER_THREADS_ENV} must be a positive integer"),
+        },
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => panic!("failed to read {TOKIO_WORKER_THREADS_ENV}: {error}"),
+    }
 }
 
 fn pin_current_thread_round_robin(cpus: &[usize]) {

@@ -115,22 +115,21 @@ impl Pipeline {
             return;
         }
 
-        let end_offset = file_offset.saturating_add(total_len as u64);
-        let mut next_offset = file_offset;
-        data.for_each_slice(|slice| {
-            if slice.is_empty() {
-                return;
-            }
-            let slice_end = next_offset.saturating_add(slice.len() as u64);
-            self.note_file_hash_chunk(
-                file_id,
-                next_offset,
-                slice,
-                part_crc,
-                part_crc_verified && slice_end == end_offset,
-            );
-            next_offset = slice_end;
-        });
+        let expected_offset = self
+            .file_hash_states
+            .get(&file_id)
+            .map(|state| state.bytes_fed())
+            .unwrap_or(0);
+        if expected_offset != file_offset {
+            self.mark_file_hash_reread_required_for(file_id, "offset_mismatch");
+            return;
+        }
+
+        let track_md5 = self.should_stream_md5_for_file(file_id);
+        self.file_hash_states
+            .entry(file_id)
+            .or_default()
+            .update_decoded_chunk(data, part_crc, part_crc_verified, track_md5);
     }
 
     fn should_use_completed_file_crc_metadata(&self, file_id: NzbFileId) -> bool {

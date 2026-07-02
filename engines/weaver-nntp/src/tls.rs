@@ -4,12 +4,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use boring::ssl::{ConnectConfiguration, SslConnector, SslMethod, SslVerifyMode, SslVersion};
 use bytes::{BufMut, BytesMut};
 use s2n_tls::{config::Config as S2nConfig, security};
 use s2n_tls_tokio::{TlsConnector as S2nTlsConnector, TlsStream as S2nTlsStream};
 use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, lookup_host};
+use tokio_boring::SslStream as BoringTlsStream;
 use tokio_rustls::client::TlsStream as RustlsTlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, ClientConnection, RootCertStore};
@@ -31,12 +33,15 @@ pin_project_lite::pin_project! {
         ManualTls { inner: ManualTlsStream, remote_addr: SocketAddr },
         /// TLS-encrypted TCP through s2n-tls.
         S2nTls { #[pin] inner: S2nTlsStream<TcpStream>, remote_addr: SocketAddr },
+        /// TLS-encrypted TCP through Cloudflare's BoringSSL bindings.
+        BoringTls { #[pin] inner: BoringTlsStream<TcpStream>, remote_addr: SocketAddr },
     }
 }
 
 const TLS_READ_BUFFER: usize = 256 * 1024;
 const TLS_PLAINTEXT_DRAIN_CHUNK: usize = 16 * 1024;
 const TLS_BACKEND_ENV: &str = "WEAVER_NNTP_TLS_BACKEND";
+const BORING_READ_AHEAD_ENV: &str = "WEAVER_NNTP_BORING_READ_AHEAD";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TransportReadStats {
@@ -58,6 +63,12 @@ pub struct TransportReadStats {
     pub s2n_pending_empty_returns: u64,
     pub s2n_pending_after_bytes_returns: u64,
     pub s2n_zero_returns: u64,
+    pub boring_read_calls: u64,
+    pub boring_read_bytes: u64,
+    pub boring_target_full_returns: u64,
+    pub boring_pending_empty_returns: u64,
+    pub boring_pending_after_bytes_returns: u64,
+    pub boring_zero_returns: u64,
 }
 
 impl TransportReadStats {
@@ -80,6 +91,12 @@ impl TransportReadStats {
         self.s2n_pending_empty_returns += other.s2n_pending_empty_returns;
         self.s2n_pending_after_bytes_returns += other.s2n_pending_after_bytes_returns;
         self.s2n_zero_returns += other.s2n_zero_returns;
+        self.boring_read_calls += other.boring_read_calls;
+        self.boring_read_bytes += other.boring_read_bytes;
+        self.boring_target_full_returns += other.boring_target_full_returns;
+        self.boring_pending_empty_returns += other.boring_pending_empty_returns;
+        self.boring_pending_after_bytes_returns += other.boring_pending_after_bytes_returns;
+        self.boring_zero_returns += other.boring_zero_returns;
     }
 }
 
@@ -139,6 +156,57 @@ async fn read_s2n_available_into(
     Ok(TransportRead { bytes, stats })
 }
 
+async fn read_boring_available_into(
+    inner: &mut BoringTlsStream<TcpStream>,
+    dst: &mut BytesMut,
+    target_read_size: usize,
+) -> io::Result<TransportRead> {
+    let started_len = dst.len();
+    let target_read_size = target_read_size.max(1);
+    let mut stats = TransportReadStats::default();
+    let bytes = std::future::poll_fn(|cx| {
+        loop {
+            let total = dst.len().saturating_sub(started_len);
+            if total >= target_read_size {
+                stats.boring_target_full_returns += 1;
+                return std::task::Poll::Ready(Ok(total));
+            }
+
+            dst.reserve(target_read_size - total);
+            let mut read_buf = ReadBuf::uninit(dst.spare_capacity_mut());
+            match std::pin::Pin::new(&mut *inner).poll_read(cx, &mut read_buf) {
+                std::task::Poll::Ready(Ok(())) => {
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        stats.boring_zero_returns += 1;
+                        return std::task::Poll::Ready(Ok(total));
+                    }
+                    unsafe {
+                        dst.advance_mut(n);
+                    }
+                    stats.boring_read_calls += 1;
+                    stats.boring_read_bytes += n as u64;
+                    stats.plaintext_bytes += n as u64;
+                }
+                std::task::Poll::Ready(Err(error)) => {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                std::task::Poll::Pending if total > 0 => {
+                    stats.boring_pending_after_bytes_returns += 1;
+                    return std::task::Poll::Ready(Ok(total));
+                }
+                std::task::Poll::Pending => {
+                    stats.boring_pending_empty_returns += 1;
+                    return std::task::Poll::Pending;
+                }
+            }
+        }
+    })
+    .await?;
+
+    Ok(TransportRead { bytes, stats })
+}
+
 pub struct ManualTlsStream {
     tcp: TcpStream,
     tls: ClientConnection,
@@ -153,6 +221,7 @@ impl NntpTransport {
             NntpTransport::Tls { .. }
                 | NntpTransport::ManualTls { .. }
                 | NntpTransport::S2nTls { .. }
+                | NntpTransport::BoringTls { .. }
         )
     }
 
@@ -161,7 +230,8 @@ impl NntpTransport {
             NntpTransport::Plain { remote_addr, .. }
             | NntpTransport::Tls { remote_addr, .. }
             | NntpTransport::ManualTls { remote_addr, .. }
-            | NntpTransport::S2nTls { remote_addr, .. } => *remote_addr,
+            | NntpTransport::S2nTls { remote_addr, .. }
+            | NntpTransport::BoringTls { remote_addr, .. } => *remote_addr,
         }
     }
 
@@ -174,6 +244,7 @@ impl NntpTransport {
             NntpTransport::Plain { inner, .. } => inner.read_buf(dst).await,
             NntpTransport::Tls { inner, .. } => inner.read_buf(dst).await,
             NntpTransport::S2nTls { inner, .. } => inner.read_buf(dst).await,
+            NntpTransport::BoringTls { inner, .. } => inner.read_buf(dst).await,
             NntpTransport::ManualTls { inner, .. } => {
                 inner.read_plaintext_into(dst, target_read_size).await
             }
@@ -213,6 +284,9 @@ impl NntpTransport {
             NntpTransport::S2nTls { inner, .. } => {
                 read_s2n_available_into(inner, dst, target_read_size).await
             }
+            NntpTransport::BoringTls { inner, .. } => {
+                read_boring_available_into(inner, dst, target_read_size).await
+            }
             NntpTransport::ManualTls { inner, .. } => {
                 inner
                     .read_plaintext_into_with_stats(dst, target_read_size)
@@ -227,6 +301,7 @@ impl NntpTransport {
             NntpTransport::Tls { inner, .. } => inner.write_all(bytes).await,
             NntpTransport::ManualTls { inner, .. } => inner.write_all(bytes).await,
             NntpTransport::S2nTls { inner, .. } => inner.write_all(bytes).await,
+            NntpTransport::BoringTls { inner, .. } => inner.write_all(bytes).await,
         }
     }
 
@@ -236,6 +311,7 @@ impl NntpTransport {
             NntpTransport::Tls { inner, .. } => inner.flush().await,
             NntpTransport::ManualTls { inner, .. } => inner.flush().await,
             NntpTransport::S2nTls { inner, .. } => inner.flush().await,
+            NntpTransport::BoringTls { inner, .. } => inner.flush().await,
         }
     }
 }
@@ -499,6 +575,7 @@ impl AsyncRead for NntpTransport {
             NntpTransportProj::Plain { inner, .. } => inner.poll_read(cx, buf),
             NntpTransportProj::Tls { inner, .. } => inner.poll_read(cx, buf),
             NntpTransportProj::S2nTls { inner, .. } => inner.poll_read(cx, buf),
+            NntpTransportProj::BoringTls { inner, .. } => inner.poll_read(cx, buf),
             NntpTransportProj::ManualTls { .. } => std::task::Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "manual TLS transport requires read_into_buf",
@@ -517,6 +594,7 @@ impl AsyncWrite for NntpTransport {
             NntpTransportProj::Plain { inner, .. } => inner.poll_write(cx, buf),
             NntpTransportProj::Tls { inner, .. } => inner.poll_write(cx, buf),
             NntpTransportProj::S2nTls { inner, .. } => inner.poll_write(cx, buf),
+            NntpTransportProj::BoringTls { inner, .. } => inner.poll_write(cx, buf),
             NntpTransportProj::ManualTls { .. } => std::task::Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "manual TLS transport requires NntpTransport::write_all",
@@ -532,6 +610,7 @@ impl AsyncWrite for NntpTransport {
             NntpTransportProj::Plain { inner, .. } => inner.poll_flush(cx),
             NntpTransportProj::Tls { inner, .. } => inner.poll_flush(cx),
             NntpTransportProj::S2nTls { inner, .. } => inner.poll_flush(cx),
+            NntpTransportProj::BoringTls { inner, .. } => inner.poll_flush(cx),
             NntpTransportProj::ManualTls { .. } => std::task::Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "manual TLS transport requires NntpTransport::flush",
@@ -547,6 +626,7 @@ impl AsyncWrite for NntpTransport {
             NntpTransportProj::Plain { inner, .. } => inner.poll_shutdown(cx),
             NntpTransportProj::Tls { inner, .. } => inner.poll_shutdown(cx),
             NntpTransportProj::S2nTls { inner, .. } => inner.poll_shutdown(cx),
+            NntpTransportProj::BoringTls { inner, .. } => inner.poll_shutdown(cx),
             NntpTransportProj::ManualTls { .. } => std::task::Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "manual TLS transport shutdown is handled by dropping the connection",
@@ -597,11 +677,20 @@ pub fn build_tls_config(ca_cert_path: Option<&Path>) -> Result<Arc<ClientConfig>
 enum NntpTlsBackend {
     ManualRustls,
     S2n,
+    Boring,
 }
 
 fn selected_tls_backend() -> Result<NntpTlsBackend, NntpError> {
     match std::env::var(TLS_BACKEND_ENV) {
         Ok(value) if value.eq_ignore_ascii_case("s2n") => Ok(NntpTlsBackend::S2n),
+        Ok(value)
+            if value.eq_ignore_ascii_case("boring")
+                || value.eq_ignore_ascii_case("boringssl")
+                || value.eq_ignore_ascii_case("tokio-boring")
+                || value.eq_ignore_ascii_case("tokio_boring") =>
+        {
+            Ok(NntpTlsBackend::Boring)
+        }
         Ok(value)
             if value.eq_ignore_ascii_case("rustls")
                 || value.eq_ignore_ascii_case("manual-rustls")
@@ -610,11 +699,41 @@ fn selected_tls_backend() -> Result<NntpTlsBackend, NntpError> {
             Ok(NntpTlsBackend::ManualRustls)
         }
         Ok(value) => Err(NntpError::MalformedResponse(format!(
-            "unsupported {TLS_BACKEND_ENV} value {value:?}; expected s2n or manual-rustls"
+            "unsupported {TLS_BACKEND_ENV} value {value:?}; expected boring, s2n, or manual-rustls"
         ))),
         Err(std::env::VarError::NotPresent) => Ok(NntpTlsBackend::ManualRustls),
         Err(error) => Err(NntpError::MalformedResponse(format!(
             "failed to read {TLS_BACKEND_ENV}: {error}"
+        ))),
+    }
+}
+
+fn env_flag_enabled(name: &str) -> Result<bool, NntpError> {
+    match std::env::var(name) {
+        Ok(value) => match value.trim() {
+            "1" => Ok(true),
+            "0" | "" => Ok(false),
+            value
+                if value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("yes")
+                    || value.eq_ignore_ascii_case("on") =>
+            {
+                Ok(true)
+            }
+            value
+                if value.eq_ignore_ascii_case("false")
+                    || value.eq_ignore_ascii_case("no")
+                    || value.eq_ignore_ascii_case("off") =>
+            {
+                Ok(false)
+            }
+            value => Err(NntpError::MalformedResponse(format!(
+                "unsupported {name} value {value:?}; expected boolean"
+            ))),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(error) => Err(NntpError::MalformedResponse(format!(
+            "failed to read {name}: {error}"
         ))),
     }
 }
@@ -649,6 +768,33 @@ fn build_s2n_tls_config(ca_cert_path: Option<&Path>) -> Result<S2nConfig, NntpEr
     Ok(config)
 }
 
+fn build_boring_tls_config(ca_cert_path: Option<&Path>) -> Result<ConnectConfiguration, NntpError> {
+    let ca_cert_path = ca_cert_path.ok_or_else(|| {
+        NntpError::MalformedResponse(format!(
+            "{TLS_BACKEND_ENV}=boring currently requires a CA PEM path for deterministic NNTP trust"
+        ))
+    })?;
+    let mut builder = SslConnector::builder(SslMethod::tls())
+        .map_err(|error| boring_config_error("create connector", error))?;
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .map_err(|error| boring_config_error("set minimum TLS version", error))?;
+    builder
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .map_err(|error| boring_config_error("set maximum TLS version", error))?;
+    builder
+        .set_ca_file(ca_cert_path)
+        .map_err(|error| boring_config_error("load CA PEM", error))?;
+    if env_flag_enabled(BORING_READ_AHEAD_ENV)? {
+        builder.set_read_ahead(true);
+    }
+    builder.set_verify(SslVerifyMode::PEER);
+    builder
+        .build()
+        .configure()
+        .map_err(|error| boring_config_error("configure connector", error))
+}
+
 fn enable_s2n_recv_multi_record(config: &mut S2nConfig) -> Result<(), NntpError> {
     let config_ptr =
         unsafe { *(std::ptr::from_mut(config) as *mut std::ptr::NonNull<s2n_tls_sys::s2n_config>) };
@@ -666,8 +812,16 @@ fn s2n_config_error(context: &str, error: s2n_tls::error::Error) -> NntpError {
     NntpError::MalformedResponse(format!("s2n TLS config failed to {context}: {error}"))
 }
 
+fn boring_config_error(context: &str, error: boring::error::ErrorStack) -> NntpError {
+    NntpError::MalformedResponse(format!("BoringSSL TLS config failed to {context}: {error}"))
+}
+
 fn s2n_handshake_error(error: s2n_tls::error::Error) -> NntpError {
     NntpError::MalformedResponse(format!("s2n TLS handshake failed: {error}"))
+}
+
+fn boring_handshake_error(error: tokio_boring::HandshakeError<TcpStream>) -> NntpError {
+    NntpError::MalformedResponse(format!("BoringSSL TLS handshake failed: {error}"))
 }
 
 async fn connect_s2n_tls(
@@ -686,6 +840,28 @@ async fn connect_s2n_tls(
         .connect(host, tcp)
         .await
         .map_err(s2n_handshake_error)
+}
+
+async fn connect_boring_tls(
+    tcp: TcpStream,
+    tls_config: ConnectConfiguration,
+    host: &str,
+) -> Result<BoringTlsStream<TcpStream>, NntpError> {
+    let stream = tokio_boring::connect(tls_config, host, tcp)
+        .await
+        .map_err(boring_handshake_error)?;
+    let version = stream.ssl().version_str();
+    let cipher = stream
+        .ssl()
+        .current_cipher()
+        .and_then(|cipher| cipher.standard_name())
+        .unwrap_or("<unknown>");
+    if version != "TLSv1.3" || cipher != "TLS_AES_128_GCM_SHA256" {
+        return Err(NntpError::MalformedResponse(format!(
+            "BoringSSL negotiated unexpected TLS settings: version={version}, cipher={cipher}"
+        )));
+    }
+    Ok(stream)
 }
 
 /// Create a `ServerName` from a hostname string.
@@ -801,6 +977,14 @@ pub async fn connect_tls_with_ip_policy(
                 remote_addr,
             })
         }
+        NntpTlsBackend::Boring => {
+            let tls_config = build_boring_tls_config(ca_cert_path)?;
+            let boring_tls = connect_boring_tls(tcp, tls_config, host).await?;
+            Ok(NntpTransport::BoringTls {
+                inner: boring_tls,
+                remote_addr,
+            })
+        }
     }
 }
 
@@ -836,7 +1020,8 @@ pub async fn upgrade_starttls(
         NntpTransport::Plain { inner, remote_addr } => (inner, remote_addr),
         NntpTransport::Tls { .. }
         | NntpTransport::ManualTls { .. }
-        | NntpTransport::S2nTls { .. } => {
+        | NntpTransport::S2nTls { .. }
+        | NntpTransport::BoringTls { .. } => {
             return Err(NntpError::MalformedResponse(
                 "cannot STARTTLS on an already-TLS connection".into(),
             ));
@@ -858,6 +1043,14 @@ pub async fn upgrade_starttls(
             let s2n_tls = connect_s2n_tls(tcp, tls_config, host).await?;
             Ok(NntpTransport::S2nTls {
                 inner: s2n_tls,
+                remote_addr,
+            })
+        }
+        NntpTlsBackend::Boring => {
+            let tls_config = build_boring_tls_config(ca_cert_path)?;
+            let boring_tls = connect_boring_tls(tcp, tls_config, host).await?;
+            Ok(NntpTransport::BoringTls {
+                inner: boring_tls,
                 remote_addr,
             })
         }
