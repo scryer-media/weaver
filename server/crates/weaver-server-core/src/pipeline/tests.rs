@@ -7198,7 +7198,7 @@ async fn ip_replacement_trial_starts_when_recovery_reserve_leaves_normal_capacit
 }
 
 #[tokio::test]
-async fn dispatch_downloads_keeps_capacity_on_hot_job_before_same_band_spillover() {
+async fn dispatch_downloads_leases_hot_job_batch_before_same_band_spillover() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -7243,11 +7243,11 @@ async fn dispatch_downloads_keeps_capacity_on_hot_job_before_same_band_spillover
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 2);
-    assert_eq!(pipeline.active_download_connections, 2);
+    assert_eq!(pipeline.active_downloads, 3);
+    assert_eq!(pipeline.active_download_connections, 1);
     assert_eq!(
         pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
-        1
+        0
     );
     assert_eq!(
         pipeline
@@ -7258,7 +7258,7 @@ async fn dispatch_downloads_keeps_capacity_on_hot_job_before_same_band_spillover
             .len(),
         1
     );
-    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&2));
+    assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&3));
     assert!(
         !pipeline
             .active_downloads_by_job
@@ -7466,7 +7466,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
 
     let leading_job_id = JobId(20021);
     let promoted_job_id = JobId(20022);
-    let leading_files = (0..10)
+    let leading_files = (0..66)
         .map(|idx| (format!("lead-{idx}.bin"), 512u32))
         .collect::<Vec<_>>();
 
@@ -7514,7 +7514,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .unwrap()
             .download_queue
             .len(),
-        8
+        1
     );
     assert_eq!(
         pipeline
@@ -7547,7 +7547,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .unwrap()
             .download_queue
             .len(),
-        8
+        1
     );
     assert_eq!(
         pipeline
@@ -8440,7 +8440,7 @@ async fn disk_write_failure_fails_job_before_commit() {
 }
 
 #[tokio::test]
-async fn completed_file_crc32_match_persists_completion() {
+async fn completed_standalone_file_crc32_match_persists_completion_without_md5() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20017);
@@ -8470,10 +8470,127 @@ async fn completed_file_crc32_match_persists_completion() {
     assert!(pipeline.jobs.contains_key(&job_id));
     assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
     let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
-    assert_eq!(
-        hashes.get(&0).copied(),
-        Some(weaver_par2::checksum::md5(payload))
+    assert!(hashes.get(&0).is_none());
+}
+
+#[tokio::test]
+async fn completed_standalone_verified_yenc_crc_skips_deferred_hash_replay() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20024);
+    let filename = "payload.bin";
+    let payload = b"abcdefgh";
+    let spec = standalone_job_spec(
+        "Verified CRC Deferred Hash",
+        &[(filename.to_string(), payload.len() as u32)],
     );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    pipeline
+        .deferred_file_hash_ranges
+        .entry(file_id)
+        .or_default()
+        .insert(
+            0,
+            DeferredFileHashRange {
+                len: 4,
+                part_crc: weaver_par2::checksum::crc32(&payload[0..4]),
+                part_crc_verified: true,
+            },
+        );
+    pipeline
+        .deferred_file_hash_ranges
+        .entry(file_id)
+        .or_default()
+        .insert(
+            4,
+            DeferredFileHashRange {
+                len: 4,
+                part_crc: weaver_par2::checksum::crc32(&payload[4..8]),
+                part_crc_verified: true,
+            },
+        );
+
+    let checksum = pipeline
+        .finalize_completed_file_hash(
+            file_id,
+            filename,
+            temp_dir.path().join("missing-payload.bin"),
+            payload.len() as u64,
+            Some(weaver_par2::checksum::crc32(payload)),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(checksum.md5, None);
+    assert_eq!(checksum.crc32, weaver_par2::checksum::crc32(payload));
+    assert!(!pipeline.deferred_file_hash_ranges.contains_key(&file_id));
+    assert!(!pipeline.deferred_file_hash_data.contains_key(&file_id));
+    assert_eq!(pipeline.deferred_file_hash_data_bytes, 0);
+    assert!(!pipeline.file_hash_states.contains_key(&file_id));
+}
+
+#[tokio::test]
+async fn completed_standalone_deferred_crc_metadata_uses_actual_crc() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20025);
+    let filename = "payload.bin";
+    let payload = b"abcdefgh";
+    let spec = standalone_job_spec(
+        "Actual CRC Deferred Hash",
+        &[(filename.to_string(), payload.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    pipeline
+        .deferred_file_hash_ranges
+        .entry(file_id)
+        .or_default()
+        .insert(
+            0,
+            DeferredFileHashRange {
+                len: 4,
+                part_crc: weaver_par2::checksum::crc32(&payload[0..4]),
+                part_crc_verified: true,
+            },
+        );
+    pipeline
+        .deferred_file_hash_ranges
+        .entry(file_id)
+        .or_default()
+        .insert(
+            4,
+            DeferredFileHashRange {
+                len: 4,
+                part_crc: weaver_par2::checksum::crc32(&payload[4..8]),
+                part_crc_verified: false,
+            },
+        );
+
+    let checksum = pipeline
+        .finalize_completed_file_hash(
+            file_id,
+            filename,
+            temp_dir.path().join("missing-payload.bin"),
+            payload.len() as u64,
+            Some(0xdead_beef),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(checksum.md5, None);
+    assert_eq!(checksum.crc32, weaver_par2::checksum::crc32(payload));
+    assert_ne!(checksum.crc32, 0xdead_beef);
+    assert!(!pipeline.deferred_file_hash_ranges.contains_key(&file_id));
 }
 
 #[tokio::test]
@@ -8519,10 +8636,7 @@ async fn completed_file_uses_decoded_size_when_raw_article_bytes_are_larger() {
         PipelineEvent::FileComplete { total_bytes, .. } if *total_bytes == payload.len() as u64
     )));
     let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
-    assert_eq!(
-        hashes.get(&0).copied(),
-        Some(weaver_par2::checksum::md5(payload))
-    );
+    assert!(hashes.get(&0).is_none());
 }
 
 #[tokio::test]
@@ -10967,7 +11081,7 @@ async fn finalize_completed_file_hash_falls_back_to_disk_after_out_of_order_stre
         )
         .await
         .unwrap();
-    assert_eq!(checksum.md5, weaver_par2::checksum::md5(payload));
+    assert_eq!(checksum.md5, Some(weaver_par2::checksum::md5(payload)));
     assert_eq!(checksum.crc32, weaver_par2::checksum::crc32(payload));
 }
 

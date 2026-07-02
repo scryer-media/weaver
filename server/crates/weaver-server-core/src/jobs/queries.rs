@@ -120,10 +120,10 @@ impl Database {
 
             let mut hashes = HashMap::new();
             for row in rows {
-                hashes.insert(
-                    row.i64("file_index")? as u32,
-                    md5_from_bytes(row.bytes("md5")?)?,
-                );
+                let Some(md5) = row.opt_bytes("md5")? else {
+                    continue;
+                };
+                hashes.insert(row.i64("file_index")? as u32, md5_from_bytes(md5)?);
             }
             Ok(hashes)
         })

@@ -1,0 +1,2 @@
+ALTER TABLE active_files
+    ALTER COLUMN md5 DROP NOT NULL;

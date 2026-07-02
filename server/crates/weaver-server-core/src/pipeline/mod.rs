@@ -1005,7 +1005,7 @@ pub(super) enum DecodeDone {
 }
 
 pub(super) struct CompletedFileChecksum {
-    pub(super) md5: [u8; 16],
+    pub(super) md5: Option<[u8; 16]>,
     pub(super) crc32: u32,
 }
 
@@ -1055,27 +1055,37 @@ impl CompletedFileChecksumState {
                 Duration::from_nanos(1),
             );
         }
-        {
-            let _cpu_scope =
-                crate::runtime::perf_probe::cpu_scope("download.file_hash.update.crc32_combine");
-            let len = data.len() as u64;
-            if !matches!(self.crc32_combine_op.as_ref(), Some((cached_len, _)) if *cached_len == len)
-            {
-                self.crc32_combine_op =
-                    Some((len, weaver_par2::checksum::Crc32CombineOp::new(len)));
-            }
-            let op = &self
-                .crc32_combine_op
-                .as_ref()
-                .expect("crc32 combine op initialized")
-                .1;
-            self.crc32 = op.combine(self.crc32, part_crc);
+        self.update_crc32(data.len() as u64, part_crc, part_crc_verified);
+    }
+
+    fn update_crc32(&mut self, len: u64, part_crc: u32, part_crc_verified: bool) {
+        if !part_crc_verified {
+            self.all_parts_crc_verified = false;
         }
-        self.bytes_fed += data.len() as u64;
+        let _cpu_scope =
+            crate::runtime::perf_probe::cpu_scope("download.file_hash.update.crc32_combine");
+        if !matches!(self.crc32_combine_op.as_ref(), Some((cached_len, _)) if *cached_len == len) {
+            self.crc32_combine_op = Some((len, weaver_par2::checksum::Crc32CombineOp::new(len)));
+        }
+        let op = &self
+            .crc32_combine_op
+            .as_ref()
+            .expect("crc32 combine op initialized")
+            .1;
+        self.crc32 = op.combine(self.crc32, part_crc);
+        self.bytes_fed += len;
     }
 
     pub(super) fn bytes_fed(&self) -> u64 {
         self.bytes_fed
+    }
+
+    pub(super) fn crc32(&self) -> u32 {
+        self.crc32
+    }
+
+    pub(super) fn all_parts_crc_verified(&self) -> bool {
+        self.all_parts_crc_verified
     }
 
     pub(super) fn tracks_md5(&self) -> bool {
@@ -1177,6 +1187,13 @@ impl BufferedChunk for BufferedDecodedSegment {
 
 pub(super) struct DeferredFileHashChunk {
     pub(super) data: DecodedChunk,
+    pub(super) part_crc: u32,
+    pub(super) part_crc_verified: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct DeferredFileHashRange {
+    pub(super) len: usize,
     pub(super) part_crc: u32,
     pub(super) part_crc_verified: bool,
 }
@@ -1323,7 +1340,7 @@ pub struct Pipeline {
     pub(super) deferred_file_hash_data: HashMap<NzbFileId, BTreeMap<u64, DeferredFileHashChunk>>,
     pub(super) deferred_file_hash_data_bytes: usize,
     /// Out-of-order persisted ranges waiting to be replayed into the streaming checksum.
-    pub(super) deferred_file_hash_ranges: HashMap<NzbFileId, BTreeMap<u64, usize>>,
+    pub(super) deferred_file_hash_ranges: HashMap<NzbFileId, BTreeMap<u64, DeferredFileHashRange>>,
     /// Expected whole-file yEnc CRC32 values observed from multipart `=yend crc32`.
     pub(super) expected_file_crcs: HashMap<NzbFileId, u32>,
     /// Files that need a one-time disk reread because out-of-order persistence broke the stream.

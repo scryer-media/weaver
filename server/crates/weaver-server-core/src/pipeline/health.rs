@@ -127,9 +127,14 @@ impl Pipeline {
 
             let critical = Self::critical_health_milli(total, par2_bytes);
 
+            let critical_failed_bytes =
+                total.saturating_sub(((total as u128 * critical as u128) / 1000) as u64);
+            let within_critical_probe_fence =
+                state.failed_bytes <= critical_failed_bytes.saturating_add(1);
             let needs_probes = health < 980
                 && !state.health_probing
-                && state.failed_bytes >= state.next_health_probe_failed_bytes;
+                && state.failed_bytes >= state.next_health_probe_failed_bytes
+                && (health > critical || within_critical_probe_fence);
             (
                 health,
                 critical,

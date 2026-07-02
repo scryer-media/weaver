@@ -133,6 +133,33 @@ impl Pipeline {
         });
     }
 
+    fn should_use_completed_file_crc_metadata(&self, file_id: NzbFileId) -> bool {
+        self.can_defer_completed_file_md5(file_id)
+            && self.expected_file_crcs.contains_key(&file_id)
+            && !self.file_hash_reread_required.contains(&file_id)
+    }
+
+    fn note_deferred_file_hash_range(
+        &mut self,
+        file_id: NzbFileId,
+        file_offset: u64,
+        len: usize,
+        part_crc: u32,
+        part_crc_verified: bool,
+    ) {
+        self.deferred_file_hash_ranges
+            .entry(file_id)
+            .or_default()
+            .insert(
+                file_offset,
+                DeferredFileHashRange {
+                    len,
+                    part_crc,
+                    part_crc_verified,
+                },
+            );
+    }
+
     fn defer_file_hash_chunk(
         &mut self,
         file_id: NzbFileId,
@@ -149,10 +176,7 @@ impl Pipeline {
             "download.file_hash.deferred_range",
             std::time::Duration::from_nanos(1),
         );
-        self.deferred_file_hash_ranges
-            .entry(file_id)
-            .or_default()
-            .insert(file_offset, len);
+        self.note_deferred_file_hash_range(file_id, file_offset, len, part_crc, part_crc_verified);
 
         if self.deferred_file_hash_data_bytes.saturating_add(len)
             <= MAX_DEFERRED_FILE_HASH_DATA_BYTES
@@ -185,6 +209,24 @@ impl Pipeline {
                 std::time::Duration::from_nanos(1),
             );
         }
+    }
+
+    fn defer_file_hash_crc_metadata(
+        &mut self,
+        file_id: NzbFileId,
+        file_offset: u64,
+        len: usize,
+        part_crc: u32,
+        part_crc_verified: bool,
+    ) {
+        if len == 0 || self.file_hash_reread_required.contains(&file_id) {
+            return;
+        }
+        crate::runtime::perf_probe::record(
+            "download.file_hash.deferred_crc_metadata",
+            std::time::Duration::from_nanos(1),
+        );
+        self.note_deferred_file_hash_range(file_id, file_offset, len, part_crc, part_crc_verified);
     }
 
     fn take_deferred_file_hash_data(
@@ -236,13 +278,14 @@ impl Pipeline {
                 .get(&file_id)
                 .map(|state| state.bytes_fed())
                 .unwrap_or(0);
-            let Some(len) = self
+            let Some(range) = self
                 .deferred_file_hash_ranges
                 .get(&file_id)
-                .and_then(|ranges| ranges.get(&expected_offset).copied())
+                .and_then(|ranges| ranges.get(&expected_offset))
             else {
                 return;
             };
+            let len = range.len;
 
             if let Some(ranges) = self.deferred_file_hash_ranges.get_mut(&file_id) {
                 ranges.remove(&expected_offset);
@@ -314,7 +357,7 @@ impl Pipeline {
     }
 
     fn should_stream_md5_for_file(&self, file_id: NzbFileId) -> bool {
-        if self.par2_set(file_id.job_id).is_none() {
+        if self.can_defer_completed_file_md5(file_id) {
             return false;
         }
         let Some(state) = self.jobs.get(&file_id.job_id) else {
@@ -330,6 +373,22 @@ impl Pipeline {
             return true;
         }
         self.par2_set(file_id.job_id).is_none()
+    }
+
+    fn can_defer_completed_file_md5(&self, file_id: NzbFileId) -> bool {
+        if self.par2_set(file_id.job_id).is_some() {
+            return false;
+        }
+        let Some(state) = self.jobs.get(&file_id.job_id) else {
+            return false;
+        };
+        let Some(file) = state.assembly.file(file_id) else {
+            return false;
+        };
+        matches!(
+            self.classified_role_for_file(file_id.job_id, file),
+            weaver_model::files::FileRole::Standalone | weaver_model::files::FileRole::Unknown
+        )
     }
 
     pub(crate) fn note_expected_file_crc(
@@ -371,6 +430,41 @@ impl Pipeline {
         }
     }
 
+    fn completed_file_checksum_from_crc_metadata(
+        &self,
+        file_id: NzbFileId,
+        total_bytes: u64,
+    ) -> Option<StreamedCompletedFileChecksum> {
+        let mut crc32 = 0;
+        let mut bytes_fed = 0;
+        let mut all_parts_crc_verified = true;
+
+        if let Some(state) = self.file_hash_states.get(&file_id) {
+            crc32 = state.crc32();
+            bytes_fed = state.bytes_fed();
+            all_parts_crc_verified = state.all_parts_crc_verified();
+        }
+
+        let ranges = self.deferred_file_hash_ranges.get(&file_id);
+        while bytes_fed < total_bytes {
+            let range = ranges.and_then(|ranges| ranges.get(&bytes_fed))?;
+            let len = range.len as u64;
+            if len == 0 {
+                return None;
+            }
+            let op = weaver_par2::checksum::Crc32CombineOp::new(len);
+            crc32 = op.combine(crc32, range.part_crc);
+            all_parts_crc_verified &= range.part_crc_verified;
+            bytes_fed = bytes_fed.checked_add(len)?;
+        }
+
+        (bytes_fed == total_bytes).then_some(StreamedCompletedFileChecksum {
+            md5: None,
+            crc32,
+            all_parts_crc_verified,
+        })
+    }
+
     pub(crate) async fn finalize_completed_file_hash(
         &mut self,
         file_id: NzbFileId,
@@ -379,6 +473,25 @@ impl Pipeline {
         total_bytes: u64,
         expected_file_crc: Option<u32>,
     ) -> Result<CompletedFileChecksum, String> {
+        if expected_file_crc.is_some()
+            && self.can_defer_completed_file_md5(file_id)
+            && !self.file_hash_reread_required.contains(&file_id)
+            && let Some(streamed) =
+                self.completed_file_checksum_from_crc_metadata(file_id, total_bytes)
+        {
+            crate::runtime::perf_probe::record(
+                "download.file_hash.crc32.from_deferred_metadata",
+                std::time::Duration::from_nanos(1),
+            );
+            self.file_hash_states.remove(&file_id);
+            self.drop_deferred_file_hash_data_for(file_id);
+            self.deferred_file_hash_ranges.remove(&file_id);
+            return Ok(CompletedFileChecksum {
+                md5: None,
+                crc32: streamed.crc32,
+            });
+        }
+
         let deferred_range_count_before = self
             .deferred_file_hash_ranges
             .get(&file_id)
@@ -435,7 +548,7 @@ impl Pipeline {
                     let streamed = hash_state.finalize();
                     if let Some(md5) = streamed.md5 {
                         return Ok(CompletedFileChecksum {
-                            md5,
+                            md5: Some(md5),
                             crc32: streamed.crc32,
                         });
                     }
@@ -451,20 +564,20 @@ impl Pipeline {
                             std::time::Duration::from_nanos(1),
                         );
                         return Ok(CompletedFileChecksum {
-                            md5,
+                            md5: Some(md5),
                             crc32: streamed.crc32,
                         });
                     }
                     if expected_file_crc
                         .is_some_and(|expected_file_crc| streamed.crc32 == expected_file_crc)
-                        && self.par2_set(file_id.job_id).is_none()
+                        && self.can_defer_completed_file_md5(file_id)
                     {
                         crate::runtime::perf_probe::record(
-                            "download.file_hash.md5.skipped_no_par2_expected_crc",
+                            "download.file_hash.md5.deferred_no_par2_expected_crc",
                             std::time::Duration::from_nanos(1),
                         );
                         return Ok(CompletedFileChecksum {
-                            md5: [0u8; 16],
+                            md5: None,
                             crc32: streamed.crc32,
                         });
                     }
@@ -1262,7 +1375,17 @@ impl Pipeline {
                     .event_tx
                     .send(PipelineEvent::SegmentCommitted { segment_id });
 
+                let use_crc_metadata = self.should_use_completed_file_crc_metadata(file_id);
                 match hash_mode {
+                    SegmentHashMode::UpdateNow if use_crc_metadata => {
+                        self.defer_file_hash_crc_metadata(
+                            file_id,
+                            file_offset,
+                            data.len_bytes(),
+                            part_crc,
+                            part_crc_verified,
+                        );
+                    }
                     SegmentHashMode::UpdateNow => {
                         self.drain_deferred_file_hash_ranges(file_id, file_path)
                             .await;
@@ -1275,6 +1398,15 @@ impl Pipeline {
                         );
                         self.drain_deferred_file_hash_ranges(file_id, file_path)
                             .await;
+                    }
+                    SegmentHashMode::DeferRange if use_crc_metadata => {
+                        self.defer_file_hash_crc_metadata(
+                            file_id,
+                            file_offset,
+                            data.len_bytes(),
+                            part_crc,
+                            part_crc_verified,
+                        );
                     }
                     SegmentHashMode::DeferRange => {
                         self.defer_file_hash_chunk(
@@ -1352,7 +1484,7 @@ impl Pipeline {
 
                             warn!(file_id = %file_id, error = %error, "failed to persist real completed-file hash");
                             CompletedFileChecksum {
-                                md5: [0u8; 16],
+                                md5: None,
                                 crc32: 0,
                             }
                         }
@@ -1404,7 +1536,12 @@ impl Pipeline {
                         let fname = filename.to_string();
                         if let Err(e) = self
                             .db_blocking(move |db| {
-                                db.complete_file(job_id, file_index, &fname, &file_hash)
+                                db.complete_file_with_optional_hash(
+                                    job_id,
+                                    file_index,
+                                    &fname,
+                                    file_hash.as_ref(),
+                                )
                             })
                             .await
                         {
@@ -1512,7 +1649,7 @@ fn checksum_completed_file(path: &std::path::Path) -> io::Result<CompletedFileCh
         crc32.update(&buffer[..bytes_read]);
     }
     Ok(CompletedFileChecksum {
-        md5: md5.finalize(),
+        md5: Some(md5.finalize()),
         crc32: crc32.finalize(),
     })
 }

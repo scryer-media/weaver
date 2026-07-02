@@ -5,6 +5,7 @@ impl Pipeline {
     const STATE_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const SHUTDOWN_DRAIN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     const DOWNLOAD_COMPLETION_DRAIN_LIMIT: usize = 128;
+    const INITIAL_CONNECTION_RAMP_LIMIT: usize = 20;
 
     /// Create a new pipeline.
     #[allow(clippy::too_many_arguments)]
@@ -164,7 +165,7 @@ impl Pipeline {
             bandwidth_cap,
             bandwidth_reservations: HashMap::new(),
             rate_limit_reservations: HashMap::new(),
-            connection_ramp: total_connections.min(5),
+            connection_ramp: total_connections.min(Self::INITIAL_CONNECTION_RAMP_LIMIT),
             rate_limiter: TokenBucket::new(0),
             write_buf_max_pending,
             decode_backlog_budget_bytes,

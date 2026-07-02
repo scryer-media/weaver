@@ -690,9 +690,19 @@ impl Database {
         filename: &str,
         md5: &[u8; 16],
     ) -> Result<(), StateError> {
+        self.complete_file_with_optional_hash(job_id, file_index, filename, Some(md5))
+    }
+
+    pub fn complete_file_with_optional_hash(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+        filename: &str,
+        md5: Option<&[u8; 16]>,
+    ) -> Result<(), StateError> {
         let datastore = self.datastore();
         let filename = filename.to_string();
-        let md5 = md5.to_vec();
+        let md5 = md5.map(|md5| md5.to_vec());
         self.run_sql_blocking(async move {
             match datastore.engine() {
                 SqlEngine::Sqlite => {
@@ -711,7 +721,7 @@ impl Database {
                                         SqlArg::I64(job_id.0 as i64),
                                         SqlArg::I64(file_index as i64),
                                         SqlArg::Text(filename),
-                                        SqlArg::Bytes(md5),
+                                        SqlArg::OptBytes(md5),
                                     ],
                                 )
                                 .await?;
@@ -742,7 +752,7 @@ impl Database {
                             SqlArg::I64(job_id.0 as i64),
                             SqlArg::I64(file_index as i64),
                             SqlArg::Text(filename),
-                            SqlArg::Bytes(md5),
+                            SqlArg::OptBytes(md5),
                         ],
                     )
                     .await
