@@ -540,6 +540,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ec2f1fc3ec205783a5da9a7e6c1509cc69dedf09a1949e412c1e18469326d00"
 dependencies = [
  "aws-lc-sys",
+ "untrusted 0.7.1",
  "zeroize",
 ]
 
@@ -3335,7 +3336,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.2.17",
  "libc",
- "untrusted",
+ "untrusted 0.9.0",
  "windows-sys 0.52.0",
 ]
 
@@ -3508,7 +3509,7 @@ dependencies = [
  "aws-lc-rs",
  "ring",
  "rustls-pki-types",
- "untrusted",
+ "untrusted 0.9.0",
 ]
 
 [[package]]
@@ -3522,6 +3523,43 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "s2n-tls"
+version = "0.3.39"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7e9f6ebf37b1fcc2ef03b7d46a0ab8209bad2622060cf1c40011e97d866ec6f"
+dependencies = [
+ "errno",
+ "hex",
+ "libc",
+ "pin-project-lite",
+ "s2n-tls-sys",
+]
+
+[[package]]
+name = "s2n-tls-sys"
+version = "0.3.39"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad635286a83358b8cce8c6a40e7fc8621c02bab9b3d3433fd91c002bb311ec21"
+dependencies = [
+ "aws-lc-rs",
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "s2n-tls-tokio"
+version = "0.3.39"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83cdcee2f7fdf66f0f044d968c5faf14eebc2659735f96781f7b4b869b5bb46b"
+dependencies = [
+ "errno",
+ "libc",
+ "pin-project-lite",
+ "s2n-tls",
+ "tokio",
+]
 
 [[package]]
 name = "salsa20"
@@ -4691,6 +4729,12 @@ dependencies = [
 
 [[package]]
 name = "untrusted"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
+
+[[package]]
+name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
@@ -4923,6 +4967,8 @@ dependencies = [
  "rand 0.10.1",
  "rcgen",
  "rustls-pemfile",
+ "s2n-tls",
+ "s2n-tls-tokio",
  "socket2",
  "thiserror 2.0.18",
  "tokio",

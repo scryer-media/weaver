@@ -4,11 +4,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
+use s2n_tls::{config::Config as S2nConfig, security};
+use s2n_tls_tokio::{TlsConnector as S2nTlsConnector, TlsStream as S2nTlsStream};
 use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, lookup_host};
-use tokio_rustls::client::TlsStream;
+use tokio_rustls::client::TlsStream as RustlsTlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, ClientConnection, RootCertStore};
 
@@ -24,14 +26,17 @@ pin_project_lite::pin_project! {
         /// Unencrypted TCP.
         Plain { #[pin] inner: TcpStream, remote_addr: SocketAddr },
         /// TLS-encrypted TCP through tokio-rustls.
-        Tls { #[pin] inner: TlsStream<TcpStream>, remote_addr: SocketAddr },
+        Tls { #[pin] inner: RustlsTlsStream<TcpStream>, remote_addr: SocketAddr },
         /// TLS-encrypted TCP driven directly through rustls.
         ManualTls { inner: ManualTlsStream, remote_addr: SocketAddr },
+        /// TLS-encrypted TCP through s2n-tls.
+        S2nTls { #[pin] inner: S2nTlsStream<TcpStream>, remote_addr: SocketAddr },
     }
 }
 
 const TLS_READ_BUFFER: usize = 256 * 1024;
 const TLS_PLAINTEXT_DRAIN_CHUNK: usize = 16 * 1024;
+const TLS_BACKEND_ENV: &str = "WEAVER_NNTP_TLS_BACKEND";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TransportReadStats {
@@ -47,6 +52,8 @@ pub struct TransportReadStats {
     pub plaintext_reader_would_block: u64,
     pub plaintext_bytes: u64,
     pub cached_plaintext_returns: u64,
+    pub s2n_read_calls: u64,
+    pub s2n_read_bytes: u64,
 }
 
 impl TransportReadStats {
@@ -63,12 +70,59 @@ impl TransportReadStats {
         self.plaintext_reader_would_block += other.plaintext_reader_would_block;
         self.plaintext_bytes += other.plaintext_bytes;
         self.cached_plaintext_returns += other.cached_plaintext_returns;
+        self.s2n_read_calls += other.s2n_read_calls;
+        self.s2n_read_bytes += other.s2n_read_bytes;
     }
 }
 
 pub struct TransportRead {
     pub bytes: usize,
     pub stats: TransportReadStats,
+}
+
+async fn read_s2n_available_into(
+    inner: &mut S2nTlsStream<TcpStream>,
+    dst: &mut BytesMut,
+    target_read_size: usize,
+) -> io::Result<TransportRead> {
+    let started_len = dst.len();
+    let target_read_size = target_read_size.max(1);
+    let mut stats = TransportReadStats::default();
+    let bytes = std::future::poll_fn(|cx| {
+        loop {
+            let total = dst.len().saturating_sub(started_len);
+            if total >= target_read_size {
+                return std::task::Poll::Ready(Ok(total));
+            }
+
+            dst.reserve(target_read_size - total);
+            let mut read_buf = ReadBuf::uninit(dst.spare_capacity_mut());
+            match std::pin::Pin::new(&mut *inner).poll_read(cx, &mut read_buf) {
+                std::task::Poll::Ready(Ok(())) => {
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        return std::task::Poll::Ready(Ok(total));
+                    }
+                    unsafe {
+                        dst.advance_mut(n);
+                    }
+                    stats.s2n_read_calls += 1;
+                    stats.s2n_read_bytes += n as u64;
+                    stats.plaintext_bytes += n as u64;
+                }
+                std::task::Poll::Ready(Err(error)) => {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                std::task::Poll::Pending if total > 0 => {
+                    return std::task::Poll::Ready(Ok(total));
+                }
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+    })
+    .await?;
+
+    Ok(TransportRead { bytes, stats })
 }
 
 pub struct ManualTlsStream {
@@ -82,7 +136,9 @@ impl NntpTransport {
     pub fn is_tls(&self) -> bool {
         matches!(
             self,
-            NntpTransport::Tls { .. } | NntpTransport::ManualTls { .. }
+            NntpTransport::Tls { .. }
+                | NntpTransport::ManualTls { .. }
+                | NntpTransport::S2nTls { .. }
         )
     }
 
@@ -90,7 +146,8 @@ impl NntpTransport {
         match self {
             NntpTransport::Plain { remote_addr, .. }
             | NntpTransport::Tls { remote_addr, .. }
-            | NntpTransport::ManualTls { remote_addr, .. } => *remote_addr,
+            | NntpTransport::ManualTls { remote_addr, .. }
+            | NntpTransport::S2nTls { remote_addr, .. } => *remote_addr,
         }
     }
 
@@ -102,6 +159,7 @@ impl NntpTransport {
         match self {
             NntpTransport::Plain { inner, .. } => inner.read_buf(dst).await,
             NntpTransport::Tls { inner, .. } => inner.read_buf(dst).await,
+            NntpTransport::S2nTls { inner, .. } => inner.read_buf(dst).await,
             NntpTransport::ManualTls { inner, .. } => {
                 inner.read_plaintext_into(dst, target_read_size).await
             }
@@ -138,6 +196,9 @@ impl NntpTransport {
                     },
                 })
             }
+            NntpTransport::S2nTls { inner, .. } => {
+                read_s2n_available_into(inner, dst, target_read_size).await
+            }
             NntpTransport::ManualTls { inner, .. } => {
                 inner
                     .read_plaintext_into_with_stats(dst, target_read_size)
@@ -151,6 +212,7 @@ impl NntpTransport {
             NntpTransport::Plain { inner, .. } => inner.write_all(bytes).await,
             NntpTransport::Tls { inner, .. } => inner.write_all(bytes).await,
             NntpTransport::ManualTls { inner, .. } => inner.write_all(bytes).await,
+            NntpTransport::S2nTls { inner, .. } => inner.write_all(bytes).await,
         }
     }
 
@@ -159,6 +221,7 @@ impl NntpTransport {
             NntpTransport::Plain { inner, .. } => inner.flush().await,
             NntpTransport::Tls { inner, .. } => inner.flush().await,
             NntpTransport::ManualTls { inner, .. } => inner.flush().await,
+            NntpTransport::S2nTls { inner, .. } => inner.flush().await,
         }
     }
 }
@@ -421,6 +484,7 @@ impl AsyncRead for NntpTransport {
         match self.project() {
             NntpTransportProj::Plain { inner, .. } => inner.poll_read(cx, buf),
             NntpTransportProj::Tls { inner, .. } => inner.poll_read(cx, buf),
+            NntpTransportProj::S2nTls { inner, .. } => inner.poll_read(cx, buf),
             NntpTransportProj::ManualTls { .. } => std::task::Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "manual TLS transport requires read_into_buf",
@@ -438,6 +502,7 @@ impl AsyncWrite for NntpTransport {
         match self.project() {
             NntpTransportProj::Plain { inner, .. } => inner.poll_write(cx, buf),
             NntpTransportProj::Tls { inner, .. } => inner.poll_write(cx, buf),
+            NntpTransportProj::S2nTls { inner, .. } => inner.poll_write(cx, buf),
             NntpTransportProj::ManualTls { .. } => std::task::Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "manual TLS transport requires NntpTransport::write_all",
@@ -452,6 +517,7 @@ impl AsyncWrite for NntpTransport {
         match self.project() {
             NntpTransportProj::Plain { inner, .. } => inner.poll_flush(cx),
             NntpTransportProj::Tls { inner, .. } => inner.poll_flush(cx),
+            NntpTransportProj::S2nTls { inner, .. } => inner.poll_flush(cx),
             NntpTransportProj::ManualTls { .. } => std::task::Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "manual TLS transport requires NntpTransport::flush",
@@ -466,6 +532,7 @@ impl AsyncWrite for NntpTransport {
         match self.project() {
             NntpTransportProj::Plain { inner, .. } => inner.poll_shutdown(cx),
             NntpTransportProj::Tls { inner, .. } => inner.poll_shutdown(cx),
+            NntpTransportProj::S2nTls { inner, .. } => inner.poll_shutdown(cx),
             NntpTransportProj::ManualTls { .. } => std::task::Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "manual TLS transport shutdown is handled by dropping the connection",
@@ -510,6 +577,86 @@ pub fn build_tls_config(ca_cert_path: Option<&Path>) -> Result<Arc<ClientConfig>
         .with_no_client_auth();
 
     Ok(Arc::new(config))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NntpTlsBackend {
+    ManualRustls,
+    S2n,
+}
+
+fn selected_tls_backend() -> Result<NntpTlsBackend, NntpError> {
+    match std::env::var(TLS_BACKEND_ENV) {
+        Ok(value) if value.eq_ignore_ascii_case("s2n") => Ok(NntpTlsBackend::S2n),
+        Ok(value)
+            if value.eq_ignore_ascii_case("rustls")
+                || value.eq_ignore_ascii_case("manual-rustls")
+                || value.eq_ignore_ascii_case("manual_rustls") =>
+        {
+            Ok(NntpTlsBackend::ManualRustls)
+        }
+        Ok(value) => Err(NntpError::MalformedResponse(format!(
+            "unsupported {TLS_BACKEND_ENV} value {value:?}; expected s2n or manual-rustls"
+        ))),
+        Err(std::env::VarError::NotPresent) => Ok(NntpTlsBackend::ManualRustls),
+        Err(error) => Err(NntpError::MalformedResponse(format!(
+            "failed to read {TLS_BACKEND_ENV}: {error}"
+        ))),
+    }
+}
+
+fn build_s2n_tls_config(ca_cert_path: Option<&Path>) -> Result<S2nConfig, NntpError> {
+    let ca_cert_path = ca_cert_path.ok_or_else(|| {
+        NntpError::MalformedResponse(format!(
+            "{TLS_BACKEND_ENV}=s2n currently requires a CA PEM path for deterministic NNTP trust"
+        ))
+    })?;
+    let pem_data = std::fs::read(ca_cert_path).map_err(|error| {
+        NntpError::MalformedResponse(format!(
+            "failed to read s2n CA PEM {}: {error}",
+            ca_cert_path.display()
+        ))
+    })?;
+
+    let mut builder = S2nConfig::builder();
+    builder
+        .with_system_certs(false)
+        .map_err(|error| s2n_config_error("disable system certs", error))?;
+    builder
+        .set_security_policy(&security::DEFAULT_TLS13)
+        .map_err(|error| s2n_config_error("set TLS 1.3 security policy", error))?;
+    builder
+        .trust_pem(&pem_data)
+        .map_err(|error| s2n_config_error("load CA PEM", error))?;
+    builder
+        .build()
+        .map_err(|error| s2n_config_error("build config", error))
+}
+
+fn s2n_config_error(context: &str, error: s2n_tls::error::Error) -> NntpError {
+    NntpError::MalformedResponse(format!("s2n TLS config failed to {context}: {error}"))
+}
+
+fn s2n_handshake_error(error: s2n_tls::error::Error) -> NntpError {
+    NntpError::MalformedResponse(format!("s2n TLS handshake failed: {error}"))
+}
+
+async fn connect_s2n_tls(
+    tcp: TcpStream,
+    tls_config: S2nConfig,
+    host: &str,
+) -> Result<S2nTlsStream<TcpStream>, NntpError> {
+    let builder = s2n_tls::connection::ModifiedBuilder::new(
+        tls_config,
+        |conn: &mut s2n_tls::connection::Connection| {
+            conn.prefer_throughput()?;
+            conn.set_receive_buffering(true)
+        },
+    );
+    S2nTlsConnector::new(builder)
+        .connect(host, tcp)
+        .await
+        .map_err(s2n_handshake_error)
 }
 
 /// Create a `ServerName` from a hostname string.
@@ -607,13 +754,25 @@ pub async fn connect_tls_with_ip_policy(
 ) -> Result<NntpTransport, NntpError> {
     let addrs = resolve_connect_addrs(host, port, excluded_ips, address_offset).await?;
     let (tcp, remote_addr) = connect_tcp_from_resolved(&addrs).await?;
-    let tls_config = build_tls_config(ca_cert_path)?;
-    let server_name = make_server_name(host)?;
-    let manual_tls = ManualTlsStream::connect(tcp, tls_config, server_name).await?;
-    Ok(NntpTransport::ManualTls {
-        inner: manual_tls,
-        remote_addr,
-    })
+    match selected_tls_backend()? {
+        NntpTlsBackend::ManualRustls => {
+            let tls_config = build_tls_config(ca_cert_path)?;
+            let server_name = make_server_name(host)?;
+            let manual_tls = ManualTlsStream::connect(tcp, tls_config, server_name).await?;
+            Ok(NntpTransport::ManualTls {
+                inner: manual_tls,
+                remote_addr,
+            })
+        }
+        NntpTlsBackend::S2n => {
+            let tls_config = build_s2n_tls_config(ca_cert_path)?;
+            let s2n_tls = connect_s2n_tls(tcp, tls_config, host).await?;
+            Ok(NntpTransport::S2nTls {
+                inner: s2n_tls,
+                remote_addr,
+            })
+        }
+    }
 }
 
 /// Connect to a host with plain TCP (e.g. port 119).
@@ -646,26 +805,53 @@ pub async fn upgrade_starttls(
 ) -> Result<NntpTransport, NntpError> {
     let (tcp, remote_addr) = match transport {
         NntpTransport::Plain { inner, remote_addr } => (inner, remote_addr),
-        NntpTransport::Tls { .. } | NntpTransport::ManualTls { .. } => {
+        NntpTransport::Tls { .. }
+        | NntpTransport::ManualTls { .. }
+        | NntpTransport::S2nTls { .. } => {
             return Err(NntpError::MalformedResponse(
                 "cannot STARTTLS on an already-TLS connection".into(),
             ));
         }
     };
 
-    let tls_config = build_tls_config(ca_cert_path)?;
-    let server_name = make_server_name(host)?;
-    let manual_tls = ManualTlsStream::connect(tcp, tls_config, server_name).await?;
-    Ok(NntpTransport::ManualTls {
-        inner: manual_tls,
-        remote_addr,
-    })
+    match selected_tls_backend()? {
+        NntpTlsBackend::ManualRustls => {
+            let tls_config = build_tls_config(ca_cert_path)?;
+            let server_name = make_server_name(host)?;
+            let manual_tls = ManualTlsStream::connect(tcp, tls_config, server_name).await?;
+            Ok(NntpTransport::ManualTls {
+                inner: manual_tls,
+                remote_addr,
+            })
+        }
+        NntpTlsBackend::S2n => {
+            let tls_config = build_s2n_tls_config(ca_cert_path)?;
+            let s2n_tls = connect_s2n_tls(tcp, tls_config, host).await?;
+            Ok(NntpTransport::S2nTls {
+                inner: s2n_tls,
+                remote_addr,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_rustls::TlsAcceptor;
+    use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
+    use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    const TLS_DRAIN_RECORD_BYTES: usize = 16 * 1024;
+    const TLS_DRAIN_RECORDS: usize = 8;
+    const TLS_DRAIN_PAYLOAD_BYTES: usize = TLS_DRAIN_RECORD_BYTES * TLS_DRAIN_RECORDS;
+    const TLS_TEST_BUFFER_BYTES: usize = 256 * 1024;
 
     #[test]
     fn filter_and_rotate_addrs_excludes_ips_before_rotation() {
@@ -707,5 +893,108 @@ mod tests {
 
         let ka_interval = sock_ref.tcp_keepalive_interval().unwrap();
         assert_eq!(ka_interval, Duration::from_secs(15));
+    }
+
+    fn s2n_probe_tls_config() -> (Arc<RustlsServerConfig>, std::path::PathBuf) {
+        let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate test cert");
+        let cert_der = certified_key.cert.der().clone();
+        let cert_pem = certified_key.cert.pem();
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            certified_key.key_pair.serialize_der(),
+        ));
+
+        let server_provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+        let server_config = RustlsServerConfig::builder_with_provider(Arc::new(server_provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("server TLS config");
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let ca_path = std::env::temp_dir().join(format!(
+            "weaver-nntp-s2n-probe-ca-{}-{nonce}.pem",
+            std::process::id()
+        ));
+        std::fs::write(&ca_path, cert_pem).expect("write s2n probe CA PEM");
+
+        (Arc::new(server_config), ca_path)
+    }
+
+    async fn spawn_tls_drain_server(
+        server_config: Arc<RustlsServerConfig>,
+    ) -> (SocketAddr, oneshot::Receiver<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (flushed_tx, flushed_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let acceptor = TlsAcceptor::from(server_config);
+            let mut tls = acceptor.accept(socket).await.unwrap();
+            let record = vec![0x5Au8; TLS_DRAIN_RECORD_BYTES];
+
+            for _ in 0..TLS_DRAIN_RECORDS {
+                tls.write_all(&record).await.unwrap();
+                tls.flush().await.unwrap();
+            }
+
+            let _ = flushed_tx.send(());
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+
+        (addr, flushed_rx)
+    }
+
+    #[tokio::test]
+    #[ignore = "diagnostic read-shape probe; run explicitly with --ignored --nocapture"]
+    async fn s2n_tls_drain_probe() {
+        let (server_config, ca_path) = s2n_probe_tls_config();
+        let (addr, flushed_rx) = spawn_tls_drain_server(server_config).await;
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let tls_config = build_s2n_tls_config(Some(&ca_path)).expect("s2n TLS config");
+        let s2n_tls = connect_s2n_tls(tcp, tls_config, "localhost")
+            .await
+            .expect("s2n TLS connect");
+        let mut transport = NntpTransport::S2nTls {
+            inner: s2n_tls,
+            remote_addr: addr,
+        };
+        let mut read_buf = BytesMut::with_capacity(TLS_TEST_BUFFER_BYTES);
+        let mut total = 0usize;
+        let mut aggregate = TransportReadStats::default();
+        let mut first_read_bytes = 0usize;
+
+        while total < TLS_DRAIN_PAYLOAD_BYTES {
+            let read = transport
+                .read_into_buf_with_stats(&mut read_buf, TLS_TEST_BUFFER_BYTES)
+                .await
+                .expect("s2n read");
+            assert_ne!(read.bytes, 0, "s2n TLS stream closed before probe payload");
+            if first_read_bytes == 0 {
+                first_read_bytes = read.bytes;
+            }
+            total += read.bytes;
+            aggregate.add(read.stats);
+        }
+
+        flushed_rx.await.expect("server flushed probe records");
+        let _ = std::fs::remove_file(&ca_path);
+        let bytes_per_read_call = if aggregate.s2n_read_calls == 0 {
+            0
+        } else {
+            aggregate.s2n_read_bytes / aggregate.s2n_read_calls
+        };
+
+        println!(
+            "s2n_tls_drain_probe first_read_bytes={first_read_bytes} total_bytes={total} records={TLS_DRAIN_RECORDS} s2n_read_calls={} bytes_per_read_call={bytes_per_read_call}",
+            aggregate.s2n_read_calls
+        );
+        assert_eq!(total, TLS_DRAIN_PAYLOAD_BYTES);
+        assert_eq!(aggregate.s2n_read_bytes as usize, total);
     }
 }

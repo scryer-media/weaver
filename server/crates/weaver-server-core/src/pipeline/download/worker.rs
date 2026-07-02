@@ -2650,6 +2650,22 @@ impl Pipeline {
                     io.transport_read.cached_plaintext_returns,
                 );
                 crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.read_calls",
+                    io.transport_read.s2n_read_calls,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.read_bytes",
+                    io.transport_read.s2n_read_bytes,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.bytes_per_read_call",
+                    if io.transport_read.s2n_read_calls == 0 {
+                        0
+                    } else {
+                        io.transport_read.s2n_read_bytes / io.transport_read.s2n_read_calls
+                    },
+                );
+                crate::runtime::perf_probe::record_value(
                     "download.nntp.read.bytes_per_call",
                     if io.read_calls == 0 {
                         0
