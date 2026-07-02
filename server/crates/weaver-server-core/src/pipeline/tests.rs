@@ -5466,7 +5466,7 @@ async fn dispatch_downloads_respects_hard_decode_byte_pressure() {
 }
 
 #[tokio::test]
-async fn dispatch_downloads_pauses_when_restart_durable_lead_is_too_large() {
+async fn dispatch_downloads_waits_for_downstream_work_when_restart_durable_lead_is_too_large() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -5525,6 +5525,7 @@ async fn dispatch_downloads_pauses_when_restart_durable_lead_is_too_large() {
     };
 
     assert!(!pipeline.primary_download_within_restart_durable_lead(job_id, &next_work));
+    pipeline.active_decodes_by_job.insert(job_id, 1);
 
     pipeline.dispatch_downloads();
 
@@ -5579,6 +5580,85 @@ async fn dispatch_downloads_pauses_when_restart_durable_lead_is_too_large() {
         !pipeline
             .download_restart_durable_lead_retry_after
             .contains_key(&job_id)
+    );
+}
+
+#[tokio::test]
+async fn dispatch_downloads_escapes_restart_durable_lead_when_pipeline_is_idle() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        2,
+    )
+    .await;
+    let job_id = JobId(20030);
+    let durable_lead_limit = Pipeline::restart_durable_lead_limit_bytes();
+    let segment_bytes = 1024 * 1024u32;
+    let segment_count = (durable_lead_limit / u64::from(segment_bytes) + 2) as u32;
+    let segments = (0..segment_count)
+        .map(|segment| {
+            segment_spec! {
+                number: segment,
+                bytes: segment_bytes,
+                message_id: format!("restart-lead-idle-{segment}@example.com"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let spec = JobSpec {
+        name: "Restart Durable Lead Idle".to_string(),
+        password: None,
+        total_bytes: u64::from(segment_count) * u64::from(segment_bytes),
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: "large-idle.bin".to_string(),
+            role: FileRole::Standalone,
+            groups: vec!["alt.binaries.test".to_string()],
+            segments,
+        }],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    submit_decoded_segment(
+        &mut pipeline,
+        file_id,
+        1,
+        64,
+        b"buffered-gap",
+        "large-idle.bin",
+        None,
+    )
+    .await;
+    assert!(
+        pipeline
+            .write_buffers
+            .get(&file_id)
+            .is_some_and(|write_buf| write_buf.buffered_len() > 0)
+    );
+    pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes = durable_lead_limit;
+
+    pipeline.dispatch_downloads();
+
+    assert!(pipeline.active_downloads > 0);
+    assert!(
+        !pipeline
+            .download_restart_durable_lead_retry_after
+            .contains_key(&job_id)
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_restart_durable_lead_blocked_total
+            .load(Ordering::Relaxed),
+        0
     );
 }
 

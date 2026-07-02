@@ -10,6 +10,27 @@ enum DispatchAttempt {
     StopAll,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct DownloadPipelineBacklog {
+    active_downloads: usize,
+    active_connections: usize,
+    active_decodes: usize,
+    delayed_retries: usize,
+    released_results: usize,
+    pending_decodes: usize,
+    buffered_write_segments: usize,
+    buffered_write_bytes: u64,
+}
+
+impl DownloadPipelineBacklog {
+    fn has_durable_catch_up_work(self) -> bool {
+        self.active_decodes != 0
+            || self.delayed_retries != 0
+            || self.released_results != 0
+            || self.pending_decodes != 0
+    }
+}
+
 const DOWNLOAD_PRESSURE_SOFT_PERCENT: u64 = 70;
 const SOFT_PRESSURE_DISPATCH_MAX_DELAY: Duration = Duration::from_millis(150);
 const SOFT_PRESSURE_DISPATCH_MIN_DELAY: Duration = Duration::from_millis(1);
@@ -143,6 +164,55 @@ impl Pipeline {
                     .unwrap_or(0),
             );
         accepted_bytes.saturating_add((active_items as u64).saturating_mul(1024 * 1024))
+    }
+
+    fn download_pipeline_backlog_for_job(&self, job_id: JobId) -> DownloadPipelineBacklog {
+        let pending_decodes = self
+            .pending_decode
+            .iter()
+            .filter(|work| work.segment_id.file_id.job_id == job_id)
+            .count();
+        let (buffered_write_segments, buffered_write_bytes) = self
+            .write_buffers
+            .iter()
+            .filter(|(file_id, _)| file_id.job_id == job_id)
+            .fold((0usize, 0u64), |(segments, bytes), (_, write_buf)| {
+                (
+                    segments.saturating_add(write_buf.buffered_len()),
+                    bytes.saturating_add(write_buf.buffered_bytes() as u64),
+                )
+            });
+
+        DownloadPipelineBacklog {
+            active_downloads: self
+                .active_downloads_by_job
+                .get(&job_id)
+                .copied()
+                .unwrap_or(0),
+            active_connections: self
+                .active_download_connections_by_job
+                .get(&job_id)
+                .copied()
+                .unwrap_or(0),
+            active_decodes: self
+                .active_decodes_by_job
+                .get(&job_id)
+                .copied()
+                .unwrap_or(0),
+            delayed_retries: self
+                .pending_retries_by_job
+                .get(&job_id)
+                .copied()
+                .unwrap_or(0),
+            released_results: self
+                .pending_released_download_results_by_job
+                .get(&job_id)
+                .copied()
+                .unwrap_or(0),
+            pending_decodes,
+            buffered_write_segments,
+            buffered_write_bytes,
+        }
     }
 
     pub(crate) fn primary_download_within_restart_durable_lead(
@@ -1266,26 +1336,46 @@ impl Pipeline {
             self.flush_file_progress_batch("download.file_progress.flush.restart_durable_lead");
             if let Some((projected_after_flush, _)) = self.restart_durable_lead_block(job_id, &work)
             {
-                self.metrics
-                    .download_restart_durable_lead_blocked_total
-                    .fetch_add(1, Ordering::Relaxed);
-                self.download_restart_durable_lead_retry_after.insert(
-                    job_id,
-                    Instant::now() + DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY,
-                );
-                debug!(
-                    job_id = job_id.0,
-                    segment = ?work.segment_id,
-                    projected_before_flush,
-                    projected_after_flush,
-                    limit,
-                    "dispatch delayed: restart durable lead"
-                );
-                if let Some(state) = self.jobs.get_mut(&job_id) {
-                    state.download_queue.push(work);
+                let backlog = self.download_pipeline_backlog_for_job(job_id);
+                if !backlog.has_durable_catch_up_work() {
+                    debug!(
+                        job_id = job_id.0,
+                        segment = ?work.segment_id,
+                        projected_before_flush,
+                        projected_after_flush,
+                        limit,
+                        "dispatch continuing: restart durable lead exceeded but download pipeline is idle"
+                    );
+                } else {
+                    self.metrics
+                        .download_restart_durable_lead_blocked_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.download_restart_durable_lead_retry_after.insert(
+                        job_id,
+                        Instant::now() + DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY,
+                    );
+                    debug!(
+                        job_id = job_id.0,
+                        segment = ?work.segment_id,
+                        projected_before_flush,
+                        projected_after_flush,
+                        limit,
+                        active_downloads = backlog.active_downloads,
+                        active_connections = backlog.active_connections,
+                        active_decodes = backlog.active_decodes,
+                        delayed_retries = backlog.delayed_retries,
+                        released_results = backlog.released_results,
+                        pending_decodes = backlog.pending_decodes,
+                        buffered_write_segments = backlog.buffered_write_segments,
+                        buffered_write_bytes = backlog.buffered_write_bytes,
+                        "dispatch delayed: restart durable lead"
+                    );
+                    if let Some(state) = self.jobs.get_mut(&job_id) {
+                        state.download_queue.push(work);
+                    }
+                    self.update_queue_metrics();
+                    return Ok(None);
                 }
-                self.update_queue_metrics();
-                return Ok(None);
             }
         }
         self.download_restart_durable_lead_retry_after
@@ -2075,6 +2165,7 @@ impl Pipeline {
                 .get(&job_id)
                 .map(|ready_at| ready_at.saturating_duration_since(now).as_millis() as u64)
                 .unwrap_or_default();
+            let backlog = self.download_pipeline_backlog_for_job(job_id);
             warn!(
                 job_id = job_id.0,
                 status = ?state.status,
@@ -2090,6 +2181,14 @@ impl Pipeline {
                 pressure_reason = pressure.reason.as_str(),
                 hot_job_id,
                 restart_durable_lead_retry_ms = durable_retry_ms,
+                active_downloads_by_job = backlog.active_downloads,
+                active_connections_by_job = backlog.active_connections,
+                active_decodes_by_job = backlog.active_decodes,
+                delayed_retries_by_job = backlog.delayed_retries,
+                released_results_by_job = backlog.released_results,
+                pending_decodes_by_job = backlog.pending_decodes,
+                buffered_write_segments_by_job = backlog.buffered_write_segments,
+                buffered_write_bytes_by_job = backlog.buffered_write_bytes,
                 "download dispatch liveness stall: queued work but no active downloads"
             );
         } else {
@@ -2502,6 +2601,54 @@ impl Pipeline {
                 crate::runtime::perf_probe::record_cpu_sample("download.fused.finish", cpu.finish);
                 crate::runtime::perf_probe::record_value("download.nntp.read.bytes", io.read_bytes);
                 crate::runtime::perf_probe::record_value("download.nntp.read.calls", io.read_calls);
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.readiness_waits",
+                    io.transport_read.readiness_waits,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.empty_readiness_wakes",
+                    io.transport_read.empty_readiness_wakes,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.try_read.calls",
+                    io.transport_read.try_read_calls,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.try_read.would_block",
+                    io.transport_read.try_read_would_block,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.try_read.bytes",
+                    io.transport_read.try_read_bytes,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.tls.read_calls",
+                    io.transport_read.tls_read_calls,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.tls.process_packets_calls",
+                    io.transport_read.tls_process_packets_calls,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.plaintext.drain_calls",
+                    io.transport_read.plaintext_drain_calls,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.plaintext.reader_calls",
+                    io.transport_read.plaintext_reader_calls,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.plaintext.reader_would_block",
+                    io.transport_read.plaintext_reader_would_block,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.plaintext.bytes",
+                    io.transport_read.plaintext_bytes,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.plaintext.cached_returns",
+                    io.transport_read.cached_plaintext_returns,
+                );
                 crate::runtime::perf_probe::record_value(
                     "download.nntp.read.bytes_per_call",
                     if io.read_calls == 0 {

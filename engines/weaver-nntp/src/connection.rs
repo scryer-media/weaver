@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
 
@@ -12,7 +12,7 @@ use crate::commands::Command;
 use crate::error::{NntpError, Result};
 use crate::fused_yenc::{FusedYencArticle, FusedYencArticleDecoder, FusedYencError};
 use crate::response::{is_multiline_status, parse_response};
-use crate::tls::NntpTransport;
+use crate::tls::{NntpTransport, TransportReadStats};
 use crate::types::{ArticleId, Capabilities, MultiLineResponse, Response};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -998,6 +998,7 @@ impl NntpConnection {
         let mut decoder = FusedYencArticleDecoder::from_body_response(initial)?;
         let mut read_calls = 0u64;
         let mut read_bytes = 0u64;
+        let mut transport_read = TransportReadStats::default();
         let mut read_poll_cpu = Duration::ZERO;
         let mut fused_decode_cpu = Duration::ZERO;
         let mut output_callback_cpu = Duration::ZERO;
@@ -1013,6 +1014,7 @@ impl NntpConnection {
                         article_chunks.append(&mut article.chunks);
                         article.stats.read_calls = read_calls;
                         article.stats.read_bytes = read_bytes;
+                        article.stats.transport_read = transport_read;
                         article.stats.read_poll_cpu = read_poll_cpu;
                         article.stats.fused_decode_cpu = fused_decode_cpu;
                         article.stats.leftover_bytes_after_terminator = self.read_buf.len() as u64;
@@ -1038,9 +1040,11 @@ impl NntpConnection {
                 }
 
                 if profile_cpu {
-                    let (read_result, read_cpu) = measure_poll_cpu(self.read_into_buffer()).await;
+                    let (read_result, read_cpu) =
+                        measure_poll_cpu(self.read_into_buffer_with_stats()).await;
                     read_poll_cpu += read_cpu;
-                    let n = read_result?;
+                    let (n, read_stats) = read_result?;
+                    transport_read.add(read_stats);
                     read_calls += 1;
                     read_bytes += n as u64;
                 } else {
@@ -1129,11 +1133,14 @@ impl NntpConnection {
         let socket_read_size = self.buffer_profile.socket_read_size.max(64 * 1024);
         self.read_buf.reserve(socket_read_size);
         let transport = self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
-        let n = transport.read_buf(&mut self.read_buf).await.map_err(|e| {
-            self.poisoned = true;
-            self.current_group = None;
-            NntpError::Io(e)
-        })?;
+        let n = transport
+            .read_into_buf(&mut self.read_buf, socket_read_size)
+            .await
+            .map_err(|e| {
+                self.poisoned = true;
+                self.current_group = None;
+                NntpError::Io(e)
+            })?;
 
         if n == 0 {
             self.poisoned = true;
@@ -1142,6 +1149,28 @@ impl NntpConnection {
         }
 
         Ok(n)
+    }
+
+    async fn read_into_buffer_with_stats(&mut self) -> Result<(usize, TransportReadStats)> {
+        let socket_read_size = self.buffer_profile.socket_read_size.max(64 * 1024);
+        self.read_buf.reserve(socket_read_size);
+        let transport = self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
+        let read = transport
+            .read_into_buf_with_stats(&mut self.read_buf, socket_read_size)
+            .await
+            .map_err(|e| {
+                self.poisoned = true;
+                self.current_group = None;
+                NntpError::Io(e)
+            })?;
+
+        if read.bytes == 0 {
+            self.poisoned = true;
+            self.current_group = None;
+            return Err(NntpError::ConnectionClosed);
+        }
+
+        Ok((read.bytes, read.stats))
     }
 
     /// Send QUIT and close the connection gracefully.
@@ -1207,12 +1236,31 @@ fn pending_multiline_terminator(buf: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Cursor, Read};
+    use std::net::TcpStream as StdTcpStream;
+    use std::sync::Arc;
+
     use super::*;
+    use crate::tls::ManualTlsStream;
+    use openssl::ssl::{ErrorCode as OpensslErrorCode, SslConnector, SslMethod, SslVersion};
+    use openssl::x509::X509;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
+    use tokio_rustls::rustls::client::UnbufferedClientConnection;
+    use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use tokio_rustls::rustls::unbuffered::ConnectionState as UnbufferedConnectionState;
+    use tokio_rustls::rustls::{
+        ClientConfig, ClientConnection, RootCertStore, ServerConfig as RustlsServerConfig,
+    };
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
     use weaver_yenc::encode;
 
     const FUSED_YENC_OUTPUT_BATCH_TARGET: usize = 512 * 1024;
+    const TLS_DRAIN_RECORD_BYTES: usize = 16 * 1024;
+    const TLS_DRAIN_RECORDS: usize = 8;
+    const TLS_DRAIN_PAYLOAD_BYTES: usize = TLS_DRAIN_RECORD_BYTES * TLS_DRAIN_RECORDS;
+    const TLS_TEST_BUFFER_BYTES: usize = 256 * 1024;
 
     struct ScriptStep {
         expect_prefix: Option<&'static str>,
@@ -1232,6 +1280,710 @@ mod tests {
             }
         }
         String::from_utf8(buf).unwrap()
+    }
+
+    fn test_tls_configs() -> (Arc<ClientConfig>, Arc<RustlsServerConfig>) {
+        let (client_config, server_config, _) = test_tls_configs_with_cert_der();
+        (client_config, server_config)
+    }
+
+    fn test_tls_configs_with_cert_der() -> (Arc<ClientConfig>, Arc<RustlsServerConfig>, Vec<u8>) {
+        let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate test cert");
+        let cert_der = certified_key.cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            certified_key.key_pair.serialize_der(),
+        ));
+
+        let server_provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+        let server_config = RustlsServerConfig::builder_with_provider(Arc::new(server_provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der.clone()).expect("client root store");
+        let client_provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+        let client_config = ClientConfig::builder_with_provider(Arc::new(client_provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        (
+            Arc::new(client_config),
+            Arc::new(server_config),
+            cert_der.as_ref().to_vec(),
+        )
+    }
+
+    fn openssl_connector_from_cert_der(cert_der: &[u8]) -> SslConnector {
+        let x509 = X509::from_der(cert_der).expect("OpenSSL test root certificate");
+        let mut builder = SslConnector::builder(SslMethod::tls_client()).expect("OpenSSL builder");
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .expect("OpenSSL TLS 1.3 minimum");
+        builder
+            .set_ciphersuites("TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256")
+            .expect("OpenSSL TLS 1.3 cipher suites");
+        builder
+            .cert_store_mut()
+            .add_cert(x509)
+            .expect("OpenSSL test root store");
+        builder.build()
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct OpensslDrainStats {
+        ssl_read_calls: usize,
+        want_read: usize,
+        want_write: usize,
+        plaintext_bytes: usize,
+    }
+
+    fn openssl_drain_payload(addr: SocketAddr, cert_der: Vec<u8>) -> (Vec<u8>, OpensslDrainStats) {
+        let connector = openssl_connector_from_cert_der(&cert_der);
+        let tcp = StdTcpStream::connect(addr).expect("OpenSSL client connect");
+        tcp.set_nodelay(true).expect("OpenSSL TCP_NODELAY");
+        let mut tls = connector
+            .connect("localhost", tcp)
+            .expect("OpenSSL TLS connect");
+        let mut output = Vec::with_capacity(TLS_DRAIN_PAYLOAD_BYTES);
+        let mut buf = vec![0u8; TLS_TEST_BUFFER_BYTES];
+        let mut stats = OpensslDrainStats::default();
+
+        while output.len() < TLS_DRAIN_PAYLOAD_BYTES {
+            stats.ssl_read_calls += 1;
+            match tls.ssl_read(&mut buf) {
+                Ok(0) => panic!("OpenSSL TLS stream closed before diagnostic payload"),
+                Ok(n) => {
+                    output.extend_from_slice(&buf[..n]);
+                    stats.plaintext_bytes += n;
+                }
+                Err(err) if err.code() == OpensslErrorCode::WANT_READ => {
+                    stats.want_read += 1;
+                    std::thread::yield_now();
+                }
+                Err(err) if err.code() == OpensslErrorCode::WANT_WRITE => {
+                    stats.want_write += 1;
+                    std::thread::yield_now();
+                }
+                Err(err) => panic!("OpenSSL TLS read failed: {err}"),
+            }
+        }
+
+        (output, stats)
+    }
+
+    async fn spawn_tls_drain_server(
+        server_config: Arc<RustlsServerConfig>,
+    ) -> (SocketAddr, oneshot::Receiver<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (flushed_tx, flushed_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let acceptor = TlsAcceptor::from(server_config);
+            let mut tls = acceptor.accept(socket).await.unwrap();
+            let record = vec![0x5Au8; TLS_DRAIN_RECORD_BYTES];
+
+            for _ in 0..TLS_DRAIN_RECORDS {
+                tls.write_all(&record).await.unwrap();
+                tls.flush().await.unwrap();
+            }
+
+            let _ = flushed_tx.send(());
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+
+        (addr, flushed_rx)
+    }
+
+    async fn connect_tls_drain_client(
+        addr: SocketAddr,
+        client_config: Arc<ClientConfig>,
+    ) -> NntpConnection {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let remote_addr = tcp.peer_addr().unwrap();
+        let connector = TlsConnector::from(client_config);
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let tls = connector.connect(server_name, tcp).await.unwrap();
+        let now = Instant::now();
+
+        NntpConnection {
+            transport: Some(NntpTransport::Tls {
+                inner: tls,
+                remote_addr,
+            }),
+            codec: NntpCodec::new(),
+            read_buf: BytesMut::with_capacity(256 * 1024),
+            buffer_profile: NntpBufferProfile {
+                read_buf_capacity: 256 * 1024,
+                socket_read_size: 256 * 1024,
+            },
+            state: ConnectionState::Ready,
+            capabilities: Capabilities::default(),
+            host: "localhost".to_string(),
+            remote_addr,
+            created_at: now,
+            last_used: now,
+            command_timeout: Duration::from_secs(5),
+            poisoned: false,
+            current_group: None,
+            credentials: None,
+            tls_ca_cert: None,
+        }
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    struct BufferedRustlsFeedStats {
+        tls_read_calls: usize,
+        process_packets_calls: usize,
+        tls_bytes: usize,
+        plaintext_bytes: usize,
+    }
+
+    impl BufferedRustlsFeedStats {
+        fn add(&mut self, other: Self) {
+            self.tls_read_calls += other.tls_read_calls;
+            self.process_packets_calls += other.process_packets_calls;
+            self.tls_bytes += other.tls_bytes;
+            self.plaintext_bytes += other.plaintext_bytes;
+        }
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    struct UnbufferedRustlsStats {
+        process_calls: usize,
+        encode_states: usize,
+        transmit_states: usize,
+        blocked_handshake_states: usize,
+        write_ready_states: usize,
+        read_traffic_states: usize,
+        app_records: usize,
+        app_bytes: usize,
+        discarded_bytes: usize,
+    }
+
+    enum UnbufferedStep {
+        NeedRead,
+        Send(Vec<u8>),
+        ReadyToWrite,
+        PeerClosed,
+        Continue,
+    }
+
+    fn feed_manual_tls(
+        tls: &mut ClientConnection,
+        ciphertext: &[u8],
+        output: &mut Vec<u8>,
+    ) -> io::Result<BufferedRustlsFeedStats> {
+        let mut cursor = Cursor::new(ciphertext);
+        let mut stats = BufferedRustlsFeedStats::default();
+
+        while (cursor.position() as usize) < ciphertext.len() {
+            stats.tls_read_calls += 1;
+            match tls.read_tls(&mut cursor) {
+                Ok(0) => break,
+                Ok(n) => {
+                    stats.tls_bytes += n;
+                    stats.process_packets_calls += 1;
+                    tls.process_new_packets()
+                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+                    stats.plaintext_bytes += drain_manual_plaintext(tls, output)?;
+                }
+                Err(err) if err.kind() == io::ErrorKind::Other => {
+                    let drained = drain_manual_plaintext(tls, output)?;
+                    if drained == 0 {
+                        return Err(err);
+                    }
+                    stats.plaintext_bytes += drained;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(stats)
+    }
+
+    fn drain_manual_plaintext(
+        tls: &mut ClientConnection,
+        output: &mut Vec<u8>,
+    ) -> io::Result<usize> {
+        let mut total = 0usize;
+        let mut chunk = [0u8; TLS_DRAIN_RECORD_BYTES];
+
+        loop {
+            match tls.reader().read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    output.extend_from_slice(&chunk[..n]);
+                    total += n;
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(total)
+    }
+
+    async fn connect_manual_rustls_client(
+        addr: SocketAddr,
+        client_config: Arc<ClientConfig>,
+    ) -> (TcpStream, ClientConnection) {
+        let mut tcp = TcpStream::connect(addr).await.unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut tls = ClientConnection::new(client_config, server_name).unwrap();
+        let mut ciphertext = vec![0u8; 64 * 1024];
+        let mut ignored_plaintext = Vec::new();
+
+        while tls.is_handshaking() {
+            while tls.wants_write() {
+                let mut outbound = Vec::new();
+                tls.write_tls(&mut outbound).unwrap();
+                if outbound.is_empty() {
+                    break;
+                }
+                tcp.write_all(&outbound).await.unwrap();
+                tcp.flush().await.unwrap();
+            }
+
+            if tls.is_handshaking() {
+                let n = tcp.read(&mut ciphertext).await.unwrap();
+                assert!(n > 0, "server closed during manual TLS handshake");
+                let _ =
+                    feed_manual_tls(&mut tls, &ciphertext[..n], &mut ignored_plaintext).unwrap();
+            }
+        }
+
+        while tls.wants_write() {
+            let mut outbound = Vec::new();
+            tls.write_tls(&mut outbound).unwrap();
+            if outbound.is_empty() {
+                break;
+            }
+            tcp.write_all(&outbound).await.unwrap();
+            tcp.flush().await.unwrap();
+        }
+
+        (tcp, tls)
+    }
+
+    async fn manual_rustls_try_drain_ready_plaintext(
+        tcp: &mut TcpStream,
+        tls: &mut ClientConnection,
+        output: &mut Vec<u8>,
+    ) -> io::Result<(usize, usize, BufferedRustlsFeedStats)> {
+        let mut ciphertext = vec![0u8; 256 * 1024];
+        let mut socket_reads = 0usize;
+        let mut stats = BufferedRustlsFeedStats::default();
+
+        tcp.readable().await?;
+        loop {
+            match tcp.try_read(&mut ciphertext) {
+                Ok(0) => break,
+                Ok(n) => {
+                    socket_reads += 1;
+                    stats.add(feed_manual_tls(tls, &ciphertext[..n], output)?);
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok((output.len(), socket_reads, stats))
+    }
+
+    fn discard_unbuffered_input(input: &mut [u8], input_len: &mut usize, discard: usize) {
+        if discard == 0 {
+            return;
+        }
+        assert!(
+            discard <= *input_len,
+            "rustls asked to discard {discard} bytes from {input_len} buffered bytes"
+        );
+        input.copy_within(discard..*input_len, 0);
+        *input_len -= discard;
+    }
+
+    fn process_unbuffered_tls_once(
+        tls: &mut UnbufferedClientConnection,
+        input: &mut [u8],
+        input_len: &mut usize,
+        output: &mut Vec<u8>,
+        stats: &mut UnbufferedRustlsStats,
+    ) -> io::Result<UnbufferedStep> {
+        stats.process_calls += 1;
+        let mut outgoing = vec![0u8; TLS_TEST_BUFFER_BYTES];
+
+        let (discard, extra_discard, step) = {
+            let status = tls.process_tls_records(&mut input[..*input_len]);
+            let discard = status.discard;
+            match status
+                .state
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+            {
+                UnbufferedConnectionState::EncodeTlsData(mut encoder) => {
+                    stats.encode_states += 1;
+                    let n = encoder.encode(&mut outgoing).map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("failed to encode TLS handshake data: {err:?}"),
+                        )
+                    })?;
+                    outgoing.truncate(n);
+                    (discard, 0, UnbufferedStep::Send(outgoing))
+                }
+                UnbufferedConnectionState::TransmitTlsData(transmit) => {
+                    stats.transmit_states += 1;
+                    transmit.done();
+                    (discard, 0, UnbufferedStep::Continue)
+                }
+                UnbufferedConnectionState::BlockedHandshake => {
+                    stats.blocked_handshake_states += 1;
+                    (discard, 0, UnbufferedStep::NeedRead)
+                }
+                UnbufferedConnectionState::WriteTraffic(_) => {
+                    stats.write_ready_states += 1;
+                    (discard, 0, UnbufferedStep::ReadyToWrite)
+                }
+                UnbufferedConnectionState::ReadTraffic(mut traffic) => {
+                    stats.read_traffic_states += 1;
+                    let mut record_discard = 0usize;
+                    while let Some(record) = traffic.next_record() {
+                        let record = record
+                            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+                        record_discard += record.discard;
+                        stats.app_records += 1;
+                        stats.app_bytes += record.payload.len();
+                        output.extend_from_slice(record.payload);
+                    }
+                    (discard, record_discard, UnbufferedStep::Continue)
+                }
+                UnbufferedConnectionState::PeerClosed | UnbufferedConnectionState::Closed => {
+                    (discard, 0, UnbufferedStep::PeerClosed)
+                }
+                _ => {
+                    return Err(io::Error::other(
+                        "unexpected rustls unbuffered state in client test probe",
+                    ));
+                }
+            }
+        };
+
+        let total_discard = discard + extra_discard;
+        discard_unbuffered_input(input, input_len, total_discard);
+        stats.discarded_bytes += total_discard;
+        Ok(step)
+    }
+
+    async fn connect_unbuffered_rustls_client(
+        addr: SocketAddr,
+        client_config: Arc<ClientConfig>,
+    ) -> (TcpStream, UnbufferedClientConnection, UnbufferedRustlsStats) {
+        let mut tcp = TcpStream::connect(addr).await.unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut tls = UnbufferedClientConnection::new(client_config, server_name).unwrap();
+        let mut input = vec![0u8; TLS_TEST_BUFFER_BYTES];
+        let mut input_len = 0usize;
+        let mut ignored_plaintext = Vec::new();
+        let mut stats = UnbufferedRustlsStats::default();
+
+        loop {
+            match process_unbuffered_tls_once(
+                &mut tls,
+                &mut input,
+                &mut input_len,
+                &mut ignored_plaintext,
+                &mut stats,
+            )
+            .unwrap()
+            {
+                UnbufferedStep::NeedRead => {
+                    if input_len == input.len() {
+                        input.resize(input.len() * 2, 0);
+                    }
+                    let n = tcp.read(&mut input[input_len..]).await.unwrap();
+                    assert!(n > 0, "server closed during unbuffered TLS handshake");
+                    input_len += n;
+                }
+                UnbufferedStep::Send(bytes) => {
+                    tcp.write_all(&bytes).await.unwrap();
+                    tcp.flush().await.unwrap();
+                }
+                UnbufferedStep::ReadyToWrite => break,
+                UnbufferedStep::PeerClosed => panic!("server closed during unbuffered handshake"),
+                UnbufferedStep::Continue => {}
+            }
+        }
+
+        (tcp, tls, stats)
+    }
+
+    async fn unbuffered_rustls_try_drain_ready_plaintext(
+        tcp: &mut TcpStream,
+        tls: &mut UnbufferedClientConnection,
+        output: &mut Vec<u8>,
+        stats: &mut UnbufferedRustlsStats,
+    ) -> io::Result<(usize, usize, usize)> {
+        let mut input = vec![0u8; TLS_TEST_BUFFER_BYTES];
+        let mut input_len = 0usize;
+        let mut socket_reads = 0usize;
+        let mut tls_bytes = 0usize;
+
+        tcp.readable().await?;
+        loop {
+            if input_len == input.len() {
+                input.resize(input.len() * 2, 0);
+            }
+            match tcp.try_read(&mut input[input_len..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    socket_reads += 1;
+                    tls_bytes += n;
+                    input_len += n;
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => return Err(err),
+            }
+        }
+
+        loop {
+            match process_unbuffered_tls_once(tls, &mut input, &mut input_len, output, stats)? {
+                UnbufferedStep::NeedRead | UnbufferedStep::ReadyToWrite => break,
+                UnbufferedStep::Send(bytes) => {
+                    tcp.write_all(&bytes).await?;
+                    tcp.flush().await?;
+                }
+                UnbufferedStep::PeerClosed => break,
+                UnbufferedStep::Continue => {}
+            }
+        }
+
+        Ok((output.len(), socket_reads, tls_bytes))
+    }
+
+    #[tokio::test]
+    async fn tls_read_into_buffer_bulk_drain_probe() {
+        let (client_config, server_config) = test_tls_configs();
+        let (addr, flushed_rx) = spawn_tls_drain_server(server_config).await;
+        let mut conn = connect_tls_drain_client(addr, client_config).await;
+
+        flushed_rx.await.expect("test server flushed TLS payload");
+
+        let first_read = conn.read_into_buffer().await.unwrap();
+        let mut read_calls = 1usize;
+        while conn.read_buf.len() < TLS_DRAIN_PAYLOAD_BYTES {
+            let n = conn.read_into_buffer().await.unwrap();
+            read_calls += 1;
+            assert!(n > 0, "transport closed before reading diagnostic payload");
+        }
+
+        println!(
+            "tls_drain_probe first_read_bytes={first_read} total_bytes={} read_calls={read_calls} target_socket_read_size={}",
+            conn.read_buf.len(),
+            conn.buffer_profile.socket_read_size
+        );
+
+        assert!(first_read > 0);
+        assert!(first_read <= TLS_DRAIN_PAYLOAD_BYTES);
+        assert_eq!(conn.read_buf.len(), TLS_DRAIN_PAYLOAD_BYTES);
+    }
+
+    #[tokio::test]
+    async fn manual_rustls_bulk_drain_probe() {
+        let (client_config, server_config) = test_tls_configs();
+        let (addr, flushed_rx) = spawn_tls_drain_server(server_config).await;
+        let (mut tcp, mut tls) = connect_manual_rustls_client(addr, client_config).await;
+
+        flushed_rx.await.expect("test server flushed TLS payload");
+
+        let mut output = Vec::with_capacity(TLS_DRAIN_PAYLOAD_BYTES);
+        let mut first_drain_plaintext = 0usize;
+        let mut total_socket_reads = 0usize;
+        let mut stats = BufferedRustlsFeedStats::default();
+        let mut drain_calls = 0usize;
+
+        while output.len() < TLS_DRAIN_PAYLOAD_BYTES {
+            let before = output.len();
+            let (drain_plaintext, socket_reads, read_stats) =
+                manual_rustls_try_drain_ready_plaintext(&mut tcp, &mut tls, &mut output)
+                    .await
+                    .unwrap();
+            if drain_calls == 0 {
+                first_drain_plaintext = drain_plaintext;
+            }
+            drain_calls += 1;
+            total_socket_reads += socket_reads;
+            stats.add(read_stats);
+            assert!(
+                output.len() > before || read_stats.tls_bytes > 0,
+                "buffered rustls probe made no progress while draining TLS payload"
+            );
+        }
+
+        println!(
+            "manual_rustls_drain_probe first_drain_plaintext={first_drain_plaintext} drain_calls={drain_calls} socket_reads={total_socket_reads} tls_bytes={} tls_read_calls={} process_packets_calls={} payload_bytes={TLS_DRAIN_PAYLOAD_BYTES}",
+            stats.tls_bytes, stats.tls_read_calls, stats.process_packets_calls
+        );
+
+        assert_eq!(output.len(), TLS_DRAIN_PAYLOAD_BYTES);
+        assert!(total_socket_reads > 0);
+        assert!(stats.tls_bytes >= TLS_DRAIN_PAYLOAD_BYTES);
+        assert!(
+            stats.tls_read_calls > TLS_DRAIN_RECORDS,
+            "buffered rustls should need multiple 4 KiB reads per 16 KiB record"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbuffered_rustls_bulk_drain_probe() {
+        let (client_config, server_config) = test_tls_configs();
+        let (addr, flushed_rx) = spawn_tls_drain_server(server_config).await;
+        let (mut tcp, mut tls, mut stats) =
+            connect_unbuffered_rustls_client(addr, client_config).await;
+        let handshake_stats = stats;
+        stats = UnbufferedRustlsStats::default();
+
+        flushed_rx.await.expect("test server flushed TLS payload");
+
+        let mut output = Vec::with_capacity(TLS_DRAIN_PAYLOAD_BYTES);
+        let mut first_drain_plaintext = 0usize;
+        let mut total_socket_reads = 0usize;
+        let mut total_tls_bytes = 0usize;
+        let mut drain_calls = 0usize;
+
+        while output.len() < TLS_DRAIN_PAYLOAD_BYTES {
+            let before = output.len();
+            let (drain_plaintext, socket_reads, tls_bytes) =
+                unbuffered_rustls_try_drain_ready_plaintext(
+                    &mut tcp,
+                    &mut tls,
+                    &mut output,
+                    &mut stats,
+                )
+                .await
+                .unwrap();
+            if drain_calls == 0 {
+                first_drain_plaintext = drain_plaintext;
+            }
+            drain_calls += 1;
+            total_socket_reads += socket_reads;
+            total_tls_bytes += tls_bytes;
+            assert!(
+                output.len() > before,
+                "unbuffered probe made no progress while draining TLS payload"
+            );
+        }
+
+        println!(
+            "unbuffered_rustls_drain_probe first_drain_plaintext={first_drain_plaintext} drain_calls={drain_calls} socket_reads={total_socket_reads} tls_bytes={total_tls_bytes} handshake_process_calls={} payload_process_calls={} read_traffic_states={} app_records={} app_bytes={} discarded_bytes={} payload_bytes={TLS_DRAIN_PAYLOAD_BYTES}",
+            handshake_stats.process_calls,
+            stats.process_calls,
+            stats.read_traffic_states,
+            stats.app_records,
+            stats.app_bytes,
+            stats.discarded_bytes
+        );
+
+        assert_eq!(output.len(), TLS_DRAIN_PAYLOAD_BYTES);
+        assert!(total_socket_reads > 0);
+        assert!(total_tls_bytes >= TLS_DRAIN_PAYLOAD_BYTES);
+        assert_eq!(stats.app_records, TLS_DRAIN_RECORDS);
+    }
+
+    #[tokio::test]
+    async fn unbuffered_rustls_first_ready_pass_probe() {
+        let (client_config, server_config) = test_tls_configs();
+        let (addr, flushed_rx) = spawn_tls_drain_server(server_config).await;
+        let (mut tcp, mut tls, mut stats) =
+            connect_unbuffered_rustls_client(addr, client_config).await;
+        let handshake_stats = stats;
+        stats = UnbufferedRustlsStats::default();
+
+        flushed_rx.await.expect("test server flushed TLS payload");
+
+        let mut output = Vec::with_capacity(TLS_DRAIN_PAYLOAD_BYTES);
+        let (first_drain_plaintext, socket_reads, tls_bytes) =
+            unbuffered_rustls_try_drain_ready_plaintext(
+                &mut tcp,
+                &mut tls,
+                &mut output,
+                &mut stats,
+            )
+            .await
+            .unwrap();
+
+        println!(
+            "unbuffered_rustls_first_ready_probe first_drain_plaintext={first_drain_plaintext} socket_reads={socket_reads} tls_bytes={tls_bytes} handshake_process_calls={} payload_process_calls={} read_traffic_states={} app_records={} app_bytes={} discarded_bytes={} payload_bytes={TLS_DRAIN_PAYLOAD_BYTES}",
+            handshake_stats.process_calls,
+            stats.process_calls,
+            stats.read_traffic_states,
+            stats.app_records,
+            stats.app_bytes,
+            stats.discarded_bytes
+        );
+
+        assert!(socket_reads > 0);
+        assert!(tls_bytes > 0);
+        assert_eq!(first_drain_plaintext, output.len());
+    }
+
+    #[tokio::test]
+    async fn manual_tls_transport_bulk_drain_probe() {
+        let (client_config, server_config) = test_tls_configs();
+        let (addr, flushed_rx) = spawn_tls_drain_server(server_config).await;
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let remote_addr = tcp.peer_addr().unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let inner = ManualTlsStream::connect(tcp, client_config, server_name)
+            .await
+            .unwrap();
+        let mut transport = NntpTransport::ManualTls { inner, remote_addr };
+
+        flushed_rx.await.expect("test server flushed TLS payload");
+
+        let mut read_buf = BytesMut::with_capacity(256 * 1024);
+        let read = transport
+            .read_into_buf_with_stats(&mut read_buf, 256 * 1024)
+            .await
+            .unwrap();
+
+        println!(
+            "manual_tls_transport_probe first_read_bytes={} total_bytes={} tls_read_calls={} process_packets_calls={} plaintext_reader_calls={} reader_would_block={}",
+            read.bytes,
+            read_buf.len(),
+            read.stats.tls_read_calls,
+            read.stats.tls_process_packets_calls,
+            read.stats.plaintext_reader_calls,
+            read.stats.plaintext_reader_would_block
+        );
+
+        assert_eq!(read.bytes, TLS_DRAIN_PAYLOAD_BYTES);
+        assert_eq!(read_buf.len(), TLS_DRAIN_PAYLOAD_BYTES);
+    }
+
+    #[tokio::test]
+    async fn openssl_bulk_drain_probe() {
+        let (_, server_config, cert_der) = test_tls_configs_with_cert_der();
+        let (addr, flushed_rx) = spawn_tls_drain_server(server_config).await;
+        let client = tokio::task::spawn_blocking(move || openssl_drain_payload(addr, cert_der));
+
+        flushed_rx.await.expect("test server flushed TLS payload");
+        let (output, stats) = client.await.expect("OpenSSL client task");
+
+        println!(
+            "openssl_drain_probe ssl_read_calls={} want_read={} want_write={} plaintext_bytes={} payload_bytes={TLS_DRAIN_PAYLOAD_BYTES}",
+            stats.ssl_read_calls, stats.want_read, stats.want_write, stats.plaintext_bytes
+        );
+
+        assert_eq!(output.len(), TLS_DRAIN_PAYLOAD_BYTES);
+        assert_eq!(stats.plaintext_bytes, TLS_DRAIN_PAYLOAD_BYTES);
+        assert!(stats.ssl_read_calls > 0);
     }
 
     async fn spawn_scripted_server(steps: Vec<ScriptStep>, hold_open_after_last: Duration) -> u16 {

@@ -16,6 +16,7 @@ use crate::error::{NntpError, Result};
 use crate::fused_yenc::{FusedYencArticleStats, FusedYencError};
 use crate::health::{CooldownReason, ServerState};
 use crate::pool::{NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig};
+use crate::tls::TransportReadStats;
 
 /// Configuration for the high-level NNTP client.
 pub struct NntpClientConfig {
@@ -92,6 +93,7 @@ pub struct DecodedBodyIo {
     pub buffer_compactions: u64,
     pub encoded_bytes_consumed: u64,
     pub decoded_bytes_written: u64,
+    pub transport_read: TransportReadStats,
 }
 
 /// Errors from the streamed BODY decode path.
@@ -126,6 +128,7 @@ fn decoded_io_from_fused_stats(stats: &FusedYencArticleStats) -> DecodedBodyIo {
         buffer_compactions: stats.buffer_compactions,
         encoded_bytes_consumed: stats.encoded_bytes_consumed,
         decoded_bytes_written: stats.decoded_bytes_written,
+        transport_read: stats.transport_read,
     }
 }
 

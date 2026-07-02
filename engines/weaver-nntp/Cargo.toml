@@ -24,6 +24,8 @@ libc = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"
+openssl = "0.10"
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 
 [[bench]]
 name = "multiline_decode"

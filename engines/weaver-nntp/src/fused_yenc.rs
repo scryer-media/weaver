@@ -9,6 +9,7 @@ use weaver_yenc::{
 
 use crate::error::NntpError;
 use crate::response::parse_response;
+use crate::tls::TransportReadStats;
 use crate::types::Response;
 
 const MAX_CONTROL_LINE: usize = 16 * 1024;
@@ -81,6 +82,7 @@ pub struct FusedYencArticleStats {
     pub nntp_terminator_bytes: u64,
     pub leftover_bytes_after_terminator: u64,
     pub buffer_compactions: u64,
+    pub transport_read: TransportReadStats,
     pub read_poll_cpu: Duration,
     pub fused_decode_cpu: Duration,
     pub output_callback_cpu: Duration,
