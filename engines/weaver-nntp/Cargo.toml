@@ -12,6 +12,7 @@ tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
 s2n-tls = "0.3.39"
+s2n-tls-sys = "0.3.39"
 s2n-tls-tokio = "0.3.39"
 rustls-pemfile = { workspace = true }
 webpki-roots = { workspace = true, default-features = false }
