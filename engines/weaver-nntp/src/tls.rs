@@ -1,7 +1,9 @@
 use std::io::{self, Cursor, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
@@ -30,7 +32,7 @@ pin_project_lite::pin_project! {
         /// TLS-encrypted TCP driven directly through rustls.
         ManualTls { inner: ManualTlsStream, remote_addr: SocketAddr },
         /// TLS-encrypted TCP through s2n-tls.
-        S2nTls { #[pin] inner: S2nTlsStream<TcpStream>, remote_addr: SocketAddr },
+        S2nTls { #[pin] inner: S2nTlsStream<CountingTcpStream>, remote_addr: SocketAddr },
     }
 }
 
@@ -54,6 +56,11 @@ pub struct TransportReadStats {
     pub cached_plaintext_returns: u64,
     pub s2n_read_calls: u64,
     pub s2n_read_bytes: u64,
+    pub s2n_tcp_read_calls: u64,
+    pub s2n_tcp_read_pending: u64,
+    pub s2n_tcp_read_zero: u64,
+    pub s2n_tcp_read_bytes: u64,
+    pub s2n_tcp_read_requested_bytes: u64,
 }
 
 impl TransportReadStats {
@@ -72,6 +79,11 @@ impl TransportReadStats {
         self.cached_plaintext_returns += other.cached_plaintext_returns;
         self.s2n_read_calls += other.s2n_read_calls;
         self.s2n_read_bytes += other.s2n_read_bytes;
+        self.s2n_tcp_read_calls += other.s2n_tcp_read_calls;
+        self.s2n_tcp_read_pending += other.s2n_tcp_read_pending;
+        self.s2n_tcp_read_zero += other.s2n_tcp_read_zero;
+        self.s2n_tcp_read_bytes += other.s2n_tcp_read_bytes;
+        self.s2n_tcp_read_requested_bytes += other.s2n_tcp_read_requested_bytes;
     }
 }
 
@@ -80,13 +92,101 @@ pub struct TransportRead {
     pub stats: TransportReadStats,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct S2nTcpReadStats {
+    read_calls: u64,
+    read_pending: u64,
+    read_zero: u64,
+    read_bytes: u64,
+    read_requested_bytes: u64,
+}
+
+impl S2nTcpReadStats {
+    fn delta_since(self, previous: Self) -> Self {
+        Self {
+            read_calls: self.read_calls.saturating_sub(previous.read_calls),
+            read_pending: self.read_pending.saturating_sub(previous.read_pending),
+            read_zero: self.read_zero.saturating_sub(previous.read_zero),
+            read_bytes: self.read_bytes.saturating_sub(previous.read_bytes),
+            read_requested_bytes: self
+                .read_requested_bytes
+                .saturating_sub(previous.read_requested_bytes),
+        }
+    }
+}
+
+pub struct CountingTcpStream {
+    inner: TcpStream,
+    read_stats: S2nTcpReadStats,
+}
+
+impl CountingTcpStream {
+    fn new(inner: TcpStream) -> Self {
+        Self {
+            inner,
+            read_stats: S2nTcpReadStats::default(),
+        }
+    }
+
+    fn read_stats(&self) -> S2nTcpReadStats {
+        self.read_stats
+    }
+}
+
+impl AsyncRead for CountingTcpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        this.read_stats.read_calls += 1;
+        this.read_stats.read_requested_bytes += buf.remaining() as u64;
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let n = buf.filled().len().saturating_sub(before);
+                if n == 0 {
+                    this.read_stats.read_zero += 1;
+                }
+                this.read_stats.read_bytes += n as u64;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => {
+                this.read_stats.read_pending += 1;
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl AsyncWrite for CountingTcpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 async fn read_s2n_available_into(
-    inner: &mut S2nTlsStream<TcpStream>,
+    inner: &mut S2nTlsStream<CountingTcpStream>,
     dst: &mut BytesMut,
     target_read_size: usize,
 ) -> io::Result<TransportRead> {
     let started_len = dst.len();
     let target_read_size = target_read_size.max(1);
+    let tcp_read_stats_before = inner.get_ref().read_stats();
     let mut stats = TransportReadStats::default();
     let bytes = std::future::poll_fn(|cx| {
         loop {
@@ -121,6 +221,15 @@ async fn read_s2n_available_into(
         }
     })
     .await?;
+    let tcp_read_stats = inner
+        .get_ref()
+        .read_stats()
+        .delta_since(tcp_read_stats_before);
+    stats.s2n_tcp_read_calls += tcp_read_stats.read_calls;
+    stats.s2n_tcp_read_pending += tcp_read_stats.read_pending;
+    stats.s2n_tcp_read_zero += tcp_read_stats.read_zero;
+    stats.s2n_tcp_read_bytes += tcp_read_stats.read_bytes;
+    stats.s2n_tcp_read_requested_bytes += tcp_read_stats.read_requested_bytes;
 
     Ok(TransportRead { bytes, stats })
 }
@@ -645,7 +754,7 @@ async fn connect_s2n_tls(
     tcp: TcpStream,
     tls_config: S2nConfig,
     host: &str,
-) -> Result<S2nTlsStream<TcpStream>, NntpError> {
+) -> Result<S2nTlsStream<CountingTcpStream>, NntpError> {
     let builder = s2n_tls::connection::ModifiedBuilder::new(
         tls_config,
         |conn: &mut s2n_tls::connection::Connection| {
@@ -654,7 +763,7 @@ async fn connect_s2n_tls(
         },
     );
     S2nTlsConnector::new(builder)
-        .connect(host, tcp)
+        .connect(host, CountingTcpStream::new(tcp))
         .await
         .map_err(s2n_handshake_error)
 }
@@ -989,12 +1098,23 @@ mod tests {
         } else {
             aggregate.s2n_read_bytes / aggregate.s2n_read_calls
         };
+        let tcp_bytes_per_read_call = if aggregate.s2n_tcp_read_calls == 0 {
+            0
+        } else {
+            aggregate.s2n_tcp_read_bytes / aggregate.s2n_tcp_read_calls
+        };
+        let tcp_requested_bytes_per_read_call = if aggregate.s2n_tcp_read_calls == 0 {
+            0
+        } else {
+            aggregate.s2n_tcp_read_requested_bytes / aggregate.s2n_tcp_read_calls
+        };
 
         println!(
-            "s2n_tls_drain_probe first_read_bytes={first_read_bytes} total_bytes={total} records={TLS_DRAIN_RECORDS} s2n_read_calls={} bytes_per_read_call={bytes_per_read_call}",
-            aggregate.s2n_read_calls
+            "s2n_tls_drain_probe first_read_bytes={first_read_bytes} total_bytes={total} records={TLS_DRAIN_RECORDS} s2n_read_calls={} bytes_per_read_call={bytes_per_read_call} tcp_read_calls={} tcp_pending={} tcp_bytes_per_read_call={tcp_bytes_per_read_call} tcp_requested_bytes_per_read_call={tcp_requested_bytes_per_read_call}",
+            aggregate.s2n_read_calls, aggregate.s2n_tcp_read_calls, aggregate.s2n_tcp_read_pending
         );
         assert_eq!(total, TLS_DRAIN_PAYLOAD_BYTES);
         assert_eq!(aggregate.s2n_read_bytes as usize, total);
+        assert_ne!(aggregate.s2n_tcp_read_calls, 0);
     }
 }

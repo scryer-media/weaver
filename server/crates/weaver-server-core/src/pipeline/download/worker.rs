@@ -2666,6 +2666,39 @@ impl Pipeline {
                     },
                 );
                 crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.tcp.read_calls",
+                    io.transport_read.s2n_tcp_read_calls,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.tcp.read_pending",
+                    io.transport_read.s2n_tcp_read_pending,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.tcp.read_zero",
+                    io.transport_read.s2n_tcp_read_zero,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.tcp.read_bytes",
+                    io.transport_read.s2n_tcp_read_bytes,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.tcp.requested_bytes_per_read_call",
+                    if io.transport_read.s2n_tcp_read_calls == 0 {
+                        0
+                    } else {
+                        io.transport_read.s2n_tcp_read_requested_bytes
+                            / io.transport_read.s2n_tcp_read_calls
+                    },
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.tcp.bytes_per_read_call",
+                    if io.transport_read.s2n_tcp_read_calls == 0 {
+                        0
+                    } else {
+                        io.transport_read.s2n_tcp_read_bytes / io.transport_read.s2n_tcp_read_calls
+                    },
+                );
+                crate::runtime::perf_probe::record_value(
                     "download.nntp.read.bytes_per_call",
                     if io.read_calls == 0 {
                         0

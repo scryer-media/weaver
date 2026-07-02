@@ -1078,6 +1078,10 @@ impl CompletedFileChecksumState {
         self.bytes_fed
     }
 
+    pub(super) fn tracks_md5(&self) -> bool {
+        self.md5.is_some()
+    }
+
     pub(super) fn finalize(self) -> StreamedCompletedFileChecksum {
         StreamedCompletedFileChecksum {
             md5: self.md5.map(weaver_par2::checksum::FileHashState::finalize),

@@ -376,12 +376,51 @@ impl Pipeline {
         total_bytes: u64,
         expected_file_crc: Option<u32>,
     ) -> Result<CompletedFileChecksum, String> {
+        let deferred_range_count_before = self
+            .deferred_file_hash_ranges
+            .get(&file_id)
+            .map_or(0, BTreeMap::len);
+        let deferred_data_count_before = self
+            .deferred_file_hash_data
+            .get(&file_id)
+            .map_or(0, BTreeMap::len);
+        let deferred_data_bytes_before = self.deferred_file_hash_data_bytes;
         self.drain_deferred_file_hash_ranges(file_id, &file_path)
             .await;
+        let deferred_range_count_after = self
+            .deferred_file_hash_ranges
+            .get(&file_id)
+            .map_or(0, BTreeMap::len);
+        let deferred_data_count_after = self
+            .deferred_file_hash_data
+            .get(&file_id)
+            .map_or(0, BTreeMap::len);
         let hash_state = self.file_hash_states.remove(&file_id);
+        let streamed_bytes = hash_state.as_ref().map_or(0, |state| state.bytes_fed());
+        let streamed_md5_active = hash_state
+            .as_ref()
+            .is_some_and(CompletedFileChecksumState::tracks_md5);
         self.deferred_file_hash_ranges.remove(&file_id);
         self.drop_deferred_file_hash_data_for(file_id);
         let reread_required = self.file_hash_reread_required.remove(&file_id);
+        if crate::runtime::perf_probe::enabled() {
+            info!(
+                file_id = %file_id,
+                filename,
+                total_bytes,
+                streamed_bytes,
+                streamed_md5_active,
+                reread_required,
+                has_expected_file_crc = expected_file_crc.is_some(),
+                expected_file_crc = expected_file_crc.unwrap_or_default(),
+                deferred_range_count_before,
+                deferred_range_count_after,
+                deferred_data_count_before,
+                deferred_data_count_after,
+                deferred_data_bytes_before,
+                "completed-file hash finalize state"
+            );
+        }
         if reread_required {
             crate::runtime::perf_probe::record(
                 "download.file_hash.reread_fallback.marked_required",
@@ -1189,7 +1228,7 @@ impl Pipeline {
             };
 
             match file_asm.commit_segment(segment_id.segment_number, decoded_size) {
-                Ok(commit) => Ok((commit.file_complete, file_asm.total_bytes())),
+                Ok(commit) => Ok((commit.file_complete, file_asm.received_bytes())),
                 Err(e) => Err(e),
             }
         };

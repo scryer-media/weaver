@@ -8436,6 +8436,55 @@ async fn completed_file_crc32_match_persists_completion() {
 }
 
 #[tokio::test]
+async fn completed_file_uses_decoded_size_when_raw_article_bytes_are_larger() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20023);
+    let filename = "payload.bin";
+    let payload = b"decoded payload";
+    let raw_article_bytes = payload.len() as u32 + 128;
+    let spec = standalone_job_spec(
+        "Decoded Size Completion",
+        &[(filename.to_string(), raw_article_bytes)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    pipeline
+        .handle_decode_success(DecodeResult {
+            segment_id: SegmentId {
+                file_id,
+                segment_number: 0,
+            },
+            raw_size: raw_article_bytes as u64,
+            file_offset: 0,
+            decoded_size: payload.len() as u32,
+            crc_valid: true,
+            part_crc_verified: true,
+            part_crc: weaver_par2::checksum::crc32(payload),
+            expected_file_crc: Some(weaver_par2::checksum::crc32(payload)),
+            data: DecodedChunk::from(payload.to_vec()),
+            yenc_name: filename.to_string(),
+        })
+        .await;
+
+    let drained_events = drain_job_events(&mut events, job_id);
+    assert!(drained_events.iter().any(|event| matches!(
+        event,
+        PipelineEvent::FileComplete { total_bytes, .. } if *total_bytes == payload.len() as u64
+    )));
+    let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
+    assert_eq!(
+        hashes.get(&0).copied(),
+        Some(weaver_par2::checksum::md5(payload))
+    );
+}
+
+#[tokio::test]
 async fn completed_rar_with_par2_metadata_and_verified_yenc_crc_uses_expected_hash() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
