@@ -54,6 +54,10 @@ pub struct TransportReadStats {
     pub cached_plaintext_returns: u64,
     pub s2n_read_calls: u64,
     pub s2n_read_bytes: u64,
+    pub s2n_target_full_returns: u64,
+    pub s2n_pending_empty_returns: u64,
+    pub s2n_pending_after_bytes_returns: u64,
+    pub s2n_zero_returns: u64,
 }
 
 impl TransportReadStats {
@@ -72,6 +76,10 @@ impl TransportReadStats {
         self.cached_plaintext_returns += other.cached_plaintext_returns;
         self.s2n_read_calls += other.s2n_read_calls;
         self.s2n_read_bytes += other.s2n_read_bytes;
+        self.s2n_target_full_returns += other.s2n_target_full_returns;
+        self.s2n_pending_empty_returns += other.s2n_pending_empty_returns;
+        self.s2n_pending_after_bytes_returns += other.s2n_pending_after_bytes_returns;
+        self.s2n_zero_returns += other.s2n_zero_returns;
     }
 }
 
@@ -92,6 +100,7 @@ async fn read_s2n_available_into(
         loop {
             let total = dst.len().saturating_sub(started_len);
             if total >= target_read_size {
+                stats.s2n_target_full_returns += 1;
                 return std::task::Poll::Ready(Ok(total));
             }
 
@@ -101,6 +110,7 @@ async fn read_s2n_available_into(
                 std::task::Poll::Ready(Ok(())) => {
                     let n = read_buf.filled().len();
                     if n == 0 {
+                        stats.s2n_zero_returns += 1;
                         return std::task::Poll::Ready(Ok(total));
                     }
                     unsafe {
@@ -114,9 +124,13 @@ async fn read_s2n_available_into(
                     return std::task::Poll::Ready(Err(error));
                 }
                 std::task::Poll::Pending if total > 0 => {
+                    stats.s2n_pending_after_bytes_returns += 1;
                     return std::task::Poll::Ready(Ok(total));
                 }
-                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Pending => {
+                    stats.s2n_pending_empty_returns += 1;
+                    return std::task::Poll::Pending;
+                }
             }
         }
     })

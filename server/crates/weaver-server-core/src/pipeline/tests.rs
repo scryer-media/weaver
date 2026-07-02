@@ -6473,6 +6473,47 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
 }
 
 #[tokio::test]
+async fn hot_clear_pressure_lane_leases_sequential_runway() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        1,
+    )
+    .await;
+    pipeline.connection_ramp = 1;
+
+    let job_id = JobId(20024);
+    let files = (0..100)
+        .map(|idx| (format!("hot-{idx}.bin"), 512u32))
+        .collect::<Vec<_>>();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Hot Sequential Runway", &files),
+    )
+    .await;
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.hot_dispatch_job, Some(job_id));
+    assert_eq!(pipeline.active_download_connections, 1);
+    assert_eq!(pipeline.active_downloads, 64);
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 36);
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_lane_lease_items_total
+            .load(Ordering::Relaxed),
+        64
+    );
+}
+
+#[tokio::test]
 async fn lane_refill_preserves_same_band_spillover_after_underfill() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(

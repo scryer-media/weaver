@@ -314,6 +314,9 @@ impl Pipeline {
     }
 
     fn should_stream_md5_for_file(&self, file_id: NzbFileId) -> bool {
+        if self.par2_set(file_id.job_id).is_none() {
+            return false;
+        }
         let Some(state) = self.jobs.get(&file_id.job_id) else {
             return true;
         };
@@ -449,6 +452,19 @@ impl Pipeline {
                         );
                         return Ok(CompletedFileChecksum {
                             md5,
+                            crc32: streamed.crc32,
+                        });
+                    }
+                    if expected_file_crc
+                        .is_some_and(|expected_file_crc| streamed.crc32 == expected_file_crc)
+                        && self.par2_set(file_id.job_id).is_none()
+                    {
+                        crate::runtime::perf_probe::record(
+                            "download.file_hash.md5.skipped_no_par2_expected_crc",
+                            std::time::Duration::from_nanos(1),
+                        );
+                        return Ok(CompletedFileChecksum {
+                            md5: [0u8; 16],
                             crc32: streamed.crc32,
                         });
                     }

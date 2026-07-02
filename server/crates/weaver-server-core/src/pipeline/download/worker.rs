@@ -35,6 +35,7 @@ const DOWNLOAD_PRESSURE_SOFT_PERCENT: u64 = 70;
 const SOFT_PRESSURE_DISPATCH_MAX_DELAY: Duration = Duration::from_millis(150);
 const SOFT_PRESSURE_DISPATCH_MIN_DELAY: Duration = Duration::from_millis(1);
 const SAB_BODY_PIPELINE_DEPTH: usize = 2;
+const HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
 const HOT_DISPATCH_WARMUP_MIN_DURATION: Duration = Duration::from_secs(2);
 const HOT_DISPATCH_FORCE_UNDERFILL_AFTER: Duration = Duration::from_secs(5);
 const HOT_DISPATCH_MIN_SUCCESSFUL_PRIMARY_BODIES: u64 = 24;
@@ -1559,7 +1560,7 @@ impl Pipeline {
         first: DownloadWork,
         pressure: DownloadPressure,
     ) -> DownloadBatchLease {
-        let work_limit = Self::download_lane_lease_work_limit(lane_mode, pressure);
+        let work_limit = self.download_lane_lease_work_limit(job_id, lane_mode, pressure);
         let mut works = vec![first];
         while works.len() < work_limit {
             let Some(next) = self.pop_download_work_for_batch(job_id, Some(&compatibility)) else {
@@ -1584,9 +1585,14 @@ impl Pipeline {
     }
 
     fn download_lane_lease_work_limit(
+        &self,
+        job_id: JobId,
         lane_mode: DownloadLaneMode,
-        _pressure: DownloadPressure,
+        pressure: DownloadPressure,
     ) -> usize {
+        if pressure.state == DownloadPressureState::Clear && self.hot_dispatch_job == Some(job_id) {
+            return HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT.max(lane_mode.max_depth());
+        }
         lane_mode.max_depth()
     }
 
@@ -2656,6 +2662,22 @@ impl Pipeline {
                 crate::runtime::perf_probe::record_value(
                     "download.nntp.transport.s2n.read_bytes",
                     io.transport_read.s2n_read_bytes,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.target_full_returns",
+                    io.transport_read.s2n_target_full_returns,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.pending_empty_returns",
+                    io.transport_read.s2n_pending_empty_returns,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.pending_after_bytes_returns",
+                    io.transport_read.s2n_pending_after_bytes_returns,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.zero_returns",
+                    io.transport_read.s2n_zero_returns,
                 );
                 crate::runtime::perf_probe::record_value(
                     "download.nntp.transport.s2n.bytes_per_read_call",
