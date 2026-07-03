@@ -1931,8 +1931,19 @@ impl Pipeline {
         let raw_size = raw.len() as u64;
         let metrics = Arc::clone(&self.metrics);
         metrics.note_decode_task_started(raw_size);
+        let queued_at = Instant::now();
+        crate::runtime::perf_probe::record_value("download.decode.spawn_blocking.submitted", 1);
+        crate::runtime::perf_probe::record_value(
+            "download.decode.spawn_blocking.raw_bytes",
+            raw_size,
+        );
 
         tokio::task::spawn_blocking(move || {
+            let task_entered = Instant::now();
+            crate::runtime::perf_probe::record(
+                "download.decode.spawn_blocking.queue_wait",
+                task_entered.duration_since(queued_at),
+            );
             crate::runtime::perf_probe::record(
                 "download.decode.task.enter",
                 Duration::from_nanos(1),
@@ -1946,6 +1957,7 @@ impl Pipeline {
                     crate::runtime::perf_probe::scope("download.decode.send_failure");
                 let _cpu_scope =
                     crate::runtime::perf_probe::cpu_scope("download.decode.send_failure");
+                let send_started = Instant::now();
                 let _ = tx.blocking_send(DecodeDone::Failed {
                     segment_id,
                     raw_size,
@@ -1953,6 +1965,10 @@ impl Pipeline {
                     source_server_idx,
                     exclude_servers: exclude_servers.clone(),
                 });
+                crate::runtime::perf_probe::record(
+                    "download.decode.done_channel.blocking_send",
+                    send_started.elapsed(),
+                );
             };
 
             if let Some(mut output) = output {
@@ -1993,6 +2009,7 @@ impl Pipeline {
                             crate::runtime::perf_probe::scope("download.decode.send_success");
                         let _cpu_scope =
                             crate::runtime::perf_probe::cpu_scope("download.decode.send_success");
+                        let send_started = Instant::now();
                         let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
                             segment_id,
                             raw_size,
@@ -2006,6 +2023,10 @@ impl Pipeline {
                             data: decoded,
                             yenc_name: decode_result.metadata.name,
                         }));
+                        crate::runtime::perf_probe::record(
+                            "download.decode.done_channel.blocking_send",
+                            send_started.elapsed(),
+                        );
                     }
                     Err(e) => {
                         if let weaver_yenc::YencError::CrcMismatch { .. } = &e {
@@ -2045,6 +2066,7 @@ impl Pipeline {
                             crate::runtime::perf_probe::scope("download.decode.send_success");
                         let _cpu_scope =
                             crate::runtime::perf_probe::cpu_scope("download.decode.send_success");
+                        let send_started = Instant::now();
                         let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
                             segment_id,
                             raw_size,
@@ -2058,6 +2080,10 @@ impl Pipeline {
                             data: DecodedChunk::from(output),
                             yenc_name: decode_result.metadata.name,
                         }));
+                        crate::runtime::perf_probe::record(
+                            "download.decode.done_channel.blocking_send",
+                            send_started.elapsed(),
+                        );
                     }
                     Err(e) => {
                         if let weaver_yenc::YencError::CrcMismatch { .. } = &e {

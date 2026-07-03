@@ -566,6 +566,10 @@ impl Pipeline {
                         self.handle_ip_replacement_trial_event(event);
                     }
                     Some(result) = self.decode_done_rx.recv() => {
+                        crate::runtime::perf_probe::record(
+                            "download.decode.done_rx.received",
+                            std::time::Duration::from_nanos(1),
+                        );
                         self.handle_decode_done(result).await;
                     }
                     Some(update) = self.probe_result_rx.recv() => {
@@ -864,8 +868,14 @@ pub(crate) async fn write_segment_to_disk(
 ) -> Result<BufferedDecodedSegment, std::io::Error> {
     let path = path.to_owned();
     let started = Instant::now();
+    let queued_at = started;
+    crate::runtime::perf_probe::record_value("download.disk_write.spawn_blocking.submitted", 1);
     let result = tokio::task::spawn_blocking(move || {
         let task_started = Instant::now();
+        crate::runtime::perf_probe::record(
+            "download.disk_write.spawn_blocking.queue_wait",
+            task_started.duration_since(queued_at),
+        );
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.disk_write.task");
         crate::runtime::affinity::pin_current_thread_for_hot_download_path();
 
@@ -899,8 +909,14 @@ pub(crate) async fn write_segments_to_disk(
 ) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
     let path = path.to_owned();
     let started = Instant::now();
+    let queued_at = started;
+    crate::runtime::perf_probe::record_value("download.disk_write.spawn_blocking.submitted", 1);
     let result = tokio::task::spawn_blocking(move || {
         let task_started = Instant::now();
+        crate::runtime::perf_probe::record(
+            "download.disk_write.spawn_blocking.queue_wait",
+            task_started.duration_since(queued_at),
+        );
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.disk_write.task");
         crate::runtime::affinity::pin_current_thread_for_hot_download_path();
 

@@ -1153,6 +1153,14 @@ impl Pipeline {
         let write_start = Instant::now();
         let ready_bytes = ready.iter().map(|(_, segment)| segment.len_bytes()).sum();
         let ready_count = ready.len();
+        crate::runtime::perf_probe::record_value(
+            "download.persist_ready_segments.batch_count",
+            ready_count as u64,
+        );
+        crate::runtime::perf_probe::record_value(
+            "download.persist_ready_segments.batch_bytes",
+            ready_bytes as u64,
+        );
         let write_result = write_segments_to_disk(&file_path, ready).await;
         self.release_write_buffered(ready_bytes, ready_count);
 
@@ -1265,6 +1273,14 @@ impl Pipeline {
             std::time::Duration::from_nanos(1),
         );
         let segment_bytes = segment.len_bytes();
+        crate::runtime::perf_probe::record_value(
+            "download.persist_out_of_order_segment.batch_count",
+            1,
+        );
+        crate::runtime::perf_probe::record_value(
+            "download.persist_out_of_order_segment.batch_bytes",
+            segment_bytes as u64,
+        );
         let Some((_job_id, filename, _working_dir, file_path)) =
             self.write_target_for_file(file_id)
         else {
