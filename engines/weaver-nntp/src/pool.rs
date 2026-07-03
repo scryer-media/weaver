@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
@@ -44,6 +45,10 @@ pub struct NntpPool {
     max_connections: Vec<usize>,
     retired_ips: Arc<Mutex<HashSet<(usize, IpAddr)>>>,
     connect_cursors: Vec<AtomicUsize>,
+}
+
+pub struct BlockingConnectionPermit {
+    _permit: OwnedSemaphorePermit,
 }
 
 /// Configuration for creating an NNTP pool.
@@ -467,6 +472,45 @@ impl NntpPool {
     /// Server configurations (parallel to health tracker indices).
     pub fn server_configs(&self) -> &[ServerConfig] {
         &self.configs
+    }
+
+    pub fn try_acquire_blocking_permit(
+        &self,
+        server: ServerId,
+    ) -> Result<BlockingConnectionPermit> {
+        let idx = server.0;
+        if idx >= self.semaphores.len() {
+            return Err(NntpError::PoolExhausted);
+        }
+        let permit = self.semaphores[idx]
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| NntpError::TooManyConnections)?;
+        Ok(BlockingConnectionPermit { _permit: permit })
+    }
+
+    pub fn blocking_connect_plan(
+        &self,
+        server: ServerId,
+        excluded_ips: &[IpAddr],
+    ) -> Result<(ServerConfig, Vec<IpAddr>, usize)> {
+        let idx = server.0;
+        if idx >= self.configs.len() {
+            return Err(NntpError::PoolExhausted);
+        }
+        let mut exclusions = Vec::new();
+        if let Ok(retired) = self.retired_ips.try_lock() {
+            exclusions.extend(
+                retired
+                    .iter()
+                    .filter_map(|(server_idx, ip)| (*server_idx == idx).then_some(*ip)),
+            );
+        }
+        exclusions.extend(excluded_ips.iter().copied());
+        exclusions.sort_unstable();
+        exclusions.dedup();
+        let offset = self.next_connect_offset(idx);
+        Ok((self.configs[idx].clone(), exclusions, offset))
     }
 
     /// Returns `(available_permits, max_connections)` for the given server.

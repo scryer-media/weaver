@@ -133,6 +133,34 @@ impl Pipeline {
             .update_decoded_chunk(data, part_crc, part_crc_verified, track_md5);
     }
 
+    fn note_file_hash_crc_metadata(
+        &mut self,
+        file_id: NzbFileId,
+        file_offset: u64,
+        len: usize,
+        part_crc: u32,
+        part_crc_verified: bool,
+    ) {
+        if len == 0 {
+            return;
+        }
+
+        let expected_offset = self
+            .file_hash_states
+            .get(&file_id)
+            .map(|state| state.bytes_fed())
+            .unwrap_or(0);
+        if expected_offset != file_offset {
+            self.mark_file_hash_reread_required_for(file_id, "offset_mismatch");
+            return;
+        }
+
+        self.file_hash_states
+            .entry(file_id)
+            .or_default()
+            .update_crc_metadata(len as u64, part_crc, part_crc_verified);
+    }
+
     fn should_use_completed_file_crc_metadata(&self, file_id: NzbFileId) -> bool {
         self.can_defer_completed_file_md5(file_id)
             && self.expected_file_crcs.contains_key(&file_id)
@@ -146,6 +174,7 @@ impl Pipeline {
         len: usize,
         part_crc: u32,
         part_crc_verified: bool,
+        source: DeferredFileHashRangeSource,
     ) {
         self.deferred_file_hash_ranges
             .entry(file_id)
@@ -156,6 +185,7 @@ impl Pipeline {
                     len,
                     part_crc,
                     part_crc_verified,
+                    source,
                 },
             );
     }
@@ -176,7 +206,14 @@ impl Pipeline {
             "download.file_hash.deferred_range",
             std::time::Duration::from_nanos(1),
         );
-        self.note_deferred_file_hash_range(file_id, file_offset, len, part_crc, part_crc_verified);
+        self.note_deferred_file_hash_range(
+            file_id,
+            file_offset,
+            len,
+            part_crc,
+            part_crc_verified,
+            DeferredFileHashRangeSource::DecodedData,
+        );
 
         if self.deferred_file_hash_data_bytes.saturating_add(len)
             <= MAX_DEFERRED_FILE_HASH_DATA_BYTES
@@ -226,7 +263,14 @@ impl Pipeline {
             "download.file_hash.deferred_crc_metadata",
             std::time::Duration::from_nanos(1),
         );
-        self.note_deferred_file_hash_range(file_id, file_offset, len, part_crc, part_crc_verified);
+        self.note_deferred_file_hash_range(
+            file_id,
+            file_offset,
+            len,
+            part_crc,
+            part_crc_verified,
+            DeferredFileHashRangeSource::CrcMetadata,
+        );
     }
 
     fn take_deferred_file_hash_data(
@@ -263,7 +307,7 @@ impl Pipeline {
             self.deferred_file_hash_data_bytes.saturating_sub(removed);
     }
 
-    async fn drain_deferred_file_hash_ranges(
+    pub(in crate::pipeline) async fn drain_deferred_file_hash_ranges(
         &mut self,
         file_id: NzbFileId,
         file_path: &std::path::Path,
@@ -286,6 +330,12 @@ impl Pipeline {
                 return;
             };
             let len = range.len;
+            let read_fallback_bucket = range.source.read_fallback_bucket();
+            let read_fallback_bytes_bucket = range.source.read_fallback_bytes_bucket();
+            let metadata_replay_bucket = range.source.metadata_replay_bucket();
+            let metadata_replay_bytes_bucket = range.source.metadata_replay_bytes_bucket();
+            let part_crc = range.part_crc;
+            let part_crc_verified = range.part_crc_verified;
 
             if let Some(ranges) = self.deferred_file_hash_ranges.get_mut(&file_id) {
                 ranges.remove(&expected_offset);
@@ -317,6 +367,31 @@ impl Pipeline {
                 continue;
             }
 
+            if part_crc_verified && !self.should_stream_md5_for_file(file_id) {
+                crate::runtime::perf_probe::record(
+                    "download.file_hash.deferred_crc_metadata_replayed",
+                    std::time::Duration::from_nanos(1),
+                );
+                crate::runtime::perf_probe::record(
+                    metadata_replay_bucket,
+                    std::time::Duration::from_nanos(1),
+                );
+                crate::runtime::perf_probe::record_value(metadata_replay_bytes_bucket, len as u64);
+                self.note_file_hash_crc_metadata(
+                    file_id,
+                    expected_offset,
+                    len,
+                    part_crc,
+                    part_crc_verified,
+                );
+                continue;
+            }
+
+            crate::runtime::perf_probe::record(
+                read_fallback_bucket,
+                std::time::Duration::from_nanos(1),
+            );
+            crate::runtime::perf_probe::record_value(read_fallback_bytes_bucket, len as u64);
             let path = file_path.to_path_buf();
             let read_result = tokio::task::spawn_blocking(move || {
                 let _cpu_scope =
@@ -1424,13 +1499,15 @@ impl Pipeline {
                 let use_crc_metadata = self.should_use_completed_file_crc_metadata(file_id);
                 match hash_mode {
                     SegmentHashMode::UpdateNow if use_crc_metadata => {
+                        let decoded_len = data.len_bytes();
                         self.defer_file_hash_crc_metadata(
                             file_id,
                             file_offset,
-                            data.len_bytes(),
+                            decoded_len,
                             part_crc,
                             part_crc_verified,
                         );
+                        drop(data);
                     }
                     SegmentHashMode::UpdateNow => {
                         self.drain_deferred_file_hash_ranges(file_id, file_path)
@@ -1444,15 +1521,18 @@ impl Pipeline {
                         );
                         self.drain_deferred_file_hash_ranges(file_id, file_path)
                             .await;
+                        drop(data);
                     }
                     SegmentHashMode::DeferRange if use_crc_metadata => {
+                        let decoded_len = data.len_bytes();
                         self.defer_file_hash_crc_metadata(
                             file_id,
                             file_offset,
-                            data.len_bytes(),
+                            decoded_len,
                             part_crc,
                             part_crc_verified,
                         );
+                        drop(data);
                     }
                     SegmentHashMode::DeferRange => {
                         self.defer_file_hash_chunk(

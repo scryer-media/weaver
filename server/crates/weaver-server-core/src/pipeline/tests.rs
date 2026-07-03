@@ -5567,11 +5567,23 @@ async fn dispatch_downloads_waits_for_downstream_work_when_restart_durable_lead_
     pipeline
         .persisted_file_progress
         .insert(file_id, durable_lead_limit);
+    pipeline.active_decodes_by_job.remove(&job_id);
+    pipeline.note_released_download_result_pending(job_id, 768 * 1024);
 
     assert!(pipeline.primary_download_within_restart_durable_lead(job_id, &next_work));
-    pipeline
-        .download_restart_durable_lead_retry_after
-        .insert(job_id, Instant::now() - Duration::from_millis(1));
+    assert_eq!(
+        pipeline
+            .pending_released_download_result_bytes_by_job
+            .get(&job_id)
+            .copied(),
+        Some(768 * 1024)
+    );
+    assert!(
+        pipeline
+            .download_restart_durable_lead_retry_after
+            .get(&job_id)
+            .is_some_and(|ready_at| *ready_at > Instant::now())
+    );
     pipeline.dispatch_downloads();
 
     assert!(pipeline.active_downloads > 0);
@@ -6876,7 +6888,7 @@ async fn released_download_result_fences_completion_until_processed() {
     };
 
     assert!(!pipeline.job_has_pending_download_pipeline_work(job_id));
-    pipeline.note_released_download_result_pending(job_id);
+    pipeline.note_released_download_result_pending(job_id, b"discarded".len() as u64);
     assert!(pipeline.job_has_pending_download_pipeline_work(job_id));
 
     pipeline
@@ -6894,6 +6906,62 @@ async fn released_download_result_fences_completion_until_processed() {
         .await;
 
     assert!(!pipeline.job_has_pending_download_pipeline_work(job_id));
+}
+
+#[tokio::test]
+async fn owned_download_lane_batch_event_releases_and_acks_results() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20024);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+
+    pipeline.active_downloads = 1;
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline
+        .active_downloads_by_file
+        .insert(segment_id.file_id, 1);
+
+    let (ack, ack_rx) = std::sync::mpsc::sync_channel(1);
+    let mut pending = VecDeque::new();
+    pipeline.handle_owned_download_lane_event(
+        OwnedDownloadLaneEvent::BatchComplete {
+            results: vec![DownloadResult {
+                segment_id,
+                data: Ok(DownloadPayload::Raw(Bytes::from_static(b"owned"))),
+                attempts: vec![],
+                lane_observation: None,
+                source_server_idx: None,
+                origin: DownloadResultOrigin::NormalPrimary,
+                retry_count: 0,
+                exclude_servers: vec![],
+                release_connection_slot: false,
+            }],
+            stats: weaver_nntp::blocking::BlockingLaneStats::default(),
+            ack,
+        },
+        &mut pending,
+    );
+
+    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.active_downloads_by_job.get(&job_id), None);
+    assert_eq!(
+        pipeline.active_downloads_by_file.get(&segment_id.file_id),
+        None
+    );
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pipeline
+            .pending_released_download_results_by_job
+            .get(&job_id),
+        Some(&1)
+    );
+    assert!(ack_rx.try_recv().is_ok());
 }
 
 #[test]
@@ -8493,6 +8561,54 @@ fn completed_file_checksum_combines_batched_decoded_crc_once() {
 }
 
 #[tokio::test]
+async fn deferred_decoded_data_hash_range_replays_verified_crc_metadata_without_reread() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20023);
+    let filename = "payload.bin";
+    let payload = b"abcdefgh";
+    let spec = standalone_job_spec(
+        "Verified Decoded Data Deferred Hash",
+        &[(filename.to_string(), payload.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    pipeline
+        .deferred_file_hash_ranges
+        .entry(file_id)
+        .or_default()
+        .insert(
+            0,
+            DeferredFileHashRange {
+                len: payload.len(),
+                part_crc: weaver_par2::checksum::crc32(payload),
+                part_crc_verified: true,
+                source: DeferredFileHashRangeSource::DecodedData,
+            },
+        );
+
+    let missing_path = temp_dir.path().join("missing-payload.bin");
+    pipeline
+        .drain_deferred_file_hash_ranges(file_id, &missing_path)
+        .await;
+
+    let state = pipeline
+        .file_hash_states
+        .get(&file_id)
+        .expect("verified metadata should advance file hash state");
+    assert_eq!(state.bytes_fed(), payload.len() as u64);
+    assert_eq!(state.crc32(), weaver_par2::checksum::crc32(payload));
+    assert!(state.all_parts_crc_verified());
+    assert!(!state.tracks_md5());
+    assert!(!pipeline.deferred_file_hash_ranges.contains_key(&file_id));
+    assert!(!pipeline.file_hash_reread_required.contains(&file_id));
+}
+
+#[tokio::test]
 async fn completed_standalone_verified_yenc_crc_skips_deferred_hash_replay() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -8519,6 +8635,7 @@ async fn completed_standalone_verified_yenc_crc_skips_deferred_hash_replay() {
                 len: 4,
                 part_crc: weaver_par2::checksum::crc32(&payload[0..4]),
                 part_crc_verified: true,
+                source: DeferredFileHashRangeSource::CrcMetadata,
             },
         );
     pipeline
@@ -8531,6 +8648,7 @@ async fn completed_standalone_verified_yenc_crc_skips_deferred_hash_replay() {
                 len: 4,
                 part_crc: weaver_par2::checksum::crc32(&payload[4..8]),
                 part_crc_verified: true,
+                source: DeferredFileHashRangeSource::CrcMetadata,
             },
         );
 
@@ -8580,6 +8698,7 @@ async fn completed_standalone_deferred_crc_metadata_uses_actual_crc() {
                 len: 4,
                 part_crc: weaver_par2::checksum::crc32(&payload[0..4]),
                 part_crc_verified: true,
+                source: DeferredFileHashRangeSource::CrcMetadata,
             },
         );
     pipeline
@@ -8592,6 +8711,7 @@ async fn completed_standalone_deferred_crc_metadata_uses_actual_crc() {
                 len: 4,
                 part_crc: weaver_par2::checksum::crc32(&payload[4..8]),
                 part_crc_verified: false,
+                source: DeferredFileHashRangeSource::CrcMetadata,
             },
         );
 
@@ -15399,7 +15519,7 @@ async fn direct_payload_par2_repair_fails_when_recovery_is_insufficient() {
         ],
     );
 
-    pipeline.note_released_download_result_pending(job_id);
+    pipeline.note_released_download_result_pending(job_id, 512);
     pipeline.check_job_completion(job_id).await;
 
     assert!(
@@ -15410,7 +15530,7 @@ async fn direct_payload_par2_repair_fails_when_recovery_is_insufficient() {
         "pending released download results must defer PAR2 fail-fast"
     );
 
-    pipeline.finish_released_download_result_processing(job_id);
+    pipeline.finish_released_download_result_processing(job_id, 512);
     pipeline.check_job_completion(job_id).await;
 
     let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) else {

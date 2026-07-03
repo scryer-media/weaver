@@ -1439,17 +1439,68 @@ unsafe fn decode_kernel_neon(
     preserve_pending: bool,
     search_end: bool,
 ) -> Result<KernelOutcome, YencError> {
-    unsafe {
-        decode_kernel_simd64(
-            input,
-            output,
-            state,
-            dot_unstuffing,
-            preserve_pending,
-            search_end,
-            try_decode_neon_block,
-        )
+    const WIDTH: usize = 64;
+
+    let mut src = 0usize;
+    let mut dst = 0usize;
+    let mode = DecodeStepMode {
+        dot_unstuffing,
+        preserve_pending,
+        search_end,
+    };
+
+    // Match rapidyenc's long-span shape on AArch64: set up constants once,
+    // then stay inside the NEON loop until scalar boundary handling is needed.
+    let tail_buffer = if dot_unstuffing {
+        WIDTH - 1 + 4
+    } else {
+        WIDTH - 1
+    };
+    let simd_limit = input.len().saturating_sub(tail_buffer);
+
+    if input.len() > WIDTH * 2 {
+        let constants = unsafe { Neon64Constants::new() };
+        while (!search_end || state.end == DecodeEnd::None) && src + WIDTH <= simd_limit {
+            if !matches!(state.state, DecoderState::None | DecoderState::CrLf)
+                || output.len().saturating_sub(dst) < WIDTH
+            {
+                if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+                    break;
+                }
+                continue;
+            }
+
+            if unsafe {
+                decode_neon64_span_block(
+                    input,
+                    &mut src,
+                    output,
+                    &mut dst,
+                    state,
+                    dot_unstuffing,
+                    &constants,
+                )?
+            } {
+                continue;
+            }
+
+            if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+                break;
+            }
+        }
     }
+
+    while (!search_end || state.end == DecodeEnd::None) && src < input.len() {
+        if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+            break;
+        }
+    }
+
+    Ok(KernelOutcome {
+        consumed: src,
+        written: dst,
+        end: state.end.into(),
+    })
 }
 
 #[cfg(all(target_arch = "arm", target_feature = "neon"))]
@@ -1474,7 +1525,7 @@ unsafe fn decode_kernel_arm_neon(
     }
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 type DecodeBlock64 = unsafe fn(
     &[u8],
     usize,
@@ -1484,7 +1535,7 @@ type DecodeBlock64 = unsafe fn(
     bool,
 ) -> Result<Option<usize>, YencError>;
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 unsafe fn decode_kernel_simd64(
     input: &[u8],
     output: &mut [u8],
@@ -1725,52 +1776,86 @@ unsafe fn try_decode_arm_neon_block(
 }
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn try_decode_neon_block(
+#[derive(Clone, Copy)]
+struct Neon64Constants {
+    eq: std::arch::aarch64::uint8x16_t,
+    cr: std::arch::aarch64::uint8x16_t,
+    lf: std::arch::aarch64::uint8x16_t,
+    dot: std::arch::aarch64::uint8x16_t,
+    bit_weights: std::arch::aarch64::uint8x16_t,
+    selector: std::arch::aarch64::uint8x16_t,
+    normal_offset: std::arch::aarch64::uint8x16_t,
+    escaped_offset: std::arch::aarch64::uint8x16_t,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Neon64Constants {
+    #[inline(always)]
+    unsafe fn new() -> Self {
+        use std::arch::aarch64::*;
+
+        Self {
+            eq: unsafe { vdupq_n_u8(b'=') },
+            cr: unsafe { vdupq_n_u8(b'\r') },
+            lf: unsafe { vdupq_n_u8(b'\n') },
+            dot: unsafe { vdupq_n_u8(b'.') },
+            bit_weights: unsafe {
+                vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr())
+            },
+            selector: unsafe {
+                vld1q_u8([0u8, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1].as_ptr())
+            },
+            normal_offset: unsafe { vdupq_n_u8(42) },
+            escaped_offset: unsafe { vdupq_n_u8(106) },
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn decode_neon64_span_block(
     input: &[u8],
-    src: usize,
+    src: &mut usize,
     output: &mut [u8],
     dst: &mut usize,
     state: &mut KernelState,
     dot_unstuffing: bool,
-) -> Result<Option<usize>, YencError> {
+    constants: &Neon64Constants,
+) -> Result<bool, YencError> {
     use std::arch::aarch64::*;
 
-    if input.len().saturating_sub(src) < 64 || output.len().saturating_sub(*dst) < 64 {
-        return Ok(None);
-    }
+    let block_src = *src;
+    debug_assert!(input.len().saturating_sub(block_src) >= 64);
+    debug_assert!(output.len().saturating_sub(*dst) >= 64);
 
-    if !matches!(state.state, DecoderState::None | DecoderState::CrLf) {
-        return Ok(None);
-    }
-
-    let a = unsafe { vld1q_u8(input.as_ptr().add(src)) };
-    let b = unsafe { vld1q_u8(input.as_ptr().add(src + 16)) };
-    let c = unsafe { vld1q_u8(input.as_ptr().add(src + 32)) };
-    let d = unsafe { vld1q_u8(input.as_ptr().add(src + 48)) };
-    let eq_a = unsafe { vceqq_u8(a, vdupq_n_u8(b'=')) };
-    let eq_b = unsafe { vceqq_u8(b, vdupq_n_u8(b'=')) };
-    let eq_c = unsafe { vceqq_u8(c, vdupq_n_u8(b'=')) };
-    let eq_d = unsafe { vceqq_u8(d, vdupq_n_u8(b'=')) };
-    let cr_a = unsafe { vceqq_u8(a, vdupq_n_u8(b'\r')) };
-    let cr_b = unsafe { vceqq_u8(b, vdupq_n_u8(b'\r')) };
-    let cr_c = unsafe { vceqq_u8(c, vdupq_n_u8(b'\r')) };
-    let cr_d = unsafe { vceqq_u8(d, vdupq_n_u8(b'\r')) };
-    let lf_a = unsafe { vceqq_u8(a, vdupq_n_u8(b'\n')) };
-    let lf_b = unsafe { vceqq_u8(b, vdupq_n_u8(b'\n')) };
-    let lf_c = unsafe { vceqq_u8(c, vdupq_n_u8(b'\n')) };
-    let lf_d = unsafe { vceqq_u8(d, vdupq_n_u8(b'\n')) };
-    let dot_a = unsafe { vceqq_u8(a, vdupq_n_u8(b'.')) };
-    let dot_b = unsafe { vceqq_u8(b, vdupq_n_u8(b'.')) };
-    let dot_c = unsafe { vceqq_u8(c, vdupq_n_u8(b'.')) };
-    let dot_d = unsafe { vceqq_u8(d, vdupq_n_u8(b'.')) };
-    let eq = unsafe { neon_compare_mask64([eq_a, eq_b, eq_c, eq_d]) };
-    let cr = unsafe { neon_compare_mask64([cr_a, cr_b, cr_c, cr_d]) };
-    let lf = unsafe { neon_compare_mask64([lf_a, lf_b, lf_c, lf_d]) };
-    let dot = unsafe { neon_compare_mask64([dot_a, dot_b, dot_c, dot_d]) };
+    let a = unsafe { vld1q_u8(input.as_ptr().add(block_src)) };
+    let b = unsafe { vld1q_u8(input.as_ptr().add(block_src + 16)) };
+    let c = unsafe { vld1q_u8(input.as_ptr().add(block_src + 32)) };
+    let d = unsafe { vld1q_u8(input.as_ptr().add(block_src + 48)) };
+    let eq_a = unsafe { vceqq_u8(a, constants.eq) };
+    let eq_b = unsafe { vceqq_u8(b, constants.eq) };
+    let eq_c = unsafe { vceqq_u8(c, constants.eq) };
+    let eq_d = unsafe { vceqq_u8(d, constants.eq) };
+    let cr_a = unsafe { vceqq_u8(a, constants.cr) };
+    let cr_b = unsafe { vceqq_u8(b, constants.cr) };
+    let cr_c = unsafe { vceqq_u8(c, constants.cr) };
+    let cr_d = unsafe { vceqq_u8(d, constants.cr) };
+    let lf_a = unsafe { vceqq_u8(a, constants.lf) };
+    let lf_b = unsafe { vceqq_u8(b, constants.lf) };
+    let lf_c = unsafe { vceqq_u8(c, constants.lf) };
+    let lf_d = unsafe { vceqq_u8(d, constants.lf) };
+    let dot_a = unsafe { vceqq_u8(a, constants.dot) };
+    let dot_b = unsafe { vceqq_u8(b, constants.dot) };
+    let dot_c = unsafe { vceqq_u8(c, constants.dot) };
+    let dot_d = unsafe { vceqq_u8(d, constants.dot) };
+    let eq = unsafe { neon_compare_mask64([eq_a, eq_b, eq_c, eq_d], constants.bit_weights) };
+    let cr = unsafe { neon_compare_mask64([cr_a, cr_b, cr_c, cr_d], constants.bit_weights) };
+    let lf = unsafe { neon_compare_mask64([lf_a, lf_b, lf_c, lf_d], constants.bit_weights) };
+    let dot = unsafe { neon_compare_mask64([dot_a, dot_b, dot_c, dot_d], constants.bit_weights) };
 
     let fixed_eq = fix_eq_mask(eq, eq << 1);
     if fixed_eq & (1u64 << 63) != 0 {
-        return Ok(None);
+        return Ok(false);
     }
 
     let escaped = fixed_eq << 1;
@@ -1790,33 +1875,45 @@ unsafe fn try_decode_neon_block(
     };
 
     if dot_start & (1u64 << 63) != 0 {
-        return Ok(None);
+        return Ok(false);
     }
 
     let dot_before_break = dot_start & (raw_breaks >> 1);
     let dot_before_eq = dot_start & (eq >> 1);
     let line_start_eq = if dot_unstuffing { eq & line_start } else { 0 };
     if dot_before_break != 0 || dot_before_eq != 0 || line_start_eq != 0 {
-        return Ok(None);
+        return Ok(false);
     }
 
     let skip = fixed_eq | raw_breaks | dot_start;
-    let sub42 = unsafe { vdupq_n_u8(42u8.wrapping_neg()) };
 
     if skip == 0 {
         unsafe {
-            vst1q_u8(output.as_mut_ptr().add(*dst), vaddq_u8(a, sub42));
-            vst1q_u8(output.as_mut_ptr().add(*dst + 16), vaddq_u8(b, sub42));
-            vst1q_u8(output.as_mut_ptr().add(*dst + 32), vaddq_u8(c, sub42));
-            vst1q_u8(output.as_mut_ptr().add(*dst + 48), vaddq_u8(d, sub42));
+            vst1q_u8(
+                output.as_mut_ptr().add(*dst),
+                vsubq_u8(a, constants.normal_offset),
+            );
+            vst1q_u8(
+                output.as_mut_ptr().add(*dst + 16),
+                vsubq_u8(b, constants.normal_offset),
+            );
+            vst1q_u8(
+                output.as_mut_ptr().add(*dst + 32),
+                vsubq_u8(c, constants.normal_offset),
+            );
+            vst1q_u8(
+                output.as_mut_ptr().add(*dst + 48),
+                vsubq_u8(d, constants.normal_offset),
+            );
         }
+        *src += 64;
         *dst += 64;
         state.state = DecoderState::None;
-        return Ok(Some(64));
+        return Ok(true);
     }
 
     let [decoded_a, decoded_b, decoded_c, decoded_d] =
-        unsafe { neon_decode_with_escape_mask([a, b, c, d], escaped) };
+        unsafe { neon_decode_with_escape_mask([a, b, c, d], escaped, constants) };
 
     unsafe { compact_store_16(decoded_a, (skip & 0xffff) as u16, output, dst)? };
     unsafe { compact_store_16(decoded_b, ((skip >> 16) & 0xffff) as u16, output, dst)? };
@@ -1824,7 +1921,8 @@ unsafe fn try_decode_neon_block(
     unsafe { compact_store_16(decoded_d, ((skip >> 48) & 0xffff) as u16, output, dst)? };
 
     state.state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
-    Ok(Some(64))
+    *src += 64;
+    Ok(true)
 }
 
 #[cfg(all(target_arch = "arm", target_feature = "neon"))]
@@ -1873,11 +1971,13 @@ unsafe fn arm_neon_decode_with_escape_mask(
 
 #[cfg(target_arch = "aarch64")]
 // Ported from rapidyenc NEON64's pairwise compare-mask packing.
-unsafe fn neon_compare_mask64(vectors: [std::arch::aarch64::uint8x16_t; 4]) -> u64 {
+#[inline(always)]
+unsafe fn neon_compare_mask64(
+    vectors: [std::arch::aarch64::uint8x16_t; 4],
+    bit_weights: std::arch::aarch64::uint8x16_t,
+) -> u64 {
     use std::arch::aarch64::*;
 
-    let bit_weights =
-        unsafe { vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr()) };
     let merge = unsafe {
         vpaddq_u8(
             vpaddq_u8(
@@ -1896,31 +1996,48 @@ unsafe fn neon_compare_mask64(vectors: [std::arch::aarch64::uint8x16_t; 4]) -> u
 
 #[cfg(target_arch = "aarch64")]
 // Ported from rapidyenc NEON64's maskEqTemp/vqtbl escaped-byte offset path.
+#[inline(always)]
 unsafe fn neon_decode_with_escape_mask(
     vectors: [std::arch::aarch64::uint8x16_t; 4],
     escaped: u64,
+    constants: &Neon64Constants,
 ) -> [std::arch::aarch64::uint8x16_t; 4] {
     use std::arch::aarch64::*;
 
-    let selector = unsafe { vld1q_u8([0u8, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1].as_ptr()) };
-    let bit_weights =
-        unsafe { vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr()) };
-    let normal = unsafe { vdupq_n_u8(42) };
-    let escaped_offset = unsafe { vdupq_n_u8(106) };
     let mut mask = unsafe { vreinterpretq_u8_u64(vdupq_n_u64(escaped)) };
-    let mask_a = unsafe { vtstq_u8(vqtbl1q_u8(mask, selector), bit_weights) };
+    let mask_a = unsafe { vtstq_u8(vqtbl1q_u8(mask, constants.selector), constants.bit_weights) };
     mask = unsafe { vextq_u8::<2>(mask, mask) };
-    let mask_b = unsafe { vtstq_u8(vqtbl1q_u8(mask, selector), bit_weights) };
+    let mask_b = unsafe { vtstq_u8(vqtbl1q_u8(mask, constants.selector), constants.bit_weights) };
     mask = unsafe { vextq_u8::<2>(mask, mask) };
-    let mask_c = unsafe { vtstq_u8(vqtbl1q_u8(mask, selector), bit_weights) };
+    let mask_c = unsafe { vtstq_u8(vqtbl1q_u8(mask, constants.selector), constants.bit_weights) };
     mask = unsafe { vextq_u8::<2>(mask, mask) };
-    let mask_d = unsafe { vtstq_u8(vqtbl1q_u8(mask, selector), bit_weights) };
+    let mask_d = unsafe { vtstq_u8(vqtbl1q_u8(mask, constants.selector), constants.bit_weights) };
 
     [
-        unsafe { vsubq_u8(vectors[0], vbslq_u8(mask_a, escaped_offset, normal)) },
-        unsafe { vsubq_u8(vectors[1], vbslq_u8(mask_b, escaped_offset, normal)) },
-        unsafe { vsubq_u8(vectors[2], vbslq_u8(mask_c, escaped_offset, normal)) },
-        unsafe { vsubq_u8(vectors[3], vbslq_u8(mask_d, escaped_offset, normal)) },
+        unsafe {
+            vsubq_u8(
+                vectors[0],
+                vbslq_u8(mask_a, constants.escaped_offset, constants.normal_offset),
+            )
+        },
+        unsafe {
+            vsubq_u8(
+                vectors[1],
+                vbslq_u8(mask_b, constants.escaped_offset, constants.normal_offset),
+            )
+        },
+        unsafe {
+            vsubq_u8(
+                vectors[2],
+                vbslq_u8(mask_c, constants.escaped_offset, constants.normal_offset),
+            )
+        },
+        unsafe {
+            vsubq_u8(
+                vectors[3],
+                vbslq_u8(mask_d, constants.escaped_offset, constants.normal_offset),
+            )
+        },
     ]
 }
 
@@ -2614,7 +2731,7 @@ mod tests {
         let mut output = vec![0u8; input.len() + 64];
         let mut state = KernelState {
             state: initial_state,
-            end: DecodeEnd::None,
+            ..KernelState::body()
         };
         let outcome =
             decode_kernel_scalar(input, &mut output, &mut state, dot_unstuffing, false, true)
@@ -2633,7 +2750,7 @@ mod tests {
         let mut dst = 0usize;
         let mut state = KernelState {
             state: initial_state,
-            end: DecodeEnd::None,
+            ..KernelState::body()
         };
         let consumed = unsafe {
             try_decode_sse2_block(input, 0, &mut output, &mut dst, &mut state, dot_unstuffing)
@@ -2658,7 +2775,7 @@ mod tests {
         let mut dst = 0usize;
         let mut state = KernelState {
             state: initial_state,
-            end: DecodeEnd::None,
+            ..KernelState::body()
         };
         let consumed = unsafe {
             try_decode_ssse3_block(input, 0, &mut output, &mut dst, &mut state, dot_unstuffing)
@@ -2683,7 +2800,7 @@ mod tests {
         let mut dst = 0usize;
         let mut state = KernelState {
             state: initial_state,
-            end: DecodeEnd::None,
+            ..KernelState::body()
         };
         let consumed = unsafe {
             try_decode_sse41_block(input, 0, &mut output, &mut dst, &mut state, dot_unstuffing)
@@ -2712,7 +2829,7 @@ mod tests {
         let mut dst = 0usize;
         let mut state = KernelState {
             state: initial_state,
-            end: DecodeEnd::None,
+            ..KernelState::body()
         };
         let consumed = unsafe {
             try_decode_avx_block(input, 0, &mut output, &mut dst, &mut state, dot_unstuffing)
@@ -2737,7 +2854,7 @@ mod tests {
         let mut dst = 0usize;
         let mut state = KernelState {
             state: initial_state,
-            end: DecodeEnd::None,
+            ..KernelState::body()
         };
         let consumed = unsafe {
             try_decode_avx2_block(input, 0, &mut output, &mut dst, &mut state, dot_unstuffing)
@@ -2767,7 +2884,7 @@ mod tests {
         let mut dst = 0usize;
         let mut state = KernelState {
             state: initial_state,
-            end: DecodeEnd::None,
+            ..KernelState::body()
         };
         let consumed = unsafe {
             try_decode_avx512_vbmi2_block(
@@ -2795,13 +2912,25 @@ mod tests {
         let mut dst = 0usize;
         let mut state = KernelState {
             state: initial_state,
-            end: DecodeEnd::None,
+            ..KernelState::body()
         };
-        let consumed = unsafe {
-            try_decode_neon_block(input, 0, &mut output, &mut dst, &mut state, dot_unstuffing)
-                .unwrap()
-        }?;
-        assert_eq!(consumed, 64);
+        let mut src = 0usize;
+        let constants = unsafe { Neon64Constants::new() };
+        if !unsafe {
+            decode_neon64_span_block(
+                input,
+                &mut src,
+                &mut output,
+                &mut dst,
+                &mut state,
+                dot_unstuffing,
+                &constants,
+            )
+            .unwrap()
+        } {
+            return None;
+        }
+        assert_eq!(src, 64);
         output.truncate(dst);
         Some((output, state))
     }

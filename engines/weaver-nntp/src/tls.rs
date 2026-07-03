@@ -738,7 +738,7 @@ fn env_flag_enabled(name: &str) -> Result<bool, NntpError> {
     }
 }
 
-fn build_s2n_tls_config(ca_cert_path: Option<&Path>) -> Result<S2nConfig, NntpError> {
+pub(crate) fn build_s2n_tls_config(ca_cert_path: Option<&Path>) -> Result<S2nConfig, NntpError> {
     let ca_cert_path = ca_cert_path.ok_or_else(|| {
         NntpError::MalformedResponse(format!(
             "{TLS_BACKEND_ENV}=s2n currently requires a CA PEM path for deterministic NNTP trust"

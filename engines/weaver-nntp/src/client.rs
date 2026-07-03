@@ -1729,6 +1729,133 @@ impl NntpClient {
         self.pool.retire_ip(server, ip).await;
     }
 
+    pub fn try_acquire_blocking_body_lane(
+        &self,
+        groups: &[String],
+        exclude: &[usize],
+    ) -> Result<crate::blocking::BlockingBodyLane> {
+        for server in self.blocking_body_server_order(exclude) {
+            let permit = match self.pool.try_acquire_blocking_permit(server) {
+                Ok(permit) => permit,
+                Err(_) => continue,
+            };
+            let (config, excluded_ips, address_offset) =
+                self.pool.blocking_connect_plan(server, &[])?;
+            if !config.tls || config.starttls || config.tls_ca_cert.is_none() {
+                continue;
+            }
+            let started = Instant::now();
+            match crate::blocking::BlockingBodyLane::connect(
+                server,
+                &config,
+                &excluded_ips,
+                address_offset,
+                groups,
+                permit,
+            ) {
+                Ok(lane) => return Ok(lane),
+                Err(error) => {
+                    self.record_blocking_connect_failure(server.0, &error);
+                    debug!(
+                        server = server.0,
+                        error = %error,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "blocking BODY lane connect failed"
+                    );
+                    continue;
+                }
+            }
+        }
+        Err(NntpError::PoolExhausted)
+    }
+
+    pub fn record_blocking_attempts(&self, attempts: &[FetchAttemptTrace]) {
+        for attempt in attempts {
+            match attempt.outcome {
+                FetchAttemptOutcome::Success => {
+                    let mut health = self.pool.health().blocking_lock();
+                    health.record_success(attempt.server_idx);
+                    health.record_latency(attempt.server_idx, attempt.elapsed);
+                }
+                FetchAttemptOutcome::AuthenticationFailure => {
+                    self.pool
+                        .health()
+                        .blocking_lock()
+                        .record_failure(attempt.server_idx, true);
+                }
+                FetchAttemptOutcome::TransientFailure => {
+                    self.pool
+                        .health()
+                        .blocking_lock()
+                        .record_cooldown(attempt.server_idx, CooldownReason::Transport);
+                }
+                FetchAttemptOutcome::NotFound | FetchAttemptOutcome::PermanentFailure => {}
+            }
+        }
+    }
+
+    fn blocking_body_server_order(&self, exclude: &[usize]) -> Vec<ServerId> {
+        let server_count = self.pool.server_count();
+        let server_groups = self.pool.server_groups();
+        let Ok(mut health) = self.pool.health().try_lock() else {
+            return Vec::new();
+        };
+        health.check_reenable_all();
+
+        let mut candidates = Vec::with_capacity(server_count);
+        for idx in 0..server_count {
+            if exclude.contains(&idx) || !health.is_available(idx) {
+                continue;
+            }
+            let candidate = {
+                let (available, max) = self.pool.server_load(idx);
+                let load_ratio = if max == 0 {
+                    1.0
+                } else {
+                    1.0 - (available as f64 / max as f64)
+                };
+                let health_rank = match health.server(idx).state() {
+                    ServerState::Healthy => 0u8,
+                    ServerState::Degraded { .. } => 1,
+                    ServerState::CoolingDown { .. } | ServerState::Disabled { .. } => 2,
+                };
+                let score = health.latency_ms(idx) * (1.0 + 2.0 * load_ratio);
+                (server_groups[idx], health_rank, score, idx)
+            };
+            if candidate.1 < 2 {
+                candidates.push(candidate);
+            }
+        }
+        candidates.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.1.cmp(&b.1))
+                .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        candidates
+            .into_iter()
+            .map(|(_, _, _, idx)| ServerId(idx))
+            .collect()
+    }
+
+    fn record_blocking_connect_failure(&self, server_idx: usize, error: &NntpError) {
+        if matches!(
+            error,
+            NntpError::AuthenticationFailed
+                | NntpError::AuthenticationRejected
+                | NntpError::AccessDenied
+        ) {
+            self.pool
+                .health()
+                .blocking_lock()
+                .record_failure(server_idx, true);
+        } else if let Some(reason) = cooldown_reason(error) {
+            self.pool
+                .health()
+                .blocking_lock()
+                .record_cooldown(server_idx, reason);
+        }
+    }
+
     async fn record_server_success(&self, server_idx: usize, elapsed: Duration) {
         let mut health = self.pool.health().lock().await;
         health.record_success(server_idx);

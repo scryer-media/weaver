@@ -38,6 +38,7 @@
 //! # }
 //! ```
 
+pub mod blocking;
 pub mod client;
 pub mod codec;
 pub mod commands;
@@ -51,6 +52,7 @@ pub mod tls;
 pub mod types;
 
 // Re-export primary types for convenience.
+pub use blocking::{BlockingBodyLane, BlockingLaneStats, BlockingNntpConnection};
 pub use client::{
     BodyLaneBatchStats, BodyLaneLease, BodyLaneMode, DecodedBody, DecodedBodyError,
     DecodedBodyTrace, NntpClient,

@@ -9,6 +9,7 @@ use weaver_yenc::{StreamingArticleDecoder, encode};
 #[derive(Debug, Clone, Copy)]
 enum YencBenchPattern {
     Clean,
+    BigBangLike,
     EscapeHeavy,
     DotStuffed,
     TerminatorBoundary,
@@ -18,6 +19,7 @@ impl YencBenchPattern {
     fn label(self) -> &'static str {
         match self {
             Self::Clean => "clean",
+            Self::BigBangLike => "bigbang_like",
             Self::EscapeHeavy => "escape_heavy",
             Self::DotStuffed => "dot_stuffed",
             Self::TerminatorBoundary => "terminator_boundary",
@@ -45,6 +47,7 @@ fn build_yenc_transcript(decoded_size: usize, pattern: YencBenchPattern) -> Byte
     for i in 0..decoded_size {
         match pattern {
             YencBenchPattern::Clean => decoded.push(((i.wrapping_mul(31)) % 250 + 5) as u8),
+            YencBenchPattern::BigBangLike => decoded.push(((i * 31 + 17) & 0xff) as u8),
             YencBenchPattern::EscapeHeavy => {
                 const SOURCE: [u8; 7] = [214, 224, 227, 19, b'A', b'B', b'C'];
                 decoded.push(SOURCE[i % SOURCE.len()]);
@@ -123,6 +126,26 @@ fn decode_fused_yenc(payload: &BytesMut) -> usize {
         .bytes_written
 }
 
+fn decode_fused_yenc_three_chunks(payload: &BytesMut) -> usize {
+    let mut decoder = FusedYencArticleDecoder::new();
+    let mut buf = BytesMut::with_capacity(payload.len());
+    let chunk_len = payload.len().div_ceil(3);
+    let mut offset = 0usize;
+    let mut article = None;
+    while offset < payload.len() {
+        let end = (offset + chunk_len).min(payload.len());
+        buf.extend_from_slice(&payload[offset..end]);
+        offset = end;
+        if article.is_none() {
+            article = decoder.decode_available(&mut buf).unwrap();
+        }
+    }
+    article
+        .expect("complete benchmark article")
+        .result
+        .bytes_written
+}
+
 fn bench_multiline_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("multiline_decode");
     for (label, stuffed_every) in [("plain", 0usize), ("stuffed", 8usize)] {
@@ -166,12 +189,17 @@ fn bench_yenc_article_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("yenc_article_decode");
     for pattern in [
         YencBenchPattern::Clean,
+        YencBenchPattern::BigBangLike,
         YencBenchPattern::EscapeHeavy,
         YencBenchPattern::DotStuffed,
         YencBenchPattern::TerminatorBoundary,
     ] {
         let label = pattern.label();
-        let payload = build_yenc_transcript(512 * 1024, pattern);
+        let decoded_size = match pattern {
+            YencBenchPattern::BigBangLike => 768_000,
+            _ => 512 * 1024,
+        };
+        let payload = build_yenc_transcript(decoded_size, pattern);
         group.bench_with_input(
             BenchmarkId::new("current", label),
             &payload,
@@ -182,6 +210,15 @@ fn bench_yenc_article_decode(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("fused", label), &payload, |b, payload| {
             b.iter(|| black_box(decode_fused_yenc(black_box(payload))));
         });
+        if matches!(pattern, YencBenchPattern::BigBangLike) {
+            group.bench_with_input(
+                BenchmarkId::new("fused_three_chunks", label),
+                &payload,
+                |b, payload| {
+                    b.iter(|| black_box(decode_fused_yenc_three_chunks(black_box(payload))));
+                },
+            );
+        }
     }
     group.finish();
 }

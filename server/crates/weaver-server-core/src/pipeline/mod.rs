@@ -598,6 +598,14 @@ pub(super) struct DownloadLaneParked {
     pub(super) release_ip_replacement_burst: bool,
 }
 
+pub(super) enum OwnedDownloadLaneEvent {
+    BatchComplete {
+        results: Vec<DownloadResult>,
+        stats: weaver_nntp::blocking::BlockingLaneStats,
+        ack: std::sync::mpsc::SyncSender<()>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DownloadResultOrigin {
     NormalPrimary,
@@ -1083,6 +1091,19 @@ impl CompletedFileChecksumState {
         self.update_crc32(total_len as u64, part_crc, part_crc_verified);
     }
 
+    pub(super) fn update_crc_metadata(&mut self, len: u64, part_crc: u32, part_crc_verified: bool) {
+        if len == 0 {
+            return;
+        }
+        if self.md5.take().is_some() {
+            crate::runtime::perf_probe::record(
+                "download.file_hash.update.md5.disabled",
+                Duration::from_nanos(1),
+            );
+        }
+        self.update_crc32(len, part_crc, part_crc_verified);
+    }
+
     fn update_crc32(&mut self, len: u64, part_crc: u32, part_crc_verified: bool) {
         if !part_crc_verified {
             self.all_parts_crc_verified = false;
@@ -1216,11 +1237,56 @@ pub(super) struct DeferredFileHashChunk {
     pub(super) part_crc_verified: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum DeferredFileHashRangeSource {
+    DecodedData,
+    CrcMetadata,
+}
+
+impl DeferredFileHashRangeSource {
+    pub(super) fn read_fallback_bucket(self) -> &'static str {
+        match self {
+            Self::DecodedData => {
+                "download.file_hash.deferred_range_read.source.decoded_data_missing"
+            }
+            Self::CrcMetadata => "download.file_hash.deferred_range_read.source.crc_metadata",
+        }
+    }
+
+    pub(super) fn read_fallback_bytes_bucket(self) -> &'static str {
+        match self {
+            Self::DecodedData => {
+                "download.file_hash.deferred_range_read.source.decoded_data_missing.bytes"
+            }
+            Self::CrcMetadata => "download.file_hash.deferred_range_read.source.crc_metadata.bytes",
+        }
+    }
+
+    pub(super) fn metadata_replay_bucket(self) -> &'static str {
+        match self {
+            Self::DecodedData => "download.file_hash.deferred_crc_metadata_replayed.decoded_data",
+            Self::CrcMetadata => "download.file_hash.deferred_crc_metadata_replayed.crc_metadata",
+        }
+    }
+
+    pub(super) fn metadata_replay_bytes_bucket(self) -> &'static str {
+        match self {
+            Self::DecodedData => {
+                "download.file_hash.deferred_crc_metadata_replayed.decoded_data.bytes"
+            }
+            Self::CrcMetadata => {
+                "download.file_hash.deferred_crc_metadata_replayed.crc_metadata.bytes"
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct DeferredFileHashRange {
     pub(super) len: usize,
     pub(super) part_crc: u32,
     pub(super) part_crc_verified: bool,
+    pub(super) source: DeferredFileHashRangeSource,
 }
 
 impl DeferredFileHashChunk {
@@ -1333,6 +1399,8 @@ pub struct Pipeline {
     pub(super) jobs_finalizing_download: HashSet<JobId>,
     /// Released download results waiting to be committed into decode/write state.
     pub(super) pending_released_download_results_by_job: HashMap<JobId, usize>,
+    /// Estimated decoded/raw bytes held by released results that are not committed yet.
+    pub(super) pending_released_download_result_bytes_by_job: HashMap<JobId, u64>,
     /// In-flight article download count per job.
     pub(super) active_downloads_by_job: HashMap<JobId, usize>,
     /// In-flight NNTP connection task count per job.
@@ -1391,6 +1459,8 @@ pub struct Pipeline {
     pub(super) download_refill_rx: mpsc::Receiver<DownloadLaneRefillRequest>,
     pub(super) download_lane_parked_tx: mpsc::Sender<DownloadLaneParked>,
     pub(super) download_lane_parked_rx: mpsc::Receiver<DownloadLaneParked>,
+    pub(super) owned_download_lane_event_tx: mpsc::Sender<OwnedDownloadLaneEvent>,
+    pub(super) owned_download_lane_event_rx: mpsc::Receiver<OwnedDownloadLaneEvent>,
     pub(super) ip_replacement_trial_tx: mpsc::Sender<IpReplacementTrialEvent>,
     pub(super) ip_replacement_trial_rx: mpsc::Receiver<IpReplacementTrialEvent>,
     pub(super) decode_done_tx: mpsc::Sender<DecodeDone>,

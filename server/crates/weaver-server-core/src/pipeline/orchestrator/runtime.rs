@@ -55,6 +55,7 @@ impl Pipeline {
         let (download_done_tx, download_done_rx) = mpsc::channel(256);
         let (download_refill_tx, download_refill_rx) = mpsc::channel(256);
         let (download_lane_parked_tx, download_lane_parked_rx) = mpsc::channel(256);
+        let (owned_download_lane_event_tx, owned_download_lane_event_rx) = mpsc::channel(128);
         let (ip_replacement_trial_tx, ip_replacement_trial_rx) = mpsc::channel(16);
         let (decode_done_tx, decode_done_rx) = mpsc::channel(256);
         let (retry_tx, retry_rx) = mpsc::channel(256);
@@ -106,6 +107,7 @@ impl Pipeline {
             active_download_passes: HashSet::new(),
             jobs_finalizing_download: HashSet::new(),
             pending_released_download_results_by_job: HashMap::new(),
+            pending_released_download_result_bytes_by_job: HashMap::new(),
             active_downloads_by_job: HashMap::new(),
             active_download_connections_by_job: HashMap::new(),
             active_downloads_by_file: HashMap::new(),
@@ -143,6 +145,8 @@ impl Pipeline {
             download_refill_rx,
             download_lane_parked_tx,
             download_lane_parked_rx,
+            owned_download_lane_event_tx,
+            owned_download_lane_event_rx,
             ip_replacement_trial_tx,
             ip_replacement_trial_rx,
             decode_done_tx,
@@ -552,7 +556,10 @@ impl Pipeline {
                     }
                     Some(result) = self.download_done_rx.recv() => {
                         self.release_download_result(&result);
-                        self.note_released_download_result_pending(result.segment_id.file_id.job_id);
+                        self.note_released_download_result_pending(
+                            result.segment_id.file_id.job_id,
+                            Self::released_download_result_lead_bytes(&result),
+                        );
                         pending_download_results.push_back(result);
                     }
                     Some(request) = self.download_refill_rx.recv() => {
@@ -561,6 +568,12 @@ impl Pipeline {
                     }
                     Some(parked) = self.download_lane_parked_rx.recv() => {
                         self.handle_download_lane_parked(parked);
+                    }
+                    Some(event) = self.owned_download_lane_event_rx.recv() => {
+                        self.handle_owned_download_lane_event(
+                            event,
+                            &mut pending_download_results,
+                        );
                     }
                     Some(event) = self.ip_replacement_trial_rx.recv() => {
                         self.handle_ip_replacement_trial_event(event);
@@ -707,11 +720,19 @@ impl Pipeline {
 
     fn drain_ready_download_results(&mut self, pending: &mut VecDeque<DownloadResult>) {
         while pending.len() < Self::DOWNLOAD_COMPLETION_DRAIN_LIMIT {
+            if let Ok(event) = self.owned_download_lane_event_rx.try_recv() {
+                self.handle_owned_download_lane_event(event, pending);
+                self.drain_ready_lane_control_messages();
+                continue;
+            }
             let Ok(result) = self.download_done_rx.try_recv() else {
                 break;
             };
             self.release_download_result(&result);
-            self.note_released_download_result_pending(result.segment_id.file_id.job_id);
+            self.note_released_download_result_pending(
+                result.segment_id.file_id.job_id,
+                Self::released_download_result_lead_bytes(&result),
+            );
             pending.push_back(result);
             self.drain_ready_lane_control_messages();
         }
@@ -818,6 +839,9 @@ impl Pipeline {
                     result = self.download_done_rx.recv(), if self.active_downloads > 0 => {
                         result.map(ShutdownDrainEvent::Download)
                     }
+                    result = self.owned_download_lane_event_rx.recv(), if self.active_downloads > 0 => {
+                        result.map(ShutdownDrainEvent::OwnedDownload)
+                    }
                     result = self.decode_done_rx.recv(), if !self.active_decodes_by_job.is_empty()
                         || !self.pending_decode.is_empty()
                         || self.metrics.decode_pending.load(Ordering::Relaxed) > 0 => {
@@ -830,6 +854,14 @@ impl Pipeline {
             match event {
                 Ok(Some(ShutdownDrainEvent::Download(result))) => {
                     self.handle_download_done(result).await;
+                    self.pump_decode_queue();
+                }
+                Ok(Some(ShutdownDrainEvent::OwnedDownload(event))) => {
+                    let mut pending = VecDeque::new();
+                    self.handle_owned_download_lane_event(event, &mut pending);
+                    while let Some(result) = pending.pop_front() {
+                        self.process_released_download_done(result).await;
+                    }
                     self.pump_decode_queue();
                 }
                 Ok(Some(ShutdownDrainEvent::Decode(result))) => {
@@ -858,6 +890,7 @@ impl Pipeline {
 
 enum ShutdownDrainEvent {
     Download(DownloadResult),
+    OwnedDownload(OwnedDownloadLaneEvent),
     Decode(DecodeDone),
 }
 

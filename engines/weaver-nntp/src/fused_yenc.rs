@@ -311,9 +311,18 @@ impl FusedYencArticleDecoder {
     }
 
     fn process_body(&mut self, src: &mut BytesMut) -> Result<Option<FusedYencArticle>> {
+        self.flush_ready_output();
+        let input_len = self.next_body_input_len(src.len());
+        if input_len == 0 {
+            return Ok(None);
+        }
+
         self.stats.decode_calls += 1;
-        let progress =
-            decode_body_chunk_until_control(&mut self.decode_state, src, &mut self.output)?;
+        let progress = decode_body_chunk_until_control(
+            &mut self.decode_state,
+            &src[..input_len],
+            &mut self.output,
+        )?;
         self.advance_src(src, progress.source_consumed);
         self.flush_ready_output();
 
@@ -454,11 +463,12 @@ impl FusedYencArticleDecoder {
         let Ok(expected) = usize::try_from(expected) else {
             return;
         };
-        if expected == 0 || expected > MAX_ARTICLE_RESERVE || expected <= self.output.capacity() {
+        let reserve = expected.min(OUTPUT_BATCH_TARGET);
+        if reserve == 0 || expected > MAX_ARTICLE_RESERVE || reserve <= self.output.capacity() {
             return;
         }
 
-        self.output.reserve_exact(expected - self.output.capacity());
+        self.output.reserve_exact(reserve - self.output.capacity());
     }
 
     fn flush_output(&mut self) {
@@ -471,10 +481,33 @@ impl FusedYencArticleDecoder {
 
     fn flush_ready_output(&mut self) {
         while self.output.len() >= OUTPUT_BATCH_TARGET {
-            let remainder = self.output.split_off(OUTPUT_BATCH_TARGET);
-            let full_batch = std::mem::replace(&mut self.output, remainder);
+            let full_batch = if self.output.len() == OUTPUT_BATCH_TARGET {
+                let next_capacity = self.next_output_capacity();
+                std::mem::replace(&mut self.output, Vec::with_capacity(next_capacity))
+            } else {
+                let remainder = self.output.split_off(OUTPUT_BATCH_TARGET);
+                std::mem::replace(&mut self.output, remainder)
+            };
             self.output_chunks.push(full_batch.into_boxed_slice());
         }
+    }
+
+    fn next_body_input_len(&self, available: usize) -> usize {
+        available.min(OUTPUT_BATCH_TARGET.saturating_sub(self.output.len()))
+    }
+
+    fn next_output_capacity(&self) -> usize {
+        let Some(metadata) = self.metadata.as_ref() else {
+            return OUTPUT_BATCH_TARGET;
+        };
+        let Some(expected) = expected_decoded_size(metadata) else {
+            return OUTPUT_BATCH_TARGET;
+        };
+        let Ok(expected) = usize::try_from(expected) else {
+            return OUTPUT_BATCH_TARGET;
+        };
+        let decoded = usize::try_from(self.decode_state.bytes_decoded).unwrap_or(usize::MAX);
+        expected.saturating_sub(decoded).min(OUTPUT_BATCH_TARGET)
     }
 
     fn advance_src(&mut self, src: &mut BytesMut, count: usize) {

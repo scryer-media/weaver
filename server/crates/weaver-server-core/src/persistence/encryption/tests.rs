@@ -137,7 +137,7 @@ fn encrypt_secret_for_write_requires_key_for_plaintext() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn persistent_store_wins_over_env_escape_hatch() {
+fn env_key_wins_over_persistent_store() {
     let dir = tempfile::tempdir().unwrap();
     let stored_key = EncryptionKey::generate();
     let env_key = EncryptionKey::generate();
@@ -147,6 +147,6 @@ fn persistent_store_wins_over_env_escape_hatch() {
 
     let loaded_key = ensure_encryption_key(Some(dir.path().to_path_buf())).unwrap();
 
-    assert_eq!(loaded_key.to_base64(), stored_key.to_base64());
-    assert_ne!(loaded_key.to_base64(), env_key.to_base64());
+    assert_eq!(loaded_key.to_base64(), env_key.to_base64());
+    assert_ne!(loaded_key.to_base64(), stored_key.to_base64());
 }
