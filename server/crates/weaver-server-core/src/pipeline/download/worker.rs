@@ -239,6 +239,15 @@ impl Pipeline {
     }
 
     fn restart_durable_lead_block(&self, job_id: JobId, work: &DownloadWork) -> Option<(u64, u64)> {
+        self.restart_durable_lead_block_with_extra(job_id, work, 0)
+    }
+
+    fn restart_durable_lead_block_with_extra(
+        &self,
+        job_id: JobId,
+        work: &DownloadWork,
+        extra_undurable_bytes: u64,
+    ) -> Option<(u64, u64)> {
         if work.is_recovery {
             return None;
         }
@@ -248,6 +257,7 @@ impl Pipeline {
         }
         let projected = self
             .estimated_undurable_download_bytes_for_job(job_id)
+            .saturating_add(extra_undurable_bytes)
             .saturating_add(work.byte_estimate as u64);
         (projected > limit).then_some((projected, limit))
     }
@@ -1575,13 +1585,33 @@ impl Pipeline {
         pressure: DownloadPressure,
     ) -> DownloadBatchLease {
         let work_limit = self.download_lane_lease_work_limit(job_id, lane_mode, pressure);
+        let mut leased_undurable_bytes = if first.is_recovery {
+            0
+        } else {
+            first.byte_estimate as u64
+        };
         let mut works = vec![first];
         while works.len() < work_limit {
             let Some(next) = self.pop_download_work_for_batch(job_id, Some(&compatibility)) else {
                 break;
             };
+            if self
+                .restart_durable_lead_block_with_extra(job_id, &next, leased_undurable_bytes)
+                .is_some()
+            {
+                if let Some(state) = self.jobs.get_mut(&job_id) {
+                    state.download_queue.push(next);
+                }
+                break;
+            }
             match self.reserve_download_work_for_dispatch(job_id, next, false) {
-                Ok(Some(next)) => works.push(next),
+                Ok(Some(next)) => {
+                    if !next.is_recovery {
+                        leased_undurable_bytes =
+                            leased_undurable_bytes.saturating_add(next.byte_estimate as u64);
+                    }
+                    works.push(next);
+                }
                 Ok(None) | Err(DispatchAttempt::StopAll) | Err(DispatchAttempt::NoWork) => break,
                 Err(DispatchAttempt::Dispatched) => unreachable!("reserve helper never dispatches"),
             }
@@ -2897,10 +2927,7 @@ impl Pipeline {
             return false;
         }
         self.nntp
-            .pool()
-            .server_configs()
-            .iter()
-            .any(|config| config.tls && !config.starttls && config.tls_ca_cert.is_some())
+            .has_blocking_body_lane_candidate(&lease.compatibility.exclude_servers)
     }
 
     pub(crate) fn handle_owned_download_lane_event(
@@ -2910,14 +2937,32 @@ impl Pipeline {
     ) {
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.owned_lane.event");
         match event {
+            OwnedDownloadLaneEvent::AcquireFailed { lease, error } => {
+                debug!(
+                    job_id = lease.job_id.0,
+                    works = lease.works.len(),
+                    error = %error,
+                    "owned blocking s2n lane unavailable; falling back to async download lane"
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.owned_lane.acquire_failed_fallback",
+                    1,
+                );
+                self.spawn_async_download_batch(lease);
+            }
             OwnedDownloadLaneEvent::BatchComplete {
                 results,
+                unrequested_works,
                 stats,
                 ack,
             } => {
                 crate::runtime::perf_probe::record_value(
                     "download.owned_lane.batch.results",
                     results.len() as u64,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.owned_lane.batch.unrequested_requeued",
+                    unrequested_works.len() as u64,
                 );
                 crate::runtime::perf_probe::record_value(
                     "download.owned_lane.socket.reads",
@@ -2951,6 +2996,9 @@ impl Pipeline {
                     );
                     pending.push_back(result);
                 }
+                for work in unrequested_works {
+                    self.restore_owned_lane_unrequested_work(work);
+                }
                 let _ = ack.send(());
             }
         }
@@ -2976,6 +3024,14 @@ impl Pipeline {
                 self.download_lane_parked_tx.clone(),
                 initial_lease,
             );
+            return;
+        }
+
+        self.spawn_async_download_batch(initial_lease);
+    }
+
+    fn spawn_async_download_batch(&mut self, initial_lease: DownloadBatchLease) {
+        if initial_lease.works.is_empty() {
             return;
         }
 
@@ -3288,7 +3344,7 @@ impl Pipeline {
                             .send(DownloadResult {
                                 segment_id: work.segment_id,
                                 data: Err(DownloadError::Fetch(DownloadFailure {
-                                    kind: DownloadFailureKind::Transient,
+                                    kind: DownloadFailureKind::Unrequested,
                                     message: "lane parked before leased article was requested"
                                         .to_string(),
                                 })),
@@ -3681,6 +3737,47 @@ impl Pipeline {
                 "failed to record ISP bandwidth usage"
             );
         }
+        self.publish_hot_dispatch_metrics(Instant::now());
+    }
+
+    fn restore_owned_lane_unrequested_work(&mut self, work: DownloadWork) {
+        let job_id = work.segment_id.file_id.job_id;
+        self.active_downloads = self.active_downloads.saturating_sub(1);
+        if work.is_recovery {
+            self.active_recovery = self.active_recovery.saturating_sub(1);
+        }
+        self.note_download_activity(job_id);
+        if let Some(in_flight) = self.active_downloads_by_job.get_mut(&job_id) {
+            *in_flight = in_flight.saturating_sub(1);
+            if *in_flight == 0 {
+                self.active_downloads_by_job.remove(&job_id);
+            }
+        }
+        if let Some(in_flight) = self
+            .active_downloads_by_file
+            .get_mut(&work.segment_id.file_id)
+        {
+            *in_flight = in_flight.saturating_sub(1);
+            if *in_flight == 0 {
+                self.active_downloads_by_file
+                    .remove(&work.segment_id.file_id);
+            }
+        }
+        if let Err(error) = self.release_bandwidth_reservation(work.segment_id) {
+            error!(error = %error, segment = %work.segment_id, "failed to release ISP bandwidth reservation for unrequested owned lane work");
+        }
+
+        if let Some(state) = self.jobs.get_mut(&job_id)
+            && !is_terminal_status(&state.status)
+        {
+            if work.is_recovery {
+                state.recovery_queue.push(work);
+            } else {
+                state.download_queue.push(work);
+            }
+        }
+        self.update_queue_metrics();
+        self.publish_active_stage_metrics();
         self.publish_hot_dispatch_metrics(Instant::now());
     }
 
@@ -4147,6 +4244,21 @@ impl Pipeline {
                     self.maybe_finish_download_pass(job_id);
                     return;
                 }
+                if failure.kind == DownloadFailureKind::Unrequested {
+                    if self.restore_download_result_work_without_retry(
+                        result.segment_id,
+                        result.retry_count,
+                        excluded_servers,
+                    ) {
+                        debug!(
+                            segment = %result.segment_id,
+                            error = %failure.message,
+                            "restored unrequested download work without consuming retry budget"
+                        );
+                    }
+                    self.maybe_finish_download_pass(job_id);
+                    return;
+                }
                 if failure.kind == DownloadFailureKind::LaneUnavailable {
                     self.metrics
                         .download_failures_capacity_unavailable
@@ -4186,6 +4298,7 @@ impl Pipeline {
                         .metrics
                         .download_failures_capacity_unavailable
                         .fetch_add(1, Ordering::Relaxed),
+                    DownloadFailureKind::Unrequested => 0,
                     DownloadFailureKind::Transient => self
                         .metrics
                         .download_failures_transient

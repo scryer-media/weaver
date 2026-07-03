@@ -1847,6 +1847,13 @@ async fn insert_active_job_with_persisted_nzb(
             created_at: 0,
             category: spec.category.clone(),
             metadata: spec.metadata.clone(),
+            status: "downloading",
+            download_state: "downloading",
+            post_state: "idle",
+            run_state: "active",
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
         })
         .unwrap();
     let (assembly, download_queue, recovery_queue) =
@@ -5595,6 +5602,55 @@ async fn dispatch_downloads_waits_for_downstream_work_when_restart_durable_lead_
 }
 
 #[tokio::test]
+async fn hot_download_batch_lease_counts_current_lease_for_restart_durable_lead() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        2,
+    )
+    .await;
+    let job_id = JobId(20029);
+    let durable_lead_limit = Pipeline::restart_durable_lead_limit_bytes();
+    let segment_bytes = (durable_lead_limit / 4).max(1).min(u64::from(u32::MAX)) as u32;
+    let segment_count = 6u32;
+    let segments = (0..segment_count)
+        .map(|segment| {
+            segment_spec! {
+                number: segment,
+                bytes: segment_bytes,
+                message_id: format!("restart-lead-lease-{segment}@example.com"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let spec = JobSpec {
+        name: "Restart Durable Lead Lease".to_string(),
+        password: None,
+        total_bytes: u64::from(segment_count) * u64::from(segment_bytes),
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: "large-lease.bin".to_string(),
+            role: FileRole::Standalone,
+            groups: vec!["alt.binaries.test".to_string()],
+            segments,
+        }],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.connection_ramp = 1;
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.active_downloads, 4);
+    assert_eq!(pipeline.active_downloads_by_job.get(&job_id), Some(&4));
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 2);
+}
+
+#[tokio::test]
 async fn dispatch_downloads_escapes_restart_durable_lead_when_pipeline_is_idle() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
@@ -6942,6 +6998,7 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
                 exclude_servers: vec![],
                 release_connection_slot: false,
             }],
+            unrequested_works: vec![],
             stats: weaver_nntp::blocking::BlockingLaneStats::default(),
             ack,
         },
@@ -6961,6 +7018,64 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
             .get(&job_id),
         Some(&1)
     );
+    assert!(ack_rx.try_recv().is_ok());
+}
+
+#[tokio::test]
+async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20025);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Owned Tail Requeue", "owned-tail.bin", &[1024, 1024]),
+    )
+    .await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    let tail_work = state.download_queue.pop().unwrap();
+
+    pipeline.active_downloads = 1;
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline
+        .active_downloads_by_file
+        .insert(segment_id.file_id, 1);
+    pipeline
+        .reserve_bandwidth_for_dispatch(segment_id, 2048)
+        .unwrap();
+
+    let (ack, ack_rx) = std::sync::mpsc::sync_channel(1);
+    let mut pending = VecDeque::new();
+    pipeline.handle_owned_download_lane_event(
+        OwnedDownloadLaneEvent::BatchComplete {
+            results: vec![],
+            unrequested_works: vec![tail_work],
+            stats: weaver_nntp::blocking::BlockingLaneStats::default(),
+            ack,
+        },
+        &mut pending,
+    );
+
+    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.active_downloads_by_job.get(&job_id), None);
+    assert_eq!(
+        pipeline.active_downloads_by_file.get(&segment_id.file_id),
+        None
+    );
+    assert!(pending.is_empty());
+    assert!(
+        !pipeline
+            .pending_released_download_results_by_job
+            .contains_key(&job_id)
+    );
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 2);
     assert!(ack_rx.try_recv().is_ok());
 }
 
@@ -9542,7 +9657,13 @@ async fn add_job_records_streamed_nzb_hash_in_active_jobs() {
     let expected_hash = crate::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
 
     pipeline
-        .add_job(job_id, spec, nzb_path, nzb_zstd)
+        .add_job(
+            job_id,
+            spec,
+            nzb_path,
+            nzb_zstd,
+            crate::jobs::AddJobOptions::default(),
+        )
         .await
         .unwrap();
 

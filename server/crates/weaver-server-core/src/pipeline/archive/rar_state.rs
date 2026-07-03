@@ -461,6 +461,13 @@ pub(crate) fn build_plan(
         }
     }
 
+    let all_default_members_extracted =
+        !member_names.is_empty() && member_names.iter().all(|member| extracted.contains(member));
+    if all_default_members_extracted {
+        waiting_on_volumes.clear();
+        topology.unresolved_spans.clear();
+    }
+
     let fact_owner_claims: BTreeMap<u32, Vec<String>> = facts
         .iter()
         .filter_map(|(&volume, facts)| {
@@ -577,12 +584,7 @@ pub(crate) fn build_plan(
         );
     }
 
-    let phase = if !member_names.is_empty()
-        && member_names.iter().all(|member| extracted.contains(member))
-        && topology
-            .expected_volume_count
-            .is_some_and(|expected| (0..expected).all(|volume| facts.contains_key(&volume)))
-    {
+    let phase = if all_default_members_extracted {
         RarSetPhase::Complete
     } else if worker_active {
         RarSetPhase::Extracting

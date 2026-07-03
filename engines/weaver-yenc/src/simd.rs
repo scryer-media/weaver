@@ -774,7 +774,11 @@ unsafe fn try_decode_sse2_block(
     let raw_cr = cr & !escaped;
     let raw_lf = lf & !escaped;
     let raw_breaks = raw_cr | raw_lf;
-    let crlf = raw_cr & (raw_lf >> 1);
+    // NNTP line boundaries exist in the raw stream even when yEnc escaped the
+    // '\r' (the scalar machine re-enters Cr after an escaped CR when
+    // dot-unstuffing), so pair detection uses the unmasked '\r' bits.
+    let pair_cr = if dot_unstuffing { cr } else { raw_cr };
+    let crlf = pair_cr & (lf >> 1);
     let line_start = if state.state == DecoderState::CrLf {
         1
     } else {
@@ -844,7 +848,13 @@ unsafe fn try_decode_sse2_block(
         }
     }
 
-    state.state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
+    let mut next_state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
+    if dot_unstuffing && (cr & escaped) & (1 << 63) != 0 {
+        // Escaped CR at the window's last byte still opens an NNTP line
+        // boundary for dot-stuffing purposes.
+        next_state = DecoderState::Cr;
+    }
+    state.state = next_state;
     Ok(Some(64))
 }
 
@@ -886,7 +896,11 @@ unsafe fn try_decode_ssse3_block(
     let raw_cr = cr & !escaped;
     let raw_lf = lf & !escaped;
     let raw_breaks = raw_cr | raw_lf;
-    let crlf = raw_cr & (raw_lf >> 1);
+    // NNTP line boundaries exist in the raw stream even when yEnc escaped the
+    // '\r' (the scalar machine re-enters Cr after an escaped CR when
+    // dot-unstuffing), so pair detection uses the unmasked '\r' bits.
+    let pair_cr = if dot_unstuffing { cr } else { raw_cr };
+    let crlf = pair_cr & (lf >> 1);
     let line_start = if state.state == DecoderState::CrLf {
         1
     } else {
@@ -946,7 +960,13 @@ unsafe fn try_decode_ssse3_block(
     unsafe { compact_store_16_ssse3(decoded_c, ((skip >> 32) & 0xffff) as u16, output, dst)? };
     unsafe { compact_store_16_ssse3(decoded_d, ((skip >> 48) & 0xffff) as u16, output, dst)? };
 
-    state.state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
+    let mut next_state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
+    if dot_unstuffing && (cr & escaped) & (1 << 63) != 0 {
+        // Escaped CR at the window's last byte still opens an NNTP line
+        // boundary for dot-stuffing purposes.
+        next_state = DecoderState::Cr;
+    }
+    state.state = next_state;
     Ok(Some(64))
 }
 
@@ -988,7 +1008,11 @@ unsafe fn try_decode_sse41_block(
     let raw_cr = cr & !escaped;
     let raw_lf = lf & !escaped;
     let raw_breaks = raw_cr | raw_lf;
-    let crlf = raw_cr & (raw_lf >> 1);
+    // NNTP line boundaries exist in the raw stream even when yEnc escaped the
+    // '\r' (the scalar machine re-enters Cr after an escaped CR when
+    // dot-unstuffing), so pair detection uses the unmasked '\r' bits.
+    let pair_cr = if dot_unstuffing { cr } else { raw_cr };
+    let crlf = pair_cr & (lf >> 1);
     let line_start = if state.state == DecoderState::CrLf {
         1
     } else {
@@ -1048,7 +1072,13 @@ unsafe fn try_decode_sse41_block(
     unsafe { compact_store_16_ssse3(decoded_c, ((skip >> 32) & 0xffff) as u16, output, dst)? };
     unsafe { compact_store_16_ssse3(decoded_d, ((skip >> 48) & 0xffff) as u16, output, dst)? };
 
-    state.state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
+    let mut next_state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
+    if dot_unstuffing && (cr & escaped) & (1 << 63) != 0 {
+        // Escaped CR at the window's last byte still opens an NNTP line
+        // boundary for dot-stuffing purposes.
+        next_state = DecoderState::Cr;
+    }
+    state.state = next_state;
     Ok(Some(64))
 }
 
@@ -1103,7 +1133,11 @@ unsafe fn try_decode_avx2_block(
     let raw_cr = cr & !escaped;
     let raw_lf = lf & !escaped;
     let raw_breaks = raw_cr | raw_lf;
-    let crlf = raw_cr & (raw_lf >> 1);
+    // NNTP line boundaries exist in the raw stream even when yEnc escaped the
+    // '\r' (the scalar machine re-enters Cr after an escaped CR when
+    // dot-unstuffing), so pair detection uses the unmasked '\r' bits.
+    let pair_cr = if dot_unstuffing { cr } else { raw_cr };
+    let crlf = pair_cr & (lf >> 1);
     let line_start = if state.state == DecoderState::CrLf {
         1
     } else {
@@ -1158,7 +1192,13 @@ unsafe fn try_decode_avx2_block(
     };
     unsafe { compact_store_16_avx2(decoded_b, true, ((skip >> 48) & 0xffff) as u16, output, dst)? };
 
-    state.state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
+    let mut next_state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
+    if dot_unstuffing && (cr & escaped) & (1 << 63) != 0 {
+        // Escaped CR at the window's last byte still opens an NNTP line
+        // boundary for dot-stuffing purposes.
+        next_state = DecoderState::Cr;
+    }
+    state.state = next_state;
     Ok(Some(64))
 }
 
@@ -1198,7 +1238,11 @@ unsafe fn try_decode_avx512_vbmi2_block(
     let raw_cr = cr & !escaped;
     let raw_lf = lf & !escaped;
     let raw_breaks = raw_cr | raw_lf;
-    let crlf = raw_cr & (raw_lf >> 1);
+    // NNTP line boundaries exist in the raw stream even when yEnc escaped the
+    // '\r' (the scalar machine re-enters Cr after an escaped CR when
+    // dot-unstuffing), so pair detection uses the unmasked '\r' bits.
+    let pair_cr = if dot_unstuffing { cr } else { raw_cr };
+    let crlf = pair_cr & (lf >> 1);
     let line_start = if state.state == DecoderState::CrLf {
         1
     } else {
@@ -1241,7 +1285,13 @@ unsafe fn try_decode_avx512_vbmi2_block(
     unsafe {
         compact_store_32_avx512_vbmi2(decoded_b, ((!skip >> 32) & 0xffff_ffff) as u32, output, dst)?
     };
-    state.state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
+    let mut next_state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
+    if dot_unstuffing && (cr & escaped) & (1 << 63) != 0 {
+        // Escaped CR at the window's last byte still opens an NNTP line
+        // boundary for dot-stuffing purposes.
+        next_state = DecoderState::Cr;
+    }
+    state.state = next_state;
     Ok(Some(64))
 }
 
@@ -1459,7 +1509,12 @@ unsafe fn decode_kernel_neon(
     let simd_limit = input.len().saturating_sub(tail_buffer);
 
     if input.len() > WIDTH * 2 {
-        let constants = unsafe { Neon64Constants::new() };
+        let ctx = Neon64Ctx {
+            dot_unstuffing,
+            search_end,
+            constants: unsafe { Neon64Constants::new() },
+            table: compact_table_16(),
+        };
         while (!search_end || state.end == DecodeEnd::None) && src + WIDTH <= simd_limit {
             if !matches!(state.state, DecoderState::None | DecoderState::CrLf)
                 || output.len().saturating_sub(dst) < WIDTH
@@ -1470,22 +1525,20 @@ unsafe fn decode_kernel_neon(
                 continue;
             }
 
-            if unsafe {
-                decode_neon64_span_block(
-                    input,
-                    &mut src,
-                    output,
-                    &mut dst,
-                    state,
-                    dot_unstuffing,
-                    &constants,
-                )?
+            match unsafe {
+                decode_neon64_span_block(input, &mut src, output, &mut dst, state, &ctx)?
             } {
-                continue;
-            }
-
-            if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
-                break;
+                SpanBlockOutcome::Consumed => {}
+                SpanBlockOutcome::ScalarThrough(through) => {
+                    // Consume the trigger byte with the scalar state machine
+                    // so the next SIMD attempt starts past it instead of
+                    // re-analyzing the same window once per scalar step.
+                    while src <= through && (!search_end || state.end == DecodeEnd::None) {
+                        if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1699,7 +1752,11 @@ unsafe fn try_decode_arm_neon_block(
     let raw_cr = cr & !escaped;
     let raw_lf = lf & !escaped;
     let raw_breaks = raw_cr | raw_lf;
-    let crlf = raw_cr & (raw_lf >> 1);
+    // NNTP line boundaries exist in the raw stream even when yEnc escaped the
+    // '\r' (the scalar machine re-enters Cr after an escaped CR when
+    // dot-unstuffing), so pair detection uses the unmasked '\r' bits.
+    let pair_cr = if dot_unstuffing { cr } else { raw_cr };
+    let crlf = pair_cr & (lf >> 1);
     let line_start = if state.state == DecoderState::CrLf {
         1
     } else {
@@ -1780,8 +1837,10 @@ unsafe fn try_decode_arm_neon_block(
 struct Neon64Constants {
     eq: std::arch::aarch64::uint8x16_t,
     cr: std::arch::aarch64::uint8x16_t,
-    lf: std::arch::aarch64::uint8x16_t,
     dot: std::arch::aarch64::uint8x16_t,
+    // Table-lookup rows marking '\n' (10) and '\r' (13) so one vqtbx1q merges
+    // the CR/LF compares into the '=' compare (rapidyenc's specials gate).
+    crlf_table: std::arch::aarch64::uint8x16_t,
     bit_weights: std::arch::aarch64::uint8x16_t,
     selector: std::arch::aarch64::uint8x16_t,
     normal_offset: std::arch::aarch64::uint8x16_t,
@@ -1797,8 +1856,10 @@ impl Neon64Constants {
         Self {
             eq: unsafe { vdupq_n_u8(b'=') },
             cr: unsafe { vdupq_n_u8(b'\r') },
-            lf: unsafe { vdupq_n_u8(b'\n') },
             dot: unsafe { vdupq_n_u8(b'.') },
+            crlf_table: unsafe {
+                vld1q_u8([0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 0, 0].as_ptr())
+            },
             bit_weights: unsafe {
                 vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr())
             },
@@ -1811,6 +1872,44 @@ impl Neon64Constants {
     }
 }
 
+/// Result of one 64-byte SIMD block attempt.
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpanBlockOutcome {
+    /// The whole 64-byte window was consumed and decoded.
+    Consumed,
+    /// A control/terminator candidate needs the scalar state machine; the
+    /// driver must consume through this absolute source index before
+    /// re-entering SIMD so the trigger is behind the next window.
+    ScalarThrough(usize),
+}
+
+/// Immutable per-kernel-call context for the 64-byte NEON block.
+#[cfg(target_arch = "aarch64")]
+struct Neon64Ctx<'a> {
+    dot_unstuffing: bool,
+    search_end: bool,
+    constants: Neon64Constants,
+    table: &'a [[u8; 16]; 32768],
+}
+
+/// Per-16-bit-group keep counts for a 64-bit skip mask, via one SWAR popcount
+/// pass (stays in the scalar domain where the mask already lives).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn per_group_keeps(skip: u64) -> (usize, usize, usize, usize) {
+    let x = skip - ((skip >> 1) & 0x5555_5555_5555_5555);
+    let x = (x & 0x3333_3333_3333_3333) + ((x >> 2) & 0x3333_3333_3333_3333);
+    let x = (x + (x >> 4)) & 0x0f0f_0f0f_0f0f_0f0f;
+    let sums = x + (x >> 8);
+    (
+        16 - (sums & 0x1f) as usize,
+        16 - ((sums >> 16) & 0x1f) as usize,
+        16 - ((sums >> 32) & 0x1f) as usize,
+        16 - ((sums >> 48) & 0x1f) as usize,
+    )
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn decode_neon64_span_block(
@@ -1819,14 +1918,30 @@ unsafe fn decode_neon64_span_block(
     output: &mut [u8],
     dst: &mut usize,
     state: &mut KernelState,
-    dot_unstuffing: bool,
-    constants: &Neon64Constants,
-) -> Result<bool, YencError> {
+    ctx: &Neon64Ctx<'_>,
+) -> Result<SpanBlockOutcome, YencError> {
     use std::arch::aarch64::*;
 
+    let dot_unstuffing = ctx.dot_unstuffing;
+    let search_end = ctx.search_end;
+    let constants = &ctx.constants;
+    let table = ctx.table;
+
     let block_src = *src;
-    debug_assert!(input.len().saturating_sub(block_src) >= 64);
+    debug_assert!(input.len().saturating_sub(block_src) > 64);
     debug_assert!(output.len().saturating_sub(*dst) >= 64);
+
+    // A line-start dot at the window's first byte is invisible to the
+    // specials gate below; resolve its lookahead here. Terminator/control
+    // shapes go to the scalar state machine, a plain stuffed dot is recorded
+    // for the vector paths.
+    let dot0 = dot_unstuffing && state.state == DecoderState::CrLf && input[block_src] == b'.';
+    if dot0 {
+        let next = input[block_src + 1];
+        if next == b'\r' || next == b'\n' || next == b'=' {
+            return Ok(SpanBlockOutcome::ScalarThrough(block_src));
+        }
+    }
 
     let a = unsafe { vld1q_u8(input.as_ptr().add(block_src)) };
     let b = unsafe { vld1q_u8(input.as_ptr().add(block_src + 16)) };
@@ -1836,58 +1951,16 @@ unsafe fn decode_neon64_span_block(
     let eq_b = unsafe { vceqq_u8(b, constants.eq) };
     let eq_c = unsafe { vceqq_u8(c, constants.eq) };
     let eq_d = unsafe { vceqq_u8(d, constants.eq) };
-    let cr_a = unsafe { vceqq_u8(a, constants.cr) };
-    let cr_b = unsafe { vceqq_u8(b, constants.cr) };
-    let cr_c = unsafe { vceqq_u8(c, constants.cr) };
-    let cr_d = unsafe { vceqq_u8(d, constants.cr) };
-    let lf_a = unsafe { vceqq_u8(a, constants.lf) };
-    let lf_b = unsafe { vceqq_u8(b, constants.lf) };
-    let lf_c = unsafe { vceqq_u8(c, constants.lf) };
-    let lf_d = unsafe { vceqq_u8(d, constants.lf) };
-    let dot_a = unsafe { vceqq_u8(a, constants.dot) };
-    let dot_b = unsafe { vceqq_u8(b, constants.dot) };
-    let dot_c = unsafe { vceqq_u8(c, constants.dot) };
-    let dot_d = unsafe { vceqq_u8(d, constants.dot) };
-    let eq = unsafe { neon_compare_mask64([eq_a, eq_b, eq_c, eq_d], constants.bit_weights) };
-    let cr = unsafe { neon_compare_mask64([cr_a, cr_b, cr_c, cr_d], constants.bit_weights) };
-    let lf = unsafe { neon_compare_mask64([lf_a, lf_b, lf_c, lf_d], constants.bit_weights) };
-    let dot = unsafe { neon_compare_mask64([dot_a, dot_b, dot_c, dot_d], constants.bit_weights) };
+    // One table lookup folds the '\r'/'\n' compares into the '=' compare, so
+    // "does this window contain any special byte?" costs a single reduce.
+    let cmp_a = unsafe { vqtbx1q_u8(eq_a, constants.crlf_table, a) };
+    let cmp_b = unsafe { vqtbx1q_u8(eq_b, constants.crlf_table, b) };
+    let cmp_c = unsafe { vqtbx1q_u8(eq_c, constants.crlf_table, c) };
+    let cmp_d = unsafe { vqtbx1q_u8(eq_d, constants.crlf_table, d) };
+    let any = unsafe { vorrq_u8(vorrq_u8(cmp_a, cmp_b), vorrq_u8(cmp_c, cmp_d)) };
+    let has_specials = unsafe { vmaxvq_u8(any) } != 0;
 
-    let fixed_eq = fix_eq_mask(eq, eq << 1);
-    if fixed_eq & (1u64 << 63) != 0 {
-        return Ok(false);
-    }
-
-    let escaped = fixed_eq << 1;
-    let raw_cr = cr & !escaped;
-    let raw_lf = lf & !escaped;
-    let raw_breaks = raw_cr | raw_lf;
-    let crlf = raw_cr & (raw_lf >> 1);
-    let line_start = if state.state == DecoderState::CrLf {
-        1
-    } else {
-        0
-    } | (crlf << 2);
-    let dot_start = if dot_unstuffing {
-        dot & !escaped & line_start
-    } else {
-        0
-    };
-
-    if dot_start & (1u64 << 63) != 0 {
-        return Ok(false);
-    }
-
-    let dot_before_break = dot_start & (raw_breaks >> 1);
-    let dot_before_eq = dot_start & (eq >> 1);
-    let line_start_eq = if dot_unstuffing { eq & line_start } else { 0 };
-    if dot_before_break != 0 || dot_before_eq != 0 || line_start_eq != 0 {
-        return Ok(false);
-    }
-
-    let skip = fixed_eq | raw_breaks | dot_start;
-
-    if skip == 0 {
+    if !has_specials && !dot0 {
         unsafe {
             vst1q_u8(
                 output.as_mut_ptr().add(*dst),
@@ -1909,20 +1982,237 @@ unsafe fn decode_neon64_span_block(
         *src += 64;
         *dst += 64;
         state.state = DecoderState::None;
-        return Ok(true);
+        return Ok(SpanBlockOutcome::Consumed);
     }
 
-    let [decoded_a, decoded_b, decoded_c, decoded_d] =
-        unsafe { neon_decode_with_escape_mask([a, b, c, d], escaped, constants) };
+    // Fold the specials mask and the '=' mask in one combined reduction:
+    // lane 0 of `merged` holds the specials bits, lane 1 the '=' bits.
+    let (mask, eq) = if has_specials {
+        let merged = unsafe {
+            vpaddq_u8(
+                vpaddq_u8(
+                    vpaddq_u8(
+                        vandq_u8(cmp_a, constants.bit_weights),
+                        vandq_u8(cmp_b, constants.bit_weights),
+                    ),
+                    vpaddq_u8(
+                        vandq_u8(cmp_c, constants.bit_weights),
+                        vandq_u8(cmp_d, constants.bit_weights),
+                    ),
+                ),
+                vpaddq_u8(
+                    vpaddq_u8(
+                        vandq_u8(eq_a, constants.bit_weights),
+                        vandq_u8(eq_b, constants.bit_weights),
+                    ),
+                    vpaddq_u8(
+                        vandq_u8(eq_c, constants.bit_weights),
+                        vandq_u8(eq_d, constants.bit_weights),
+                    ),
+                ),
+            )
+        };
+        (
+            unsafe { vgetq_lane_u64::<0>(vreinterpretq_u64_u8(merged)) },
+            unsafe { vgetq_lane_u64::<1>(vreinterpretq_u64_u8(merged)) },
+        )
+    } else {
+        (0, 0)
+    };
 
-    unsafe { compact_store_16(decoded_a, (skip & 0xffff) as u16, output, dst)? };
-    unsafe { compact_store_16(decoded_b, ((skip >> 16) & 0xffff) as u16, output, dst)? };
-    unsafe { compact_store_16(decoded_c, ((skip >> 32) & 0xffff) as u16, output, dst)? };
-    unsafe { compact_store_16(decoded_d, ((skip >> 48) & 0xffff) as u16, output, dst)? };
+    let fixed_eq = fix_eq_mask(eq, eq << 1);
+    let escaped = fixed_eq << 1;
 
-    state.state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
+    let entry_line_start = (state.state == DecoderState::CrLf) as u64;
+    let (raw_cr, escaped_cr, raw_breaks, crlf, line_start, dot_start);
+    if mask == eq {
+        // No line breaks in the window; the only possible line start (and
+        // stripped dot) is at bit 0, carried in through the entry state.
+        raw_cr = 0;
+        escaped_cr = 0;
+        raw_breaks = 0;
+        crlf = 0;
+        line_start = entry_line_start;
+        dot_start = dot0 as u64;
+    } else {
+        // Breaks present: fold '\r' and '.' the same combined way and derive
+        // '\n' from the specials mask.
+        let cr_a = unsafe { vceqq_u8(a, constants.cr) };
+        let cr_b = unsafe { vceqq_u8(b, constants.cr) };
+        let cr_c = unsafe { vceqq_u8(c, constants.cr) };
+        let cr_d = unsafe { vceqq_u8(d, constants.cr) };
+        let dot_a = unsafe { vceqq_u8(a, constants.dot) };
+        let dot_b = unsafe { vceqq_u8(b, constants.dot) };
+        let dot_c = unsafe { vceqq_u8(c, constants.dot) };
+        let dot_d = unsafe { vceqq_u8(d, constants.dot) };
+        let merged = unsafe {
+            vpaddq_u8(
+                vpaddq_u8(
+                    vpaddq_u8(
+                        vandq_u8(cr_a, constants.bit_weights),
+                        vandq_u8(cr_b, constants.bit_weights),
+                    ),
+                    vpaddq_u8(
+                        vandq_u8(cr_c, constants.bit_weights),
+                        vandq_u8(cr_d, constants.bit_weights),
+                    ),
+                ),
+                vpaddq_u8(
+                    vpaddq_u8(
+                        vandq_u8(dot_a, constants.bit_weights),
+                        vandq_u8(dot_b, constants.bit_weights),
+                    ),
+                    vpaddq_u8(
+                        vandq_u8(dot_c, constants.bit_weights),
+                        vandq_u8(dot_d, constants.bit_weights),
+                    ),
+                ),
+            )
+        };
+        let cr = unsafe { vgetq_lane_u64::<0>(vreinterpretq_u64_u8(merged)) };
+        let dot_mask = unsafe { vgetq_lane_u64::<1>(vreinterpretq_u64_u8(merged)) };
+        let lf = mask & !eq & !cr;
+        raw_cr = cr & !escaped;
+        escaped_cr = cr & escaped;
+        let raw_lf = lf & !escaped;
+        raw_breaks = raw_cr | raw_lf;
+        // NNTP line boundaries exist in the raw stream even when yEnc escaped
+        // the '\r' (the scalar machine re-enters Cr after an escaped CR when
+        // dot-unstuffing), so pair detection uses the unmasked '\r' bits.
+        let pair_cr = if dot_unstuffing { cr } else { raw_cr };
+        crlf = pair_cr & (lf >> 1);
+        line_start = entry_line_start | (crlf << 2);
+        dot_start = if dot_unstuffing {
+            (dot_mask & !escaped & line_start) | dot0 as u64
+        } else {
+            0
+        };
+    }
+
+    // '=' at a line start is a potential control line ("=y…"). Confirm with a
+    // one-byte lookahead and fall back only for a real control line (once per
+    // article, at the =yend trailer).
+    if search_end && dot_unstuffing {
+        let mut line_start_eq = fixed_eq & line_start;
+        while line_start_eq != 0 {
+            let bit = line_start_eq.trailing_zeros() as usize;
+            if input[block_src + bit + 1] == b'y' {
+                return Ok(SpanBlockOutcome::ScalarThrough(block_src + bit));
+            }
+            line_start_eq &= line_start_eq - 1;
+        }
+    }
+
+    if dot_start != 0 {
+        // A line-start dot immediately before a break or '=' needs
+        // terminator/control lookahead; hand it to the scalar state machine.
+        let hazards = dot_start & ((raw_breaks >> 1) | (eq >> 1));
+        if hazards != 0 {
+            return Ok(SpanBlockOutcome::ScalarThrough(
+                block_src + hazards.trailing_zeros() as usize,
+            ));
+        }
+    }
+
+    let skip = fixed_eq | raw_breaks | dot_start;
+
+    let decoded = if escaped == 0 {
+        [
+            unsafe { vsubq_u8(a, constants.normal_offset) },
+            unsafe { vsubq_u8(b, constants.normal_offset) },
+            unsafe { vsubq_u8(c, constants.normal_offset) },
+            unsafe { vsubq_u8(d, constants.normal_offset) },
+        ]
+    } else if eq & (eq << 1) == 0 {
+        // No adjacent '=': escaped positions are exactly the '=' compares
+        // shifted one lane, so the offset select never leaves the vector
+        // domain (rapidyenc's shortcut path).
+        let zero = unsafe { vdupq_n_u8(0) };
+        let sel_a = unsafe { vextq_u8::<15>(zero, eq_a) };
+        let sel_b = unsafe { vextq_u8::<15>(eq_a, eq_b) };
+        let sel_c = unsafe { vextq_u8::<15>(eq_b, eq_c) };
+        let sel_d = unsafe { vextq_u8::<15>(eq_c, eq_d) };
+        [
+            unsafe {
+                vsubq_u8(
+                    a,
+                    vbslq_u8(sel_a, constants.escaped_offset, constants.normal_offset),
+                )
+            },
+            unsafe {
+                vsubq_u8(
+                    b,
+                    vbslq_u8(sel_b, constants.escaped_offset, constants.normal_offset),
+                )
+            },
+            unsafe {
+                vsubq_u8(
+                    c,
+                    vbslq_u8(sel_c, constants.escaped_offset, constants.normal_offset),
+                )
+            },
+            unsafe {
+                vsubq_u8(
+                    d,
+                    vbslq_u8(sel_d, constants.escaped_offset, constants.normal_offset),
+                )
+            },
+        ]
+    } else {
+        // Invalid '=' chains ("==", "==="): expand the chain-resolved mask
+        // through the table path.
+        unsafe { neon_decode_with_escape_mask([a, b, c, d], escaped, constants) }
+    };
+
+    let keeps = per_group_keeps(skip);
+    unsafe {
+        compact_store_16(decoded[0], (skip & 0xffff) as u16, keeps.0, table, output, dst);
+        compact_store_16(
+            decoded[1],
+            ((skip >> 16) & 0xffff) as u16,
+            keeps.1,
+            table,
+            output,
+            dst,
+        );
+        compact_store_16(
+            decoded[2],
+            ((skip >> 32) & 0xffff) as u16,
+            keeps.2,
+            table,
+            output,
+            dst,
+        );
+        compact_store_16(
+            decoded[3],
+            ((skip >> 48) & 0xffff) as u16,
+            keeps.3,
+            table,
+            output,
+            dst,
+        );
+    }
+
+    let mut next_state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
+    if fixed_eq & (1 << 63) != 0 {
+        // Escape at the window's last byte: its partner is in the next
+        // window; carry through the state machine (rapidyenc's escFirst).
+        next_state = if dot_unstuffing && line_start & (1 << 63) != 0 {
+            DecoderState::CrLfEq
+        } else {
+            DecoderState::Eq
+        };
+    } else if dot_start & (1 << 63) != 0 {
+        // Line-start dot at the last byte: it is stripped either way; the
+        // state machine resolves terminator vs stuffed data on the next byte.
+        next_state = DecoderState::CrLfDot;
+    } else if dot_unstuffing && escaped_cr & (1 << 63) != 0 {
+        // Escaped CR at the last byte still opens an NNTP line boundary.
+        next_state = DecoderState::Cr;
+    }
+    state.state = next_state;
     *src += 64;
-    Ok(true)
+    Ok(SpanBlockOutcome::Consumed)
 }
 
 #[cfg(all(target_arch = "arm", target_feature = "neon"))]
@@ -1967,31 +2257,6 @@ unsafe fn arm_neon_decode_with_escape_mask(
     [unsafe { vsubq_u8(vectors[0], offset_a) }, unsafe {
         vsubq_u8(vectors[1], offset_b)
     }]
-}
-
-#[cfg(target_arch = "aarch64")]
-// Ported from rapidyenc NEON64's pairwise compare-mask packing.
-#[inline(always)]
-unsafe fn neon_compare_mask64(
-    vectors: [std::arch::aarch64::uint8x16_t; 4],
-    bit_weights: std::arch::aarch64::uint8x16_t,
-) -> u64 {
-    use std::arch::aarch64::*;
-
-    let merge = unsafe {
-        vpaddq_u8(
-            vpaddq_u8(
-                vandq_u8(vectors[0], bit_weights),
-                vandq_u8(vectors[1], bit_weights),
-            ),
-            vpaddq_u8(
-                vandq_u8(vectors[2], bit_weights),
-                vandq_u8(vectors[3], bit_weights),
-            ),
-        )
-    };
-    let packed = unsafe { vpaddq_u8(merge, vdupq_n_u8(0)) };
-    unsafe { vgetq_lane_u64::<0>(vreinterpretq_u64_u8(packed)) }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2177,27 +2442,26 @@ unsafe fn compact_store_16_avx2(
 }
 
 #[cfg(target_arch = "aarch64")]
+#[inline(always)]
 unsafe fn compact_store_16(
     decoded: std::arch::aarch64::uint8x16_t,
     skip_mask: u16,
+    keep: usize,
+    table: &[[u8; 16]; 32768],
     output: &mut [u8],
     dst: &mut usize,
-) -> Result<(), YencError> {
+) {
     use std::arch::aarch64::*;
 
-    let keep = 16 - skip_mask.count_ones() as usize;
-    if output.len().saturating_sub(*dst) < 16 {
-        return Err(YencError::BufferTooSmall {
-            needed: *dst + 16,
-            available: output.len(),
-        });
-    }
-
-    let shuffle = unsafe { vld1q_u8(compact_table_16()[(skip_mask & 0x7fff) as usize].as_ptr()) };
+    // The caller guarantees 64 spare output bytes per block, so each of the
+    // four stores can write a full 16-byte vector; bytes past `keep` are
+    // overwritten by the next store.
+    debug_assert!(output.len().saturating_sub(*dst) >= 16);
+    debug_assert_eq!(keep, 16 - skip_mask.count_ones() as usize);
+    let shuffle = unsafe { vld1q_u8(table[(skip_mask & 0x7fff) as usize].as_ptr()) };
     let packed = unsafe { vqtbl1q_u8(decoded, shuffle) };
     unsafe { vst1q_u8(output.as_mut_ptr().add(*dst), packed) };
     *dst += keep;
-    Ok(())
 }
 
 #[inline]
@@ -2908,6 +3172,10 @@ mod tests {
         initial_state: DecoderState,
         dot_unstuffing: bool,
     ) -> Option<(Vec<u8>, KernelState)> {
+        // The block reads one byte past the 64-byte window for control-line
+        // lookahead; give it the same slack the kernel driver guarantees.
+        let mut padded = input.to_vec();
+        padded.extend_from_slice(&[b'A'; 8]);
         let mut output = vec![0u8; input.len() + 64];
         let mut dst = 0usize;
         let mut state = KernelState {
@@ -2915,20 +3183,18 @@ mod tests {
             ..KernelState::body()
         };
         let mut src = 0usize;
-        let constants = unsafe { Neon64Constants::new() };
-        if !unsafe {
-            decode_neon64_span_block(
-                input,
-                &mut src,
-                &mut output,
-                &mut dst,
-                &mut state,
-                dot_unstuffing,
-                &constants,
-            )
-            .unwrap()
+        let ctx = Neon64Ctx {
+            dot_unstuffing,
+            search_end: true,
+            constants: unsafe { Neon64Constants::new() },
+            table: compact_table_16(),
+        };
+        match unsafe {
+            decode_neon64_span_block(&padded, &mut src, &mut output, &mut dst, &mut state, &ctx)
+                .unwrap()
         } {
-            return None;
+            SpanBlockOutcome::Consumed => {}
+            SpanBlockOutcome::ScalarThrough(_) => return None,
         }
         assert_eq!(src, 64);
         output.truncate(dst);
@@ -3626,5 +3892,296 @@ mod tests {
         let (output, state) = scalar_body_with_state(b"A\r\n.=yignored", DecoderState::CrLf, true);
         assert_eq!(output, vec![b'A'.wrapping_sub(42)]);
         assert_eq!(state.end, DecodeEnd::Control);
+    }
+
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed >> 33
+    }
+
+    /// Build an adversarial raw NNTP/yEnc stream: normal runs interleaved
+    /// with escapes, chains, malformed escapes, bare breaks, line-start dots
+    /// and escapes, and (rarely) control/terminator shapes.
+    fn adversarial_stream(seed: &mut u64, len_target: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len_target + 16);
+        while out.len() < len_target {
+            match lcg(seed) % 20 {
+                0..=7 => {
+                    let run = (lcg(seed) % 90) as usize + 1;
+                    for _ in 0..run {
+                        let byte = (lcg(seed) % 256) as u8;
+                        if !matches!(byte, b'=' | b'\r' | b'\n') {
+                            out.push(byte);
+                        }
+                    }
+                }
+                8..=10 => out.extend_from_slice(b"\r\n"),
+                11 => {
+                    out.push(b'=');
+                    out.push((lcg(seed) % 256) as u8);
+                }
+                12 => out.extend_from_slice(b"=\r"),
+                13 => out.extend_from_slice(b"=\n"),
+                14 => out.extend_from_slice(b"=="),
+                15 => out.extend_from_slice(b"==="),
+                16 => out.extend_from_slice(b"\r\n."),
+                17 => out.extend_from_slice(b"\r\n.."),
+                18 => out.extend_from_slice(b"\r\n=J"),
+                19 => match lcg(seed) % 6 {
+                    0 => out.extend_from_slice(b"\r"),
+                    1 => out.extend_from_slice(b"\n"),
+                    2 => out.extend_from_slice(b"\r\r"),
+                    3 => out.extend_from_slice(b"\n\n"),
+                    4 => out.extend_from_slice(b"\r\n.\r\n"),
+                    _ => out.extend_from_slice(b"\r\n=y"),
+                },
+                _ => unreachable!(),
+            }
+        }
+        // Avoid a trailing escape so non-preserving modes do not error and
+        // every mode combination can run over the same stream.
+        while matches!(out.last(), Some(b'=')) {
+            out.pop();
+        }
+        out
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn run_kernel_whole(
+        input: &[u8],
+        dot_unstuffing: bool,
+        preserve_pending: bool,
+        search_end: bool,
+        scalar: bool,
+    ) -> Result<(Vec<u8>, usize, RapidyencDecodeEnd, KernelState), YencError> {
+        let mut output = vec![0u8; input.len() + 64];
+        let mut state = KernelState::body();
+        let outcome = if scalar {
+            decode_kernel_scalar(
+                input,
+                &mut output,
+                &mut state,
+                dot_unstuffing,
+                preserve_pending,
+                search_end,
+            )?
+        } else {
+            decode_kernel(
+                input,
+                &mut output,
+                &mut state,
+                dot_unstuffing,
+                preserve_pending,
+                search_end,
+            )?
+        };
+        output.truncate(outcome.written);
+        Ok((output, outcome.consumed, outcome.end, state))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn run_kernel_chunked(
+        input: &[u8],
+        chunk_len: usize,
+        dot_unstuffing: bool,
+        search_end: bool,
+        scalar: bool,
+    ) -> (Vec<u8>, usize, RapidyencDecodeEnd, KernelState) {
+        let mut output = vec![0u8; input.len() + 64];
+        let mut state = KernelState::body();
+        let mut consumed = 0usize;
+        let mut written = 0usize;
+        let mut end = RapidyencDecodeEnd::None;
+        while consumed < input.len() && end == RapidyencDecodeEnd::None {
+            let chunk_end = (consumed + chunk_len).min(input.len());
+            let chunk = &input[consumed..chunk_end];
+            let outcome = if scalar {
+                decode_kernel_scalar(
+                    chunk,
+                    &mut output[written..],
+                    &mut state,
+                    dot_unstuffing,
+                    true,
+                    search_end,
+                )
+            } else {
+                decode_kernel(
+                    chunk,
+                    &mut output[written..],
+                    &mut state,
+                    dot_unstuffing,
+                    true,
+                    search_end,
+                )
+            }
+            .expect("chunked decode with preserve_pending cannot error");
+            written += outcome.written;
+            end = outcome.end;
+            if outcome.consumed == 0 && outcome.end == RapidyencDecodeEnd::None {
+                break;
+            }
+            consumed += outcome.consumed;
+        }
+        output.truncate(written);
+        (output, consumed, end, state)
+    }
+
+    #[test]
+    fn dispatch_kernel_matches_scalar_on_adversarial_streams() {
+        let mut seed = 0x00c0ffee_d15ea5e5u64;
+        for round in 0..64 {
+            let len = 256 + (lcg(&mut seed) % 4096) as usize;
+            let input = adversarial_stream(&mut seed, len);
+            for &(dot, preserve, search) in &[
+                (true, true, true),
+                (true, true, false),
+                (true, false, true),
+                (false, true, false),
+                (false, false, false),
+            ] {
+                let simd = run_kernel_whole(&input, dot, preserve, search, false);
+                let reference = run_kernel_whole(&input, dot, preserve, search, true);
+                match (simd, reference) {
+                    (Ok(simd), Ok(reference)) => {
+                        assert_eq!(
+                            simd, reference,
+                            "round {round} dot={dot} preserve={preserve} search={search}"
+                        );
+                    }
+                    (Err(simd), Err(reference)) => {
+                        assert_eq!(
+                            simd.to_string(),
+                            reference.to_string(),
+                            "round {round} dot={dot} preserve={preserve} search={search}"
+                        );
+                    }
+                    (simd, reference) => panic!(
+                        "kernel disagreement round {round} dot={dot} preserve={preserve} \
+                         search={search}: simd={simd:?} reference={reference:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_kernel_matches_scalar_across_chunk_splits() {
+        let mut seed = 0xfeedface_0badf00du64;
+        for round in 0..12 {
+            let len = 1024 + (lcg(&mut seed) % 2048) as usize;
+            let input = adversarial_stream(&mut seed, len);
+            for &chunk_len in &[1usize, 2, 3, 63, 64, 65, 127, 128, 257] {
+                for &(dot, search) in &[(true, true), (true, false), (false, false)] {
+                    let simd = run_kernel_chunked(&input, chunk_len, dot, search, false);
+                    let reference = run_kernel_chunked(&input, chunk_len, dot, search, true);
+                    assert_eq!(
+                        simd, reference,
+                        "round {round} chunk={chunk_len} dot={dot} search={search}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_kernel_handles_boundary_specials_like_scalar() {
+        // Deterministic windows that pin the block-boundary carries: escapes,
+        // line-start escapes and dots, and escaped CRs at the 64-byte edge,
+        // plus control lines and terminators mid-window.
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+
+        // '=' as the final byte of the first 64-byte window.
+        let mut case = vec![b'A'; 63];
+        case.push(b'=');
+        case.extend_from_slice(b"J then more data follows here");
+        case.extend_from_slice(&[b'B'; 96]);
+        cases.push(case);
+
+        // Line-start '=' at the window edge: "\r\n" at 61..63, '=' at 63.
+        let mut case = vec![b'A'; 61];
+        case.extend_from_slice(b"\r\n=");
+        case.extend_from_slice(b"Jrest-of-line");
+        case.extend_from_slice(&[b'C'; 96]);
+        cases.push(case);
+
+        // Line-start '=y' split across the window edge (control line).
+        let mut case = vec![b'A'; 61];
+        case.extend_from_slice(b"\r\n=");
+        case.extend_from_slice(b"yend size=128");
+        case.extend_from_slice(&[b'D'; 96]);
+        cases.push(case);
+
+        // Line-start dot at the window edge, stuffed-data continuation.
+        let mut case = vec![b'A'; 61];
+        case.extend_from_slice(b"\r\n.");
+        case.extend_from_slice(b".data-after-stuffed-dot");
+        case.extend_from_slice(&[b'E'; 96]);
+        cases.push(case);
+
+        // Line-start dot at the window edge, terminator continuation.
+        let mut case = vec![b'A'; 61];
+        case.extend_from_slice(b"\r\n.");
+        case.extend_from_slice(b"\r\nignored-after-terminator");
+        case.extend_from_slice(&[b'F'; 96]);
+        cases.push(case);
+
+        // Escaped CR at the window edge, dot-stuffed continuation.
+        let mut case = vec![b'A'; 62];
+        case.extend_from_slice(b"=\r");
+        case.extend_from_slice(b"\n.more-data");
+        case.extend_from_slice(&[b'G'; 96]);
+        cases.push(case);
+
+        // Escaped CR mid-window opening a line boundary ("=\r\n." strips).
+        let mut case = vec![b'H'; 32];
+        case.extend_from_slice(b"=\r\n.stuffed");
+        case.extend_from_slice(&[b'I'; 128]);
+        cases.push(case);
+
+        // '=' chains crossing the window edge.
+        let mut case = vec![b'J'; 62];
+        case.extend_from_slice(b"===");
+        case.extend_from_slice(b"KLMNOP");
+        case.extend_from_slice(&[b'K'; 96]);
+        cases.push(case);
+
+        // Control line "=y" mid-window with a line-start escape before it.
+        let mut case = vec![b'L'; 20];
+        case.extend_from_slice(b"\r\n=Mescaped-line-start\r\n=yend trailer");
+        case.extend_from_slice(&[b'M'; 96]);
+        cases.push(case);
+
+        // Plain terminator mid-window.
+        let mut case = vec![b'N'; 40];
+        case.extend_from_slice(b"\r\n.\r\nleftover");
+        case.extend_from_slice(&[b'O'; 96]);
+        cases.push(case);
+
+        for (idx, input) in cases.iter().enumerate() {
+            for &(dot, preserve, search) in &[
+                (true, true, true),
+                (true, true, false),
+                (true, false, true),
+                (false, true, false),
+            ] {
+                let simd = run_kernel_whole(input, dot, preserve, search, false);
+                let reference = run_kernel_whole(input, dot, preserve, search, true);
+                match (simd, reference) {
+                    (Ok(simd), Ok(reference)) => assert_eq!(
+                        simd, reference,
+                        "case {idx} dot={dot} preserve={preserve} search={search}"
+                    ),
+                    (Err(simd), Err(reference)) => assert_eq!(
+                        simd.to_string(),
+                        reference.to_string(),
+                        "case {idx} dot={dot} preserve={preserve} search={search}"
+                    ),
+                    (simd, reference) => panic!(
+                        "kernel disagreement case {idx} dot={dot} preserve={preserve} \
+                         search={search}: simd={simd:?} reference={reference:?}"
+                    ),
+                }
+            }
+        }
     }
 }

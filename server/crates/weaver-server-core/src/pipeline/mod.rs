@@ -599,8 +599,13 @@ pub(super) struct DownloadLaneParked {
 }
 
 pub(super) enum OwnedDownloadLaneEvent {
+    AcquireFailed {
+        lease: DownloadBatchLease,
+        error: String,
+    },
     BatchComplete {
         results: Vec<DownloadResult>,
+        unrequested_works: Vec<DownloadWork>,
         stats: weaver_nntp::blocking::BlockingLaneStats,
         ack: std::sync::mpsc::SyncSender<()>,
     },
@@ -673,6 +678,7 @@ pub(super) enum DownloadFailureKind {
     ArticleNotFound,
     CapacityUnavailable,
     LaneUnavailable,
+    Unrequested,
     Transient,
     Auth,
     Permanent,

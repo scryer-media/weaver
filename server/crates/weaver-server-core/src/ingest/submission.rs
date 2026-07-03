@@ -39,6 +39,27 @@ struct PreparedSubmission {
     submit_started: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CategoryResolutionMode {
+    ResolveConfigured,
+    PreserveSubmitted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmissionOptions {
+    pub category_resolution: CategoryResolutionMode,
+    pub add_paused: bool,
+}
+
+impl Default for SubmissionOptions {
+    fn default() -> Self {
+        Self {
+            category_resolution: CategoryResolutionMode::ResolveConfigured,
+            add_paused: false,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SubmitNzbError {
     #[error("NZB parse error: {0}")]
@@ -151,7 +172,24 @@ pub async fn resolve_submission_category(
     config: &SharedConfig,
     category: Option<&str>,
 ) -> Option<String> {
+    resolve_submission_category_with_mode(
+        config,
+        category,
+        CategoryResolutionMode::ResolveConfigured,
+    )
+    .await
+}
+
+pub async fn resolve_submission_category_with_mode(
+    config: &SharedConfig,
+    category: Option<&str>,
+    mode: CategoryResolutionMode,
+) -> Option<String> {
     let category = category?;
+    if matches!(mode, CategoryResolutionMode::PreserveSubmitted) {
+        return Some(category.to_string());
+    }
+
     let cfg = config.read().await;
     if cfg.categories.is_empty() {
         return Some(category.to_string());
@@ -172,6 +210,7 @@ async fn submit_prepared_nzb(
     config: &SharedConfig,
     nzb: Nzb,
     prepared: PreparedSubmission,
+    options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
     if nzb.files.is_empty() {
         return Err(SubmitNzbError::Empty);
@@ -186,7 +225,12 @@ async fn submit_prepared_nzb(
         submit_started,
     } = prepared;
 
-    let resolved_category = resolve_submission_category(config, category.as_deref()).await;
+    let resolved_category = resolve_submission_category_with_mode(
+        config,
+        category.as_deref(),
+        options.category_resolution,
+    )
+    .await;
     let job_id = db.reserve_next_job_id()?;
     let job_hash = persisted_nzb::hash_persisted_nzb_bytes(&nzb_zstd);
     let spec = nzb_to_submission_spec(
@@ -203,7 +247,15 @@ async fn submit_prepared_nzb(
     );
 
     if let Err(error) = handle
-        .add_job(job_id, spec.clone(), nzb_path.clone(), nzb_zstd)
+        .add_job_with_options(
+            job_id,
+            spec.clone(),
+            nzb_path.clone(),
+            nzb_zstd,
+            crate::jobs::AddJobOptions {
+                initially_paused: options.add_paused,
+            },
+        )
         .await
     {
         return Err(error.into());
@@ -238,6 +290,32 @@ pub async fn submit_nzb_bytes(
     category: Option<String>,
     metadata: Vec<(String, String)>,
 ) -> Result<SubmittedJob, SubmitNzbError> {
+    submit_nzb_bytes_with_options(
+        db,
+        handle,
+        config,
+        nzb_bytes,
+        filename,
+        password,
+        category,
+        metadata,
+        SubmissionOptions::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_nzb_bytes_with_options(
+    db: &Database,
+    handle: &SchedulerHandle,
+    config: &SharedConfig,
+    nzb_bytes: &[u8],
+    filename: Option<String>,
+    password: Option<String>,
+    category: Option<String>,
+    metadata: Vec<(String, String)>,
+    options: SubmissionOptions,
+) -> Result<SubmittedJob, SubmitNzbError> {
     let submit_started = Instant::now();
     let nzb = weaver_nzb::parse_nzb(nzb_bytes)?;
     let nzb_zstd = persisted_nzb::compress_nzb_bytes(nzb_bytes).map_err(SubmitNzbError::Save)?;
@@ -254,6 +332,7 @@ pub async fn submit_nzb_bytes(
             metadata,
             submit_started,
         },
+        options,
     )
     .await
 }
@@ -415,6 +494,7 @@ where
             metadata,
             submit_started,
         },
+        SubmissionOptions::default(),
     )
     .await
 }
@@ -453,6 +533,7 @@ pub async fn submit_staged_nzb_zstd(
             metadata,
             submit_started,
         },
+        SubmissionOptions::default(),
     )
     .await
 }

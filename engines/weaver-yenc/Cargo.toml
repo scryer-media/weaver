@@ -13,8 +13,14 @@ memchr = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"
+libloading = "0.8"
 
 [[bench]]
 name = "decode_simd"
 path = "benches/decode_simd.rs"
+harness = false
+
+[[bench]]
+name = "rapidyenc_parity"
+path = "benches/rapidyenc_parity.rs"
 harness = false

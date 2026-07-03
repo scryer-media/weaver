@@ -14,6 +14,13 @@ pub struct ActiveJob {
     pub created_at: u64,
     pub category: Option<String>,
     pub metadata: Vec<(String, String)>,
+    pub status: &'static str,
+    pub download_state: &'static str,
+    pub post_state: &'static str,
+    pub run_state: &'static str,
+    pub paused_resume_status: Option<&'static str>,
+    pub paused_resume_download_state: Option<&'static str>,
+    pub paused_resume_post_state: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

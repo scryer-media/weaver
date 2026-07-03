@@ -37,27 +37,15 @@ fn run_owned_blocking_s2n_download_lane(
 ) {
     let fetch_started = Instant::now();
     let mut lease = initial_lease;
-    let mut recorded_mode = lease.lane_mode;
-    let mut current_job_id = lease.job_id;
     let mut lane = match nntp.try_acquire_blocking_body_lane(
         &lease.compatibility.groups,
         &lease.compatibility.exclude_servers,
     ) {
         Ok(lane) => lane,
         Err(error) => {
-            let failure = DownloadFailure::from_lane_acquire_failure(Some(&error));
-            let results = lane_acquire_failure_results(lease, failure);
-            let _ = send_owned_batch(
-                &event_tx,
-                results,
-                weaver_nntp::blocking::BlockingLaneStats::default(),
-            );
-            let _ = parked_tx.blocking_send(DownloadLaneParked {
-                job_id: current_job_id,
-                mode: recorded_mode,
-                reason: LaneParkReason::Error,
-                release_connection_slot: true,
-                release_ip_replacement_burst: false,
+            let _ = event_tx.blocking_send(OwnedDownloadLaneEvent::AcquireFailed {
+                lease,
+                error: error.to_string(),
             });
             crate::runtime::perf_probe::record(
                 "download.fetch_body.owned",
@@ -67,7 +55,7 @@ fn run_owned_blocking_s2n_download_lane(
         }
     };
 
-    let park_reason = loop {
+    let (park_reason, parked_job_id, parked_mode) = loop {
         let DownloadBatchLease {
             job_id,
             lane_mode,
@@ -75,7 +63,6 @@ fn run_owned_blocking_s2n_download_lane(
             compatibility,
             works,
         } = lease;
-        current_job_id = job_id;
         let server_idx = lane.server_id().0;
         let supports_pipelining = lane.supports_pipelining();
         let actual_mode = Pipeline::actual_download_lane_mode(
@@ -84,12 +71,12 @@ fn run_owned_blocking_s2n_download_lane(
             server_idx,
             supports_pipelining,
         );
-        recorded_mode = actual_mode;
         let is_recovery = compatibility.is_recovery;
         let exclude_servers = compatibility.exclude_servers.clone();
         let mut batch_clean_for_refill = true;
         let mut pending_works: VecDeque<DownloadWork> = works.into_iter().collect();
         let mut results = Vec::with_capacity(pending_works.len());
+        let mut unrequested_works = Vec::new();
 
         while let Some(first_work) = pending_works.pop_front() {
             let batch_depth = actual_mode.max_depth();
@@ -198,30 +185,16 @@ fn run_owned_blocking_s2n_download_lane(
         }
 
         if !batch_clean_for_refill {
-            let tail_count = pending_works.len() as u64;
-            for work in pending_works {
-                results.push(unresolved_result(
-                    work,
-                    server_idx,
-                    actual_mode,
-                    supports_pipelining,
-                    lane.rtt_ewma(),
-                    0,
-                    tail_count,
-                    is_recovery,
-                    &exclude_servers,
-                    "lane parked before leased article was requested",
-                ));
-            }
+            unrequested_works.extend(pending_works);
         }
 
         let stats = lane.stats();
-        if send_owned_batch(&event_tx, results, stats).is_err() {
-            break LaneParkReason::Error;
+        if send_owned_batch(&event_tx, results, unrequested_works, stats).is_err() {
+            break (LaneParkReason::Error, job_id, actual_mode);
         }
 
         if !batch_clean_for_refill {
-            break LaneParkReason::Error;
+            break (LaneParkReason::Error, job_id, actual_mode);
         }
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -231,13 +204,13 @@ fn run_owned_blocking_s2n_download_lane(
                 server_idx,
                 remote_ip: lane.remote_ip(),
                 supports_pipelining,
-                current_mode: recorded_mode,
+                current_mode: actual_mode,
                 compatibility,
                 response_tx,
             })
             .is_err()
         {
-            break LaneParkReason::Error;
+            break (LaneParkReason::Error, job_id, actual_mode);
         }
 
         match response_rx.blocking_recv() {
@@ -248,18 +221,18 @@ fn run_owned_blocking_s2n_download_lane(
                     lease = next_lease;
                     continue;
                 }
-                break response.park_reason;
+                break (response.park_reason, job_id, actual_mode);
             }
             Err(_) => {
-                break LaneParkReason::ProbeYield;
+                break (LaneParkReason::ProbeYield, job_id, actual_mode);
             }
         }
     };
 
     lane.park();
     let _ = parked_tx.blocking_send(DownloadLaneParked {
-        job_id: current_job_id,
-        mode: recorded_mode,
+        job_id: parked_job_id,
+        mode: parked_mode,
         reason: park_reason,
         release_connection_slot: true,
         release_ip_replacement_burst: false,
@@ -270,55 +243,23 @@ fn run_owned_blocking_s2n_download_lane(
 fn send_owned_batch(
     event_tx: &mpsc::Sender<OwnedDownloadLaneEvent>,
     results: Vec<DownloadResult>,
+    unrequested_works: Vec<DownloadWork>,
     stats: weaver_nntp::blocking::BlockingLaneStats,
 ) -> Result<(), ()> {
-    if results.is_empty() {
+    if results.is_empty() && unrequested_works.is_empty() {
         return Ok(());
     }
     let (ack, ack_rx) = std::sync::mpsc::sync_channel(0);
     event_tx
         .blocking_send(OwnedDownloadLaneEvent::BatchComplete {
             results,
+            unrequested_works,
             stats,
             ack,
         })
         .map_err(|_| ())?;
     ack_rx.recv().map_err(|_| ())?;
     Ok(())
-}
-
-fn lane_acquire_failure_results(
-    lease: DownloadBatchLease,
-    failure: DownloadFailure,
-) -> Vec<DownloadResult> {
-    let is_recovery = lease.compatibility.is_recovery;
-    let exclude_servers = lease.compatibility.exclude_servers.clone();
-    let mode = lease.lane_mode;
-    lease
-        .works
-        .into_iter()
-        .map(|work| DownloadResult {
-            segment_id: work.segment_id,
-            data: Err(DownloadError::Fetch(failure.clone())),
-            attempts: Vec::new(),
-            lane_observation: Some(DownloadLaneObservation {
-                server_idx: None,
-                mode,
-                supports_pipelining: false,
-                rtt: None,
-                batch_complete: true,
-                batch_clean: false,
-                batch_response_count: 0,
-                unresolved_count: 1,
-                connection_discarded: false,
-            }),
-            source_server_idx: None,
-            origin: DownloadResultOrigin::from_recovery(is_recovery),
-            retry_count: work.retry_count,
-            exclude_servers: exclude_servers.clone(),
-            release_connection_slot: false,
-        })
-        .collect()
 }
 
 fn result_from_trace(

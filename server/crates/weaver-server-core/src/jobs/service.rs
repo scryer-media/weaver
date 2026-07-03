@@ -567,6 +567,7 @@ impl Pipeline {
         spec: JobSpec,
         nzb_path: PathBuf,
         nzb_zstd: Vec<u8>,
+        options: crate::jobs::AddJobOptions,
     ) -> Result<(), crate::SchedulerError> {
         let started = std::time::Instant::now();
         let _profile_scope = crate::runtime::perf_probe::scope("pipeline.add_job.total");
@@ -604,6 +605,22 @@ impl Pipeline {
             Self::build_job_assembly(job_id, &spec, &HashSet::new());
         let file_identities = Self::build_initial_file_identities(&spec, &HashMap::new());
         let initial_file_identities = file_identities.values().cloned().collect::<Vec<_>>();
+        let (initial_status, initial_download_state, initial_post_state, initial_run_state) =
+            if options.initially_paused {
+                (
+                    JobStatus::Paused,
+                    crate::jobs::model::DownloadState::Queued,
+                    crate::jobs::model::PostState::Idle,
+                    crate::jobs::model::RunState::Paused,
+                )
+            } else {
+                (
+                    JobStatus::Queued,
+                    crate::jobs::model::DownloadState::Queued,
+                    crate::jobs::model::PostState::Idle,
+                    crate::jobs::model::RunState::Active,
+                )
+            };
         crate::runtime::perf_probe::record(
             "pipeline.add_job.build_runtime_inputs",
             stage_start.elapsed(),
@@ -620,6 +637,19 @@ impl Pipeline {
                 created_at,
                 category: spec.category.clone(),
                 metadata: spec.metadata.clone(),
+                status: initial_status.persisted_status(),
+                download_state: initial_download_state.as_str(),
+                post_state: initial_post_state.as_str(),
+                run_state: initial_run_state.as_str(),
+                paused_resume_status: options
+                    .initially_paused
+                    .then_some(JobStatus::Queued.persisted_status()),
+                paused_resume_download_state: options
+                    .initially_paused
+                    .then_some(crate::jobs::model::DownloadState::Queued.as_str()),
+                paused_resume_post_state: options
+                    .initially_paused
+                    .then_some(crate::jobs::model::PostState::Idle.as_str()),
             },
             &initial_file_identities,
         ) {
@@ -653,19 +683,23 @@ impl Pipeline {
             job_id,
             job_hash: nzb_hash,
             spec,
-            status: JobStatus::Queued,
-            download_state: crate::jobs::model::DownloadState::Queued,
-            post_state: crate::jobs::model::PostState::Idle,
-            run_state: crate::jobs::model::RunState::Active,
+            status: initial_status,
+            download_state: initial_download_state,
+            post_state: initial_post_state,
+            run_state: initial_run_state,
             assembly,
             extraction_depth: 0,
             created_at: std::time::Instant::now(),
             created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
             queued_repair_at_epoch_ms: None,
             queued_extract_at_epoch_ms: None,
-            paused_resume_status: None,
-            paused_resume_download_state: None,
-            paused_resume_post_state: None,
+            paused_resume_status: options.initially_paused.then_some(JobStatus::Queued),
+            paused_resume_download_state: options
+                .initially_paused
+                .then_some(crate::jobs::model::DownloadState::Queued),
+            paused_resume_post_state: options
+                .initially_paused
+                .then_some(crate::jobs::model::PostState::Idle),
             failure_error: None,
             working_dir: working_dir.clone(),
             downloaded_bytes: 0,
@@ -1026,7 +1060,14 @@ impl Pipeline {
             self.db
                 .delete_active_job(job_id)
                 .map_err(crate::SchedulerError::State)?;
-            self.add_job(job_id, spec, nzb_path, nzb_zstd).await?;
+            self.add_job(
+                job_id,
+                spec,
+                nzb_path,
+                nzb_zstd,
+                crate::jobs::AddJobOptions::default(),
+            )
+            .await?;
             self.reset_failed_job_runtime(job_id);
             self.reload_metadata_from_disk(job_id).await;
             info!(job_id = job_id.0, "re-downloading terminal job");
@@ -1064,7 +1105,14 @@ impl Pipeline {
 
             self.remove_redownload_artifacts(job_id, &working_dir, None)
                 .await;
-            self.add_job(job_id, spec, nzb_path, nzb_zstd).await?;
+            self.add_job(
+                job_id,
+                spec,
+                nzb_path,
+                nzb_zstd,
+                crate::jobs::AddJobOptions::default(),
+            )
+            .await?;
             self.delete_failed_history_entry(job_id).await;
             self.reset_failed_job_runtime(job_id);
             self.reload_metadata_from_disk(job_id).await;
@@ -1110,7 +1158,14 @@ impl Pipeline {
 
         self.remove_redownload_artifacts(job_id, &working_dir, None)
             .await;
-        self.add_job(job_id, spec, nzb_path, nzb_zstd).await?;
+        self.add_job(
+            job_id,
+            spec,
+            nzb_path,
+            nzb_zstd,
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await?;
         self.delete_failed_history_entry(job_id).await;
         self.reset_failed_job_runtime(job_id);
         self.reload_metadata_from_disk(job_id).await;
@@ -1149,8 +1204,14 @@ impl Pipeline {
                 self.load_restart_nzb(source_job_id, &source_nzb_path, nzb_zstd)?;
             let spec = crate::ingest::nzb_to_spec(&nzb, &source_nzb_path, category, metadata);
 
-            self.add_job(diagnostic_job_id, spec, source_nzb_path, nzb_zstd)
-                .await?;
+            self.add_job(
+                diagnostic_job_id,
+                spec,
+                source_nzb_path,
+                nzb_zstd,
+                crate::jobs::AddJobOptions::default(),
+            )
+            .await?;
             self.reload_metadata_from_disk(diagnostic_job_id).await;
             info!(
                 source_job_id = source_job_id.0,
@@ -1193,8 +1254,14 @@ impl Pipeline {
             let spec =
                 crate::ingest::nzb_to_spec(&nzb, &source_nzb_path, row.category.clone(), metadata);
 
-            self.add_job(diagnostic_job_id, spec, source_nzb_path, nzb_zstd)
-                .await?;
+            self.add_job(
+                diagnostic_job_id,
+                spec,
+                source_nzb_path,
+                nzb_zstd,
+                crate::jobs::AddJobOptions::default(),
+            )
+            .await?;
             self.reload_metadata_from_disk(diagnostic_job_id).await;
             info!(
                 source_job_id = source_job_id.0,
@@ -1238,8 +1305,14 @@ impl Pipeline {
         let spec =
             crate::ingest::nzb_to_spec(&nzb, &source_nzb_path, info.category.clone(), metadata);
 
-        self.add_job(diagnostic_job_id, spec, source_nzb_path, nzb_zstd)
-            .await?;
+        self.add_job(
+            diagnostic_job_id,
+            spec,
+            source_nzb_path,
+            nzb_zstd,
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await?;
         self.reload_metadata_from_disk(diagnostic_job_id).await;
         info!(
             source_job_id = source_job_id.0,

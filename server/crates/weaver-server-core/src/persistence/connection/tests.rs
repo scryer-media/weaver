@@ -66,6 +66,13 @@ fn postgres_sample_job(job_id: crate::jobs::ids::JobId) -> ActiveJob {
         created_at: 1_700_000_000 + job_id.0,
         category: Some("postgres".to_string()),
         metadata: vec![("engine".to_string(), "postgres".to_string())],
+        status: "queued",
+        download_state: "queued",
+        post_state: "idle",
+        run_state: "active",
+        paused_resume_status: None,
+        paused_resume_download_state: None,
+        paused_resume_post_state: None,
     }
 }
 
@@ -1530,6 +1537,13 @@ async fn postgres_runtime_smoke_when_configured() {
         created_at: 1_700_000_000,
         category: Some("smoke".to_string()),
         metadata: vec![("engine".to_string(), "postgres".to_string())],
+        status: "queued",
+        download_state: "queued",
+        post_state: "idle",
+        run_state: "active",
+        paused_resume_status: None,
+        paused_resume_download_state: None,
+        paused_resume_post_state: None,
     })
     .unwrap();
     db.upsert_file_progress_batch(&[ActiveFileProgress {

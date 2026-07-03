@@ -489,6 +489,50 @@ fn build_plan_claims_missing_continuation_volumes_for_pending_owners() {
 }
 
 #[test]
+fn build_plan_keeps_fully_extracted_set_complete_when_source_fact_is_missing() {
+    let files = build_multifile_multivolume_rar_set();
+    let mut archive = RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+    for (volume, (_, bytes)) in files.iter().enumerate().skip(1) {
+        archive
+            .add_volume(volume, Box::new(Cursor::new(bytes.clone())))
+            .unwrap();
+    }
+
+    let mut facts: BTreeMap<u32, RarVolumeFacts> = files
+        .iter()
+        .enumerate()
+        .map(|(volume, (_, bytes))| {
+            (
+                volume as u32,
+                RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None).unwrap(),
+            )
+        })
+        .collect();
+    facts.remove(&1);
+    let volume_map = files
+        .iter()
+        .enumerate()
+        .map(|(volume, (filename, _))| (filename.clone(), volume as u32))
+        .collect();
+    let extracted = HashSet::from(["E01.mkv".to_string(), "E02.mkv".to_string()]);
+
+    let plan = build_plan(
+        volume_map,
+        &facts,
+        &archive,
+        &extracted,
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(plan.phase, RarSetPhase::Complete);
+    assert!(plan.waiting_on_volumes.is_empty());
+    assert!(plan.topology.unresolved_spans.is_empty());
+    assert!(!plan.deletion_eligible.contains(&1));
+}
+
+#[test]
 fn build_plan_blocks_delete_for_missing_start_continuation_spans() {
     let files = build_multifile_multivolume_rar_set();
     let mut archive = RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();

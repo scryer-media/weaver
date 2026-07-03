@@ -194,6 +194,10 @@ pub enum BodyLaneMode {
     PipelineDepth4,
 }
 
+fn supports_blocking_s2n_body_lane(config: &ServerConfig) -> bool {
+    config.tls && !config.starttls && config.tls_ca_cert.is_some()
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct BodyLaneBatchStats {
     pub requested: usize,
@@ -1741,7 +1745,7 @@ impl NntpClient {
             };
             let (config, excluded_ips, address_offset) =
                 self.pool.blocking_connect_plan(server, &[])?;
-            if !config.tls || config.starttls || config.tls_ca_cert.is_none() {
+            if !supports_blocking_s2n_body_lane(&config) {
                 continue;
             }
             let started = Instant::now();
@@ -1767,6 +1771,20 @@ impl NntpClient {
             }
         }
         Err(NntpError::PoolExhausted)
+    }
+
+    pub fn has_blocking_body_lane_candidate(&self, exclude: &[usize]) -> bool {
+        self.blocking_body_server_order(exclude)
+            .into_iter()
+            .any(|server| {
+                if self.pool.server_load(server.0).0 == 0 {
+                    return false;
+                }
+                let Ok((config, _, _)) = self.pool.blocking_connect_plan(server, &[]) else {
+                    return false;
+                };
+                supports_blocking_s2n_body_lane(&config)
+            })
     }
 
     pub fn record_blocking_attempts(&self, attempts: &[FetchAttemptTrace]) {
@@ -2750,11 +2768,48 @@ mod tests {
         }
     }
 
+    fn scripted_blocking_s2n_server(port: u16, max_connections: usize) -> ServerPoolConfig {
+        ServerPoolConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port,
+                tls: true,
+                tls_ca_cert: Some(std::path::PathBuf::from("/tmp/weaver-test-ca.pem")),
+                connect_timeout: Duration::from_secs(1),
+                command_timeout: Duration::from_secs(1),
+                ..Default::default()
+            },
+            max_connections,
+            group: 0,
+        }
+    }
+
     #[test]
     fn fetch_kind_is_copy() {
         let kind = FetchKind::Body;
         let _copy = kind;
         let _another = kind;
+    }
+
+    #[test]
+    fn blocking_body_lane_candidate_honors_exclusions_and_capacity() {
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_blocking_s2n_server(1, 2), scripted_server(2, 0)],
+            max_idle_age: Duration::from_secs(30),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(15),
+        });
+
+        assert!(client.has_blocking_body_lane_candidate(&[]));
+        assert!(!client.has_blocking_body_lane_candidate(&[0]));
+
+        let saturated = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_blocking_s2n_server(1, 0)],
+            max_idle_age: Duration::from_secs(30),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(15),
+        });
+        assert!(!saturated.has_blocking_body_lane_candidate(&[]));
     }
 
     #[test]

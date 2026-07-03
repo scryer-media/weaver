@@ -5275,6 +5275,7 @@ version = "0.6.9"
 dependencies = [
  "crc32fast",
  "criterion",
+ "libloading",
  "memchr",
  "thiserror 2.0.18",
 ]

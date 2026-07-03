@@ -140,6 +140,17 @@ fn api_key_cache(raw_key: &str, scope: &str) -> ApiKeyCache {
 }
 
 fn scheduler_handle_with_mock_commands(jobs: Vec<JobInfo>) -> SchedulerHandle {
+    scheduler_handle_with_mock_commands_with_db(jobs, None)
+}
+
+fn scheduler_handle_with_mock_commands_and_db(jobs: Vec<JobInfo>, db: Database) -> SchedulerHandle {
+    scheduler_handle_with_mock_commands_with_db(jobs, Some(db))
+}
+
+fn scheduler_handle_with_mock_commands_with_db(
+    jobs: Vec<JobInfo>,
+    db: Option<Database>,
+) -> SchedulerHandle {
     let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
     let (event_tx, _) = broadcast::channel(16);
     let shared_state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
@@ -150,11 +161,18 @@ fn scheduler_handle_with_mock_commands(jobs: Vec<JobInfo>) -> SchedulerHandle {
                 SchedulerCommand::AddJob {
                     job_id,
                     spec,
+                    options,
                     reply,
                     ..
                 } => {
                     let mut jobs = state.list_jobs();
-                    jobs.push(job_info_from_spec(job_id, spec));
+                    let mut job = job_info_from_spec(job_id, spec);
+                    if options.initially_paused {
+                        job.status = JobStatus::Paused;
+                        job.download_state = weaver_server_core::DownloadState::Queued;
+                        job.run_state = weaver_server_core::RunState::Paused;
+                    }
+                    jobs.push(job);
                     state.publish_jobs(jobs);
                     let _ = reply.send(Ok(()));
                 }
@@ -168,17 +186,52 @@ fn scheduler_handle_with_mock_commands(jobs: Vec<JobInfo>) -> SchedulerHandle {
                 SchedulerCommand::CancelJob { job_id, reply } => {
                     let mut jobs = state.list_jobs();
                     let original_len = jobs.len();
+                    let cancelled = jobs.iter().find(|job| job.job_id == job_id).cloned();
                     jobs.retain(|job| job.job_id != job_id);
                     let result = if jobs.len() == original_len {
                         Err(SchedulerError::JobNotFound(job_id))
                     } else {
+                        if let (Some(db), Some(job)) = (&db, cancelled) {
+                            let _ = db.insert_job_history(&weaver_server_core::JobHistoryRow {
+                                job_id: job_id.0,
+                                job_hash: job.job_hash.map(|hash| hash.to_vec()),
+                                name: job.name,
+                                status: "cancelled".to_string(),
+                                error_message: None,
+                                total_bytes: job.total_bytes,
+                                downloaded_bytes: job.downloaded_bytes,
+                                optional_recovery_bytes: job.optional_recovery_bytes,
+                                optional_recovery_downloaded_bytes: job
+                                    .optional_recovery_downloaded_bytes,
+                                failed_bytes: job.failed_bytes,
+                                health: job.health,
+                                category: job.category,
+                                output_dir: job.output_dir,
+                                nzb_path: None,
+                                created_at: (job.created_at_epoch_ms / 1000.0) as i64,
+                                completed_at: (job.created_at_epoch_ms / 1000.0) as i64,
+                                metadata: if job.metadata.is_empty() {
+                                    None
+                                } else {
+                                    serde_json::to_string(&job.metadata).ok()
+                                },
+                                last_diagnostic_id: None,
+                                last_diagnostic_uploaded_at_epoch_ms: None,
+                            });
+                        }
                         state.publish_jobs(jobs);
                         Ok(())
                     };
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::DeleteHistory { reply, .. }
-                | SchedulerCommand::RedownloadJob { reply, .. } => {
+                SchedulerCommand::DeleteHistory { job_id, reply, .. } => {
+                    if let Some(db) = &db {
+                        let _ = db.delete_job_history(job_id.0);
+                        let _ = db.delete_job_events(job_id.0);
+                    }
+                    let _ = reply.send(Ok(()));
+                }
+                SchedulerCommand::RedownloadJob { reply, .. } => {
                     let _ = reply.send(Ok(()));
                 }
                 _ => {}
@@ -495,6 +548,174 @@ async fn nzbget_append_accepts_arr_v16_base64_payload_and_preserves_drone() {
 }
 
 #[tokio::test]
+async fn nzbget_append_preserves_submitted_category_case_for_facade() {
+    use base64::Engine as _;
+
+    let db = Database::open_in_memory().unwrap();
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let config = test_config();
+    {
+        let mut config_write = config.write().await;
+        config_write
+            .categories
+            .push(weaver_server_core::categories::CategoryConfig {
+                id: 1,
+                name: "TV".into(),
+                dest_dir: None,
+                aliases: String::new(),
+            });
+    }
+    let app = nzbget_test_router(
+        db,
+        handle.clone(),
+        config,
+        api_key_cache("control-key", "control"),
+    );
+    let nzb_b64 =
+        base64::engine::general_purpose::STANDARD.encode(minimal_nzb("Case.Category.Release"));
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "append",
+            "params": [
+                "Case.Category.Release.nzb",
+                nzb_b64,
+                "tv",
+                0,
+                false,
+                false,
+                "",
+                0,
+                "all",
+                ["drone", "case-category"]
+            ],
+            "id": "append-category"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["result"].as_u64().unwrap() >= 10_000);
+    assert_eq!(handle.list_jobs()[0].category.as_deref(), Some("tv"));
+
+    let (status, groups_payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "listgroups",
+            "params": [],
+            "id": "listgroups"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(groups_payload["result"][0]["Category"], "tv");
+}
+
+#[tokio::test]
+async fn nzbget_append_rejection_returns_zero_for_invalid_nzb() {
+    use base64::Engine as _;
+
+    let db = Database::open_in_memory().unwrap();
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        db,
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let invalid_nzb_b64 = base64::engine::general_purpose::STANDARD.encode("not an nzb");
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "append",
+            "params": [
+                "Invalid.Release.nzb",
+                invalid_nzb_b64,
+                "tv",
+                0,
+                false,
+                false,
+                "",
+                0,
+                "all",
+                ["drone", "invalid-release"]
+            ],
+            "id": "append-invalid"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], 0);
+    assert!(handle.list_jobs().is_empty());
+}
+
+#[tokio::test]
+async fn nzbget_append_add_paused_is_initially_paused() {
+    use base64::Engine as _;
+
+    let db = Database::open_in_memory().unwrap();
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        db,
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let nzb_b64 = base64::engine::general_purpose::STANDARD.encode(minimal_nzb("Paused.Release"));
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "append",
+            "params": [
+                "Paused.Release.nzb",
+                nzb_b64,
+                "tv",
+                0,
+                false,
+                true,
+                "",
+                0,
+                "all",
+                ["drone", "paused-release"]
+            ],
+            "id": "append-paused"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["result"].as_u64().unwrap() >= 10_000);
+    let jobs = handle.list_jobs();
+    assert_eq!(jobs[0].status, JobStatus::Paused);
+    assert_eq!(
+        jobs[0].download_state,
+        weaver_server_core::DownloadState::Queued
+    );
+    assert_eq!(jobs[0].run_state, weaver_server_core::RunState::Paused);
+
+    let (status, groups_payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "listgroups",
+            "params": [],
+            "id": "listgroups-paused"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(groups_payload["result"][0]["Status"], "PAUSED");
+}
+
+#[tokio::test]
 async fn nzbget_append_rejects_private_url_payloads_for_prowlarr_shape() {
     let db = Database::open_in_memory().unwrap();
     let handle = scheduler_handle_with_mock_commands(vec![]);
@@ -622,6 +843,42 @@ async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
 }
 
 #[tokio::test]
+async fn nzbget_status_clamps_download_rate_to_arr_int() {
+    let metrics = PipelineMetrics::new();
+    let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+    let (event_tx, _) = broadcast::channel(1);
+    let shared_state = SharedPipelineState::new(metrics.clone(), vec![]);
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    metrics
+        .bytes_downloaded
+        .store((i32::MAX as u64) * 4, std::sync::atomic::Ordering::Relaxed);
+    shared_state.refresh_metrics_snapshot();
+    assert!(shared_state.metrics_snapshot().current_download_speed > i32::MAX as u64);
+    let handle = SchedulerHandle::new(cmd_tx, event_tx, shared_state);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle,
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "status",
+            "params": [],
+            "id": "status-clamp"
+        }),
+        "Bearer session-token",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"]["DownloadRate"], i32::MAX);
+    assert_eq!(payload["result"]["AverageDownloadRate"], i32::MAX);
+}
+
+#[tokio::test]
 async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
     let db = Database::open_in_memory().unwrap();
     let metadata = serde_json::to_string(&vec![(
@@ -704,6 +961,58 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
 }
 
 #[tokio::test]
+async fn nzbget_history_includes_terminal_memory_items_missing_from_db() {
+    let job = nzbget_test_job(
+        202,
+        JobStatus::Complete,
+        weaver_server_core::DownloadState::Complete,
+        123,
+        123,
+        vec![(
+            weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+            "drone-terminal-memory".to_string(),
+        )],
+    );
+    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle,
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, groups_payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "listgroups",
+            "params": [],
+            "id": "listgroups-terminal"
+        }),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(groups_payload["result"].as_array().unwrap().is_empty());
+
+    let (status, history_payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "history",
+            "params": [],
+            "id": "history-terminal"
+        }),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = history_payload["result"].as_array().unwrap();
+    let item = items.iter().find(|item| item["ID"] == 202).unwrap();
+    assert_eq!(item["ParStatus"], "SUCCESS");
+    assert_eq!(item["Parameters"][0]["Name"], "drone");
+    assert_eq!(item["Parameters"][0]["Value"], "drone-terminal-memory");
+}
+
+#[tokio::test]
 async fn nzbget_config_exposes_real_categories_and_keep_history() {
     let config = test_config();
     {
@@ -748,6 +1057,58 @@ async fn nzbget_config_exposes_real_categories_and_keep_history() {
     assert_eq!(value_for("Category1.Name"), "tv");
     assert_eq!(value_for("Category1.DestDir"), "/media/tv");
     assert_eq!(value_for("Category1.Aliases"), "series,shows");
+}
+
+#[tokio::test]
+async fn nzbget_group_final_delete_does_not_resurface_cancelled_history() {
+    let db = Database::open_in_memory().unwrap();
+    let job = nzbget_test_job(
+        77,
+        JobStatus::Queued,
+        weaver_server_core::DownloadState::Queued,
+        100,
+        0,
+        vec![(
+            weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+            "drone-delete".to_string(),
+        )],
+    );
+    let handle = scheduler_handle_with_mock_commands_and_db(vec![job], db.clone());
+    let app = nzbget_test_router(
+        db.clone(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupFinalDelete", 0, "", 77],
+            "id": "delete"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+    assert!(handle.list_jobs().is_empty());
+    assert!(db.get_job_history(77).unwrap().is_none());
+
+    let (status, history_payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "history",
+            "params": [],
+            "id": "history"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(history_payload["result"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1130,6 +1491,13 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
         created_at: 1_700_000_000,
         category: Some("tv".to_string()),
         metadata: vec![],
+        status: "queued",
+        download_state: "queued",
+        post_state: "idle",
+        run_state: "active",
+        paused_resume_status: None,
+        paused_resume_download_state: None,
+        paused_resume_post_state: None,
     })
     .unwrap();
     db.archive_job(
@@ -1300,6 +1668,7 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         download_pressure_stalls_total: 24,
         download_pressure_stall_duration_ms: 1500,
         download_pressure_current_stall_ms: 250,
+        download_restart_durable_lead_blocked_total: 0,
         hot_dispatch_job_id: 42,
         hot_dispatch_mode: weaver_server_core::DispatchShareMode::Shared,
         hot_dispatch_underfill_ms: 2500,
@@ -1540,6 +1909,7 @@ fn renders_prometheus_download_observed_limiter_states() {
         download_pressure_stalls_total: 0,
         download_pressure_stall_duration_ms: 0,
         download_pressure_current_stall_ms: 0,
+        download_restart_durable_lead_blocked_total: 0,
         hot_dispatch_job_id: 0,
         hot_dispatch_mode: weaver_server_core::DispatchShareMode::Exclusive,
         hot_dispatch_underfill_ms: 0,

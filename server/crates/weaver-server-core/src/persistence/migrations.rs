@@ -287,6 +287,13 @@ impl Database {
                 created_at: job.created_at,
                 category: job.category.clone(),
                 metadata: job.metadata.clone(),
+                status: "queued",
+                download_state: "queued",
+                post_state: "idle",
+                run_state: "active",
+                paused_resume_status: None,
+                paused_resume_download_state: None,
+                paused_resume_post_state: None,
             })?;
 
             // Map the PersistedJobStatus to a string for the active table.

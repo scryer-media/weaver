@@ -32,5 +32,6 @@ pub use settings::types::*;
 pub use system::runtime::load_global_pause_from_db;
 pub use system::types::*;
 pub use weaver_server_core::ingest::{
-    SubmitNzbError, SubmittedJob, fetch_nzb_from_url, init_job_counter, submit_nzb_bytes,
+    CategoryResolutionMode, SubmissionOptions, SubmitNzbError, SubmittedJob, fetch_nzb_from_url,
+    init_job_counter, submit_nzb_bytes, submit_nzb_bytes_with_options,
 };

@@ -4,6 +4,7 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use weaver_yenc::crc::Crc32;
 use weaver_yenc::decode::{
     DecodeOptions, DecodeState, decode_body, decode_body_chunk_until_control, decode_chunk,
+    decode_rapidyenc,
 };
 
 const OUTPUT_BATCH_TARGET: usize = 512 * 1024;
@@ -68,6 +69,55 @@ fn bigbang_like_body() -> Vec<u8> {
         }
     }
     body
+}
+
+/// Column-accurate yEnc encoding at 128 encoded columns, matching what real
+/// posts (and rapidyenc's own bench) look like. `bigbang_like_body` breaks
+/// after 128 *input* bytes instead, which shifts line-break phase relative to
+/// the decoder's 64-byte windows and historically flattered the kernel.
+fn real_yenc_128col_body() -> Vec<u8> {
+    let mut body = Vec::with_capacity(800 * 1024);
+    let mut col = 0usize;
+    for idx in 0..768_000usize {
+        let byte = ((idx * 31 + 17) & 0xff) as u8;
+        let encoded = byte.wrapping_add(42);
+        match encoded {
+            0x00 | 0x0a | 0x0d | 0x3d => {
+                body.push(b'=');
+                body.push(encoded.wrapping_add(64));
+                col += 2;
+            }
+            0x2e if col == 0 => {
+                body.push(b'=');
+                body.push(encoded.wrapping_add(64));
+                col += 2;
+            }
+            _ => {
+                body.push(encoded);
+                col += 1;
+            }
+        }
+        if col >= 128 {
+            body.extend_from_slice(b"\r\n");
+            col = 0;
+        }
+    }
+    if col > 0 {
+        body.extend_from_slice(b"\r\n");
+    }
+    body
+}
+
+/// Kernel-only lane: rapidyenc-semantics raw decode, no CRC. Directly
+/// comparable to `rapidyenc_decode` numbers from the parity bench.
+fn bench_decode_only(c: &mut Criterion, name: &str, input: &[u8]) {
+    let mut output = vec![0u8; input.len() + 64];
+    c.bench_function(name, |b| {
+        b.iter(|| {
+            let written = decode_rapidyenc(black_box(input), &mut output).unwrap();
+            black_box(written);
+        });
+    });
 }
 
 fn raw_terminator_body() -> Vec<u8> {
@@ -359,6 +409,7 @@ fn benches(c: &mut Criterion) {
     let dot_stuffed = dot_stuffed_body();
     let raw_terminator = raw_terminator_body();
     let bigbang_like = bigbang_like_body();
+    let real_shape = real_yenc_128col_body();
 
     bench_body(
         c,
@@ -396,6 +447,16 @@ fn benches(c: &mut Criterion) {
             dot_unstuffing: true,
         },
     );
+    bench_body(
+        c,
+        "yenc_decode_realshape_128col",
+        &real_shape,
+        DecodeOptions {
+            dot_unstuffing: true,
+        },
+    );
+    bench_decode_only(c, "yenc_decode_only_realshape_128col", &real_shape);
+    bench_decode_only(c, "yenc_decode_only_bigbang_like", &bigbang_like);
     bench_until_control(c, &bigbang_like);
     bench_chunked(c, &dot_stuffed);
     bench_real_article_if_configured(c);

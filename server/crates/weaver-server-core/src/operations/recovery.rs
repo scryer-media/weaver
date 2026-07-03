@@ -365,6 +365,13 @@ mod tests {
             created_at: 1_700_000_000 + id,
             category: None,
             metadata: vec![],
+            status: "queued",
+            download_state: "queued",
+            post_state: "idle",
+            run_state: "active",
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
         }
     }
 

@@ -10,12 +10,13 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::warn;
+use std::collections::HashSet;
 
 use weaver_server_api::{
-    Attribute, AttributeInput, CLIENT_REQUEST_ID_ATTRIBUTE_KEY, PRIORITY_ATTRIBUTE_KEY, QueueItem,
-    QueueItemState, fetch_nzb_from_url, history_item_from_row, queue_item_from_job,
-    submit_metadata, submit_nzb_bytes,
+    Attribute, AttributeInput, CLIENT_REQUEST_ID_ATTRIBUTE_KEY, CategoryResolutionMode,
+    PRIORITY_ATTRIBUTE_KEY, QueueItem, QueueItemState, SubmissionOptions, SubmitNzbError,
+    fetch_nzb_from_url, history_item_from_row, queue_item_from_job, submit_metadata,
+    submit_nzb_bytes_with_options,
 };
 use weaver_server_core::auth::{ApiKeyCache, CallerScope, LoginAuthCache};
 use weaver_server_core::settings::model::SharedConfig;
@@ -315,7 +316,7 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
 
     let metadata = submit_metadata(Some(attributes), client_request_id)
         .map_err(RpcError::invalid_parameter)?;
-    let submitted = submit_nzb_bytes(
+    let submitted = submit_nzb_bytes_with_options(
         &ctx.db,
         &ctx.handle,
         &ctx.config,
@@ -324,21 +325,20 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
         None,
         request.category,
         metadata,
+        SubmissionOptions {
+            category_resolution: CategoryResolutionMode::PreserveSubmitted,
+            add_paused: request.add_paused,
+        },
     )
-    .await
-    .map_err(|error| RpcError::invalid_parameter(error.to_string()))?;
+    .await;
 
-    if request.add_paused
-        && let Err(error) = ctx.handle.pause_job(submitted.job_id).await
-    {
-        warn!(
-            job_id = submitted.job_id.0,
-            error = %error,
-            "accepted NZBGet append but could not apply AddPaused"
-        );
+    match submitted {
+        Ok(submitted) => Ok(json!(submitted.job_id.0)),
+        Err(SubmitNzbError::Parse(_) | SubmitNzbError::Empty | SubmitNzbError::NotXml) => {
+            Ok(json!(0))
+        }
+        Err(error) => Err(RpcError::invalid_parameter(error.to_string())),
     }
-
-    Ok(json!(submitted.job_id.0))
 }
 
 fn parse_append_params(params: Option<Value>) -> Result<AppendRequest, RpcError> {
@@ -376,6 +376,7 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         .sum::<u64>();
     let metrics = ctx.handle.get_metrics();
     let download_rate = metrics.current_download_speed;
+    let arr_download_rate = download_rate.min(i32::MAX as u64);
     let config = ctx.config.read().await;
     let download_limit = config.max_download_speed.unwrap_or(0);
     let (remaining_lo, remaining_hi) = size_parts(remaining);
@@ -389,10 +390,10 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         "DownloadedSizeLo": downloaded_lo,
         "DownloadedSizeHi": downloaded_hi,
         "DownloadedSizeMB": bytes_to_mib(downloaded),
-        "DownloadRate": download_rate,
+        "DownloadRate": arr_download_rate,
         "DownloadRateLo": rate_lo,
         "DownloadRateHi": rate_hi,
-        "AverageDownloadRate": download_rate,
+        "AverageDownloadRate": arr_download_rate,
         "AverageDownloadRateLo": rate_lo,
         "AverageDownloadRateHi": rate_hi,
         "DownloadLimit": download_limit,
@@ -491,17 +492,63 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     .await
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?;
-    let items = rows
+    let mut seen_ids = HashSet::with_capacity(rows.len());
+    let mut items = rows
         .iter()
         .map(|row| {
+            seen_ids.insert(row.job_id);
             let item = history_item_from_row(row, None, None);
             nzbget_history_item(&item)
         })
         .collect::<Vec<_>>();
+    items.extend(
+        ctx.handle
+            .list_jobs()
+            .iter()
+            .map(queue_item_from_job)
+            .filter(|item| {
+                matches!(
+                    item.state,
+                    QueueItemState::Completed | QueueItemState::Failed
+                )
+            })
+            .filter(|item| seen_ids.insert(item.id))
+            .map(|item| nzbget_history_queue_item(&item)),
+    );
     Ok(Value::Array(items))
 }
 
 fn nzbget_history_item(item: &weaver_server_api::HistoryItem) -> Value {
+    let total = item.total_bytes;
+    let (file_lo, file_hi) = size_parts(total);
+    let failed = item.state == QueueItemState::Failed;
+    let par_status = if failed { "FAILURE" } else { "SUCCESS" };
+    let unpack_status = if failed { "NONE" } else { "SUCCESS" };
+    let output_dir = item.output_dir.clone().unwrap_or_default();
+
+    json!({
+        "ID": item.id,
+        "NZBID": item.id,
+        "Name": item.name,
+        "Category": item.category.clone().unwrap_or_default(),
+        "FileSizeLo": file_lo,
+        "FileSizeHi": file_hi,
+        "FileSizeMB": bytes_to_mib(total),
+        "DestDir": output_dir,
+        "FinalDir": output_dir,
+        "ParStatus": par_status,
+        "UnpackStatus": unpack_status,
+        "MoveStatus": "SUCCESS",
+        "ScriptStatus": "SUCCESS",
+        "DeleteStatus": "NONE",
+        "MarkStatus": "NONE",
+        "Status": if failed { "FAILURE" } else { "SUCCESS" },
+        "Message": item.error.clone().unwrap_or_default(),
+        "Parameters": response_parameters(item.client_request_id.as_deref(), &item.attributes),
+    })
+}
+
+fn nzbget_history_queue_item(item: &QueueItem) -> Value {
     let total = item.total_bytes;
     let (file_lo, file_hi) = size_parts(total);
     let failed = item.state == QueueItemState::Failed;
@@ -600,7 +647,7 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
 
     for job_id in ids {
         let result = match command.as_str() {
-            "GroupFinalDelete" => ctx.handle.cancel_job(job_id).await,
+            "GroupFinalDelete" => group_final_delete(ctx, job_id).await,
             "HistoryDelete" => ctx.handle.delete_history(job_id, false).await,
             "HistoryRedownload" => ctx.handle.redownload_job(job_id).await,
             other => return Err(RpcError::invalid_action(other)),
@@ -617,6 +664,14 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
     }
 
     Ok(json!(true))
+}
+
+async fn group_final_delete(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+) -> Result<(), SchedulerError> {
+    ctx.handle.cancel_job(job_id).await?;
+    ctx.handle.delete_history(job_id, false).await
 }
 
 fn positional_params(params: Option<Value>) -> Result<Vec<Value>, RpcError> {

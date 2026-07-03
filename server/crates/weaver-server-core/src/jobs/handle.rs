@@ -162,6 +162,11 @@ pub struct RestoreJobRequest {
     pub working_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AddJobOptions {
+    pub initially_paused: bool,
+}
+
 pub enum SchedulerCommand {
     /// Submit a new job.
     AddJob {
@@ -169,6 +174,7 @@ pub enum SchedulerCommand {
         spec: JobSpec,
         nzb_path: PathBuf,
         nzb_zstd: Vec<u8>,
+        options: AddJobOptions,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
     /// Restore a job from the journal (crash recovery).
@@ -334,6 +340,19 @@ impl SchedulerHandle {
         nzb_path: PathBuf,
         nzb_zstd: Vec<u8>,
     ) -> Result<(), SchedulerError> {
+        self.add_job_with_options(job_id, spec, nzb_path, nzb_zstd, AddJobOptions::default())
+            .await
+    }
+
+    /// Submit a new download job with explicit scheduler options.
+    pub async fn add_job_with_options(
+        &self,
+        job_id: JobId,
+        spec: JobSpec,
+        nzb_path: PathBuf,
+        nzb_zstd: Vec<u8>,
+        options: AddJobOptions,
+    ) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::AddJob {
@@ -341,6 +360,7 @@ impl SchedulerHandle {
                 spec,
                 nzb_path,
                 nzb_zstd,
+                options,
                 reply: tx,
             })
             .await

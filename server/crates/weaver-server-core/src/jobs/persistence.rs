@@ -413,9 +413,16 @@ impl Database {
             SqlArg::Text(job.nzb_path.to_str().unwrap_or("").to_string()),
             SqlArg::Bytes(job.nzb_zstd.clone()),
             SqlArg::Text(job.output_dir.to_str().unwrap_or("").to_string()),
+            SqlArg::Text(job.status.to_string()),
+            SqlArg::Text(job.download_state.to_string()),
+            SqlArg::Text(job.post_state.to_string()),
+            SqlArg::Text(job.run_state.to_string()),
             SqlArg::I64(job.created_at as i64),
             SqlArg::OptText(job.category.clone()),
             SqlArg::OptText(metadata_json(&job.metadata)?),
+            SqlArg::OptText(job.paused_resume_status.map(str::to_string)),
+            SqlArg::OptText(job.paused_resume_download_state.map(str::to_string)),
+            SqlArg::OptText(job.paused_resume_post_state.map(str::to_string)),
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "create_active_job", |tx| {
@@ -423,8 +430,8 @@ impl Database {
                 Box::pin(async move {
                     tx.execute(
                         "INSERT INTO active_jobs
-                         (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata)
-                         VALUES ({}, {}, {}, {}, {}, 'queued', 'queued', 'idle', 'active', {}, {}, {})",
+                         (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state)
+                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                         &args,
                     )
                     .await?;
@@ -449,9 +456,16 @@ impl Database {
             SqlArg::Text(job.nzb_path.to_str().unwrap_or("").to_string()),
             SqlArg::Bytes(job.nzb_zstd.clone()),
             SqlArg::Text(job.output_dir.to_str().unwrap_or("").to_string()),
+            SqlArg::Text(job.status.to_string()),
+            SqlArg::Text(job.download_state.to_string()),
+            SqlArg::Text(job.post_state.to_string()),
+            SqlArg::Text(job.run_state.to_string()),
             SqlArg::I64(job.created_at as i64),
             SqlArg::OptText(job.category.clone()),
             SqlArg::OptText(metadata_json(&job.metadata)?),
+            SqlArg::OptText(job.paused_resume_status.map(str::to_string)),
+            SqlArg::OptText(job.paused_resume_download_state.map(str::to_string)),
+            SqlArg::OptText(job.paused_resume_post_state.map(str::to_string)),
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(
@@ -463,8 +477,8 @@ impl Database {
                     Box::pin(async move {
                         tx.execute(
                             "INSERT INTO active_jobs
-                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata)
-                             VALUES ({}, {}, {}, {}, {}, 'queued', 'queued', 'idle', 'active', {}, {}, {})",
+                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state)
+                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                             &args,
                         )
                         .await?;

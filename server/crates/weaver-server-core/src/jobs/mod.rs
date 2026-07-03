@@ -12,8 +12,8 @@ pub mod working_dir;
 
 pub use error::SchedulerError;
 pub use handle::{
-    DownloadBlockKind, DownloadBlockState, FINISHED_JOBS_RUNTIME_CAP, JobInfo, RestoreJobRequest,
-    SchedulerCommand, SchedulerHandle, SharedPipelineState,
+    AddJobOptions, DownloadBlockKind, DownloadBlockState, FINISHED_JOBS_RUNTIME_CAP, JobInfo,
+    RestoreJobRequest, SchedulerCommand, SchedulerHandle, SharedPipelineState,
 };
 pub use ids::{ConnectionId, JobId, MessageId, NzbFileId, SegmentId, ServerId};
 pub use model::{

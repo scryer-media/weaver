@@ -8,9 +8,12 @@ impl Pipeline {
                 spec,
                 nzb_path,
                 nzb_zstd,
+                options,
                 reply,
             } => {
-                let result = self.add_job(job_id, spec, nzb_path, nzb_zstd).await;
+                let result = self
+                    .add_job(job_id, spec, nzb_path, nzb_zstd, options)
+                    .await;
                 if result.is_ok() {
                     self.publish_snapshot();
                 }

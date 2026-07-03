@@ -102,6 +102,10 @@ Weaver exposes a **GraphQL API** at `/graphql` with full query, mutation, and su
 
 WebSocket subscriptions provide real-time push updates for job progress, server status, and system events.
 
+Weaver also exposes a small NZBGet-compatible JSON-RPC facade at `/jsonrpc` for Sonarr and Radarr. Use a Weaver API key with `control` scope as the NZBGet password; the username is ignored. A read-scoped key is enough for Test/version/config calls but cannot grab or remove downloads. Fresh Radarr setups use NZBGet's default password (`tegbzn6789`), so replace it with the Weaver API key.
+
+The NZBGet facade supports the Sonarr/Radarr surface: `version`, `status`, `config`, `listgroups`, `history`, `append`, and the `GroupFinalDelete`, `HistoryDelete`, and `HistoryRedownload` `editqueue` actions. Broader NZBGet ecosystem features such as XML-RPC, URL credentials, `listfiles`, `postqueue`, rate controls, pause/resume/move queue commands, and full `NewsServers` objects are not implemented.
+
 ## License
 
 GPLv3 — see [LICENSE](LICENSE) for details.

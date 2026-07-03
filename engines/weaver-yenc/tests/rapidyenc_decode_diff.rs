@@ -30,7 +30,7 @@ void decoder_set_avx2_funcs() {}
 void decoder_set_vbmi2_funcs() {}
 void decoder_set_neon_funcs() {}
 void decoder_set_rvv_funcs() {}
-const bool decoder_has_avx10 = false;
+extern const bool decoder_has_avx10 = false;
 }
 
 static int hex_value(char c) {

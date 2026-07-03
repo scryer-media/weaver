@@ -172,6 +172,25 @@ pub enum JobStatus {
     Paused,
 }
 
+impl JobStatus {
+    pub fn persisted_status(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Downloading => "downloading",
+            Self::Checking => "checking",
+            Self::Verifying => "verifying",
+            Self::QueuedRepair => "queued_repair",
+            Self::Repairing => "repairing",
+            Self::QueuedExtract => "queued_extract",
+            Self::Extracting => "extracting",
+            Self::Moving => "moving",
+            Self::Complete => "complete",
+            Self::Failed { .. } => "failed",
+            Self::Paused => "paused",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DownloadState {
     Queued,
