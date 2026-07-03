@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use s2n_tls_sys as s2n;
 use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
@@ -43,8 +43,15 @@ struct BlockingS2nStream {
     conn: RawS2nConnection,
     _config: RawS2nConfig,
     tcp: TcpStream,
+    read_mode: S2nReadMode,
     stats: BlockingLaneStats,
     read_scratch: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum S2nReadMode {
+    SingleRecordScratch,
+    BufferedPullDirect,
 }
 
 enum BlockingTransport {
@@ -726,67 +733,69 @@ impl BlockingS2nStream {
         tcp.set_read_timeout(Some(timeout)).map_err(NntpError::Io)?;
         tcp.set_write_timeout(Some(timeout))
             .map_err(NntpError::Io)?;
-        tcp.set_nonblocking(true).map_err(NntpError::Io)?;
+        tcp.set_nonblocking(false).map_err(NntpError::Io)?;
 
-        let config = crate::tls::build_s2n_tls_config(ca_cert_path)?;
-        let mut conn = S2nConnection::new_client();
-        conn.set_config(config)
-            .map_err(|error| s2n_error("set config", error))?;
-        conn.set_server_name(host)
-            .map_err(|error| s2n_error("set server name", error))?;
-        conn.prefer_throughput()
-            .map_err(|error| s2n_error("prefer throughput", error))?;
-        // Receive buffering can block a large s2n_recv waiting for more wire
-        // data, which deadlocks small NNTP control responses on blocking IO.
-        conn.set_blinding(Blinding::SelfService)
-            .map_err(|error| s2n_error("set blinding", error))?;
+        let config = RawS2nConfig::new(ca_cert_path)?;
+        let conn = RawS2nConnection::new_client()?;
+        let read_mode = S2nReadMode::from_env();
 
         let mut stream = Self {
             conn,
-            io: Box::new(BlockingS2nIo {
-                tcp,
-                stats: BlockingLaneStats::default(),
-                last_error: None,
-                last_blocked: None,
-            }),
+            _config: config,
+            tcp,
+            read_mode,
+            stats: BlockingLaneStats::default(),
             read_scratch: vec![0; 256 * 1024],
         };
-        stream.install_callbacks()?;
+        stream.configure(host)?;
         stream.negotiate(timeout)?;
         Ok(stream)
     }
 
-    fn install_callbacks(&mut self) -> Result<()> {
-        let ctx = (&mut *self.io) as *mut BlockingS2nIo as *mut c_void;
-        self.conn
-            .set_receive_callback(Some(blocking_s2n_recv_cb))
-            .map_err(|error| s2n_error("set receive callback", error))?;
-        self.conn
-            .set_send_callback(Some(blocking_s2n_send_cb))
-            .map_err(|error| s2n_error("set send callback", error))?;
-        unsafe {
-            self.conn
-                .set_receive_context(ctx)
-                .map_err(|error| s2n_error("set receive context", error))?;
-            self.conn
-                .set_send_context(ctx)
-                .map_err(|error| s2n_error("set send context", error))?;
-        }
+    fn configure(&mut self, host: &str) -> Result<()> {
+        let server_name = CString::new(host).map_err(|_| {
+            NntpError::MalformedResponse(format!("invalid s2n server name contains NUL: {host:?}"))
+        })?;
+        check_s2n_status("set config", unsafe {
+            s2n::s2n_connection_set_config(self.conn.as_ptr(), self._config.as_ptr())
+        })?;
+        check_s2n_status("set server name", unsafe {
+            s2n::s2n_set_server_name(self.conn.as_ptr(), server_name.as_ptr())
+        })?;
+        check_s2n_status("prefer throughput", unsafe {
+            s2n::s2n_connection_prefer_throughput(self.conn.as_ptr())
+        })?;
+        check_s2n_status("configure receive buffering", unsafe {
+            s2n::s2n_connection_set_recv_buffering(
+                self.conn.as_ptr(),
+                self.read_mode.recv_buffering_enabled(),
+            )
+        })?;
+        check_s2n_status("set blinding", unsafe {
+            s2n::s2n_connection_set_blinding(
+                self.conn.as_ptr(),
+                s2n::s2n_blinding::SELF_SERVICE_BLINDING,
+            )
+        })?;
+        check_s2n_status("set fd", unsafe {
+            s2n::s2n_connection_set_fd(self.conn.as_ptr(), self.tcp.as_raw_fd())
+        })?;
         Ok(())
     }
 
     fn negotiate(&mut self, timeout: Duration) -> Result<()> {
+        let started = Instant::now();
         loop {
-            self.io.last_blocked = None;
-            match self.conn.poll_negotiate() {
-                Poll::Ready(Ok(_)) => return Ok(()),
-                Poll::Ready(Err(error)) => {
-                    return Err(self
-                        .take_io_error()
-                        .unwrap_or_else(|| s2n_error("handshake", error)));
-                }
-                Poll::Pending => self.wait_for_blocked_io(timeout).map_err(NntpError::Io)?,
+            let mut blocked = s2n::s2n_blocked_status::NOT_BLOCKED;
+            let rc = unsafe { s2n::s2n_negotiate(self.conn.as_ptr(), &mut blocked) };
+            if rc >= 0 {
+                let _ = unsafe { s2n::s2n_connection_free_handshake(self.conn.as_ptr()) };
+                return Ok(());
             }
+            if s2n_retryable_blocked(blocked) && started.elapsed() < timeout {
+                continue;
+            }
+            return Err(s2n_last_error("handshake", blocked));
         }
     }
 
@@ -796,12 +805,28 @@ impl BlockingS2nStream {
         target_read_size: usize,
         timeout: Duration,
     ) -> io::Result<(usize, TransportReadStats)> {
-        self.io.tcp.set_read_timeout(Some(timeout))?;
+        match self.read_mode {
+            S2nReadMode::SingleRecordScratch => {
+                self.read_single_record_scratch(dst, target_read_size, timeout)
+            }
+            S2nReadMode::BufferedPullDirect => {
+                self.read_buffered_pull_direct(dst, target_read_size, timeout)
+            }
+        }
+    }
+
+    fn read_single_record_scratch(
+        &mut self,
+        dst: &mut BytesMut,
+        target_read_size: usize,
+        timeout: Duration,
+    ) -> io::Result<(usize, TransportReadStats)> {
         let target = target_read_size.max(1);
         if self.read_scratch.len() < target {
             self.read_scratch.resize(target, 0);
         }
 
+        let started = Instant::now();
         let mut total = 0usize;
         let mut stats = TransportReadStats::default();
         loop {
@@ -809,211 +834,345 @@ impl BlockingS2nStream {
                 stats.s2n_target_full_returns += 1;
                 break;
             }
-            self.io.last_blocked = None;
-            match self.conn.poll_recv(&mut self.read_scratch[total..target]) {
-                Poll::Ready(Ok(0)) => {
-                    stats.s2n_zero_returns += 1;
+            let mut blocked = s2n::s2n_blocked_status::NOT_BLOCKED;
+            let n = unsafe {
+                s2n::s2n_recv(
+                    self.conn.as_ptr(),
+                    self.read_scratch[total..target].as_mut_ptr().cast(),
+                    (target - total) as isize,
+                    &mut blocked,
+                )
+            };
+            if n > 0 {
+                let n = n as usize;
+                total += n;
+                self.stats.tls_recv_calls += 1;
+                stats.s2n_read_calls += 1;
+                stats.s2n_read_bytes += n as u64;
+                stats.plaintext_bytes += n as u64;
+                if unsafe { s2n::s2n_peek(self.conn.as_ptr()) } == 0 {
                     break;
                 }
-                Poll::Ready(Ok(n)) => {
-                    total += n;
-                    self.io.stats.tls_recv_calls += 1;
-                    stats.s2n_read_calls += 1;
-                    stats.s2n_read_bytes += n as u64;
-                    stats.plaintext_bytes += n as u64;
-                    if self.conn.peek_len() == 0 && self.conn.peek_buffered_len() == 0 {
-                        break;
-                    }
-                }
-                Poll::Ready(Err(error)) => {
-                    if let Some(error) = self.take_io_error() {
-                        return match error {
-                            NntpError::Io(error) => Err(error),
-                            other => Err(io::Error::other(other)),
-                        };
-                    }
-                    return Err(io::Error::other(s2n_error("recv", error)));
-                }
-                Poll::Pending => {
-                    if total == 0 {
-                        stats.s2n_pending_empty_returns += 1;
-                    } else {
-                        stats.s2n_pending_after_bytes_returns += 1;
-                    }
-                    if total > 0 {
-                        break;
-                    }
-                    self.wait_for_blocked_io(timeout)?;
-                }
+                continue;
             }
+            if n == 0 {
+                stats.s2n_zero_returns += 1;
+                break;
+            }
+            if total == 0 {
+                stats.s2n_pending_empty_returns += 1;
+            } else {
+                stats.s2n_pending_after_bytes_returns += 1;
+            }
+            if s2n_retryable_blocked(blocked) && total > 0 {
+                break;
+            }
+            if s2n_retryable_blocked(blocked) && started.elapsed() < timeout {
+                continue;
+            }
+            return Err(nntp_error_to_io(s2n_last_error("recv", blocked)));
         }
 
         dst.extend_from_slice(&self.read_scratch[..total]);
+        stats.s2n_scratch_copied_bytes += total as u64;
         Ok((total, stats))
     }
 
-    fn write_all(&mut self, mut bytes: &[u8], timeout: Duration) -> Result<()> {
-        self.io
-            .tcp
-            .set_write_timeout(Some(timeout))
-            .map_err(NntpError::Io)?;
-        while !bytes.is_empty() {
-            self.io.last_blocked = None;
-            match self.conn.poll_send(bytes) {
-                Poll::Ready(Ok(0)) => {
-                    return Err(NntpError::Io(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "s2n write returned zero",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => {
-                    self.io.stats.tls_send_calls += 1;
-                    bytes = &bytes[n..];
-                }
-                Poll::Ready(Err(error)) => {
-                    return Err(self
-                        .take_io_error()
-                        .unwrap_or_else(|| s2n_error("send", error)));
-                }
-                Poll::Pending => self.wait_for_blocked_io(timeout).map_err(NntpError::Io)?,
+    fn read_buffered_pull_direct(
+        &mut self,
+        dst: &mut BytesMut,
+        target_read_size: usize,
+        timeout: Duration,
+    ) -> io::Result<(usize, TransportReadStats)> {
+        let target = target_read_size.max(1);
+        dst.reserve(target);
+
+        let started = Instant::now();
+        let mut total = 0usize;
+        let mut stats = TransportReadStats::default();
+        loop {
+            if total >= target {
+                stats.s2n_target_full_returns += 1;
+                break;
             }
+
+            let peek_before = self.peek_plaintext();
+            let buffered_before = self.peek_buffered_ciphertext();
+            let want = target - total;
+            dst.reserve(want);
+            let writable = dst.chunk_mut();
+            let writable_len = writable.len().min(want);
+            if writable_len == 0 {
+                stats.s2n_target_full_returns += 1;
+                break;
+            }
+
+            let mut blocked = s2n::s2n_blocked_status::NOT_BLOCKED;
+            let n = unsafe {
+                s2n::s2n_recv(
+                    self.conn.as_ptr(),
+                    writable.as_mut_ptr().cast(),
+                    writable_len as isize,
+                    &mut blocked,
+                )
+            };
+            if n > 0 {
+                let n = n as usize;
+                unsafe { dst.advance_mut(n) };
+                total += n;
+                self.stats.tls_recv_calls += 1;
+                stats.s2n_read_calls += 1;
+                stats.s2n_read_bytes += n as u64;
+                stats.s2n_direct_buf_reads += 1;
+                stats.plaintext_bytes += n as u64;
+                if peek_before > 0 {
+                    stats.s2n_buffered_plaintext_drains += 1;
+                }
+                if buffered_before > 0 {
+                    stats.s2n_buffered_ciphertext_drains += 1;
+                }
+
+                if self.peek_plaintext() > 0 || self.peek_buffered_ciphertext() > 0 {
+                    continue;
+                }
+                break;
+            }
+            if n == 0 {
+                stats.s2n_zero_returns += 1;
+                break;
+            }
+            if total == 0 {
+                stats.s2n_pending_empty_returns += 1;
+            } else {
+                stats.s2n_pending_after_bytes_returns += 1;
+            }
+            if s2n_retryable_blocked(blocked) {
+                if total > 0 {
+                    break;
+                }
+                if self.peek_plaintext() > 0 || self.peek_buffered_ciphertext() > 0 {
+                    continue;
+                }
+                if started.elapsed() < timeout {
+                    continue;
+                }
+            }
+            return Err(nntp_error_to_io(s2n_last_error("recv", blocked)));
+        }
+
+        Ok((total, stats))
+    }
+
+    fn peek_plaintext(&self) -> u32 {
+        unsafe { s2n::s2n_peek(self.conn.as_ptr()) }
+    }
+
+    fn peek_buffered_ciphertext(&self) -> u32 {
+        unsafe { s2n::s2n_peek_buffered(self.conn.as_ptr()) }
+    }
+
+    fn write_all(&mut self, mut bytes: &[u8], timeout: Duration) -> Result<()> {
+        let started = Instant::now();
+        while !bytes.is_empty() {
+            let mut blocked = s2n::s2n_blocked_status::NOT_BLOCKED;
+            let n = unsafe {
+                s2n::s2n_send(
+                    self.conn.as_ptr(),
+                    bytes.as_ptr().cast(),
+                    bytes.len() as isize,
+                    &mut blocked,
+                )
+            };
+            if n > 0 {
+                self.stats.tls_send_calls += 1;
+                bytes = &bytes[n as usize..];
+                continue;
+            }
+            if n == 0 {
+                return Err(NntpError::Io(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "s2n write returned zero",
+                )));
+            }
+            if s2n_retryable_blocked(blocked) && started.elapsed() < timeout {
+                continue;
+            }
+            return Err(s2n_last_error("send", blocked));
         }
         self.flush(timeout)
     }
 
     fn flush(&mut self, timeout: Duration) -> Result<()> {
-        self.io
-            .tcp
-            .set_write_timeout(Some(timeout))
-            .map_err(NntpError::Io)?;
+        let started = Instant::now();
         loop {
-            self.io.last_blocked = None;
-            match self.conn.poll_flush() {
-                Poll::Ready(Ok(_)) => return Ok(()),
-                Poll::Ready(Err(error)) => {
-                    return Err(self
-                        .take_io_error()
-                        .unwrap_or_else(|| s2n_error("flush", error)));
-                }
-                Poll::Pending => self.wait_for_blocked_io(timeout).map_err(NntpError::Io)?,
-            }
-        }
-    }
-
-    fn wait_for_blocked_io(&mut self, timeout: Duration) -> io::Result<()> {
-        let event = match self.io.last_blocked.take() {
-            Some(BlockedIo::Read) => libc::POLLIN,
-            Some(BlockedIo::Write) => libc::POLLOUT,
-            None => libc::POLLIN | libc::POLLOUT,
-        };
-        wait_fd(self.io.tcp.as_raw_fd(), event, timeout)
-    }
-
-    fn take_io_error(&mut self) -> Option<NntpError> {
-        self.io.last_error.take().map(NntpError::Io)
-    }
-}
-
-impl Drop for BlockingS2nStream {
-    fn drop(&mut self) {
-        let _ = self.conn.set_receive_callback(None);
-        let _ = self.conn.set_send_callback(None);
-        unsafe {
-            let _ = self.conn.set_receive_context(std::ptr::null_mut());
-            let _ = self.conn.set_send_context(std::ptr::null_mut());
-        }
-    }
-}
-
-unsafe extern "C" fn blocking_s2n_recv_cb(ctx: *mut c_void, buf: *mut u8, len: u32) -> c_int {
-    if ctx.is_null() {
-        return -1;
-    }
-    let io = unsafe { &mut *(ctx as *mut BlockingS2nIo) };
-    let dest = unsafe { std::slice::from_raw_parts_mut(buf, len as usize) };
-    match io.tcp.read(dest) {
-        Ok(n) => {
-            io.stats.socket_reads += 1;
-            n as c_int
-        }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            io.last_blocked = Some(BlockedIo::Read);
-            set_errno_would_block();
-            -1
-        }
-        Err(error) => {
-            io.last_error = Some(error);
-            -1
-        }
-    }
-}
-
-unsafe extern "C" fn blocking_s2n_send_cb(ctx: *mut c_void, buf: *const u8, len: u32) -> c_int {
-    if ctx.is_null() {
-        return -1;
-    }
-    let io = unsafe { &mut *(ctx as *mut BlockingS2nIo) };
-    let src = unsafe { std::slice::from_raw_parts(buf, len as usize) };
-    match io.tcp.write(src) {
-        Ok(n) => {
-            io.stats.socket_writes += 1;
-            n as c_int
-        }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            io.last_blocked = Some(BlockedIo::Write);
-            set_errno_would_block();
-            -1
-        }
-        Err(error) => {
-            io.last_error = Some(error);
-            -1
-        }
-    }
-}
-
-fn wait_fd(fd: RawFd, events: libc::c_short, timeout: Duration) -> io::Result<()> {
-    let timeout_ms = timeout.as_millis().min(c_int::MAX as u128) as c_int;
-    let timeout_ms = timeout_ms.max(1);
-    let mut pollfd = libc::pollfd {
-        fd,
-        events,
-        revents: 0,
-    };
-    loop {
-        let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-        if rc > 0 {
-            if pollfd.revents & events != 0 {
+            let mut blocked = s2n::s2n_blocked_status::NOT_BLOCKED;
+            let rc = unsafe { s2n::s2n_flush(self.conn.as_ptr(), &mut blocked) };
+            if rc >= 0 {
                 return Ok(());
             }
-            if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    format!("s2n socket poll failed: revents=0x{:x}", pollfd.revents),
-                ));
+            if s2n_retryable_blocked(blocked) && started.elapsed() < timeout {
+                continue;
             }
-            return Ok(());
-        }
-        if rc == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "timed out waiting for s2n socket",
-            ));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
+            return Err(s2n_last_error("flush", blocked));
         }
     }
 }
 
-fn set_errno_would_block() {
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    unsafe {
-        *libc::__error() = libc::EWOULDBLOCK;
+impl S2nReadMode {
+    fn from_env() -> Self {
+        match std::env::var("WEAVER_OWNED_S2N_READ_MODE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("buffered-pull" | "buffered_pull" | "direct") => Self::BufferedPullDirect,
+            _ => Self::SingleRecordScratch,
+        }
     }
-    #[cfg(target_os = "linux")]
-    unsafe {
-        *libc::__errno_location() = libc::EWOULDBLOCK;
+
+    fn recv_buffering_enabled(self) -> bool {
+        matches!(self, Self::BufferedPullDirect)
+    }
+}
+
+impl RawS2nConfig {
+    fn new(ca_cert_path: Option<&std::path::Path>) -> Result<Self> {
+        s2n_tls::init::init();
+        let ca_cert_path = ca_cert_path.ok_or_else(|| {
+            NntpError::MalformedResponse(
+                "blocking s2n currently requires a CA PEM path for deterministic NNTP trust"
+                    .to_string(),
+            )
+        })?;
+        let pem_data = std::fs::read(ca_cert_path).map_err(|error| {
+            NntpError::MalformedResponse(format!(
+                "failed to read blocking s2n CA PEM {}: {error}",
+                ca_cert_path.display()
+            ))
+        })?;
+        let pem = CString::new(pem_data).map_err(|_| {
+            NntpError::MalformedResponse(format!(
+                "blocking s2n CA PEM {} contains NUL",
+                ca_cert_path.display()
+            ))
+        })?;
+        let policy = CString::new("default_tls13").expect("static s2n policy has no NUL");
+        let ptr = NonNull::new(unsafe { s2n::s2n_config_new_minimal() }).ok_or_else(|| {
+            NntpError::MalformedResponse("blocking s2n failed to allocate config".to_string())
+        })?;
+        let config = Self { ptr };
+        check_s2n_status("set TLS 1.3 security policy", unsafe {
+            s2n::s2n_config_set_cipher_preferences(config.as_ptr(), policy.as_ptr())
+        })?;
+        check_s2n_status("load CA PEM", unsafe {
+            s2n::s2n_config_add_pem_to_trust_store(config.as_ptr(), pem.as_ptr())
+        })?;
+        check_s2n_status("disable multi-record receive", unsafe {
+            s2n::s2n_config_set_recv_multi_record(config.as_ptr(), false)
+        })?;
+        Ok(config)
+    }
+
+    fn as_ptr(&self) -> *mut s2n::s2n_config {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for RawS2nConfig {
+    fn drop(&mut self) {
+        let _ = unsafe { s2n::s2n_config_free(self.as_ptr()) };
+    }
+}
+
+impl RawS2nConnection {
+    fn new_client() -> Result<Self> {
+        s2n_tls::init::init();
+        let ptr = NonNull::new(unsafe { s2n::s2n_connection_new(s2n::s2n_mode::CLIENT) })
+            .ok_or_else(|| {
+                NntpError::MalformedResponse(
+                    "blocking s2n failed to allocate connection".to_string(),
+                )
+            })?;
+        Ok(Self { ptr })
+    }
+
+    fn as_ptr(&self) -> *mut s2n::s2n_connection {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for RawS2nConnection {
+    fn drop(&mut self) {
+        let _ = unsafe { s2n::s2n_connection_free(self.as_ptr()) };
+    }
+}
+
+unsafe impl Send for RawS2nConfig {}
+unsafe impl Send for RawS2nConnection {}
+
+fn check_s2n_status(context: &str, rc: libc::c_int) -> Result<()> {
+    if rc < 0 {
+        return Err(s2n_last_error(
+            context,
+            s2n::s2n_blocked_status::NOT_BLOCKED,
+        ));
+    }
+    Ok(())
+}
+
+fn s2n_last_error(context: &str, blocked: s2n::s2n_blocked_status::Type) -> NntpError {
+    let errno = unsafe { *s2n::s2n_errno_location() };
+    let kind = unsafe { s2n::s2n_error_get_type(errno) as s2n::s2n_error_type::Type };
+    if kind == s2n::s2n_error_type::CLOSED {
+        return NntpError::ConnectionClosed;
+    }
+    if kind == s2n::s2n_error_type::IO {
+        return NntpError::Io(io::Error::last_os_error());
+    }
+    if kind == s2n::s2n_error_type::BLOCKED || blocked != s2n::s2n_blocked_status::NOT_BLOCKED {
+        return NntpError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("blocking s2n timed out during {context}: blocked={blocked}"),
+        ));
+    }
+
+    NntpError::MalformedResponse(format!(
+        "blocking s2n failed to {context}: {}: {} (type={kind}, errno={errno})",
+        s2n_error_name(errno),
+        s2n_error_message(errno)
+    ))
+}
+
+fn s2n_retryable_blocked(blocked: s2n::s2n_blocked_status::Type) -> bool {
+    if blocked != s2n::s2n_blocked_status::NOT_BLOCKED {
+        return true;
+    }
+    let errno = unsafe { *s2n::s2n_errno_location() };
+    let kind = unsafe { s2n::s2n_error_get_type(errno) as s2n::s2n_error_type::Type };
+    kind == s2n::s2n_error_type::BLOCKED
+}
+
+fn s2n_error_name(errno: libc::c_int) -> String {
+    unsafe_cstr_to_string(unsafe { s2n::s2n_strerror_name(errno) })
+}
+
+fn s2n_error_message(errno: libc::c_int) -> String {
+    unsafe_cstr_to_string(unsafe { s2n::s2n_strerror(errno, std::ptr::null()) })
+}
+
+fn unsafe_cstr_to_string(ptr: *const libc::c_char) -> String {
+    if ptr.is_null() {
+        return "<null>".to_string();
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn nntp_error_to_io(error: NntpError) -> io::Error {
+    match error {
+        NntpError::Io(error) => error,
+        other => io::Error::other(other),
     }
 }
 
@@ -1098,10 +1257,6 @@ fn profile_cpu_timings_enabled() -> bool {
     )
 }
 
-fn s2n_error(context: &str, error: s2n_tls::error::Error) -> NntpError {
-    NntpError::MalformedResponse(format!("blocking s2n failed to {context}: {error}"))
-}
-
 fn clone_nntp_error(error: &NntpError) -> NntpError {
     match error {
         NntpError::Timeout => NntpError::Timeout,
@@ -1171,11 +1326,286 @@ fn is_connection_error(err: &NntpError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio_rustls::TlsAcceptor;
+    use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
+    use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    enum TestArticle {
+        Body(Vec<u8>),
+        Truncated(Vec<u8>),
+    }
+
+    fn s2n_test_guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     fn yenc_body(data: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();
         weaver_yenc::encode(data, &mut body, 128, "owned.bin").unwrap();
         body
+    }
+
+    fn spawn_tls_nntp_server(
+        articles: Vec<(&'static str, TestArticle)>,
+    ) -> (
+        ServerConfig,
+        std::thread::JoinHandle<()>,
+        std::path::PathBuf,
+    ) {
+        let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate test cert");
+        let cert_der = certified_key.cert.der().clone();
+        let cert_pem = certified_key.cert.pem();
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            certified_key.key_pair.serialize_der(),
+        ));
+
+        let server_provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+        let server_config = RustlsServerConfig::builder_with_provider(Arc::new(server_provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("server TLS config");
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let ca_path = std::env::temp_dir().join(format!(
+            "weaver-blocking-s2n-ca-{}-{nonce}.pem",
+            std::process::id()
+        ));
+        std::fs::write(&ca_path, cert_pem).expect("write blocking s2n CA PEM");
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+
+        let articles = articles
+            .into_iter()
+            .map(|(id, article)| (id.to_string(), article))
+            .collect::<HashMap<_, _>>();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let (socket, _) = listener.accept().await.unwrap();
+                let acceptor = TlsAcceptor::from(Arc::new(server_config));
+                let tls = acceptor.accept(socket).await.unwrap();
+                let mut stream = BufReader::new(tls);
+                stream.get_mut().write_all(b"200 test server ready\r\n").await.unwrap();
+                stream.get_mut().flush().await.unwrap();
+
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if stream.read_line(&mut line).await.unwrap() == 0 {
+                        break;
+                    }
+                    let command = line.trim_end_matches(['\r', '\n']);
+                    if command.eq_ignore_ascii_case("CAPABILITIES") {
+                        stream
+                            .get_mut()
+                            .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n")
+                            .await
+                            .unwrap();
+                    } else if command.to_ascii_uppercase().starts_with("GROUP ") {
+                        stream
+                            .get_mut()
+                            .write_all(b"211 1 1 1 alt.test\r\n")
+                            .await
+                            .unwrap();
+                    } else if let Some(id) = command.strip_prefix("BODY ") {
+                        match articles.get(id.trim()) {
+                            Some(TestArticle::Body(data)) => {
+                                stream
+                                    .get_mut()
+                                    .write_all(format!("222 0 {} body follows\r\n", id.trim()).as_bytes())
+                                    .await
+                                    .unwrap();
+                                stream.get_mut().write_all(&yenc_body(data)).await.unwrap();
+                                stream.get_mut().write_all(b".\r\n").await.unwrap();
+                            }
+                            Some(TestArticle::Truncated(data)) => {
+                                stream
+                                    .get_mut()
+                                    .write_all(format!("222 0 {} body follows\r\n", id.trim()).as_bytes())
+                                    .await
+                                    .unwrap();
+                                stream.get_mut().write_all(&yenc_body(data)).await.unwrap();
+                                stream.get_mut().flush().await.unwrap();
+                                break;
+                            }
+                            None => {
+                                stream
+                                    .get_mut()
+                                    .write_all(b"430 no such article\r\n")
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    } else if command.eq_ignore_ascii_case("QUIT") {
+                        stream.get_mut().write_all(b"205 closing\r\n").await.unwrap();
+                        stream.get_mut().flush().await.unwrap();
+                        break;
+                    } else {
+                        stream
+                            .get_mut()
+                            .write_all(b"500 command not recognized\r\n")
+                            .await
+                            .unwrap();
+                    }
+                    stream.get_mut().flush().await.unwrap();
+                }
+            });
+        });
+
+        let config = ServerConfig {
+            host: "localhost".to_string(),
+            port,
+            tls: true,
+            starttls: false,
+            username: None,
+            password: None,
+            connect_timeout: Duration::from_secs(5),
+            command_timeout: Duration::from_secs(5),
+            buffer_profile: NntpBufferProfile::default(),
+            tls_ca_cert: Some(ca_path.clone()),
+        };
+        (config, handle, ca_path)
+    }
+
+    #[test]
+    fn blocking_s2n_fd_reads_pipelined_body_responses() {
+        let _guard = s2n_test_guard();
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![
+            ("<one@test>", TestArticle::Body(b"first article".to_vec())),
+            ("<two@test>", TestArticle::Body(b"second article".to_vec())),
+        ]);
+        let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+        conn.select_group("alt.test").unwrap();
+        conn.write_body_request("<one@test>").unwrap();
+        conn.write_body_request("<two@test>").unwrap();
+        conn.flush_commands().unwrap();
+
+        let first = conn.stream_next_yenc_article().unwrap();
+        let second = conn.stream_next_yenc_article().unwrap();
+
+        assert_eq!(first.into_data(), b"first article");
+        assert_eq!(second.into_data(), b"second article");
+        assert!(conn.stats().tls_recv_calls > 0);
+        assert!(conn.stats().tls_send_calls > 0);
+        conn.quit().unwrap();
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
+    }
+
+    #[test]
+    fn blocking_s2n_buffered_pull_direct_reads_pipelined_body_responses() {
+        let _guard = s2n_test_guard();
+        let _mode = EnvVarGuard::set("WEAVER_OWNED_S2N_READ_MODE", "buffered-pull");
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![
+            ("<one@test>", TestArticle::Body(vec![b'a'; 128 * 1024])),
+            ("<two@test>", TestArticle::Body(vec![b'b'; 128 * 1024])),
+        ]);
+        let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+        conn.select_group("alt.test").unwrap();
+        conn.write_body_request("<one@test>").unwrap();
+        conn.write_body_request("<two@test>").unwrap();
+        conn.flush_commands().unwrap();
+
+        let first = conn.stream_next_yenc_article().unwrap();
+        let second = conn.stream_next_yenc_article().unwrap();
+
+        assert_eq!(first.to_data(), vec![b'a'; 128 * 1024]);
+        assert_eq!(second.to_data(), vec![b'b'; 128 * 1024]);
+        assert!(
+            first.stats.transport_read.s2n_direct_buf_reads
+                + second.stats.transport_read.s2n_direct_buf_reads
+                > 0
+        );
+        assert_eq!(
+            first.stats.transport_read.s2n_scratch_copied_bytes
+                + second.stats.transport_read.s2n_scratch_copied_bytes,
+            0
+        );
+        conn.quit().unwrap();
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
+    }
+
+    #[test]
+    fn blocking_s2n_fd_reports_missing_article() {
+        let _guard = s2n_test_guard();
+        let (config, handle, ca_path) = spawn_tls_nntp_server(Vec::new());
+        let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+        conn.select_group("alt.test").unwrap();
+
+        let error = conn.stream_yenc_article("<missing@test>").unwrap_err();
+
+        assert!(matches!(
+            error,
+            FusedYencError::Nntp(NntpError::NoSuchArticle { .. })
+                | FusedYencError::Nntp(NntpError::ArticleNotFound)
+        ));
+        conn.quit().unwrap();
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
+    }
+
+    #[test]
+    fn blocking_s2n_fd_reports_truncated_response() {
+        let _guard = s2n_test_guard();
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
+            "<truncated@test>",
+            TestArticle::Truncated(b"incomplete article".to_vec()),
+        )]);
+        let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+        conn.select_group("alt.test").unwrap();
+
+        let error = conn.stream_yenc_article("<truncated@test>").unwrap_err();
+
+        assert!(matches!(
+            error,
+            FusedYencError::Nntp(NntpError::ConnectionClosed)
+                | FusedYencError::Nntp(NntpError::Io(_))
+                | FusedYencError::Nntp(NntpError::TruncatedMultilineBody)
+                | FusedYencError::Yenc(_)
+        ));
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
     }
 
     #[test]

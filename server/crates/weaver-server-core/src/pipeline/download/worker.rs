@@ -2784,6 +2784,22 @@ impl Pipeline {
                     io.transport_read.s2n_zero_returns,
                 );
                 crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.direct_buf_reads",
+                    io.transport_read.s2n_direct_buf_reads,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.buffered_plaintext_drains",
+                    io.transport_read.s2n_buffered_plaintext_drains,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.buffered_ciphertext_drains",
+                    io.transport_read.s2n_buffered_ciphertext_drains,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "download.nntp.transport.s2n.scratch_copied_bytes",
+                    io.transport_read.s2n_scratch_copied_bytes,
+                );
+                crate::runtime::perf_probe::record_value(
                     "download.nntp.transport.s2n.bytes_per_read_call",
                     if io.transport_read.s2n_read_calls == 0 {
                         0
