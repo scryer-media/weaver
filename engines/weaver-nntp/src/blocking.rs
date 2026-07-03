@@ -43,15 +43,7 @@ struct BlockingS2nStream {
     conn: RawS2nConnection,
     _config: RawS2nConfig,
     tcp: TcpStream,
-    read_mode: S2nReadMode,
     stats: BlockingLaneStats,
-    read_scratch: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum S2nReadMode {
-    SingleRecordScratch,
-    BufferedPullDirect,
 }
 
 enum BlockingTransport {
@@ -737,15 +729,12 @@ impl BlockingS2nStream {
 
         let config = RawS2nConfig::new(ca_cert_path)?;
         let conn = RawS2nConnection::new_client()?;
-        let read_mode = S2nReadMode::from_env();
 
         let mut stream = Self {
             conn,
             _config: config,
             tcp,
-            read_mode,
             stats: BlockingLaneStats::default(),
-            read_scratch: vec![0; 256 * 1024],
         };
         stream.configure(host)?;
         stream.negotiate(timeout)?;
@@ -766,10 +755,7 @@ impl BlockingS2nStream {
             s2n::s2n_connection_prefer_throughput(self.conn.as_ptr())
         })?;
         check_s2n_status("configure receive buffering", unsafe {
-            s2n::s2n_connection_set_recv_buffering(
-                self.conn.as_ptr(),
-                self.read_mode.recv_buffering_enabled(),
-            )
+            s2n::s2n_connection_set_recv_buffering(self.conn.as_ptr(), true)
         })?;
         check_s2n_status("set blinding", unsafe {
             s2n::s2n_connection_set_blinding(
@@ -805,77 +791,7 @@ impl BlockingS2nStream {
         target_read_size: usize,
         timeout: Duration,
     ) -> io::Result<(usize, TransportReadStats)> {
-        match self.read_mode {
-            S2nReadMode::SingleRecordScratch => {
-                self.read_single_record_scratch(dst, target_read_size, timeout)
-            }
-            S2nReadMode::BufferedPullDirect => {
-                self.read_buffered_pull_direct(dst, target_read_size, timeout)
-            }
-        }
-    }
-
-    fn read_single_record_scratch(
-        &mut self,
-        dst: &mut BytesMut,
-        target_read_size: usize,
-        timeout: Duration,
-    ) -> io::Result<(usize, TransportReadStats)> {
-        let target = target_read_size.max(1);
-        if self.read_scratch.len() < target {
-            self.read_scratch.resize(target, 0);
-        }
-
-        let started = Instant::now();
-        let mut total = 0usize;
-        let mut stats = TransportReadStats::default();
-        loop {
-            if total >= target {
-                stats.s2n_target_full_returns += 1;
-                break;
-            }
-            let mut blocked = s2n::s2n_blocked_status::NOT_BLOCKED;
-            let n = unsafe {
-                s2n::s2n_recv(
-                    self.conn.as_ptr(),
-                    self.read_scratch[total..target].as_mut_ptr().cast(),
-                    (target - total) as isize,
-                    &mut blocked,
-                )
-            };
-            if n > 0 {
-                let n = n as usize;
-                total += n;
-                self.stats.tls_recv_calls += 1;
-                stats.s2n_read_calls += 1;
-                stats.s2n_read_bytes += n as u64;
-                stats.plaintext_bytes += n as u64;
-                if unsafe { s2n::s2n_peek(self.conn.as_ptr()) } == 0 {
-                    break;
-                }
-                continue;
-            }
-            if n == 0 {
-                stats.s2n_zero_returns += 1;
-                break;
-            }
-            if total == 0 {
-                stats.s2n_pending_empty_returns += 1;
-            } else {
-                stats.s2n_pending_after_bytes_returns += 1;
-            }
-            if s2n_retryable_blocked(blocked) && total > 0 {
-                break;
-            }
-            if s2n_retryable_blocked(blocked) && started.elapsed() < timeout {
-                continue;
-            }
-            return Err(nntp_error_to_io(s2n_last_error("recv", blocked)));
-        }
-
-        dst.extend_from_slice(&self.read_scratch[..total]);
-        stats.s2n_scratch_copied_bytes += total as u64;
-        Ok((total, stats))
+        self.read_buffered_pull_direct(dst, target_read_size, timeout)
     }
 
     fn read_buffered_pull_direct(
@@ -896,8 +812,6 @@ impl BlockingS2nStream {
                 break;
             }
 
-            let peek_before = self.peek_plaintext();
-            let buffered_before = self.peek_buffered_ciphertext();
             let want = target - total;
             dst.reserve(want);
             let writable = dst.chunk_mut();
@@ -923,14 +837,7 @@ impl BlockingS2nStream {
                 self.stats.tls_recv_calls += 1;
                 stats.s2n_read_calls += 1;
                 stats.s2n_read_bytes += n as u64;
-                stats.s2n_direct_buf_reads += 1;
                 stats.plaintext_bytes += n as u64;
-                if peek_before > 0 {
-                    stats.s2n_buffered_plaintext_drains += 1;
-                }
-                if buffered_before > 0 {
-                    stats.s2n_buffered_ciphertext_drains += 1;
-                }
 
                 if self.peek_plaintext() > 0 || self.peek_buffered_ciphertext() > 0 {
                     continue;
@@ -1015,23 +922,6 @@ impl BlockingS2nStream {
             }
             return Err(s2n_last_error("flush", blocked));
         }
-    }
-}
-
-impl S2nReadMode {
-    fn from_env() -> Self {
-        match std::env::var("WEAVER_OWNED_S2N_READ_MODE")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-        {
-            Some("buffered-pull" | "buffered_pull" | "direct") => Self::BufferedPullDirect,
-            _ => Self::SingleRecordScratch,
-        }
-    }
-
-    fn recv_buffering_enabled(self) -> bool {
-        matches!(self, Self::BufferedPullDirect)
     }
 }
 
@@ -1345,28 +1235,6 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
     fn yenc_body(data: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();
         weaver_yenc::encode(data, &mut body, 128, "owned.bin").unwrap();
@@ -1533,9 +1401,8 @@ mod tests {
     }
 
     #[test]
-    fn blocking_s2n_buffered_pull_direct_reads_pipelined_body_responses() {
+    fn blocking_s2n_reads_large_pipelined_body_responses() {
         let _guard = s2n_test_guard();
-        let _mode = EnvVarGuard::set("WEAVER_OWNED_S2N_READ_MODE", "buffered-pull");
         let (config, handle, ca_path) = spawn_tls_nntp_server(vec![
             ("<one@test>", TestArticle::Body(vec![b'a'; 128 * 1024])),
             ("<two@test>", TestArticle::Body(vec![b'b'; 128 * 1024])),
@@ -1551,16 +1418,6 @@ mod tests {
 
         assert_eq!(first.to_data(), vec![b'a'; 128 * 1024]);
         assert_eq!(second.to_data(), vec![b'b'; 128 * 1024]);
-        assert!(
-            first.stats.transport_read.s2n_direct_buf_reads
-                + second.stats.transport_read.s2n_direct_buf_reads
-                > 0
-        );
-        assert_eq!(
-            first.stats.transport_read.s2n_scratch_copied_bytes
-                + second.stats.transport_read.s2n_scratch_copied_bytes,
-            0
-        );
         conn.quit().unwrap();
         handle.join().unwrap();
         let _ = std::fs::remove_file(ca_path);

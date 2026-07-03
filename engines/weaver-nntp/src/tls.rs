@@ -63,10 +63,6 @@ pub struct TransportReadStats {
     pub s2n_pending_empty_returns: u64,
     pub s2n_pending_after_bytes_returns: u64,
     pub s2n_zero_returns: u64,
-    pub s2n_direct_buf_reads: u64,
-    pub s2n_buffered_plaintext_drains: u64,
-    pub s2n_buffered_ciphertext_drains: u64,
-    pub s2n_scratch_copied_bytes: u64,
     pub boring_read_calls: u64,
     pub boring_read_bytes: u64,
     pub boring_target_full_returns: u64,
@@ -95,10 +91,6 @@ impl TransportReadStats {
         self.s2n_pending_empty_returns += other.s2n_pending_empty_returns;
         self.s2n_pending_after_bytes_returns += other.s2n_pending_after_bytes_returns;
         self.s2n_zero_returns += other.s2n_zero_returns;
-        self.s2n_direct_buf_reads += other.s2n_direct_buf_reads;
-        self.s2n_buffered_plaintext_drains += other.s2n_buffered_plaintext_drains;
-        self.s2n_buffered_ciphertext_drains += other.s2n_buffered_ciphertext_drains;
-        self.s2n_scratch_copied_bytes += other.s2n_scratch_copied_bytes;
         self.boring_read_calls += other.boring_read_calls;
         self.boring_read_bytes += other.boring_read_bytes;
         self.boring_target_full_returns += other.boring_target_full_returns;

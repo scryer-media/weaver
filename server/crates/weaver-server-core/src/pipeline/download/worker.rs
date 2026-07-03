@@ -57,21 +57,6 @@ const DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY: Duration = Duration::from_milli
 const BODY_LANE_UNAVAILABLE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
-fn owned_blocking_s2n_lane_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("WEAVER_DOWNLOAD_LANE_DRIVER")
-                .ok()
-                .as_deref()
-                .map(str::trim)
-                .map(str::to_ascii_lowercase)
-                .as_deref(),
-            Some("owned-blocking-s2n" | "owned-s2n" | "owned")
-        )
-    })
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DownloadPressure {
     state: DownloadPressureState,
@@ -2784,22 +2769,6 @@ impl Pipeline {
                     io.transport_read.s2n_zero_returns,
                 );
                 crate::runtime::perf_probe::record_value(
-                    "download.nntp.transport.s2n.direct_buf_reads",
-                    io.transport_read.s2n_direct_buf_reads,
-                );
-                crate::runtime::perf_probe::record_value(
-                    "download.nntp.transport.s2n.buffered_plaintext_drains",
-                    io.transport_read.s2n_buffered_plaintext_drains,
-                );
-                crate::runtime::perf_probe::record_value(
-                    "download.nntp.transport.s2n.buffered_ciphertext_drains",
-                    io.transport_read.s2n_buffered_ciphertext_drains,
-                );
-                crate::runtime::perf_probe::record_value(
-                    "download.nntp.transport.s2n.scratch_copied_bytes",
-                    io.transport_read.s2n_scratch_copied_bytes,
-                );
-                crate::runtime::perf_probe::record_value(
                     "download.nntp.transport.s2n.bytes_per_read_call",
                     if io.transport_read.s2n_read_calls == 0 {
                         0
@@ -2921,7 +2890,7 @@ impl Pipeline {
     }
 
     fn should_use_owned_blocking_s2n_lane(&self, lease: &DownloadBatchLease) -> bool {
-        if !owned_blocking_s2n_lane_enabled() || lease.compatibility.is_recovery {
+        if lease.compatibility.is_recovery {
             return false;
         }
         if lease.works.iter().any(|work| work.is_recovery) {
