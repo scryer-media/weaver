@@ -69,6 +69,34 @@ fn overflow_forces_oldest_eviction() {
 }
 
 #[test]
+fn oldest_buffered_batch_drains_lowest_offsets() {
+    let mut buf = WriteReorderBuffer::<Vec<u8>>::new(8);
+
+    buf.insert(3000, vec![3u8; 1000]);
+    buf.insert(1000, vec![1u8; 1000]);
+    buf.insert(5000, vec![5u8; 1000]);
+    buf.mark_persisted(2000, 1000);
+    buf.insert(4000, vec![4u8; 1000]);
+
+    let drained = buf.take_oldest_buffered_batch(3);
+    let offsets: Vec<u64> = drained.iter().map(|(offset, _)| *offset).collect();
+
+    assert_eq!(offsets, vec![1000, 3000, 4000]);
+    assert_eq!(buf.buffered_len(), 1);
+    assert_eq!(buf.buffered_bytes(), 1000);
+}
+
+#[test]
+fn oldest_buffered_batch_respects_zero_limit() {
+    let mut buf = WriteReorderBuffer::<Vec<u8>>::new(8);
+
+    buf.insert(1000, vec![1u8; 1000]);
+
+    assert!(buf.take_oldest_buffered_batch(0).is_empty());
+    assert_eq!(buf.buffered_len(), 1);
+}
+
+#[test]
 fn flush_all_drains_everything() {
     let mut buf = WriteReorderBuffer::<Vec<u8>>::new(16);
 

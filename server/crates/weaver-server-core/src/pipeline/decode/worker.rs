@@ -7,6 +7,7 @@ use std::time::Instant;
 use super::*;
 
 const MAX_DEFERRED_FILE_HASH_DATA_BYTES: usize = 128 * 1024 * 1024;
+const OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
 enum SegmentHashMode {
@@ -790,20 +791,24 @@ impl Pipeline {
             let mut flushed_segments = 0usize;
             for file_id in file_ids {
                 loop {
-                    let candidate = self
+                    let batch = self
                         .write_buffers
                         .get_mut(&file_id)
-                        .and_then(WriteReorderBuffer::take_oldest_buffered);
-                    let Some((offset, segment)) = candidate else {
+                        .map(|write_buf| {
+                            write_buf
+                                .take_oldest_buffered_batch(OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS)
+                        })
+                        .unwrap_or_default();
+                    if batch.is_empty() {
                         self.remove_empty_write_buffer(file_id);
                         break;
-                    };
+                    }
+                    let batch_len = batch.len();
 
                     if let Err(error) = self
-                        .persist_out_of_order_segment(
+                        .persist_out_of_order_segments(
                             file_id,
-                            offset,
-                            segment,
+                            batch,
                             OutOfOrderPersistReason::QuiescentFlush,
                         )
                         .await
@@ -814,7 +819,7 @@ impl Pipeline {
                         );
                         break;
                     }
-                    flushed_segments += 1;
+                    flushed_segments += batch_len;
                 }
             }
 
@@ -1203,24 +1208,23 @@ impl Pipeline {
         file_id: NzbFileId,
     ) -> Result<(), SegmentWriteError> {
         loop {
-            let to_persist = {
+            let batch = {
                 let Some(write_buf) = self.write_buffers.get_mut(&file_id) else {
                     return Ok(());
                 };
                 if !write_buf.exceeds_max_pending() {
                     return Ok(());
                 }
-                write_buf.take_oldest_buffered()
+                write_buf.take_oldest_buffered_batch(OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS)
             };
 
-            let Some((offset, segment)) = to_persist else {
+            if batch.is_empty() {
                 self.remove_empty_write_buffer(file_id);
                 return Ok(());
-            };
-            self.persist_out_of_order_segment(
+            }
+            self.persist_out_of_order_segments(
                 file_id,
-                offset,
-                segment,
+                batch,
                 OutOfOrderPersistReason::PerFileMaxPending,
             )
             .await?;
@@ -1240,19 +1244,21 @@ impl Pipeline {
                 break;
             };
 
-            let candidate = self
+            let batch = self
                 .write_buffers
                 .get_mut(&file_id)
-                .and_then(WriteReorderBuffer::take_oldest_buffered);
-            let Some((offset, segment)) = candidate else {
+                .map(|write_buf| {
+                    write_buf.take_oldest_buffered_batch(OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS)
+                })
+                .unwrap_or_default();
+            if batch.is_empty() {
                 self.remove_empty_write_buffer(file_id);
                 continue;
-            };
+            }
 
-            self.persist_out_of_order_segment(
+            self.persist_out_of_order_segments(
                 file_id,
-                offset,
-                segment,
+                batch,
                 OutOfOrderPersistReason::GlobalWriteBacklog,
             )
             .await?;
@@ -1261,21 +1267,31 @@ impl Pipeline {
         Ok(())
     }
 
-    async fn persist_out_of_order_segment(
+    async fn persist_out_of_order_segments(
         &mut self,
         file_id: NzbFileId,
-        offset: u64,
-        segment: BufferedDecodedSegment,
+        segments: Vec<(u64, BufferedDecodedSegment)>,
         reason: OutOfOrderPersistReason,
     ) -> Result<(), SegmentWriteError> {
-        crate::runtime::perf_probe::record(
-            reason.profile_bucket(),
-            std::time::Duration::from_nanos(1),
-        );
-        let segment_bytes = segment.len_bytes();
+        if segments.is_empty() {
+            self.remove_empty_write_buffer(file_id);
+            return Ok(());
+        }
+
+        for _ in 0..segments.len() {
+            crate::runtime::perf_probe::record(
+                reason.profile_bucket(),
+                std::time::Duration::from_nanos(1),
+            );
+        }
+        let segment_count = segments.len();
+        let segment_bytes = segments
+            .iter()
+            .map(|(_, segment)| segment.len_bytes())
+            .sum::<usize>();
         crate::runtime::perf_probe::record_value(
             "download.persist_out_of_order_segment.batch_count",
-            1,
+            segment_count as u64,
         );
         crate::runtime::perf_probe::record_value(
             "download.persist_out_of_order_segment.batch_bytes",
@@ -1284,36 +1300,51 @@ impl Pipeline {
         let Some((_job_id, filename, _working_dir, file_path)) =
             self.write_target_for_file(file_id)
         else {
-            self.release_write_buffered(segment_bytes, 1);
+            self.release_write_buffered(segment_bytes, segment_count);
             self.remove_empty_write_buffer(file_id);
             return Ok(());
         };
 
         let write_start = Instant::now();
-        let write_result = write_segment_to_disk(&file_path, offset, segment).await;
+        let write_result = write_segments_to_disk(&file_path, segments).await;
         let write_us = write_start.elapsed().as_micros() as u64;
         self.metrics
             .disk_write_latency_us
             .store(write_us, Ordering::Relaxed);
-        self.release_write_buffered(segment_bytes, 1);
-        let segment = write_result.map_err(|source| SegmentWriteError::new(file_id, source))?;
-        crate::e2e_failpoint::maybe_trip("download.after_disk_write_before_commit");
+        self.release_write_buffered(segment_bytes, segment_count);
+        let (written, write_error) = match write_result {
+            Ok(written) => (written, None),
+            Err(error) => {
+                let source = error.source;
+                let written = error.written;
+                drop(error.unwritten);
+                (written, Some(source))
+            }
+        };
 
-        if let Some(write_buf) = self.write_buffers.get_mut(&file_id) {
-            write_buf.mark_persisted(offset, segment_bytes);
+        for (offset, segment) in written {
+            crate::e2e_failpoint::maybe_trip("download.after_disk_write_before_commit");
+            let segment_bytes = segment.len_bytes();
+
+            if let Some(write_buf) = self.write_buffers.get_mut(&file_id) {
+                write_buf.mark_persisted(offset, segment_bytes);
+            }
+            self.metrics
+                .direct_write_evictions
+                .fetch_add(1, Ordering::Relaxed);
+
+            self.commit_persisted_segment(
+                offset,
+                segment,
+                &filename,
+                &file_path,
+                SegmentHashMode::DeferRange,
+            )
+            .await;
         }
-        self.metrics
-            .direct_write_evictions
-            .fetch_add(1, Ordering::Relaxed);
-
-        self.commit_persisted_segment(
-            offset,
-            segment,
-            &filename,
-            &file_path,
-            SegmentHashMode::DeferRange,
-        )
-        .await;
+        if let Some(source) = write_error {
+            return Err(SegmentWriteError::new(file_id, source));
+        }
         self.remove_empty_write_buffer(file_id);
         Ok(())
     }

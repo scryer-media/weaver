@@ -868,31 +868,23 @@ pub(crate) async fn write_segment_to_disk(
 ) -> Result<BufferedDecodedSegment, std::io::Error> {
     let path = path.to_owned();
     let started = Instant::now();
-    let queued_at = started;
-    crate::runtime::perf_probe::record_value("download.disk_write.spawn_blocking.submitted", 1);
-    let result = tokio::task::spawn_blocking(move || {
-        let task_started = Instant::now();
-        crate::runtime::perf_probe::record(
-            "download.disk_write.spawn_blocking.queue_wait",
-            task_started.duration_since(queued_at),
-        );
-        let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.disk_write.task");
-        crate::runtime::affinity::pin_current_thread_for_hot_download_path();
-
-        use std::io::Seek;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)?;
-        file.seek(std::io::SeekFrom::Start(offset))?;
-        segment.data.write_to(&mut file)?;
-        let result = Ok::<BufferedDecodedSegment, std::io::Error>(segment);
-        crate::runtime::perf_probe::record("download.disk_write.task", task_started.elapsed());
-        result
-    })
-    .await
-    .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+    let result = disk_write_owner_pool()
+        .write_batch(path, vec![(offset, segment)])
+        .await
+        .and_then(|mut written| {
+            written
+                .pop()
+                .map(|(_, segment)| segment)
+                .ok_or_else(|| SegmentWriteBatchError {
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "disk write owner returned no written segment",
+                    ),
+                    written,
+                    unwritten: Vec::new(),
+                })
+        })
+        .map_err(|error| error.source);
     crate::runtime::perf_probe::record("download.disk_write.await", started.elapsed());
     result
 }
@@ -903,58 +895,139 @@ pub(crate) struct SegmentWriteBatchError {
     pub(crate) unwritten: Vec<(u64, BufferedDecodedSegment)>,
 }
 
-pub(crate) async fn write_segments_to_disk(
-    path: &std::path::Path,
-    segments: Vec<(u64, BufferedDecodedSegment)>,
-) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
-    let path = path.to_owned();
-    let started = Instant::now();
-    let queued_at = started;
-    crate::runtime::perf_probe::record_value("download.disk_write.spawn_blocking.submitted", 1);
-    let result = tokio::task::spawn_blocking(move || {
-        let task_started = Instant::now();
-        crate::runtime::perf_probe::record(
-            "download.disk_write.spawn_blocking.queue_wait",
-            task_started.duration_since(queued_at),
-        );
-        let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.disk_write.task");
-        crate::runtime::affinity::pin_current_thread_for_hot_download_path();
+const DISK_WRITE_OWNER_THREADS: usize = 8;
 
-        use std::io::Seek;
-        let mut file = match std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-        {
-            Ok(file) => file,
-            Err(source) => {
-                return Err(SegmentWriteBatchError {
-                    source,
-                    written: Vec::new(),
-                    unwritten: segments,
-                });
-            }
+struct DiskWriteOwnerPool {
+    senders: Vec<std::sync::mpsc::Sender<DiskWriteCommand>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+enum DiskWriteCommand {
+    Batch {
+        path: std::path::PathBuf,
+        segments: Vec<(u64, BufferedDecodedSegment)>,
+        queued_at: Instant,
+        response: tokio::sync::oneshot::Sender<
+            Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError>,
+        >,
+    },
+}
+
+impl DiskWriteOwnerPool {
+    fn new() -> Self {
+        let mut senders = Vec::with_capacity(DISK_WRITE_OWNER_THREADS);
+        for index in 0..DISK_WRITE_OWNER_THREADS {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name(format!("weaver-disk-wr-{index}"))
+                .spawn(move || run_disk_write_owner(rx))
+                .expect("failed to spawn Weaver disk write owner thread");
+            senders.push(tx);
+        }
+
+        Self {
+            senders,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    async fn write_batch(
+        &self,
+        path: std::path::PathBuf,
+        segments: Vec<(u64, BufferedDecodedSegment)>,
+    ) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
+        let queued_at = Instant::now();
+        crate::runtime::perf_probe::record_value("download.disk_write.owner.submitted", 1);
+        let (response, response_rx) = tokio::sync::oneshot::channel();
+        let sender_index =
+            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.senders.len();
+        let command = DiskWriteCommand::Batch {
+            path,
+            segments,
+            queued_at,
+            response,
         };
 
-        let mut written = Vec::with_capacity(segments.len());
-        let mut next_file_offset = None;
-        let mut remaining = segments.into_iter();
-        while let Some((offset, segment)) = remaining.next() {
-            let segment_len = segment.data.len_bytes() as u64;
-            if next_file_offset != Some(offset) {
-                if let Err(source) = file.seek(std::io::SeekFrom::Start(offset)) {
-                    let mut unwritten = Vec::with_capacity(1 + remaining.size_hint().0);
-                    unwritten.push((offset, segment));
-                    unwritten.extend(remaining);
-                    return Err(SegmentWriteBatchError {
-                        source,
-                        written,
-                        unwritten,
-                    });
-                }
+        if let Err(error) = self.senders[sender_index].send(command) {
+            let DiskWriteCommand::Batch { segments, .. } = error.0;
+            return Err(SegmentWriteBatchError {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "disk write owner thread stopped",
+                ),
+                written: Vec::new(),
+                unwritten: segments,
+            });
+        }
+
+        response_rx.await.unwrap_or_else(|error| {
+            Err(SegmentWriteBatchError {
+                source: std::io::Error::other(error),
+                written: Vec::new(),
+                unwritten: Vec::new(),
+            })
+        })
+    }
+}
+
+fn disk_write_owner_pool() -> &'static DiskWriteOwnerPool {
+    static POOL: std::sync::OnceLock<DiskWriteOwnerPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(DiskWriteOwnerPool::new)
+}
+
+fn run_disk_write_owner(rx: std::sync::mpsc::Receiver<DiskWriteCommand>) {
+    crate::runtime::affinity::pin_current_thread_for_hot_download_path();
+    while let Ok(command) = rx.recv() {
+        match command {
+            DiskWriteCommand::Batch {
+                path,
+                segments,
+                queued_at,
+                response,
+            } => {
+                let result = write_segments_to_disk_blocking(path, segments, queued_at);
+                let _ = response.send(result);
             }
-            if let Err(source) = segment.data.write_to(&mut file) {
+        }
+    }
+}
+
+fn write_segments_to_disk_blocking(
+    path: std::path::PathBuf,
+    segments: Vec<(u64, BufferedDecodedSegment)>,
+    queued_at: Instant,
+) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
+    let task_started = Instant::now();
+    crate::runtime::perf_probe::record(
+        "download.disk_write.owner.queue_wait",
+        task_started.duration_since(queued_at),
+    );
+    let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.disk_write.task");
+
+    use std::io::Seek;
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(source) => {
+            return Err(SegmentWriteBatchError {
+                source,
+                written: Vec::new(),
+                unwritten: segments,
+            });
+        }
+    };
+
+    let mut written = Vec::with_capacity(segments.len());
+    let mut next_file_offset = None;
+    let mut remaining = segments.into_iter();
+    while let Some((offset, segment)) = remaining.next() {
+        let segment_len = segment.data.len_bytes() as u64;
+        if next_file_offset != Some(offset) {
+            if let Err(source) = file.seek(std::io::SeekFrom::Start(offset)) {
                 let mut unwritten = Vec::with_capacity(1 + remaining.size_hint().0);
                 unwritten.push((offset, segment));
                 unwritten.extend(remaining);
@@ -964,21 +1037,32 @@ pub(crate) async fn write_segments_to_disk(
                     unwritten,
                 });
             }
-            next_file_offset = Some(offset + segment_len);
-            written.push((offset, segment));
         }
+        if let Err(source) = segment.data.write_to(&mut file) {
+            let mut unwritten = Vec::with_capacity(1 + remaining.size_hint().0);
+            unwritten.push((offset, segment));
+            unwritten.extend(remaining);
+            return Err(SegmentWriteBatchError {
+                source,
+                written,
+                unwritten,
+            });
+        }
+        next_file_offset = Some(offset + segment_len);
+        written.push((offset, segment));
+    }
 
-        crate::runtime::perf_probe::record("download.disk_write.task", task_started.elapsed());
-        Ok(written)
-    })
-    .await
-    .unwrap_or_else(|e| {
-        Err(SegmentWriteBatchError {
-            source: std::io::Error::other(e),
-            written: Vec::new(),
-            unwritten: Vec::new(),
-        })
-    });
+    crate::runtime::perf_probe::record("download.disk_write.task", task_started.elapsed());
+    Ok(written)
+}
+
+pub(crate) async fn write_segments_to_disk(
+    path: &std::path::Path,
+    segments: Vec<(u64, BufferedDecodedSegment)>,
+) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
+    let path = path.to_owned();
+    let started = Instant::now();
+    let result = disk_write_owner_pool().write_batch(path, segments).await;
     crate::runtime::perf_probe::record("download.disk_write.await", started.elapsed());
     result
 }
