@@ -90,6 +90,9 @@ pub struct Model {
     init_rl: i32,
     debug_output_index: u64,
     model_fault: bool,
+    // Cached WEAVER_RAR4_DEBUG_PPM flag; the OnceLock lookup is too hot for
+    // the per-symbol decode paths.
+    debug: bool,
 }
 
 // --- Helpers for converting between NodeRef and byte offsets ---
@@ -130,6 +133,7 @@ impl Model {
             init_rl: -(max_order.min(12) as i32) - 1,
             debug_output_index: 0,
             model_fault: false,
+            debug: ppmd_debug_enabled(),
         };
         model.build_lookup_tables();
         model.restart();
@@ -378,7 +382,7 @@ impl Model {
     /// Decode one character. Returns 0-255 on success, -1 on error/restart.
     pub fn decode_char<R: RangeCode>(&mut self, rc: &mut R) -> i32 {
         let debug_output_index = self.debug_output_index;
-        if ppmd_debug_enabled() && (40272340..=40272346).contains(&debug_output_index) {
+        if self.debug && (40272340..=40272346).contains(&debug_output_index) {
             let ns = self.ctx_num_stats(self.min_context);
             eprintln!(
                 "PPMD decode_char start: index=117 min_context={} ns={} order_fall={} found_state={}",
@@ -389,7 +393,7 @@ impl Model {
             || self.alloc.text_exhausted()
             || !self.context_offset_valid(self.min_context)
         {
-            if ppmd_debug_enabled() {
+            if self.debug {
                 eprintln!(
                     "PPMD decode_char early fail: min_context={} text_exhausted={} heap_end={}",
                     self.min_context,
@@ -409,7 +413,7 @@ impl Model {
             }
             // Multi-symbol context.
             if !self.decode_symbol1(rc) {
-                if ppmd_debug_enabled() {
+                if self.debug {
                     eprintln!(
                         "PPMD decode_symbol1 failed: min_context={}",
                         self.min_context
@@ -433,7 +437,7 @@ impl Model {
                 let suffix = self.ctx_suffix(self.min_context);
                 self.min_context = suffix;
                 if self.min_context == 0 {
-                    if ppmd_debug_enabled() {
+                    if self.debug {
                         eprintln!(
                             "PPMD suffix chain hit null: prev_ctx={} prev_ns={} num_masked={} max_context={} order_fall={}",
                             prev_ctx,
@@ -479,7 +483,7 @@ impl Model {
                 }
                 // Validate context pointer.
                 if !self.context_offset_valid(self.min_context) {
-                    if ppmd_debug_enabled() {
+                    if self.debug {
                         eprintln!(
                             "PPMD suffix context invalid: ctx={} p_text={} heap_end={}",
                             self.min_context,
@@ -495,7 +499,7 @@ impl Model {
                 }
             }
             if !self.decode_symbol2(rc) {
-                if ppmd_debug_enabled() {
+                if self.debug {
                     eprintln!(
                         "PPMD decode_symbol2 failed: min_context={}",
                         self.min_context
@@ -529,7 +533,7 @@ impl Model {
             }
         }
 
-        if ppmd_debug_enabled() {
+        if self.debug {
             eprintln!(
                 "PPMD decode_char ok: index={} symbol={} found_state={} order_fall={} min_context={}",
                 debug_output_index, symbol, self.found_state, self.order_fall, self.min_context
@@ -584,7 +588,7 @@ impl Model {
         let idx0 = (freq as usize).saturating_sub(1).min(127);
         let idx1 = idx1.min(63);
         let bs = self.bin_summ[idx0][idx1];
-        if ppmd_debug_enabled() && (40272340..=40272346).contains(&self.debug_output_index) {
+        if self.debug && (40272340..=40272346).contains(&self.debug_output_index) {
             eprintln!(
                 "PPMD decode_bin_symbol: ctx={} symbol={} freq={} prev={} suffix={} suffix_ns={} hi={} sym_hi={} run={} idx0={} idx1={} bs={}",
                 ctx,
@@ -606,7 +610,7 @@ impl Model {
             return false;
         }
         let threshold = rc.get_threshold(BIN_SCALE);
-        if ppmd_debug_enabled() && (40272340..=40272346).contains(&self.debug_output_index) {
+        if self.debug && (40272340..=40272346).contains(&self.debug_output_index) {
             eprintln!(
                 "PPMD decode_bin_symbol threshold: ctx={} threshold={} bs={}",
                 ctx, threshold, bs
@@ -633,7 +637,7 @@ impl Model {
             let Some(&init_esc) = EXP_ESCAPE.get((new_bs >> 10) as usize) else {
                 return false;
             };
-            if ppmd_debug_enabled() && (40272340..=40272346).contains(&self.debug_output_index) {
+            if self.debug && (40272340..=40272346).contains(&self.debug_output_index) {
                 eprintln!(
                     "PPMD decode_bin_symbol escaped: ctx={} symbol={} new_bs={} init_esc={}",
                     ctx, symbol, new_bs, init_esc
@@ -665,14 +669,14 @@ impl Model {
         }
 
         let count = rc.get_current_count(sum_freq);
-        if ppmd_debug_enabled() && (40272340..=40272346).contains(&self.debug_output_index) {
+        if self.debug && (40272340..=40272346).contains(&self.debug_output_index) {
             eprintln!(
                 "PPMD decode_symbol1: ctx={} ns={} sum_freq={} count={}",
                 ctx, ns, sum_freq, count
             );
         }
         if count >= sum_freq {
-            if ppmd_debug_enabled() {
+            if self.debug {
                 eprintln!(
                     "PPMD decode_symbol1 count overflow: count={} sum_freq={} ctx={} found_state={}",
                     count, sum_freq, ctx, self.found_state
@@ -702,7 +706,7 @@ impl Model {
         }
 
         if self.found_state == 0 {
-            if ppmd_debug_enabled() {
+            if self.debug {
                 eprintln!("PPMD decode_symbol1 found_state=0");
             }
             return false;
@@ -789,7 +793,7 @@ impl Model {
             return false;
         }
         let Some(diff) = ns.checked_sub(self.num_masked) else {
-            if ppmd_debug_enabled() {
+            if self.debug {
                 eprintln!(
                     "PPMD decode_symbol2 masked overflow: ctx={} ns={} num_masked={} max_context={} order_fall={}",
                     ctx, ns, self.num_masked, self.max_context, self.order_fall
@@ -853,7 +857,7 @@ impl Model {
             return false;
         };
         if diff == 0 {
-            if ppmd_debug_enabled() {
+            if self.debug {
                 eprintln!(
                     "PPMD decode_symbol2 diff=0: ctx={} ns={} num_masked={}",
                     ctx, ns, self.num_masked
@@ -887,7 +891,7 @@ impl Model {
 
         let scale = esc_freq + hi_cnt;
         let count = rc.get_current_count(scale);
-        if ppmd_debug_enabled() && (40272340..=40272346).contains(&self.debug_output_index) {
+        if self.debug && (40272340..=40272346).contains(&self.debug_output_index) {
             let mut preview = Vec::new();
             for &(st_off, freq) in &unmasked[..n.min(8)] {
                 preview.push((self.st_sym(st_off), freq));
@@ -898,7 +902,7 @@ impl Model {
             );
         }
         if count >= scale {
-            if ppmd_debug_enabled() {
+            if self.debug {
                 eprintln!(
                     "PPMD decode_symbol2 count overflow: ctx={} ns={} diff={} num_masked={} esc_count={} esc_freq={} hi_cnt={} scale={} count={}",
                     ctx, ns, diff, self.num_masked, self.esc_count, esc_freq, hi_cnt, scale, count
@@ -1180,7 +1184,7 @@ impl Model {
         let fs_freq = self.st_freq(self.found_state);
         let fs_succ = self.st_succ(self.found_state);
 
-        if ppmd_debug_enabled() && (110..=120).contains(&self.debug_output_index) {
+        if self.debug && (110..=120).contains(&self.debug_output_index) {
             eprintln!(
                 "PPMD update_model: index={} fs_sym={} fs_freq={} fs_succ={} order_fall={} min_context={} max_context={}",
                 self.debug_output_index,
@@ -1212,7 +1216,7 @@ impl Model {
                         p += STATE_SIZE as u32;
                     }
                     if p >= end {
-                        if ppmd_debug_enabled() {
+                        if self.debug {
                             eprintln!(
                                 "PPMD update_model missing suffix symbol: fs_sym={} min_context={} suffix={} suffix_ns={}",
                                 fs_sym, self.min_context, suffix, sns
@@ -1257,7 +1261,7 @@ impl Model {
         if self.order_fall == 0 {
             // No escape: create successors.
             let new_ctx = self.create_successors(true, p1);
-            if ppmd_debug_enabled() && self.is_text_succ(new_ctx) {
+            if self.debug && self.is_text_succ(new_ctx) {
                 eprintln!(
                     "PPMD order_fall=0 create_successors returned text: new_ctx={} p1={} found_state={} min_context={} max_context={}",
                     new_ctx, p1, self.found_state, self.min_context, self.max_context
@@ -1402,7 +1406,7 @@ impl Model {
             pc = self.ctx_suffix(pc);
         }
 
-        if ppmd_debug_enabled() && self.is_text_succ(next_min_context) {
+        if self.debug && self.is_text_succ(next_min_context) {
             eprintln!(
                 "PPMD next_min_context still text: next={} final_succ={} fs_succ={} found_state={} min_ctx={} max_ctx={} order_fall={}",
                 next_min_context,
@@ -1426,7 +1430,7 @@ impl Model {
         let up_branch = self.st_succ(self.found_state);
         let found_sym = self.st_sym(self.found_state);
 
-        if ppmd_debug_enabled() && (40272337..=40272346).contains(&self.debug_output_index) {
+        if self.debug && (40272337..=40272346).contains(&self.debug_output_index) {
             eprintln!(
                 "PPMD create_successors: index={} skip={} p1={} up_branch={} found_sym={} min_context={} max_context={}",
                 self.debug_output_index,
@@ -1504,7 +1508,7 @@ impl Model {
                 // Binary context.
                 p = pc + CTX_ONE_SYM as u32;
             }
-            if ppmd_debug_enabled() && (40272337..=40272346).contains(&self.debug_output_index) {
+            if self.debug && (40272337..=40272346).contains(&self.debug_output_index) {
                 eprintln!(
                     "PPMD create_successors loop: index={} pc={} ns={} p={} p_succ={} p_sym={} ps_len={}",
                     self.debug_output_index,
@@ -1563,7 +1567,7 @@ impl Model {
         self.set_one_succ(child, up_succ);
         self.set_ctx_suffix(child, base_ctx);
         self.set_st_succ(state_off, child);
-        if ppmd_debug_enabled() && (40272337..=40272346).contains(&self.debug_output_index) {
+        if self.debug && (40272337..=40272346).contains(&self.debug_output_index) {
             eprintln!(
                 "PPMD materialize_text_successor: index={} base_ctx={} state_off={} text_succ={} child={} up_sym={} up_freq={}",
                 self.debug_output_index, base_ctx, state_off, text_succ, child, up_sym, up_freq
@@ -1602,7 +1606,7 @@ impl Model {
         found_sym: u8,
     ) -> u32 {
         if ps.is_empty() {
-            if ppmd_debug_enabled() && self.is_text_succ(pc) {
+            if self.debug && self.is_text_succ(pc) {
                 eprintln!(
                     "PPMD finish_create_successors returning text pc={} up_branch={} found_sym={}",
                     pc, up_branch, found_sym
@@ -1650,7 +1654,7 @@ impl Model {
         }
 
         // Create child contexts from ps (in reverse order).
-        if ppmd_debug_enabled() && (40272337..=40272346).contains(&self.debug_output_index) {
+        if self.debug && (40272337..=40272346).contains(&self.debug_output_index) {
             eprintln!(
                 "PPMD finish_create_successors: index={} ps_len={} base_pc={} up_sym={} up_succ={} up_freq={}",
                 self.debug_output_index,
@@ -1681,7 +1685,7 @@ impl Model {
             pc = child;
         }
 
-        if ppmd_debug_enabled() && (40272337..=40272346).contains(&self.debug_output_index) {
+        if self.debug && (40272337..=40272346).contains(&self.debug_output_index) {
             eprintln!(
                 "PPMD finish_create_successors result: index={} new_pc={}",
                 self.debug_output_index, pc

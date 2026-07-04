@@ -36,6 +36,7 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         download_pressure_stalls_total: 0,
         download_pressure_stall_duration_ms: 0,
         download_pressure_current_stall_ms: 0,
+        download_restart_durable_lead_blocked_total: 0,
         hot_dispatch_job_id: 0,
         hot_dispatch_mode: weaver_server_core::DispatchShareMode::Exclusive,
         hot_dispatch_underfill_ms: 0,

@@ -294,16 +294,25 @@ impl SubAllocator {
         // list order within each bin. `units` mirrors the block's `NU` field.
         let mut chain: Vec<(NodeRef, u32)> = Vec::new();
         let mut removed: Vec<bool> = Vec::new();
-        let mut by_start: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
         for (idx, &bin_units) in INDEX_TO_UNITS.iter().enumerate().take(NUM_INDEXES) {
             let units = bin_units as u32;
             while !self.free_lists[idx].is_null() {
                 let node = self.remove_node(idx);
-                by_start.insert(node.0, chain.len());
                 chain.push((node, units));
                 removed.push(false);
             }
         }
+
+        // Physical-successor lookup: start offset -> chain index.
+        let mut by_start: Vec<(u32, usize)> =
+            chain.iter().enumerate().map(|(i, e)| (e.0.0, i)).collect();
+        by_start.sort_unstable_by_key(|&(start, _)| start);
+        let lookup = |start: u32| -> Option<usize> {
+            by_start
+                .binary_search_by_key(&start, |&(s, _)| s)
+                .ok()
+                .map(|pos| by_start[pos].1)
+        };
 
         // Walk the chain in unrar's order — `insertAt(&s0)` builds the chain
         // by head insertion, so iteration visits blocks in reverse collection
@@ -316,7 +325,7 @@ impl SubAllocator {
             }
             loop {
                 let (node, units) = chain[i];
-                let Some(&j) = by_start.get(&(node.0 + units)) else {
+                let Some(j) = lookup(node.0 + units) else {
                     break;
                 };
                 if removed[j] || units + chain[j].1 >= 0x10000 {
@@ -330,7 +339,8 @@ impl SubAllocator {
         // Reinsert the merged runs in the same reverse-collection chain
         // order: leading 128-unit blocks first, then unrar's tail-before-head
         // split for non-bin sizes. Free lists are LIFO, so this order decides
-        // which block later allocations return.
+        // which block later allocations return — and through that the
+        // model-restart lockstep.
         for i in (0..chain.len()).rev() {
             if removed[i] {
                 continue;

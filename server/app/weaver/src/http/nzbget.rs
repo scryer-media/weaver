@@ -280,9 +280,10 @@ struct AppendRequest {
 async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
     let request = parse_append_params(params)?;
     let (nzb_bytes, fetched_filename) = if is_http_url(&request.content_or_url) {
-        fetch_nzb_from_url(&ctx.http_client, &request.content_or_url)
-            .await
-            .map_err(|error| RpcError::invalid_parameter(error.to_string()))?
+        match fetch_nzb_from_url(&ctx.http_client, &request.content_or_url).await {
+            Ok(fetched) => fetched,
+            Err(error) => return append_rejection_result(error),
+        }
     } else {
         let bytes = BASE64_STANDARD
             .decode(&request.content_or_url)
@@ -334,10 +335,41 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
 
     match submitted {
         Ok(submitted) => Ok(json!(submitted.job_id.0)),
-        Err(SubmitNzbError::Parse(_) | SubmitNzbError::Empty | SubmitNzbError::NotXml) => {
-            Ok(json!(0))
-        }
-        Err(error) => Err(RpcError::invalid_parameter(error.to_string())),
+        Err(error) => append_rejection_result(error),
+    }
+}
+
+fn append_rejection_result(error: SubmitNzbError) -> Result<Value, RpcError> {
+    match error {
+        SubmitNzbError::Parse(_) | SubmitNzbError::Empty | SubmitNzbError::NotXml => Ok(json!(0)),
+        error => Err(RpcError::invalid_parameter(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod append_rejection_tests {
+    use super::*;
+
+    #[test]
+    fn append_rejection_result_returns_zero_for_parse_empty_and_notxml() {
+        let parse_error = weaver_nzb::parse_nzb(b"not an nzb").unwrap_err();
+        assert_eq!(
+            append_rejection_result(SubmitNzbError::Parse(parse_error)).unwrap(),
+            json!(0)
+        );
+        assert_eq!(
+            append_rejection_result(SubmitNzbError::Empty).unwrap(),
+            json!(0)
+        );
+        assert_eq!(
+            append_rejection_result(SubmitNzbError::NotXml).unwrap(),
+            json!(0)
+        );
+
+        let error =
+            append_rejection_result(SubmitNzbError::Fetch("not allowed".into())).unwrap_err();
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("not allowed"));
     }
 }
 

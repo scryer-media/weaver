@@ -9889,6 +9889,45 @@ async fn restore_job_reuses_persisted_rar_volume_facts_after_restart() {
 }
 
 #[tokio::test]
+async fn add_job_with_options_initially_paused_publishes_queued_lane_from_real_pipeline() {
+    let harness = TestHarness::new().await;
+    let job_id = JobId(30037);
+
+    harness
+        .handle
+        .add_job_with_options(
+            job_id,
+            standalone_job_spec("Paused From Start", &[("episode.mkv".to_string(), 123)]),
+            PathBuf::from(format!("job-{}.nzb", job_id.0)),
+            sample_nzb_zstd(),
+            crate::jobs::AddJobOptions {
+                initially_paused: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    let info = harness.handle.get_job(job_id).unwrap();
+    assert_eq!(info.status, JobStatus::Paused);
+    assert_eq!(
+        info.download_state,
+        crate::jobs::model::DownloadState::Queued
+    );
+    assert_eq!(info.run_state, crate::jobs::model::RunState::Paused);
+
+    harness.handle.resume_job(job_id).await.unwrap();
+    let info = harness.handle.get_job(job_id).unwrap();
+    assert_eq!(info.status, JobStatus::Queued);
+    assert_eq!(
+        info.download_state,
+        crate::jobs::model::DownloadState::Queued
+    );
+    assert_eq!(info.run_state, crate::jobs::model::RunState::Active);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn add_job_records_streamed_nzb_hash_in_active_jobs() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

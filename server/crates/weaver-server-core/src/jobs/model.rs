@@ -411,11 +411,7 @@ pub fn runtime_lanes_from_status_snapshot(
             RunState::Active,
         ),
         JobStatus::Failed { .. } => (DownloadState::Failed, PostState::Failed, RunState::Active),
-        JobStatus::Paused => (
-            DownloadState::Downloading,
-            PostState::Idle,
-            RunState::Paused,
-        ),
+        JobStatus::Paused => (DownloadState::Queued, PostState::Idle, RunState::Paused),
     }
 }
 
