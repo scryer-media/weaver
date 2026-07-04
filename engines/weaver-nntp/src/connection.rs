@@ -1274,16 +1274,10 @@ fn pending_multiline_terminator(buf: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use std::io::{self, Cursor, Read};
-    #[cfg(feature = "openssl-probe")]
-    use std::net::TcpStream as StdTcpStream;
     use std::sync::Arc;
 
     use super::*;
     use crate::tls::ManualTlsStream;
-    #[cfg(feature = "openssl-probe")]
-    use openssl::ssl::{ErrorCode as OpensslErrorCode, SslConnector, SslMethod, SslVersion};
-    #[cfg(feature = "openssl-probe")]
-    use openssl::x509::X509;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
@@ -1357,67 +1351,6 @@ mod tests {
             Arc::new(server_config),
             cert_der.as_ref().to_vec(),
         )
-    }
-
-    #[cfg(feature = "openssl-probe")]
-    fn openssl_connector_from_cert_der(cert_der: &[u8]) -> SslConnector {
-        let x509 = X509::from_der(cert_der).expect("OpenSSL test root certificate");
-        let mut builder = SslConnector::builder(SslMethod::tls_client()).expect("OpenSSL builder");
-        builder
-            .set_min_proto_version(Some(SslVersion::TLS1_3))
-            .expect("OpenSSL TLS 1.3 minimum");
-        builder
-            .set_ciphersuites("TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256")
-            .expect("OpenSSL TLS 1.3 cipher suites");
-        builder
-            .cert_store_mut()
-            .add_cert(x509)
-            .expect("OpenSSL test root store");
-        builder.build()
-    }
-
-    #[cfg(feature = "openssl-probe")]
-    #[derive(Clone, Copy, Debug, Default)]
-    struct OpensslDrainStats {
-        ssl_read_calls: usize,
-        want_read: usize,
-        want_write: usize,
-        plaintext_bytes: usize,
-    }
-
-    #[cfg(feature = "openssl-probe")]
-    fn openssl_drain_payload(addr: SocketAddr, cert_der: Vec<u8>) -> (Vec<u8>, OpensslDrainStats) {
-        let connector = openssl_connector_from_cert_der(&cert_der);
-        let tcp = StdTcpStream::connect(addr).expect("OpenSSL client connect");
-        tcp.set_nodelay(true).expect("OpenSSL TCP_NODELAY");
-        let mut tls = connector
-            .connect("localhost", tcp)
-            .expect("OpenSSL TLS connect");
-        let mut output = Vec::with_capacity(TLS_DRAIN_PAYLOAD_BYTES);
-        let mut buf = vec![0u8; TLS_TEST_BUFFER_BYTES];
-        let mut stats = OpensslDrainStats::default();
-
-        while output.len() < TLS_DRAIN_PAYLOAD_BYTES {
-            stats.ssl_read_calls += 1;
-            match tls.ssl_read(&mut buf) {
-                Ok(0) => panic!("OpenSSL TLS stream closed before diagnostic payload"),
-                Ok(n) => {
-                    output.extend_from_slice(&buf[..n]);
-                    stats.plaintext_bytes += n;
-                }
-                Err(err) if err.code() == OpensslErrorCode::WANT_READ => {
-                    stats.want_read += 1;
-                    std::thread::yield_now();
-                }
-                Err(err) if err.code() == OpensslErrorCode::WANT_WRITE => {
-                    stats.want_write += 1;
-                    std::thread::yield_now();
-                }
-                Err(err) => panic!("OpenSSL TLS read failed: {err}"),
-            }
-        }
-
-        (output, stats)
     }
 
     async fn spawn_tls_drain_server(
@@ -2008,26 +1941,6 @@ mod tests {
 
         assert_eq!(read.bytes, TLS_DRAIN_PAYLOAD_BYTES);
         assert_eq!(read_buf.len(), TLS_DRAIN_PAYLOAD_BYTES);
-    }
-
-    #[cfg(feature = "openssl-probe")]
-    #[tokio::test]
-    async fn openssl_bulk_drain_probe() {
-        let (_, server_config, cert_der) = test_tls_configs_with_cert_der();
-        let (addr, flushed_rx) = spawn_tls_drain_server(server_config).await;
-        let client = tokio::task::spawn_blocking(move || openssl_drain_payload(addr, cert_der));
-
-        flushed_rx.await.expect("test server flushed TLS payload");
-        let (output, stats) = client.await.expect("OpenSSL client task");
-
-        println!(
-            "openssl_drain_probe ssl_read_calls={} want_read={} want_write={} plaintext_bytes={} payload_bytes={TLS_DRAIN_PAYLOAD_BYTES}",
-            stats.ssl_read_calls, stats.want_read, stats.want_write, stats.plaintext_bytes
-        );
-
-        assert_eq!(output.len(), TLS_DRAIN_PAYLOAD_BYTES);
-        assert_eq!(stats.plaintext_bytes, TLS_DRAIN_PAYLOAD_BYTES);
-        assert!(stats.ssl_read_calls > 0);
     }
 
     async fn spawn_scripted_server(steps: Vec<ScriptStep>, hold_open_after_last: Duration) -> u16 {

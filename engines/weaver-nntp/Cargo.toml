@@ -6,19 +6,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-openssl-probe = []
-
 [dependencies]
 weaver-yenc = { path = "../weaver-yenc", default-features = false }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
-boring = "5.1.0"
 s2n-tls = "0.3.39"
 s2n-tls-sys = "0.3.39"
 s2n-tls-tokio = "0.3.39"
-tokio-boring = "5.0.0"
 rustls-pemfile = { workspace = true }
 webpki-roots = { workspace = true, default-features = false }
 thiserror = { workspace = true }
@@ -32,7 +27,6 @@ libc = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"
-openssl = "0.10"
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 
 [[bench]]
