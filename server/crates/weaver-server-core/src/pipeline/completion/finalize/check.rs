@@ -191,17 +191,22 @@ impl Pipeline {
         set_names
     }
 
-    fn job_has_idle_ready_rar_work(&self, job_id: JobId) -> bool {
+    fn job_has_idle_startable_rar_work(&self, job_id: JobId) -> bool {
         self.rar_sets
             .iter()
             .filter(|((rar_job_id, _), _)| *rar_job_id == job_id)
-            .any(|(_, set_state)| {
+            .any(|((_, set_name), set_state)| {
                 set_state.active_workers == 0
                     && set_state.in_flight_members.is_empty()
-                    && set_state
-                        .plan
-                        .as_ref()
-                        .is_some_and(|plan| !plan.ready_members.is_empty())
+                    && set_state.plan.as_ref().is_some_and(|plan| {
+                        plan.ready_members.iter().any(|ready_member| {
+                            self.rar_ready_member_is_startable_for_batch_extraction(
+                                job_id,
+                                set_name,
+                                &ready_member.name,
+                            )
+                        })
+                    })
             })
     }
 
@@ -1812,7 +1817,7 @@ impl Pipeline {
             && !has_crc_failures
             && !par2_validation_needed
             && !has_exhausted_rar_active_extraction_tasks
-            && self.job_has_idle_ready_rar_work(job_id)
+            && self.job_has_idle_startable_rar_work(job_id)
             && matches!(
                 current_status,
                 JobStatus::Downloading | JobStatus::QueuedExtract | JobStatus::Extracting

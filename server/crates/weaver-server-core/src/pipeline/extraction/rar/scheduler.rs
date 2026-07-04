@@ -141,6 +141,66 @@ impl Pipeline {
         })
     }
 
+    pub(crate) fn rar_ready_member_is_startable_for_batch_extraction(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        member_name: &str,
+    ) -> bool {
+        if self
+            .inflight_extractions
+            .get(&job_id)
+            .is_some_and(|sets| sets.contains(set_name))
+        {
+            return false;
+        }
+        if self.pending_rar_capacity_retries.contains(&(
+            job_id,
+            set_name.to_string(),
+            RarCapacityRetryKind::Extraction,
+        )) {
+            return false;
+        }
+        if self.pending_rar_capacity_retries.contains(&(
+            job_id,
+            set_name.to_string(),
+            RarCapacityRetryKind::Refresh,
+        )) {
+            return false;
+        }
+        if self
+            .rar_member_refresh_request(job_id, set_name, member_name)
+            .is_some()
+        {
+            return false;
+        }
+        let Some(set_state) = self.rar_sets.get(&(job_id, set_name.to_string())) else {
+            return false;
+        };
+        let Some(plan) = set_state.plan.as_ref() else {
+            return false;
+        };
+        if set_state.active_workers >= Self::rar_set_worker_limit(plan) {
+            return false;
+        }
+        if set_state.in_flight_members.contains(member_name) {
+            return false;
+        }
+        if plan
+            .member_dependencies
+            .get(member_name)
+            .is_some_and(|dependency| {
+                !self
+                    .extracted_members
+                    .get(&job_id)
+                    .is_some_and(|extracted| extracted.contains(&dependency.source_member))
+            })
+        {
+            return false;
+        }
+        self.rar_member_can_start_extraction(job_id, set_name, member_name)
+    }
+
     pub(in crate::pipeline) fn rar_member_refresh_request(
         &self,
         job_id: JobId,
@@ -453,7 +513,9 @@ impl Pipeline {
                         request.reason,
                     );
                     blocked_members.push(member);
-                } else {
+                } else if self
+                    .rar_ready_member_is_startable_for_batch_extraction(job_id, &set_name, &member)
+                {
                     gated_members.push(member);
                 }
             }

@@ -411,6 +411,7 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     let arr_download_rate = download_rate.min(i32::MAX as u64);
     let config = ctx.config.read().await;
     let download_limit = config.max_download_speed.unwrap_or(0);
+    let arr_download_limit = download_limit.min(i32::MAX as u64);
     let (remaining_lo, remaining_hi) = size_parts(remaining);
     let (downloaded_lo, downloaded_hi) = size_parts(downloaded);
     let (rate_lo, rate_hi) = size_parts(download_rate);
@@ -428,7 +429,7 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         "AverageDownloadRate": arr_download_rate,
         "AverageDownloadRateLo": rate_lo,
         "AverageDownloadRateHi": rate_hi,
-        "DownloadLimit": download_limit,
+        "DownloadLimit": arr_download_limit,
         "DownloadPaused": ctx.handle.is_globally_paused(),
         "ServerPaused": false,
         "Download2Paused": false,
@@ -524,38 +525,61 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     .await
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?;
-    let mut seen_ids = HashSet::with_capacity(rows.len());
-    let mut items = rows
+    let terminal_items = ctx
+        .handle
+        .list_jobs()
         .iter()
-        .map(|row| {
-            seen_ids.insert(row.job_id);
-            let item = history_item_from_row(row, None, None);
-            nzbget_history_item(&item)
+        .map(queue_item_from_job)
+        .filter(|item| {
+            matches!(
+                item.state,
+                QueueItemState::Completed | QueueItemState::Failed
+            )
         })
         .collect::<Vec<_>>();
-    items.extend(
-        ctx.handle
-            .list_jobs()
-            .iter()
-            .map(queue_item_from_job)
-            .filter(|item| {
-                matches!(
-                    item.state,
-                    QueueItemState::Completed | QueueItemState::Failed
-                )
-            })
-            .filter(|item| seen_ids.insert(item.id))
-            .map(|item| nzbget_history_queue_item(&item)),
-    );
+    let mut seen_ids = HashSet::with_capacity(rows.len() + terminal_items.len());
+    let mut items = terminal_items
+        .iter()
+        .filter(|item| seen_ids.insert(item.id))
+        .map(nzbget_history_queue_item)
+        .collect::<Vec<_>>();
+    items.extend(rows.iter().filter(|row| seen_ids.insert(row.job_id)).map(|row| {
+        let item = history_item_from_row(row, None, None);
+        nzbget_history_item(&item)
+    }));
     Ok(Value::Array(items))
 }
 
 fn nzbget_history_item(item: &weaver_server_api::HistoryItem) -> Value {
     let total = item.total_bytes;
     let (file_lo, file_hi) = size_parts(total);
-    let failed = item.state == QueueItemState::Failed;
-    let par_status = if failed { "FAILURE" } else { "SUCCESS" };
-    let unpack_status = if failed { "NONE" } else { "SUCCESS" };
+    let cancelled = item
+        .attention
+        .as_ref()
+        .is_some_and(|attention| attention.code == "CANCELLED");
+    let failed = item.state == QueueItemState::Failed && !cancelled;
+    let par_status = if cancelled {
+        "NONE"
+    } else if failed {
+        "FAILURE"
+    } else {
+        "SUCCESS"
+    };
+    let unpack_status = if cancelled || failed {
+        "NONE"
+    } else {
+        "SUCCESS"
+    };
+    let move_status = if cancelled { "NONE" } else { "SUCCESS" };
+    let script_status = if cancelled { "NONE" } else { "SUCCESS" };
+    let delete_status = if cancelled { "MANUAL" } else { "NONE" };
+    let status = if cancelled {
+        "DELETED"
+    } else if failed {
+        "FAILURE"
+    } else {
+        "SUCCESS"
+    };
     let output_dir = item.output_dir.clone().unwrap_or_default();
 
     json!({
@@ -570,11 +594,11 @@ fn nzbget_history_item(item: &weaver_server_api::HistoryItem) -> Value {
         "FinalDir": output_dir,
         "ParStatus": par_status,
         "UnpackStatus": unpack_status,
-        "MoveStatus": "SUCCESS",
-        "ScriptStatus": "SUCCESS",
-        "DeleteStatus": "NONE",
+        "MoveStatus": move_status,
+        "ScriptStatus": script_status,
+        "DeleteStatus": delete_status,
         "MarkStatus": "NONE",
-        "Status": if failed { "FAILURE" } else { "SUCCESS" },
+        "Status": status,
         "Message": item.error.clone().unwrap_or_default(),
         "Parameters": response_parameters(item.client_request_id.as_deref(), &item.attributes),
     })
@@ -621,7 +645,7 @@ async fn config(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         config_entry("AppendCategoryDir", "yes"),
     ];
 
-    let categories = if config.categories.is_empty() {
+    let raw_categories = if config.categories.is_empty() {
         ["tv", "Movies", "Music", "Books", "Prowlarr"]
             .into_iter()
             .map(|name| {
@@ -648,6 +672,7 @@ async fn config(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
             })
             .collect::<Vec<_>>()
     };
+    let categories = nzbget_config_categories(raw_categories);
 
     for (index, (name, dest_dir, aliases)) in categories.iter().enumerate() {
         let prefix = format!("Category{}.", index + 1);
@@ -659,6 +684,61 @@ async fn config(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     }
 
     Ok(Value::Array(entries))
+}
+
+fn nzbget_config_categories(
+    raw_categories: Vec<(String, String, String)>,
+) -> Vec<(String, String, String)> {
+    let mut categories = Vec::new();
+    let mut seen_names = HashSet::new();
+
+    for (name, dest_dir, aliases) in raw_categories {
+        push_nzbget_config_category(
+            &mut categories,
+            &mut seen_names,
+            name.clone(),
+            dest_dir.clone(),
+            aliases.clone(),
+        );
+
+        let lowercase_name = name.to_ascii_lowercase();
+        if lowercase_name != name {
+            push_nzbget_config_category(
+                &mut categories,
+                &mut seen_names,
+                lowercase_name,
+                dest_dir.clone(),
+                String::new(),
+            );
+        }
+
+        for alias in aliases.split(',').map(str::trim) {
+            if alias.is_empty() || alias.contains('*') || alias.contains('?') {
+                continue;
+            }
+            push_nzbget_config_category(
+                &mut categories,
+                &mut seen_names,
+                alias.to_string(),
+                dest_dir.clone(),
+                String::new(),
+            );
+        }
+    }
+
+    categories
+}
+
+fn push_nzbget_config_category(
+    categories: &mut Vec<(String, String, String)>,
+    seen_names: &mut HashSet<String>,
+    name: String,
+    dest_dir: String,
+    aliases: String,
+) {
+    if seen_names.insert(name.clone()) {
+        categories.push((name, dest_dir, aliases));
+    }
 }
 
 async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {

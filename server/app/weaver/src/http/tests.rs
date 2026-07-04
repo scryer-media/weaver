@@ -81,6 +81,43 @@ fn minimal_nzb(name: &str) -> String {
     )
 }
 
+fn drone_metadata(drone_id: &str) -> String {
+    serde_json::to_string(&vec![(
+        weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+        drone_id.to_string(),
+    )])
+    .unwrap()
+}
+
+fn nzbget_history_row(
+    job_id: u64,
+    status: &str,
+    completed_at: i64,
+    metadata: Option<String>,
+) -> weaver_server_core::JobHistoryRow {
+    weaver_server_core::JobHistoryRow {
+        job_id,
+        job_hash: None,
+        name: format!("History.Release.{job_id}"),
+        status: status.to_string(),
+        error_message: (status == "failed").then(|| "article failures".to_string()),
+        total_bytes: 456,
+        downloaded_bytes: if status == "complete" { 456 } else { 100 },
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: if status == "failed" { 356 } else { 0 },
+        health: if status == "failed" { 100 } else { 1000 },
+        category: Some("tv".into()),
+        output_dir: Some(format!("/downloads/tv/History.Release.{job_id}")),
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at,
+        metadata,
+        last_diagnostic_id: None,
+        last_diagnostic_uploaded_at_epoch_ms: None,
+    }
+}
+
 fn test_scheduler_handle() -> SchedulerHandle {
     let (cmd_tx, _cmd_rx) = mpsc::channel(1);
     let (event_tx, _) = broadcast::channel(1);
@@ -855,10 +892,15 @@ async fn nzbget_status_clamps_download_rate_to_arr_int() {
     shared_state.refresh_metrics_snapshot();
     assert!(shared_state.metrics_snapshot().current_download_speed > i32::MAX as u64);
     let handle = SchedulerHandle::new(cmd_tx, event_tx, shared_state);
+    let config = test_config();
+    {
+        let mut config_write = config.write().await;
+        config_write.max_download_speed = Some((i32::MAX as u64) * 4);
+    }
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle,
-        test_config(),
+        config,
         ApiKeyCache::default(),
     );
 
@@ -876,6 +918,7 @@ async fn nzbget_status_clamps_download_rate_to_arr_int() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["result"]["DownloadRate"], i32::MAX);
     assert_eq!(payload["result"]["AverageDownloadRate"], i32::MAX);
+    assert_eq!(payload["result"]["DownloadLimit"], i32::MAX);
 }
 
 #[tokio::test]
@@ -957,6 +1000,7 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
     assert_eq!(complete["Parameters"][0]["Name"], "drone");
     assert_eq!(complete["Parameters"][0]["Value"], "drone-history");
     assert_eq!(failed["ParStatus"], "FAILURE");
+    assert_eq!(failed["DeleteStatus"], "NONE");
     assert_eq!(failed["Message"], "article failures");
 }
 
@@ -1013,6 +1057,104 @@ async fn nzbget_history_includes_terminal_memory_items_missing_from_db() {
 }
 
 #[tokio::test]
+async fn nzbget_history_orders_terminal_memory_items_before_db_rows_and_dedupes() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(
+        202,
+        "complete",
+        1_700_000_300,
+        Some(drone_metadata("drone-db-duplicate")),
+    ))
+    .unwrap();
+    db.insert_job_history(&nzbget_history_row(
+        203,
+        "complete",
+        1_700_000_400,
+        Some(drone_metadata("drone-db-newer")),
+    ))
+    .unwrap();
+    let job = nzbget_test_job(
+        202,
+        JobStatus::Complete,
+        weaver_server_core::DownloadState::Complete,
+        123,
+        123,
+        vec![(
+            weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+            "drone-terminal-memory".to_string(),
+        )],
+    );
+    let app = nzbget_test_router(
+        db,
+        scheduler_handle_with_mock_commands(vec![job]),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, history_payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "history",
+            "params": [],
+            "id": "history-terminal-first"
+        }),
+        "Bearer session-token",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let items = history_payload["result"].as_array().unwrap();
+    assert_eq!(items[0]["ID"], 202);
+    assert_eq!(
+        items.iter().filter(|item| item["ID"] == 202).count(),
+        1,
+        "terminal memory item should replace duplicate DB history row"
+    );
+    assert_eq!(items[0]["Parameters"][0]["Value"], "drone-terminal-memory");
+    assert!(items.iter().any(|item| item["ID"] == 203));
+}
+
+#[tokio::test]
+async fn nzbget_history_maps_cancelled_db_rows_to_manual_delete() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(
+        301,
+        "cancelled",
+        1_700_000_500,
+        Some(drone_metadata("drone-cancelled")),
+    ))
+    .unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, history_payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "history",
+            "params": [],
+            "id": "history-cancelled"
+        }),
+        "Bearer session-token",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let items = history_payload["result"].as_array().unwrap();
+    let item = items.iter().find(|item| item["ID"] == 301).unwrap();
+    assert_eq!(item["DeleteStatus"], "MANUAL");
+    assert_eq!(item["ParStatus"], "NONE");
+    assert_eq!(item["UnpackStatus"], "NONE");
+    assert_eq!(item["MoveStatus"], "NONE");
+    assert_eq!(item["ScriptStatus"], "NONE");
+    assert_eq!(item["MarkStatus"], "NONE");
+    assert_eq!(item["Parameters"][0]["Value"], "drone-cancelled");
+}
+
+#[tokio::test]
 async fn nzbget_config_exposes_real_categories_and_keep_history() {
     let config = test_config();
     {
@@ -1057,6 +1199,58 @@ async fn nzbget_config_exposes_real_categories_and_keep_history() {
     assert_eq!(value_for("Category1.Name"), "tv");
     assert_eq!(value_for("Category1.DestDir"), "/media/tv");
     assert_eq!(value_for("Category1.Aliases"), "series,shows");
+}
+
+#[tokio::test]
+async fn nzbget_config_emits_virtual_literal_alias_categories_for_arr_test() {
+    let config = test_config();
+    {
+        let mut config_write = config.write().await;
+        config_write
+            .categories
+            .push(weaver_server_core::categories::CategoryConfig {
+                id: 1,
+                name: "TV".into(),
+                dest_dir: Some("/media/tv".into()),
+                aliases: "sonarr, movie*".into(),
+            });
+    }
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        config,
+        ApiKeyCache::default(),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "config",
+            "params": [],
+            "id": "config-aliases"
+        }),
+        "Bearer session-token",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let entries = payload["result"].as_array().unwrap();
+    let value_for = |name: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["Name"] == name)
+            .and_then(|entry| entry["Value"].as_str())
+            .unwrap()
+    };
+    let category_names = (1..=3)
+        .map(|index| value_for(&format!("Category{index}.Name")))
+        .collect::<Vec<_>>();
+
+    assert_eq!(category_names, vec!["TV", "tv", "sonarr"]);
+    assert_eq!(value_for("Category1.DestDir"), "/media/tv");
+    assert_eq!(value_for("Category2.DestDir"), "/media/tv");
+    assert_eq!(value_for("Category3.DestDir"), "/media/tv");
+    assert!(entries.iter().all(|entry| entry["Value"] != "movie*"));
 }
 
 #[tokio::test]
