@@ -6338,3 +6338,29 @@ fn test_rar5_multifile_lz_list() {
     let names = archive.member_names();
     assert_eq!(names, vec!["hello.txt", "second.txt", "zeros_64k.bin"]);
 }
+
+// -- RAR4 PPMd model-restart lockstep -----------------------------------------
+
+/// Regression test for the PPMd sub-allocator restart-lockstep bug: the model
+/// must exhaust its arena and restart at exactly the same symbol as the
+/// reference encoder, or decode desyncs right after the first mid-stream
+/// restart ("RAR4: missing LD table" via the corrupt-PPM LZ fallback).
+///
+/// Fixture: 1,600,000 bytes of deterministic base64 text compressed with a
+/// deliberately small 1 MB PPMd heap so several restarts occur.
+/// Created with `rar 6.24`: `rar a -ma4 -m5 -mc16:1t+ -md4m -ep`.
+#[test]
+fn test_rar4_ppmd_solid_restart_lockstep() {
+    let mut archive = open_single("rar4", "rar4_ppm_solid_restart.rar");
+    let opts = weaver_unrar::ExtractOptions {
+        verify: true,
+        password: None,
+        restore_owners: false,
+    };
+    let result = archive.extract_member(0, &opts, None).unwrap();
+    assert_eq!(result.len(), 1_600_000);
+    let bytes = result.to_bytes().unwrap();
+    // Deterministic content: base64 of python `random.seed(20260704)` bytes.
+    assert_eq!(&bytes[..16], b"25Qmjo7RkW0gF0Pq");
+    assert!(bytes.iter().all(|b| b.is_ascii()));
+}

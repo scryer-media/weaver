@@ -908,6 +908,7 @@ impl Rar4LzDecoder {
                         unpacked_size,
                         output_size,
                         Some(flush_threshold),
+                        writer,
                     )?;
                 }
             }
@@ -1027,6 +1028,7 @@ impl Rar4LzDecoder {
                         unpacked_size,
                         output_size,
                         Some(flush_threshold),
+                        &mut *current_writer,
                     )?;
                 }
             }
@@ -1127,6 +1129,7 @@ impl Rar4LzDecoder {
                         unpacked_size,
                         output_size,
                         Some(flush_threshold),
+                        &mut *current_writer,
                     )?;
                 }
             }
@@ -1730,12 +1733,18 @@ impl Rar4LzDecoder {
     ///
     /// Creates a RangeDecoder from the remaining bitstream bytes, decodes
     /// symbols via the PPMd model, and handles escape sequences.
-    fn decode_ppm_symbols<R: BitRead>(
+    ///
+    /// The range decoder's lookahead state cannot survive a drop/recreate, so
+    /// unlike the LZ loop this one cannot yield to the caller for flushing;
+    /// instead it flushes ready output to `writer` itself whenever the
+    /// unflushed window span reaches `yield_threshold`.
+    fn decode_ppm_symbols<R: BitRead, W: Write + ?Sized>(
         &mut self,
         reader: &mut R,
         unpacked_size: u64,
         mut output_size: u64,
-        _yield_threshold: Option<usize>,
+        yield_threshold: Option<usize>,
+        writer: &mut W,
     ) -> RarResult<u64> {
         if reader.bits_remaining() < 32 {
             return Ok(output_size);
@@ -1747,6 +1756,12 @@ impl Rar4LzDecoder {
             let mut rc = BitReadRangeDecoder::new(reader)?;
 
             while output_size < unpacked_size {
+                if let Some(threshold) = yield_threshold
+                    && self.window.unflushed_bytes() as usize >= threshold
+                {
+                    self.flush_ready_output_to_writer(writer, false)?;
+                }
+
                 let model = match self.ppm_model.as_mut() {
                     Some(m) => m,
                     None => {

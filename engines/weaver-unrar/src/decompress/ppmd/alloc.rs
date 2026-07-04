@@ -25,8 +25,23 @@ static INDEX_TO_UNITS: [u8; 38] = [
 /// Number of distinct free-list bin sizes.
 const NUM_INDEXES: usize = 38;
 
+/// Units-to-bin lookup, mirroring unrar's `Units2Indx`: entry `u - 1` is the
+/// first bin whose size is >= `u`.
+static UNITS_TO_INDEX: [u8; 128] = {
+    let mut table = [0u8; 128];
+    let mut i = 0usize;
+    let mut k = 0usize;
+    while k < 128 {
+        if (INDEX_TO_UNITS[i] as usize) < k + 1 {
+            i += 1;
+        }
+        table[k] = i as u8;
+        k += 1;
+    }
+    table
+};
+
 const GLUE_COUNT_RESET: u8 = 255;
-const FREE_BLOCK_STAMP: u16 = 0xFFFF;
 const HEAP_BASE_BYTES: usize = UNIT_SIZE;
 
 /// A reference to an allocated unit block in the arena.
@@ -53,12 +68,6 @@ impl NodeRef {
 #[derive(Clone, Copy)]
 struct FreeNode {
     next: NodeRef,
-}
-
-#[derive(Clone, Copy)]
-struct GlueBlock {
-    node: NodeRef,
-    units: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -230,14 +239,10 @@ impl SubAllocator {
     // ---- Unit allocation ----
 
     /// Map a requested number of units to a free-list bin index.
-    #[allow(clippy::needless_range_loop)]
+    #[inline(always)]
     fn units_to_index(units: usize) -> usize {
-        for i in 0..NUM_INDEXES {
-            if INDEX_TO_UNITS[i] as usize >= units {
-                return i;
-            }
-        }
-        NUM_INDEXES - 1
+        debug_assert!((1..=128).contains(&units));
+        UNITS_TO_INDEX[(units - 1).min(127)] as usize
     }
 
     #[inline]
@@ -278,60 +283,71 @@ impl SubAllocator {
         self.insert_node(p, tail_idx);
     }
 
-    fn insert_free_block_by_units(&mut self, node: NodeRef, units: usize) {
-        debug_assert!((1..=128).contains(&units));
-        let idx = Self::units_to_index(units);
-        if INDEX_TO_UNITS[idx] as usize == units {
-            self.insert_node(node, idx);
-            return;
-        }
-
-        let head_idx = idx.saturating_sub(1);
-        let head_units = INDEX_TO_UNITS[head_idx] as usize;
-        let tail_units = units.saturating_sub(head_units);
-        self.insert_node(node, head_idx);
-        if tail_units > 0 {
-            self.insert_free_block_by_units(NodeRef(node.0 + head_units as u32), tail_units);
-        }
-    }
-
+    /// Merge physically adjacent free blocks, replicating unrar's
+    /// `GlueFreeBlocks` step for step. Free lists are LIFO stacks, so the
+    /// collection order, merge order, and reinsertion order all determine
+    /// which block a later allocation returns — and through that the
+    /// fragmentation pattern and the model-restart point, which must stay in
+    /// lockstep with the encoder.
     fn glue_free_blocks(&mut self) {
-        let mut blocks = Vec::new();
-
-        for (idx, units) in INDEX_TO_UNITS.iter().enumerate().take(NUM_INDEXES) {
+        // Collect every free block in unrar's chain order: bin 0 upward,
+        // list order within each bin. `units` mirrors the block's `NU` field.
+        let mut chain: Vec<(NodeRef, u32)> = Vec::new();
+        let mut removed: Vec<bool> = Vec::new();
+        let mut by_start: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for (idx, &bin_units) in INDEX_TO_UNITS.iter().enumerate().take(NUM_INDEXES) {
+            let units = bin_units as u32;
             while !self.free_lists[idx].is_null() {
                 let node = self.remove_node(idx);
-                let units = *units as usize;
-                self.write_glue_block(node, units);
-                blocks.push(GlueBlock { node, units });
+                by_start.insert(node.0, chain.len());
+                chain.push((node, units));
+                removed.push(false);
             }
         }
 
-        blocks.sort_unstable_by_key(|block| block.node.0);
-
-        let mut merged: Vec<GlueBlock> = Vec::with_capacity(blocks.len());
-        for block in blocks {
-            if let Some(last) = merged.last_mut() {
-                let adjacent = last.node.0 + last.units as u32 == block.node.0;
-                if adjacent && last.units + block.units < 0x10000 {
-                    last.units += block.units;
-                    continue;
+        // Walk the chain in unrar's order — `insertAt(&s0)` builds the chain
+        // by head insertion, so iteration visits blocks in reverse collection
+        // order. Each entry repeatedly absorbs the free block that starts
+        // exactly where it ends (unrar probes the stamp of the physically
+        // following block). Absorbed entries leave the chain.
+        for i in (0..chain.len()).rev() {
+            if removed[i] {
+                continue;
+            }
+            loop {
+                let (node, units) = chain[i];
+                let Some(&j) = by_start.get(&(node.0 + units)) else {
+                    break;
+                };
+                if removed[j] || units + chain[j].1 >= 0x10000 {
+                    break;
                 }
+                chain[i].1 += chain[j].1;
+                removed[j] = true;
             }
-            merged.push(block);
         }
 
-        for block in merged {
-            let mut node = block.node;
-            let mut remaining = block.units;
-            while remaining > 128 {
+        // Reinsert the merged runs in the same reverse-collection chain
+        // order: leading 128-unit blocks first, then unrar's tail-before-head
+        // split for non-bin sizes. Free lists are LIFO, so this order decides
+        // which block later allocations return.
+        for i in (0..chain.len()).rev() {
+            if removed[i] {
+                continue;
+            }
+            let (mut node, mut sz) = chain[i];
+            while sz > 128 {
                 self.insert_node(node, NUM_INDEXES - 1);
                 node = NodeRef(node.0 + 128);
-                remaining -= 128;
+                sz -= 128;
             }
-            if remaining > 0 {
-                self.insert_free_block_by_units(node, remaining);
+            let mut idx = Self::units_to_index(sz as usize);
+            if INDEX_TO_UNITS[idx] as u32 != sz {
+                idx -= 1;
+                let tail = sz - INDEX_TO_UNITS[idx] as u32;
+                self.insert_node(NodeRef(node.0 + (sz - tail)), (tail - 1) as usize);
             }
+            self.insert_node(node, idx);
         }
     }
 
@@ -660,11 +676,6 @@ impl SubAllocator {
 
     fn write_free_node(&mut self, node: NodeRef, free_node: FreeNode) {
         self.write_u32(node, 0, free_node.next.0);
-    }
-
-    fn write_glue_block(&mut self, node: NodeRef, units: usize) {
-        self.write_u16(node, 0, FREE_BLOCK_STAMP);
-        self.write_u16(node, 2, units as u16);
     }
 
     /// Check if the allocator has available memory.

@@ -619,36 +619,6 @@ fn selected_tls_backend() -> Result<NntpTlsBackend, NntpError> {
     }
 }
 
-fn env_flag_enabled(name: &str) -> Result<bool, NntpError> {
-    match std::env::var(name) {
-        Ok(value) => match value.trim() {
-            "1" => Ok(true),
-            "0" | "" => Ok(false),
-            value
-                if value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("yes")
-                    || value.eq_ignore_ascii_case("on") =>
-            {
-                Ok(true)
-            }
-            value
-                if value.eq_ignore_ascii_case("false")
-                    || value.eq_ignore_ascii_case("no")
-                    || value.eq_ignore_ascii_case("off") =>
-            {
-                Ok(false)
-            }
-            value => Err(NntpError::MalformedResponse(format!(
-                "unsupported {name} value {value:?}; expected boolean"
-            ))),
-        },
-        Err(std::env::VarError::NotPresent) => Ok(false),
-        Err(error) => Err(NntpError::MalformedResponse(format!(
-            "failed to read {name}: {error}"
-        ))),
-    }
-}
-
 pub(crate) fn build_s2n_tls_config(ca_cert_path: Option<&Path>) -> Result<S2nConfig, NntpError> {
     let ca_cert_path = ca_cert_path.ok_or_else(|| {
         NntpError::MalformedResponse(format!(
