@@ -50,6 +50,11 @@ impl OwnedDownloadLanePool {
         self.senders.truncate(worker_count);
     }
 
+    #[cfg(test)]
+    pub(crate) fn worker_count(&self) -> usize {
+        self.senders.len()
+    }
+
     pub(crate) fn reset(&self) {
         for sender in &self.senders {
             let _ = sender.send(OwnedLanePoolCommand::Reset);

@@ -389,6 +389,44 @@ async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf)
     .await
 }
 
+#[tokio::test]
+async fn owned_download_lane_pool_respects_configured_connection_count_at_startup() {
+    let low_temp_dir = tempfile::tempdir().unwrap();
+    let (low_pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &low_temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        3,
+    )
+    .await;
+
+    assert_eq!(low_pipeline.owned_download_lane_pool.worker_count(), 3);
+    assert_eq!(low_pipeline.connection_ramp, 3);
+    assert_eq!(low_pipeline.tuner.params().max_concurrent_downloads, 3);
+
+    let high_temp_dir = tempfile::tempdir().unwrap();
+    let (high_pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &high_temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        24,
+    )
+    .await;
+
+    assert_eq!(high_pipeline.owned_download_lane_pool.worker_count(), 24);
+    assert!(
+        high_pipeline.connection_ramp < high_pipeline.owned_download_lane_pool.worker_count(),
+        "high-connection pool must not be capped by the startup ramp"
+    );
+    assert_eq!(high_pipeline.tuner.params().max_concurrent_downloads, 24);
+}
+
 fn encode_article_part(
     filename: &str,
     payload: &[u8],
