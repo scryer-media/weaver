@@ -273,6 +273,9 @@ impl Pipeline {
             } => {
                 if let Ok(new_client) = client.downcast::<NntpClient>() {
                     self.nntp = Arc::new(*new_client);
+                    self.owned_download_lane_pool.reset();
+                    self.owned_download_lane_pool
+                        .resize(total_connections.max(1));
                     self.connection_ramp = total_connections.min(5);
                     self.tuner.set_connection_limit(total_connections);
                     info!(

@@ -131,14 +131,14 @@ impl Pipeline {
         {
             return false;
         }
-        self.rar_sets
-            .get(&(job_id, set_name.to_string()))
-            .and_then(|state| state.plan.as_ref())
-            .is_some_and(|plan| {
-                plan.ready_members
-                    .iter()
-                    .any(|ready_member| ready_member.name == member_name)
-            })
+        let Some(set_state) = self.rar_sets.get(&(job_id, set_name.to_string())) else {
+            return false;
+        };
+        set_state.plan.as_ref().is_some_and(|plan| {
+            plan.ready_members
+                .iter()
+                .any(|ready_member| ready_member.name == member_name)
+        })
     }
 
     pub(in crate::pipeline) fn rar_member_refresh_request(
@@ -511,6 +511,9 @@ impl Pipeline {
                 if scheduled_slots >= available_slots {
                     return;
                 }
+                if !self.rar_member_can_start_extraction(job_id, &set_name, &member_name) {
+                    continue;
+                }
 
                 let members_to_extract = vec![member_name.clone()];
                 let volume_paths_for_member = self.volume_paths_for_rar_members(
@@ -530,13 +533,17 @@ impl Pipeline {
                     "RAR incremental extraction member ready"
                 );
 
-                if let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
-                    set_state.active_workers += 1;
-                    set_state.in_flight_members.insert(member_name.clone());
-                    set_state.phase = crate::pipeline::archive::rar_state::RarSetPhase::Extracting;
-                    if let Some(plan) = set_state.plan.as_mut() {
-                        plan.phase = crate::pipeline::archive::rar_state::RarSetPhase::Extracting;
-                    }
+                let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) else {
+                    continue;
+                };
+                if set_state.in_flight_members.contains(&member_name) {
+                    continue;
+                }
+                set_state.active_workers += 1;
+                set_state.in_flight_members.insert(member_name.clone());
+                set_state.phase = crate::pipeline::archive::rar_state::RarSetPhase::Extracting;
+                if let Some(plan) = set_state.plan.as_mut() {
+                    plan.phase = crate::pipeline::archive::rar_state::RarSetPhase::Extracting;
                 }
                 if let Some(volume_index) = self.rar_waiting_members.remove(&(
                     job_id,
@@ -926,13 +933,34 @@ impl Pipeline {
                 attempted,
                 result,
             } => {
+                let current_attempted =
+                    if let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
+                        let current = attempted
+                            .iter()
+                            .filter(|member| set_state.in_flight_members.contains(*member))
+                            .cloned()
+                            .collect::<HashSet<_>>();
+                        set_state.active_workers = set_state.active_workers.saturating_sub(1);
+                        for member in &attempted {
+                            set_state.in_flight_members.remove(member);
+                        }
+                        set_state.extraction_generation =
+                            set_state.extraction_generation.saturating_add(1);
+                        current
+                    } else {
+                        HashSet::new()
+                    };
+                let already_extracted = self
+                    .extracted_members
+                    .get(&job_id)
+                    .cloned()
+                    .unwrap_or_default();
                 if let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
-                    set_state.active_workers = set_state.active_workers.saturating_sub(1);
-                    for member in &attempted {
-                        set_state.in_flight_members.remove(member);
-                    }
-                    set_state.extraction_generation =
-                        set_state.extraction_generation.saturating_add(1);
+                    debug_assert!(
+                        attempted
+                            .iter()
+                            .all(|member| !set_state.in_flight_members.contains(member))
+                    );
                 }
                 self.mark_rar_unlock_priorities_dirty(job_id);
 
@@ -1003,6 +1031,18 @@ impl Pipeline {
                             self.clear_failed_extraction_member(job_id, name);
                         }
                         for (member, error) in &outcome.failed {
+                            if already_extracted.contains(member)
+                                || !current_attempted.contains(member)
+                            {
+                                warn!(
+                                    job_id = job_id.0,
+                                    set_name = %set_name,
+                                    member = %member,
+                                    error = %error,
+                                    "ignoring stale RAR batch member failure for non-current or already extracted member"
+                                );
+                                continue;
+                            }
                             if Self::is_stale_topology_batch_extraction_error(error) {
                                 warn!(
                                     job_id = job_id.0,
@@ -1036,16 +1076,20 @@ impl Pipeline {
                             .failed
                             .iter()
                             .filter_map(|(member, error)| {
-                                Self::is_stale_topology_batch_extraction_error(error)
-                                    .then_some(member.clone())
+                                (current_attempted.contains(member)
+                                    && !already_extracted.contains(member)
+                                    && Self::is_stale_topology_batch_extraction_error(error))
+                                .then_some(member.clone())
                             })
                             .collect::<Vec<_>>();
                         let capacity_retry_members = outcome
                             .failed
                             .iter()
                             .filter_map(|(member, error)| {
-                                Self::is_capacity_pressure_batch_extraction_error(error)
-                                    .then_some(member.clone())
+                                (current_attempted.contains(member)
+                                    && !already_extracted.contains(member)
+                                    && Self::is_capacity_pressure_batch_extraction_error(error))
+                                .then_some(member.clone())
                             })
                             .collect::<Vec<_>>();
                         if !refresh_retry_members.is_empty() {
@@ -1071,7 +1115,23 @@ impl Pipeline {
                         }
                     }
                     Err(error) => {
-                        if Self::is_stale_topology_batch_extraction_error(&error) {
+                        let current_failed_members = attempted
+                            .iter()
+                            .filter(|member| {
+                                current_attempted.contains(*member)
+                                    && !already_extracted.contains(*member)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if current_failed_members.is_empty() {
+                            warn!(
+                                job_id = job_id.0,
+                                set_name = %set_name,
+                                attempted = ?attempted,
+                                error = %error,
+                                "ignoring stale RAR batch extraction failure for non-current or already extracted members"
+                            );
+                        } else if Self::is_stale_topology_batch_extraction_error(&error) {
                             warn!(
                                 job_id = job_id.0,
                                 set_name = %set_name,
@@ -1085,7 +1145,11 @@ impl Pipeline {
                                 self.latest_completed_rar_volume(job_id, &set_name),
                                 RefreshReason::ValidationFailure,
                             );
-                            self.reconcile_waiting_members_for_set(job_id, &set_name, &attempted);
+                            self.reconcile_waiting_members_for_set(
+                                job_id,
+                                &set_name,
+                                &current_failed_members,
+                            );
                         } else if Self::is_capacity_pressure_batch_extraction_error(&error) {
                             capacity_retry = true;
                             warn!(
@@ -1095,7 +1159,11 @@ impl Pipeline {
                                 error = %error,
                                 "RAR batch extraction worker hit FD capacity pressure; keeping members waiting"
                             );
-                            self.reconcile_waiting_members_for_set(job_id, &set_name, &attempted);
+                            self.reconcile_waiting_members_for_set(
+                                job_id,
+                                &set_name,
+                                &current_failed_members,
+                            );
                         } else {
                             warn!(
                                 job_id = job_id.0,
@@ -1104,7 +1172,7 @@ impl Pipeline {
                                 error = %error,
                                 "RAR batch extraction worker failed"
                             );
-                            for member in &attempted {
+                            for member in &current_failed_members {
                                 self.set_failed_extraction_member(job_id, member);
                                 self.promote_recovery_for_failed_member(job_id, &set_name, member)
                                     .await;
@@ -1118,7 +1186,19 @@ impl Pipeline {
                     .settle_rar_set_after_extraction_worker(job_id, &set_name)
                     .await;
                 if self.rar_sets.contains_key(&(job_id, set_name.clone())) {
-                    self.reconcile_waiting_members_for_set(job_id, &set_name, &attempted);
+                    let extracted_members = self.extracted_members.get(&job_id);
+                    let waiting_reconcile_members = attempted
+                        .iter()
+                        .filter(|member| {
+                            extracted_members.is_none_or(|extracted| !extracted.contains(*member))
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    self.reconcile_waiting_members_for_set(
+                        job_id,
+                        &set_name,
+                        &waiting_reconcile_members,
+                    );
                 }
                 self.reconcile_job_progress(job_id).await;
                 let all_downloaded = self.jobs.get(&job_id).is_some_and(|state| {

@@ -66,6 +66,12 @@ impl Pipeline {
         let (verified_suspect_persist_done_tx, verified_suspect_persist_done_rx) =
             mpsc::channel(32);
         let (move_done_tx, move_done_rx) = mpsc::channel(32);
+        let nntp = Arc::new(nntp);
+        let owned_download_lane_pool = download::owned_lane::OwnedDownloadLanePool::new(
+            total_connections
+                .max(Self::INITIAL_CONNECTION_RAMP_LIMIT)
+                .max(1),
+        );
         shared_state.set_paused(initial_global_paused);
         let pp_pool = crate::runtime::postprocess_pool::build_postprocess_pool(
             tuner.params().extract_thread_count,
@@ -76,7 +82,7 @@ impl Pipeline {
         let mut pipeline = Self {
             cmd_rx,
             event_tx,
-            nntp: Arc::new(nntp),
+            nntp,
             buffers,
             tuner,
             metrics,
@@ -147,6 +153,7 @@ impl Pipeline {
             download_lane_parked_rx,
             owned_download_lane_event_tx,
             owned_download_lane_event_rx,
+            owned_download_lane_pool,
             ip_replacement_trial_tx,
             ip_replacement_trial_rx,
             decode_done_tx,

@@ -1,61 +1,191 @@
 use super::*;
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::Instant;
 
 use tokio::sync::{mpsc, oneshot};
 
-pub(super) fn spawn_owned_blocking_s2n_download_batch(
+pub(crate) struct OwnedDownloadLanePool {
+    senders: Vec<std_mpsc::Sender<OwnedLanePoolCommand>>,
+    next: AtomicUsize,
+}
+
+struct OwnedLaneRun {
     nntp: Arc<weaver_nntp::NntpClient>,
     event_tx: mpsc::Sender<OwnedDownloadLaneEvent>,
     refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
     parked_tx: mpsc::Sender<DownloadLaneParked>,
     initial_lease: DownloadBatchLease,
-) {
+}
+
+enum OwnedLanePoolCommand {
+    Run(OwnedLaneRun),
+    Reset,
+}
+
+struct CachedOwnedLane {
+    nntp: Arc<weaver_nntp::NntpClient>,
+    groups: Vec<String>,
+    lane: weaver_nntp::blocking::BlockingBodyLane,
+}
+
+impl OwnedDownloadLanePool {
+    pub(crate) fn new(worker_count: usize) -> Self {
+        let mut pool = Self {
+            senders: Vec::new(),
+            next: AtomicUsize::new(0),
+        };
+        pool.resize(worker_count);
+        pool
+    }
+
+    pub(crate) fn resize(&mut self, worker_count: usize) {
+        let worker_count = worker_count.max(1);
+        while self.senders.len() < worker_count {
+            let index = self.senders.len();
+            self.senders.push(spawn_owned_lane_worker(index));
+        }
+        self.senders.truncate(worker_count);
+    }
+
+    pub(crate) fn reset(&self) {
+        for sender in &self.senders {
+            let _ = sender.send(OwnedLanePoolCommand::Reset);
+        }
+    }
+
+    pub(crate) fn submit(
+        &self,
+        nntp: Arc<weaver_nntp::NntpClient>,
+        event_tx: mpsc::Sender<OwnedDownloadLaneEvent>,
+        refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
+        parked_tx: mpsc::Sender<DownloadLaneParked>,
+        initial_lease: DownloadBatchLease,
+    ) -> Result<(), DownloadBatchLease> {
+        if self.senders.is_empty() {
+            return Err(initial_lease);
+        }
+        let command = OwnedLanePoolCommand::Run(OwnedLaneRun {
+            nntp,
+            event_tx,
+            refill_tx,
+            parked_tx,
+            initial_lease,
+        });
+        let sender_index = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
+        self.senders[sender_index]
+            .send(command)
+            .map_err(|error| match error.0 {
+                OwnedLanePoolCommand::Run(run) => run.initial_lease,
+                OwnedLanePoolCommand::Reset => {
+                    unreachable!("reset command cannot fail from submit")
+                }
+            })
+    }
+}
+
+fn spawn_owned_lane_worker(index: usize) -> std_mpsc::Sender<OwnedLanePoolCommand> {
+    let (tx, rx) = std_mpsc::channel();
     std::thread::Builder::new()
-        .name("weaver-owned-nntp".to_string())
+        .name(format!("weaver-nntp-lane-{index}"))
         .spawn(move || {
             crate::runtime::affinity::pin_current_thread_for_hot_download_path();
-            run_owned_blocking_s2n_download_lane(
-                nntp,
-                event_tx,
-                refill_tx,
-                parked_tx,
-                initial_lease,
-            );
+            run_owned_lane_worker(rx);
         })
         .expect("failed to spawn owned blocking NNTP lane");
+    tx
+}
+
+fn run_owned_lane_worker(rx: std_mpsc::Receiver<OwnedLanePoolCommand>) {
+    let mut cached_lane = None;
+    while let Ok(command) = rx.recv() {
+        match command {
+            OwnedLanePoolCommand::Run(run) => {
+                run_owned_blocking_s2n_download_lane(&mut cached_lane, run);
+            }
+            OwnedLanePoolCommand::Reset => {
+                park_cached_lane(&mut cached_lane);
+            }
+        }
+    }
+    park_cached_lane(&mut cached_lane);
+}
+
+impl CachedOwnedLane {
+    fn matches(
+        &self,
+        nntp: &Arc<weaver_nntp::NntpClient>,
+        compatibility: &DownloadBatchCompatibility,
+    ) -> bool {
+        Arc::ptr_eq(&self.nntp, nntp)
+            && self.groups == compatibility.groups
+            && !compatibility
+                .exclude_servers
+                .contains(&self.lane.server_id().0)
+    }
+}
+
+fn park_cached_lane(cached_lane: &mut Option<CachedOwnedLane>) {
+    if let Some(cached) = cached_lane.take() {
+        cached.lane.park();
+    }
 }
 
 fn run_owned_blocking_s2n_download_lane(
-    nntp: Arc<weaver_nntp::NntpClient>,
-    event_tx: mpsc::Sender<OwnedDownloadLaneEvent>,
-    refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
-    parked_tx: mpsc::Sender<DownloadLaneParked>,
-    initial_lease: DownloadBatchLease,
+    cached_lane: &mut Option<CachedOwnedLane>,
+    run: OwnedLaneRun,
 ) {
     let fetch_started = Instant::now();
+    let OwnedLaneRun {
+        nntp,
+        event_tx,
+        refill_tx,
+        parked_tx,
+        initial_lease,
+    } = run;
     let mut lease = initial_lease;
-    let mut lane = match nntp.try_acquire_blocking_body_lane(
-        &lease.compatibility.groups,
-        &lease.compatibility.exclude_servers,
-    ) {
-        Ok(lane) => lane,
-        Err(error) => {
-            let _ = event_tx.blocking_send(OwnedDownloadLaneEvent::AcquireFailed {
-                lease,
-                error: error.to_string(),
-            });
-            crate::runtime::perf_probe::record(
-                "download.fetch_body.owned",
-                fetch_started.elapsed(),
-            );
-            return;
-        }
-    };
 
-    let (park_reason, parked_job_id, parked_mode) = loop {
+    if cached_lane
+        .as_ref()
+        .is_some_and(|cached| !cached.matches(&nntp, &lease.compatibility))
+    {
+        park_cached_lane(cached_lane);
+    }
+
+    if cached_lane.is_none() {
+        match nntp.try_acquire_blocking_body_lane(
+            &lease.compatibility.groups,
+            &lease.compatibility.exclude_servers,
+        ) {
+            Ok(lane) => {
+                *cached_lane = Some(CachedOwnedLane {
+                    nntp: Arc::clone(&nntp),
+                    groups: lease.compatibility.groups.clone(),
+                    lane,
+                });
+            }
+            Err(error) => {
+                let _ = event_tx.blocking_send(OwnedDownloadLaneEvent::AcquireFailed {
+                    lease,
+                    error: error.to_string(),
+                });
+                crate::runtime::perf_probe::record(
+                    "download.fetch_body.owned",
+                    fetch_started.elapsed(),
+                );
+                return;
+            }
+        }
+    }
+
+    let lane = &mut cached_lane
+        .as_mut()
+        .expect("owned lane cache populated before run")
+        .lane;
+    let (park_reason, parked_job_id, parked_mode, keep_cached_lane) = loop {
+        let stats_before = lane.stats();
         let DownloadBatchLease {
             job_id,
             lane_mode,
@@ -188,13 +318,13 @@ fn run_owned_blocking_s2n_download_lane(
             unrequested_works.extend(pending_works);
         }
 
-        let stats = lane.stats();
+        let stats = stats_delta(lane.stats(), stats_before);
         if send_owned_batch(&event_tx, results, unrequested_works, stats).is_err() {
-            break (LaneParkReason::Error, job_id, actual_mode);
+            break (LaneParkReason::Error, job_id, actual_mode, false);
         }
 
         if !batch_clean_for_refill {
-            break (LaneParkReason::Error, job_id, actual_mode);
+            break (LaneParkReason::Error, job_id, actual_mode, false);
         }
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -210,7 +340,7 @@ fn run_owned_blocking_s2n_download_lane(
             })
             .is_err()
         {
-            break (LaneParkReason::Error, job_id, actual_mode);
+            break (LaneParkReason::Error, job_id, actual_mode, false);
         }
 
         match response_rx.blocking_recv() {
@@ -221,15 +351,22 @@ fn run_owned_blocking_s2n_download_lane(
                     lease = next_lease;
                     continue;
                 }
-                break (response.park_reason, job_id, actual_mode);
+                break (
+                    response.park_reason,
+                    job_id,
+                    actual_mode,
+                    keep_cached_lane_after_park(response.park_reason),
+                );
             }
             Err(_) => {
-                break (LaneParkReason::ProbeYield, job_id, actual_mode);
+                break (LaneParkReason::ProbeYield, job_id, actual_mode, false);
             }
         }
     };
 
-    lane.park();
+    if !keep_cached_lane {
+        park_cached_lane(cached_lane);
+    }
     let _ = parked_tx.blocking_send(DownloadLaneParked {
         job_id: parked_job_id,
         mode: parked_mode,
@@ -238,6 +375,34 @@ fn run_owned_blocking_s2n_download_lane(
         release_ip_replacement_burst: false,
     });
     crate::runtime::perf_probe::record("download.fetch_body.owned", fetch_started.elapsed());
+}
+
+fn keep_cached_lane_after_park(reason: LaneParkReason) -> bool {
+    matches!(
+        reason,
+        LaneParkReason::NoWork
+            | LaneParkReason::Pressure
+            | LaneParkReason::ProbeYield
+            | LaneParkReason::HotReclaim
+            | LaneParkReason::SpilloverWithdraw
+            | LaneParkReason::SpilloverSpeedHarm
+    )
+}
+
+fn stats_delta(
+    after: weaver_nntp::blocking::BlockingLaneStats,
+    before: weaver_nntp::blocking::BlockingLaneStats,
+) -> weaver_nntp::blocking::BlockingLaneStats {
+    weaver_nntp::blocking::BlockingLaneStats {
+        socket_reads: after.socket_reads.saturating_sub(before.socket_reads),
+        socket_writes: after.socket_writes.saturating_sub(before.socket_writes),
+        tls_recv_calls: after.tls_recv_calls.saturating_sub(before.tls_recv_calls),
+        tls_send_calls: after.tls_send_calls.saturating_sub(before.tls_send_calls),
+        body_responses: after.body_responses.saturating_sub(before.body_responses),
+        decoded_articles: after
+            .decoded_articles
+            .saturating_sub(before.decoded_articles),
+    }
 }
 
 fn send_owned_batch(

@@ -1467,6 +1467,7 @@ pub struct Pipeline {
     pub(super) download_lane_parked_rx: mpsc::Receiver<DownloadLaneParked>,
     pub(super) owned_download_lane_event_tx: mpsc::Sender<OwnedDownloadLaneEvent>,
     pub(super) owned_download_lane_event_rx: mpsc::Receiver<OwnedDownloadLaneEvent>,
+    pub(super) owned_download_lane_pool: download::owned_lane::OwnedDownloadLanePool,
     pub(super) ip_replacement_trial_tx: mpsc::Sender<IpReplacementTrialEvent>,
     pub(super) ip_replacement_trial_rx: mpsc::Receiver<IpReplacementTrialEvent>,
     pub(super) decode_done_tx: mpsc::Sender<DecodeDone>,

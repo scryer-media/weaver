@@ -2166,7 +2166,14 @@ unsafe fn decode_neon64_span_block(
 
     let keeps = per_group_keeps(skip);
     unsafe {
-        compact_store_16(decoded[0], (skip & 0xffff) as u16, keeps.0, table, output, dst);
+        compact_store_16(
+            decoded[0],
+            (skip & 0xffff) as u16,
+            keeps.0,
+            table,
+            output,
+            dst,
+        );
         compact_store_16(
             decoded[1],
             ((skip >> 16) & 0xffff) as u16,
@@ -3895,7 +3902,9 @@ mod tests {
     }
 
     fn lcg(seed: &mut u64) -> u64 {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *seed >> 33
     }
 

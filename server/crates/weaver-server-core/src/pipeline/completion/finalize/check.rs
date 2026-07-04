@@ -2263,13 +2263,17 @@ impl Pipeline {
                     }
                 }
 
+                let emit_verification_events = !(has_crc_failures
+                    && self.par2_verified.contains(&job_id)
+                    && !authoritative_par2_verification_needed
+                    && !matches!(current_status, JobStatus::Repairing));
                 let (verification, placement_plan) = match self
                     .verify_par2_with_placement(
                         job_id,
                         Arc::clone(&par2_set),
                         working_dir.clone(),
                         matches!(current_status, JobStatus::Repairing),
-                        true,
+                        emit_verification_events,
                     )
                     .await
                 {

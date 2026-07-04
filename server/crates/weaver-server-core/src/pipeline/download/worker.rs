@@ -228,6 +228,9 @@ impl Pipeline {
         job_id: JobId,
         work: &DownloadWork,
     ) -> bool {
+        if !self.should_enforce_restart_durable_lead(job_id) {
+            return true;
+        }
         self.restart_durable_lead_block(job_id, work).is_none()
     }
 
@@ -260,6 +263,24 @@ impl Pipeline {
             .saturating_add(extra_undurable_bytes)
             .saturating_add(work.byte_estimate as u64);
         (projected > limit).then_some((projected, limit))
+    }
+
+    fn should_enforce_restart_durable_lead(&self, job_id: JobId) -> bool {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        if state.restored_download_floor_bytes == 0 {
+            return false;
+        }
+        self.download_restart_durable_lead_retry_after
+            .contains_key(&job_id)
+            || self
+                .download_pipeline_backlog_for_job(job_id)
+                .has_durable_catch_up_work()
+    }
+
+    fn should_cap_lease_for_restart_durable_lead(&self, job_id: JobId) -> bool {
+        self.should_enforce_restart_durable_lead(job_id)
     }
 
     fn normal_download_connection_capacity_limit(&self, effective_total: usize) -> usize {
@@ -1585,6 +1606,7 @@ impl Pipeline {
         pressure: DownloadPressure,
     ) -> DownloadBatchLease {
         let work_limit = self.download_lane_lease_work_limit(job_id, lane_mode, pressure);
+        let cap_for_restart_durable_lead = self.should_cap_lease_for_restart_durable_lead(job_id);
         let mut leased_undurable_bytes = if first.is_recovery {
             0
         } else {
@@ -1595,9 +1617,10 @@ impl Pipeline {
             let Some(next) = self.pop_download_work_for_batch(job_id, Some(&compatibility)) else {
                 break;
             };
-            if self
-                .restart_durable_lead_block_with_extra(job_id, &next, leased_undurable_bytes)
-                .is_some()
+            if cap_for_restart_durable_lead
+                && self
+                    .restart_durable_lead_block_with_extra(job_id, &next, leased_undurable_bytes)
+                    .is_some()
             {
                 if let Some(state) = self.jobs.get_mut(&job_id) {
                     state.download_queue.push(next);
@@ -3017,13 +3040,16 @@ impl Pipeline {
         );
 
         if self.should_use_owned_blocking_s2n_lane(&initial_lease) {
-            super::owned_lane::spawn_owned_blocking_s2n_download_batch(
+            if let Err(lease) = self.owned_download_lane_pool.submit(
                 Arc::clone(&self.nntp),
                 self.owned_download_lane_event_tx.clone(),
                 self.download_refill_tx.clone(),
                 self.download_lane_parked_tx.clone(),
                 initial_lease,
-            );
+            ) {
+                warn!("owned blocking s2n lane pool stopped; falling back to async download lane");
+                self.spawn_async_download_batch(lease);
+            }
             return;
         }
 

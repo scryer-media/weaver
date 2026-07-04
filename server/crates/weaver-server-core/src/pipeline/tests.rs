@@ -2701,6 +2701,73 @@ async fn active_sibling_extraction_does_not_launch_post_refresh_or_reselect_fini
 }
 
 #[tokio::test]
+async fn stale_rar_batch_failure_for_extracted_member_is_ignored() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40135);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Stale Batch Failure", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let key = (job_id, "show".to_string());
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&key)
+            .expect("RAR set should exist");
+        set_state.active_workers = 1;
+        set_state.in_flight_members = ["E01.mkv".to_string()].into_iter().collect();
+        set_state.extraction_generation = 11;
+        set_state.phase = crate::pipeline::archive::rar_state::RarSetPhase::Extracting;
+        let plan = set_state.plan.as_mut().expect("RAR plan should exist");
+        plan.phase = crate::pipeline::archive::rar_state::RarSetPhase::Extracting;
+    }
+    pipeline
+        .extracted_members
+        .entry(job_id)
+        .or_default()
+        .insert("E01.mkv".to_string());
+
+    pipeline
+        .handle_extraction_done(ExtractionDone::Batch {
+            job_id,
+            set_name: "show".to_string(),
+            attempted: vec!["E01.mkv".to_string()],
+            result: Err(
+                "failed to finalize output work/sample.mkv.partial: No such file or directory (os error 2)"
+                    .to_string(),
+            ),
+        })
+        .await;
+
+    let set_state = pipeline.rar_sets.get(&key).expect("RAR set should remain");
+    assert_eq!(set_state.active_workers, 0);
+    assert_eq!(set_state.extraction_generation, 12);
+    assert!(!set_state.in_flight_members.contains("E01.mkv"));
+    assert!(
+        !pipeline
+            .failed_extractions
+            .get(&job_id)
+            .is_some_and(|members| members.contains("E01.mkv")),
+        "stale duplicate failure must not promote an already extracted member to repair"
+    );
+    assert!(
+        !pipeline.rar_member_can_start_extraction(job_id, "show", "E01.mkv"),
+        "already extracted member must stay non-startable after a stale duplicate failure"
+    );
+    assert!(!matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+}
+
+#[tokio::test]
 async fn idle_rar_worker_drain_recomputes_and_clears_obsolete_post_refresh() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -5515,7 +5582,11 @@ async fn dispatch_downloads_waits_for_downstream_work_when_restart_durable_lead_
         }],
     };
     insert_active_job(&mut pipeline, job_id, spec).await;
-    pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes = durable_lead_limit;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.downloaded_bytes = durable_lead_limit;
+        state.restored_download_floor_bytes = 1;
+    }
     let next_work = DownloadWork {
         segment_id: SegmentId {
             file_id,
@@ -5530,8 +5601,8 @@ async fn dispatch_downloads_waits_for_downstream_work_when_restart_durable_lead_
         exclude_servers: vec![],
     };
 
-    assert!(!pipeline.primary_download_within_restart_durable_lead(job_id, &next_work));
     pipeline.active_decodes_by_job.insert(job_id, 1);
+    assert!(!pipeline.primary_download_within_restart_durable_lead(job_id, &next_work));
 
     pipeline.dispatch_downloads();
 
@@ -5602,7 +5673,7 @@ async fn dispatch_downloads_waits_for_downstream_work_when_restart_durable_lead_
 }
 
 #[tokio::test]
-async fn hot_download_batch_lease_counts_current_lease_for_restart_durable_lead() {
+async fn hot_download_batch_lease_stays_large_for_fresh_job_when_restart_lead_would_cap_it() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -5642,6 +5713,69 @@ async fn hot_download_batch_lease_counts_current_lease_for_restart_durable_lead(
     };
     insert_active_job(&mut pipeline, job_id, spec).await;
     pipeline.connection_ramp = 1;
+    pipeline
+        .pending_released_download_results_by_job
+        .insert(job_id, 1);
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.active_downloads, segment_count as usize);
+    assert_eq!(
+        pipeline.active_downloads_by_job.get(&job_id),
+        Some(&(segment_count as usize))
+    );
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 0);
+}
+
+#[tokio::test]
+async fn hot_download_batch_lease_caps_restored_job_for_restart_durable_lead() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        2,
+    )
+    .await;
+    let job_id = JobId(20030);
+    let durable_lead_limit = Pipeline::restart_durable_lead_limit_bytes();
+    let segment_bytes = (durable_lead_limit / 4).max(1).min(u64::from(u32::MAX)) as u32;
+    let segment_count = 6u32;
+    let segments = (0..segment_count)
+        .map(|segment| {
+            segment_spec! {
+                number: segment,
+                bytes: segment_bytes,
+                message_id: format!("restart-lead-restored-lease-{segment}@example.com"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let spec = JobSpec {
+        name: "Restart Durable Lead Restored Lease".to_string(),
+        password: None,
+        total_bytes: u64::from(segment_count) * u64::from(segment_bytes),
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: "restored-large-lease.bin".to_string(),
+            role: FileRole::Standalone,
+            groups: vec!["alt.binaries.test".to_string()],
+            segments,
+        }],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.connection_ramp = 1;
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .restored_download_floor_bytes = 1;
+    pipeline
+        .pending_released_download_results_by_job
+        .insert(job_id, 1);
 
     pipeline.dispatch_downloads();
 
@@ -5711,6 +5845,12 @@ async fn dispatch_downloads_escapes_restart_durable_lead_when_pipeline_is_idle()
             .is_some_and(|write_buf| write_buf.buffered_len() > 0)
     );
     pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes = durable_lead_limit;
+    pipeline
+        .pending_released_download_results_by_job
+        .insert(job_id, 1);
+    pipeline
+        .download_restart_durable_lead_retry_after
+        .insert(job_id, Instant::now() + Duration::from_millis(250));
 
     pipeline.dispatch_downloads();
 

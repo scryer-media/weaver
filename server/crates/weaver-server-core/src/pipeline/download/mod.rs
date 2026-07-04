@@ -1,6 +1,6 @@
 use super::*;
 
-mod owned_lane;
+pub(super) mod owned_lane;
 pub mod queue;
 mod rar_unlock;
 pub mod retry;
