@@ -29,9 +29,11 @@ struct PreparsedBlocks {
 /// Below this, rayon overhead exceeds the benefit.
 const MIN_PARALLEL_BLOCKS: usize = 4;
 
-/// Number of blocks to queue per worker in the parallel RAR5 path.
-/// Matches unrar's `UNP_BLOCKS_PER_THREAD` batching strategy.
-const BLOCKS_PER_THREAD: usize = 2;
+/// Maximum number of blocks per parallel dispatch. Typical RAR5 blocks carry
+/// tens of kilobytes of compressed data, so this covers a multi-megabyte span
+/// per fork/join — few enough barriers that worker wake/park churn stays
+/// negligible next to decode work.
+const MAX_BATCH_BLOCKS: usize = 64;
 
 /// Per-block decoded item buffer size.
 /// Matches unrar's `DecodedAllocated = 0x4100`.
@@ -222,6 +224,7 @@ fn parse_next_block(
 
 fn preparse_complete_blocks(
     input: &[u8],
+    header_limit: usize,
     code_lengths: &mut [u8],
     existing_tables: Option<&TableSet>,
     extra_dist: bool,
@@ -239,6 +242,12 @@ fn preparse_complete_blocks(
     }
 
     loop {
+        // Stop accepting blocks whose header would start at or beyond the
+        // caller's limit (volume boundary or unreliable staging tail).
+        if reader.position().div_ceil(8) >= header_limit {
+            break;
+        }
+
         let checkpoint_code_lengths = working_code_lengths.clone();
         let checkpoint_table_set_len = table_sets.len();
 
@@ -622,6 +631,27 @@ fn decoded_item_buffers(
     &mut buffers[..active_len]
 }
 
+/// Dedicated bounded pool for RAR block decode, mirroring unrar's
+/// `MaxUserThreads = Min(Threads, 8)`. Keeps decode fan-out off the shared
+/// global pool and bounds wake/park churn.
+fn rar_decode_pool() -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(MAX_PARALLEL_THREADS);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("weaver-rar-dec-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
 fn parallel_decode_batch_into(
     input: &[u8],
     blocks: &[BlockInfo],
@@ -630,21 +660,24 @@ fn parallel_decode_batch_into(
     items: &mut [Vec<DecodedItem>],
 ) -> RarResult<()> {
     debug_assert_eq!(blocks.len(), items.len());
-    blocks
-        .par_iter()
-        .zip(items.par_iter_mut())
-        .try_for_each(|(block, items)| {
-            let tables = &table_sets[block.table_set_index];
-            decode_block_symbols(input, block, tables, extra_dist, items)
-        })
+    let mut decode = || {
+        blocks
+            .par_iter()
+            .zip(items.par_iter_mut())
+            .try_for_each(|(block, items)| {
+                let tables = &table_sets[block.table_set_index];
+                decode_block_symbols(input, block, tables, extra_dist, items)
+            })
+    };
+    match rar_decode_pool() {
+        Some(pool) => pool.install(decode),
+        None => decode(),
+    }
 }
 
 fn parallel_batch_size(thread_count: usize, block_count: usize) -> usize {
-    thread_count
-        .clamp(1, MAX_PARALLEL_THREADS)
-        .saturating_mul(BLOCKS_PER_THREAD)
-        .max(MIN_PARALLEL_BLOCKS)
-        .min(block_count)
+    let _ = thread_count;
+    block_count.min(MAX_BATCH_BLOCKS)
 }
 
 fn next_small_block_batch_end(blocks: &[BlockInfo], start: usize, batch_size: usize) -> usize {
@@ -694,6 +727,7 @@ impl LzDecoder {
     pub(super) fn process_buffered_blocks<W: std::io::Write>(
         &mut self,
         input: &[u8],
+        header_limit: usize,
         unpacked_size: u64,
         output_size: &mut u64,
         writer: &mut W,
@@ -716,6 +750,7 @@ impl LzDecoder {
 
         let preparsed = preparse_complete_blocks(
             input,
+            header_limit,
             &mut self.code_lengths,
             existing_tables.as_ref(),
             self.extra_dist,
@@ -1043,15 +1078,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parallel_batch_size_respects_unrar_thread_cap() {
-        assert_eq!(parallel_batch_size(32, 128), 16);
-        assert_eq!(parallel_batch_size(64, 128), 16);
+    fn parallel_batch_size_caps_dispatch_at_max_batch_blocks() {
+        assert_eq!(parallel_batch_size(32, 128), MAX_BATCH_BLOCKS);
+        assert_eq!(parallel_batch_size(64, 1024), MAX_BATCH_BLOCKS);
     }
 
     #[test]
-    fn parallel_batch_size_preserves_minimum_batch_floor() {
-        assert_eq!(parallel_batch_size(1, 8), 4);
-        assert_eq!(parallel_batch_size(0, 8), 4);
+    fn parallel_batch_size_is_thread_count_independent() {
+        assert_eq!(parallel_batch_size(1, 8), 8);
+        assert_eq!(parallel_batch_size(0, 8), 8);
     }
 
     #[test]

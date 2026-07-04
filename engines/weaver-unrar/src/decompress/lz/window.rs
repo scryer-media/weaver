@@ -4,7 +4,6 @@
 //! reference bytes already written to the window. The window wraps around
 //! when it reaches the dictionary size.
 
-use std::collections::VecDeque;
 use std::io::Write;
 use std::ptr;
 
@@ -22,9 +21,12 @@ const FRAGMENTED_BLOCK_SIZE: usize = 0x400000;
 #[cfg_attr(not(any(test, target_pointer_width = "32")), allow(dead_code))]
 const FRAGMENTED_MAX_BLOCKS: usize = 32;
 
-#[cfg_attr(not(any(test, target_pointer_width = "32")), allow(dead_code))]
 enum WindowStorage {
     Contiguous(Vec<u8>),
+    // On 64-bit release builds the fragmented fallback is unreachable, so the
+    // variant is compiled out entirely: every storage access then reduces to
+    // a direct Vec access with no discriminant dispatch on the hot path.
+    #[cfg(any(test, target_pointer_width = "32"))]
     Fragmented(FragmentedWindow),
 }
 
@@ -36,7 +38,7 @@ impl WindowStorage {
         Ok(Self::Contiguous(buf))
     }
 
-    #[cfg_attr(not(target_pointer_width = "32"), allow(dead_code))]
+    #[cfg(target_pointer_width = "32")]
     fn try_fragmented(len: usize) -> RarResult<Self> {
         Ok(Self::Fragmented(FragmentedWindow::try_new(
             len,
@@ -51,34 +53,45 @@ impl WindowStorage {
         )?))
     }
 
+    #[inline(always)]
     fn len(&self) -> usize {
         match self {
             Self::Contiguous(buf) => buf.len(),
+            #[cfg(any(test, target_pointer_width = "32"))]
             Self::Fragmented(buf) => buf.len(),
         }
     }
 
     fn is_fragmented(&self) -> bool {
-        matches!(self, Self::Fragmented(_))
+        match self {
+            Self::Contiguous(_) => false,
+            #[cfg(any(test, target_pointer_width = "32"))]
+            Self::Fragmented(_) => true,
+        }
     }
 
     fn as_mut_slice(&mut self) -> Option<&mut [u8]> {
         match self {
             Self::Contiguous(buf) => Some(buf.as_mut_slice()),
+            #[cfg(any(test, target_pointer_width = "32"))]
             Self::Fragmented(_) => None,
         }
     }
 
+    #[inline(always)]
     fn get(&self, idx: usize) -> u8 {
         match self {
             Self::Contiguous(buf) => buf[idx],
+            #[cfg(any(test, target_pointer_width = "32"))]
             Self::Fragmented(buf) => buf.get(idx),
         }
     }
 
+    #[inline(always)]
     fn set(&mut self, idx: usize, value: u8) {
         match self {
             Self::Contiguous(buf) => buf[idx] = value,
+            #[cfg(any(test, target_pointer_width = "32"))]
             Self::Fragmented(buf) => buf.set(idx, value),
         }
     }
@@ -86,6 +99,7 @@ impl WindowStorage {
     fn copy_from_slice(&mut self, start: usize, bytes: &[u8]) {
         match self {
             Self::Contiguous(buf) => buf[start..start + bytes.len()].copy_from_slice(bytes),
+            #[cfg(any(test, target_pointer_width = "32"))]
             Self::Fragmented(buf) => buf.copy_from_slice(start, bytes),
         }
     }
@@ -93,6 +107,7 @@ impl WindowStorage {
     fn fill(&mut self, start: usize, len: usize, value: u8) {
         match self {
             Self::Contiguous(buf) => buf[start..start + len].fill(value),
+            #[cfg(any(test, target_pointer_width = "32"))]
             Self::Fragmented(buf) => buf.fill(start, len, value),
         }
     }
@@ -100,6 +115,7 @@ impl WindowStorage {
     fn fill_all(&mut self, value: u8) {
         match self {
             Self::Contiguous(buf) => buf.fill(value),
+            #[cfg(any(test, target_pointer_width = "32"))]
             Self::Fragmented(buf) => buf.fill_all(value),
         }
     }
@@ -107,6 +123,7 @@ impl WindowStorage {
     fn extend_from_range(&self, start: usize, len: usize, out: &mut Vec<u8>) {
         match self {
             Self::Contiguous(buf) => out.extend_from_slice(&buf[start..start + len]),
+            #[cfg(any(test, target_pointer_width = "32"))]
             Self::Fragmented(buf) => buf.extend_from_range(start, len, out),
         }
     }
@@ -119,6 +136,7 @@ impl WindowStorage {
     ) -> std::io::Result<()> {
         match self {
             Self::Contiguous(buf) => writer.write_all(&buf[start..start + len]),
+            #[cfg(any(test, target_pointer_width = "32"))]
             Self::Fragmented(buf) => buf.write_range_to_writer(start, len, writer),
         }
     }
@@ -131,7 +149,7 @@ struct FragmentedWindow {
     len: usize,
 }
 
-#[cfg_attr(not(any(test, target_pointer_width = "32")), allow(dead_code))]
+#[cfg_attr(not(target_pointer_width = "32"), allow(dead_code))]
 impl FragmentedWindow {
     fn try_new(len: usize, min_block_size: usize) -> RarResult<Self> {
         if len == 0 || min_block_size == 0 {
@@ -389,8 +407,11 @@ pub struct Window {
     total_written: u64,
     /// Absolute dictionary position consumed by the external writer.
     total_flushed: u64,
-    /// Logical output ranges that are visible to callers and still pending flush.
-    visible_ranges: VecDeque<(u64, usize)>,
+    /// Absolute output ranges that advanced the dictionary but must not be
+    /// emitted to callers (truncated final matches). Almost always empty, so
+    /// the visible output is derived as the complement — this keeps the
+    /// per-literal hot path free of range bookkeeping.
+    invisible_ranges: Vec<(u64, u64)>,
 }
 
 impl Window {
@@ -422,7 +443,7 @@ impl Window {
                         pos: 0,
                         total_written: 0,
                         total_flushed: 0,
-                        visible_ranges: VecDeque::new(),
+                        invisible_ranges: Vec::new(),
                     });
                 }
 
@@ -437,7 +458,7 @@ impl Window {
             pos: 0,
             total_written: 0,
             total_flushed: 0,
-            visible_ranges: VecDeque::new(),
+            invisible_ranges: Vec::new(),
         })
     }
 
@@ -449,36 +470,60 @@ impl Window {
             pos: 0,
             total_written: 0,
             total_flushed: 0,
-            visible_ranges: VecDeque::new(),
+            invisible_ranges: Vec::new(),
         }
     }
 
-    fn push_visible_range(&mut self, start_total: u64, len: usize) {
+    /// Record a dictionary-only advance: bytes in `[start_total,
+    /// start_total + len)` advanced the window but must not reach callers.
+    fn mark_invisible(&mut self, start_total: u64, len: u64) {
         if len == 0 {
             return;
         }
-
-        if let Some((last_start, last_len)) = self.visible_ranges.back_mut()
-            && last_start.saturating_add(*last_len as u64) == start_total
+        if let Some((last_start, last_len)) = self.invisible_ranges.last_mut()
+            && last_start.saturating_add(*last_len) == start_total
         {
             *last_len += len;
             return;
         }
+        self.invisible_ranges.push((start_total, len));
+    }
 
-        self.visible_ranges.push_back((start_total, len));
+    /// Sum of invisible bytes intersecting `[start, end)`.
+    fn invisible_overlap(&self, start: u64, end: u64) -> u64 {
+        if self.invisible_ranges.is_empty() {
+            return 0;
+        }
+        self.invisible_ranges
+            .iter()
+            .map(|&(inv_start, inv_len)| {
+                let inv_end = inv_start.saturating_add(inv_len);
+                let overlap_start = inv_start.max(start);
+                let overlap_end = inv_end.min(end);
+                overlap_end.saturating_sub(overlap_start)
+            })
+            .sum()
+    }
+
+    /// Drop invisible ranges that ended at or before the flushed border.
+    fn gc_invisible(&mut self) {
+        if self.invisible_ranges.is_empty() {
+            return;
+        }
+        let border = self.total_flushed;
+        self.invisible_ranges
+            .retain(|&(start, len)| start.saturating_add(len) > border);
     }
 
     /// Write a single literal byte to the window.
-    #[inline]
+    #[inline(always)]
     pub fn put_byte(&mut self, b: u8) {
-        let start_total = self.total_written;
         self.buf.set(self.pos, b);
         self.pos += 1;
         if self.pos >= self.buf.len() {
             self.pos = 0;
         }
         self.total_written += 1;
-        self.push_visible_range(start_total, 1);
     }
 
     /// Write a contiguous slice of literal bytes to the window.
@@ -488,7 +533,6 @@ impl Window {
             return;
         }
 
-        let start_total = self.total_written;
         let dict_size = self.buf.len();
         let dst = self.pos;
         let length = bytes.len();
@@ -508,7 +552,6 @@ impl Window {
         }
 
         self.total_written += length as u64;
-        self.push_visible_range(start_total, length);
     }
 
     #[inline]
@@ -659,7 +702,13 @@ impl Window {
     ) -> RarResult<()> {
         let start_total = self.total_written;
         self.copy_advance(distance, length)?;
-        self.push_visible_range(start_total, visible_len.min(length));
+        let visible = visible_len.min(length);
+        if visible < length {
+            self.mark_invisible(
+                start_total + visible as u64,
+                (length - visible) as u64,
+            );
+        }
         Ok(())
     }
 
@@ -677,12 +726,16 @@ impl Window {
         let start_total = self.total_written;
         if distance == 0 {
             self.fill_zeroes_advance(length);
-            self.push_visible_range(start_total, visible_len.min(length));
-            return Ok(());
+        } else {
+            self.copy_advance(distance, length)?;
         }
-
-        self.copy_advance(distance, length)?;
-        self.push_visible_range(start_total, visible_len.min(length));
+        let visible = visible_len.min(length);
+        if visible < length {
+            self.mark_invisible(
+                start_total + visible as u64,
+                (length - visible) as u64,
+            );
+        }
         Ok(())
     }
 
@@ -802,6 +855,7 @@ impl Window {
         let unflushed = self.unflushed_bytes();
         if unflushed == 0 {
             self.total_flushed = self.total_written;
+            self.gc_invisible();
             return Ok(0);
         }
 
@@ -814,13 +868,44 @@ impl Window {
                 ),
             ));
         }
-        while let Some((start_total, len)) = self.visible_ranges.pop_front() {
-            self.write_range_to_writer(start_total, len, writer)?;
-            self.total_flushed = start_total.saturating_add(len as u64);
-        }
-
+        self.write_visible_span(self.total_flushed, self.total_written, writer)?;
         self.total_flushed = self.total_written;
+        self.gc_invisible();
         Ok(unflushed)
+    }
+
+    /// Write the visible bytes of `[start, end)` to `writer`, skipping any
+    /// invisible ranges. Ranges are stored in increasing start order.
+    fn write_visible_span<W: Write + ?Sized>(
+        &self,
+        start: u64,
+        end: u64,
+        writer: &mut W,
+    ) -> std::io::Result<u64> {
+        let mut written = 0u64;
+        let mut cursor = start;
+        if !self.invisible_ranges.is_empty() {
+            for &(inv_start, inv_len) in &self.invisible_ranges {
+                let inv_end = inv_start.saturating_add(inv_len);
+                if inv_end <= cursor {
+                    continue;
+                }
+                if inv_start >= end {
+                    break;
+                }
+                if inv_start > cursor {
+                    let gap_end = inv_start.min(end);
+                    self.write_range_to_writer(cursor, (gap_end - cursor) as usize, writer)?;
+                    written += gap_end - cursor;
+                }
+                cursor = cursor.max(inv_end.min(end));
+            }
+        }
+        if cursor < end {
+            self.write_range_to_writer(cursor, (end - cursor) as usize, writer)?;
+            written += end - cursor;
+        }
+        Ok(written)
     }
 
     /// Flush visible output up to `up_to`, advancing across hidden dictionary
@@ -835,34 +920,9 @@ impl Window {
             return Ok(0);
         }
 
-        let mut written = 0u64;
-        while let Some((start_total, len)) = self.visible_ranges.pop_front() {
-            let end_total = start_total.saturating_add(len as u64);
-
-            if end_total <= self.total_flushed {
-                continue;
-            }
-            if start_total >= target {
-                self.visible_ranges.push_front((start_total, len));
-                break;
-            }
-
-            let write_start = start_total.max(self.total_flushed);
-            let write_end = end_total.min(target);
-            if write_end > write_start {
-                let write_len = (write_end - write_start) as usize;
-                self.write_range_to_writer(write_start, write_len, writer)?;
-                written += write_len as u64;
-            }
-
-            if end_total > target {
-                self.visible_ranges
-                    .push_front((target, (end_total - target) as usize));
-                break;
-            }
-        }
-
+        let written = self.write_visible_span(self.total_flushed, target, writer)?;
         self.total_flushed = target;
+        self.gc_invisible();
         Ok(written)
     }
 
@@ -871,20 +931,28 @@ impl Window {
     /// Each tuple is `(offset_inside_range, visible_len)`. Hidden bytes are
     /// dictionary-only advancement and must not be emitted to callers.
     pub(crate) fn visible_subranges(&self, start_total: u64, len: usize) -> Vec<(usize, usize)> {
-        let end_total = start_total.saturating_add(len as u64);
+        let end_total = start_total
+            .saturating_add(len as u64)
+            .min(self.total_written);
         let mut ranges = Vec::new();
+        let mut cursor = start_total;
 
-        for &(visible_start, visible_len) in &self.visible_ranges {
-            let visible_end = visible_start.saturating_add(visible_len as u64);
-            let overlap_start = visible_start.max(start_total);
-            let overlap_end = visible_end.min(end_total);
-            if overlap_end <= overlap_start {
+        for &(inv_start, inv_len) in &self.invisible_ranges {
+            let inv_end = inv_start.saturating_add(inv_len);
+            if inv_end <= cursor {
                 continue;
             }
-            ranges.push((
-                (overlap_start - start_total) as usize,
-                (overlap_end - overlap_start) as usize,
-            ));
+            if inv_start >= end_total {
+                break;
+            }
+            if inv_start > cursor {
+                let gap_end = inv_start.min(end_total);
+                ranges.push(((cursor - start_total) as usize, (gap_end - cursor) as usize));
+            }
+            cursor = cursor.max(inv_end.min(end_total));
+        }
+        if cursor < end_total {
+            ranges.push(((cursor - start_total) as usize, (end_total - cursor) as usize));
         }
 
         ranges
@@ -892,7 +960,8 @@ impl Window {
 
     /// Number of unflushed bytes currently in the window.
     pub fn unflushed_bytes(&self) -> u64 {
-        self.visible_ranges.iter().map(|(_, len)| *len as u64).sum()
+        let span = self.total_written.saturating_sub(self.total_flushed);
+        span - self.invisible_overlap(self.total_flushed, self.total_written)
     }
 
     /// Absolute position up to which data has been flushed.
@@ -964,23 +1033,8 @@ impl Window {
     /// Manually mark data as flushed up to a given total position.
     /// Used when data is extracted via `copy_output` and written externally.
     pub fn mark_flushed(&mut self, up_to: u64) {
-        let up_to = up_to.min(self.total_written);
-        while let Some((start, len)) = self.visible_ranges.front().copied() {
-            let end = start.saturating_add(len as u64);
-            if end <= up_to {
-                self.visible_ranges.pop_front();
-            } else if start < up_to {
-                let trim = (up_to - start) as usize;
-                if let Some((range_start, range_len)) = self.visible_ranges.front_mut() {
-                    *range_start = up_to;
-                    *range_len -= trim;
-                }
-                break;
-            } else {
-                break;
-            }
-        }
-        self.total_flushed = up_to;
+        self.total_flushed = up_to.min(self.total_written);
+        self.gc_invisible();
     }
 
     /// Reset the window for a new file (non-solid mode).
@@ -989,7 +1043,7 @@ impl Window {
         self.pos = 0;
         self.total_written = 0;
         self.total_flushed = 0;
-        self.visible_ranges.clear();
+        self.invisible_ranges.clear();
     }
 }
 

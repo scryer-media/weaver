@@ -964,6 +964,17 @@ impl Pipeline {
                 }
                 self.mark_rar_unlock_priorities_dirty(job_id);
 
+                if current_attempted.is_empty() {
+                    warn!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        attempted = ?attempted,
+                        result = if result.is_ok() { "success" } else { "error" },
+                        "ignoring stale RAR batch extraction completion for non-current members"
+                    );
+                    return;
+                }
+
                 let mut capacity_retry = false;
                 match result {
                     Ok(outcome) => {

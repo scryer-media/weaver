@@ -476,6 +476,10 @@ impl Pipeline {
                 plan.phase = crate::pipeline::archive::rar_state::RarSetPhase::Extracting;
             }
         }
+        self.inflight_extractions
+            .entry(job_id)
+            .or_default()
+            .insert(set_name.to_string());
 
         // Collect already-extracted members so we skip them.
         let already_extracted: HashSet<String> = self

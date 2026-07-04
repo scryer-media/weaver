@@ -55,6 +55,16 @@ const MAX_FILTER_BLOCK_SIZE: usize = 0x400000;
 const UNPACK_MAX_WRITE: usize = 0x400000;
 const STREAMING_PARALLEL_READ_BUFFER_SIZE: usize = 0x400000;
 const STREAMING_PARALLEL_MIN_PROCESS_SIZE: usize = 1024;
+/// Trailing staged bytes treated as unreliable for header/table parsing while
+/// more input may follow: a block header plus full Huffman tables fit well
+/// within this margin, so anything parsed before it only touches real bits.
+const STREAMING_HEADER_MARGIN: usize = 1024;
+/// Bit margin the mid-block staged decode keeps in reserve so no symbol read
+/// can reach the staging edge, where 16-bit peeks would otherwise fabricate
+/// zero bits in place of real, not-yet-staged data (unrar's ReadBorder idea).
+/// The widest RAR5 symbol (code + length extra + distance code + high distance
+/// bits + align code, or a filter descriptor) stays under 128 bits.
+const STREAMING_SYMBOL_MARGIN_BITS: i64 = 512;
 
 /// State for the LZ decompressor.
 pub struct LzDecoder {
@@ -502,17 +512,43 @@ impl LzDecoder {
         // single comparison per iteration (matching unrar's ReadBorder check).
         let block_end_pos = reader.position() as i64 + self.block_bits_remaining;
 
+        // Hoist the per-block tables out of the symbol loop. Cloning the Arcs
+        // (a refcount bump per block) keeps `self` free for mutable window and
+        // filter calls without an Option check per symbol.
+        let missing_table = |what: &str| RarError::CorruptArchive {
+            detail: format!("RAR5 LZ block is missing {what} table"),
+        };
+        let nc_table = Arc::clone(
+            self.nc_table
+                .as_ref()
+                .ok_or_else(|| missing_table("literal/length"))?,
+        );
+        let dc_table = Arc::clone(
+            self.dc_table
+                .as_ref()
+                .ok_or_else(|| missing_table("distance"))?,
+        );
+        let ldc_table = Arc::clone(
+            self.ldc_table
+                .as_ref()
+                .ok_or_else(|| missing_table("low-distance"))?,
+        );
+        let rc_table = Arc::clone(
+            self.rc_table
+                .as_ref()
+                .ok_or_else(|| missing_table("repeat-length"))?,
+        );
+
+        // The flushed border only moves outside decode_block, so the yield
+        // check reduces to one monotonic total_written comparison per symbol.
+        let yield_at = yield_threshold
+            .map(|threshold| self.window.total_flushed().saturating_add(threshold as u64));
+
         while output_size < unpacked_size && (reader.position() as i64) < block_end_pos {
             if !reader.has_bits() {
                 break;
             }
 
-            let nc_table = self
-                .nc_table
-                .as_ref()
-                .ok_or_else(|| RarError::CorruptArchive {
-                    detail: "RAR5 LZ block is missing literal/length table".into(),
-                })?;
             let sym = nc_table.decode(reader)? as u32;
             let mut should_check_yield = false;
 
@@ -525,19 +561,7 @@ impl LzDecoder {
                 // Inline length-distance pair (second most common).
                 let length_idx = (sym - 262) as usize;
                 let mut length = Self::slot_to_length(reader, length_idx)?;
-                let dc = self
-                    .dc_table
-                    .as_ref()
-                    .ok_or_else(|| RarError::CorruptArchive {
-                        detail: "RAR5 LZ block is missing distance table".into(),
-                    })?;
-                let ldc = self
-                    .ldc_table
-                    .as_ref()
-                    .ok_or_else(|| RarError::CorruptArchive {
-                        detail: "RAR5 LZ block is missing low-distance table".into(),
-                    })?;
-                let distance = self.decode_distance(reader, dc, ldc)?;
+                let distance = self.decode_distance(reader, &dc_table, &ldc_table)?;
                 length = Self::adjust_length_for_distance(length, distance);
                 let remaining = (unpacked_size - output_size) as usize;
                 let visible_len = length.min(remaining);
@@ -569,13 +593,7 @@ impl LzDecoder {
                 let cache_idx = (sym - 258) as usize;
                 let distance = self.promote_old_dist(cache_idx)?;
 
-                let rc = self
-                    .rc_table
-                    .as_ref()
-                    .ok_or_else(|| RarError::CorruptArchive {
-                        detail: "RAR5 LZ block is missing repeat-length table".into(),
-                    })?;
-                let length = self.decode_rc_length(reader, rc)?;
+                let length = self.decode_rc_length(reader, &rc_table)?;
                 let remaining = (unpacked_size - output_size) as usize;
                 let visible_len = length.min(remaining);
 
@@ -587,9 +605,9 @@ impl LzDecoder {
             }
 
             if should_check_yield
-                && let Some(threshold) = yield_threshold
+                && let Some(limit) = yield_at
                 && self.pending_filters.is_empty()
-                && self.window.unflushed_bytes() as usize >= threshold
+                && self.window.total_written() >= limit
             {
                 break;
             }
@@ -863,24 +881,66 @@ impl LzDecoder {
                 staged.extend_from_slice(&read_buf[..read]);
             }
 
+            // A finished block can end mid-byte; the remaining bits of that
+            // byte belong to the finished block, and the next header starts at
+            // the following byte boundary. Align here so the buffered header
+            // parse below sees the true header start (and so this loop cannot
+            // spin on a zero-length residual decode). The offset can span
+            // multiple bytes when a header/table parse left no block data.
+            if self.block_bits_remaining <= 0 && staged_bit_offset > 0 {
+                staged_start += staged_bit_offset.div_ceil(8);
+                staged_bit_offset = 0;
+                if staged_start >= staged.len() {
+                    staged.clear();
+                    staged_start = 0;
+                }
+            }
+
             let staged_slice = &staged[staged_start..];
             if staged_slice.is_empty() {
-                break;
+                if reached_eof {
+                    break;
+                }
+                continue;
             }
 
             let have_incomplete_block = self.block_bits_remaining > 0 || staged_bit_offset > 0;
             if have_incomplete_block {
+                // Clamp the decode budget a symbol-width short of the staging
+                // edge: 16-bit peeks fabricate zero bits past the slice end,
+                // which can silently desync the stream when the real bits
+                // arrive with the next refill.
+                let avail_bits = (staged_slice.len() * 8).saturating_sub(staged_bit_offset) as i64;
+                let usable_bits = if reached_eof {
+                    avail_bits
+                } else {
+                    avail_bits - STREAMING_SYMBOL_MARGIN_BITS
+                };
+                if usable_bits <= 0 {
+                    if reached_eof {
+                        break;
+                    }
+                    continue;
+                }
+
+                let full_remaining = self.block_bits_remaining;
+                self.block_bits_remaining = full_remaining.min(usable_bits);
+
                 let mut reader = BitReader::new(staged_slice);
                 if staged_bit_offset > 0 {
                     reader.skip_bits(staged_bit_offset as u32)?;
                 }
 
-                match self.decode_block(
+                let decode_result = self.decode_block(
                     &mut reader,
                     unpacked_size,
                     output_size,
                     Some(self.flush_threshold()),
-                ) {
+                );
+                let consumed_bits = (reader.position() - staged_bit_offset) as i64;
+                self.block_bits_remaining = full_remaining - consumed_bits;
+
+                match decode_result {
                     Ok(new_output_size) => {
                         output_size = new_output_size;
                         self.flush_stream_output(writer)?;
@@ -905,8 +965,16 @@ impl LzDecoder {
                 }
             }
 
+            // Only accept block headers that start clear of the unreliable
+            // staging tail (header plus tables always fit in the margin).
+            let header_limit = if reached_eof {
+                staged_slice.len()
+            } else {
+                staged_slice.len().saturating_sub(STREAMING_HEADER_MARGIN)
+            };
             let consumed = self.process_buffered_blocks(
                 staged_slice,
+                header_limit,
                 unpacked_size,
                 &mut output_size,
                 writer,
@@ -1083,7 +1151,7 @@ impl LzDecoder {
         unpacked_size: u64,
         first_volume_index: usize,
         transitions: std::sync::Arc<std::sync::Mutex<Vec<super::VolumeTransition>>>,
-        mut writer_factory: F,
+        writer_factory: F,
     ) -> RarResult<Vec<(usize, u64)>>
     where
         F: FnMut(usize) -> RarResult<Box<dyn Write>>,
@@ -1092,6 +1160,272 @@ impl LzDecoder {
             return Ok(Vec::new());
         }
 
+        if !parallel::parallel_enabled() {
+            return self.decompress_reader_to_writer_chunked_single_thread(
+                input,
+                unpacked_size,
+                first_volume_index,
+                transitions,
+                writer_factory,
+            );
+        }
+
+        self.decompress_reader_to_writer_chunked_parallel(
+            input,
+            unpacked_size,
+            first_volume_index,
+            transitions,
+            writer_factory,
+        )
+    }
+
+    /// Staged block-parallel variant of the solid chunked decode: complete
+    /// blocks before the next volume boundary fan out to rayon (same engine
+    /// as `decompress_reader_to_writer`), while boundary-straddling blocks and
+    /// writer switching stay on the sequential path at block granularity.
+    fn decompress_reader_to_writer_chunked_parallel<Rd: std::io::Read, F>(
+        &mut self,
+        mut input: Rd,
+        unpacked_size: u64,
+        first_volume_index: usize,
+        transitions: std::sync::Arc<std::sync::Mutex<Vec<super::VolumeTransition>>>,
+        mut writer_factory: F,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
+        self.begin_file_decode();
+
+        let mut chunks: Vec<(usize, u64)> = Vec::new();
+        let mut current_vol = first_volume_index;
+        let mut current_writer = writer_factory(current_vol)?;
+        let mut chunk_bytes: u64 = 0;
+        let mut boundary_idx = 0usize;
+
+        let mut output_size = 0u64;
+        let mut staged = Vec::with_capacity(STREAMING_PARALLEL_READ_BUFFER_SIZE);
+        let mut read_buf = vec![0u8; STREAMING_PARALLEL_READ_BUFFER_SIZE];
+        let mut reached_eof = false;
+        let mut staged_start = 0usize;
+        let mut staged_bit_offset = 0usize;
+        // Absolute compressed offset (from member start) of staged[0].
+        let mut staged_base: u64 = 0;
+
+        let next_boundary = |boundary_idx: usize| -> RarResult<Option<super::VolumeTransition>> {
+            let guard = transitions.lock().map_err(|_| RarError::CorruptArchive {
+                detail: "RAR5 chunked transition state poisoned".into(),
+            })?;
+            Ok(guard.get(boundary_idx).cloned())
+        };
+
+        while output_size < unpacked_size {
+            if staged_start > 0
+                && (staged_start >= STREAMING_PARALLEL_READ_BUFFER_SIZE / 2
+                    || staged.len() == STREAMING_PARALLEL_READ_BUFFER_SIZE)
+            {
+                staged_base += staged_start as u64;
+                Self::compact_staged_buffer(&mut staged, &mut staged_start);
+            }
+
+            while !reached_eof && staged.len() - staged_start < STREAMING_PARALLEL_READ_BUFFER_SIZE
+            {
+                if staged.len() == STREAMING_PARALLEL_READ_BUFFER_SIZE {
+                    staged_base += staged_start as u64;
+                    Self::compact_staged_buffer(&mut staged, &mut staged_start);
+                }
+
+                let max_read = STREAMING_PARALLEL_READ_BUFFER_SIZE - (staged.len() - staged_start);
+                let read = input
+                    .read(&mut read_buf[..max_read])
+                    .map_err(RarError::Io)?;
+                if read == 0 {
+                    reached_eof = true;
+                    break;
+                }
+                staged.extend_from_slice(&read_buf[..read]);
+            }
+
+            // A finished block can end mid-byte; the residual bits belong to
+            // the finished block and the next header starts at the following
+            // byte boundary. The offset can span multiple bytes when a
+            // header/table parse left no block data.
+            if self.block_bits_remaining <= 0 && staged_bit_offset > 0 {
+                staged_start += staged_bit_offset.div_ceil(8);
+                staged_bit_offset = 0;
+                if staged_start >= staged.len() {
+                    staged_base += staged.len() as u64;
+                    staged.clear();
+                    staged_start = 0;
+                }
+            }
+
+            let staged_slice = &staged[staged_start..];
+            if staged_slice.is_empty() {
+                if reached_eof {
+                    break;
+                }
+                continue;
+            }
+
+            // Absolute compressed byte offset of the decode cursor.
+            let abs_cursor = staged_base + staged_start as u64 + (staged_bit_offset / 8) as u64;
+            let boundary = next_boundary(boundary_idx)?;
+
+            // Writer switch once the cursor has reached a volume boundary and
+            // no block is in flight (in-flight blocks finish on the old
+            // writer, matching the sequential path's attribution).
+            if let Some(ref b) = boundary
+                && self.block_bits_remaining <= 0
+                && staged_bit_offset == 0
+                && abs_cursor >= b.compressed_offset
+            {
+                self.flush_filters_and_write(&mut *current_writer)?;
+                chunks.push((current_vol, chunk_bytes));
+                current_vol = b.volume_index;
+                boundary_idx += 1;
+                current_writer = writer_factory(current_vol)?;
+                chunk_bytes = 0;
+                continue;
+            }
+
+            // Finish an in-flight block sequentially, keeping the decode
+            // budget a symbol-width short of the staging edge (peeks would
+            // fabricate zero bits there while real data may follow).
+            if self.block_bits_remaining > 0 || staged_bit_offset > 0 {
+                let avail_bits = (staged_slice.len() * 8).saturating_sub(staged_bit_offset) as i64;
+                let usable_bits = if reached_eof {
+                    avail_bits
+                } else {
+                    avail_bits - STREAMING_SYMBOL_MARGIN_BITS
+                };
+                if usable_bits <= 0 {
+                    if reached_eof {
+                        break;
+                    }
+                    continue;
+                }
+
+                let full_remaining = self.block_bits_remaining;
+                self.block_bits_remaining = full_remaining.min(usable_bits);
+
+                let mut reader = BitReader::new(staged_slice);
+                if staged_bit_offset > 0 {
+                    reader.skip_bits(staged_bit_offset as u32)?;
+                }
+
+                let prev_output = output_size;
+                let decode_result = self.decode_block(
+                    &mut reader,
+                    unpacked_size,
+                    output_size,
+                    Some(self.flush_threshold()),
+                );
+                let consumed_bits = (reader.position() - staged_bit_offset) as i64;
+                self.block_bits_remaining = full_remaining - consumed_bits;
+
+                match decode_result {
+                    Ok(new_output_size) => {
+                        output_size = new_output_size;
+                        chunk_bytes += output_size - prev_output;
+                        self.flush_stream_output(&mut current_writer)?;
+                        staged_bit_offset = reader.position();
+                        Self::advance_staged_prefix(
+                            &mut staged_start,
+                            staged.len(),
+                            &mut staged_bit_offset,
+                        );
+                        continue;
+                    }
+                    Err(error) if parallel::is_truncated_input_error(&error) && !reached_eof => {
+                        staged_bit_offset = reader.position();
+                        Self::advance_staged_prefix(
+                            &mut staged_start,
+                            staged.len(),
+                            &mut staged_bit_offset,
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+
+            // Block-parallel decode of headers starting before the next
+            // volume boundary and clear of the unreliable staging tail. A
+            // block whose data crosses the boundary still decodes here and
+            // attributes to the current volume, matching the sequential
+            // path's switch-after-crossing behavior.
+            let header_limit = if reached_eof {
+                staged_slice.len()
+            } else {
+                staged_slice.len().saturating_sub(STREAMING_HEADER_MARGIN)
+            };
+            let span = boundary
+                .as_ref()
+                .map(|b| {
+                    usize::try_from(b.compressed_offset.saturating_sub(abs_cursor))
+                        .unwrap_or(usize::MAX)
+                        .min(header_limit)
+                })
+                .unwrap_or(header_limit);
+            if span > 0 {
+                let prev_output = output_size;
+                let consumed = self.process_buffered_blocks(
+                    staged_slice,
+                    span,
+                    unpacked_size,
+                    &mut output_size,
+                    &mut current_writer,
+                )?;
+                if consumed > 0 {
+                    chunk_bytes += output_size - prev_output;
+                    staged_start += consumed;
+                    if staged_start >= staged.len() {
+                        staged_base += staged.len() as u64;
+                        staged.clear();
+                        staged_start = 0;
+                    }
+                    staged_bit_offset = 0;
+                    continue;
+                }
+            }
+
+            if !reached_eof && staged_slice.len() < STREAMING_PARALLEL_MIN_PROCESS_SIZE {
+                continue;
+            }
+
+            // No complete block fits before the boundary (or within the
+            // stage): read one header and decode that block sequentially via
+            // the in-flight branch above.
+            let mut reader = BitReader::new(staged_slice);
+            if !self.try_read_block_header_buffered(&mut reader)? {
+                if reached_eof {
+                    break;
+                }
+                continue;
+            }
+
+            staged_bit_offset = reader.position();
+        }
+
+        self.flush_filters_and_write(&mut *current_writer)?;
+        if chunk_bytes > 0 || chunks.is_empty() {
+            chunks.push((current_vol, chunk_bytes));
+        }
+
+        Ok(chunks)
+    }
+
+    fn decompress_reader_to_writer_chunked_single_thread<Rd: std::io::Read, F>(
+        &mut self,
+        input: Rd,
+        unpacked_size: u64,
+        first_volume_index: usize,
+        transitions: std::sync::Arc<std::sync::Mutex<Vec<super::VolumeTransition>>>,
+        mut writer_factory: F,
+    ) -> RarResult<Vec<(usize, u64)>>
+    where
+        F: FnMut(usize) -> RarResult<Box<dyn Write>>,
+    {
         self.begin_file_decode();
         let mut reader = StreamingBitReader::new(input);
         let mut output_size: u64 = 0;

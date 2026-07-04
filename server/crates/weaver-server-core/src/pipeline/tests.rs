@@ -2768,6 +2768,70 @@ async fn stale_rar_batch_failure_for_extracted_member_is_ignored() {
 }
 
 #[tokio::test]
+async fn stale_rar_batch_success_for_non_current_member_is_ignored_before_normalize() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40136);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Stale Batch Success", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let key = (job_id, "show".to_string());
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&key)
+            .expect("RAR set should exist");
+        set_state.active_workers = 0;
+        set_state.in_flight_members.clear();
+        set_state.extraction_generation = 11;
+        set_state.phase = crate::pipeline::archive::rar_state::RarSetPhase::Complete;
+        let plan = set_state.plan.as_mut().expect("RAR plan should exist");
+        plan.phase = crate::pipeline::archive::rar_state::RarSetPhase::Complete;
+    }
+
+    let stale_staging = pipeline.deterministic_extraction_staging_dir(job_id);
+    let _ = tokio::fs::remove_dir_all(&stale_staging).await;
+    pipeline.pending_completion_checks.clear();
+
+    pipeline
+        .handle_extraction_done(ExtractionDone::Batch {
+            job_id,
+            set_name: "show".to_string(),
+            attempted: vec!["E01.mkv".to_string()],
+            result: Ok(BatchExtractionOutcome {
+                extracted: vec!["E01.mkv".to_string()],
+                failed: Vec::new(),
+                selected_password: None,
+            }),
+        })
+        .await;
+
+    let set_state = pipeline.rar_sets.get(&key).expect("RAR set should remain");
+    assert_eq!(set_state.active_workers, 0);
+    assert_eq!(set_state.extraction_generation, 12);
+    assert!(set_state.in_flight_members.is_empty());
+    assert!(
+        !pipeline
+            .extracted_members
+            .get(&job_id)
+            .is_some_and(|members| members.contains("E01.mkv")),
+        "stale success must not mark extracted members"
+    );
+    assert!(pipeline.pending_completion_checks.is_empty());
+    assert!(!matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+}
+
+#[tokio::test]
 async fn idle_rar_worker_drain_recomputes_and_clears_obsolete_post_refresh() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -16149,6 +16213,23 @@ async fn restore_job_rehydrates_existing_deterministic_staging_dir() {
 }
 
 #[test]
+fn quick_par2_verification_uses_verifying_failpoint() {
+    assert_eq!(
+        Pipeline::par2_verification_started_failpoint_name(),
+        crate::e2e_failpoint::STATUS_ENTER_VERIFYING
+    );
+    assert_eq!(
+        Pipeline::status_enter_failpoint_for_transition(
+            crate::jobs::model::PostState::Idle,
+            crate::jobs::model::RunState::Active,
+            crate::jobs::model::PostState::Verifying,
+            crate::jobs::model::RunState::Active,
+        ),
+        Some(Pipeline::par2_verification_started_failpoint_name())
+    );
+}
+
+#[test]
 fn runtime_transition_failpoint_mapping_uses_lane_transitions() {
     assert_eq!(
         Pipeline::status_enter_failpoint_for_transition(
@@ -16157,7 +16238,7 @@ fn runtime_transition_failpoint_mapping_uses_lane_transitions() {
             crate::jobs::model::PostState::Verifying,
             crate::jobs::model::RunState::Active,
         ),
-        Some("status.enter_verifying")
+        Some(crate::e2e_failpoint::STATUS_ENTER_VERIFYING)
     );
     assert_eq!(
         Pipeline::status_enter_failpoint_for_transition(
@@ -16166,7 +16247,7 @@ fn runtime_transition_failpoint_mapping_uses_lane_transitions() {
             crate::jobs::model::PostState::Repairing,
             crate::jobs::model::RunState::Active,
         ),
-        Some("status.enter_repairing")
+        Some(crate::e2e_failpoint::STATUS_ENTER_REPAIRING)
     );
     assert_eq!(
         Pipeline::status_enter_failpoint_for_transition(
@@ -16175,7 +16256,7 @@ fn runtime_transition_failpoint_mapping_uses_lane_transitions() {
             crate::jobs::model::PostState::Idle,
             crate::jobs::model::RunState::Paused,
         ),
-        Some("status.enter_paused")
+        Some(crate::e2e_failpoint::STATUS_ENTER_PAUSED)
     );
     assert_eq!(
         Pipeline::status_enter_failpoint_for_transition(
@@ -19971,10 +20052,62 @@ async fn extracting_rar_restart_with_failed_member_enters_repair_or_relaunches()
 }
 
 #[tokio::test]
-async fn active_full_set_rar_extraction_blocks_restart_repair_and_relaunch() {
+async fn direct_full_set_rar_extraction_registers_and_blocks_incremental_batches() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(31204);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("Direct full-set RAR ownership", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let key = (job_id, "show".to_string());
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.status = JobStatus::Extracting;
+        state.refresh_runtime_lanes_from_status();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    pipeline
+        .extract_rar_set(job_id, "show")
+        .await
+        .expect("direct full-set extraction should launch");
+    assert!(
+        pipeline
+            .inflight_extractions
+            .get(&job_id)
+            .is_some_and(|sets| sets.contains("show")),
+        "direct full-set extraction must register set ownership"
+    );
+
+    pipeline.try_rar_extraction(job_id).await;
+
+    let set_state = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("RAR set should remain while full-set extraction is active");
+    assert_eq!(set_state.active_workers, 1);
+    assert!(
+        set_state.in_flight_members.is_empty(),
+        "incremental batches must not start for a set owned by direct full-set extraction"
+    );
+
+    let done = next_extraction_done(&mut pipeline).await;
+    pipeline.handle_extraction_done(done).await;
+}
+
+#[tokio::test]
+async fn active_full_set_rar_extraction_blocks_restart_repair_and_relaunch() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31208);
     let files = build_multifile_multivolume_rar_set();
     let spec = rar_job_spec("Active full-set RAR restart guard", &files);
     insert_active_job(&mut pipeline, job_id, spec).await;
@@ -19989,22 +20122,9 @@ async fn active_full_set_rar_extraction_blocks_restart_repair_and_relaunch() {
         .failed_extractions
         .insert(job_id, ["E01.mkv".to_string()].into_iter().collect());
     pipeline
-        .inflight_extractions
-        .entry(job_id)
-        .or_default()
-        .insert("show".to_string());
-    {
-        let set_state = pipeline
-            .rar_sets
-            .get_mut(&key)
-            .expect("RAR set state should exist after all volumes complete");
-        set_state.active_workers = 0;
-        set_state.in_flight_members.clear();
-        set_state.phase = crate::pipeline::rar_state::RarSetPhase::Extracting;
-        if let Some(plan) = set_state.plan.as_mut() {
-            plan.phase = crate::pipeline::rar_state::RarSetPhase::Extracting;
-        }
-    }
+        .extract_rar_set(job_id, "show")
+        .await
+        .expect("direct full-set extraction should launch");
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.status = JobStatus::Extracting;
@@ -20032,7 +20152,7 @@ async fn active_full_set_rar_extraction_blocks_restart_repair_and_relaunch() {
         .rar_sets
         .get(&key)
         .expect("RAR set should remain while full-set extraction is active");
-    assert_eq!(set_state.active_workers, 0);
+    assert_eq!(set_state.active_workers, 1);
     assert!(set_state.in_flight_members.is_empty());
     assert!(
         pipeline
@@ -20040,6 +20160,9 @@ async fn active_full_set_rar_extraction_blocks_restart_repair_and_relaunch() {
             .get(&job_id)
             .is_some_and(|sets| sets.contains("show"))
     );
+
+    let done = next_extraction_done(&mut pipeline).await;
+    pipeline.handle_extraction_done(done).await;
 }
 
 #[tokio::test]

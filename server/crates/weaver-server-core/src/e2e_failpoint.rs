@@ -1,6 +1,12 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub const STATUS_ENTER_PAUSED: &str = "status.enter_paused";
+pub const STATUS_ENTER_VERIFYING: &str = "status.enter_verifying";
+pub const STATUS_ENTER_REPAIRING: &str = "status.enter_repairing";
+pub const STATUS_ENTER_QUEUED_REPAIR: &str = "status.enter_queued_repair";
+pub const STATUS_ENTER_QUEUED_EXTRACT: &str = "status.enter_queued_extract";
+
 struct ConfiguredFailpoint {
     name: String,
     fired: AtomicBool,

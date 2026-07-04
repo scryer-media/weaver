@@ -24,6 +24,7 @@ pub trait BitRead {
         self.position() / 8
     }
     fn read_bits(&mut self, count: u8) -> RarResult<u32>;
+    #[inline(always)]
     fn read_bits64(&mut self, count: u8) -> RarResult<u64> {
         debug_assert!(count <= 64);
         if count <= 32 {
@@ -75,16 +76,30 @@ impl<'a> BitReader<'a> {
 
     /// Refill the accumulator from the source data.
     ///
-    /// Loads bytes until we have at least 56 bits (or the source is exhausted).
-    /// This is designed to be called infrequently — typically every ~4-7 bytes
-    /// consumed, not on every bit read.
-    #[inline]
+    /// Fast path is branchless: one 8-byte big-endian load ORed below the
+    /// valid bits, advancing by however many whole bytes fit. After it runs
+    /// the accumulator holds 56-63 valid bits. The byte-loop tail only runs
+    /// within the last 8 bytes of the source.
+    #[inline(always)]
     fn refill(&mut self) {
-        // Fast path: load 8 bytes at once if available.
-        // We can always fit more bytes when acc_bits <= 56.
+        if self.acc_bits > 56 {
+            return;
+        }
+        if self.byte_pos + 8 <= self.data.len() {
+            // SAFETY of the OR: the low (64 - acc_bits) bits of `acc` are
+            // always zero between operations.
+            let chunk = u64::from_be_bytes(
+                self.data[self.byte_pos..self.byte_pos + 8]
+                    .try_into()
+                    .expect("8-byte window"),
+            );
+            self.acc |= chunk >> self.acc_bits;
+            // Whole bytes actually absorbed; leaves acc_bits at 56 + (old % 8).
+            self.byte_pos += (63 - self.acc_bits as usize) >> 3;
+            self.acc_bits |= 56;
+            return;
+        }
         while self.acc_bits <= 56 && self.byte_pos < self.data.len() {
-            // Place the new byte into the correct position (left-aligned,
-            // just below the existing valid bits).
             self.acc |= (self.data[self.byte_pos] as u64) << (56 - self.acc_bits);
             self.byte_pos += 1;
             self.acc_bits += 8;
@@ -113,8 +128,8 @@ impl<'a> BitReader<'a> {
     /// Returns the current position in bits from the start.
     #[inline]
     pub fn position(&self) -> usize {
-        // Total bits in source minus bits we haven't consumed yet.
-        self.data.len() * 8 - self.bits_remaining()
+        // Bytes loaded into the accumulator minus bits still unconsumed there.
+        self.byte_pos * 8 - self.acc_bits as usize
     }
 
     /// Returns the current byte position (rounded down from bit position).
@@ -472,8 +487,29 @@ impl<R: Read> StreamingBitReader<R> {
         Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     fn refill(&mut self) -> RarResult<()> {
+        if self.acc_bits > 56 {
+            return Ok(());
+        }
+        if self.buf_pos + 8 <= self.buf_len {
+            // Branchless bulk refill: one 8-byte big-endian load, absorbing
+            // whole bytes below the valid bits (low bits of `acc` are zero).
+            let chunk = u64::from_be_bytes(
+                self.buf[self.buf_pos..self.buf_pos + 8]
+                    .try_into()
+                    .expect("8-byte window"),
+            );
+            self.acc |= chunk >> self.acc_bits;
+            self.buf_pos += (63 - self.acc_bits as usize) >> 3;
+            self.acc_bits |= 56;
+            return Ok(());
+        }
+        self.refill_slow()
+    }
+
+    #[cold]
+    fn refill_slow(&mut self) -> RarResult<()> {
         while self.acc_bits <= 56 {
             self.fill_buffer()?;
             if self.buf_pos >= self.buf_len {

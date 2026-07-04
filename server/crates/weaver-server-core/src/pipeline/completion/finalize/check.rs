@@ -1886,6 +1886,7 @@ impl Pipeline {
             let par2_set = self.par2_set(job_id).cloned();
             if quick_par2_verification_allowed && let Some(par2_set) = par2_set.as_ref() {
                 let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
+                Self::trip_par2_verification_started_failpoint();
                 match self
                     .quick_verify_par2_with_placement(
                         job_id,

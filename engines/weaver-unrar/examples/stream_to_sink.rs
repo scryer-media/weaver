@@ -36,6 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         archive.set_password(pwd);
     }
 
+    for (index, path) in paths.iter().enumerate().skip(1) {
+        archive.add_volume(index, Box::new(File::open(path)?))?;
+    }
+
     let provider = StaticVolumeProvider::from_ordered(paths.clone());
     let options = ExtractOptions {
         verify: true,

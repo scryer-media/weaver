@@ -11,18 +11,36 @@ impl Pipeline {
         if old_run_state != new_run_state
             && matches!(new_run_state, crate::jobs::model::RunState::Paused)
         {
-            return Some("status.enter_paused");
+            return Some(crate::e2e_failpoint::STATUS_ENTER_PAUSED);
         }
         if old_post_state == new_post_state {
             return None;
         }
         match new_post_state {
-            crate::jobs::model::PostState::Verifying => Some("status.enter_verifying"),
-            crate::jobs::model::PostState::Repairing => Some("status.enter_repairing"),
-            crate::jobs::model::PostState::QueuedRepair => Some("status.enter_queued_repair"),
-            crate::jobs::model::PostState::QueuedExtract => Some("status.enter_queued_extract"),
+            crate::jobs::model::PostState::Verifying => {
+                Some(Self::par2_verification_started_failpoint_name())
+            }
+            crate::jobs::model::PostState::Repairing => {
+                Some(crate::e2e_failpoint::STATUS_ENTER_REPAIRING)
+            }
+            crate::jobs::model::PostState::QueuedRepair => {
+                Some(crate::e2e_failpoint::STATUS_ENTER_QUEUED_REPAIR)
+            }
+            crate::jobs::model::PostState::QueuedExtract => {
+                Some(crate::e2e_failpoint::STATUS_ENTER_QUEUED_EXTRACT)
+            }
             _ => None,
         }
+    }
+
+    pub(crate) fn par2_verification_started_failpoint_name() -> &'static str {
+        crate::e2e_failpoint::STATUS_ENTER_VERIFYING
+    }
+
+    pub(crate) fn trip_par2_verification_started_failpoint() {
+        let name = Self::par2_verification_started_failpoint_name();
+        crate::e2e_failpoint::maybe_delay(name);
+        crate::e2e_failpoint::maybe_trip(name);
     }
 
     pub(crate) fn persist_active_runtime(&self, job_id: JobId) {
@@ -237,18 +255,22 @@ impl Pipeline {
             if state.run_state != new_run_state
                 && matches!(new_run_state, crate::jobs::model::RunState::Paused)
             {
-                Some("status.enter_paused")
+                Some(crate::e2e_failpoint::STATUS_ENTER_PAUSED)
             } else if state.post_state == new_post_state {
                 None
             } else {
                 match new_post_state {
-                    crate::jobs::model::PostState::Verifying => Some("status.enter_verifying"),
-                    crate::jobs::model::PostState::Repairing => Some("status.enter_repairing"),
+                    crate::jobs::model::PostState::Verifying => {
+                        Some(Self::par2_verification_started_failpoint_name())
+                    }
+                    crate::jobs::model::PostState::Repairing => {
+                        Some(crate::e2e_failpoint::STATUS_ENTER_REPAIRING)
+                    }
                     crate::jobs::model::PostState::QueuedRepair => {
-                        Some("status.enter_queued_repair")
+                        Some(crate::e2e_failpoint::STATUS_ENTER_QUEUED_REPAIR)
                     }
                     crate::jobs::model::PostState::QueuedExtract => {
-                        Some("status.enter_queued_extract")
+                        Some(crate::e2e_failpoint::STATUS_ENTER_QUEUED_EXTRACT)
                     }
                     _ => None,
                 }
