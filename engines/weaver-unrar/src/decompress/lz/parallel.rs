@@ -652,7 +652,8 @@ fn rar_decode_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-fn parallel_decode_batch_into(
+/// Decode a batch on whatever rayon context the caller is already in.
+fn decode_batch_direct(
     input: &[u8],
     blocks: &[BlockInfo],
     table_sets: &[TableSet],
@@ -660,19 +661,40 @@ fn parallel_decode_batch_into(
     items: &mut [Vec<DecodedItem>],
 ) -> RarResult<()> {
     debug_assert_eq!(blocks.len(), items.len());
-    let mut decode = || {
-        blocks
-            .par_iter()
-            .zip(items.par_iter_mut())
-            .try_for_each(|(block, items)| {
-                let tables = &table_sets[block.table_set_index];
-                decode_block_symbols(input, block, tables, extra_dist, items)
-            })
-    };
+    blocks
+        .par_iter()
+        .zip(items.par_iter_mut())
+        .try_for_each(|(block, items)| {
+            let tables = &table_sets[block.table_set_index];
+            decode_block_symbols(input, block, tables, extra_dist, items)
+        })
+}
+
+fn parallel_decode_batch_into(
+    input: &[u8],
+    blocks: &[BlockInfo],
+    table_sets: &[TableSet],
+    extra_dist: bool,
+    items: &mut [Vec<DecodedItem>],
+) -> RarResult<()> {
     match rar_decode_pool() {
-        Some(pool) => pool.install(decode),
-        None => decode(),
+        Some(pool) => {
+            pool.install(|| decode_batch_direct(input, blocks, table_sets, extra_dist, items))
+        }
+        None => decode_batch_direct(input, blocks, table_sets, extra_dist, items),
     }
+}
+
+/// A decoded-item buffer set moving through the decode/apply pipeline.
+enum PipelineMsg {
+    /// A decoded batch, in dispatch order.
+    Decoded {
+        set: Vec<Vec<DecodedItem>>,
+        batch_len: usize,
+        result: RarResult<()>,
+    },
+    /// An unused buffer set returned when the producer shuts down.
+    Leftover { set: Vec<Vec<DecodedItem>> },
 }
 
 fn parallel_batch_size(thread_count: usize, block_count: usize) -> usize {
@@ -692,6 +714,16 @@ fn next_small_block_batch_end(blocks: &[BlockInfo], start: usize, batch_size: us
 // ─── Public entry point ──────────────────────────────────────────────────────
 
 impl LzDecoder {
+    fn take_item_buffer_set(&mut self) -> Vec<Vec<DecodedItem>> {
+        self.parallel_item_buffer_sets.pop().unwrap_or_default()
+    }
+
+    fn recycle_item_buffer_set(&mut self, set: Vec<Vec<DecodedItem>>) {
+        if self.parallel_item_buffer_sets.len() < 2 {
+            self.parallel_item_buffer_sets.push(set);
+        }
+    }
+
     fn decode_and_apply_parallel_batch<W: std::io::Write>(
         &mut self,
         input: &[u8],
@@ -701,9 +733,9 @@ impl LzDecoder {
         output_size: &mut u64,
         writer: &mut W,
     ) -> RarResult<()> {
-        let mut item_buffers = std::mem::take(&mut self.parallel_item_buffers);
+        let mut set = self.take_item_buffer_set();
         let result = {
-            let active_buffers = decoded_item_buffers(&mut item_buffers, block_batch.len());
+            let active_buffers = decoded_item_buffers(&mut set, block_batch.len());
             parallel_decode_batch_into(
                 input,
                 block_batch,
@@ -720,8 +752,153 @@ impl LzDecoder {
                 )
             })
         };
-        self.parallel_item_buffers = item_buffers;
+        self.recycle_item_buffer_set(set);
         result
+    }
+
+    /// Decode and apply a run of consecutive small blocks with the decode and
+    /// apply phases pipelined: a producer task on the decode pool fans each
+    /// batch out via rayon into one of two recycled buffer sets, while this
+    /// (calling) thread applies the previous batch's items to the window.
+    /// Buffer-set ownership moves through channels, so the writer and decoder
+    /// state never leave the calling thread.
+    fn decode_and_apply_small_run<W: std::io::Write>(
+        &mut self,
+        input: &[u8],
+        run: &[BlockInfo],
+        table_sets: &[TableSet],
+        unpacked_size: u64,
+        output_size: &mut u64,
+        writer: &mut W,
+    ) -> RarResult<()> {
+        let batch_size = parallel_batch_size(0, run.len());
+
+        // A single batch has nothing to overlap with.
+        if run.len() <= batch_size {
+            return self.decode_and_apply_parallel_batch(
+                input,
+                run,
+                table_sets,
+                unpacked_size,
+                output_size,
+                writer,
+            );
+        }
+
+        let Some(pool) = rar_decode_pool() else {
+            for batch in run.chunks(batch_size) {
+                self.decode_and_apply_parallel_batch(
+                    input,
+                    batch,
+                    table_sets,
+                    unpacked_size,
+                    output_size,
+                    writer,
+                )?;
+                if *output_size >= unpacked_size {
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        };
+
+        let extra_dist = self.extra_dist;
+        let batches: Vec<&[BlockInfo]> = run.chunks(batch_size).collect();
+        let batch_count = batches.len();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<PipelineMsg>();
+        let (free_tx, free_rx) = std::sync::mpsc::channel::<Vec<Vec<DecodedItem>>>();
+        // Prime the pipeline with two buffer sets: one decoding, one applying.
+        for _ in 0..2 {
+            let set = self.take_item_buffer_set();
+            free_tx.send(set).expect("free receiver alive");
+        }
+
+        let mut run_result: RarResult<()> = Ok(());
+        let batches_ref = &batches;
+
+        pool.in_place_scope(|scope| {
+            scope.spawn(move |_| {
+                // Producer: decode batches in dispatch order, blocking on a
+                // free buffer set so at most two batches are in flight.
+                for batch in batches_ref {
+                    let Ok(mut set) = free_rx.recv() else { break };
+                    let active = decoded_item_buffers(&mut set, batch.len());
+                    let result =
+                        decode_batch_direct(input, batch, table_sets, extra_dist, active);
+                    let failed = result.is_err();
+                    let sent = done_tx.send(PipelineMsg::Decoded {
+                        set,
+                        batch_len: batch.len(),
+                        result,
+                    });
+                    if sent.is_err() || failed {
+                        break;
+                    }
+                }
+                // Hand any unused sets back for recycling.
+                while let Ok(set) = free_rx.try_recv() {
+                    let _ = done_tx.send(PipelineMsg::Leftover { set });
+                }
+            });
+
+            // Consumer: apply each decoded batch in order on this thread.
+            for _ in 0..batch_count {
+                let msg = match done_rx.recv() {
+                    Ok(msg) => msg,
+                    Err(_) => break,
+                };
+                let (set, batch_len, result) = match msg {
+                    PipelineMsg::Decoded {
+                        set,
+                        batch_len,
+                        result,
+                    } => (set, batch_len, result),
+                    PipelineMsg::Leftover { set } => {
+                        self.recycle_item_buffer_set(set);
+                        break;
+                    }
+                };
+
+                if let Err(error) = result {
+                    self.recycle_item_buffer_set(set);
+                    run_result = Err(error);
+                    break;
+                }
+
+                let applied = self.apply_decoded_items_parallel(
+                    &set[..batch_len],
+                    unpacked_size,
+                    output_size,
+                    writer,
+                );
+                match free_tx.send(set) {
+                    Ok(()) => {}
+                    Err(returned) => self.recycle_item_buffer_set(returned.0),
+                }
+                if let Err(error) = applied {
+                    run_result = Err(error);
+                    break;
+                }
+                if *output_size >= unpacked_size {
+                    break;
+                }
+            }
+
+            // Shut the producer down and recover in-flight buffer sets. The
+            // scope waits for the producer, whose sends fail once these ends
+            // drop, so this cannot deadlock.
+            drop(free_tx);
+            while let Ok(msg) = done_rx.recv() {
+                match msg {
+                    PipelineMsg::Decoded { set, .. } | PipelineMsg::Leftover { set } => {
+                        self.recycle_item_buffer_set(set);
+                    }
+                }
+            }
+        });
+
+        run_result
     }
 
     pub(super) fn process_buffered_blocks<W: std::io::Write>(
@@ -759,7 +936,6 @@ impl LzDecoder {
             return Ok(0);
         }
 
-        let batch_size = parallel_batch_size(rayon::current_num_threads(), preparsed.blocks.len());
         let mut block_index = 0usize;
         while block_index < preparsed.blocks.len() {
             if preparsed.blocks[block_index].is_large {
@@ -774,34 +950,39 @@ impl LzDecoder {
                     writer,
                 )?;
                 block_index += 1;
-                continue;
-            }
-
-            let batch_end = next_small_block_batch_end(&preparsed.blocks, block_index, batch_size);
-            let block_batch = &preparsed.blocks[block_index..batch_end];
-            if block_batch.len() >= MIN_PARALLEL_BLOCKS && parallel_enabled() {
-                self.decode_and_apply_parallel_batch(
-                    input,
-                    block_batch,
-                    &preparsed.table_sets,
-                    unpacked_size,
-                    output_size,
-                    writer,
-                )?;
             } else {
-                for block in block_batch {
-                    let tables = &preparsed.table_sets[block.table_set_index];
-                    self.decode_preparsed_block_inline(
+                // Whole run of consecutive small blocks up to the next large
+                // block; the pipelined path batches internally.
+                let run_end = next_small_block_batch_end(
+                    &preparsed.blocks,
+                    block_index,
+                    preparsed.blocks.len(),
+                );
+                let run = &preparsed.blocks[block_index..run_end];
+                if run.len() >= MIN_PARALLEL_BLOCKS && parallel_enabled() {
+                    self.decode_and_apply_small_run(
                         input,
-                        block,
-                        tables,
+                        run,
+                        &preparsed.table_sets,
                         unpacked_size,
                         output_size,
                         writer,
                     )?;
+                } else {
+                    for block in run {
+                        let tables = &preparsed.table_sets[block.table_set_index];
+                        self.decode_preparsed_block_inline(
+                            input,
+                            block,
+                            tables,
+                            unpacked_size,
+                            output_size,
+                            writer,
+                        )?;
+                    }
                 }
+                block_index = run_end;
             }
-            block_index = batch_end;
 
             if *output_size >= unpacked_size {
                 break;
@@ -1018,8 +1199,6 @@ impl LzDecoder {
             return Ok(None); // Too few blocks — fall back to single-threaded.
         }
 
-        let batch_size = parallel_batch_size(rayon::current_num_threads(), blocks.len());
-
         let mut output_size = 0u64;
         let mut block_index = 0usize;
         while block_index < blocks.len() {
@@ -1036,17 +1215,17 @@ impl LzDecoder {
                 )?;
                 block_index += 1;
             } else {
-                let batch_end = next_small_block_batch_end(&blocks, block_index, batch_size);
-                let block_batch = &blocks[block_index..batch_end];
-                self.decode_and_apply_parallel_batch(
+                let run_end = next_small_block_batch_end(&blocks, block_index, blocks.len());
+                let run = &blocks[block_index..run_end];
+                self.decode_and_apply_small_run(
                     input,
-                    block_batch,
+                    run,
                     &table_sets,
                     unpacked_size,
                     &mut output_size,
                     writer,
                 )?;
-                block_index = batch_end;
+                block_index = run_end;
             }
 
             if output_size >= unpacked_size {

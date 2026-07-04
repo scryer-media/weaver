@@ -83,6 +83,9 @@ type ApiKeyScope = "CONTROL" | "READ" | "ADMIN";
 const API_KEY_GENERATE_PARAM = "apiKeyGenerate";
 const API_KEY_NAME_PARAM = "apiKeyName";
 const API_KEY_SCOPE_PARAM = "apiKeyScope";
+const API_KEY_GENERATE_PARAMS = [API_KEY_GENERATE_PARAM, "createApiKey"] as const;
+const API_KEY_NAME_PARAMS = [API_KEY_NAME_PARAM, "name"] as const;
+const API_KEY_SCOPE_PARAMS = [API_KEY_SCOPE_PARAM, "scope"] as const;
 
 function parseApiKeyScope(value: string | null): ApiKeyScope | null {
   switch (value?.trim().toLowerCase()) {
@@ -100,6 +103,22 @@ function parseApiKeyScope(value: string | null): ApiKeyScope | null {
 
 function isTruthyQueryParam(value: string | null) {
   return value === "1" || value?.trim().toLowerCase() === "true";
+}
+
+function firstQueryParam(params: URLSearchParams, names: readonly string[]) {
+  for (const name of names) {
+    const value = params.get(name);
+    if (value !== null) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function deleteQueryParams(params: URLSearchParams, names: readonly string[]) {
+  for (const name of names) {
+    params.delete(name);
+  }
 }
 
 export function BackupRestoreSection({
@@ -581,22 +600,22 @@ export function ApiKeysSection() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    if (!isTruthyQueryParam(params.get(API_KEY_GENERATE_PARAM))) {
+    if (!isTruthyQueryParam(firstQueryParam(params, API_KEY_GENERATE_PARAMS))) {
       return;
     }
 
-    const name = params.get(API_KEY_NAME_PARAM)?.trim() ?? "";
+    const name = firstQueryParam(params, API_KEY_NAME_PARAMS)?.trim() ?? "";
     if (!name) {
       return;
     }
 
-    const scope = parseApiKeyScope(params.get(API_KEY_SCOPE_PARAM)) ?? "CONTROL";
+    const scope = parseApiKeyScope(firstQueryParam(params, API_KEY_SCOPE_PARAMS)) ?? "CONTROL";
     setNewKeyName(name);
     setNewKeyScope(scope);
 
-    params.delete(API_KEY_GENERATE_PARAM);
-    params.delete(API_KEY_NAME_PARAM);
-    params.delete(API_KEY_SCOPE_PARAM);
+    deleteQueryParams(params, API_KEY_GENERATE_PARAMS);
+    deleteQueryParams(params, API_KEY_NAME_PARAMS);
+    deleteQueryParams(params, API_KEY_SCOPE_PARAMS);
 
     const nextSearch = params.toString();
     const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ""}${window.location.hash}`;

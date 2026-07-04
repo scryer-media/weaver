@@ -97,8 +97,9 @@ pub struct LzDecoder {
     /// This advances by filter block length even when unsupported filters
     /// suppress the corresponding output bytes.
     current_file_written_size: u64,
-    /// Reusable decoded-item buffers for RAR5 multithreaded block decode.
-    parallel_item_buffers: Vec<Vec<parallel::DecodedItem>>,
+    /// Recycled decoded-item buffer sets for RAR5 multithreaded block decode
+    /// (two sets so batch N+1 decodes while batch N applies).
+    parallel_item_buffer_sets: Vec<Vec<Vec<parallel::DecodedItem>>>,
 }
 
 impl LzDecoder {
@@ -140,7 +141,7 @@ impl LzDecoder {
             pending_filters: Vec::new(),
             current_file_base_total: 0,
             current_file_written_size: 0,
-            parallel_item_buffers: Vec::new(),
+            parallel_item_buffer_sets: Vec::new(),
         })
     }
 
