@@ -6364,3 +6364,61 @@ fn test_rar4_ppmd_solid_restart_lockstep() {
     assert_eq!(&bytes[..16], b"25Qmjo7RkW0gF0Pq");
     assert!(bytes.iter().all(|b| b.is_ascii()));
 }
+
+/// Multi-member v29 solid streams end each member with an in-stream marker
+/// (LZ code 256 with new-file/new-table flags) that must be consumed after
+/// the member's last output symbol — unrar's output check is strictly
+/// `WrittenFileSize > DestUnpSize`, so it always reads it. Skipping it
+/// leaves stale Huffman tables and members 1+ decode garbage.
+///
+/// Fixture: 3 x 300 KB part-random binaries, `rar 6.24`:
+/// `rar a -ma4 -m3 -mct- -md1m -s -ep`.
+#[test]
+fn test_rar4_lz_solid_multi_member_boundaries() {
+    let mut archive = open_single("rar4", "rar4_lz_solid_mv.rar");
+    let opts = weaver_unrar::ExtractOptions {
+        verify: true,
+        password: None,
+        restore_owners: false,
+    };
+    let expected_prefixes: [&[u8]; 3] = [
+        &[0xa5, 0x4d, 0xca, 0x18, 0x25, 0x30, 0xbb, 0x1d],
+        &[0x15, 0xa0, 0x84, 0x44, 0x1e, 0x46, 0xd2, 0xf9],
+        &[0x27, 0xb6, 0x16, 0xe8, 0xc4, 0xf9, 0x86, 0x30],
+    ];
+    for (index, prefix) in expected_prefixes.iter().enumerate() {
+        let result = archive.extract_member(index, &opts, None).unwrap();
+        assert_eq!(result.len(), 307_200, "member {index} length");
+        let bytes = result.to_bytes().unwrap();
+        assert_eq!(&bytes[..8], *prefix, "member {index} prefix");
+    }
+}
+
+/// PPMd variant of the solid member boundary: the end-of-file marker is the
+/// in-stream `esc,2` pair, and the range coder registers persist across
+/// members (unrar keeps one coder alive; only PPMd block headers
+/// re-initialize it). Re-initializing per member reads 4 payload bytes as
+/// init bytes and desyncs.
+///
+/// Fixture: 3 x ~2.9 MB word-salad texts, `rar 6.24`:
+/// `rar a -ma4 -m5 -mc16:1t+ -md4m -s -ep`.
+#[test]
+fn test_rar4_ppmd_solid_multi_member_boundaries() {
+    let mut archive = open_single("rar4", "rar4_ppm_solid_mv.rar");
+    let opts = weaver_unrar::ExtractOptions {
+        verify: true,
+        password: None,
+        restore_owners: false,
+    };
+    let expected: [(usize, &[u8]); 3] = [
+        (2_881_486, b"usenet weaver stream sol"),
+        (2_880_210, b"solid archive boundary w"),
+        (2_881_867, b"window boundary solid de"),
+    ];
+    for (index, (len, prefix)) in expected.iter().enumerate() {
+        let result = archive.extract_member(index, &opts, None).unwrap();
+        assert_eq!(result.len(), *len, "member {index} length");
+        let bytes = result.to_bytes().unwrap();
+        assert_eq!(&bytes[..prefix.len()], *prefix, "member {index} prefix");
+    }
+}

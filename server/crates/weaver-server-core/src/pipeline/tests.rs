@@ -1475,6 +1475,14 @@ fn standalone_job_spec(name: &str, files: &[(String, u32)]) -> JobSpec {
     }
 }
 
+fn many_standalone_files(prefix: &str, count: usize) -> Vec<(String, u32)> {
+    (0..count)
+        .map(|idx| (format!("{prefix}-{idx}.bin"), 512u32))
+        .collect()
+}
+
+const TEST_HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
+
 fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes: u32) -> JobSpec {
     JobSpec {
         name: name.to_string(),
@@ -6601,6 +6609,236 @@ async fn dispatch_downloads_prefers_earliest_job_within_priority_band() {
 }
 
 #[tokio::test]
+async fn dispatch_downloads_bounded_same_band_shares_capacity() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        8,
+    )
+    .await;
+    pipeline.connection_ramp = 8;
+
+    let job_ids = [JobId(21400), JobId(21401), JobId(21402), JobId(21403)];
+    for (idx, job_id) in job_ids.into_iter().enumerate() {
+        let files = many_standalone_files(&format!("bounded-share-{idx}"), 500);
+        insert_active_job(
+            &mut pipeline,
+            job_id,
+            with_priority(
+                standalone_job_spec(&format!("Bounded Share {idx}"), &files),
+                "NORMAL",
+            ),
+        )
+        .await;
+    }
+
+    pipeline.dispatch_downloads();
+
+    let hot_job_id = job_ids[0];
+    assert_eq!(pipeline.hot_dispatch_job, Some(hot_job_id));
+    assert_eq!(pipeline.active_download_connections, 8);
+    assert_eq!(
+        pipeline.active_download_connections_by_job.get(&hot_job_id),
+        Some(&6)
+    );
+    let peer_lane_total = job_ids[1..]
+        .iter()
+        .map(|job_id| {
+            pipeline
+                .active_download_connections_by_job
+                .get(job_id)
+                .copied()
+                .unwrap_or(0)
+        })
+        .sum::<usize>();
+    assert_eq!(peer_lane_total, 2);
+    assert_eq!(
+        job_ids[1..]
+            .iter()
+            .filter(|job_id| pipeline
+                .active_download_connections_by_job
+                .get(job_id)
+                .copied()
+                .unwrap_or(0)
+                > 0)
+            .count(),
+        2
+    );
+    assert_eq!(
+        pipeline
+            .hot_dispatch_spillover_loans
+            .bounded_lent_connections(),
+        2
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .hot_dispatch_spillover_allowed_bounded_same_band_total
+            .load(Ordering::Relaxed),
+        2
+    );
+}
+
+#[tokio::test]
+async fn dispatch_downloads_single_job_keeps_hot_runway() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        8,
+    )
+    .await;
+    pipeline.connection_ramp = 8;
+
+    let job_id = JobId(21410);
+    let files = many_standalone_files("single-hot-runway", 600);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Single Hot Runway", &files),
+    )
+    .await;
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.hot_dispatch_job, Some(job_id));
+    assert_eq!(pipeline.active_download_connections, 8);
+    assert_eq!(
+        pipeline.active_download_connections_by_job.get(&job_id),
+        Some(&8)
+    );
+    assert_eq!(
+        pipeline.active_downloads_by_job.get(&job_id),
+        Some(&(8 * TEST_HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT))
+    );
+    assert_eq!(
+        pipeline
+            .hot_dispatch_spillover_loans
+            .active_lent_connections(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn dispatch_downloads_does_not_share_with_lower_priority() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        8,
+    )
+    .await;
+    pipeline.connection_ramp = 8;
+
+    let hot_job_id = JobId(21420);
+    let low_job_id = JobId(21421);
+    let hot_files = many_standalone_files("normal-hot", 600);
+    let low_files = many_standalone_files("low-peer", 600);
+    insert_active_job(
+        &mut pipeline,
+        hot_job_id,
+        with_priority(standalone_job_spec("Normal Hot", &hot_files), "NORMAL"),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        low_job_id,
+        with_priority(standalone_job_spec("Low Peer", &low_files), "LOW"),
+    )
+    .await;
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.hot_dispatch_job, Some(hot_job_id));
+    assert_eq!(
+        pipeline.active_download_connections_by_job.get(&hot_job_id),
+        Some(&8)
+    );
+    assert_eq!(
+        pipeline.active_download_connections_by_job.get(&low_job_id),
+        None
+    );
+    assert_eq!(
+        pipeline
+            .hot_dispatch_spillover_loans
+            .bounded_lent_connections(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn dispatch_downloads_pressure_disables_bounded_share() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        8,
+    )
+    .await;
+    pipeline.connection_ramp = 8;
+
+    let hot_job_id = JobId(21430);
+    let peer_job_id = JobId(21431);
+    let hot_files = many_standalone_files("pressure-hot", 600);
+    let peer_files = many_standalone_files("pressure-peer", 600);
+    insert_active_job(
+        &mut pipeline,
+        hot_job_id,
+        with_priority(standalone_job_spec("Pressure Hot", &hot_files), "NORMAL"),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        peer_job_id,
+        with_priority(standalone_job_spec("Pressure Peer", &peer_files), "NORMAL"),
+    )
+    .await;
+    pipeline.decode_backlog_budget_bytes = 1000;
+    pipeline
+        .metrics
+        .decode_pending_bytes
+        .store(700, Ordering::Relaxed);
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.hot_dispatch_job, Some(hot_job_id));
+    assert_eq!(pipeline.active_download_connections, 1);
+    assert_eq!(
+        pipeline.active_download_connections_by_job.get(&hot_job_id),
+        Some(&1)
+    );
+    assert_eq!(
+        pipeline
+            .active_download_connections_by_job
+            .get(&peer_job_id),
+        None
+    );
+    assert_eq!(
+        pipeline
+            .hot_dispatch_spillover_loans
+            .bounded_lent_connections(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
@@ -6819,6 +7057,175 @@ async fn hot_clear_pressure_lane_leases_sequential_runway() {
             .download_lane_lease_items_total
             .load(Ordering::Relaxed),
         64
+    );
+}
+
+#[tokio::test]
+async fn hot_lane_refill_yields_when_bounded_share_unmet() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        8,
+    )
+    .await;
+    pipeline.connection_ramp = 8;
+
+    let hot_job_id = JobId(21440);
+    let peer_job_id = JobId(21441);
+    let hot_files = many_standalone_files("yield-hot", 600);
+    let peer_files = many_standalone_files("yield-peer", 600);
+    insert_active_job(
+        &mut pipeline,
+        hot_job_id,
+        with_priority(standalone_job_spec("Yield Hot", &hot_files), "NORMAL"),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        peer_job_id,
+        with_priority(standalone_job_spec("Yield Peer", &peer_files), "NORMAL"),
+    )
+    .await;
+
+    pipeline.hot_dispatch_job = Some(hot_job_id);
+    pipeline.hot_dispatch_started_at = Some(Instant::now() - Duration::from_secs(5));
+    pipeline.active_download_connections = 8;
+    pipeline
+        .active_download_connections_by_job
+        .insert(hot_job_id, 8);
+    pipeline.active_downloads_by_job.insert(
+        hot_job_id,
+        8 * TEST_HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT,
+    );
+
+    let refill_compatibility = {
+        let state = pipeline.jobs.get_mut(&hot_job_id).unwrap();
+        let sample = state.download_queue.pop().unwrap();
+        let compatibility = DownloadBatchCompatibility::from_work(&sample);
+        state.download_queue.push(sample);
+        compatibility
+    };
+    let (response_tx, response_rx) = oneshot::channel();
+    pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        job_id: hot_job_id,
+        server_idx: 0,
+        remote_ip: "127.0.0.1".parse().unwrap(),
+        supports_pipelining: false,
+        current_mode: DownloadLaneMode::Sequential,
+        compatibility: refill_compatibility,
+        response_tx,
+    });
+
+    let response = response_rx.await.unwrap();
+    assert!(response.lease.is_none());
+    assert_eq!(response.park_reason, LaneParkReason::HotShareYield);
+    assert!(pipeline.hot_share_yield_signal.is_requested_for(hot_job_id));
+}
+
+#[tokio::test]
+async fn bounded_same_band_refill_survives_hot_queued_primary() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        8,
+    )
+    .await;
+    pipeline.connection_ramp = 8;
+
+    let hot_job_id = JobId(21450);
+    let peer_job_id = JobId(21451);
+    let hot_files = many_standalone_files("bounded-refill-hot", 600);
+    let peer_files = many_standalone_files("bounded-refill-peer", 600);
+    insert_active_job(
+        &mut pipeline,
+        hot_job_id,
+        with_priority(
+            standalone_job_spec("Bounded Refill Hot", &hot_files),
+            "NORMAL",
+        ),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        peer_job_id,
+        with_priority(
+            standalone_job_spec("Bounded Refill Peer", &peer_files),
+            "NORMAL",
+        ),
+    )
+    .await;
+
+    let now = Instant::now();
+    pipeline.hot_dispatch_job = Some(hot_job_id);
+    pipeline.hot_dispatch_started_at = Some(now - Duration::from_secs(5));
+    pipeline.hot_dispatch_mode = DispatchShareMode::Shared;
+    pipeline.active_download_connections = 7;
+    pipeline
+        .active_download_connections_by_job
+        .insert(hot_job_id, 6);
+    pipeline
+        .active_download_connections_by_job
+        .insert(peer_job_id, 1);
+    pipeline.active_downloads_by_job.insert(
+        hot_job_id,
+        6 * TEST_HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT,
+    );
+    pipeline
+        .active_downloads_by_job
+        .insert(peer_job_id, TEST_HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT);
+    pipeline.hot_dispatch_spillover_loans.start_or_extend(
+        peer_job_id,
+        now,
+        10_000,
+        SpilloverLoanKind::BoundedSameBand,
+    );
+
+    let refill_compatibility = {
+        let state = pipeline.jobs.get_mut(&peer_job_id).unwrap();
+        let sample = state.download_queue.pop().unwrap();
+        let compatibility = DownloadBatchCompatibility::from_work(&sample);
+        state.download_queue.push(sample);
+        compatibility
+    };
+    let (response_tx, response_rx) = oneshot::channel();
+    pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        job_id: peer_job_id,
+        server_idx: 0,
+        remote_ip: "127.0.0.1".parse().unwrap(),
+        supports_pipelining: false,
+        current_mode: DownloadLaneMode::Sequential,
+        compatibility: refill_compatibility,
+        response_tx,
+    });
+
+    let response = response_rx.await.unwrap();
+    let lease = response
+        .lease
+        .expect("bounded same-band lane should refill while in budget");
+    assert_eq!(lease.job_id, peer_job_id);
+    assert_eq!(response.park_reason, LaneParkReason::NoWork);
+    assert_eq!(
+        pipeline
+            .hot_dispatch_spillover_loans
+            .loan_kind_for(peer_job_id),
+        Some(SpilloverLoanKind::BoundedSameBand)
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_lane_refill_granted_total
+            .load(Ordering::Relaxed),
+        1
     );
 }
 
@@ -7344,9 +7751,14 @@ fn spillover_loan_book_tracks_multiple_jobs_and_reclaims_independently() {
     let first_job = JobId(21001);
     let second_job = JobId(21002);
 
-    loans.start_or_extend(first_job, now, 10_000);
-    loans.start_or_extend(first_job, now, 10_000);
-    loans.start_or_extend(second_job, now, 12_000);
+    loans.start_or_extend(first_job, now, 10_000, SpilloverLoanKind::MeasuredUnderfill);
+    loans.start_or_extend(first_job, now, 10_000, SpilloverLoanKind::MeasuredUnderfill);
+    loans.start_or_extend(
+        second_job,
+        now,
+        12_000,
+        SpilloverLoanKind::MeasuredUnderfill,
+    );
 
     assert_eq!(loans.active_lent_connections(), 3);
     assert_eq!(loans.active_loan_count(), 2);
@@ -7367,6 +7779,25 @@ fn spillover_loan_book_tracks_multiple_jobs_and_reclaims_independently() {
     assert!(loans.reclaim_pending_for(second_job));
     assert_eq!(loans.active_lent_connections(), 1);
     assert_eq!(loans.active_loan_count(), 1);
+}
+
+#[test]
+fn bounded_same_band_does_not_reclaim_on_hot_only_speed_drop() {
+    let now = Instant::now();
+    let mut loans = SpilloverLoanBook::default();
+    let peer_job = JobId(21031);
+
+    loans.start_or_extend(peer_job, now, 10_000, SpilloverLoanKind::BoundedSameBand);
+
+    assert_eq!(loans.active_lent_connections(), 1);
+    assert_eq!(loans.bounded_lent_connections(), 1);
+    assert_eq!(loans.speed_snapshot(), (0, 0, 1));
+    assert!(!loans.update_speed_harm(now + Duration::from_secs(2), 1, 7));
+    assert!(!loans.reclaim_pending_for(peer_job));
+    assert_eq!(
+        loans.loan_kind_for(peer_job),
+        Some(SpilloverLoanKind::BoundedSameBand)
+    );
 }
 
 #[tokio::test]

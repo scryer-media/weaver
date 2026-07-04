@@ -3,6 +3,20 @@ use std::sync::atomic::Ordering;
 use super::*;
 
 #[test]
+fn spillover_decision_codes_preserve_existing_meanings() {
+    assert_eq!(SpilloverDecision::ReclaimedSpeedHarm.as_code(), 11);
+    assert_eq!(
+        SpilloverDecision::from_code(11),
+        SpilloverDecision::ReclaimedSpeedHarm
+    );
+    assert_eq!(SpilloverDecision::AllowedBoundedSameBand.as_code(), 12);
+    assert_eq!(
+        SpilloverDecision::from_code(12),
+        SpilloverDecision::AllowedBoundedSameBand
+    );
+}
+
+#[test]
 fn metrics_snapshot() {
     let m = PipelineMetrics::new();
     m.bytes_downloaded.store(1024, Ordering::Relaxed);

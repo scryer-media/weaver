@@ -10,6 +10,14 @@ enum DispatchAttempt {
     StopAll,
 }
 
+#[derive(Debug, Clone)]
+struct BoundedSameBandSharePlan {
+    hot_job_id: JobId,
+    hot_target: usize,
+    share_target: usize,
+    peer_jobs: Vec<JobId>,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct DownloadPipelineBacklog {
     active_downloads: usize,
@@ -43,6 +51,8 @@ const HOT_DISPATCH_MIN_SUCCESSFUL_PRIMARY_BODIES: u64 = 24;
 const HOT_DISPATCH_UNDERFILL_WINDOW: Duration = Duration::from_secs(2);
 const HOT_DISPATCH_EXPANSION_HELPFUL_PERCENT: u64 = 5;
 const HOT_DISPATCH_SPILLOVER_HARM_PERCENT: u64 = 7;
+const HOT_DISPATCH_BOUNDED_SHARE_MIN_CONNECTIONS: usize = 4;
+const HOT_DISPATCH_BOUNDED_SHARE_MAX_LANES: usize = 3;
 const LANE_REFILL_GRACE: Duration = Duration::from_millis(5);
 const IP_REPLACEMENT_MIN_OLD_SAMPLES: u16 = 16;
 const IP_REPLACEMENT_MIN_OLD_AGE: Duration = Duration::from_secs(30);
@@ -549,6 +559,75 @@ impl Pipeline {
         })
     }
 
+    fn job_has_primary_download_work(&self, job_id: JobId) -> bool {
+        self.jobs.get(&job_id).is_some_and(|state| {
+            state.download_queue.has_primary_work()
+                && Self::status_allows_download_dispatch(&state.status)
+        })
+    }
+
+    fn bounded_same_band_share_plan(
+        &self,
+        eligible: &[(u8, usize, JobId)],
+        hot_priority: u8,
+        hot_job_id: JobId,
+        max_connections: usize,
+        pressure: DownloadPressure,
+        bandwidth_cap_tight: bool,
+    ) -> Option<BoundedSameBandSharePlan> {
+        if pressure.state != DownloadPressureState::Clear
+            || bandwidth_cap_tight
+            || max_connections < HOT_DISPATCH_BOUNDED_SHARE_MIN_CONNECTIONS
+            || !self.job_has_primary_download_work(hot_job_id)
+        {
+            return None;
+        }
+
+        let peer_jobs = eligible
+            .iter()
+            .filter_map(|(priority, _, job_id)| {
+                (*job_id != hot_job_id
+                    && *priority == hot_priority
+                    && self.job_has_primary_download_work(*job_id))
+                .then_some(*job_id)
+            })
+            .collect::<Vec<_>>();
+        if peer_jobs.is_empty() {
+            return None;
+        }
+
+        let share_target = (max_connections / 4).min(HOT_DISPATCH_BOUNDED_SHARE_MAX_LANES);
+        if share_target == 0 {
+            return None;
+        }
+
+        Some(BoundedSameBandSharePlan {
+            hot_job_id,
+            hot_target: max_connections.saturating_sub(share_target),
+            share_target,
+            peer_jobs,
+        })
+    }
+
+    fn hot_share_yield_unmet(&self, plan: &BoundedSameBandSharePlan) -> bool {
+        self.active_download_connections_by_job
+            .get(&plan.hot_job_id)
+            .copied()
+            .unwrap_or(0)
+            > plan.hot_target
+            && self.hot_dispatch_spillover_loans.bounded_lent_connections() < plan.share_target
+    }
+
+    fn update_hot_share_yield_signal(&self, plan: Option<&BoundedSameBandSharePlan>) {
+        if let Some(plan) = plan
+            && self.hot_share_yield_unmet(plan)
+        {
+            self.hot_share_yield_signal.request(plan.hot_job_id);
+            return;
+        }
+        self.hot_share_yield_signal.clear();
+    }
+
     fn hot_job_has_pending_pipeline_promotion(
         &mut self,
         job_id: JobId,
@@ -664,6 +743,7 @@ impl Pipeline {
         self.hot_dispatch_exclusive_window.clear();
         self.hot_dispatch_expansion_window.clear();
         self.hot_dispatch_spillover_loans.clear();
+        self.hot_share_yield_signal.clear();
         self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
     }
 
@@ -680,6 +760,7 @@ impl Pipeline {
         self.hot_dispatch_exclusive_window.clear();
         self.hot_dispatch_expansion_window.clear();
         self.hot_dispatch_spillover_loans.clear();
+        self.hot_share_yield_signal.clear();
         self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
         self.publish_hot_dispatch_metrics(Instant::now());
     }
@@ -747,10 +828,20 @@ impl Pipeline {
             .reclaim_pending_for(job_id)
     }
 
-    fn start_spillover_loan(&mut self, job_id: JobId, now: Instant, hot_speed_bps: u64) {
+    fn start_spillover_loan(
+        &mut self,
+        job_id: JobId,
+        now: Instant,
+        hot_speed_bps: u64,
+        kind: SpilloverLoanKind,
+    ) {
         self.hot_dispatch_spillover_loans
-            .start_or_extend(job_id, now, hot_speed_bps);
+            .start_or_extend(job_id, now, hot_speed_bps, kind);
         self.hot_dispatch_last_lend_at = Some(now);
+    }
+
+    fn spillover_loan_kind_for(&self, job_id: JobId) -> Option<SpilloverLoanKind> {
+        self.hot_dispatch_spillover_loans.loan_kind_for(job_id)
     }
 
     fn clear_spillover_loan_if_idle(&mut self) {
@@ -889,6 +980,11 @@ impl Pipeline {
             SpilloverDecision::AllowedMeasuredUnderfill => {
                 self.metrics
                     .hot_dispatch_spillover_allowed_measured_underfill_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            SpilloverDecision::AllowedBoundedSameBand => {
+                self.metrics
+                    .hot_dispatch_spillover_allowed_bounded_same_band_total
                     .fetch_add(1, Ordering::Relaxed);
             }
             SpilloverDecision::Reclaimed => {
@@ -1257,6 +1353,10 @@ impl Pipeline {
             LaneParkReason::HotReclaim => self
                 .metrics
                 .download_lane_parks_hot_reclaim_total
+                .fetch_add(1, Ordering::Relaxed),
+            LaneParkReason::HotShareYield => self
+                .metrics
+                .download_lane_parks_hot_share_yield_total
                 .fetch_add(1, Ordering::Relaxed),
             LaneParkReason::SpilloverWithdraw => self
                 .metrics
@@ -2533,14 +2633,33 @@ impl Pipeline {
         }
 
         let eligible_count = eligible.len();
-        let Some((_hot_priority, hot_job_id)) = self.select_hot_dispatch_job(&eligible, now) else {
+        let Some((hot_priority, hot_job_id)) = self.select_hot_dispatch_job(&eligible, now) else {
             self.clear_hot_dispatch_period();
             self.update_queue_metrics();
             return;
         };
+        let bounded_share_plan = self.bounded_same_band_share_plan(
+            &eligible,
+            hot_priority,
+            hot_job_id,
+            max,
+            pressure,
+            bandwidth_cap_tight,
+        );
+        self.update_hot_share_yield_signal(bounded_share_plan.as_ref());
 
         let active_connections_before_dispatch = self.active_download_connections;
+        let hot_target = bounded_share_plan
+            .as_ref()
+            .map(|plan| plan.hot_target)
+            .unwrap_or(max);
         while self.active_download_connections < max
+            && self
+                .active_download_connections_by_job
+                .get(&hot_job_id)
+                .copied()
+                .unwrap_or(0)
+                < hot_target
             && !self.rate_limiter.should_wait()
             && dispatch_budget > 0
         {
@@ -2552,6 +2671,76 @@ impl Pipeline {
                     return;
                 }
             }
+        }
+
+        if let Some(plan) = bounded_share_plan.as_ref() {
+            let mut bounded_slots = plan
+                .share_target
+                .saturating_sub(self.hot_dispatch_spillover_loans.bounded_lent_connections())
+                .min(max.saturating_sub(self.active_download_connections))
+                .min(dispatch_budget);
+            while bounded_slots > 0
+                && self.active_download_connections < max
+                && !self.rate_limiter.should_wait()
+                && dispatch_budget > 0
+            {
+                let Some(peer_job_id) = plan
+                    .peer_jobs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, job_id)| self.job_has_primary_download_work(**job_id))
+                    .min_by_key(|(index, job_id)| {
+                        (
+                            self.active_download_connections_by_job
+                                .get(job_id)
+                                .copied()
+                                .unwrap_or(0),
+                            *index,
+                        )
+                    })
+                    .map(|(_, job_id)| *job_id)
+                else {
+                    break;
+                };
+
+                match self.try_dispatch_download_for_job(peer_job_id, pressure) {
+                    DispatchAttempt::Dispatched => {
+                        self.hot_dispatch_mode = DispatchShareMode::Shared;
+                        let hot_speed_bps = self.hot_dispatch_speed_bps(now);
+                        self.start_spillover_loan(
+                            peer_job_id,
+                            now,
+                            hot_speed_bps,
+                            SpilloverLoanKind::BoundedSameBand,
+                        );
+                        self.record_spillover_decision(SpilloverDecision::AllowedBoundedSameBand);
+                        dispatch_budget = dispatch_budget.saturating_sub(1);
+                        bounded_slots = bounded_slots.saturating_sub(1);
+                    }
+                    DispatchAttempt::NoWork => break,
+                    DispatchAttempt::StopAll => {
+                        self.publish_hot_dispatch_metrics(now);
+                        return;
+                    }
+                }
+            }
+
+            while self.active_download_connections < max
+                && !self.rate_limiter.should_wait()
+                && dispatch_budget > 0
+            {
+                match self.try_dispatch_download_for_job(hot_job_id, pressure) {
+                    DispatchAttempt::Dispatched => {
+                        dispatch_budget = dispatch_budget.saturating_sub(1)
+                    }
+                    DispatchAttempt::NoWork => break,
+                    DispatchAttempt::StopAll => {
+                        self.publish_hot_dispatch_metrics(now);
+                        return;
+                    }
+                }
+            }
+            self.update_hot_share_yield_signal(Some(plan));
         }
 
         let hot_speed_bps = self.hot_dispatch_speed_bps(now);
@@ -2577,6 +2766,13 @@ impl Pipeline {
             self.hot_dispatch_underfill_since = None;
             self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
             self.block_or_reclaim_spillover(SpilloverDecision::BlockedNearCap);
+            false
+        } else if bounded_share_plan.is_some() {
+            self.hot_dispatch_underfill_since = None;
+            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
+            if self.hot_dispatch_spillover_loans.active_lent_connections() == 0 {
+                self.hot_dispatch_mode = DispatchShareMode::Exclusive;
+            }
             false
         } else if best_mode_block_reason == HotBestModeBlockReason::HotHasQueuedPrimary {
             self.hot_dispatch_underfill_since = None;
@@ -2634,7 +2830,12 @@ impl Pipeline {
                 {
                     match self.try_dispatch_download_for_job(job_id, pressure) {
                         DispatchAttempt::Dispatched => {
-                            self.start_spillover_loan(job_id, now, hot_speed_bps);
+                            self.start_spillover_loan(
+                                job_id,
+                                now,
+                                hot_speed_bps,
+                                SpilloverLoanKind::MeasuredUnderfill,
+                            );
                             self.record_spillover_decision(
                                 SpilloverDecision::AllowedMeasuredUnderfill,
                             );
@@ -3013,6 +3214,7 @@ impl Pipeline {
                 self.owned_download_lane_event_tx.clone(),
                 self.download_refill_tx.clone(),
                 self.download_lane_parked_tx.clone(),
+                Arc::clone(&self.hot_share_yield_signal),
                 initial_lease,
             ) {
                 warn!("owned blocking s2n lane pool stopped; falling back to async download lane");
@@ -3870,8 +4072,34 @@ impl Pipeline {
             let requested_priority = eligible.iter().find_map(|(priority, _, eligible_job_id)| {
                 (*eligible_job_id == job_id).then_some(*priority)
             });
-            match self.select_hot_dispatch_job(&eligible, now) {
-                Some((_hot_priority, hot_job_id)) if hot_job_id == job_id => {}
+            let effective_capacity = self.effective_download_connection_capacity(
+                self.tuner.params().max_concurrent_downloads,
+            );
+            let bandwidth_cap_tight = self.bandwidth_cap.cap_enabled()
+                && self.bandwidth_cap.remaining_bytes()
+                    <= self.bandwidth_cap.limit_bytes() * 15 / 100;
+            let selected_hot = self.select_hot_dispatch_job(&eligible, now);
+            let bounded_share_plan = selected_hot.and_then(|(hot_priority, hot_job_id)| {
+                self.bounded_same_band_share_plan(
+                    &eligible,
+                    hot_priority,
+                    hot_job_id,
+                    effective_capacity,
+                    pressure,
+                    bandwidth_cap_tight,
+                )
+            });
+            self.update_hot_share_yield_signal(bounded_share_plan.as_ref());
+            match selected_hot {
+                Some((_hot_priority, hot_job_id)) if hot_job_id == job_id => {
+                    if bounded_share_plan
+                        .as_ref()
+                        .is_some_and(|plan| self.hot_share_yield_unmet(plan))
+                    {
+                        allow_refill = false;
+                        park_reason = LaneParkReason::HotShareYield;
+                    }
+                }
                 Some((hot_priority, hot_job_id)) => {
                     let hot_speed_bps = self.hot_dispatch_speed_bps(now);
                     self.hot_dispatch_expansion_window
@@ -3880,17 +4108,24 @@ impl Pipeline {
                         .hot_dispatch_expansion_window
                         .recent_improvement_pct(now)
                         >= HOT_DISPATCH_EXPANSION_HELPFUL_PERCENT;
-                    let effective_capacity = self.effective_download_connection_capacity(
-                        self.tuner.params().max_concurrent_downloads,
-                    );
                     let best_mode_block_reason = self.hot_best_mode_block_reason(
                         hot_job_id,
                         effective_capacity,
                         pressure,
                         recent_expansion_helped,
                     );
+                    let loan_kind = self.spillover_loan_kind_for(job_id);
+                    let can_keep_bounded_same_band = loan_kind
+                        == Some(SpilloverLoanKind::BoundedSameBand)
+                        && requested_priority == Some(hot_priority)
+                        && bounded_share_plan.as_ref().is_some_and(|plan| {
+                            plan.peer_jobs.contains(&job_id)
+                                && self.hot_dispatch_spillover_loans.bounded_lent_connections()
+                                    <= plan.share_target
+                        });
                     let can_keep_lent_lane = requested_priority.is_some_and(|request_priority| {
-                        self.hot_dispatch_mode == DispatchShareMode::Shared
+                        loan_kind == Some(SpilloverLoanKind::MeasuredUnderfill)
+                            && self.hot_dispatch_mode == DispatchShareMode::Shared
                             && request_priority >= hot_priority
                             && best_mode_block_reason == HotBestModeBlockReason::None
                             && !self.hot_spillover_reclaim_pending_for(job_id)
@@ -3899,6 +4134,12 @@ impl Pipeline {
                         allow_refill = false;
                         park_reason = LaneParkReason::SpilloverSpeedHarm;
                         self.block_or_reclaim_spillover(SpilloverDecision::ReclaimedSpeedHarm);
+                    } else if can_keep_bounded_same_band {
+                        self.hot_dispatch_last_lend_at = Some(now);
+                    } else if loan_kind == Some(SpilloverLoanKind::BoundedSameBand) {
+                        allow_refill = false;
+                        park_reason = LaneParkReason::SpilloverWithdraw;
+                        self.record_spillover_decision(SpilloverDecision::Reclaimed);
                     } else if can_keep_lent_lane {
                         self.hot_dispatch_last_lend_at = Some(now);
                     } else {
@@ -3939,6 +4180,7 @@ impl Pipeline {
                 None => {
                     allow_refill = false;
                     self.clear_hot_dispatch_period();
+                    self.hot_share_yield_signal.clear();
                     park_reason = LaneParkReason::NoWork;
                 }
             }

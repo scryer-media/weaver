@@ -49,6 +49,7 @@ pub(crate) enum LaneParkReason {
     Pressure,
     ProbeYield,
     HotReclaim,
+    HotShareYield,
     SpilloverWithdraw,
     SpilloverSpeedHarm,
     IpReplacementRetired,

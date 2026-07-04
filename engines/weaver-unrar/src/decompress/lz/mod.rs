@@ -118,14 +118,7 @@ impl LzDecoder {
                 return Err(RarError::UnsupportedCompression { method: 0, version });
             }
         };
-        let total_symbols = huffman::HUFF_NC
-            + if extra_dist {
-                huffman::HUFF_DCX
-            } else {
-                huffman::HUFF_DCB
-            }
-            + huffman::HUFF_LDC
-            + huffman::HUFF_RC;
+        let total_symbols = huffman::total_symbols(extra_dist);
         Ok(Self {
             window: Window::try_new(dict_size)?,
             dist_cache: [usize::MAX; DIST_CACHE_SIZE],
@@ -1622,6 +1615,38 @@ impl LzDecoder {
         self.current_file_base_total = self.window.total_written();
         self.current_file_written_size = 0;
     }
+
+    /// Align decoder state with the next solid member's compression parameters.
+    ///
+    /// UnRAR sets `ExtraDist` per file in `DoUnpack`, so one solid stream may
+    /// mix RAR5 (version 0) and RAR7 (version 1) members; Huffman tables
+    /// persist across the switch. UnRAR's `Unpack::Init` refuses to grow the
+    /// window mid-solid-stream, so a member declaring a dictionary larger than
+    /// the existing window is rejected.
+    pub fn ensure_solid_member_compat(&mut self, dict_size: usize, version: u8) -> RarResult<()> {
+        if dict_size > self.window.dict_size() {
+            return Err(RarError::CorruptArchive {
+                detail: format!(
+                    "solid member declares {dict_size} byte dictionary but the solid stream window is {} bytes",
+                    self.window.dict_size()
+                ),
+            });
+        }
+        let extra_dist = match version {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(RarError::UnsupportedCompression { method: 0, version });
+            }
+        };
+        if extra_dist != self.extra_dist {
+            self.extra_dist = extra_dist;
+            self.code_lengths.clear();
+            self.code_lengths
+                .resize(huffman::total_symbols(extra_dist), 0);
+        }
+        Ok(())
+    }
 }
 
 /// Decompress LZ-compressed data.
@@ -1997,6 +2022,72 @@ mod tests {
         assert_eq!(decoder.window.total_written(), 2);
         assert_eq!(decoder.window.get_byte(1), 0xBB);
         assert_eq!(decoder.window.get_byte(2), 0xAA);
+    }
+
+    #[test]
+    fn solid_version_switch_updates_extra_dist_and_code_lengths_like_unrar() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        decoder.dist_cache = [10, 20, 30, 40];
+        decoder.window.put_byte(0xAA);
+        assert!(!decoder.extra_dist);
+        assert_eq!(decoder.code_lengths.len(), huffman::total_symbols(false));
+
+        // RAR7 member continuing a RAR5-started solid stream.
+        decoder
+            .ensure_solid_member_compat(128 * 1024, 1)
+            .expect("version switch must be accepted");
+
+        assert!(decoder.extra_dist);
+        assert_eq!(decoder.code_lengths.len(), huffman::total_symbols(true));
+        // Window and rep-distance state carry across like unrar's per-file
+        // ExtraDist switch in DoUnpack.
+        assert_eq!(decoder.dist_cache, [10, 20, 30, 40]);
+        assert_eq!(decoder.window.total_written(), 1);
+
+        // Switching back also works and shrinks the table scratch.
+        decoder
+            .ensure_solid_member_compat(128 * 1024, 0)
+            .expect("switch back must be accepted");
+        assert!(!decoder.extra_dist);
+        assert_eq!(decoder.code_lengths.len(), huffman::total_symbols(false));
+    }
+
+    #[test]
+    fn solid_member_same_version_is_a_noop() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+        decoder.code_lengths[0] = 7;
+
+        decoder
+            .ensure_solid_member_compat(64 * 1024, 0)
+            .expect("same version, smaller dict is fine");
+
+        // No resize happened; scratch contents untouched.
+        assert_eq!(decoder.code_lengths[0], 7);
+    }
+
+    #[test]
+    fn solid_member_dict_growth_is_rejected_like_unrar() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+
+        let err = decoder
+            .ensure_solid_member_compat(256 * 1024, 0)
+            .unwrap_err();
+
+        assert!(matches!(err, RarError::CorruptArchive { .. }));
+    }
+
+    #[test]
+    fn solid_member_unknown_version_is_rejected() {
+        let mut decoder = LzDecoder::new(128 * 1024, 0);
+
+        let err = decoder
+            .ensure_solid_member_compat(128 * 1024, 2)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RarError::UnsupportedCompression { version: 2, .. }
+        ));
     }
 
     #[test]

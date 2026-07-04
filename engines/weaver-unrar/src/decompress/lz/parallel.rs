@@ -69,7 +69,8 @@ pub enum DecodedItem {
     Literals { bytes: [u8; 8], count: u8 },
     /// Inline match (sym >= 262): length and distance fully resolved.
     /// Distance is 1-based. Length includes distance-based adjustment.
-    Match { length: u32, distance: u32 },
+    /// Distance must be u64: RAR7 (`extra_dist`) match distances exceed 4 GiB.
+    Match { length: u32, distance: u64 },
     /// Repeat previous match (sym 257). Uses current last_length + dist_cache[0].
     RepeatPrev,
     /// Cache reference (sym 258–261). Distance resolved from cache during apply.
@@ -475,7 +476,7 @@ fn decode_block_symbols(
             let length = adjust_length_for_distance(length, distance);
             items.push(DecodedItem::Match {
                 length: length as u32,
-                distance: distance as u32,
+                distance: distance as u64,
             });
             continue;
         }
@@ -824,8 +825,7 @@ impl LzDecoder {
                 for batch in batches_ref {
                     let Ok(mut set) = free_rx.recv() else { break };
                     let active = decoded_item_buffers(&mut set, batch.len());
-                    let result =
-                        decode_batch_direct(input, batch, table_sets, extra_dist, active);
+                    let result = decode_batch_direct(input, batch, table_sets, extra_dist, active);
                     let failed = result.is_err();
                     let sent = done_tx.send(PipelineMsg::Decoded {
                         set,
@@ -1279,6 +1279,50 @@ mod tests {
         let distance = super::LzDecoder::distance_from_slot_parts(62, 30, 0, 0, 32).unwrap();
 
         assert_eq!(distance, u32::MAX as usize);
+    }
+
+    #[test]
+    fn decoded_item_matches_unrar_item_size() {
+        // unrar's UnpackDecodedItem is 16 bytes; the apply loop streams these,
+        // so the u64 distance must not grow the item.
+        assert_eq!(std::mem::size_of::<DecodedItem>(), 16);
+    }
+
+    #[test]
+    fn decode_block_symbols_preserves_rar7_distance_beyond_u32() {
+        // Uniform code lengths make canonical codes equal symbol indices:
+        // NC len 9 (306 syms), DC len 7 (80 syms, RAR7 DCX), LDC len 4, RC len 6.
+        let tables = TableSet {
+            nc: Arc::new(HuffmanTable::build(&[9u8; 306]).unwrap()),
+            dc: Arc::new(HuffmanTable::build(&[7u8; 80]).unwrap()),
+            ldc: Arc::new(HuffmanTable::build(&[4u8; 16]).unwrap()),
+            rc: Arc::new(HuffmanTable::build(&[6u8; 44]).unwrap()),
+        };
+
+        // Bitstream: NC sym 262 (9 bits) → length slot 0 (len 2, no extra),
+        // DC sym 66 (7 bits) → 32 distance bits: 28 high bits = 0 from the
+        // stream, low 4 bits from LDC sym 3. distance = (2<<32) + 3 + 1.
+        // Packed MSB-first: 100000110 1000010 0^28 0011 = 48 bits.
+        let input = [0x83u8, 0x42, 0x00, 0x00, 0x00, 0x03, 0, 0, 0, 0];
+        let block = BlockInfo {
+            data_bit_offset: 0,
+            data_bits: 48,
+            table_set_index: 0,
+            is_large: false,
+        };
+
+        let mut items = Vec::new();
+        decode_block_symbols(&input, &block, &tables, true, &mut items).unwrap();
+
+        assert_eq!(items.len(), 1);
+        let DecodedItem::Match { length, distance } = items[0] else {
+            panic!("expected a match item");
+        };
+        let expected = (2u64 << 32) + 3 + 1;
+        assert!(expected > u32::MAX as u64);
+        assert_eq!(distance, expected);
+        // Base length 2, +3 from the distance-based length adjustment.
+        assert_eq!(length, 5);
     }
 
     #[test]

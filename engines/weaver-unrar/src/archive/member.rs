@@ -5203,6 +5203,7 @@ impl RarArchive {
             decoder.decompress_reader_to_writer(compressed, unpacked_size, writer)
         } else {
             let decoder = if let Some(decoder) = solid_decoder {
+                decoder.ensure_solid_member_compat(dict_size, fh.compression.version)?;
                 decoder.prepare_solid_continuation();
                 decoder
             } else {
@@ -5279,6 +5280,7 @@ impl RarArchive {
             )?
         } else {
             let decoder = if let Some(decoder) = solid_decoder {
+                decoder.ensure_solid_member_compat(dict_size, fh.compression.version)?;
                 decoder.prepare_solid_continuation();
                 decoder
             } else {

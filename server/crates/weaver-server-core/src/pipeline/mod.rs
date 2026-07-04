@@ -18,7 +18,7 @@ use orchestrator::{is_terminal_status, write_segment_to_disk, write_segments_to_
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -416,9 +416,16 @@ pub(super) enum SpilloverReclaimReason {
     SpeedHarm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SpilloverLoanKind {
+    MeasuredUnderfill,
+    BoundedSameBand,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SpilloverLoanState {
     pub(super) lent_connections: usize,
+    pub(super) kind: SpilloverLoanKind,
     pub(super) post_lend_bps: Option<u64>,
     pub(super) reclaim_reason: Option<SpilloverReclaimReason>,
 }
@@ -439,8 +446,14 @@ impl SpilloverLoanBook {
         self.aggregate_post_lend_bps = None;
     }
 
-    pub(super) fn start_or_extend(&mut self, job_id: JobId, now: Instant, hot_speed_bps: u64) {
-        if self.loans.is_empty() {
+    pub(super) fn start_or_extend(
+        &mut self,
+        job_id: JobId,
+        now: Instant,
+        hot_speed_bps: u64,
+        kind: SpilloverLoanKind,
+    ) {
+        if kind == SpilloverLoanKind::MeasuredUnderfill && self.measured_lent_connections() == 0 {
             self.aggregate_pre_lend_bps = Some(hot_speed_bps);
             self.aggregate_lent_at = Some(now);
             self.aggregate_post_lend_bps = None;
@@ -452,6 +465,7 @@ impl SpilloverLoanBook {
             })
             .or_insert(SpilloverLoanState {
                 lent_connections: 1,
+                kind,
                 post_lend_bps: None,
                 reclaim_reason: None,
             });
@@ -465,7 +479,7 @@ impl SpilloverLoanBook {
         if loan.lent_connections == 0 {
             self.loans.remove(&job_id);
         }
-        if self.loans.is_empty() {
+        if self.measured_lent_connections() == 0 {
             self.aggregate_pre_lend_bps = None;
             self.aggregate_lent_at = None;
             self.aggregate_post_lend_bps = None;
@@ -491,8 +505,28 @@ impl SpilloverLoanBook {
             .is_some_and(|loan| loan.reclaim_reason.is_some())
     }
 
+    pub(super) fn loan_kind_for(&self, job_id: JobId) -> Option<SpilloverLoanKind> {
+        self.loans.get(&job_id).map(|loan| loan.kind)
+    }
+
     pub(super) fn active_lent_connections(&self) -> usize {
         self.loans.values().map(|loan| loan.lent_connections).sum()
+    }
+
+    pub(super) fn bounded_lent_connections(&self) -> usize {
+        self.loans
+            .values()
+            .filter(|loan| loan.kind == SpilloverLoanKind::BoundedSameBand)
+            .map(|loan| loan.lent_connections)
+            .sum()
+    }
+
+    fn measured_lent_connections(&self) -> usize {
+        self.loans
+            .values()
+            .filter(|loan| loan.kind == SpilloverLoanKind::MeasuredUnderfill)
+            .map(|loan| loan.lent_connections)
+            .sum()
     }
 
     pub(super) fn active_loan_count(&self) -> usize {
@@ -511,7 +545,7 @@ impl SpilloverLoanBook {
         hot_speed_bps: u64,
         harm_percent: u64,
     ) -> bool {
-        if self.loans.is_empty() || hot_speed_bps == 0 {
+        if self.measured_lent_connections() == 0 || hot_speed_bps == 0 {
             return false;
         }
 
@@ -527,6 +561,9 @@ impl SpilloverLoanBook {
 
         self.aggregate_post_lend_bps = Some(hot_speed_bps);
         for loan in self.loans.values_mut() {
+            if loan.kind != SpilloverLoanKind::MeasuredUnderfill {
+                continue;
+            }
             loan.post_lend_bps = Some(hot_speed_bps);
         }
 
@@ -537,12 +574,34 @@ impl SpilloverLoanBook {
 
         let mut newly_reclaimed = false;
         for loan in self.loans.values_mut() {
+            if loan.kind != SpilloverLoanKind::MeasuredUnderfill {
+                continue;
+            }
             if loan.reclaim_reason.is_none() {
                 loan.reclaim_reason = Some(SpilloverReclaimReason::SpeedHarm);
                 newly_reclaimed = true;
             }
         }
         newly_reclaimed
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct HotShareYieldSignal {
+    requested_hot_job_id: AtomicU64,
+}
+
+impl HotShareYieldSignal {
+    pub(super) fn request(&self, job_id: JobId) {
+        self.requested_hot_job_id.store(job_id.0, Ordering::Relaxed);
+    }
+
+    pub(super) fn clear(&self) {
+        self.requested_hot_job_id.store(0, Ordering::Relaxed);
+    }
+
+    pub(super) fn is_requested_for(&self, job_id: JobId) -> bool {
+        self.requested_hot_job_id.load(Ordering::Relaxed) == job_id.0
     }
 }
 
@@ -1387,6 +1446,8 @@ pub struct Pipeline {
     pub(super) hot_dispatch_expansion_window: HotExpansionWindow,
     /// Active reclaimable spillover loans keyed by lent job.
     pub(super) hot_dispatch_spillover_loans: SpilloverLoanBook,
+    /// Cooperative signal asking owned hot lanes to return their unrequested tail.
+    pub(super) hot_share_yield_signal: Arc<HotShareYieldSignal>,
     /// Runtime-only article transport classification per active job.
     pub(super) job_transport_profiles: HashMap<JobId, JobTransportProfile>,
     /// Runtime-only lane/proof state for BODY dispatch.

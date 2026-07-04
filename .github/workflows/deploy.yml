@@ -245,7 +245,7 @@ jobs:
         run: |
           printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-unknown-linux-musl" --lane portable)" >> "$GITHUB_ENV"
       - name: Run ARM-specific crate tests (NEON, CLMUL, PMULL)
-        run: cargo test --locked -p weaver-par2 -p weaver-yenc -p weaver-rar --features weaver-par2/slow-tests --target aarch64-unknown-linux-musl
+        run: cargo test --locked -p weaver-par2 -p weaver-yenc -p weaver-unrar --features weaver-par2/slow-tests --target aarch64-unknown-linux-musl
 
   rust-test-sde:
     name: rust-test-sde-${{ matrix.name }}
@@ -515,7 +515,7 @@ jobs:
           $flags = cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}" --lane "${{ matrix.lane }}"
           "RUSTFLAGS=$flags" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - name: Check native crypto crates
-        run: cargo check --locked -p weaver-rar -p weaver-par2 --target ${{ matrix.target }}
+        run: cargo check --locked -p weaver-unrar -p weaver-par2 --target ${{ matrix.target }}
       - name: Show Windows sccache stats
         if: always() && runner.os == 'Windows'
         shell: pwsh

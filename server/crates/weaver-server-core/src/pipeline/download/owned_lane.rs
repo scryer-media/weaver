@@ -7,6 +7,8 @@ use std::time::Instant;
 
 use tokio::sync::{mpsc, oneshot};
 
+const HOT_SHARE_YIELD_CHECK_ARTICLES: usize = 4;
+
 pub(crate) struct OwnedDownloadLanePool {
     senders: Vec<std_mpsc::Sender<OwnedLanePoolCommand>>,
     next: AtomicUsize,
@@ -17,6 +19,7 @@ struct OwnedLaneRun {
     event_tx: mpsc::Sender<OwnedDownloadLaneEvent>,
     refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
     parked_tx: mpsc::Sender<DownloadLaneParked>,
+    hot_share_yield_signal: Arc<HotShareYieldSignal>,
     initial_lease: DownloadBatchLease,
 }
 
@@ -67,6 +70,7 @@ impl OwnedDownloadLanePool {
         event_tx: mpsc::Sender<OwnedDownloadLaneEvent>,
         refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
         parked_tx: mpsc::Sender<DownloadLaneParked>,
+        hot_share_yield_signal: Arc<HotShareYieldSignal>,
         initial_lease: DownloadBatchLease,
     ) -> Result<(), DownloadBatchLease> {
         if self.senders.is_empty() {
@@ -77,6 +81,7 @@ impl OwnedDownloadLanePool {
             event_tx,
             refill_tx,
             parked_tx,
+            hot_share_yield_signal,
             initial_lease,
         });
         let sender_index = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
@@ -148,6 +153,7 @@ fn run_owned_blocking_s2n_download_lane(
         event_tx,
         refill_tx,
         parked_tx,
+        hot_share_yield_signal,
         initial_lease,
     } = run;
     let mut lease = initial_lease;
@@ -212,6 +218,8 @@ fn run_owned_blocking_s2n_download_lane(
         let mut pending_works: VecDeque<DownloadWork> = works.into_iter().collect();
         let mut results = Vec::with_capacity(pending_works.len());
         let mut unrequested_works = Vec::new();
+        let mut completed_since_yield_check = 0usize;
+        let mut yielded_for_hot_share = false;
 
         while let Some(first_work) = pending_works.pop_front() {
             let batch_depth = actual_mode.max_depth();
@@ -317,9 +325,18 @@ fn run_owned_blocking_s2n_download_lane(
             if !batch_clean_for_refill {
                 break;
             }
+
+            completed_since_yield_check = completed_since_yield_check.saturating_add(completed);
+            if completed_since_yield_check >= HOT_SHARE_YIELD_CHECK_ARTICLES {
+                completed_since_yield_check = 0;
+                if hot_share_yield_signal.is_requested_for(job_id) {
+                    yielded_for_hot_share = true;
+                    break;
+                }
+            }
         }
 
-        if !batch_clean_for_refill {
+        if !batch_clean_for_refill || yielded_for_hot_share {
             unrequested_works.extend(pending_works);
         }
 
@@ -330,6 +347,9 @@ fn run_owned_blocking_s2n_download_lane(
 
         if !batch_clean_for_refill {
             break (LaneParkReason::Error, job_id, actual_mode, false);
+        }
+        if yielded_for_hot_share {
+            break (LaneParkReason::HotShareYield, job_id, actual_mode, false);
         }
 
         let (response_tx, response_rx) = oneshot::channel();

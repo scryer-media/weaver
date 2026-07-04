@@ -268,7 +268,7 @@ fn quick_bits_for_size(num_symbols: usize) -> u8 {
     }
 }
 
-fn total_symbols(extra_dist: bool) -> usize {
+pub(crate) fn total_symbols(extra_dist: bool) -> usize {
     HUFF_NC + if extra_dist { HUFF_DCX } else { HUFF_DCB } + HUFF_LDC + HUFF_RC
 }
 
@@ -331,7 +331,12 @@ pub fn read_tables<R: BitRead>(
 
     while i < total_symbols {
         if reader.bits_remaining() == 0 {
-            break;
+            // unrar fails the whole table read when input runs out mid-table;
+            // building from a partial array would leak stale lengths from the
+            // previous block's tables.
+            return Err(RarError::CorruptArchive {
+                detail: format!("RAR5 Huffman table truncated: {i} of {total_symbols} lengths"),
+            });
         }
 
         let sym = bc_table.decode(reader)? as usize;
@@ -414,7 +419,9 @@ pub fn read_tables_bitreader(
 
     while i < total_symbols {
         if !reader.has_bits() {
-            break;
+            return Err(RarError::CorruptArchive {
+                detail: format!("RAR5 Huffman table truncated: {i} of {total_symbols} lengths"),
+            });
         }
 
         let number = bc_table.decode_bitreader(reader)? as usize;
@@ -497,6 +504,26 @@ mod tests {
         let table = HuffmanTable::build(&lengths).unwrap();
         assert_eq!(table.max_length, 0);
         assert_eq!(table.num_symbols(), 10);
+    }
+
+    #[test]
+    fn truncated_table_read_fails_instead_of_building_stale_tables() {
+        // 20 BC nibbles (length 5 each) fill the bootstrap table, then the
+        // input ends before any of the main code lengths. unrar fails this
+        // read; building from the leftover prev_lengths would leak the
+        // previous block's table tail.
+        let input = [0x55u8; 10];
+        let mut lengths = vec![0u8; total_symbols(false)];
+
+        let mut reader = BitReader::new(&input);
+        let Err(err) = read_tables_bitreader(&mut reader, &mut lengths, false) else {
+            panic!("truncated table read must fail");
+        };
+
+        assert!(matches!(
+            err,
+            RarError::CorruptArchive { ref detail } if detail.contains("truncated")
+        ));
     }
 
     #[test]

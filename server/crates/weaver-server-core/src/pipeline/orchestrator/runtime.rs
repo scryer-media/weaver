@@ -101,6 +101,7 @@ impl Pipeline {
             hot_dispatch_exclusive_window: HotExclusiveWindow::default(),
             hot_dispatch_expansion_window: HotExpansionWindow::default(),
             hot_dispatch_spillover_loans: SpilloverLoanBook::default(),
+            hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
             job_transport_profiles: HashMap::new(),
             download_lane_runtime: DownloadLaneRuntimeState::default(),
             ip_replacement_trial_extra_connections,

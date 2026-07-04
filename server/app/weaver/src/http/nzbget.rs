@@ -543,10 +543,14 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         .filter(|item| seen_ids.insert(item.id))
         .map(nzbget_history_queue_item)
         .collect::<Vec<_>>();
-    items.extend(rows.iter().filter(|row| seen_ids.insert(row.job_id)).map(|row| {
-        let item = history_item_from_row(row, None, None);
-        nzbget_history_item(&item)
-    }));
+    items.extend(
+        rows.iter()
+            .filter(|row| seen_ids.insert(row.job_id))
+            .map(|row| {
+                let item = history_item_from_row(row, None, None);
+                nzbget_history_item(&item)
+            }),
+    );
     Ok(Value::Array(items))
 }
 

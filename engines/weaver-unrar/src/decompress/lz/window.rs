@@ -31,10 +31,24 @@ enum WindowStorage {
 }
 
 impl WindowStorage {
-    fn try_contiguous(len: usize) -> Result<Self, std::collections::TryReserveError> {
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(len)?;
-        buf.resize(len, 0);
+    fn try_contiguous(len: usize) -> Result<Self, String> {
+        debug_assert!(len > 0);
+        let layout = std::alloc::Layout::array::<u8>(len).map_err(|err| err.to_string())?;
+        // alloc_zeroed reaches calloc/mmap for large sizes, so the OS hands
+        // back lazy zero pages: a RAR7-scale dictionary (>4 GiB) reserves
+        // address space up front but commits physical pages only as the
+        // window fills. Vec::resize(len, 0) would memset-commit the whole
+        // declared size before the first decoded byte. unrar dropped its
+        // window memset in 2023 for the same reason; window reads of
+        // never-written areas must still observe zeros.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            return Err(format!("allocation of {len} bytes failed"));
+        }
+        // SAFETY: ptr came from the global allocator with the exact layout
+        // Vec<u8> uses to deallocate len == capacity bytes, and every byte is
+        // initialized (zeroed).
+        let buf = unsafe { Vec::from_raw_parts(ptr, len, len) };
         Ok(Self::Contiguous(buf))
     }
 
@@ -704,10 +718,7 @@ impl Window {
         self.copy_advance(distance, length)?;
         let visible = visible_len.min(length);
         if visible < length {
-            self.mark_invisible(
-                start_total + visible as u64,
-                (length - visible) as u64,
-            );
+            self.mark_invisible(start_total + visible as u64, (length - visible) as u64);
         }
         Ok(())
     }
@@ -731,10 +742,7 @@ impl Window {
         }
         let visible = visible_len.min(length);
         if visible < length {
-            self.mark_invisible(
-                start_total + visible as u64,
-                (length - visible) as u64,
-            );
+            self.mark_invisible(start_total + visible as u64, (length - visible) as u64);
         }
         Ok(())
     }
@@ -952,7 +960,10 @@ impl Window {
             cursor = cursor.max(inv_end.min(end_total));
         }
         if cursor < end_total {
-            ranges.push(((cursor - start_total) as usize, (end_total - cursor) as usize));
+            ranges.push((
+                (cursor - start_total) as usize,
+                (end_total - cursor) as usize,
+            ));
         }
 
         ranges

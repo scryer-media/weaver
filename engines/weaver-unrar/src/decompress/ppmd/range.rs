@@ -41,6 +41,19 @@ pub struct BitReadRangeDecoder<'a, R: BitRead> {
     pos: usize,
 }
 
+/// Snapshot of the range coder registers.
+///
+/// RAR4 solid streams keep one PPMd range coder alive across member
+/// boundaries (unrar's coder lives in the persistent model). The registers
+/// are saved when a member's output completes mid-PPM-block and restored for
+/// the next member without re-reading init bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct RangeCoderState {
+    low: u32,
+    code: u32,
+    range: u32,
+}
+
 impl<'a> RangeDecoder<'a> {
     /// Initialize the range decoder from a byte stream.
     ///
@@ -165,6 +178,26 @@ impl<R: BitRead> BitReadRangeDecoder<'_, R> {
             range: u32::MAX,
             pos: 4,
         })
+    }
+
+    /// Resume a coder from saved registers without consuming init bytes.
+    pub fn from_state(reader: &mut R, state: RangeCoderState) -> BitReadRangeDecoder<'_, R> {
+        BitReadRangeDecoder {
+            reader,
+            low: state.low,
+            code: state.code,
+            range: state.range,
+            pos: 0,
+        }
+    }
+
+    /// Save the coder registers for later resumption via [`Self::from_state`].
+    pub fn state(&self) -> RangeCoderState {
+        RangeCoderState {
+            low: self.low,
+            code: self.code,
+            range: self.range,
+        }
     }
 
     fn read_byte(&mut self) -> u8 {

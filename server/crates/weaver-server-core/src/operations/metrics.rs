@@ -127,6 +127,7 @@ pub enum SpilloverDecision {
     BlockedRecentExpansionHelped,
     BlockedCapSpeed,
     AllowedMeasuredUnderfill,
+    AllowedBoundedSameBand,
     ReclaimedSpeedHarm,
 }
 
@@ -145,6 +146,7 @@ impl SpilloverDecision {
             Self::BlockedCapSpeed => 9,
             Self::AllowedMeasuredUnderfill => 10,
             Self::ReclaimedSpeedHarm => 11,
+            Self::AllowedBoundedSameBand => 12,
         }
     }
 
@@ -161,6 +163,7 @@ impl SpilloverDecision {
             Self::BlockedRecentExpansionHelped => "blocked_recent_expansion_helped",
             Self::BlockedCapSpeed => "blocked_cap_speed",
             Self::AllowedMeasuredUnderfill => "allowed_measured_underfill",
+            Self::AllowedBoundedSameBand => "allowed_bounded_same_band",
             Self::ReclaimedSpeedHarm => "reclaimed_speed_harm",
         }
     }
@@ -178,6 +181,7 @@ impl SpilloverDecision {
             9 => Self::BlockedCapSpeed,
             10 => Self::AllowedMeasuredUnderfill,
             11 => Self::ReclaimedSpeedHarm,
+            12 => Self::AllowedBoundedSameBand,
             _ => Self::None,
         }
     }
@@ -308,6 +312,7 @@ pub struct PipelineMetrics {
     pub hot_dispatch_spillover_blocked_cap_speed_total: AtomicU64,
     pub hot_dispatch_spillover_allowed_underfill_total: AtomicU64,
     pub hot_dispatch_spillover_allowed_measured_underfill_total: AtomicU64,
+    pub hot_dispatch_spillover_allowed_bounded_same_band_total: AtomicU64,
     pub hot_dispatch_spillover_reclaimed_total: AtomicU64,
     pub hot_dispatch_hot_speed_bps: AtomicU64,
     pub hot_dispatch_exclusive_peak_bps: AtomicU64,
@@ -337,6 +342,7 @@ pub struct PipelineMetrics {
     pub download_lane_parks_pressure_total: AtomicU64,
     pub download_lane_parks_probe_yield_total: AtomicU64,
     pub download_lane_parks_hot_reclaim_total: AtomicU64,
+    pub download_lane_parks_hot_share_yield_total: AtomicU64,
     pub download_lane_parks_spillover_withdraw_total: AtomicU64,
     pub download_lane_parks_spillover_speed_harm_total: AtomicU64,
     pub download_lane_parks_ip_replacement_retired_total: AtomicU64,
@@ -442,6 +448,7 @@ impl PipelineMetrics {
             hot_dispatch_spillover_blocked_cap_speed_total: AtomicU64::new(0),
             hot_dispatch_spillover_allowed_underfill_total: AtomicU64::new(0),
             hot_dispatch_spillover_allowed_measured_underfill_total: AtomicU64::new(0),
+            hot_dispatch_spillover_allowed_bounded_same_band_total: AtomicU64::new(0),
             hot_dispatch_spillover_reclaimed_total: AtomicU64::new(0),
             hot_dispatch_hot_speed_bps: AtomicU64::new(0),
             hot_dispatch_exclusive_peak_bps: AtomicU64::new(0),
@@ -471,6 +478,7 @@ impl PipelineMetrics {
             download_lane_parks_pressure_total: AtomicU64::new(0),
             download_lane_parks_probe_yield_total: AtomicU64::new(0),
             download_lane_parks_hot_reclaim_total: AtomicU64::new(0),
+            download_lane_parks_hot_share_yield_total: AtomicU64::new(0),
             download_lane_parks_spillover_withdraw_total: AtomicU64::new(0),
             download_lane_parks_spillover_speed_harm_total: AtomicU64::new(0),
             download_lane_parks_ip_replacement_retired_total: AtomicU64::new(0),
@@ -703,6 +711,9 @@ impl PipelineMetrics {
             hot_dispatch_spillover_allowed_measured_underfill_total: self
                 .hot_dispatch_spillover_allowed_measured_underfill_total
                 .load(Ordering::Relaxed),
+            hot_dispatch_spillover_allowed_bounded_same_band_total: self
+                .hot_dispatch_spillover_allowed_bounded_same_band_total
+                .load(Ordering::Relaxed),
             hot_dispatch_spillover_reclaimed_total: self
                 .hot_dispatch_spillover_reclaimed_total
                 .load(Ordering::Relaxed),
@@ -779,6 +790,9 @@ impl PipelineMetrics {
                 .load(Ordering::Relaxed),
             download_lane_parks_hot_reclaim_total: self
                 .download_lane_parks_hot_reclaim_total
+                .load(Ordering::Relaxed),
+            download_lane_parks_hot_share_yield_total: self
+                .download_lane_parks_hot_share_yield_total
                 .load(Ordering::Relaxed),
             download_lane_parks_spillover_withdraw_total: self
                 .download_lane_parks_spillover_withdraw_total
@@ -941,6 +955,7 @@ pub struct MetricsSnapshot {
     pub hot_dispatch_spillover_blocked_cap_speed_total: u64,
     pub hot_dispatch_spillover_allowed_underfill_total: u64,
     pub hot_dispatch_spillover_allowed_measured_underfill_total: u64,
+    pub hot_dispatch_spillover_allowed_bounded_same_band_total: u64,
     pub hot_dispatch_spillover_reclaimed_total: u64,
     pub hot_dispatch_hot_speed_bps: u64,
     pub hot_dispatch_exclusive_peak_bps: u64,
@@ -970,6 +985,7 @@ pub struct MetricsSnapshot {
     pub download_lane_parks_pressure_total: u64,
     pub download_lane_parks_probe_yield_total: u64,
     pub download_lane_parks_hot_reclaim_total: u64,
+    pub download_lane_parks_hot_share_yield_total: u64,
     pub download_lane_parks_spillover_withdraw_total: u64,
     pub download_lane_parks_spillover_speed_harm_total: u64,
     pub download_lane_parks_ip_replacement_retired_total: u64,

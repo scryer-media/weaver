@@ -20,7 +20,7 @@ use super::lz::bitstream::{BitRead, BitReader, StreamingBitReader};
 use super::lz::huffman::HuffmanTable;
 use super::lz::window::Window;
 use super::ppmd::model::Model;
-use super::ppmd::range::{BitReadRangeDecoder, RangeCode};
+use super::ppmd::range::{BitReadRangeDecoder, RangeCode, RangeCoderState};
 use crate::error::{RarError, RarResult};
 
 fn rar4_debug_filters_enabled() -> bool {
@@ -164,6 +164,11 @@ pub struct Rar4LzDecoder {
     current_file_base_total: u64,
     /// UnRAR's `WrittenFileSize` for RAR3 VM filter R6.
     current_file_written_size: u64,
+    /// Range coder registers saved when a solid member's output ends inside
+    /// a PPMd block. unrar keeps one coder alive across solid members: only
+    /// PPMd block headers re-initialize it, so the next member must resume
+    /// with these registers instead of consuming init bytes.
+    ppm_rc_state: Option<RangeCoderState>,
 }
 
 impl Rar4LzDecoder {
@@ -197,6 +202,7 @@ impl Rar4LzDecoder {
             last_vm_filter: 0,
             current_file_base_total: 0,
             current_file_written_size: 0,
+            ppm_rc_state: None,
         })
     }
 
@@ -866,6 +872,11 @@ impl Rar4LzDecoder {
             return Ok(0);
         }
 
+        // Each solid member's data area is an independent byte-aligned
+        // bitstream: unrar's UnpInitData resets the bit input for every file
+        // (solid or not) and discards any leftover from the previous area.
+        // Only decoder state (window, tables, block type, PPM model and its
+        // range coder registers) persists.
         let mut reader = StreamingBitReader::new(input);
         self.decompress_to_writer_with_reader(&mut reader, unpacked_size, writer)
     }
@@ -918,6 +929,9 @@ impl Rar4LzDecoder {
             }
         }
 
+        if output_size >= unpacked_size {
+            self.consume_solid_end_marker(reader)?;
+        }
         self.flush_ready_output_to_writer(writer, true)?;
         Ok(output_size)
     }
@@ -1070,6 +1084,9 @@ impl Rar4LzDecoder {
             }
         }
 
+        if output_size >= unpacked_size {
+            self.consume_solid_end_marker(reader)?;
+        }
         self.flush_ready_output_to_writer(&mut *current_writer, true)?;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
@@ -1177,6 +1194,9 @@ impl Rar4LzDecoder {
             }
         }
 
+        if output_size >= unpacked_size {
+            self.consume_solid_end_marker(reader)?;
+        }
         self.flush_ready_output_to_writer(&mut *current_writer, true)?;
         if chunk_bytes > 0 || chunks.is_empty() {
             chunks.push((current_vol, chunk_bytes));
@@ -1375,6 +1395,35 @@ impl Rar4LzDecoder {
 
     /// Main decode loop — processes symbols until unpacked_size is reached
     /// or end-of-block.
+    /// Consume the end-of-block marker that follows a member's last output
+    /// symbol.
+    ///
+    /// unrar's output check is strictly `WrittenFileSize > DestUnpSize`, so
+    /// after the final output symbol it still decodes the next code: for a
+    /// well-formed solid member that is code 256 whose new-file/new-table
+    /// flags decide whether the next member re-reads Huffman tables. Skipping
+    /// it leaves `tables_read` stale and desyncs every later solid member.
+    fn consume_solid_end_marker<R: BitRead>(&mut self, reader: &mut R) -> RarResult<()> {
+        if !matches!(self.block_type, BlockType::Lz) || !self.tables_read {
+            return Ok(());
+        }
+        let number = {
+            let Some(ld) = self.ld_table.as_ref() else {
+                return Ok(());
+            };
+            // At the true end of the stream there may be no marker at all;
+            // a failed decode is not an error here.
+            match ld.decode(reader) {
+                Ok(number) => number as usize,
+                Err(_) => return Ok(()),
+            }
+        };
+        if number == 256 {
+            self.read_end_of_block(reader)?;
+        }
+        Ok(())
+    }
+
     fn decode_lz_symbols<R: BitRead>(
         &mut self,
         reader: &mut R,
@@ -1684,6 +1733,10 @@ impl Rar4LzDecoder {
     /// - If bit 6: next byte = new escape character
     /// - Then the range coder reads its init bytes from the stream
     fn init_ppm<R: BitRead>(&mut self, reader: &mut R) -> RarResult<()> {
+        // A new PPMd block header always starts a fresh range coder; any
+        // saved mid-block registers are stale.
+        self.ppm_rc_state = None;
+
         // The PPM flag (bit 7) was consumed as 1 bit. Read remaining 7 bits
         // to reconstruct the MaxOrder byte (bit 7 is always 1 but unused).
         if reader.bits_remaining() < 7 {
@@ -1746,14 +1799,21 @@ impl Rar4LzDecoder {
         yield_threshold: Option<usize>,
         writer: &mut W,
     ) -> RarResult<u64> {
-        if reader.bits_remaining() < 32 {
+        if self.ppm_rc_state.is_none() && reader.bits_remaining() < 32 {
             return Ok(output_size);
         }
 
         let mut switch_to_lz_tables = false;
+        let mut end_marker_seen = false;
 
         {
-            let mut rc = BitReadRangeDecoder::new(reader)?;
+            // A solid member boundary can fall inside a PPMd block; unrar
+            // keeps one range coder alive across members, so resume from the
+            // saved registers instead of consuming init bytes again.
+            let mut rc = match self.ppm_rc_state.take() {
+                Some(state) => BitReadRangeDecoder::from_state(reader, state),
+                None => BitReadRangeDecoder::new(reader)?,
+            };
 
             while output_size < unpacked_size {
                 if let Some(threshold) = yield_threshold
@@ -1842,6 +1902,7 @@ impl Rar4LzDecoder {
                             if rar4_debug_filters_enabled() {
                                 eprintln!("RAR4 PPM end_of_file at output_size={output_size}");
                             }
+                            end_marker_seen = true;
                             break;
                         }
                         3 => {
@@ -1912,6 +1973,40 @@ impl Rar4LzDecoder {
                     output_size += 1;
                 }
             }
+
+            if !switch_to_lz_tables
+                && matches!(self.block_type, BlockType::Ppm)
+                && self.ppm_model.is_some()
+            {
+                // unrar's output check is strictly `Written > DestSize`, so
+                // the esc,2 end-of-file marker following a member's last
+                // output byte is consumed before its decode ends. Consume it
+                // here when the loop stopped on exact output completion.
+                if !end_marker_seen && output_size >= unpacked_size {
+                    let esc = self.ppm_esc_char;
+                    if let Some(model) = self.ppm_model.as_mut()
+                        && let Ok(Some(ch)) = model.decode_char_result(&mut rc)
+                    {
+                        if rar4_debug_filters_enabled() {
+                            eprintln!(
+                                "RAR4 PPM trailing consume: ch={ch} esc={esc} output_size={output_size}"
+                            );
+                        }
+                        if ch == esc {
+                            // Subcode 2 = end of file; anything else only
+                            // occurs in malformed streams.
+                            let sub = model.decode_char_result(&mut rc);
+                            if rar4_debug_filters_enabled() {
+                                eprintln!("RAR4 PPM trailing consume subcode: {sub:?}");
+                            }
+                        }
+                    }
+                }
+
+                // The member's output ended while the PPMd block continues;
+                // the next solid member resumes with these registers.
+                self.ppm_rc_state = Some(rc.state());
+            }
         }
 
         if switch_to_lz_tables {
@@ -1980,6 +2075,7 @@ impl Rar4LzDecoder {
         self.last_vm_filter = 0;
         self.current_file_base_total = 0;
         self.current_file_written_size = 0;
+        self.ppm_rc_state = None;
         self.window.reset();
     }
 }
