@@ -1,5 +1,3 @@
-#[cfg(test)]
-use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +12,7 @@ use crate::SchedulerHandle;
 use crate::ingest::submit_nzb_bytes;
 use crate::rss::model::{FeedItem, apply_basic_auth, build_submission_metadata};
 #[cfg(test)]
-use crate::rss::model::{compile_rules, evaluate_item, feed_item_from_entry, unix_now_secs};
+use crate::rss::model::{compile_rules, evaluate_item, parse_feed_items, unix_now_secs};
 use crate::security::{RuntimeSecurityConfig, resolve_fetch_target};
 use crate::settings::SharedConfig;
 use crate::{Database, RssFeedRow, RssRuleRow, RssSeenItemRow};

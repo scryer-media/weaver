@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
+use std::io::Cursor;
 
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::{Reader, XmlVersion};
 use regex::Regex;
 use tracing::warn;
 
@@ -18,6 +21,23 @@ pub(crate) struct FeedItem {
     pub(crate) categories: Vec<String>,
     pub(crate) download_url: Option<String>,
     pub(crate) display_url: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ParsedFeedEntry {
+    id: String,
+    title: Option<String>,
+    published_at: Option<i64>,
+    updated_at: Option<i64>,
+    categories: Vec<String>,
+    links: Vec<ParsedFeedLink>,
+    enclosures: Vec<ParsedFeedLink>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedFeedLink {
+    href: String,
+    length: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,25 +178,74 @@ pub(crate) fn build_submission_metadata(
     merged.into_iter().collect()
 }
 
-pub(crate) fn feed_item_from_entry(entry: feed_rs::model::Entry) -> FeedItem {
+pub(crate) fn parse_feed_items(xml: &[u8]) -> Result<Vec<FeedItem>, String> {
+    let mut reader = Reader::from_reader(Cursor::new(xml));
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut text_buf = String::new();
+    let mut current_entry: Option<ParsedFeedEntry> = None;
+    let mut items = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                let raw = String::from_utf8_lossy(name.as_ref()).to_ascii_lowercase();
+                let local = String::from_utf8_lossy(local_name(name.as_ref())).to_ascii_lowercase();
+                if local == "item" || local == "entry" {
+                    current_entry = Some(ParsedFeedEntry::default());
+                } else if let Some(entry) = current_entry.as_mut() {
+                    apply_empty_feed_element(&reader, &e, &raw, &local, entry)?;
+                }
+                text_buf.clear();
+            }
+            Ok(Event::Empty(e)) => {
+                let name = e.name();
+                let raw = String::from_utf8_lossy(name.as_ref()).to_ascii_lowercase();
+                let local = String::from_utf8_lossy(local_name(name.as_ref())).to_ascii_lowercase();
+                if let Some(entry) = current_entry.as_mut() {
+                    apply_empty_feed_element(&reader, &e, &raw, &local, entry)?;
+                }
+                text_buf.clear();
+            }
+            Ok(Event::Text(e)) => {
+                let decoded = e.decode().map_err(|e| e.to_string())?;
+                text_buf = quick_xml::escape::unescape(&decoded)
+                    .map_err(|e| e.to_string())?
+                    .into_owned();
+            }
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                let local = String::from_utf8_lossy(local_name(name.as_ref())).to_ascii_lowercase();
+                if local == "item" || local == "entry" {
+                    if let Some(entry) = current_entry.take() {
+                        items.push(feed_item_from_entry(entry));
+                    }
+                } else if let Some(entry) = current_entry.as_mut() {
+                    apply_text_feed_element(&local, text_buf.trim(), entry);
+                }
+                text_buf.clear();
+            }
+            Err(error) => return Err(error.to_string()),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(items)
+}
+
+fn feed_item_from_entry(entry: ParsedFeedEntry) -> FeedItem {
     let title = entry
         .title
-        .as_ref()
-        .map(|value| value.content.clone())
+        .clone()
         .unwrap_or_else(|| "Untitled RSS Item".to_string());
-    let media_content = entry
-        .media
-        .iter()
-        .flat_map(|media| media.content.iter())
-        .find_map(|content| {
-            content
-                .url
-                .as_ref()
-                .map(|url| (url.to_string(), content.size))
-        });
+    let media_content = entry.enclosures.iter().find(|link| !link.href.is_empty());
     let download_url = media_content
         .as_ref()
-        .map(|(url, _)| url.clone())
+        .map(|link| link.href.clone())
         .or_else(|| {
             entry
                 .links
@@ -190,14 +259,10 @@ pub(crate) fn feed_item_from_entry(entry: feed_rs::model::Entry) -> FeedItem {
     } else if let Some(url) = download_url.clone().or_else(|| display_url.clone()) {
         url
     } else {
-        fallback_item_id(
-            &title,
-            entry.published.as_ref().map(|ts| ts.timestamp()),
-            None,
-        )
+        fallback_item_id(&title, entry.published_at, None)
     };
 
-    let size_bytes = media_content.and_then(|(_, size)| size).or_else(|| {
+    let size_bytes = media_content.and_then(|link| link.length).or_else(|| {
         entry
             .links
             .iter()
@@ -208,12 +273,120 @@ pub(crate) fn feed_item_from_entry(entry: feed_rs::model::Entry) -> FeedItem {
     FeedItem {
         item_id,
         title,
-        published_at: entry.published.or(entry.updated).map(|ts| ts.timestamp()),
+        published_at: entry.published_at.or(entry.updated_at),
         size_bytes,
-        categories: entry.categories.into_iter().map(|cat| cat.term).collect(),
+        categories: entry.categories,
         download_url,
         display_url,
     }
+}
+
+fn apply_empty_feed_element<R: std::io::BufRead>(
+    reader: &Reader<R>,
+    element: &BytesStart<'_>,
+    raw_name: &str,
+    local_name: &str,
+    entry: &mut ParsedFeedEntry,
+) -> Result<(), String> {
+    match local_name {
+        "link" => {
+            if let Some(link) = feed_link_from_attrs(reader, element)? {
+                let rel = attr_value_by_name(reader, element, b"rel")?;
+                if rel
+                    .as_deref()
+                    .is_some_and(|rel| rel.eq_ignore_ascii_case("enclosure"))
+                {
+                    entry.enclosures.push(link.clone());
+                }
+                entry.links.push(link);
+            }
+        }
+        "enclosure" => {
+            if let Some(link) = feed_link_from_attrs(reader, element)? {
+                entry.enclosures.push(link);
+            }
+        }
+        "content" if raw_name == "media:content" => {
+            if let Some(link) = feed_link_from_attrs(reader, element)? {
+                entry.enclosures.push(link);
+            }
+        }
+        "category" => {
+            if let Some(term) = attr_value_by_name(reader, element, b"term")?
+                && !term.is_empty()
+            {
+                entry.categories.push(term);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn apply_text_feed_element(local_name: &str, text: &str, entry: &mut ParsedFeedEntry) {
+    if text.is_empty() {
+        return;
+    }
+    match local_name {
+        "title" if entry.title.is_none() => entry.title = Some(text.to_string()),
+        "id" | "guid" if entry.id.is_empty() => entry.id = text.to_string(),
+        "link" => entry.links.push(ParsedFeedLink {
+            href: text.to_string(),
+            length: None,
+        }),
+        "category" => entry.categories.push(text.to_string()),
+        "pubdate" | "published" => entry.published_at = parse_feed_timestamp(text),
+        "updated" => entry.updated_at = parse_feed_timestamp(text),
+        _ => {}
+    }
+}
+
+fn feed_link_from_attrs<R: std::io::BufRead>(
+    reader: &Reader<R>,
+    element: &BytesStart<'_>,
+) -> Result<Option<ParsedFeedLink>, String> {
+    let href = match attr_value_by_name(reader, element, b"href")? {
+        Some(href) => Some(href),
+        None => attr_value_by_name(reader, element, b"url")?,
+    };
+    let Some(href) = href.filter(|href| !href.is_empty()) else {
+        return Ok(None);
+    };
+    let length = match attr_value_by_name(reader, element, b"length")? {
+        Some(length) => Some(length),
+        None => attr_value_by_name(reader, element, b"filesize")?,
+    }
+    .and_then(|value| value.parse::<u64>().ok());
+    Ok(Some(ParsedFeedLink { href, length }))
+}
+
+fn attr_value_by_name<R: std::io::BufRead>(
+    reader: &Reader<R>,
+    element: &BytesStart<'_>,
+    wanted: &[u8],
+) -> Result<Option<String>, String> {
+    for attr in element.attributes() {
+        let attr = attr.map_err(|e| e.to_string())?;
+        if local_name(attr.key.as_ref()).eq_ignore_ascii_case(wanted) {
+            let value = attr
+                .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
+                .map(std::borrow::Cow::into_owned)
+                .unwrap_or_else(|_| String::from_utf8_lossy(&attr.value).into_owned());
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_feed_timestamp(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .or_else(|_| chrono::DateTime::parse_from_rfc2822(value))
+        .ok()
+        .map(|timestamp| timestamp.timestamp())
+}
+
+fn local_name(name: &[u8]) -> &[u8] {
+    name.rsplit(|byte| *byte == b':').next().unwrap_or(name)
 }
 
 pub(crate) fn looks_like_direct_nzb_url(url: &str) -> bool {

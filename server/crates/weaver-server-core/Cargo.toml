@@ -38,7 +38,7 @@ sha2 = { workspace = true }
 hmac = { workspace = true, default-features = false }
 reqwest = { workspace = true }
 regex = { workspace = true }
-feed-rs = { workspace = true, default-features = false }
+quick-xml = { workspace = true }
 zstd = { workspace = true }
 zip = { workspace = true }
 tar = { workspace = true }
