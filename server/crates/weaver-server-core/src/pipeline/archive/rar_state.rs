@@ -584,6 +584,10 @@ pub(crate) fn build_plan(
         );
     }
 
+    if metadata.is_solid && !waiting_on_volumes.is_empty() {
+        ready_members.clear();
+    }
+
     let phase = if all_default_members_extracted {
         RarSetPhase::Complete
     } else if worker_active {

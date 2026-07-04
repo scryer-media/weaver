@@ -191,6 +191,20 @@ impl Pipeline {
         set_names
     }
 
+    fn job_has_idle_ready_rar_work(&self, job_id: JobId) -> bool {
+        self.rar_sets
+            .iter()
+            .filter(|((rar_job_id, _), _)| *rar_job_id == job_id)
+            .any(|(_, set_state)| {
+                set_state.active_workers == 0
+                    && set_state.in_flight_members.is_empty()
+                    && set_state
+                        .plan
+                        .as_ref()
+                        .is_some_and(|plan| !plan.ready_members.is_empty())
+            })
+    }
+
     pub(crate) fn job_has_live_rar_waiting_for_missing_volumes(&self, job_id: JobId) -> bool {
         let current_set_names = self.current_rar_set_names_for_job(job_id);
 
@@ -1685,15 +1699,27 @@ impl Pipeline {
             || (has_incomplete_data_files && download_pipeline_exhausted)
             || rar_waiting_for_missing_volumes
             || par2_validation_needed;
-
-        if download_pipeline_exhausted && only_rar_archives {
-            let promoted_recovery = self.promoted_recovery_pipeline_state(job_id);
+        let exhausted_rar_activity = if download_pipeline_exhausted && only_rar_archives {
             let inflight_extractions = self
                 .inflight_extractions
                 .get(&job_id)
                 .map_or(0, HashSet::len);
             let has_active_rar_workers = self.has_active_rar_workers(job_id);
-            let has_active_extraction_tasks = has_active_rar_workers || inflight_extractions > 0;
+            Some((
+                inflight_extractions,
+                has_active_rar_workers,
+                has_active_rar_workers || inflight_extractions > 0,
+            ))
+        } else {
+            None
+        };
+        let has_exhausted_rar_active_extraction_tasks =
+            exhausted_rar_activity.is_some_and(|(_, _, active)| active);
+
+        if download_pipeline_exhausted && only_rar_archives {
+            let promoted_recovery = self.promoted_recovery_pipeline_state(job_id);
+            let (inflight_extractions, has_active_rar_workers, has_active_extraction_tasks) =
+                exhausted_rar_activity.unwrap_or((0, false, false));
             let only_archive_residuals =
                 self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id);
             let mut rar_set_state = self
@@ -1781,11 +1807,52 @@ impl Pipeline {
             return;
         }
 
+        if download_pipeline_exhausted
+            && only_rar_archives
+            && !has_crc_failures
+            && !par2_validation_needed
+            && !has_exhausted_rar_active_extraction_tasks
+            && self.job_has_idle_ready_rar_work(job_id)
+            && matches!(
+                current_status,
+                JobStatus::Downloading | JobStatus::QueuedExtract | JobStatus::Extracting
+            )
+        {
+            info!(
+                job_id = job_id.0,
+                status = ?current_status,
+                "restarting idle RAR extraction work"
+            );
+            self.try_rar_extraction(job_id).await;
+            return;
+        }
+
         if !has_crc_failures
             && self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id)
         {
             self.finalize_completed_archive_job(job_id).await;
             return;
+        }
+
+        if download_pipeline_exhausted
+            && only_rar_archives
+            && has_crc_failures
+            && !has_exhausted_rar_active_extraction_tasks
+            && matches!(
+                current_status,
+                JobStatus::QueuedExtract | JobStatus::Extracting
+            )
+        {
+            info!(
+                job_id = job_id.0,
+                status = ?current_status,
+                "normalizing idle RAR extraction status before repair evaluation"
+            );
+            self.transition_postprocessing_status(
+                job_id,
+                JobStatus::Downloading,
+                Some("downloading"),
+            );
         }
 
         if rar_waiting_for_missing_volumes && self.job_has_incoherent_rar_waiting_state(job_id) {
@@ -1803,10 +1870,15 @@ impl Pipeline {
                 return;
             }
 
-            if self.has_active_rar_workers(job_id) {
+            let has_active_extraction_tasks = if download_pipeline_exhausted && only_rar_archives {
+                has_exhausted_rar_active_extraction_tasks
+            } else {
+                self.job_has_active_extraction_tasks(job_id)
+            };
+            if has_active_extraction_tasks {
                 info!(
                     job_id = job_id.0,
-                    "deferring verify — active RAR extraction workers"
+                    "deferring verify — active extraction workers"
                 );
                 return;
             }

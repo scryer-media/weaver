@@ -19803,6 +19803,246 @@ async fn restore_queued_postprocessing_schedules_completion_check() {
 }
 
 #[tokio::test]
+async fn queued_rar_extract_restart_relaunches_idle_ready_work() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31202);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("Restore queued RAR extract", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let key = (job_id, "show".to_string());
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&key)
+            .expect("RAR set state should exist after all volumes complete");
+        assert!(
+            set_state
+                .plan
+                .as_ref()
+                .is_some_and(|plan| !plan.ready_members.is_empty())
+        );
+        set_state.active_workers = 0;
+        set_state.in_flight_members.clear();
+    }
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.status = JobStatus::QueuedExtract;
+        state.refresh_runtime_lanes_from_status();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    pipeline.pending_completion_checks.clear();
+    pipeline.check_job_completion(job_id).await;
+
+    let active_workers = pipeline
+        .rar_sets
+        .get(&key)
+        .map(|state| state.active_workers)
+        .unwrap_or_default();
+    assert!(
+        active_workers > 0,
+        "idle restored QueuedExtract job should relaunch ready RAR work"
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Extracting)
+    );
+
+    for _ in 0..active_workers {
+        let done = next_extraction_done(&mut pipeline).await;
+        pipeline.handle_extraction_done(done).await;
+    }
+}
+
+#[tokio::test]
+async fn extracting_rar_restart_with_failed_member_enters_repair_or_relaunches() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31203);
+    let files = build_multifile_multivolume_rar_set();
+    let index_filename = "repair.par2";
+    let recovery_filename = "repair.vol00+01.par2";
+    let par2_bytes = build_test_par2_index(&files[0].0, &files[0].1, files[0].1.len() as u64);
+    let recovery_bytes = vec![0xAA; files[0].1.len()];
+    let mut all_files = files.clone();
+    all_files.push((index_filename.to_string(), par2_bytes.clone()));
+    all_files.push((recovery_filename.to_string(), recovery_bytes.clone()));
+    let spec = rar_job_spec("Restore failed RAR repair", &all_files);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        files.len() as u32,
+        index_filename,
+        &par2_bytes,
+    )
+    .await;
+    write_and_complete_file(
+        &mut pipeline,
+        job_id,
+        files.len() as u32 + 1,
+        recovery_filename,
+        &recovery_bytes,
+    )
+    .await;
+
+    let mut damaged_first_volume = files[0].1.clone();
+    damaged_first_volume[0] ^= 0xFF;
+    tokio::fs::write(working_dir.join(&files[0].0), &damaged_first_volume)
+        .await
+        .unwrap();
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(&files[0].0, &files[0].1, files[0].1.len() as u64, 1),
+        &[
+            (files.len() as u32, index_filename, 0, false),
+            (files.len() as u32 + 1, recovery_filename, 1, true),
+        ],
+    );
+
+    pipeline
+        .failed_extractions
+        .insert(job_id, ["E01.mkv".to_string()].into_iter().collect());
+    let key = (job_id, "show".to_string());
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&key)
+            .expect("RAR set state should exist after all volumes complete");
+        set_state.active_workers = 0;
+        set_state.in_flight_members.clear();
+        set_state.phase = crate::pipeline::rar_state::RarSetPhase::AwaitingRepair;
+        if let Some(plan) = set_state.plan.as_mut() {
+            plan.phase = crate::pipeline::rar_state::RarSetPhase::AwaitingRepair;
+        }
+    }
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.status = JobStatus::Extracting;
+        state.refresh_runtime_lanes_from_status();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    pipeline.pending_completion_checks.clear();
+    pipeline.check_job_completion(job_id).await;
+
+    let active_workers = pipeline
+        .rar_sets
+        .get(&key)
+        .map(|state| state.active_workers)
+        .unwrap_or_default();
+    let status = pipeline.jobs.get(&job_id).map(|state| state.status.clone());
+    let completion_check_pending = pipeline.pending_completion_checks.contains(&job_id);
+
+    assert!(
+        !matches!(status, Some(JobStatus::Failed { .. })),
+        "restart repair liveness must not terminally fail; status={status:?}"
+    );
+
+    assert!(
+        active_workers > 0
+            || matches!(
+                status,
+                Some(JobStatus::Repairing | JobStatus::QueuedRepair | JobStatus::Complete)
+            )
+            || completion_check_pending,
+        "stale idle failed RAR extraction must enter repair or relaunch extraction; status={status:?}, active_workers={active_workers}"
+    );
+
+    for _ in 0..active_workers {
+        let done = next_extraction_done(&mut pipeline).await;
+        pipeline.handle_extraction_done(done).await;
+    }
+}
+
+#[tokio::test]
+async fn active_full_set_rar_extraction_blocks_restart_repair_and_relaunch() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31204);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("Active full-set RAR restart guard", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let key = (job_id, "show".to_string());
+    pipeline
+        .failed_extractions
+        .insert(job_id, ["E01.mkv".to_string()].into_iter().collect());
+    pipeline
+        .inflight_extractions
+        .entry(job_id)
+        .or_default()
+        .insert("show".to_string());
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&key)
+            .expect("RAR set state should exist after all volumes complete");
+        set_state.active_workers = 0;
+        set_state.in_flight_members.clear();
+        set_state.phase = crate::pipeline::rar_state::RarSetPhase::Extracting;
+        if let Some(plan) = set_state.plan.as_mut() {
+            plan.phase = crate::pipeline::rar_state::RarSetPhase::Extracting;
+        }
+    }
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.status = JobStatus::Extracting;
+        state.refresh_runtime_lanes_from_status();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    pipeline.pending_completion_checks.clear();
+    pipeline.check_job_completion(job_id).await;
+
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Extracting)
+    );
+    assert_eq!(pipeline.metrics.repair_active.load(Ordering::Relaxed), 0);
+    assert!(pipeline.pending_completion_checks.is_empty());
+    assert!(
+        pipeline
+            .failed_extractions
+            .get(&job_id)
+            .is_some_and(|members| members.contains("E01.mkv"))
+    );
+    let set_state = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("RAR set should remain while full-set extraction is active");
+    assert_eq!(set_state.active_workers, 0);
+    assert!(set_state.in_flight_members.is_empty());
+    assert!(
+        pipeline
+            .inflight_extractions
+            .get(&job_id)
+            .is_some_and(|sets| sets.contains("show"))
+    );
+}
+
+#[tokio::test]
 async fn restore_repairing_preserves_status_and_slot_ownership() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

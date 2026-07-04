@@ -208,6 +208,34 @@ fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     ]
 }
 
+fn build_solid_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
+    let mut files = build_multifile_multivolume_rar_set();
+    let solid_flag = 0x0004;
+
+    for (volume, (_, bytes)) in files.iter_mut().enumerate() {
+        let mut solid_bytes = Vec::new();
+        solid_bytes.extend_from_slice(&TEST_RAR5_SIG);
+        let flags = if volume == 0 {
+            0x0001 | solid_flag
+        } else {
+            0x0001 | 0x0002 | solid_flag
+        };
+        let volume_number = (volume != 0).then_some(volume as u64);
+        solid_bytes.extend_from_slice(&build_test_rar_main_header(flags, volume_number));
+
+        let main_header_len = TEST_RAR5_SIG.len()
+            + build_test_rar_main_header(
+                if volume == 0 { 0x0001 } else { 0x0001 | 0x0002 },
+                volume_number,
+            )
+            .len();
+        solid_bytes.extend_from_slice(&bytes[main_header_len..]);
+        *bytes = solid_bytes;
+    }
+
+    files
+}
+
 #[test]
 fn push_unique_ready_member_preserves_order_and_dedupes_names() {
     let mut ready_members = Vec::new();
@@ -486,6 +514,48 @@ fn build_plan_claims_missing_continuation_volumes_for_pending_owners() {
     assert_eq!(decision.owners, vec!["E02.mkv".to_string()]);
     assert_eq!(decision.pending_owners, vec!["E02.mkv".to_string()]);
     assert!(!decision.ownership_eligible);
+}
+
+#[test]
+fn build_plan_solid_waits_instead_of_starting_ready_prefix() {
+    let files = build_solid_multifile_multivolume_rar_set();
+    let mut archive = RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+    archive
+        .add_volume(1, Box::new(Cursor::new(files[1].1.clone())))
+        .unwrap();
+    archive
+        .add_volume(2, Box::new(Cursor::new(files[2].1.clone())))
+        .unwrap();
+
+    let present_volumes = [0usize, 1, 2];
+    let facts: BTreeMap<u32, RarVolumeFacts> = present_volumes
+        .iter()
+        .map(|&volume| {
+            (
+                volume as u32,
+                RarArchive::parse_volume_facts(Cursor::new(files[volume].1.clone()), None).unwrap(),
+            )
+        })
+        .collect();
+    let volume_map = present_volumes
+        .iter()
+        .map(|&volume| (files[volume].0.clone(), volume as u32))
+        .collect();
+
+    let plan = build_plan(
+        volume_map,
+        &facts,
+        &archive,
+        &HashSet::new(),
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+
+    assert!(plan.is_solid);
+    assert!(plan.ready_members.is_empty());
+    assert!(plan.waiting_on_volumes.contains(&3));
+    assert_eq!(plan.phase, RarSetPhase::WaitingForVolumes);
 }
 
 #[test]
