@@ -709,12 +709,8 @@ impl Pipeline {
         }
 
         let job_id = file_id.job_id;
-        let Some(state) = self.jobs.get(&job_id) else {
-            return None;
-        };
-        let Some(file) = state.assembly.file(file_id) else {
-            return None;
-        };
+        let state = self.jobs.get(&job_id)?;
+        let file = state.assembly.file(file_id)?;
         if !matches!(
             self.classified_role_for_file(job_id, file),
             weaver_model::files::FileRole::RarVolume { .. }

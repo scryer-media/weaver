@@ -357,10 +357,10 @@ impl ManualTlsStream {
             if saw_eof {
                 return Ok(0);
             }
-            if dst.len() == len_before_ready {
-                if let Some(stats) = stats.as_deref_mut() {
-                    stats.empty_readiness_wakes += 1;
-                }
+            if dst.len() == len_before_ready
+                && let Some(stats) = stats.as_deref_mut()
+            {
+                stats.empty_readiness_wakes += 1;
             }
         }
     }
@@ -1013,11 +1013,10 @@ mod tests {
 
         flushed_rx.await.expect("server flushed probe records");
         let _ = std::fs::remove_file(&ca_path);
-        let bytes_per_read_call = if aggregate.s2n_read_calls == 0 {
-            0
-        } else {
-            aggregate.s2n_read_bytes / aggregate.s2n_read_calls
-        };
+        let bytes_per_read_call = aggregate
+            .s2n_read_bytes
+            .checked_div(aggregate.s2n_read_calls)
+            .unwrap_or(0);
 
         println!(
             "s2n_tls_drain_probe first_read_bytes={first_read_bytes} total_bytes={total} records={TLS_DRAIN_RECORDS} s2n_read_calls={} bytes_per_read_call={bytes_per_read_call}",

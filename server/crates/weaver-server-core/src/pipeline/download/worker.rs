@@ -840,10 +840,6 @@ impl Pipeline {
         self.hot_dispatch_last_lend_at = Some(now);
     }
 
-    fn spillover_loan_kind_for(&self, job_id: JobId) -> Option<SpilloverLoanKind> {
-        self.hot_dispatch_spillover_loans.loan_kind_for(job_id)
-    }
-
     fn clear_spillover_loan_if_idle(&mut self) {
         if self.active_spillover_connections() == 0 {
             self.hot_dispatch_spillover_loans.clear();
@@ -1656,6 +1652,7 @@ impl Pipeline {
             let lease = DownloadBatchLease {
                 job_id,
                 lane_mode: DownloadLaneMode::Sequential,
+                spillover_loan_kind: None,
                 server_modes: Vec::new(),
                 compatibility,
                 works: vec![first],
@@ -1685,6 +1682,7 @@ impl Pipeline {
         let lease = DownloadBatchLease {
             job_id,
             lane_mode: DownloadLaneMode::Sequential,
+            spillover_loan_kind: None,
             server_modes: Vec::new(),
             compatibility,
             works,
@@ -1745,6 +1743,7 @@ impl Pipeline {
         DownloadBatchLease {
             job_id,
             lane_mode,
+            spillover_loan_kind: None,
             server_modes,
             compatibility,
             works,
@@ -1933,35 +1932,36 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         pressure: DownloadPressure,
+        spillover_loan_kind: Option<SpilloverLoanKind>,
     ) -> DispatchAttempt {
         if let Some(ready_at) = self
             .download_restart_durable_lead_retry_after
             .get(&job_id)
             .copied()
+            && ready_at > Instant::now()
         {
-            if ready_at > Instant::now() {
-                let backlog = self.download_pipeline_backlog_for_job(job_id);
-                if backlog.has_durable_catch_up_work() {
-                    if self.next_queued_download_exceeds_restart_durable_lead(job_id) {
-                        self.flush_file_progress_batch(
-                            "download.file_progress.flush.restart_durable_lead_retry_recheck",
-                        );
-                    }
-                    if self.next_queued_download_exceeds_restart_durable_lead(job_id) {
-                        self.update_queue_metrics();
-                        return DispatchAttempt::NoWork;
-                    }
+            let backlog = self.download_pipeline_backlog_for_job(job_id);
+            if backlog.has_durable_catch_up_work() {
+                if self.next_queued_download_exceeds_restart_durable_lead(job_id) {
+                    self.flush_file_progress_batch(
+                        "download.file_progress.flush.restart_durable_lead_retry_recheck",
+                    );
                 }
-                self.download_restart_durable_lead_retry_after
-                    .remove(&job_id);
+                if self.next_queued_download_exceeds_restart_durable_lead(job_id) {
+                    self.update_queue_metrics();
+                    return DispatchAttempt::NoWork;
+                }
             }
+            self.download_restart_durable_lead_retry_after
+                .remove(&job_id);
         }
         self.apply_rar_unlock_priorities_if_dirty(job_id);
-        let lease = match self.try_lease_initial_download_batch(job_id, pressure) {
+        let mut lease = match self.try_lease_initial_download_batch(job_id, pressure) {
             Ok(Some(lease)) => lease,
             Ok(None) => return DispatchAttempt::NoWork,
             Err(attempt) => return attempt,
         };
+        lease.spillover_loan_kind = spillover_loan_kind;
         let activation_items = Self::activation_items(&lease);
         self.activate_download_batch_lease(&lease, &activation_items, true);
         self.spawn_download_batch(lease);
@@ -2448,6 +2448,7 @@ impl Pipeline {
     pub(crate) fn dispatch_downloads(&mut self) {
         let now = Instant::now();
         if self.global_paused || self.rate_limiter.should_wait() {
+            self.hot_share_yield_signal.clear();
             if self.active_downloads == 0 {
                 debug!(
                     global_paused = self.global_paused,
@@ -2460,10 +2461,12 @@ impl Pipeline {
         }
         if let Err(error) = self.refresh_bandwidth_cap_window() {
             error!(error = %error, "failed to refresh ISP bandwidth cap state");
+            self.hot_share_yield_signal.clear();
             self.publish_hot_dispatch_metrics(now);
             return;
         }
         if self.bandwidth_cap.cap_enabled() && self.bandwidth_cap.remaining_bytes() == 0 {
+            self.hot_share_yield_signal.clear();
             self.update_queue_metrics();
             if self.active_downloads == 0 {
                 debug!("dispatch blocked: bandwidth cap exhausted");
@@ -2474,6 +2477,7 @@ impl Pipeline {
 
         let pressure = self.refresh_download_pressure();
         if pressure.is_hard() {
+            self.hot_share_yield_signal.clear();
             self.update_queue_metrics();
             if self.active_downloads == 0 {
                 debug!(
@@ -2498,6 +2502,7 @@ impl Pipeline {
                 .download_pressure_soft_dispatch_after
                 .is_some_and(|ready_at| ready_at > now)
             {
+                self.hot_share_yield_signal.clear();
                 self.update_queue_metrics();
                 if self.active_downloads == 0 {
                     debug!(
@@ -2663,7 +2668,7 @@ impl Pipeline {
             && !self.rate_limiter.should_wait()
             && dispatch_budget > 0
         {
-            match self.try_dispatch_download_for_job(hot_job_id, pressure) {
+            match self.try_dispatch_download_for_job(hot_job_id, pressure, None) {
                 DispatchAttempt::Dispatched => dispatch_budget = dispatch_budget.saturating_sub(1),
                 DispatchAttempt::NoWork => break,
                 DispatchAttempt::StopAll => {
@@ -2679,6 +2684,7 @@ impl Pipeline {
                 .saturating_sub(self.hot_dispatch_spillover_loans.bounded_lent_connections())
                 .min(max.saturating_sub(self.active_download_connections))
                 .min(dispatch_budget);
+            let mut skipped_peer_jobs = Vec::new();
             while bounded_slots > 0
                 && self.active_download_connections < max
                 && !self.rate_limiter.should_wait()
@@ -2689,6 +2695,7 @@ impl Pipeline {
                     .iter()
                     .enumerate()
                     .filter(|(_, job_id)| self.job_has_primary_download_work(**job_id))
+                    .filter(|(_, job_id)| !skipped_peer_jobs.contains(*job_id))
                     .min_by_key(|(index, job_id)| {
                         (
                             self.active_download_connections_by_job
@@ -2703,7 +2710,11 @@ impl Pipeline {
                     break;
                 };
 
-                match self.try_dispatch_download_for_job(peer_job_id, pressure) {
+                match self.try_dispatch_download_for_job(
+                    peer_job_id,
+                    pressure,
+                    Some(SpilloverLoanKind::BoundedSameBand),
+                ) {
                     DispatchAttempt::Dispatched => {
                         self.hot_dispatch_mode = DispatchShareMode::Shared;
                         let hot_speed_bps = self.hot_dispatch_speed_bps(now);
@@ -2717,7 +2728,9 @@ impl Pipeline {
                         dispatch_budget = dispatch_budget.saturating_sub(1);
                         bounded_slots = bounded_slots.saturating_sub(1);
                     }
-                    DispatchAttempt::NoWork => break,
+                    DispatchAttempt::NoWork => {
+                        skipped_peer_jobs.push(peer_job_id);
+                    }
                     DispatchAttempt::StopAll => {
                         self.publish_hot_dispatch_metrics(now);
                         return;
@@ -2729,7 +2742,7 @@ impl Pipeline {
                 && !self.rate_limiter.should_wait()
                 && dispatch_budget > 0
             {
-                match self.try_dispatch_download_for_job(hot_job_id, pressure) {
+                match self.try_dispatch_download_for_job(hot_job_id, pressure, None) {
                     DispatchAttempt::Dispatched => {
                         dispatch_budget = dispatch_budget.saturating_sub(1)
                     }
@@ -2758,11 +2771,13 @@ impl Pipeline {
             self.hot_best_mode_block_reason(hot_job_id, max, pressure, recent_expansion_helped);
 
         let spillover_allowed = if suppress_spillover {
+            self.hot_share_yield_signal.clear();
             self.hot_dispatch_underfill_since = None;
             self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
             self.block_or_reclaim_spillover(SpilloverDecision::BlockedPressure);
             false
         } else if bandwidth_cap_tight {
+            self.hot_share_yield_signal.clear();
             self.hot_dispatch_underfill_since = None;
             self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
             self.block_or_reclaim_spillover(SpilloverDecision::BlockedNearCap);
@@ -2828,7 +2843,11 @@ impl Pipeline {
                     && !self.rate_limiter.should_wait()
                     && dispatch_budget > 0
                 {
-                    match self.try_dispatch_download_for_job(job_id, pressure) {
+                    match self.try_dispatch_download_for_job(
+                        job_id,
+                        pressure,
+                        Some(SpilloverLoanKind::MeasuredUnderfill),
+                    ) {
                         DispatchAttempt::Dispatched => {
                             self.start_spillover_loan(
                                 job_id,
@@ -3024,19 +3043,14 @@ impl Pipeline {
                 );
                 crate::runtime::perf_probe::record_value(
                     "download.nntp.transport.s2n.bytes_per_read_call",
-                    if io.transport_read.s2n_read_calls == 0 {
-                        0
-                    } else {
-                        io.transport_read.s2n_read_bytes / io.transport_read.s2n_read_calls
-                    },
+                    io.transport_read
+                        .s2n_read_bytes
+                        .checked_div(io.transport_read.s2n_read_calls)
+                        .unwrap_or(0),
                 );
                 crate::runtime::perf_probe::record_value(
                     "download.nntp.read.bytes_per_call",
-                    if io.read_calls == 0 {
-                        0
-                    } else {
-                        io.read_bytes / io.read_calls
-                    },
+                    io.read_bytes.checked_div(io.read_calls).unwrap_or(0),
                 );
                 crate::runtime::perf_probe::record_value(
                     "download.nntp.buffer.leftover_after_terminator",
@@ -3240,6 +3254,7 @@ impl Pipeline {
             let fetch_started = Instant::now();
             let mut lease = initial_lease;
             let mut recorded_mode = lease.lane_mode;
+            let mut current_spillover_loan_kind: Option<SpilloverLoanKind>;
             let mut current_job_id: JobId;
             let park_reason: LaneParkReason;
 
@@ -3266,6 +3281,7 @@ impl Pipeline {
                 let is_recovery = lease.compatibility.is_recovery;
                 let exclude_servers = lease.compatibility.exclude_servers.clone();
                 let mode = lease.lane_mode;
+                let spillover_loan_kind = lease.spillover_loan_kind;
                 let job_id = lease.job_id;
                 for work in lease.works {
                     let _ = tx
@@ -3296,6 +3312,7 @@ impl Pipeline {
                     .send(DownloadLaneParked {
                         job_id,
                         mode,
+                        spillover_loan_kind,
                         reason: LaneParkReason::Error,
                         release_connection_slot: true,
                         release_ip_replacement_burst: false,
@@ -3309,11 +3326,13 @@ impl Pipeline {
                 let DownloadBatchLease {
                     job_id,
                     lane_mode,
+                    spillover_loan_kind,
                     server_modes,
                     compatibility,
                     works,
                 } = lease;
                 current_job_id = job_id;
+                current_spillover_loan_kind = spillover_loan_kind;
                 let server_idx = lane.server_id().0;
                 let supports_pipelining = lane.supports_pipelining();
                 let actual_mode = Self::actual_download_lane_mode(
@@ -3576,6 +3595,7 @@ impl Pipeline {
                         remote_ip: lane.remote_ip(),
                         supports_pipelining,
                         current_mode: recorded_mode,
+                        spillover_loan_kind,
                         compatibility,
                         response_tx,
                     })
@@ -3615,6 +3635,7 @@ impl Pipeline {
                 .send(DownloadLaneParked {
                     job_id: current_job_id,
                     mode: recorded_mode,
+                    spillover_loan_kind: current_spillover_loan_kind,
                     reason: park_reason,
                     release_connection_slot: true,
                     release_ip_replacement_burst: false,
@@ -3826,6 +3847,7 @@ impl Pipeline {
                 .send(DownloadLaneParked {
                     job_id,
                     mode,
+                    spillover_loan_kind: None,
                     reason: if accepted {
                         park_reason
                     } else {
@@ -3981,8 +4003,9 @@ impl Pipeline {
         if parked.release_connection_slot {
             self.note_download_lane_released(parked.mode, parked.reason);
             self.active_download_connections = self.active_download_connections.saturating_sub(1);
-            if self.hot_dispatch_job != Some(parked.job_id) {
-                self.hot_dispatch_spillover_loans.release_one(parked.job_id);
+            if let Some(kind) = parked.spillover_loan_kind {
+                self.hot_dispatch_spillover_loans
+                    .release_one(parked.job_id, kind);
             }
             if let Some(in_flight) = self
                 .active_download_connections_by_job
@@ -4014,12 +4037,16 @@ impl Pipeline {
             remote_ip,
             supports_pipelining,
             current_mode,
+            spillover_loan_kind,
             compatibility,
             response_tx,
         } = request;
         let now = Instant::now();
         let mut park_reason = LaneParkReason::NoWork;
         let mut allow_refill = !self.global_paused && !self.rate_limiter.should_wait();
+        if !allow_refill {
+            self.hot_share_yield_signal.clear();
+        }
         let lane_ip_key = ServerIpKey {
             server_idx,
             ip: remote_ip,
@@ -4033,6 +4060,7 @@ impl Pipeline {
         }
         if allow_refill && let Err(error) = self.refresh_bandwidth_cap_window() {
             error!(error = %error, "failed to refresh ISP bandwidth cap state for lane refill");
+            self.hot_share_yield_signal.clear();
             allow_refill = false;
             park_reason = LaneParkReason::Error;
         }
@@ -4040,12 +4068,14 @@ impl Pipeline {
             && self.bandwidth_cap.cap_enabled()
             && self.bandwidth_cap.remaining_bytes() == 0
         {
+            self.hot_share_yield_signal.clear();
             allow_refill = false;
             park_reason = LaneParkReason::Pressure;
         }
 
         let pressure = self.refresh_download_pressure();
         if allow_refill && pressure.state != DownloadPressureState::Clear {
+            self.hot_share_yield_signal.clear();
             allow_refill = false;
             park_reason = LaneParkReason::Pressure;
         }
@@ -4114,8 +4144,7 @@ impl Pipeline {
                         pressure,
                         recent_expansion_helped,
                     );
-                    let loan_kind = self.spillover_loan_kind_for(job_id);
-                    let can_keep_bounded_same_band = loan_kind
+                    let can_keep_bounded_same_band = spillover_loan_kind
                         == Some(SpilloverLoanKind::BoundedSameBand)
                         && requested_priority == Some(hot_priority)
                         && bounded_share_plan.as_ref().is_some_and(|plan| {
@@ -4124,19 +4153,21 @@ impl Pipeline {
                                     <= plan.share_target
                         });
                     let can_keep_lent_lane = requested_priority.is_some_and(|request_priority| {
-                        loan_kind == Some(SpilloverLoanKind::MeasuredUnderfill)
+                        spillover_loan_kind == Some(SpilloverLoanKind::MeasuredUnderfill)
                             && self.hot_dispatch_mode == DispatchShareMode::Shared
                             && request_priority >= hot_priority
                             && best_mode_block_reason == HotBestModeBlockReason::None
                             && !self.hot_spillover_reclaim_pending_for(job_id)
                     });
-                    if self.hot_spillover_reclaim_pending_for(job_id) {
+                    if spillover_loan_kind == Some(SpilloverLoanKind::MeasuredUnderfill)
+                        && self.hot_spillover_reclaim_pending_for(job_id)
+                    {
                         allow_refill = false;
                         park_reason = LaneParkReason::SpilloverSpeedHarm;
                         self.block_or_reclaim_spillover(SpilloverDecision::ReclaimedSpeedHarm);
                     } else if can_keep_bounded_same_band {
                         self.hot_dispatch_last_lend_at = Some(now);
-                    } else if loan_kind == Some(SpilloverLoanKind::BoundedSameBand) {
+                    } else if spillover_loan_kind == Some(SpilloverLoanKind::BoundedSameBand) {
                         allow_refill = false;
                         park_reason = LaneParkReason::SpilloverWithdraw;
                         self.record_spillover_decision(SpilloverDecision::Reclaimed);
@@ -4186,7 +4217,7 @@ impl Pipeline {
             }
         }
 
-        let lease = if allow_refill {
+        let mut lease = if allow_refill {
             match self.try_lease_refill_download_batch(job_id, compatibility, pressure) {
                 Ok(lease) => lease,
                 Err(DispatchAttempt::StopAll) => {
@@ -4199,6 +4230,9 @@ impl Pipeline {
         } else {
             None
         };
+        if let Some(lease) = lease.as_mut() {
+            lease.spillover_loan_kind = spillover_loan_kind;
+        }
 
         let Some(lease) = lease else {
             self.metrics

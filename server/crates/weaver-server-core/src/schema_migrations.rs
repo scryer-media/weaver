@@ -923,6 +923,19 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    type PausedActiveJobRow = (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<f64>,
+        Option<f64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+
     async fn open_test_pool(path: &Path) -> sqlx::SqlitePool {
         SqlitePoolOptions::new()
             .max_connections(1)
@@ -1140,18 +1153,7 @@ mod tests {
             )
         );
 
-        let paused: (
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<f64>,
-            Option<f64>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = sqlx::query_as(
+        let paused: PausedActiveJobRow = sqlx::query_as(
             "SELECT status, download_state, post_state, run_state, error,
                     queued_repair_at_epoch_ms, queued_extract_at_epoch_ms,
                     paused_resume_status, paused_resume_download_state,

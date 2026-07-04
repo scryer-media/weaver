@@ -105,11 +105,9 @@ fn decode_current_yenc(payload: &BytesMut) -> usize {
 
     let mut decoder = StreamingArticleDecoder::new();
     let mut output = Vec::new();
-    loop {
-        match codec.decode_streaming_raw_chunk(&mut buf).unwrap().unwrap() {
-            StreamChunk::Data(data) => decoder.feed_chunk(&data, &mut output).unwrap(),
-            StreamChunk::End => break,
-        }
+    while let StreamChunk::Data(data) = codec.decode_streaming_raw_chunk(&mut buf).unwrap().unwrap()
+    {
+        decoder.feed_chunk(&data, &mut output).unwrap();
     }
 
     decoder.finish(output).unwrap().data.len()

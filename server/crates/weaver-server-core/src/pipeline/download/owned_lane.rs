@@ -195,11 +195,12 @@ fn run_owned_blocking_s2n_download_lane(
         .as_mut()
         .expect("owned lane cache populated before run")
         .lane;
-    let (park_reason, parked_job_id, parked_mode, keep_cached_lane) = loop {
+    let (park_reason, parked_job_id, parked_mode, parked_spillover_loan_kind, keep_cached_lane) = loop {
         let stats_before = lane.stats();
         let DownloadBatchLease {
             job_id,
             lane_mode,
+            spillover_loan_kind,
             server_modes,
             compatibility,
             works,
@@ -336,20 +337,40 @@ fn run_owned_blocking_s2n_download_lane(
             }
         }
 
-        if !batch_clean_for_refill || yielded_for_hot_share {
-            unrequested_works.extend(pending_works);
-        }
+        unrequested_works.extend(take_unrequested_tail(
+            &mut pending_works,
+            batch_clean_for_refill,
+            yielded_for_hot_share,
+        ));
 
         let stats = stats_delta(lane.stats(), stats_before);
         if send_owned_batch(&event_tx, results, unrequested_works, stats).is_err() {
-            break (LaneParkReason::Error, job_id, actual_mode, false);
+            break (
+                LaneParkReason::Error,
+                job_id,
+                actual_mode,
+                spillover_loan_kind,
+                false,
+            );
         }
 
         if !batch_clean_for_refill {
-            break (LaneParkReason::Error, job_id, actual_mode, false);
+            break (
+                LaneParkReason::Error,
+                job_id,
+                actual_mode,
+                spillover_loan_kind,
+                false,
+            );
         }
         if yielded_for_hot_share {
-            break (LaneParkReason::HotShareYield, job_id, actual_mode, false);
+            break (
+                LaneParkReason::HotShareYield,
+                job_id,
+                actual_mode,
+                spillover_loan_kind,
+                false,
+            );
         }
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -360,12 +381,19 @@ fn run_owned_blocking_s2n_download_lane(
                 remote_ip: lane.remote_ip(),
                 supports_pipelining,
                 current_mode: actual_mode,
+                spillover_loan_kind,
                 compatibility,
                 response_tx,
             })
             .is_err()
         {
-            break (LaneParkReason::Error, job_id, actual_mode, false);
+            break (
+                LaneParkReason::Error,
+                job_id,
+                actual_mode,
+                spillover_loan_kind,
+                false,
+            );
         }
 
         match response_rx.blocking_recv() {
@@ -380,11 +408,18 @@ fn run_owned_blocking_s2n_download_lane(
                     response.park_reason,
                     job_id,
                     actual_mode,
+                    spillover_loan_kind,
                     keep_cached_lane_after_park(response.park_reason),
                 );
             }
             Err(_) => {
-                break (LaneParkReason::ProbeYield, job_id, actual_mode, false);
+                break (
+                    LaneParkReason::ProbeYield,
+                    job_id,
+                    actual_mode,
+                    spillover_loan_kind,
+                    false,
+                );
             }
         }
     };
@@ -395,11 +430,23 @@ fn run_owned_blocking_s2n_download_lane(
     let _ = parked_tx.blocking_send(DownloadLaneParked {
         job_id: parked_job_id,
         mode: parked_mode,
+        spillover_loan_kind: parked_spillover_loan_kind,
         reason: park_reason,
         release_connection_slot: true,
         release_ip_replacement_burst: false,
     });
     crate::runtime::perf_probe::record("download.fetch_body.owned", fetch_started.elapsed());
+}
+
+fn take_unrequested_tail(
+    pending_works: &mut VecDeque<DownloadWork>,
+    batch_clean_for_refill: bool,
+    yielded_for_hot_share: bool,
+) -> Vec<DownloadWork> {
+    if batch_clean_for_refill && !yielded_for_hot_share {
+        return Vec::new();
+    }
+    pending_works.drain(..).collect()
 }
 
 fn keep_cached_lane_after_park(reason: LaneParkReason) -> bool {
@@ -514,5 +561,45 @@ fn unresolved_result(
         retry_count: work.retry_count,
         exclude_servers: exclude_servers.to_vec(),
         release_connection_slot: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
+
+    fn tail_work(segment_number: u32, retry_count: u32) -> DownloadWork {
+        DownloadWork {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id: JobId(42),
+                    file_index: 0,
+                },
+                segment_number,
+            },
+            message_id: MessageId::new(&format!("tail-{segment_number}@example.invalid")),
+            groups: vec!["alt.binaries.test".to_string()],
+            priority: 3,
+            byte_estimate: 1024,
+            retry_count,
+            is_recovery: false,
+            exclude_servers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn owned_hot_lane_yield_returns_unrequested_tail_without_retry() {
+        let mut pending_works = VecDeque::from([tail_work(2, 4), tail_work(3, 7)]);
+
+        let tail = take_unrequested_tail(&mut pending_works, true, true);
+
+        assert!(pending_works.is_empty());
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].segment_id.segment_number, 2);
+        assert_eq!(tail[0].retry_count, 4);
+        assert_eq!(tail[1].segment_id.segment_number, 3);
+        assert_eq!(tail[1].retry_count, 7);
     }
 }

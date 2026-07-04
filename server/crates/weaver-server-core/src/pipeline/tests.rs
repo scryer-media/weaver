@@ -2232,6 +2232,7 @@ async fn submit_decoded_segment(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn submit_decoded_segment_with_part_crc_verified(
     pipeline: &mut Pipeline,
     file_id: NzbFileId,
@@ -6685,6 +6686,112 @@ async fn dispatch_downloads_bounded_same_band_shares_capacity() {
 }
 
 #[tokio::test]
+async fn dispatch_downloads_bounded_same_band_skips_blocked_peer_and_tries_next() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        8,
+    )
+    .await;
+    pipeline.connection_ramp = 8;
+
+    let hot_job_id = JobId(21404);
+    let blocked_peer_id = JobId(21405);
+    let good_peer_a = JobId(21406);
+    let good_peer_b = JobId(21407);
+
+    let hot_files = many_standalone_files("bounded-skip-hot", 600);
+    insert_active_job(
+        &mut pipeline,
+        hot_job_id,
+        standalone_job_spec("Bounded Skip Hot", &hot_files),
+    )
+    .await;
+
+    let durable_lead_limit = Pipeline::restart_durable_lead_limit_bytes();
+    let segment_bytes = 1024 * 1024u32;
+    let segment_count = (durable_lead_limit / u64::from(segment_bytes) + 2) as u32;
+    let blocked_segments = (0..segment_count)
+        .map(|segment| {
+            segment_spec! {
+                number: segment,
+                bytes: segment_bytes,
+                message_id: format!("bounded-skip-blocked-{segment}@example.com"),
+            }
+        })
+        .collect::<Vec<_>>();
+    insert_active_job(
+        &mut pipeline,
+        blocked_peer_id,
+        JobSpec {
+            name: "Bounded Skip Blocked".to_string(),
+            password: None,
+            total_bytes: u64::from(segment_count) * u64::from(segment_bytes),
+            category: None,
+            metadata: vec![],
+            files: vec![FileSpec {
+                filename: "blocked.bin".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                segments: blocked_segments,
+            }],
+        },
+    )
+    .await;
+    {
+        let state = pipeline.jobs.get_mut(&blocked_peer_id).unwrap();
+        state.downloaded_bytes = durable_lead_limit;
+        state.restored_download_floor_bytes = 1;
+    }
+    pipeline.active_decodes_by_job.insert(blocked_peer_id, 1);
+
+    for (job_id, name) in [
+        (good_peer_a, "Bounded Skip Good A"),
+        (good_peer_b, "Bounded Skip Good B"),
+    ] {
+        let files = many_standalone_files(name, 600);
+        insert_active_job(&mut pipeline, job_id, standalone_job_spec(name, &files)).await;
+    }
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.hot_dispatch_job, Some(hot_job_id));
+    assert_eq!(
+        pipeline.active_download_connections_by_job.get(&hot_job_id),
+        Some(&6)
+    );
+    assert_eq!(
+        pipeline
+            .active_download_connections_by_job
+            .get(&blocked_peer_id),
+        None
+    );
+    assert_eq!(
+        pipeline
+            .active_download_connections_by_job
+            .get(&good_peer_a),
+        Some(&1)
+    );
+    assert_eq!(
+        pipeline
+            .active_download_connections_by_job
+            .get(&good_peer_b),
+        Some(&1)
+    );
+    assert_eq!(
+        pipeline
+            .hot_dispatch_spillover_loans
+            .bounded_lent_connections(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn dispatch_downloads_single_job_keeps_hot_runway() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
@@ -6836,6 +6943,107 @@ async fn dispatch_downloads_pressure_disables_bounded_share() {
             .bounded_lent_connections(),
         0
     );
+}
+
+#[tokio::test]
+async fn hot_share_yield_signal_clears_when_dispatch_gates_disable_bounded_share() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        4,
+    )
+    .await;
+    let hot_job_id = JobId(21432);
+
+    pipeline.hot_share_yield_signal.request(hot_job_id);
+    pipeline.global_paused = true;
+    pipeline.dispatch_downloads();
+    assert!(!pipeline.hot_share_yield_signal.is_requested_for(hot_job_id));
+    pipeline.global_paused = false;
+
+    pipeline.hot_share_yield_signal.request(hot_job_id);
+    pipeline.rate_limiter.set_rate(1_000);
+    pipeline.rate_limiter.refund(1_000);
+    pipeline.rate_limiter.consume(1_500);
+    assert!(pipeline.rate_limiter.should_wait());
+    pipeline.dispatch_downloads();
+    assert!(!pipeline.hot_share_yield_signal.is_requested_for(hot_job_id));
+
+    pipeline.hot_share_yield_signal.request(hot_job_id);
+    let now = chrono::Local::now();
+    let reset_minutes = (now.hour() as u16 * 60 + now.minute() as u16).saturating_sub(1);
+    pipeline
+        .db
+        .add_bandwidth_usage_minute(now.timestamp().div_euclid(60), 1024)
+        .unwrap();
+    pipeline
+        .apply_bandwidth_cap_policy(Some(crate::bandwidth::IspBandwidthCapConfig {
+            enabled: true,
+            period: crate::bandwidth::IspBandwidthCapPeriod::Daily,
+            limit_bytes: 512,
+            reset_time_minutes_local: reset_minutes,
+            weekly_reset_weekday: crate::bandwidth::IspBandwidthCapWeekday::Mon,
+            monthly_reset_day: 1,
+        }))
+        .unwrap();
+    pipeline.rate_limiter.refund(2_000);
+    assert!(!pipeline.rate_limiter.should_wait());
+    pipeline.dispatch_downloads();
+    assert!(!pipeline.hot_share_yield_signal.is_requested_for(hot_job_id));
+
+    pipeline.apply_bandwidth_cap_policy(None).unwrap();
+    pipeline.hot_share_yield_signal.request(hot_job_id);
+    pipeline.decode_backlog_budget_bytes = 1_000;
+    pipeline
+        .metrics
+        .decode_pending_bytes
+        .store(1_000, Ordering::Relaxed);
+    pipeline.dispatch_downloads();
+    assert!(!pipeline.hot_share_yield_signal.is_requested_for(hot_job_id));
+
+    pipeline.hot_share_yield_signal.request(hot_job_id);
+    pipeline
+        .metrics
+        .decode_pending_bytes
+        .store(700, Ordering::Relaxed);
+    pipeline.download_pressure_soft_dispatch_after = Some(Instant::now() + Duration::from_secs(5));
+    pipeline.dispatch_downloads();
+    assert!(!pipeline.hot_share_yield_signal.is_requested_for(hot_job_id));
+}
+
+#[tokio::test]
+async fn hot_share_yield_signal_clears_when_refill_gates_disable_bounded_share() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(21433);
+
+    pipeline.hot_share_yield_signal.request(job_id);
+    pipeline.global_paused = true;
+    let (response_tx, response_rx) = oneshot::channel();
+    pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        job_id,
+        server_idx: 0,
+        remote_ip: "127.0.0.1".parse().unwrap(),
+        supports_pipelining: false,
+        current_mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: None,
+        compatibility: DownloadBatchCompatibility {
+            priority: FileRole::Standalone.download_priority(),
+            is_recovery: false,
+            groups: vec!["alt.binaries.test".to_string()],
+            exclude_servers: Vec::new(),
+        },
+        response_tx,
+    });
+
+    let response = response_rx.await.unwrap();
+    assert!(response.lease.is_none());
+    assert!(!pipeline.hot_share_yield_signal.is_requested_for(job_id));
 }
 
 #[tokio::test]
@@ -7117,6 +7325,7 @@ async fn hot_lane_refill_yields_when_bounded_share_unmet() {
         remote_ip: "127.0.0.1".parse().unwrap(),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: None,
         compatibility: refill_compatibility,
         response_tx,
     });
@@ -7204,6 +7413,7 @@ async fn bounded_same_band_refill_survives_hot_queued_primary() {
         remote_ip: "127.0.0.1".parse().unwrap(),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: Some(SpilloverLoanKind::BoundedSameBand),
         compatibility: refill_compatibility,
         response_tx,
     });
@@ -7215,9 +7425,7 @@ async fn bounded_same_band_refill_survives_hot_queued_primary() {
     assert_eq!(lease.job_id, peer_job_id);
     assert_eq!(response.park_reason, LaneParkReason::NoWork);
     assert_eq!(
-        pipeline
-            .hot_dispatch_spillover_loans
-            .loan_kind_for(peer_job_id),
+        lease.spillover_loan_kind,
         Some(SpilloverLoanKind::BoundedSameBand)
     );
     assert_eq!(
@@ -7303,6 +7511,7 @@ async fn lane_refill_preserves_same_band_spillover_after_underfill() {
         remote_ip: "127.0.0.1".parse().unwrap(),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: Some(SpilloverLoanKind::MeasuredUnderfill),
         compatibility: refill_compatibility,
         response_tx,
     });
@@ -7481,6 +7690,7 @@ async fn lane_refill_reclaims_spillover_after_measured_speed_harm() {
         remote_ip: "127.0.0.1".parse().unwrap(),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: Some(SpilloverLoanKind::MeasuredUnderfill),
         compatibility: refill_compatibility,
         response_tx,
     });
@@ -7510,6 +7720,7 @@ async fn lane_refill_reclaims_spillover_after_measured_speed_harm() {
     pipeline.handle_download_lane_parked(DownloadLaneParked {
         job_id: spillover_job_id,
         mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: Some(SpilloverLoanKind::MeasuredUnderfill),
         reason: LaneParkReason::SpilloverSpeedHarm,
         release_connection_slot: true,
         release_ip_replacement_burst: false,
@@ -7772,9 +7983,9 @@ fn spillover_loan_book_tracks_multiple_jobs_and_reclaims_independently() {
     assert!(loans.reclaim_pending_for(second_job));
     assert_eq!(loans.speed_snapshot(), (10_000, 8_000, 2));
 
-    loans.release_one(first_job);
+    loans.release_one(first_job, SpilloverLoanKind::MeasuredUnderfill);
     assert!(loans.reclaim_pending_for(first_job));
-    loans.release_one(first_job);
+    loans.release_one(first_job, SpilloverLoanKind::MeasuredUnderfill);
     assert!(!loans.reclaim_pending_for(first_job));
     assert!(loans.reclaim_pending_for(second_job));
     assert_eq!(loans.active_lent_connections(), 1);
@@ -7794,10 +8005,34 @@ fn bounded_same_band_does_not_reclaim_on_hot_only_speed_drop() {
     assert_eq!(loans.speed_snapshot(), (0, 0, 1));
     assert!(!loans.update_speed_harm(now + Duration::from_secs(2), 1, 7));
     assert!(!loans.reclaim_pending_for(peer_job));
-    assert_eq!(
-        loans.loan_kind_for(peer_job),
-        Some(SpilloverLoanKind::BoundedSameBand)
-    );
+    assert_eq!(loans.bounded_lent_connections(), 1);
+}
+
+#[test]
+fn spillover_loan_book_releases_mixed_kinds_independently() {
+    let now = Instant::now();
+    let mut loans = SpilloverLoanBook::default();
+    let peer_job = JobId(21032);
+
+    loans.start_or_extend(peer_job, now, 10_000, SpilloverLoanKind::MeasuredUnderfill);
+    loans.start_or_extend(peer_job, now, 10_000, SpilloverLoanKind::BoundedSameBand);
+
+    assert_eq!(loans.active_lent_connections(), 2);
+    assert_eq!(loans.bounded_lent_connections(), 1);
+    assert_eq!(loans.active_loan_count(), 1);
+
+    assert!(loans.update_speed_harm(now + Duration::from_secs(2), 8_000, 7));
+    assert!(loans.reclaim_pending_for(peer_job));
+
+    loans.release_one(peer_job, SpilloverLoanKind::BoundedSameBand);
+    assert_eq!(loans.active_lent_connections(), 1);
+    assert_eq!(loans.bounded_lent_connections(), 0);
+    assert!(loans.reclaim_pending_for(peer_job));
+
+    loans.release_one(peer_job, SpilloverLoanKind::MeasuredUnderfill);
+    assert_eq!(loans.active_lent_connections(), 0);
+    assert_eq!(loans.active_loan_count(), 0);
+    assert!(!loans.reclaim_pending_for(peer_job));
 }
 
 #[tokio::test]
@@ -7952,6 +8187,7 @@ async fn retired_ip_replacement_lane_parks_at_refill_boundary() {
         remote_ip: old_key.ip,
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: None,
         compatibility: DownloadBatchCompatibility {
             priority: 3,
             is_recovery: false,
@@ -9325,7 +9561,7 @@ async fn completed_standalone_file_crc32_match_persists_completion_without_md5()
     assert!(pipeline.jobs.contains_key(&job_id));
     assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
     let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
-    assert!(hashes.get(&0).is_none());
+    assert!(!hashes.contains_key(&0));
 }
 
 #[test]
@@ -9563,7 +9799,7 @@ async fn completed_file_uses_decoded_size_when_raw_article_bytes_are_larger() {
         PipelineEvent::FileComplete { total_bytes, .. } if *total_bytes == payload.len() as u64
     )));
     let hashes = pipeline.db.load_complete_file_hashes(job_id).unwrap();
-    assert!(hashes.get(&0).is_none());
+    assert!(!hashes.contains_key(&0));
 }
 
 #[tokio::test]
@@ -9863,14 +10099,15 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
         job_id,
         file_index: 0,
     };
+    let buffered_payload = [9u8; 64];
     let buffered = BufferedDecodedSegment {
         segment_id: SegmentId {
             file_id,
             segment_number: 0,
         },
         decoded_size: 64,
-        data: DecodedChunk::from(vec![9u8; 64]),
-        part_crc: weaver_par2::checksum::crc32(&vec![9u8; 64]),
+        data: DecodedChunk::from(buffered_payload.to_vec()),
+        part_crc: weaver_par2::checksum::crc32(&buffered_payload),
         part_crc_verified: true,
         yenc_name: "episode.bin".to_string(),
     };
@@ -19799,6 +20036,7 @@ async fn rar_unlock_dirty_priorities_apply_before_lane_refill() {
         remote_ip: "127.0.0.1".parse().unwrap(),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: None,
         compatibility: DownloadBatchCompatibility {
             priority: 3,
             is_recovery: false,

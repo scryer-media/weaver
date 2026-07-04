@@ -64,6 +64,8 @@ jobs:
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}\.sccache
       SCCACHE_IDLE_TIMEOUT: "0"
+      CC_x86_64_pc_windows_msvc: clang-cl
+      CXX_x86_64_pc_windows_msvc: clang-cl
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1

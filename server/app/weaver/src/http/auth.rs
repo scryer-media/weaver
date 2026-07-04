@@ -384,6 +384,7 @@ fn secure_cookie_suffix(security: &RuntimeSecurityConfig) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

@@ -233,6 +233,7 @@ struct DecodedBatchItem {
     result: std::result::Result<DecodedBody, DecodedBodyError>,
 }
 
+#[allow(clippy::large_enum_variant)] // Terminal is the hot path; boxing would allocate per decoded article.
 enum DecodedBatchDisposition {
     Terminal(std::result::Result<DecodedBody, DecodedBodyError>),
     Retry,
@@ -379,7 +380,7 @@ impl BodyLaneLease {
                         batch_complete: is_last,
                         batch_clean: false,
                         batch_response_count: if is_last { stats.completed as u64 } else { 0 },
-                        unresolved_count: if is_last { 0 } else { 0 },
+                        unresolved_count: 0,
                         connection_discarded: stats.connection_discarded,
                     },
                 )
@@ -1821,7 +1822,7 @@ impl NntpClient {
         health.check_reenable_all();
 
         let mut candidates = Vec::with_capacity(server_count);
-        for idx in 0..server_count {
+        for (idx, group) in server_groups.iter().copied().enumerate().take(server_count) {
             if exclude.contains(&idx) || !health.is_available(idx) {
                 continue;
             }
@@ -1838,7 +1839,7 @@ impl NntpClient {
                     ServerState::CoolingDown { .. } | ServerState::Disabled { .. } => 2,
                 };
                 let score = health.latency_ms(idx) * (1.0 + 2.0 * load_ratio);
-                (server_groups[idx], health_rank, score, idx)
+                (group, health_rank, score, idx)
             };
             if candidate.1 < 2 {
                 candidates.push(candidate);

@@ -347,6 +347,7 @@ fn append_rejection_result(error: SubmitNzbError) -> Result<Value, RpcError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod append_rejection_tests {
     use super::*;
 

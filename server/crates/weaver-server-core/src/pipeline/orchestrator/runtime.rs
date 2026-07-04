@@ -1064,17 +1064,17 @@ fn write_segments_to_disk_blocking(
     let mut remaining = segments.into_iter();
     while let Some((offset, segment)) = remaining.next() {
         let segment_len = segment.data.len_bytes() as u64;
-        if next_file_offset != Some(offset) {
-            if let Err(source) = file.seek(std::io::SeekFrom::Start(offset)) {
-                let mut unwritten = Vec::with_capacity(1 + remaining.size_hint().0);
-                unwritten.push((offset, segment));
-                unwritten.extend(remaining);
-                return Err(SegmentWriteBatchError {
-                    source,
-                    written,
-                    unwritten,
-                });
-            }
+        if next_file_offset != Some(offset)
+            && let Err(source) = file.seek(std::io::SeekFrom::Start(offset))
+        {
+            let mut unwritten = Vec::with_capacity(1 + remaining.size_hint().0);
+            unwritten.push((offset, segment));
+            unwritten.extend(remaining);
+            return Err(SegmentWriteBatchError {
+                source,
+                written,
+                unwritten,
+            });
         }
         if let Err(source) = segment.data.write_to(&mut file) {
             let mut unwritten = Vec::with_capacity(1 + remaining.size_hint().0);

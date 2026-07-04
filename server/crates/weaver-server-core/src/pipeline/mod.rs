@@ -219,6 +219,7 @@ impl DownloadBatchCompatibility {
 pub(super) struct DownloadBatchLease {
     pub(super) job_id: JobId,
     pub(super) lane_mode: DownloadLaneMode,
+    pub(super) spillover_loan_kind: Option<SpilloverLoanKind>,
     pub(super) server_modes: Vec<(usize, DownloadLaneMode)>,
     pub(super) compatibility: DownloadBatchCompatibility,
     pub(super) works: Vec<DownloadWork>,
@@ -230,6 +231,7 @@ pub(super) struct DownloadLaneRefillRequest {
     pub(super) remote_ip: IpAddr,
     pub(super) supports_pipelining: bool,
     pub(super) current_mode: DownloadLaneMode,
+    pub(super) spillover_loan_kind: Option<SpilloverLoanKind>,
     pub(super) compatibility: DownloadBatchCompatibility,
     pub(super) response_tx: oneshot::Sender<DownloadLaneRefillResponse>,
 }
@@ -424,10 +426,10 @@ pub(super) enum SpilloverLoanKind {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SpilloverLoanState {
-    pub(super) lent_connections: usize,
-    pub(super) kind: SpilloverLoanKind,
-    pub(super) post_lend_bps: Option<u64>,
-    pub(super) reclaim_reason: Option<SpilloverReclaimReason>,
+    pub(super) measured_lent_connections: usize,
+    pub(super) bounded_lent_connections: usize,
+    pub(super) measured_post_lend_bps: Option<u64>,
+    pub(super) measured_reclaim_reason: Option<SpilloverReclaimReason>,
 }
 
 #[derive(Debug, Default)]
@@ -461,22 +463,24 @@ impl SpilloverLoanBook {
         self.loans
             .entry(job_id)
             .and_modify(|loan| {
-                loan.lent_connections = loan.lent_connections.saturating_add(1);
+                loan.increment(kind);
             })
             .or_insert(SpilloverLoanState {
-                lent_connections: 1,
-                kind,
-                post_lend_bps: None,
-                reclaim_reason: None,
+                measured_lent_connections: usize::from(
+                    kind == SpilloverLoanKind::MeasuredUnderfill,
+                ),
+                bounded_lent_connections: usize::from(kind == SpilloverLoanKind::BoundedSameBand),
+                measured_post_lend_bps: None,
+                measured_reclaim_reason: None,
             });
     }
 
-    pub(super) fn release_one(&mut self, job_id: JobId) {
+    pub(super) fn release_one(&mut self, job_id: JobId, kind: SpilloverLoanKind) {
         let Some(loan) = self.loans.get_mut(&job_id) else {
             return;
         };
-        loan.lent_connections = loan.lent_connections.saturating_sub(1);
-        if loan.lent_connections == 0 {
+        loan.decrement(kind);
+        if loan.total_lent_connections() == 0 {
             self.loans.remove(&job_id);
         }
         if self.measured_lent_connections() == 0 {
@@ -494,38 +498,35 @@ impl SpilloverLoanBook {
         reason: SpilloverReclaimReason,
     ) {
         if let Some(loan) = self.loans.get_mut(&job_id) {
-            loan.post_lend_bps = post_lend_bps;
-            loan.reclaim_reason = Some(reason);
+            loan.measured_post_lend_bps = post_lend_bps;
+            loan.measured_reclaim_reason = Some(reason);
         }
     }
 
     pub(super) fn reclaim_pending_for(&self, job_id: JobId) -> bool {
         self.loans
             .get(&job_id)
-            .is_some_and(|loan| loan.reclaim_reason.is_some())
-    }
-
-    pub(super) fn loan_kind_for(&self, job_id: JobId) -> Option<SpilloverLoanKind> {
-        self.loans.get(&job_id).map(|loan| loan.kind)
+            .is_some_and(|loan| loan.measured_reclaim_reason.is_some())
     }
 
     pub(super) fn active_lent_connections(&self) -> usize {
-        self.loans.values().map(|loan| loan.lent_connections).sum()
+        self.loans
+            .values()
+            .map(SpilloverLoanState::total_lent_connections)
+            .sum()
     }
 
     pub(super) fn bounded_lent_connections(&self) -> usize {
         self.loans
             .values()
-            .filter(|loan| loan.kind == SpilloverLoanKind::BoundedSameBand)
-            .map(|loan| loan.lent_connections)
+            .map(|loan| loan.bounded_lent_connections)
             .sum()
     }
 
     fn measured_lent_connections(&self) -> usize {
         self.loans
             .values()
-            .filter(|loan| loan.kind == SpilloverLoanKind::MeasuredUnderfill)
-            .map(|loan| loan.lent_connections)
+            .map(|loan| loan.measured_lent_connections)
             .sum()
     }
 
@@ -561,10 +562,10 @@ impl SpilloverLoanBook {
 
         self.aggregate_post_lend_bps = Some(hot_speed_bps);
         for loan in self.loans.values_mut() {
-            if loan.kind != SpilloverLoanKind::MeasuredUnderfill {
+            if loan.measured_lent_connections == 0 {
                 continue;
             }
-            loan.post_lend_bps = Some(hot_speed_bps);
+            loan.measured_post_lend_bps = Some(hot_speed_bps);
         }
 
         let harm_threshold = pre_lend_bps.saturating_mul(100 - harm_percent) / 100;
@@ -574,15 +575,44 @@ impl SpilloverLoanBook {
 
         let mut newly_reclaimed = false;
         for loan in self.loans.values_mut() {
-            if loan.kind != SpilloverLoanKind::MeasuredUnderfill {
+            if loan.measured_lent_connections == 0 {
                 continue;
             }
-            if loan.reclaim_reason.is_none() {
-                loan.reclaim_reason = Some(SpilloverReclaimReason::SpeedHarm);
+            if loan.measured_reclaim_reason.is_none() {
+                loan.measured_reclaim_reason = Some(SpilloverReclaimReason::SpeedHarm);
                 newly_reclaimed = true;
             }
         }
         newly_reclaimed
+    }
+}
+
+impl SpilloverLoanState {
+    fn increment(&mut self, kind: SpilloverLoanKind) {
+        match kind {
+            SpilloverLoanKind::MeasuredUnderfill => {
+                self.measured_lent_connections = self.measured_lent_connections.saturating_add(1)
+            }
+            SpilloverLoanKind::BoundedSameBand => {
+                self.bounded_lent_connections = self.bounded_lent_connections.saturating_add(1)
+            }
+        }
+    }
+
+    fn decrement(&mut self, kind: SpilloverLoanKind) {
+        match kind {
+            SpilloverLoanKind::MeasuredUnderfill => {
+                self.measured_lent_connections = self.measured_lent_connections.saturating_sub(1)
+            }
+            SpilloverLoanKind::BoundedSameBand => {
+                self.bounded_lent_connections = self.bounded_lent_connections.saturating_sub(1)
+            }
+        }
+    }
+
+    fn total_lent_connections(&self) -> usize {
+        self.measured_lent_connections
+            .saturating_add(self.bounded_lent_connections)
     }
 }
 
@@ -652,6 +682,7 @@ pub(super) enum IpReplacementTrialEvent {
 pub(super) struct DownloadLaneParked {
     pub(super) job_id: JobId,
     pub(super) mode: DownloadLaneMode,
+    pub(super) spillover_loan_kind: Option<SpilloverLoanKind>,
     pub(super) reason: LaneParkReason,
     pub(super) release_connection_slot: bool,
     pub(super) release_ip_replacement_burst: bool,
