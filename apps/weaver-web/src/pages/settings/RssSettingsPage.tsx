@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import { useMutation, useQuery } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { DirectoryBrowserDialog } from "@/components/DirectoryBrowserDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
 import { formatBytes } from "@/components/SpeedDisplay";
@@ -28,6 +29,8 @@ import {
   DELETE_RSS_RULE_MUTATION,
   RSS_SETTINGS_QUERY,
   RUN_RSS_SYNC_MUTATION,
+  SCAN_WATCH_FOLDER_MUTATION,
+  UPDATE_SETTINGS_MUTATION,
   UPDATE_RSS_FEED_MUTATION,
   UPDATE_RSS_RULE_MUTATION,
 } from "@/graphql/queries";
@@ -100,7 +103,50 @@ type RssSyncReport = {
   feedResults: RssFeedSyncResult[];
 };
 
+type WatchFolderMode = "off" | "polling" | "realtime";
+
+type WatchFolderSettings = {
+  mode: WatchFolderMode;
+  path: string | null;
+  pollIntervalSecs: number;
+  stabilitySecs: number;
+  categoryFromSubfolders: boolean;
+  scanningPaused: boolean;
+};
+
+type WatchFolderFormValues = {
+  mode: WatchFolderMode;
+  path: string;
+  pollIntervalSecs: number;
+  stabilitySecs: number;
+  categoryFromSubfolders: boolean;
+  scanningPaused: boolean;
+};
+
+type WatchFolderScanIssue = {
+  path: string;
+  reason: string;
+};
+
+type WatchFolderMarkerRename = {
+  from: string;
+  to: string;
+  marker: string;
+};
+
+type WatchFolderScanReport = {
+  discoveredFiles: string[];
+  queuedNzbs: string[];
+  skippedInputs: WatchFolderScanIssue[];
+  permanentErrors: WatchFolderScanIssue[];
+  transientErrors: WatchFolderScanIssue[];
+  markerRenamedSources: WatchFolderMarkerRename[];
+};
+
 type RssSettingsData = {
+  settings: {
+    watchFolder: WatchFolderSettings;
+  };
   rssFeeds: RssFeed[];
   rssSeenItems: RssSeenItem[];
   categories: Category[];
@@ -169,6 +215,26 @@ const defaultRuleForm: RuleFormValues = {
   metadata: [],
 };
 
+const defaultWatchFolderSettings: WatchFolderSettings = {
+  mode: "off",
+  path: null,
+  pollIntervalSecs: 60,
+  stabilitySecs: 3,
+  categoryFromSubfolders: true,
+  scanningPaused: false,
+};
+
+function watchFolderFormFromSettings(settings: WatchFolderSettings): WatchFolderFormValues {
+  return {
+    mode: settings.mode,
+    path: settings.path ?? "",
+    pollIntervalSecs: settings.pollIntervalSecs,
+    stabilitySecs: settings.stabilitySecs,
+    categoryFromSubfolders: settings.categoryFromSubfolders,
+    scanningPaused: settings.scanningPaused,
+  };
+}
+
 export function RssSettingsPage() {
   const t = useTranslate();
   const [{ data, fetching, error }, reexecuteQuery] = useQuery<RssSettingsData>({
@@ -183,6 +249,8 @@ export function RssSettingsPage() {
   const [, deleteSeenItem] = useMutation(DELETE_RSS_SEEN_ITEM_MUTATION);
   const [, clearSeenItems] = useMutation(CLEAR_RSS_SEEN_ITEMS_MUTATION);
   const [runSyncState, runSync] = useMutation(RUN_RSS_SYNC_MUTATION);
+  const [updateSettingsState, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
+  const [scanWatchFolderState, scanWatchFolder] = useMutation(SCAN_WATCH_FOLDER_MUTATION);
 
   const feeds = useMemo(
     () =>
@@ -208,6 +276,7 @@ export function RssSettingsPage() {
     return grouped;
   }, [data?.rssSeenItems]);
   const totalSeenItems = data?.rssSeenItems?.length ?? 0;
+  const watchFolderSettings = data?.settings?.watchFolder ?? defaultWatchFolderSettings;
 
   const [editingFeed, setEditingFeed] = useState<RssFeed | null>(null);
   const [showFeedForm, setShowFeedForm] = useState(false);
@@ -224,6 +293,13 @@ export function RssSettingsPage() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [syncReport, setSyncReport] = useState<RssSyncReport | null>(null);
+  const [watchFolderValues, setWatchFolderValues] = useState<WatchFolderFormValues>(
+    watchFolderFormFromSettings(defaultWatchFolderSettings),
+  );
+  const [watchFolderScanReport, setWatchFolderScanReport] =
+    useState<WatchFolderScanReport | null>(null);
+  const [showWatchFolderBrowser, setShowWatchFolderBrowser] = useState(false);
+  const [browsePath, setBrowsePath] = useState<string | null>(null);
   const isSavingFeed = addFeedState.fetching || updateFeedState.fetching;
   const isSavingRule = addRuleState.fetching || updateRuleState.fetching;
 
@@ -232,6 +308,10 @@ export function RssSettingsPage() {
       setErrorMessage(error.message);
     }
   }, [error]);
+
+  useEffect(() => {
+    setWatchFolderValues(watchFolderFormFromSettings(watchFolderSettings));
+  }, [watchFolderSettings]);
 
   const refresh = () => {
     reexecuteQuery({ requestPolicy: "network-only" });
@@ -399,6 +479,42 @@ export function RssSettingsPage() {
     }
   };
 
+  const handleWatchFolderSave = async (values: WatchFolderFormValues) => {
+    resetFeedback();
+    const result = await updateSettings({
+      input: {
+        watchFolder: {
+          mode: values.mode,
+          path: values.path.trim() || null,
+          pollIntervalSecs: Math.max(1, Math.round(values.pollIntervalSecs || 60)),
+          stabilitySecs: Math.max(0, Math.round(values.stabilitySecs || 0)),
+          categoryFromSubfolders: values.categoryFromSubfolders,
+          scanningPaused: values.scanningPaused,
+        },
+      },
+    });
+    if (result.error) {
+      setErrorMessage(result.error.message);
+      return;
+    }
+    setNotice(t("watchFolder.settingsSaved"));
+    refresh();
+  };
+
+  const handleWatchFolderScan = async () => {
+    resetFeedback();
+    const result = await scanWatchFolder({});
+    if (result.error) {
+      setErrorMessage(result.error.message);
+      return;
+    }
+    if (result.data?.scanWatchFolder) {
+      setWatchFolderScanReport(result.data.scanWatchFolder);
+      setNotice(t("watchFolder.scanComplete"));
+      refresh();
+    }
+  };
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -432,6 +548,20 @@ export function RssSettingsPage() {
       {notice ? <StatusBanner variant="success">{notice}</StatusBanner> : null}
 
       {syncReport ? <SyncReportCard report={syncReport} /> : null}
+
+      <WatchFolderSettingsCard
+        values={watchFolderValues}
+        saving={updateSettingsState.fetching}
+        scanning={scanWatchFolderState.fetching}
+        scanReport={watchFolderScanReport}
+        onChange={setWatchFolderValues}
+        onSave={handleWatchFolderSave}
+        onScan={handleWatchFolderScan}
+        onBrowse={() => {
+          setBrowsePath(watchFolderValues.path.trim() || null);
+          setShowWatchFolderBrowser(true);
+        }}
+      />
 
       {showFeedForm ? (
         <FeedFormCard
@@ -673,7 +803,231 @@ export function RssSettingsPage() {
         }
         onCancel={() => setClearSeenTarget(null)}
       />
+
+      {showWatchFolderBrowser ? (
+        <DirectoryBrowserDialog
+          open={showWatchFolderBrowser}
+          path={browsePath}
+          onPathChange={setBrowsePath}
+          onClose={() => setShowWatchFolderBrowser(false)}
+          onChoose={(path) => {
+            setWatchFolderValues((current) => ({ ...current, path }));
+            setShowWatchFolderBrowser(false);
+          }}
+        />
+      ) : null}
     </div>
+  );
+}
+
+function WatchFolderSettingsCard({
+  values,
+  saving,
+  scanning,
+  scanReport,
+  onChange,
+  onSave,
+  onScan,
+  onBrowse,
+}: {
+  values: WatchFolderFormValues;
+  saving: boolean;
+  scanning: boolean;
+  scanReport: WatchFolderScanReport | null;
+  onChange: (values: WatchFolderFormValues) => void;
+  onSave: (values: WatchFolderFormValues) => Promise<void>;
+  onScan: () => Promise<void>;
+  onBrowse: () => void;
+}) {
+  const t = useTranslate();
+  const hasPath = values.path.trim().length > 0;
+  const automaticEnabled = values.mode !== "off" && !values.scanningPaused;
+
+  return (
+    <Card>
+      <CardHeader className="gap-4">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <CardTitle>{t("watchFolder.title")}</CardTitle>
+            <CardDescription>
+              {t("watchFolder.desc")}
+            </CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={() => void onScan()} disabled={!hasPath || scanning}>
+              {scanning ? t("watchFolder.scanning") : t("watchFolder.scanNow")}
+            </Button>
+            <Button onClick={() => void onSave(values)} disabled={saving}>
+              {saving ? t("watchFolder.saving") : t("action.save")}
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+
+      <CardContent className="space-y-5">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <Field label={t("watchFolder.mode")}>
+            <Select
+              value={values.mode}
+              onValueChange={(mode) =>
+                onChange({ ...values, mode: mode as WatchFolderMode })
+              }
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="off">{t("watchFolder.modeOff")}</SelectItem>
+                <SelectItem value="polling">{t("watchFolder.modePolling")}</SelectItem>
+                <SelectItem value="realtime">{t("watchFolder.modeRealtime")}</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+
+          <Field label={t("watchFolder.folder")}>
+            <div className="flex gap-2">
+              <Input
+                value={values.path}
+                onChange={(event) => onChange({ ...values, path: event.target.value })}
+              />
+              <Button type="button" variant="outline" onClick={onBrowse}>
+                {t("watchFolder.browse")}
+              </Button>
+            </div>
+          </Field>
+
+          <Field label={t("watchFolder.pollInterval")}>
+            <Input
+              type="number"
+              min={1}
+              value={values.pollIntervalSecs}
+              onChange={(event) =>
+                onChange({
+                  ...values,
+                  pollIntervalSecs: Number(event.target.value),
+                })
+              }
+            />
+          </Field>
+
+          <Field label={t("watchFolder.stabilityWait")}>
+            <Input
+              type="number"
+              min={0}
+              value={values.stabilitySecs}
+              onChange={(event) =>
+                onChange({
+                  ...values,
+                  stabilitySecs: Number(event.target.value),
+                })
+              }
+            />
+          </Field>
+        </div>
+
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="flex items-center justify-between rounded-xl border border-border/70 px-4 py-3">
+            <div>
+              <div className="text-sm font-medium text-foreground">
+                {t("watchFolder.categorySubfolders")}
+              </div>
+              <div className="text-xs text-muted-foreground">
+                {t("watchFolder.categorySubfoldersDesc")}
+              </div>
+            </div>
+            <Switch
+              checked={values.categoryFromSubfolders}
+              onCheckedChange={(checked) =>
+                onChange({ ...values, categoryFromSubfolders: checked })
+              }
+            />
+          </div>
+
+          <div className="flex items-center justify-between rounded-xl border border-border/70 px-4 py-3">
+            <div>
+              <div className="text-sm font-medium text-foreground">
+                {t("watchFolder.automaticScanning")}
+              </div>
+              <div className="text-xs text-muted-foreground">
+                {automaticEnabled
+                  ? t("watchFolder.automaticEnabled")
+                  : t("watchFolder.automaticPausedOrOff")}
+              </div>
+            </div>
+            <Switch
+              checked={!values.scanningPaused && values.mode !== "off"}
+              disabled={values.mode === "off"}
+              onCheckedChange={(checked) =>
+                onChange({ ...values, scanningPaused: !checked })
+              }
+            />
+          </div>
+        </div>
+
+        {scanReport ? <WatchFolderScanReportCard report={scanReport} /> : null}
+      </CardContent>
+    </Card>
+  );
+}
+
+function WatchFolderScanReportCard({ report }: { report: WatchFolderScanReport }) {
+  const t = useTranslate();
+  const issueCount =
+    report.skippedInputs.length + report.permanentErrors.length + report.transientErrors.length;
+
+  return (
+    <div className="space-y-4 rounded-xl border border-border/70 p-4">
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+        <DetailCard label={t("watchFolder.discovered")}>{report.discoveredFiles.length}</DetailCard>
+        <DetailCard label={t("watchFolder.queued")}>{report.queuedNzbs.length}</DetailCard>
+        <DetailCard label={t("watchFolder.markers")}>{report.markerRenamedSources.length}</DetailCard>
+        <DetailCard label={t("watchFolder.skipped")}>{report.skippedInputs.length}</DetailCard>
+        <DetailCard label={t("watchFolder.issues")}>{issueCount}</DetailCard>
+      </div>
+
+      {report.queuedNzbs.length > 0 ? (
+        <ScanList title={t("watchFolder.queuedNzbs")} items={report.queuedNzbs} />
+      ) : null}
+      {report.markerRenamedSources.length > 0 ? (
+        <ScanList
+          title={t("watchFolder.markerRenames")}
+          items={report.markerRenamedSources.map((rename) => `${rename.from} -> ${rename.to}`)}
+        />
+      ) : null}
+      {report.permanentErrors.length > 0 ? (
+        <ScanIssueList title={t("watchFolder.permanentErrors")} items={report.permanentErrors} />
+      ) : null}
+      {report.transientErrors.length > 0 ? (
+        <ScanIssueList title={t("watchFolder.transientErrors")} items={report.transientErrors} />
+      ) : null}
+      {report.skippedInputs.length > 0 ? (
+        <ScanIssueList title={t("watchFolder.skippedInputs")} items={report.skippedInputs} />
+      ) : null}
+    </div>
+  );
+}
+
+function ScanList({ title, items }: { title: string; items: string[] }) {
+  return (
+    <div className="space-y-2">
+      <div className="text-sm font-medium text-foreground">{title}</div>
+      <div className="space-y-1">
+        {items.slice(0, 8).map((item) => (
+          <div key={item} className="break-all text-xs text-muted-foreground">
+            {item}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ScanIssueList({ title, items }: { title: string; items: WatchFolderScanIssue[] }) {
+  return (
+    <ScanList
+      title={title}
+      items={items.map((item) => `${item.path}: ${item.reason}`)}
+    />
   );
 }
 

@@ -3,6 +3,7 @@ use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidt
 use crate::persistence::Database;
 use crate::settings::record::SettingRecord;
 use crate::settings::{BufferPoolOverrides, Config, RetryOverrides, TunerOverrides};
+use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
 impl Database {
     /// Load a full `Config` from the settings and servers tables.
@@ -30,6 +31,29 @@ impl Database {
         let cleanup_after_extract = settings
             .get("cleanup_after_extract")
             .and_then(|v| v.parse().ok());
+        let watch_folder = WatchFolderConfig {
+            mode: settings
+                .get("watch_folder.mode")
+                .and_then(|v| WatchFolderMode::parse(v))
+                .unwrap_or_default(),
+            path: settings.get("watch_folder.path").cloned(),
+            poll_interval_secs: settings
+                .get("watch_folder.poll_interval_secs")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+            stability_secs: settings
+                .get("watch_folder.stability_secs")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3),
+            category_from_subfolders: settings
+                .get("watch_folder.category_from_subfolders")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(true),
+            scanning_paused: settings
+                .get("watch_folder.scanning_paused")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(false),
+        };
         let isp_bandwidth_cap = {
             let enabled = settings
                 .get("bandwidth_cap.enabled")
@@ -152,6 +176,7 @@ impl Database {
             cleanup_after_extract,
             isp_bandwidth_cap,
             ip_replacement_trial_extra_connections,
+            watch_folder,
             config_path: None,
         })
     }
@@ -174,6 +199,27 @@ impl Database {
         if let Some(extra) = config.ip_replacement_trial_extra_connections {
             self.set_setting("ip_replacement_trial_extra_connections", &extra.to_string())?;
         }
+        self.set_setting("watch_folder.mode", config.watch_folder.mode.as_str())?;
+        match config.watch_folder.normalized_path() {
+            Some(path) => self.set_setting("watch_folder.path", &path)?,
+            None => self.delete_setting("watch_folder.path")?,
+        }
+        self.set_setting(
+            "watch_folder.poll_interval_secs",
+            &config.watch_folder.poll_interval_secs.to_string(),
+        )?;
+        self.set_setting(
+            "watch_folder.stability_secs",
+            &config.watch_folder.stability_secs.to_string(),
+        )?;
+        self.set_setting(
+            "watch_folder.category_from_subfolders",
+            &config.watch_folder.category_from_subfolders.to_string(),
+        )?;
+        self.set_setting(
+            "watch_folder.scanning_paused",
+            &config.watch_folder.scanning_paused.to_string(),
+        )?;
         if let Some(ref cap) = config.isp_bandwidth_cap {
             self.set_setting("bandwidth_cap.enabled", &cap.enabled.to_string())?;
             self.set_setting("bandwidth_cap.period", bandwidth_cap_period_str(cap.period))?;

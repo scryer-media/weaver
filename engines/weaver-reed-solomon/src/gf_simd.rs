@@ -404,6 +404,13 @@ pub fn mul_acc_input_batch_prepared(dst: &mut [u8], factors_and_srcs: &[Prepared
 
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("gfni")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+        {
+            unsafe { mul_acc_input_batch_gfni_avx512_prepared(dst, factors_and_srcs) };
+            return;
+        }
         if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
             unsafe { mul_acc_input_batch_gfni_avx2_prepared(dst, factors_and_srcs) };
             return;
@@ -1242,6 +1249,105 @@ unsafe fn mul_acc_input_batch_gfni_avx2_prepared(
                 mul_acc_region_scalar(input.factor, &input.src[offset..], tail);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grouped-input GFNI + AVX-512 kernel
+//
+// 512-bit counterpart to the GFNI+AVX2 grouped-input path: each 64-byte dst
+// strip is loaded and stored once while every prepared source in the batch
+// is multiplied into it.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "gfni,avx512bw,avx512vl")]
+unsafe fn mul_acc_input_batch_gfni_avx512_prepared(
+    dst: &mut [u8],
+    factors_and_srcs: &[PreparedFactorSrc<'_>],
+) {
+    use std::arch::x86_64::*;
+
+    let len = dst.len();
+
+    struct PreparedInput<'a> {
+        m_ll: __m512i,
+        m_lh: __m512i,
+        m_hl: __m512i,
+        m_hh: __m512i,
+        src: &'a [u8],
+    }
+
+    let xor_inputs: Vec<&[u8]> = factors_and_srcs
+        .iter()
+        .filter(|fs| fs.prepared.factor == 1)
+        .map(|fs| fs.src)
+        .collect();
+
+    let prepared: Vec<PreparedInput<'_>> = factors_and_srcs
+        .iter()
+        .filter_map(|fs| match fs.prepared.x86.as_ref() {
+            Some(PreparedX86Factor::Gfni(matrices)) => Some(PreparedInput {
+                m_ll: _mm512_set1_epi64(matrices.m_ll as i64),
+                m_lh: _mm512_set1_epi64(matrices.m_lh as i64),
+                m_hl: _mm512_set1_epi64(matrices.m_hl as i64),
+                m_hh: _mm512_set1_epi64(matrices.m_hh as i64),
+                src: fs.src,
+            }),
+            _ => None,
+        })
+        .collect();
+
+    let mut offset = 0usize;
+    unsafe {
+        let deint_lo = _mm512_broadcast_i32x4(_mm_set_epi8(
+            -1, -1, -1, -1, -1, -1, -1, -1, 14, 12, 10, 8, 6, 4, 2, 0,
+        ));
+        let deint_hi = _mm512_broadcast_i32x4(_mm_set_epi8(
+            -1, -1, -1, -1, -1, -1, -1, -1, 15, 13, 11, 9, 7, 5, 3, 1,
+        ));
+
+        while offset + 64 <= len {
+            let mut acc = _mm512_loadu_si512(dst.as_ptr().add(offset) as *const __m512i);
+
+            for src in &xor_inputs {
+                let s = _mm512_loadu_si512(src.as_ptr().add(offset) as *const __m512i);
+                acc = _mm512_xor_si512(acc, s);
+            }
+
+            for input in &prepared {
+                let s = _mm512_loadu_si512(input.src.as_ptr().add(offset) as *const __m512i);
+                let lo_bytes = _mm512_shuffle_epi8(s, deint_lo);
+                let hi_bytes = _mm512_shuffle_epi8(s, deint_hi);
+
+                let result_lo = _mm512_xor_si512(
+                    _mm512_gf2p8affine_epi64_epi8::<0>(lo_bytes, input.m_ll),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(hi_bytes, input.m_lh),
+                );
+                let result_hi = _mm512_xor_si512(
+                    _mm512_gf2p8affine_epi64_epi8::<0>(lo_bytes, input.m_hl),
+                    _mm512_gf2p8affine_epi64_epi8::<0>(hi_bytes, input.m_hh),
+                );
+
+                let product = _mm512_unpacklo_epi8(result_lo, result_hi);
+                acc = _mm512_xor_si512(acc, product);
+            }
+
+            _mm512_storeu_si512(dst.as_mut_ptr().add(offset) as *mut __m512i, acc);
+            offset += 64;
+        }
+    }
+
+    // Tail: reuse the 256-bit prepared kernel for the remainder.
+    if offset < len {
+        let tail_srcs: Vec<PreparedFactorSrc<'_>> = factors_and_srcs
+            .iter()
+            .map(|fs| PreparedFactorSrc {
+                prepared: fs.prepared,
+                src: &fs.src[offset..],
+            })
+            .collect();
+        unsafe { mul_acc_input_batch_gfni_avx2_prepared(&mut dst[offset..], &tail_srcs) };
     }
 }
 

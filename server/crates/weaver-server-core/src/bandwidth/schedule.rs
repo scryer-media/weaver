@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 use crate::bandwidth::{ScheduleAction, ScheduleEntry, Weekday};
 
 use crate::jobs::handle::SchedulerHandle;
+use crate::watch_folder::WatchFolderService;
 
 /// State shared between the evaluator and the API layer for reloading schedules.
 pub type SharedSchedules = Arc<RwLock<Vec<ScheduleEntry>>>;
@@ -23,6 +24,14 @@ pub type SharedSchedules = Arc<RwLock<Vec<ScheduleEntry>>>;
 /// startup and on config changes), evaluates them against the current time every
 /// 60 seconds, and sends commands to the scheduler when the active action changes.
 pub fn spawn_evaluator(handle: SchedulerHandle, schedules: SharedSchedules) {
+    spawn_evaluator_with_watch_folder(handle, schedules, None);
+}
+
+pub fn spawn_evaluator_with_watch_folder(
+    handle: SchedulerHandle,
+    schedules: SharedSchedules,
+    watch_folder: Option<WatchFolderService>,
+) {
     tokio::spawn(async move {
         let mut last_action: Option<ScheduleAction> = None;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -32,6 +41,7 @@ pub fn spawn_evaluator(handle: SchedulerHandle, schedules: SharedSchedules) {
 
             let schedules = schedules.clone();
             let handle = handle.clone();
+            let watch_folder = watch_folder.clone();
             let prev_action = last_action.clone();
 
             let result = tokio::spawn(async move {
@@ -53,7 +63,13 @@ pub fn spawn_evaluator(handle: SchedulerHandle, schedules: SharedSchedules) {
                             action = ?action,
                             "schedule transition: applying new action"
                         );
-                        if let Err(e) = handle.apply_schedule_action(action.clone()).await {
+                        if let Err(e) = apply_schedule_action(
+                            handle.clone(),
+                            watch_folder.clone(),
+                            action.clone(),
+                        )
+                        .await
+                        {
                             warn!(error = %e, "failed to apply schedule action");
                         }
                     }
@@ -79,6 +95,37 @@ pub fn spawn_evaluator(handle: SchedulerHandle, schedules: SharedSchedules) {
             }
         }
     });
+}
+
+async fn apply_schedule_action(
+    handle: SchedulerHandle,
+    watch_folder: Option<WatchFolderService>,
+    action: ScheduleAction,
+) -> Result<(), String> {
+    match action {
+        ScheduleAction::PauseWatchFolderScanning => {
+            let Some(watch_folder) = watch_folder else {
+                return Err("watch folder service is not available".to_string());
+            };
+            watch_folder
+                .set_scanning_paused(true)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        ScheduleAction::ResumeWatchFolderScanning => {
+            let Some(watch_folder) = watch_folder else {
+                return Err("watch folder service is not available".to_string());
+            };
+            watch_folder
+                .set_scanning_paused(false)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        other => handle
+            .apply_schedule_action(other)
+            .await
+            .map_err(|error| error.to_string()),
+    }
 }
 
 /// Find the most recently applicable schedule entry for the given time.

@@ -184,6 +184,12 @@ export function ScheduleSettingsPage() {
                       <SelectItem value="pause">{t("schedule.actionPause")}</SelectItem>
                       <SelectItem value="resume">{t("schedule.actionResume")}</SelectItem>
                       <SelectItem value="speed_limit">{t("schedule.actionSpeedLimit")}</SelectItem>
+                      <SelectItem value="pause_watch_folder_scanning">
+                        {t("schedule.actionPauseWatchFolder")}
+                      </SelectItem>
+                      <SelectItem value="resume_watch_folder_scanning">
+                        {t("schedule.actionResumeWatchFolder")}
+                      </SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -287,7 +293,11 @@ export function ScheduleSettingsPage() {
                         ? `${t("schedule.actionSpeedLimit")}: ${entry.speedLimitBytes === 0 || entry.speedLimitBytes == null ? t("settings.unlimited") : formatSpeed(entry.speedLimitBytes)}`
                         : entry.actionType === "pause"
                           ? t("schedule.actionPause")
-                          : t("schedule.actionResume")}
+                          : entry.actionType === "resume"
+                            ? t("schedule.actionResume")
+                            : entry.actionType === "pause_watch_folder_scanning"
+                              ? t("schedule.actionPauseWatchFolder")
+                              : t("schedule.actionResumeWatchFolder")}
                     </span>
                   </div>
                   <div className="text-xs text-muted-foreground">

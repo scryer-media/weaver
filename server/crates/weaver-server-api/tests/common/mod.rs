@@ -153,12 +153,18 @@ impl TestHarness {
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
             ip_replacement_trial_extra_connections: None,
+            watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             config_path: None,
         };
         let shared_config: SharedConfig = Arc::new(RwLock::new(config));
 
         let (handle, metrics, shared_state, scheduler_task) = spawn_test_scheduler(db.clone());
         let rss = RssService::new(handle.clone(), shared_config.clone(), db.clone());
+        let watch_folder = weaver_server_core::watch_folder::WatchFolderService::new(
+            db.clone(),
+            handle.clone(),
+            shared_config.clone(),
+        );
         let auth_cache =
             LoginAuthCache::from_credentials(None, db.get_or_create_jwt_signing_secret().unwrap());
         let api_key_cache = ApiKeyCache::from_rows(vec![]);
@@ -172,6 +178,7 @@ impl TestHarness {
             auth_cache: auth_cache.clone(),
             api_key_cache,
             rss,
+            watch_folder,
             schedules: shared_schedules,
             log_buffer:
                 weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),

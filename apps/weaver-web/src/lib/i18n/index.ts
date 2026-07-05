@@ -93,10 +93,26 @@ export function getLanguageLabel(code: string): string {
 
 export async function loadLocaleDictionary(code: string | null | undefined): Promise<LocaleDictionary> {
   const key = normalizeLocale(code);
+  if (key === DEFAULT_LANGUAGE) {
+    try {
+      return await cachedLocaleDictionary(key);
+    } catch {
+      return {};
+    }
+  }
+
   try {
-    return await cachedLocaleDictionary(key);
+    const [fallback, selected] = await Promise.all([
+      cachedLocaleDictionary(DEFAULT_LANGUAGE),
+      cachedLocaleDictionary(key),
+    ]);
+    return { ...fallback, ...selected };
   } catch {
-    return {};
+    try {
+      return await cachedLocaleDictionary(DEFAULT_LANGUAGE);
+    } catch {
+      return {};
+    }
   }
 }
 

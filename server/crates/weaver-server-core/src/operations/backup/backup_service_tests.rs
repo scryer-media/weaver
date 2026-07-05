@@ -99,6 +99,7 @@ fn sample_config() -> Config {
         isp_bandwidth_cap: None,
         ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(true),
+        watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         config_path: None,
     }
 }
@@ -274,6 +275,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             isp_bandwidth_cap: None,
             ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
+            watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             config_path: None,
         })
         .unwrap();
@@ -293,6 +295,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             isp_bandwidth_cap: None,
             ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
+            watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             config_path: None,
         },
     );
@@ -349,6 +352,7 @@ async fn restore_rewrites_paths_and_refreshes_runtime() {
             isp_bandwidth_cap: None,
             ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
+            watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             config_path: None,
         })
         .unwrap();
@@ -368,6 +372,7 @@ async fn restore_rewrites_paths_and_refreshes_runtime() {
             isp_bandwidth_cap: None,
             ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
+            watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             config_path: None,
         },
     );

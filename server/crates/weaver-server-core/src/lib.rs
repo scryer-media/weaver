@@ -18,6 +18,7 @@ pub mod schema_migrations;
 pub mod security;
 pub mod servers;
 pub mod settings;
+pub mod watch_folder;
 
 pub use auth::{ApiKeyRow, AuthCredentials};
 pub use bandwidth::rate_limiter::TokenBucket;

@@ -501,7 +501,8 @@ fn chunk_words_for_budget(word_count: usize, outputs: usize, limit_bytes: usize)
         return word_count.max(1);
     }
 
-    let streaming_buffers = outputs.saturating_add(1);
+    // Outputs plus both double-buffered source-batch sets share the budget.
+    let streaming_buffers = outputs.saturating_add(2 * STREAM_INPUT_BATCH);
     let chunk_bytes = (limit_bytes / streaming_buffers)
         .max(2)
         .min(word_count.saturating_mul(2));
@@ -550,16 +551,22 @@ fn method_tuned_chunk_words(slice_size: usize) -> usize {
 fn select_repair_execution_mode(plan: &RepairPlan, options: &RepairOptions) -> RepairExecutionMode {
     let slice_size = plan.slice_size as usize;
     let word_count = (slice_size / 2).max(1);
-    let method_chunk_words = method_tuned_chunk_words(slice_size);
 
     let limit = options.memory_limit.unwrap_or(DEFAULT_REPAIR_MEMORY_LIMIT);
     let budget_chunk_words = chunk_words_for_budget(word_count, plan.missing_slices.len(), limit);
-    let chunk_words = budget_chunk_words.min(method_chunk_words);
     if estimated_in_memory_repair_bytes(plan) <= limit {
-        RepairExecutionMode::InMemory { chunk_words }
+        // The in-memory path keeps its historical cache-tuned chunking.
+        let method_chunk_words = method_tuned_chunk_words(slice_size);
+        RepairExecutionMode::InMemory {
+            chunk_words: budget_chunk_words.min(method_chunk_words),
+        }
     } else {
+        // Streaming chunks are budget-driven only: the outer chunk decides how
+        // many times every source is re-read from disk, so it must stay as
+        // large as the budget allows. Cache tiling happens inside the batch
+        // compute (STREAM_STRIP_BYTES), never in the I/O loop.
         RepairExecutionMode::Streaming {
-            chunk_words,
+            chunk_words: budget_chunk_words,
             budget: limit,
         }
     }
@@ -627,43 +634,199 @@ fn grouped_output_factors(plan: &RepairPlan) -> Vec<Vec<OutputFactor>> {
         .collect()
 }
 
-fn accumulate_input_to_outputs(output_ptrs: &[usize], output_factors: &[OutputFactor], src: &[u8]) {
-    if output_factors.is_empty() {
-        return;
+/// Number of source slices (present inputs + recovery blocks) multiplied into
+/// every output per streamed batch. Batching sources lets the prepared
+/// input-batch kernels load and store each output region once per K sources
+/// instead of once per source, cutting output memory traffic by ~K.
+const STREAM_INPUT_BATCH: usize = 64;
+
+/// Strip size for the batched streaming compute. One strip across a full
+/// source batch (K × 32 KiB = 2 MiB at K=64) stays cache-resident while a
+/// strip task walks every output, so source data is read from DRAM once per
+/// batch rather than once per output.
+const STREAM_STRIP_BYTES: usize = 32 * 1024;
+
+/// Lazily prepared multiply tables, one slot per distinct GF(2^16) factor.
+/// Entries are boxed so references handed to worker threads stay valid; the
+/// memo is fully populated before any parallel compute runs.
+struct PreparedFactorMemo {
+    slots: Vec<Option<Box<crate::gf_simd::PreparedInputFactor>>>,
+}
+
+impl PreparedFactorMemo {
+    fn from_output_factors(output_factors: &[Vec<OutputFactor>]) -> Self {
+        let mut slots: Vec<Option<Box<crate::gf_simd::PreparedInputFactor>>> = vec![None; 1 << 16];
+        for factors in output_factors {
+            for of in factors {
+                let slot = &mut slots[of.factor as usize];
+                if slot.is_none() {
+                    *slot = Some(Box::new(crate::gf_simd::prepare_input_factor(of.factor)));
+                }
+            }
+        }
+        Self { slots }
     }
 
-    let run_batch = |factor_start: usize| {
-        let factor_end = (factor_start + XOR_OUT_PAR_CHUNK).min(output_factors.len());
-        let mut pairs: Vec<crate::gf_simd::FactorDst<'_>> =
-            Vec::with_capacity(factor_end - factor_start);
+    #[inline]
+    fn get(&self, factor: u16) -> &crate::gf_simd::PreparedInputFactor {
+        self.slots[factor as usize]
+            .as_deref()
+            .expect("factor prepared during memo construction")
+    }
+}
 
-        for output_factor in &output_factors[factor_start..factor_end] {
-            let dst = unsafe {
-                let ptr = output_ptrs[output_factor.output_idx] as *mut u8;
-                std::slice::from_raw_parts_mut(ptr, src.len())
-            };
-            pairs.push(crate::gf_simd::FactorDst {
-                factor: output_factor.factor,
-                dst,
-            });
+/// One double-buffered set of streamed source chunks plus the per-output
+/// gather lists describing which batch-local sources feed each output.
+struct StreamBatchSet {
+    bufs: Vec<Vec<u8>>,
+    /// Per output: (batch-local source index, factor) pairs.
+    per_output: Vec<Vec<(u32, u16)>>,
+    len: usize,
+}
+
+impl StreamBatchSet {
+    fn new(outputs: usize, max_byte_len: usize) -> Self {
+        Self {
+            bufs: vec![vec![0u8; max_byte_len]; STREAM_INPUT_BATCH],
+            per_output: vec![Vec::new(); outputs],
+            len: 0,
         }
+    }
+}
 
-        crate::gf_simd::mul_acc_multi_region(&mut pairs, src);
-    };
-
-    // Each batch touches a disjoint set of output buffers (an output index
-    // appears at most once per input in `grouped_output_factors`), so batches
-    // can run in parallel while sharing the read-only source chunk. This is
-    // what keeps the streamed repair path multi-core.
-    let batch_count = output_factors.len().div_ceil(XOR_OUT_PAR_CHUNK);
-    if batch_count > 1 && rayon::current_num_threads() > 1 {
-        (0..batch_count)
-            .into_par_iter()
-            .for_each(|batch| run_batch(batch * XOR_OUT_PAR_CHUNK));
+/// Read one streamed source chunk (a present input slice range or a recovery
+/// block range) into `dst`, zero-padding any short tail.
+#[allow(clippy::too_many_arguments)]
+fn read_stream_source_chunk(
+    plan: &RepairPlan,
+    par2_set: &Par2FileSet,
+    file_access: &mut dyn FileAccess,
+    recovery_files: &mut HashMap<PathBuf, File>,
+    available_inputs: usize,
+    source_idx: usize,
+    byte_start: usize,
+    dst: &mut [u8],
+) -> Result<()> {
+    if source_idx < available_inputs {
+        let global_idx = plan.available_input_global_indices[source_idx];
+        let (file_id, local_slice) = plan.global_to_file[global_idx];
+        let offset = local_slice as u64 * plan.slice_size + byte_start as u64;
+        let read_len = file_access
+            .read_file_range_into(&file_id, offset, dst)
+            .map_err(Par2Error::Io)?;
+        dst[read_len..].fill(0);
     } else {
-        for batch in 0..batch_count {
-            run_batch(batch * XOR_OUT_PAR_CHUNK);
+        let exp = plan.recovery_exponents[source_idx - available_inputs];
+        let rs = par2_set
+            .recovery_slices
+            .get(&exp)
+            .ok_or_else(|| Par2Error::ReedSolomonError {
+                reason: format!("recovery block with exponent {exp} not found"),
+            })?;
+        fill_recovery_chunk(&rs.data, byte_start, dst, recovery_files).map_err(Par2Error::Io)?;
+    }
+    Ok(())
+}
+
+/// Fill one batch set: read the source chunks for `[batch_start,
+/// batch_start+len)` and rebuild the per-output gather lists.
+#[allow(clippy::too_many_arguments)]
+fn fill_stream_batch(
+    set: &mut StreamBatchSet,
+    plan: &RepairPlan,
+    par2_set: &Par2FileSet,
+    file_access: &mut dyn FileAccess,
+    recovery_files: &mut HashMap<PathBuf, File>,
+    output_factors: &[Vec<OutputFactor>],
+    available_inputs: usize,
+    batch_start: usize,
+    batch_len: usize,
+    byte_start: usize,
+    byte_len: usize,
+    options: &RepairOptions,
+) -> Result<()> {
+    for list in &mut set.per_output {
+        list.clear();
+    }
+    for b in 0..batch_len {
+        if b % 64 == 0 {
+            check_cancel(options)?;
         }
+        let source_idx = batch_start + b;
+        read_stream_source_chunk(
+            plan,
+            par2_set,
+            file_access,
+            recovery_files,
+            available_inputs,
+            source_idx,
+            byte_start,
+            &mut set.bufs[b][..byte_len],
+        )?;
+        for of in &output_factors[source_idx] {
+            set.per_output[of.output_idx].push((b as u32, of.factor));
+        }
+    }
+    set.len = batch_len;
+    Ok(())
+}
+
+/// Multiply one source batch into every output. Strip-parallel when the chunk
+/// is large (keeps the batch's source strips cache-resident across all
+/// outputs); output-parallel when the chunk itself is small.
+fn run_stream_batch_compute(
+    output_ptrs: &[usize],
+    set: &StreamBatchSet,
+    memo: &PreparedFactorMemo,
+    byte_len: usize,
+) {
+    let strips = byte_len.div_ceil(STREAM_STRIP_BYTES);
+    let threads = rayon::current_num_threads().max(1);
+
+    if strips >= threads {
+        (0..strips).into_par_iter().for_each(|si| {
+            let s0 = si * STREAM_STRIP_BYTES;
+            let s1 = (s0 + STREAM_STRIP_BYTES).min(byte_len);
+            let mut srcs: Vec<crate::gf_simd::PreparedFactorSrc<'_>> =
+                Vec::with_capacity(STREAM_INPUT_BATCH);
+            for (j, list) in set.per_output.iter().enumerate() {
+                if list.is_empty() {
+                    continue;
+                }
+                srcs.clear();
+                for &(b, factor) in list {
+                    srcs.push(crate::gf_simd::PreparedFactorSrc {
+                        prepared: memo.get(factor),
+                        src: &set.bufs[b as usize][s0..s1],
+                    });
+                }
+                // Safe: each (strip, output) range has exactly one writer —
+                // strips partition the chunk and this task is the only one
+                // for strip `si`; batches are processed sequentially.
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut((output_ptrs[j] as *mut u8).add(s0), s1 - s0)
+                };
+                crate::gf_simd::mul_acc_input_batch_prepared(dst, &srcs);
+            }
+        });
+    } else {
+        set.per_output.par_iter().enumerate().for_each(|(j, list)| {
+            if list.is_empty() {
+                return;
+            }
+            let mut srcs: Vec<crate::gf_simd::PreparedFactorSrc<'_>> =
+                Vec::with_capacity(list.len());
+            for &(b, factor) in list {
+                srcs.push(crate::gf_simd::PreparedFactorSrc {
+                    prepared: memo.get(factor),
+                    src: &set.bufs[b as usize][..byte_len],
+                });
+            }
+            // Safe: one task per output buffer.
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(output_ptrs[j] as *mut u8, byte_len) };
+            crate::gf_simd::mul_acc_input_batch_prepared(dst, &srcs);
+        });
     }
 }
 
@@ -1173,14 +1336,20 @@ fn execute_repair_streaming(
     let mut recovery_files: HashMap<PathBuf, File> = HashMap::new();
     let max_byte_len = chunk_words * 2;
     let mut chunk_output: Vec<Vec<u8>> = vec![vec![0u8; max_byte_len]; n];
-    let mut input_chunk = vec![0u8; max_byte_len];
     let output_factors = grouped_output_factors(plan);
     let available_inputs = plan.available_input_global_indices.len();
+    let total_sources = available_inputs + plan.recovery_exponents.len();
+    let memo = PreparedFactorMemo::from_output_factors(&output_factors);
+    let mut batch_sets = [
+        StreamBatchSet::new(n, max_byte_len),
+        StreamBatchSet::new(n, max_byte_len),
+    ];
 
     info!(
         missing_slices = n,
         chunk_bytes = chunk_words * 2,
         budget_bytes = budget,
+        source_batch = STREAM_INPUT_BATCH,
         "repairing with streamed chunk path"
     );
 
@@ -1200,44 +1369,60 @@ fn execute_repair_streaming(
             })
             .collect();
 
-        for (input_idx, &global_idx) in plan.available_input_global_indices.iter().enumerate() {
-            if input_idx % 64 == 0 {
-                check_cancel(options)?;
-            }
+        // Batched source loop with read/compute overlap: while a batch's
+        // multiply runs on the rayon pool, the caller thread fills the other
+        // buffer set with the next batch's source chunks.
+        let batch_count = total_sources.div_ceil(STREAM_INPUT_BATCH);
+        fill_stream_batch(
+            &mut batch_sets[0],
+            plan,
+            par2_set,
+            file_access,
+            &mut recovery_files,
+            &output_factors,
+            available_inputs,
+            0,
+            STREAM_INPUT_BATCH.min(total_sources),
+            byte_start,
+            byte_len,
+            options,
+        )?;
+        for batch_idx in 0..batch_count {
+            check_cancel(options)?;
+            let (set_a, set_b) = batch_sets.split_at_mut(1);
+            let (current, next): (&StreamBatchSet, &mut StreamBatchSet) = if batch_idx % 2 == 0 {
+                (&set_a[0], &mut set_b[0])
+            } else {
+                (&set_b[0], &mut set_a[0])
+            };
 
-            let (file_id, local_slice) = plan.global_to_file[global_idx];
-            let offset = local_slice as u64 * plan.slice_size + byte_start as u64;
-            let read_len = file_access
-                .read_file_range_into(&file_id, offset, &mut input_chunk[..byte_len])
-                .map_err(Par2Error::Io)?;
-            input_chunk[read_len..byte_len].fill(0);
-            accumulate_input_to_outputs(
-                &output_ptrs,
-                &output_factors[input_idx],
-                &input_chunk[..byte_len],
-            );
-        }
-
-        for (recovery_idx, &exp) in plan.recovery_exponents.iter().enumerate() {
-            let rs =
-                par2_set
-                    .recovery_slices
-                    .get(&exp)
-                    .ok_or_else(|| Par2Error::ReedSolomonError {
-                        reason: format!("recovery block with exponent {exp} not found"),
-                    })?;
-            fill_recovery_chunk(
-                &rs.data,
-                byte_start,
-                &mut input_chunk[..byte_len],
-                &mut recovery_files,
-            )
-            .map_err(Par2Error::Io)?;
-            accumulate_input_to_outputs(
-                &output_ptrs,
-                &output_factors[available_inputs + recovery_idx],
-                &input_chunk[..byte_len],
-            );
+            let mut read_result: Result<()> = Ok(());
+            rayon::in_place_scope(|scope| {
+                let output_ptrs = &output_ptrs;
+                let memo = &memo;
+                scope.spawn(move |_| {
+                    run_stream_batch_compute(output_ptrs, current, memo, byte_len);
+                });
+                if batch_idx + 1 < batch_count {
+                    let next_start = (batch_idx + 1) * STREAM_INPUT_BATCH;
+                    let next_len = STREAM_INPUT_BATCH.min(total_sources - next_start);
+                    read_result = fill_stream_batch(
+                        next,
+                        plan,
+                        par2_set,
+                        file_access,
+                        &mut recovery_files,
+                        &output_factors,
+                        available_inputs,
+                        next_start,
+                        next_len,
+                        byte_start,
+                        byte_len,
+                        options,
+                    );
+                }
+            });
+            read_result?;
         }
 
         for (j, target) in write_targets.iter().enumerate() {

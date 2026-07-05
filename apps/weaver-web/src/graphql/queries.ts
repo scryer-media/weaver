@@ -217,6 +217,14 @@ const GENERAL_SETTINGS_FIELDS = `
     ispBandwidthCap {
       ...IspBandwidthCapFields
     }
+    watchFolder {
+      mode
+      path
+      pollIntervalSecs
+      stabilitySecs
+      categoryFromSubfolders
+      scanningPaused
+    }
   }
 `;
 
@@ -993,6 +1001,16 @@ export const CHANGE_PASSWORD_MUTATION = gql`
 
 export const RSS_SETTINGS_QUERY = gql`
   query RssSettings {
+    settings {
+      watchFolder {
+        mode
+        path
+        pollIntervalSecs
+        stabilitySecs
+        categoryFromSubfolders
+        scanningPaused
+      }
+    }
     rssFeeds {
       ...RssFeedFields
     }
@@ -1092,6 +1110,32 @@ export const DELETE_RSS_SEEN_ITEM_MUTATION = gql`
 export const CLEAR_RSS_SEEN_ITEMS_MUTATION = gql`
   mutation ClearRssSeenItems($feedId: Int) {
     clearRssSeenItems(feedId: $feedId)
+  }
+`;
+
+export const SCAN_WATCH_FOLDER_MUTATION = gql`
+  mutation ScanWatchFolder {
+    scanWatchFolder {
+      discoveredFiles
+      queuedNzbs
+      skippedInputs {
+        path
+        reason
+      }
+      permanentErrors {
+        path
+        reason
+      }
+      transientErrors {
+        path
+        reason
+      }
+      markerRenamedSources {
+        from
+        to
+        marker
+      }
+    }
   }
 `;
 

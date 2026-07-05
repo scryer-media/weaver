@@ -4,6 +4,7 @@ use async_graphql::{Schema, SchemaBuilder};
 use weaver_server_core::Database;
 use weaver_server_core::auth::ApiKeyCache;
 use weaver_server_core::settings::SharedConfig;
+use weaver_server_core::watch_folder::WatchFolderService;
 
 use crate::auth::LoginAuthCache;
 use crate::jobs::replay::QueueEventReplay;
@@ -31,6 +32,7 @@ pub struct SchemaContext {
     pub auth_cache: LoginAuthCache,
     pub api_key_cache: ApiKeyCache,
     pub rss: RssService,
+    pub watch_folder: WatchFolderService,
     pub schedules: weaver_server_core::bandwidth::schedule::SharedSchedules,
     pub log_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
 }
@@ -69,6 +71,7 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
     .data(context.auth_cache)
     .data(context.api_key_cache)
     .data(context.rss)
+    .data(context.watch_folder)
     .data(context.schedules)
     .data(http_client)
     .data(context.log_buffer)

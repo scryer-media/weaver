@@ -9,6 +9,7 @@ use crate::observability::{
 };
 use weaver_server_core::Database;
 use weaver_server_core::settings::SharedConfig;
+use weaver_server_core::watch_folder::WatchFolderService;
 
 static CATEGORY_MUTATION_GUARD: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -91,6 +92,7 @@ impl CategoriesMutation {
         };
 
         info!(id, name = %name, "category added");
+        reconcile_watch_folder(ctx).await?;
         Ok(added)
     }
     /// Update a category by ID.
@@ -167,6 +169,7 @@ impl CategoriesMutation {
         .await;
 
         info!(id, "category updated");
+        reconcile_watch_folder(ctx).await?;
         Ok(updated_category)
     }
     /// Remove a category by ID.
@@ -216,8 +219,16 @@ impl CategoriesMutation {
         .await;
 
         info!(id, "category removed");
+        reconcile_watch_folder(ctx).await?;
         Ok(remaining)
     }
+}
+
+async fn reconcile_watch_folder(ctx: &Context<'_>) -> Result<()> {
+    ctx.data::<WatchFolderService>()?
+        .reconcile_from_config()
+        .await
+        .map_err(|error| async_graphql::Error::new(error.to_string()))
 }
 
 #[cfg(test)]
@@ -246,6 +257,7 @@ mod tests {
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
             ip_replacement_trial_extra_connections: None,
+            watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             config_path: None,
         }))
     }

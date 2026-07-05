@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 use crate::bandwidth::IspBandwidthCapConfig;
 use crate::categories::CategoryConfig;
 use crate::servers::ServerConfig;
+use crate::watch_folder::WatchFolderConfig;
 
 /// Shared config handle for runtime reads and writes.
 pub type SharedConfig = Arc<RwLock<Config>>;
@@ -44,6 +45,9 @@ pub struct Config {
     /// Defaults to 0 and is capped at 1.
     #[serde(default)]
     pub ip_replacement_trial_extra_connections: Option<u8>,
+    /// Watched-folder NZB intake settings.
+    #[serde(default)]
+    pub watch_folder: WatchFolderConfig,
     /// Path to the config file on disk. Not serialized to TOML.
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
@@ -101,6 +105,10 @@ impl Config {
 
         if self.ip_replacement_trial_extra_connections.unwrap_or(0) > 1 {
             errors.push("ip_replacement_trial_extra_connections must be 0 or 1".to_string());
+        }
+
+        if let Err(error) = self.watch_folder.validate() {
+            errors.push(error);
         }
 
         if errors.is_empty() {

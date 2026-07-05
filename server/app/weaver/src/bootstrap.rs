@@ -123,6 +123,7 @@ mod tests {
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
             ip_replacement_trial_extra_connections: None,
+            watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             config_path: None,
         }
     }

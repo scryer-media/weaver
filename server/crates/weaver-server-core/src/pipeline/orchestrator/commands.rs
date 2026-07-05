@@ -251,6 +251,13 @@ impl Pipeline {
                         self.shared_state.set_download_block(block);
                         info!(bytes_per_sec, "schedule: set speed limit");
                     }
+                    ScheduleAction::PauseWatchFolderScanning
+                    | ScheduleAction::ResumeWatchFolderScanning => {
+                        warn!(
+                            action = ?action,
+                            "watch folder schedule action reached download pipeline"
+                        );
+                    }
                 }
                 let _ = reply.send(());
             }

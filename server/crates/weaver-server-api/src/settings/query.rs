@@ -21,6 +21,7 @@ impl SettingsQuery {
                 ip_replacement_trial_extra_connections: cfg
                     .ip_replacement_trial_extra_connections(),
                 isp_bandwidth_cap: cfg.isp_bandwidth_cap.as_ref().map(Into::into),
+                watch_folder: (&cfg.watch_folder).into(),
             })
             .await,
         )

@@ -69,6 +69,11 @@ pub(crate) async fn run(
     shared_state.publish_jobs(initial_history.clone());
 
     let rss = weaver_server_api::RssService::new(handle.clone(), shared_config.clone(), db.clone());
+    let watch_folder = weaver_server_core::watch_folder::WatchFolderService::new(
+        db.clone(),
+        handle.clone(),
+        shared_config.clone(),
+    );
     let backup = weaver_server_api::BackupService::new(
         handle.clone(),
         shared_config.clone(),
@@ -97,9 +102,10 @@ pub(crate) async fn run(
         let initial = db.list_schedules().unwrap_or_default();
         std::sync::Arc::new(tokio::sync::RwLock::new(initial))
     };
-    weaver_server_core::bandwidth::schedule::spawn_evaluator(
+    weaver_server_core::bandwidth::schedule::spawn_evaluator_with_watch_folder(
         handle.clone(),
         shared_schedules.clone(),
+        Some(watch_folder.clone()),
     );
 
     // Build GraphQL schema with shared config and database.
@@ -111,6 +117,7 @@ pub(crate) async fn run(
         auth_cache: login_auth_cache.clone(),
         api_key_cache: api_key_cache.clone(),
         rss: rss.clone(),
+        watch_folder: watch_folder.clone(),
         schedules: shared_schedules,
         log_buffer: log_ring_buffer,
     });
@@ -149,6 +156,7 @@ pub(crate) async fn run(
     });
 
     let rss_task = rss.start_background_loop();
+    watch_folder.reconcile_from_config().await?;
     let metrics_history_task = shutdown::spawn_metrics_history_task(handle.clone(), db.clone());
     let maintenance_task = weaver_server_core::operations::spawn_maintenance_worker(
         db.clone(),
@@ -189,6 +197,7 @@ pub(crate) async fn run(
             }
             server_task.abort();
             rss_task.abort();
+            watch_folder.stop().await;
             metrics_history_task.abort();
             maintenance_task.abort();
             Ok(())
@@ -197,6 +206,7 @@ pub(crate) async fn run(
             let error = shutdown::pipeline_exit_error(result);
             server_task.abort();
             rss_task.abort();
+            watch_folder.stop().await;
             metrics_history_task.abort();
             maintenance_task.abort();
             Err(error.into())
@@ -207,6 +217,7 @@ pub(crate) async fn run(
                 error!(error = %join_error, "pipeline task failed during HTTP shutdown");
             }
             rss_task.abort();
+            watch_folder.stop().await;
             metrics_history_task.abort();
             maintenance_task.abort();
             match result {

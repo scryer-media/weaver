@@ -115,6 +115,41 @@ async fn create_schedule_speed_limit() {
 }
 
 #[tokio::test]
+async fn create_watch_folder_scanning_schedules() {
+    let h = TestHarness::new().await;
+
+    for (label, action_type) in [
+        ("Pause watcher", "pause_watch_folder_scanning"),
+        ("Resume watcher", "resume_watch_folder_scanning"),
+    ] {
+        let resp = h
+            .execute(&format!(
+                r#"mutation {{
+                    createSchedule(input: {{
+                        enabled: true,
+                        label: "{label}",
+                        days: [],
+                        time: "08:00",
+                        actionType: "{action_type}"
+                    }}) {{
+                        label actionType speedLimitBytes
+                    }}
+                }}"#
+            ))
+            .await;
+        assert_no_errors(&resp);
+        let data = response_data(&resp);
+        let schedules = data["createSchedule"].as_array().unwrap();
+        let sched = schedules
+            .iter()
+            .find(|schedule| schedule["label"].as_str().unwrap() == label)
+            .unwrap();
+        assert_eq!(sched["actionType"].as_str().unwrap(), action_type);
+        assert!(sched["speedLimitBytes"].is_null());
+    }
+}
+
+#[tokio::test]
 async fn update_schedule() {
     let h = TestHarness::new().await;
 

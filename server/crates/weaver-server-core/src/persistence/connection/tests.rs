@@ -1420,6 +1420,7 @@ async fn postgres_runtime_smoke_when_configured() {
             monthly_reset_day: 7,
         }),
         ip_replacement_trial_extra_connections: Some(1),
+        watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         config_path: None,
     };
     db.save_config(&config).unwrap();
