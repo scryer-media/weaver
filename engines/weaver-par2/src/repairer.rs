@@ -41,6 +41,8 @@ const SCANNER_MD5_BATCH_LANES: usize = 4;
 const SCANNER_MD5_BATCH_MEMORY_BYTES: usize = 4 * 1024 * 1024;
 const SCANNER_IO_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const SCANNER_MMAP_FALLBACK_SLICE_BYTES: usize = 8 * 1024 * 1024;
+const SCANNER_PARALLEL_SEGMENT_TARGET_BYTES: usize = 8 * 1024 * 1024;
+const ORDERED_SCAN_SERIAL_ENV: &str = "WEAVER_PAR2_SERIAL_SCAN";
 const CANONICAL_COMPLETE_HASH_SKIP_BYTES: u64 = 1024 * 1024;
 const ORDERED_SCAN_DEFAULT_SKIP_LEEWAY: u64 = 64;
 const SCANNER_SLOW_WARN_STEPS: u64 = 5_000_000;
@@ -78,6 +80,7 @@ pub struct ScanDiagnostics {
 enum FileScanMode {
     Complete,
     OrderedCanonical,
+    OrderedCanonicalParallel,
     RollingGeneric,
 }
 
@@ -86,6 +89,7 @@ impl FileScanMode {
         match self {
             Self::Complete => "complete",
             Self::OrderedCanonical => "ordered_canonical",
+            Self::OrderedCanonicalParallel => "ordered_canonical_parallel",
             Self::RollingGeneric => "rolling_generic",
         }
     }
@@ -144,6 +148,10 @@ impl<'a> ScanBlockState<'a> {
 
     fn block(&self, block_index: usize) -> &SourceBlock {
         &self.blocks[block_index]
+    }
+
+    fn baseline(&self) -> &'a [SourceBlock] {
+        self.blocks
     }
 
     fn location(&self, block_index: usize) -> Option<&BlockLocation> {
@@ -1291,6 +1299,7 @@ impl RepairState {
                     skip_data: options.scan_skip_data,
                     skip_leeway: options.scan_skip_leeway,
                 },
+                options.cancel.as_ref(),
             )?
         } else {
             scanner.scan_file_with_state_options(
@@ -2045,6 +2054,43 @@ struct OrderedWindowMatch<'a> {
     offset: u64,
 }
 
+/// Selection-half inputs for one ordered window: everything
+/// `select_ordered_match` needs besides the hashed match set.
+struct OrderedSelection<'a> {
+    path: &'a Path,
+    kind: BlockLocationKind,
+    target_file_id: &'a FileId,
+    expected_block: Option<usize>,
+    offset: u64,
+}
+
+/// Facts for aligned window `i` (offset `i * slice_size`).
+/// `matches` holds ascending block indices confirmed by CRC *and* MD5;
+/// empty means no aligned selection is possible at this offset.
+#[derive(Default)]
+struct AlignedWindowFacts {
+    matches: Vec<u32>,
+}
+
+/// How a gap resync hands control back to the aligned merge loop.
+enum ResyncOutcome {
+    Realigned {
+        next_window: usize,
+        preferred_next: Option<usize>,
+    },
+    End,
+}
+
+/// Shared read-only inputs for the gap resync loop.
+struct OrderedResync<'a> {
+    map: &'a [u8],
+    facts: &'a [AlignedWindowFacts],
+    ordered_full_blocks: &'a [usize],
+    path: &'a Path,
+    kind: BlockLocationKind,
+    target_file_id: &'a FileId,
+}
+
 struct OrderedWindowCursor<'a> {
     file: File,
     path: PathBuf,
@@ -2304,12 +2350,65 @@ impl<'a> RollingBlockScanner<'a> {
             target_file,
             &mut state,
             scan_options,
+            None,
         )?;
         state.apply_to_blocks(blocks);
         Ok(stats)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_file_ordered_canonical_state(
+        &self,
+        path: &Path,
+        kind: BlockLocationKind,
+        lookup: SourceFileScanLookup<'_>,
+        target_file: &SourceFileEntry,
+        blocks: &mut ScanBlockState<'_>,
+        scan_options: ScanSkipOptions,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<FileScanStats> {
+        // Skip-data sampling is stateful and intentionally lossy, so it keeps
+        // the serial scanner; the env flag and single-thread pools do too.
+        if scan_options.skip_data
+            || ordered_scan_force_serial()
+            || rayon::current_num_threads() <= 1
+        {
+            return self.scan_file_ordered_canonical_serial(
+                path,
+                kind,
+                lookup,
+                target_file,
+                blocks,
+                scan_options,
+            );
+        }
+        let segment_windows = ordered_scan_segment_windows(self.table.slice_size as usize);
+        match self.scan_file_ordered_canonical_parallel(
+            path,
+            kind,
+            lookup,
+            target_file,
+            blocks,
+            scan_options,
+            segment_windows,
+            cancel,
+        ) {
+            Ok(stats) => Ok(stats),
+            Err(Par2Error::Cancelled) => Err(Par2Error::Cancelled),
+            // mmap or I/O setup failure: the serial scanner owns the error
+            // story (and will surface the same error if it persists).
+            Err(_) => self.scan_file_ordered_canonical_serial(
+                path,
+                kind,
+                lookup,
+                target_file,
+                blocks,
+                scan_options,
+            ),
+        }
+    }
+
+    fn scan_file_ordered_canonical_serial(
         &self,
         path: &Path,
         kind: BlockLocationKind,
@@ -2434,56 +2533,90 @@ impl<'a> RollingBlockScanner<'a> {
         window: OrderedWindowMatch<'_>,
         blocks: &mut ScanBlockState<'_>,
     ) -> Option<usize> {
-        let mut selected = None;
-        let mut md5 = None;
+        let matches = self.ordered_window_md5_matches(blocks.baseline(), window.data, window.crc);
+        self.select_ordered_match(
+            OrderedSelection {
+                path: window.path,
+                kind: window.kind,
+                target_file_id: window.target_file_id,
+                expected_block: window.expected_block,
+                offset: window.offset,
+            },
+            &matches,
+            blocks,
+        )
+    }
 
-        if let Some(expected_block) = window.expected_block {
-            let block = blocks.block(expected_block);
-            if block.expected_len == self.table.slice_size && block.checksum.crc32 == window.crc {
-                let digest = checksum::md5(window.data);
-                md5 = Some(digest);
-                if block.checksum.md5 == digest
-                    && can_select_ordered_match(
-                        expected_block,
-                        Some(expected_block),
-                        window.path,
-                        blocks,
-                    )
-                {
-                    selected = Some(expected_block);
-                }
+    /// Hashing half of the ordered window check: block indices whose CRC and
+    /// MD5 both match the window, ascending. Expected-independent — the
+    /// expected-block fast path can never select a block this set lacks, and
+    /// the MD5 is computed exactly when any size-eligible CRC candidate
+    /// exists, matching the serial lazy-init.
+    fn ordered_window_md5_matches(
+        &self,
+        blocks: &[SourceBlock],
+        data: &[u8],
+        crc: u32,
+    ) -> Vec<u32> {
+        let mut matches = Vec::new();
+        let Some(candidates) = self.table.by_crc.get(&crc) else {
+            return matches;
+        };
+        let mut md5 = None;
+        for block_index in candidates {
+            let block = &blocks[*block_index];
+            if block.expected_len != self.table.slice_size {
+                continue;
+            }
+            let digest = *md5.get_or_insert_with(|| checksum::md5(data));
+            if block.checksum.md5 == digest {
+                matches.push(*block_index as u32);
             }
         }
+        matches
+    }
 
-        if let Some(candidates) = self.table.by_crc.get(&window.crc) {
-            for block_index in candidates {
-                let block = blocks.block(*block_index);
-                if block.expected_len != self.table.slice_size {
-                    continue;
-                }
-                if Some(*block_index) == window.expected_block && selected == Some(*block_index) {
-                    continue;
-                }
+    /// Selection half of the ordered window check: applies the expected-block
+    /// fast path, the duplicate-slice gate, and the rank preference over an
+    /// already-hashed match set, then records the winner.
+    fn select_ordered_match(
+        &self,
+        selection: OrderedSelection<'_>,
+        matches: &[u32],
+        blocks: &mut ScanBlockState<'_>,
+    ) -> Option<usize> {
+        let mut selected = None;
 
-                let digest = *md5.get_or_insert_with(|| checksum::md5(window.data));
-                if block.checksum.md5 != digest {
-                    continue;
-                }
+        if let Some(expected_block) = selection.expected_block
+            && matches.contains(&(expected_block as u32))
+            && can_select_ordered_match(
+                expected_block,
+                Some(expected_block),
+                selection.path,
+                blocks,
+            )
+        {
+            selected = Some(expected_block);
+        }
 
-                if can_select_ordered_match(
-                    *block_index,
-                    window.expected_block,
-                    window.path,
-                    blocks,
-                ) && preferred_ordered_match(
-                    selected,
-                    *block_index,
-                    window.expected_block,
-                    *window.target_file_id,
-                    blocks,
-                ) {
-                    selected = Some(*block_index);
-                }
+        for block_index in matches {
+            let block_index = *block_index as usize;
+            if Some(block_index) == selection.expected_block && selected == Some(block_index) {
+                continue;
+            }
+            if can_select_ordered_match(
+                block_index,
+                selection.expected_block,
+                selection.path,
+                blocks,
+            ) && preferred_ordered_match(
+                selected,
+                block_index,
+                selection.expected_block,
+                *selection.target_file_id,
+                blocks,
+            ) {
+                selected = Some(block_index);
             }
         }
 
@@ -2493,15 +2626,306 @@ impl<'a> RollingBlockScanner<'a> {
                 blocks,
                 selected,
                 BlockLocation {
-                    path: window.path.to_path_buf(),
-                    offset: window.offset,
+                    path: selection.path.to_path_buf(),
+                    offset: selection.offset,
                     len: block.expected_len,
-                    kind: window.kind,
+                    kind: selection.kind,
                 },
             );
         }
 
         selected
+    }
+
+    /// Parallel ordered canonical scan: Phase A computes expected-independent
+    /// facts for every slice-aligned window in parallel, Phase B replays the
+    /// serial cursor state machine over those facts, and Phase C byte-steps
+    /// through gaps, splicing back into Phase B when a match realigns.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_file_ordered_canonical_parallel(
+        &self,
+        path: &Path,
+        kind: BlockLocationKind,
+        lookup: SourceFileScanLookup<'_>,
+        target_file: &SourceFileEntry,
+        blocks: &mut ScanBlockState<'_>,
+        scan_options: ScanSkipOptions,
+        segment_windows: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<FileScanStats> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        let slice_size = self.table.slice_size as usize;
+        if len == 0 || slice_size == 0 || len < slice_size {
+            drop(file);
+            return self.scan_file_ordered_canonical_serial(
+                path,
+                kind,
+                lookup,
+                target_file,
+                blocks,
+                scan_options,
+            );
+        }
+        crate::file_cache::advise_sequential(&file, path, len as u64);
+        let map = unsafe { MmapOptions::new().map(&file)? };
+        let mut stats = FileScanStats::new(FileScanMode::OrderedCanonicalParallel, len as u64);
+
+        let last_full_offset = len - slice_size;
+        let window_count = last_full_offset / slice_size + 1;
+        let segment_windows = segment_windows.max(1);
+        let mut facts: Vec<AlignedWindowFacts> = Vec::new();
+        facts.resize_with(window_count, AlignedWindowFacts::default);
+        let baseline = blocks.baseline();
+        facts
+            .par_chunks_mut(segment_windows)
+            .enumerate()
+            .try_for_each(|(segment_index, segment)| {
+                self.compute_aligned_window_facts(
+                    &map,
+                    baseline,
+                    segment,
+                    segment_index * segment_windows,
+                    cancel,
+                )
+            })?;
+
+        let ordered_full_blocks: Vec<usize> = (0..target_file.block_count)
+            .map(|local| target_file.first_block + local)
+            .filter(|block_index| blocks.block(*block_index).expected_len == self.table.slice_size)
+            .collect();
+        let resync = OrderedResync {
+            map: &map,
+            facts: &facts,
+            ordered_full_blocks: &ordered_full_blocks,
+            path,
+            kind,
+            target_file_id: &target_file.file_id,
+        };
+
+        let mut preferred_next = (!ordered_full_blocks.is_empty()).then_some(0usize);
+        let mut current_step_run = 0u64;
+        let mut window_index = 0usize;
+        while window_index < window_count {
+            let expected_block = preferred_next
+                .and_then(|position| ordered_full_blocks.get(position))
+                .copied();
+            let offset = window_index * slice_size;
+            let selected = self.select_ordered_match(
+                OrderedSelection {
+                    path,
+                    kind,
+                    target_file_id: &target_file.file_id,
+                    expected_block,
+                    offset: offset as u64,
+                },
+                &facts[window_index].matches,
+                blocks,
+            );
+
+            if let Some(selected) = selected {
+                preferred_next = ordered_preferred_after_selection(
+                    &ordered_full_blocks,
+                    selected,
+                    &target_file.file_id,
+                    blocks,
+                );
+                stats.jumps_taken += 1;
+                stats.max_consecutive_steps = stats.max_consecutive_steps.max(current_step_run);
+                current_step_run = 0;
+                window_index += 1;
+                continue;
+            }
+
+            // A mismatch clears the expected chain; the resync outcome
+            // carries the replacement `preferred_next` back across the
+            // boundary. Mirrors the serial cursor: a failed step off the
+            // last full window ends the scan without counting a step.
+            if offset >= last_full_offset {
+                break;
+            }
+            stats.windows_stepped += 1;
+            current_step_run += 1;
+            match self.rolling_resync_ordered(
+                &resync,
+                offset + 1,
+                blocks,
+                &mut stats,
+                &mut current_step_run,
+            ) {
+                ResyncOutcome::Realigned {
+                    next_window,
+                    preferred_next: next_preferred,
+                } => {
+                    window_index = next_window;
+                    preferred_next = next_preferred;
+                }
+                ResyncOutcome::End => break,
+            }
+        }
+
+        stats.max_consecutive_steps = stats.max_consecutive_steps.max(current_step_run);
+
+        let short_result = scan_short_blocks_from_file(
+            self.table,
+            path,
+            kind,
+            lookup.files,
+            lookup.file_index_by_id,
+            blocks,
+            len,
+        );
+        drop(map);
+        crate::file_cache::drop_file_cache(&file, path, 0, len as u64);
+        short_result?;
+
+        Ok(stats)
+    }
+
+    /// Phase A worker: fills one segment's facts. Reads only the hash table
+    /// and the immutable baseline blocks, so segments run lock-free.
+    fn compute_aligned_window_facts(
+        &self,
+        map: &[u8],
+        blocks: &[SourceBlock],
+        facts: &mut [AlignedWindowFacts],
+        first_window: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<()> {
+        if let Some(cancel) = cancel
+            && cancel.is_cancelled()
+        {
+            return Err(Par2Error::Cancelled);
+        }
+
+        let slice_size = self.table.slice_size as usize;
+        let batch_lanes = scanner_md5_batch_lanes(slice_size);
+        let mut pending: Vec<usize> = Vec::with_capacity(batch_lanes);
+        for slot in 0..facts.len() {
+            let offset = (first_window + slot) * slice_size;
+            let window = &map[offset..offset + slice_size];
+            let crc = checksum::crc32(window);
+            let Some(candidates) = self.table.by_crc.get(&crc) else {
+                continue;
+            };
+            let eligible: Vec<u32> = candidates
+                .iter()
+                .filter(|block_index| blocks[**block_index].expected_len == self.table.slice_size)
+                .map(|block_index| *block_index as u32)
+                .collect();
+            if eligible.is_empty() {
+                continue;
+            }
+            if batch_lanes < 2 {
+                let digest = checksum::md5(window);
+                facts[slot].matches = eligible
+                    .into_iter()
+                    .filter(|block_index| blocks[*block_index as usize].checksum.md5 == digest)
+                    .collect();
+                continue;
+            }
+            facts[slot].matches = eligible;
+            pending.push(slot);
+            if pending.len() == batch_lanes {
+                confirm_pending_fact_md5(
+                    map,
+                    blocks,
+                    facts,
+                    &mut pending,
+                    first_window,
+                    slice_size,
+                );
+            }
+        }
+        confirm_pending_fact_md5(map, blocks, facts, &mut pending, first_window, slice_size);
+        Ok(())
+    }
+
+    /// Phase C: byte-steps from `start` exactly as the serial cursor would
+    /// after a failed window, consuming precomputed facts whenever the
+    /// position is slice-aligned. Returns `Realigned` when a match lands on
+    /// an aligned offset so the merge loop can resume from facts.
+    fn rolling_resync_ordered(
+        &self,
+        resync: &OrderedResync<'_>,
+        start: usize,
+        blocks: &mut ScanBlockState<'_>,
+        stats: &mut FileScanStats,
+        current_step_run: &mut u64,
+    ) -> ResyncOutcome {
+        let slice_size = self.table.slice_size as usize;
+        let last_full_offset = resync.map.len() - slice_size;
+        let mut preferred_next: Option<usize> = None;
+        let mut offset = start;
+        let mut crc = checksum::crc32(&resync.map[offset..offset + slice_size]);
+
+        loop {
+            let expected_block = preferred_next
+                .and_then(|position| resync.ordered_full_blocks.get(position))
+                .copied();
+            let selection = OrderedSelection {
+                path: resync.path,
+                kind: resync.kind,
+                target_file_id: resync.target_file_id,
+                expected_block,
+                offset: offset as u64,
+            };
+            let aligned_window = offset
+                .is_multiple_of(slice_size)
+                .then(|| offset / slice_size);
+            let selected = if let Some(window_index) = aligned_window {
+                self.select_ordered_match(selection, &resync.facts[window_index].matches, blocks)
+            } else {
+                let matches = self.ordered_window_md5_matches(
+                    blocks.baseline(),
+                    &resync.map[offset..offset + slice_size],
+                    crc,
+                );
+                self.select_ordered_match(selection, &matches, blocks)
+            };
+
+            if let Some(selected) = selected {
+                let next_preferred = ordered_preferred_after_selection(
+                    resync.ordered_full_blocks,
+                    selected,
+                    resync.target_file_id,
+                    blocks,
+                );
+                stats.jumps_taken += 1;
+                stats.max_consecutive_steps = stats.max_consecutive_steps.max(*current_step_run);
+                *current_step_run = 0;
+                if let Some(window_index) = aligned_window {
+                    return ResyncOutcome::Realigned {
+                        next_window: window_index + 1,
+                        preferred_next: next_preferred,
+                    };
+                }
+                preferred_next = next_preferred;
+                let next = offset + slice_size;
+                if next > last_full_offset {
+                    return ResyncOutcome::End;
+                }
+                offset = next;
+                // Fresh window after a jump, matching the serial cursor's
+                // full CRC recompute.
+                crc = checksum::crc32(&resync.map[offset..offset + slice_size]);
+                continue;
+            }
+
+            preferred_next = None;
+            if offset >= last_full_offset {
+                return ResyncOutcome::End;
+            }
+            crc = crc_slide_char(
+                crc,
+                resync.map[offset + slice_size],
+                resync.map[offset],
+                &self.window_table,
+            );
+            offset += 1;
+            stats.windows_stepped += 1;
+            *current_step_run += 1;
+        }
     }
 
     #[cfg(test)]
@@ -2845,6 +3269,68 @@ impl<'a> RollingBlockScanner<'a> {
         crate::file_cache::drop_file_cache(&file, path, 0, len as u64);
         Ok(stats)
     }
+}
+
+fn ordered_scan_force_serial() -> bool {
+    static FORCE_SERIAL: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var(ORDERED_SCAN_SERIAL_ENV)
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    });
+    *FORCE_SERIAL
+}
+
+fn ordered_scan_segment_windows(slice_size: usize) -> usize {
+    if slice_size == 0 {
+        return 1;
+    }
+    (SCANNER_PARALLEL_SEGMENT_TARGET_BYTES / slice_size).clamp(1, 4096)
+}
+
+/// Confirms pending Phase A CRC candidates with one multi-lane MD5 batch.
+/// All inputs are full slices, so lane lengths are uniform and the SIMD
+/// kernel always engages.
+fn confirm_pending_fact_md5(
+    map: &[u8],
+    blocks: &[SourceBlock],
+    facts: &mut [AlignedWindowFacts],
+    pending: &mut Vec<usize>,
+    first_window: usize,
+    slice_size: usize,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let inputs: Vec<&[u8]> = pending
+        .iter()
+        .map(|slot| {
+            let offset = (first_window + *slot) * slice_size;
+            &map[offset..offset + slice_size]
+        })
+        .collect();
+    let digests = md5_simd::md5_multi(&inputs, None);
+    for (slot, digest) in pending.drain(..).zip(digests) {
+        facts[slot]
+            .matches
+            .retain(|block_index| blocks[*block_index as usize].checksum.md5 == digest);
+    }
+}
+
+/// The serial scanner's post-selection `preferred_next` rule: continue the
+/// chain past the selected block when it belongs to the target file, drop it
+/// otherwise.
+fn ordered_preferred_after_selection(
+    ordered_full_blocks: &[usize],
+    selected: usize,
+    target_file_id: &FileId,
+    blocks: &ScanBlockState<'_>,
+) -> Option<usize> {
+    if blocks.block(selected).file_id != *target_file_id {
+        return None;
+    }
+    ordered_full_blocks
+        .iter()
+        .position(|block_index| *block_index == selected)
+        .and_then(|position| ordered_full_blocks.get(position + 1).map(|_| position + 1))
 }
 
 fn ordered_match_rank(
@@ -4888,6 +5374,651 @@ mod tests {
         assert!(default_stats.windows_stepped >= slice_size);
         assert!(skip_stats.windows_stepped < default_stats.windows_stepped / 2);
         assert!(skip_stats.max_consecutive_steps <= ORDERED_SCAN_DEFAULT_SKIP_LEEWAY);
+    }
+
+    fn scan_ordered_serial_direct(
+        state: &RepairState,
+        path: &Path,
+    ) -> (BlockLocationSummary, FileScanStats) {
+        let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
+        let mut blocks = state.blocks.clone();
+        let baseline = blocks.clone();
+        let mut scan_state = ScanBlockState::new(&baseline);
+        let target = state
+            .files
+            .iter()
+            .find(|file| file.safe_path == path)
+            .unwrap();
+        let stats = scanner
+            .scan_file_ordered_canonical_serial(
+                path,
+                BlockLocationKind::Canonical,
+                SourceFileScanLookup {
+                    files: &state.files,
+                    file_index_by_id: &state.file_index_by_id,
+                },
+                target,
+                &mut scan_state,
+                ScanSkipOptions::disabled(),
+            )
+            .unwrap();
+        scan_state.apply_to_blocks(&mut blocks);
+        (block_location_summary(&blocks), stats)
+    }
+
+    fn scan_ordered_parallel_direct(
+        state: &RepairState,
+        path: &Path,
+        segment_windows: usize,
+    ) -> (BlockLocationSummary, FileScanStats) {
+        let scanner = RollingBlockScanner::new(&state.hash_table, state.set.slice_size);
+        let mut blocks = state.blocks.clone();
+        let baseline = blocks.clone();
+        let mut scan_state = ScanBlockState::new(&baseline);
+        let target = state
+            .files
+            .iter()
+            .find(|file| file.safe_path == path)
+            .unwrap();
+        let stats = scanner
+            .scan_file_ordered_canonical_parallel(
+                path,
+                BlockLocationKind::Canonical,
+                SourceFileScanLookup {
+                    files: &state.files,
+                    file_index_by_id: &state.file_index_by_id,
+                },
+                target,
+                &mut scan_state,
+                ScanSkipOptions::disabled(),
+                segment_windows,
+                None,
+            )
+            .unwrap();
+        scan_state.apply_to_blocks(&mut blocks);
+        (block_location_summary(&blocks), stats)
+    }
+
+    fn scan_stat_counters(stats: FileScanStats) -> (u64, u64, u64, u64) {
+        (
+            stats.bytes_scanned,
+            stats.windows_stepped,
+            stats.jumps_taken,
+            stats.max_consecutive_steps,
+        )
+    }
+
+    /// Runs the serial scanner and the parallel scanner (forced-tiny and
+    /// default segment sizes) over the same candidate and asserts identical
+    /// block locations and scan counters. Returns the serial result for
+    /// fixture-specific assertions.
+    fn assert_ordered_scan_parity(
+        state: &RepairState,
+        path: &Path,
+    ) -> (BlockLocationSummary, FileScanStats) {
+        let (serial_locations, serial_stats) = scan_ordered_serial_direct(state, path);
+        let default_segment = ordered_scan_segment_windows(state.set.slice_size as usize);
+        for segment_windows in [1usize, 2, default_segment] {
+            let (parallel_locations, parallel_stats) =
+                scan_ordered_parallel_direct(state, path, segment_windows);
+            assert_eq!(
+                parallel_locations, serial_locations,
+                "locations diverged with segment_windows={segment_windows}"
+            );
+            assert_eq!(
+                scan_stat_counters(parallel_stats),
+                scan_stat_counters(serial_stats),
+                "scan counters diverged with segment_windows={segment_windows}"
+            );
+        }
+        (serial_locations, serial_stats)
+    }
+
+    fn seeded_block(seed: u8, slice_size: usize) -> Vec<u8> {
+        (0..slice_size)
+            .map(|index| {
+                seed.wrapping_mul(37)
+                    .wrapping_add((index as u8).wrapping_mul(11))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ordered_parallel_scan_matches_serial_for_intact_file() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let mut target = Vec::new();
+        for seed in 0..6u8 {
+            target.extend_from_slice(&seeded_block(seed, slice_size as usize));
+        }
+        target.extend_from_slice(b"tail!");
+        let set = synthetic_set(&[("target.bin", &target)], slice_size);
+        let candidate = dir.path().join("target.bin");
+        fs::write(&candidate, &target).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let (locations, stats) = assert_ordered_scan_parity(&state, &candidate);
+
+        assert!(locations.iter().all(Option::is_some));
+        assert_eq!(stats.windows_stepped, 0);
+        assert_eq!(stats.jumps_taken, 6);
+    }
+
+    #[test]
+    fn ordered_parallel_scan_matches_serial_for_deleted_full_block() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let blocks: Vec<Vec<u8>> = (0..6u8)
+            .map(|seed| seeded_block(seed, slice_size as usize))
+            .collect();
+        let target: Vec<u8> = blocks.concat();
+        let set = synthetic_set(&[("target.bin", &target)], slice_size);
+        let candidate = dir.path().join("target.bin");
+        let mut damaged = Vec::new();
+        for (index, block) in blocks.iter().enumerate() {
+            if index != 2 {
+                damaged.extend_from_slice(block);
+            }
+        }
+        fs::write(&candidate, damaged).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let (locations, _) = assert_ordered_scan_parity(&state, &candidate);
+        let generic = scan_with_mmap(&state, &candidate, BlockLocationKind::Canonical);
+
+        assert_eq!(locations, generic);
+        assert_eq!(locations[2], None);
+        assert_eq!(
+            locations[3],
+            Some((
+                candidate.clone(),
+                slice_size * 2,
+                slice_size,
+                BlockLocationKind::Canonical
+            ))
+        );
+    }
+
+    #[test]
+    fn ordered_parallel_scan_matches_serial_for_insertion_gap() {
+        let dir = tempdir().unwrap();
+        let slice_size = 1024u64;
+        let first = seeded_block(3, slice_size as usize);
+        let second = seeded_block(71, slice_size as usize);
+        let target = [first.as_slice(), second.as_slice()].concat();
+        let set = synthetic_set(&[("target.bin", &target)], slice_size);
+        let candidate = dir.path().join("target.bin");
+        let mut damaged = Vec::new();
+        damaged.extend_from_slice(&first);
+        damaged.extend(std::iter::repeat_n(0xEE, 176));
+        damaged.extend_from_slice(&second);
+        fs::write(&candidate, damaged).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let (locations, stats) = assert_ordered_scan_parity(&state, &candidate);
+
+        assert_eq!(
+            locations[1],
+            Some((
+                candidate.clone(),
+                slice_size + 176,
+                slice_size,
+                BlockLocationKind::Canonical
+            ))
+        );
+        assert!(stats.windows_stepped > 64);
+    }
+
+    #[test]
+    fn ordered_parallel_scan_realigns_mid_file_after_compensating_deletion() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64usize;
+        let blocks: Vec<Vec<u8>> = (0..6u8)
+            .map(|seed| seeded_block(seed.wrapping_add(11), slice_size))
+            .collect();
+        let target: Vec<u8> = blocks.concat();
+        let set = synthetic_set(&[("target.bin", &target)], slice_size as u64);
+        let candidate = dir.path().join("target.bin");
+        // Insert 17 junk bytes before block 1, then replace block 2 with 47
+        // junk bytes: block 1 matches unaligned, block 3 realigns exactly at
+        // 3 * slice_size, so the resync must splice back into the aligned
+        // merge mid-file.
+        let insert_len = 17usize;
+        let mut damaged = Vec::new();
+        damaged.extend_from_slice(&blocks[0]);
+        damaged.extend(std::iter::repeat_n(0xEE, insert_len));
+        damaged.extend_from_slice(&blocks[1]);
+        damaged.extend(std::iter::repeat_n(0xDD, slice_size - insert_len));
+        damaged.extend_from_slice(&blocks[3]);
+        damaged.extend_from_slice(&blocks[4]);
+        damaged.extend_from_slice(&blocks[5]);
+        assert_eq!(damaged.len(), target.len());
+        fs::write(&candidate, damaged).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let (locations, stats) = assert_ordered_scan_parity(&state, &candidate);
+
+        let aligned = |index: u64| {
+            Some((
+                candidate.clone(),
+                index * slice_size as u64,
+                slice_size as u64,
+                BlockLocationKind::Canonical,
+            ))
+        };
+        assert_eq!(locations[0], aligned(0));
+        assert_eq!(
+            locations[1],
+            Some((
+                candidate.clone(),
+                (slice_size + insert_len) as u64,
+                slice_size as u64,
+                BlockLocationKind::Canonical
+            ))
+        );
+        assert_eq!(locations[2], None);
+        assert_eq!(locations[3], aligned(3));
+        assert_eq!(locations[4], aligned(4));
+        assert_eq!(locations[5], aligned(5));
+        assert_eq!(stats.jumps_taken, 5);
+    }
+
+    #[test]
+    fn ordered_parallel_scan_stays_misaligned_through_unaligned_tail() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64usize;
+        let blocks: Vec<Vec<u8>> = (0..5u8)
+            .map(|seed| seeded_block(seed.wrapping_add(29), slice_size))
+            .collect();
+        let target: Vec<u8> = blocks.concat();
+        let set = synthetic_set(&[("target.bin", &target)], slice_size as u64);
+        let candidate = dir.path().join("target.bin");
+        // Delete 17 bytes (not a multiple of the slice size) from block 1:
+        // every later block sits at an unaligned offset until EOF, so the
+        // scan never realigns after the gap.
+        let mut damaged = Vec::new();
+        damaged.extend_from_slice(&blocks[0]);
+        damaged.extend_from_slice(&blocks[1][..slice_size - 17]);
+        damaged.extend_from_slice(&blocks[2]);
+        damaged.extend_from_slice(&blocks[3]);
+        damaged.extend_from_slice(&blocks[4]);
+        fs::write(&candidate, damaged).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let (locations, _) = assert_ordered_scan_parity(&state, &candidate);
+        let generic = scan_with_mmap(&state, &candidate, BlockLocationKind::Canonical);
+
+        assert_eq!(locations, generic);
+        assert_eq!(locations[1], None);
+        for index in [2u64, 3, 4] {
+            assert_eq!(
+                locations[index as usize],
+                Some((
+                    candidate.clone(),
+                    index * slice_size as u64 - 17,
+                    slice_size as u64,
+                    BlockLocationKind::Canonical
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_parallel_scan_dedupes_duplicate_blocks_across_segment_boundary() {
+        let dir = tempdir().unwrap();
+        let target = b"aaaabbbbaaaacccc".to_vec();
+        let set = synthetic_set(&[("target.bin", &target)], 4);
+        let candidate = dir.path().join("target.bin");
+        fs::write(&candidate, b"aaaaaaaacccc").unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        // The parity helper forces one- and two-window segments, so the
+        // duplicate pair lands in different Phase A tasks.
+        let (locations, _) = assert_ordered_scan_parity(&state, &candidate);
+
+        assert_eq!(
+            locations[0],
+            Some((candidate.clone(), 0, 4, BlockLocationKind::Canonical))
+        );
+        assert_eq!(
+            locations[2],
+            Some((candidate.clone(), 4, 4, BlockLocationKind::Canonical))
+        );
+    }
+
+    #[test]
+    fn ordered_parallel_scan_prefers_target_blocks_over_cross_file_duplicates() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64usize;
+        let shared = seeded_block(200, slice_size);
+        let alpha = [
+            shared.clone(),
+            seeded_block(1, slice_size),
+            seeded_block(2, slice_size),
+            seeded_block(3, slice_size),
+        ]
+        .concat();
+        let beta = [
+            seeded_block(4, slice_size),
+            shared.clone(),
+            seeded_block(5, slice_size),
+            seeded_block(6, slice_size),
+        ]
+        .concat();
+        let set = synthetic_set(
+            &[("alpha.bin", &alpha), ("beta.bin", &beta)],
+            slice_size as u64,
+        );
+        let candidate = dir.path().join("alpha.bin");
+        // Junk replaces alpha's first block, pushing the shared block to an
+        // offset only reachable through the resync loop; the target's copy
+        // (rank 1) must win over beta's identical block (rank 2).
+        let mut damaged = Vec::new();
+        damaged.extend(std::iter::repeat_n(0xEE, slice_size));
+        damaged.extend_from_slice(&shared);
+        damaged.extend_from_slice(&alpha[slice_size * 2..]);
+        fs::write(&candidate, damaged).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let (locations, _) = assert_ordered_scan_parity(&state, &candidate);
+
+        assert_eq!(
+            locations[0],
+            Some((
+                candidate.clone(),
+                slice_size as u64,
+                slice_size as u64,
+                BlockLocationKind::Canonical
+            ))
+        );
+        // Beta's identical block stays unclaimed by alpha's scan.
+        assert_eq!(locations[5], None);
+    }
+
+    #[test]
+    fn ordered_parallel_scan_matches_serial_for_mixed_harvesting() {
+        let dir = tempdir().unwrap();
+        let alpha = b"aaaabbbbccccdddd".to_vec();
+        let beta = b"1111222233334444".to_vec();
+        let set = synthetic_set(&[("alpha.bin", &alpha), ("beta.bin", &beta)], 4);
+        let candidate = dir.path().join("alpha.bin");
+        fs::write(&candidate, b"aaaa2222ccccxxxx").unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let (locations, _) = assert_ordered_scan_parity(&state, &candidate);
+
+        assert_eq!(
+            locations[5],
+            Some((candidate.clone(), 4, 4, BlockLocationKind::Canonical))
+        );
+    }
+
+    #[test]
+    fn ordered_parallel_scan_matches_serial_with_segment_boundary_damage() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64usize;
+        let blocks: Vec<Vec<u8>> = (0..8u8)
+            .map(|seed| seeded_block(seed.wrapping_add(53), slice_size))
+            .collect();
+        let target: Vec<u8> = blocks.concat();
+        let set = synthetic_set(&[("target.bin", &target)], slice_size as u64);
+        let candidate = dir.path().join("target.bin");
+        // With two-window segments, window 1 is the last of segment 0 and
+        // window 2 the first of segment 1; damaging both spans the boundary.
+        let mut damaged = target.clone();
+        damaged[slice_size..slice_size * 3].fill(0xEE);
+        fs::write(&candidate, damaged).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let (locations, _) = assert_ordered_scan_parity(&state, &candidate);
+
+        assert_eq!(locations[1], None);
+        assert_eq!(locations[2], None);
+        for index in [0usize, 3, 4, 5, 6, 7] {
+            assert_eq!(
+                locations[index],
+                Some((
+                    candidate.clone(),
+                    index as u64 * slice_size as u64,
+                    slice_size as u64,
+                    BlockLocationKind::Canonical
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_parallel_scan_matches_serial_with_md5_batch_straddling_damage() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64usize;
+        let blocks: Vec<Vec<u8>> = (0..10u8)
+            .map(|seed| seeded_block(seed.wrapping_add(101), slice_size))
+            .collect();
+        let target: Vec<u8> = blocks.concat();
+        let set = synthetic_set(&[("target.bin", &target)], slice_size as u64);
+        let candidate = dir.path().join("target.bin");
+        // Windows 3 and 4 straddle the four-lane MD5 batch boundary inside a
+        // single default-size segment.
+        let mut damaged = target.clone();
+        damaged[slice_size * 3..slice_size * 5].fill(0xEE);
+        fs::write(&candidate, damaged).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let (locations, _) = assert_ordered_scan_parity(&state, &candidate);
+
+        assert_eq!(locations[3], None);
+        assert_eq!(locations[4], None);
+        assert!(locations.iter().filter(|entry| entry.is_some()).count() == 8);
+    }
+
+    #[test]
+    fn ordered_parallel_scan_handles_single_window_file() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64usize;
+        let target = seeded_block(77, slice_size);
+        let set = synthetic_set(&[("target.bin", &target)], slice_size as u64);
+        let candidate = dir.path().join("target.bin");
+        fs::write(&candidate, &target).unwrap();
+        let state = RepairState::from_set(dir.path(), set).unwrap();
+
+        let (locations, stats) = assert_ordered_scan_parity(&state, &candidate);
+        assert_eq!(
+            locations[0],
+            Some((
+                candidate.clone(),
+                0,
+                slice_size as u64,
+                BlockLocationKind::Canonical
+            ))
+        );
+        assert_eq!(stats.jumps_taken, 1);
+        assert_eq!(stats.windows_stepped, 0);
+
+        // Damaged single window: the failed step off the only full window
+        // must end the scan without counting a step, in both modes.
+        fs::write(&candidate, vec![0xEE; slice_size]).unwrap();
+        let (damaged_locations, damaged_stats) = assert_ordered_scan_parity(&state, &candidate);
+        assert_eq!(damaged_locations[0], None);
+        assert_eq!(damaged_stats.windows_stepped, 0);
+        assert_eq!(damaged_stats.jumps_taken, 0);
+    }
+
+    #[test]
+    fn full_state_scan_with_renamed_copy_matches_between_thread_pools() {
+        let slice_size = 64usize;
+        let blocks: Vec<Vec<u8>> = (0..6u8)
+            .map(|seed| seeded_block(seed.wrapping_add(151), slice_size))
+            .collect();
+        let mut data: Vec<u8> = blocks.concat();
+        data.extend_from_slice(b"short-tail");
+
+        let run_scan = |threads: usize| {
+            let dir = tempdir().unwrap();
+            let set = synthetic_set(&[("target.bin", &data)], slice_size as u64);
+            let mut damaged = data.clone();
+            damaged[slice_size * 2..slice_size * 3].fill(0xEE);
+            fs::write(dir.path().join("target.bin"), &damaged).unwrap();
+            fs::write(dir.path().join("renamed-copy.bin"), &data).unwrap();
+
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let mut state = RepairState::from_set(dir.path(), set).unwrap();
+            let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+            pool.install(|| state.scan(&options)).unwrap();
+            let verification = state.verification_result();
+            let locations: Vec<Option<(u64, u64, BlockLocationKind, String)>> = state
+                .blocks
+                .iter()
+                .map(|block| {
+                    block.location.as_ref().map(|location| {
+                        (
+                            location.offset,
+                            location.len,
+                            location.kind,
+                            location
+                                .path
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .into_owned(),
+                        )
+                    })
+                })
+                .collect();
+            let statuses: Vec<String> = verification
+                .files
+                .iter()
+                .map(|file| match &file.status {
+                    FileStatus::Renamed(path) => {
+                        format!("Renamed({})", path.file_name().unwrap().to_string_lossy())
+                    }
+                    status => format!("{status:?}"),
+                })
+                .collect();
+            (
+                locations,
+                statuses,
+                verification.total_missing_blocks,
+                verification
+                    .files
+                    .iter()
+                    .map(|file| file.valid_slices.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        // One thread forces the serial ordered scanner through the
+        // dispatcher; four threads take the parallel path.
+        let serial = run_scan(1);
+        let parallel = run_scan(4);
+        assert_eq!(parallel.0, serial.0);
+        assert_eq!(parallel.1, serial.1);
+        assert_eq!(parallel.2, serial.2);
+        assert_eq!(parallel.3, serial.3);
+        assert_eq!(serial.2, 0, "complete renamed copy supplies every block");
+    }
+
+    struct ParityLcg(u64);
+
+    impl ParityLcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound.max(1)
+        }
+    }
+
+    #[test]
+    fn ordered_parallel_scan_randomized_parity_matches_serial() {
+        let slice_size = 64usize;
+        let mut rng = ParityLcg(0x5EED_CAFE_F00D_D00D);
+
+        for iteration in 0..24 {
+            let dir = tempdir().unwrap();
+            let block_count = 4 + rng.below(8) as usize;
+            // A small seed alphabet makes duplicate block content likely.
+            let mut target = Vec::new();
+            for _ in 0..block_count {
+                target.extend_from_slice(&seeded_block(rng.below(4) as u8, slice_size));
+            }
+            if rng.below(2) == 0 {
+                let tail_len = 1 + rng.below(slice_size as u64 - 1) as usize;
+                target.extend((0..tail_len).map(|_| rng.below(256) as u8));
+            }
+            let set = synthetic_set(&[("target.bin", &target)], slice_size as u64);
+
+            let mut damaged = target.clone();
+            for _ in 0..=rng.below(3) {
+                if damaged.is_empty() {
+                    break;
+                }
+                match rng.below(4) {
+                    0 => {
+                        // In-place corruption.
+                        let start = rng.below(damaged.len() as u64) as usize;
+                        let len = (1 + rng.below(2 * slice_size as u64) as usize)
+                            .min(damaged.len() - start);
+                        for byte in &mut damaged[start..start + len] {
+                            *byte ^= 0x5A;
+                        }
+                    }
+                    1 => {
+                        // Insertion.
+                        let at = rng.below(damaged.len() as u64 + 1) as usize;
+                        let len = 1 + rng.below(2 * slice_size as u64) as usize;
+                        let junk: Vec<u8> = (0..len).map(|_| rng.below(256) as u8).collect();
+                        damaged.splice(at..at, junk);
+                    }
+                    2 => {
+                        // Deletion.
+                        let start = rng.below(damaged.len() as u64) as usize;
+                        let len = (1 + rng.below(2 * slice_size as u64) as usize)
+                            .min(damaged.len() - start);
+                        damaged.drain(start..start + len);
+                    }
+                    _ => {
+                        // Duplicate a source block's content at a random spot.
+                        if damaged.len() >= slice_size {
+                            let source = rng.below(block_count as u64) as usize * slice_size;
+                            let at = rng.below((damaged.len() - slice_size) as u64 + 1) as usize;
+                            let copy = target[source..source + slice_size].to_vec();
+                            damaged[at..at + slice_size].copy_from_slice(&copy);
+                        }
+                    }
+                }
+            }
+
+            let candidate = dir.path().join("target.bin");
+            fs::write(&candidate, &damaged).unwrap();
+            let state = RepairState::from_set(dir.path(), set).unwrap();
+
+            let (serial_locations, serial_stats) = scan_ordered_serial_direct(&state, &candidate);
+            let default_segment = ordered_scan_segment_windows(slice_size);
+            for segment_windows in [2usize, default_segment] {
+                let (parallel_locations, parallel_stats) =
+                    scan_ordered_parallel_direct(&state, &candidate, segment_windows);
+                assert_eq!(
+                    parallel_locations,
+                    serial_locations,
+                    "iteration {iteration}: locations diverged (segment_windows={segment_windows}, damaged_len={})",
+                    damaged.len()
+                );
+                assert_eq!(
+                    scan_stat_counters(parallel_stats),
+                    scan_stat_counters(serial_stats),
+                    "iteration {iteration}: counters diverged (segment_windows={segment_windows}, damaged_len={})",
+                    damaged.len()
+                );
+            }
+        }
     }
 
     #[test]

@@ -9,20 +9,14 @@ use weaver_model::files::{
 
 const PAR2_REPAIR_MEMORY_LIMIT_ENV: &str = "WEAVER_PAR2_REPAIR_MEMORY_LIMIT_BYTES";
 // Sizes the transient streaming repair buffers (the decode matrix has its own
-// budget floor inside weaver-par2). The floor keeps chunk re-read
-// amplification low on heavily damaged jobs; scaling with physical memory
-// lets big sets repair in one pass on machines that can afford it.
-const PAR2_REPAIR_MEMORY_LIMIT_FLOOR_BYTES: usize = 512 * 1024 * 1024;
-const PAR2_REPAIR_MEMORY_LIMIT_CEILING_BYTES: usize = 4 * 1024 * 1024 * 1024;
+// budget floor inside weaver-par2). 64 MiB measured within noise of far
+// larger budgets on heavily damaged sets once streaming repair got its
+// batched kernels, so the default stays small and repairs coexist with
+// concurrent downloads; the env override remains for tuning.
+const DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 fn default_par2_repair_memory_limit_bytes() -> usize {
-    let scaled = crate::runtime::system_probe::detect_total_memory_bytes()
-        .map(|total| (total / 8) as usize)
-        .unwrap_or(PAR2_REPAIR_MEMORY_LIMIT_FLOOR_BYTES);
-    scaled.clamp(
-        PAR2_REPAIR_MEMORY_LIMIT_FLOOR_BYTES,
-        PAR2_REPAIR_MEMORY_LIMIT_CEILING_BYTES,
-    )
+    DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
 }
 
 fn configured_par2_repair_memory_limit_bytes() -> usize {
@@ -3051,13 +3045,13 @@ mod tests {
 
     #[test]
     fn par2_repair_memory_limit_defaults_when_unset() {
-        let default_bytes = default_par2_repair_memory_limit_bytes();
-        assert!(default_bytes >= PAR2_REPAIR_MEMORY_LIMIT_FLOOR_BYTES);
-        assert!(default_bytes <= PAR2_REPAIR_MEMORY_LIMIT_CEILING_BYTES);
-        assert_eq!(parse_par2_repair_memory_limit_bytes(None), default_bytes);
+        assert_eq!(
+            parse_par2_repair_memory_limit_bytes(None),
+            DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
+        );
         assert_eq!(
             parse_par2_repair_memory_limit_bytes(Some("  ")),
-            default_bytes
+            DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
         );
     }
 

@@ -3,7 +3,7 @@ name = "weaver-yenc"
 description = "yEnc encoding and decoding with streaming CRC verification"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [dependencies]

@@ -542,13 +542,21 @@ fn method_tuned_chunk_words(slice_size: usize) -> usize {
     word_count
 }
 
+/// Repairs whose estimated in-memory footprint fits under this take the
+/// in-memory path; everything larger streams. Streaming outperforms the
+/// in-memory path on every measured large set (it received all the
+/// kernel/batching work), so a generous memory budget must not steer big
+/// repairs in-memory — the budget only sizes streaming chunks. Small repairs
+/// keep the in-memory path's lower fixed overhead.
+const IN_MEMORY_REPAIR_MAX_BYTES: usize = 128 * 1024 * 1024;
+
 fn select_repair_execution_mode(plan: &RepairPlan, options: &RepairOptions) -> RepairExecutionMode {
     let slice_size = plan.slice_size as usize;
     let word_count = (slice_size / 2).max(1);
 
     let limit = options.memory_limit.unwrap_or(DEFAULT_REPAIR_MEMORY_LIMIT);
     let budget_chunk_words = chunk_words_for_budget(word_count, plan.missing_slices.len(), limit);
-    if estimated_in_memory_repair_bytes(plan) <= limit {
+    if estimated_in_memory_repair_bytes(plan) <= limit.min(IN_MEMORY_REPAIR_MAX_BYTES) {
         // The in-memory path keeps its historical cache-tuned chunking.
         let method_chunk_words = method_tuned_chunk_words(slice_size);
         RepairExecutionMode::InMemory {

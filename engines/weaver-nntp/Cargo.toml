@@ -3,7 +3,7 @@ name = "weaver-nntp"
 description = "Async NNTP protocol client with TLS and connection pooling"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [dependencies]

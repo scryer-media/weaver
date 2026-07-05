@@ -189,9 +189,12 @@ fn coordinator_loop(
 /// standard GF(2) length-shift operator: crc(A ++ B) =
 /// shift(crc(A), len(B)) ^ crc(B). Two lanes keep CRC off the read loop's
 /// critical path even when a single lane cannot match the read rate.
+/// Per-lane results: chunk CRCs in submission order plus recycled buffers.
+type CrcLaneOutput = (Vec<ChunkCrc>, Vec<Vec<u8>>);
+
 struct CrcLanes {
     txs: Vec<mpsc::SyncSender<(u64, Vec<u8>)>>,
-    handles: Vec<JoinHandle<(Vec<ChunkCrc>, Vec<Vec<u8>>)>>,
+    handles: Vec<JoinHandle<CrcLaneOutput>>,
     next_seq: u64,
 }
 

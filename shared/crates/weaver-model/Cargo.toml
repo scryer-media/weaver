@@ -3,7 +3,7 @@ name = "weaver-model"
 description = "Shared low-level file classification contracts for Weaver engines and server code"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [dependencies]

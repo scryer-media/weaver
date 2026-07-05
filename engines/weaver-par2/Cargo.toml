@@ -3,7 +3,7 @@ name = "weaver-par2"
 description = "PAR2 parity verification and repair"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [features]

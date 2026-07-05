@@ -3,6 +3,7 @@ name = "xtask"
 version = "0.0.0"
 edition = "2024"
 publish = false
+license-file.workspace = true
 
 [dependencies]
 anyhow = { version = "1", default-features = false, features = ["std"] }

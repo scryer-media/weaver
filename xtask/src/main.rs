@@ -1594,7 +1594,7 @@ PublisherSupportUrl: https://github.com/scryer-media/weaver/issues\n\
 Author: Scryer Media\n\
 PackageName: {WINGET_PACKAGE_NAME}\n\
 PackageUrl: https://github.com/scryer-media/weaver\n\
-License: GPL-3.0\n\
+License: GPL-3.0-or-later with UnRAR restriction\n\
 LicenseUrl: https://github.com/scryer-media/weaver/blob/main/LICENSE\n\
 Copyright: Copyright (c) Scryer Media\n\
 ShortDescription: High-performance Usenet binary downloader.\n\
@@ -2894,7 +2894,9 @@ mod tests {
         assert!(manifest.contains("PackageIdentifier: ScryerMedia.Weaver"));
         assert!(manifest.contains("Publisher: Scryer Media"));
         assert!(manifest.contains("PackageName: Weaver"));
-        assert!(manifest.contains("License: GPL-3.0"));
+        assert!(manifest.contains(
+            "License: GPL-3.0-or-later with UnRAR restriction"
+        ));
         assert!(manifest.contains("Moniker: weaver-usenet"));
         assert!(manifest.contains(
             "ReleaseNotesUrl: https://github.com/scryer-media/weaver/releases/tag/weaver-v0.6.6"

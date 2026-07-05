@@ -17,7 +17,7 @@ resolver = "2"
 [workspace.package]
 version = "0.6.9"
 edition = "2024"
-license = "GPL-3.0-or-later"
+license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
 
 [workspace.dependencies]

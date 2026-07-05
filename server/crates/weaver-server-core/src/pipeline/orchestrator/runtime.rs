@@ -1118,18 +1118,14 @@ pub(crate) fn compute_write_backlog_budget_bytes(
 ) -> usize {
     use crate::runtime::system_profile::StorageClass;
 
-    // On memory-rich machines the write backlog should absorb a full burst of
-    // in-flight lane output rather than tripping pressure on every wave; the
-    // scaled term lifts the budget with available memory while the cap keeps
-    // dirty buffered data bounded.
-    const WRITE_BACKLOG_SCALED_MAX_BYTES: usize = 768 * 1024 * 1024;
-
+    // The write backlog stays scratch-anchored: growing it with memory only
+    // defers flushing into a larger end-of-job drain tail (measured as added
+    // wall variance), while decode-side scaling is what prevents pressure
+    // latch cycles during download waves.
     let scratch_bytes = buffer_pool_total_bytes(buffers);
     let available_bytes = profile.memory.available_bytes.max(256 * 1024 * 1024) as usize;
-    let scaled = (available_bytes / 24).min(WRITE_BACKLOG_SCALED_MAX_BYTES);
     let base = scratch_bytes
         .max(64 * 1024 * 1024)
-        .max(scaled)
         .min((available_bytes / 8).max(64 * 1024 * 1024));
 
     match profile.disk.storage_class {

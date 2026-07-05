@@ -108,4 +108,5 @@ The NZBGet facade supports the Sonarr/Radarr surface: `version`, `status`, `conf
 
 ## License
 
-GPLv3 — see [LICENSE](LICENSE) for details.
+GPL-3.0-or-later with the UnRAR source-code restriction for RAR extraction
+and recovery code. See [LICENSE](LICENSE) for details.

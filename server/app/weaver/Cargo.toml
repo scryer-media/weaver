@@ -3,7 +3,7 @@ name = "weaver"
 description = "Unified Usenet binary downloader, repair, and extraction engine"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [[bin]]
