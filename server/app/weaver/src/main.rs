@@ -18,10 +18,12 @@ use crate::args::{Cli, Command};
 const LOG_FILE_ENV: &str = "WEAVER_LOG_FILE";
 const DOTENV_FILE: &str = ".env";
 
-// musl's bundled allocator serializes multi-threaded allocation heavily; the
-// container (musl) builds swap in mimalloc. glibc/macOS builds keep the
-// system allocator.
-#[cfg(target_env = "musl")]
+// musl's bundled allocator serializes multi-threaded allocation heavily
+// (measured −18% CPU on the container download benchmark when replaced), and
+// the Windows system heap has the same reputation under threaded load, so
+// both build targets swap in mimalloc. glibc/macOS builds keep the system
+// allocator.
+#[cfg(any(target_env = "musl", target_os = "windows"))]
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

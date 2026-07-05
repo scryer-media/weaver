@@ -957,8 +957,8 @@ impl RawS2nConfig {
         check_s2n_status("load CA PEM", unsafe {
             s2n::s2n_config_add_pem_to_trust_store(config.as_ptr(), pem.as_ptr())
         })?;
-        check_s2n_status("disable multi-record receive", unsafe {
-            s2n::s2n_config_set_recv_multi_record(config.as_ptr(), false)
+        check_s2n_status("configure multi-record receive", unsafe {
+            s2n::s2n_config_set_recv_multi_record(config.as_ptr(), multi_record_receive_enabled())
         })?;
         Ok(config)
     }
@@ -966,6 +966,19 @@ impl RawS2nConfig {
     fn as_ptr(&self) -> *mut s2n::s2n_config {
         self.ptr.as_ptr()
     }
+}
+
+/// Multi-record receive decrypts every full record already buffered before
+/// returning, trading larger reads for extra buffered-copy work. Off by
+/// default (single-record reads measured better under the previous allocator
+/// economics); env-gated so the trade can be re-measured without a rebuild.
+fn multi_record_receive_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("WEAVER_NNTP_S2N_MULTI_RECORD")
+            .map(|value| matches!(value.trim(), "1" | "true" | "on"))
+            .unwrap_or(false)
+    })
 }
 
 impl Drop for RawS2nConfig {

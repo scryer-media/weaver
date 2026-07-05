@@ -1,6 +1,7 @@
 use super::checkpoint::{
     DirectOutputWriter, ExtractionCheckpointState, FinalizeMemberContext, SharedOutputFile,
 };
+use super::readahead::ReadaheadVolumeProvider;
 use super::source::BoundedRarSourcePool;
 use super::*;
 use std::path::{Component, Path, PathBuf};
@@ -444,7 +445,7 @@ impl Pipeline {
                 };
                 provider_paths.insert((absolute_volume - first_volume) as usize, path.clone());
             }
-            let provider = weaver_unrar::StaticVolumeProvider::new(provider_paths);
+            let provider = ReadaheadVolumeProvider::new(provider_paths);
             let shared_ref = Rc::clone(&shared);
             let checkpoint_ref = Arc::clone(&checkpoint);
             archive
@@ -937,7 +938,7 @@ impl Pipeline {
             };
             provider_paths.insert((absolute_volume - first_volume) as usize, path.clone());
         }
-        let provider = weaver_unrar::StaticVolumeProvider::new(provider_paths);
+        let provider = ReadaheadVolumeProvider::new(provider_paths);
         let mut sink = std::io::sink();
         archive
             .extract_member_streaming(idx, &options, &provider, &mut sink)

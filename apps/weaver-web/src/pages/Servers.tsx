@@ -4,8 +4,8 @@ import { useMutation, useQuery } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
+import { SectionCard } from "@/components/SectionCard";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -26,6 +26,7 @@ import {
   UPDATE_SERVER_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { cn } from "@/lib/utils";
 
 type Server = {
   id: number;
@@ -228,12 +229,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
 
       {showForm ? (
         editingServerId != null && !editingServerDetail ? (
-          <Card>
-            <CardHeader>
-              <CardTitle>{t("servers.editServer")}</CardTitle>
-              <CardDescription>{t("settings.serversDesc")}</CardDescription>
-            </CardHeader>
-            <CardContent className="flex items-center justify-between gap-4">
+          <SectionCard title={t("servers.editServer")} description={t("settings.serversDesc")}>
+            <div className="flex items-center justify-between gap-4">
               <div className="flex items-center gap-3 text-sm text-muted-foreground">
                 {editingServerFetching ? <Loader2 className="size-4 animate-spin" /> : null}
                 <span>
@@ -245,8 +242,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
               <Button variant="ghost" onClick={closeForm}>
                 {t("action.cancel")}
               </Button>
-            </CardContent>
-          </Card>
+            </div>
+          </SectionCard>
         ) : (
           <ServerFormCard
             initialValues={
@@ -295,17 +292,17 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
         />
       ) : (
         groupedServers.map(([priority, items]) => (
-          <Card key={priority}>
-            <CardHeader>
-              <CardTitle>{t("servers.group")} {priority}</CardTitle>
-              <CardDescription>{t("servers.groupDescription")}</CardDescription>
-            </CardHeader>
-            <CardContent className="px-0 pb-0">
+          <SectionCard
+            key={priority}
+            title={`${t("servers.group")} ${priority}`}
+            description={t("servers.groupDescription")}
+            contentClassName="-mx-5 -mb-5 sm:-mx-6 sm:-mb-6"
+          >
+            <div className="overflow-x-auto">
               <Table>
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
                     <TableHead>{t("servers.host")}</TableHead>
-                    <TableHead>{t("servers.port")}</TableHead>
                     <TableHead>{t("servers.connections")}</TableHead>
                     <TableHead>{t("servers.tls")}</TableHead>
                     <TableHead>{t("servers.active")}</TableHead>
@@ -315,9 +312,35 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                 <TableBody>
                   {items.map((server) => (
                     <TableRow key={server.id}>
-                      <TableCell className="font-medium">{server.host}</TableCell>
-                      <TableCell>{server.port}</TableCell>
-                      <TableCell>{server.connections}</TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-2.5">
+                          <span
+                            className={cn(
+                              "size-2 shrink-0 rounded-pill",
+                              server.active ? "bg-status-completed animate-status-pulse" : "bg-muted-foreground/40",
+                            )}
+                            aria-hidden="true"
+                          />
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span
+                                className={cn(
+                                  "rounded-chip px-1.5 py-px text-[10px] font-bold uppercase tracking-[0.06em]",
+                                  priority === 0
+                                    ? "bg-priority-high/15 text-priority-high"
+                                    : "bg-secondary text-muted-foreground",
+                                )}
+                              >
+                                {priority === 0 ? "Primary" : "Backup"}
+                              </span>
+                            </div>
+                            <div className="mt-1 truncate font-mono text-[13px] text-foreground">
+                              {server.host}:{server.port}
+                            </div>
+                          </div>
+                        </div>
+                      </TableCell>
+                      <TableCell className="tabular-nums">{server.connections}</TableCell>
                       <TableCell>{server.tls ? t("label.enabled") : t("label.disabled")}</TableCell>
                       <TableCell>{server.active ? t("label.enabled") : t("label.disabled")}</TableCell>
                       <TableCell>
@@ -336,8 +359,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                   ))}
                 </TableBody>
               </Table>
-            </CardContent>
-          </Card>
+            </div>
+          </SectionCard>
         ))
       )}
 
@@ -410,12 +433,11 @@ function ServerFormCard({
   };
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{editing ? t("servers.editServer") : t("servers.addServer")}</CardTitle>
-        <CardDescription>{t("settings.serversDesc")}</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-5">
+    <SectionCard
+      title={editing ? t("servers.editServer") : t("servers.addServer")}
+      description={t("settings.serversDesc")}
+    >
+      <div className="space-y-5">
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
           <Field label={t("servers.host")}>
             <Input
@@ -464,7 +486,7 @@ function ServerFormCard({
           </Field>
         </div>
 
-        <div className="flex flex-wrap gap-6 rounded-2xl border border-border/70 bg-background/70 p-4">
+        <div className="flex flex-wrap gap-6 rounded-inner border border-border bg-background/40 p-4">
           <ToggleField
             label={t("servers.tls")}
             checked={values.tls}
@@ -488,7 +510,14 @@ function ServerFormCard({
         />
 
         {testResult ? (
-          <div className={testResult.success ? "rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4 text-sm text-emerald-700 dark:text-emerald-300" : "rounded-2xl border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive"}>
+          <div
+            className={cn(
+              "rounded-inner border p-4 text-sm",
+              testResult.success
+                ? "border-status-completed/30 bg-status-completed/10 text-status-completed"
+                : "border-destructive/30 bg-destructive/10 text-destructive",
+            )}
+          >
             {testResult.success
               ? `${t("servers.testSuccess")} (${testResult.latencyMs}ms${testResult.supportsPipelining ? ", pipelining supported" : ""})`
               : `${t("servers.testFailed")}: ${testResult.message}`}
@@ -496,7 +525,7 @@ function ServerFormCard({
         ) : null}
 
         {saveError ? (
-          <div className="rounded-2xl border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+          <div className="rounded-inner border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
             {saveError}
           </div>
         ) : null}
@@ -512,8 +541,8 @@ function ServerFormCard({
             {t("action.cancel")}
           </Button>
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </SectionCard>
   );
 }
 

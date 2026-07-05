@@ -17,14 +17,18 @@
     not(any(
         all(target_arch = "x86_64", target_os = "macos"),
         all(target_arch = "aarch64", target_os = "macos"),
+        all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"),
+        all(target_arch = "aarch64", target_os = "linux", target_env = "gnu"),
         all(target_arch = "x86_64", target_os = "linux", target_env = "musl"),
         all(target_arch = "aarch64", target_os = "linux", target_env = "musl"),
+        all(target_arch = "x86_64", target_os = "freebsd"),
+        all(target_arch = "aarch64", target_os = "freebsd"),
         all(target_arch = "x86_64", target_os = "windows", target_env = "msvc"),
         all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")
     ))
 ))]
 compile_error!(
-    "weaver-par2 native-crypto only supports x86_64/aarch64 on macOS, Linux musl, and Windows MSVC"
+    "weaver-par2 native-crypto only supports x86_64/aarch64 on macOS, Linux GNU/musl, FreeBSD, and Windows MSVC"
 );
 
 pub mod checksum;

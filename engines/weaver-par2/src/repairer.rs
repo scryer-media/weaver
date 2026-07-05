@@ -1677,47 +1677,78 @@ impl RepairState {
             );
             bytes_copied += block.expected_len;
         }
-        for range in &block_copy_ranges {
-            check_cancel(options)?;
-            copy_range(
-                &range.src,
-                range.src_offset,
-                &range.dst,
-                range.dst_offset,
-                range.len,
-            )?;
-        }
+        let copy_block_ranges = |ranges: &[BlockCopyRange]| -> Result<()> {
+            for range in ranges {
+                check_cancel(options)?;
+                copy_range(
+                    &range.src,
+                    range.src_offset,
+                    &range.dst,
+                    range.dst_offset,
+                    range.len,
+                )?;
+            }
+            Ok(())
+        };
 
         let mut bytes_reconstructed = 0u64;
         if verification.total_missing_blocks > 0 {
-            let mut access = RepairExecutionAccess::new(
-                install_dir.clone(),
-                &self.files,
-                &self.blocks,
-                &staged_file_ids,
-                self.set.slice_size,
-            )?;
-            let plan =
-                plan_repair_with_memory_limit(&self.set, verification, options.memory_limit)?;
-            bytes_reconstructed = plan
-                .missing_slices
-                .iter()
-                .filter_map(|(file_id, local)| {
-                    if let Some(idx) = self.block_index_by_file_slice.get(&(*file_id, *local)) {
-                        return Some(self.blocks[*idx].expected_len);
-                    }
-                    self.set.file_description(file_id).map(|desc| {
-                        let offset = *local as u64 * self.set.slice_size;
-                        desc.length.saturating_sub(offset).min(self.set.slice_size)
-                    })
-                })
-                .sum();
-            let repair_options = RepairOptions {
-                cancel: options.cancel.clone(),
-                progress: options.progress.clone(),
-                memory_limit: options.memory_limit,
-            };
-            execute_repair_with_options(&plan, &self.set, &mut access, &repair_options)?;
+            // Overlap the intact block copies with reconstruction: every
+            // copied block has a scanned source location, so reconstruction
+            // reads its inputs from those original locations and writes only
+            // missing-slice ranges — the two sides touch disjoint byte ranges
+            // of the staged files. The whole-file copies above must stay
+            // ahead of reconstruction because complete-file matches can mark
+            // slices valid without per-block locations, and those input reads
+            // fall back to the staged copy.
+            bytes_reconstructed = std::thread::scope(|scope| -> Result<u64> {
+                let copier = scope.spawn(|| copy_block_ranges(&block_copy_ranges));
+                let compute = (|| -> Result<u64> {
+                    let mut access = RepairExecutionAccess::new(
+                        install_dir.clone(),
+                        &self.files,
+                        &self.blocks,
+                        &staged_file_ids,
+                        self.set.slice_size,
+                    )?;
+                    let plan = plan_repair_with_memory_limit(
+                        &self.set,
+                        verification,
+                        options.memory_limit,
+                    )?;
+                    let reconstructed: u64 = plan
+                        .missing_slices
+                        .iter()
+                        .filter_map(|(file_id, local)| {
+                            if let Some(idx) =
+                                self.block_index_by_file_slice.get(&(*file_id, *local))
+                            {
+                                return Some(self.blocks[*idx].expected_len);
+                            }
+                            self.set.file_description(file_id).map(|desc| {
+                                let offset = *local as u64 * self.set.slice_size;
+                                desc.length.saturating_sub(offset).min(self.set.slice_size)
+                            })
+                        })
+                        .sum();
+                    let repair_options = RepairOptions {
+                        cancel: options.cancel.clone(),
+                        progress: options.progress.clone(),
+                        memory_limit: options.memory_limit,
+                    };
+                    execute_repair_with_options(&plan, &self.set, &mut access, &repair_options)?;
+                    Ok(reconstructed)
+                })();
+                let copied = copier
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                // Copy failures surface ahead of compute failures, matching
+                // the previous serial order where copies ran first.
+                copied?;
+                compute
+            })?;
+        } else {
+            copy_block_ranges(&block_copy_ranges)?;
         }
 
         Ok(RepairInstall {

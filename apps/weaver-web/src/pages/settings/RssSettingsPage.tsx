@@ -5,10 +5,10 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { DirectoryBrowserDialog } from "@/components/DirectoryBrowserDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
+import { SectionCard } from "@/components/SectionCard";
 import { formatBytes } from "@/components/SpeedDisplay";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -20,6 +20,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { cn } from "@/lib/utils";
 import {
   ADD_RSS_FEED_MUTATION,
   ADD_RSS_RULE_MUTATION,
@@ -516,7 +517,7 @@ export function RssSettingsPage() {
   };
 
   return (
-    <div className="space-y-6">
+    <div className="max-w-[1180px] space-y-6">
       <PageHeader
         title={t("settings.rss")}
         description={t("settings.rssDesc")}
@@ -589,11 +590,9 @@ export function RssSettingsPage() {
       ) : null}
 
       {fetching && !data ? (
-        <Card>
-          <CardContent className="py-6 text-sm text-muted-foreground">
-            {t("label.loading")}
-          </CardContent>
-        </Card>
+        <div className="rounded-card border border-border bg-card p-6 text-sm text-muted-foreground">
+          {t("label.loading")}
+        </div>
       ) : null}
 
       {!fetching && feeds.length === 0 && !showFeedForm ? (
@@ -606,58 +605,62 @@ export function RssSettingsPage() {
       ) : null}
 
       {feeds.map((feed) => (
-        <Card key={feed.id}>
-          <CardHeader className="gap-4">
-            <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-              <div className="space-y-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <CardTitle>{feed.name}</CardTitle>
-                  <Badge variant={feed.enabled ? "success" : "muted"}>
-                    {feed.enabled ? t("label.enabled") : t("label.disabled")}
-                  </Badge>
-                  {feed.hasPassword ? (
-                    <Badge variant="info">{t("rss.passwordSaved")}</Badge>
-                  ) : null}
-                  {feed.consecutiveFailures > 0 ? (
-                    <Badge variant="warning">
-                      {t("rss.failures")} {feed.consecutiveFailures}
-                    </Badge>
-                  ) : null}
-                </div>
-                <CardDescription className="break-all">{feed.url}</CardDescription>
-              </div>
-
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => void handleRunSync(feed.id)}
-                  disabled={runSyncState.fetching}
-                >
-                  {syncTarget === feed.id ? t("rss.syncing") : t("rss.runFeed")}
-                </Button>
-                <Button variant="outline" size="sm" onClick={() => openAddRule(feed.id)}>
-                  {t("rss.addRule")}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setClearSeenTarget(feed.id)}
-                  disabled={(seenItemsByFeed.get(feed.id)?.length ?? 0) === 0}
-                >
-                  {t("rss.clearSeen")}
-                </Button>
-                <Button variant="ghost" size="sm" onClick={() => openEditFeed(feed)}>
-                  {t("action.edit")}
-                </Button>
-                <Button variant="ghost" size="sm" onClick={() => setDeleteFeedId(feed.id)}>
-                  {t("action.delete")}
-                </Button>
-              </div>
+        <SectionCard
+          key={feed.id}
+          title={
+            <span className="flex flex-wrap items-center gap-2">
+              <span
+                className={cn(
+                  "size-2 rounded-pill",
+                  feed.enabled ? "bg-status-completed" : "bg-muted-foreground/40",
+                )}
+              />
+              {feed.name}
+              <Badge variant={feed.enabled ? "success" : "muted"}>
+                {feed.enabled ? t("label.enabled") : t("label.disabled")}
+              </Badge>
+              {feed.hasPassword ? (
+                <Badge variant="info">{t("rss.passwordSaved")}</Badge>
+              ) : null}
+              {feed.consecutiveFailures > 0 ? (
+                <Badge variant="warning">
+                  {t("rss.failures")} {feed.consecutiveFailures}
+                </Badge>
+              ) : null}
+            </span>
+          }
+          description={<span className="break-all font-mono">{feed.url}</span>}
+          actions={
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void handleRunSync(feed.id)}
+                disabled={runSyncState.fetching}
+              >
+                {syncTarget === feed.id ? t("rss.syncing") : t("rss.runFeed")}
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => openAddRule(feed.id)}>
+                {t("rss.addRule")}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setClearSeenTarget(feed.id)}
+                disabled={(seenItemsByFeed.get(feed.id)?.length ?? 0) === 0}
+              >
+                {t("rss.clearSeen")}
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => openEditFeed(feed)}>
+                {t("action.edit")}
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setDeleteFeedId(feed.id)}>
+                {t("action.delete")}
+              </Button>
             </div>
-          </CardHeader>
-
-          <CardContent className="space-y-5">
+          }
+        >
+          <div className="space-y-5">
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
               <DetailCard label={t("rss.pollInterval")}>
                 {feed.pollIntervalSecs}s
@@ -687,7 +690,7 @@ export function RssSettingsPage() {
 
             {feed.defaultMetadata.length > 0 ? (
               <div className="space-y-2">
-                <div className="text-sm font-medium text-foreground">{t("rss.defaultMetadata")}</div>
+                <div className="text-sm font-semibold text-foreground">{t("rss.defaultMetadata")}</div>
                 <div className="flex flex-wrap gap-2">
                   {feed.defaultMetadata.map((entry) => (
                     <Badge key={`${entry.key}:${entry.value}`} variant="outline">
@@ -699,8 +702,8 @@ export function RssSettingsPage() {
             ) : null}
 
             {feed.lastError ? (
-              <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-4 py-3">
-                <div className="text-sm font-medium text-destructive">{t("rss.lastError")}</div>
+              <div className="rounded-inner border border-destructive/30 bg-destructive/5 px-4 py-3">
+                <div className="text-sm font-semibold text-destructive">{t("rss.lastError")}</div>
                 <div className="mt-1 text-sm text-muted-foreground">{feed.lastError}</div>
               </div>
             ) : null}
@@ -733,8 +736,8 @@ export function RssSettingsPage() {
             ) : null}
 
             {feed.rules.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-border/80 px-4 py-6 text-sm text-muted-foreground">
-                <div className="font-medium text-foreground">{t("rss.noRules")}</div>
+              <div className="rounded-inner border border-dashed border-border px-4 py-6 text-sm text-muted-foreground">
+                <div className="font-semibold text-foreground">{t("rss.noRules")}</div>
                 <p className="mt-1">{t("rss.noRulesHint")}</p>
               </div>
             ) : (
@@ -761,8 +764,8 @@ export function RssSettingsPage() {
               items={seenItemsByFeed.get(feed.id) ?? []}
               onForget={handleForgetSeenItem}
             />
-          </CardContent>
-        </Card>
+          </div>
+        </SectionCard>
       ))}
 
       <ConfirmDialog
@@ -844,27 +847,21 @@ function WatchFolderSettingsCard({
   const automaticEnabled = values.mode !== "off" && !values.scanningPaused;
 
   return (
-    <Card>
-      <CardHeader className="gap-4">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-          <div>
-            <CardTitle>{t("watchFolder.title")}</CardTitle>
-            <CardDescription>
-              {t("watchFolder.desc")}
-            </CardDescription>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" onClick={() => void onScan()} disabled={!hasPath || scanning}>
-              {scanning ? t("watchFolder.scanning") : t("watchFolder.scanNow")}
-            </Button>
-            <Button onClick={() => void onSave(values)} disabled={saving}>
-              {saving ? t("watchFolder.saving") : t("action.save")}
-            </Button>
-          </div>
+    <SectionCard
+      title={t("watchFolder.title")}
+      description={t("watchFolder.desc")}
+      actions={
+        <div className="flex flex-wrap gap-2">
+          <Button variant="outline" onClick={() => void onScan()} disabled={!hasPath || scanning}>
+            {scanning ? t("watchFolder.scanning") : t("watchFolder.scanNow")}
+          </Button>
+          <Button onClick={() => void onSave(values)} disabled={saving}>
+            {saving ? t("watchFolder.saving") : t("action.save")}
+          </Button>
         </div>
-      </CardHeader>
-
-      <CardContent className="space-y-5">
+      }
+    >
+      <div className="space-y-5">
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           <Field label={t("watchFolder.mode")}>
             <Select
@@ -889,6 +886,7 @@ function WatchFolderSettingsCard({
               <Input
                 value={values.path}
                 onChange={(event) => onChange({ ...values, path: event.target.value })}
+                className="font-mono"
               />
               <Button type="button" variant="outline" onClick={onBrowse}>
                 {t("watchFolder.browse")}
@@ -926,12 +924,12 @@ function WatchFolderSettingsCard({
         </div>
 
         <div className="grid gap-4 md:grid-cols-2">
-          <div className="flex items-center justify-between rounded-xl border border-border/70 px-4 py-3">
+          <div className="flex items-center justify-between gap-4 rounded-inner border border-border p-5">
             <div>
-              <div className="text-sm font-medium text-foreground">
+              <div className="text-sm font-semibold text-foreground">
                 {t("watchFolder.categorySubfolders")}
               </div>
-              <div className="text-xs text-muted-foreground">
+              <div className="mt-1 text-[12.5px] text-muted-foreground">
                 {t("watchFolder.categorySubfoldersDesc")}
               </div>
             </div>
@@ -943,12 +941,12 @@ function WatchFolderSettingsCard({
             />
           </div>
 
-          <div className="flex items-center justify-between rounded-xl border border-border/70 px-4 py-3">
+          <div className="flex items-center justify-between gap-4 rounded-inner border border-border p-5">
             <div>
-              <div className="text-sm font-medium text-foreground">
+              <div className="text-sm font-semibold text-foreground">
                 {t("watchFolder.automaticScanning")}
               </div>
-              <div className="text-xs text-muted-foreground">
+              <div className="mt-1 text-[12.5px] text-muted-foreground">
                 {automaticEnabled
                   ? t("watchFolder.automaticEnabled")
                   : t("watchFolder.automaticPausedOrOff")}
@@ -965,8 +963,8 @@ function WatchFolderSettingsCard({
         </div>
 
         {scanReport ? <WatchFolderScanReportCard report={scanReport} /> : null}
-      </CardContent>
-    </Card>
+      </div>
+    </SectionCard>
   );
 }
 
@@ -976,7 +974,7 @@ function WatchFolderScanReportCard({ report }: { report: WatchFolderScanReport }
     report.skippedInputs.length + report.permanentErrors.length + report.transientErrors.length;
 
   return (
-    <div className="space-y-4 rounded-xl border border-border/70 p-4">
+    <div className="space-y-4 rounded-inner border border-border p-5">
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
         <DetailCard label={t("watchFolder.discovered")}>{report.discoveredFiles.length}</DetailCard>
         <DetailCard label={t("watchFolder.queued")}>{report.queuedNzbs.length}</DetailCard>
@@ -1010,10 +1008,10 @@ function WatchFolderScanReportCard({ report }: { report: WatchFolderScanReport }
 function ScanList({ title, items }: { title: string; items: string[] }) {
   return (
     <div className="space-y-2">
-      <div className="text-sm font-medium text-foreground">{title}</div>
+      <div className="text-sm font-semibold text-foreground">{title}</div>
       <div className="space-y-1">
         {items.slice(0, 8).map((item) => (
-          <div key={item} className="break-all text-xs text-muted-foreground">
+          <div key={item} className="break-all font-mono text-xs text-muted-foreground">
             {item}
           </div>
         ))}
@@ -1054,12 +1052,11 @@ function FeedFormCard({
   }, [initialValues]);
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{editing ? t("rss.editFeed") : t("rss.addFeed")}</CardTitle>
-        <CardDescription>{t("settings.rssDesc")}</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-5">
+    <SectionCard
+      title={editing ? t("rss.editFeed") : t("rss.addFeed")}
+      description={t("settings.rssDesc")}
+    >
+      <div className="space-y-5">
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           <Field label={t("rss.feedName")}>
             <Input
@@ -1078,6 +1075,7 @@ function FeedFormCard({
               onChange={(event) =>
                 setValues((current) => ({ ...current, url: event.target.value }))
               }
+              className="font-mono"
             />
           </Field>
 
@@ -1159,10 +1157,10 @@ function FeedFormCard({
           </Field>
         </div>
 
-        <div className="flex flex-col gap-4 rounded-2xl border border-border/70 bg-background/70 p-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-center justify-between gap-4 rounded-inner border border-border p-5">
           <div>
-            <div className="text-sm font-medium text-foreground">{t("rss.feedEnabled")}</div>
-            <div className="text-xs text-muted-foreground">{t("rss.feedEnabledDesc")}</div>
+            <div className="text-sm font-semibold text-foreground">{t("rss.feedEnabled")}</div>
+            <div className="mt-1 text-[12.5px] text-muted-foreground">{t("rss.feedEnabledDesc")}</div>
           </div>
           <Switch
             checked={values.enabled}
@@ -1197,8 +1195,8 @@ function FeedFormCard({
             {t("action.cancel")}
           </Button>
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </SectionCard>
   );
 }
 
@@ -1225,12 +1223,12 @@ function RuleFormCard({
   }, [initialValues]);
 
   return (
-    <div className="rounded-2xl border border-border/70 bg-background/70 p-4">
+    <div className="rounded-inner border border-border bg-background/40 p-5">
       <div className="mb-4">
-        <div className="text-base font-semibold text-foreground">
+        <div className="font-space-grotesk text-base font-bold text-foreground">
           {editing ? t("rss.editRule") : t("rss.addRule")}
         </div>
-        <div className="text-sm text-muted-foreground">{t("rss.ruleDesc")}</div>
+        <div className="mt-1 text-[12.5px] text-muted-foreground">{t("rss.ruleDesc")}</div>
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
@@ -1343,10 +1341,10 @@ function RuleFormCard({
         </Field>
       </div>
 
-      <div className="mt-4 flex flex-col gap-4 rounded-2xl border border-border/70 bg-card px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+      <div className="mt-4 flex items-center justify-between gap-4 rounded-inner border border-border bg-card px-4 py-3">
         <div>
-          <div className="text-sm font-medium text-foreground">{t("rss.ruleEnabled")}</div>
-          <div className="text-xs text-muted-foreground">{t("rss.ruleEnabledDesc")}</div>
+          <div className="text-sm font-semibold text-foreground">{t("rss.ruleEnabled")}</div>
+          <div className="mt-1 text-[12.5px] text-muted-foreground">{t("rss.ruleEnabledDesc")}</div>
         </div>
         <Switch
           checked={values.enabled}
@@ -1389,7 +1387,7 @@ function RuleCard({
   const t = useTranslate();
 
   return (
-    <div className="rounded-2xl border border-border/70 bg-background/70 p-4">
+    <div className="rounded-inner border border-border bg-background/40 p-5">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="space-y-3">
           <div className="flex flex-wrap items-center gap-2">
@@ -1454,12 +1452,8 @@ function SyncReportCard({ report }: { report: RssSyncReport }) {
   const t = useTranslate();
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{t("rss.syncReport")}</CardTitle>
-        <CardDescription>{t("rss.syncSummary")}</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
+    <SectionCard title={t("rss.syncReport")} description={t("rss.syncSummary")}>
+      <div className="space-y-4">
         <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
           <DetailCard label={t("rss.feedsPolled")}>{report.feedsPolled}</DetailCard>
           <DetailCard label={t("rss.itemsFetched")}>{report.itemsFetched}</DetailCard>
@@ -1474,9 +1468,9 @@ function SyncReportCard({ report }: { report: RssSyncReport }) {
             {report.feedResults.map((result) => (
               <div
                 key={result.feedId}
-                className="rounded-2xl border border-border/70 bg-background/70 p-4"
+                className="rounded-inner border border-border bg-background/40 p-5"
               >
-                <div className="mb-3 text-sm font-medium text-foreground">
+                <div className="mb-3 text-sm font-semibold text-foreground">
                   {result.feedName}
                 </div>
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
@@ -1513,8 +1507,8 @@ function SyncReportCard({ report }: { report: RssSyncReport }) {
             ))}
           </div>
         ) : null}
-      </CardContent>
-    </Card>
+      </div>
+    </SectionCard>
   );
 }
 
@@ -1531,15 +1525,15 @@ function SeenItemsCard({
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-3">
         <div>
-          <div className="text-sm font-medium text-foreground">{t("rss.seenHistory")}</div>
-          <div className="text-xs text-muted-foreground">{t("rss.seenHistoryDesc")}</div>
+          <div className="text-sm font-semibold text-foreground">{t("rss.seenHistory")}</div>
+          <div className="mt-1 text-[12.5px] text-muted-foreground">{t("rss.seenHistoryDesc")}</div>
         </div>
         {items.length > 0 ? <Badge variant="outline">{items.length}</Badge> : null}
       </div>
 
       {items.length === 0 ? (
-        <div className="rounded-2xl border border-dashed border-border/80 px-4 py-6 text-sm text-muted-foreground">
-          <div className="font-medium text-foreground">{t("rss.noSeenItems")}</div>
+        <div className="rounded-inner border border-dashed border-border px-4 py-6 text-sm text-muted-foreground">
+          <div className="font-semibold text-foreground">{t("rss.noSeenItems")}</div>
           <p className="mt-1">{t("rss.noSeenItemsHint")}</p>
         </div>
       ) : (
@@ -1547,7 +1541,7 @@ function SeenItemsCard({
           {items.slice(0, 8).map((item) => (
             <div
               key={`${item.feedId}:${item.itemId}`}
-              className="rounded-2xl border border-border/70 bg-card px-4 py-4"
+              className="rounded-inner border border-border bg-card px-4 py-4"
             >
               <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                 <div className="min-w-0 space-y-3">
@@ -1566,8 +1560,8 @@ function SeenItemsCard({
                   </div>
 
                   <div>
-                    <div className="text-sm font-medium text-foreground">{item.itemTitle}</div>
-                    <div className="mt-1 break-all text-xs text-muted-foreground">
+                    <div className="text-sm font-semibold text-foreground">{item.itemTitle}</div>
+                    <div className="mt-1 break-all font-mono text-xs text-muted-foreground">
                       {item.itemId}
                     </div>
                   </div>
@@ -1599,7 +1593,7 @@ function SeenItemsCard({
                   </div>
 
                   {item.error ? (
-                    <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-3 py-3 text-sm text-destructive">
+                    <div className="rounded-inner border border-destructive/30 bg-destructive/5 px-3 py-3 text-sm text-destructive">
                       {item.error}
                     </div>
                   ) : null}
@@ -1704,9 +1698,9 @@ function Field({
 }) {
   return (
     <div className="space-y-2">
-      <Label>{label}</Label>
+      <Label className="text-sm font-semibold">{label}</Label>
       {children}
-      {description ? <p className="text-xs text-muted-foreground">{description}</p> : null}
+      {description ? <p className="text-[12.5px] text-muted-foreground">{description}</p> : null}
     </div>
   );
 }
@@ -1719,11 +1713,11 @@ function DetailCard({
   children: ReactNode;
 }) {
   return (
-    <div className="rounded-xl border border-border/70 bg-card px-3 py-3">
-      <div className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
+    <div className="rounded-inner border border-border bg-card px-3 py-3">
+      <div className="text-[10.5px] font-semibold uppercase tracking-[0.13em] text-muted-foreground">
         {label}
       </div>
-      <div className="mt-2 text-sm font-medium text-foreground">{children}</div>
+      <div className="mt-2 text-sm font-semibold text-foreground">{children}</div>
     </div>
   );
 }
@@ -1737,10 +1731,10 @@ function StatusBanner({
 }) {
   const className =
     variant === "success"
-      ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+      ? "border-status-completed/25 bg-status-completed/10 text-status-completed"
       : "border-destructive/25 bg-destructive/10 text-destructive";
 
-  return <div className={`rounded-2xl border px-4 py-3 text-sm ${className}`}>{children}</div>;
+  return <div className={cn("rounded-card border px-4 py-3 text-sm", className)}>{children}</div>;
 }
 
 function splitCommaList(value: string) {

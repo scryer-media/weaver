@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod checkpoint;
 mod member;
+mod readahead;
 mod scheduler;
 mod source;
 

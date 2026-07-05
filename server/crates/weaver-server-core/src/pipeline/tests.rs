@@ -9397,7 +9397,9 @@ fn decode_backlog_budget_is_separate_bounded_raw_article_cache() {
     let decode_budget = compute_decode_backlog_budget_bytes(&profile, &buffers, write_budget);
 
     assert!(decode_budget > write_budget);
-    assert_eq!(decode_budget, 432 * 1024 * 1024);
+    // Memory-scaled: available/12 dominates the buffer-pool term on an 8 GiB
+    // machine, bounded by available/8.
+    assert_eq!(decode_budget, 8 * 1024 * 1024 * 1024 / 12);
 }
 
 #[test]

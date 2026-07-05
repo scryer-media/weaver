@@ -74,12 +74,16 @@ export function UploadModal({ open, onClose }: UploadModalProps) {
   return (
     <Dialog open={open} onOpenChange={(next) => (!next ? onClose() : undefined)}>
       <DialogContent
-        className="max-h-[90vh] w-[min(96vw,72rem)] overflow-y-auto p-4 sm:max-w-5xl sm:p-6"
+        className="max-h-[90vh] w-[min(96vw,72rem)] overflow-y-auto rounded-card p-4 sm:max-w-5xl sm:p-6 [&>button]:top-6 [&>button]:right-6 [&>button]:size-8 [&>button]:rounded-inner [&>button]:border [&>button]:border-border [&>button]:bg-card [&>button]:opacity-100"
         onKeyDownCapture={handleDialogKeyDown}
       >
-        <DialogHeader>
-          <DialogTitle>{t("upload.title")}</DialogTitle>
-          <DialogDescription>{t("upload.accepts")}</DialogDescription>
+        <DialogHeader className="gap-2 text-left">
+          <DialogTitle className="font-space-grotesk text-2xl font-bold leading-none tracking-tight">
+            {t("upload.title")}
+          </DialogTitle>
+          <DialogDescription className="text-[13px] text-muted-foreground">
+            {t("upload.accepts")}
+          </DialogDescription>
         </DialogHeader>
         {open ? (
           <UploadNzbForm

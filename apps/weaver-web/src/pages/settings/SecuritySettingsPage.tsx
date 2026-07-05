@@ -2,14 +2,8 @@ import { useCallback, useEffect, useState } from "react";
 import { Lock, LockOpen, LogOut } from "lucide-react";
 import { useMutation, useQuery } from "urql";
 import { ApiKeysSection, SettingsPageHeader } from "@/pages/settings/shared";
+import { SectionCard } from "@/components/SectionCard";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -139,36 +133,37 @@ function LoginProtectionSection() {
   }
 
   return (
-    <Card className="mb-6">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-base">
+    <SectionCard
+      title={
+        <span className="flex items-center gap-2">
           {status?.enabled ? (
             <Lock className="size-4" />
           ) : (
             <LockOpen className="size-4" />
           )}
           Login Protection
-        </CardTitle>
-        <CardDescription>
-          {status?.enabled
-            ? `Enabled — signed in as ${status.username}`
-            : "Disabled — the UI is accessible without authentication"}
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
+        </span>
+      }
+      description={
+        status?.enabled
+          ? `Enabled — signed in as ${status.username}`
+          : "Disabled — the UI is accessible without authentication"
+      }
+    >
+      <div className="space-y-4">
         {error ? (
-          <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <div className="rounded-inner border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
           </div>
         ) : null}
         {success ? (
-          <div className="rounded-lg border border-green-500/30 bg-green-500/10 px-3 py-2 text-sm text-green-600 dark:text-green-400">
+          <div className="rounded-inner border border-status-completed/30 bg-status-completed/10 px-3 py-2 text-sm text-status-completed">
             {success}
           </div>
         ) : null}
 
         {!status?.enabled ? (
-          <div className="space-y-3">
+          <div className="space-y-3 rounded-inner border border-border p-5">
             <div className="space-y-1.5">
               <Label htmlFor="login-username">Username</Label>
               <Input
@@ -206,8 +201,8 @@ function LoginProtectionSection() {
           </div>
         ) : (
           <div className="space-y-4">
-            <div className="space-y-3 rounded-lg border border-border/60 p-4">
-              <div className="text-sm font-medium">Change Password</div>
+            <div className="space-y-3 rounded-inner border border-border p-5">
+              <div className="text-sm font-semibold text-foreground">Change Password</div>
               <div className="space-y-1.5">
                 <Label htmlFor="current-password">Current Password</Label>
                 <Input
@@ -254,20 +249,22 @@ function LoginProtectionSection() {
             </div>
           </div>
         )}
-      </CardContent>
-    </Card>
+      </div>
+    </SectionCard>
   );
 }
 
 export function SecuritySettingsPage() {
   return (
-    <div>
+    <div className="max-w-[1180px]">
       <SettingsPageHeader
         title="Security"
         description="Manage login protection and API keys"
       />
-      <LoginProtectionSection />
-      <ApiKeysSection />
+      <div className="space-y-6">
+        <LoginProtectionSection />
+        <ApiKeysSection />
+      </div>
     </div>
   );
 }

@@ -396,13 +396,7 @@ struct FactorIndex {
     input_idx: u16,
 }
 
-#[derive(Clone, Copy)]
-struct OutputFactor {
-    factor: u16,
-    output_idx: usize,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 struct RepairWriteTarget {
     file_id: FileId,
     filename: String,
@@ -617,28 +611,12 @@ fn grouped_input_factors(coefficients: &matrix::Matrix) -> Vec<Vec<FactorIndex>>
         .collect()
 }
 
-fn grouped_output_factors(plan: &RepairPlan) -> Vec<Vec<OutputFactor>> {
-    (0..plan.input_factors.cols)
-        .map(|input_idx| {
-            (0..plan.input_factors.rows)
-                .filter_map(|output_idx| {
-                    let factor = plan.input_factors.get(output_idx, input_idx);
-                    if factor == 0 {
-                        None
-                    } else {
-                        Some(OutputFactor { factor, output_idx })
-                    }
-                })
-                .collect()
-        })
-        .collect()
-}
-
 /// Number of source slices (present inputs + recovery blocks) multiplied into
-/// every output per streamed batch. Batching sources lets the prepared
-/// input-batch kernels load and store each output region once per K sources
-/// instead of once per source, cutting output memory traffic by ~K.
-const STREAM_INPUT_BATCH: usize = 64;
+/// every output per streamed batch. Batching sources lets the batch kernels
+/// load and store each output region once per K sources instead of once per
+/// source, cutting output memory traffic by ~K. A multiple of the folded
+/// kernel's group width so batches split into whole groups.
+const STREAM_INPUT_BATCH: usize = 11 * crate::gf_simd::FOLDED_GROUP;
 
 /// Strip size for the batched streaming compute. One strip across a full
 /// source batch (K × 32 KiB = 2 MiB at K=64) stays cache-resident while a
@@ -649,19 +627,34 @@ const STREAM_STRIP_BYTES: usize = 32 * 1024;
 /// Lazily prepared multiply tables, one slot per distinct GF(2^16) factor.
 /// Entries are boxed so references handed to worker threads stay valid; the
 /// memo is fully populated before any parallel compute runs.
+struct MemoEntry {
+    prepared: crate::gf_simd::PreparedInputFactor,
+    /// Affine matrix forms for the folded split-layout kernel; only built
+    /// when that path is active.
+    affine: Option<crate::gf_simd::AffineMulMatrices>,
+}
+
 struct PreparedFactorMemo {
-    slots: Vec<Option<Box<crate::gf_simd::PreparedInputFactor>>>,
+    slots: Vec<Option<Box<MemoEntry>>>,
 }
 
 impl PreparedFactorMemo {
-    fn from_output_factors(output_factors: &[Vec<OutputFactor>]) -> Self {
-        let mut slots: Vec<Option<Box<crate::gf_simd::PreparedInputFactor>>> = vec![None; 1 << 16];
-        for factors in output_factors {
-            for of in factors {
-                let slot = &mut slots[of.factor as usize];
-                if slot.is_none() {
-                    *slot = Some(Box::new(crate::gf_simd::prepare_input_factor(of.factor)));
-                }
+    fn from_matrix(matrix: &matrix::Matrix, with_affine: bool) -> Self {
+        let mut slots: Vec<Option<Box<MemoEntry>>> = (0..1usize << 16).map(|_| None).collect();
+        // Factor 0 backs the padding lanes of partially filled groups.
+        let ensure = |factor: u16, slots: &mut Vec<Option<Box<MemoEntry>>>| {
+            let slot = &mut slots[factor as usize];
+            if slot.is_none() {
+                *slot = Some(Box::new(MemoEntry {
+                    prepared: crate::gf_simd::prepare_input_factor(factor),
+                    affine: with_affine.then(|| crate::gf_simd::precompute_affine_matrices(factor)),
+                }));
+            }
+        };
+        ensure(0, &mut slots);
+        for output_idx in 0..matrix.rows {
+            for source_idx in 0..matrix.cols {
+                ensure(matrix.get(output_idx, source_idx), &mut slots);
             }
         }
         Self { slots }
@@ -669,27 +662,64 @@ impl PreparedFactorMemo {
 
     #[inline]
     fn get(&self, factor: u16) -> &crate::gf_simd::PreparedInputFactor {
+        &self.slots[factor as usize]
+            .as_deref()
+            .expect("factor prepared during memo construction")
+            .prepared
+    }
+
+    #[inline]
+    fn get_affine(&self, factor: u16) -> &crate::gf_simd::AffineMulMatrices {
         self.slots[factor as usize]
             .as_deref()
             .expect("factor prepared during memo construction")
+            .affine
+            .as_ref()
+            .expect("affine matrices built for the folded path")
     }
 }
 
-/// One double-buffered set of streamed source chunks plus the per-output
-/// gather lists describing which batch-local sources feed each output.
+/// One double-buffered set of streamed source chunks. Which sources feed
+/// which outputs is read directly from the decode matrix inside the compute
+/// tasks — no gather lists are materialized.
 struct StreamBatchSet {
+    /// Per-source chunk buffers (generic kernel path).
     bufs: Vec<Vec<u8>>,
-    /// Per output: (batch-local source index, factor) pairs.
-    per_output: Vec<Vec<(u32, u16)>>,
+    /// Folded path: per group of FOLDED_GROUP sources, their split-layout
+    /// blocks interleaved at 32-byte granularity into one stream.
+    staging: Vec<Vec<u8>>,
+    /// Folded path: read scratch, and each source's sub-block tail bytes
+    /// (kept in normal layout, applied scalar).
+    scratch: Vec<u8>,
+    tails: Vec<[u8; crate::gf_simd::SPLIT_BLOCK_BYTES]>,
+    tail_len: usize,
+    start: usize,
     len: usize,
 }
 
 impl StreamBatchSet {
-    fn new(outputs: usize, max_byte_len: usize) -> Self {
-        Self {
-            bufs: vec![vec![0u8; max_byte_len]; STREAM_INPUT_BATCH],
-            per_output: vec![Vec::new(); outputs],
-            len: 0,
+    fn new(max_byte_len: usize, folded: bool) -> Self {
+        let groups = STREAM_INPUT_BATCH / crate::gf_simd::FOLDED_GROUP;
+        if folded {
+            Self {
+                bufs: Vec::new(),
+                staging: vec![vec![0u8; max_byte_len * crate::gf_simd::FOLDED_GROUP]; groups],
+                scratch: vec![0u8; max_byte_len],
+                tails: vec![[0u8; crate::gf_simd::SPLIT_BLOCK_BYTES]; STREAM_INPUT_BATCH],
+                tail_len: 0,
+                start: 0,
+                len: 0,
+            }
+        } else {
+            Self {
+                bufs: vec![vec![0u8; max_byte_len]; STREAM_INPUT_BATCH],
+                staging: Vec::new(),
+                scratch: Vec::new(),
+                tails: Vec::new(),
+                tail_len: 0,
+                start: 0,
+                len: 0,
+            }
         }
     }
 }
@@ -729,7 +759,7 @@ fn read_stream_source_chunk(
 }
 
 /// Fill one batch set: read the source chunks for `[batch_start,
-/// batch_start+len)` and rebuild the per-output gather lists.
+/// batch_start+len)`.
 #[allow(clippy::too_many_arguments)]
 fn fill_stream_batch(
     set: &mut StreamBatchSet,
@@ -737,49 +767,153 @@ fn fill_stream_batch(
     par2_set: &Par2FileSet,
     file_access: &mut dyn FileAccess,
     recovery_files: &mut HashMap<PathBuf, File>,
-    output_factors: &[Vec<OutputFactor>],
     available_inputs: usize,
     batch_start: usize,
     batch_len: usize,
     byte_start: usize,
     byte_len: usize,
+    use_folded: bool,
     options: &RepairOptions,
 ) -> Result<()> {
-    for list in &mut set.per_output {
-        list.clear();
-    }
     for b in 0..batch_len {
         if b % 64 == 0 {
             check_cancel(options)?;
         }
-        let source_idx = batch_start + b;
         read_stream_source_chunk(
             plan,
             par2_set,
             file_access,
             recovery_files,
             available_inputs,
-            source_idx,
+            batch_start + b,
             byte_start,
-            &mut set.bufs[b][..byte_len],
+            if use_folded {
+                &mut set.scratch[..byte_len]
+            } else {
+                &mut set.bufs[b][..byte_len]
+            },
         )?;
-        for of in &output_factors[source_idx] {
-            set.per_output[of.output_idx].push((b as u32, of.factor));
+        if use_folded {
+            let group = b / crate::gf_simd::FOLDED_GROUP;
+            let lane = b % crate::gf_simd::FOLDED_GROUP;
+            crate::gf_simd::split_encode_scatter(
+                &set.scratch[..byte_len],
+                &mut set.staging[group],
+                lane,
+            );
+            let vec_len = byte_len & !(crate::gf_simd::SPLIT_BLOCK_BYTES - 1);
+            let tail_len = byte_len - vec_len;
+            set.tails[b][..tail_len].copy_from_slice(&set.scratch[vec_len..byte_len]);
+            set.tail_len = tail_len;
         }
     }
+    set.start = batch_start;
     set.len = batch_len;
     Ok(())
 }
 
-/// Multiply one source batch into every output. Strip-parallel when the chunk
-/// is large (keeps the batch's source strips cache-resident across all
-/// outputs); output-parallel when the chunk itself is small.
+/// Multiply one source batch into every output, with factors read straight
+/// from the decode matrix inside each task. Strip-parallel when the chunk is
+/// large (keeps the batch's source strips cache-resident across all outputs);
+/// output-parallel when the chunk itself is small.
 fn run_stream_batch_compute(
     output_ptrs: &[usize],
     set: &StreamBatchSet,
+    plan: &RepairPlan,
     memo: &PreparedFactorMemo,
     byte_len: usize,
+    use_folded: bool,
 ) {
+    let matrix = &plan.input_factors;
+    if use_folded {
+        let vec_len = byte_len & !(crate::gf_simd::SPLIT_BLOCK_BYTES - 1);
+        let groups = set.len.div_ceil(crate::gf_simd::FOLDED_GROUP);
+        let group_matrices = |j: usize,
+                              g: usize|
+         -> [&crate::gf_simd::AffineMulMatrices;
+                                  crate::gf_simd::FOLDED_GROUP] {
+            std::array::from_fn(|lane| {
+                let b = g * crate::gf_simd::FOLDED_GROUP + lane;
+                // Padding lanes multiply through zero matrices and add nothing.
+                let factor = if b < set.len {
+                    matrix.get(j, set.start + b)
+                } else {
+                    0
+                };
+                memo.get_affine(factor)
+            })
+        };
+
+        if vec_len > 0 {
+            let strips = vec_len.div_ceil(STREAM_STRIP_BYTES);
+            let threads = rayon::current_num_threads().max(1);
+            if strips >= threads {
+                (0..strips).into_par_iter().for_each(|si| {
+                    let s0 = si * STREAM_STRIP_BYTES;
+                    let s1 = (s0 + STREAM_STRIP_BYTES).min(vec_len);
+                    for (j, output_ptr) in output_ptrs.iter().copied().enumerate() {
+                        // Safe: strips partition the region and this task is
+                        // the only writer for strip `si`.
+                        let dst = unsafe {
+                            std::slice::from_raw_parts_mut((output_ptr as *mut u8).add(s0), s1 - s0)
+                        };
+                        for g in 0..groups {
+                            let stride = crate::gf_simd::FOLDED_GROUP;
+                            crate::gf_simd::mul_acc_folded_group(
+                                dst,
+                                &set.staging[g][s0 * stride..s1 * stride],
+                                &group_matrices(j, g),
+                            );
+                        }
+                    }
+                });
+            } else {
+                output_ptrs
+                    .par_iter()
+                    .copied()
+                    .enumerate()
+                    .for_each(|(j, output_ptr)| {
+                        // Safe: one task per output buffer.
+                        let dst = unsafe {
+                            std::slice::from_raw_parts_mut(output_ptr as *mut u8, vec_len)
+                        };
+                        for g in 0..groups {
+                            let stride = crate::gf_simd::FOLDED_GROUP;
+                            crate::gf_simd::mul_acc_folded_group(
+                                dst,
+                                &set.staging[g][..vec_len * stride],
+                                &group_matrices(j, g),
+                            );
+                        }
+                    });
+            }
+        }
+
+        // Sub-block tails stay in normal layout on both sides; apply scalar.
+        if set.tail_len > 0 {
+            output_ptrs
+                .par_iter()
+                .copied()
+                .enumerate()
+                .for_each(|(j, output_ptr)| {
+                    let dst = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (output_ptr as *mut u8).add(vec_len),
+                            set.tail_len,
+                        )
+                    };
+                    for b in 0..set.len {
+                        let factor = matrix.get(j, set.start + b);
+                        if factor == 0 {
+                            continue;
+                        }
+                        crate::gf_simd::mul_acc_region(factor, &set.tails[b][..set.tail_len], dst);
+                    }
+                });
+        }
+        return;
+    }
+
     let strips = byte_len.div_ceil(STREAM_STRIP_BYTES);
     let threads = rayon::current_num_threads().max(1);
 
@@ -787,46 +921,57 @@ fn run_stream_batch_compute(
         (0..strips).into_par_iter().for_each(|si| {
             let s0 = si * STREAM_STRIP_BYTES;
             let s1 = (s0 + STREAM_STRIP_BYTES).min(byte_len);
-            let mut srcs: Vec<crate::gf_simd::PreparedFactorSrc<'_>> =
-                Vec::with_capacity(STREAM_INPUT_BATCH);
-            for (j, list) in set.per_output.iter().enumerate() {
-                if list.is_empty() {
-                    continue;
-                }
+            let mut srcs: Vec<crate::gf_simd::PreparedFactorSrc<'_>> = Vec::with_capacity(set.len);
+            for (j, output_ptr) in output_ptrs.iter().copied().enumerate() {
                 srcs.clear();
-                for &(b, factor) in list {
+                for b in 0..set.len {
+                    let factor = matrix.get(j, set.start + b);
+                    if factor == 0 {
+                        continue;
+                    }
                     srcs.push(crate::gf_simd::PreparedFactorSrc {
                         prepared: memo.get(factor),
-                        src: &set.bufs[b as usize][s0..s1],
+                        src: &set.bufs[b][s0..s1],
                     });
+                }
+                if srcs.is_empty() {
+                    continue;
                 }
                 // Safe: each (strip, output) range has exactly one writer —
                 // strips partition the chunk and this task is the only one
                 // for strip `si`; batches are processed sequentially.
                 let dst = unsafe {
-                    std::slice::from_raw_parts_mut((output_ptrs[j] as *mut u8).add(s0), s1 - s0)
+                    std::slice::from_raw_parts_mut((output_ptr as *mut u8).add(s0), s1 - s0)
                 };
                 crate::gf_simd::mul_acc_input_batch_prepared(dst, &srcs);
             }
         });
     } else {
-        set.per_output.par_iter().enumerate().for_each(|(j, list)| {
-            if list.is_empty() {
-                return;
-            }
-            let mut srcs: Vec<crate::gf_simd::PreparedFactorSrc<'_>> =
-                Vec::with_capacity(list.len());
-            for &(b, factor) in list {
-                srcs.push(crate::gf_simd::PreparedFactorSrc {
-                    prepared: memo.get(factor),
-                    src: &set.bufs[b as usize][..byte_len],
-                });
-            }
-            // Safe: one task per output buffer.
-            let dst =
-                unsafe { std::slice::from_raw_parts_mut(output_ptrs[j] as *mut u8, byte_len) };
-            crate::gf_simd::mul_acc_input_batch_prepared(dst, &srcs);
-        });
+        output_ptrs
+            .par_iter()
+            .copied()
+            .enumerate()
+            .for_each(|(j, output_ptr)| {
+                let mut srcs: Vec<crate::gf_simd::PreparedFactorSrc<'_>> =
+                    Vec::with_capacity(set.len);
+                for b in 0..set.len {
+                    let factor = matrix.get(j, set.start + b);
+                    if factor == 0 {
+                        continue;
+                    }
+                    srcs.push(crate::gf_simd::PreparedFactorSrc {
+                        prepared: memo.get(factor),
+                        src: &set.bufs[b][..byte_len],
+                    });
+                }
+                if srcs.is_empty() {
+                    return;
+                }
+                // Safe: one task per output buffer.
+                let dst =
+                    unsafe { std::slice::from_raw_parts_mut(output_ptr as *mut u8, byte_len) };
+                crate::gf_simd::mul_acc_input_batch_prepared(dst, &srcs);
+            });
     }
 }
 
@@ -1336,13 +1481,17 @@ fn execute_repair_streaming(
     let mut recovery_files: HashMap<PathBuf, File> = HashMap::new();
     let max_byte_len = chunk_words * 2;
     let mut chunk_output: Vec<Vec<u8>> = vec![vec![0u8; max_byte_len]; n];
-    let output_factors = grouped_output_factors(plan);
     let available_inputs = plan.available_input_global_indices.len();
     let total_sources = available_inputs + plan.recovery_exponents.len();
-    let memo = PreparedFactorMemo::from_output_factors(&output_factors);
+    // The folded path keeps every buffer in split byte-plane layout end to
+    // end: sources are encoded and group-interleaved as they are read,
+    // accumulation runs plane-wise with register-resident folded matrices,
+    // and outputs decode once per chunk before writing.
+    let use_folded = crate::gf_simd::altmap_supported();
+    let memo = PreparedFactorMemo::from_matrix(&plan.input_factors, use_folded);
     let mut batch_sets = [
-        StreamBatchSet::new(n, max_byte_len),
-        StreamBatchSet::new(n, max_byte_len),
+        StreamBatchSet::new(max_byte_len, use_folded),
+        StreamBatchSet::new(max_byte_len, use_folded),
     ];
 
     info!(
@@ -1379,12 +1528,12 @@ fn execute_repair_streaming(
             par2_set,
             file_access,
             &mut recovery_files,
-            &output_factors,
             available_inputs,
             0,
             STREAM_INPUT_BATCH.min(total_sources),
             byte_start,
             byte_len,
+            use_folded,
             options,
         )?;
         for batch_idx in 0..batch_count {
@@ -1401,7 +1550,14 @@ fn execute_repair_streaming(
                 let output_ptrs = &output_ptrs;
                 let memo = &memo;
                 scope.spawn(move |_| {
-                    run_stream_batch_compute(output_ptrs, current, memo, byte_len);
+                    run_stream_batch_compute(
+                        output_ptrs,
+                        current,
+                        plan,
+                        memo,
+                        byte_len,
+                        use_folded,
+                    );
                 });
                 if batch_idx + 1 < batch_count {
                     let next_start = (batch_idx + 1) * STREAM_INPUT_BATCH;
@@ -1412,17 +1568,23 @@ fn execute_repair_streaming(
                         par2_set,
                         file_access,
                         &mut recovery_files,
-                        &output_factors,
                         available_inputs,
                         next_start,
                         next_len,
                         byte_start,
                         byte_len,
+                        use_folded,
                         options,
                     );
                 }
             });
             read_result?;
+        }
+
+        if use_folded {
+            chunk_output.par_iter_mut().for_each(|output| {
+                crate::gf_simd::altmap_decode(&mut output[..byte_len]);
+            });
         }
 
         for (j, target) in write_targets.iter().enumerate() {

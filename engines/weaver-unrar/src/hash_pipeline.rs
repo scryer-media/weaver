@@ -163,72 +163,200 @@ fn coordinator_loop(
     compute_crc: bool,
     compute_blake: bool,
 ) -> CoordinatorResult {
-    let mut crc_worker = compute_crc.then(CrcWorker::spawn);
+    let mut crc_lanes = compute_crc.then(CrcLanes::spawn);
     let mut blake = compute_blake.then(BlakeLanes::spawn);
 
     while let Ok(ChunkMsg::Data(chunk)) = chunk_rx.recv() {
         if let Some(ref mut lanes) = blake {
             lanes.split_chunk(&chunk);
         }
-        match crc_worker {
-            // The CRC worker owns the buffer and recycles it when done.
-            Some(ref worker) => worker.submit(chunk),
+        match crc_lanes {
+            // The CRC lanes own the buffer and recycle it when done.
+            Some(ref mut lanes) => lanes.submit(chunk),
             None => {
                 let _ = free_tx.send(chunk);
             }
         }
     }
 
-    let crc32 = crc_worker.take().map(|worker| worker.finalize(&free_tx));
+    let crc32 = crc_lanes.take().map(|lanes| lanes.finalize(&free_tx));
     let blake2sp = blake.take().map(BlakeLanes::finalize);
     CoordinatorResult { crc32, blake2sp }
 }
 
-struct CrcWorker {
-    tx: Option<mpsc::SyncSender<Vec<u8>>>,
-    handle: JoinHandle<(u32, Vec<Vec<u8>>)>,
+/// CRC32 of a whole stream, computed as independent per-chunk CRCs on two
+/// worker threads and folded back together in chunk order. Folding uses the
+/// standard GF(2) length-shift operator: crc(A ++ B) =
+/// shift(crc(A), len(B)) ^ crc(B). Two lanes keep CRC off the read loop's
+/// critical path even when a single lane cannot match the read rate.
+struct CrcLanes {
+    txs: Vec<mpsc::SyncSender<(u64, Vec<u8>)>>,
+    handles: Vec<JoinHandle<(Vec<ChunkCrc>, Vec<Vec<u8>>)>>,
+    next_seq: u64,
 }
 
-impl CrcWorker {
+struct ChunkCrc {
+    seq: u64,
+    crc: u32,
+    len: u64,
+}
+
+const CRC_LANE_COUNT: usize = 2;
+
+impl CrcLanes {
     fn spawn() -> Self {
-        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(MAX_IN_FLIGHT);
-        let handle = std::thread::Builder::new()
-            .name("weaver-rar-crc".into())
-            .spawn(move || {
-                let mut hasher = crc32fast::Hasher::new();
-                let mut spare: Vec<Vec<u8>> = Vec::new();
-                while let Ok(chunk) = rx.recv() {
-                    hasher.update(&chunk);
-                    if spare.len() < MAX_IN_FLIGHT {
-                        spare.push(chunk);
+        let mut txs = Vec::with_capacity(CRC_LANE_COUNT);
+        let mut handles = Vec::with_capacity(CRC_LANE_COUNT);
+        for lane in 0..CRC_LANE_COUNT {
+            let (tx, rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(MAX_IN_FLIGHT);
+            let handle = std::thread::Builder::new()
+                .name(format!("weaver-rar-crc-{lane}"))
+                .spawn(move || {
+                    let mut results: Vec<ChunkCrc> = Vec::new();
+                    let mut spare: Vec<Vec<u8>> = Vec::new();
+                    while let Ok((seq, chunk)) = rx.recv() {
+                        results.push(ChunkCrc {
+                            seq,
+                            crc: crc32fast::hash(&chunk),
+                            len: chunk.len() as u64,
+                        });
+                        if spare.len() < MAX_IN_FLIGHT {
+                            spare.push(chunk);
+                        }
                     }
-                }
-                (hasher.finalize(), spare)
-            })
-            .expect("spawn CRC worker");
+                    (results, spare)
+                })
+                .expect("spawn CRC lane");
+            txs.push(tx);
+            handles.push(handle);
+        }
         Self {
-            tx: Some(tx),
-            handle,
+            txs,
+            handles,
+            next_seq: 0,
         }
     }
 
-    fn submit(&self, chunk: Vec<u8>) {
-        if let Some(ref tx) = self.tx {
-            let _ = tx.send(chunk);
-        }
+    fn submit(&mut self, chunk: Vec<u8>) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let lane = (seq as usize) % self.txs.len();
+        let _ = self.txs[lane].send((seq, chunk));
     }
 
     fn finalize(mut self, free_tx: &mpsc::Sender<Vec<u8>>) -> u32 {
-        drop(self.tx.take());
-        let (crc, spare) = self.handle.join().unwrap_or((0, Vec::new()));
-        for buf in spare {
-            let _ = free_tx.send(buf);
+        self.txs.clear();
+        let mut results: Vec<ChunkCrc> = Vec::new();
+        for handle in self.handles.drain(..) {
+            let (lane_results, spare) = handle.join().unwrap_or((Vec::new(), Vec::new()));
+            results.extend(lane_results);
+            for buf in spare {
+                let _ = free_tx.send(buf);
+            }
+        }
+        results.sort_unstable_by_key(|entry| entry.seq);
+
+        let mut ops: Vec<(u64, CrcShiftOp)> = Vec::new();
+        let mut crc = 0u32;
+        for entry in results {
+            let op = match ops.iter().find(|(len, _)| *len == entry.len) {
+                Some((_, op)) => op,
+                None => {
+                    ops.push((entry.len, CrcShiftOp::new(entry.len)));
+                    &ops.last().expect("just pushed").1
+                }
+            };
+            crc = op.shift(crc) ^ entry.crc;
         }
         crc
     }
 }
 
-/// The 8 BLAKE2sp leaf lanes plus the deinterleave state.
+/// Operator that advances a finalized CRC32 past `len` zero bytes, so
+/// per-chunk CRCs can be folded into the CRC of the concatenated stream.
+struct CrcShiftOp {
+    op: Option<[u32; 32]>,
+}
+
+impl CrcShiftOp {
+    fn new(len: u64) -> Self {
+        if len == 0 {
+            return Self { op: None };
+        }
+
+        fn mat_vec(mat: &[u32; 32], mut vec: u32) -> u32 {
+            let mut sum = 0u32;
+            let mut idx = 0usize;
+            while vec != 0 {
+                if vec & 1 != 0 {
+                    sum ^= mat[idx];
+                }
+                vec >>= 1;
+                idx += 1;
+            }
+            sum
+        }
+        fn mat_square(dst: &mut [u32; 32], src: &[u32; 32]) {
+            for n in 0..32 {
+                dst[n] = mat_vec(src, src[n]);
+            }
+        }
+
+        // One-bit shift operator over the reflected CRC32 polynomial; square
+        // it up to the byte level, then square-and-multiply over `len`.
+        let mut odd = [0u32; 32];
+        odd[0] = 0xEDB8_8320;
+        for (n, item) in odd.iter_mut().enumerate().skip(1) {
+            *item = 1 << (n - 1);
+        }
+        let mut even = [0u32; 32];
+        mat_square(&mut even, &odd); // 2 bits
+        mat_square(&mut odd, &even); // 4 bits
+        mat_square(&mut even, &odd); // 8 bits = 1 byte
+
+        let mut combined = [0u32; 32];
+        for (n, item) in combined.iter_mut().enumerate() {
+            *item = 1 << n;
+        }
+        let mut per_step = even;
+        let mut scratch = [0u32; 32];
+        let mut remaining = len;
+        loop {
+            if remaining & 1 != 0 {
+                let previous = combined;
+                for n in 0..32 {
+                    combined[n] = mat_vec(&per_step, previous[n]);
+                }
+            }
+            remaining >>= 1;
+            if remaining == 0 {
+                break;
+            }
+            mat_square(&mut scratch, &per_step);
+            per_step = scratch;
+        }
+
+        Self { op: Some(combined) }
+    }
+
+    fn shift(&self, crc: u32) -> u32 {
+        let Some(ref op) = self.op else {
+            return crc;
+        };
+        let mut sum = 0u32;
+        let mut vec = crc;
+        let mut idx = 0usize;
+        while vec != 0 {
+            if vec & 1 != 0 {
+                sum ^= op[idx];
+            }
+            vec >>= 1;
+            idx += 1;
+        }
+        sum
+    }
+}
+
 struct BlakeLanes {
     lane_tx: Vec<mpsc::SyncSender<LaneMsg>>,
     lane_handles: Vec<JoinHandle<[u8; 32]>>,
@@ -695,5 +823,17 @@ mod tests {
         let outputs = pipeline.finalize().unwrap();
         assert_eq!(outputs.crc32.unwrap(), crc32fast::hash(&data));
         assert!(outputs.blake2sp.is_none());
+    }
+
+    #[test]
+    fn crc_shift_op_folds_chunk_crcs() {
+        let data: Vec<u8> = (0..1_000_003).map(|i| (i * 131 % 256) as u8).collect();
+        let whole = crc32fast::hash(&data);
+        for split in [0usize, 1, 63, 4096, 65_536, 999_999, 1_000_003] {
+            let (a, b) = data.split_at(split);
+            let folded =
+                CrcShiftOp::new(b.len() as u64).shift(crc32fast::hash(a)) ^ crc32fast::hash(b);
+            assert_eq!(folded, whole, "split at {split}");
+        }
     }
 }

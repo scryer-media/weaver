@@ -7,6 +7,9 @@ use weaver_model::files::{FileRole, archive_base_name};
 
 use crate::security::RuntimeSecurityConfig;
 
+const MAX_NZB_MEMBERS_PER_INPUT: usize = 256;
+const MAX_TOTAL_NZB_BYTES_PER_INPUT: u64 = 512 * 1024 * 1024;
+
 trait ReadSeek: Read + Seek + Send {}
 impl<T: Read + Seek + Send> ReadSeek for T {}
 
@@ -20,14 +23,43 @@ pub(super) struct ExtractedNzb {
 pub(super) struct IntakeOutput {
     pub nzbs: Vec<ExtractedNzb>,
     pub permanent_errors: Vec<String>,
+    total_nzb_bytes: u64,
 }
 
 impl IntakeOutput {
     fn one(nzb: ExtractedNzb) -> Self {
+        let total_nzb_bytes = nzb.bytes.len() as u64;
         Self {
             nzbs: vec![nzb],
             permanent_errors: Vec::new(),
+            total_nzb_bytes,
         }
+    }
+
+    fn one_checked(nzb: ExtractedNzb, per_member_limit: u64) -> Result<Self, IntakeError> {
+        let mut output = Self::default();
+        output
+            .push_nzb(nzb, per_member_limit)
+            .map_err(IntakeError::Permanent)?;
+        Ok(output)
+    }
+
+    fn push_nzb(&mut self, nzb: ExtractedNzb, per_member_limit: u64) -> Result<(), String> {
+        if self.nzbs.len() >= MAX_NZB_MEMBERS_PER_INPUT {
+            return Err(format!(
+                "input contains more than {MAX_NZB_MEMBERS_PER_INPUT} NZB members"
+            ));
+        }
+        let next_total = self.total_nzb_bytes.saturating_add(nzb.bytes.len() as u64);
+        let total_limit = total_nzb_bytes_limit(per_member_limit);
+        if next_total > total_limit {
+            return Err(format!(
+                "extracted NZB members exceed {total_limit} total bytes"
+            ));
+        }
+        self.total_nzb_bytes = next_total;
+        self.nzbs.push(nzb);
+        Ok(())
     }
 }
 
@@ -98,6 +130,8 @@ pub(super) fn read_nzbs_from_path_with_name(
     path: &Path,
     name: &str,
 ) -> Result<IntakeOutput, IntakeError> {
+    // Despite the test-oriented name, this is the existing runtime env reader
+    // plus safe defaults when no security env vars are present.
     let limit = RuntimeSecurityConfig::from_env_or_default_for_tests().nzb_decompressed_limit_bytes;
     let lower = name.to_ascii_lowercase();
     if lower.ends_with(".nzb") {
@@ -123,53 +157,34 @@ pub(super) fn read_nzbs_from_path_with_name(
         FileRole::GzArchive => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = flate2::read::GzDecoder::new(file);
-            Ok(IntakeOutput::one(single_stream_nzb(
-                name,
-                &[".gz"],
-                reader,
-                limit,
-            )?))
+            IntakeOutput::one_checked(single_stream_nzb(name, &[".gz"], reader, limit)?, limit)
         }
         FileRole::DeflateArchive => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = flate2::read::DeflateDecoder::new(file);
-            Ok(IntakeOutput::one(single_stream_nzb(
-                name,
-                &[".deflate"],
-                reader,
+            IntakeOutput::one_checked(
+                single_stream_nzb(name, &[".deflate"], reader, limit)?,
                 limit,
-            )?))
+            )
         }
         FileRole::BrotliArchive => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = brotli::Decompressor::new(file, 4096);
-            Ok(IntakeOutput::one(single_stream_nzb(
-                name,
-                &[".br"],
-                reader,
-                limit,
-            )?))
+            IntakeOutput::one_checked(single_stream_nzb(name, &[".br"], reader, limit)?, limit)
         }
         FileRole::ZstdArchive => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = zstd::stream::read::Decoder::new(file)
                 .map_err(|error| IntakeError::Permanent(format!("failed to open zstd: {error}")))?;
-            Ok(IntakeOutput::one(single_stream_nzb(
-                name,
-                &[".zstd", ".zst"],
-                reader,
+            IntakeOutput::one_checked(
+                single_stream_nzb(name, &[".zstd", ".zst"], reader, limit)?,
                 limit,
-            )?))
+            )
         }
         FileRole::Bzip2Archive => {
             let file = File::open(path).map_err(transient_io)?;
             let reader = bzip2::read::BzDecoder::new(file);
-            Ok(IntakeOutput::one(single_stream_nzb(
-                name,
-                &[".bz2"],
-                reader,
-                limit,
-            )?))
+            IntakeOutput::one_checked(single_stream_nzb(name, &[".bz2"], reader, limit)?, limit)
         }
         FileRole::SevenZipArchive | FileRole::SevenZipSplit { number: 0 } => {
             extract_7z_nzbs(path, name, limit)
@@ -272,10 +287,18 @@ fn extract_zip_nzbs(path: &Path, limit: u64) -> Result<IntakeOutput, IntakeError
             continue;
         }
         match read_limited(&mut entry, limit) {
-            Ok(bytes) => output.nzbs.push(ExtractedNzb {
-                filename: member_filename(&safe_path),
-                bytes,
-            }),
+            Ok(bytes) => {
+                if let Err(error) = output.push_nzb(
+                    ExtractedNzb {
+                        filename: member_filename(&safe_path),
+                        bytes,
+                    },
+                    limit,
+                ) {
+                    output.permanent_errors.push(error);
+                    break;
+                }
+            }
             Err(error) => output.permanent_errors.push(format!(
                 "failed to read zip NZB member {entry_name}: {error}"
             )),
@@ -332,10 +355,18 @@ fn extract_tar_nzbs<R: Read>(reader: R, limit: u64) -> Result<IntakeOutput, Inta
             continue;
         }
         match read_limited(&mut entry, limit) {
-            Ok(bytes) => output.nzbs.push(ExtractedNzb {
-                filename: member_filename(&safe_path),
-                bytes,
-            }),
+            Ok(bytes) => {
+                if let Err(error) = output.push_nzb(
+                    ExtractedNzb {
+                        filename: member_filename(&safe_path),
+                        bytes,
+                    },
+                    limit,
+                ) {
+                    output.permanent_errors.push(error);
+                    break;
+                }
+            }
             Err(error) => output
                 .permanent_errors
                 .push(format!("failed to read tar NZB member {raw_name}: {error}")),
@@ -363,6 +394,7 @@ fn extract_7z_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput, 
         .map_err(|error| IntakeError::Transient(format!("failed to create temp dir: {error}")))?;
     let password = sevenz_rust2::Password::empty();
     let mut output = IntakeOutput::default();
+    let mut cap_reached = false;
 
     let extract_fn = |entry: &sevenz_rust2::ArchiveEntry,
                       reader: &mut dyn Read,
@@ -379,11 +411,29 @@ fn extract_7z_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput, 
             }
         };
         if is_nzb_member_path(&safe_path) {
+            if cap_reached {
+                return Ok(true);
+            }
+            if output.nzbs.len() >= MAX_NZB_MEMBERS_PER_INPUT {
+                output.permanent_errors.push(format!(
+                    "input contains more than {MAX_NZB_MEMBERS_PER_INPUT} NZB members"
+                ));
+                cap_reached = true;
+                return Ok(true);
+            }
             match read_limited(reader, limit) {
-                Ok(bytes) => output.nzbs.push(ExtractedNzb {
-                    filename: member_filename(&safe_path),
-                    bytes,
-                }),
+                Ok(bytes) => {
+                    if let Err(error) = output.push_nzb(
+                        ExtractedNzb {
+                            filename: member_filename(&safe_path),
+                            bytes,
+                        },
+                        limit,
+                    ) {
+                        output.permanent_errors.push(error);
+                        cap_reached = true;
+                    }
+                }
                 Err(error) => output.permanent_errors.push(format!(
                     "failed to read 7z NZB member {}: {error}",
                     entry.name()
@@ -413,6 +463,7 @@ fn extract_rar_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput,
     let first = File::open(path).map_err(transient_io)?;
     let mut archive = weaver_unrar::RarArchive::open(first)
         .map_err(|error| IntakeError::Permanent(format!("failed to read RAR archive: {error}")))?;
+    archive.set_limits(rar_limits(limit));
 
     let parts = adjacent_archive_parts(path, name, |role| {
         matches!(role, FileRole::RarVolume { .. })
@@ -448,7 +499,7 @@ fn extract_rar_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput,
         };
         let extracted = match archive.extract_member(idx, &options, None) {
             Ok(extracted) => extracted,
-            Err(error) => match rar_member_error(error.to_string()) {
+            Err(error) => match rar_member_error(error) {
                 IntakeError::Transient(reason) => return Err(IntakeError::Transient(reason)),
                 IntakeError::Permanent(reason) => {
                     output.permanent_errors.push(format!(
@@ -476,13 +527,33 @@ fn extract_rar_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput,
             ));
             continue;
         }
-        output.nzbs.push(ExtractedNzb {
-            filename: member_filename(&safe_path),
-            bytes,
-        });
+        if let Err(error) = output.push_nzb(
+            ExtractedNzb {
+                filename: member_filename(&safe_path),
+                bytes,
+            },
+            limit,
+        ) {
+            output.permanent_errors.push(error);
+            break;
+        }
     }
 
     Ok(output)
+}
+
+fn total_nzb_bytes_limit(per_member_limit: u64) -> u64 {
+    per_member_limit
+        .saturating_mul(16)
+        .min(MAX_TOTAL_NZB_BYTES_PER_INPUT)
+}
+
+fn rar_limits(per_member_limit: u64) -> weaver_unrar::Limits {
+    weaver_unrar::Limits {
+        max_data_segment: per_member_limit,
+        max_unpacked_size: per_member_limit,
+        ..weaver_unrar::Limits::default()
+    }
 }
 
 fn extract_split_nzb(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput, IntakeError> {
@@ -495,7 +566,7 @@ fn extract_split_nzb(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput
         .unwrap_or(name)
         .to_string();
     let bytes = read_limited(reader, limit).map_err(transient_io)?;
-    Ok(IntakeOutput::one(ExtractedNzb { filename, bytes }))
+    IntakeOutput::one_checked(ExtractedNzb { filename, bytes }, limit)
 }
 
 fn adjacent_archive_parts(
@@ -547,12 +618,29 @@ fn archive_volume_number(role: &FileRole) -> u32 {
     }
 }
 
-fn rar_member_error(message: String) -> IntakeError {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("missing volume") || lower.contains("not available") {
-        IntakeError::Transient(message)
-    } else {
-        IntakeError::Permanent(message)
+fn rar_member_error(error: weaver_unrar::RarError) -> IntakeError {
+    match error {
+        weaver_unrar::RarError::MissingVolume { .. } => IntakeError::Transient(error.to_string()),
+        weaver_unrar::RarError::Io(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::Interrupted
+                    | io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            IntakeError::Transient(error.to_string())
+        }
+        other => {
+            let message = other.to_string();
+            let lower = message.to_ascii_lowercase();
+            if lower.contains("not available") {
+                IntakeError::Transient(message)
+            } else {
+                IntakeError::Permanent(message)
+            }
+        }
     }
 }
 
@@ -734,5 +822,85 @@ mod tests {
         let error = read_nzbs_from_path(&path).unwrap_err();
 
         assert!(error.to_string().contains("unsafe zip entry path"));
+    }
+
+    #[test]
+    fn intake_output_rejects_too_many_nzb_members() {
+        let mut output = IntakeOutput::default();
+        for idx in 0..MAX_NZB_MEMBERS_PER_INPUT {
+            output
+                .push_nzb(
+                    ExtractedNzb {
+                        filename: format!("{idx}.nzb"),
+                        bytes: vec![0],
+                    },
+                    1024 * 1024,
+                )
+                .unwrap();
+        }
+
+        let error = output
+            .push_nzb(
+                ExtractedNzb {
+                    filename: "overflow.nzb".to_string(),
+                    bytes: vec![0],
+                },
+                1024 * 1024,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("more than 256 NZB members"));
+    }
+
+    #[test]
+    fn intake_output_rejects_total_extracted_nzb_bytes_over_cap() {
+        let mut output = IntakeOutput::default();
+        for idx in 0..16 {
+            output
+                .push_nzb(
+                    ExtractedNzb {
+                        filename: format!("{idx}.nzb"),
+                        bytes: vec![0; 10],
+                    },
+                    10,
+                )
+                .unwrap();
+        }
+
+        let error = output
+            .push_nzb(
+                ExtractedNzb {
+                    filename: "overflow.nzb".to_string(),
+                    bytes: vec![0],
+                },
+                10,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("extracted NZB members exceed 160 total bytes"));
+    }
+
+    #[test]
+    fn rar_limits_bind_data_segment_and_unpacked_size_to_input_limit() {
+        let limits = rar_limits(123);
+
+        assert_eq!(limits.max_data_segment, 123);
+        assert_eq!(limits.max_unpacked_size, 123);
+    }
+
+    #[test]
+    fn rar_member_error_classifies_typed_missing_volume_as_transient() {
+        let error = weaver_unrar::RarError::MissingVolume {
+            volume: 2,
+            member: "release.nzb".to_string(),
+        };
+
+        assert!(matches!(rar_member_error(error), IntakeError::Transient(_)));
+        assert!(matches!(
+            rar_member_error(weaver_unrar::RarError::ResourceLimit {
+                detail: "too large".to_string()
+            }),
+            IntakeError::Permanent(_)
+        ));
     }
 }

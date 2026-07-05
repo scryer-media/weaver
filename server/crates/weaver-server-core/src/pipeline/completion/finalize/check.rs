@@ -9,9 +9,21 @@ use weaver_model::files::{
 
 const PAR2_REPAIR_MEMORY_LIMIT_ENV: &str = "WEAVER_PAR2_REPAIR_MEMORY_LIMIT_BYTES";
 // Sizes the transient streaming repair buffers (the decode matrix has its own
-// budget floor inside weaver-par2). 512 MiB keeps chunk re-read amplification
-// low on heavily damaged jobs while staying modest for concurrent repairs.
-const DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
+// budget floor inside weaver-par2). The floor keeps chunk re-read
+// amplification low on heavily damaged jobs; scaling with physical memory
+// lets big sets repair in one pass on machines that can afford it.
+const PAR2_REPAIR_MEMORY_LIMIT_FLOOR_BYTES: usize = 512 * 1024 * 1024;
+const PAR2_REPAIR_MEMORY_LIMIT_CEILING_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+fn default_par2_repair_memory_limit_bytes() -> usize {
+    let scaled = crate::runtime::system_probe::detect_total_memory_bytes()
+        .map(|total| (total / 8) as usize)
+        .unwrap_or(PAR2_REPAIR_MEMORY_LIMIT_FLOOR_BYTES);
+    scaled.clamp(
+        PAR2_REPAIR_MEMORY_LIMIT_FLOOR_BYTES,
+        PAR2_REPAIR_MEMORY_LIMIT_CEILING_BYTES,
+    )
+}
 
 fn configured_par2_repair_memory_limit_bytes() -> usize {
     parse_par2_repair_memory_limit_bytes(
@@ -21,18 +33,17 @@ fn configured_par2_repair_memory_limit_bytes() -> usize {
 
 fn parse_par2_repair_memory_limit_bytes(raw: Option<&str>) -> usize {
     let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        return DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES;
+        return default_par2_repair_memory_limit_bytes();
     };
     match value.parse::<usize>() {
         Ok(bytes) if bytes > 0 => bytes,
         _ => {
+            let default_bytes = default_par2_repair_memory_limit_bytes();
             warn!(
                 env = PAR2_REPAIR_MEMORY_LIMIT_ENV,
-                value,
-                default_bytes = DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES,
-                "invalid PAR2 repair memory limit; using default"
+                value, default_bytes, "invalid PAR2 repair memory limit; using default"
             );
-            DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
+            default_bytes
         }
     }
 }
@@ -3040,13 +3051,13 @@ mod tests {
 
     #[test]
     fn par2_repair_memory_limit_defaults_when_unset() {
-        assert_eq!(
-            parse_par2_repair_memory_limit_bytes(None),
-            DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
-        );
+        let default_bytes = default_par2_repair_memory_limit_bytes();
+        assert!(default_bytes >= PAR2_REPAIR_MEMORY_LIMIT_FLOOR_BYTES);
+        assert!(default_bytes <= PAR2_REPAIR_MEMORY_LIMIT_CEILING_BYTES);
+        assert_eq!(parse_par2_repair_memory_limit_bytes(None), default_bytes);
         assert_eq!(
             parse_par2_repair_memory_limit_bytes(Some("  ")),
-            DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
+            default_bytes
         );
     }
 
@@ -3060,13 +3071,14 @@ mod tests {
 
     #[test]
     fn par2_repair_memory_limit_rejects_invalid_or_zero_values() {
+        let default_bytes = default_par2_repair_memory_limit_bytes();
         assert_eq!(
             parse_par2_repair_memory_limit_bytes(Some("not-bytes")),
-            DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
+            default_bytes
         );
         assert_eq!(
             parse_par2_repair_memory_limit_bytes(Some("0")),
-            DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
+            default_bytes
         );
     }
 

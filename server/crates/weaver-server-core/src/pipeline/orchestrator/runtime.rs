@@ -1118,10 +1118,18 @@ pub(crate) fn compute_write_backlog_budget_bytes(
 ) -> usize {
     use crate::runtime::system_profile::StorageClass;
 
+    // On memory-rich machines the write backlog should absorb a full burst of
+    // in-flight lane output rather than tripping pressure on every wave; the
+    // scaled term lifts the budget with available memory while the cap keeps
+    // dirty buffered data bounded.
+    const WRITE_BACKLOG_SCALED_MAX_BYTES: usize = 768 * 1024 * 1024;
+
     let scratch_bytes = buffer_pool_total_bytes(buffers);
     let available_bytes = profile.memory.available_bytes.max(256 * 1024 * 1024) as usize;
+    let scaled = (available_bytes / 24).min(WRITE_BACKLOG_SCALED_MAX_BYTES);
     let base = scratch_bytes
         .max(64 * 1024 * 1024)
+        .max(scaled)
         .min((available_bytes / 8).max(64 * 1024 * 1024));
 
     match profile.disk.storage_class {
@@ -1140,19 +1148,25 @@ pub(crate) fn compute_decode_backlog_budget_bytes(
 ) -> usize {
     const DECODE_BACKLOG_POOL_MULTIPLIER: usize = 3;
     const DECODE_BACKLOG_MEMORY_FRACTION: usize = 8;
-    const DECODE_BACKLOG_MAX_BYTES: usize = 1024 * 1024 * 1024;
+    const DECODE_BACKLOG_MAX_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
     let scratch_bytes = buffer_pool_total_bytes(buffers);
-    let effective_memory_bytes =
-        crate::runtime::buffers::BufferPoolConfig::runtime_sizing_memory_bytes(
-            profile.memory.available_bytes.max(256 * 1024 * 1024),
-            profile.memory.cgroup_limit,
-        ) as usize;
-    let memory_cap = (effective_memory_bytes / DECODE_BACKLOG_MEMORY_FRACTION)
+    let mut available_bytes = profile.memory.available_bytes.max(256 * 1024 * 1024);
+    if let Some(cgroup_limit) = profile.memory.cgroup_limit {
+        available_bytes = available_bytes.min(cgroup_limit);
+    }
+    let available_bytes = available_bytes as usize;
+    // A full download wave (every lane's leased runway decoding at once) must
+    // fit under the soft limit on machines with memory to spare, or the
+    // pressure latch cycles on every wave; scale the budget with available
+    // memory instead of pinning it to buffer-pool scratch alone.
+    let scaled = available_bytes / 12;
+    let memory_cap = (available_bytes / DECODE_BACKLOG_MEMORY_FRACTION)
         .max(write_backlog_budget_bytes)
         .min(DECODE_BACKLOG_MAX_BYTES);
     let target = scratch_bytes
         .saturating_mul(DECODE_BACKLOG_POOL_MULTIPLIER)
+        .max(scaled)
         .max(write_backlog_budget_bytes);
 
     target.min(memory_cap).max(1)

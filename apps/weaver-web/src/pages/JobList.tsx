@@ -8,7 +8,16 @@ import {
   type RowSelectionState,
   type SortingState,
 } from "@tanstack/react-table";
-import { ChevronDown, ListFilter, Pause, Pencil, Play, X } from "lucide-react";
+import {
+  ChevronDown,
+  ListFilter,
+  Pause,
+  Pencil,
+  Play,
+  Rows3,
+  Table as TableIcon,
+  X,
+} from "lucide-react";
 import {
   memo,
   useCallback,
@@ -29,9 +38,11 @@ import { DataTableColumnHeader } from "@/components/data-table/DataTableColumnHe
 import { DataTablePagination } from "@/components/data-table/DataTablePagination";
 import { DataTableToolbar } from "@/components/data-table/DataTableToolbar";
 import { EmptyState } from "@/components/EmptyState";
+import { FilterChip } from "@/components/FilterChip";
 import { JobProgress } from "@/components/JobProgress";
-import { JobStatusBadge } from "@/components/JobStatusBadge";
+import { JobStatusBadgeGroup } from "@/components/JobStatusBadge";
 import { PageHeader } from "@/components/PageHeader";
+import { SegmentedControl } from "@/components/ui/segmented-control";
 import { formatBytes, formatSpeed } from "@/components/SpeedDisplay";
 import { UploadModal } from "@/components/UploadModal";
 import { Badge } from "@/components/ui/badge";
@@ -76,6 +87,8 @@ import {
 import { useTranslate } from "@/lib/context/translate-context";
 import { useTablePreferences } from "@/lib/hooks/use-table-preferences";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
+import { getJobStages } from "@/lib/job-stages";
+import { isActiveStatus, STATUS_BG_CLASS, statusToken } from "@/lib/status-tokens";
 import { useStableQueueEta } from "@/lib/hooks/use-stable-queue-eta";
 import { formatJobReleaseName, type JobData } from "@/lib/job-types";
 import { cn } from "@/lib/utils";
@@ -146,7 +159,20 @@ const QUEUE_STATUS_OPTIONS: QueueStatusFilter[] = [
   "MOVING",
 ];
 const QUEUE_PRIORITY_OPTIONS: QueuePriorityFilter[] = ["HIGH", "NORMAL", "LOW"];
+const QUEUE_ACTIVE_STATUSES: QueueStatusFilter[] = [
+  "DOWNLOADING",
+  "VERIFYING",
+  "REPAIRING",
+  "EXTRACTING",
+  "MOVING",
+];
 const NO_CATEGORY_SELECT_VALUE = "__no_category__";
+
+type QueueLayout = "table" | "compact";
+
+function sameStatusSet(current: readonly string[], preset: readonly string[]): boolean {
+  return current.length === preset.length && preset.every((value) => current.includes(value));
+}
 
 type QueueActionButtonsProps = {
   jobId: number;
@@ -304,9 +330,9 @@ const QueueStatusCell = memo(function QueueStatusCell({
 }) {
   return (
     <div className="flex flex-col items-center gap-1 text-center">
-      <JobStatusBadge status={status} compact className="px-1.5" />
+      <JobStatusBadgeGroup statuses={getJobStages({ status })} compact className="justify-center" />
       {blockedByIspCap ? (
-        <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-orange-600 dark:text-orange-300">
+        <span className="text-[10px] font-medium uppercase tracking-[0.14em] text-status-paused">
           {bandwidthCapLabel}
         </span>
       ) : null}
@@ -526,6 +552,7 @@ export function JobList() {
   const [pendingJobUpdates, setPendingJobUpdates] = useState<Record<number, PendingQueueJobUpdate>>({});
   const [savingQueueFields, setSavingQueueFields] = useState<Record<string, boolean>>({});
   const [openQueueCellSelect, setOpenQueueCellSelect] = useState<OpenQueueCellSelect>(null);
+  const [queueLayout, setQueueLayout] = useState<QueueLayout>("table");
 
   const allJobs = useLiveJobs();
   const speed = useLiveSpeed();
@@ -1252,6 +1279,40 @@ export function JobList() {
 
   const activeQueueFilterCount = countActiveQueueFilters(queuePreferences);
 
+  const applyStatusChip = useCallback(
+    (statuses: QueueStatusFilter[]) => {
+      setQueuePreferences((current) => ({ ...current, statuses }));
+      setPageIndex(0);
+    },
+    [setQueuePreferences],
+  );
+  const statusChips: {
+    key: string;
+    label: string;
+    count: number;
+    statuses: QueueStatusFilter[];
+  }[] = [
+    { key: "all", label: t("history.filterAll"), count: jobs.length, statuses: [] },
+    {
+      key: "active",
+      label: t("queue.filterActive"),
+      count: jobs.filter((job) => QUEUE_ACTIVE_STATUSES.includes(job.status as QueueStatusFilter)).length,
+      statuses: QUEUE_ACTIVE_STATUSES,
+    },
+    {
+      key: "queued",
+      label: t("status.queued"),
+      count: jobs.filter((job) => job.status === "QUEUED").length,
+      statuses: ["QUEUED"],
+    },
+    {
+      key: "stalled",
+      label: t("queue.filterStalled"),
+      count: jobs.filter((job) => job.status === "PAUSED").length,
+      statuses: ["PAUSED"],
+    },
+  ];
+
   function resetQueueView() {
     setQueuePreferences((current) => ({
       ...current,
@@ -1270,31 +1331,38 @@ export function JobList() {
         title={t("jobs.title")}
         actions={
           <>
-            <div className="min-w-[120px] rounded-xl border border-border/70 bg-background/70 px-4 py-2">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-                {t("label.downloadSpeed")}
-              </div>
-              <div className="text-base font-semibold text-foreground">
-                {formatSpeed(speed)}
-              </div>
-              {isPaused ? (
-                <div className="mt-1 text-[11px] font-medium uppercase tracking-[0.16em] text-amber-600 dark:text-amber-300">
-                  {t("jobs.downloadsPaused")}
+            <div className="flex overflow-hidden rounded-inner border border-border bg-card">
+              <div className="border-r border-border px-4 py-2.5">
+                <div className="text-[9.5px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+                  {t("label.downloadSpeed")}
                 </div>
-              ) : null}
+                <div className="mt-0.5 font-space-grotesk text-lg font-bold text-foreground">
+                  {formatSpeed(speed)}
+                </div>
+                {isPaused ? (
+                  <div className="text-[10px] font-medium uppercase tracking-[0.14em] text-status-paused">
+                    {t("jobs.downloadsPaused")}
+                  </div>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                onClick={openSpeedLimitDialog}
+                className="px-4 py-2.5 text-left transition-colors hover:bg-accent/40"
+              >
+                <div className="text-[9.5px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+                  {t("settings.speedLimit")}
+                </div>
+                <div
+                  className={cn(
+                    "mt-0.5 font-space-grotesk text-lg font-bold",
+                    effectiveSpeedLimit === 0 ? "text-status-completed" : "text-status-paused",
+                  )}
+                >
+                  {effectiveSpeedLimit === 0 ? t("settings.unlimited") : formatSpeed(effectiveSpeedLimit)}
+                </div>
+              </button>
             </div>
-            <button
-              type="button"
-              onClick={openSpeedLimitDialog}
-              className="min-w-[120px] rounded-xl border border-border/70 bg-background/70 px-4 py-2 text-left transition hover:bg-accent/40"
-            >
-              <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-                {t("settings.speedLimit")}
-              </div>
-              <div className={`text-base font-semibold ${effectiveSpeedLimit === 0 ? "text-emerald-600 dark:text-emerald-400" : "text-amber-600 dark:text-amber-300"}`}>
-                {effectiveSpeedLimit === 0 ? t("settings.unlimited") : formatSpeed(effectiveSpeedLimit)}
-              </div>
-            </button>
             <Button
               variant={isPaused ? "default" : "outline"}
               onClick={() => void (isPaused ? resumeAll({}) : pauseAll({}))}
@@ -1429,8 +1497,42 @@ export function JobList() {
                       <X className="size-4" />
                     </Button>
                   </div>
-                ) : null}
+                ) : (
+                  <div className="flex flex-wrap items-center justify-center gap-2">
+                    {statusChips.map((chip) => (
+                      <FilterChip
+                        key={chip.key}
+                        label={chip.label}
+                        count={chip.count}
+                        active={
+                          chip.statuses.length === 0
+                            ? queuePreferences.statuses.length === 0
+                            : sameStatusSet(queuePreferences.statuses, chip.statuses)
+                        }
+                        onClick={() => applyStatusChip(chip.statuses)}
+                      />
+                    ))}
+                  </div>
+                )}
               >
+                <SegmentedControl
+                  size="sm"
+                  ariaLabel={t("queue.layoutTable")}
+                  value={queueLayout}
+                  onValueChange={setQueueLayout}
+                  options={[
+                    {
+                      value: "table",
+                      icon: <TableIcon className="size-4" />,
+                      title: t("queue.layoutTable"),
+                    },
+                    {
+                      value: "compact",
+                      icon: <Rows3 className="size-4" />,
+                      title: t("queue.layoutCompact"),
+                    },
+                  ]}
+                />
                 <Popover>
                   <PopoverTrigger asChild>
                     <Button variant="outline" className="h-10 w-full justify-between gap-3 sm:w-[176px]">
@@ -1677,21 +1779,127 @@ export function JobList() {
               </DataTableToolbar>
             </div>
 
-            <DataTable
-              table={queueTable}
-              wrapperClassName="max-h-[70vh]"
-              rowClassName={() => "text-xs"}
-              emptyState={
-                <div className="space-y-3 py-12 text-center">
-                  <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
-                  <div>
-                    <Button variant="outline" onClick={resetQueueView}>
-                      {t("action.clearFilters")}
-                    </Button>
+            {queueLayout === "table" ? (
+              <DataTable
+                table={queueTable}
+                wrapperClassName="max-h-[70vh]"
+                rowClassName={() => "text-xs"}
+                emptyState={
+                  <div className="space-y-3 py-12 text-center">
+                    <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
+                    <div>
+                      <Button variant="outline" onClick={resetQueueView}>
+                        {t("action.clearFilters")}
+                      </Button>
+                    </div>
                   </div>
+                }
+              />
+            ) : queueTable.getRowModel().rows.length === 0 ? (
+              <div className="space-y-3 py-12 text-center">
+                <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
+                <div>
+                  <Button variant="outline" onClick={resetQueueView}>
+                    {t("action.clearFilters")}
+                  </Button>
                 </div>
-              }
-            />
+              </div>
+            ) : (
+              <div className="max-h-[70vh] overflow-y-auto border-t border-border">
+                {queueTable.getRowModel().rows.map((row) => {
+                  const job = row.original;
+                  const stages = getJobStages({ status: job.status });
+                  return (
+                    <div
+                      key={row.id}
+                      data-state={row.getIsSelected() ? "selected" : undefined}
+                      className="group/row flex items-center gap-3 border-b border-border px-6 py-2.5 transition-colors last:border-0 hover:bg-accent/20 data-[state=selected]:bg-primary/[0.06]"
+                    >
+                      <div data-row-click-ignore="true" className="shrink-0">
+                        <Checkbox
+                          checked={row.getIsSelected()}
+                          onCheckedChange={(value) => row.toggleSelected(value === true)}
+                        />
+                      </div>
+                      <span className="flex shrink-0 items-center gap-0.5">
+                        {stages.map((stage, index) => (
+                          <span
+                            key={`${stage}-${index}`}
+                            title={index === 0 ? job.statusLabel : undefined}
+                            className={cn(
+                              "size-2 rounded-pill",
+                              STATUS_BG_CLASS[statusToken(stage)],
+                              isActiveStatus(stage) && "animate-status-pulse",
+                            )}
+                          />
+                        ))}
+                      </span>
+                      <Link
+                        to={`/jobs/${job.id}`}
+                        title={job.displayName}
+                        className="min-w-0 flex-[1.6] truncate text-[13px] font-medium text-foreground"
+                      >
+                        {job.displayName}
+                      </Link>
+                      <div className="hidden min-w-[130px] flex-1 sm:block">
+                        <JobProgress
+                          compact
+                          progress={job.progress}
+                          status={job.status}
+                          totalBytes={job.totalBytes}
+                          downloadedBytes={job.downloadedBytes}
+                          failedBytes={job.failedBytes}
+                        />
+                      </div>
+                      <span className="hidden w-16 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground md:block">
+                        {job.etaDisplay}
+                      </span>
+                      <span className="w-16 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground">
+                        {formatBytes(job.totalBytes)}
+                      </span>
+                      <div
+                        data-row-click-ignore="true"
+                        className="flex shrink-0 items-center gap-1 opacity-40 transition-opacity group-hover/row:opacity-100"
+                      >
+                        {job.status === "PAUSED" ? (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="size-7 text-muted-foreground hover:text-foreground"
+                            title={t("action.resume")}
+                            aria-label={t("action.resume")}
+                            onClick={() => handleResumeJob(job.id)}
+                          >
+                            <Play className="size-3.5" />
+                          </Button>
+                        ) : (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="size-7 text-muted-foreground hover:text-foreground"
+                            title={t("action.pause")}
+                            aria-label={t("action.pause")}
+                            onClick={() => handlePauseJob(job.id)}
+                          >
+                            <Pause className="size-3.5" />
+                          </Button>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="size-7 text-muted-foreground hover:text-foreground"
+                          title={t("action.cancel")}
+                          aria-label={t("action.cancel")}
+                          onClick={() => handleCancelJob(job.id)}
+                        >
+                          <X className="size-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
             <DataTablePagination
               table={queueTable}
               totalCount={queueTable.getFilteredRowModel().rows.length}

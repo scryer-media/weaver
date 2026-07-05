@@ -26,6 +26,12 @@ const en: LocaleDictionary = {
   "status.paused": "Paused",
   "status.checking": "Checking",
   "status.propagating": "Propagating",
+  "status.finalizing": "Finalizing",
+  "status.cancelled": "Cancelled",
+  "queue.filterActive": "Active",
+  "queue.filterStalled": "Stalled",
+  "queue.layoutTable": "Table",
+  "queue.layoutCompact": "Compact",
 
   // Actions
   "action.pause": "Pause",

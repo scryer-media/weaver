@@ -15,6 +15,9 @@ use super::{
     WatchFolderScannerError,
 };
 
+const PROCESSING_PREFIX: &str = ".weaver-processing-";
+const MARKER_SUFFIXES: [&str; 4] = [".queued", ".error", ".partial", ".processed"];
+
 #[derive(Debug, thiserror::Error)]
 pub enum WatchFolderServiceError {
     #[error("state error: {0}")]
@@ -187,9 +190,9 @@ async fn run_realtime_watch_cycle(
     config: SharedConfig,
     settings: WatchFolderConfig,
 ) -> notify::Result<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let mut watcher = notify::recommended_watcher(move |event| {
-        let _ = tx.send(event);
+        let _ = enqueue_scan_signal(&tx, event);
     })?;
     let mut watched_paths = HashSet::new();
 
@@ -200,20 +203,34 @@ async fn run_realtime_watch_cycle(
         Err(error) => warn!(error = %error, "watch folder startup scan failed"),
     }
 
-    while let Some(event) = rx.recv().await {
-        if let Err(error) = event {
-            warn!(error = %error, "watch folder realtime event failed");
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        while rx.try_recv().is_ok() {}
-        refresh_watch_paths(&mut watcher, &mut watched_paths, &config, &settings).await?;
-        match scanner.scan_once(settings.clone()).await {
-            Ok(report) => log_scan_report("realtime", &report),
-            Err(error) => warn!(error = %error, "watch folder realtime scan failed"),
+    let mut fallback_interval = tokio::time::interval(realtime_fallback_interval(&settings));
+    fallback_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    fallback_interval.tick().await;
+
+    loop {
+        tokio::select! {
+            signal = rx.recv() => {
+                let Some(()) = signal else {
+                    return Ok(());
+                };
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                while rx.try_recv().is_ok() {
+                }
+                refresh_watch_paths(&mut watcher, &mut watched_paths, &config, &settings).await?;
+                match scanner.scan_once(settings.clone()).await {
+                    Ok(report) => log_scan_report("realtime", &report),
+                    Err(error) => warn!(error = %error, "watch folder realtime scan failed"),
+                }
+            }
+            _ = fallback_interval.tick() => {
+                refresh_watch_paths(&mut watcher, &mut watched_paths, &config, &settings).await?;
+                match scanner.scan_once(settings.clone()).await {
+                    Ok(report) => log_scan_report("realtime-reconcile", &report),
+                    Err(error) => warn!(error = %error, "watch folder realtime reconciliation scan failed"),
+                }
+            }
         }
     }
-
-    Ok(())
 }
 
 async fn refresh_watch_paths(
@@ -222,7 +239,21 @@ async fn refresh_watch_paths(
     config: &SharedConfig,
     settings: &WatchFolderConfig,
 ) -> notify::Result<()> {
-    for (idx, path) in watch_paths(config, settings).await.into_iter().enumerate() {
+    let desired_paths = watch_paths(config, settings).await;
+    let desired_set = desired_paths.iter().cloned().collect::<HashSet<_>>();
+    let stale_paths = watched_paths
+        .iter()
+        .filter(|path| !desired_set.contains(*path) || !path.exists())
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in stale_paths {
+        if let Err(error) = watcher.unwatch(&path) {
+            debug!(path = %path.display(), error = %error, "failed to unwatch stale watch folder path");
+        }
+        watched_paths.remove(&path);
+    }
+
+    for (idx, path) in desired_paths.into_iter().enumerate() {
         if watched_paths.contains(&path) {
             continue;
         }
@@ -241,6 +272,44 @@ async fn refresh_watch_paths(
 
 fn realtime_retry_delay(settings: &WatchFolderConfig) -> Duration {
     Duration::from_secs(settings.poll_interval_secs.clamp(5, 60))
+}
+
+fn realtime_fallback_interval(settings: &WatchFolderConfig) -> Duration {
+    Duration::from_secs(settings.poll_interval_secs.clamp(30, 300))
+}
+
+fn event_result_requests_scan(event: notify::Result<notify::Event>) -> bool {
+    match event {
+        Ok(event) => watch_event_requests_scan(&event),
+        Err(error) => {
+            warn!(error = %error, "watch folder realtime event failed");
+            true
+        }
+    }
+}
+
+fn enqueue_scan_signal(
+    tx: &tokio::sync::mpsc::Sender<()>,
+    event: notify::Result<notify::Event>,
+) -> bool {
+    event_result_requests_scan(event) && tx.try_send(()).is_ok()
+}
+
+fn watch_event_requests_scan(event: &notify::Event) -> bool {
+    event.paths.is_empty()
+        || event
+            .paths
+            .iter()
+            .any(|path| !is_ignored_watch_event_path(path))
+}
+
+fn is_ignored_watch_event_path(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    name.starts_with(PROCESSING_PREFIX)
+        || MARKER_SUFFIXES.iter().any(|suffix| lower.ends_with(suffix))
 }
 
 async fn watch_paths(config: &SharedConfig, settings: &WatchFolderConfig) -> Vec<PathBuf> {
@@ -408,5 +477,57 @@ mod tests {
             WatchFolderMode::Polling
         );
         assert!(shared.read().await.watch_folder.scanning_paused);
+    }
+
+    #[test]
+    fn realtime_fallback_interval_clamps_to_slow_reconcile_range() {
+        let mut cfg = WatchFolderConfig {
+            poll_interval_secs: 1,
+            ..WatchFolderConfig::default()
+        };
+        assert_eq!(realtime_fallback_interval(&cfg), Duration::from_secs(30));
+
+        cfg.poll_interval_secs = 120;
+        assert_eq!(realtime_fallback_interval(&cfg), Duration::from_secs(120));
+
+        cfg.poll_interval_secs = 999;
+        assert_eq!(realtime_fallback_interval(&cfg), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn realtime_event_filter_ignores_self_generated_marker_and_claim_paths() {
+        let marker = notify::Event::new(notify::EventKind::Any)
+            .add_path(PathBuf::from("/watch/release.nzb.queued"));
+        let claim = notify::Event::new(notify::EventKind::Any)
+            .add_path(PathBuf::from("/watch/.weaver-processing-0-release.nzb"));
+        let candidate =
+            notify::Event::new(notify::EventKind::Any).add_path(PathBuf::from("/watch/new.nzb"));
+        let mixed = notify::Event::new(notify::EventKind::Any)
+            .add_path(PathBuf::from("/watch/release.nzb.queued"))
+            .add_path(PathBuf::from("/watch/new.nzb"));
+
+        assert!(!watch_event_requests_scan(&marker));
+        assert!(!watch_event_requests_scan(&claim));
+        assert!(watch_event_requests_scan(&candidate));
+        assert!(watch_event_requests_scan(&mixed));
+    }
+
+    #[test]
+    fn realtime_scan_signal_channel_filters_and_coalesces_events() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let marker = notify::Event::new(notify::EventKind::Any)
+            .add_path(PathBuf::from("/watch/release.nzb.queued"));
+        let first =
+            notify::Event::new(notify::EventKind::Any).add_path(PathBuf::from("/watch/first.nzb"));
+        let second =
+            notify::Event::new(notify::EventKind::Any).add_path(PathBuf::from("/watch/second.nzb"));
+
+        assert!(!enqueue_scan_signal(&tx, Ok(marker)));
+        assert!(rx.try_recv().is_err());
+
+        assert!(enqueue_scan_signal(&tx, Ok(first)));
+        assert!(!enqueue_scan_signal(&tx, Ok(second)));
+        assert_eq!(rx.try_recv().unwrap(), ());
+        assert!(rx.try_recv().is_err());
     }
 }

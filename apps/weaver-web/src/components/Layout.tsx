@@ -27,8 +27,10 @@ import {
   LIVE_METRICS_SUBSCRIPTION,
   VERSION_QUERY,
 } from "@/graphql/queries";
-import { SpeedDisplay, formatSpeed } from "@/components/SpeedDisplay";
+import { formatSpeed } from "@/components/SpeedDisplay";
+import { Sparkline } from "@/components/ui/sparkline";
 import { UploadModal } from "@/components/UploadModal";
+import { useSpeedHistory } from "@/lib/hooks/use-speed-history";
 import { LiveDataProvider, type DownloadBlockState } from "@/lib/context/live-data-context";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
@@ -43,6 +45,7 @@ import {
 import { useTranslate } from "@/lib/context/translate-context";
 import { usePwa } from "@/lib/context/pwa-context";
 import { settingsNav } from "@/pages/settings/settings-nav";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {
   Sheet,
@@ -279,13 +282,12 @@ function mapQueueSnapshot(
   };
 }
 
-function ThemeToggle() {
+function ThemeToggle({ className }: { className?: string }) {
   const { theme, setTheme } = useTheme();
 
   return (
-    <Button
-      variant="ghost"
-      size="icon"
+    <button
+      type="button"
       onClick={() => {
         if (theme === "dark") {
           setTheme("light");
@@ -298,15 +300,20 @@ function ThemeToggle() {
         setTheme("dark");
       }}
       title={theme === "dark" ? "Dark" : theme === "light" ? "Light" : "System"}
+      aria-label="Toggle theme"
+      className={cn(
+        "flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-[9px] border border-border bg-card text-muted-foreground transition-colors hover:text-foreground",
+        className,
+      )}
     >
       {theme === "dark" ? (
-        <MoonStar className="size-4" />
-      ) : theme === "light" ? (
         <Sun className="size-4" />
+      ) : theme === "light" ? (
+        <MoonStar className="size-4" />
       ) : (
         <Monitor className="size-4" />
       )}
-    </Button>
+    </button>
   );
 }
 
@@ -463,6 +470,7 @@ export function Layout() {
   const disconnectBannerMessage = liveData.connection.isPolling
     ? t("connection.pollingBody")
     : t("connection.retryingBody");
+  const speedHistory = useSpeedHistory(liveData.speed);
   const titleEtaSpeed = useStableEtaSpeed(liveData.jobs, liveData.speed);
 
   const lastTitleUpdate = useRef(0);
@@ -511,206 +519,221 @@ export function Layout() {
       downloadBlock={liveData.downloadBlock}
       connection={liveData.connection}
     >
-      <div className="min-h-screen bg-background text-foreground">
-        <div className="mx-auto w-full max-w-[1787px] px-3 py-3 sm:px-4 sm:py-4">
-          <div className="relative overflow-hidden rounded-[28px] border border-border/70 bg-card/60 shadow-[0_20px_80px_rgba(15,23,42,0.12)] backdrop-blur-md dark:shadow-[0_24px_90px_rgba(2,6,23,0.45)]">
-            <div className="pointer-events-none absolute inset-x-0 top-0 h-56 bg-gradient-to-br from-primary/10 via-transparent to-transparent" />
-            {liveData.connection.isDisconnected ? (
-              <div className="relative z-20">
-                <DisconnectBanner
-                  title={t("connection.disconnectedTitle")}
-                  message={disconnectBannerMessage}
-                />
+      <div className="flex h-screen overflow-hidden bg-background text-foreground">
+        {/* Desktop sidebar */}
+        <aside className="hidden w-52 shrink-0 flex-col border-r border-border bg-card/40 backdrop-blur-md md:flex lg:w-[248px]">
+          <div className="flex items-start justify-between border-b border-border px-5 py-5">
+            <Link to="/" className="min-w-0">
+              <div className="font-space-grotesk text-[22px] font-bold leading-none tracking-tight text-foreground">
+                Weaver
+              </div>
+              <div className="mt-1.5 text-[10.5px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">
+                Queue Control
+              </div>
+            </Link>
+            <ThemeToggle />
+          </div>
+
+          <nav className="flex-1 overflow-y-auto px-3 py-3.5">
+            <div className="space-y-1">
+              {navItems.map((item) => {
+                const Icon = item.icon;
+                const topLevelActive = isActive(item.to);
+                return (
+                  <div key={item.to}>
+                    <Link
+                      to={item.to}
+                      className={cn(
+                        "flex items-center gap-3 rounded-[10px] px-3 py-2.5 text-[13.5px] transition-colors",
+                        topLevelActive
+                          ? "bg-primary font-semibold text-primary-foreground shadow-[0_8px_20px_-10px_var(--primary)]"
+                          : "font-medium text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+                      )}
+                    >
+                      <Icon className="size-[18px]" />
+                      <span>{t(item.labelKey)}</span>
+                    </Link>
+
+                    {item.to === "/settings" && settingsOpen ? (
+                      <div className="mt-1 mb-1 ml-5 space-y-0.5 border-l border-border pl-3">
+                        {settingsNav.map((entry) => {
+                          const childActive = location.pathname === entry.to;
+                          return (
+                            <Link
+                              key={entry.to}
+                              to={entry.to}
+                              className={cn(
+                                "block rounded-lg px-2.5 py-1.5 text-[13px] transition-colors",
+                                childActive
+                                  ? "bg-accent font-semibold text-foreground"
+                                  : "font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground",
+                              )}
+                            >
+                              {t(entry.labelKey)}
+                            </Link>
+                          );
+                        })}
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          </nav>
+
+          <div className="mt-auto flex flex-col gap-3 border-t border-border p-4">
+            <div className="rounded-inner border border-border bg-card px-3.5 py-3">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+                {t("label.downloadSpeed")}
+              </div>
+              <div className="mt-1 font-space-grotesk text-xl font-bold text-foreground">
+                {formatSpeed(liveData.speed)}
+              </div>
+              <Sparkline
+                values={speedHistory}
+                className="mt-1.5 text-status-completed"
+                height={26}
+                capValue={liveData.downloadBlock.scheduledSpeedLimit || null}
+              />
+            </div>
+            <Button onClick={() => setUploadOpen(true)} className="w-full">
+              <FolderUp className="size-4" />
+              {t("nav.upload")}
+            </Button>
+            {versionData?.version ? (
+              <div className="text-center text-[11px] tracking-wide text-muted-foreground/70">
+                v{versionData.version}
               </div>
             ) : null}
-            <div className="relative grid min-h-[calc(100vh-1.5rem)] md:grid-cols-[224px_minmax(0,1fr)]">
-              <aside className="hidden border-r border-border/60 bg-background/90 md:flex md:flex-col">
-                <div className="flex items-center justify-between border-b border-border/60 px-4 py-4">
-                  <Link to="/">
-                    <div className="font-space-grotesk text-lg font-semibold tracking-tight text-foreground">
-                      Weaver
-                    </div>
-                    <div className="text-xs uppercase tracking-[0.22em] text-muted-foreground">
-                      Queue Control
-                    </div>
-                  </Link>
-                  <ThemeToggle />
-                </div>
+          </div>
+        </aside>
 
-                <nav className="flex-1 px-2 py-3">
-                  <div className="space-y-1">
-                    {navItems.map((item) => {
-                      const Icon = item.icon;
-                      const topLevelActive = isActive(item.to);
-                      return (
-                        <div key={item.to}>
-                          <Link
-                            to={item.to}
-                            className={`flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition ${
-                              topLevelActive
-                                ? "bg-primary/14 font-medium text-foreground"
-                                : "text-muted-foreground hover:bg-accent/40 hover:text-foreground"
-                            }`}
-                          >
-                            <Icon className="size-4" />
-                            <span>{t(item.labelKey)}</span>
-                          </Link>
+        {/* Main column */}
+        <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+          <header className="flex flex-none items-center gap-3 border-b border-border bg-card/50 px-4 py-3 backdrop-blur md:hidden">
+            <button
+              type="button"
+              onClick={() => setMobileNavOpen(true)}
+              aria-label="Open navigation"
+              className="flex size-9 items-center justify-center rounded-[9px] border border-border bg-card text-foreground"
+            >
+              <Menu className="size-4" />
+            </button>
+            <span className="font-space-grotesk text-lg font-bold tracking-tight">Weaver</span>
+            <span className="ml-auto font-space-grotesk text-[15px] font-bold text-foreground">
+              {formatSpeed(liveData.speed)}
+            </span>
+          </header>
 
-                          {item.to === "/settings" && settingsOpen ? (
-                            <div className="mt-1 ml-4 space-y-1 border-l border-border/50 pl-3">
-                              {settingsNav.map((entry) => {
-                                const childActive = location.pathname === entry.to;
-                                return (
-                                  <Link
-                                    key={entry.to}
-                                    to={entry.to}
-                                    className={`block rounded-lg px-2.5 py-1.5 text-sm transition ${
-                                      childActive
-                                        ? "bg-primary/10 font-medium text-foreground"
-                                        : "text-muted-foreground hover:bg-accent/30 hover:text-foreground"
-                                    }`}
-                                  >
-                                    {t(entry.labelKey)}
-                                  </Link>
-                                );
-                              })}
-                            </div>
-                          ) : null}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </nav>
+          {liveData.connection.isDisconnected ? (
+            <div className="flex-none">
+              <DisconnectBanner
+                title={t("connection.disconnectedTitle")}
+                message={disconnectBannerMessage}
+              />
+            </div>
+          ) : null}
 
-                <div className="mt-auto space-y-3 border-t border-border/60 px-3 py-3">
-                  <div className="rounded-2xl border border-border/70 bg-background/70 px-3 py-2.5">
-                    <div className="text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
-                      {t("label.downloadSpeed")}
-                    </div>
-                    <SpeedDisplay
-                      bytesPerSec={liveData.speed}
-                      className="mt-1 text-base font-semibold text-foreground"
-                    />
-                  </div>
-                  <Button onClick={() => setUploadOpen(true)} className="w-full">
-                    <FolderUp className="size-4" />
-                    {t("nav.upload")}
-                  </Button>
-                  {versionData?.version ? (
-                    <div className="text-center text-[10px] text-muted-foreground/60">
-                      v{versionData.version}
-                    </div>
-                  ) : null}
-                </div>
-              </aside>
-
-              <main className="min-w-0 bg-transparent">
-                <header className="sticky top-0 z-10 flex items-center justify-between border-b border-border/60 bg-background/75 px-4 py-3 backdrop-blur md:hidden">
-                  <div className="flex items-center gap-2">
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => setMobileNavOpen(true)}
-                    >
-                      <Menu className="size-4" />
-                    </Button>
-                    <span className="font-space-grotesk text-lg font-semibold tracking-tight">
-                      Weaver
-                    </span>
-                  </div>
-                  <ThemeToggle />
-                </header>
-
-                <div className="w-full px-4 py-6 sm:px-6 md:px-8 md:py-8">
-                  <RoutedOutlet />
-                </div>
-              </main>
+          <div className="flex-1 overflow-y-auto">
+            <div className="mx-auto w-full max-w-[1600px] px-4 py-5 sm:px-6 lg:px-8 lg:py-8">
+              <RoutedOutlet />
             </div>
           </div>
-        </div>
-
-        <Sheet open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
-          <SheetContent side="left" className="w-[280px] p-0 sm:max-w-[280px]">
-            <SheetHeader className="border-b border-border/60 px-5 py-5 text-left">
-              <SheetTitle className="font-space-grotesk text-lg">Weaver</SheetTitle>
-              <SheetDescription>Queue Control</SheetDescription>
-            </SheetHeader>
-            <div className="flex h-full flex-col bg-background">
-              <nav className="flex-1 px-3 py-4">
-                <div className="space-y-1">
-                  {navItems.map((item) => {
-                    const Icon = item.icon;
-                    const topLevelActive = isActive(item.to);
-                    return (
-                      <div key={item.to}>
-                        <Link
-                          to={item.to}
-                          onClick={() => setMobileNavOpen(false)}
-                          className={`flex items-center gap-3 rounded-xl px-4 py-3 text-sm transition ${
-                            topLevelActive
-                              ? "bg-primary/14 font-medium text-foreground"
-                              : "text-muted-foreground hover:bg-accent/40 hover:text-foreground"
-                          }`}
-                        >
-                          <Icon className="size-4" />
-                          <span>{t(item.labelKey)}</span>
-                        </Link>
-
-                        {item.to === "/settings" && settingsOpen ? (
-                          <div className="mt-1 ml-5 space-y-1 border-l border-border/50 pl-4">
-                            {settingsNav.map((entry) => {
-                              const childActive = location.pathname === entry.to;
-                              return (
-                                <Link
-                                  key={entry.to}
-                                  to={entry.to}
-                                  onClick={() => setMobileNavOpen(false)}
-                                  className={`block rounded-lg px-3 py-2 text-sm transition ${
-                                    childActive
-                                      ? "bg-primary/10 font-medium text-foreground"
-                                      : "text-muted-foreground hover:bg-accent/30 hover:text-foreground"
-                                  }`}
-                                >
-                                  {t(entry.labelKey)}
-                                </Link>
-                              );
-                            })}
-                          </div>
-                        ) : null}
-                      </div>
-                    );
-                  })}
-                </div>
-              </nav>
-
-              <div className="space-y-4 border-t border-border/60 px-4 py-4">
-                <div className="rounded-2xl border border-border/70 bg-background/70 px-4 py-3">
-                  <div className="text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
-                    {t("label.downloadSpeed")}
-                  </div>
-                  <SpeedDisplay
-                    bytesPerSec={liveData.speed}
-                    className="mt-1 text-base font-semibold text-foreground"
-                  />
-                </div>
-                <Button
-                  onClick={() => {
-                    setMobileNavOpen(false);
-                    setUploadOpen(true);
-                  }}
-                  className="w-full"
-                >
-                  <FolderUp className="size-4" />
-                  {t("nav.upload")}
-                </Button>
-              </div>
-            </div>
-          </SheetContent>
-        </Sheet>
-
-        <UploadModal open={uploadOpen} onClose={() => setUploadOpen(false)} />
-        <PwaUpdateBanner />
+        </main>
       </div>
+
+      <Sheet open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
+        <SheetContent side="left" className="w-[280px] border-border bg-card sm:max-w-[280px]">
+          <SheetHeader className="border-b border-border px-5 py-5 text-left">
+            <SheetTitle className="font-space-grotesk text-xl font-bold text-foreground">
+              Weaver
+            </SheetTitle>
+            <SheetDescription className="text-[10.5px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">
+              Queue Control
+            </SheetDescription>
+          </SheetHeader>
+          <div className="flex min-h-0 flex-1 flex-col">
+            <nav className="flex-1 overflow-y-auto px-3 py-4">
+              <div className="space-y-1">
+                {navItems.map((item) => {
+                  const Icon = item.icon;
+                  const topLevelActive = isActive(item.to);
+                  return (
+                    <div key={item.to}>
+                      <Link
+                        to={item.to}
+                        onClick={() => setMobileNavOpen(false)}
+                        className={cn(
+                          "flex items-center gap-3 rounded-[10px] px-4 py-3 text-sm transition-colors",
+                          topLevelActive
+                            ? "bg-primary font-semibold text-primary-foreground"
+                            : "font-medium text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+                        )}
+                      >
+                        <Icon className="size-[18px]" />
+                        <span>{t(item.labelKey)}</span>
+                      </Link>
+
+                      {item.to === "/settings" && settingsOpen ? (
+                        <div className="mt-1 mb-1 ml-5 space-y-0.5 border-l border-border pl-4">
+                          {settingsNav.map((entry) => {
+                            const childActive = location.pathname === entry.to;
+                            return (
+                              <Link
+                                key={entry.to}
+                                to={entry.to}
+                                onClick={() => setMobileNavOpen(false)}
+                                className={cn(
+                                  "block rounded-lg px-3 py-2 text-[13px] transition-colors",
+                                  childActive
+                                    ? "bg-accent font-semibold text-foreground"
+                                    : "font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground",
+                                )}
+                              >
+                                {t(entry.labelKey)}
+                              </Link>
+                            );
+                          })}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            </nav>
+
+            <div className="mt-auto flex flex-col gap-3 border-t border-border p-4">
+              <div className="rounded-inner border border-border bg-card px-3.5 py-3">
+                <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+                  {t("label.downloadSpeed")}
+                </div>
+                <div className="mt-1 font-space-grotesk text-xl font-bold text-foreground">
+                  {formatSpeed(liveData.speed)}
+                </div>
+                <Sparkline
+                  values={speedHistory}
+                  className="mt-1.5 text-status-completed"
+                  height={26}
+                  capValue={liveData.downloadBlock.scheduledSpeedLimit || null}
+                />
+              </div>
+              <Button
+                onClick={() => {
+                  setMobileNavOpen(false);
+                  setUploadOpen(true);
+                }}
+                className="w-full"
+              >
+                <FolderUp className="size-4" />
+                {t("nav.upload")}
+              </Button>
+            </div>
+          </div>
+        </SheetContent>
+      </Sheet>
+
+      <UploadModal open={uploadOpen} onClose={() => setUploadOpen(false)} />
+      <PwaUpdateBanner />
     </LiveDataProvider>
   );
 }

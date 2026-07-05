@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 import { useTranslate } from "@/lib/context/translate-context";
+import { STATUS_BG_CLASS, type StatusToken } from "@/lib/status-tokens";
 
 export interface TimelineSpan {
   startedAt: number;
@@ -129,39 +130,30 @@ function stageSpanSubtitle(
   return span.label && span.label !== stageTitle ? stageTitle : null;
 }
 
+const LANE_STATUS_TOKEN: Record<TimelineLane["stage"], StatusToken> = {
+  PENDING_DOWNLOAD: "queued",
+  DOWNLOADING: "downloading",
+  FINALIZING_DOWNLOAD: "copying",
+  PAUSED: "paused",
+  VERIFYING: "verifying",
+  REPAIRING: "repairing",
+  EXTRACTING: "extracting",
+  INTERRUPTED: "failed",
+  FINAL_MOVE: "completed",
+};
+
+const MEMBER_SPAN_STATUS_TOKEN: Record<ExtractionMemberSpan["kind"], StatusToken> = {
+  WAITING_FOR_VOLUME: "queued",
+  APPENDING: "copying",
+  EXTRACTING: "extracting",
+};
+
 function laneColor(stage: TimelineLane["stage"]): string {
-  switch (stage) {
-    case "PENDING_DOWNLOAD":
-      return "bg-slate-400/75";
-    case "DOWNLOADING":
-      return "bg-sky-500/90";
-    case "FINALIZING_DOWNLOAD":
-      return "bg-teal-500/90";
-    case "PAUSED":
-      return "bg-cyan-500/85";
-    case "VERIFYING":
-      return "bg-amber-500/90";
-    case "REPAIRING":
-      return "bg-orange-500/90";
-    case "EXTRACTING":
-      return "bg-violet-500/90";
-    case "INTERRUPTED":
-      return "bg-rose-500/70";
-    case "FINAL_MOVE":
-      return "bg-emerald-500/90";
-  }
+  return STATUS_BG_CLASS[LANE_STATUS_TOKEN[stage]];
 }
 
 function spanColor(kind: ExtractionMemberSpan["kind"]): string {
-  switch (kind) {
-    case "WAITING_FOR_VOLUME":
-      return "bg-slate-300/85";
-    case "APPENDING":
-      return "bg-teal-500/90";
-    case "EXTRACTING":
-    default:
-      return "bg-violet-500/90";
-  }
+  return STATUS_BG_CLASS[MEMBER_SPAN_STATUS_TOKEN[kind]];
 }
 
 function stateVariant(
@@ -400,9 +392,9 @@ function TimelineSpanPopover({
         >
           <span
             className={cn(
-              "absolute inset-0 rounded-[3px] border border-background/50 shadow-sm",
+              "absolute inset-x-0 top-1/2 h-[9px] -translate-y-1/2 rounded-[2px] border border-background/40 shadow-sm",
               span.colorClass,
-              span.state === "FAILED" && "bg-destructive/85",
+              span.state === "FAILED" && "bg-status-failed",
               span.dashed && "border-dashed",
             )}
           />
@@ -629,7 +621,7 @@ function SharedPlot({
                         <div
                           className={cn(
                             "pointer-events-none absolute top-1/2 z-20 h-4 w-[2px] -translate-x-1/2 -translate-y-1/2 bg-foreground/80",
-                            span.state === "FAILED" && "bg-destructive",
+                            span.state === "FAILED" && "bg-status-failed",
                           )}
                           style={pointStyle(span.endedAt, axisStart, axisEnd)}
                         />
