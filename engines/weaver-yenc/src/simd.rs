@@ -35,6 +35,7 @@ pub(crate) enum DecodeEnd {
 struct KernelState {
     state: DecoderState,
     end: DecodeEnd,
+    line_length: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,10 +63,16 @@ impl From<DecodeEnd> for RapidyencDecodeEnd {
 }
 
 impl KernelState {
+    #[cfg(test)]
     fn body() -> Self {
+        Self::body_with_line_length(None)
+    }
+
+    fn body_with_line_length(line_length: Option<u32>) -> Self {
         Self {
             state: DecoderState::CrLf,
             end: DecodeEnd::None,
+            line_length: sanitize_line_length(line_length),
         }
     }
 
@@ -89,6 +96,7 @@ impl KernelState {
         Self {
             state: decoder_state,
             end: DecodeEnd::None,
+            line_length: state.line_length_hint,
         }
     }
 
@@ -105,6 +113,7 @@ impl KernelState {
         Self {
             state,
             end: DecodeEnd::None,
+            line_length: None,
         }
     }
 
@@ -119,6 +128,7 @@ impl KernelState {
                 | DecoderState::CrLfDotCr
                 | DecoderState::CrLfEq
         );
+        state.line_length_hint = self.line_length;
     }
 
     fn write_back_rapidyenc(self, state: &mut RapidyencDecodeState) {
@@ -134,13 +144,30 @@ impl KernelState {
     }
 }
 
+#[inline]
+fn sanitize_line_length(line_length: Option<u32>) -> Option<usize> {
+    line_length
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|&value| value > 0)
+}
+
 /// Decode a complete body buffer with the SIMD-capable internal kernel.
+#[cfg(test)]
 pub(crate) fn decode_body_into(
     input: &[u8],
     output: &mut [u8],
     dot_unstuffing: bool,
 ) -> Result<usize, YencError> {
-    let mut state = KernelState::body();
+    decode_body_into_with_line_length(input, output, dot_unstuffing, None)
+}
+
+pub(crate) fn decode_body_into_with_line_length(
+    input: &[u8],
+    output: &mut [u8],
+    dot_unstuffing: bool,
+    line_length: Option<u32>,
+) -> Result<usize, YencError> {
+    let mut state = KernelState::body_with_line_length(line_length);
     Ok(decode_kernel(input, output, &mut state, dot_unstuffing, false, false)?.written)
 }
 
@@ -701,7 +728,7 @@ unsafe fn decode_kernel_avx2(
     search_end: bool,
 ) -> Result<KernelOutcome, YencError> {
     unsafe {
-        decode_kernel_simd64(
+        decode_kernel_simd64_avx2_line_aware(
             input,
             output,
             state,
@@ -724,7 +751,10 @@ unsafe fn decode_kernel_avx512_vbmi2(
     search_end: bool,
 ) -> Result<KernelOutcome, YencError> {
     unsafe {
-        decode_kernel_simd64(
+        // The AVX2 line-aware driver applies to this tier too: VBMI2 implies
+        // AVX2, and anything the line fast path declines still routes through
+        // this tier's own block fn.
+        decode_kernel_simd64_avx2_line_aware(
             input,
             output,
             state,
@@ -1526,6 +1556,7 @@ fn x86_dot_start_mask(input: &[u8], src: usize, line_start: u64, escaped: u64) -
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn x86_final_state_after_block(
     fixed_eq: u64,
     dot_start: u64,
@@ -1557,7 +1588,7 @@ fn x86_final_state_after_block(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-#[inline(always)]
+#[inline]
 unsafe fn sse2_special_mask64(vectors: [std::arch::x86_64::__m128i; 4]) -> u64 {
     use std::arch::x86_64::*;
 
@@ -1579,7 +1610,7 @@ unsafe fn sse2_special_mask64(vectors: [std::arch::x86_64::__m128i; 4]) -> u64 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
-#[inline(always)]
+#[inline]
 unsafe fn ssse3_special_mask64(vectors: [std::arch::x86_64::__m128i; 4]) -> u64 {
     use std::arch::x86_64::*;
 
@@ -1615,7 +1646,7 @@ unsafe fn ssse3_special_mask64(vectors: [std::arch::x86_64::__m128i; 4]) -> u64 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[inline(always)]
+#[inline]
 unsafe fn avx2_special_mask64(a: std::arch::x86_64::__m256i, b: std::arch::x86_64::__m256i) -> u64 {
     use std::arch::x86_64::*;
 
@@ -1667,7 +1698,7 @@ unsafe fn avx2_special_mask64(a: std::arch::x86_64::__m256i, b: std::arch::x86_6
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-#[inline(always)]
+#[inline]
 unsafe fn sse2_mask64(vectors: [std::arch::x86_64::__m128i; 4], byte: u8) -> u64 {
     use std::arch::x86_64::*;
 
@@ -1681,7 +1712,7 @@ unsafe fn sse2_mask64(vectors: [std::arch::x86_64::__m128i; 4], byte: u8) -> u64
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[inline(always)]
+#[inline]
 unsafe fn avx2_mask64(
     a: std::arch::x86_64::__m256i,
     b: std::arch::x86_64::__m256i,
@@ -1897,6 +1928,15 @@ unsafe fn decode_kernel_neon(
                 continue;
             }
 
+            if state.line_length.is_some()
+                && let Some(consumed) = unsafe {
+                    try_decode_neon64_line(input, src, output, &mut dst, state, &ctx, simd_limit)?
+                }
+            {
+                src += consumed;
+                continue;
+            }
+
             match unsafe {
                 decode_neon64_span_block(input, &mut src, output, &mut dst, state, &ctx)?
             } {
@@ -2024,6 +2064,209 @@ unsafe fn decode_kernel_simd64(
         written: dst,
         end: state.end.into(),
     })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_kernel_simd64_avx2_line_aware(
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut KernelState,
+    dot_unstuffing: bool,
+    preserve_pending: bool,
+    search_end: bool,
+    block: DecodeBlock64,
+) -> Result<KernelOutcome, YencError> {
+    const WIDTH: usize = 64;
+
+    let mut src = 0usize;
+    let mut dst = 0usize;
+    let mode = DecodeStepMode {
+        dot_unstuffing,
+        preserve_pending,
+        search_end,
+    };
+    let tail_buffer = if dot_unstuffing {
+        WIDTH - 1 + 4
+    } else {
+        WIDTH - 1
+    };
+    let simd_limit = input.len().saturating_sub(tail_buffer);
+
+    if input.len() > WIDTH * 2 {
+        while (!search_end || state.end == DecodeEnd::None) && src + WIDTH <= simd_limit {
+            if state.line_length.is_some()
+                && let Some(consumed) = unsafe {
+                    try_decode_avx2_line(
+                        input,
+                        src,
+                        output,
+                        &mut dst,
+                        state,
+                        dot_unstuffing,
+                        search_end,
+                        simd_limit,
+                    )?
+                }
+            {
+                src += consumed;
+                continue;
+            }
+
+            if let Some(consumed) = unsafe {
+                block(
+                    input,
+                    src,
+                    output,
+                    &mut dst,
+                    state,
+                    dot_unstuffing,
+                    search_end,
+                )?
+            } {
+                src += consumed;
+                continue;
+            }
+
+            if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+                break;
+            }
+        }
+    }
+
+    while (!search_end || state.end == DecodeEnd::None) && src < input.len() {
+        if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+            break;
+        }
+    }
+
+    Ok(KernelOutcome {
+        consumed: src,
+        written: dst,
+        end: state.end.into(),
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn try_decode_avx2_line(
+    input: &[u8],
+    src: usize,
+    output: &mut [u8],
+    dst: &mut usize,
+    state: &mut KernelState,
+    dot_unstuffing: bool,
+    search_end: bool,
+    simd_limit: usize,
+) -> Result<Option<usize>, YencError> {
+    use std::arch::x86_64::*;
+
+    const WIDTH: usize = 64;
+    const MAX_LINE_CHUNKS: usize = 16;
+    const LAST: u64 = 1u64 << 63;
+
+    let Some(line_length) = state.line_length else {
+        return Ok(None);
+    };
+    if state.state != DecoderState::CrLf
+        || line_length < WIDTH
+        || line_length % WIDTH != 0
+        || line_length / WIDTH > MAX_LINE_CHUNKS
+    {
+        return Ok(None);
+    }
+
+    let line_end = src.saturating_add(line_length);
+    let after_crlf = line_end.saturating_add(2);
+    if after_crlf > input.len() || after_crlf > simd_limit {
+        return Ok(None);
+    }
+    if input[line_end] != b'\r' || input[line_end + 1] != b'\n' {
+        return Ok(None);
+    }
+    if dot_unstuffing && input[src] == b'.' {
+        return Ok(None);
+    }
+    if search_end && dot_unstuffing && input[src] == b'=' && input[src + 1] == b'y' {
+        return Ok(None);
+    }
+    if input[line_end - 1] == b'=' || output.len().saturating_sub(*dst) < line_length {
+        return Ok(None);
+    }
+
+    let chunks = line_length / WIDTH;
+    let mut eq_masks = [0u64; MAX_LINE_CHUNKS];
+    for (chunk_idx, eq_slot) in eq_masks.iter_mut().take(chunks).enumerate() {
+        let chunk_src = src + chunk_idx * WIDTH;
+        let a = unsafe { _mm256_loadu_si256(input.as_ptr().add(chunk_src) as *const __m256i) };
+        let b = unsafe { _mm256_loadu_si256(input.as_ptr().add(chunk_src + 32) as *const __m256i) };
+        let crlf = unsafe { avx2_mask64(a, b, b'\r') | avx2_mask64(a, b, b'\n') };
+        if crlf != 0 {
+            return Ok(None);
+        }
+        *eq_slot = unsafe { avx2_mask64(a, b, b'=') };
+    }
+
+    let mut preflight_esc_first = 0u64;
+    for &eq in eq_masks.iter().take(chunks) {
+        let fixed_eq = fix_eq_mask(eq, (eq << 1) | preflight_esc_first);
+        preflight_esc_first = (fixed_eq & LAST != 0) as u64;
+    }
+    if preflight_esc_first != 0 {
+        return Ok(None);
+    }
+
+    let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
+    let mut esc_first = 0u64;
+    for (chunk_idx, &eq) in eq_masks.iter().take(chunks).enumerate() {
+        let chunk_src = src + chunk_idx * WIDTH;
+        let a = unsafe { _mm256_loadu_si256(input.as_ptr().add(chunk_src) as *const __m256i) };
+        let b = unsafe { _mm256_loadu_si256(input.as_ptr().add(chunk_src + 32) as *const __m256i) };
+        let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+        let escaped = (fixed_eq << 1) | esc_first;
+        let skip = fixed_eq;
+
+        if skip == 0 && escaped == 0 {
+            unsafe {
+                _mm256_storeu_si256(
+                    output.as_mut_ptr().add(*dst) as *mut __m256i,
+                    _mm256_add_epi8(a, sub42),
+                );
+                _mm256_storeu_si256(
+                    output.as_mut_ptr().add(*dst + 32) as *mut __m256i,
+                    _mm256_add_epi8(b, sub42),
+                );
+            }
+            *dst += WIDTH;
+        } else {
+            let (decoded_a, decoded_b) = unsafe { avx2_decode_with_escape_mask(a, b, escaped) };
+            unsafe {
+                compact_store_16_avx2(decoded_a, false, (skip & 0xffff) as u16, output, dst)?
+            };
+            unsafe {
+                compact_store_16_avx2(decoded_a, true, ((skip >> 16) & 0xffff) as u16, output, dst)?
+            };
+            unsafe {
+                compact_store_16_avx2(
+                    decoded_b,
+                    false,
+                    ((skip >> 32) & 0xffff) as u16,
+                    output,
+                    dst,
+                )?
+            };
+            unsafe {
+                compact_store_16_avx2(decoded_b, true, ((skip >> 48) & 0xffff) as u16, output, dst)?
+            };
+        }
+
+        esc_first = (fixed_eq & LAST != 0) as u64;
+    }
+
+    debug_assert_eq!(esc_first, 0);
+    state.state = DecoderState::CrLf;
+    Ok(Some(line_length + 2))
 }
 
 #[cfg(all(target_arch = "arm", target_feature = "neon"))]
@@ -2218,6 +2461,7 @@ unsafe fn try_decode_arm_neon_block(
 struct Neon64Constants {
     eq: std::arch::aarch64::uint8x16_t,
     cr: std::arch::aarch64::uint8x16_t,
+    lf: std::arch::aarch64::uint8x16_t,
     dot: std::arch::aarch64::uint8x16_t,
     // Table-lookup rows marking '\n' (10) and '\r' (13) so one vqtbx1q merges
     // the CR/LF compares into the '=' compare (rapidyenc's specials gate).
@@ -2237,6 +2481,7 @@ impl Neon64Constants {
         Self {
             eq: unsafe { vdupq_n_u8(b'=') },
             cr: unsafe { vdupq_n_u8(b'\r') },
+            lf: unsafe { vdupq_n_u8(b'\n') },
             dot: unsafe { vdupq_n_u8(b'.') },
             crlf_table: unsafe {
                 vld1q_u8([0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 0, 0].as_ptr())
@@ -2289,6 +2534,194 @@ fn per_group_keeps(skip: u64) -> (usize, usize, usize, usize) {
         16 - ((sums >> 32) & 0x1f) as usize,
         16 - ((sums >> 48) & 0x1f) as usize,
     )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn neon64_compare_mask64(
+    vectors: [std::arch::aarch64::uint8x16_t; 4],
+    bit_weights: std::arch::aarch64::uint8x16_t,
+) -> u64 {
+    use std::arch::aarch64::*;
+
+    let merged = unsafe {
+        vpaddq_u8(
+            vpaddq_u8(
+                vpaddq_u8(
+                    vandq_u8(vectors[0], bit_weights),
+                    vandq_u8(vectors[1], bit_weights),
+                ),
+                vpaddq_u8(
+                    vandq_u8(vectors[2], bit_weights),
+                    vandq_u8(vectors[3], bit_weights),
+                ),
+            ),
+            vdupq_n_u8(0),
+        )
+    };
+    unsafe { vgetq_lane_u64::<0>(vreinterpretq_u64_u8(merged)) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn try_decode_neon64_line(
+    input: &[u8],
+    src: usize,
+    output: &mut [u8],
+    dst: &mut usize,
+    state: &mut KernelState,
+    ctx: &Neon64Ctx<'_>,
+    simd_limit: usize,
+) -> Result<Option<usize>, YencError> {
+    use std::arch::aarch64::*;
+
+    const WIDTH: usize = 64;
+    const MAX_LINE_CHUNKS: usize = 16;
+    const LAST: u64 = 1u64 << 63;
+
+    let Some(line_length) = state.line_length else {
+        return Ok(None);
+    };
+    if state.state != DecoderState::CrLf
+        || line_length < WIDTH
+        || line_length % WIDTH != 0
+        || line_length / WIDTH > MAX_LINE_CHUNKS
+    {
+        return Ok(None);
+    }
+
+    let line_end = src.saturating_add(line_length);
+    let after_crlf = line_end.saturating_add(2);
+    if after_crlf > input.len() || after_crlf > simd_limit {
+        return Ok(None);
+    }
+    if input[line_end] != b'\r' || input[line_end + 1] != b'\n' {
+        return Ok(None);
+    }
+    if ctx.dot_unstuffing && input[src] == b'.' {
+        return Ok(None);
+    }
+    if ctx.search_end && ctx.dot_unstuffing && input[src] == b'=' && input[src + 1] == b'y' {
+        return Ok(None);
+    }
+    if input[line_end - 1] == b'=' || output.len().saturating_sub(*dst) < line_length {
+        return Ok(None);
+    }
+
+    let constants = &ctx.constants;
+    let chunks = line_length / WIDTH;
+    let mut eq_masks = [0u64; MAX_LINE_CHUNKS];
+    for (chunk_idx, eq_slot) in eq_masks.iter_mut().take(chunks).enumerate() {
+        let chunk_src = src + chunk_idx * WIDTH;
+        let a = unsafe { vld1q_u8(input.as_ptr().add(chunk_src)) };
+        let b = unsafe { vld1q_u8(input.as_ptr().add(chunk_src + 16)) };
+        let c = unsafe { vld1q_u8(input.as_ptr().add(chunk_src + 32)) };
+        let d = unsafe { vld1q_u8(input.as_ptr().add(chunk_src + 48)) };
+        let eq = [
+            unsafe { vceqq_u8(a, constants.eq) },
+            unsafe { vceqq_u8(b, constants.eq) },
+            unsafe { vceqq_u8(c, constants.eq) },
+            unsafe { vceqq_u8(d, constants.eq) },
+        ];
+        let crlf = [
+            unsafe { vorrq_u8(vceqq_u8(a, constants.cr), vceqq_u8(a, constants.lf)) },
+            unsafe { vorrq_u8(vceqq_u8(b, constants.cr), vceqq_u8(b, constants.lf)) },
+            unsafe { vorrq_u8(vceqq_u8(c, constants.cr), vceqq_u8(c, constants.lf)) },
+            unsafe { vorrq_u8(vceqq_u8(d, constants.cr), vceqq_u8(d, constants.lf)) },
+        ];
+        if unsafe { neon64_compare_mask64(crlf, constants.bit_weights) } != 0 {
+            return Ok(None);
+        }
+        *eq_slot = unsafe { neon64_compare_mask64(eq, constants.bit_weights) };
+    }
+
+    let mut preflight_esc_first = 0u64;
+    for &eq in eq_masks.iter().take(chunks) {
+        let fixed_eq = fix_eq_mask(eq, (eq << 1) | preflight_esc_first);
+        preflight_esc_first = (fixed_eq & LAST != 0) as u64;
+    }
+    if preflight_esc_first != 0 {
+        return Ok(None);
+    }
+
+    let mut esc_first = 0u64;
+    for (chunk_idx, &eq) in eq_masks.iter().take(chunks).enumerate() {
+        let chunk_src = src + chunk_idx * WIDTH;
+        let vectors = [
+            unsafe { vld1q_u8(input.as_ptr().add(chunk_src)) },
+            unsafe { vld1q_u8(input.as_ptr().add(chunk_src + 16)) },
+            unsafe { vld1q_u8(input.as_ptr().add(chunk_src + 32)) },
+            unsafe { vld1q_u8(input.as_ptr().add(chunk_src + 48)) },
+        ];
+        let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+        let escaped = (fixed_eq << 1) | esc_first;
+        let skip = fixed_eq;
+
+        if skip == 0 && escaped == 0 {
+            unsafe {
+                vst1q_u8(
+                    output.as_mut_ptr().add(*dst),
+                    vsubq_u8(vectors[0], constants.normal_offset),
+                );
+                vst1q_u8(
+                    output.as_mut_ptr().add(*dst + 16),
+                    vsubq_u8(vectors[1], constants.normal_offset),
+                );
+                vst1q_u8(
+                    output.as_mut_ptr().add(*dst + 32),
+                    vsubq_u8(vectors[2], constants.normal_offset),
+                );
+                vst1q_u8(
+                    output.as_mut_ptr().add(*dst + 48),
+                    vsubq_u8(vectors[3], constants.normal_offset),
+                );
+            }
+            *dst += WIDTH;
+        } else {
+            let decoded = unsafe { neon_decode_with_escape_mask(vectors, escaped, constants) };
+            let keeps = per_group_keeps(skip);
+            unsafe {
+                compact_store_16(
+                    decoded[0],
+                    (skip & 0xffff) as u16,
+                    keeps.0,
+                    ctx.table,
+                    output,
+                    dst,
+                );
+                compact_store_16(
+                    decoded[1],
+                    ((skip >> 16) & 0xffff) as u16,
+                    keeps.1,
+                    ctx.table,
+                    output,
+                    dst,
+                );
+                compact_store_16(
+                    decoded[2],
+                    ((skip >> 32) & 0xffff) as u16,
+                    keeps.2,
+                    ctx.table,
+                    output,
+                    dst,
+                );
+                compact_store_16(
+                    decoded[3],
+                    ((skip >> 48) & 0xffff) as u16,
+                    keeps.3,
+                    ctx.table,
+                    output,
+                    dst,
+                );
+            }
+        }
+
+        esc_first = (fixed_eq & LAST != 0) as u64;
+    }
+
+    debug_assert_eq!(esc_first, 0);
+    state.state = DecoderState::CrLf;
+    Ok(Some(line_length + 2))
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -3609,7 +4042,7 @@ mod tests {
             ..KernelState::body()
         };
 
-        let mut check = |name: &str, result: Option<(Vec<u8>, KernelState)>| {
+        let check = |name: &str, result: Option<(Vec<u8>, KernelState)>| {
             if let Some((actual_output, actual_state)) = result {
                 assert_eq!(actual_output, expected_output, "{name} output");
                 assert_eq!(actual_state, expected_state, "{name} state");
@@ -3769,6 +4202,78 @@ mod tests {
                 b'D'.wrapping_sub(42),
             ]
         );
+    }
+
+    fn encoded_body_for(input: &[u8], line_length: usize) -> Vec<u8> {
+        let mut article = Vec::new();
+        crate::encode::encode(input, &mut article, line_length, "line-aware.bin").unwrap();
+        let parsed = crate::header::parse_headers(&article).unwrap();
+        article[parsed.data_start..parsed.data_end].to_vec()
+    }
+
+    fn assert_line_hint_matches_general(body: &[u8], line_length: u32, dot_unstuffing: bool) {
+        let mut general = vec![0u8; body.len() + 128];
+        let general_written = decode_body_into(body, &mut general, dot_unstuffing).unwrap();
+        general.truncate(general_written);
+
+        let mut hinted = vec![0u8; body.len() + 128];
+        let hinted_written =
+            decode_body_into_with_line_length(body, &mut hinted, dot_unstuffing, Some(line_length))
+                .unwrap();
+        hinted.truncate(hinted_written);
+
+        assert_eq!(hinted, general);
+    }
+
+    #[test]
+    fn line_hint_matches_general_for_128_column_article() {
+        let input: Vec<u8> = (0..32_768)
+            .map(|idx| ((idx * 31 + 17) & 0xff) as u8)
+            .collect();
+        let body = encoded_body_for(&input, 128);
+
+        assert_line_hint_matches_general(&body, 128, false);
+    }
+
+    #[test]
+    fn line_hint_matches_general_for_escape_heavy_lines() {
+        let input = vec![0x13; 512];
+        let body = encoded_body_for(&input, 128);
+
+        assert_line_hint_matches_general(&body, 128, false);
+    }
+
+    #[test]
+    fn line_hint_handles_escape_at_predicted_boundary() {
+        let mut input = vec![b'A'; 126];
+        input.push(0x13);
+        input.extend((0..512).map(|idx| ((idx * 19 + 3) & 0xff) as u8));
+        let body = encoded_body_for(&input, 128);
+
+        assert_eq!(&body[126..128], b"=}");
+        assert_eq!(&body[128..130], b"\r\n");
+        assert_line_hint_matches_general(&body, 128, false);
+    }
+
+    #[test]
+    fn line_hint_falls_back_on_wrong_line_length() {
+        let input: Vec<u8> = (0..4096)
+            .map(|idx| ((idx * 13 + 91) & 0xff) as u8)
+            .collect();
+        let body = encoded_body_for(&input, 128);
+
+        assert_line_hint_matches_general(&body, 64, false);
+    }
+
+    #[test]
+    fn line_hint_falls_back_on_dot_stuffed_line() {
+        let mut body = Vec::new();
+        body.push(b'.');
+        body.extend(std::iter::repeat_n(b'A', 128));
+        body.extend_from_slice(b"\r\n");
+        body.extend(std::iter::repeat_n(b'B', 128));
+
+        assert_line_hint_matches_general(&body, 128, true);
     }
 
     #[test]

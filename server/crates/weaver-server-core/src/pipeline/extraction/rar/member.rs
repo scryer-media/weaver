@@ -15,6 +15,45 @@ pub(crate) struct RarExtractionContext<'a> {
     pub(crate) options: &'a weaver_unrar::ExtractOptions,
 }
 
+const RAR_MAX_DICT_ENV: &str = "WEAVER_RAR_MAX_DICT_BYTES";
+/// Engine default (256 MiB) refuses every real RAR7 archive, whose
+/// dictionaries are >4 GiB by construction. Floor of the scaled default.
+const RAR_MAX_DICT_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
+/// unrar's own compatibility ceiling for declared dictionary sizes.
+const RAR_MAX_DICT_CEILING_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Maximum RAR dictionary size the server will decode.
+///
+/// `WEAVER_RAR_MAX_DICT_BYTES` overrides; otherwise half of physical memory,
+/// clamped to [256 MiB, 64 GiB]. The dictionary window is the dominant
+/// allocation when extracting solid/big-dictionary archives, so this scales
+/// the admission policy with the machine instead of refusing all RAR7 input.
+fn configured_rar_max_dict_bytes() -> u64 {
+    static CONFIGURED: OnceLock<u64> = OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        if let Ok(value) = std::env::var(RAR_MAX_DICT_ENV) {
+            match value.trim().parse::<u64>() {
+                Ok(bytes) if bytes > 0 => return bytes,
+                _ => tracing::warn!(
+                    env = RAR_MAX_DICT_ENV,
+                    value,
+                    "invalid RAR max dictionary override; using memory-scaled default"
+                ),
+            }
+        }
+        crate::runtime::system_probe::detect_total_memory_bytes()
+            .map(|total| (total / 2).clamp(RAR_MAX_DICT_FLOOR_BYTES, RAR_MAX_DICT_CEILING_BYTES))
+            .unwrap_or(RAR_MAX_DICT_FLOOR_BYTES)
+    })
+}
+
+/// Apply the server's decode limits to a freshly opened archive.
+fn apply_server_rar_limits(archive: &mut weaver_unrar::RarArchive) {
+    let mut limits = weaver_unrar::Limits::default();
+    limits.max_dict_size = configured_rar_max_dict_bytes();
+    archive.set_limits(limits);
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RarArchiveOpenMode {
     AttachOnly,
@@ -345,6 +384,7 @@ impl Pipeline {
                 partial_path.display()
             )
         })?;
+        weaver_unrar::RarArchive::preallocate_output_file(&partial_file, unpacked_size);
         let shared = Rc::new(RefCell::new(SharedOutputFile {
             inner: std::io::BufWriter::with_capacity(8 * 1024 * 1024, partial_file),
         }));
@@ -695,6 +735,7 @@ impl Pipeline {
                 )?
             }
         };
+        apply_server_rar_limits(&mut archive);
 
         let full_set_open = requested_members.is_some_and(|members| members.is_empty());
         let metadata_may_expand =

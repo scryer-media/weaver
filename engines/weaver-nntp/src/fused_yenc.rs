@@ -302,6 +302,8 @@ impl FusedYencArticleDecoder {
         let metadata = header::parse_ybegin_line(&self.line_buf)?;
         self.line_buf.clear();
         let needs_ypart = metadata.part.is_some();
+        self.decode_state
+            .set_line_length_hint(Some(metadata.line_length));
         self.metadata = Some(metadata);
         if !needs_ypart {
             self.reserve_output_if_known();

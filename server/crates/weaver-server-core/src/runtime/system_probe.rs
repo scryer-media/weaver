@@ -171,6 +171,12 @@ fn detect_memory() -> MemoryProfile {
     }
 }
 
+/// Total physical memory, if detectable. Used for memory-scaled policy
+/// defaults (e.g. the RAR dictionary-size ceiling).
+pub(crate) fn detect_total_memory_bytes() -> Option<u64> {
+    detect_memory_bytes().map(|(total, _)| total)
+}
+
 /// Returns (total_bytes, available_bytes).
 fn detect_memory_bytes() -> Option<(u64, u64)> {
     #[cfg(target_os = "macos")]

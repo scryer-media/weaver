@@ -39,6 +39,7 @@ pub mod decompress;
 pub mod early;
 pub mod error;
 pub mod extract;
+pub(crate) mod hash_pipeline;
 pub mod header;
 pub mod limits;
 pub mod path;

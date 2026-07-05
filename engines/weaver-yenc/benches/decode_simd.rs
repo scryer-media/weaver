@@ -6,6 +6,7 @@ use weaver_yenc::decode::{
     DecodeOptions, DecodeState, decode_body, decode_body_chunk_until_control, decode_chunk,
     decode_rapidyenc,
 };
+use weaver_yenc::{decode as decode_article, encode as encode_article};
 
 const OUTPUT_BATCH_TARGET: usize = 512 * 1024;
 
@@ -120,6 +121,19 @@ fn bench_decode_only(c: &mut Criterion, name: &str, input: &[u8]) {
     });
 }
 
+fn real_yenc_128col_decoded() -> Vec<u8> {
+    (0..768_000usize)
+        .map(|idx| ((idx * 31 + 17) & 0xff) as u8)
+        .collect()
+}
+
+fn real_yenc_128col_article() -> Vec<u8> {
+    let decoded = real_yenc_128col_decoded();
+    let mut article = Vec::with_capacity(decoded.len() + decoded.len() / 64 + 256);
+    encode_article(&decoded, &mut article, 128, "bench.bin").unwrap();
+    article
+}
+
 fn raw_terminator_body() -> Vec<u8> {
     let mut body = dot_stuffed_body();
     body.extend_from_slice(b".\r\nignored-after-terminator");
@@ -134,6 +148,17 @@ fn bench_body(c: &mut Criterion, name: &str, input: &[u8], options: DecodeOption
             let written = decode_body(black_box(input), &mut output, &mut crc, options).unwrap();
             black_box(written);
             black_box(crc.finalize());
+        });
+    });
+}
+
+fn bench_article(c: &mut Criterion, name: &str, article: &[u8]) {
+    let mut output = vec![0u8; article.len()];
+    c.bench_function(name, |b| {
+        b.iter(|| {
+            let result = decode_article(black_box(article), &mut output).unwrap();
+            black_box(result.bytes_written);
+            black_box(result.part_crc);
         });
     });
 }
@@ -410,6 +435,7 @@ fn benches(c: &mut Criterion) {
     let raw_terminator = raw_terminator_body();
     let bigbang_like = bigbang_like_body();
     let real_shape = real_yenc_128col_body();
+    let real_article = real_yenc_128col_article();
 
     bench_body(
         c,
@@ -455,6 +481,7 @@ fn benches(c: &mut Criterion) {
             dot_unstuffing: true,
         },
     );
+    bench_article(c, "yenc_decode_article_realshape_128col", &real_article);
     bench_decode_only(c, "yenc_decode_only_realshape_128col", &real_shape);
     bench_decode_only(c, "yenc_decode_only_bigbang_like", &bigbang_like);
     bench_until_control(c, &bigbang_like);

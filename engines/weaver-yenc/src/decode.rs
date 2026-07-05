@@ -150,7 +150,13 @@ pub fn decode_with_options(
     let data = &input[parsed.data_start..data_end];
 
     let mut crc = Crc32::new();
-    let bytes_written = decode_body(data, output, &mut crc, options)?;
+    let bytes_written = decode_body_with_line_length(
+        data,
+        output,
+        &mut crc,
+        options,
+        Some(parsed.metadata.line_length),
+    )?;
 
     let part_crc = crc.finalize();
 
@@ -431,6 +437,8 @@ impl StreamingArticleDecoder {
 
         match header::parse_headers(&self.header_bytes) {
             Ok(parsed) => {
+                self.decode_state
+                    .set_line_length_hint(Some(parsed.metadata.line_length));
                 self.metadata = Some(parsed.metadata);
                 self.stage = StreamingStage::Body;
             }
@@ -537,7 +545,22 @@ pub fn decode_body(
     crc: &mut Crc32,
     options: DecodeOptions,
 ) -> Result<usize, YencError> {
-    let written = crate::simd::decode_body_into(input, output, options.dot_unstuffing)?;
+    decode_body_with_line_length(input, output, crc, options, None)
+}
+
+fn decode_body_with_line_length(
+    input: &[u8],
+    output: &mut [u8],
+    crc: &mut Crc32,
+    options: DecodeOptions,
+    line_length: Option<u32>,
+) -> Result<usize, YencError> {
+    let written = crate::simd::decode_body_into_with_line_length(
+        input,
+        output,
+        options.dot_unstuffing,
+        line_length,
+    )?;
 
     // CRC is updated once at the end for better hardware utilization
     // (crc32fast's PCLMULQDQ path needs >= 128 bytes).
@@ -566,7 +589,9 @@ pub struct DecodeState {
     /// to decide whether this is a real CRLF line boundary.
     pub(crate) cr_pending: bool,
     /// Running CRC32 state.
-    pub(crate) crc: crc32fast::Hasher,
+    pub(crate) crc: Crc32,
+    /// Trusted encoded-column line length hint from `=ybegin line=...`.
+    pub(crate) line_length_hint: Option<usize>,
     /// Total bytes decoded so far across all chunks.
     pub bytes_decoded: u64,
     /// Number of CRC update calls made while streaming this body.
@@ -581,10 +606,18 @@ impl DecodeState {
             at_line_start: true,
             dot_pending: false,
             cr_pending: false,
-            crc: crc32fast::Hasher::new(),
+            crc: Crc32::new(),
+            line_length_hint: None,
             bytes_decoded: 0,
             crc_update_calls: 0,
         }
+    }
+
+    /// Provide the encoded-column line length from `=ybegin line=...`.
+    pub fn set_line_length_hint(&mut self, line_length: Option<u32>) {
+        self.line_length_hint = line_length
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|&value| value > 0);
     }
 
     /// Finalize and return the CRC32 of all decoded data. Consumes the state.
@@ -595,7 +628,7 @@ impl DecodeState {
     /// Get the current CRC32 value without consuming the state.
     /// (clones the hasher internally)
     pub fn current_crc(&self) -> u32 {
-        self.crc.clone().finalize()
+        self.crc.current()
     }
 }
 
