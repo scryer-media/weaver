@@ -678,6 +678,7 @@ impl Pipeline {
             return false;
         }
 
+        self.phase_end_extracting_if_idle(job_id);
         self.transition_postprocessing_status(job_id, JobStatus::Repairing, Some("repairing"));
         let _ = self.event_tx.send(PipelineEvent::RepairStarted { job_id });
         true

@@ -30,6 +30,56 @@ fn empty_queue() {
 }
 
 #[test]
+fn excluded_work_count_tracks_push_pop_and_bulk_removal() {
+    let mut q = DownloadQueue::new();
+    let mut excluded = make_work(1, 0, 0, 10);
+    excluded.exclude_servers = vec![0];
+    q.push(excluded);
+    q.push(make_work(1, 0, 1, 20));
+    let mut other_job = make_work(2, 0, 0, 30);
+    other_job.exclude_servers = vec![1];
+    q.push(other_job);
+    assert_eq!(q.excluded_work_count(), 2);
+
+    let first = q.pop().unwrap();
+    assert_eq!(first.exclude_servers, vec![0]);
+    assert_eq!(q.excluded_work_count(), 1);
+
+    q.remove_job(JobId(2));
+    assert_eq!(q.excluded_work_count(), 0);
+    assert_eq!(q.len(), 1);
+
+    let mut again = make_work(3, 0, 0, 5);
+    again.exclude_servers = vec![2];
+    q.push(again);
+    assert_eq!(q.drain_job(JobId(3)).len(), 1);
+    assert_eq!(q.excluded_work_count(), 0);
+
+    let mut last = make_work(4, 0, 0, 5);
+    last.exclude_servers = vec![3];
+    q.push(last);
+    q.drain_all();
+    assert_eq!(q.excluded_work_count(), 0);
+}
+
+#[test]
+fn clear_exclude_servers_drops_stale_indices_and_counter() {
+    let mut q = DownloadQueue::new();
+    let mut excluded = make_work(1, 0, 0, 10);
+    excluded.exclude_servers = vec![4, 7];
+    q.push(excluded);
+    q.push(make_work(1, 0, 1, 20));
+    assert_eq!(q.excluded_work_count(), 1);
+
+    q.clear_exclude_servers();
+    assert_eq!(q.excluded_work_count(), 0);
+    assert_eq!(q.len(), 2);
+    while let Some(work) = q.pop() {
+        assert!(work.exclude_servers.is_empty());
+    }
+}
+
+#[test]
 fn priority_ordering() {
     let mut q = DownloadQueue::new();
     q.push(make_work(1, 0, 0, 100));

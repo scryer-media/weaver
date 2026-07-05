@@ -358,6 +358,8 @@ impl Pipeline {
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
         self.remove_pending_completion_check(job_id);
         self.clear_par2_runtime_state(job_id);
+        self.clear_job_phase_progress_runtime(job_id);
+        self.clear_job_retention_excludes(job_id);
         self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
         self.record_job_history(job_id);

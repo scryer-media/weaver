@@ -7,10 +7,15 @@ fn copy_fallback_copies_file_then_removes_source() {
     let dst = temp.path().join("dest").join("source.bin");
     std::fs::write(&src, b"copied payload").unwrap();
 
-    move_path_with_copy_fallback(&src, &dst).unwrap();
+    let counters = PhaseCounters::default();
+    move_path_with_copy_fallback(&src, &dst, &counters).unwrap();
 
     assert!(!src.exists());
     assert_eq!(std::fs::read(&dst).unwrap(), b"copied payload");
+    assert_eq!(
+        counters.completed_bytes.load(Ordering::Relaxed),
+        b"copied payload".len() as u64
+    );
 }
 
 #[test]
@@ -21,7 +26,8 @@ fn copy_fallback_does_not_overwrite_destination() {
     std::fs::write(&src, b"source payload").unwrap();
     std::fs::write(&dst, b"existing payload").unwrap();
 
-    let error = move_path_with_copy_fallback(&src, &dst).unwrap_err();
+    let counters = PhaseCounters::default();
+    let error = move_path_with_copy_fallback(&src, &dst, &counters).unwrap_err();
 
     assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(std::fs::read(&src).unwrap(), b"source payload");
@@ -65,7 +71,15 @@ async fn final_move_does_not_overwrite_existing_destination_file() {
     std::fs::write(&src, b"new payload").unwrap();
     std::fs::write(&dst, b"existing payload").unwrap();
 
-    let error = match run_move_to_complete(JobId(1), working, Some(staging), dest).await {
+    let error = match run_move_to_complete(
+        JobId(1),
+        working,
+        Some(staging),
+        dest,
+        Arc::new(PhaseCounters::default()),
+    )
+    .await
+    {
         Ok(_) => panic!("final move should reject an occupied destination"),
         Err(error) => error,
     };
@@ -84,7 +98,8 @@ fn copy_fallback_moves_nested_directory_contents() {
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::write(nested.join("payload.bin"), b"nested payload").unwrap();
 
-    move_path_with_copy_fallback(&src, &dst).unwrap();
+    let counters = PhaseCounters::default();
+    move_path_with_copy_fallback(&src, &dst, &counters).unwrap();
 
     assert!(!src.exists());
     assert_eq!(
@@ -103,7 +118,8 @@ fn copy_fallback_does_not_overwrite_destination_directory() {
     std::fs::create_dir(&dst).unwrap();
     std::fs::write(dst.join("existing.bin"), b"existing payload").unwrap();
 
-    let error = move_path_with_copy_fallback(&src, &dst).unwrap_err();
+    let counters = PhaseCounters::default();
+    let error = move_path_with_copy_fallback(&src, &dst, &counters).unwrap_err();
 
     assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(
@@ -128,7 +144,8 @@ fn copy_fallback_preserves_nested_symlink_entries() {
     std::fs::write(&target, b"target payload").unwrap();
     std::os::unix::fs::symlink(&target, nested.join("linked.bin")).unwrap();
 
-    move_path_with_copy_fallback(&src, &dst).unwrap();
+    let counters = PhaseCounters::default();
+    move_path_with_copy_fallback(&src, &dst, &counters).unwrap();
 
     assert!(!src.exists());
     let placed = dst.join("nested").join("linked.bin");
@@ -154,9 +171,15 @@ async fn final_move_preserves_symlink_entries() {
     std::fs::write(&target, b"target payload").unwrap();
     std::os::unix::fs::symlink(&target, staging.join("linked.bin")).unwrap();
 
-    let result = run_move_to_complete(JobId(1), working, Some(staging), dest.clone())
-        .await
-        .unwrap();
+    let result = run_move_to_complete(
+        JobId(1),
+        working,
+        Some(staging),
+        dest.clone(),
+        Arc::new(PhaseCounters::default()),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.moved_entries, 1);
     let placed = dest.join("linked.bin");

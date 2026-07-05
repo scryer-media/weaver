@@ -1266,6 +1266,39 @@ impl Pipeline {
             }
             return;
         };
+        if input.cached_headers.is_none() && !input.volume_paths.contains_key(&0) {
+            // The compute path is guaranteed to fail this state ("cannot be
+            // rebuilt without cached headers or volume 0"). Park instead of
+            // burning a blocking task per completed volume; the volume-0
+            // completion or the next identity rebind re-enqueues a refresh.
+            // With downloads still running that re-enqueue is guaranteed, so
+            // parking is routine; with none left it may never come, so say so
+            // loudly.
+            let active_downloads = self
+                .active_downloads_by_job
+                .get(&job_id)
+                .copied()
+                .unwrap_or(0);
+            if active_downloads == 0 {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    reason = ?request.reason,
+                    "RAR refresh parked waiting on volume 0 with no active downloads"
+                );
+            } else {
+                debug!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    reason = ?request.reason,
+                    "RAR refresh parked waiting on volume 0"
+                );
+            }
+            if let Some(state) = self.rar_refresh_state.get_mut(&(job_id, set_name)) {
+                state.in_flight = None;
+            }
+            return;
+        }
         let extraction_generation = input.extraction_generation;
         let refresh_done_tx = self.rar_refresh_done_tx.clone();
         tokio::spawn(async move {

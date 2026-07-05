@@ -12,6 +12,8 @@ pub(crate) struct ServerRecord {
     pub active: bool,
     pub supports_pipelining: bool,
     pub priority: u32,
+    pub backfill: bool,
+    pub retention_days: u32,
     pub tls_ca_cert: Option<String>,
 }
 
@@ -28,6 +30,8 @@ impl ServerRecord {
             active: self.active,
             supports_pipelining: self.supports_pipelining,
             priority: self.priority,
+            backfill: self.backfill,
+            retention_days: self.retention_days,
             tls_ca_cert: self.tls_ca_cert.map(std::path::PathBuf::from),
         }
     }
@@ -44,6 +48,8 @@ impl ServerRecord {
             active: server.active,
             supports_pipelining: server.supports_pipelining,
             priority: server.priority,
+            backfill: server.backfill,
+            retention_days: server.retention_days,
             tls_ca_cert: server
                 .tls_ca_cert
                 .as_ref()

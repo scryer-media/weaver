@@ -627,6 +627,19 @@ impl Pipeline {
                 let event_tx = self.event_tx.clone();
                 let attempted = members_to_extract.clone();
                 let extract_done_tx = self.extract_done_tx.clone();
+                let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
+                let already_extracted_for_totals = self
+                    .extracted_members
+                    .get(&job_id)
+                    .cloned()
+                    .unwrap_or_default();
+                self.phase_reserve_topology_extraction_totals(
+                    job_id,
+                    &set_name,
+                    members_to_extract.iter().map(String::as_str),
+                    &already_extracted_for_totals,
+                    &phase_counters,
+                );
                 let set_name_owned = set_name.clone();
                 let set_name_for_task = set_name.clone();
                 let set_name_for_archive = set_name.clone();
@@ -664,6 +677,7 @@ impl Pipeline {
                                 extracted: Vec::new(),
                                 failed: Vec::new(),
                                 selected_password: selection.validated_password,
+                                phase_completed_bytes: 0,
                             };
 
                             for member_name in &members_to_extract {
@@ -689,6 +703,9 @@ impl Pipeline {
                                         set_name: &set_name_for_task,
                                         output_dir: &output_dir,
                                         options: &options,
+                                        phase_attempt: Some(Arc::new(PhaseAttemptCounters::new(
+                                            Arc::clone(&phase_counters),
+                                        ))),
                                     },
                                     idx,
                                 ) {
@@ -711,6 +728,9 @@ impl Pipeline {
                                                 member: extracted_name.clone(),
                                             },
                                         );
+                                        outcome.phase_completed_bytes = outcome
+                                            .phase_completed_bytes
+                                            .saturating_add(bytes_written);
                                         outcome.extracted.push(extracted_name);
                                     }
                                     Err(error) => {
@@ -1027,6 +1047,13 @@ impl Pipeline {
                 self.mark_rar_unlock_priorities_dirty(job_id);
 
                 if current_attempted.is_empty() {
+                    if let Ok(outcome) = &result {
+                        self.phase_subtract_completed_bytes(
+                            job_id,
+                            JobPhase::Extracting,
+                            outcome.phase_completed_bytes,
+                        );
+                    }
                     warn!(
                         job_id = job_id.0,
                         set_name = %set_name,
@@ -1373,6 +1400,7 @@ impl Pipeline {
                         if let Some(sets) = self.inflight_extractions.get_mut(&job_id) {
                             sets.remove(&set_name);
                         }
+                        self.phase_end_extracting_if_idle(job_id);
                         if let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.clone()))
                         {
                             let fallback_phase =
@@ -1414,6 +1442,7 @@ impl Pipeline {
                             failed = ?outcome.failed,
                             "set extraction completed with failures"
                         );
+                        self.phase_end_extracting_if_idle(job_id);
                         for (member, _error) in &outcome.failed {
                             if let Some(members) = self.extracted_members.get_mut(&job_id) {
                                 members.remove(member);
@@ -1477,6 +1506,7 @@ impl Pipeline {
                         sets.remove(&set_name);
                     }
                     if rar_capacity_pressure {
+                        self.phase_end_extracting_if_idle(job_id);
                         self.schedule_rar_capacity_retry(
                             job_id,
                             &set_name,
@@ -1486,6 +1516,7 @@ impl Pipeline {
                     }
                     self.purge_empty_rar_set_if_idle(job_id, &set_name);
                     if Self::is_recoverable_full_set_extraction_error(&e) {
+                        self.phase_end_extracting_if_idle(job_id);
                         self.set_failed_extraction_member(job_id, &set_name);
                         self.check_job_completion(job_id).await;
                         return;

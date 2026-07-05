@@ -46,6 +46,19 @@ export interface DeleteOperationData {
   errorMessage?: string | null;
 }
 
+export type JobPhase = "DOWNLOADING" | "REPAIRING" | "EXTRACTING" | "MOVING";
+
+export interface JobPhaseProgressData {
+  phase: JobPhase;
+  completedBytes: number;
+  totalBytes: number;
+  progressPercent: number;
+  rateBps?: number | null;
+  estimatedRemainingMs?: number | null;
+  startedAtEpochMs: number;
+  updatedAtEpochMs: number;
+}
+
 export interface JobData {
   id: number;
   name: string;
@@ -59,6 +72,7 @@ export interface JobData {
   downloadedBytes: number;
   optionalRecoveryBytes: number;
   optionalRecoveryDownloadedBytes: number;
+  phaseProgress: JobPhaseProgressData[];
   failedBytes: number;
   health: number;
   hasPassword: boolean;
@@ -71,13 +85,14 @@ export interface JobData {
   deleteOperation?: DeleteOperationData | null;
 }
 
-export interface GraphqlJobData extends Omit<JobData, "progress" | "createdAt" | "completedAt" | "metadata"> {
+export interface GraphqlJobData extends Omit<JobData, "progress" | "phaseProgress" | "createdAt" | "completedAt" | "metadata"> {
   progress?: number | null;
   progressPercent?: number | null;
   createdAt?: string | number | null;
   completedAt?: string | number | null;
   metadata?: { key: string; value: string }[];
   attributes?: { key: string; value: string }[];
+  phaseProgress?: JobPhaseProgressData[] | null;
 }
 
 export function normalizeFacadeJobStatus(status: string): string {
@@ -122,6 +137,7 @@ export function normalizeJobData<T extends GraphqlJobData>(job: T): T & JobData 
     ...job,
     status: normalizeFacadeJobStatus(job.status),
     progress: normalizeFacadeJobProgress(job.progressPercent, job.progress),
+    phaseProgress: job.phaseProgress ?? [],
     createdAt: normalizeGraphqlTimestamp(job.createdAt),
     completedAt: normalizeGraphqlTimestamp(job.completedAt),
     metadata: job.metadata ?? job.attributes ?? [],

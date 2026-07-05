@@ -787,6 +787,12 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                 file_id: None,
                 message: "all downloads resumed".into(),
             },
+            PipelineEvent::PhaseProgressUpdated { job_id } => Self {
+                kind: EventKind::PhaseProgressUpdated,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: "phase progress updated".into(),
+            },
             _ => Self {
                 kind: EventKind::SegmentCommitted,
                 job_id: None,
@@ -802,4 +808,60 @@ pub struct SystemStatus {
     pub version: String,
     pub global_state: GlobalQueueState,
     pub summary: QueueSummary,
+}
+
+/// Filesystem capacity for a configured storage directory (data / intermediate / complete).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+pub struct DiskUsage {
+    /// Human label for the directory role (e.g. "Data", "Complete library").
+    pub label: String,
+    /// Configured directory path.
+    pub path: String,
+    /// Total capacity of the backing filesystem, in bytes.
+    pub total_bytes: u64,
+    /// Used capacity of the backing filesystem, in bytes.
+    pub used_bytes: u64,
+    /// Available (non-reserved) capacity, in bytes.
+    pub free_bytes: u64,
+}
+
+/// Live health for one configured news server, derived from the NNTP connection pool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+pub struct ServerHealth {
+    pub host: String,
+    pub port: u16,
+    /// `host:port` label.
+    pub label: String,
+    /// "PRIMARY" for the highest-priority server, "BACKUP" otherwise.
+    pub tier: String,
+    /// One of "healthy", "degraded", "cooling_down", "disabled".
+    pub state: String,
+    /// Currently in-use connections (max - available permits).
+    pub connections_active: u32,
+    /// Configured maximum connections.
+    pub connections_max: u32,
+    /// EWMA request latency in milliseconds.
+    pub latency_ms: f64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub consecutive_failures: u32,
+    /// Connections that died before reaching a healthy age, recently.
+    pub premature_deaths: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use weaver_server_core::events::model::PipelineEvent;
+    use weaver_server_core::jobs::JobId;
+
+    #[test]
+    fn phase_progress_event_is_not_reported_as_segment_committed() {
+        let event =
+            PipelineEventGql::from(&PipelineEvent::PhaseProgressUpdated { job_id: JobId(42) });
+
+        assert_eq!(event.kind, EventKind::PhaseProgressUpdated);
+        assert_eq!(event.job_id, Some(42));
+        assert_eq!(event.file_id, None);
+    }
 }

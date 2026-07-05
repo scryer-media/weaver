@@ -5,7 +5,7 @@
 //! stage/copy known-good blocks, run RS reconstruction for the missing blocks,
 //! and verify repaired output before installing it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -13,7 +13,7 @@ use std::os::unix::fs::FileExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -31,7 +31,7 @@ use crate::repair::{
 use crate::types::{
     CancellationToken, FileId, MAX_SLICES_PER_FILE, ProgressCallback, SliceChecksum,
 };
-use crate::verify::{FileStatus, FileVerification, Repairability, VerificationResult, verify_all};
+use crate::verify::{self, FileStatus, FileVerification, Repairability, VerificationResult};
 use memmap2::MmapOptions;
 use rayon::prelude::*;
 use tracing::{debug, warn};
@@ -43,6 +43,7 @@ const SCANNER_IO_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const SCANNER_MMAP_FALLBACK_SLICE_BYTES: usize = 8 * 1024 * 1024;
 const SCANNER_PARALLEL_SEGMENT_TARGET_BYTES: usize = 8 * 1024 * 1024;
 const ORDERED_SCAN_SERIAL_ENV: &str = "WEAVER_PAR2_SERIAL_SCAN";
+const ORDERED_SCAN_PARALLEL_ENV: &str = "WEAVER_PAR2_PARALLEL_SCAN";
 const CANONICAL_COMPLETE_HASH_SKIP_BYTES: u64 = 1024 * 1024;
 const ORDERED_SCAN_DEFAULT_SKIP_LEEWAY: u64 = 64;
 const SCANNER_SLOW_WARN_STEPS: u64 = 5_000_000;
@@ -74,6 +75,39 @@ pub struct ScanDiagnostics {
     pub blocks_found: u32,
     pub duplicate_blocks: u32,
     pub files_skipped: u32,
+}
+
+/// Scan state carried from an analyze pass to a later execute pass over the
+/// same set, letting the execute pass skip re-scanning every source file.
+/// Application re-stats every file the scan observed (including recording
+/// nonexistence) and refuses on any drift, falling back to a full scan.
+/// A carry never discovers source files that appeared after the analyze
+/// pass — callers that allow drop-ins between passes should not supply one.
+#[derive(Debug)]
+pub struct ScanCarry {
+    set_file_ids: Vec<FileId>,
+    snapshot: Vec<CarriedFileStat>,
+    files: Vec<SourceFileEntry>,
+    blocks: Vec<SourceBlock>,
+    diagnostics: ScanDiagnostics,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CarriedFileStat {
+    path: PathBuf,
+    /// `(length, modified)` when the path existed as a regular file.
+    state: Option<(u64, SystemTime)>,
+}
+
+fn stat_for_carry(path: &Path) -> CarriedFileStat {
+    let state = fs::symlink_metadata(path)
+        .ok()
+        .filter(|meta| meta.file_type().is_file())
+        .and_then(|meta| meta.modified().ok().map(|modified| (meta.len(), modified)));
+    CarriedFileStat {
+        path: path.to_path_buf(),
+        state,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +292,12 @@ pub struct Par2RepairerOptions {
     pub scan_skip_leeway: u64,
     pub cancel: Option<CancellationToken>,
     pub progress: Option<ProgressCallback>,
+    /// Scan state from a prior pass over the same set (see
+    /// [`Par2Repairer::verify_or_repair_carrying`]). Applied only when the
+    /// set matches and every observed file is unchanged on disk; otherwise
+    /// this pass scans normally. Must come from a pass with the same
+    /// `base_dir`/`extra_paths`/`scan_skip_*` configuration.
+    pub scan_carry: Option<Arc<ScanCarry>>,
 }
 
 impl Par2RepairerOptions {
@@ -276,6 +316,7 @@ impl Par2RepairerOptions {
             scan_skip_leeway: ORDERED_SCAN_DEFAULT_SKIP_LEEWAY,
             cancel: None,
             progress: None,
+            scan_carry: None,
         }
     }
 }
@@ -369,6 +410,22 @@ impl Par2Repairer {
     }
 
     pub fn verify_or_repair(&self) -> Result<Par2RepairOutcome> {
+        Ok(self.verify_or_repair_inner(false)?.0)
+    }
+
+    /// Like [`Self::verify_or_repair`], additionally returning this pass's
+    /// scan state for reuse by a later pass over the same set
+    /// ([`Par2RepairerOptions::scan_carry`]). The carry reflects the disk
+    /// as scanned: after a `Repaired` outcome the repaired files have
+    /// changed, so a carry taken from that pass refuses to apply.
+    pub fn verify_or_repair_carrying(&self) -> Result<(Par2RepairOutcome, Option<Arc<ScanCarry>>)> {
+        self.verify_or_repair_inner(true)
+    }
+
+    fn verify_or_repair_inner(
+        &self,
+        want_carry: bool,
+    ) -> Result<(Par2RepairOutcome, Option<Arc<ScanCarry>>)> {
         let PacketInventory {
             set,
             diagnostics,
@@ -380,7 +437,15 @@ impl Par2Repairer {
         packet_diagnostics.discarded_recovery_blocks = state.discarded_recovery_blocks;
         packet_diagnostics.inconsistent_packets = state.inconsistent_packets;
 
-        let scan = state.scan(&self.options)?;
+        let scan = match self
+            .options
+            .scan_carry
+            .as_deref()
+            .and_then(|carry| state.try_apply_carry(carry))
+        {
+            Some(diagnostics) => diagnostics,
+            None => state.scan(&self.options)?,
+        };
         let mut verification = state.verification_result();
         if let Some(reason) = repair_matrix_resource_limit_reason(
             &state.set,
@@ -389,18 +454,22 @@ impl Par2Repairer {
         )? {
             verification.repairable = Repairability::ResourceLimited { reason };
         }
+        let carry = want_carry.then(|| Arc::new(state.scan_carry(&scan)));
 
         if verification.total_missing_blocks == 0 && state.files_are_canonical_complete() {
             if self.options.purge {
                 purge_files_best_effort(&purge_paths);
             }
-            return Ok(state.outcome(
-                Par2RepairStatus::Verified,
-                0,
-                0,
-                packet_diagnostics,
-                scan,
-                verification,
+            return Ok((
+                state.outcome(
+                    Par2RepairStatus::Verified,
+                    0,
+                    0,
+                    packet_diagnostics,
+                    scan,
+                    verification,
+                ),
+                carry,
             ));
         }
 
@@ -411,7 +480,10 @@ impl Par2Repairer {
                 Repairability::Insufficient { .. } => Par2RepairStatus::Insufficient,
                 Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
             };
-            return Ok(state.outcome(status, 0, 0, packet_diagnostics, scan, verification));
+            return Ok((
+                state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
+                carry,
+            ));
         }
 
         if matches!(
@@ -422,7 +494,10 @@ impl Par2Repairer {
                 Repairability::ResourceLimited { .. } => Par2RepairStatus::ResourceLimited,
                 _ => Par2RepairStatus::Insufficient,
             };
-            return Ok(state.outcome(status, 0, 0, packet_diagnostics, scan, verification));
+            return Ok((
+                state.outcome(status, 0, 0, packet_diagnostics, scan, verification),
+                carry,
+            ));
         }
 
         let repair = state.repair(&self.options, &verification)?;
@@ -431,7 +506,22 @@ impl Par2Repairer {
             &repair.install_dir,
             &repair.staged_file_ids,
         );
-        let post = verify_all(&state.set, &repaired_access);
+        // Only staged files changed on disk; everything else keeps its
+        // analyze-phase verification. Staged files are re-verified from
+        // disk (full-hash semantics unchanged), one rayon task per file.
+        // A damaged file that somehow escaped staging keeps its Damaged
+        // analyze entry and fails the gate below, so the merge fails
+        // closed.
+        let staged_ids: Vec<FileId> = state
+            .set
+            .recovery_file_ids
+            .iter()
+            .filter(|file_id| repair.staged_file_ids.contains(file_id))
+            .copied()
+            .collect();
+        let post_staged =
+            verify::verify_selected_file_ids_parallel(&state.set, &repaired_access, &staged_ids);
+        let post = verify::merge_verification_results(&state.set, &verification, post_staged);
         if post.total_missing_blocks > 0
             || !post
                 .files
@@ -456,13 +546,16 @@ impl Par2Repairer {
             purge_files_best_effort(&purge_paths);
         }
 
-        Ok(state.outcome(
-            Par2RepairStatus::Repaired,
-            repair.bytes_copied,
-            repair.bytes_reconstructed,
-            packet_diagnostics,
-            scan,
-            post,
+        Ok((
+            state.outcome(
+                Par2RepairStatus::Repaired,
+                repair.bytes_copied,
+                repair.bytes_reconstructed,
+                packet_diagnostics,
+                scan,
+                post,
+            ),
+            carry,
         ))
     }
 
@@ -858,6 +951,28 @@ fn read_file_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<usize> {
     let mut cloned = file.try_clone()?;
     cloned.seek(SeekFrom::Start(offset))?;
     cloned.read(dst)
+}
+
+/// Positional `read_exact`: fills `dst` from `offset` without relying on the
+/// handle's seek cursor, so parallel scan segments can share one handle.
+fn read_exact_file_at(file: &File, mut dst: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !dst.is_empty() {
+        match read_file_at(file, dst, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            Ok(read) => {
+                dst = &mut dst[read..];
+                offset += read as u64;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 struct RepairVerificationAccess {
@@ -1518,6 +1633,55 @@ impl RepairState {
         })
     }
 
+    /// Capture the scan's full effect (file states + block locations) plus
+    /// a stat snapshot of every path it observed, for reuse by a later
+    /// pass over the same set.
+    fn scan_carry(&self, diagnostics: &ScanDiagnostics) -> ScanCarry {
+        let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
+        for file in &self.files {
+            paths.insert(file.safe_path.clone());
+            if let Some(location) = &file.complete_location {
+                paths.insert(location.path.clone());
+            }
+        }
+        for block in &self.blocks {
+            if let Some(location) = &block.location {
+                paths.insert(location.path.clone());
+            }
+        }
+        ScanCarry {
+            set_file_ids: self.files.iter().map(|file| file.file_id).collect(),
+            snapshot: paths.iter().map(|path| stat_for_carry(path)).collect(),
+            files: self.files.clone(),
+            blocks: self.blocks.clone(),
+            diagnostics: diagnostics.clone(),
+        }
+    }
+
+    /// Install a carried scan if it matches this state's set and every
+    /// observed path is unchanged on disk (length + mtime, including
+    /// nonexistence). Returns the carried diagnostics on success; `None`
+    /// means the caller must run a real scan.
+    fn try_apply_carry(&mut self, carry: &ScanCarry) -> Option<ScanDiagnostics> {
+        let ids_match = self.files.len() == carry.set_file_ids.len()
+            && self
+                .files
+                .iter()
+                .zip(carry.set_file_ids.iter())
+                .all(|(file, id)| file.file_id == *id);
+        if !ids_match || self.blocks.len() != carry.blocks.len() {
+            return None;
+        }
+        for expected in &carry.snapshot {
+            if stat_for_carry(&expected.path) != *expected {
+                return None;
+            }
+        }
+        self.files = carry.files.clone();
+        self.blocks = carry.blocks.clone();
+        Some(carry.diagnostics.clone())
+    }
+
     fn verification_result(&self) -> VerificationResult {
         let mut files = Vec::new();
         let mut total_missing_blocks = 0u32;
@@ -1700,64 +1864,43 @@ impl RepairState {
             Ok(())
         };
 
+        // The intact block copies run serially AHEAD of reconstruction.
+        // Overlapping them was measured as a net loss on heavily damaged
+        // sets: the ~GB-scale copy dirties page cache and competes for
+        // memory bandwidth with the DRAM-sensitive GF16 compute, costing
+        // more wall than the copy it hides.
+        copy_block_ranges(&block_copy_ranges)?;
+
         let mut bytes_reconstructed = 0u64;
         if verification.total_missing_blocks > 0 {
-            // Overlap the intact block copies with reconstruction: every
-            // copied block has a scanned source location, so reconstruction
-            // reads its inputs from those original locations and writes only
-            // missing-slice ranges — the two sides touch disjoint byte ranges
-            // of the staged files. The whole-file copies above must stay
-            // ahead of reconstruction because complete-file matches can mark
-            // slices valid without per-block locations, and those input reads
-            // fall back to the staged copy.
-            bytes_reconstructed = std::thread::scope(|scope| -> Result<u64> {
-                let copier = scope.spawn(|| copy_block_ranges(&block_copy_ranges));
-                let compute = (|| -> Result<u64> {
-                    let mut access = RepairExecutionAccess::new(
-                        install_dir.clone(),
-                        &self.files,
-                        &self.blocks,
-                        &staged_file_ids,
-                        self.set.slice_size,
-                    )?;
-                    let plan = plan_repair_with_memory_limit(
-                        &self.set,
-                        verification,
-                        options.memory_limit,
-                    )?;
-                    let reconstructed: u64 = plan
-                        .missing_slices
-                        .iter()
-                        .filter_map(|(file_id, local)| {
-                            if let Some(idx) =
-                                self.block_index_by_file_slice.get(&(*file_id, *local))
-                            {
-                                return Some(self.blocks[*idx].expected_len);
-                            }
-                            self.set.file_description(file_id).map(|desc| {
-                                let offset = *local as u64 * self.set.slice_size;
-                                desc.length.saturating_sub(offset).min(self.set.slice_size)
-                            })
-                        })
-                        .sum();
-                    let repair_options = RepairOptions {
-                        cancel: options.cancel.clone(),
-                        progress: options.progress.clone(),
-                        memory_limit: options.memory_limit,
-                    };
-                    execute_repair_with_options(&plan, &self.set, &mut access, &repair_options)?;
-                    Ok(reconstructed)
-                })();
-                let copied = copier
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                // Copy failures surface ahead of compute failures, matching
-                // the previous serial order where copies ran first.
-                copied?;
-                compute
-            })?;
-        } else {
-            copy_block_ranges(&block_copy_ranges)?;
+            let mut access = RepairExecutionAccess::new(
+                install_dir.clone(),
+                &self.files,
+                &self.blocks,
+                &staged_file_ids,
+                self.set.slice_size,
+            )?;
+            let plan =
+                plan_repair_with_memory_limit(&self.set, verification, options.memory_limit)?;
+            bytes_reconstructed = plan
+                .missing_slices
+                .iter()
+                .filter_map(|(file_id, local)| {
+                    if let Some(idx) = self.block_index_by_file_slice.get(&(*file_id, *local)) {
+                        return Some(self.blocks[*idx].expected_len);
+                    }
+                    self.set.file_description(file_id).map(|desc| {
+                        let offset = *local as u64 * self.set.slice_size;
+                        desc.length.saturating_sub(offset).min(self.set.slice_size)
+                    })
+                })
+                .sum();
+            let repair_options = RepairOptions {
+                cancel: options.cancel.clone(),
+                progress: options.progress.clone(),
+                memory_limit: options.memory_limit,
+            };
+            execute_repair_with_options(&plan, &self.set, &mut access, &repair_options)?;
         }
 
         Ok(RepairInstall {
@@ -2083,7 +2226,6 @@ enum ResyncOutcome {
 
 /// Shared read-only inputs for the gap resync loop.
 struct OrderedResync<'a> {
-    map: &'a [u8],
     facts: &'a [AlignedWindowFacts],
     ordered_full_blocks: &'a [usize],
     path: &'a Path,
@@ -2097,6 +2239,7 @@ struct OrderedWindowCursor<'a> {
     len: usize,
     block_size: usize,
     buffer: Vec<u8>,
+    first_offset: usize,
     read_offset: usize,
     current_offset: usize,
     out_index: usize,
@@ -2108,9 +2251,29 @@ struct OrderedWindowCursor<'a> {
 
 impl<'a> OrderedWindowCursor<'a> {
     fn new(path: &Path, block_size: usize, window_table: &'a [u32; 256]) -> io::Result<Self> {
-        let file = File::open(path)?;
+        Self::new_at(path, block_size, window_table, 0)
+    }
+
+    /// Cursor whose first window starts at `start` (callers guarantee a full
+    /// window fits there). The parallel scan's gap resync uses this to read
+    /// only the gap region through the bounded two-window buffer.
+    fn new_at(
+        path: &Path,
+        block_size: usize,
+        window_table: &'a [u32; 256],
+        start: usize,
+    ) -> io::Result<Self> {
+        let mut file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
-        crate::file_cache::advise_sequential(&file, path, len as u64);
+        if start > 0 {
+            file.seek(SeekFrom::Start(start as u64))?;
+        }
+        crate::file_cache::advise_range_sequential(
+            &file,
+            path,
+            start as u64,
+            len.saturating_sub(start) as u64,
+        );
         let buffer_len = block_size.checked_mul(2).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "scanner buffer overflow")
         })?;
@@ -2120,8 +2283,9 @@ impl<'a> OrderedWindowCursor<'a> {
             len,
             block_size,
             buffer: vec![0u8; buffer_len],
-            read_offset: 0,
-            current_offset: 0,
+            first_offset: start,
+            read_offset: start,
+            current_offset: start,
             out_index: 0,
             in_index: block_size,
             tail_index: 0,
@@ -2241,8 +2405,8 @@ impl Drop for OrderedWindowCursor<'_> {
             &self.file,
             &self.path,
             self.len as u64,
-            0,
-            self.read_offset as u64,
+            self.first_offset as u64,
+            (self.read_offset - self.first_offset) as u64,
         );
     }
 }
@@ -2368,9 +2532,12 @@ impl<'a> RollingBlockScanner<'a> {
         cancel: Option<&CancellationToken>,
     ) -> Result<FileScanStats> {
         // Skip-data sampling is stateful and intentionally lossy, so it keeps
-        // the serial scanner; the env flag and single-thread pools do too.
+        // the serial scanner; single-thread pools do too. The parallel scan
+        // stays opt-in until it clears its measured speed/RSS gate (see
+        // ordered_scan_parallel_enabled).
         if scan_options.skip_data
             || ordered_scan_force_serial()
+            || !ordered_scan_parallel_enabled()
             || rayon::current_num_threads() <= 1
         {
             return self.scan_file_ordered_canonical_serial(
@@ -2640,7 +2807,10 @@ impl<'a> RollingBlockScanner<'a> {
     /// Parallel ordered canonical scan: Phase A computes expected-independent
     /// facts for every slice-aligned window in parallel, Phase B replays the
     /// serial cursor state machine over those facts, and Phase C byte-steps
-    /// through gaps, splicing back into Phase B when a match realigns.
+    /// through gaps, splicing back into Phase B when a match realigns. All
+    /// reads go through bounded buffers (positional reads in Phase A, the
+    /// serial cursor in Phase C), so resident memory tracks thread count,
+    /// not file size.
     #[allow(clippy::too_many_arguments)]
     fn scan_file_ordered_canonical_parallel(
         &self,
@@ -2668,7 +2838,6 @@ impl<'a> RollingBlockScanner<'a> {
             );
         }
         crate::file_cache::advise_sequential(&file, path, len as u64);
-        let map = unsafe { MmapOptions::new().map(&file)? };
         let mut stats = FileScanStats::new(FileScanMode::OrderedCanonicalParallel, len as u64);
 
         let last_full_offset = len - slice_size;
@@ -2677,15 +2846,17 @@ impl<'a> RollingBlockScanner<'a> {
         let mut facts: Vec<AlignedWindowFacts> = Vec::new();
         facts.resize_with(window_count, AlignedWindowFacts::default);
         let baseline = blocks.baseline();
+        let shared_file = &file;
         facts
             .par_chunks_mut(segment_windows)
             .enumerate()
-            .try_for_each(|(segment_index, segment)| {
+            .try_for_each_init(Vec::new, |read_buffer, (segment_index, segment)| {
                 self.compute_aligned_window_facts(
-                    &map,
+                    shared_file,
                     baseline,
                     segment,
                     segment_index * segment_windows,
+                    read_buffer,
                     cancel,
                 )
             })?;
@@ -2695,7 +2866,6 @@ impl<'a> RollingBlockScanner<'a> {
             .filter(|block_index| blocks.block(*block_index).expected_len == self.table.slice_size)
             .collect();
         let resync = OrderedResync {
-            map: &map,
             facts: &facts,
             ordered_full_blocks: &ordered_full_blocks,
             path,
@@ -2752,7 +2922,7 @@ impl<'a> RollingBlockScanner<'a> {
                 blocks,
                 &mut stats,
                 &mut current_step_run,
-            ) {
+            )? {
                 ResyncOutcome::Realigned {
                     next_window,
                     preferred_next: next_preferred,
@@ -2775,7 +2945,6 @@ impl<'a> RollingBlockScanner<'a> {
             blocks,
             len,
         );
-        drop(map);
         crate::file_cache::drop_file_cache(&file, path, 0, len as u64);
         short_result?;
 
@@ -2783,13 +2952,19 @@ impl<'a> RollingBlockScanner<'a> {
     }
 
     /// Phase A worker: fills one segment's facts. Reads only the hash table
-    /// and the immutable baseline blocks, so segments run lock-free.
+    /// and the immutable baseline blocks, so segments run lock-free. Windows
+    /// arrive through `read_buffer` in whole-window chunks of roughly
+    /// `SCANNER_IO_TARGET_BYTES`, positionally read from the shared handle.
+    /// Hashing is the serial scanner's single-shot CRC-gated MD5: multi-lane
+    /// MD5 batching lost here because every lane required a padded copy of
+    /// its window (it may return per-arch if measurement justifies it).
     fn compute_aligned_window_facts(
         &self,
-        map: &[u8],
+        file: &File,
         blocks: &[SourceBlock],
         facts: &mut [AlignedWindowFacts],
         first_window: usize,
+        read_buffer: &mut Vec<u8>,
         cancel: Option<&CancellationToken>,
     ) -> Result<()> {
         if let Some(cancel) = cancel
@@ -2799,52 +2974,31 @@ impl<'a> RollingBlockScanner<'a> {
         }
 
         let slice_size = self.table.slice_size as usize;
-        let batch_lanes = scanner_md5_batch_lanes(slice_size);
-        let mut pending: Vec<usize> = Vec::with_capacity(batch_lanes);
-        for slot in 0..facts.len() {
-            let offset = (first_window + slot) * slice_size;
-            let window = &map[offset..offset + slice_size];
-            let crc = checksum::crc32(window);
-            let Some(candidates) = self.table.by_crc.get(&crc) else {
-                continue;
-            };
-            let eligible: Vec<u32> = candidates
-                .iter()
-                .filter(|block_index| blocks[**block_index].expected_len == self.table.slice_size)
-                .map(|block_index| *block_index as u32)
-                .collect();
-            if eligible.is_empty() {
-                continue;
+        let read_windows = (SCANNER_IO_TARGET_BYTES / slice_size).max(1);
+        let mut slot = 0usize;
+        while slot < facts.len() {
+            let read_count = read_windows.min(facts.len() - slot);
+            let read_len = read_count * slice_size;
+            if read_buffer.len() < read_len {
+                read_buffer.resize(read_len, 0);
             }
-            if batch_lanes < 2 {
-                let digest = checksum::md5(window);
-                facts[slot].matches = eligible
-                    .into_iter()
-                    .filter(|block_index| blocks[*block_index as usize].checksum.md5 == digest)
-                    .collect();
-                continue;
+            let read_offset = ((first_window + slot) * slice_size) as u64;
+            read_exact_file_at(file, &mut read_buffer[..read_len], read_offset)?;
+            for (index, window) in read_buffer[..read_len].chunks_exact(slice_size).enumerate() {
+                let crc = checksum::crc32(window);
+                facts[slot + index].matches = self.ordered_window_md5_matches(blocks, window, crc);
             }
-            facts[slot].matches = eligible;
-            pending.push(slot);
-            if pending.len() == batch_lanes {
-                confirm_pending_fact_md5(
-                    map,
-                    blocks,
-                    facts,
-                    &mut pending,
-                    first_window,
-                    slice_size,
-                );
-            }
+            slot += read_count;
         }
-        confirm_pending_fact_md5(map, blocks, facts, &mut pending, first_window, slice_size);
         Ok(())
     }
 
     /// Phase C: byte-steps from `start` exactly as the serial cursor would
     /// after a failed window, consuming precomputed facts whenever the
     /// position is slice-aligned. Returns `Realigned` when a match lands on
-    /// an aligned offset so the merge loop can resume from facts.
+    /// an aligned offset so the merge loop can resume from facts. Gap bytes
+    /// are read through the serial scanner's bounded cursor, so only the gap
+    /// region is touched and only two windows are ever resident.
     fn rolling_resync_ordered(
         &self,
         resync: &OrderedResync<'_>,
@@ -2852,17 +3006,17 @@ impl<'a> RollingBlockScanner<'a> {
         blocks: &mut ScanBlockState<'_>,
         stats: &mut FileScanStats,
         current_step_run: &mut u64,
-    ) -> ResyncOutcome {
+    ) -> Result<ResyncOutcome> {
         let slice_size = self.table.slice_size as usize;
-        let last_full_offset = resync.map.len() - slice_size;
         let mut preferred_next: Option<usize> = None;
-        let mut offset = start;
-        let mut crc = checksum::crc32(&resync.map[offset..offset + slice_size]);
+        let mut cursor =
+            OrderedWindowCursor::new_at(resync.path, slice_size, &self.window_table, start)?;
 
         loop {
             let expected_block = preferred_next
                 .and_then(|position| resync.ordered_full_blocks.get(position))
                 .copied();
+            let offset = cursor.offset();
             let selection = OrderedSelection {
                 path: resync.path,
                 kind: resync.kind,
@@ -2876,11 +3030,8 @@ impl<'a> RollingBlockScanner<'a> {
             let selected = if let Some(window_index) = aligned_window {
                 self.select_ordered_match(selection, &resync.facts[window_index].matches, blocks)
             } else {
-                let matches = self.ordered_window_md5_matches(
-                    blocks.baseline(),
-                    &resync.map[offset..offset + slice_size],
-                    crc,
-                );
+                let matches =
+                    self.ordered_window_md5_matches(blocks.baseline(), cursor.data(), cursor.crc());
                 self.select_ordered_match(selection, &matches, blocks)
             };
 
@@ -2895,34 +3046,24 @@ impl<'a> RollingBlockScanner<'a> {
                 stats.max_consecutive_steps = stats.max_consecutive_steps.max(*current_step_run);
                 *current_step_run = 0;
                 if let Some(window_index) = aligned_window {
-                    return ResyncOutcome::Realigned {
+                    return Ok(ResyncOutcome::Realigned {
                         next_window: window_index + 1,
                         preferred_next: next_preferred,
-                    };
+                    });
                 }
                 preferred_next = next_preferred;
-                let next = offset + slice_size;
-                if next > last_full_offset {
-                    return ResyncOutcome::End;
+                // The cursor jump recomputes a fresh window CRC, matching the
+                // serial scanner's post-jump recompute.
+                if !cursor.jump(slice_size)? {
+                    return Ok(ResyncOutcome::End);
                 }
-                offset = next;
-                // Fresh window after a jump, matching the serial cursor's
-                // full CRC recompute.
-                crc = checksum::crc32(&resync.map[offset..offset + slice_size]);
                 continue;
             }
 
             preferred_next = None;
-            if offset >= last_full_offset {
-                return ResyncOutcome::End;
+            if !cursor.step()? {
+                return Ok(ResyncOutcome::End);
             }
-            crc = crc_slide_char(
-                crc,
-                resync.map[offset + slice_size],
-                resync.map[offset],
-                &self.window_table,
-            );
-            offset += 1;
             stats.windows_stepped += 1;
             *current_step_run += 1;
         }
@@ -3279,40 +3420,25 @@ fn ordered_scan_force_serial() -> bool {
     *FORCE_SERIAL
 }
 
+/// The parallel ordered scan is opt-in. Its first cut (whole-file mmap +
+/// padded-lane MD5 batching) measured ~1.4x slower than the serial cursor on
+/// a 2 GB damaged set while holding the entire file resident; it has since
+/// been reworked onto bounded buffered reads and single-shot MD5. It stays
+/// opt-in until it clears the recorded damaged-verify speed/RSS gate, at
+/// which point the default flips here.
+fn ordered_scan_parallel_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var(ORDERED_SCAN_PARALLEL_ENV)
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    });
+    *ENABLED
+}
+
 fn ordered_scan_segment_windows(slice_size: usize) -> usize {
     if slice_size == 0 {
         return 1;
     }
     (SCANNER_PARALLEL_SEGMENT_TARGET_BYTES / slice_size).clamp(1, 4096)
-}
-
-/// Confirms pending Phase A CRC candidates with one multi-lane MD5 batch.
-/// All inputs are full slices, so lane lengths are uniform and the SIMD
-/// kernel always engages.
-fn confirm_pending_fact_md5(
-    map: &[u8],
-    blocks: &[SourceBlock],
-    facts: &mut [AlignedWindowFacts],
-    pending: &mut Vec<usize>,
-    first_window: usize,
-    slice_size: usize,
-) {
-    if pending.is_empty() {
-        return;
-    }
-    let inputs: Vec<&[u8]> = pending
-        .iter()
-        .map(|slot| {
-            let offset = (first_window + *slot) * slice_size;
-            &map[offset..offset + slice_size]
-        })
-        .collect();
-    let digests = md5_simd::md5_multi(&inputs, None);
-    for (slot, digest) in pending.drain(..).zip(digests) {
-        facts[slot]
-            .matches
-            .retain(|block_index| blocks[*block_index as usize].checksum.md5 == digest);
-    }
 }
 
 /// The serial scanner's post-selection `preferred_next` rule: continue the
@@ -4166,13 +4292,30 @@ fn copy_range(
     let mut output = OpenOptions::new().write(true).open(dst)?;
     output.seek(SeekFrom::Start(dst_offset))?;
 
-    let mut remaining = len;
-    let mut buf = [0u8; 64 * 1024];
-    while remaining > 0 {
-        let take = remaining.min(buf.len() as u64) as usize;
-        input.read_exact(&mut buf[..take])?;
-        output.write_all(&buf[..take])?;
-        remaining -= take as u64;
+    #[cfg(target_os = "linux")]
+    {
+        // File-to-file io::copy stays in the kernel when the filesystem
+        // supports range copies; the take() bound caps the span at `len`.
+        let copied = io::copy(&mut (&mut input).take(len), &mut output)?;
+        if copied != len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "source exhausted before the copy range completed",
+            ));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // The generic io::copy buffer is smaller than this; keep the wider
+        // userspace loop where no kernel-copy path exists.
+        let mut remaining = len;
+        let mut buf = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let take = remaining.min(buf.len() as u64) as usize;
+            input.read_exact(&mut buf[..take])?;
+            output.write_all(&buf[..take])?;
+            remaining -= take as u64;
+        }
     }
     output.flush()?;
     crate::file_cache::drop_touched_file_cache(&input, src, source_len, src_offset, len);
@@ -4365,6 +4508,7 @@ fn crc_slide_char(crc: u32, new: u8, old: u8, window_table: &[u32; 256]) -> u32 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verify::verify_all;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
@@ -5788,7 +5932,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_parallel_scan_matches_serial_with_md5_batch_straddling_damage() {
+    fn ordered_parallel_scan_matches_serial_with_adjacent_damage_mid_segment() {
         let dir = tempdir().unwrap();
         let slice_size = 64usize;
         let blocks: Vec<Vec<u8>> = (0..10u8)
@@ -5797,8 +5941,9 @@ mod tests {
         let target: Vec<u8> = blocks.concat();
         let set = synthetic_set(&[("target.bin", &target)], slice_size as u64);
         let candidate = dir.path().join("target.bin");
-        // Windows 3 and 4 straddle the four-lane MD5 batch boundary inside a
-        // single default-size segment.
+        // Adjacent damaged windows 3 and 4 sit inside a single default-size
+        // segment, so the gap resync starts and realigns without crossing a
+        // segment boundary.
         let mut damaged = target.clone();
         damaged[slice_size * 3..slice_size * 5].fill(0xEE);
         fs::write(&candidate, damaged).unwrap();
@@ -6955,6 +7100,101 @@ mod tests {
         .verify_or_repair()
         .unwrap();
 
+        assert_eq!(outcome.status, Par2RepairStatus::Repaired);
+        assert_eq!(outcome.verification.total_missing_blocks, 0);
+
+        let mut reverify = Par2RepairerOptions::new(temp.path().to_path_buf(), par2_paths);
+        reverify.repair = false;
+        let clean = Par2Repairer::new(reverify).verify_or_repair().unwrap();
+        assert_eq!(clean.status, Par2RepairStatus::Verified, "{clean:#?}");
+        assert_eq!(clean.verification.total_missing_blocks, 0, "{clean:#?}");
+    }
+
+    #[test]
+    fn scan_carry_applies_when_disk_unchanged_and_refuses_on_drift() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let file_data: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+        let set = synthetic_set(&[("data.bin", &file_data)], slice_size);
+        fs::write(dir.path().join("data.bin"), &file_data).unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set.clone()).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        let diagnostics = state.scan(&options).unwrap();
+        let carry = state.scan_carry(&diagnostics);
+        let baseline = format!("{:?}", state.verification_result());
+
+        let mut fresh = RepairState::from_set(dir.path(), set.clone()).unwrap();
+        let applied = fresh.try_apply_carry(&carry);
+        assert!(applied.is_some(), "carry must apply to an unchanged tree");
+        assert_eq!(
+            format!("{:?}", fresh.verification_result()),
+            baseline,
+            "carried state must reproduce the scanned verification"
+        );
+
+        // Rewriting a file with identical content still changes its mtime;
+        // any observed drift must refuse the carry.
+        let reference = fs::read(dir.path().join("data.bin")).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(dir.path().join("data.bin"), &reference).unwrap();
+        let mut drifted = RepairState::from_set(dir.path(), set).unwrap();
+        assert!(
+            drifted.try_apply_carry(&carry).is_none(),
+            "mtime drift must invalidate the carry"
+        );
+    }
+
+    #[test]
+    fn stale_scan_carry_falls_back_to_fresh_scan() {
+        let dir = tempdir().unwrap();
+        let slice_size = 64u64;
+        let file_data: Vec<u8> = (0..1024u32).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+        let set = synthetic_set(&[("data.bin", &file_data)], slice_size);
+
+        let mut damaged = file_data.clone();
+        damaged[..64].fill(0);
+        fs::write(dir.path().join("data.bin"), &damaged).unwrap();
+
+        let mut analyze = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        analyze.file_set = Some(set.clone());
+        analyze.repair = false;
+        let (analyze_outcome, carry) = Par2Repairer::new(analyze)
+            .verify_or_repair_carrying()
+            .unwrap();
+        assert!(analyze_outcome.verification.total_missing_blocks > 0);
+        let carry = carry.expect("carrying pass returns scan state");
+
+        // The damage is healed out-of-band, so the carry is stale: the
+        // execute pass must refuse it, rescan, and report Verified rather
+        // than acting on the carried damage.
+        fs::write(dir.path().join("data.bin"), &file_data).unwrap();
+        let mut execute = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        execute.file_set = Some(set);
+        execute.repair = true;
+        execute.scan_carry = Some(carry);
+        let outcome = Par2Repairer::new(execute).verify_or_repair().unwrap();
+        assert_eq!(outcome.status, Par2RepairStatus::Verified, "{outcome:#?}");
+    }
+
+    #[cfg(feature = "slow-tests")]
+    #[test]
+    fn carried_scan_execute_repairs_and_reverifies_clean() {
+        let temp = copy_fixture_dir("rar5_lz_plain");
+        fs::remove_file(temp.path().join("fixture_rar5_lz_plain.part4.rar")).unwrap();
+        let par2_paths = collect_paths(temp.path(), "fixture_rar5_lz_plain_repair", "par2");
+
+        let mut analyze = Par2RepairerOptions::new(temp.path().to_path_buf(), par2_paths.clone());
+        analyze.repair = false;
+        let (preview, carry) = Par2Repairer::new(analyze)
+            .verify_or_repair_carrying()
+            .unwrap();
+        assert_eq!(preview.status, Par2RepairStatus::RepairPossible);
+        let carry = carry.expect("analyze pass carries scan state");
+
+        let mut execute = Par2RepairerOptions::new(temp.path().to_path_buf(), par2_paths.clone());
+        execute.scan_carry = Some(carry);
+        let outcome = Par2Repairer::new(execute).verify_or_repair().unwrap();
         assert_eq!(outcome.status, Par2RepairStatus::Repaired);
         assert_eq!(outcome.verification.total_missing_blocks, 0);
 

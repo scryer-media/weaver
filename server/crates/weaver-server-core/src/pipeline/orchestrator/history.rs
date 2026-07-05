@@ -187,6 +187,8 @@ impl Pipeline {
         self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
         self.clear_job_progress_floor_runtime(job_id);
+        self.clear_job_phase_progress_runtime(job_id);
+        self.clear_job_retention_excludes(job_id);
         self.decode_retries
             .retain(|seg_id, _| seg_id.file_id.job_id != job_id);
         self.rate_limit_reservations
@@ -268,6 +270,7 @@ impl Pipeline {
                 downloaded_bytes: Self::effective_downloaded_bytes(state),
                 optional_recovery_bytes,
                 optional_recovery_downloaded_bytes,
+                phase_progress: Vec::new(),
                 failed_bytes: state.failed_bytes,
                 health,
                 password: state.spec.password.clone(),

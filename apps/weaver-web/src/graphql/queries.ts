@@ -15,6 +15,16 @@ const FACADE_QUEUE_ITEM_FIELDS = `
     downloadedBytes
     optionalRecoveryBytes
     optionalRecoveryDownloadedBytes
+    phaseProgress {
+      phase
+      completedBytes
+      totalBytes
+      progressPercent
+      rateBps
+      estimatedRemainingMs
+      startedAtEpochMs
+      updatedAtEpochMs
+    }
     failedBytes
     health
     hasPassword
@@ -133,6 +143,8 @@ const SERVER_FIELDS = `
     active
     supportsPipelining
     priority
+    backfill
+    retentionDays
   }
 `;
 
@@ -147,6 +159,8 @@ const SERVER_DETAILS_FIELDS = `
     active
     supportsPipelining
     priority
+    backfill
+    retentionDays
   }
 `;
 
@@ -525,6 +539,37 @@ export const LIVE_METRICS_QUERY = gql`
     }
   }
   ${DOWNLOAD_BLOCK_FIELDS}
+`;
+
+export const DISK_USAGE_QUERY = gql`
+  query DiskUsage {
+    diskUsage {
+      label
+      path
+      totalBytes
+      usedBytes
+      freeBytes
+    }
+  }
+`;
+
+export const SERVER_HEALTH_QUERY = gql`
+  query ServerHealth {
+    serverHealth {
+      host
+      port
+      label
+      tier
+      state
+      connectionsActive
+      connectionsMax
+      latencyMs
+      successCount
+      failureCount
+      consecutiveFailures
+      prematureDeaths
+    }
+  }
 `;
 
 export const METRICS_HISTORY_QUERY = gql`

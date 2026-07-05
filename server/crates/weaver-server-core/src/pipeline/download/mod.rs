@@ -3,6 +3,7 @@ use super::*;
 pub(super) mod owned_lane;
 pub mod queue;
 mod rar_unlock;
+mod retention;
 pub mod retry;
 pub(super) mod transport;
 mod worker;

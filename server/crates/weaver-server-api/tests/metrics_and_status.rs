@@ -148,6 +148,7 @@ fn history_job(job_id: u64, status: JobStatus) -> JobInfo {
         downloaded_bytes: 0,
         optional_recovery_bytes: 0,
         optional_recovery_downloaded_bytes: 0,
+        phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
         password: None,

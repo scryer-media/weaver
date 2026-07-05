@@ -2,6 +2,8 @@ use super::*;
 use crate::observability::with_timed_config_read;
 use crate::system::metrics_history::{build_metrics_history, tier_for_range};
 use crate::system::types::MetricsHistoryRangeGql;
+use std::sync::Arc;
+use weaver_nntp::pool::NntpPool;
 
 #[derive(Default)]
 pub(crate) struct SystemQuery;
@@ -145,6 +147,95 @@ impl SystemQuery {
         let handle = ctx.data::<SchedulerHandle>()?;
         Ok(DownloadBlock::from(&handle.get_download_block()))
     }
+
+    /// Live per-server NNTP health (connections, latency, state) for the monitoring dashboard.
+    #[graphql(guard = "ReadGuard")]
+    async fn server_health(&self, ctx: &Context<'_>) -> Result<Vec<ServerHealth>> {
+        match ctx.data::<Option<Arc<NntpPool>>>()? {
+            Some(pool) => Ok(collect_server_health(pool).await),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Filesystem capacity for the configured storage directories (data / intermediate / complete).
+    #[graphql(guard = "ReadGuard")]
+    async fn disk_usage(&self, ctx: &Context<'_>) -> Result<Vec<DiskUsage>> {
+        let config = ctx.data::<SharedConfig>()?;
+        let dirs = with_timed_config_read(config, "system.query.disk_usage", |cfg| {
+            vec![
+                ("Data".to_string(), cfg.data_dir.clone()),
+                ("Intermediate downloads".to_string(), cfg.intermediate_dir()),
+                ("Complete library".to_string(), cfg.complete_dir()),
+            ]
+        })
+        .await;
+
+        let usage = tokio::task::spawn_blocking(move || {
+            dirs.into_iter()
+                .filter_map(|(label, path)| -> Option<DiskUsage> {
+                    let space =
+                        weaver_server_core::operations::disk_space(std::path::Path::new(&path))?;
+                    Some(DiskUsage {
+                        label,
+                        total_bytes: space.total_bytes,
+                        used_bytes: space.used_bytes(),
+                        free_bytes: space.available_bytes,
+                        path,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+
+        Ok(usage)
+    }
+}
+
+/// Snapshot per-server health from the live NNTP pool. Mirrors the per-server fields
+/// emitted by the Prometheus exporter (`collect_server_health` in the app binary), shaped
+/// for the GraphQL monitoring API. The connection pool orders servers by priority, so the
+/// first entry is the primary and the rest are backups.
+async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealth> {
+    let configs = pool.server_configs();
+    // Read connection load outside the health lock.
+    let pre: Vec<(String, u16, String, usize, usize)> = configs
+        .iter()
+        .enumerate()
+        .map(|(idx, cfg)| {
+            let (available, max) = pool.server_load(idx);
+            let tier = if idx == 0 { "PRIMARY" } else { "BACKUP" };
+            (cfg.host.clone(), cfg.port, tier.to_string(), available, max)
+        })
+        .collect();
+
+    let health = pool.health().lock().await;
+    pre.into_iter()
+        .enumerate()
+        .map(|(idx, (host, port, tier, available, max))| {
+            let srv = health.server(idx);
+            let state = match srv.state() {
+                weaver_nntp::ServerState::Healthy => "healthy",
+                weaver_nntp::ServerState::Degraded { .. } => "degraded",
+                weaver_nntp::ServerState::CoolingDown { .. } => "cooling_down",
+                weaver_nntp::ServerState::Disabled { .. } => "disabled",
+            };
+            ServerHealth {
+                label: format!("{host}:{port}"),
+                host,
+                port,
+                tier,
+                state: state.to_string(),
+                connections_active: max.saturating_sub(available) as u32,
+                connections_max: max as u32,
+                latency_ms: health.latency_ms(idx),
+                success_count: srv.success_count,
+                failure_count: srv.failure_count,
+                consecutive_failures: srv.consecutive_failures,
+                premature_deaths: health.recent_premature_deaths(idx) as u32,
+            }
+        })
+        .collect()
 }
 
 fn absolutize_default_browse_path(path: String) -> std::io::Result<std::path::PathBuf> {

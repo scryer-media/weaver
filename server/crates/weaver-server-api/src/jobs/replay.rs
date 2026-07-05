@@ -6,7 +6,7 @@ use tokio::sync::{RwLock, broadcast};
 
 use crate::jobs::types::{
     PersistedQueueEvent, QueueDownloadState, QueueEvent, QueueEventKind, QueueItem, QueueItemState,
-    QueuePostState, QueueWaitReason, encode_event_cursor, global_queue_state,
+    QueuePhase, QueuePostState, QueueWaitReason, encode_event_cursor, global_queue_state,
     queue_event_from_record, queue_item_from_job,
 };
 use weaver_server_core::SchedulerHandle;
@@ -24,6 +24,11 @@ type DetailSignature = (
     Option<QueueWaitReason>,
 );
 type AttentionSignature = Option<(String, String)>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProgressSignature {
+    overall_bucket: u8,
+    phases: Vec<(QueuePhase, u8, bool)>,
+}
 
 #[derive(Clone)]
 pub(crate) struct QueueEventReplay {
@@ -234,7 +239,7 @@ fn validate_cursor(
 struct QueueEventCaches {
     last_items: HashMap<u64, QueueItem>,
     last_item_details: HashMap<u64, DetailSignature>,
-    last_progress_buckets: HashMap<u64, u8>,
+    last_progress_buckets: HashMap<u64, ProgressSignature>,
     last_attention: HashMap<u64, AttentionSignature>,
 }
 
@@ -250,7 +255,7 @@ impl QueueEventCaches {
             self.last_item_details
                 .insert(item.id, queue_event_detail_signature(&item));
             self.last_progress_buckets
-                .insert(item.id, item.progress_percent.floor() as u8);
+                .insert(item.id, queue_event_progress_signature(&item));
             self.last_attention
                 .insert(item.id, queue_event_attention_signature(&item));
             self.last_items.insert(item.id, item);
@@ -346,12 +351,14 @@ async fn queue_event_records_from_pipeline_event(
 
     let item = queue_item_from_job(&info);
     let detail_signature = queue_event_detail_signature(&item);
-    let progress_bucket = item.progress_percent.floor() as u8;
+    let progress_signature = queue_event_progress_signature(&item);
     let attention_signature = queue_event_attention_signature(&item);
     let previous_item = caches.last_items.insert(job_id, item.clone());
     let previous_state = previous_item.as_ref().map(|value| value.state);
     let previous_detail = caches.last_item_details.insert(job_id, detail_signature);
-    let previous_progress = caches.last_progress_buckets.insert(job_id, progress_bucket);
+    let previous_progress = caches
+        .last_progress_buckets
+        .insert(job_id, progress_signature.clone());
     let previous_attention = caches
         .last_attention
         .insert(job_id, attention_signature.clone());
@@ -391,8 +398,8 @@ async fn queue_event_records_from_pipeline_event(
 
     if item.state != QueueItemState::Completed
         && item.state != QueueItemState::Failed
-        && progress_bucket > 0
-        && previous_progress.is_none_or(|value| progress_bucket > value)
+        && progress_signature_has_progress(&progress_signature)
+        && previous_progress.is_none_or(|value| value != progress_signature)
     {
         queue_events.push(PersistedQueueEvent {
             occurred_at_ms,
@@ -442,4 +449,27 @@ fn queue_event_attention_signature(item: &QueueItem) -> AttentionSignature {
     item.attention
         .as_ref()
         .map(|value| (value.code.clone(), value.message.clone()))
+}
+
+fn queue_event_progress_signature(item: &QueueItem) -> ProgressSignature {
+    let mut phases = item
+        .phase_progress
+        .iter()
+        .map(|phase| {
+            (
+                phase.phase,
+                phase.progress_percent.floor().clamp(0.0, 100.0) as u8,
+                phase.rate_bps.is_some(),
+            )
+        })
+        .collect::<Vec<_>>();
+    phases.sort_by_key(|(phase, _, _)| *phase as u8);
+    ProgressSignature {
+        overall_bucket: item.progress_percent.floor().clamp(0.0, 100.0) as u8,
+        phases,
+    }
+}
+
+fn progress_signature_has_progress(signature: &ProgressSignature) -> bool {
+    signature.overall_bucket > 0 || !signature.phases.is_empty()
 }

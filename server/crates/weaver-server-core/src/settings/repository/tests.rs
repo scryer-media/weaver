@@ -31,6 +31,8 @@ fn server_crud() {
         active: true,
         supports_pipelining: false,
         priority: 0,
+        backfill: false,
+        retention_days: 0,
         tls_ca_cert: None,
     };
 
@@ -78,6 +80,8 @@ fn config_roundtrip() {
             active: true,
             supports_pipelining: true,
             priority: 0,
+            backfill: false,
+            retention_days: 0,
             tls_ca_cert: None,
         }],
         categories: vec![CategoryConfig {

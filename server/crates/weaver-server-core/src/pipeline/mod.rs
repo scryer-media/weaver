@@ -8,6 +8,7 @@ pub mod download;
 mod extraction;
 mod health;
 mod orchestrator;
+mod progress;
 mod repair;
 
 pub(crate) use orchestrator::check_disk_space;
@@ -37,6 +38,7 @@ use crate::jobs::assembly::JobAssembly;
 use crate::jobs::assembly::write_buffer::{BufferedChunk, WriteReorderBuffer};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::{ArchivePasswordCandidate, ArchivePasswordSource};
+use crate::jobs::{JobPhase, JobPhaseProgress, PhaseAttemptCounters, PhaseCounters};
 use crate::runtime::buffers::{BufferHandle, BufferPool};
 use crate::runtime::system_profile::SystemProfile;
 use crate::{
@@ -222,6 +224,10 @@ pub(super) struct DownloadBatchLease {
     pub(super) spillover_loan_kind: Option<SpilloverLoanKind>,
     pub(super) server_modes: Vec<(usize, DownloadLaneMode)>,
     pub(super) compatibility: DownloadBatchCompatibility,
+    /// Compatibility excludes plus the job's retention exclusions — the set
+    /// server ordering and lane acquisition use. Results keep reporting the
+    /// compatibility (failure-only) excludes; retention stays job-derived.
+    pub(super) effective_exclude_servers: Vec<usize>,
     pub(super) works: Vec<DownloadWork>,
 }
 
@@ -1033,6 +1039,7 @@ pub(super) struct BatchExtractionOutcome {
     pub(super) extracted: Vec<String>,
     pub(super) failed: Vec<(String, String)>,
     pub(super) selected_password: Option<String>,
+    pub(super) phase_completed_bytes: u64,
 }
 
 pub(super) struct FullSetExtractionOutcome {
@@ -1052,6 +1059,11 @@ pub(super) struct Par2FileRuntime {
 pub(super) struct Par2RuntimeState {
     pub(super) set: Option<Arc<Par2FileSet>>,
     pub(super) files: HashMap<u32, Par2FileRuntime>,
+    /// Scan state from the most recent analyze pass, reused by the execute
+    /// pass so a repair does not re-scan sources the analysis just hashed.
+    /// Self-invalidating: the engine re-stats every observed file and falls
+    /// back to a full scan on any drift.
+    pub(super) scan_carry: Option<Arc<weaver_par2::ScanCarry>>,
 }
 
 pub(super) enum ExtractionDone {
@@ -1639,6 +1651,20 @@ pub struct Pipeline {
     /// Archives with in-flight extraction tasks (spawned but not yet completed).
     /// Prevents duplicate spawns and ensures cleanup waits for extraction to finish.
     pub(super) inflight_extractions: HashMap<JobId, HashSet<String>>,
+    /// Transient byte-progress state for active user-visible phases.
+    pub(super) phase_progress: HashMap<(JobId, JobPhase), progress::JobPhaseRuntime>,
+    /// Last sampled phase-progress snapshots projected into JobInfo.
+    pub(super) phase_progress_snapshots: HashMap<JobId, Vec<JobPhaseProgress>>,
+    /// Per-job queue-event coalescing state for sampled phase progress.
+    pub(super) phase_publish_state: HashMap<JobId, progress::PhasePublishState>,
+    /// Extraction member totals already reserved into the live Extracting phase.
+    pub(super) phase_extraction_member_totals: HashSet<(JobId, String, String)>,
+    /// Cached per-job retention exclusions (pool server indices whose
+    /// retention window is older than the job). TTL'd; cleared on NNTP
+    /// client rebuilds and job removal.
+    pub(super) job_retention_exclude_cache: HashMap<JobId, (Instant, Arc<Vec<usize>>)>,
+    /// Rate limiter for the "no eligible news server" warning.
+    pub(super) last_no_eligible_server_warn: Option<Instant>,
     /// Jobs currently performing their final move into the complete directory.
     pub(super) inflight_moves: HashSet<JobId>,
     /// Complete destinations reserved for in-flight moves so concurrent jobs do not collide.

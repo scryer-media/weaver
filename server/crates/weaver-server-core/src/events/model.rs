@@ -249,6 +249,9 @@ pub enum PipelineEvent {
 
     /// Final move from intermediate to complete finished successfully.
     MoveToCompleteFinished { job_id: JobId },
+
+    /// Runtime-only sampled phase progress changed for a job.
+    PhaseProgressUpdated { job_id: JobId },
 }
 
 /// Result of verifying a file against PAR2 checksums.

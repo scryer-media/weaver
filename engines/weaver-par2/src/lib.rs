@@ -75,7 +75,7 @@ pub use repair::{
 };
 pub use repairer::{
     BlockLocation, BlockLocationKind, PacketDiagnostics, PacketInventory, Par2RepairOutcome,
-    Par2RepairStatus, Par2Repairer, Par2RepairerOptions, ScanDiagnostics, SourceBlock,
+    Par2RepairStatus, Par2Repairer, Par2RepairerOptions, ScanCarry, ScanDiagnostics, SourceBlock,
     SourceFileEntry,
 };
 pub use session::VerificationSession;

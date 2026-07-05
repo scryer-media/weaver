@@ -1597,6 +1597,7 @@ mod tests {
                 filename: "episode.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![
                     SegmentSpec {
                         ordinal: 0,

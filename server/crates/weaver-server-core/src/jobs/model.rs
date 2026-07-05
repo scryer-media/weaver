@@ -134,6 +134,9 @@ pub struct FileSpec {
     pub role: FileRole,
     /// Newsgroups to try.
     pub groups: Vec<String>,
+    /// Unix epoch seconds from the NZB `<file date="…">` attribute; `None`
+    /// when absent or unparseable. Drives per-server retention skipping.
+    pub posted_at_epoch: Option<u64>,
     /// Segments (articles) that make up this file.
     pub segments: Vec<SegmentSpec>,
 }

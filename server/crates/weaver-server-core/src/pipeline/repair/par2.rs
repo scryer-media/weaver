@@ -1317,6 +1317,11 @@ impl Pipeline {
                 downloaded_bytes: Self::effective_downloaded_bytes(state),
                 optional_recovery_bytes,
                 optional_recovery_downloaded_bytes,
+                phase_progress: self
+                    .phase_progress_snapshots
+                    .get(&state.job_id)
+                    .cloned()
+                    .unwrap_or_default(),
                 failed_bytes: state.failed_bytes,
                 health,
                 password: state.spec.password.clone(),

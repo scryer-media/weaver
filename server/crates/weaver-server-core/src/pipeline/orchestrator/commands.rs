@@ -116,6 +116,8 @@ impl Pipeline {
                     self.clear_job_rar_runtime(job_id);
                     self.clear_job_write_backlog(job_id);
                     self.clear_job_progress_floor_runtime(job_id);
+                    self.clear_job_phase_progress_runtime(job_id);
+                    self.clear_job_retention_excludes(job_id);
 
                     let working_dir = state.working_dir.clone();
                     let staging_dir = state.staging_dir.clone();
@@ -278,6 +280,14 @@ impl Pipeline {
             } => {
                 if let Ok(new_client) = client.downcast::<NntpClient>() {
                     self.nntp = Arc::new(*new_client);
+                    // Server indices and retention windows may have changed:
+                    // recompute retention and drop queued failure exclusions,
+                    // whose indices refer to the old pool layout.
+                    self.clear_retention_exclude_cache();
+                    for state in self.jobs.values_mut() {
+                        state.download_queue.clear_exclude_servers();
+                        state.recovery_queue.clear_exclude_servers();
+                    }
                     self.owned_download_lane_pool.reset();
                     self.owned_download_lane_pool
                         .resize(total_connections.max(1));

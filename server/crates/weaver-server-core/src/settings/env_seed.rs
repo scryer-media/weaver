@@ -22,6 +22,8 @@ const SERVER_FIELD_PASSWORD: &str = "PASSWORD";
 const SERVER_FIELD_CONNECTIONS: &str = "CONNECTIONS";
 const SERVER_FIELD_ACTIVE: &str = "ACTIVE";
 const SERVER_FIELD_PRIORITY: &str = "PRIORITY";
+const SERVER_FIELD_BACKFILL: &str = "BACKFILL";
+const SERVER_FIELD_RETENTION_DAYS: &str = "RETENTION_DAYS";
 const SERVER_FIELD_TLS_CA_CERT: &str = "TLS_CA_CERT";
 
 #[derive(Debug, Clone, Default)]
@@ -92,6 +94,8 @@ struct PartialServerSeed {
     connections: Option<u16>,
     active: Option<bool>,
     priority: Option<u32>,
+    backfill: Option<bool>,
+    retention_days: Option<u32>,
     tls_ca_cert: Option<PathBuf>,
 }
 
@@ -249,6 +253,12 @@ fn parse_servers(vars: &HashMap<String, String>) -> Result<Vec<ServerConfig>, En
             SERVER_FIELD_PRIORITY => {
                 partial.priority = Some(parse_u32_value(key, value)?);
             }
+            SERVER_FIELD_BACKFILL => {
+                partial.backfill = Some(parse_bool_value(key, value)?);
+            }
+            SERVER_FIELD_RETENTION_DAYS => {
+                partial.retention_days = Some(parse_u32_value(key, value)?);
+            }
             SERVER_FIELD_TLS_CA_CERT => {
                 partial.tls_ca_cert = normalize_optional_string(value).map(PathBuf::from);
             }
@@ -288,6 +298,8 @@ fn parse_servers(vars: &HashMap<String, String>) -> Result<Vec<ServerConfig>, En
             active: partial.active.unwrap_or(true),
             supports_pipelining: false,
             priority: partial.priority.unwrap_or(0),
+            backfill: partial.backfill.unwrap_or(false),
+            retention_days: partial.retention_days.unwrap_or(0),
             tls_ca_cert: partial.tls_ca_cert,
         });
     }
@@ -563,6 +575,8 @@ mod tests {
                 active: true,
                 supports_pipelining: false,
                 priority: 0,
+                backfill: false,
+                retention_days: 0,
                 tls_ca_cert: None,
             }],
             categories: vec![CategoryConfig {

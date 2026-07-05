@@ -626,11 +626,49 @@ fn grouped_input_factors(coefficients: &matrix::Matrix) -> Vec<Vec<FactorIndex>>
 /// kernel's group width so batches split into whole groups.
 const STREAM_INPUT_BATCH: usize = 11 * crate::gf_simd::FOLDED_GROUP;
 
-/// Strip size for the batched streaming compute. One strip across a full
-/// source batch (K × 32 KiB = 2 MiB at K=64) stays cache-resident while a
-/// strip task walks every output, so source data is read from DRAM once per
-/// batch rather than once per output.
+/// Compute tile for the folded streaming kernel. The destination tile must
+/// stay L1-resident across every source group of a batch: the kernel loads
+/// and stores the destination once per six-source group, so a tile larger
+/// than L1 turns those group passes into DRAM traffic — measured as the
+/// dominant repair cost at larger tile sizes. 4 KiB keeps the dst tile plus
+/// a group's staging column comfortably inside L1/L2 on every supported
+/// core, including E-cores with small shared caches.
+const COMPUTE_TILE_BYTES: usize = 4 * 1024;
+
+/// Strip size for the generic (non-folded) compute path, whose kernels
+/// iterate every source per destination pass and so tolerate larger strips.
 const STREAM_STRIP_BYTES: usize = 32 * 1024;
+
+/// Experiment gate: warm the next output row's destination tile while the
+/// current row computes, covering the row-switch lines the in-row prefetch
+/// distance cannot. Off by default so baselines are unaffected; set
+/// `WEAVER_PAR2_PREFETCH_NEXT_TILE=1` to A/B on hardware.
+fn prefetch_next_tile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("WEAVER_PAR2_PREFETCH_NEXT_TILE").is_some_and(|v| v == "1")
+    })
+}
+
+/// 64-byte-aligned backing for the folded staging streams so every 32-byte
+/// block sits cache-line aligned.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct StagingCell([u8; 64]);
+
+fn staging_cells_for(bytes: usize) -> Vec<StagingCell> {
+    vec![StagingCell([0u8; 64]); bytes.div_ceil(64)]
+}
+
+fn staging_bytes(cells: &[StagingCell]) -> &[u8] {
+    // Safe: StagingCell is a plain 64-byte array with alignment 64; viewing
+    // the contiguous cell storage as bytes narrows alignment only.
+    unsafe { std::slice::from_raw_parts(cells.as_ptr() as *const u8, cells.len() * 64) }
+}
+
+fn staging_bytes_mut(cells: &mut [StagingCell]) -> &mut [u8] {
+    unsafe { std::slice::from_raw_parts_mut(cells.as_mut_ptr() as *mut u8, cells.len() * 64) }
+}
 
 /// Lazily prepared multiply tables, one slot per distinct GF(2^16) factor.
 /// Entries are boxed so references handed to worker threads stay valid; the
@@ -694,8 +732,9 @@ struct StreamBatchSet {
     /// Per-source chunk buffers (generic kernel path).
     bufs: Vec<Vec<u8>>,
     /// Folded path: per group of FOLDED_GROUP sources, their split-layout
-    /// blocks interleaved at 32-byte granularity into one stream.
-    staging: Vec<Vec<u8>>,
+    /// blocks interleaved at 32-byte granularity into one 64-byte-aligned
+    /// stream.
+    staging: Vec<Vec<StagingCell>>,
     /// Folded path: read scratch, and each source's sub-block tail bytes
     /// (kept in normal layout, applied scalar).
     scratch: Vec<u8>,
@@ -711,7 +750,9 @@ impl StreamBatchSet {
         if folded {
             Self {
                 bufs: Vec::new(),
-                staging: vec![vec![0u8; max_byte_len * crate::gf_simd::FOLDED_GROUP]; groups],
+                staging: (0..groups)
+                    .map(|_| staging_cells_for(max_byte_len * crate::gf_simd::FOLDED_GROUP))
+                    .collect(),
                 scratch: vec![0u8; max_byte_len],
                 tails: vec![[0u8; crate::gf_simd::SPLIT_BLOCK_BYTES]; STREAM_INPUT_BATCH],
                 tail_len: 0,
@@ -806,7 +847,7 @@ fn fill_stream_batch(
             let lane = b % crate::gf_simd::FOLDED_GROUP;
             crate::gf_simd::split_encode_scatter(
                 &set.scratch[..byte_len],
-                &mut set.staging[group],
+                staging_bytes_mut(&mut set.staging[group]),
                 lane,
             );
             let vec_len = byte_len & !(crate::gf_simd::SPLIT_BLOCK_BYTES - 1);
@@ -853,48 +894,76 @@ fn run_stream_batch_compute(
         };
 
         if vec_len > 0 {
-            let strips = vec_len.div_ceil(STREAM_STRIP_BYTES);
+            // Coefficient matrices are resolved ONCE per batch into a flat
+            // table (outputs x groups); compute tasks index it instead of
+            // walking the decode matrix and memo per tile, which multiplied
+            // lookup work by the tile count.
+            let mut batch_matrices: Vec<
+                [&crate::gf_simd::AffineMulMatrices; crate::gf_simd::FOLDED_GROUP],
+            > = Vec::with_capacity(output_ptrs.len() * groups);
+            for j in 0..output_ptrs.len() {
+                for g in 0..groups {
+                    batch_matrices.push(group_matrices(j, g));
+                }
+            }
+            let batch_matrices = &batch_matrices;
+
+            // Reference-style tile nest: tile-outer -> output -> source-group.
+            // The 4 KiB destination tile stays L1-resident across every group
+            // pass (the kernel reloads dst once per group — an L1 hit at this
+            // size), and the tile's staging column (~batch x 4 KiB) stays in
+            // L2 across the output sweep. Larger tiles turn the per-group dst
+            // reload into DRAM traffic that dominates the whole repair.
+            let tiles = vec_len.div_ceil(COMPUTE_TILE_BYTES);
             let threads = rayon::current_num_threads().max(1);
-            if strips >= threads {
-                (0..strips).into_par_iter().for_each(|si| {
-                    let s0 = si * STREAM_STRIP_BYTES;
-                    let s1 = (s0 + STREAM_STRIP_BYTES).min(vec_len);
-                    for (j, output_ptr) in output_ptrs.iter().copied().enumerate() {
-                        // Safe: strips partition the region and this task is
-                        // the only writer for strip `si`.
-                        let dst = unsafe {
-                            std::slice::from_raw_parts_mut((output_ptr as *mut u8).add(s0), s1 - s0)
-                        };
-                        for g in 0..groups {
-                            let stride = crate::gf_simd::FOLDED_GROUP;
-                            crate::gf_simd::mul_acc_folded_group(
-                                dst,
-                                &set.staging[g][s0 * stride..s1 * stride],
-                                &group_matrices(j, g),
+            let outputs_n = output_ptrs.len();
+            // One task per tile when tiles alone give enough parallelism;
+            // otherwise split the output sweep so every thread has work.
+            let blocks_per_tile = if tiles >= threads * 2 {
+                1
+            } else {
+                (threads * 4)
+                    .div_ceil(tiles.max(1))
+                    .clamp(1, outputs_n.max(1))
+            };
+            let output_block = outputs_n.div_ceil(blocks_per_tile).max(1);
+            let task_count = tiles * blocks_per_tile;
+            let prefetch_next = prefetch_next_tile_enabled();
+            (0..task_count).into_par_iter().for_each(|task| {
+                let tile = task / blocks_per_tile;
+                let block = task % blocks_per_tile;
+                let s0 = tile * COMPUTE_TILE_BYTES;
+                let s1 = (s0 + COMPUTE_TILE_BYTES).min(vec_len);
+                let j0 = block * output_block;
+                let j1 = (j0 + output_block).min(outputs_n);
+                let stride = crate::gf_simd::FOLDED_GROUP;
+                let stagings: Vec<&[u8]> = (0..groups)
+                    .map(|g| &staging_bytes(&set.staging[g])[s0 * stride..s1 * stride])
+                    .collect();
+                for (j, output_ptr) in output_ptrs.iter().copied().enumerate().take(j1).skip(j0) {
+                    if prefetch_next && j + 1 < j1 {
+                        // Safe: s0..s1 is in bounds for every output region,
+                        // and prefetch only hints the cache.
+                        unsafe {
+                            crate::gf_simd::prefetch_write_hint(
+                                (output_ptrs[j + 1] as *const u8).add(s0),
+                                (s1 - s0).min(256),
                             );
                         }
                     }
-                });
-            } else {
-                output_ptrs
-                    .par_iter()
-                    .copied()
-                    .enumerate()
-                    .for_each(|(j, output_ptr)| {
-                        // Safe: one task per output buffer.
-                        let dst = unsafe {
-                            std::slice::from_raw_parts_mut(output_ptr as *mut u8, vec_len)
-                        };
-                        for g in 0..groups {
-                            let stride = crate::gf_simd::FOLDED_GROUP;
-                            crate::gf_simd::mul_acc_folded_group(
-                                dst,
-                                &set.staging[g][..vec_len * stride],
-                                &group_matrices(j, g),
-                            );
-                        }
-                    });
-            }
+                    // Safe: (tile, output) ranges have exactly one writer —
+                    // tiles partition the region, output blocks partition the
+                    // outputs, and batches are processed sequentially.
+                    let dst = unsafe {
+                        std::slice::from_raw_parts_mut((output_ptr as *mut u8).add(s0), s1 - s0)
+                    };
+                    crate::gf_simd::mul_acc_folded_batch(
+                        dst,
+                        &stagings,
+                        &batch_matrices[j * groups..(j + 1) * groups],
+                    );
+                }
+            });
         }
 
         // Sub-block tails stay in normal layout on both sides; apply scalar.
@@ -1136,6 +1205,7 @@ pub fn prepare_recovery_buffers(
                 current: i as u32 + 1,
                 total: n as u32,
                 bytes_processed: (i + 1) as u64 * slice_size as u64,
+                total_bytes: None,
             });
         }
     }
@@ -1226,6 +1296,9 @@ pub fn reconstruct_and_write(
 
     let total_chunks_usize = word_count.div_ceil(chunk_words);
     let total_chunks = total_chunks_usize.min(u32::MAX as usize) as u32;
+    let repair_total_bytes = (word_count as u64).saturating_mul(2);
+    let write_total_bytes = (n as u64).saturating_mul(slice_size as u64);
+    let operation_total_bytes = repair_total_bytes.saturating_add(write_total_bytes);
 
     check_cancel(options)?;
 
@@ -1281,7 +1354,11 @@ pub fn reconstruct_and_write(
                     stage: ProgressStage::Repairing,
                     current,
                     total: total_chunks,
-                    bytes_processed: current as u64 * chunk_words as u64 * 2,
+                    bytes_processed: (current as u64)
+                        .saturating_mul(chunk_words as u64)
+                        .saturating_mul(2)
+                        .min(repair_total_bytes),
+                    total_bytes: Some(operation_total_bytes),
                 });
             }
 
@@ -1326,7 +1403,9 @@ pub fn reconstruct_and_write(
                 stage: ProgressStage::WritingRepaired,
                 current: j as u32 + 1,
                 total: n as u32,
-                bytes_processed: (j + 1) as u64 * slice_size as u64,
+                bytes_processed: repair_total_bytes
+                    .saturating_add((j + 1) as u64 * slice_size as u64),
+                total_bytes: Some(operation_total_bytes),
             });
         }
     }
@@ -1380,6 +1459,9 @@ fn reconstruct_and_write_grouped_inputs(
 
     let mut repaired_slices: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; n];
     let completed_outputs = AtomicU32::new(0);
+    let repair_total_bytes = (n as u64).saturating_mul(slice_size as u64);
+    let write_total_bytes = (n as u64).saturating_mul(slice_size as u64);
+    let operation_total_bytes = repair_total_bytes.saturating_add(write_total_bytes);
 
     repaired_slices.par_iter_mut().enumerate().try_for_each(
         |(output_idx, repaired)| -> Result<()> {
@@ -1416,6 +1498,7 @@ fn reconstruct_and_write_grouped_inputs(
                     current,
                     total: n as u32,
                     bytes_processed: current as u64 * slice_size as u64,
+                    total_bytes: Some(operation_total_bytes),
                 });
             }
 
@@ -1455,7 +1538,9 @@ fn reconstruct_and_write_grouped_inputs(
                 stage: ProgressStage::WritingRepaired,
                 current: j as u32 + 1,
                 total: n as u32,
-                bytes_processed: (j + 1) as u64 * slice_size as u64,
+                bytes_processed: repair_total_bytes
+                    .saturating_add((j + 1) as u64 * slice_size as u64),
+                total_bytes: Some(operation_total_bytes),
             });
         }
     }
@@ -1485,6 +1570,7 @@ fn execute_repair_streaming(
     let word_count = slice_size / 2;
     let total_chunks_usize = word_count.div_ceil(chunk_words);
     let total_chunks = total_chunks_usize.min(u32::MAX as usize) as u32;
+    let operation_total_bytes = (word_count as u64).saturating_mul(2);
     let write_targets = build_write_targets(plan, par2_set)?;
     let mut recovery_files: HashMap<PathBuf, File> = HashMap::new();
     let max_byte_len = chunk_words * 2;
@@ -1617,7 +1703,11 @@ fn execute_repair_streaming(
                 stage: ProgressStage::Repairing,
                 current: chunk_idx as u32 + 1,
                 total: total_chunks,
-                bytes_processed: (chunk_idx + 1) as u64 * chunk_words as u64 * 2,
+                bytes_processed: ((chunk_idx + 1) as u64)
+                    .saturating_mul(chunk_words as u64)
+                    .saturating_mul(2)
+                    .min(operation_total_bytes),
+                total_bytes: Some(operation_total_bytes),
             });
         }
     }
@@ -1655,6 +1745,12 @@ pub fn execute_repair_with_options(
             let available_inputs = plan.available_input_global_indices.len();
             let total_inputs = available_inputs + plan.recovery_exponents.len();
             let total_inputs_u32 = total_inputs.min(u32::MAX as usize) as u32;
+            let read_total_bytes = (total_inputs as u64).saturating_mul(slice_size as u64);
+            let repair_total_bytes = (n as u64).saturating_mul(slice_size as u64);
+            let write_total_bytes = (n as u64).saturating_mul(slice_size as u64);
+            let operation_total_bytes = read_total_bytes
+                .saturating_add(repair_total_bytes)
+                .saturating_add(write_total_bytes);
             let mut input_buffers: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; total_inputs];
             let mut repaired_slices: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; n];
 
@@ -1676,6 +1772,7 @@ pub fn execute_repair_with_options(
                         current: input_idx as u32 + 1,
                         total: total_inputs_u32,
                         bytes_processed: (input_idx + 1) as u64 * slice_size as u64,
+                        total_bytes: Some(operation_total_bytes),
                     });
                 }
             }
@@ -1700,6 +1797,7 @@ pub fn execute_repair_with_options(
                         current: current.min(u32::MAX as usize) as u32,
                         total: total_inputs_u32,
                         bytes_processed: current as u64 * slice_size as u64,
+                        total_bytes: Some(operation_total_bytes),
                     });
                 }
             }
@@ -1764,7 +1862,9 @@ pub fn execute_repair_with_options(
                             stage: ProgressStage::Repairing,
                             current,
                             total: n as u32,
-                            bytes_processed: current as u64 * slice_size as u64,
+                            bytes_processed: read_total_bytes
+                                .saturating_add(current as u64 * slice_size as u64),
+                            total_bytes: Some(operation_total_bytes),
                         });
                     }
 
@@ -1801,7 +1901,10 @@ pub fn execute_repair_with_options(
                         stage: ProgressStage::WritingRepaired,
                         current: j as u32 + 1,
                         total: n as u32,
-                        bytes_processed: (j + 1) as u64 * slice_size as u64,
+                        bytes_processed: read_total_bytes
+                            .saturating_add(repair_total_bytes)
+                            .saturating_add((j + 1) as u64 * slice_size as u64),
+                        total_bytes: Some(operation_total_bytes),
                     });
                 }
             }

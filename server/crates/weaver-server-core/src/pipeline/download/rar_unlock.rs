@@ -1,7 +1,7 @@
 use super::*;
 use crate::jobs::assembly::{ArchiveMember, DetectedArchiveKind};
 use crate::jobs::record::FileIdentitySource;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 const RAR_UNLOCK_PRIORITY: u32 = 3;
 const RAR_UNLOCK_PROTECTED_PRIORITY: u32 = RAR_UNLOCK_PRIORITY - 1;
@@ -194,10 +194,13 @@ impl Pipeline {
             let Some(normal_priority) = normal_priority_by_file.get(&file_id).copied() else {
                 continue;
             };
-            if normal_priority > RAR_UNLOCK_PROTECTED_PRIORITY {
-                updates.insert(file_id, (RAR_UNLOCK_PRIORITY, Some(rank as u32)));
-                boosted_files.insert(file_id);
-            }
+            // min() keeps protected-tier files (e.g. volume 0) at their base
+            // priority while still correcting queue entries pushed before the
+            // file was classified; the reprioritize closure never touches
+            // entries already at or below the protected tier.
+            let target_priority = normal_priority.min(RAR_UNLOCK_PRIORITY);
+            updates.insert(file_id, (target_priority, Some(rank as u32)));
+            boosted_files.insert(file_id);
         }
 
         for file_id in previous_boosted.difference(&boosted_files) {
@@ -287,6 +290,10 @@ impl Pipeline {
             })
             .collect::<Vec<_>>();
         sets.sort_by_key(|(set_name, _, _)| (*set_name).clone());
+        let planned_sets: HashSet<&str> = sets
+            .iter()
+            .map(|(set_name, _, _)| set_name.as_str())
+            .collect();
 
         for (set_name, set_state, plan) in sets {
             if plan.is_solid {
@@ -330,6 +337,77 @@ impl Pipeline {
             }
         }
 
+        // Sets whose volumes are classified through trusted identities (in
+        // practice PAR2 metadata) but which have no computed plan yet. A plan
+        // needs volume 0 or cached headers before it can exist, so pull the
+        // sequential volume prefix forward; without this the download order
+        // is volume-blind exactly while incremental extraction is waiting
+        // for its first volume.
+        let bootstrap_sets: BTreeSet<&str> = volume_files
+            .keys()
+            .map(|(set_name, _)| set_name.as_str())
+            .filter(|set_name| !planned_sets.contains(set_name))
+            .collect();
+        for set_name in bootstrap_sets {
+            let remaining = RAR_UNLOCK_NON_SOLID_VOLUME_CAP.saturating_sub(selected.len());
+            if remaining == 0 {
+                break;
+            }
+            let added = Self::select_bootstrap_rar_unlock_files(
+                set_name,
+                volume_files,
+                completed_volume_files,
+                remaining.min(RAR_UNLOCK_SOLID_VOLUME_CAP),
+            );
+            for file_id in added {
+                if seen_files.insert(file_id) {
+                    selected.push(file_id);
+                }
+            }
+        }
+
+        selected
+    }
+
+    /// Sequential-prefix selection for a set with no computed plan: walk
+    /// volumes from 0 upward, skip completed and in-flight ones, and boost
+    /// queued volumes until the known prefix breaks or the cap is reached.
+    /// Volume 0 leads because it carries the archive headers that unlock the
+    /// first real plan.
+    fn select_bootstrap_rar_unlock_files(
+        set_name: &str,
+        volume_files: &HashMap<(String, u32), RarUnlockVolumeFile>,
+        completed_volume_files: &HashSet<(String, u32)>,
+        cap: usize,
+    ) -> Vec<NzbFileId> {
+        let Some(max_volume) = volume_files
+            .keys()
+            .chain(completed_volume_files.iter())
+            .filter_map(|(name, volume)| (name.as_str() == set_name).then_some(*volume))
+            .max()
+        else {
+            return Vec::new();
+        };
+
+        let mut selected = Vec::new();
+        for volume in 0..=max_volume {
+            if selected.len() >= cap {
+                break;
+            }
+            let key = (set_name.to_string(), volume);
+            if completed_volume_files.contains(&key) {
+                continue;
+            }
+            let Some(file) = volume_files.get(&key) else {
+                // A volume with nothing queued or active breaks the prefix;
+                // volumes past the hole cannot produce headers or extend a
+                // solid run.
+                break;
+            };
+            if file.queued {
+                selected.push(file.file_id);
+            }
+        }
         selected
     }
 

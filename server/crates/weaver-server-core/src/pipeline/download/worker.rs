@@ -45,6 +45,9 @@ const SOFT_PRESSURE_DISPATCH_MAX_DELAY: Duration = Duration::from_millis(150);
 const SOFT_PRESSURE_DISPATCH_MIN_DELAY: Duration = Duration::from_millis(1);
 const SAB_BODY_PIPELINE_DEPTH: usize = 2;
 const HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
+const HOT_LEASE_TARGET_RUNWAY_SECS: u64 = 2;
+const HOT_LEASE_WARMUP_WORK_LIMIT: usize = 16;
+const NO_ELIGIBLE_SERVER_WARN_INTERVAL: Duration = Duration::from_secs(60);
 const HOT_DISPATCH_WARMUP_MIN_DURATION: Duration = Duration::from_secs(2);
 const HOT_DISPATCH_FORCE_UNDERFILL_AFTER: Duration = Duration::from_secs(5);
 const HOT_DISPATCH_MIN_SUCCESSFUL_PRIMARY_BODIES: u64 = 24;
@@ -116,7 +119,30 @@ impl Pipeline {
     fn normal_download_connection_capacity_available(&self) -> bool {
         let params = self.tuner.params();
         let total = self.effective_download_connection_capacity(params.max_concurrent_downloads);
-        self.active_download_connections < self.normal_download_connection_capacity_limit(total)
+        let mut limit = self.normal_download_connection_capacity_limit(total);
+        // Ordinary work can only run on fill servers; lanes beyond the fill
+        // tier's connection budget would block on saturated fill semaphores
+        // without ever reaching backfill. Escalated demand (queued work with
+        // failure exclusions, or a job whose age retention-excludes servers)
+        // may legitimately need backfill lanes, so it restores the full
+        // budget. The retention read uses the warm cache only — leases keep
+        // it fresh for active jobs. All-fill configs skip the clamp entirely:
+        // the tuner already bounds lanes against total capacity there.
+        let fill_capacity = self.nntp.pool().fill_connection_capacity();
+        if self.nntp.pool().has_backfill_servers() && fill_capacity < limit {
+            let escalated_demand = self
+                .job_retention_exclude_cache
+                .values()
+                .any(|(_, excludes)| !excludes.is_empty())
+                || self
+                    .jobs
+                    .values()
+                    .any(|state| state.download_queue.excluded_work_count() > 0);
+            if !escalated_demand {
+                limit = fill_capacity;
+            }
+        }
+        self.active_download_connections < limit
     }
 
     pub(crate) fn restart_durable_lead_limit_bytes() -> u64 {
@@ -1561,6 +1587,27 @@ impl Pipeline {
         }
     }
 
+    /// Terminal-failure bookkeeping shared by missing-article exhaustion and
+    /// retry exhaustion: track failed bytes for health, release any promoted
+    /// recovery segment waiting on this one, and re-evaluate job health.
+    fn book_failed_segment(&mut self, seg_id: SegmentId) {
+        let job_id = seg_id.file_id.job_id;
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            let file_idx = seg_id.file_id.file_index as usize;
+            if let Some(file_spec) = state.spec.files.get(file_idx)
+                && file_spec.role.counts_toward_health()
+                && let Some(seg_spec) = file_spec
+                    .segments
+                    .iter()
+                    .find(|s| s.ordinal == seg_id.segment_number)
+            {
+                state.failed_bytes += seg_spec.bytes as u64;
+            }
+        }
+        self.mark_promoted_recovery_segment_unavailable(seg_id);
+        self.check_health(job_id);
+    }
+
     fn pop_download_work_for_batch(
         &mut self,
         job_id: JobId,
@@ -1669,6 +1716,8 @@ impl Pipeline {
             return Ok(None);
         };
         let compatibility = DownloadBatchCompatibility::from_work(&first);
+        let effective_exclude_servers =
+            self.effective_exclude_servers(job_id, &compatibility.exclude_servers);
         if compatibility.is_recovery {
             let lease = DownloadBatchLease {
                 job_id,
@@ -1676,6 +1725,7 @@ impl Pipeline {
                 spillover_loan_kind: None,
                 server_modes: Vec::new(),
                 compatibility,
+                effective_exclude_servers,
                 works: vec![first],
             };
             self.rollback_download_batch_lease(lease);
@@ -1706,6 +1756,7 @@ impl Pipeline {
             spillover_loan_kind: None,
             server_modes: Vec::new(),
             compatibility,
+            effective_exclude_servers,
             works,
         };
         if lease.works.len() < IP_REPLACEMENT_TRIAL_SAMPLES {
@@ -1725,7 +1776,13 @@ impl Pipeline {
         pressure: DownloadPressure,
         refill: bool,
     ) -> DownloadBatchLease {
-        let work_limit = self.download_lane_lease_work_limit(job_id, lane_mode, pressure, refill);
+        let work_limit = self.download_lane_lease_work_limit(
+            job_id,
+            lane_mode,
+            pressure,
+            refill,
+            first.byte_estimate,
+        );
         let cap_for_restart_durable_lead = self.should_cap_lease_for_restart_durable_lead(job_id);
         let mut leased_undurable_bytes = if first.is_recovery {
             0
@@ -1770,27 +1827,31 @@ impl Pipeline {
             compatibility.is_recovery,
             server_modes_pressure,
         );
+        let effective_exclude_servers =
+            self.effective_exclude_servers(job_id, &compatibility.exclude_servers);
         DownloadBatchLease {
             job_id,
             lane_mode,
             spillover_loan_kind: None,
             server_modes,
             compatibility,
+            effective_exclude_servers,
             works,
         }
     }
 
     fn download_lane_lease_work_limit(
-        &self,
+        &mut self,
         job_id: JobId,
         lane_mode: DownloadLaneMode,
         pressure: DownloadPressure,
         refill: bool,
+        article_bytes: u32,
     ) -> usize {
         if self.hot_dispatch_job == Some(job_id) {
             match pressure.state {
                 DownloadPressureState::Clear => {
-                    return HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT.max(lane_mode.max_depth());
+                    return self.hot_lease_work_limit(job_id, lane_mode, article_bytes);
                 }
                 // Refills keep an established lane on its full runway under soft
                 // pressure; hard pressure is the flow control (those requests are
@@ -1799,12 +1860,58 @@ impl Pipeline {
                 // pressure stays a minimal probe because it adds a new connection
                 // to an already-loaded pipeline.
                 DownloadPressureState::Soft if refill => {
-                    return HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT.max(lane_mode.max_depth());
+                    return self.hot_lease_work_limit(job_id, lane_mode, article_bytes);
                 }
                 DownloadPressureState::Soft | DownloadPressureState::Hard => {}
             }
         }
         lane_mode.max_depth()
+    }
+
+    /// Hot-lane lease size in articles, bounded by a time-based runway.
+    ///
+    /// A flat article count sizes the in-flight window by bandwidth: at full
+    /// caps, `lanes x 64` articles are committed the moment a job starts,
+    /// which on a slow link leases several RAR volumes' worth of work at once
+    /// and spreads bandwidth evenly across them, so no volume finishes early.
+    /// Incremental extraction needs the earliest volumes to finish first, so
+    /// cap each lease near HOT_LEASE_TARGET_RUNWAY_SECS of the lane's
+    /// measured throughput: fast lanes keep full batches, slow lanes cycle
+    /// back to the queue head, which base priorities and unlock boosts keep
+    /// pointed at the volume frontier.
+    pub(in crate::pipeline) fn hot_lease_work_limit(
+        &mut self,
+        job_id: JobId,
+        lane_mode: DownloadLaneMode,
+        article_bytes: u32,
+    ) -> usize {
+        let full = HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT.max(lane_mode.max_depth());
+        if article_bytes == 0 {
+            return full;
+        }
+        let speed_bps = self.hot_dispatch_speed_bps(Instant::now());
+        if speed_bps == 0 {
+            // No measured throughput yet (fresh hot job or a stall): the
+            // first dispatch wave must not lease several volumes' worth of
+            // articles blind — on a slow link those leases take minutes to
+            // drain before any runway discipline applies. A quarter batch
+            // bounds cold-start refill churn until the window fills.
+            return HOT_LEASE_WARMUP_WORK_LIMIT
+                .max(lane_mode.max_depth())
+                .min(full);
+        }
+        // The throughput window tracks hot-job primary bytes, so divide by the
+        // hot job's own lanes; the global count only stands in before the
+        // per-job entry exists.
+        let lanes = self
+            .active_download_connections_by_job
+            .get(&job_id)
+            .copied()
+            .filter(|count| *count > 0)
+            .unwrap_or_else(|| self.active_download_connections.max(1)) as u64;
+        let runway_bytes = (speed_bps / lanes).saturating_mul(HOT_LEASE_TARGET_RUNWAY_SECS);
+        let articles = (runway_bytes / u64::from(article_bytes)) as usize;
+        articles.clamp(lane_mode.max_depth(), full)
     }
 
     pub(super) fn actual_download_lane_mode(
@@ -2116,6 +2223,12 @@ impl Pipeline {
         }
         self.note_download_activity(job_id);
         if self.active_download_passes.insert(job_id) {
+            let total = self
+                .jobs
+                .get(&job_id)
+                .map(|state| state.spec.total_bytes)
+                .unwrap_or(0);
+            self.phase_begin(job_id, JobPhase::Downloading, Some(total));
             let _ = self
                 .event_tx
                 .send(PipelineEvent::DownloadStarted { job_id });
@@ -3177,7 +3290,7 @@ impl Pipeline {
             return false;
         }
         self.nntp
-            .has_blocking_body_lane_candidate(&lease.compatibility.exclude_servers)
+            .has_blocking_body_lane_candidate(&lease.effective_exclude_servers)
     }
 
     pub(crate) fn handle_owned_download_lane_event(
@@ -3309,7 +3422,7 @@ impl Pipeline {
             let mut lane = None;
             let mut acquire_error = None;
             for server in nntp
-                .body_server_order(&lease.compatibility.exclude_servers)
+                .body_server_order(&lease.effective_exclude_servers)
                 .await
             {
                 match nntp
@@ -3377,6 +3490,7 @@ impl Pipeline {
                     spillover_loan_kind,
                     server_modes,
                     compatibility,
+                    effective_exclude_servers: _,
                     works,
                 } = lease;
                 current_job_id = job_id;
@@ -4618,6 +4732,44 @@ impl Pipeline {
                     return;
                 }
                 if failure.kind == DownloadFailureKind::LaneUnavailable {
+                    // A work item whose effective exclusions (failure plus
+                    // retention) cover every server can never be served: the
+                    // order it builds is empty, so it would requeue through
+                    // this arm forever without a fetch to fail. A job older
+                    // than every server's retention window hits exactly this.
+                    // Book it as missing instead.
+                    let server_count = self.nntp.pool().server_count();
+                    if server_count > 0
+                        && self.unavailable_server_count(job_id, &excluded_servers) >= server_count
+                    {
+                        self.metrics
+                            .articles_not_found
+                            .fetch_add(1, Ordering::Relaxed);
+                        let _ = self.event_tx.send(PipelineEvent::ArticleNotFound {
+                            segment_id: result.segment_id,
+                        });
+                        self.book_failed_segment(result.segment_id);
+                        self.maybe_finish_download_pass(job_id);
+                        return;
+                    }
+                    // Servers exist that could serve this article but none is
+                    // eligible right now. When that is a health condition
+                    // rather than saturation (empty order, not just busy
+                    // permits), surface it — a fill server stuck in
+                    // auth-disable cycles otherwise stalls the queue silently.
+                    if self
+                        .last_no_eligible_server_warn
+                        .is_none_or(|at| at.elapsed() >= NO_ELIGIBLE_SERVER_WARN_INTERVAL)
+                    {
+                        let effective = self.effective_exclude_servers(job_id, &excluded_servers);
+                        if self.nntp.body_server_order(&effective).await.is_empty() {
+                            self.last_no_eligible_server_warn = Some(Instant::now());
+                            warn!(
+                                job_id = job_id.0,
+                                "downloads waiting: no eligible news server (cooling down, disabled, or outside retention); check server health and credentials"
+                            );
+                        }
+                    }
                     self.metrics
                         .download_failures_capacity_unavailable
                         .fetch_add(1, Ordering::Relaxed);
@@ -4699,7 +4851,13 @@ impl Pipeline {
                     == DownloadFailureKind::ArticleNotFound
                     && (retry_exclude_servers.is_empty() || {
                         let server_count = self.nntp.pool().server_count();
-                        server_count > 0 && retry_exclude_servers.len() >= server_count
+                        server_count > 0 && {
+                            // Retention-excluded servers can never 430; they
+                            // count as unavailable or exhaustion could not
+                            // complete while one is configured.
+                            self.unavailable_server_count(job_id, &retry_exclude_servers)
+                                >= server_count
+                        }
                     });
 
                 if article_not_found_exhausted {
@@ -4709,23 +4867,7 @@ impl Pipeline {
                     let _ = self.event_tx.send(PipelineEvent::ArticleNotFound {
                         segment_id: result.segment_id,
                     });
-                    // Track failed bytes for health calculation.
-                    let seg_id = result.segment_id;
-                    let job_id = seg_id.file_id.job_id;
-                    if let Some(state) = self.jobs.get_mut(&job_id) {
-                        let file_idx = seg_id.file_id.file_index as usize;
-                        if let Some(file_spec) = state.spec.files.get(file_idx)
-                            && file_spec.role.counts_toward_health()
-                            && let Some(seg_spec) = file_spec
-                                .segments
-                                .iter()
-                                .find(|s| s.ordinal == seg_id.segment_number)
-                        {
-                            state.failed_bytes += seg_spec.bytes as u64;
-                        }
-                    }
-                    self.mark_promoted_recovery_segment_unavailable(seg_id);
-                    self.check_health(job_id);
+                    self.book_failed_segment(result.segment_id);
                 } else {
                     let seg_id = result.segment_id;
                     let capacity_unavailable =
@@ -4746,6 +4888,10 @@ impl Pipeline {
                         self.metrics
                             .segments_failed_permanent
                             .fetch_add(1, Ordering::Relaxed);
+                        // Retry exhaustion is as terminal as a missing
+                        // article: without this, health stays optimistic and
+                        // recovery promotion waits for post-download verify.
+                        self.book_failed_segment(seg_id);
                     } else if let Some(state) = self.jobs.get(&job_id) {
                         let file_idx = seg_id.file_id.file_index as usize;
                         if let Some(file_spec) = state.spec.files.get(file_idx)

@@ -39,7 +39,7 @@ import { DataTablePagination } from "@/components/data-table/DataTablePagination
 import { DataTableToolbar } from "@/components/data-table/DataTableToolbar";
 import { EmptyState } from "@/components/EmptyState";
 import { FilterChip } from "@/components/FilterChip";
-import { JobProgress } from "@/components/JobProgress";
+import { JobPhaseProgressBars } from "@/components/JobPhaseProgressBars";
 import { JobStatusBadgeGroup } from "@/components/JobStatusBadge";
 import { PageHeader } from "@/components/PageHeader";
 import { SegmentedControl } from "@/components/ui/segmented-control";
@@ -341,35 +341,14 @@ const QueueStatusCell = memo(function QueueStatusCell({
 });
 
 const QueueProgressCell = memo(function QueueProgressCell({
-  etaDisplay,
-  progress,
-  status,
-  totalBytes,
-  downloadedBytes,
-  failedBytes,
+  phaseProgress,
 }: {
-  etaDisplay: string;
-  progress: number;
-  status: JobData["status"];
-  totalBytes: number;
-  downloadedBytes: number;
-  failedBytes: number;
+  phaseProgress: JobData["phaseProgress"];
 }) {
   return (
     <div className="flex justify-center">
       <div className="w-full max-w-[176px]">
-        <div className="mb-1 text-right text-[10px] font-medium tabular-nums text-muted-foreground">
-          {etaDisplay}
-        </div>
-        <JobProgress
-          progress={progress}
-          status={status}
-          totalBytes={totalBytes}
-          downloadedBytes={downloadedBytes}
-          failedBytes={failedBytes}
-          compact
-          showLabel={false}
-        />
+        <JobPhaseProgressBars phaseProgress={phaseProgress} compact />
       </div>
     </div>
   );
@@ -1076,14 +1055,7 @@ export function JobList() {
           />
         ),
         cell: ({ row }) => (
-          <QueueProgressCell
-            etaDisplay={row.original.etaDisplay}
-            progress={row.original.progress}
-            status={row.original.status}
-            totalBytes={row.original.totalBytes}
-            downloadedBytes={row.original.downloadedBytes}
-            failedBytes={row.original.failedBytes}
-          />
+          <QueueProgressCell phaseProgress={row.original.phaseProgress} />
         ),
         meta: {
           headerClassName: "h-7 w-[188px] px-2 text-center",
@@ -1842,14 +1814,7 @@ export function JobList() {
                         {job.displayName}
                       </Link>
                       <div className="hidden min-w-[130px] flex-1 sm:block">
-                        <JobProgress
-                          compact
-                          progress={job.progress}
-                          status={job.status}
-                          totalBytes={job.totalBytes}
-                          downloadedBytes={job.downloadedBytes}
-                          failedBytes={job.failedBytes}
-                        />
+                        <JobPhaseProgressBars compact phaseProgress={job.phaseProgress} />
                       </div>
                       <span className="hidden w-16 shrink-0 text-right text-[12px] tabular-nums text-muted-foreground md:block">
                         {job.etaDisplay}

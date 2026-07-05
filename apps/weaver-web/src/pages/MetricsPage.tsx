@@ -9,7 +9,12 @@ import { TimeSeriesChart } from "@/components/TimeSeriesChart";
 import { Progress } from "@/components/ui/progress";
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { requestGraphqlClientRestart } from "@/graphql/client";
-import { METRICS_PAGE_QUERY, METRICS_PAGE_SUBSCRIPTION } from "@/graphql/queries";
+import {
+  DISK_USAGE_QUERY,
+  METRICS_PAGE_QUERY,
+  METRICS_PAGE_SUBSCRIPTION,
+  SERVER_HEALTH_QUERY,
+} from "@/graphql/queries";
 import {
   useLiveConnection,
   useLiveDownloadBlock,
@@ -27,6 +32,36 @@ import {
 } from "@/lib/metrics";
 import { STATUS_BG_CLASS, statusToken } from "@/lib/status-tokens";
 import { cn } from "@/lib/utils";
+
+interface DiskUsageEntry {
+  label: string;
+  path: string;
+  totalBytes: number;
+  usedBytes: number;
+  freeBytes: number;
+}
+
+interface ServerHealthEntry {
+  host: string;
+  port: number;
+  label: string;
+  tier: string;
+  state: string;
+  connectionsActive: number;
+  connectionsMax: number;
+  latencyMs: number;
+  successCount: number;
+  failureCount: number;
+  consecutiveFailures: number;
+  prematureDeaths: number;
+}
+
+const SERVER_STATE_DOT_CLASS: Record<string, string> = {
+  healthy: "bg-status-completed",
+  degraded: "bg-status-paused",
+  cooling_down: "bg-status-paused",
+  disabled: "bg-status-failed",
+};
 
 export function MetricsPage() {
   const t = useTranslate();
@@ -62,6 +97,27 @@ export function MetricsPage() {
       setPolledSnapshot(undefined);
     }
   }, [liveConnection.isDisconnected]);
+
+  const [{ data: diskData }, reexecuteDiskUsage] = useQuery<{ diskUsage: DiskUsageEntry[] }>({
+    query: DISK_USAGE_QUERY,
+  });
+  const [{ data: serverHealthData }, reexecuteServerHealth] = useQuery<{
+    serverHealth: ServerHealthEntry[];
+  }>({ query: SERVER_HEALTH_QUERY });
+
+  useEffect(() => {
+    if (liveConnection.isDisconnected) {
+      return;
+    }
+    const id = window.setInterval(() => {
+      reexecuteServerHealth({ requestPolicy: "network-only" });
+      reexecuteDiskUsage({ requestPolicy: "network-only" });
+    }, 5000);
+    return () => window.clearInterval(id);
+  }, [liveConnection.isDisconnected, reexecuteDiskUsage, reexecuteServerHealth]);
+
+  const diskUsage = diskData?.diskUsage ?? [];
+  const serverHealth = serverHealthData?.serverHealth ?? [];
 
   const counts = useMemo(() => {
     const total = liveJobs.length;
@@ -215,6 +271,137 @@ export function MetricsPage() {
               ariaLabel={t("metrics.historySectionTitle")}
             />
           </div>
+
+          {diskUsage.length ? (
+            <SectionCard title={t("metrics.diskUsage")} description={t("metrics.diskUsageDesc")}>
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                {diskUsage.map((mount) => {
+                  const pct = mount.totalBytes > 0 ? (mount.usedBytes / mount.totalBytes) * 100 : 0;
+                  const barClass =
+                    pct >= 85
+                      ? "bg-status-failed"
+                      : pct >= 65
+                        ? "bg-status-paused"
+                        : "bg-status-downloading";
+                  return (
+                    <div
+                      key={mount.path}
+                      className="rounded-inner border border-border bg-background/40 p-4"
+                    >
+                      <div className="flex items-baseline justify-between gap-3">
+                        <span className="truncate text-[13px] font-semibold text-foreground">
+                          {mount.label}
+                        </span>
+                        <span className="shrink-0 text-[12px] tabular-nums text-muted-foreground">
+                          {Math.round(pct)}%
+                        </span>
+                      </div>
+                      <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground" title={mount.path}>
+                        {mount.path}
+                      </div>
+                      <div className="mt-3 h-2 overflow-hidden rounded-pill bg-secondary">
+                        <div
+                          className={cn("h-full rounded-pill transition-[width] duration-500 motion-reduce:transition-none", barClass)}
+                          style={{ width: `${Math.min(100, pct)}%` }}
+                        />
+                      </div>
+                      <div className="mt-2.5 flex items-center justify-between text-[12px]">
+                        <span className="font-medium text-foreground">
+                          {formatBytes(mount.usedBytes)}{" "}
+                          <span className="font-normal text-muted-foreground">
+                            / {formatBytes(mount.totalBytes)}
+                          </span>
+                        </span>
+                        <span className="text-muted-foreground">
+                          {formatBytes(mount.freeBytes)} {t("metrics.diskFree")}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </SectionCard>
+          ) : null}
+
+          {serverHealth.length ? (
+            <SectionCard
+              title={t("metrics.newsServers")}
+              description={t("metrics.newsServersDesc")}
+            >
+              <div className="flex flex-col">
+                {serverHealth.map((server) => {
+                  const dotClass = SERVER_STATE_DOT_CLASS[server.state] ?? "bg-muted-foreground";
+                  const active = server.connectionsActive > 0 && server.state !== "disabled";
+                  const connPct =
+                    server.connectionsMax > 0
+                      ? (server.connectionsActive / server.connectionsMax) * 100
+                      : 0;
+                  const latencyClass =
+                    server.latencyMs < 80
+                      ? "text-status-completed"
+                      : server.latencyMs < 160
+                        ? "text-status-paused"
+                        : "text-status-failed";
+                  const isPrimary = server.tier === "PRIMARY";
+                  return (
+                    <div
+                      key={server.label}
+                      className="flex items-center gap-4 border-b border-border/60 py-3 last:border-0"
+                    >
+                      <span
+                        className={cn(
+                          "size-2.5 shrink-0 rounded-pill",
+                          dotClass,
+                          active && "animate-status-pulse",
+                        )}
+                        title={server.state}
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="truncate text-[13px] font-semibold text-foreground">
+                            {server.host}
+                          </span>
+                          <span
+                            className={cn(
+                              "shrink-0 rounded-chip px-2 py-px text-[10px] font-bold uppercase tracking-[0.06em]",
+                              isPrimary ? "bg-primary/15 text-primary" : "bg-secondary text-muted-foreground",
+                            )}
+                          >
+                            {isPrimary ? t("metrics.serverTierPrimary") : t("metrics.serverTierBackup")}
+                          </span>
+                        </div>
+                        <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">
+                          {server.label}
+                        </div>
+                      </div>
+                      <div className="hidden w-32 shrink-0 sm:block">
+                        <div className="flex items-center justify-between text-[10.5px] text-muted-foreground">
+                          <span>{t("metrics.serverConns")}</span>
+                          <span className="font-semibold tabular-nums text-foreground">
+                            {server.connectionsActive} / {server.connectionsMax}
+                          </span>
+                        </div>
+                        <div className="mt-1.5 h-1.5 overflow-hidden rounded-pill bg-secondary">
+                          <div
+                            className="h-full rounded-pill bg-status-downloading transition-[width] duration-500 motion-reduce:transition-none"
+                            style={{ width: `${Math.min(100, connPct)}%` }}
+                          />
+                        </div>
+                      </div>
+                      <div className="w-20 shrink-0 text-right">
+                        <div className="text-[9px] font-semibold uppercase tracking-[0.1em] text-muted-foreground">
+                          {t("metrics.serverLatency")}
+                        </div>
+                        <div className={cn("text-[13px] font-semibold tabular-nums", latencyClass)}>
+                          {Math.round(server.latencyMs)} ms
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </SectionCard>
+          ) : null}
 
           <div className="grid gap-4 lg:grid-cols-2">
             <div className="rounded-card border border-border bg-card p-5 sm:p-6">

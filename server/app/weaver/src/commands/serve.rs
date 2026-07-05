@@ -108,19 +108,7 @@ pub(crate) async fn run(
         Some(watch_folder.clone()),
     );
 
-    // Build GraphQL schema with shared config and database.
     let pipeline_config = shared_config.clone();
-    let schema = weaver_server_api::build_schema(weaver_server_api::SchemaContext {
-        handle: handle.clone(),
-        config: shared_config.clone(),
-        db: db.clone(),
-        auth_cache: login_auth_cache.clone(),
-        api_key_cache: api_key_cache.clone(),
-        rss: rss.clone(),
-        watch_folder: watch_folder.clone(),
-        schedules: shared_schedules,
-        log_buffer: log_ring_buffer,
-    });
 
     // Spawn event persistence subscriber (records meaningful events to SQLite).
     {
@@ -149,6 +137,21 @@ pub(crate) async fn run(
     .await?;
 
     let nntp_pool = pipeline.nntp_pool();
+
+    // Build the GraphQL schema now that the live NNTP pool exists (for server-health metrics).
+    let schema = weaver_server_api::build_schema(weaver_server_api::SchemaContext {
+        handle: handle.clone(),
+        config: shared_config.clone(),
+        db: db.clone(),
+        auth_cache: login_auth_cache.clone(),
+        api_key_cache: api_key_cache.clone(),
+        rss: rss.clone(),
+        watch_folder: watch_folder.clone(),
+        schedules: shared_schedules,
+        log_buffer: log_ring_buffer,
+        nntp_pool: Some(nntp_pool.clone()),
+    });
+
     let metrics_exporter = http::PrometheusMetricsExporter::new(handle.clone(), nntp_pool);
 
     let mut pipeline_task = tokio::spawn(async move {

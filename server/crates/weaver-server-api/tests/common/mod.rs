@@ -182,6 +182,7 @@ impl TestHarness {
             schedules: shared_schedules,
             log_buffer:
                 weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),
+            nntp_pool: None,
         });
 
         Self {
@@ -722,6 +723,7 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             downloaded_bytes: 0,
             optional_recovery_bytes: 0,
             optional_recovery_downloaded_bytes: 0,
+            phase_progress: Vec::new(),
             failed_bytes: 0,
             health: 1000,
             password: state.spec.password.clone(),

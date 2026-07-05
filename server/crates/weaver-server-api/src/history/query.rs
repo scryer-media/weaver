@@ -571,6 +571,7 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         downloaded_bytes: row.downloaded_bytes,
         optional_recovery_bytes: row.optional_recovery_bytes,
         optional_recovery_downloaded_bytes: row.optional_recovery_downloaded_bytes,
+        phase_progress: Vec::new(),
         failed_bytes: row.failed_bytes,
         health: row.health,
         password: None,

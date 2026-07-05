@@ -714,6 +714,7 @@ impl Pipeline {
 
     async fn run_par2_repairer(
         &mut self,
+        job_id: JobId,
         par2_set: Arc<weaver_par2::Par2FileSet>,
         working_dir: std::path::PathBuf,
         repair: bool,
@@ -728,7 +729,14 @@ impl Pipeline {
         }
 
         let memory_limit = configured_par2_repair_memory_limit_bytes();
-        let repair_result = tokio::task::spawn_blocking(move || {
+        // The analyze pass's scan carries into the execute pass so the
+        // repair does not re-scan sources the analysis just hashed. The
+        // engine re-stats every observed file and rescans on any drift.
+        let scan_carry = self
+            .par2_runtime(job_id)
+            .and_then(|runtime| runtime.scan_carry.clone());
+        let phase_counters = repair.then(|| self.phase_begin(job_id, JobPhase::Repairing, None));
+        let mut repair_task = tokio::task::spawn_blocking(move || {
             if repair {
                 crate::e2e_failpoint::maybe_delay("repair.task_start");
             }
@@ -736,9 +744,29 @@ impl Pipeline {
             options.file_set = Some((*par2_set).clone());
             options.repair = repair;
             options.memory_limit = Some(memory_limit);
+            options.scan_carry = scan_carry;
+            if let Some(counters) = phase_counters {
+                options.progress = Some(Arc::new(move |update: weaver_par2::ProgressUpdate| {
+                    if !matches!(
+                        update.stage,
+                        weaver_par2::ProgressStage::Repairing
+                            | weaver_par2::ProgressStage::WritingRepaired
+                    ) {
+                        return;
+                    }
+                    counters
+                        .completed_bytes
+                        .fetch_max(update.bytes_processed, Ordering::Relaxed);
+                    if let Some(total_bytes) = update.total_bytes {
+                        counters
+                            .total_bytes
+                            .fetch_max(total_bytes, Ordering::Relaxed);
+                    }
+                }));
+            }
             let repairer = weaver_par2::Par2Repairer::new(options);
-            let outcome = repairer
-                .verify_or_repair()
+            let (outcome, carry) = repairer
+                .verify_or_repair_carrying()
                 .map_err(|e| format!("PAR2 repairer failed: {e}"))?;
             if repair {
                 match outcome.status {
@@ -754,12 +782,32 @@ impl Pipeline {
                     }
                 }
             }
-            Ok(outcome)
-        })
-        .await;
+            Ok((outcome, carry))
+        });
+        let repair_result = if repair {
+            loop {
+                tokio::select! {
+                    result = &mut repair_task => break result,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                        self.sample_phase_progress();
+                    }
+                }
+            }
+        } else {
+            repair_task.await
+        };
+
+        if repair {
+            self.phase_end(job_id, JobPhase::Repairing);
+        }
 
         match repair_result {
-            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Ok((outcome, carry))) => {
+                // Keep the analyze pass's scan for the execute pass; after a
+                // repair the files just changed, so drop any stored carry.
+                self.ensure_par2_runtime(job_id).scan_carry = if repair { None } else { carry };
+                Ok(outcome)
+            }
             Ok(Err(error)) => Err(error),
             Err(error) => Err(format!("repair task panicked: {error}")),
         }
@@ -791,7 +839,9 @@ impl Pipeline {
         self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
         info!(job_id = job_id.0, "par2 damaged-path analysis started");
 
-        let outcome_result = self.run_par2_repairer(par2_set, working_dir, false).await;
+        let outcome_result = self
+            .run_par2_repairer(job_id, par2_set, working_dir, false)
+            .await;
 
         self.metrics.verify_active.fetch_sub(1, Ordering::Relaxed);
 
@@ -2239,7 +2289,7 @@ impl Pipeline {
                     }
 
                     match self
-                        .run_par2_repairer(Arc::clone(&par2_set), working_dir.clone(), true)
+                        .run_par2_repairer(job_id, Arc::clone(&par2_set), working_dir.clone(), true)
                         .await
                     {
                         Ok(outcome) => {
@@ -2498,7 +2548,12 @@ impl Pipeline {
                     }
 
                     let repair_preview = match self
-                        .run_par2_repairer(Arc::clone(&par2_set), working_dir.clone(), false)
+                        .run_par2_repairer(
+                            job_id,
+                            Arc::clone(&par2_set),
+                            working_dir.clone(),
+                            false,
+                        )
                         .await
                     {
                         Ok(outcome) => outcome,
@@ -2587,7 +2642,7 @@ impl Pipeline {
                     }
 
                     match self
-                        .run_par2_repairer(Arc::clone(&par2_set), working_dir.clone(), true)
+                        .run_par2_repairer(job_id, Arc::clone(&par2_set), working_dir.clone(), true)
                         .await
                     {
                         Ok(outcome) => {

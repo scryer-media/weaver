@@ -482,6 +482,21 @@ impl RarArchive {
             .collect()
     }
 
+    /// List member names whose starting header is present.
+    ///
+    /// With a gappy volume set, a member that spans a missing volume appears
+    /// twice: once from its base header and once as an orphan continuation
+    /// (`split_before`) discovered past the gap. The orphan is not
+    /// independently extractable and merges into the base entry when the gap
+    /// fills, so path-collision checks must ignore it.
+    pub fn started_member_names(&self) -> Vec<&str> {
+        self.members
+            .iter()
+            .filter(|m| !m.file_header.split_before)
+            .map(|m| m.file_header.name.as_str())
+            .collect()
+    }
+
     /// Find a member by name, returning its index.
     pub fn find_member(&self, name: &str) -> Option<usize> {
         self.members.iter().position(|m| m.file_header.name == name)

@@ -4930,6 +4930,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "weaver-nntp",
  "weaver-server-core",
  "zstd",
 ]

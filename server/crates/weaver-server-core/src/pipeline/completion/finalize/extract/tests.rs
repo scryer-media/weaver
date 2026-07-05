@@ -5,6 +5,8 @@ use std::io::Cursor;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tempfile::TempDir;
 use zip::ZipWriter;
@@ -110,7 +112,27 @@ fn extract_with_weaver_zip_result(
         &event_tx,
         JobId(1),
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
+        None,
     )
+}
+
+fn extract_with_weaver_zip_result_with_phase(
+    archive_path: &Path,
+    output_dir: &Path,
+    password: Option<&str>,
+) -> (Result<Vec<String>, String>, Arc<PhaseCounters>) {
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
+    let phase_counters = Arc::new(PhaseCounters::default());
+    let result = extract_zip(
+        archive_path,
+        output_dir,
+        password,
+        &event_tx,
+        JobId(1),
+        archive_path.file_name().unwrap().to_string_lossy().as_ref(),
+        Some(Arc::clone(&phase_counters)),
+    );
+    (result, phase_counters)
 }
 
 fn create_zip_with_entries(archive_path: &Path, entries: &[(&str, &[u8])]) {
@@ -200,14 +222,28 @@ fn assert_zip_method_matches_7z(extra_args: &[&str], password: Option<&str>) {
     create_zip_archive(&archive_path, &source_dir, extra_args);
 
     extract_with_7z(&archive_path, &out_7z, password);
-    let extracted_names = extract_with_weaver_zip(&archive_path, &out_weaver, password);
+    let (extracted_names, phase_counters) =
+        extract_with_weaver_zip_result_with_phase(&archive_path, &out_weaver, password);
+    let extracted_names = extracted_names.unwrap();
 
     let seven_zip = read_dir_contents(&out_7z);
     let weaver_zip = read_dir_contents(&out_weaver);
+    let expected_total = expected
+        .values()
+        .map(|bytes| bytes.len() as u64)
+        .sum::<u64>();
 
     assert_eq!(seven_zip, expected);
     assert_eq!(weaver_zip, expected);
     assert_eq!(weaver_zip, seven_zip);
+    assert_eq!(
+        phase_counters.total_bytes.load(Ordering::Relaxed),
+        expected_total
+    );
+    assert_eq!(
+        phase_counters.completed_bytes.load(Ordering::Relaxed),
+        expected_total
+    );
 
     let mut actual_names: Vec<_> = extracted_names.into_iter().collect();
     actual_names.sort();

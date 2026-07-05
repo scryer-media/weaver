@@ -244,6 +244,7 @@ pub enum EventKind {
     SegmentFailedPermanent,
     GlobalPaused,
     GlobalResumed,
+    PhaseProgressUpdated,
 }
 
 impl std::str::FromStr for EventKind {

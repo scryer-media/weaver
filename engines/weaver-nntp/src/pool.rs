@@ -41,6 +41,10 @@ pub struct NntpPool {
     stale_check_age: Duration,
     /// Priority group for each server (parallel to pools/configs).
     groups: Vec<u32>,
+    /// Backfill flag for each server (parallel to pools/configs).
+    backfill: Vec<bool>,
+    /// Retention window in days for each server (parallel to pools/configs).
+    retention_days: Vec<u32>,
     /// Maximum connections per server (parallel to pools/configs).
     max_connections: Vec<usize>,
     retired_ips: Arc<Mutex<HashSet<(usize, IpAddr)>>>,
@@ -76,8 +80,27 @@ impl Default for PoolConfig {
 pub struct ServerPoolConfig {
     pub server: ServerConfig,
     pub max_connections: usize,
-    /// Priority group (0 = primary, 1+ = backfill). Lower values tried first.
+    /// Priority group. Lower values tried first within a tier.
     pub group: u32,
+    /// Backfill servers are ordered after every fill server and are only
+    /// reachable once all fill servers are excluded for a request.
+    pub backfill: bool,
+    /// Days of retention this server is expected to hold (0 = unlimited).
+    /// Inert metadata for the pool: callers translate it into per-request
+    /// exclusions; carrying it here keeps it aligned with server indices.
+    pub retention_days: u32,
+}
+
+impl Default for ServerPoolConfig {
+    fn default() -> Self {
+        Self {
+            server: ServerConfig::default(),
+            max_connections: 1,
+            group: 0,
+            backfill: false,
+            retention_days: 0,
+        }
+    }
 }
 
 impl NntpPool {
@@ -89,11 +112,22 @@ impl NntpPool {
         let mut semaphores = Vec::with_capacity(server_count);
         let mut last_connect_failure = Vec::with_capacity(server_count);
         let mut groups = Vec::with_capacity(server_count);
+        let mut backfill = Vec::with_capacity(server_count);
+        let mut retention_days = Vec::with_capacity(server_count);
         let mut max_connections = Vec::with_capacity(server_count);
         let mut connect_cursors = Vec::with_capacity(server_count);
 
+        // A config where every server is backfill has no fill tier to
+        // exhaust; treat it as an all-fill config so downloads can proceed.
+        let all_backfill = server_count > 0 && config.servers.iter().all(|spc| spc.backfill);
+        if all_backfill {
+            warn!("every configured server is marked backfill; treating all servers as fill");
+        }
+
         for spc in &config.servers {
             groups.push(spc.group);
+            backfill.push(spc.backfill && !all_backfill);
+            retention_days.push(spc.retention_days);
             max_connections.push(spc.max_connections);
             connect_cursors.push(AtomicUsize::new(0));
             semaphores.push(Arc::new(Semaphore::new(spc.max_connections)));
@@ -123,6 +157,8 @@ impl NntpPool {
             reconnect_delay: config.reconnect_delay,
             stale_check_age: config.stale_check_age,
             groups,
+            backfill,
+            retention_days,
             max_connections,
             retired_ips: Arc::new(Mutex::new(HashSet::new())),
             connect_cursors,
@@ -361,12 +397,18 @@ impl NntpPool {
         }
 
         // All available servers at capacity or no available servers;
-        // fall back to blocking on the first available, or server 0 if all disabled.
+        // fall back to blocking on the first available, or the first fill
+        // server if all are disabled — generic callers must never be handed
+        // a backfill connection.
         if let Some(&first) = ordered.first() {
             self.acquire(ServerId(first)).await
         } else {
-            // All servers disabled — fall back to server 0.
-            self.acquire(ServerId(0)).await
+            let fallback = self
+                .backfill
+                .iter()
+                .position(|backfill| !*backfill)
+                .unwrap_or(0);
+            self.acquire(ServerId(fallback)).await
         }
     }
 
@@ -386,6 +428,12 @@ impl NntpPool {
             std::collections::BTreeMap::new();
         for idx in 0..self.server_count() {
             if !health.is_available(idx) {
+                continue;
+            }
+            // acquire_any serves ordinary callers with no failure history;
+            // backfill servers are only reachable through the per-request
+            // exclusion ladder (build_server_order).
+            if self.backfill[idx] {
                 continue;
             }
             let entry = groups.entry(self.groups[idx]).or_default();
@@ -462,6 +510,43 @@ impl NntpPool {
     /// Priority group for each server (indexed by pool position).
     pub fn server_groups(&self) -> &[u32] {
         &self.groups
+    }
+
+    /// Backfill flag for each server (indexed by pool position). An
+    /// all-backfill config is normalized to all-fill at construction.
+    pub fn server_backfill_flags(&self) -> &[bool] {
+        &self.backfill
+    }
+
+    /// Retention window in days for each server (0 = unlimited), indexed by
+    /// pool position.
+    pub fn server_retention_days(&self) -> &[u32] {
+        &self.retention_days
+    }
+
+    /// Whether any configured server is a backfill server.
+    pub fn has_backfill_servers(&self) -> bool {
+        self.backfill.iter().any(|backfill| *backfill)
+    }
+
+    /// Total configured connections across fill (non-backfill) servers.
+    pub fn fill_connection_capacity(&self) -> usize {
+        self.backfill
+            .iter()
+            .zip(&self.max_connections)
+            .filter(|(backfill, _)| !**backfill)
+            .map(|(_, max)| *max)
+            .sum()
+    }
+
+    /// Whether every fill (non-backfill) server is in `exclude` — the gate
+    /// that makes backfill servers reachable for a request.
+    pub fn fill_servers_exhausted(&self, exclude: &[usize]) -> bool {
+        self.backfill
+            .iter()
+            .enumerate()
+            .filter(|(_, backfill)| !**backfill)
+            .all(|(idx, _)| exclude.contains(&idx))
     }
 
     /// Access the health tracker for observability.
@@ -661,6 +746,7 @@ mod tests {
                 },
                 max_connections: max_per_server,
                 group: 0,
+                ..ServerPoolConfig::default()
             }],
             max_idle_age: Duration::from_mins(5),
             health_config: HealthConfig::default(),
@@ -686,6 +772,7 @@ mod tests {
                     },
                     max_connections: 10,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
                 ServerPoolConfig {
                     server: ServerConfig {
@@ -694,6 +781,7 @@ mod tests {
                     },
                     max_connections: 5,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
             ],
             max_idle_age: Duration::from_mins(5),
@@ -703,6 +791,42 @@ mod tests {
         };
         let pool = NntpPool::new(config);
         assert_eq!(pool.server_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn acquire_any_order_skips_backfill_servers() {
+        let config = PoolConfig {
+            servers: vec![
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "fill.example.com".into(),
+                        ..Default::default()
+                    },
+                    max_connections: 2,
+                    group: 0,
+                    ..ServerPoolConfig::default()
+                },
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "backfill.example.com".into(),
+                        ..Default::default()
+                    },
+                    max_connections: 2,
+                    group: 1,
+                    backfill: true,
+                    ..ServerPoolConfig::default()
+                },
+            ],
+            ..PoolConfig::default()
+        };
+        let pool = NntpPool::new(config);
+        assert_eq!(
+            pool.acquire_any_order().await,
+            vec![0],
+            "ordinary callers must never be handed a backfill connection"
+        );
+        assert!(pool.fill_servers_exhausted(&[0]));
+        assert!(!pool.fill_servers_exhausted(&[]));
     }
 
     #[tokio::test]
@@ -733,6 +857,7 @@ mod tests {
                     },
                     max_connections: 5,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
                 ServerPoolConfig {
                     server: ServerConfig {
@@ -741,6 +866,7 @@ mod tests {
                     },
                     max_connections: 5,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
             ],
             max_idle_age: Duration::from_mins(5),
@@ -770,6 +896,7 @@ mod tests {
                 },
                 max_connections: 2,
                 group: 0,
+                ..ServerPoolConfig::default()
             }],
             max_idle_age: Duration::from_mins(5),
             health_config: HealthConfig::default(),
@@ -812,6 +939,7 @@ mod tests {
                 },
                 max_connections: 2,
                 group: 0,
+                ..ServerPoolConfig::default()
             }],
             max_idle_age: Duration::from_mins(5),
             health_config: HealthConfig::default(),
@@ -868,6 +996,7 @@ mod tests {
                     },
                     max_connections: 0,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
                 ServerPoolConfig {
                     server: ServerConfig {
@@ -876,6 +1005,7 @@ mod tests {
                     },
                     max_connections: 1,
                     group: 1,
+                    ..ServerPoolConfig::default()
                 },
             ],
             max_idle_age: Duration::from_mins(5),
@@ -900,6 +1030,7 @@ mod tests {
                     },
                     max_connections: 0,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
                 ServerPoolConfig {
                     server: ServerConfig {
@@ -908,6 +1039,7 @@ mod tests {
                     },
                     max_connections: 1,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
             ],
             max_idle_age: Duration::from_mins(5),
@@ -941,6 +1073,7 @@ mod tests {
                     },
                     max_connections: 10,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
                 ServerPoolConfig {
                     server: ServerConfig {
@@ -949,6 +1082,7 @@ mod tests {
                     },
                     max_connections: 5,
                     group: 1,
+                    ..ServerPoolConfig::default()
                 },
             ],
             max_idle_age: Duration::from_mins(5),

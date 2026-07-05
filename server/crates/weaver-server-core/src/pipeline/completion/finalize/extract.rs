@@ -1,7 +1,38 @@
 use super::*;
 use crate::pipeline::extraction::RarExtractionOpenRequest;
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+struct CountingWriter<W> {
+    inner: W,
+    attempt: Arc<PhaseAttemptCounters>,
+}
+
+impl<W> CountingWriter<W> {
+    fn new(inner: W, attempt: Arc<PhaseAttemptCounters>) -> Self {
+        Self { inner, attempt }
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.attempt.record_completed(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(buf)?;
+        self.attempt.record_completed(buf.len() as u64);
+        Ok(())
+    }
+}
 
 fn validate_zip_entry_path(raw_name: &str) -> Result<PathBuf, String> {
     validate_archive_entry_path(raw_name, "zip")
@@ -78,11 +109,26 @@ fn extract_zip(
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
+    phase_counters: Option<Arc<PhaseCounters>>,
 ) -> Result<Vec<String>, String> {
     let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open zip: {e}"))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("failed to read zip archive: {e}"))?;
     let mut extracted = Vec::new();
+    if let Some(counters) = phase_counters.as_ref() {
+        let mut known_total = 0u64;
+        for i in 0..archive.len() {
+            let entry = archive
+                .by_index_raw(i)
+                .map_err(|e| format!("failed to read zip entry {i}: {e}"))?;
+            if !entry.is_dir() {
+                known_total = known_total.saturating_add(entry.size());
+            }
+        }
+        counters
+            .total_bytes
+            .fetch_add(known_total, Ordering::Relaxed);
+    }
 
     for i in 0..archive.len() {
         let mut entry = if let Some(pw) = password {
@@ -116,10 +162,30 @@ fn extract_zip(
             member: name.clone(),
         });
 
-        let mut outfile = std::fs::File::create(&out_path)
+        let outfile = std::fs::File::create(&out_path)
             .map_err(|e| format!("failed to create {name}: {e}"))?;
-        let bytes_written = std::io::copy(&mut entry, &mut outfile)
-            .map_err(|e| format!("failed to extract {name}: {e}"))?;
+        let attempt = phase_counters
+            .as_ref()
+            .map(|counters| Arc::new(PhaseAttemptCounters::new(Arc::clone(counters))));
+        let mut outfile: Box<dyn Write> = if let Some(attempt) = attempt.as_ref() {
+            Box::new(CountingWriter::new(outfile, Arc::clone(attempt)))
+        } else {
+            Box::new(outfile)
+        };
+        let bytes_written = match std::io::copy(&mut entry, &mut outfile) {
+            Ok(bytes) => {
+                if let Some(attempt) = &attempt {
+                    attempt.commit();
+                }
+                bytes
+            }
+            Err(error) => {
+                if let Some(attempt) = &attempt {
+                    attempt.rollback();
+                }
+                return Err(format!("failed to extract {name}: {error}"));
+            }
+        };
 
         let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
             job_id,
@@ -414,6 +480,7 @@ fn extract_split(
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
+    phase_counters: Option<Arc<PhaseCounters>>,
 ) -> Result<Vec<String>, String> {
     // Output filename: the base name from the set (e.g., "movie.mkv" from "movie.mkv.001")
     let first_name = file_paths[0]
@@ -435,10 +502,35 @@ fn extract_split(
 
     let mut reader = crate::pipeline::archive::split_reader::SplitFileReader::open(file_paths)
         .map_err(|e| format!("failed to open split files: {e}"))?;
-    let mut outfile = std::fs::File::create(&out_path)
+    let outfile = std::fs::File::create(&out_path)
         .map_err(|e| format!("failed to create {output_name}: {e}"))?;
-    let bytes_written = std::io::copy(&mut reader, &mut outfile)
-        .map_err(|e| format!("failed to concatenate split files: {e}"))?;
+    let attempt = phase_counters.as_ref().map(|counters| {
+        let total = file_paths
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok().map(|metadata| metadata.len()))
+            .sum::<u64>();
+        counters.total_bytes.fetch_add(total, Ordering::Relaxed);
+        Arc::new(PhaseAttemptCounters::new(Arc::clone(counters)))
+    });
+    let mut outfile: Box<dyn Write> = if let Some(attempt) = attempt.as_ref() {
+        Box::new(CountingWriter::new(outfile, Arc::clone(attempt)))
+    } else {
+        Box::new(outfile)
+    };
+    let bytes_written = match std::io::copy(&mut reader, &mut outfile) {
+        Ok(bytes) => {
+            if let Some(attempt) = &attempt {
+                attempt.commit();
+            }
+            bytes
+        }
+        Err(error) => {
+            if let Some(attempt) = &attempt {
+                attempt.rollback();
+            }
+            return Err(format!("failed to concatenate split files: {error}"));
+        }
+    };
 
     let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
         job_id,
@@ -507,6 +599,14 @@ impl Pipeline {
         } else {
             crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly
         };
+        let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
+        self.phase_reserve_topology_extraction_totals(
+            job_id,
+            set_name,
+            std::iter::empty::<&str>(),
+            &already_extracted,
+            &phase_counters,
+        );
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || pp_pool.install(move || {
                 if volume_paths.is_empty() {
@@ -555,7 +655,10 @@ impl Pipeline {
                             &set_name_for_task,
                             &output_dir,
                             &options,
-                        ),
+                        )
+                        .with_phase_attempt(Some(Arc::new(PhaseAttemptCounters::new(Arc::clone(
+                            &phase_counters,
+                        ))))),
                         idx,
                     ) {
                         Ok((member_name, bytes_written, total_bytes)) => {
@@ -734,6 +837,7 @@ impl Pipeline {
         let extract_done_tx = self.extract_done_tx.clone();
         let set_name_for_channel = set_name.to_string();
         let pp_pool = self.pp_pool.clone();
+        let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 pp_pool.install(move || {
@@ -746,6 +850,37 @@ impl Pipeline {
                     } else {
                         sevenz_rust2::Password::empty()
                     };
+                    let known_total = if file_paths.len() == 1 {
+                        let file = std::fs::File::open(&file_paths[0])
+                            .map_err(|e| format!("failed to open 7z file: {e}"))?;
+                        let archive_reader = sevenz_rust2::ArchiveReader::new(file, pw.clone())
+                            .map_err(|e| format!("failed to read 7z archive: {e}"))?;
+                        archive_reader
+                            .archive()
+                            .files
+                            .iter()
+                            .filter(|entry| !entry.is_directory())
+                            .map(|entry| entry.size())
+                            .sum::<u64>()
+                    } else {
+                        let reader = crate::pipeline::archive::split_reader::SplitFileReader::open(
+                            &file_paths,
+                        )
+                        .map_err(|e| format!("failed to open 7z split files: {e}"))?;
+                        let archive_reader =
+                            sevenz_rust2::ArchiveReader::new(reader, pw.clone())
+                                .map_err(|e| format!("failed to read 7z archive: {e}"))?;
+                        archive_reader
+                            .archive()
+                            .files
+                            .iter()
+                            .filter(|entry| !entry.is_directory())
+                            .map(|entry| entry.size())
+                            .sum::<u64>()
+                    };
+                    phase_counters
+                        .total_bytes
+                        .fetch_add(known_total, Ordering::Relaxed);
 
                     let mut extracted_members = Vec::new();
                     let extracted_members_ref = &mut extracted_members;
@@ -772,8 +907,20 @@ impl Pipeline {
                             member: entry.name().to_string(),
                         });
 
-                        let mut file = std::fs::File::create(&out_path)?;
-                        let bytes_written = std::io::copy(reader, &mut file)?;
+                        let file = std::fs::File::create(&out_path)?;
+                        let attempt =
+                            Arc::new(PhaseAttemptCounters::new(Arc::clone(&phase_counters)));
+                        let mut file = CountingWriter::new(file, Arc::clone(&attempt));
+                        let bytes_written = match std::io::copy(reader, &mut file) {
+                            Ok(bytes) => {
+                                attempt.commit();
+                                bytes
+                            }
+                            Err(error) => {
+                                attempt.rollback();
+                                return Err(error.into());
+                            }
+                        };
 
                         tracing::info!(
                             job_id = job_id.0,
@@ -893,6 +1040,7 @@ impl Pipeline {
         let extract_done_tx = self.extract_done_tx.clone();
         let set_name_for_channel = set_name.to_string();
         let pp_pool = self.pp_pool.clone();
+        let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
 
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -909,6 +1057,7 @@ impl Pipeline {
                             &event_tx,
                             job_id,
                             &set_name_owned,
+                            Some(Arc::clone(&phase_counters)),
                         )?,
                         SimpleArchiveKind::Tar => extract_tar(
                             &file_paths[0],
@@ -972,6 +1121,7 @@ impl Pipeline {
                             &event_tx,
                             job_id,
                             &set_name_owned,
+                            Some(Arc::clone(&phase_counters)),
                         )?,
                     };
 

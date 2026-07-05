@@ -71,6 +71,27 @@ impl Pipeline {
         })
     }
 
+    /// Obfuscated posts routinely name articles (yEnc) differently from both
+    /// the subject-declared filename and the PAR2 canonical name. Once PAR2
+    /// metadata is loaded the recovery set is the naming authority: the yEnc
+    /// name either already matches the canonical name, or the rebind that
+    /// follows completion settles the disagreement.
+    pub(crate) fn yenc_name_expected_from_par2_identity(
+        &self,
+        job_id: JobId,
+        file_id: NzbFileId,
+        yenc_name: &str,
+    ) -> bool {
+        let Some(identity) = self.file_identity(job_id, file_id) else {
+            return false;
+        };
+        if identity.canonical_filename.as_deref() == Some(yenc_name) {
+            return true;
+        }
+        identity.classification_source != crate::jobs::record::FileIdentitySource::Par2
+            && self.par2_set(job_id).is_some()
+    }
+
     pub(crate) fn note_file_hash_chunk(
         &mut self,
         file_id: NzbFileId,
@@ -1635,6 +1656,15 @@ impl Pipeline {
                                 current = %filename,
                                 yenc = %yenc_name,
                                 "yEnc name differs from current filename after file identity rewrite"
+                            );
+                        } else if self
+                            .yenc_name_expected_from_par2_identity(job_id, file_id, &yenc_name)
+                        {
+                            debug!(
+                                job_id = job_id.0,
+                                assembly = %filename,
+                                yenc = %yenc_name,
+                                "yEnc name deferred to PAR2 canonical identity"
                             );
                         } else {
                             warn!(

@@ -59,6 +59,10 @@ impl Ord for PrioritizedWork {
 pub struct DownloadQueue {
     heap: BinaryHeap<Reverse<PrioritizedWork>>,
     next_sequence: u64,
+    /// Queued items carrying failure exclusions — escalated work that may
+    /// need a backfill lane. Maintained on push/pop; recounted on the rare
+    /// bulk-removal paths.
+    excluded_work: usize,
 }
 
 impl DownloadQueue {
@@ -66,6 +70,7 @@ impl DownloadQueue {
         Self {
             heap: BinaryHeap::new(),
             next_sequence: 0,
+            excluded_work: 0,
         }
     }
 
@@ -73,6 +78,9 @@ impl DownloadQueue {
         let priority = work.priority;
         let sequence = self.next_sequence;
         self.next_sequence += 1;
+        if !work.exclude_servers.is_empty() {
+            self.excluded_work += 1;
+        }
         self.heap.push(Reverse(PrioritizedWork {
             priority,
             rank: None,
@@ -82,7 +90,41 @@ impl DownloadQueue {
     }
 
     pub fn pop(&mut self) -> Option<DownloadWork> {
-        self.heap.pop().map(|Reverse(pw)| pw.work)
+        let work = self.heap.pop().map(|Reverse(pw)| pw.work);
+        if let Some(work) = &work
+            && !work.exclude_servers.is_empty()
+        {
+            self.excluded_work = self.excluded_work.saturating_sub(1);
+        }
+        work
+    }
+
+    /// Number of queued items with failure exclusions.
+    pub fn excluded_work_count(&self) -> usize {
+        self.excluded_work
+    }
+
+    /// Drop failure exclusions from all queued work. Used when the server
+    /// config is rebuilt: exclusion indices refer to the old pool layout and
+    /// would mis-target (or spuriously exhaust) servers in the new one.
+    pub fn clear_exclude_servers(&mut self) {
+        if self.excluded_work == 0 {
+            return;
+        }
+        let items: Vec<_> = self.heap.drain().collect();
+        for Reverse(mut pw) in items {
+            pw.work.exclude_servers.clear();
+            self.heap.push(Reverse(pw));
+        }
+        self.excluded_work = 0;
+    }
+
+    fn recount_excluded_work(&mut self) {
+        self.excluded_work = self
+            .heap
+            .iter()
+            .filter(|item| !item.0.work.exclude_servers.is_empty())
+            .count();
     }
 
     pub fn pop_next_pipelining_compatible_with(
@@ -104,7 +146,7 @@ impl DownloadQueue {
         self.heap
             .peek()
             .is_some_and(|Reverse(pw)| matches(&pw.work))
-            .then(|| self.heap.pop().map(|Reverse(pw)| pw.work))?
+            .then(|| self.pop())?
     }
 
     pub fn peek_next_matching(
@@ -141,6 +183,7 @@ impl DownloadQueue {
 
     /// Remove and return all queued segments.
     pub fn drain_all(&mut self) -> Vec<DownloadWork> {
+        self.excluded_work = 0;
         self.heap.drain().map(|Reverse(pw)| pw.work).collect()
     }
 
@@ -152,6 +195,7 @@ impl DownloadQueue {
                 self.heap.push(item);
             }
         }
+        self.recount_excluded_work();
     }
 
     /// Remove and return all queued segments for a given job.
@@ -165,6 +209,7 @@ impl DownloadQueue {
                 self.heap.push(item);
             }
         }
+        self.recount_excluded_work();
         drained
     }
 

@@ -64,6 +64,10 @@ impl OwnedDownloadLanePool {
         }
     }
 
+    // The Err variant hands the lease back to the caller for the async
+    // fallback path; it only occurs when the pool is stopped, so the size
+    // of the returned lease is irrelevant.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn submit(
         &self,
         nntp: Arc<weaver_nntp::NntpClient>,
@@ -124,15 +128,11 @@ fn run_owned_lane_worker(rx: std_mpsc::Receiver<OwnedLanePoolCommand>) {
 }
 
 impl CachedOwnedLane {
-    fn matches(
-        &self,
-        nntp: &Arc<weaver_nntp::NntpClient>,
-        compatibility: &DownloadBatchCompatibility,
-    ) -> bool {
+    fn matches(&self, nntp: &Arc<weaver_nntp::NntpClient>, lease: &DownloadBatchLease) -> bool {
         Arc::ptr_eq(&self.nntp, nntp)
-            && self.groups == compatibility.groups
-            && !compatibility
-                .exclude_servers
+            && self.groups == lease.compatibility.groups
+            && !lease
+                .effective_exclude_servers
                 .contains(&self.lane.server_id().0)
     }
 }
@@ -160,7 +160,7 @@ fn run_owned_blocking_s2n_download_lane(
 
     if cached_lane
         .as_ref()
-        .is_some_and(|cached| !cached.matches(&nntp, &lease.compatibility))
+        .is_some_and(|cached| !cached.matches(&nntp, &lease))
     {
         park_cached_lane(cached_lane);
     }
@@ -168,7 +168,7 @@ fn run_owned_blocking_s2n_download_lane(
     if cached_lane.is_none() {
         match nntp.try_acquire_blocking_body_lane(
             &lease.compatibility.groups,
-            &lease.compatibility.exclude_servers,
+            &lease.effective_exclude_servers,
         ) {
             Ok(lane) => {
                 *cached_lane = Some(CachedOwnedLane {
@@ -203,6 +203,7 @@ fn run_owned_blocking_s2n_download_lane(
             spillover_loan_kind,
             server_modes,
             compatibility,
+            effective_exclude_servers: _,
             works,
         } = lease;
         let server_idx = lane.server_id().0;

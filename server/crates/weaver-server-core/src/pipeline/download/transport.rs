@@ -403,6 +403,7 @@ mod tests {
             filename: "sample.bin".to_string(),
             role,
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: sizes
                 .iter()
                 .enumerate()

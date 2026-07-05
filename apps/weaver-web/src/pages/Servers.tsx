@@ -37,6 +37,8 @@ type Server = {
   active: boolean;
   supportsPipelining: boolean;
   priority: number;
+  backfill: boolean;
+  retentionDays: number;
 };
 
 type ServerDetails = Server & {
@@ -52,6 +54,8 @@ type ServerFormValues = {
   connections: number;
   active: boolean;
   priority: number;
+  backfill: boolean;
+  retentionDays: number;
 };
 
 const defaultForm: ServerFormValues = {
@@ -63,6 +67,8 @@ const defaultForm: ServerFormValues = {
   connections: 20,
   active: true,
   priority: 0,
+  backfill: false,
+  retentionDays: 0,
 };
 
 export function Servers({ embedded = false }: { embedded?: boolean }) {
@@ -143,6 +149,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
       connections: values.connections,
       active: values.active,
       priority: values.priority,
+      backfill: values.backfill,
+      retentionDays: values.retentionDays,
     };
 
     if (editingServerId != null) {
@@ -207,6 +215,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
         connections: values.connections,
         active: values.active,
         priority: values.priority,
+        backfill: values.backfill,
+        retentionDays: values.retentionDays,
       },
     });
     setTestResult(result.data?.testConnection ?? null);
@@ -257,6 +267,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                     connections: editingServerDetail.connections,
                     active: editingServerDetail.active,
                     priority: editingServerDetail.priority,
+                    backfill: editingServerDetail.backfill,
+                    retentionDays: editingServerDetail.retentionDays,
                   }
                 : editingServer
                   ? {
@@ -268,6 +280,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                       connections: editingServer.connections,
                       active: editingServer.active,
                       priority: editingServer.priority,
+                      backfill: editingServer.backfill,
+                      retentionDays: editingServer.retentionDays,
                     }
                   : defaultForm
             }
@@ -326,13 +340,27 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                               <span
                                 className={cn(
                                   "rounded-chip px-1.5 py-px text-[10px] font-bold uppercase tracking-[0.06em]",
-                                  priority === 0
-                                    ? "bg-priority-high/15 text-priority-high"
-                                    : "bg-secondary text-muted-foreground",
+                                  server.backfill
+                                    ? "bg-status-queued/15 text-status-queued"
+                                    : priority === 0
+                                      ? "bg-priority-high/15 text-priority-high"
+                                      : "bg-secondary text-muted-foreground",
                                 )}
                               >
-                                {priority === 0 ? "Primary" : "Backup"}
+                                {server.backfill
+                                  ? t("servers.backfillBadge")
+                                  : priority === 0
+                                    ? "Primary"
+                                    : "Backup"}
                               </span>
+                              {server.retentionDays > 0 ? (
+                                <span className="text-[10px] text-muted-foreground">
+                                  {t("servers.retentionBadge").replace(
+                                    "{days}",
+                                    String(server.retentionDays),
+                                  )}
+                                </span>
+                              ) : null}
                             </div>
                             <div className="mt-1 truncate font-mono text-[13px] text-foreground">
                               {server.host}:{server.port}
@@ -484,6 +512,19 @@ function ServerFormCard({
               onChange={(event) => setValues((current) => ({ ...current, priority: Number(event.target.value) }))}
             />
           </Field>
+          <Field label={t("servers.retention")} description={t("servers.retentionDescription")}>
+            <Input
+              type="number"
+              min={0}
+              value={values.retentionDays}
+              onChange={(event) =>
+                setValues((current) => ({
+                  ...current,
+                  retentionDays: Math.max(0, Number(event.target.value) || 0),
+                }))
+              }
+            />
+          </Field>
         </div>
 
         <div className="flex flex-wrap gap-6 rounded-inner border border-border bg-background/40 p-4">
@@ -496,6 +537,12 @@ function ServerFormCard({
             label={t("servers.active")}
             checked={values.active}
             onCheckedChange={(checked) => setValues((current) => ({ ...current, active: checked }))}
+          />
+          <ToggleField
+            label={t("servers.backfill")}
+            description={t("servers.backfillDescription")}
+            checked={values.backfill}
+            onCheckedChange={(checked) => setValues((current) => ({ ...current, backfill: checked }))}
           />
         </div>
 
@@ -566,17 +613,22 @@ function Field({
 
 function ToggleField({
   label,
+  description,
   checked,
   onCheckedChange,
 }: {
   label: string;
+  description?: string;
   checked: boolean;
   onCheckedChange: (checked: boolean) => void;
 }) {
   return (
-    <Label className="gap-3">
-      <Checkbox checked={checked} onCheckedChange={(value) => onCheckedChange(value === true)} />
-      {label}
-    </Label>
+    <div className="space-y-1">
+      <Label className="gap-3">
+        <Checkbox checked={checked} onCheckedChange={(value) => onCheckedChange(value === true)} />
+        {label}
+      </Label>
+      {description ? <p className="text-xs text-muted-foreground">{description}</p> : null}
+    </div>
   );
 }

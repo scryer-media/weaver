@@ -88,6 +88,7 @@ pub fn nzb_to_spec(
             filename,
             role,
             groups: nzb_file.groups.clone(),
+            posted_at_epoch: (nzb_file.date > 0).then_some(nzb_file.date),
             segments,
         });
     }

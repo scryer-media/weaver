@@ -127,6 +127,52 @@ pub struct QueueAttention {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Enum)]
+pub enum QueuePhase {
+    Downloading,
+    Repairing,
+    Extracting,
+    Moving,
+}
+
+impl From<weaver_server_core::JobPhase> for QueuePhase {
+    fn from(value: weaver_server_core::JobPhase) -> Self {
+        match value {
+            weaver_server_core::JobPhase::Downloading => Self::Downloading,
+            weaver_server_core::JobPhase::Repairing => Self::Repairing,
+            weaver_server_core::JobPhase::Extracting => Self::Extracting,
+            weaver_server_core::JobPhase::Moving => Self::Moving,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+pub struct QueuePhaseProgress {
+    pub phase: QueuePhase,
+    pub completed_bytes: f64,
+    pub total_bytes: f64,
+    pub progress_percent: f64,
+    pub rate_bps: Option<f64>,
+    pub estimated_remaining_ms: Option<f64>,
+    pub started_at_epoch_ms: f64,
+    pub updated_at_epoch_ms: f64,
+}
+
+impl From<weaver_server_core::JobPhaseProgress> for QueuePhaseProgress {
+    fn from(value: weaver_server_core::JobPhaseProgress) -> Self {
+        Self {
+            phase: QueuePhase::from(value.phase),
+            completed_bytes: value.completed_bytes as f64,
+            total_bytes: value.total_bytes as f64,
+            progress_percent: value.progress_percent as f64,
+            rate_bps: value.rate_bps.map(|rate| rate as f64),
+            estimated_remaining_ms: value.estimated_remaining_ms.map(|value| value as f64),
+            started_at_epoch_ms: value.started_at_epoch_ms,
+            updated_at_epoch_ms: value.updated_at_epoch_ms,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct QueueItem {
     pub id: u64,
@@ -147,6 +193,8 @@ pub struct QueueItem {
     pub downloaded_bytes: u64,
     pub optional_recovery_bytes: u64,
     pub optional_recovery_downloaded_bytes: u64,
+    #[serde(default)]
+    pub phase_progress: Vec<QueuePhaseProgress>,
     pub failed_bytes: u64,
     pub health: u32,
     pub has_password: bool,
@@ -624,6 +672,12 @@ pub fn queue_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
         downloaded_bytes: info.downloaded_bytes,
         optional_recovery_bytes: info.optional_recovery_bytes,
         optional_recovery_downloaded_bytes: info.optional_recovery_downloaded_bytes,
+        phase_progress: info
+            .phase_progress
+            .iter()
+            .copied()
+            .map(QueuePhaseProgress::from)
+            .collect(),
         failed_bytes: info.failed_bytes,
         health: info.health,
         has_password: info.password.is_some(),
@@ -662,6 +716,7 @@ pub fn queue_item_from_submission(
         downloaded_bytes: 0,
         optional_recovery_bytes: 0,
         optional_recovery_downloaded_bytes: 0,
+        phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
         has_password: submitted.spec.password.is_some(),

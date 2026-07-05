@@ -5,7 +5,7 @@ use super::readahead::ReadaheadVolumeProvider;
 use super::source::BoundedRarSourcePool;
 use super::*;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 pub(crate) struct RarExtractionContext<'a> {
     pub(crate) volume_paths: &'a std::collections::BTreeMap<u32, PathBuf>,
@@ -14,6 +14,42 @@ pub(crate) struct RarExtractionContext<'a> {
     pub(crate) set_name: &'a str,
     pub(crate) output_dir: &'a std::path::Path,
     pub(crate) options: &'a weaver_unrar::ExtractOptions,
+    pub(crate) phase_attempt: Option<Arc<PhaseAttemptCounters>>,
+}
+
+struct PhaseAttemptRollbackGuard {
+    attempt: Option<Arc<PhaseAttemptCounters>>,
+}
+
+impl PhaseAttemptRollbackGuard {
+    fn new(attempt: Option<Arc<PhaseAttemptCounters>>) -> Self {
+        Self { attempt }
+    }
+
+    fn attempt(&self) -> Option<Arc<PhaseAttemptCounters>> {
+        self.attempt.as_ref().map(Arc::clone)
+    }
+
+    fn record_and_commit(mut self, bytes: u64) {
+        if let Some(attempt) = self.attempt.take() {
+            attempt.record_completed(bytes);
+            attempt.commit();
+        }
+    }
+
+    fn commit(mut self) {
+        if let Some(attempt) = self.attempt.take() {
+            attempt.commit();
+        }
+    }
+}
+
+impl Drop for PhaseAttemptRollbackGuard {
+    fn drop(&mut self) {
+        if let Some(attempt) = &self.attempt {
+            attempt.rollback();
+        }
+    }
 }
 
 const RAR_MAX_DICT_ENV: &str = "WEAVER_RAR_MAX_DICT_BYTES";
@@ -252,7 +288,7 @@ fn ensure_unique_sanitized_rar_member_paths(
     archive: &weaver_unrar::RarArchive,
 ) -> Result<(), String> {
     let mut occupied = std::collections::HashSet::<String>::new();
-    for raw_name in archive.member_names() {
+    for raw_name in archive.started_member_names() {
         let member_name = weaver_unrar::sanitize_path(raw_name);
         let safe_path = validate_sanitized_rar_member_path(&member_name)?;
         let collision_key = safe_path
@@ -284,7 +320,13 @@ impl<'a> RarExtractionContext<'a> {
             set_name,
             output_dir,
             options,
+            phase_attempt: None,
         }
+    }
+
+    pub(crate) fn with_phase_attempt(mut self, attempt: Option<Arc<PhaseAttemptCounters>>) -> Self {
+        self.phase_attempt = attempt;
+        self
     }
 }
 
@@ -302,7 +344,9 @@ impl Pipeline {
             set_name,
             output_dir,
             options,
+            phase_attempt,
         } = ctx;
+        let phase_guard = PhaseAttemptRollbackGuard::new(phase_attempt);
         let member = archive
             .member_info(idx)
             .ok_or_else(|| format!("member index {idx} missing from archive metadata"))?;
@@ -345,6 +389,7 @@ impl Pipeline {
             let bytes_written = archive
                 .extract_member_to_file(idx, options, None, &out_path)
                 .map_err(|error| format!("failed to extract {member_name}: {error}"))?;
+            phase_guard.record_and_commit(bytes_written);
             info!(
                 job_id = job_id.0,
                 set_name,
@@ -418,6 +463,7 @@ impl Pipeline {
                         bytes_written: 0,
                         volume_index: absolute_volume,
                         checkpoint: Some(Arc::clone(&checkpoint_ref)),
+                        phase_attempt: phase_guard.attempt(),
                     }) as Box<dyn Write>)
                 })
                 .and_then(|records| {
@@ -456,6 +502,7 @@ impl Pipeline {
                         bytes_written: 0,
                         volume_index,
                         checkpoint: Some(Arc::clone(&checkpoint_ref)),
+                        phase_attempt: phase_guard.attempt(),
                     }) as Box<dyn Write>)
                 })
                 .and_then(|records| {
@@ -548,6 +595,7 @@ impl Pipeline {
 
         let _ = chunk_records;
 
+        phase_guard.commit();
         Ok((member_name, bytes_written, unpacked_size))
     }
 
@@ -1209,6 +1257,7 @@ mod tests {
                 set_name: "rar5-symlink",
                 output_dir: output_dir.path(),
                 options: &options,
+                phase_attempt: None,
             },
             symlink_idx,
         )

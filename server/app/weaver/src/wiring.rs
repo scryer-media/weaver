@@ -124,6 +124,8 @@ pub(crate) fn build_nntp_client(config: &Config, profile: &SystemProfile) -> Nnt
             },
             max_connections: server.connections as usize,
             group: server.priority,
+            backfill: server.backfill,
+            retention_days: server.retention_days,
         })
         .collect();
 

@@ -41,7 +41,7 @@ impl NntpClientConfig {
             servers: vec![ServerPoolConfig {
                 server,
                 max_connections,
-                group: 0,
+                ..ServerPoolConfig::default()
             }],
             max_idle_age: Duration::from_secs(300),
             max_retries_per_server: 1,
@@ -1816,6 +1816,8 @@ impl NntpClient {
     fn blocking_body_server_order(&self, exclude: &[usize]) -> Vec<ServerId> {
         let server_count = self.pool.server_count();
         let server_groups = self.pool.server_groups();
+        let backfill_flags = self.pool.server_backfill_flags();
+        let backfill_unlocked = self.pool.fill_servers_exhausted(exclude);
         let Ok(mut health) = self.pool.health().try_lock() else {
             return Vec::new();
         };
@@ -1824,6 +1826,11 @@ impl NntpClient {
         let mut candidates = Vec::with_capacity(server_count);
         for (idx, group) in server_groups.iter().copied().enumerate().take(server_count) {
             if exclude.contains(&idx) || !health.is_available(idx) {
+                continue;
+            }
+            // Backfill servers only serve requests whose fill tier is
+            // exhausted; health never unlocks them (see build_server_order).
+            if backfill_flags[idx] && !backfill_unlocked {
                 continue;
             }
             let candidate = {
@@ -1839,20 +1846,21 @@ impl NntpClient {
                     ServerState::CoolingDown { .. } | ServerState::Disabled { .. } => 2,
                 };
                 let score = health.latency_ms(idx) * (1.0 + 2.0 * load_ratio);
-                (group, health_rank, score, idx)
+                (backfill_flags[idx], group, health_rank, score, idx)
             };
-            if candidate.1 < 2 {
+            if candidate.2 < 2 {
                 candidates.push(candidate);
             }
         }
         candidates.sort_by(|a, b| {
             a.0.cmp(&b.0)
                 .then(a.1.cmp(&b.1))
-                .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                .then(a.2.cmp(&b.2))
+                .then_with(|| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal))
         });
         candidates
             .into_iter()
-            .map(|(_, _, _, idx)| ServerId(idx))
+            .map(|(_, _, _, _, idx)| ServerId(idx))
             .collect()
     }
 
@@ -1927,18 +1935,23 @@ impl NntpClient {
         NntpError::SoftTimeout(self.soft_timeout.as_secs())
     }
 
-    /// Build the server try-order, exhausting lower-priority groups before
-    /// considering higher-priority backfill groups.
+    /// Build the server try-order, exhausting lower-priority fill groups
+    /// before higher-priority ones, with backfill servers reachable only
+    /// once every fill server is excluded for this request.
     ///
     /// Servers in `exclude` are skipped entirely. Disabled servers and
     /// short-lived cooldown servers are excluded so we don't waste time on
-    /// servers that are known to be failing right now. Within a priority
-    /// group, immediately acquirable servers are preferred over fully
-    /// saturated peers.
+    /// servers that are known to be failing right now — but health does NOT
+    /// unlock backfill: a cooling fill tier means the order is temporarily
+    /// empty and callers wait, rather than spilling ordinary work onto
+    /// backfill accounts. Within a priority group, immediately acquirable
+    /// servers are preferred over fully saturated peers.
     #[allow(clippy::needless_range_loop)]
     async fn build_server_order(&self, exclude: &[usize]) -> Vec<usize> {
         let server_count = self.pool.server_count();
         let server_groups = self.pool.server_groups();
+        let backfill_flags = self.pool.server_backfill_flags();
+        let backfill_unlocked = self.pool.fill_servers_exhausted(exclude);
 
         // Check health to skip disabled servers.
         let mut health = self.pool.health().lock().await;
@@ -1952,11 +1965,21 @@ impl NntpClient {
             waiting_degraded: Vec<usize>,
         }
 
-        let mut groups: std::collections::BTreeMap<u32, GroupCandidates> =
+        let mut fill_groups: std::collections::BTreeMap<u32, GroupCandidates> =
+            std::collections::BTreeMap::new();
+        let mut backfill_groups: std::collections::BTreeMap<u32, GroupCandidates> =
             std::collections::BTreeMap::new();
         for idx in 0..server_count {
             if !exclude.contains(&idx) && health.is_available(idx) {
-                let entry = groups.entry(server_groups[idx]).or_default();
+                if backfill_flags[idx] && !backfill_unlocked {
+                    continue;
+                }
+                let tier = if backfill_flags[idx] {
+                    &mut backfill_groups
+                } else {
+                    &mut fill_groups
+                };
+                let entry = tier.entry(server_groups[idx]).or_default();
                 let ready = self.pool.server_load(idx).0 > 0;
                 match health.server(idx).state() {
                     ServerState::Healthy => {
@@ -1980,7 +2003,10 @@ impl NntpClient {
         drop(health);
 
         let mut result = Vec::with_capacity(server_count);
-        for (_priority, candidates) in groups {
+        for candidates in fill_groups
+            .into_values()
+            .chain(backfill_groups.into_values())
+        {
             if !candidates.ready_healthy.is_empty() {
                 result.extend(self.rank_servers_in_group(&candidates.ready_healthy).await);
             }
@@ -2766,6 +2792,7 @@ mod tests {
             },
             max_connections: 2,
             group: group as u32,
+            ..ServerPoolConfig::default()
         }
     }
 
@@ -2782,6 +2809,7 @@ mod tests {
             },
             max_connections,
             group: 0,
+            ..ServerPoolConfig::default()
         }
     }
 
@@ -2811,6 +2839,34 @@ mod tests {
             soft_timeout: Duration::from_secs(15),
         });
         assert!(!saturated.has_blocking_body_lane_candidate(&[]));
+    }
+
+    #[test]
+    fn blocking_body_lane_candidate_keeps_backfill_locked_until_fill_excluded() {
+        // The fill server is not s2n-capable; the only s2n candidate is a
+        // backfill server, which must stay unreachable for ordinary work.
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![
+                scripted_server(1, 0),
+                ServerPoolConfig {
+                    backfill: true,
+                    ..scripted_blocking_s2n_server(2, 2)
+                },
+            ],
+            max_idle_age: Duration::from_secs(30),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(15),
+        });
+
+        assert!(
+            !client.has_blocking_body_lane_candidate(&[]),
+            "locked backfill must not serve ordinary work"
+        );
+        assert!(
+            client.has_blocking_body_lane_candidate(&[0]),
+            "excluding the fill tier unlocks backfill"
+        );
+        assert!(!client.has_blocking_body_lane_candidate(&[0, 1]));
     }
 
     #[test]
@@ -3056,6 +3112,7 @@ mod tests {
                 },
                 max_connections: 10,
                 group: if i < 2 { 0 } else { 1 }, // first 2 in group 0, rest in group 1
+                ..ServerPoolConfig::default()
             })
             .collect();
 
@@ -3111,6 +3168,100 @@ mod tests {
         assert!(!order.contains(&3));
         assert!(order.contains(&0));
         assert!(order.contains(&2));
+    }
+
+    /// Servers: 0 = fill (group 0), 1 = fill (group 1), 2 = backfill (group 0).
+    fn tiered_client(backfill_flags: &[bool]) -> NntpClient {
+        let servers: Vec<ServerPoolConfig> = backfill_flags
+            .iter()
+            .enumerate()
+            .map(|(i, &backfill)| ServerPoolConfig {
+                server: ServerConfig {
+                    host: format!("server{i}.example.com"),
+                    ..Default::default()
+                },
+                max_connections: 10,
+                group: (i % 2) as u32,
+                backfill,
+                ..ServerPoolConfig::default()
+            })
+            .collect();
+        let pool = NntpPool::new(PoolConfig {
+            servers,
+            ..PoolConfig::default()
+        });
+        NntpClient::from_pool(pool.into())
+    }
+
+    #[tokio::test]
+    async fn backfill_server_absent_from_ordinary_order() {
+        let client = tiered_client(&[false, false, true]);
+
+        let order = client.build_server_order(&[]).await;
+        assert_eq!(order.len(), 2);
+        assert!(order.contains(&0));
+        assert!(order.contains(&1));
+        assert!(
+            !order.contains(&2),
+            "backfill server must not serve ordinary work"
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_unlocks_only_when_all_active_fill_servers_excluded() {
+        let client = tiered_client(&[false, false, true]);
+
+        let order = client.build_server_order(&[0]).await;
+        assert_eq!(
+            order,
+            vec![1],
+            "one fill server left: backfill stays locked"
+        );
+
+        let order = client.build_server_order(&[0, 1]).await;
+        assert_eq!(
+            order,
+            vec![2],
+            "all fill servers excluded: backfill unlocks"
+        );
+    }
+
+    #[tokio::test]
+    async fn cooling_fill_server_keeps_backfill_locked_and_order_empty() {
+        let client = tiered_client(&[false, true]);
+
+        client
+            .pool
+            .health()
+            .lock()
+            .await
+            .record_cooldown(0, CooldownReason::Transport);
+
+        let order = client.build_server_order(&[]).await;
+        assert!(
+            order.is_empty(),
+            "cooling fill tier must wait, not spill onto backfill: {order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_backfill_config_degrades_to_fill_with_warning() {
+        let client = tiered_client(&[true, true]);
+
+        let order = client.build_server_order(&[]).await;
+        assert_eq!(order.len(), 2, "all-backfill config is normalized to fill");
+    }
+
+    #[tokio::test]
+    async fn backfill_server_that_misses_joins_exclusion_ladder() {
+        let client = tiered_client(&[false, true]);
+
+        // Fill server missed the article, backfill unlocked…
+        let order = client.build_server_order(&[0]).await;
+        assert_eq!(order, vec![1]);
+        // …and a backfill miss exhausts the order entirely.
+        let order = client.build_server_order(&[0, 1]).await;
+        assert!(order.is_empty());
     }
 
     #[tokio::test]
@@ -3549,6 +3700,7 @@ mod tests {
                     },
                     max_connections: 0,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
                 ServerPoolConfig {
                     server: ServerConfig {
@@ -3557,6 +3709,7 @@ mod tests {
                     },
                     max_connections: 1,
                     group: 1,
+                    ..ServerPoolConfig::default()
                 },
             ],
             max_idle_age: Duration::from_secs(300),
@@ -3584,6 +3737,7 @@ mod tests {
                     },
                     max_connections: 0,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
                 ServerPoolConfig {
                     server: ServerConfig {
@@ -3592,6 +3746,7 @@ mod tests {
                     },
                     max_connections: 1,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
             ],
             max_idle_age: Duration::from_secs(300),

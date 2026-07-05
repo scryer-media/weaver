@@ -749,6 +749,99 @@ pub fn verify_all_with_options(
     verify_selected_file_ids_with_options(par2, access, &par2.recovery_file_ids, options)
 }
 
+/// Verify selected PAR2 file IDs with one rayon task per file. Each file
+/// runs the serial single-file pipeline unchanged (no cancellation or
+/// progress on this path), so results are identical to
+/// [`verify_selected_file_ids`] with the set-level repairability assessed
+/// once over the combined outcome.
+pub fn verify_selected_file_ids_parallel(
+    par2: &Par2FileSet,
+    access: &(dyn FileAccess + Sync),
+    file_ids: &[FileId],
+) -> VerificationResult {
+    use rayon::prelude::*;
+    let partials: Vec<VerificationResult> = file_ids
+        .par_iter()
+        .map(|file_id| verify_selected_file_ids(par2, access, std::slice::from_ref(file_id)))
+        .collect();
+
+    let mut files = Vec::with_capacity(file_ids.len());
+    let mut total_missing_blocks = 0u32;
+    let mut resource_limit_reason = None;
+    for partial in partials {
+        total_missing_blocks = total_missing_blocks.saturating_add(partial.total_missing_blocks);
+        if let Repairability::ResourceLimited { reason } = &partial.repairable {
+            resource_limit_reason.get_or_insert_with(|| reason.clone());
+        }
+        files.extend(partial.files);
+    }
+
+    let recovery_blocks_available = par2.recovery_block_count();
+    let repairable = repairability_for_result_with_resource_limit(
+        &files,
+        total_missing_blocks,
+        recovery_blocks_available,
+        resource_limit_reason,
+    );
+    VerificationResult {
+        files,
+        recovery_blocks_available,
+        total_missing_blocks,
+        repairable,
+    }
+}
+
+/// Overlay `updated` per-file verifications onto `base` (matched by file
+/// id), recomputing the totals and set-level repairability. Files absent
+/// from `updated` keep their `base` entry — the caller asserts their state
+/// on disk has not changed since `base` was computed.
+pub fn merge_verification_results(
+    par2: &Par2FileSet,
+    base: &VerificationResult,
+    updated: VerificationResult,
+) -> VerificationResult {
+    let mut updated_by_id: HashMap<FileId, FileVerification> = updated
+        .files
+        .into_iter()
+        .map(|file| (file.file_id, file))
+        .collect();
+    let files: Vec<FileVerification> = base
+        .files
+        .iter()
+        .map(|file| {
+            updated_by_id
+                .remove(&file.file_id)
+                .unwrap_or_else(|| file.clone())
+        })
+        .collect();
+
+    let mut total_missing_blocks = 0u32;
+    for file in &files {
+        total_missing_blocks = total_missing_blocks.saturating_add(file.missing_slice_count);
+    }
+    let resource_limit_reason = match &updated.repairable {
+        Repairability::ResourceLimited { reason } => Some(reason.clone()),
+        _ => match &base.repairable {
+            Repairability::ResourceLimited { reason } => Some(reason.clone()),
+            _ => None,
+        },
+    };
+
+    let recovery_blocks_available = par2.recovery_block_count();
+    let repairable = repairability_for_result_with_resource_limit(
+        &files,
+        total_missing_blocks,
+        recovery_blocks_available,
+        resource_limit_reason,
+    );
+    VerificationResult {
+        files,
+        recovery_blocks_available,
+        total_missing_blocks,
+        repairable,
+    }
+}
+
 /// Verify selected PAR2 file IDs with cancellation and progress support.
 pub fn verify_selected_file_ids_with_options(
     par2: &Par2FileSet,
@@ -872,6 +965,7 @@ pub fn verify_selected_file_ids_with_options(
                     current: file_index as u32 + 1,
                     total: total_files,
                     bytes_processed,
+                    total_bytes: None,
                 });
             }
             continue;
@@ -947,6 +1041,7 @@ pub fn verify_selected_file_ids_with_options(
                 current: file_index as u32 + 1,
                 total: total_files,
                 bytes_processed,
+                total_bytes: None,
             });
         }
     }
@@ -1776,6 +1871,58 @@ mod tests {
             damaged_only.files[0].status,
             FileStatus::Damaged(1)
         ));
+    }
+
+    #[test]
+    fn parallel_selected_verify_matches_serial() {
+        let intact = vec![0x11u8; 4096];
+        let damaged = vec![0x22u8; 4096];
+        let truncated = vec![0x33u8; 4096];
+        let (set, mut access, file_ids) = setup_test_set_multi(
+            &[
+                (&intact, "intact.rar"),
+                (&damaged, "damaged.rar"),
+                (&truncated, "truncated.rar"),
+            ],
+            1024,
+        );
+
+        let mut corrupted = damaged.clone();
+        corrupted[1500] ^= 0xFF;
+        corrupted[3000] ^= 0xFF;
+        access.add_file(file_ids[1], corrupted);
+        access.add_file(file_ids[2], truncated[..2500].to_vec());
+
+        let serial = verify_selected_file_ids(&set, &access, &file_ids);
+        let parallel = verify_selected_file_ids_parallel(&set, &access, &file_ids);
+        assert!(serial.total_missing_blocks > 0, "fixture must have damage");
+        assert_eq!(
+            format!("{serial:?}"),
+            format!("{parallel:?}"),
+            "parallel selected verify must match the serial pipeline exactly"
+        );
+
+        // Merging the post-repair way: overlaying a subset onto a base
+        // keeps untouched entries and recomputes the totals.
+        let base = verify_selected_file_ids(&set, &access, &file_ids);
+        let fixed_subset = {
+            let mut fixed = MemoryFileAccess::new();
+            fixed.add_file(file_ids[0], intact.clone());
+            fixed.add_file(file_ids[1], damaged.clone());
+            fixed.add_file(file_ids[2], truncated.clone());
+            verify_selected_file_ids_parallel(&set, &fixed, &file_ids[1..])
+        };
+        let merged = merge_verification_results(&set, &base, fixed_subset);
+        assert_eq!(merged.files.len(), file_ids.len());
+        assert_eq!(merged.total_missing_blocks, 0);
+        assert!(
+            merged
+                .files
+                .iter()
+                .all(|file| matches!(file.status, FileStatus::Complete)),
+            "merged result must show all files complete: {merged:?}"
+        );
+        assert!(matches!(merged.repairable, Repairability::NotNeeded));
     }
 
     #[test]

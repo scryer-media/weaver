@@ -139,6 +139,23 @@ file = "migrations/0030_remove_diagnostic_redownload/postgres.sql"
 engine = "postgres"
 scope = "all"
 
+[[migration]]
+version = 31
+description = "server backfill and retention"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0031_server_backfill_retention/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0031_server_backfill_retention/postgres.sql"
+engine = "postgres"
+scope = "all"
+
 [[baseline]]
 through_version = 21
 file = "migrations/0021_legacy_schema_parity/fresh.sql"

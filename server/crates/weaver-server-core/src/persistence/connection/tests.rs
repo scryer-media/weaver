@@ -1396,6 +1396,8 @@ async fn postgres_runtime_smoke_when_configured() {
             active: true,
             supports_pipelining: true,
             priority: 2,
+            backfill: false,
+            retention_days: 0,
             tls_ca_cert: Some(PathBuf::from("/tmp/ca.pem")),
         }],
         categories: vec![CategoryConfig {

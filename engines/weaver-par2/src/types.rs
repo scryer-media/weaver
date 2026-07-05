@@ -124,6 +124,8 @@ pub struct ProgressUpdate {
     pub total: u32,
     /// Cumulative bytes processed so far.
     pub bytes_processed: u64,
+    /// Total bytes in this operation when known.
+    pub total_bytes: Option<u64>,
 }
 
 /// Stage of a PAR2 operation for progress reporting.

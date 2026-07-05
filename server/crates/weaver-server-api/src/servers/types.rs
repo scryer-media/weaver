@@ -10,6 +10,8 @@ pub struct Server {
     pub active: bool,
     pub supports_pipelining: bool,
     pub priority: u32,
+    pub backfill: bool,
+    pub retention_days: u32,
     pub tls_ca_cert: Option<String>,
 }
 
@@ -24,6 +26,8 @@ impl From<&weaver_server_core::servers::ServerConfig> for Server {
             active: s.active,
             supports_pipelining: s.supports_pipelining,
             priority: s.priority,
+            backfill: s.backfill,
+            retention_days: s.retention_days,
             tls_ca_cert: s.tls_ca_cert.as_ref().map(|p| p.display().to_string()),
         }
     }
@@ -40,6 +44,8 @@ pub struct ServerDetails {
     pub active: bool,
     pub supports_pipelining: bool,
     pub priority: u32,
+    pub backfill: bool,
+    pub retention_days: u32,
     pub tls_ca_cert: Option<String>,
 }
 
@@ -55,6 +61,8 @@ impl From<&weaver_server_core::servers::ServerConfig> for ServerDetails {
             active: s.active,
             supports_pipelining: s.supports_pipelining,
             priority: s.priority,
+            backfill: s.backfill,
+            retention_days: s.retention_days,
             tls_ca_cert: s.tls_ca_cert.as_ref().map(|p| p.display().to_string()),
         }
     }
@@ -72,6 +80,12 @@ pub struct ServerInput {
     pub active: bool,
     #[graphql(default = 0)]
     pub priority: u16,
+    /// Backfill servers only serve articles the fill tier is missing.
+    #[graphql(default = false)]
+    pub backfill: bool,
+    /// Days of retention this server holds (0 = unlimited).
+    #[graphql(default = 0)]
+    pub retention_days: u32,
     pub tls_ca_cert: Option<String>,
 }
 

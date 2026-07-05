@@ -90,6 +90,8 @@ pub async fn rebuild_nntp_from_config(config: &SharedConfig, handle: &SchedulerH
                 },
                 max_connections: server.connections as usize,
                 group: server.priority,
+                backfill: server.backfill,
+                retention_days: server.retention_days,
             })
             .collect();
 

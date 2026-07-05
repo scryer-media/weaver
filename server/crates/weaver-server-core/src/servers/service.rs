@@ -24,8 +24,8 @@ impl Database {
                                     .map_err(StateError::Database)?;
                             tx.execute(
                                 "INSERT INTO servers
-                                    (id, host, port, tls, username, password, connections, active, supports_pipelining, priority, tls_ca_cert)
-                                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                                    (id, host, port, tls, username, password, connections, active, supports_pipelining, priority, backfill, retention_days, tls_ca_cert)
+                                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                                 &crate::servers::persistence::server_args(record, encrypted_password),
                             )
                             .await?;

@@ -173,6 +173,26 @@ function sameMetadata(
       entry.key === resolvedRight[index]?.key && entry.value === resolvedRight[index]?.value);
 }
 
+function samePhaseProgress(
+  left: JobData["phaseProgress"],
+  right: GraphqlJobData["phaseProgress"],
+): boolean {
+  const resolvedRight = right ?? [];
+  return left.length === resolvedRight.length
+    && left.every((phase, index) => {
+      const other = resolvedRight[index];
+      return other !== undefined
+        && phase.phase === other.phase
+        && phase.completedBytes === other.completedBytes
+        && phase.totalBytes === other.totalBytes
+        && phase.progressPercent === other.progressPercent
+        && phase.rateBps === other.rateBps
+        && phase.estimatedRemainingMs === other.estimatedRemainingMs
+        && phase.startedAtEpochMs === other.startedAtEpochMs
+        && phase.updatedAtEpochMs === other.updatedAtEpochMs;
+    });
+}
+
 function sameDeleteOperation(
   left: JobData["deleteOperation"],
   right: GraphqlJobData["deleteOperation"],
@@ -231,6 +251,7 @@ function matchesNormalizedJob(previous: JobData, next: GraphqlJobData): boolean 
     && previous.error === (next.error ?? null)
     && previous.outputDir === (next.outputDir ?? null)
     && sameMetadata(previous.metadata, next.metadata ?? next.attributes)
+    && samePhaseProgress(previous.phaseProgress, next.phaseProgress)
     && sameDeleteOperation(previous.deleteOperation ?? null, next.deleteOperation ?? null);
 }
 

@@ -406,6 +406,22 @@ pub fn altmap_supported() -> bool {
     false
 }
 
+/// Whether the fused two-group 512-bit folded kernel can run. Setting
+/// `WEAVER_GF16_FOLDED_AVX512=0` pins the 256-bit kernel so wide hardware can
+/// A/B the two widths without a rebuild.
+#[cfg(target_arch = "x86_64")]
+fn folded_avx512_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if std::env::var_os("WEAVER_GF16_FOLDED_AVX512").is_some_and(|v| v == "0") {
+            return false;
+        }
+        is_x86_feature_detected!("gfni")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+    })
+}
+
 /// Bytes per split-layout block: one 256-bit register holding 16 GF(2^16)
 /// words as [16 low bytes | 16 high bytes].
 pub const SPLIT_BLOCK_BYTES: usize = 32;
@@ -461,29 +477,25 @@ pub fn split_encode_scatter(src: &[u8], staging: &mut [u8], lane: usize) {
 #[target_feature(enable = "avx2")]
 unsafe fn split_block_avx2(data: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::*;
-    unsafe {
-        // Per 128-bit lane: even (low) bytes to the lower 8 bytes, odd (high)
-        // bytes to the upper 8; then swap the middle 64-bit quarters so the
-        // register reads [16 low bytes | 16 high bytes].
-        let deint_128 = _mm_set_epi8(15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0);
-        let deint = _mm256_broadcastsi128_si256(deint_128);
-        let lanes = _mm256_shuffle_epi8(data, deint);
-        _mm256_permute4x64_epi64::<0b1101_1000>(lanes)
-    }
+    // Per 128-bit lane: even (low) bytes to the lower 8 bytes, odd (high)
+    // bytes to the upper 8; then swap the middle 64-bit quarters so the
+    // register reads [16 low bytes | 16 high bytes].
+    let deint_128 = _mm_set_epi8(15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0);
+    let deint = _mm256_broadcastsi128_si256(deint_128);
+    let lanes = _mm256_shuffle_epi8(data, deint);
+    _mm256_permute4x64_epi64::<0b1101_1000>(lanes)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn unsplit_block_avx2(data: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::*;
-    unsafe {
-        // Inverse of `split_block_avx2`: un-swap the middle quarters, then
-        // re-interleave low/high bytes within each lane.
-        let int_128 = _mm_set_epi8(15, 7, 14, 6, 13, 5, 12, 4, 11, 3, 10, 2, 9, 1, 8, 0);
-        let inter = _mm256_broadcastsi128_si256(int_128);
-        let lanes = _mm256_permute4x64_epi64::<0b1101_1000>(data);
-        _mm256_shuffle_epi8(lanes, inter)
-    }
+    // Inverse of `split_block_avx2`: un-swap the middle quarters, then
+    // re-interleave low/high bytes within each lane.
+    let int_128 = _mm_set_epi8(15, 7, 14, 6, 13, 5, 12, 4, 11, 3, 10, 2, 9, 1, 8, 0);
+    let inter = _mm256_broadcastsi128_si256(int_128);
+    let lanes = _mm256_permute4x64_epi64::<0b1101_1000>(data);
+    _mm256_shuffle_epi8(lanes, inter)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -536,6 +548,27 @@ unsafe fn split_encode_scatter_avx2(src: &[u8], staging: &mut [u8], lane: usize,
     }
 }
 
+/// Hint an upcoming read-modify-write region toward cache. No-op outside
+/// x86_64. `ptr` may be unaligned; the prefetch itself never faults.
+///
+/// # Safety
+/// `ptr..ptr + len` must lie within one allocation (pointer arithmetic
+/// requirement); the memory may be concurrently written by other threads.
+#[inline]
+pub unsafe fn prefetch_write_hint(ptr: *const u8, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_ET1, _mm_prefetch};
+        let mut line = 0usize;
+        while line < len {
+            _mm_prefetch::<{ _MM_HINT_ET1 }>(ptr.add(line) as *const i8);
+            line += 64;
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (ptr, len);
+}
+
 /// Zero affine matrices: multiplying through them contributes nothing, which
 /// lets partially filled groups run the uniform six-wide kernel.
 pub const ZERO_AFFINE: AffineMulMatrices = AffineMulMatrices {
@@ -545,6 +578,59 @@ pub const ZERO_AFFINE: AffineMulMatrices = AffineMulMatrices {
     m_hh: 0,
     factor: 0,
 };
+
+/// Multiply every six-source group of a batch into one split-layout
+/// destination tile with a single call. `stagings[g]` is group `g`'s
+/// interleaved stream sliced to this tile (each `dst.len() * FOLDED_GROUP`
+/// bytes) and `matrices[g]` its six folded coefficient sets. One call per
+/// (tile, output) amortizes call overhead across the whole batch, and a
+/// small destination tile keeps the per-group dst reload in L1.
+///
+/// With 512-bit GFNI available, adjacent groups run fused two at a time: the
+/// doubled register file holds both groups' folded matrices, so each
+/// destination block is read and written once per twelve sources instead of
+/// once per six. An odd trailing group falls back to the 256-bit kernel.
+pub fn mul_acc_folded_batch(
+    dst: &mut [u8],
+    stagings: &[&[u8]],
+    matrices: &[[&AffineMulMatrices; FOLDED_GROUP]],
+) {
+    assert_eq!(stagings.len(), matrices.len(), "one matrix set per group");
+    #[cfg(target_arch = "x86_64")]
+    if folded_avx512_enabled() {
+        let len = dst.len();
+        assert!(
+            len.is_multiple_of(SPLIT_BLOCK_BYTES),
+            "split dst length must be a multiple of {SPLIT_BLOCK_BYTES}"
+        );
+        for staging in stagings {
+            assert!(
+                staging.len() >= len * FOLDED_GROUP,
+                "staging must cover the full group"
+            );
+        }
+        let mut g = 0usize;
+        while g + 1 < stagings.len() {
+            unsafe {
+                mul_acc_folded_pair_gfni_avx512(
+                    dst,
+                    stagings[g],
+                    stagings[g + 1],
+                    &matrices[g],
+                    &matrices[g + 1],
+                )
+            };
+            g += 2;
+        }
+        if g < stagings.len() {
+            mul_acc_folded_group(dst, stagings[g], &matrices[g]);
+        }
+        return;
+    }
+    for (staging, group_matrices) in stagings.iter().zip(matrices.iter()) {
+        mul_acc_folded_group(dst, staging, group_matrices);
+    }
+}
 
 /// Multiply one interleaved six-source group into a split-layout destination.
 ///
@@ -655,6 +741,132 @@ unsafe fn mul_acc_folded_group_gfni_avx2(
             let crossed = _mm256_permute2x128_si256::<0x01>(acc2, acc2);
             acc1 = _mm256_xor_si256(acc1, crossed);
             _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, acc1);
+
+            offset += SPLIT_BLOCK_BYTES;
+            src += stride;
+        }
+    }
+}
+
+/// Multiply two interleaved six-source groups into a split-layout destination
+/// with one pass over `dst`.
+///
+/// One 512-bit load spans two adjacent 32-byte split blocks of a group's
+/// interleaved stream — two sources at the same block index — so each group
+/// needs three data loads per destination block. Matrices fold per 128-bit
+/// lane across the source pair: norm = [ll_x | hh_x | ll_y | hh_y], swap =
+/// [hl_x | lh_x | hl_y | lh_y]. Twelve matrix registers cover both groups,
+/// ternary-logic ops fuse the XOR reduction, and one 512→256 fold per block
+/// (amortized over twelve sources) lands the accumulators on the 32-byte
+/// destination block.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "gfni,avx512bw,avx512vl")]
+unsafe fn mul_acc_folded_pair_gfni_avx512(
+    dst: &mut [u8],
+    staging_a: &[u8],
+    staging_b: &[u8],
+    matrices_a: &[&AffineMulMatrices; FOLDED_GROUP],
+    matrices_b: &[&AffineMulMatrices; FOLDED_GROUP],
+) {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        // Fold two sources' matrices into one register pair: lanes 0-1 serve
+        // source `x`, lanes 2-3 source `y`, matching the [lo_x hi_x lo_y hi_y]
+        // lane order of a 64-byte load from the interleaved stream.
+        macro_rules! fold2 {
+            ($mx:expr, $my:expr) => {
+                (
+                    _mm512_set_epi64(
+                        $my.m_hh as i64,
+                        $my.m_hh as i64,
+                        $my.m_ll as i64,
+                        $my.m_ll as i64,
+                        $mx.m_hh as i64,
+                        $mx.m_hh as i64,
+                        $mx.m_ll as i64,
+                        $mx.m_ll as i64,
+                    ),
+                    _mm512_set_epi64(
+                        $my.m_lh as i64,
+                        $my.m_lh as i64,
+                        $my.m_hl as i64,
+                        $my.m_hl as i64,
+                        $mx.m_lh as i64,
+                        $mx.m_lh as i64,
+                        $mx.m_hl as i64,
+                        $mx.m_hl as i64,
+                    ),
+                )
+            };
+        }
+        let (na0, sa0) = fold2!(matrices_a[0], matrices_a[1]);
+        let (na1, sa1) = fold2!(matrices_a[2], matrices_a[3]);
+        let (na2, sa2) = fold2!(matrices_a[4], matrices_a[5]);
+        let (nb0, sb0) = fold2!(matrices_b[0], matrices_b[1]);
+        let (nb1, sb1) = fold2!(matrices_b[2], matrices_b[3]);
+        let (nb2, sb2) = fold2!(matrices_b[4], matrices_b[5]);
+
+        let len = dst.len();
+        let stride = FOLDED_GROUP * SPLIT_BLOCK_BYTES;
+        let mut offset = 0usize;
+        let mut src = 0usize;
+        while offset < len {
+            _mm_prefetch::<{ _MM_HINT_ET1 }>(dst.as_ptr().add(offset + 128) as *const i8);
+
+            let da0 = _mm512_loadu_si512(staging_a.as_ptr().add(src) as *const __m512i);
+            let da1 = _mm512_loadu_si512(staging_a.as_ptr().add(src + 64) as *const __m512i);
+            let da2 = _mm512_loadu_si512(staging_a.as_ptr().add(src + 128) as *const __m512i);
+            let db0 = _mm512_loadu_si512(staging_b.as_ptr().add(src) as *const __m512i);
+            let db1 = _mm512_loadu_si512(staging_b.as_ptr().add(src + 64) as *const __m512i);
+            let db2 = _mm512_loadu_si512(staging_b.as_ptr().add(src + 128) as *const __m512i);
+
+            // acc = acc ^ p ^ q in one ternary-logic op per affine pair.
+            let mut acc1 = _mm512_xor_si512(
+                _mm512_gf2p8affine_epi64_epi8::<0>(da0, na0),
+                _mm512_gf2p8affine_epi64_epi8::<0>(da1, na1),
+            );
+            acc1 = _mm512_ternarylogic_epi64::<0x96>(
+                acc1,
+                _mm512_gf2p8affine_epi64_epi8::<0>(da2, na2),
+                _mm512_gf2p8affine_epi64_epi8::<0>(db0, nb0),
+            );
+            acc1 = _mm512_ternarylogic_epi64::<0x96>(
+                acc1,
+                _mm512_gf2p8affine_epi64_epi8::<0>(db1, nb1),
+                _mm512_gf2p8affine_epi64_epi8::<0>(db2, nb2),
+            );
+
+            let mut acc2 = _mm512_xor_si512(
+                _mm512_gf2p8affine_epi64_epi8::<0>(da0, sa0),
+                _mm512_gf2p8affine_epi64_epi8::<0>(da1, sa1),
+            );
+            acc2 = _mm512_ternarylogic_epi64::<0x96>(
+                acc2,
+                _mm512_gf2p8affine_epi64_epi8::<0>(da2, sa2),
+                _mm512_gf2p8affine_epi64_epi8::<0>(db0, sb0),
+            );
+            acc2 = _mm512_ternarylogic_epi64::<0x96>(
+                acc2,
+                _mm512_gf2p8affine_epi64_epi8::<0>(db1, sb1),
+                _mm512_gf2p8affine_epi64_epi8::<0>(db2, sb2),
+            );
+
+            // Halves of each accumulator hold the two sources' contributions
+            // to the same destination block: fold 512→256, swap the
+            // cross-plane half, and land everything with one ternary-logic.
+            let red1 = _mm256_xor_si256(
+                _mm512_castsi512_si256(acc1),
+                _mm512_extracti64x4_epi64::<1>(acc1),
+            );
+            let red2 = _mm256_xor_si256(
+                _mm512_castsi512_si256(acc2),
+                _mm512_extracti64x4_epi64::<1>(acc2),
+            );
+            let crossed = _mm256_permute2x128_si256::<0x01>(red2, red2);
+            let prior = _mm256_loadu_si256(dst.as_ptr().add(offset) as *const __m256i);
+            let mixed = _mm256_ternarylogic_epi64::<0x96>(prior, red1, crossed);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(offset) as *mut __m256i, mixed);
 
             offset += SPLIT_BLOCK_BYTES;
             src += stride;
@@ -2839,6 +3051,99 @@ mod tests {
                 altmap_decode(&mut dst);
 
                 assert_eq!(dst, reference, "folded kernel mismatch at len {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn folded_batch_kernel_match() {
+        if !altmap_supported() {
+            return;
+        }
+        // Odd and even group counts cover the fused-pair path, the odd
+        // trailing group, and the single-group case; factors mix zero
+        // (padding lanes), one, and arbitrary values.
+        for groups in [1usize, 2, 3, 5] {
+            for len in [32usize, 4096, 21824] {
+                let factor_sets: Vec<[u16; FOLDED_GROUP]> = (0..groups)
+                    .map(|g| {
+                        let mut set = [0u16; FOLDED_GROUP];
+                        for (l, slot) in set.iter_mut().enumerate() {
+                            *slot = match (g + l) % 5 {
+                                0 => 0x0000,
+                                1 => 0x0001,
+                                _ => (0x2F1Du16)
+                                    .wrapping_mul((g * FOLDED_GROUP + l + 1) as u16)
+                                    .wrapping_add(0x0101),
+                            };
+                        }
+                        set
+                    })
+                    .collect();
+                let inputs: Vec<Vec<Vec<u8>>> = (0..groups)
+                    .map(|g| {
+                        (0..FOLDED_GROUP)
+                            .map(|l| {
+                                (0..len)
+                                    .map(|i| ((i * (g * 7 + l + 3) + 29) % 256) as u8)
+                                    .collect()
+                            })
+                            .collect()
+                    })
+                    .collect();
+
+                let mut reference = vec![0xA5u8; len];
+                for (set, group_inputs) in factor_sets.iter().zip(inputs.iter()) {
+                    for (&factor, input) in set.iter().zip(group_inputs.iter()) {
+                        mul_acc_region(factor, input, &mut reference);
+                    }
+                }
+
+                let stagings: Vec<Vec<u8>> = inputs
+                    .iter()
+                    .map(|group_inputs| {
+                        let mut staging = vec![0u8; len * FOLDED_GROUP];
+                        for (lane, input) in group_inputs.iter().enumerate() {
+                            split_encode_scatter(input, &mut staging, lane);
+                        }
+                        staging
+                    })
+                    .collect();
+                let matrices: Vec<Vec<AffineMulMatrices>> = factor_sets
+                    .iter()
+                    .map(|set| set.iter().map(|&f| precompute_affine_matrices(f)).collect())
+                    .collect();
+                let matrix_sets: Vec<[&AffineMulMatrices; FOLDED_GROUP]> = matrices
+                    .iter()
+                    .map(|group| {
+                        [
+                            &group[0], &group[1], &group[2], &group[3], &group[4], &group[5],
+                        ]
+                    })
+                    .collect();
+                let staging_refs: Vec<&[u8]> = stagings.iter().map(|s| s.as_slice()).collect();
+
+                let mut dst_batch = vec![0xA5u8; len];
+                altmap_encode(&mut dst_batch);
+                mul_acc_folded_batch(&mut dst_batch, &staging_refs, &matrix_sets);
+                altmap_decode(&mut dst_batch);
+                assert_eq!(
+                    dst_batch, reference,
+                    "batch kernel mismatch groups={groups} len={len}"
+                );
+
+                // The per-group kernel must agree with whatever width the
+                // batch dispatch chose.
+                let mut dst_seq = vec![0xA5u8; len];
+                altmap_encode(&mut dst_seq);
+                for (staging, set) in staging_refs.iter().zip(matrix_sets.iter()) {
+                    mul_acc_folded_group(&mut dst_seq, staging, set);
+                }
+                altmap_decode(&mut dst_seq);
+                assert_eq!(
+                    dst_seq, reference,
+                    "sequential kernel mismatch groups={groups} len={len}"
+                );
             }
         }
     }

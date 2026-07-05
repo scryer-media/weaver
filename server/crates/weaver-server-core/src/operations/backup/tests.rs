@@ -40,6 +40,8 @@ fn sample_config() -> Config {
             active: true,
             supports_pipelining: true,
             priority: 0,
+            backfill: false,
+            retention_days: 0,
             tls_ca_cert: None,
         }],
         categories: vec![CategoryConfig {

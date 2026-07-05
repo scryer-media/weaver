@@ -1,5 +1,6 @@
 pub mod async_ops;
 pub mod backup;
+pub mod disk;
 pub mod health;
 pub mod logs;
 pub mod maintenance;
@@ -17,6 +18,7 @@ pub use backup::{
     BackupStatus, CategoryRemapInput, CategoryRemapRequirement, RestoreOptions, RestoreReport,
     StableStateExport,
 };
+pub use disk::{DiskSpace, disk_space};
 pub use health::{
     BrowseDirectoryError, CreateDirectoryError, DirectoryBrowseEntry, DirectoryBrowseListing,
     browse_directories, create_directory,

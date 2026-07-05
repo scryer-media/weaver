@@ -284,6 +284,8 @@ pub struct JobInfo {
     pub downloaded_bytes: u64,
     pub optional_recovery_bytes: u64,
     pub optional_recovery_downloaded_bytes: u64,
+    #[serde(default)]
+    pub phase_progress: Vec<crate::jobs::phase_progress::JobPhaseProgress>,
     /// Bytes from segments that are permanently lost (430 / max retries).
     pub failed_bytes: u64,
     /// Job health 0-1000 (1000 = perfect). Drops as articles fail.

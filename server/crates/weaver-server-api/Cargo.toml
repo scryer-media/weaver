@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 weaver-server-core = { path = "../weaver-server-core", default-features = false }
+weaver-nntp = { path = "../../../engines/weaver-nntp" }
 base64 = { workspace = true }
 age = { workspace = true, default-features = false }
 tokio = { workspace = true }

@@ -240,6 +240,7 @@ fn finished_job_info(job_id: JobId) -> JobInfo {
         downloaded_bytes: 0,
         optional_recovery_bytes: 0,
         optional_recovery_downloaded_bytes: 0,
+        phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
         password: None,
@@ -385,6 +386,106 @@ async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf)
         0,
     )
     .await
+}
+
+#[tokio::test]
+async fn phase_end_removes_only_the_ended_phase_snapshot() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(99);
+
+    let repairing = pipeline.phase_begin(job_id, JobPhase::Repairing, Some(100));
+    repairing.completed_bytes.store(25, Ordering::Relaxed);
+    let extracting = pipeline.phase_begin(job_id, JobPhase::Extracting, Some(200));
+    extracting.completed_bytes.store(50, Ordering::Relaxed);
+    pipeline.phase_extraction_member_totals.insert((
+        job_id,
+        "set.rar".to_string(),
+        "member.mkv".to_string(),
+    ));
+
+    pipeline.sample_phase_progress();
+    assert_eq!(
+        pipeline.phase_progress_snapshots.get(&job_id).map(Vec::len),
+        Some(2)
+    );
+
+    pipeline.phase_end(job_id, JobPhase::Extracting);
+
+    let remaining = pipeline.phase_progress_snapshots.get(&job_id).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].phase, JobPhase::Repairing);
+    assert!(
+        !pipeline
+            .phase_extraction_member_totals
+            .iter()
+            .any(|(phase_job_id, _, _)| *phase_job_id == job_id)
+    );
+}
+
+#[tokio::test]
+async fn phase_end_extracting_if_idle_preserves_sibling_inflight_set() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(100);
+
+    pipeline.phase_begin(job_id, JobPhase::Extracting, Some(200));
+    pipeline
+        .inflight_extractions
+        .entry(job_id)
+        .or_default()
+        .insert("sibling-set".to_string());
+
+    pipeline.phase_end_extracting_if_idle(job_id);
+
+    assert!(
+        pipeline
+            .phase_progress
+            .contains_key(&(job_id, JobPhase::Extracting)),
+        "job-level extracting phase must stay live while any set is inflight"
+    );
+
+    pipeline.inflight_extractions.remove(&job_id);
+    pipeline.phase_end_extracting_if_idle(job_id);
+
+    assert!(
+        !pipeline
+            .phase_progress
+            .contains_key(&(job_id, JobPhase::Extracting)),
+        "extracting phase should end once all set and member work is idle"
+    );
+}
+
+#[tokio::test]
+async fn extraction_member_total_reservation_is_idempotent_across_retries() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(101);
+    let counters = pipeline.phase_begin(job_id, JobPhase::Extracting, None);
+
+    pipeline.phase_reserve_extraction_member_total(
+        job_id,
+        "movie.part01.rar",
+        "movie.mkv",
+        1_000,
+        &counters,
+    );
+    pipeline.phase_reserve_extraction_member_total(
+        job_id,
+        "movie.part01.rar",
+        "movie.mkv",
+        1_000,
+        &counters,
+    );
+    pipeline.phase_reserve_extraction_member_total(
+        job_id,
+        "movie.part01.rar",
+        "sample.srt",
+        25,
+        &counters,
+    );
+
+    assert_eq!(counters.total_bytes.load(Ordering::Relaxed), 1_025);
 }
 
 #[tokio::test]
@@ -618,6 +719,98 @@ fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
         ("show.part03.rar".to_string(), part03),
         ("show.part04.rar".to_string(), part04),
     ]
+}
+
+#[tokio::test]
+async fn hot_lease_work_limit_scales_with_lane_throughput() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40142);
+    let article_bytes: u32 = 768 * 1024;
+
+    // No measured throughput yet: warmup batch, not the full 64 — the first
+    // dispatch wave must not blind-lease several volumes on a slow link.
+    assert_eq!(
+        pipeline.hot_lease_work_limit(job_id, DownloadLaneMode::PipelineDepth4, article_bytes),
+        16
+    );
+
+    // 120MB/s across 10 lanes -> 12MB/s per lane -> 2s runway is ~30 articles.
+    pipeline
+        .active_download_connections_by_job
+        .insert(job_id, 10);
+    pipeline
+        .hot_dispatch_throughput_window
+        .record(Instant::now(), 240_000_000);
+    assert_eq!(
+        pipeline.hot_lease_work_limit(job_id, DownloadLaneMode::PipelineDepth4, article_bytes),
+        30
+    );
+
+    // 7.5MB/s across 10 lanes -> under one article of runway -> clamp to the
+    // lane's pipeline depth so slow links cycle back to the queue head.
+    pipeline.hot_dispatch_throughput_window.clear();
+    pipeline
+        .hot_dispatch_throughput_window
+        .record(Instant::now(), 15_000_000);
+    assert_eq!(
+        pipeline.hot_lease_work_limit(job_id, DownloadLaneMode::PipelineDepth4, article_bytes),
+        4
+    );
+}
+
+#[test]
+fn started_member_names_excludes_orphan_split_continuations() {
+    let payload = b"movie-payload-spanning-three-volumes";
+    let crc = checksum::crc32(payload);
+    let first = &payload[..12];
+    let last = &payload[24..];
+
+    let mut vol0 = Vec::new();
+    vol0.extend_from_slice(&TEST_RAR5_SIG);
+    vol0.extend_from_slice(&build_test_rar_main_header(0x0001, None));
+    vol0.extend_from_slice(&build_test_rar_file_header(
+        "MOVIE.m2ts",
+        0x0010,
+        first.len() as u64,
+        payload.len() as u64,
+        None,
+    ));
+    vol0.extend_from_slice(first);
+    vol0.extend_from_slice(&build_test_rar_end_header(true));
+
+    let mut vol2 = Vec::new();
+    vol2.extend_from_slice(&TEST_RAR5_SIG);
+    vol2.extend_from_slice(&build_test_rar_main_header(0x0001 | 0x0002, Some(2)));
+    vol2.extend_from_slice(&build_test_rar_file_header(
+        "MOVIE.m2ts",
+        0x0008,
+        last.len() as u64,
+        payload.len() as u64,
+        Some(crc),
+    ));
+    vol2.extend_from_slice(last);
+    vol2.extend_from_slice(&build_test_rar_end_header(false));
+
+    // Volume 1 is missing: the member's continuation in volume 2 cannot be
+    // linked to its base entry, so it surfaces as a second entry with the
+    // same path. Path-collision checks must not treat that as a collision.
+    let mut archive = weaver_unrar::RarArchive::open(std::io::Cursor::new(vol0)).unwrap();
+    archive
+        .add_volume(2, Box::new(std::io::Cursor::new(vol2)))
+        .unwrap();
+
+    let names = archive.member_names();
+    assert_eq!(
+        names.iter().filter(|name| **name == "MOVIE.m2ts").count(),
+        2,
+        "gapped volume set should surface the base entry and the orphan continuation"
+    );
+    assert_eq!(
+        archive.started_member_names(),
+        vec!["MOVIE.m2ts"],
+        "collision checks must see only the started entry"
+    );
 }
 
 #[tokio::test]
@@ -1439,6 +1632,7 @@ fn rar_job_spec(name: &str, files: &[(String, Vec<u8>)]) -> JobSpec {
                 filename: filename.clone(),
                 role: FileRole::from_filename(filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: bytes.len() as u32,
@@ -1463,6 +1657,7 @@ fn standalone_job_spec(name: &str, files: &[(String, u32)]) -> JobSpec {
                 filename: filename.clone(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: *bytes,
@@ -1480,6 +1675,7 @@ fn many_standalone_files(prefix: &str, count: usize) -> Vec<(String, u32)> {
 }
 
 const TEST_HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
+const TEST_HOT_LEASE_WARMUP_WORK_LIMIT: usize = 16;
 
 fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes: u32) -> JobSpec {
     JobSpec {
@@ -1493,6 +1689,7 @@ fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes:
                 filename: "payload.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: payload_bytes,
@@ -1506,6 +1703,7 @@ fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes:
                     recovery_block_count: 0,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 16,
@@ -1519,6 +1717,7 @@ fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes:
                     recovery_block_count: 1,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: recovery_bytes,
@@ -1806,6 +2005,7 @@ fn par2_only_job_spec(name: &str, filename: &str, bytes: u32) -> JobSpec {
             filename: filename.to_string(),
             role: FileRole::from_filename(filename),
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: vec![segment_spec! {
                 number: 0,
                 bytes: bytes,
@@ -1834,6 +2034,7 @@ fn segmented_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) -> JobS
             filename: filename.to_string(),
             role: FileRole::Standalone,
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: segment_sizes
                 .iter()
                 .enumerate()
@@ -2192,6 +2393,7 @@ fn two_segment_standalone_job_spec(
             filename: filename.to_string(),
             role: FileRole::Standalone,
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: vec![
                 segment_spec! {
                     number: 0,
@@ -2485,6 +2687,61 @@ async fn rar_refresh_follow_up_does_not_starve_covered_ready_members() {
 }
 
 #[tokio::test]
+async fn rar_refresh_parks_until_volume_zero_available() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40141);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR Refresh Park", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // A mid-set volume completes first: no cached headers and no volume 0 on
+    // disk, so a refresh compute is guaranteed to fail. The spawn must park
+    // quietly instead of failing once per completed volume.
+    write_and_complete_rar_volume_without_drain(&mut pipeline, job_id, 2, &files[2].0, &files[2].1)
+        .await;
+
+    let key = (job_id, "show".to_string());
+    let refresh = pipeline
+        .rar_refresh_state
+        .get(&key)
+        .expect("refresh state should exist after volume completion");
+    assert!(
+        refresh.in_flight.is_none(),
+        "refresh without volume 0 or cached headers must park"
+    );
+    assert!(
+        refresh.last_error.is_none(),
+        "parked refresh is an expected state, not an error"
+    );
+    assert!(
+        pipeline.rar_refresh_done_rx.try_recv().is_err(),
+        "no refresh compute should have been spawned"
+    );
+    let set_state = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("RAR set state should exist");
+    assert!(
+        set_state.plan.is_none(),
+        "no plan can exist before volume 0"
+    );
+    assert!(set_state.facts.contains_key(&2));
+
+    // Volume 0 arriving re-enqueues a refresh through facts registration and
+    // the first plan comes up through the normal drain path.
+    write_and_complete_rar_volume(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+    let set_state = pipeline
+        .rar_sets
+        .get(&key)
+        .expect("RAR set state should exist");
+    assert!(
+        set_state.plan.is_some(),
+        "volume 0 arrival should unlock the first plan"
+    );
+}
+
+#[tokio::test]
 async fn rar_refresh_done_uses_actual_refreshed_frontier() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -2711,6 +2968,7 @@ async fn active_sibling_extraction_does_not_launch_post_refresh_or_reselect_fini
                 extracted: vec!["E01.mkv".to_string()],
                 failed: Vec::new(),
                 selected_password: None,
+                phase_completed_bytes: 0,
             }),
         })
         .await;
@@ -2844,6 +3102,8 @@ async fn stale_rar_batch_success_for_non_current_member_is_ignored_before_normal
     let stale_staging = pipeline.deterministic_extraction_staging_dir(job_id);
     let _ = tokio::fs::remove_dir_all(&stale_staging).await;
     pipeline.pending_completion_checks.clear();
+    let phase_counters = pipeline.phase_begin(job_id, JobPhase::Extracting, None);
+    phase_counters.completed_bytes.store(400, Ordering::Relaxed);
 
     pipeline
         .handle_extraction_done(ExtractionDone::Batch {
@@ -2854,6 +3114,7 @@ async fn stale_rar_batch_success_for_non_current_member_is_ignored_before_normal
                 extracted: vec!["E01.mkv".to_string()],
                 failed: Vec::new(),
                 selected_password: None,
+                phase_completed_bytes: 123,
             }),
         })
         .await;
@@ -2869,6 +3130,7 @@ async fn stale_rar_batch_success_for_non_current_member_is_ignored_before_normal
             .is_some_and(|members| members.contains("E01.mkv")),
         "stale success must not mark extracted members"
     );
+    assert_eq!(phase_counters.completed_bytes.load(Ordering::Relaxed), 277);
     assert!(pipeline.pending_completion_checks.is_empty());
     assert!(!matches!(
         job_status_for_assert(&pipeline, job_id),
@@ -2928,6 +3190,7 @@ async fn idle_rar_worker_drain_recomputes_and_clears_obsolete_post_refresh() {
                 extracted: vec!["E01.mkv".to_string()],
                 failed: Vec::new(),
                 selected_password: None,
+                phase_completed_bytes: 0,
             }),
         })
         .await;
@@ -3007,6 +3270,7 @@ async fn idle_rar_worker_drain_keeps_extracting_when_coverage_refresh_launches()
                 extracted: vec!["E01.mkv".to_string()],
                 failed: Vec::new(),
                 selected_password: None,
+                phase_completed_bytes: 0,
             }),
         })
         .await;
@@ -4624,6 +4888,7 @@ async fn in_order_segments_keep_write_cursor_until_file_completes() {
             filename: filename.to_string(),
             role: FileRole::Standalone,
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: (0..segment_count)
                 .map(|number| {
                     segment_spec! {
@@ -4707,6 +4972,7 @@ async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
             filename: filename.to_string(),
             role: FileRole::Standalone,
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: vec![
                 segment_spec! {
                     ordinal: 0,
@@ -5057,6 +5323,202 @@ async fn excluded_source_not_found_retries_without_marking_health_failure() {
         .expect("excluded-source miss should requeue the segment");
     assert_eq!(work.exclude_servers, vec![0]);
     assert_eq!(work.retry_count, 1);
+}
+
+/// Fill servers with the given retention windows (days, 0 = unlimited). No
+/// connections are opened — only the config matters.
+fn retention_client(retention_days: &[u32]) -> weaver_nntp::client::NntpClient {
+    let servers = retention_days
+        .iter()
+        .enumerate()
+        .map(|(idx, days)| weaver_nntp::pool::ServerPoolConfig {
+            server: weaver_nntp::ServerConfig {
+                host: format!("retention-{idx}.example.com"),
+                ..Default::default()
+            },
+            max_connections: 2,
+            retention_days: *days,
+            ..weaver_nntp::pool::ServerPoolConfig::default()
+        })
+        .collect();
+    weaver_nntp::client::NntpClient::new(weaver_nntp::client::NntpClientConfig {
+        servers,
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(1),
+    })
+}
+
+/// Two fill servers: index 0 holds 5 days of retention, index 1 is unlimited.
+fn two_server_retention_client() -> weaver_nntp::client::NntpClient {
+    retention_client(&[5, 0])
+}
+
+fn age_job_days(pipeline: &mut Pipeline, job_id: JobId, days: u64) {
+    let posted = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - days * 86_400;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    for file in &mut state.spec.files {
+        file.posted_at_epoch = Some(posted);
+    }
+}
+
+#[tokio::test]
+async fn retention_excludes_derive_from_job_age_and_server_windows() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40150);
+    let spec = segmented_job_spec("Retention Derivation", "old.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.nntp = std::sync::Arc::new(two_server_retention_client());
+
+    // Unknown post date: never retention-skipped.
+    assert!(pipeline.job_retention_excludes(job_id).is_empty());
+
+    // Older than server 0's five-day window: server 0 is excluded, and the
+    // effective set merges with per-article failure excludes without dupes.
+    age_job_days(&mut pipeline, job_id, 10);
+    pipeline.clear_job_retention_excludes(job_id);
+    assert_eq!(pipeline.job_retention_excludes(job_id).as_slice(), &[0]);
+    assert_eq!(pipeline.effective_exclude_servers(job_id, &[1]), vec![1, 0]);
+    assert_eq!(pipeline.effective_exclude_servers(job_id, &[0]), vec![0]);
+
+    // Younger than every window: nothing excluded.
+    age_job_days(&mut pipeline, job_id, 1);
+    pipeline.clear_job_retention_excludes(job_id);
+    assert!(pipeline.job_retention_excludes(job_id).is_empty());
+}
+
+#[tokio::test]
+async fn article_not_found_exhaustion_counts_retention_excluded_servers() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40151);
+    let spec = segmented_job_spec("Retention Exhaustion", "aged.bin", &[128, 128, 128, 128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.nntp = std::sync::Arc::new(two_server_retention_client());
+    age_job_days(&mut pipeline, job_id, 10);
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    // A miss on the deep server (index 1) plus the retention-excluded
+    // short server (index 0) exhausts both servers: the article books
+    // failed bytes instead of retrying forever.
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                segment_number: 0,
+            },
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::ArticleNotFound,
+                "article not found",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(1),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: Vec::new(),
+            release_connection_slot: true,
+        })
+        .await;
+
+    // Exhaustion (not a retry) is the proof: the non-exhausted path
+    // schedules a retry and never bumps articles_not_found. With no PAR2 in
+    // the spec the booked failure also fails the job outright.
+    assert_eq!(
+        pipeline
+            .metrics
+            .articles_not_found
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "retention-excluded server must count toward exhaustion"
+    );
+    assert_eq!(pipeline.pending_retries_by_job.get(&job_id).copied(), None);
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| state.failed_bytes == 128),
+        "failed bytes must be booked (job may already be archived by health)"
+    );
+}
+
+#[tokio::test]
+async fn fully_retention_excluded_job_books_missing_instead_of_requeueing() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40152);
+    let spec = segmented_job_spec("Beyond All Retention", "ancient.bin", &[128, 128, 128, 128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[5, 5]));
+    age_job_days(&mut pipeline, job_id, 10);
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    // Every server is retention-excluded, so the lane path never fetches —
+    // the failure surfaces as LaneUnavailable. It must be booked as a
+    // missing article, not requeued without budget forever.
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                segment_number: 0,
+            },
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::LaneUnavailable,
+                "failed to acquire BODY lane",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: Vec::new(),
+            release_connection_slot: true,
+        })
+        .await;
+
+    assert_eq!(
+        pipeline
+            .metrics
+            .articles_not_found
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "an unserveable article must be booked missing"
+    );
+    assert_eq!(pipeline.pending_retries_by_job.get(&job_id).copied(), None);
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| state.failed_bytes == 128),
+        "failed bytes must be booked (job may already be archived by health)"
+    );
 }
 
 #[tokio::test]
@@ -5687,6 +6149,7 @@ async fn dispatch_downloads_waits_for_downstream_work_when_restart_durable_lead_
             filename: "large.bin".to_string(),
             role: FileRole::Standalone,
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments,
         }],
     };
@@ -5817,6 +6280,7 @@ async fn hot_download_batch_lease_stays_large_for_fresh_job_when_restart_lead_wo
             filename: "large-lease.bin".to_string(),
             role: FileRole::Standalone,
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments,
         }],
     };
@@ -5872,6 +6336,7 @@ async fn hot_download_batch_lease_caps_restored_job_for_restart_durable_lead() {
             filename: "restored-large-lease.bin".to_string(),
             role: FileRole::Standalone,
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments,
         }],
     };
@@ -5929,6 +6394,7 @@ async fn dispatch_downloads_escapes_restart_durable_lead_when_pipeline_is_idle()
             filename: "large-idle.bin".to_string(),
             role: FileRole::Standalone,
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments,
         }],
     };
@@ -6002,6 +6468,7 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
                 volume_number: file_index,
             },
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: vec![segment_spec! {
                 number: 0,
                 bytes: file_bytes,
@@ -6736,6 +7203,7 @@ async fn dispatch_downloads_bounded_same_band_skips_blocked_peer_and_tries_next(
                 filename: "blocked.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: blocked_segments,
             }],
         },
@@ -6821,9 +7289,11 @@ async fn dispatch_downloads_single_job_keeps_hot_runway() {
         pipeline.active_download_connections_by_job.get(&job_id),
         Some(&8)
     );
+    // First dispatch wave has no measured throughput yet, so lanes lease the
+    // warmup batch rather than the full hot runway.
     assert_eq!(
         pipeline.active_downloads_by_job.get(&job_id),
-        Some(&(8 * TEST_HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT))
+        Some(&(8 * TEST_HOT_LEASE_WARMUP_WORK_LIMIT))
     );
     assert_eq!(
         pipeline
@@ -7255,14 +7725,17 @@ async fn hot_clear_pressure_lane_leases_sequential_runway() {
 
     assert_eq!(pipeline.hot_dispatch_job, Some(job_id));
     assert_eq!(pipeline.active_download_connections, 1);
-    assert_eq!(pipeline.active_downloads, 64);
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 36);
+    // First dispatch has no measured throughput yet, so the hot lane leases
+    // the warmup batch; the full 64-article runway resumes once the
+    // throughput window is warm (see hot_lease_work_limit_scales_with_lane_throughput).
+    assert_eq!(pipeline.active_downloads, 16);
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 84);
     assert_eq!(
         pipeline
             .metrics
             .download_lane_lease_items_total
             .load(Ordering::Relaxed),
-        64
+        16
     );
 }
 
@@ -8596,6 +9069,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
 
     pipeline.dispatch_downloads();
 
+    // 65 queued articles minus the 16-article warmup first-wave lease.
     assert_eq!(
         pipeline
             .jobs
@@ -8603,7 +9077,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .unwrap()
             .download_queue
             .len(),
-        1
+        49
     );
     assert_eq!(
         pipeline
@@ -8629,6 +9103,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
 
     pipeline.dispatch_downloads();
 
+    // The promoted job takes the lane; the leading job's queue is untouched.
     assert_eq!(
         pipeline
             .jobs
@@ -8636,7 +9111,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .unwrap()
             .download_queue
             .len(),
-        1
+        49
     );
     assert_eq!(
         pipeline
@@ -10059,6 +10534,7 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
                 filename: "episode.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 64,
@@ -10072,6 +10548,7 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
                     recovery_block_count: 0,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 16,
@@ -10085,6 +10562,7 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
                     recovery_block_count: 1,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 32,
@@ -10163,6 +10641,7 @@ async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() 
                 filename: payload_filename.to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![
                     segment_spec! {
                         number: 0,
@@ -10183,6 +10662,7 @@ async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() 
                     recovery_block_count: 0,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 16,
@@ -10196,6 +10676,7 @@ async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() 
                     recovery_block_count: 2,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 32,
@@ -10411,6 +10892,7 @@ async fn eager_delete_waits_for_par2_verification_before_removing_rar_sources() 
             recovery_block_count: 0,
         },
         groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
         segments: vec![segment_spec! {
             number: 0,
             bytes: par2_bytes.len() as u32,
@@ -10926,6 +11408,7 @@ async fn par2_metadata_immediately_rebinds_obfuscated_rar_file_identity() {
                 filename: obfuscated_filename.to_string(),
                 role: FileRole::from_filename(obfuscated_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: rar_bytes.len() as u32,
@@ -10936,6 +11419,7 @@ async fn par2_metadata_immediately_rebinds_obfuscated_rar_file_identity() {
                 filename: par2_filename.to_string(),
                 role: FileRole::from_filename(par2_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
@@ -11020,6 +11504,7 @@ async fn par2_metadata_sanitizes_unsafe_canonical_target_before_rename() {
             filename: obfuscated_filename.to_string(),
             role: FileRole::from_filename(obfuscated_filename),
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: vec![segment_spec! {
                 number: 0,
                 bytes: rar_bytes.len() as u32,
@@ -11091,6 +11576,7 @@ async fn par2_metadata_records_canonical_name_without_phantom_current_path() {
             filename: source_filename.to_string(),
             role: FileRole::from_filename(source_filename),
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: vec![segment_spec! {
                 number: 0,
                 bytes: rar_bytes.len() as u32,
@@ -11391,6 +11877,7 @@ async fn yenc_source_name_is_treated_as_expected_after_par2_rebind() {
             filename: source_filename.to_string(),
             role: FileRole::from_filename(source_filename),
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: vec![segment_spec! {
                 number: 0,
                 bytes: rar_bytes.len() as u32,
@@ -12557,6 +13044,7 @@ async fn restore_job_reparses_par2_without_promoted_recovery_state() {
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
@@ -12567,6 +13055,7 @@ async fn restore_job_reparses_par2_without_promoted_recovery_state() {
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 64,
@@ -14746,6 +15235,7 @@ async fn no_par2_full_set_failure_requeues_archive_source() {
             filename: "archive.zip".to_string(),
             role: FileRole::from_filename("archive.zip"),
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: vec![segment_spec! {
                 number: 0,
                 bytes: 128,
@@ -14821,6 +15311,7 @@ async fn no_par2_single_file_retry_marks_zip_volume_complete_after_redownload() 
             filename: "archive.zip".to_string(),
             role: FileRole::from_filename("archive.zip"),
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: vec![segment_spec! {
                 number: 0,
                 bytes: 128,
@@ -14910,6 +15401,7 @@ async fn no_par2_single_file_retry_marks_7z_volume_complete_after_redownload() {
             filename: "archive.7z".to_string(),
             role: FileRole::from_filename("archive.7z"),
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: vec![segment_spec! {
                 number: 0,
                 bytes: 128,
@@ -15000,6 +15492,7 @@ async fn par2_verified_complete_archive_refreshes_missing_existing_topology_only
             filename: filename.to_string(),
             role: FileRole::from_filename(filename),
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: vec![segment_spec! {
                 number: 0,
                 bytes: 128,
@@ -15083,6 +15576,7 @@ async fn incomplete_download_promotes_parked_par2_metadata_before_failing() {
                 filename: payload_filename.to_string(),
                 role: FileRole::from_filename(payload_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 100,
@@ -15093,6 +15587,7 @@ async fn incomplete_download_promotes_parked_par2_metadata_before_failing() {
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 64,
@@ -15162,6 +15657,7 @@ async fn direct_payload_par2_repair_completes_after_download_exhaustion() {
                 filename: payload_filename.to_string(),
                 role: FileRole::from_filename(payload_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![
                     segment_spec! {
                         number: 0,
@@ -15179,6 +15675,7 @@ async fn direct_payload_par2_repair_completes_after_download_exhaustion() {
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
@@ -15189,6 +15686,7 @@ async fn direct_payload_par2_repair_completes_after_download_exhaustion() {
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: recovery_bytes.len() as u32,
@@ -15270,6 +15768,7 @@ async fn direct_payload_par2_copy_only_repair_does_not_require_recovery_blocks()
                 filename: payload_filename.to_string(),
                 role: FileRole::from_filename(payload_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![
                     segment_spec! {
                         number: 0,
@@ -15287,6 +15786,7 @@ async fn direct_payload_par2_copy_only_repair_does_not_require_recovery_blocks()
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
@@ -15374,6 +15874,7 @@ async fn direct_payload_par2_repair_verifies_complete_corrupt_payload() {
                 filename: payload_filename.to_string(),
                 role: FileRole::from_filename(payload_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![
                     segment_spec! {
                         number: 0,
@@ -15391,6 +15892,7 @@ async fn direct_payload_par2_repair_verifies_complete_corrupt_payload() {
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
@@ -15401,6 +15903,7 @@ async fn direct_payload_par2_repair_verifies_complete_corrupt_payload() {
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: recovery_bytes.len() as u32,
@@ -15498,6 +16001,7 @@ async fn restored_repairing_payload_uses_single_repairer_analyze_and_execute_pas
                 filename: payload_filename.to_string(),
                 role: FileRole::from_filename(payload_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![
                     segment_spec! {
                         number: 0,
@@ -15515,6 +16019,7 @@ async fn restored_repairing_payload_uses_single_repairer_analyze_and_execute_pas
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
@@ -15525,6 +16030,7 @@ async fn restored_repairing_payload_uses_single_repairer_analyze_and_execute_pas
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: recovery_bytes.len() as u32,
@@ -15735,6 +16241,7 @@ async fn complete_direct_payload_with_loaded_par2_does_not_finalize_with_parked_
                 filename: payload_filename.to_string(),
                 role: FileRole::from_filename(payload_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![
                     segment_spec! {
                         number: 0,
@@ -15752,6 +16259,7 @@ async fn complete_direct_payload_with_loaded_par2_does_not_finalize_with_parked_
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
@@ -15762,6 +16270,7 @@ async fn complete_direct_payload_with_loaded_par2_does_not_finalize_with_parked_
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 64,
@@ -15862,6 +16371,7 @@ async fn archive_payload_does_not_extract_while_promoted_recovery_is_pending() {
                 filename: archive_filename.to_string(),
                 role: FileRole::from_filename(archive_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 128,
@@ -15872,6 +16382,7 @@ async fn archive_payload_does_not_extract_while_promoted_recovery_is_pending() {
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 64,
@@ -15963,6 +16474,7 @@ async fn cancel_job_clears_promoted_recovery_runtime_state() {
                 filename: "payload.bin".to_string(),
                 role: FileRole::from_filename("payload.bin"),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 128,
@@ -15973,6 +16485,7 @@ async fn cancel_job_clears_promoted_recovery_runtime_state() {
                 filename: "payload.vol00+01.par2".to_string(),
                 role: FileRole::from_filename("payload.vol00+01.par2"),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 64,
@@ -16103,6 +16616,7 @@ async fn promoted_recovery_wait_does_not_reverify_until_recovery_finishes() {
                 filename: payload_filename.to_string(),
                 role: FileRole::from_filename(payload_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![
                     segment_spec! {
                         number: 0,
@@ -16120,6 +16634,7 @@ async fn promoted_recovery_wait_does_not_reverify_until_recovery_finishes() {
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
@@ -16130,6 +16645,7 @@ async fn promoted_recovery_wait_does_not_reverify_until_recovery_finishes() {
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 64,
@@ -16244,6 +16760,7 @@ async fn promoted_recovery_retry_reenters_dispatchable_queue() {
                 filename: "payload.bin".to_string(),
                 role: FileRole::from_filename("payload.bin"),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 128,
@@ -16254,6 +16771,7 @@ async fn promoted_recovery_retry_reenters_dispatchable_queue() {
                 filename: "payload.vol00+01.par2".to_string(),
                 role: FileRole::from_filename("payload.vol00+01.par2"),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 64,
@@ -16343,6 +16861,7 @@ async fn unavailable_promoted_recovery_promotes_next_candidate_before_failing() 
                 filename: payload_filename.to_string(),
                 role: FileRole::from_filename(payload_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![
                     segment_spec! {
                         number: 0,
@@ -16360,6 +16879,7 @@ async fn unavailable_promoted_recovery_promotes_next_candidate_before_failing() 
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
@@ -16370,6 +16890,7 @@ async fn unavailable_promoted_recovery_promotes_next_candidate_before_failing() 
                 filename: first_recovery_filename.to_string(),
                 role: FileRole::from_filename(first_recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 32,
@@ -16380,6 +16901,7 @@ async fn unavailable_promoted_recovery_promotes_next_candidate_before_failing() 
                 filename: second_recovery_filename.to_string(),
                 role: FileRole::from_filename(second_recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 64,
@@ -16532,6 +17054,7 @@ async fn direct_payload_par2_repair_fails_when_recovery_is_insufficient() {
                 filename: payload_filename.to_string(),
                 role: FileRole::from_filename(payload_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![
                     segment_spec! {
                         number: 0,
@@ -16549,6 +17072,7 @@ async fn direct_payload_par2_repair_fails_when_recovery_is_insufficient() {
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: par2_bytes.len() as u32,
@@ -16559,6 +17083,7 @@ async fn direct_payload_par2_repair_fails_when_recovery_is_insufficient() {
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: recovery_bytes.len() as u32,
@@ -16645,6 +17170,7 @@ async fn generic_par2_repair_requeues_extraction_for_7z_and_gzip_payloads() {
                     filename: payload_filename.to_string(),
                     role: FileRole::from_filename(payload_filename),
                     groups: vec!["alt.binaries.test".to_string()],
+                    posted_at_epoch: None,
                     segments: vec![segment_spec! {
                         number: 0,
                         bytes: original_payload.len() as u32,
@@ -16655,6 +17181,7 @@ async fn generic_par2_repair_requeues_extraction_for_7z_and_gzip_payloads() {
                     filename: index_filename.to_string(),
                     role: FileRole::from_filename(index_filename),
                     groups: vec!["alt.binaries.test".to_string()],
+                    posted_at_epoch: None,
                     segments: vec![segment_spec! {
                         number: 0,
                         bytes: par2_bytes.len() as u32,
@@ -16665,6 +17192,7 @@ async fn generic_par2_repair_requeues_extraction_for_7z_and_gzip_payloads() {
                     filename: recovery_filename.to_string(),
                     role: FileRole::from_filename(recovery_filename),
                     groups: vec!["alt.binaries.test".to_string()],
+                    posted_at_epoch: None,
                     segments: vec![segment_spec! {
                         number: 0,
                         bytes: recovery_bytes.len() as u32,
@@ -16735,6 +17263,7 @@ async fn extracted_archive_job_finalizes_without_reverifying_missing_par2_index(
         filename: "repair.par2".to_string(),
         role: FileRole::from_filename("repair.par2"),
         groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
         segments: vec![segment_spec! {
             number: 0,
             bytes: 64,
@@ -16745,6 +17274,7 @@ async fn extracted_archive_job_finalizes_without_reverifying_missing_par2_index(
         filename: "repair.vol00+01.par2".to_string(),
         role: FileRole::from_filename("repair.vol00+01.par2"),
         groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
         segments: vec![segment_spec! {
             number: 0,
             bytes: 64,
@@ -17036,6 +17566,7 @@ async fn split_files_register_topology_when_completed() {
                 filename: filename.clone(),
                 role: FileRole::from_filename(filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: bytes.len() as u32,
@@ -18879,6 +19410,7 @@ async fn probe_projection_uses_only_payload_bytes() {
                 filename: "payload-a.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 128,
@@ -18889,6 +19421,7 @@ async fn probe_projection_uses_only_payload_bytes() {
                 filename: "payload-b.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 128,
@@ -18902,6 +19435,7 @@ async fn probe_projection_uses_only_payload_bytes() {
                     recovery_block_count: 0,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 16,
@@ -18915,6 +19449,7 @@ async fn probe_projection_uses_only_payload_bytes() {
                     recovery_block_count: 1,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 320,
@@ -19367,6 +19902,7 @@ async fn incomplete_download_with_active_extraction_defers_instead_of_failing() 
                 filename: payload_filename.to_string(),
                 role: FileRole::from_filename(payload_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![
                     segment_spec! {
                         number: 0,
@@ -19384,6 +19920,7 @@ async fn incomplete_download_with_active_extraction_defers_instead_of_failing() 
                 filename: index_filename.to_string(),
                 role: FileRole::from_filename(index_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 32,
@@ -19394,6 +19931,7 @@ async fn incomplete_download_with_active_extraction_defers_instead_of_failing() 
                 filename: recovery_filename.to_string(),
                 role: FileRole::from_filename(recovery_filename),
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 32,
@@ -19680,6 +20218,7 @@ async fn rar_unlock_uses_par2_authoritative_identity_for_obfuscated_volume() {
             filename: "obfuscated.bin".to_string(),
             role: FileRole::Unknown,
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: vec![segment_spec! {
                 number: 0,
                 bytes: 8,
@@ -19743,6 +20282,91 @@ async fn rar_unlock_uses_par2_authoritative_identity_for_obfuscated_volume() {
 }
 
 #[tokio::test]
+async fn rar_unlock_bootstraps_volume_prefix_before_plan_exists() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40140);
+    let spec = JobSpec {
+        name: "RAR Unlock Bootstrap".to_string(),
+        password: None,
+        total_bytes: 32,
+        category: None,
+        metadata: Vec::new(),
+        files: (0..4)
+            .map(|index| FileSpec {
+                filename: format!("obfuscated-{index}.bin"),
+                role: FileRole::Unknown,
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 8,
+                    message_id: format!("rar-unlock-bootstrap-{index}@example.com"),
+                }],
+            })
+            .collect(),
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        for index in 0..4 {
+            state.download_queue.push(rar_unlock_work(
+                job_id,
+                index,
+                FileRole::Unknown.download_priority(),
+            ));
+        }
+    }
+    // PAR2 metadata classified every file, but no volume has completed yet:
+    // no rar_sets plan exists, so only the bootstrap prefix selection can
+    // pull volume 0 forward.
+    for index in 0..4u32 {
+        pipeline
+            .set_file_identity(
+                job_id,
+                crate::jobs::record::ActiveFileIdentity {
+                    file_index: index,
+                    source_filename: format!("obfuscated-{index}.bin"),
+                    current_filename: format!("vol.part{:02}.rar", index + 1),
+                    canonical_filename: Some(format!("vol.part{:02}.rar", index + 1)),
+                    classification: Some(crate::jobs::assembly::DetectedArchiveIdentity {
+                        kind: crate::jobs::assembly::DetectedArchiveKind::Rar,
+                        set_name: "vol".to_string(),
+                        volume_index: Some(index),
+                    }),
+                    classification_source: FileIdentitySource::Par2,
+                },
+            )
+            .unwrap();
+    }
+
+    pipeline.mark_rar_unlock_priorities_dirty(job_id);
+    pipeline.apply_rar_unlock_priorities_if_dirty(job_id);
+
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    let order = (0..4)
+        .map(|_| state.download_queue.pop().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        order
+            .iter()
+            .map(|work| work.segment_id.file_id.file_index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3],
+        "volume 0 must lead the bootstrap prefix"
+    );
+    assert_eq!(
+        order[0].priority, 1,
+        "volume 0 queue entries are corrected to the protected base priority"
+    );
+    assert!(
+        order[1..].iter().all(|work| work.priority == 3),
+        "later prefix volumes ride the unlock tier"
+    );
+}
+
+#[tokio::test]
 async fn rar_unlock_does_not_boost_untrusted_topology_disagreement() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -19757,6 +20381,7 @@ async fn rar_unlock_does_not_boost_untrusted_topology_disagreement() {
             filename: "not-the-topology-name.rar".to_string(),
             role: FileRole::Unknown,
             groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
             segments: vec![segment_spec! {
                 number: 0,
                 bytes: 8,
@@ -20227,6 +20852,7 @@ async fn clean_probe_waits_for_material_new_damage_before_rearming() {
                 filename: "payload-a.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 100 * 1024 * 1024,
@@ -20237,6 +20863,7 @@ async fn clean_probe_waits_for_material_new_damage_before_rearming() {
                 filename: "payload-b.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 100 * 1024 * 1024,
@@ -20250,6 +20877,7 @@ async fn clean_probe_waits_for_material_new_damage_before_rearming() {
                     recovery_block_count: 1,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 100 * 1024 * 1024,
@@ -20318,6 +20946,7 @@ async fn missed_probe_rearms_on_next_failed_byte() {
                 filename: "payload-a.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 100 * 1024 * 1024,
@@ -20328,6 +20957,7 @@ async fn missed_probe_rearms_on_next_failed_byte() {
                 filename: "payload-b.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 100 * 1024 * 1024,
@@ -20341,6 +20971,7 @@ async fn missed_probe_rearms_on_next_failed_byte() {
                     recovery_block_count: 1,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 100 * 1024 * 1024,
@@ -20423,6 +21054,7 @@ async fn health_below_critical_with_par2_defers_to_completion() {
                 filename: "payload-a.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 100,
@@ -20433,6 +21065,7 @@ async fn health_below_critical_with_par2_defers_to_completion() {
                 filename: "payload-b.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 100,
@@ -20446,6 +21079,7 @@ async fn health_below_critical_with_par2_defers_to_completion() {
                     recovery_block_count: 1,
                 },
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![segment_spec! {
                     number: 0,
                     bytes: 100,

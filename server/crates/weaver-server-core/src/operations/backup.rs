@@ -382,6 +382,26 @@ impl Database {
                             } else {
                                 "0"
                             };
+                            let src_server_backfill =
+                                if table_has_column(&mut conn, "src", "servers", "backfill")
+                                    .await?
+                                {
+                                    "backfill"
+                                } else {
+                                    "0"
+                                };
+                            let src_server_retention_days = if table_has_column(
+                                &mut conn,
+                                "src",
+                                "servers",
+                                "retention_days",
+                            )
+                            .await?
+                            {
+                                "retention_days"
+                            } else {
+                                "0"
+                            };
 
                             let mut tx = conn.begin().await.map_err(db_err)?;
                             for table in CLEAR_IMPORT_TABLES {
@@ -395,8 +415,8 @@ impl Database {
                             let import_sql = format!(
                                 "INSERT INTO settings (key, value)
                                      SELECT key, value FROM src.settings;
-                                 INSERT INTO servers (id, host, port, tls, username, password, connections, active, supports_pipelining, priority)
-                                     SELECT id, host, port, tls, username, password, connections, active, supports_pipelining, priority FROM src.servers;
+                                 INSERT INTO servers (id, host, port, tls, username, password, connections, active, supports_pipelining, priority, backfill, retention_days)
+                                     SELECT id, host, port, tls, username, password, connections, active, supports_pipelining, priority, {src_server_backfill}, {src_server_retention_days} FROM src.servers;
                                  INSERT INTO categories (id, name, dest_dir, aliases)
                                      SELECT id, name, dest_dir, aliases FROM src.categories;
                                  INSERT INTO api_keys (id, name, key_hash, scope, created_at, last_used_at)

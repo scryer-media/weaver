@@ -1,6 +1,8 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_graphql::{Schema, SchemaBuilder};
+use weaver_nntp::pool::NntpPool;
 use weaver_server_core::Database;
 use weaver_server_core::auth::ApiKeyCache;
 use weaver_server_core::settings::SharedConfig;
@@ -35,6 +37,8 @@ pub struct SchemaContext {
     pub watch_folder: WatchFolderService,
     pub schedules: weaver_server_core::bandwidth::schedule::SharedSchedules,
     pub log_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
+    /// Live NNTP pool for per-server health metrics. `None` in contexts without a pool (tests).
+    pub nntp_pool: Option<Arc<NntpPool>>,
 }
 
 pub fn build_schema(context: SchemaContext) -> WeaverSchema {
@@ -75,6 +79,7 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
     .data(context.schedules)
     .data(http_client)
     .data(context.log_buffer)
+    .data(context.nntp_pool)
     .data(replay)
     .data(history_delete_manager)
     .data(staged_upload_manager);

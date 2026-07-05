@@ -194,6 +194,12 @@ impl Pipeline {
             extracted_archives: HashMap::new(),
             decode_retries: HashMap::new(),
             inflight_extractions: HashMap::new(),
+            phase_progress: HashMap::new(),
+            phase_progress_snapshots: HashMap::new(),
+            phase_publish_state: HashMap::new(),
+            phase_extraction_member_totals: HashSet::new(),
+            job_retention_exclude_cache: HashMap::new(),
+            last_no_eligible_server_warn: None,
             inflight_moves: HashSet::new(),
             reserved_complete_destinations: HashMap::new(),
             failed_extractions: HashMap::new(),
@@ -379,6 +385,7 @@ impl Pipeline {
 
     pub(crate) fn emit_download_finished_if_active(&mut self, job_id: JobId) {
         if self.active_download_passes.remove(&job_id) {
+            self.phase_end(job_id, JobPhase::Downloading);
             let finalization_pending = self.job_has_pending_download_pipeline_work(job_id);
             if finalization_pending {
                 self.jobs_finalizing_download.insert(job_id);
@@ -613,6 +620,7 @@ impl Pipeline {
                         self.requeue_retry_work(work);
                     }
                     _ = metrics_snapshot_interval.tick() => {
+                        self.sample_phase_progress();
                         self.shared_state.refresh_metrics_snapshot();
                         // Fallback wake for refills held under hard pressure, in
                         // case the backlog drained without a download event.
