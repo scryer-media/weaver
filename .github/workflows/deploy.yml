@@ -331,8 +331,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-      - name: Run ARM-specific crate tests (NEON, CLMUL, PMULL)
-        run: cargo test --locked --no-fail-fast -p weaver-par2 -p weaver-yenc -p weaver-unrar --features weaver-par2/slow-tests,weaver-unrar/slow-tests
+      - name: Run ARM-specific PAR2 crate tests (CLMUL, PMULL)
+        run: cargo test --locked --no-fail-fast -p weaver-par2 --no-default-features --features slow-tests
+      - name: Run ARM-specific yEnc/unrar crate tests (NEON)
+        run: cargo test --locked --no-fail-fast -p weaver-yenc -p weaver-unrar --features weaver-unrar/slow-tests
 
   rust-test-sde:
     name: rust-test-sde-${{ matrix.name }}
@@ -373,13 +375,13 @@ jobs:
           echo "/opt/sde-external-9.48.0-2024-11-25-lin" >> "$GITHUB_PATH"
       - name: Build accelerated SIMD tests (${{ matrix.name }})
         env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           set -o pipefail
-          cargo test --package weaver-par2 --lib --test repair_stress --test real_world_generated --features slow-tests --no-run --no-fail-fast --locked --message-format=json \
+          cargo test --package weaver-par2 --lib --test repair_stress --test real_world_generated --features slow-tests --no-run --no-fail-fast --locked --target x86_64-unknown-linux-gnu --message-format=json \
             | jq -r 'select(.executable != null and .profile.test == true) | .executable' \
             | sort -u > /tmp/test-bins.txt
-          cargo test --package weaver-yenc --lib --no-run --no-fail-fast --locked --message-format=json \
+          cargo test --package weaver-yenc --lib --no-run --no-fail-fast --locked --target x86_64-unknown-linux-gnu --message-format=json \
             | jq -r 'select(.executable != null and .profile.test == true) | .executable' \
             >> /tmp/test-bins.txt
           sort -u -o /tmp/test-bins.txt /tmp/test-bins.txt
@@ -1284,8 +1286,8 @@ jobs:
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}\.sccache
       SCCACHE_IDLE_TIMEOUT: "0"
-      CC_aarch64_pc_windows_msvc: clang-cl
-      CXX_aarch64_pc_windows_msvc: clang-cl
+      CC_aarch64_pc_windows_msvc: clang
+      CXX_aarch64_pc_windows_msvc: clang++
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1

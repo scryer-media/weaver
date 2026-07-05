@@ -13,9 +13,8 @@ pub enum FilterType {
     E8,
     E8E9,
     Arm,
-    /// UnRAR treats unknown filter types as invalid filters: it consumes the
-    /// covered block without writing transformed bytes and lets the final CRC
-    /// report corruption.
+    /// Unknown filter types consume the covered block without writing
+    /// transformed bytes and let the final CRC report corruption.
     Unsupported(u8),
 }
 
@@ -49,12 +48,11 @@ pub struct PendingFilter {
     pub channels: u8,
 }
 
-/// Add a pending RAR5 filter with UnRAR's defensive queue behavior.
+/// Add a pending RAR5 filter with defensive queue behavior.
 ///
-/// UnRAR first tries to flush filters when `MAX_UNPACK_FILTERS` is reached and
-/// then calls `InitFilters` if the queue is still full. Weaver cannot always
-/// flush at descriptor-read time, so this helper implements the same bounded
-/// fallback: reset the queue before accepting the next malformed-stream filter.
+/// Weaver cannot always flush at descriptor-read time, so this helper keeps the
+/// queue bounded by resetting it before accepting the next malformed-stream
+/// filter.
 pub(crate) fn push_pending_filter(
     filters: &mut Vec<PendingFilter>,
     filter: PendingFilter,
@@ -210,14 +208,14 @@ mod tests {
     fn test_apply_delta_single_channel() {
         let mut data = [255u8, 254, 253, 252];
         apply_delta(&mut data, 1);
-        // UnRAR-style delta uses subtractive accumulation.
+        // RAR delta uses subtractive accumulation.
         // Encoded bytes [255, 254, 253, 252] decode to [1, 3, 6, 10].
         assert_eq!(data, [1, 3, 6, 10]);
     }
 
     #[test]
     fn test_apply_delta_multi_channel() {
-        // UnRAR groups each channel contiguously in the encoded stream.
+        // RAR groups each channel contiguously in the encoded stream.
         // Channel 0 encoded deltas [246, 251, 249] -> [10, 15, 22]
         // Channel 1 encoded deltas [236, 253, 255] -> [20, 23, 24]
         let mut data = [246u8, 251, 249, 236, 253, 255];
@@ -230,7 +228,7 @@ mod tests {
     fn test_apply_e8_basic() {
         // Place a 0xE8 at position 0 with an absolute address that should
         // be converted back to relative.
-        // UnRAR uses the current written offset of the 4-byte address field,
+        // RAR uses the current written offset of the 4-byte address field,
         // so file_offset = 0 and position = 0 yields an address offset of 1.
         // Stored absolute addr = 100 (which is >= 0 and < file_size)
         // Expected relative = 100 - 1 = 99
@@ -434,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn push_pending_filter_resets_full_queue_like_unrar() {
+    fn push_pending_filter_resets_full_queue_like_rar_behavior() {
         let mut filters = vec![
             PendingFilter {
                 filter_type: FilterType::E8,

@@ -29,7 +29,7 @@ use std::sync::Arc;
 use tracing::trace;
 
 use crate::error::{RarError, RarResult};
-use crate::limits::{Limits, UNRAR_MIN_LZ_WINDOW_SIZE, UNRAR_UNPACK_MAX_DICT_SIZE};
+use crate::limits::{Limits, RAR_MIN_LZ_WINDOW_SIZE, RAR_UNPACK_MAX_DICT_SIZE};
 use crate::types::CompressionInfo;
 use bitstream::{BitRead, BitReader, StreamingBitReader};
 use filter::{FilterType, PendingFilter};
@@ -43,15 +43,14 @@ const NUM_LENGTH_SLOTS: usize = 44;
 const DIST_CACHE_SIZE: usize = 4;
 
 /// Maximum number of pending filters to hold before treating the archive as invalid.
-/// Mirrors unrar's defensive `MAX_UNPACK_FILTERS` bound.
+/// Defensive RAR filter queue bound.
 const MAX_PENDING_FILTERS: usize = 8192;
 
 /// Maximum filter block size accepted from the bitstream.
-/// Mirrors unrar's `MAX_FILTER_BLOCK_SIZE` bound.
+/// RAR filter blocks above this size are treated as invalid.
 const MAX_FILTER_BLOCK_SIZE: usize = 0x400000;
 
 /// Maximum number of bytes to accumulate before flushing decoded output.
-/// Mirrors unrar's `UNPACK_MAX_WRITE` write border.
 const UNPACK_MAX_WRITE: usize = 0x400000;
 const STREAMING_PARALLEL_READ_BUFFER_SIZE: usize = 0x400000;
 const STREAMING_PARALLEL_MIN_PROCESS_SIZE: usize = 1024;
@@ -61,7 +60,7 @@ const STREAMING_PARALLEL_MIN_PROCESS_SIZE: usize = 1024;
 const STREAMING_HEADER_MARGIN: usize = 1024;
 /// Bit margin the mid-block staged decode keeps in reserve so no symbol read
 /// can reach the staging edge, where 16-bit peeks would otherwise fabricate
-/// zero bits in place of real, not-yet-staged data (unrar's ReadBorder idea).
+/// zero bits in place of real, not-yet-staged data.
 /// The widest RAR5 symbol (code + length extra + distance code + high distance
 /// bits + align code, or a filter descriptor) stays under 128 bits.
 const STREAMING_SYMBOL_MARGIN_BITS: i64 = 512;
@@ -92,7 +91,7 @@ pub struct LzDecoder {
     pending_filters: Vec<PendingFilter>,
     /// Absolute output offset where the current file begins in the window.
     current_file_base_total: u64,
-    /// Logical UnRAR `WrittenFileSize` for the current file after filters.
+    /// Logical written-file size for the current file after filters.
     ///
     /// This advances by filter block length even when unsupported filters
     /// suppress the corresponding output bytes.
@@ -112,7 +111,7 @@ impl LzDecoder {
     pub fn try_new(dict_size: usize, version: u8) -> RarResult<Self> {
         let extra_dist = match version {
             0 => false,
-            // UnRAR stores RAR 7.0 LZ as version 1 (`VER_PACK7` minus 70).
+            // RAR 7.0 LZ is stored as version 1.
             1 => true,
             _ => {
                 return Err(RarError::UnsupportedCompression { method: 0, version });
@@ -403,7 +402,7 @@ impl LzDecoder {
     }
 
     #[cfg(test)]
-    /// Apply pending filters to an in-memory output buffer using UnRAR's write
+    /// Apply pending filters to an in-memory output buffer using RAR write
     /// semantics: invalid filters suppress their covered block, but the logical
     /// `WrittenFileSize` used for later filters still advances by block length.
     fn apply_filters_to_vec(&mut self, output: Vec<u8>, base_offset: u64) -> Vec<u8> {
@@ -488,11 +487,11 @@ impl LzDecoder {
     ///
     /// Returns the updated output_size.
     ///
-    /// Hot loop optimized to match unrar's Unpack5:
+    /// Hot loop optimized for the RAR5 unpacking layout:
     /// - Precompute block end position — compare against it instead of
     ///   decrementing block_bits_remaining per symbol
     /// - No range checks — ordered `if/else if` with simple comparisons
-    ///   matching unrar's frequency order (literal first, match >= 262 second)
+    ///   matching the format's frequency order (literal first, match >= 262 second)
     /// - `has_bits()` instead of `bits_remaining() < 1`
     fn decode_block<R: BitRead>(
         &mut self,
@@ -503,7 +502,7 @@ impl LzDecoder {
     ) -> RarResult<u64> {
         // Precompute the bitstream position at which this block ends.
         // This replaces per-symbol block_bits_remaining decrement with a
-        // single comparison per iteration (matching unrar's ReadBorder check).
+        // single comparison per iteration.
         let block_end_pos = reader.position() as i64 + self.block_bits_remaining;
 
         // Hoist the per-block tables out of the symbol loop. Cloning the Arcs
@@ -615,7 +614,7 @@ impl LzDecoder {
 
     /// Convert a length slot (0-43) to a match length.
     ///
-    /// Uses the same formula as unrar's SlotToLength:
+    /// Uses the RAR SlotToLength formula:
     /// - Slots 0-7: length = 2 + slot, no extra bits
     /// - Slots 8+:  extra_bits = slot/4 - 1
     ///   length = 2 + (4 | (slot & 3)) << extra_bits + read_bits(extra_bits)
@@ -678,11 +677,11 @@ impl LzDecoder {
                 0
             };
             let low = ldc.decode(reader)? as u64;
-            Self::distance_from_slot_parts(dist_code, num_bits, high, low, usize::BITS)?
+            Self::distance_from_slot_parts(dist_code, num_bits, high, low)?
         } else {
             // All extra bits from bitstream.
             let extra = reader.read_bits64(num_bits as u8)?;
-            Self::distance_from_slot_parts(dist_code, num_bits, extra, 0, usize::BITS)?
+            Self::distance_from_slot_parts(dist_code, num_bits, extra, 0)?
         };
 
         Ok(distance)
@@ -693,14 +692,9 @@ impl LzDecoder {
         num_bits: usize,
         high_or_extra: u64,
         low: u64,
-        pointer_bits: u32,
     ) -> RarResult<usize> {
-        // Current UnRAR maps distances that would overflow 32-bit size_t to
-        // size_t(-1), so CopyString treats them as invalid and zero-fills.
-        if pointer_bits <= 32 && num_bits >= 30 {
-            return Ok(u32::MAX as usize);
-        }
-
+        // Weaver is 64-bit only, so it accepts distances that would overflow
+        // a 32-bit size_t sentinel.
         let base = (2u64 | (dist_code as u64 & 1))
             .checked_shl(num_bits as u32)
             .ok_or_else(|| RarError::CorruptArchive {
@@ -1618,11 +1612,10 @@ impl LzDecoder {
 
     /// Align decoder state with the next solid member's compression parameters.
     ///
-    /// UnRAR sets `ExtraDist` per file in `DoUnpack`, so one solid stream may
-    /// mix RAR5 (version 0) and RAR7 (version 1) members; Huffman tables
-    /// persist across the switch. UnRAR's `Unpack::Init` refuses to grow the
-    /// window mid-solid-stream, so a member declaring a dictionary larger than
-    /// the existing window is rejected.
+    /// RAR stores `ExtraDist` per file, so one solid stream may mix RAR5
+    /// (version 0) and RAR7 (version 1) members; Huffman tables persist across
+    /// the switch. The window cannot grow mid-solid-stream, so a member
+    /// declaring a dictionary larger than the existing window is rejected.
     pub fn ensure_solid_member_compat(&mut self, dict_size: usize, version: u8) -> RarResult<()> {
         if dict_size > self.window.dict_size() {
             return Err(RarError::CorruptArchive {
@@ -1802,15 +1795,15 @@ where
 }
 
 pub(crate) fn effective_lz_window_size(dict_size: u64) -> u64 {
-    dict_size.max(UNRAR_MIN_LZ_WINDOW_SIZE)
+    dict_size.max(RAR_MIN_LZ_WINDOW_SIZE)
 }
 
 fn checked_lz_dict_size(info: &CompressionInfo, max_dict_size: u64) -> RarResult<usize> {
     let dict_size = effective_lz_window_size(info.dict_size);
-    if dict_size > UNRAR_UNPACK_MAX_DICT_SIZE {
+    if dict_size > RAR_UNPACK_MAX_DICT_SIZE {
         return Err(RarError::DictionaryTooLarge {
             size: dict_size,
-            max: UNRAR_UNPACK_MAX_DICT_SIZE,
+            max: RAR_UNPACK_MAX_DICT_SIZE,
         });
     }
     if dict_size > max_dict_size {
@@ -1875,7 +1868,7 @@ mod tests {
     }
 
     #[test]
-    fn test_uninitialized_old_dist_uses_unrar_sentinel() {
+    fn test_uninitialized_old_dist_uses_rar_behavior_sentinel() {
         let mut decoder = LzDecoder::new(128 * 1024, 0);
 
         assert_eq!(decoder.promote_old_dist(2).unwrap(), usize::MAX);
@@ -1883,7 +1876,7 @@ mod tests {
     }
 
     #[test]
-    fn lz_decoder_rejects_future_rar5_unpack_versions_like_unrar() {
+    fn lz_decoder_rejects_future_rar5_unpack_versions_like_rar_behavior() {
         assert!(matches!(
             LzDecoder::try_new(128 * 1024, 2),
             Err(RarError::UnsupportedCompression { version: 2, .. })
@@ -1891,7 +1884,7 @@ mod tests {
     }
 
     #[test]
-    fn lz_decoder_accepts_rar7_unpack_version_like_unrar() {
+    fn lz_decoder_accepts_rar7_unpack_version_like_rar_behavior() {
         let decoder = LzDecoder::try_new(128 * 1024, 1).unwrap();
 
         assert!(decoder.extra_dist);
@@ -1902,29 +1895,21 @@ mod tests {
     }
 
     #[test]
-    fn test_effective_lz_window_uses_unrar_minimum() {
+    fn test_effective_lz_window_uses_rar_behavior_minimum() {
         assert_eq!(effective_lz_window_size(128 * 1024), 0x40000);
         assert_eq!(effective_lz_window_size(512 * 1024), 512 * 1024);
     }
 
     #[test]
-    fn distance_slot_parts_keep_32bit_boundary_before_unrar_overflow_sentinel() {
-        let distance =
-            LzDecoder::distance_from_slot_parts(61, 29, (1u64 << 29) - 16, 15, 32).unwrap();
+    fn distance_slot_parts_compute_boundary_distances_exactly() {
+        let distance = LzDecoder::distance_from_slot_parts(61, 29, (1u64 << 29) - 16, 15).unwrap();
 
         assert_eq!(distance, 0x8000_0000);
     }
 
     #[test]
-    fn distance_slot_parts_use_unrar_32bit_overflow_sentinel() {
-        let distance = LzDecoder::distance_from_slot_parts(62, 30, 0, 0, 32).unwrap();
-
-        assert_eq!(distance, u32::MAX as usize);
-    }
-
-    #[test]
-    fn distance_slot_parts_allow_rar7_extended_distance_on_64bit() {
-        let distance = LzDecoder::distance_from_slot_parts(79, 38, 0, 0, 64).unwrap();
+    fn distance_slot_parts_allow_rar7_extended_distance() {
+        let distance = LzDecoder::distance_from_slot_parts(79, 38, 0, 0).unwrap();
 
         assert_eq!(distance, (3u64 << 38) as usize + 1);
     }
@@ -2025,7 +2010,7 @@ mod tests {
     }
 
     #[test]
-    fn solid_version_switch_updates_extra_dist_and_code_lengths_like_unrar() {
+    fn solid_version_switch_updates_extra_dist_and_code_lengths_like_rar_behavior() {
         let mut decoder = LzDecoder::new(128 * 1024, 0);
         decoder.dist_cache = [10, 20, 30, 40];
         decoder.window.put_byte(0xAA);
@@ -2039,8 +2024,8 @@ mod tests {
 
         assert!(decoder.extra_dist);
         assert_eq!(decoder.code_lengths.len(), huffman::total_symbols(true));
-        // Window and rep-distance state carry across like unrar's per-file
-        // ExtraDist switch in DoUnpack.
+        // Window and rep-distance state carry across the per-file ExtraDist
+        // switch.
         assert_eq!(decoder.dist_cache, [10, 20, 30, 40]);
         assert_eq!(decoder.window.total_written(), 1);
 
@@ -2066,7 +2051,7 @@ mod tests {
     }
 
     #[test]
-    fn solid_member_dict_growth_is_rejected_like_unrar() {
+    fn solid_member_dict_growth_is_rejected_like_rar_behavior() {
         let mut decoder = LzDecoder::new(128 * 1024, 0);
 
         let err = decoder
@@ -2120,7 +2105,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filterless_flush_advances_hidden_match_tail_like_unrar() {
+    fn test_filterless_flush_advances_hidden_match_tail_like_rar_behavior() {
         let mut decoder = LzDecoder::new(128 * 1024, 0);
         decoder.window.put_bytes(b"ABCD");
         decoder.window.mark_flushed(4);
@@ -2139,7 +2124,7 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_stream_flush_advances_later_filter_file_offset_like_unrar() {
+    fn test_raw_stream_flush_advances_later_filter_file_offset_like_rar_behavior() {
         let mut decoder = LzDecoder::new(128 * 1024, 0);
         let mut out = Vec::new();
 
@@ -2221,7 +2206,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_filter_skips_block_like_unrar() {
+    fn test_unsupported_filter_skips_block_like_rar_behavior() {
         let mut decoder = LzDecoder::new(128 * 1024, 0);
         decoder.window.put_bytes(b"prefixBLOCKsuffix");
         decoder.pending_filters = vec![PendingFilter {
@@ -2271,7 +2256,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_descriptor_resets_full_queue_like_unrar() {
+    fn test_filter_descriptor_resets_full_queue_like_rar_behavior() {
         let mut decoder = LzDecoder::new(128 * 1024, 0);
         decoder.pending_filters = vec![
             PendingFilter {

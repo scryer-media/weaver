@@ -171,10 +171,16 @@ fn detect_memory() -> MemoryProfile {
     }
 }
 
-/// Total physical memory, if detectable. Used for memory-scaled policy
-/// defaults (e.g. the RAR dictionary-size ceiling).
+/// Total memory the process can actually use: physical total, clamped by any
+/// cgroup v2 limit (containers see the host's /proc/meminfo, not their own
+/// budget). Used for memory-scaled policy defaults (e.g. the RAR
+/// dictionary-size ceiling).
 pub(crate) fn detect_total_memory_bytes() -> Option<u64> {
-    detect_memory_bytes().map(|(total, _)| total)
+    let total = detect_memory_bytes().map(|(total, _)| total)?;
+    Some(match detect_cgroup_memory_limit() {
+        Some(limit) => total.min(limit),
+        None => total,
+    })
 }
 
 /// Returns (total_bytes, available_bytes).

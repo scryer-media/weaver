@@ -556,7 +556,7 @@ fn build_two_volume_stored_archive_with_split_crc(
     // Main archive header: VOLUME flag (0x0001), no volume number field (first volume)
     vol0.extend_from_slice(&build_main_archive_header(0x0001, None));
     // File header: SPLIT_AFTER (0x0010), data_size = part1.len()
-    // If present, this CRC is UnRAR's Pack-CRC32 for this split segment.
+    // If present, this CRC is the Pack-CRC32 for this split segment.
     vol0.extend_from_slice(&build_file_header_ex(
         filename,
         0x0010, // SPLIT_AFTER
@@ -4067,8 +4067,8 @@ fn test_extract_member_to_file_rejects_later_rar5_filecopy_source_like_unrar() {
     let temp_dir = tempfile::tempdir().unwrap();
     let out_path = temp_dir.path().join("copy.txt");
 
-    // UnRAR's RefList only helps after the referenced source has been
-    // encountered in stream order. A future source is not available yet.
+    // RefList only helps after the referenced source has been encountered in
+    // stream order. A future source is not available yet.
     let err = archive
         .extract_member_to_file(0, &weaver_unrar::ExtractOptions::default(), None, &out_path)
         .unwrap_err();
@@ -6443,9 +6443,8 @@ fn test_rar4_ppmd_solid_restart_lockstep() {
 
 /// Multi-member v29 solid streams end each member with an in-stream marker
 /// (LZ code 256 with new-file/new-table flags) that must be consumed after
-/// the member's last output symbol — unrar's output check is strictly
-/// `WrittenFileSize > DestUnpSize`, so it always reads it. Skipping it
-/// leaves stale Huffman tables and members 1+ decode garbage.
+/// the member's last output symbol. Skipping it leaves stale Huffman tables
+/// and members 1+ decode garbage.
 ///
 /// Fixture: 3 x 300 KB part-random binaries, `rar 6.24`:
 /// `rar a -ma4 -m3 -mct- -md1m -s -ep`.
@@ -6472,9 +6471,8 @@ fn test_rar4_lz_solid_multi_member_boundaries() {
 
 /// PPMd variant of the solid member boundary: the end-of-file marker is the
 /// in-stream `esc,2` pair, and the range coder registers persist across
-/// members (unrar keeps one coder alive; only PPMd block headers
-/// re-initialize it). Re-initializing per member reads 4 payload bytes as
-/// init bytes and desyncs.
+/// members; only PPMd block headers re-initialize it. Re-initializing per
+/// member reads 4 payload bytes as init bytes and desyncs.
 ///
 /// Fixture: 3 x ~2.9 MB word-salad texts, `rar 6.24`:
 /// `rar a -ma4 -m5 -mc16:1t+ -md4m -s -ep`.

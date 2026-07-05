@@ -320,7 +320,7 @@ fn parse_redirection(data: &[u8]) -> ExtraRecord {
         target_bytes[..copy_len].copy_from_slice(&rest[name_start..name_start + copy_len]);
     }
     let (target, target_raw) =
-        crate::header::common::decode_utf8_prefix_until_nul_with_unrar_bytes(&target_bytes);
+        crate::header::common::decode_utf8_prefix_until_nul_with_encoded_bytes(&target_bytes);
 
     ExtraRecord::Redirection {
         redir_type,
@@ -543,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_encryption_zero_fills_short_salt_and_iv_like_unrar() {
+    fn test_parse_encryption_zero_fills_short_salt_and_iv_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(0));
         body.extend_from_slice(&encode_vint(0));
@@ -572,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_encryption_truncated_version_vint_defaults_like_unrar() {
+    fn test_parse_encryption_truncated_version_vint_defaults_like_rar_behavior() {
         let data = build_extra_record(record_type::FILE_ENCRYPTION, &[0x80]);
         let records = parse_extra_area(&data, ExtraAreaOwner::File).unwrap();
 
@@ -598,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_encryption_truncated_flags_vint_defaults_like_unrar() {
+    fn test_parse_encryption_truncated_flags_vint_defaults_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(0));
         body.push(0x80);
@@ -648,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_file_time_ignores_field_shorter_than_unrar_minimum() {
+    fn test_parse_file_time_ignores_field_shorter_than_rar_behavior_minimum() {
         let flags = FHEXTRA_HTIME_UNIXTIME | FHEXTRA_HTIME_MTIME;
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(flags));
@@ -672,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_file_time_missing_flagged_unix_value_defaults_to_epoch_like_unrar() {
+    fn test_parse_file_time_missing_flagged_unix_value_defaults_to_epoch_like_rar_behavior() {
         let flags = FHEXTRA_HTIME_UNIXTIME | FHEXTRA_HTIME_MTIME | FHEXTRA_HTIME_CTIME;
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(flags));
@@ -708,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_file_version_truncated_flags_vint_defaults_to_zero_like_unrar() {
+    fn test_parse_file_version_truncated_flags_vint_defaults_to_zero_like_rar_behavior() {
         let data = build_extra_record(record_type::FILE_VERSION, &[0x80]);
         let records = parse_extra_area(&data, ExtraAreaOwner::File).unwrap();
         match &records[0] {
@@ -718,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_file_version_truncated_version_vint_defaults_to_zero_like_unrar() {
+    fn test_parse_file_version_truncated_version_vint_defaults_to_zero_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(0));
         body.push(0x80);
@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_redirection_ignores_empty_target_like_unrar() {
+    fn test_parse_redirection_ignores_empty_target_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(1));
         body.extend_from_slice(&encode_vint(0));
@@ -774,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_redirection_ignores_maxpathsize_target_like_unrar() {
+    fn test_parse_redirection_ignores_maxpathsize_target_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(1));
         body.extend_from_slice(&encode_vint(0));
@@ -791,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_redirection_zero_fills_and_truncates_short_target_like_unrar() {
+    fn test_parse_redirection_zero_fills_and_truncates_short_target_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(1));
         body.extend_from_slice(&encode_vint(0));
@@ -812,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_redirection_truncates_embedded_nul_like_unrar() {
+    fn test_parse_redirection_truncates_embedded_nul_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(1));
         body.extend_from_slice(&encode_vint(0));
@@ -833,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_redirection_invalid_utf8_target_keeps_prefix_like_unrar() {
+    fn test_parse_redirection_invalid_utf8_target_keeps_prefix_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(1));
         body.extend_from_slice(&encode_vint(0));
@@ -854,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_redirection_overlong_utf8_target_decodes_like_unrar() {
+    fn test_parse_redirection_overlong_utf8_target_decodes_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(1));
         body.extend_from_slice(&encode_vint(0));
@@ -875,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_redirection_surrogate_target_preserves_unrar_bytes() {
+    fn test_parse_redirection_surrogate_target_preserves_rar_behavior_bytes() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(1));
         body.extend_from_slice(&encode_vint(0));
@@ -922,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_extra_area_truncated_size_vint_stops_like_unrar() {
+    fn test_parse_extra_area_truncated_size_vint_stops_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(0));
         body.extend_from_slice(&encode_vint(3));
@@ -938,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_unix_owner_names_are_capped_like_unrar() {
+    fn test_parse_unix_owner_names_are_capped_like_rar_behavior() {
         let long_name = vec![b'a'; UNIX_OWNER_NAME_MAX + 10];
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(OWNER_USER_NAME));
@@ -958,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_unix_owner_name_truncates_at_nul_like_unrar() {
+    fn test_parse_unix_owner_name_truncates_at_nul_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(OWNER_USER_NAME));
         body.extend_from_slice(&encode_vint(9));
@@ -976,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_unix_owner_preserves_non_utf8_raw_bytes_for_lookup_like_unrar() {
+    fn test_parse_unix_owner_preserves_non_utf8_raw_bytes_for_lookup_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(OWNER_USER_NAME | OWNER_GROUP_NAME));
         body.extend_from_slice(&encode_vint(6));
@@ -1018,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_unix_owner_zero_fills_short_name_like_unrar() {
+    fn test_parse_unix_owner_zero_fills_short_name_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(OWNER_USER_NAME));
         body.extend_from_slice(&encode_vint(5));
@@ -1035,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_unix_owner_truncated_name_length_vint_defaults_to_empty_like_unrar() {
+    fn test_parse_unix_owner_truncated_name_length_vint_defaults_to_empty_like_rar_behavior() {
         let body = vec![OWNER_USER_NAME as u8, 0x80];
 
         let data = build_extra_record(record_type::UNIX_OWNER, &body);
@@ -1049,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_unix_owner_numeric_ids_default_to_zero_on_missing_vint_like_unrar() {
+    fn test_parse_unix_owner_numeric_ids_default_to_zero_on_missing_vint_like_rar_behavior() {
         let body = encode_vint(OWNER_USER_UID | OWNER_GROUP_GID);
 
         let data = build_extra_record(record_type::UNIX_OWNER, &body);
@@ -1092,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_blake2_hash_zero_fills_short_digest_like_unrar() {
+    fn test_parse_blake2_hash_zero_fills_short_digest_like_rar_behavior() {
         let body = [0, 0x42, 0x43, 0x44];
         let data = build_extra_record(record_type::FILE_HASH, &body);
         let records = parse_extra_area(&data, ExtraAreaOwner::File).unwrap();
@@ -1108,7 +1108,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_blake2_hash_empty_body_defaults_to_zero_hash_like_unrar() {
+    fn test_parse_blake2_hash_empty_body_defaults_to_zero_hash_like_rar_behavior() {
         let data = build_extra_record(record_type::FILE_HASH, &[]);
         let records = parse_extra_area(&data, ExtraAreaOwner::File).unwrap();
 
@@ -1119,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_blake2_hash_truncated_type_vint_defaults_to_zero_hash_like_unrar() {
+    fn test_parse_blake2_hash_truncated_type_vint_defaults_to_zero_hash_like_rar_behavior() {
         let body = [0x80, 0x80];
         let data = build_extra_record(record_type::FILE_HASH, &body);
         let records = parse_extra_area(&data, ExtraAreaOwner::File).unwrap();

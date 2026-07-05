@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn rar4_store_allows_future_unpack_version_like_unrar() {
+    fn rar4_store_allows_future_unpack_version_like_rar_behavior() {
         let data = b"stored data ignores unpack version";
         let info = CompressionInfo {
             format: ArchiveFormat::Rar4,
@@ -362,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn rar4_compressed_rejects_future_unpack_version_like_unrar() {
+    fn rar4_compressed_rejects_future_unpack_version_like_rar_behavior() {
         let info = CompressionInfo {
             format: ArchiveFormat::Rar4,
             version: 30,
@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_store_allows_future_unpack_version_like_unrar() {
+    fn rar5_store_allows_future_unpack_version_like_rar_behavior() {
         let data = b"stored rar5 data ignores unpack version";
         let info = CompressionInfo {
             format: ArchiveFormat::Rar5,
@@ -394,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_compressed_rejects_future_unpack_version_like_unrar() {
+    fn rar5_compressed_rejects_future_unpack_version_like_rar_behavior() {
         let info = CompressionInfo {
             format: ArchiveFormat::Rar5,
             version: 2,

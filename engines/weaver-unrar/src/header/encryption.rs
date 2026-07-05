@@ -171,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encryption_header_truncated_salt_is_padded_like_unrar() {
+    fn test_encryption_header_truncated_salt_is_padded_like_rar_behavior() {
         let mut type_body = Vec::new();
         type_body.extend_from_slice(&encode_vint(0)); // version
         type_body.extend_from_slice(&encode_vint(0)); // flags
@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encryption_header_truncated_password_check_disables_check_like_unrar() {
+    fn test_encryption_header_truncated_password_check_disables_check_like_rar_behavior() {
         let mut type_body = Vec::new();
         type_body.extend_from_slice(&encode_vint(0)); // version
         type_body.extend_from_slice(&encode_vint(0x0001)); // password check present

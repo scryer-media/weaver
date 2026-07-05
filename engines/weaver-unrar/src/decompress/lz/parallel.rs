@@ -1,8 +1,8 @@
 //! Block-level parallel Huffman decode for RAR5 LZ decompression.
 //!
-//! Matches unrar's `RAR_SMP` approach: scan block headers sequentially to
-//! resolve Huffman table dependencies, dispatch per-block symbol decoding
-//! to rayon worker threads, then apply decoded items to the window serially.
+//! Scans block headers sequentially to resolve Huffman table dependencies,
+//! dispatches per-block symbol decoding to rayon worker threads, then applies
+//! decoded items to the window serially.
 //!
 //! The parallelism is in the Huffman decode phase only — window writes,
 //! distance cache updates, and filter application remain sequential because
@@ -36,33 +36,27 @@ const MIN_PARALLEL_BLOCKS: usize = 4;
 const MAX_BATCH_BLOCKS: usize = 64;
 
 /// Per-block decoded item buffer size.
-/// Matches unrar's `DecodedAllocated = 0x4100`.
 const DECODED_ITEMS_CAPACITY: usize = 0x4100;
 
 /// Maximum worker count to consider when sizing parallel decode batches.
-/// Mirrors unrar's `MaxUserThreads = Min(Threads, 8)` behavior.
 const MAX_PARALLEL_THREADS: usize = 8;
 
 /// Maximum compressed block size (in bits) for parallel decode.
 /// Blocks exceeding this fall back to single-threaded inline decode.
-/// Matches unrar's LargeBlockSize = 0x20000 bytes = 1,048,576 bits.
 const LARGE_BLOCK_BITS: i64 = 0x20000 * 8;
 
 /// Maximum number of pending filters to hold at once.
-/// Mirrors unrar's defensive `MAX_UNPACK_FILTERS` bound.
 const MAX_PENDING_FILTERS: usize = 8192;
 
 /// Maximum accepted filter block size.
-/// Mirrors unrar's `MAX_FILTER_BLOCK_SIZE` bound.
 const MAX_FILTER_BLOCK_SIZE: u32 = 0x400000;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 /// A decoded Huffman item — one logical operation extracted from the bitstream.
 ///
-/// Matches unrar's `UnpackDecodedItem`. Everything needed from the bitstream
-/// is fully resolved; only sequential state (window, dist_cache, last_length)
-/// is deferred to the apply phase.
+/// Everything needed from the bitstream is fully resolved; only sequential
+/// state (window, dist_cache, last_length) is deferred to the apply phase.
 #[derive(Clone, Copy)]
 pub enum DecodedItem {
     /// 1–8 consecutive literal bytes, batched for cache efficiency.
@@ -444,7 +438,7 @@ fn decode_block_symbols(
     // Pending literal batch kept in locals: touching items.last_mut() per
     // literal costs a load + discriminant check per byte on the hottest path.
     // `lit_count` is the number of valid bytes (1-based); the stored item
-    // count stays 0-indexed like unrar.
+    // count stays 0-indexed.
     let mut lit_bytes = [0u8; 8];
     let mut lit_count: usize = 0;
 
@@ -604,10 +598,10 @@ fn decode_distance(
             0
         };
         let low = ldc.decode_bitreader(reader)? as u64;
-        super::LzDecoder::distance_from_slot_parts(dist_code, num_bits, high, low, usize::BITS)?
+        super::LzDecoder::distance_from_slot_parts(dist_code, num_bits, high, low)?
     } else {
         let extra = reader.read_bits64(num_bits as u8)?;
-        super::LzDecoder::distance_from_slot_parts(dist_code, num_bits, extra, 0, usize::BITS)?
+        super::LzDecoder::distance_from_slot_parts(dist_code, num_bits, extra, 0)?
     };
 
     Ok(distance)
@@ -647,9 +641,8 @@ fn decoded_item_buffers(
     &mut buffers[..active_len]
 }
 
-/// Dedicated bounded pool for RAR block decode, mirroring unrar's
-/// `MaxUserThreads = Min(Threads, 8)`. Keeps decode fan-out off the shared
-/// global pool and bounds wake/park churn.
+/// Dedicated bounded pool for RAR block decode. Keeps decode fan-out off the
+/// shared global pool and bounds wake/park churn.
 fn rar_decode_pool() -> Option<&'static rayon::ThreadPool> {
     use std::sync::OnceLock;
 
@@ -1290,16 +1283,9 @@ mod tests {
     }
 
     #[test]
-    fn parallel_distance_finalizer_uses_unrar_32bit_overflow_sentinel() {
-        let distance = super::LzDecoder::distance_from_slot_parts(62, 30, 0, 0, 32).unwrap();
-
-        assert_eq!(distance, u32::MAX as usize);
-    }
-
-    #[test]
-    fn decoded_item_matches_unrar_item_size() {
-        // unrar's UnpackDecodedItem is 16 bytes; the apply loop streams these,
-        // so the u64 distance must not grow the item.
+    fn decoded_item_stays_cache_sized() {
+        // The apply loop streams these items, so the u64 distance must not grow
+        // the item beyond 16 bytes.
         assert_eq!(std::mem::size_of::<DecodedItem>(), 16);
     }
 

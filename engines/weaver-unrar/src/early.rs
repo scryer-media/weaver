@@ -104,9 +104,8 @@ fn find_rar_signature(data: &[u8]) -> Option<EarlySignature> {
         });
     }
 
-    // Match UnRAR's SFX probe for modern RAR signatures: after the initial
-    // 7-byte mark read fails, scan the bounded SFX window while reserving the
-    // last 16 bytes of MAXSFXSIZE.
+    // After the initial 7-byte mark read fails, scan the bounded SFX window
+    // while reserving the last 16 bytes.
     let scan_start = RAR4_SIGNATURE.len();
     let scan_len = DEFAULT_SFX_MAX_SCAN.saturating_sub(16) as usize;
     let scan_end = data.len().min(scan_start.saturating_add(scan_len));
@@ -721,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn sfx_rar14_file_encrypted_requires_rsfx_marker_like_unrar() {
+    fn sfx_rar14_file_encrypted_requires_rsfx_marker_like_rar_behavior() {
         let mut data = vec![0xAAu8; 64];
         data[28..32].copy_from_slice(&RAR14_SFX_MARKER);
         data.extend_from_slice(&build_rar14_archive_header(0));
@@ -730,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn sfx_rar14_without_rsfx_marker_is_ignored_like_unrar() {
+    fn sfx_rar14_without_rsfx_marker_is_ignored_like_rar_behavior() {
         let mut data = vec![0xAAu8; 64];
         data.extend_from_slice(&build_rar14_archive_header(0));
         data.extend_from_slice(&build_rar14_file_header(0x04)); // LHD_PASSWORD

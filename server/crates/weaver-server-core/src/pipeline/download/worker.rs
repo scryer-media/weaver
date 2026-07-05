@@ -2223,15 +2223,14 @@ impl Pipeline {
                 let mut output = {
                     let _cpu_scope =
                         crate::runtime::perf_probe::cpu_scope("download.decode.alloc_vec");
-                    vec![0u8; raw.len()]
+                    Vec::with_capacity(raw.len())
                 };
                 let decode_result = {
                     let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.yenc");
-                    weaver_yenc::decode_nntp(&raw, &mut output)
+                    weaver_yenc::decode_nntp_append(&raw, &mut output)
                 };
                 match decode_result {
                     Ok(decode_result) => {
-                        output.truncate(decode_result.bytes_written);
                         metrics
                             .bytes_decoded
                             .fetch_add(decode_result.bytes_written as u64, Ordering::Relaxed);

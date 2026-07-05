@@ -1314,8 +1314,8 @@ impl Model {
             // No successor yet: set text pointer as successor.
             self.set_st_succ(self.found_state, successor);
             final_succ = successor;
-            // Match unrar: fs.Successor becomes the current MinContext even though the
-            // live FoundState successor now points into the text buffer.
+            // fs.Successor becomes the current MinContext even though the live
+            // FoundState successor now points into the text buffer.
             next_min_context = self.min_context;
         }
 

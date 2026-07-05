@@ -42,7 +42,7 @@ pub struct FileEncryptionParams {
     pub iv: [u8; 16],
     pub check_data: Option<[u8; 12]>,
     /// When true, CRC32 and BLAKE2 hashes in the header are HMAC-transformed
-    /// and cannot be verified without HashKey (from unrar's custom PBKDF2 chain).
+    /// and cannot be verified without HashKey from the RAR5 KDF chain.
     pub use_hash_mac: bool,
 }
 
@@ -1051,7 +1051,7 @@ mod tests {
         cached_header: &[u8],
     ) -> Vec<u8> {
         let mut body = Vec::new();
-        body.extend_from_slice(&vint::encode_vint(0)); // flags, unused by UnRAR.
+        body.extend_from_slice(&vint::encode_vint(0)); // flags, unused here.
         body.extend_from_slice(&vint::encode_vint(
             qopen_header_offset - original_header_offset,
         ));
@@ -1144,7 +1144,7 @@ mod tests {
     }
 
     #[test]
-    fn quick_open_uses_unpacked_size_not_data_area_size_like_unrar() {
+    fn quick_open_uses_unpacked_size_not_data_area_size_like_rar_behavior() {
         let qopen_offset = 256u64;
         let cached_file_offset = 96u64;
         let cached_end_offset = 160u64;
@@ -1187,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn quick_open_record_size_vint_longer_than_three_bytes_is_rejected_like_unrar() {
+    fn quick_open_record_size_vint_longer_than_three_bytes_is_rejected_like_rar_behavior() {
         let size = [0x81, 0x80, 0x80, 0x00];
         let record = build_test_qopen_record_with_raw_size(&size, &[0]);
         let mut cursor = std::io::Cursor::new(record.as_slice());
@@ -1202,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn quick_open_cached_header_size_vint_longer_than_three_bytes_is_rejected_like_unrar() {
+    fn quick_open_cached_header_size_vint_longer_than_three_bytes_is_rejected_like_rar_behavior() {
         let size = [0x81, 0x80, 0x80, 0x00];
         let cached_header = build_test_qopen_record_with_raw_size(&size, &[0]);
 
@@ -1449,7 +1449,7 @@ mod tests {
         let result = parse_encrypted_headers(&mut cursor, &key, &mut parsed);
         assert!(
             matches!(result, Err(RarError::CorruptArchive { ref detail }) if detail.contains("header size vint")),
-            "expected non-UnRAR header-size vint to be rejected, got: {result:?}"
+            "expected non-canonical header-size vint to be rejected, got: {result:?}"
         );
     }
 }

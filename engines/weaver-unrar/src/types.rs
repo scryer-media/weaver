@@ -19,7 +19,7 @@ impl ArchiveFormat {
 /// Unpacked data integrity value stored in archive headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataHash {
-    /// RAR 1.4 stores UnRAR's legacy 16-bit Checksum14, not CRC32.
+    /// RAR 1.4 stores legacy 16-bit Checksum14, not CRC32.
     Rar14(u16),
     /// RAR 1.5+ stores CRC32.
     Crc32(u32),
@@ -149,9 +149,9 @@ pub struct UnixOwnerInfo {
     pub user_name: Option<String>,
     /// UTF-8/lossy display form retained for existing metadata callers.
     pub group_name: Option<String>,
-    /// Raw owner name bytes used for UnRAR-parity Unix account lookup.
+    /// Raw owner name bytes used for RAR-compatible Unix account lookup.
     pub user_name_raw: Option<Vec<u8>>,
-    /// Raw group name bytes used for UnRAR-parity Unix group lookup.
+    /// Raw group name bytes used for RAR-compatible Unix group lookup.
     pub group_name_raw: Option<Vec<u8>>,
     pub uid: Option<u64>,
     pub gid: Option<u64>,
@@ -179,7 +179,7 @@ pub struct MemberInfo {
     pub name: String,
     /// The original unsanitized name from the archive header.
     pub raw_name: String,
-    /// Raw archive name bytes after UnRAR-compatible header read/cap behavior.
+    /// Raw archive name bytes after RAR-compatible header read/cap behavior.
     /// This is needed for byte-preserving Unix extraction of names that cannot
     /// be represented losslessly in `raw_name`.
     pub raw_name_bytes: Option<Vec<u8>>,
@@ -203,7 +203,7 @@ pub struct MemberInfo {
     pub is_hardlink: bool,
     pub is_file_copy: bool,
     pub link_target: Option<String>,
-    /// Raw RAR5 redirection target bytes after UnRAR-compatible UTF-8
+    /// Raw RAR5 redirection target bytes after RAR-compatible UTF-8
     /// decoding/re-encoding. RAR3 Unix symlink targets live in the member
     /// payload, so they are not available in header-only metadata.
     pub link_target_bytes: Option<Vec<u8>>,
@@ -247,8 +247,8 @@ pub struct ArchiveMetadata {
 /// Metadata for embedded recovery records discovered in archive headers.
 ///
 /// This describes RAR4 protect headers and RAR5 `RR` service records. It does
-/// not feed volume restoration; official UnRAR's `RecVolumesRestore` path also
-/// restores standalone `.rev` volumes rather than consuming embedded RR data.
+/// not feed volume restoration; standalone `.rev` recovery volumes are handled
+/// by the recovery-volume restore API instead of consuming embedded RR data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryRecordInfo {
     pub format: ArchiveFormat,

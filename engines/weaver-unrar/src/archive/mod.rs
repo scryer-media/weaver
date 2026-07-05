@@ -85,7 +85,7 @@ pub(super) struct ServiceEntry {
 
 /// Integrity hash for a split segment's packed bytes.
 ///
-/// UnRAR treats hashes on split-after headers as `Pack-CRC32`/`Pack-BLAKE2`;
+/// Split-after header hashes describe packed bytes as `Pack-CRC32`/`Pack-BLAKE2`;
 /// only the final continuation's hash is the whole unpacked file hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PackedDataHash {
@@ -749,7 +749,7 @@ mod tests {
         cached_header: &[u8],
     ) -> Vec<u8> {
         let mut body = Vec::new();
-        body.extend_from_slice(&crate::vint::encode_vint(0)); // flags, unused by UnRAR.
+        body.extend_from_slice(&crate::vint::encode_vint(0)); // flags, unused here.
         body.extend_from_slice(&crate::vint::encode_vint(
             qopen_header_offset - original_header_offset,
         ));
@@ -889,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_hydrates_rar5_rr_service_from_locator_like_unrar() {
+    fn metadata_hydrates_rar5_rr_service_from_locator_like_rar_behavior() {
         let rr_offset = 256usize;
         let mut locator = Vec::new();
         locator.extend_from_slice(&crate::vint::encode_vint(0x02)); // RR only.
@@ -946,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_scans_rar5_rr_service_when_quick_open_hides_bad_locator_like_unrar() {
+    fn metadata_scans_rar5_rr_service_when_quick_open_hides_bad_locator_like_rar_behavior() {
         let qopen_offset = 512usize;
         let cached_end_offset = 160u64;
 
@@ -1047,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn member_info_uses_unrar_rar5_windows_backslash_conversion() {
+    fn member_info_uses_rar_behavior_rar5_windows_backslash_conversion() {
         let archive = archive_with_member(ArchiveFormat::Rar5, HostOs::Windows, "dir\\file.txt");
         let info = archive.member_info(0).unwrap();
 
@@ -1062,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn member_info_uses_unrar_rar5_unix_backslash_conversion() {
+    fn member_info_uses_rar_behavior_rar5_unix_backslash_conversion() {
         let archive = archive_with_member(ArchiveFormat::Rar5, HostOs::Unix, "dir\\file.txt");
         let info = archive.member_info(0).unwrap();
 
@@ -1073,7 +1073,7 @@ mod tests {
     }
 
     #[test]
-    fn member_info_uses_unrar_rar4_backslash_separator_conversion() {
+    fn member_info_uses_rar_behavior_rar4_backslash_separator_conversion() {
         let archive = archive_with_member(ArchiveFormat::Rar4, HostOs::Windows, "dir\\file.txt");
         let info = archive.member_info(0).unwrap();
 

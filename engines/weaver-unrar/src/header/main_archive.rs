@@ -50,7 +50,7 @@ pub struct MainArchiveHeader {
     pub recovery_record_offset: Option<u64>,
     /// Original archive name from the metadata extra record.
     pub original_name: Option<String>,
-    /// Raw original archive name bytes after UnRAR's metadata-name cap and
+    /// Raw original archive name bytes after the RAR metadata-name cap and
     /// short-read zero-fill behavior.
     pub original_name_raw: Option<Vec<u8>>,
     /// Original archive creation time from the metadata extra record.
@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn test_main_metadata_short_name_zero_fills_like_unrar() {
+    fn test_main_metadata_short_name_zero_fills_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(main_extra::METADATA_NAME));
         body.extend_from_slice(&encode_vint(12));
@@ -480,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_main_metadata_invalid_utf8_name_keeps_prefix_like_unrar() {
+    fn test_main_metadata_invalid_utf8_name_keeps_prefix_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(main_extra::METADATA_NAME));
         body.extend_from_slice(&encode_vint(15));
@@ -499,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn test_main_metadata_overlong_utf8_name_decodes_like_unrar() {
+    fn test_main_metadata_overlong_utf8_name_decodes_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(main_extra::METADATA_NAME));
         body.extend_from_slice(&encode_vint(11));
@@ -519,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn test_main_metadata_missing_unix_ctime_defaults_to_epoch_like_unrar() {
+    fn test_main_metadata_missing_unix_ctime_defaults_to_epoch_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(
             main_extra::METADATA_CTIME | main_extra::METADATA_UNIXTIME,

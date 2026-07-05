@@ -1,9 +1,9 @@
 //! RAR recovery-volume restore support.
 //!
-//! RAR recovery volumes are not PAR2 files. RAR5 uses UnRAR's GF(2^16)
-//! `RSCoder16` Cauchy matrix semantics, while legacy RAR3 uses a byte-wise
-//! GF(2^8) erasure coder. This module keeps that restore logic separate from
-//! archive extraction so existing extraction APIs remain unchanged.
+//! RAR recovery volumes are not PAR2 files. RAR5 uses GF(2^16) Cauchy matrix
+//! semantics, while legacy RAR3 uses a byte-wise GF(2^8) erasure coder. This
+//! module keeps that restore logic separate from archive extraction so existing
+//! extraction APIs remain unchanged.
 
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -86,7 +86,7 @@ pub fn restore_volumes_from_paths(
     if let Some(source) = first_embedded_recovery_record_path(paths)? {
         return Err(RarError::CorruptArchive {
             detail: format!(
-                "embedded {:?} recovery record detected in {}, but this API restores standalone .rev recovery volumes only; the official UnRAR RecVolumesRestore path also restores .rev files and does not consume embedded RR/protect data",
+                "embedded {:?} recovery record detected in {}, but this API restores standalone .rev recovery volumes only and does not consume embedded RR/protect data",
                 source.format,
                 source.path.display()
             ),
@@ -145,7 +145,7 @@ fn recovery_discovery_prefix(path: &Path) -> Option<String> {
         let trimmed = stem.trim_end_matches(|ch: char| ch.is_ascii_digit() || ch == '_');
         return (!trimmed.is_empty()).then(|| trimmed.to_string());
     }
-    if let Some((start, _)) = unrar_volume_digit_run(&stem) {
+    if let Some((start, _)) = rar_volume_digit_run(&stem) {
         let prefix = &stem[..start];
         return (!prefix.is_empty()).then(|| prefix.to_string());
     }
@@ -1050,8 +1050,8 @@ fn finalize_rar3_restored_output(
 ) -> RarResult<()> {
     output.flush().map_err(RarError::Io)?;
 
-    // UnRAR clears the synthetic 7-byte footer only for RAR 3.10+ recovery
-    // sets. Old-style name#_#_#.rev volumes do not carry this footer.
+    // RAR 3.10+ recovery sets carry a synthetic 7-byte footer; old-style
+    // name#_#_#.rev volumes do not.
     if new_style {
         let len = output.seek(SeekFrom::End(0)).map_err(RarError::Io)?;
         if len >= 7 {
@@ -1288,7 +1288,7 @@ fn parse_old_rar3_numbered_extension(ext: &str) -> Option<usize> {
     let prefix = bytes[0].to_ascii_lowercase();
     let number = usize::from(bytes[1] - b'0') * 10 + usize::from(bytes[2] - b'0');
     if (b'a'..b'r').contains(&prefix) {
-        // UnRAR's old-numbering path increments .999 to .a00. Keep .r00
+        // Old numeric extension rollover increments .999 to .a00. Keep .r00
         // mapped to the classic .rar, .r00, .r01 sequence below.
         return Some(999 + usize::from(prefix - b'a') * 100 + number);
     }
@@ -1386,7 +1386,7 @@ fn old_rar3_numbered_extension(volume_index: usize) -> String {
 
 fn parse_part_number(path: &Path) -> Option<usize> {
     let stem = path.file_stem()?.to_string_lossy();
-    let (start, end) = unrar_volume_digit_run(&stem)?;
+    let (start, end) = rar_volume_digit_run(&stem)?;
     stem[start..end].parse::<usize>().ok()
 }
 
@@ -1401,7 +1401,7 @@ fn infer_numbered_volume_path(
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or(file_name.clone());
-    let generated_name = if let Some((start, end)) = unrar_volume_digit_run(&stem) {
+    let generated_name = if let Some((start, end)) = rar_volume_digit_run(&stem) {
         let width = end - start;
         let number = volume_index + 1;
         let mut next_stem = stem.clone();
@@ -1416,7 +1416,7 @@ fn infer_numbered_volume_path(
     output_dir.join(generated_name)
 }
 
-fn unrar_volume_digit_run(value: &str) -> Option<(usize, usize)> {
+fn rar_volume_digit_run(value: &str) -> Option<(usize, usize)> {
     let bytes = value.as_bytes();
     let end = bytes.iter().rposition(|b| b.is_ascii_digit())? + 1;
     let start = bytes[..end]
@@ -1424,8 +1424,8 @@ fn unrar_volume_digit_run(value: &str) -> Option<(usize, usize)> {
         .rposition(|b| !b.is_ascii_digit())
         .map_or(0, |idx| idx + 1);
 
-    // Match UnRAR's GetVolNumPos: for names like `name.part##of##.rar`,
-    // select the first numeric run after a dot, not the final total count.
+    // For names like `name.part##of##.rar`, select the first numeric run after
+    // a dot, not the final total count.
     let mut scan = start;
     while scan > 0 && bytes[scan - 1] != b'.' {
         scan -= 1;
@@ -1715,10 +1715,10 @@ mod tests {
     }
 
     #[test]
-    fn unrar_volume_digit_run_finds_part_number() {
-        assert_eq!(unrar_volume_digit_run("movie.part0007"), Some((10, 14)));
-        assert_eq!(unrar_volume_digit_run("movie.part01of10"), Some((10, 12)));
-        assert_eq!(unrar_volume_digit_run("movie"), None);
+    fn rar_volume_digit_run_finds_part_number() {
+        assert_eq!(rar_volume_digit_run("movie.part0007"), Some((10, 14)));
+        assert_eq!(rar_volume_digit_run("movie.part01of10"), Some((10, 12)));
+        assert_eq!(rar_volume_digit_run("movie"), None);
     }
 
     #[test]
@@ -1828,7 +1828,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_recovery_slot_probe_uses_filename_number_like_unrar() {
+    fn rar5_recovery_slot_probe_uses_filename_number_like_rar_behavior() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("movie.part03.rar");
         std::fs::write(
@@ -1888,7 +1888,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_rev_parser_ignores_truncated_header_body_like_unrar() {
+    fn rar5_rev_parser_ignores_truncated_header_body_like_rar_behavior() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("movie.part0002.rev");
         let mut bytes = REV5_SIGN.to_vec();
@@ -1901,7 +1901,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_rev_parser_ignores_crc_valid_short_metadata_like_unrar() {
+    fn rar5_rev_parser_ignores_crc_valid_short_metadata_like_rar_behavior() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("movie.part0002.rev");
         std::fs::write(&path, build_rar5_rev_from_raw(&[1, 1, 0])).unwrap();
@@ -1969,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_recovery_renames_invalid_existing_data_volume_like_unrar() {
+    fn rar5_recovery_renames_invalid_existing_data_volume_like_rar_behavior() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("movie.part01.rar");
         std::fs::write(&path, b"bad data").unwrap();
@@ -2083,7 +2083,7 @@ mod tests {
         let paths = vec![PathBuf::from("/tmp/movie.part01_02_03.rev")];
 
         let err = rar3_recovery_reference_name(&paths)
-            .expect_err("RAR3 .rev-only restore needs a data volume like UnRAR");
+            .expect_err("RAR3 .rev-only restore needs a data volume");
 
         match err {
             RarError::CorruptArchive { detail } => {
@@ -2115,7 +2115,7 @@ mod tests {
     }
 
     #[test]
-    fn infer_numbered_volume_uses_first_part_digits_like_unrar() {
+    fn infer_numbered_volume_uses_first_part_digits_like_rar_behavior() {
         let path = Path::new("/tmp/movie.part01of10.rar");
         let output = infer_numbered_volume_path(path, Path::new("/out"), 1, "rar");
         assert_eq!(output, Path::new("/out/movie.part02of10.rar"));
@@ -2328,7 +2328,7 @@ mod tests {
             RarError::CorruptArchive { detail } => {
                 assert!(detail.contains("embedded Rar4 recovery record detected"));
                 assert!(detail.contains("standalone .rev recovery volumes only"));
-                assert!(detail.contains("official UnRAR RecVolumesRestore path"));
+                assert!(detail.contains("standalone .rev recovery volumes only"));
                 assert!(detail.contains("does not consume embedded RR/protect data"));
             }
             other => panic!("unexpected error: {other:?}"),

@@ -15,15 +15,15 @@ use std::io::{Read, Seek, SeekFrom};
 use tracing::warn;
 
 use crate::error::{RarError, RarResult};
-use crate::limits::UNRAR_RAR5_MAX_HEADER_BODY;
+use crate::limits::RAR5_MAX_HEADER_BODY;
 use crate::vint;
 
 /// Maximum header body size accepted by the RAR5 parser.
 ///
-/// Match UnRAR's `MAX_HEADER_SIZE_RAR5` (2 MiB). Keeping the same cap prevents
+/// Keeping the 2 MiB RAR5 cap prevents
 /// malformed header sizes from turning into large allocations before the parser
 /// can reject the archive as corrupt.
-pub(crate) const MAX_HEADER_BODY: u64 = UNRAR_RAR5_MAX_HEADER_BODY;
+pub(crate) const MAX_HEADER_BODY: u64 = RAR5_MAX_HEADER_BODY;
 const MAX_HEADER_SIZE_VINT_BYTES: usize = 3;
 
 /// Common header flags shared by all header types.
@@ -157,7 +157,7 @@ pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawHe
 
     if computed_crc != stored_crc {
         warn!(
-            "RAR5 header CRC mismatch at offset {}: expected {:#010x}, got {:#010x}; parsing anyway like UnRAR",
+            "RAR5 header CRC mismatch at offset {}: expected {:#010x}, got {:#010x}; parsing anyway for recovery",
             offset, stored_crc, computed_crc
         );
     }
@@ -236,19 +236,18 @@ pub(crate) fn vint_encode_for_crc(value: u64, byte_count: usize) -> Vec<u8> {
     result
 }
 
-/// Decode RAR5 UTF-8 text the way UnRAR callers use `UtfToWide`.
+/// Decode RAR5 UTF-8 text with the archive format's lenient header rules.
 ///
-/// The official decoder validates only continuation-byte shapes, so overlong
-/// sequences are decoded instead of rejected. It returns `false` at the first
-/// malformed byte, but several header readers ignore that return value and keep
-/// the prefix decoded before the error. They also stop at the first NUL byte.
+/// The legacy decoder behavior validates only continuation-byte shapes, so
+/// overlong sequences are decoded instead of rejected. Header readers keep the
+/// decoded prefix before the first malformed byte and stop at the first NUL byte.
 pub(crate) fn decode_utf8_prefix_until_nul(bytes: &[u8]) -> String {
-    decode_utf8_prefix_until_nul_with_unrar_bytes(bytes).0
+    decode_utf8_prefix_until_nul_with_encoded_bytes(bytes).0
 }
 
-pub(crate) fn decode_utf8_prefix_until_nul_with_unrar_bytes(bytes: &[u8]) -> (String, Vec<u8>) {
+pub(crate) fn decode_utf8_prefix_until_nul_with_encoded_bytes(bytes: &[u8]) -> (String, Vec<u8>) {
     let mut decoded = String::new();
-    let mut unrar_bytes = Vec::new();
+    let mut encoded_bytes = Vec::new();
     let mut pos = 0usize;
 
     while let Some(&first) = bytes.get(pos) {
@@ -307,13 +306,13 @@ pub(crate) fn decode_utf8_prefix_until_nul_with_unrar_bytes(bytes: &[u8]) -> (St
             ch
         };
         decoded.push(ch);
-        append_unrar_utf8(scalar, &mut unrar_bytes);
+        append_lenient_utf8(scalar, &mut encoded_bytes);
     }
 
-    (decoded, unrar_bytes)
+    (decoded, encoded_bytes)
 }
 
-fn append_unrar_utf8(scalar: u32, out: &mut Vec<u8>) {
+fn append_lenient_utf8(scalar: u32, out: &mut Vec<u8>) {
     if scalar <= 0x7f {
         out.push(scalar as u8);
     } else if scalar <= 0x7ff {
@@ -345,7 +344,7 @@ pub(crate) fn validate_header_size(
     if header_size_vint_len > MAX_HEADER_SIZE_VINT_BYTES {
         return Err(RarError::CorruptArchive {
             detail: format!(
-                "header size vint at offset {} uses {} bytes, exceeding UnRAR RAR5 maximum {}",
+                "header size vint at offset {} uses {} bytes, exceeding RAR5 maximum {}",
                 offset, header_size_vint_len, MAX_HEADER_SIZE_VINT_BYTES
             ),
         });
@@ -456,28 +455,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn utf8_prefix_decoder_accepts_overlong_sequences_like_unrar() {
+    fn utf8_prefix_decoder_accepts_overlong_sequences_like_rar_behavior() {
         assert_eq!(decode_utf8_prefix_until_nul(b"a\xc0\xafpath"), "a/path");
     }
 
     #[test]
-    fn utf8_prefix_decoder_keeps_prefix_before_malformed_continuation_like_unrar() {
+    fn utf8_prefix_decoder_keeps_prefix_before_malformed_continuation_like_rar_behavior() {
         assert_eq!(decode_utf8_prefix_until_nul(b"valid/\xffignored"), "valid/");
         assert_eq!(decode_utf8_prefix_until_nul(b"valid/\xe2bad"), "valid/");
     }
 
     #[test]
-    fn utf8_prefix_decoder_stops_at_nul_like_unrar() {
+    fn utf8_prefix_decoder_stops_at_nul_like_rar_behavior() {
         assert_eq!(decode_utf8_prefix_until_nul(b"abc\0ignored"), "abc");
     }
 
     #[test]
-    fn utf8_prefix_decoder_skips_out_of_range_four_byte_scalars_like_unrar() {
+    fn utf8_prefix_decoder_skips_out_of_range_four_byte_scalars_like_rar_behavior() {
         assert_eq!(decode_utf8_prefix_until_nul(b"a\xf7\xbf\xbf\xbfb"), "ab");
     }
 
     #[test]
-    fn utf8_prefix_decoder_preserves_surrogate_position_like_unrar() {
+    fn utf8_prefix_decoder_preserves_surrogate_position_like_rar_behavior() {
         assert_eq!(
             decode_utf8_prefix_until_nul(b"a\xed\xa0\x80b"),
             "a\u{fffd}b"
@@ -485,8 +484,9 @@ mod tests {
     }
 
     #[test]
-    fn utf8_prefix_decoder_exposes_unrar_wide_to_char_bytes() {
-        let (text, bytes) = decode_utf8_prefix_until_nul_with_unrar_bytes(b"a\xc0\xaf\xed\xa0\x80");
+    fn utf8_prefix_decoder_exposes_lenient_wide_to_char_bytes() {
+        let (text, bytes) =
+            decode_utf8_prefix_until_nul_with_encoded_bytes(b"a\xc0\xaf\xed\xa0\x80");
         assert_eq!(text, "a/\u{fffd}");
         assert_eq!(bytes, b"a/\xed\xa0\x80");
     }
@@ -539,10 +539,10 @@ mod tests {
     }
 
     #[test]
-    fn test_crc_mismatch_warns_but_parses_like_unrar() {
+    fn test_crc_mismatch_warns_but_parses_for_recovery() {
         let mut data = build_header(1, 0, &[]);
-        // Corrupt the stored CRC while leaving the body parseable. UnRAR reports
-        // this damage but still attempts to process plaintext headers.
+        // Corrupt the stored CRC while leaving the body parseable. The parser
+        // reports this damage but still attempts to process plaintext headers.
         data[0] ^= 0xFF;
         let mut cursor = std::io::Cursor::new(data);
         let raw = read_raw_header(&mut cursor).unwrap().unwrap();
@@ -559,16 +559,16 @@ mod tests {
     }
 
     #[test]
-    fn max_header_body_matches_unrar_rar5_limit() {
+    fn max_header_body_matches_rar5_limit() {
         assert_eq!(MAX_HEADER_BODY, 0x200000);
     }
 
     #[test]
-    fn header_size_vint_longer_than_three_bytes_is_rejected_like_unrar() {
+    fn header_size_vint_longer_than_three_bytes_is_rejected() {
         let mut data = Vec::new();
         data.extend_from_slice(&0u32.to_le_bytes());
-        // Non-minimal four-byte vint encoding of value 1. UnRAR rejects RAR5
-        // header-size vints that occupy more than three bytes regardless of
+        // Non-minimal four-byte vint encoding of value 1. RAR5 header-size
+        // vints that occupy more than three bytes are rejected regardless of
         // decoded value.
         data.extend_from_slice(&[0x81, 0x80, 0x80, 0x00]);
 
@@ -581,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_parsed_header_size_vint_longer_than_three_bytes_is_rejected_like_unrar() {
+    fn pre_parsed_header_size_vint_longer_than_three_bytes_is_rejected_like_rar_behavior() {
         let result = parse_raw_header_from_parts(0, 0, 1, 4, vec![1]);
         assert!(
             matches!(result, Err(RarError::CorruptArchive { ref detail }) if detail.contains("header size vint")),
@@ -590,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_parsed_header_size_above_unrar_limit_is_rejected() {
+    fn pre_parsed_header_size_above_rar_behavior_limit_is_rejected() {
         let result = parse_raw_header_from_parts(0, 0, MAX_HEADER_BODY + 1, 3, vec![1]);
         assert!(
             matches!(result, Err(RarError::CorruptArchive { ref detail }) if detail.contains("exceeds maximum")),

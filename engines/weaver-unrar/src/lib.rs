@@ -12,7 +12,7 @@
 //! - Detection and extraction of supported encrypted archives
 //! - RAR4 archive support, including legacy RAR 1.5/2.0/2.9 decompression
 //! - SFX (self-extracting) archive support
-//! - AES decryption with UnRAR-compatible key derivation
+//! - AES decryption with RAR-compatible key derivation
 //! - LZ decompression (methods 1-5) with Huffman decoding and sliding window
 //! - PPMd decompression (variant H)
 //! - Post-decompression filters (Delta, E8, E8E9, ARM)

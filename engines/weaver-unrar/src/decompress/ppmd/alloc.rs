@@ -25,8 +25,7 @@ static INDEX_TO_UNITS: [u8; 38] = [
 /// Number of distinct free-list bin sizes.
 const NUM_INDEXES: usize = 38;
 
-/// Units-to-bin lookup, mirroring unrar's `Units2Indx`: entry `u - 1` is the
-/// first bin whose size is >= `u`.
+/// Units-to-bin lookup: entry `u - 1` is the first bin whose size is >= `u`.
 static UNITS_TO_INDEX: [u8; 128] = {
     let mut table = [0u8; 128];
     let mut i = 0usize;
@@ -107,15 +106,15 @@ pub struct SubAllocator {
     hi_unit: u32,
     /// Total number of units in the arena.
     total_units: u32,
-    /// Rare-allocation glue countdown, matching unrar's GlueCount.
+    /// Rare-allocation glue countdown.
     glue_count: u8,
 }
 
 impl SubAllocator {
     fn layout_for(requested_size: usize) -> AllocatorLayout {
         let requested_size = requested_size.max(UNIT_SIZE * 8);
-        let unrar_allocated_size = (requested_size / UNIT_SIZE) * UNIT_SIZE + 2 * UNIT_SIZE;
-        let allocated_size = HEAP_BASE_BYTES + unrar_allocated_size;
+        let rar_allocated_size = (requested_size / UNIT_SIZE) * UNIT_SIZE + 2 * UNIT_SIZE;
+        let allocated_size = HEAP_BASE_BYTES + rar_allocated_size;
 
         let size2 = UNIT_SIZE * ((requested_size / 8 / UNIT_SIZE) * 7);
         let real_size2 = (size2 / UNIT_SIZE) * UNIT_SIZE;
@@ -221,7 +220,7 @@ impl SubAllocator {
         self.total_units.saturating_sub(1) as usize * UNIT_SIZE
     }
 
-    /// Validate a semantic model pointer against unrar's pText/HeapEnd guards.
+    /// Validate a semantic model pointer against pText/HeapEnd guards.
     #[inline]
     pub fn model_offset_valid(&self, off: u32) -> bool {
         let off = off as usize;
@@ -283,15 +282,14 @@ impl SubAllocator {
         self.insert_node(p, tail_idx);
     }
 
-    /// Merge physically adjacent free blocks, replicating unrar's
-    /// `GlueFreeBlocks` step for step. Free lists are LIFO stacks, so the
-    /// collection order, merge order, and reinsertion order all determine
+    /// Merge physically adjacent free blocks. Free lists are LIFO stacks, so
+    /// the collection order, merge order, and reinsertion order all determine
     /// which block a later allocation returns — and through that the
     /// fragmentation pattern and the model-restart point, which must stay in
     /// lockstep with the encoder.
     fn glue_free_blocks(&mut self) {
-        // Collect every free block in unrar's chain order: bin 0 upward,
-        // list order within each bin. `units` mirrors the block's `NU` field.
+        // Collect every free block in chain order: bin 0 upward, list order
+        // within each bin. `units` mirrors the block's `NU` field.
         let mut chain: Vec<(NodeRef, u32)> = Vec::new();
         let mut removed: Vec<bool> = Vec::new();
         for (idx, &bin_units) in INDEX_TO_UNITS.iter().enumerate().take(NUM_INDEXES) {
@@ -314,11 +312,9 @@ impl SubAllocator {
                 .map(|pos| by_start[pos].1)
         };
 
-        // Walk the chain in unrar's order — `insertAt(&s0)` builds the chain
-        // by head insertion, so iteration visits blocks in reverse collection
-        // order. Each entry repeatedly absorbs the free block that starts
-        // exactly where it ends (unrar probes the stamp of the physically
-        // following block). Absorbed entries leave the chain.
+        // Walk the chain in reverse collection order. Each entry repeatedly
+        // absorbs the free block that starts exactly where it ends. Absorbed
+        // entries leave the chain.
         for i in (0..chain.len()).rev() {
             if removed[i] {
                 continue;
@@ -336,11 +332,10 @@ impl SubAllocator {
             }
         }
 
-        // Reinsert the merged runs in the same reverse-collection chain
-        // order: leading 128-unit blocks first, then unrar's tail-before-head
-        // split for non-bin sizes. Free lists are LIFO, so this order decides
-        // which block later allocations return — and through that the
-        // model-restart lockstep.
+        // Reinsert the merged runs in the same reverse-collection chain order:
+        // leading 128-unit blocks first, then the tail-before-head split for
+        // non-bin sizes. Free lists are LIFO, so this order decides which block
+        // later allocations return — and through that the model-restart lockstep.
         for i in (0..chain.len()).rev() {
             if removed[i] {
                 continue;
@@ -700,7 +695,7 @@ impl SubAllocator {
 mod tests {
     use super::*;
 
-    fn unrar_layout_values(requested_size: usize) -> (usize, usize, usize, usize) {
+    fn rar_layout_values(requested_size: usize) -> (usize, usize, usize, usize) {
         let allocated_size = (requested_size / UNIT_SIZE) * UNIT_SIZE + 2 * UNIT_SIZE;
         let size2 = UNIT_SIZE * ((requested_size / 8 / UNIT_SIZE) * 7);
         let size1 = requested_size - size2;
@@ -710,12 +705,11 @@ mod tests {
     }
 
     #[test]
-    fn allocator_layout_matches_unrar_suballocator_formula() {
+    fn allocator_layout_matches_rar_suballocator_formula() {
         for mib in [1usize, 2, 4, 8, 17] {
             let requested_size = mib * 1024 * 1024;
             let layout = SubAllocator::layout_for(requested_size);
-            let (allocated_size, size1, real_size1, real_size2) =
-                unrar_layout_values(requested_size);
+            let (allocated_size, size1, real_size1, real_size2) = rar_layout_values(requested_size);
 
             assert_eq!(layout.allocated_size, HEAP_BASE_BYTES + allocated_size);
             assert_eq!(layout.fake_units_start_bytes, HEAP_BASE_BYTES + size1);
@@ -738,9 +732,9 @@ mod tests {
     }
 
     #[test]
-    fn text_region_preserves_full_unrar_size1_capacity() {
+    fn text_region_preserves_full_rar_size1_capacity() {
         let requested_size = 4 * 1024 * 1024;
-        let (_, size1, _, _) = unrar_layout_values(requested_size);
+        let (_, size1, _, _) = rar_layout_values(requested_size);
         let alloc = SubAllocator::new(requested_size);
 
         assert_eq!(alloc.text_position(), HEAP_BASE_BYTES);
@@ -748,9 +742,9 @@ mod tests {
     }
 
     #[test]
-    fn text_exhaustion_occurs_after_full_unrar_text_capacity() {
+    fn text_exhaustion_occurs_after_full_rar_text_capacity() {
         let requested_size = 96;
-        let (_, size1, _, _) = unrar_layout_values(requested_size);
+        let (_, size1, _, _) = rar_layout_values(requested_size);
         let mut alloc = SubAllocator::new(requested_size);
 
         for _ in 0..size1 {
@@ -763,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_restores_unrar_layout_boundaries() {
+    fn reset_restores_rar_layout_boundaries() {
         let requested_size = 4 * 1024 * 1024;
         let mut alloc = SubAllocator::new(requested_size);
         let original_fake_start = alloc.fake_units_start_bytes;

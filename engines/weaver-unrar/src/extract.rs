@@ -22,7 +22,7 @@ pub struct ExtractOptions {
     pub password: Option<String>,
     /// Restore archived Unix owner/group metadata when available.
     ///
-    /// This mirrors UnRAR's explicit `-ow` / `ProcessOwners` mode. It remains
+    /// This mirrors explicit owner-restore modes in RAR extraction tools. It remains
     /// disabled by default so extraction does not unexpectedly require owner
     /// privileges or alter ownership on normal user workflows.
     pub restore_owners: bool,

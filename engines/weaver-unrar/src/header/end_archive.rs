@@ -107,7 +107,7 @@ mod tests {
     }
 
     #[test]
-    fn test_end_archive_truncated_flags_vint_defaults_like_unrar() {
+    fn test_end_archive_truncated_flags_vint_defaults_like_rar_behavior() {
         let data = build_end_header_from_type_body(&[0x80]);
         let mut cursor = std::io::Cursor::new(data);
         let raw = read_raw_header(&mut cursor).unwrap().unwrap();

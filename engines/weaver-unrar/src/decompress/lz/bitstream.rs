@@ -247,7 +247,7 @@ impl<'a> BitReader<'a> {
 
     /// Peek up to 16 bits and return them left-aligned in a 16-bit field.
     ///
-    /// This matches unrar's hot `getbits() & 0xfffe` use in Huffman decode.
+    /// This supports the hot `getbits() & 0xfffe` shape in Huffman decode.
     #[inline]
     pub fn peek_16_left_aligned(&self) -> RarResult<u32> {
         if self.acc_bits >= 16 {
@@ -270,7 +270,7 @@ impl<'a> BitReader<'a> {
         })
     }
 
-    /// unrar-style `fgetbits()`: return the next raw 16 bits without masking.
+    /// Return the next raw 16 bits without masking.
     #[inline]
     pub fn peek_16_raw(&self) -> RarResult<u32> {
         if self.acc_bits >= 16 {
@@ -293,7 +293,7 @@ impl<'a> BitReader<'a> {
         })
     }
 
-    /// unrar-style `getbits()`: return the next bits as a left-aligned 16-bit field.
+    /// Return the next bits as a left-aligned 16-bit field.
     #[inline(always)]
     pub fn getbits(&self) -> RarResult<u32> {
         self.peek_16_left_aligned()
@@ -317,7 +317,7 @@ impl<'a> BitReader<'a> {
         self.skip_bits(count as u32)
     }
 
-    /// unrar-style `addbits()`: advance by `count` bits.
+    /// Advance by `count` bits.
     #[inline(always)]
     pub fn addbits(&mut self, count: u8) -> RarResult<()> {
         self.consume_bits(count)

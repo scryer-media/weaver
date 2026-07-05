@@ -737,9 +737,8 @@ impl RarArchive {
         fh: &crate::rar4::types::Rar4FileHeader,
         archive_solid: bool,
     ) -> bool {
-        // UnRAR's extract path uses the archive-level solid flag for RAR 1.3
-        // through RAR 1.5 because those formats do not reliably store a
-        // per-file solid bit.
+        // RAR 1.3 through RAR 1.5 use the archive-level solid flag because
+        // those formats do not reliably store a per-file solid bit.
         fh.is_solid || (archive_solid && fh.unpack_version <= 15)
     }
 }
@@ -989,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn rar4_file_header_conversion_host_system_matches_unrar() {
+    fn rar4_file_header_conversion_host_system_matches_rar_behavior() {
         let mut fh = crate::rar4::types::Rar4FileHeader {
             is_rar14: false,
             flags: 0,
@@ -1061,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn rar15_effective_solid_uses_archive_flag_like_unrar() {
+    fn rar15_effective_solid_uses_archive_flag_like_rar_behavior() {
         let mut fh = crate::rar4::types::Rar4FileHeader {
             is_rar14: false,
             flags: 0,

@@ -105,8 +105,8 @@ fn read_raw_u32_lossy(data: &[u8], pos: &mut usize) -> u32 {
 pub struct FileHeader {
     /// File name (UTF-8).
     pub name: String,
-    /// Raw archive name bytes after UnRAR's MAXPATHSIZE cap and short-read
-    /// zero-fill behavior. This preserves filename data that cannot be
+    /// Raw archive name bytes after the RAR name cap and short-read zero-fill
+    /// behavior. This preserves filename data that cannot be
     /// represented losslessly in `name`.
     pub name_raw: Option<Vec<u8>>,
     /// Unpacked size in bytes (None if unknown).
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_header_unknown_algorithm_store_is_allowed_like_unrar() {
+    fn test_file_header_unknown_algorithm_store_is_allowed_like_rar_behavior() {
         let data = build_file_header(TestFileHeaderArgs {
             file_flags: 0,
             unpacked_size: 0,
@@ -394,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn test_directory_header_ignores_rar7_dictionary_size_like_unrar() {
+    fn test_directory_header_ignores_rar7_dictionary_size_like_rar_behavior() {
         let data = build_file_header(TestFileHeaderArgs {
             file_flags: flags::DIRECTORY,
             unpacked_size: 0,
@@ -416,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_header_truncated_flag_vint_defaults_like_unrar() {
+    fn test_file_header_truncated_flag_vint_defaults_like_rar_behavior() {
         let data = build_file_header_from_type_body(&[0x80]);
         let mut cursor = std::io::Cursor::new(data);
         let raw = read_raw_header(&mut cursor).unwrap().unwrap();
@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_header_missing_flagged_time_and_crc_default_like_unrar() {
+    fn test_file_header_missing_flagged_time_and_crc_default_like_rar_behavior() {
         let mut body = Vec::new();
         body.extend_from_slice(&encode_vint(flags::TIME_PRESENT | flags::CRC32_PRESENT));
         let data = build_file_header_from_type_body(&body);
@@ -467,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_header_name_decode_is_capped_like_unrar() {
+    fn test_file_header_name_decode_is_capped_like_rar_behavior() {
         let mut name = vec![b'a'; MAXPATHSIZE + 3];
         name[MAXPATHSIZE] = b'b';
         name[MAXPATHSIZE + 1] = b'c';
@@ -492,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_header_invalid_utf8_name_keeps_prefix_like_unrar() {
+    fn test_file_header_invalid_utf8_name_keeps_prefix_like_rar_behavior() {
         let data =
             build_file_header_with_raw_name(0, 0, 0, None, None, 0, 0, 16, b"valid/\xffignored");
         let mut cursor = std::io::Cursor::new(data);
@@ -507,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_header_overlong_utf8_name_decodes_like_unrar() {
+    fn test_file_header_overlong_utf8_name_decodes_like_rar_behavior() {
         let data =
             build_file_header_with_raw_name(0, 0, 0, None, None, 0, 0, 10, b"valid\xc0\xafok");
         let mut cursor = std::io::Cursor::new(data);
@@ -519,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_header_short_name_zero_fills_and_truncates_at_nul_like_unrar() {
+    fn test_file_header_short_name_zero_fills_and_truncates_at_nul_like_rar_behavior() {
         let data = build_file_header_with_raw_name(0, 0, 0, None, None, 0, 0, 12, b"abc");
         let mut cursor = std::io::Cursor::new(data);
         let raw = read_raw_header(&mut cursor).unwrap().unwrap();
@@ -530,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_header_name_decode_truncates_embedded_nul_like_unrar() {
+    fn test_file_header_name_decode_truncates_embedded_nul_like_rar_behavior() {
         let data = build_file_header_with_raw_name(0, 0, 0, None, None, 0, 0, 7, b"abc\0def");
         let mut cursor = std::io::Cursor::new(data);
         let raw = read_raw_header(&mut cursor).unwrap().unwrap();

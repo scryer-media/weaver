@@ -659,7 +659,7 @@ unsafe fn decode_kernel_ssse3(
     search_end: bool,
 ) -> Result<KernelOutcome, YencError> {
     unsafe {
-        decode_kernel_simd64(
+        decode_kernel_simd64_ssse3_line_aware(
             input,
             output,
             state,
@@ -682,7 +682,7 @@ unsafe fn decode_kernel_sse41(
     search_end: bool,
 ) -> Result<KernelOutcome, YencError> {
     unsafe {
-        decode_kernel_simd64(
+        decode_kernel_simd64_ssse3_line_aware(
             input,
             output,
             state,
@@ -705,7 +705,7 @@ unsafe fn decode_kernel_avx(
     search_end: bool,
 ) -> Result<KernelOutcome, YencError> {
     unsafe {
-        decode_kernel_simd64(
+        decode_kernel_simd64_ssse3_line_aware(
             input,
             output,
             state,
@@ -1062,10 +1062,10 @@ unsafe fn try_decode_ssse3_block(
     let decoded_c = unsafe { ssse3_decode_with_escape_mask(c, ((escaped >> 32) & 0xffff) as u16) };
     let decoded_d = unsafe { ssse3_decode_with_escape_mask(d, ((escaped >> 48) & 0xffff) as u16) };
 
-    unsafe { compact_store_16_ssse3(decoded_a, (skip & 0xffff) as u16, output, dst)? };
-    unsafe { compact_store_16_ssse3(decoded_b, ((skip >> 16) & 0xffff) as u16, output, dst)? };
-    unsafe { compact_store_16_ssse3(decoded_c, ((skip >> 32) & 0xffff) as u16, output, dst)? };
-    unsafe { compact_store_16_ssse3(decoded_d, ((skip >> 48) & 0xffff) as u16, output, dst)? };
+    unsafe { compact_store_16_ssse3(decoded_a, (skip & 0xffff) as u16, output, dst) };
+    unsafe { compact_store_16_ssse3(decoded_b, ((skip >> 16) & 0xffff) as u16, output, dst) };
+    unsafe { compact_store_16_ssse3(decoded_c, ((skip >> 32) & 0xffff) as u16, output, dst) };
+    unsafe { compact_store_16_ssse3(decoded_d, ((skip >> 48) & 0xffff) as u16, output, dst) };
 
     state.state = x86_final_state_after_block(
         fixed_eq,
@@ -1215,10 +1215,10 @@ unsafe fn try_decode_sse41_block(
     let decoded_c = unsafe { sse41_decode_with_escape_mask(c, ((escaped >> 32) & 0xffff) as u16) };
     let decoded_d = unsafe { sse41_decode_with_escape_mask(d, ((escaped >> 48) & 0xffff) as u16) };
 
-    unsafe { compact_store_16_ssse3(decoded_a, (skip & 0xffff) as u16, output, dst)? };
-    unsafe { compact_store_16_ssse3(decoded_b, ((skip >> 16) & 0xffff) as u16, output, dst)? };
-    unsafe { compact_store_16_ssse3(decoded_c, ((skip >> 32) & 0xffff) as u16, output, dst)? };
-    unsafe { compact_store_16_ssse3(decoded_d, ((skip >> 48) & 0xffff) as u16, output, dst)? };
+    unsafe { compact_store_16_ssse3(decoded_a, (skip & 0xffff) as u16, output, dst) };
+    unsafe { compact_store_16_ssse3(decoded_b, ((skip >> 16) & 0xffff) as u16, output, dst) };
+    unsafe { compact_store_16_ssse3(decoded_c, ((skip >> 32) & 0xffff) as u16, output, dst) };
+    unsafe { compact_store_16_ssse3(decoded_d, ((skip >> 48) & 0xffff) as u16, output, dst) };
 
     state.state = x86_final_state_after_block(
         fixed_eq,
@@ -1360,8 +1360,8 @@ unsafe fn try_decode_avx2_block(
     }
 
     let (decoded_a, decoded_b) = unsafe { avx2_decode_with_escape_mask(a, b, escaped) };
-    unsafe { compact_store_16_avx2(decoded_a, false, (skip & 0xffff) as u16, output, dst)? };
-    unsafe { compact_store_16_avx2(decoded_a, true, ((skip >> 16) & 0xffff) as u16, output, dst)? };
+    unsafe { compact_store_16_avx2(decoded_a, false, (skip & 0xffff) as u16, output, dst) };
+    unsafe { compact_store_16_avx2(decoded_a, true, ((skip >> 16) & 0xffff) as u16, output, dst) };
     unsafe {
         compact_store_16_avx2(
             decoded_b,
@@ -1369,9 +1369,9 @@ unsafe fn try_decode_avx2_block(
             ((skip >> 32) & 0xffff) as u16,
             output,
             dst,
-        )?
+        )
     };
-    unsafe { compact_store_16_avx2(decoded_b, true, ((skip >> 48) & 0xffff) as u16, output, dst)? };
+    unsafe { compact_store_16_avx2(decoded_b, true, ((skip >> 48) & 0xffff) as u16, output, dst) };
 
     state.state = x86_final_state_after_block(
         fixed_eq,
@@ -1495,9 +1495,9 @@ unsafe fn try_decode_avx512_vbmi2_block(
         return Ok(Some(64));
     }
 
-    unsafe { compact_store_32_avx512_vbmi2(decoded_a, (!skip & 0xffff_ffff) as u32, output, dst)? };
+    unsafe { compact_store_32_avx512_vbmi2(decoded_a, (!skip & 0xffff_ffff) as u32, output, dst) };
     unsafe {
-        compact_store_32_avx512_vbmi2(decoded_b, ((!skip >> 32) & 0xffff_ffff) as u32, output, dst)?
+        compact_store_32_avx512_vbmi2(decoded_b, ((!skip >> 32) & 0xffff_ffff) as u32, output, dst)
     };
     state.state = x86_final_state_after_block(
         fixed_eq,
@@ -1733,21 +1733,17 @@ unsafe fn compact_store_32_avx512_vbmi2(
     keep_mask: u32,
     output: &mut [u8],
     dst: &mut usize,
-) -> Result<(), YencError> {
+) {
     use std::arch::x86_64::*;
 
+    // The caller guarantees 64 spare output bytes per block, so both stores
+    // can write a full 32-byte vector; bytes past `keep` are overwritten by
+    // the next store.
+    debug_assert!(output.len().saturating_sub(*dst) >= 32);
     let keep = keep_mask.count_ones() as usize;
-    if output.len().saturating_sub(*dst) < 32 {
-        return Err(YencError::BufferTooSmall {
-            needed: *dst + 32,
-            available: output.len(),
-        });
-    }
-
     let packed = _mm256_maskz_compress_epi8(keep_mask, decoded);
     unsafe { _mm256_storeu_si256(output.as_mut_ptr().add(*dst) as *mut __m256i, packed) };
     *dst += keep;
-    Ok(())
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1919,8 +1915,10 @@ unsafe fn decode_kernel_neon(
             table: compact_table_16(),
         };
         while (!search_end || state.end == DecodeEnd::None) && src + WIDTH <= simd_limit {
-            if !matches!(state.state, DecoderState::None | DecoderState::CrLf)
-                || output.len().saturating_sub(dst) < WIDTH
+            if !matches!(
+                state.state,
+                DecoderState::None | DecoderState::CrLf | DecoderState::Eq | DecoderState::CrLfEq
+            ) || output.len().saturating_sub(dst) < WIDTH
             {
                 if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
                     break;
@@ -2242,10 +2240,10 @@ unsafe fn try_decode_avx2_line(
         } else {
             let (decoded_a, decoded_b) = unsafe { avx2_decode_with_escape_mask(a, b, escaped) };
             unsafe {
-                compact_store_16_avx2(decoded_a, false, (skip & 0xffff) as u16, output, dst)?
+                compact_store_16_avx2(decoded_a, false, (skip & 0xffff) as u16, output, dst)
             };
             unsafe {
-                compact_store_16_avx2(decoded_a, true, ((skip >> 16) & 0xffff) as u16, output, dst)?
+                compact_store_16_avx2(decoded_a, true, ((skip >> 16) & 0xffff) as u16, output, dst)
             };
             unsafe {
                 compact_store_16_avx2(
@@ -2254,11 +2252,221 @@ unsafe fn try_decode_avx2_line(
                     ((skip >> 32) & 0xffff) as u16,
                     output,
                     dst,
-                )?
+                )
             };
             unsafe {
-                compact_store_16_avx2(decoded_b, true, ((skip >> 48) & 0xffff) as u16, output, dst)?
+                compact_store_16_avx2(decoded_b, true, ((skip >> 48) & 0xffff) as u16, output, dst)
             };
+        }
+
+        esc_first = (fixed_eq & LAST != 0) as u64;
+    }
+
+    debug_assert_eq!(esc_first, 0);
+    state.state = DecoderState::CrLf;
+    Ok(Some(line_length + 2))
+}
+
+/// SSSE3 twin of [`decode_kernel_simd64_avx2_line_aware`] for the pre-AVX2
+/// tiers in the portable binary.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn decode_kernel_simd64_ssse3_line_aware(
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut KernelState,
+    dot_unstuffing: bool,
+    preserve_pending: bool,
+    search_end: bool,
+    block: DecodeBlock64,
+) -> Result<KernelOutcome, YencError> {
+    const WIDTH: usize = 64;
+
+    let mut src = 0usize;
+    let mut dst = 0usize;
+    let mode = DecodeStepMode {
+        dot_unstuffing,
+        preserve_pending,
+        search_end,
+    };
+    let tail_buffer = if dot_unstuffing {
+        WIDTH - 1 + 4
+    } else {
+        WIDTH - 1
+    };
+    let simd_limit = input.len().saturating_sub(tail_buffer);
+
+    if input.len() > WIDTH * 2 {
+        while (!search_end || state.end == DecodeEnd::None) && src + WIDTH <= simd_limit {
+            if state.line_length.is_some()
+                && let Some(consumed) = unsafe {
+                    try_decode_ssse3_line(
+                        input,
+                        src,
+                        output,
+                        &mut dst,
+                        state,
+                        dot_unstuffing,
+                        search_end,
+                        simd_limit,
+                    )?
+                }
+            {
+                src += consumed;
+                continue;
+            }
+
+            if let Some(consumed) = unsafe {
+                block(
+                    input,
+                    src,
+                    output,
+                    &mut dst,
+                    state,
+                    dot_unstuffing,
+                    search_end,
+                )?
+            } {
+                src += consumed;
+                continue;
+            }
+
+            if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+                break;
+            }
+        }
+    }
+
+    while (!search_end || state.end == DecodeEnd::None) && src < input.len() {
+        if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+            break;
+        }
+    }
+
+    Ok(KernelOutcome {
+        consumed: src,
+        written: dst,
+        end: state.end.into(),
+    })
+}
+
+/// SSSE3 twin of [`try_decode_avx2_line`]: same guards and bail conditions,
+/// 4x16-byte vectors instead of 2x32.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn try_decode_ssse3_line(
+    input: &[u8],
+    src: usize,
+    output: &mut [u8],
+    dst: &mut usize,
+    state: &mut KernelState,
+    dot_unstuffing: bool,
+    search_end: bool,
+    simd_limit: usize,
+) -> Result<Option<usize>, YencError> {
+    use std::arch::x86_64::*;
+
+    const WIDTH: usize = 64;
+    const MAX_LINE_CHUNKS: usize = 16;
+    const LAST: u64 = 1u64 << 63;
+
+    let Some(line_length) = state.line_length else {
+        return Ok(None);
+    };
+    if state.state != DecoderState::CrLf
+        || line_length < WIDTH
+        || line_length % WIDTH != 0
+        || line_length / WIDTH > MAX_LINE_CHUNKS
+    {
+        return Ok(None);
+    }
+
+    let line_end = src.saturating_add(line_length);
+    let after_crlf = line_end.saturating_add(2);
+    if after_crlf > input.len() || after_crlf > simd_limit {
+        return Ok(None);
+    }
+    if input[line_end] != b'\r' || input[line_end + 1] != b'\n' {
+        return Ok(None);
+    }
+    if dot_unstuffing && input[src] == b'.' {
+        return Ok(None);
+    }
+    if search_end && dot_unstuffing && input[src] == b'=' && input[src + 1] == b'y' {
+        return Ok(None);
+    }
+    if input[line_end - 1] == b'=' || output.len().saturating_sub(*dst) < line_length {
+        return Ok(None);
+    }
+
+    let load4 = |chunk_src: usize| -> [__m128i; 4] {
+        unsafe {
+            [
+                _mm_loadu_si128(input.as_ptr().add(chunk_src) as *const __m128i),
+                _mm_loadu_si128(input.as_ptr().add(chunk_src + 16) as *const __m128i),
+                _mm_loadu_si128(input.as_ptr().add(chunk_src + 32) as *const __m128i),
+                _mm_loadu_si128(input.as_ptr().add(chunk_src + 48) as *const __m128i),
+            ]
+        }
+    };
+
+    let chunks = line_length / WIDTH;
+    let mut eq_masks = [0u64; MAX_LINE_CHUNKS];
+    for (chunk_idx, eq_slot) in eq_masks.iter_mut().take(chunks).enumerate() {
+        let vectors = load4(src + chunk_idx * WIDTH);
+        let crlf =
+            unsafe { sse2_mask64(vectors, b'\r') | sse2_mask64(vectors, b'\n') };
+        if crlf != 0 {
+            return Ok(None);
+        }
+        *eq_slot = unsafe { sse2_mask64(vectors, b'=') };
+    }
+
+    let mut preflight_esc_first = 0u64;
+    for &eq in eq_masks.iter().take(chunks) {
+        let fixed_eq = fix_eq_mask(eq, (eq << 1) | preflight_esc_first);
+        preflight_esc_first = (fixed_eq & LAST != 0) as u64;
+    }
+    if preflight_esc_first != 0 {
+        return Ok(None);
+    }
+
+    let sub42 = _mm_set1_epi8(42i8.wrapping_neg());
+    let mut esc_first = 0u64;
+    for (chunk_idx, &eq) in eq_masks.iter().take(chunks).enumerate() {
+        let vectors = load4(src + chunk_idx * WIDTH);
+        let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+        let escaped = (fixed_eq << 1) | esc_first;
+        let skip = fixed_eq;
+
+        if skip == 0 && escaped == 0 {
+            unsafe {
+                _mm_storeu_si128(
+                    output.as_mut_ptr().add(*dst) as *mut __m128i,
+                    _mm_add_epi8(vectors[0], sub42),
+                );
+                _mm_storeu_si128(
+                    output.as_mut_ptr().add(*dst + 16) as *mut __m128i,
+                    _mm_add_epi8(vectors[1], sub42),
+                );
+                _mm_storeu_si128(
+                    output.as_mut_ptr().add(*dst + 32) as *mut __m128i,
+                    _mm_add_epi8(vectors[2], sub42),
+                );
+                _mm_storeu_si128(
+                    output.as_mut_ptr().add(*dst + 48) as *mut __m128i,
+                    _mm_add_epi8(vectors[3], sub42),
+                );
+            }
+            *dst += WIDTH;
+        } else {
+            for (group, &vector) in vectors.iter().enumerate() {
+                let group_escaped = ((escaped >> (group * 16)) & 0xffff) as u16;
+                let decoded = unsafe { ssse3_decode_with_escape_mask(vector, group_escaped) };
+                let group_skip = ((skip >> (group * 16)) & 0xffff) as u16;
+                unsafe { compact_store_16_ssse3(decoded, group_skip, output, dst) };
+            }
         }
 
         esc_first = (fixed_eq & LAST != 0) as u64;
@@ -2745,6 +2953,19 @@ unsafe fn decode_neon64_span_block(
     debug_assert!(input.len().saturating_sub(block_src) > 64);
     debug_assert!(output.len().saturating_sub(*dst) >= 64);
 
+    // Escape carried in from the previous window's trailing '=' (rapidyenc's
+    // escFirst): bit 0 of this window is the escaped partner byte.
+    let esc_first = matches!(state.state, DecoderState::Eq | DecoderState::CrLfEq);
+    if esc_first
+        && search_end
+        && dot_unstuffing
+        && state.state == DecoderState::CrLfEq
+        && input[block_src] == b'y'
+    {
+        // Line-start "=y…" control candidate; the scalar machine resolves it.
+        return Ok(SpanBlockOutcome::ScalarThrough(block_src));
+    }
+
     // A line-start dot at the window's first byte is invisible to the
     // specials gate below; resolve its lookahead here. Terminator/control
     // shapes go to the scalar state machine, a plain stuffed dot is recorded
@@ -2774,7 +2995,7 @@ unsafe fn decode_neon64_span_block(
     let any = unsafe { vorrq_u8(vorrq_u8(cmp_a, cmp_b), vorrq_u8(cmp_c, cmp_d)) };
     let has_specials = unsafe { vmaxvq_u8(any) } != 0;
 
-    if !has_specials && !dot0 {
+    if !has_specials && !dot0 && !esc_first {
         unsafe {
             vst1q_u8(
                 output.as_mut_ptr().add(*dst),
@@ -2834,8 +3055,9 @@ unsafe fn decode_neon64_span_block(
         (0, 0)
     };
 
-    let fixed_eq = fix_eq_mask(eq, eq << 1);
-    let escaped = fixed_eq << 1;
+    let esc_first = esc_first as u64;
+    let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+    let escaped = (fixed_eq << 1) | esc_first;
 
     let entry_line_start = (state.state == DecoderState::CrLf) as u64;
     let (raw_cr, escaped_cr, raw_breaks, crlf, line_start, dot_start);
@@ -2937,10 +3159,10 @@ unsafe fn decode_neon64_span_block(
             unsafe { vsubq_u8(c, constants.normal_offset) },
             unsafe { vsubq_u8(d, constants.normal_offset) },
         ]
-    } else if eq & (eq << 1) == 0 {
-        // No adjacent '=': escaped positions are exactly the '=' compares
-        // shifted one lane, so the offset select never leaves the vector
-        // domain (rapidyenc's shortcut path).
+    } else if esc_first == 0 && eq & (eq << 1) == 0 {
+        // No adjacent '=' and no carried-in escape: escaped positions are
+        // exactly the '=' compares shifted one lane, so the offset select
+        // never leaves the vector domain (rapidyenc's shortcut path).
         let zero = unsafe { vdupq_n_u8(0) };
         let sel_a = unsafe { vextq_u8::<15>(zero, eq_a) };
         let sel_b = unsafe { vextq_u8::<15>(eq_a, eq_b) };
@@ -3204,24 +3426,20 @@ unsafe fn compact_store_16_ssse3(
     skip_mask: u16,
     output: &mut [u8],
     dst: &mut usize,
-) -> Result<(), YencError> {
+) {
     use std::arch::x86_64::*;
 
+    // The caller guarantees 64 spare output bytes per block, so each of the
+    // four stores can write a full 16-byte vector; bytes past `keep` are
+    // overwritten by the next store.
+    debug_assert!(output.len().saturating_sub(*dst) >= 16);
     let keep = 16 - skip_mask.count_ones() as usize;
-    if output.len().saturating_sub(*dst) < keep {
-        return Err(YencError::BufferTooSmall {
-            needed: *dst + keep,
-            available: output.len(),
-        });
-    }
-
     let shuffle = unsafe {
         _mm_loadu_si128(compact_table_16()[(skip_mask & 0x7fff) as usize].as_ptr() as *const __m128i)
     };
     let packed = _mm_shuffle_epi8(decoded, shuffle);
     unsafe { _mm_storeu_si128(output.as_mut_ptr().add(*dst) as *mut __m128i, packed) };
     *dst += keep;
-    Ok(())
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3232,17 +3450,14 @@ unsafe fn compact_store_16_avx2(
     skip_mask: u16,
     output: &mut [u8],
     dst: &mut usize,
-) -> Result<(), YencError> {
+) {
     use std::arch::x86_64::*;
 
+    // The caller guarantees 64 spare output bytes per block, so each of the
+    // four stores can write a full 16-byte vector; bytes past `keep` are
+    // overwritten by the next store.
+    debug_assert!(output.len().saturating_sub(*dst) >= 16);
     let keep = 16 - skip_mask.count_ones() as usize;
-    if output.len().saturating_sub(*dst) < keep {
-        return Err(YencError::BufferTooSmall {
-            needed: *dst + keep,
-            available: output.len(),
-        });
-    }
-
     let shuffle = unsafe {
         _mm_loadu_si128(compact_table_16()[(skip_mask & 0x7fff) as usize].as_ptr() as *const __m128i)
     };
@@ -3254,7 +3469,6 @@ unsafe fn compact_store_16_avx2(
     let packed = _mm_shuffle_epi8(lane, shuffle);
     unsafe { _mm_storeu_si128(output.as_mut_ptr().add(*dst) as *mut __m128i, packed) };
     *dst += keep;
-    Ok(())
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -5023,9 +5237,10 @@ mod tests {
         preserve_pending: bool,
         search_end: bool,
         scalar: bool,
+        line_length: Option<u32>,
     ) -> Result<(Vec<u8>, usize, RapidyencDecodeEnd, KernelState), YencError> {
         let mut output = vec![0u8; input.len() + 64];
-        let mut state = KernelState::body();
+        let mut state = KernelState::body_with_line_length(line_length);
         let outcome = if scalar {
             decode_kernel_scalar(
                 input,
@@ -5056,9 +5271,10 @@ mod tests {
         dot_unstuffing: bool,
         search_end: bool,
         scalar: bool,
+        line_length: Option<u32>,
     ) -> (Vec<u8>, usize, RapidyencDecodeEnd, KernelState) {
         let mut output = vec![0u8; input.len() + 64];
-        let mut state = KernelState::body();
+        let mut state = KernelState::body_with_line_length(line_length);
         let mut consumed = 0usize;
         let mut written = 0usize;
         let mut end = RapidyencDecodeEnd::None;
@@ -5102,33 +5318,38 @@ mod tests {
         for round in 0..64 {
             let len = 256 + (lcg(&mut seed) % 4096) as usize;
             let input = adversarial_stream(&mut seed, len);
-            for &(dot, preserve, search) in &[
-                (true, true, true),
-                (true, true, false),
-                (true, false, true),
-                (false, true, false),
-                (false, false, false),
-            ] {
-                let simd = run_kernel_whole(&input, dot, preserve, search, false);
-                let reference = run_kernel_whole(&input, dot, preserve, search, true);
-                match (simd, reference) {
-                    (Ok(simd), Ok(reference)) => {
-                        assert_eq!(
-                            simd, reference,
-                            "round {round} dot={dot} preserve={preserve} search={search}"
-                        );
+            for &hint in &[None, Some(128u32)] {
+                for &(dot, preserve, search) in &[
+                    (true, true, true),
+                    (true, true, false),
+                    (true, false, true),
+                    (false, true, false),
+                    (false, false, false),
+                ] {
+                    let simd = run_kernel_whole(&input, dot, preserve, search, false, hint);
+                    let reference = run_kernel_whole(&input, dot, preserve, search, true, hint);
+                    match (simd, reference) {
+                        (Ok(simd), Ok(reference)) => {
+                            assert_eq!(
+                                simd, reference,
+                                "round {round} hint={hint:?} dot={dot} preserve={preserve} \
+                                 search={search}"
+                            );
+                        }
+                        (Err(simd), Err(reference)) => {
+                            assert_eq!(
+                                simd.to_string(),
+                                reference.to_string(),
+                                "round {round} hint={hint:?} dot={dot} preserve={preserve} \
+                                 search={search}"
+                            );
+                        }
+                        (simd, reference) => panic!(
+                            "kernel disagreement round {round} hint={hint:?} dot={dot} \
+                             preserve={preserve} search={search}: simd={simd:?} \
+                             reference={reference:?}"
+                        ),
                     }
-                    (Err(simd), Err(reference)) => {
-                        assert_eq!(
-                            simd.to_string(),
-                            reference.to_string(),
-                            "round {round} dot={dot} preserve={preserve} search={search}"
-                        );
-                    }
-                    (simd, reference) => panic!(
-                        "kernel disagreement round {round} dot={dot} preserve={preserve} \
-                         search={search}: simd={simd:?} reference={reference:?}"
-                    ),
                 }
             }
         }
@@ -5141,13 +5362,17 @@ mod tests {
             let len = 1024 + (lcg(&mut seed) % 2048) as usize;
             let input = adversarial_stream(&mut seed, len);
             for &chunk_len in &[1usize, 2, 3, 63, 64, 65, 127, 128, 257] {
-                for &(dot, search) in &[(true, true), (true, false), (false, false)] {
-                    let simd = run_kernel_chunked(&input, chunk_len, dot, search, false);
-                    let reference = run_kernel_chunked(&input, chunk_len, dot, search, true);
-                    assert_eq!(
-                        simd, reference,
-                        "round {round} chunk={chunk_len} dot={dot} search={search}"
-                    );
+                for &hint in &[None, Some(128u32)] {
+                    for &(dot, search) in &[(true, true), (true, false), (false, false)] {
+                        let simd = run_kernel_chunked(&input, chunk_len, dot, search, false, hint);
+                        let reference =
+                            run_kernel_chunked(&input, chunk_len, dot, search, true, hint);
+                        assert_eq!(
+                            simd, reference,
+                            "round {round} chunk={chunk_len} hint={hint:?} dot={dot} \
+                             search={search}"
+                        );
+                    }
                 }
             }
         }
@@ -5228,28 +5453,163 @@ mod tests {
         cases.push(case);
 
         for (idx, input) in cases.iter().enumerate() {
-            for &(dot, preserve, search) in &[
-                (true, true, true),
-                (true, true, false),
-                (true, false, true),
-                (false, true, false),
-            ] {
-                let simd = run_kernel_whole(input, dot, preserve, search, false);
-                let reference = run_kernel_whole(input, dot, preserve, search, true);
-                match (simd, reference) {
-                    (Ok(simd), Ok(reference)) => assert_eq!(
+            for &hint in &[None, Some(64u32)] {
+                for &(dot, preserve, search) in &[
+                    (true, true, true),
+                    (true, true, false),
+                    (true, false, true),
+                    (false, true, false),
+                ] {
+                    let simd = run_kernel_whole(input, dot, preserve, search, false, hint);
+                    let reference = run_kernel_whole(input, dot, preserve, search, true, hint);
+                    match (simd, reference) {
+                        (Ok(simd), Ok(reference)) => assert_eq!(
+                            simd, reference,
+                            "case {idx} hint={hint:?} dot={dot} preserve={preserve} \
+                             search={search}"
+                        ),
+                        (Err(simd), Err(reference)) => assert_eq!(
+                            simd.to_string(),
+                            reference.to_string(),
+                            "case {idx} hint={hint:?} dot={dot} preserve={preserve} \
+                             search={search}"
+                        ),
+                        (simd, reference) => panic!(
+                            "kernel disagreement case {idx} hint={hint:?} dot={dot} \
+                             preserve={preserve} search={search}: simd={simd:?} \
+                             reference={reference:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn forced_tier_kernels_match_scalar_with_line_hints() {
+        // Every x86 tier kernel (not just the one dispatch picks on this
+        // machine) against the scalar oracle, hint-less and hinted, so the
+        // per-tier line-aware paths keep differential coverage. Tiers whose
+        // features are missing self-skip.
+        type KernelFn = unsafe fn(
+            &[u8],
+            &mut [u8],
+            &mut KernelState,
+            bool,
+            bool,
+            bool,
+        ) -> Result<KernelOutcome, YencError>;
+        let tiers: &[(&str, bool, KernelFn)] = &[
+            (
+                "ssse3",
+                is_x86_feature_detected!("ssse3"),
+                decode_kernel_ssse3 as KernelFn,
+            ),
+            (
+                "sse4.1",
+                is_x86_feature_detected!("sse4.1") && is_x86_feature_detected!("ssse3"),
+                decode_kernel_sse41 as KernelFn,
+            ),
+            (
+                "avx",
+                is_x86_feature_detected!("avx")
+                    && is_x86_feature_detected!("popcnt")
+                    && is_x86_feature_detected!("sse4.1")
+                    && is_x86_feature_detected!("ssse3"),
+                decode_kernel_avx as KernelFn,
+            ),
+            (
+                "avx2",
+                is_x86_feature_detected!("avx2"),
+                decode_kernel_avx2 as KernelFn,
+            ),
+            (
+                "avx512-vbmi2",
+                is_x86_feature_detected!("avx512vbmi2")
+                    && is_x86_feature_detected!("avx512vl")
+                    && is_x86_feature_detected!("avx512bw")
+                    && is_x86_feature_detected!("avx512f")
+                    && is_x86_feature_detected!("avx2"),
+                decode_kernel_avx512_vbmi2 as KernelFn,
+            ),
+        ];
+
+        let mut seed = 0x71e2_ca5e_0b5e_55edu64;
+        for round in 0..8 {
+            let len = 1024 + (lcg(&mut seed) % 4096) as usize;
+            let payload: Vec<u8> = (0..len).map(|_| (lcg(&mut seed) % 256) as u8).collect();
+            let body = encoded_body_for(&payload, 128);
+            for &hint in &[None, Some(128u32), Some(64)] {
+                let mut reference = vec![0u8; body.len() + 64];
+                let mut reference_state = KernelState::body_with_line_length(hint);
+                let reference_outcome = decode_kernel_scalar(
+                    &body,
+                    &mut reference,
+                    &mut reference_state,
+                    true,
+                    false,
+                    false,
+                )
+                .unwrap();
+                reference.truncate(reference_outcome.written);
+
+                for &(name, available, kernel) in tiers {
+                    if !available {
+                        continue;
+                    }
+                    let mut output = vec![0u8; body.len() + 64];
+                    let mut state = KernelState::body_with_line_length(hint);
+                    let outcome =
+                        unsafe { kernel(&body, &mut output, &mut state, true, false, false) }
+                            .unwrap();
+                    output.truncate(outcome.written);
+                    assert_eq!(
+                        (output, outcome.consumed, outcome.end, state),
+                        (
+                            reference.clone(),
+                            reference_outcome.consumed,
+                            reference_outcome.end,
+                            reference_state,
+                        ),
+                        "tier {name} round {round} hint={hint:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_kernel_matches_scalar_on_hinted_encoded_streams() {
+        // Well-formed fixed-column articles decoded WITH the line hint set, so
+        // the line-aware fast path actually engages (the adversarial streams
+        // above mostly bail out of it). Right and wrong hints, whole and
+        // chunked, against the scalar oracle carrying the same hint.
+        let mut seed = 0x5eed_1a7e_c0de_beefu64;
+        for round in 0..24 {
+            let len = 512 + (lcg(&mut seed) % 8192) as usize;
+            let payload: Vec<u8> = (0..len).map(|_| (lcg(&mut seed) % 256) as u8).collect();
+            let body = encoded_body_for(&payload, 128);
+            for &hint in &[Some(128u32), Some(64), Some(256)] {
+                for &(dot, preserve, search) in
+                    &[(true, true, true), (true, false, false), (false, true, false)]
+                {
+                    let simd = run_kernel_whole(&body, dot, preserve, search, false, hint);
+                    let reference = run_kernel_whole(&body, dot, preserve, search, true, hint);
+                    assert_eq!(
+                        simd.as_ref().map_err(ToString::to_string),
+                        reference.as_ref().map_err(ToString::to_string),
+                        "round {round} hint={hint:?} dot={dot} preserve={preserve} \
+                         search={search}"
+                    );
+                }
+                for &chunk_len in &[63usize, 128, 130, 257, 1024] {
+                    let simd = run_kernel_chunked(&body, chunk_len, true, false, false, hint);
+                    let reference = run_kernel_chunked(&body, chunk_len, true, false, true, hint);
+                    assert_eq!(
                         simd, reference,
-                        "case {idx} dot={dot} preserve={preserve} search={search}"
-                    ),
-                    (Err(simd), Err(reference)) => assert_eq!(
-                        simd.to_string(),
-                        reference.to_string(),
-                        "case {idx} dot={dot} preserve={preserve} search={search}"
-                    ),
-                    (simd, reference) => panic!(
-                        "kernel disagreement case {idx} dot={dot} preserve={preserve} \
-                         search={search}: simd={simd:?} reference={reference:?}"
-                    ),
+                        "round {round} chunk={chunk_len} hint={hint:?}"
+                    );
                 }
             }
         }

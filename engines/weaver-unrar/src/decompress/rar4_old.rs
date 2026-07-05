@@ -2,8 +2,8 @@
 //!
 //! RAR 3.x/4.x use the RAR29 unpacker implemented in `rar4.rs`. Older
 //! RAR 2.0/2.6 and RAR 1.5 members use different bitstreams. This module
-//! ports unrar's `Unpack20` and `Unpack15` control flow closely enough to
-//! keep those members out of the RAR29 decoder.
+//! implements the legacy `Unpack20` and `Unpack15` control flow so those
+//! members stay out of the RAR29 decoder.
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -1655,7 +1655,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn old_rar_version_gate_matches_unrar_dispatch() {
+    fn old_rar_version_gate_matches_rar_behavior_dispatch() {
         assert!(ensure_supported_rar4_version(13, 3).is_ok());
         assert!(ensure_supported_rar4_version(14, 3).is_ok());
         assert!(ensure_supported_rar4_version(15, 3).is_ok());
@@ -1673,14 +1673,14 @@ mod tests {
     }
 
     #[test]
-    fn effective_rar4_window_size_applies_unrar_minimum() {
+    fn effective_rar4_window_size_applies_rar_behavior_minimum() {
         assert_eq!(effective_rar4_window_size(0), 0x40000);
         assert_eq!(effective_rar4_window_size(128 * 1024), 0x40000);
         assert_eq!(effective_rar4_window_size(512 * 1024), 512 * 1024);
     }
 
     #[test]
-    fn rar20_audio_keeps_unrar_raw_unsigned_last_char_after_underflow() {
+    fn rar20_audio_keeps_rar_behavior_raw_unsigned_last_char_after_underflow() {
         let mut decoder = Rar20Decoder::try_new(0x40000).unwrap();
         assert_eq!(decoder.decode_audio(1), 0xff);
         assert_eq!(decoder.audio_vars[0].last_char, u32::MAX);
@@ -1692,7 +1692,7 @@ mod tests {
     }
 
     #[test]
-    fn rar4_decoder_uses_unrar_minimum_window_for_legacy_methods() {
+    fn rar4_decoder_uses_rar_behavior_minimum_window_for_legacy_methods() {
         match Rar4Decoder::new(20, 128 * 1024, 3).unwrap() {
             Rar4Decoder::V20(decoder) => assert_eq!(decoder.window.dict_size(), 0x40000),
             _ => panic!("expected RAR20 decoder"),
@@ -1710,7 +1710,7 @@ mod tests {
     }
 
     #[test]
-    fn rar4_decoder_rejects_future_old_format_unpack_versions_like_unrar() {
+    fn rar4_decoder_rejects_future_old_format_unpack_versions_like_rar_behavior() {
         assert!(matches!(
             Rar4Decoder::new(30, 128 * 1024, 3),
             Err(RarError::UnsupportedCompression { version: 30, .. })
@@ -1736,7 +1736,7 @@ mod tests {
     }
 
     #[test]
-    fn rar15_decode_num_matches_unrar_table_shape() {
+    fn rar15_decode_num_matches_rar_behavior_table_shape() {
         let data = [0x80, 0x00];
         let mut reader = BitReader::new(&data);
         let value = decode_num(&mut reader, STARTL1, &DECL1, &POSL1).unwrap();
@@ -1752,7 +1752,7 @@ mod tests {
     }
 
     #[test]
-    fn rar20_read_last_tables_ignores_short_tail_like_unrar() {
+    fn rar20_read_last_tables_ignores_short_tail_like_rar_behavior() {
         let mut decoder = Rar20Decoder::try_new(128 * 1024).unwrap();
         let mut ld_lengths = vec![0u8; NC20];
         ld_lengths[269] = 1;
@@ -1766,7 +1766,7 @@ mod tests {
     }
 
     #[test]
-    fn rar20_read_last_tables_ignores_streaming_short_tail_like_unrar() {
+    fn rar20_read_last_tables_ignores_streaming_short_tail_like_rar_behavior() {
         let mut decoder = Rar20Decoder::try_new(128 * 1024).unwrap();
         let mut ld_lengths = vec![0u8; NC20];
         ld_lengths[269] = 1;

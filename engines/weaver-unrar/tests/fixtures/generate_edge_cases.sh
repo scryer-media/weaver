@@ -51,7 +51,7 @@ echo "long filename test" > "$SRCDIR/$LONGNAME"
 # Comment file
 echo "This is a test comment for the archive" > "$SRCDIR/_comment.txt"
 # RAR4 long-password KDF fixture. UTF-16LE password bytes plus salt exceed one
-# SHA-1 block, so this exercises unrar's RAR29 message-schedule write-back path.
+# SHA-1 block, so this exercises the RAR29 message-schedule write-back path.
 echo "RAR4 long password KDF fixture" > "$SRCDIR/rar4_long_password.txt"
 # Symlink
 ln -sf hello.txt "$SRCDIR/link_to_hello.txt"

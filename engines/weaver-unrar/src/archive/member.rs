@@ -52,7 +52,7 @@ fn current_umask() -> u32 {
     static UMASK: OnceLock<u32> = OnceLock::new();
     *UMASK.get_or_init(|| {
         // `umask` is the only portable way to read the current mask. Restore it
-        // immediately, matching UnRAR's ConvertAttributes path.
+        // immediately after reading it.
         let mask = unsafe { libc::umask(0o022) };
         unsafe {
             libc::umask(mask);
@@ -1136,7 +1136,7 @@ impl RarArchive {
         fh: &FileHeader,
         target_bytes: &[u8],
     ) -> RarResult<String> {
-        let Some(target) = Self::decode_unrar_utf8_for_link_safety(target_bytes) else {
+        let Some(target) = Self::decode_rar_lenient_utf8_for_link_safety(target_bytes) else {
             return Err(RarError::CorruptArchive {
                 detail: format!(
                     "RAR3 Unix symlink target for {} is not valid UTF-8",
@@ -1162,7 +1162,7 @@ impl RarArchive {
         Ok(target)
     }
 
-    fn decode_unrar_utf8_for_link_safety(bytes: &[u8]) -> Option<String> {
+    fn decode_rar_lenient_utf8_for_link_safety(bytes: &[u8]) -> Option<String> {
         let mut out = String::new();
         let mut pos = 0usize;
         while pos < bytes.len() {
@@ -1528,7 +1528,7 @@ impl RarArchive {
                     tracing::debug!(
                         original = %out_path.display(),
                         fallback = %fallback_path.display(),
-                        "retrying directory creation with UnRAR-compatible Windows-share name"
+                        "retrying directory creation with Windows-share-compatible RAR name"
                     );
                     Self::ensure_output_directory_at_member_path(
                         &fallback_member_name,
@@ -1808,7 +1808,7 @@ impl RarArchive {
                     tracing::debug!(
                         original = %out_path.display(),
                         fallback = %fallback_path.display(),
-                        "retrying file creation with UnRAR-compatible Windows-share name"
+                        "retrying file creation with Windows-share-compatible RAR name"
                     );
                     let file = Self::create_regular_output_file_at_member_path(
                         &fallback_member_name,
@@ -2102,9 +2102,9 @@ impl RarArchive {
     fn ensure_windows_reparse_privileges() {
         static ENABLED: OnceLock<()> = OnceLock::new();
         ENABLED.get_or_init(|| {
-            // Mirrors UnRAR's best-effort SetPrivilege calls before creating
-            // Windows symlink or junction reparse points. Missing privileges
-            // are reported by the later FSCTL_SET_REPARSE_POINT call.
+            // Best-effort privilege enabling before creating Windows symlink or
+            // junction reparse points. Missing privileges are reported by the
+            // later FSCTL_SET_REPARSE_POINT call.
             Self::try_enable_windows_privilege(windows_sys::Win32::Security::SE_RESTORE_NAME);
             Self::try_enable_windows_privilege(
                 windows_sys::Win32::Security::SE_CREATE_SYMBOLIC_LINK_NAME,
@@ -2723,7 +2723,7 @@ impl RarArchive {
         match fh.host_os {
             crate::types::HostOs::Windows => fh.attributes.0 as u32,
             // Scryer only maps Windows, Unix/Linux, and Darwin behavior. On
-            // Windows, UnRAR converts non-Windows archive origins to normal
+            // Windows extraction maps non-Windows archive origins to normal
             // Win32 directory/file attributes instead of treating their mode
             // bits as native Windows flags.
             crate::types::HostOs::Unix
@@ -2985,9 +2985,8 @@ impl RarArchive {
             }
             crate::types::HostOs::Darwin | crate::types::HostOs::Unknown(_) => {
                 // RAR4 `HSYS_MACOS` is a legacy Mac marker, not POSIX mode
-                // storage. Official UnRAR's Unix `ConvertAttributes` treats
-                // it like other non-Unix legacy hosts, so only real Unix
-                // archive origins preserve raw mode bits here.
+                // storage. Treat it like other non-Unix legacy hosts, so only
+                // real Unix archive origins preserve raw mode bits here.
                 let mode = if fh.is_directory { 0o777 } else { 0o666 };
                 Some(mode & !current_umask())
             }
@@ -3020,8 +3019,8 @@ impl RarArchive {
         Self::remove_existing_link_output(out_path)?;
         let target_path = Self::redirection_target_path(member_name, target, out_path);
         std::fs::hard_link(&target_path, out_path).map_err(RarError::Io)?;
-        // UnRAR sets attributes for hardlinks after creation because deleting
-        // or replacing the output link can affect the shared target metadata.
+        // Set attributes for hardlinks after creation because deleting or
+        // replacing the output link can affect the shared target metadata.
         Self::apply_unix_permissions(fh, out_path)?;
         Self::apply_windows_attributes(fh, out_path)?;
         Ok(0)
@@ -7380,7 +7379,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_comment_text_stops_at_nul_like_unrar() {
+    fn rar5_comment_text_stops_at_nul_like_rar_behavior() {
         assert_eq!(
             RarArchive::decode_rar5_comment_text(b"comment\0ignored"),
             "comment"
@@ -7388,7 +7387,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_comment_text_keeps_prefix_before_invalid_utf8_like_unrar() {
+    fn rar5_comment_text_keeps_prefix_before_invalid_utf8_like_rar_behavior() {
         assert_eq!(
             RarArchive::decode_rar5_comment_text(b"hello/\xffignored"),
             "hello/"
@@ -7396,7 +7395,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_comment_text_decodes_overlong_utf8_like_unrar() {
+    fn rar5_comment_text_decodes_overlong_utf8_like_rar_behavior() {
         assert_eq!(
             RarArchive::decode_rar5_comment_text(b"hello\xc0\xafworld"),
             "hello/world"
@@ -7404,7 +7403,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_windows_symlink_target_strips_absolute_prefix_like_unrar() {
+    fn rar5_windows_symlink_target_strips_absolute_prefix_like_rar_behavior() {
         assert_eq!(
             RarArchive::normalized_rar5_redirection_target(
                 header::RedirectionType::WindowsSymlink,
@@ -7415,7 +7414,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_windows_absolute_symlink_is_relative_after_unix_normalization_like_unrar() {
+    fn rar5_windows_absolute_symlink_is_relative_after_unix_normalization_like_rar_behavior() {
         let target = RarArchive::normalized_rar5_redirection_target(
             header::RedirectionType::WindowsSymlink,
             "\\??\\C:\\target",
@@ -7437,7 +7436,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_windows_junction_reparse_names_match_unrar_prefix_rules() {
+    fn rar5_windows_junction_reparse_names_match_rar_behavior_prefix_rules() {
         let substitute = RarArchive::windows_junction_substitute_name("/??/UNC/server/share");
         assert_eq!(substitute, "\\??\\UNC\\server\\share");
         assert_eq!(
@@ -7454,7 +7453,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_windows_junction_reparse_buffer_matches_unrar_layout() {
+    fn rar5_windows_junction_reparse_buffer_matches_rar_behavior_layout() {
         let buffer = RarArchive::windows_junction_reparse_buffer("dir/target").unwrap();
 
         assert_eq!(
@@ -7486,7 +7485,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_windows_reparse_absolute_targets_are_blocked_like_unrar_default() {
+    fn rar5_windows_reparse_absolute_targets_are_blocked_like_rar_behavior_default() {
         for target in [
             "\\??\\C:\\target",
             "\\?\\C:\\target",
@@ -7523,7 +7522,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_windows_symlink_reparse_buffer_matches_unrar_layout() {
+    fn rar5_windows_symlink_reparse_buffer_matches_rar_behavior_layout() {
         let buffer = RarArchive::windows_symlink_reparse_buffer("dir/target").unwrap();
 
         assert_eq!(
@@ -7559,7 +7558,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_filetime_interval_conversion_matches_unrar_epoch() {
+    fn windows_filetime_interval_conversion_matches_rar_behavior_epoch() {
         assert_eq!(
             RarArchive::windows_filetime_intervals(std::time::UNIX_EPOCH).unwrap(),
             116_444_736_000_000_000
@@ -7592,7 +7591,7 @@ mod tests {
     }
 
     #[test]
-    fn unix_output_mode_converts_windows_attributes_like_unrar() {
+    fn unix_output_mode_converts_windows_attributes_like_rar_behavior() {
         let mask = current_umask();
         let mut fh = test_rar3_symlink_header(None);
         fh.host_os = HostOs::Windows;
@@ -7610,7 +7609,7 @@ mod tests {
     }
 
     #[test]
-    fn unix_output_mode_uses_unrar_default_for_unsupported_hosts() {
+    fn unix_output_mode_uses_rar_behavior_default_for_unsupported_hosts() {
         let mask = current_umask();
         let mut fh = test_rar3_symlink_header(None);
         fh.host_os = HostOs::Unknown(0);
@@ -7718,7 +7717,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_overwrite_prepare_allows_missing_path_like_unrar_replace_flow() {
+    fn windows_overwrite_prepare_allows_missing_path_like_rar_behavior_replace_flow() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing.bin");
         RarArchive::clear_windows_readonly_before_overwrite(&missing).unwrap();
@@ -7764,7 +7763,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn directory_output_retries_with_unrar_windows_share_name_after_create_failure() {
+    fn directory_output_retries_with_rar_behavior_windows_share_name_after_create_failure() {
         let temp = tempfile::tempdir().unwrap();
         let original = temp.path().join("bad?dir");
         let fallback = temp.path().join("bad_dir");
@@ -7780,7 +7779,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn regular_output_retries_with_unrar_windows_share_name_after_create_failure() {
+    fn regular_output_retries_with_rar_behavior_windows_share_name_after_create_failure() {
         use std::io::Write;
 
         let temp = tempfile::tempdir().unwrap();
@@ -7799,7 +7798,7 @@ mod tests {
     }
 
     #[test]
-    fn unix_owner_chown_link_following_matches_unrar_platform_branch() {
+    fn unix_owner_chown_link_following_matches_rar_behavior_platform_branch() {
         assert!(RarArchive::unix_owner_chown_follows_links(true));
         assert_eq!(
             RarArchive::unix_owner_chown_follows_links(false),
@@ -7809,7 +7808,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_owner_restore_failure_is_best_effort_like_unrar() {
+    fn unix_owner_restore_failure_is_best_effort_like_rar_behavior() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing.bin");
         let owner = crate::types::UnixOwnerInfo {
@@ -7822,7 +7821,7 @@ mod tests {
     }
 
     #[test]
-    fn unix_regular_file_times_use_now_for_missing_counterpart_like_unrar() {
+    fn unix_regular_file_times_use_now_for_missing_counterpart_like_rar_behavior() {
         let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
         let atime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000);
         let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(3_000);
@@ -7847,7 +7846,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn regular_output_timestamp_failures_are_best_effort_like_unrar() {
+    fn regular_output_timestamp_failures_are_best_effort_like_rar_behavior() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing.bin");
         let mut fh = test_rar3_symlink_header(None);
@@ -7858,7 +7857,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_owner_mode_restore_round_trips_followed_mode_like_unrar() {
+    fn unix_owner_mode_restore_round_trips_followed_mode_like_rar_behavior() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
@@ -7881,7 +7880,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_hardlink_target_keeps_prefix_after_slash_to_native_like_unrar() {
+    fn rar5_hardlink_target_keeps_prefix_after_slash_to_native_like_rar_behavior() {
         assert_eq!(
             RarArchive::normalized_rar5_redirection_target(
                 header::RedirectionType::Hardlink,
@@ -7893,7 +7892,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn hardlink_output_restores_shared_inode_attributes_like_unrar() {
+    fn hardlink_output_restores_shared_inode_attributes_like_rar_behavior() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
@@ -7924,7 +7923,7 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn rar5_file_reference_drive_prefix_is_relative_like_unrar_on_unix() {
+    fn rar5_file_reference_drive_prefix_is_relative_like_rar_behavior_on_unix() {
         assert_eq!(
             RarArchive::normalized_rar5_redirection_target(
                 header::RedirectionType::FileCopy,
@@ -7948,7 +7947,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_filecopy_target_uses_slash_to_native_and_convert_path_like_unrar() {
+    fn rar5_filecopy_target_uses_slash_to_native_and_convert_path_like_rar_behavior() {
         assert_eq!(
             RarArchive::normalized_rar5_redirection_target(
                 header::RedirectionType::FileCopy,
@@ -7959,7 +7958,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_filecopy_ignores_dir_target_flag_like_unrar() {
+    fn rar5_filecopy_ignores_dir_target_flag_like_rar_behavior() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source.bin");
         let out_path = temp.path().join("copy.bin");
@@ -7994,7 +7993,7 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn rar5_unix_symlink_uses_unrar_target_bytes() {
+    fn rar5_unix_symlink_uses_rar_behavior_target_bytes() {
         use std::os::unix::ffi::OsStrExt;
 
         let temp = tempfile::tempdir().unwrap();
@@ -8030,7 +8029,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rar5_windows_junction_extracts_as_symlink_on_unix_like_unrar() {
+    fn rar5_windows_junction_extracts_as_symlink_on_unix_like_rar_behavior() {
         use std::os::unix::ffi::OsStrExt;
 
         let temp = tempfile::tempdir().unwrap();
@@ -8146,7 +8145,7 @@ mod tests {
     }
 
     #[test]
-    fn ntfs_stream_name_rules_match_unrar() {
+    fn ntfs_stream_name_rules_match_rar_behavior() {
         assert!(RarArchive::is_allowed_ntfs_stream_name(":Zone.Identifier"));
         assert!(RarArchive::is_allowed_ntfs_stream_name(":stream"));
 
@@ -8181,7 +8180,7 @@ mod tests {
     }
 
     #[test]
-    fn broken_ntfs_stream_name_policy_matches_unrar_windows_scope() {
+    fn broken_ntfs_stream_name_policy_matches_rar_behavior_windows_scope() {
         assert_eq!(
             RarArchive::broken_ntfs_stream_name_is_fatal(),
             cfg!(windows)
@@ -8284,7 +8283,7 @@ mod tests {
     }
 
     #[test]
-    fn ntfs_acl_security_information_matches_unrar_privilege_gate() {
+    fn ntfs_acl_security_information_matches_rar_behavior_privilege_gate() {
         let base = WINDOWS_OWNER_SECURITY_INFORMATION
             | WINDOWS_GROUP_SECURITY_INFORMATION
             | WINDOWS_DACL_SECURITY_INFORMATION;
@@ -8296,7 +8295,7 @@ mod tests {
     }
 
     #[test]
-    fn ntfs_acl_long_path_fallback_matches_unrar_get_win_long_path() {
+    fn ntfs_acl_long_path_fallback_matches_rar_behavior_get_win_long_path() {
         assert_eq!(
             RarArchive::windows_long_path_string("C:/deep/path/file.txt", "D:\\extract"),
             Some("\\\\?\\C:\\deep\\path\\file.txt".to_string())
@@ -8328,7 +8327,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_create_dir_special_names_match_unrar_detection() {
+    fn windows_create_dir_special_names_match_rar_behavior_detection() {
         assert!(RarArchive::windows_path_ends_with_dot_or_space(
             std::path::Path::new("dir.")
         ));
@@ -8359,7 +8358,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_comment_service_returns_none_like_unrar() {
+    fn empty_comment_service_returns_none_like_rar_behavior() {
         let mut archive = empty_rar5_archive();
         archive.services.push(test_rar5_service("CMT", 42, 0));
 
@@ -8367,7 +8366,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_packed_service_payload_returns_empty_like_unrar() {
+    fn zero_packed_service_payload_returns_empty_like_rar_behavior() {
         let mut archive = empty_rar5_archive();
         let service = test_rar5_service("UOW", 42, 0);
 
@@ -8452,7 +8451,7 @@ mod tests {
     }
 
     #[test]
-    fn rar3_symlink_target_rejects_oversized_packed_target_before_reading_like_unrar() {
+    fn rar3_symlink_target_rejects_oversized_packed_target_before_reading_like_rar_behavior() {
         let mut archive = empty_rar5_archive();
         archive.format = ArchiveFormat::Rar4;
         let mut fh = test_rar3_symlink_header(None);
@@ -8470,7 +8469,7 @@ mod tests {
     }
 
     #[test]
-    fn rar3_symlink_target_truncates_at_nul_and_hashes_visible_target_like_unrar() {
+    fn rar3_symlink_target_truncates_at_nul_and_hashes_visible_target_like_rar_behavior() {
         let target = b"safe/target";
         let fh = test_rar3_symlink_header(Some(crc32fast::hash(target)));
 
@@ -8483,7 +8482,7 @@ mod tests {
     }
 
     #[test]
-    fn rar3_symlink_target_preserves_raw_bytes_after_unrar_safety_decode() {
+    fn rar3_symlink_target_preserves_raw_bytes_after_rar_behavior_safety_decode() {
         let fh = test_rar3_symlink_header(None);
 
         let decoded =
@@ -8495,7 +8494,7 @@ mod tests {
     }
 
     #[test]
-    fn rar3_symlink_target_accepts_utf8_surrogate_values_like_unrar_safety_decode() {
+    fn rar3_symlink_target_accepts_utf8_surrogate_values_like_rar_behavior_safety_decode() {
         let fh = test_rar3_symlink_header(None);
 
         let decoded =
@@ -8507,7 +8506,7 @@ mod tests {
     }
 
     #[test]
-    fn rar3_symlink_target_rejects_decoded_path_metacharacter_mismatch_like_unrar() {
+    fn rar3_symlink_target_rejects_decoded_path_metacharacter_mismatch_like_rar_behavior() {
         let fh = test_rar3_symlink_header(None);
 
         let err =
@@ -8522,7 +8521,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rar3_symlink_output_creates_raw_byte_target_like_unrar() {
+    fn rar3_symlink_output_creates_raw_byte_target_like_rar_behavior() {
         use std::os::unix::ffi::OsStrExt;
 
         let temp = tempfile::tempdir().unwrap();
@@ -8550,7 +8549,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rar3_symlink_output_restores_symlink_mtime_like_unrar() {
+    fn rar3_symlink_output_restores_symlink_mtime_like_rar_behavior() {
         let temp = tempfile::tempdir().unwrap();
         let out_path = temp.path().join("link");
         let expected_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(123_456);
@@ -8580,7 +8579,7 @@ mod tests {
     }
 
     #[test]
-    fn rar3_symlink_target_rejects_empty_target_like_unrar() {
+    fn rar3_symlink_target_rejects_empty_target_like_rar_behavior() {
         let fh = test_rar3_symlink_header(None);
 
         let err =
@@ -8593,7 +8592,7 @@ mod tests {
     }
 
     #[test]
-    fn rar3_symlink_target_rejects_invalid_utf8_like_unrar_safe_char_to_wide() {
+    fn rar3_symlink_target_rejects_invalid_utf8_like_rar_behavior_safe_char_to_wide() {
         let fh = test_rar3_symlink_header(None);
 
         let err = RarArchive::decode_rar3_unix_link_target_payload(&fh, b"safe/\xfftarget", false)

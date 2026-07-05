@@ -8,7 +8,7 @@
 //! - `HUFF_LDC = 16` — lower distance bits codes
 //! - `HUFF_RC = 44` — repeating/cached distance codes
 //!
-//! Decoding uses the same canonical ordering as unrar, but with two
+//! Decoding uses RAR canonical ordering with two
 //! precomputed lookup layers:
 //! - Quick table (9-bit lookup) for the most common short codes
 //! - Full 15-bit direct lookup for longer codes
@@ -36,7 +36,7 @@ pub const HUFF_RC: usize = 44;
 /// Maximum Huffman code length in bits.
 const MAX_CODE_LENGTH: usize = 15;
 
-/// Maximum quick decode bits (matches unrar MAX_QUICK_DECODE_BITS = 9).
+/// Maximum quick decode bits.
 const MAX_QUICK_BITS: u8 = 9;
 
 /// Maximum number of symbols across supported Huffman tables.
@@ -45,7 +45,7 @@ const MAX_NUM_SYMBOLS: usize = HUFF_NC;
 /// Maximum quick decode table size.
 const MAX_QUICK_ENTRIES: usize = 1 << MAX_QUICK_BITS;
 
-/// A Huffman decoding table using unrar's sorted-threshold scheme.
+/// A Huffman decoding table using RAR's sorted-threshold scheme.
 #[derive(Clone)]
 ///
 /// Instead of a binary tree, uses left-aligned upper-limit codes per bit
@@ -86,7 +86,7 @@ impl HuffmanTable {
     /// `bit_lengths[i]` is the code length for symbol `i`.
     /// A length of 0 means the symbol is not present.
     ///
-    /// Matches unrar's `MakeDecodeTables`.
+    /// Builds the RAR decode-length/decode-position tables.
     pub fn build(bit_lengths: &[u8]) -> RarResult<Self> {
         let num_symbols = bit_lengths.len();
         if num_symbols > MAX_NUM_SYMBOLS {
@@ -203,12 +203,11 @@ impl HuffmanTable {
 
     /// Decode the next symbol from the bitstream.
     ///
-    /// Matches unrar's `DecodeNumber`: peek 16 left-aligned bits, try quick
+    /// DecodeNumber-style path: peek 16 left-aligned bits, try quick
     /// table, fall back to linear threshold scan.
     #[inline(always)]
     pub fn decode<R: BitRead>(&self, reader: &mut R) -> RarResult<u16> {
-        // Peek 16 left-aligned bits (or fewer if near end of stream), matching
-        // unrar's `getbits() & 0xfffe` hot path.
+        // Peek 16 left-aligned bits, or fewer if near end of stream.
         let bit_field = reader.peek_16_left_aligned()?;
 
         // Quick path: if bit_field is below the threshold for quick_bits length.
@@ -227,8 +226,7 @@ impl HuffmanTable {
         Ok(self.symbol_for_bits(bit_field, bits))
     }
 
-    /// Slice-reader specialization of `DecodeNumber`, organized to follow
-    /// unrar's `getbits()` / `addbits()` control flow as directly as possible.
+    /// Slice-reader specialization of `DecodeNumber`.
     #[inline(always)]
     pub fn decode_bitreader(&self, reader: &mut BitReader<'_>) -> RarResult<u16> {
         let bit_field = reader.getbits()?;
@@ -331,9 +329,9 @@ pub fn read_tables<R: BitRead>(
 
     while i < total_symbols {
         if reader.bits_remaining() == 0 {
-            // unrar fails the whole table read when input runs out mid-table;
-            // building from a partial array would leak stale lengths from the
-            // previous block's tables.
+            // Fail the whole table read when input runs out mid-table; building
+            // from a partial array would leak stale lengths from the previous
+            // block's tables.
             return Err(RarError::CorruptArchive {
                 detail: format!("RAR5 Huffman table truncated: {i} of {total_symbols} lengths"),
             });
@@ -509,9 +507,9 @@ mod tests {
     #[test]
     fn truncated_table_read_fails_instead_of_building_stale_tables() {
         // 20 BC nibbles (length 5 each) fill the bootstrap table, then the
-        // input ends before any of the main code lengths. unrar fails this
-        // read; building from the leftover prev_lengths would leak the
-        // previous block's table tail.
+        // input ends before any of the main code lengths. This must fail;
+        // building from the leftover prev_lengths would leak the previous
+        // block's table tail.
         let input = [0x55u8; 10];
         let mut lengths = vec![0u8; total_symbols(false)];
 
@@ -626,10 +624,10 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_table_decode_matches_unrar_zero_symbol_recovery() {
-        // UnRAR keeps all-zero tables for damaged archives. DecodeNumber
-        // consumes the 15-bit slow path, clamps out-of-range positions to 0,
-        // and returns DecodeNum[0], which is zero-initialized.
+    fn test_empty_table_decode_matches_zero_symbol_recovery() {
+        // All-zero tables for damaged archives follow the DecodeNumber slow
+        // path, clamp out-of-range positions to 0, and return DecodeNum[0],
+        // which is zero-initialized.
         let lengths = [0u8; 8];
         let table = HuffmanTable::build(&lengths).unwrap();
         let data = [0xFF, 0xFF];
@@ -751,14 +749,14 @@ mod tests {
         let table = HuffmanTable::build(&lengths).unwrap();
         let data = [0b01111010, 0b00000000];
         let mut generic = BitReader::new(&data);
-        let mut ported = BitReader::new(&data);
+        let mut specialized = BitReader::new(&data);
 
         for _ in 0..3 {
             assert_eq!(
                 table.decode(&mut generic).unwrap(),
-                table.decode_bitreader(&mut ported).unwrap()
+                table.decode_bitreader(&mut specialized).unwrap()
             );
-            assert_eq!(generic.position(), ported.position());
+            assert_eq!(generic.position(), specialized.position());
         }
     }
 
@@ -783,20 +781,20 @@ mod tests {
 
         let data = pack_bits(&bits);
         let mut prev_generic = vec![0u8; HUFF_NC + HUFF_DC + HUFF_LDC + HUFF_RC];
-        let mut prev_ported = prev_generic.clone();
+        let mut prev_specialized = prev_generic.clone();
         let mut generic = BitReader::new(&data);
-        let mut ported = BitReader::new(&data);
+        let mut specialized = BitReader::new(&data);
 
         let (generic_nc, generic_dc, generic_ldc, generic_rc) =
             read_tables(&mut generic, &mut prev_generic, false).unwrap();
-        let (ported_nc, ported_dc, ported_ldc, ported_rc) =
-            read_tables_bitreader(&mut ported, &mut prev_ported, false).unwrap();
+        let (specialized_nc, specialized_dc, specialized_ldc, specialized_rc) =
+            read_tables_bitreader(&mut specialized, &mut prev_specialized, false).unwrap();
 
-        assert_eq!(generic.position(), ported.position());
-        assert_eq!(prev_generic, prev_ported);
-        assert_eq!(generic_nc.max_length(), ported_nc.max_length());
-        assert_eq!(generic_dc.max_length(), ported_dc.max_length());
-        assert_eq!(generic_ldc.max_length(), ported_ldc.max_length());
-        assert_eq!(generic_rc.max_length(), ported_rc.max_length());
+        assert_eq!(generic.position(), specialized.position());
+        assert_eq!(prev_generic, prev_specialized);
+        assert_eq!(generic_nc.max_length(), specialized_nc.max_length());
+        assert_eq!(generic_dc.max_length(), specialized_dc.max_length());
+        assert_eq!(generic_ldc.max_length(), specialized_ldc.max_length());
+        assert_eq!(generic_rc.max_length(), specialized_rc.max_length());
     }
 }

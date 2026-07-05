@@ -9,15 +9,15 @@ use std::ptr;
 
 use crate::error::{RarError, RarResult};
 
-/// Matches unrar's PackDef::MAX_INC_LZ_MATCH.
+/// Maximum incremental match length used by RAR LZ decoding.
 const MAX_INC_LZ_MATCH: usize = 0x1004;
-/// Matches unrar's fragmented dictionary cutoff.
+/// Fragmented dictionary cutoff for 32-bit fallback allocations.
 #[cfg_attr(not(target_pointer_width = "32"), allow(dead_code))]
 const FRAGMENTED_MIN_WINDOW: usize = 0x1000000;
-/// Matches unrar's minimum fragmented allocation attempt.
+/// Minimum fragmented dictionary allocation attempt.
 #[cfg_attr(not(any(test, target_pointer_width = "32")), allow(dead_code))]
 const FRAGMENTED_BLOCK_SIZE: usize = 0x400000;
-/// Matches unrar's FragmentedWindow::MAX_MEM_BLOCKS.
+/// Maximum fragmented dictionary block count.
 #[cfg_attr(not(any(test, target_pointer_width = "32")), allow(dead_code))]
 const FRAGMENTED_MAX_BLOCKS: usize = 32;
 
@@ -38,8 +38,7 @@ impl WindowStorage {
         // back lazy zero pages: a RAR7-scale dictionary (>4 GiB) reserves
         // address space up front but commits physical pages only as the
         // window fills. Vec::resize(len, 0) would memset-commit the whole
-        // declared size before the first decoded byte. unrar dropped its
-        // window memset in 2023 for the same reason; window reads of
+        // declared size before the first decoded byte. Window reads of
         // never-written areas must still observe zeros.
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         if ptr.is_null() {
@@ -193,7 +192,8 @@ impl FragmentedWindow {
         let mut allocated = 0usize;
         while allocated < len && blocks.len() < FRAGMENTED_MAX_BLOCKS {
             let remaining = len - allocated;
-            let min_chunk = Self::unrar_min_block_size(remaining, blocks.len(), min_block_size)?;
+            let min_chunk =
+                Self::fragmented_min_block_size(remaining, blocks.len(), min_block_size)?;
             let mut chunk = remaining;
             let block = loop {
                 match Self::try_zeroed_block(chunk) {
@@ -297,7 +297,7 @@ impl FragmentedWindow {
         })
     }
 
-    fn unrar_min_block_size(
+    fn fragmented_min_block_size(
         remaining: usize,
         block_num: usize,
         min_block_size: usize,
@@ -439,7 +439,6 @@ impl Window {
 
     /// Fallibly create a new window with the given dictionary size.
     ///
-    /// Official UnRAR reports allocation failure for oversized dictionaries.
     /// Use fallible allocation on production paths so a crafted large-window
     /// archive cannot abort the daemon through Rust's infallible Vec allocation.
     pub fn try_new(dict_size: usize) -> RarResult<Self> {
@@ -608,7 +607,7 @@ impl Window {
                 ptr::copy_nonoverlapping(src_ptr, dst_ptr, length);
             } else {
                 // Seed from the look-back source once, then expand from the
-                // just-written destination prefix like unrar's CopyString.
+                // just-written destination prefix.
                 let mut copied = distance;
                 ptr::copy_nonoverlapping(src_ptr, dst_ptr, copied);
 
@@ -678,7 +677,7 @@ impl Window {
             return Ok(());
         }
 
-        // Match unrar's fast-path guard: if both pointers are sufficiently far
+        // If both pointers are sufficiently far
         // from the end of the window, CopyString can avoid wrap handling for
         // the maximum legal match length, not just for this specific length.
         let fast_limit = dict_size.saturating_sub(MAX_INC_LZ_MATCH);
@@ -692,7 +691,7 @@ impl Window {
         }
 
         // General path with wrap handling and overlap support.
-        // Keep it branch-light and forward-copying like unrar's slow path.
+        // Keep it branch-light and forward-copying.
         let mut src = src;
         let mut dst = self.pos;
         let mut remaining = length;
@@ -727,7 +726,7 @@ impl Window {
 
     /// Copy a full match into the dictionary while exposing only `visible_len`.
     ///
-    /// UnRAR advances the sliding dictionary by the complete match even when a
+    /// Advance the sliding dictionary by the complete match even when a
     /// malformed final match crosses the declared unpacked size. Only the bytes
     /// within the declared member size are emitted to callers.
     #[inline]
@@ -748,7 +747,7 @@ impl Window {
 
     /// Copy for RAR 1.5 damaged-stream compatibility.
     ///
-    /// unrar's `CopyString15` zero-fills invalid pre-window, oversize, and
+    /// RAR 1.5 zero-fills invalid pre-window, oversize, and
     /// zero-distance matches instead of hard-failing. Valid streams never use
     /// distance zero, but this keeps damaged old-RAR recovery aligned.
     pub(crate) fn copy_rar15_with_visible_len(
@@ -1148,20 +1147,20 @@ mod tests {
     }
 
     #[test]
-    fn fragmented_window_enforces_unrar_block_count_limit() {
+    fn fragmented_window_enforces_block_count_limit() {
         let Err(err) = WindowStorage::fragmented_for_test(FRAGMENTED_MAX_BLOCKS + 1, 1) else {
-            panic!("fragmented window unexpectedly exceeded UnRAR block count limit");
+            panic!("fragmented window unexpectedly exceeded block count limit");
         };
 
         assert!(matches!(err, RarError::ResourceLimit { .. }));
     }
 
     #[test]
-    fn unrar_fragmented_window_min_block_size_is_not_a_128mib_cap() {
+    fn fragmented_window_min_block_size_is_not_a_128mib_cap() {
         let len = FRAGMENTED_BLOCK_SIZE * FRAGMENTED_MAX_BLOCKS + FRAGMENTED_MAX_BLOCKS;
 
         let min_first =
-            FragmentedWindow::unrar_min_block_size(len, 0, FRAGMENTED_BLOCK_SIZE).unwrap();
+            FragmentedWindow::fragmented_min_block_size(len, 0, FRAGMENTED_BLOCK_SIZE).unwrap();
 
         assert_eq!(min_first, len / FRAGMENTED_MAX_BLOCKS);
         assert!(min_first > FRAGMENTED_BLOCK_SIZE);
@@ -1388,7 +1387,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_zero_distance_preserves_zeroed_first_window_like_unrar() {
+    fn test_generic_zero_distance_preserves_zeroed_first_window_like_rar_behavior() {
         let mut w = Window::new(8);
         w.put_bytes(b"ABCD");
 
@@ -1401,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generic_zero_distance_preserves_wrapped_window_bytes_like_unrar() {
+    fn test_generic_zero_distance_preserves_wrapped_window_bytes_like_rar_behavior() {
         let mut w = Window::new(4);
         w.put_bytes(b"ABCD");
         w.put_byte(b'E');
@@ -1437,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pre_window_distance_zero_fills_like_unrar() {
+    fn test_pre_window_distance_zero_fills_like_rar_behavior() {
         let mut w = Window::new(8);
         w.put_byte(b'A');
 
@@ -1451,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn test_oversize_distance_zero_fills_like_unrar() {
+    fn test_oversize_distance_zero_fills_like_rar_behavior() {
         let mut w = Window::new(8);
         w.put_bytes(b"ABCD");
 

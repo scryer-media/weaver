@@ -39,7 +39,7 @@ impl SeeContext {
         }
     }
 
-    /// Get the current escape frequency estimate (getMean in unrar).
+    /// Get the current escape frequency estimate.
     ///
     /// Returns the mean AND subtracts it from summ.
     /// Minimum return value is 1 to avoid zero-frequency issues.
@@ -52,7 +52,7 @@ impl SeeContext {
         if ret == 0 { 1 } else { ret }
     }
 
-    /// Update after a successful symbol decode (SEE2.update in unrar).
+    /// Update after a successful symbol decode.
     #[inline]
     pub fn update(&mut self) {
         if self.shift < PERIOD_BITS {
@@ -79,7 +79,7 @@ impl Default for SeeTable {
 }
 
 impl SeeTable {
-    /// Initialize the SEE table matching unrar's init(5*i+10).
+    /// Initialize the SEE table using the RAR PPMd context schedule.
     pub fn new() -> Self {
         let mut contexts = [[SeeContext::init(0); 16]; 25];
         for (i, row) in contexts.iter_mut().enumerate() {

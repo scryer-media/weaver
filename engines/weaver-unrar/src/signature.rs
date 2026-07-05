@@ -20,25 +20,21 @@ pub const RAR5_SIGNATURE: [u8; 8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0
 pub const RAR4_SIGNATURE: [u8; 7] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
 
 /// RAR 1.4 magic bytes.
-///
-/// Official UnRAR recognizes this as `RARFMT14`.
 pub const RAR14_SIGNATURE: [u8; 4] = [0x52, 0x45, 0x7E, 0x5E];
 
-/// RAR 1.4 SFX marker checked by UnRAR at absolute offset 28.
+/// RAR 1.4 SFX marker checked at absolute offset 28.
 pub(crate) const RAR14_SFX_MARKER: [u8; 4] = [0x52, 0x53, 0x46, 0x58]; // "RSFX"
 
 /// Length of the RAR5 signature.
 pub const RAR5_SIGNATURE_LEN: usize = 8;
 
-/// Length of the RAR4/RAR15 mark header UnRAR probes before SFX scanning.
+/// Length of the RAR4/RAR15 mark header probed before SFX scanning.
 const RAR4_SIGNATURE_LEN: usize = 7;
 
 /// Default maximum number of bytes to scan for an SFX signature (4 MiB).
-///
-/// This matches unrar's `MAXSFXSIZE` so large but valid SFX stubs are accepted.
 pub const DEFAULT_SFX_MAX_SCAN: u64 = 0x400000;
-const UNRAR_SFX_INITIAL_MARK_READ: u64 = RAR4_SIGNATURE_LEN as u64;
-const UNRAR_SFX_READ_RESERVE: u64 = 16;
+const SFX_INITIAL_MARK_READ: u64 = RAR4_SIGNATURE_LEN as u64;
+const SFX_READ_RESERVE: u64 = 16;
 
 /// Size of each read chunk when scanning for a signature.
 const SCAN_CHUNK_SIZE: usize = 8192;
@@ -127,9 +123,9 @@ fn scan_for_signature_range<R: Read + Seek>(
             return Ok(Some(absolute));
         }
 
-        // Match UnRAR's RAR14 SFX guard: scanned RAR14 signatures after the
-        // first scanned byte require "RSFX" at absolute offset 28 when enough
-        // prefix bytes are available.
+        // RAR14 SFX guard: scanned RAR14 signatures after the first scanned
+        // byte require "RSFX" at absolute offset 28 when enough prefix bytes
+        // are available.
         let mut rar14_search_from = 0usize;
         while let Some(pos) = find_subsequence(&window[rar14_search_from..], &RAR14_SIGNATURE) {
             let pos = rar14_search_from + pos;
@@ -158,13 +154,13 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-fn scan_for_signature_like_unrar_sfx<R: Read + Seek>(
+fn scan_for_sfx_signature<R: Read + Seek>(
     reader: &mut R,
     archive_base: u64,
     max_scan: u64,
 ) -> RarResult<Option<u64>> {
-    let scan_start = archive_base.saturating_add(UNRAR_SFX_INITIAL_MARK_READ);
-    let scan_len = max_scan.saturating_sub(UNRAR_SFX_READ_RESERVE);
+    let scan_start = archive_base.saturating_add(SFX_INITIAL_MARK_READ);
+    let scan_len = max_scan.saturating_sub(SFX_READ_RESERVE);
     scan_for_signature_range(reader, archive_base, scan_start, scan_len)
 }
 
@@ -229,9 +225,9 @@ pub fn read_signature<R: Read + Seek>(reader: &mut R) -> RarResult<ArchiveFormat
         direct_result?;
     }
 
-    // Match UnRAR's SFX probe: after the direct 7-byte mark read fails, it
-    // scans from that point and reserves 16 bytes at the end of MAXSFXSIZE.
-    match scan_for_signature_like_unrar_sfx(reader, start, DEFAULT_SFX_MAX_SCAN)? {
+    // After the direct 7-byte mark read fails, scan from that point and reserve
+    // 16 bytes at the end of the SFX search window.
+    match scan_for_sfx_signature(reader, start, DEFAULT_SFX_MAX_SCAN)? {
         Some(offset) => {
             // Seek to the offset and read the signature to determine format.
             reader.seek(SeekFrom::Start(offset)).map_err(RarError::Io)?;
@@ -375,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sfx_rar14_signature_without_rsfx_marker_is_ignored_like_unrar() {
+    fn test_sfx_rar14_signature_without_rsfx_marker_is_ignored_like_rar_behavior() {
         let stub_size = 500;
         let mut data = vec![0xAAu8; stub_size];
         data.extend_from_slice(&RAR14_SIGNATURE);
@@ -399,9 +395,9 @@ mod tests {
     }
 
     #[test]
-    fn test_sfx_signature_just_under_unrar_scan_limit() {
-        let stub_size = (UNRAR_SFX_INITIAL_MARK_READ + DEFAULT_SFX_MAX_SCAN
-            - UNRAR_SFX_READ_RESERVE
+    fn test_sfx_signature_just_under_scan_limit() {
+        let stub_size = (SFX_INITIAL_MARK_READ + DEFAULT_SFX_MAX_SCAN
+            - SFX_READ_RESERVE
             - RAR5_SIGNATURE_LEN as u64) as usize;
         let mut data = vec![0xABu8; stub_size];
         data.extend_from_slice(&RAR5_SIGNATURE);
@@ -414,9 +410,9 @@ mod tests {
     }
 
     #[test]
-    fn test_sfx_signature_just_past_unrar_reserved_tail_is_rejected() {
-        let stub_size = (UNRAR_SFX_INITIAL_MARK_READ + DEFAULT_SFX_MAX_SCAN
-            - UNRAR_SFX_READ_RESERVE
+    fn test_sfx_signature_just_past_reserved_tail_is_rejected() {
+        let stub_size = (SFX_INITIAL_MARK_READ + DEFAULT_SFX_MAX_SCAN
+            - SFX_READ_RESERVE
             - RAR5_SIGNATURE_LEN as u64
             + 1) as usize;
         let mut data = vec![0xABu8; stub_size];
@@ -429,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sfx_signature_before_unrar_scan_start_is_ignored() {
+    fn test_sfx_signature_before_scan_start_is_ignored() {
         let stub_size = 3;
         let mut data = vec![0xABu8; stub_size];
         data.extend_from_slice(&RAR5_SIGNATURE);

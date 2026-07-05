@@ -323,7 +323,7 @@ pub(crate) fn parse_rar4_uowner_subdata(data: &[u8]) -> Option<UnixOwnerInfo> {
 ///
 /// In RAR4 header encryption (`-hp`), each header is individually encrypted:
 /// a fresh 8-byte salt precedes each header in the stream, and the decryptor
-/// is re-initialized per header (arcread.cpp:157-164 in unrar).
+/// is re-initialized per header.
 fn parse_rar4_encrypted_headers<R: Read + Seek>(
     reader: &mut R,
     password: &str,
@@ -431,7 +431,7 @@ pub fn to_member_info(fh: &Rar4FileHeader, volume_index: usize) -> MemberInfo {
 
 /// Convert a RAR4 file header using the archive-level solid flag.
 ///
-/// UnRAR treats RAR 1.3 through 1.5 solidness as archive-global because those
+/// RAR 1.3 through RAR 1.5 treat solidness as archive-global because those
 /// formats do not reliably store a per-file solid bit.
 pub fn to_member_info_with_archive_solid(
     fh: &Rar4FileHeader,
@@ -720,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rar4_headers_derives_first_volume_from_first_file_like_unrar() {
+    fn test_parse_rar4_headers_derives_first_volume_from_first_file_like_rar_behavior() {
         let data = build_minimal_rar4_archive_with_flags(
             "hello.txt",
             b"Hello world",
@@ -735,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rar4_headers_split_first_file_is_not_first_volume_like_unrar() {
+    fn test_parse_rar4_headers_split_first_file_is_not_first_volume_like_rar_behavior() {
         let data = build_minimal_rar4_archive_with_flags(
             "hello.txt",
             b"Hello world",
@@ -809,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_member_info_with_archive_solid_matches_unrar_for_rar15() {
+    fn test_to_member_info_with_archive_solid_matches_rar_behavior_for_rar15() {
         let mut fh = Rar4FileHeader {
             is_rar14: false,
             flags: 0,
@@ -905,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_member_info_host_system_matches_unrar_rar4_classification() {
+    fn test_to_member_info_host_system_matches_rar_behavior_rar4_classification() {
         let mut fh = Rar4FileHeader {
             is_rar14: false,
             flags: 0,
@@ -962,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rar4_uowner_preserves_raw_bytes_for_lookup_like_unrar() {
+    fn test_parse_rar4_uowner_preserves_raw_bytes_for_lookup_like_rar_behavior() {
         let owner = parse_rar4_uowner_subdata(b"al\xffice\0gr\xf0up").unwrap();
 
         assert_eq!(owner.user_name_raw.as_deref(), Some(&b"al\xffice"[..]));

@@ -74,6 +74,35 @@ pub fn decode_nntp(input: &[u8], output: &mut [u8]) -> Result<DecodeResult, Yenc
     )
 }
 
+/// Decode a raw NNTP yEnc article, appending decoded bytes to `output`.
+///
+/// Unlike [`decode_nntp`], the destination does not need to be pre-sized (or
+/// zero-initialized): decoded bytes are written straight into the vector's
+/// spare capacity. Decoded output never exceeds the encoded input, so one
+/// `input.len()` reservation is always sufficient.
+pub fn decode_nntp_append(input: &[u8], output: &mut Vec<u8>) -> Result<DecodeResult, YencError> {
+    let start = output.len();
+    output.reserve(input.len());
+    let spare = output.spare_capacity_mut();
+    // SAFETY: the decode writes at most `input.len()` initialized bytes into
+    // this spare region and reports exactly how many bytes were written.
+    let out =
+        unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), input.len()) };
+    let result = decode_with_options(
+        input,
+        out,
+        DecodeOptions {
+            dot_unstuffing: true,
+        },
+    )?;
+    // SAFETY: the first `bytes_written` bytes of the spare region were
+    // initialized by the decode, and `bytes_written <= input.len()`.
+    unsafe {
+        output.set_len(start + result.bytes_written);
+    }
+    Ok(result)
+}
+
 /// Decode bytes with rapidyenc's `rapidyenc_decode` semantics.
 pub fn decode_rapidyenc(input: &[u8], output: &mut [u8]) -> Result<usize, YencError> {
     let mut state = RapidyencDecodeState::default();
@@ -794,6 +823,40 @@ mod tests {
     fn lcg_next(seed: &mut u64) -> u8 {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         (*seed >> 32) as u8
+    }
+
+    #[test]
+    fn decode_nntp_append_matches_slice_decode() {
+        let mut seed = 0xa11a_c0de_5eed_f00du64;
+        for len in [0usize, 1, 63, 128, 4096, 40_000] {
+            let original: Vec<u8> = (0..len).map(|_| lcg_next(&mut seed)).collect();
+            let mut article = Vec::new();
+            crate::encode::encode(&original, &mut article, 128, "append.bin").unwrap();
+
+            let mut slice_out = vec![0u8; article.len() + 64];
+            let slice_result = decode_nntp(&article, &mut slice_out).unwrap();
+            slice_out.truncate(slice_result.bytes_written);
+
+            // Append into an empty vector and into one carrying a prefix.
+            let mut appended = Vec::new();
+            let append_result = decode_nntp_append(&article, &mut appended).unwrap();
+            assert_eq!(appended, slice_out);
+            assert_eq!(append_result.bytes_written, slice_result.bytes_written);
+            assert_eq!(append_result.part_crc, slice_result.part_crc);
+
+            let mut prefixed = b"prefix".to_vec();
+            decode_nntp_append(&article, &mut prefixed).unwrap();
+            assert_eq!(&prefixed[..6], b"prefix");
+            assert_eq!(&prefixed[6..], slice_out.as_slice());
+        }
+    }
+
+    #[test]
+    fn decode_nntp_append_leaves_output_untouched_on_error() {
+        let mut prefixed = b"keep".to_vec();
+        let err = decode_nntp_append(b"not a yenc article", &mut prefixed);
+        assert!(err.is_err());
+        assert_eq!(prefixed, b"keep");
     }
 
     #[test]

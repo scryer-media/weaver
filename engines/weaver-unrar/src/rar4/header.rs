@@ -106,7 +106,7 @@ fn rar4_dictionary_size(flags: u16, is_directory: bool) -> u64 {
     }
 }
 
-/// UnRAR's legacy checksum for RAR 1.4 archives.
+/// Legacy checksum for RAR 1.4 archives.
 pub(crate) fn checksum14_update(mut crc: u16, data: &[u8]) -> u16 {
     for &byte in data {
         crc = crc.wrapping_add(u16::from(byte));
@@ -251,7 +251,7 @@ pub fn read_raw_header<R: Read + Seek>(reader: &mut R) -> RarResult<Option<RawRa
     let actual_crc = rar4_header_crc16(&data);
     if actual_crc != crc16 {
         warn!(
-            "RAR4 header CRC mismatch at offset {}: expected {:#06x}, got {:#06x}; parsing anyway like UnRAR",
+            "RAR4 header CRC mismatch at offset {}: expected {:#06x}, got {:#06x}; parsing anyway for recovery",
             offset, crc16, actual_crc
         );
     }
@@ -303,8 +303,8 @@ pub fn parse_archive_header(raw: &RawRar4Header) -> RarResult<Rar4ArchiveHeader>
 
 /// Parse a RAR 1.4 main header.
 ///
-/// UnRAR's `ReadHeader14` treats the 4-byte `RE~^` marker as the beginning of
-/// the main header, followed by `HeadSize:u16` and one byte of archive flags.
+/// The 4-byte `RE~^` marker begins the RAR 1.4 main header, followed by
+/// `HeadSize:u16` and one byte of archive flags.
 pub fn parse_rar14_archive_header(data: &[u8]) -> RarResult<(Rar4ArchiveHeader, u16)> {
     if data.len() < 7 || data[..4] != crate::signature::RAR14_SIGNATURE {
         return Err(RarError::InvalidSignature);
@@ -338,9 +338,9 @@ pub fn parse_rar14_archive_header(data: &[u8]) -> RarResult<(Rar4ArchiveHeader, 
 
 /// Parse the optional RAR 1.4 archive comment stored inside the main header.
 ///
-/// UnRAR's `DoGetComment` reads `CmtLength:u16` immediately after the 7-byte
-/// RAR14 main header. If `MHD_PACK_COMMENT` is set, the next `u16` is the
-/// unpacked comment size and the remaining bytes are encrypted packed data.
+/// RAR 1.4 reads `CmtLength:u16` immediately after the 7-byte main header. If
+/// `MHD_PACK_COMMENT` is set, the next `u16` is the unpacked comment size and
+/// the remaining bytes are encrypted packed data.
 pub fn parse_rar14_main_comment(
     main_body: &[u8],
     main_offset: u64,
@@ -562,8 +562,8 @@ pub fn parse_file_header(raw: &RawRar4Header) -> RarResult<Rar4FileHeader> {
         (None, None, None)
     };
 
-    // Match UnRAR's RAR4 handling: modern file headers encode directories in
-    // the dictionary/window bits, not in the host-specific file attributes.
+    // Modern RAR4 file headers encode directories in the dictionary/window
+    // bits, not in the host-specific file attributes.
     let mut is_directory = raw.flags & file_flags::WINDOW_MASK == file_flags::DIRECTORY;
     if unpack_version < 20 && attributes & 0x10 != 0 {
         is_directory = true;
@@ -643,8 +643,8 @@ pub fn parse_end_header(raw: &RawRar4Header) -> Rar4EndHeader {
 
 /// Parse a RAR4 recovery record (`HEAD3_PROTECT`).
 ///
-/// This mirrors unrar's `ProtectHead` fields: data size, version,
-/// recovery-sector count, total protected blocks, and the 8-byte marker.
+/// This reads `ProtectHead` fields: data size, version, recovery-sector count,
+/// total protected blocks, and the 8-byte marker.
 pub fn parse_recovery_header(raw: &RawRar4Header) -> RarResult<Rar4RecoveryRecord> {
     let mut cursor = RawCursor::new(&raw.data, 7); // skip common header
     let data_size = u64::from(cursor.get4());
@@ -667,7 +667,7 @@ pub fn parse_recovery_header(raw: &RawRar4Header) -> RarResult<Rar4RecoveryRecor
 
 /// Parse an old RAR 2.9 service header (`HEAD3_OLDSERVICE`).
 ///
-/// UnRAR reads `DataSize:u32`, `SubType:u16`, `Level:u8`, then subtype-specific
+/// Reads `DataSize:u32`, `SubType:u16`, `Level:u8`, then subtype-specific
 /// fields for NT ACL and alternate stream records.
 pub fn parse_old_service_header(raw: &RawRar4Header) -> RarResult<Rar4OldServiceHeader> {
     let mut cursor = RawCursor::new(&raw.data, 7); // skip common header
@@ -719,7 +719,7 @@ pub fn parse_old_service_header(raw: &RawRar4Header) -> RarResult<Rar4OldService
 
 /// Parse an old-style RAR4/RAR2.9 comment header (`HEAD3_CMT`).
 ///
-/// UnRAR's `CommHead` layout is the 7-byte short header followed by:
+/// `CommHead` layout is the 7-byte short header followed by:
 /// `UnpSize:u16`, `UnpVer:u8`, `Method:u8`, `CommCRC:u16`, then comment data.
 pub fn parse_comment_header(raw: &RawRar4Header) -> RarResult<Rar4CommentHeader> {
     let mut cursor = RawCursor::new(&raw.data, 7); // skip common header
@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_recovery_header_matches_unrar_protect_head() {
+    fn test_parse_recovery_header_matches_rar_behavior_protect_head() {
         let mut extra = Vec::new();
         extra.extend_from_slice(&4096u32.to_le_bytes());
         extra.push(3);
@@ -1106,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_recovery_header_truncated_marker_is_lossy_like_unrar() {
+    fn test_parse_recovery_header_truncated_marker_is_lossy_like_rar_behavior() {
         let mut extra = Vec::new();
         extra.extend_from_slice(&4096u32.to_le_bytes());
         extra.push(3);
@@ -1128,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_old_service_ntacl_like_unrar() {
+    fn test_parse_old_service_ntacl_like_rar_behavior() {
         let mut extra = Vec::new();
         extra.extend_from_slice(&1234u32.to_le_bytes());
         extra.extend_from_slice(&OLD_SERVICE_NTACL.to_le_bytes());
@@ -1158,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_old_service_uowner_like_unrar() {
+    fn test_parse_old_service_uowner_like_rar_behavior() {
         let mut extra = Vec::new();
         extra.extend_from_slice(&17u32.to_le_bytes());
         extra.extend_from_slice(&OLD_SERVICE_UOWNER.to_le_bytes());
@@ -1176,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_old_service_truncated_base_fields_are_lossy_like_unrar() {
+    fn test_parse_old_service_truncated_base_fields_are_lossy_like_rar_behavior() {
         let extra = 1234u32.to_le_bytes();
         let data = build_raw_header(0x77, common_flags::HAS_DATA, &extra);
         let mut cursor = Cursor::new(data);
@@ -1191,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_old_service_stream_name_is_capped_like_unrar() {
+    fn test_parse_old_service_stream_name_is_capped_like_rar_behavior() {
         let long_name = vec![b'a'; MAX_STREAM_NAME20 + 10];
         let old = parse_test_old_service_stream(&long_name);
 
@@ -1218,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_old_service_stream_name_overlong_utf8_decodes_like_unrar() {
+    fn test_parse_old_service_stream_name_overlong_utf8_decodes_like_rar_behavior() {
         let old = parse_test_old_service_stream(b":safe\xc0\xafstream");
 
         match old.data {
@@ -1235,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_old_service_stream_name_invalid_utf8_keeps_prefix_like_unrar() {
+    fn test_parse_old_service_stream_name_invalid_utf8_keeps_prefix_like_rar_behavior() {
         let old = parse_test_old_service_stream(b":safe/\xffhidden");
 
         match old.data {
@@ -1307,7 +1307,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_file_header_truncated_fixed_fields_are_lossy_like_unrar() {
+    fn test_parse_file_header_truncated_fixed_fields_are_lossy_like_rar_behavior() {
         let data = build_raw_header(0x74, 0, &[]);
         let mut cursor = Cursor::new(data);
         let raw = read_raw_header(&mut cursor).unwrap().unwrap();
@@ -1326,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_file_header_truncated_name_is_zero_padded_like_unrar() {
+    fn test_parse_file_header_truncated_name_is_zero_padded_like_rar_behavior() {
         let mut extra = Vec::new();
         extra.extend_from_slice(&0u32.to_le_bytes()); // packed size
         extra.extend_from_slice(&0u32.to_le_bytes()); // unpacked size
@@ -1348,7 +1348,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_file_header_comment_flag_matches_unrar() {
+    fn test_parse_file_header_comment_flag_matches_rar_behavior() {
         let name = b"commented.txt";
         let mut extra = Vec::new();
         extra.extend_from_slice(&10u32.to_le_bytes());
@@ -1371,7 +1371,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_file_header_non_unicode_name_truncates_at_nul_like_unrar() {
+    fn test_parse_file_header_non_unicode_name_truncates_at_nul_like_rar_behavior() {
         let name = b"safe.txt\0hidden.txt";
         let mut extra = Vec::new();
         extra.extend_from_slice(&10u32.to_le_bytes());
@@ -1394,7 +1394,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_service_header_non_unicode_name_truncates_at_nul_like_unrar() {
+    fn test_parse_service_header_non_unicode_name_truncates_at_nul_like_rar_behavior() {
         let name = b"UOW\0ignored";
         let mut extra = Vec::new();
         extra.extend_from_slice(&0u32.to_le_bytes());
@@ -1417,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_service_header_solid_flag_means_subblock_like_unrar() {
+    fn test_parse_service_header_solid_flag_means_subblock_like_rar_behavior() {
         let name = b"CMT";
         let mut extra = Vec::new();
         extra.extend_from_slice(&0u32.to_le_bytes());
@@ -1441,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_service_header_truncated_salt_is_padded_like_unrar() {
+    fn test_parse_service_header_truncated_salt_is_padded_like_rar_behavior() {
         let name = b"UOW";
         let mut extra = Vec::new();
         extra.extend_from_slice(&0u32.to_le_bytes());
@@ -1467,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_file_header_extended_times_like_unrar() {
+    fn test_parse_file_header_extended_times_like_rar_behavior() {
         let name = b"times.txt";
         let base_mtime = dos_dt(2024, 5, 6, 1, 2, 4);
         let ctime = dos_dt(2024, 5, 7, 3, 4, 6);
@@ -1505,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_file_header_version_suffix_like_unrar() {
+    fn test_parse_file_header_version_suffix_like_rar_behavior() {
         let name = b"report.txt;42beta";
         let mut extra = Vec::new();
         extra.extend_from_slice(&10u32.to_le_bytes());
@@ -1580,7 +1580,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_file_header_truncated_large_fields_are_lossy_like_unrar() {
+    fn test_parse_file_header_truncated_large_fields_are_lossy_like_rar_behavior() {
         let mut extra = Vec::new();
         extra.extend_from_slice(&0x1122_3344u32.to_le_bytes()); // packed low
         extra.extend_from_slice(&0x5566_7788u32.to_le_bytes()); // unpacked low
@@ -1603,7 +1603,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_file_header_truncated_salt_is_padded_like_unrar() {
+    fn test_parse_file_header_truncated_salt_is_padded_like_rar_behavior() {
         let mut extra = Vec::new();
         extra.extend_from_slice(&0u32.to_le_bytes()); // packed low
         extra.extend_from_slice(&0u32.to_le_bytes()); // unpacked low
@@ -1776,13 +1776,13 @@ mod tests {
     }
 
     #[test]
-    fn test_plain_name_invalid_utf8_keeps_prefix_like_unrar() {
+    fn test_plain_name_invalid_utf8_keeps_prefix_like_rar_behavior() {
         let result = decode_rar4_unicode_name(b"safe/\xffhidden");
         assert_eq!(result, "safe/");
     }
 
     #[test]
-    fn test_plain_name_overlong_utf8_decodes_like_unrar() {
+    fn test_plain_name_overlong_utf8_decodes_like_rar_behavior() {
         let result = decode_rar4_unicode_name(b"safe\xc0\xafname.txt");
         assert_eq!(result, "safe/name.txt");
     }
@@ -1804,15 +1804,15 @@ mod tests {
 
     #[test]
     fn test_unicode_name_truncated_stream_does_not_append_ascii_tail() {
-        // UnRAR's EncodeFileName::Decode stops at the decoded Unicode length;
-        // it does not append undecoded bytes from the ASCII fallback name.
+        // Unicode filename decoding stops at the decoded Unicode length; it
+        // does not append undecoded bytes from the ASCII fallback name.
         let data = [b'a', b'b', b'c', b'd', 0, 0x00, 0x00, b'x'];
         let result = decode_rar4_unicode_name(&data);
         assert_eq!(result, "x");
     }
 
     #[test]
-    fn test_unicode_name_embedded_nul_truncates_like_unrar() {
+    fn test_unicode_name_embedded_nul_truncates_like_rar_behavior() {
         // ConvertFileHeader truncates broken decoded names at the first NUL.
         let data = [b'a', b'b', 0, 0x00, 0x00, 0, b'z'];
         let result = decode_rar4_unicode_name(&data);
@@ -1820,7 +1820,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unicode_name_mode3_correction_matches_unrar_layout() {
+    fn test_unicode_name_mode3_correction_matches_rar_behavior_layout() {
         let data = [b'a', b'b', 0, 0x01, 0xC0, 0x80, 0x00];
         let result = decode_rar4_unicode_name(&data);
         let units: Vec<u16> = result.encode_utf16().collect();
@@ -1828,7 +1828,7 @@ mod tests {
     }
 
     #[test]
-    fn test_comment_header_optional_fields_match_unrar_order() {
+    fn test_comment_header_optional_fields_match_rar_behavior_order() {
         let mut body = Vec::new();
         body.extend_from_slice(&4u16.to_le_bytes());
         body.push(29);
@@ -1850,7 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn test_comment_header_truncated_fields_are_lossy_like_unrar() {
+    fn test_comment_header_truncated_fields_are_lossy_like_rar_behavior() {
         let body = 7u16.to_le_bytes();
         let data = build_raw_header(0x75, 0, &body);
         let mut cursor = Cursor::new(data);
@@ -1879,7 +1879,7 @@ mod tests {
     }
 
     #[test]
-    fn test_end_header_optional_fields_match_unrar_order() {
+    fn test_end_header_optional_fields_match_rar_behavior_order() {
         let mut body = Vec::new();
         body.extend_from_slice(&0xAABB_CCDDu32.to_le_bytes());
         body.extend_from_slice(&7u16.to_le_bytes());
@@ -1901,7 +1901,7 @@ mod tests {
     }
 
     #[test]
-    fn test_end_header_truncated_optional_fields_are_lossy_like_unrar() {
+    fn test_end_header_truncated_optional_fields_are_lossy_like_rar_behavior() {
         let body = 9u16.to_le_bytes();
         let flags = end_flags::DATA_CRC | end_flags::VOLUME_NUMBER;
         let data = build_raw_header(0x7B, flags, &body);
@@ -1926,7 +1926,7 @@ mod tests {
     }
 
     #[test]
-    fn test_header_crc_mismatch_warns_but_parses_like_unrar() {
+    fn test_header_crc_mismatch_warns_but_parses_like_rar_behavior() {
         let mut data = build_raw_header(0x73, 0x0000, &[0x00; 6]);
         data[0] ^= 0x01;
         let mut cursor = Cursor::new(data);

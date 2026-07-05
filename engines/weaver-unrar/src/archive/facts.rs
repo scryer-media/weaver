@@ -947,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn rar4_volume_facts_preserve_signed_main_header_like_unrar() {
+    fn rar4_volume_facts_preserve_signed_main_header_like_rar_behavior() {
         let facts =
             RarArchive::parse_volume_facts(Cursor::new(signed_rar4_archive_bytes()), None).unwrap();
 

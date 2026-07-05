@@ -9,7 +9,7 @@
 //!
 //! Includes a [`KdfCache`] that avoids re-deriving keys when the same
 //! password+salt combination is used across multiple members (which is
-//! the common case). Matches unrar's `KDF3Cache`/`KDF5Cache` approach.
+//! the common case).
 
 use std::borrow::Cow;
 use std::io::Read;
@@ -34,8 +34,8 @@ use crate::rar4::types::Rar4EncryptionMethod;
 pub const CRYPT5_KDF_LG2_COUNT_MAX: u8 = 24;
 
 /// RAR standard crypto uses AWS-LC on Scryer's supported targets. RAR4's
-/// custom RAR29 SHA-1 KDF and legacy RAR 1.5/2.0 ciphers are UnRAR-specific
-/// algorithms, so they stay as local reference ports.
+/// custom RAR29 SHA-1 KDF and legacy RAR 1.5/2.0 ciphers are RAR-specific
+/// legacy algorithms, so they stay as local implementations.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rar5KeyMaterial {
@@ -183,7 +183,7 @@ pub fn derive_rar5_material(
 
 /// Derive AES-256 key from password and salt using PBKDF2-HMAC-SHA256.
 ///
-/// RAR5 KDF: iterations = 1 << kdf_count (confirmed against unrar source).
+/// RAR5 KDF: iterations = 1 << kdf_count.
 /// Returns only the 32-byte key. IVs in RAR5 are read from the stream
 /// (each encrypted block is preceded by a 16-byte IV), not derived.
 pub fn derive_key(
@@ -230,7 +230,7 @@ pub fn decrypt_data(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> RarResult<Vec
 
 /// Verify a password using the optional check value from the encryption header.
 ///
-/// RAR5 uses a continuous PBKDF2 chain (reference: unrar crypt5.cpp):
+/// RAR5 uses a continuous PBKDF2 chain:
 ///   Key       = PBKDF2(password, salt, Count)       — AES-256 key
 ///   V1        = PBKDF2(password, salt, Count + 16)   — HashKey (for HMAC CRC)
 ///   V2        = PBKDF2(password, salt, Count + 32)   — PswCheckValue (for password check)
@@ -354,7 +354,7 @@ impl Drop for Kdf3Entry {
     }
 }
 
-/// Thread-safe KDF cache matching unrar's `KDF3Cache[4]`/`KDF5Cache[4]`.
+/// Thread-safe KDF cache for repeated RAR3/RAR5 key derivations.
 ///
 /// Stores the most recent key derivation results and returns cached values
 /// when the same password+salt combination is requested again. This avoids
@@ -1315,7 +1315,7 @@ mod sha1_hw {
 
 /// Derive AES-128 key and IV from password and salt using RAR4's custom KDF.
 ///
-/// RAR4 KDF algorithm (reference: unrar crypt3.cpp SetKey30):
+/// RAR4 KDF algorithm:
 /// - Encodes password as UTF-16LE
 /// - Concatenates password_utf16le + salt into a single buffer
 /// - Iterates 262144 times, each time hashing: buffer + 3-byte iteration counter
@@ -1323,10 +1323,10 @@ mod sha1_hw {
 ///   SHA-1 intermediate digest word H4's low byte is extracted as an IV byte
 /// - After all iterations, the final SHA-1 digest words H0-H3 are extracted as the
 ///   AES-128 key in little-endian byte order per word
-fn rar4_derive_key_unrar(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [u8; 16]) {
+fn rar4_derive_key_material(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [u8; 16]) {
     let password = rar_password_compat(password);
-    // Encode password as UTF-16LE, then append salt if present — matching
-    // unrar's RawPsw buffer for both salted and saltless RAR30 members.
+    // Encode password as UTF-16LE, then append salt if present for both salted
+    // and saltless RAR30 members.
     let mut raw_psw: Vec<u8> = password
         .encode_utf16()
         .flat_map(|c| c.to_le_bytes())
@@ -1346,7 +1346,7 @@ fn rar4_derive_key_unrar(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [
         let i_bytes = [i as u8, (i >> 8) as u8, (i >> 16) as u8];
         sha.process(&i_bytes);
 
-        // Extract IV byte at each interval boundary (unrar: `I%(HashRounds/16)==0`).
+        // Extract one IV byte at each interval boundary.
         if i % iv_interval == 0 {
             let intermediate = sha.clone().finish_words();
             let iv_index = (i / iv_interval) as usize;
@@ -1356,8 +1356,7 @@ fn rar4_derive_key_unrar(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [
 
     let mut digest = sha.finish_words();
 
-    // unrar extracts key bytes in LE order per 32-bit digest word:
-    //   AESKey[I*4+J] = (byte)(digest[I] >> (J*8))
+    // RAR4 stores key bytes in little-endian order per 32-bit digest word.
     let mut key = [0u8; 16];
     for word in 0..4 {
         key[word * 4..word * 4 + 4].copy_from_slice(&digest[word].to_le_bytes());
@@ -1373,7 +1372,7 @@ fn rar4_derive_key_unrar(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [
 }
 
 pub fn rar4_derive_key(password: &str, salt: Option<&[u8; 8]>) -> ([u8; 16], [u8; 16]) {
-    rar4_derive_key_unrar(password, salt)
+    rar4_derive_key_material(password, salt)
 }
 
 /// Decrypt data using AES-128-CBC (RAR4).
@@ -1859,7 +1858,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rar_password_compat_matches_unrar_limit() {
+    fn test_rar_password_compat_matches_rar_behavior_limit() {
         let exact = "a".repeat(RAR_PASSWORD_MAX_UNITS);
         assert!(matches!(rar_password_compat(&exact), Cow::Borrowed(_)));
 
@@ -1889,7 +1888,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rar5_kdf_ignores_password_tail_after_unrar_limit() {
+    fn test_rar5_kdf_ignores_password_tail_after_rar_behavior_limit() {
         let salt = [0x5Au8; 16];
         let prefix = "p".repeat(RAR_PASSWORD_MAX_UNITS);
         let material = derive_rar5_material(&prefix, &salt, 0).unwrap();
@@ -1905,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rar4_kdf_ignores_password_tail_after_unrar_limit() {
+    fn test_rar4_kdf_ignores_password_tail_after_rar_behavior_limit() {
         let salt = [0xA5u8; 8];
         let prefix = "p".repeat(RAR_PASSWORD_MAX_UNITS);
         let expected = rar4_derive_key(&prefix, Some(&salt));
@@ -1917,7 +1916,7 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_rar_decryptors_ignore_password_tail_after_unrar_limit() {
+    fn test_legacy_rar_decryptors_ignore_password_tail_after_rar_behavior_limit() {
         let prefix = "p".repeat(RAR_PASSWORD_MAX_UNITS);
         let long = format!("{prefix}tail");
 
@@ -1964,7 +1963,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rar14_packed_comment_decrypt_uses_unrar_fixed_key() {
+    fn test_rar14_packed_comment_decrypt_uses_rar_behavior_fixed_key() {
         let mut data = [0x54, 0x55, 0x56];
 
         decrypt_rar14_packed_comment(&mut data);
@@ -2023,7 +2022,7 @@ mod tests {
         let kdf_count = 0u8;
 
         // Derive the password check value using the production RAR5 material
-        // builder, which internally follows unrar's Count+32 PBKDF2 chain.
+        // builder, which internally follows the Count+32 PBKDF2 chain.
         let psw_check = derive_rar5_material("testpass", &salt, kdf_count)
             .unwrap()
             .psw_check;
@@ -2077,7 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rar5_kdf_count_above_unrar_limit_is_unsupported() {
+    fn test_rar5_kdf_count_above_rar_behavior_limit_is_unsupported() {
         let salt = [0xAB; 16];
         let result = derive_rar5_material(
             "cache-pass",
@@ -2125,7 +2124,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rar4_derive_key_matches_unrar_rar29_sha1() {
+    fn test_rar4_derive_key_matches_rar_behavior_rar29_sha1() {
         let salt = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         let (short_key, short_iv) = rar4_derive_key("password", Some(&salt));
         assert_eq!(hex(&short_key), "6dc5de01e3b2dbe3be10be0a04a61451");
@@ -2142,9 +2141,8 @@ mod tests {
     }
 
     #[test]
-    fn test_rar4_long_password_kdf_matches_local_unrar_vector() {
-        // Generated with the local unrar checkout's crypt3.cpp SetKey30 loop
-        // and sha1.cpp sha1_process_rar29 implementation.
+    fn test_rar4_long_password_kdf_matches_reference_vector() {
+        // Generated from the RAR4 KDF and RAR29 SHA-1 reference algorithm.
         let salt = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
         let password = "abcdefghijklmnopqrstuvwxyzabcdef";
 

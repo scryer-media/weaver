@@ -1,14 +1,14 @@
-/// Minimum LZ window allocation used by official UnRAR for modern unpackers.
+/// Minimum LZ window allocation used by modern RAR unpackers.
 ///
-/// RAR5 headers can declare 128 KiB, but `Unpack::Init` allocates at least
+/// RAR5 headers can declare 128 KiB, but the extraction window uses at least
 /// 256 KiB so filter accounting always has enough room.
-pub const UNRAR_MIN_LZ_WINDOW_SIZE: u64 = 0x40000;
+pub const RAR_MIN_LZ_WINDOW_SIZE: u64 = 0x40000;
 
-/// Maximum dictionary official UnRAR permits for extraction.
-pub const UNRAR_UNPACK_MAX_DICT_SIZE: u64 = 0x1000000000;
+/// Maximum dictionary size accepted for RAR extraction.
+pub const RAR_UNPACK_MAX_DICT_SIZE: u64 = 0x1000000000;
 
-/// Maximum RAR5 header body size accepted by official UnRAR.
-pub const UNRAR_RAR5_MAX_HEADER_BODY: u64 = 0x200000;
+/// Maximum RAR5 header body size accepted by the parser.
+pub const RAR5_MAX_HEADER_BODY: u64 = 0x200000;
 
 /// Weaver's finite anti-abuse ceiling for a single packed or unpacked member.
 pub const WEAVER_MAX_MEMBER_DATA_SIZE: u64 = 500 * 1024 * 1024 * 1024;
@@ -16,7 +16,7 @@ pub const WEAVER_MAX_MEMBER_DATA_SIZE: u64 = 500 * 1024 * 1024 * 1024;
 /// Configurable limits for archive processing to prevent resource exhaustion.
 #[derive(Debug, Clone)]
 pub struct Limits {
-    /// Maximum header body size in bytes (default 2 MiB, matching UnRAR).
+    /// Maximum header body size in bytes (default 2 MiB).
     pub max_header_size: u64,
     /// Maximum single data segment size in bytes.
     pub max_data_segment: u64,
@@ -29,7 +29,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_header_size: UNRAR_RAR5_MAX_HEADER_BODY,
+            max_header_size: RAR5_MAX_HEADER_BODY,
             max_data_segment: WEAVER_MAX_MEMBER_DATA_SIZE,
             max_unpacked_size: WEAVER_MAX_MEMBER_DATA_SIZE,
             max_dict_size: 256 * 1024 * 1024, // 256 MB
@@ -44,7 +44,7 @@ mod tests {
     #[test]
     fn test_default_limits() {
         let limits = Limits::default();
-        assert_eq!(limits.max_header_size, UNRAR_RAR5_MAX_HEADER_BODY);
+        assert_eq!(limits.max_header_size, RAR5_MAX_HEADER_BODY);
         assert_eq!(limits.max_data_segment, WEAVER_MAX_MEMBER_DATA_SIZE);
         assert_eq!(limits.max_unpacked_size, WEAVER_MAX_MEMBER_DATA_SIZE);
         assert_eq!(limits.max_dict_size, 256 * 1024 * 1024);

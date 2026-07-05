@@ -863,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn volume_header_encryption_state_must_match_unrar_merge_guard() {
+    fn volume_header_encryption_state_must_match_rar_behavior_merge_guard() {
         let mut archive = empty_archive(Vec::new());
         assert!(
             archive

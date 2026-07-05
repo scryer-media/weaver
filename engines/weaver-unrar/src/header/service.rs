@@ -18,7 +18,7 @@ pub struct ServiceHeader {
     pub header_offset: u64,
     /// Whether this service block depends on the preceding file block.
     pub is_child: bool,
-    /// Whether UnRAR would preserve this child block when updating its host.
+    /// Whether this child block should be preserved when updating its host.
     pub is_inherited: bool,
 }
 
@@ -72,7 +72,7 @@ mod tests {
     }
 
     #[test]
-    fn service_preserves_unrar_child_and_inherited_header_flags() {
+    fn service_preserves_rar_behavior_child_and_inherited_header_flags() {
         let raw = minimal_service_raw(common::flags::CHILD | common::flags::INHERITED);
         let service = parse(&raw, 128).unwrap();
 

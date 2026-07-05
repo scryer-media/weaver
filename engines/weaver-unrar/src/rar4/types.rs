@@ -178,7 +178,7 @@ pub struct Rar4ArchiveHeader {
     pub new_naming: bool,
 }
 
-/// RAR4 embedded recovery record (`HEAD3_PROTECT` in unrar).
+/// RAR4 embedded recovery record (`HEAD3_PROTECT`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rar4RecoveryRecord {
     pub header_offset: u64,
@@ -199,7 +199,7 @@ pub struct Rar4CommentHeader {
     pub unpacked_size: u16,
     pub unpack_version: u8,
     pub method: Rar4Method,
-    /// UnRAR stores only the low 16 bits of the comment data CRC.
+    /// RAR stores only the low 16 bits of the comment data CRC.
     pub crc16: u16,
 }
 
@@ -254,8 +254,8 @@ pub struct Rar4FileHeader {
     pub method: Rar4Method,
     pub dict_size: u64,
     pub name: String,
-    /// Raw RAR4 header name bytes, capped and zero-filled like UnRAR's
-    /// ReadHeader paths before Unicode/OEM conversion.
+    /// Raw RAR4 header name bytes, capped and zero-filled before Unicode/OEM
+    /// conversion.
     pub name_raw: Option<Vec<u8>>,
     pub is_directory: bool,
     pub is_unix_symlink: bool,

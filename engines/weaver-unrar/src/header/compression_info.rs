@@ -10,7 +10,7 @@
 //! - Bit 20: `FCI_RAR5_COMPAT`
 
 use crate::error::{RarError, RarResult};
-use crate::limits::UNRAR_UNPACK_MAX_DICT_SIZE;
+use crate::limits::RAR_UNPACK_MAX_DICT_SIZE;
 use crate::types::{CompressionInfo, CompressionMethod};
 
 const RAR5_DICT_BASE: u64 = 128 * 1024;
@@ -60,10 +60,10 @@ pub(crate) fn decode_compression_info_for_file(
             });
         }
     };
-    if dict_size > UNRAR_UNPACK_MAX_DICT_SIZE {
+    if dict_size > RAR_UNPACK_MAX_DICT_SIZE {
         return Err(RarError::DictionaryTooLarge {
             size: dict_size,
-            max: UNRAR_UNPACK_MAX_DICT_SIZE,
+            max: RAR_UNPACK_MAX_DICT_SIZE,
         });
     }
 
@@ -143,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_version_store_is_allowed_like_unrar() {
+    fn test_unknown_version_store_is_allowed_like_rar_behavior() {
         let raw = 5u64; // version=5, method=store
         let info = decode_compression_info(raw).unwrap();
         assert_eq!(info.version, 5);
@@ -206,20 +206,20 @@ mod tests {
     }
 
     #[test]
-    fn test_rar7_dictionary_above_unrar_unpack_max_is_rejected() {
+    fn test_rar7_dictionary_above_rar_unpack_max_is_rejected() {
         let raw = 1u64 | (20u64 << 10);
         let err = decode_compression_info(raw).unwrap_err();
         assert!(matches!(
             err,
             RarError::DictionaryTooLarge {
                 size,
-                max: UNRAR_UNPACK_MAX_DICT_SIZE
-            } if size > UNRAR_UNPACK_MAX_DICT_SIZE
+                max: RAR_UNPACK_MAX_DICT_SIZE
+            } if size > RAR_UNPACK_MAX_DICT_SIZE
         ));
     }
 
     #[test]
-    fn test_directory_ignores_dictionary_size_like_unrar() {
+    fn test_directory_ignores_dictionary_size_like_rar_behavior() {
         let raw = 1u64 | FCI_RAR5_COMPAT | (20u64 << 10);
         let info = decode_compression_info_for_file(raw, true).unwrap();
         assert_eq!(info.version, 1);

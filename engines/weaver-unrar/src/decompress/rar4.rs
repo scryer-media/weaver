@@ -5,7 +5,7 @@
 //! Symbol interpretation (LD table, 299 symbols):
 //! - 0-255: literal bytes
 //! - 256: end of block
-//! - 257: VM filter code (current UnRAR only applies recognized standard filters)
+//! - 257: VM filter code (only recognized standard filters are applied)
 //! - 258: repeat previous match (last_length, dist_cache[0])
 //! - 259-262: repeat distance cache references (new length from RD table)
 //! - 263-270: short distance matches (length=2)
@@ -69,7 +69,6 @@ const MAX3_UNPACK_CHANNELS: u32 = 1024;
 const MAX3_INC_LZ_MATCH: usize = 0x104;
 
 /// Maximum number of bytes to accumulate before flushing decoded output.
-/// Mirrors unrar's `UNPACK_MAX_WRITE` write border.
 const UNPACK_MAX_WRITE: usize = 0x400000;
 
 /// Block type: LZ or PPMd.
@@ -81,7 +80,7 @@ enum BlockType {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Rar4StandardFilter {
-    /// Non-standard VM bytecode. Current UnRAR leaves `VMSF_NONE` with
+    /// Non-standard VM bytecode. Unknown programs leave `VMSF_NONE` with
     /// `FilteredDataSize == 0`, so the covered block is suppressed.
     None,
     E8,
@@ -152,7 +151,7 @@ pub struct Rar4LzDecoder {
     ppm_model: Option<Model>,
     /// PPMd escape character (default 2).
     ppm_esc_char: u8,
-    /// Equivalent to unrar's TablesRead3 flag.
+    /// Whether the RAR3 Huffman tables have been read.
     tables_read: bool,
     /// Reusable VM filter definitions within the current filter scope.
     vm_filters: Vec<Rar4VmFilterDefinition>,
@@ -162,10 +161,10 @@ pub struct Rar4LzDecoder {
     last_vm_filter: usize,
     /// Absolute window position where the current file started.
     current_file_base_total: u64,
-    /// UnRAR's `WrittenFileSize` for RAR3 VM filter R6.
+    /// Logical written-file size for RAR3 VM filter R6.
     current_file_written_size: u64,
     /// Range coder registers saved when a solid member's output ends inside
-    /// a PPMd block. unrar keeps one coder alive across solid members: only
+    /// a PPMd block. One coder stays alive across solid members: only
     /// PPMd block headers re-initialize it, so the next member must resume
     /// with these registers instead of consuming init bytes.
     ppm_rc_state: Option<RangeCoderState>,
@@ -721,9 +720,9 @@ impl Rar4LzDecoder {
 
             let next_start = self.pending_vm_filters[0].block_start_total;
             if next_start < written_border {
-                // Current UnRAR can leave a later same-start filter behind after
-                // a VMSF_NONE program suppresses the block to zero bytes. Once
-                // the raw block has been flushed, the later filter is inert.
+                // A later same-start filter can remain after a VMSF_NONE program
+                // suppresses the block to zero bytes. Once the raw block has
+                // been flushed, the later filter is inert.
                 self.pending_vm_filters.remove(0);
                 continue;
             }
@@ -756,9 +755,9 @@ impl Rar4LzDecoder {
                     );
                 }
                 if final_flush {
-                    // UnRAR leaves the write border at the incomplete filter
-                    // and returns, so damaged streams surface later through
-                    // size/CRC validation instead of a filter-specific error.
+                    // Leave the write border at the incomplete filter so damaged
+                    // streams surface later through size/CRC validation instead
+                    // of a filter-specific error.
                     return Ok(());
                 }
                 return Ok(());
@@ -873,8 +872,8 @@ impl Rar4LzDecoder {
         }
 
         // Each solid member's data area is an independent byte-aligned
-        // bitstream: unrar's UnpInitData resets the bit input for every file
-        // (solid or not) and discards any leftover from the previous area.
+        // bitstream: reset the bit input for every file (solid or not) and
+        // discard any leftover from the previous area.
         // Only decoder state (window, tables, block type, PPM model and its
         // range coder registers) persists.
         let mut reader = StreamingBitReader::new(input);
@@ -1398,7 +1397,7 @@ impl Rar4LzDecoder {
     /// Consume the end-of-block marker that follows a member's last output
     /// symbol.
     ///
-    /// unrar's output check is strictly `WrittenFileSize > DestUnpSize`, so
+    /// The output check is strictly `WrittenFileSize > DestUnpSize`, so
     /// after the final output symbol it still decodes the next code: for a
     /// well-formed solid member that is code 256 whose new-file/new-table
     /// flags decide whether the next member re-reads Huffman tables. Skipping
@@ -1722,7 +1721,7 @@ impl Rar4LzDecoder {
         self.add_vm_code(first_byte, &code, output_size)
     }
 
-    /// Initialize PPMd block (DecodeInit equivalent from unrar).
+    /// Initialize a PPMd block from the RAR3 DecodeInit header.
     ///
     /// The PPM flag bit has already been consumed. The remaining 7 bits of that
     /// byte plus subsequent bytes form the DecodeInit header:
@@ -1807,9 +1806,9 @@ impl Rar4LzDecoder {
         let mut end_marker_seen = false;
 
         {
-            // A solid member boundary can fall inside a PPMd block; unrar
-            // keeps one range coder alive across members, so resume from the
-            // saved registers instead of consuming init bytes again.
+            // A solid member boundary can fall inside a PPMd block; one range
+            // coder stays alive across members, so resume from the saved
+            // registers instead of consuming init bytes again.
             let mut rc = match self.ppm_rc_state.take() {
                 Some(state) => BitReadRangeDecoder::from_state(reader, state),
                 None => BitReadRangeDecoder::new(reader)?,
@@ -1978,7 +1977,7 @@ impl Rar4LzDecoder {
                 && matches!(self.block_type, BlockType::Ppm)
                 && self.ppm_model.is_some()
             {
-                // unrar's output check is strictly `Written > DestSize`, so
+                // The output check is strictly `Written > DestSize`, so
                 // the esc,2 end-of-file marker following a member's last
                 // output byte is consumed before its decode ends. Consume it
                 // here when the loop stopped on exact output completion.
@@ -2045,7 +2044,7 @@ impl Rar4LzDecoder {
 
     /// Prepare for solid continuation (keep window state, reset block state).
     pub fn prepare_solid_continuation(&mut self) {
-        // Tables are kept (TablesRead3 stays true in unrar).
+        // Tables are kept across solid continuation.
         // Window state is preserved.
         // Reset low distance state.
         self.low_dist_rep_count = 0;
@@ -2198,7 +2197,7 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_lz_helpers_apply_unrar_minimum_window() {
+    fn test_direct_lz_helpers_apply_rar_behavior_minimum_window() {
         assert_eq!(effective_lz_dict_size(0).unwrap(), 0x40000);
         assert_eq!(effective_lz_dict_size(128 * 1024).unwrap(), 0x40000);
         assert_eq!(effective_lz_dict_size(512 * 1024).unwrap(), 512 * 1024);
@@ -2223,7 +2222,7 @@ mod tests {
     }
 
     #[test]
-    fn test_uninitialized_old_dist_zero_fills_like_unrar() {
+    fn test_uninitialized_old_dist_zero_fills_like_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024);
         let distance = decoder.dist_cache[0];
 
@@ -2293,7 +2292,7 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_standard_filters_leave_block_unchanged_like_unrar() {
+    fn test_invalid_standard_filters_leave_block_unchanged_like_rar_behavior() {
         for (filter_type, data, init_regs) in [
             (Rar4StandardFilter::E8, vec![0xe8, 1, 2], [0; 7]),
             (Rar4StandardFilter::Itanium, vec![0x10; 20], [0; 7]),
@@ -2321,7 +2320,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vm_itanium_filter_advances_per_bundle_like_unrar() {
+    fn test_vm_itanium_filter_advances_per_bundle_like_rar_behavior() {
         let mut data = vec![0u8; 48];
         data[16] = 0x10; // selects mask 4, which probes slot 2 in this bundle.
         Rar4LzDecoder::itanium_set_bits(&mut data[16..], 0x12345, 100, 20);
@@ -2375,8 +2374,8 @@ mod tests {
         decoder.begin_file_decode();
         decoder.window.put_bytes(b"ABCD");
         decoder.window.mark_flushed(4);
-        // The test pre-marks ABCD as flushed, so mirror UnRAR's
-        // WrittenFileSize for those already-emitted bytes.
+        // The test pre-marks ABCD as flushed, so mirror the logical
+        // written-file size for those already-emitted bytes.
         decoder.current_file_written_size = 4;
         decoder.window.copy_with_visible_len(4, 4, 2).unwrap();
         decoder.window.put_bytes(&[0xE8, 100, 0, 0, 0]);
@@ -2420,7 +2419,7 @@ mod tests {
     }
 
     #[test]
-    fn test_incomplete_final_vm_filter_defers_like_unrar() {
+    fn test_incomplete_final_vm_filter_defers_like_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024);
         decoder.begin_file_decode();
         decoder.window.put_bytes(b"abcdef");
@@ -2442,7 +2441,7 @@ mod tests {
     }
 
     #[test]
-    fn test_none_vm_filter_emits_zero_bytes_like_unrar() {
+    fn test_none_vm_filter_emits_zero_bytes_like_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024);
         decoder.begin_file_decode();
         decoder.window.put_bytes(b"prefixBLOCKsuffix");
@@ -2490,7 +2489,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vm_none_filter_suppresses_block_like_current_unrar() {
+    fn test_vm_none_filter_suppresses_block_like_current_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024);
         decoder.begin_file_decode();
         decoder.window.put_bytes(b"prefixBLOCKsuffix");
@@ -2513,7 +2512,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vm_none_filter_discards_stale_same_start_filter_like_current_unrar() {
+    fn test_vm_none_filter_discards_stale_same_start_filter_like_current_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024);
         decoder.begin_file_decode();
         decoder.window.put_bytes(b"prefixBLOCKsuffix");
@@ -2539,7 +2538,7 @@ mod tests {
         assert!(decoder.pending_vm_filters.is_empty());
     }
 
-    fn unrar_rgb_filter_reference(input: &[u8], width: usize, pos_r: usize) -> Vec<u8> {
+    fn rar_rgb_filter_reference(input: &[u8], width: usize, pos_r: usize) -> Vec<u8> {
         let mut output = vec![0u8; input.len()];
         let mut src_pos = 0usize;
         for channel in 0..3 {
@@ -2584,9 +2583,9 @@ mod tests {
     }
 
     #[test]
-    fn test_vm_rgb_filter_keeps_predictor_wide_like_unrar() {
+    fn test_vm_rgb_filter_keeps_predictor_wide_like_rar_behavior() {
         let mut data = [0xff, 0xff, 0xff, 0x01, 0x02, 0x03].repeat(16);
-        let expected = unrar_rgb_filter_reference(&data, 1, 0);
+        let expected = rar_rgb_filter_reference(&data, 1, 0);
         Rar4LzDecoder::execute_standard_filter(
             &Rar4PendingVmFilter {
                 filter_type: Rar4StandardFilter::Rgb,
@@ -2606,7 +2605,7 @@ mod tests {
         );
     }
 
-    fn unrar_audio_filter_reference(input: &[u8], channels: usize) -> Vec<u8> {
+    fn rar_audio_filter_reference(input: &[u8], channels: usize) -> Vec<u8> {
         let mut output = vec![0u8; input.len()];
         let mut src_pos = 0usize;
         for channel in 0..channels {
@@ -2677,9 +2676,9 @@ mod tests {
     }
 
     #[test]
-    fn test_vm_audio_filter_uses_signed_delta_for_adaptation_like_unrar() {
+    fn test_vm_audio_filter_uses_signed_delta_for_adaptation_like_rar_behavior() {
         let mut data = [0xff, 0x00, 0x80, 0x7f].repeat(24);
-        let expected = unrar_audio_filter_reference(&data, 1);
+        let expected = rar_audio_filter_reference(&data, 1);
         Rar4LzDecoder::execute_standard_filter(
             &Rar4PendingVmFilter {
                 filter_type: Rar4StandardFilter::Audio,
@@ -2757,11 +2756,11 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_vm_program_becomes_none_filter_like_unrar() {
+    fn test_custom_vm_program_becomes_none_filter_like_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024);
         // first_byte: new filter definition with explicit block length.
         // VM data: slot=0, start=0, length=1, code_size=1, code=[0].
-        // The one-byte program is not one of UnRAR's standard-filter programs.
+        // The one-byte program is not one of the standard-filter programs.
         decoder
             .add_vm_code(0xA0, &[0x00, 0x00, 0x41, 0x00], 0)
             .unwrap();
@@ -2776,11 +2775,11 @@ mod tests {
     }
 
     #[test]
-    fn test_vm_program_body_must_fit_filter_packet_like_unrar() {
+    fn test_vm_program_body_must_fit_filter_packet_like_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024);
-        // Same packet shape as test_custom_vm_program_becomes_none_filter_like_unrar,
-        // but the declared one-byte program body is missing. UnRAR rejects this
-        // with VMCodeInp.InAddr + VMCodeSize > CodeSize.
+        // Same packet shape as test_custom_vm_program_becomes_none_filter,
+        // but the declared one-byte program body is missing, so the packet
+        // fails the VMCodeInp.InAddr + VMCodeSize > CodeSize guard.
         let err = decoder
             .add_vm_code(0xA0, &[0x00, 0x00, 0x41], 0)
             .unwrap_err();
@@ -2790,14 +2789,14 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_vm_program_suppresses_filtered_block_like_current_unrar() {
+    fn test_custom_vm_program_suppresses_filtered_block_like_current_rar_behavior() {
         let mut decoder = Rar4LzDecoder::new(1024);
         decoder.begin_file_decode();
         decoder.window.put_bytes(b"ABCD");
 
-        // Current official UnRAR's rarvm.cpp only executes recognized standard
-        // filters. Non-standard bytecode remains VMSF_NONE, leaving
-        // FilteredDataSize == 0, so the covered block is suppressed.
+        // Only recognized standard filters execute. Non-standard bytecode
+        // remains VMSF_NONE, leaving FilteredDataSize == 0, so the covered block
+        // is suppressed.
         decoder
             .add_vm_code(0xA0, &[0x00, 0x00, 0x41, 0x00], 0)
             .unwrap();
