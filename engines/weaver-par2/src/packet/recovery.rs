@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 
+use crate::checksum::Md5State;
 use crate::error::{Par2Error, Result};
 use crate::types::RecoveryExponent;
 
@@ -14,6 +15,10 @@ pub enum RecoverySliceData {
         path: PathBuf,
         offset: u64,
         len: usize,
+        /// Packet MD5 from the header, kept so lazily-loaded payloads can be
+        /// re-validated against on-disk damage before repair uses them.
+        /// `None` means the payload was already validated (or is synthetic).
+        packet_hash: Option<[u8; 16]>,
     },
 }
 
@@ -23,7 +28,71 @@ impl RecoverySliceData {
     }
 
     pub fn file_backed(path: PathBuf, offset: u64, len: usize) -> Self {
-        Self::FileBacked { path, offset, len }
+        Self::FileBacked {
+            path,
+            offset,
+            len,
+            packet_hash: None,
+        }
+    }
+
+    pub fn file_backed_with_hash(
+        path: PathBuf,
+        offset: u64,
+        len: usize,
+        packet_hash: [u8; 16],
+    ) -> Self {
+        Self::FileBacked {
+            path,
+            offset,
+            len,
+            packet_hash: Some(packet_hash),
+        }
+    }
+
+    /// Re-check the PAR2 packet hash covering this recovery slice.
+    ///
+    /// In-memory payloads were hash-validated when the packet was parsed, and
+    /// file-backed payloads recorded without a hash are trusted as-is.
+    /// File-backed payloads captured by the streaming scanner (which skips
+    /// payload hashing for speed) are re-hashed from disk here: the packet
+    /// hash covers `recovery_set_id || type || exponent || payload`.
+    pub fn validate_packet_hash(
+        &self,
+        recovery_set_id: &[u8; 16],
+        exponent: RecoveryExponent,
+    ) -> io::Result<bool> {
+        let Self::FileBacked {
+            path,
+            offset,
+            len,
+            packet_hash: Some(expected),
+        } = self
+        else {
+            return Ok(true);
+        };
+
+        let mut hasher = Md5State::new();
+        hasher.update(recovery_set_id);
+        hasher.update(super::header::TYPE_RECOVERY);
+        hasher.update(&exponent.to_le_bytes());
+
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(*offset))?;
+        let mut remaining = *len;
+        let mut buf = vec![0u8; remaining.clamp(1, 256 * 1024)];
+        while remaining > 0 {
+            let take = remaining.min(buf.len());
+            file.read_exact(&mut buf[..take])?;
+            hasher.update(&buf[..take]);
+            remaining -= take;
+        }
+        let file_len = file
+            .metadata()
+            .ok()
+            .map_or(*offset + *len as u64, |metadata| metadata.len());
+        crate::file_cache::drop_touched_file_cache(&file, path, file_len, *offset, *len as u64);
+        Ok(hasher.finalize() == *expected)
     }
 
     pub fn len(&self) -> usize {
@@ -47,7 +116,9 @@ impl RecoverySliceData {
     pub fn file_span(&self) -> Option<(&Path, u64, usize)> {
         match self {
             Self::InMemory(_) => None,
-            Self::FileBacked { path, offset, len } => Some((path.as_path(), *offset, *len)),
+            Self::FileBacked {
+                path, offset, len, ..
+            } => Some((path.as_path(), *offset, *len)),
         }
     }
 
@@ -70,7 +141,9 @@ impl RecoverySliceData {
                 dst[..copy_len].copy_from_slice(&data[start..end]);
                 Ok(())
             }
-            Self::FileBacked { path, offset, len } => {
+            Self::FileBacked {
+                path, offset, len, ..
+            } => {
                 if start >= *len {
                     return Ok(());
                 }

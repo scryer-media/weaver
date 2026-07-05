@@ -441,6 +441,13 @@ fn decode_block_symbols(
 
     let block_end_bits = bit_remainder + block.data_bits as usize;
 
+    // Pending literal batch kept in locals: touching items.last_mut() per
+    // literal costs a load + discriminant check per byte on the hottest path.
+    // `lit_count` is the number of valid bytes (1-based); the stored item
+    // count stays 0-indexed like unrar.
+    let mut lit_bytes = [0u8; 8];
+    let mut lit_count: usize = 0;
+
     while reader.position() < block_end_bits {
         if !reader.has_bits() {
             break;
@@ -449,23 +456,24 @@ fn decode_block_symbols(
         let sym = tables.nc.decode_bitreader(&mut reader)? as u32;
 
         if sym < 256 {
-            // Literal — try to batch with previous item.
-            if let Some(DecodedItem::Literals { bytes, count }) = items.last_mut()
-                && (*count as usize) < 7
-            {
-                *count += 1;
-                bytes[*count as usize] = sym as u8;
-                continue;
+            lit_bytes[lit_count] = sym as u8;
+            lit_count += 1;
+            if lit_count == 8 {
+                items.push(DecodedItem::Literals {
+                    bytes: lit_bytes,
+                    count: 7,
+                });
+                lit_count = 0;
             }
-            items.push(DecodedItem::Literals {
-                bytes: {
-                    let mut b = [0u8; 8];
-                    b[0] = sym as u8;
-                    b
-                },
-                count: 0, // 0 means 1 byte (count is 0-indexed like unrar)
-            });
             continue;
+        }
+
+        if lit_count > 0 {
+            items.push(DecodedItem::Literals {
+                bytes: lit_bytes,
+                count: (lit_count - 1) as u8,
+            });
+            lit_count = 0;
         }
 
         if sym >= 262 {
@@ -506,6 +514,13 @@ fn decode_block_symbols(
         items.push(DecodedItem::CacheRef {
             cache_idx,
             length: length as u32,
+        });
+    }
+
+    if lit_count > 0 {
+        items.push(DecodedItem::Literals {
+            bytes: lit_bytes,
+            count: (lit_count - 1) as u8,
         });
     }
 
@@ -646,7 +661,7 @@ fn rar_decode_pool() -> Option<&'static rayon::ThreadPool> {
             .min(MAX_PARALLEL_THREADS);
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
-            .thread_name(|i| format!("weaver-rar-dec-{i}"))
+            .thread_name(|i| format!("weaver-unrar-dec-{i}"))
             .build()
             .ok()
     })
@@ -1074,7 +1089,7 @@ impl LzDecoder {
                 match *item {
                     DecodedItem::Literals { bytes, count } => {
                         let n = (count as usize + 1).min((unpacked_size - *output_size) as usize);
-                        self.window.put_bytes(&bytes[..n]);
+                        self.window.put_literal_batch(&bytes, n);
                         *output_size += n as u64;
                         produced = n;
                     }

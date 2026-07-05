@@ -141,8 +141,6 @@ fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> 
         SqlArg::I64(history.created_at),
         SqlArg::I64(history.completed_at),
         SqlArg::OptText(history.metadata.clone()),
-        SqlArg::OptText(history.last_diagnostic_id.clone()),
-        SqlArg::OptI64(history.last_diagnostic_uploaded_at_epoch_ms),
     ]
 }
 
@@ -161,12 +159,12 @@ async fn archive_job_sql(
                  (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                   optional_recovery_bytes, optional_recovery_downloaded_bytes,
                   failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
-                  created_at, completed_at, metadata, last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms)
+                  created_at, completed_at, metadata)
                  VALUES ({}, COALESCE({}, (SELECT nzb_hash FROM active_jobs WHERE job_id = {})),
                          {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                          COALESCE({}, (SELECT nzb_path FROM active_jobs WHERE job_id = {})),
                          (SELECT nzb_zstd FROM active_jobs WHERE job_id = {}),
-                         {}, {}, {}, {}, {})
+                         {}, {}, {})
                  ON CONFLICT(job_id) DO UPDATE SET
                     job_hash = excluded.job_hash,
                     name = excluded.name,
@@ -184,14 +182,11 @@ async fn archive_job_sql(
                     nzb_zstd = COALESCE(excluded.nzb_zstd, job_history.nzb_zstd),
                     created_at = excluded.created_at,
                     completed_at = excluded.completed_at,
-                    metadata = excluded.metadata,
-                    last_diagnostic_id = excluded.last_diagnostic_id,
-                    last_diagnostic_uploaded_at_epoch_ms = excluded.last_diagnostic_uploaded_at_epoch_ms
+                    metadata = excluded.metadata
                  RETURNING job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                     optional_recovery_bytes, optional_recovery_downloaded_bytes,
                     failed_bytes, health, category, output_dir, nzb_path,
-                    created_at, completed_at, metadata,
-                    last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms",
+                    created_at, completed_at, metadata",
                 &args,
             )
             .await?

@@ -745,6 +745,7 @@ unsafe fn try_decode_sse2_block(
     dst: &mut usize,
     state: &mut KernelState,
     dot_unstuffing: bool,
+    search_end: bool,
 ) -> Result<Option<usize>, YencError> {
     use std::arch::x86_64::*;
 
@@ -752,59 +753,94 @@ unsafe fn try_decode_sse2_block(
         return Ok(None);
     }
 
-    if !matches!(state.state, DecoderState::None | DecoderState::CrLf) {
-        return Ok(None);
-    }
-
     let a = unsafe { _mm_loadu_si128(input.as_ptr().add(src) as *const __m128i) };
     let b = unsafe { _mm_loadu_si128(input.as_ptr().add(src + 16) as *const __m128i) };
     let c = unsafe { _mm_loadu_si128(input.as_ptr().add(src + 32) as *const __m128i) };
     let d = unsafe { _mm_loadu_si128(input.as_ptr().add(src + 48) as *const __m128i) };
-    let eq = unsafe { sse2_mask64([a, b, c, d], b'=') };
-    let cr = unsafe { sse2_mask64([a, b, c, d], b'\r') };
-    let lf = unsafe { sse2_mask64([a, b, c, d], b'\n') };
-    let dot = unsafe { sse2_mask64([a, b, c, d], b'.') };
-
-    let fixed_eq = fix_eq_mask(eq, eq << 1);
-    if fixed_eq & (1u64 << 63) != 0 {
+    let vectors = [a, b, c, d];
+    let Some((esc_first, dot0)) =
+        x86_block_entry_flags(input, src, state.state, dot_unstuffing, search_end)
+    else {
         return Ok(None);
+    };
+    let specials = unsafe { sse2_special_mask64(vectors) };
+    let sub42 = _mm_set1_epi8(42i8.wrapping_neg());
+
+    if specials == 0 && !dot0 && !esc_first {
+        unsafe {
+            _mm_storeu_si128(
+                output.as_mut_ptr().add(*dst) as *mut __m128i,
+                _mm_add_epi8(a, sub42),
+            );
+            _mm_storeu_si128(
+                output.as_mut_ptr().add(*dst + 16) as *mut __m128i,
+                _mm_add_epi8(b, sub42),
+            );
+            _mm_storeu_si128(
+                output.as_mut_ptr().add(*dst + 32) as *mut __m128i,
+                _mm_add_epi8(c, sub42),
+            );
+            _mm_storeu_si128(
+                output.as_mut_ptr().add(*dst + 48) as *mut __m128i,
+                _mm_add_epi8(d, sub42),
+            );
+        }
+        *dst += 64;
+        state.state = DecoderState::None;
+        return Ok(Some(64));
     }
 
-    let escaped = fixed_eq << 1;
-    let raw_cr = cr & !escaped;
-    let raw_lf = lf & !escaped;
-    let raw_breaks = raw_cr | raw_lf;
-    // NNTP line boundaries exist in the raw stream even when yEnc escaped the
-    // '\r' (the scalar machine re-enters Cr after an escaped CR when
-    // dot-unstuffing), so pair detection uses the unmasked '\r' bits.
-    let pair_cr = if dot_unstuffing { cr } else { raw_cr };
-    let crlf = pair_cr & (lf >> 1);
-    let line_start = if state.state == DecoderState::CrLf {
-        1
-    } else {
-        0
-    } | (crlf << 2);
-    let dot_start = if dot_unstuffing {
-        dot & !escaped & line_start
+    let eq = if specials != 0 {
+        unsafe { sse2_mask64(vectors, b'=') }
     } else {
         0
     };
+    let esc_first = esc_first as u64;
+    let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+    let escaped = (fixed_eq << 1) | esc_first;
+    let entry_line_start = (state.state == DecoderState::CrLf) as u64;
 
-    if dot_start & (1u64 << 63) != 0 {
-        return Ok(None);
-    }
+    let (cr, raw_cr, raw_breaks, crlf, line_start, dot_start) = if specials == eq {
+        (
+            0,
+            0,
+            0,
+            0,
+            entry_line_start,
+            if dot_unstuffing {
+                x86_dot_start_mask(input, src, entry_line_start, escaped)
+            } else {
+                0
+            },
+        )
+    } else {
+        let cr = unsafe { sse2_mask64(vectors, b'\r') };
+        let lf = specials & !eq & !cr;
+        let raw_cr = cr & !escaped;
+        let raw_lf = lf & !escaped;
+        let raw_breaks = raw_cr | raw_lf;
+        // NNTP line boundaries exist in the raw stream even when yEnc escaped
+        // the '\r', so pair detection uses the unmasked '\r' bits.
+        let pair_cr = if dot_unstuffing { cr } else { raw_cr };
+        let crlf = pair_cr & (lf >> 1);
+        let line_start = entry_line_start | (crlf << 2);
+        let dot_start = if dot_unstuffing {
+            x86_dot_start_mask(input, src, line_start, escaped)
+        } else {
+            0
+        };
+        (cr, raw_cr, raw_breaks, crlf, line_start, dot_start)
+    };
 
     let dot_before_break = dot_start & (raw_breaks >> 1);
     let dot_before_eq = dot_start & (eq >> 1);
     let line_start_eq = if dot_unstuffing { eq & line_start } else { 0 };
-    if dot_before_break != 0 || dot_before_eq != 0 || line_start_eq != 0 {
+    if dot_before_break != 0 || dot_before_eq != 0 || (line_start_eq & !(1u64 << 63)) != 0 {
         return Ok(None);
     }
 
     let skip = fixed_eq | raw_breaks | dot_start;
-    let sub42 = _mm_set1_epi8(42i8.wrapping_neg());
-
-    if skip == 0 {
+    if skip == 0 && escaped == 0 {
         unsafe {
             _mm_storeu_si128(
                 output.as_mut_ptr().add(*dst) as *mut __m128i,
@@ -848,13 +884,18 @@ unsafe fn try_decode_sse2_block(
         }
     }
 
-    let mut next_state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
-    if dot_unstuffing && (cr & escaped) & (1 << 63) != 0 {
-        // Escaped CR at the window's last byte still opens an NNTP line
-        // boundary for dot-stuffing purposes.
-        next_state = DecoderState::Cr;
-    }
-    state.state = next_state;
+    state.state = x86_final_state_after_block(
+        fixed_eq,
+        dot_start,
+        raw_breaks,
+        raw_cr,
+        crlf,
+        skip,
+        line_start,
+        cr,
+        escaped,
+        dot_unstuffing,
+    );
     Ok(Some(64))
 }
 
@@ -867,6 +908,7 @@ unsafe fn try_decode_ssse3_block(
     dst: &mut usize,
     state: &mut KernelState,
     dot_unstuffing: bool,
+    search_end: bool,
 ) -> Result<Option<usize>, YencError> {
     use std::arch::x86_64::*;
 
@@ -874,59 +916,94 @@ unsafe fn try_decode_ssse3_block(
         return Ok(None);
     }
 
-    if !matches!(state.state, DecoderState::None | DecoderState::CrLf) {
-        return Ok(None);
-    }
-
     let a = unsafe { _mm_loadu_si128(input.as_ptr().add(src) as *const __m128i) };
     let b = unsafe { _mm_loadu_si128(input.as_ptr().add(src + 16) as *const __m128i) };
     let c = unsafe { _mm_loadu_si128(input.as_ptr().add(src + 32) as *const __m128i) };
     let d = unsafe { _mm_loadu_si128(input.as_ptr().add(src + 48) as *const __m128i) };
-    let eq = unsafe { sse2_mask64([a, b, c, d], b'=') };
-    let cr = unsafe { sse2_mask64([a, b, c, d], b'\r') };
-    let lf = unsafe { sse2_mask64([a, b, c, d], b'\n') };
-    let dot = unsafe { sse2_mask64([a, b, c, d], b'.') };
-
-    let fixed_eq = fix_eq_mask(eq, eq << 1);
-    if fixed_eq & (1u64 << 63) != 0 {
+    let vectors = [a, b, c, d];
+    let Some((esc_first, dot0)) =
+        x86_block_entry_flags(input, src, state.state, dot_unstuffing, search_end)
+    else {
         return Ok(None);
+    };
+    let specials = unsafe { ssse3_special_mask64(vectors) };
+    let sub42 = _mm_set1_epi8(42i8.wrapping_neg());
+
+    if specials == 0 && !dot0 && !esc_first {
+        unsafe {
+            _mm_storeu_si128(
+                output.as_mut_ptr().add(*dst) as *mut __m128i,
+                _mm_add_epi8(a, sub42),
+            );
+            _mm_storeu_si128(
+                output.as_mut_ptr().add(*dst + 16) as *mut __m128i,
+                _mm_add_epi8(b, sub42),
+            );
+            _mm_storeu_si128(
+                output.as_mut_ptr().add(*dst + 32) as *mut __m128i,
+                _mm_add_epi8(c, sub42),
+            );
+            _mm_storeu_si128(
+                output.as_mut_ptr().add(*dst + 48) as *mut __m128i,
+                _mm_add_epi8(d, sub42),
+            );
+        }
+        *dst += 64;
+        state.state = DecoderState::None;
+        return Ok(Some(64));
     }
 
-    let escaped = fixed_eq << 1;
-    let raw_cr = cr & !escaped;
-    let raw_lf = lf & !escaped;
-    let raw_breaks = raw_cr | raw_lf;
-    // NNTP line boundaries exist in the raw stream even when yEnc escaped the
-    // '\r' (the scalar machine re-enters Cr after an escaped CR when
-    // dot-unstuffing), so pair detection uses the unmasked '\r' bits.
-    let pair_cr = if dot_unstuffing { cr } else { raw_cr };
-    let crlf = pair_cr & (lf >> 1);
-    let line_start = if state.state == DecoderState::CrLf {
-        1
-    } else {
-        0
-    } | (crlf << 2);
-    let dot_start = if dot_unstuffing {
-        dot & !escaped & line_start
+    let eq = if specials != 0 {
+        unsafe { sse2_mask64(vectors, b'=') }
     } else {
         0
     };
+    let esc_first = esc_first as u64;
+    let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+    let escaped = (fixed_eq << 1) | esc_first;
+    let entry_line_start = (state.state == DecoderState::CrLf) as u64;
 
-    if dot_start & (1u64 << 63) != 0 {
-        return Ok(None);
-    }
+    let (cr, raw_cr, raw_breaks, crlf, line_start, dot_start) = if specials == eq {
+        (
+            0,
+            0,
+            0,
+            0,
+            entry_line_start,
+            if dot_unstuffing {
+                x86_dot_start_mask(input, src, entry_line_start, escaped)
+            } else {
+                0
+            },
+        )
+    } else {
+        let cr = unsafe { sse2_mask64(vectors, b'\r') };
+        let lf = specials & !eq & !cr;
+        let raw_cr = cr & !escaped;
+        let raw_lf = lf & !escaped;
+        let raw_breaks = raw_cr | raw_lf;
+        // NNTP line boundaries exist in the raw stream even when yEnc escaped
+        // the '\r', so pair detection uses the unmasked '\r' bits.
+        let pair_cr = if dot_unstuffing { cr } else { raw_cr };
+        let crlf = pair_cr & (lf >> 1);
+        let line_start = entry_line_start | (crlf << 2);
+        let dot_start = if dot_unstuffing {
+            x86_dot_start_mask(input, src, line_start, escaped)
+        } else {
+            0
+        };
+        (cr, raw_cr, raw_breaks, crlf, line_start, dot_start)
+    };
 
     let dot_before_break = dot_start & (raw_breaks >> 1);
     let dot_before_eq = dot_start & (eq >> 1);
     let line_start_eq = if dot_unstuffing { eq & line_start } else { 0 };
-    if dot_before_break != 0 || dot_before_eq != 0 || line_start_eq != 0 {
+    if dot_before_break != 0 || dot_before_eq != 0 || (line_start_eq & !(1u64 << 63)) != 0 {
         return Ok(None);
     }
 
     let skip = fixed_eq | raw_breaks | dot_start;
-    let sub42 = _mm_set1_epi8(42i8.wrapping_neg());
-
-    if skip == 0 {
+    if skip == 0 && escaped == 0 {
         unsafe {
             _mm_storeu_si128(
                 output.as_mut_ptr().add(*dst) as *mut __m128i,
@@ -960,13 +1037,18 @@ unsafe fn try_decode_ssse3_block(
     unsafe { compact_store_16_ssse3(decoded_c, ((skip >> 32) & 0xffff) as u16, output, dst)? };
     unsafe { compact_store_16_ssse3(decoded_d, ((skip >> 48) & 0xffff) as u16, output, dst)? };
 
-    let mut next_state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
-    if dot_unstuffing && (cr & escaped) & (1 << 63) != 0 {
-        // Escaped CR at the window's last byte still opens an NNTP line
-        // boundary for dot-stuffing purposes.
-        next_state = DecoderState::Cr;
-    }
-    state.state = next_state;
+    state.state = x86_final_state_after_block(
+        fixed_eq,
+        dot_start,
+        raw_breaks,
+        raw_cr,
+        crlf,
+        skip,
+        line_start,
+        cr,
+        escaped,
+        dot_unstuffing,
+    );
     Ok(Some(64))
 }
 
@@ -979,6 +1061,7 @@ unsafe fn try_decode_sse41_block(
     dst: &mut usize,
     state: &mut KernelState,
     dot_unstuffing: bool,
+    search_end: bool,
 ) -> Result<Option<usize>, YencError> {
     use std::arch::x86_64::*;
 
@@ -986,59 +1069,94 @@ unsafe fn try_decode_sse41_block(
         return Ok(None);
     }
 
-    if !matches!(state.state, DecoderState::None | DecoderState::CrLf) {
-        return Ok(None);
-    }
-
     let a = unsafe { _mm_loadu_si128(input.as_ptr().add(src) as *const __m128i) };
     let b = unsafe { _mm_loadu_si128(input.as_ptr().add(src + 16) as *const __m128i) };
     let c = unsafe { _mm_loadu_si128(input.as_ptr().add(src + 32) as *const __m128i) };
     let d = unsafe { _mm_loadu_si128(input.as_ptr().add(src + 48) as *const __m128i) };
-    let eq = unsafe { sse2_mask64([a, b, c, d], b'=') };
-    let cr = unsafe { sse2_mask64([a, b, c, d], b'\r') };
-    let lf = unsafe { sse2_mask64([a, b, c, d], b'\n') };
-    let dot = unsafe { sse2_mask64([a, b, c, d], b'.') };
-
-    let fixed_eq = fix_eq_mask(eq, eq << 1);
-    if fixed_eq & (1u64 << 63) != 0 {
+    let vectors = [a, b, c, d];
+    let Some((esc_first, dot0)) =
+        x86_block_entry_flags(input, src, state.state, dot_unstuffing, search_end)
+    else {
         return Ok(None);
+    };
+    let specials = unsafe { ssse3_special_mask64(vectors) };
+    let sub42 = _mm_set1_epi8(42i8.wrapping_neg());
+
+    if specials == 0 && !dot0 && !esc_first {
+        unsafe {
+            _mm_storeu_si128(
+                output.as_mut_ptr().add(*dst) as *mut __m128i,
+                _mm_add_epi8(a, sub42),
+            );
+            _mm_storeu_si128(
+                output.as_mut_ptr().add(*dst + 16) as *mut __m128i,
+                _mm_add_epi8(b, sub42),
+            );
+            _mm_storeu_si128(
+                output.as_mut_ptr().add(*dst + 32) as *mut __m128i,
+                _mm_add_epi8(c, sub42),
+            );
+            _mm_storeu_si128(
+                output.as_mut_ptr().add(*dst + 48) as *mut __m128i,
+                _mm_add_epi8(d, sub42),
+            );
+        }
+        *dst += 64;
+        state.state = DecoderState::None;
+        return Ok(Some(64));
     }
 
-    let escaped = fixed_eq << 1;
-    let raw_cr = cr & !escaped;
-    let raw_lf = lf & !escaped;
-    let raw_breaks = raw_cr | raw_lf;
-    // NNTP line boundaries exist in the raw stream even when yEnc escaped the
-    // '\r' (the scalar machine re-enters Cr after an escaped CR when
-    // dot-unstuffing), so pair detection uses the unmasked '\r' bits.
-    let pair_cr = if dot_unstuffing { cr } else { raw_cr };
-    let crlf = pair_cr & (lf >> 1);
-    let line_start = if state.state == DecoderState::CrLf {
-        1
-    } else {
-        0
-    } | (crlf << 2);
-    let dot_start = if dot_unstuffing {
-        dot & !escaped & line_start
+    let eq = if specials != 0 {
+        unsafe { sse2_mask64(vectors, b'=') }
     } else {
         0
     };
+    let esc_first = esc_first as u64;
+    let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+    let escaped = (fixed_eq << 1) | esc_first;
+    let entry_line_start = (state.state == DecoderState::CrLf) as u64;
 
-    if dot_start & (1u64 << 63) != 0 {
-        return Ok(None);
-    }
+    let (cr, raw_cr, raw_breaks, crlf, line_start, dot_start) = if specials == eq {
+        (
+            0,
+            0,
+            0,
+            0,
+            entry_line_start,
+            if dot_unstuffing {
+                x86_dot_start_mask(input, src, entry_line_start, escaped)
+            } else {
+                0
+            },
+        )
+    } else {
+        let cr = unsafe { sse2_mask64(vectors, b'\r') };
+        let lf = specials & !eq & !cr;
+        let raw_cr = cr & !escaped;
+        let raw_lf = lf & !escaped;
+        let raw_breaks = raw_cr | raw_lf;
+        // NNTP line boundaries exist in the raw stream even when yEnc escaped
+        // the '\r', so pair detection uses the unmasked '\r' bits.
+        let pair_cr = if dot_unstuffing { cr } else { raw_cr };
+        let crlf = pair_cr & (lf >> 1);
+        let line_start = entry_line_start | (crlf << 2);
+        let dot_start = if dot_unstuffing {
+            x86_dot_start_mask(input, src, line_start, escaped)
+        } else {
+            0
+        };
+        (cr, raw_cr, raw_breaks, crlf, line_start, dot_start)
+    };
 
     let dot_before_break = dot_start & (raw_breaks >> 1);
     let dot_before_eq = dot_start & (eq >> 1);
     let line_start_eq = if dot_unstuffing { eq & line_start } else { 0 };
-    if dot_before_break != 0 || dot_before_eq != 0 || line_start_eq != 0 {
+    if dot_before_break != 0 || dot_before_eq != 0 || (line_start_eq & !(1u64 << 63)) != 0 {
         return Ok(None);
     }
 
     let skip = fixed_eq | raw_breaks | dot_start;
-    let sub42 = _mm_set1_epi8(42i8.wrapping_neg());
-
-    if skip == 0 {
+    if skip == 0 && escaped == 0 {
         unsafe {
             _mm_storeu_si128(
                 output.as_mut_ptr().add(*dst) as *mut __m128i,
@@ -1072,13 +1190,18 @@ unsafe fn try_decode_sse41_block(
     unsafe { compact_store_16_ssse3(decoded_c, ((skip >> 32) & 0xffff) as u16, output, dst)? };
     unsafe { compact_store_16_ssse3(decoded_d, ((skip >> 48) & 0xffff) as u16, output, dst)? };
 
-    let mut next_state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
-    if dot_unstuffing && (cr & escaped) & (1 << 63) != 0 {
-        // Escaped CR at the window's last byte still opens an NNTP line
-        // boundary for dot-stuffing purposes.
-        next_state = DecoderState::Cr;
-    }
-    state.state = next_state;
+    state.state = x86_final_state_after_block(
+        fixed_eq,
+        dot_start,
+        raw_breaks,
+        raw_cr,
+        crlf,
+        skip,
+        line_start,
+        cr,
+        escaped,
+        dot_unstuffing,
+    );
     Ok(Some(64))
 }
 
@@ -1091,10 +1214,11 @@ unsafe fn try_decode_avx_block(
     dst: &mut usize,
     state: &mut KernelState,
     dot_unstuffing: bool,
+    search_end: bool,
 ) -> Result<Option<usize>, YencError> {
     // rapidyenc's AVX decoder reuses the SSE decode body with the SSE4/POPCNT
     // ISA level; keep that shape here instead of inventing a separate AVX1 body.
-    unsafe { try_decode_sse41_block(input, src, output, dst, state, dot_unstuffing) }
+    unsafe { try_decode_sse41_block(input, src, output, dst, state, dot_unstuffing, search_end) }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1106,6 +1230,7 @@ unsafe fn try_decode_avx2_block(
     dst: &mut usize,
     state: &mut KernelState,
     dot_unstuffing: bool,
+    search_end: bool,
 ) -> Result<Option<usize>, YencError> {
     use std::arch::x86_64::*;
 
@@ -1113,56 +1238,82 @@ unsafe fn try_decode_avx2_block(
         return Ok(None);
     }
 
-    if !matches!(state.state, DecoderState::None | DecoderState::CrLf) {
-        return Ok(None);
-    }
-
     let a = unsafe { _mm256_loadu_si256(input.as_ptr().add(src) as *const __m256i) };
     let b = unsafe { _mm256_loadu_si256(input.as_ptr().add(src + 32) as *const __m256i) };
-    let eq = unsafe { avx2_mask64(a, b, b'=') };
-    let cr = unsafe { avx2_mask64(a, b, b'\r') };
-    let lf = unsafe { avx2_mask64(a, b, b'\n') };
-    let dot = unsafe { avx2_mask64(a, b, b'.') };
-
-    let fixed_eq = fix_eq_mask(eq, eq << 1);
-    if fixed_eq & (1u64 << 63) != 0 {
+    let Some((esc_first, dot0)) =
+        x86_block_entry_flags(input, src, state.state, dot_unstuffing, search_end)
+    else {
         return Ok(None);
+    };
+    let specials = unsafe { avx2_special_mask64(a, b) };
+
+    if specials == 0 && !dot0 && !esc_first {
+        let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
+        let decoded_a = _mm256_add_epi8(a, sub42);
+        let decoded_b = _mm256_add_epi8(b, sub42);
+        unsafe {
+            _mm256_storeu_si256(output.as_mut_ptr().add(*dst) as *mut __m256i, decoded_a);
+            _mm256_storeu_si256(
+                output.as_mut_ptr().add(*dst + 32) as *mut __m256i,
+                decoded_b,
+            );
+        }
+        *dst += 64;
+        state.state = DecoderState::None;
+        return Ok(Some(64));
     }
 
-    let escaped = fixed_eq << 1;
-    let raw_cr = cr & !escaped;
-    let raw_lf = lf & !escaped;
-    let raw_breaks = raw_cr | raw_lf;
-    // NNTP line boundaries exist in the raw stream even when yEnc escaped the
-    // '\r' (the scalar machine re-enters Cr after an escaped CR when
-    // dot-unstuffing), so pair detection uses the unmasked '\r' bits.
-    let pair_cr = if dot_unstuffing { cr } else { raw_cr };
-    let crlf = pair_cr & (lf >> 1);
-    let line_start = if state.state == DecoderState::CrLf {
-        1
-    } else {
-        0
-    } | (crlf << 2);
-    let dot_start = if dot_unstuffing {
-        dot & !escaped & line_start
+    let eq = if specials != 0 {
+        unsafe { avx2_mask64(a, b, b'=') }
     } else {
         0
     };
+    let esc_first = esc_first as u64;
+    let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+    let escaped = (fixed_eq << 1) | esc_first;
+    let entry_line_start = (state.state == DecoderState::CrLf) as u64;
 
-    if dot_start & (1u64 << 63) != 0 {
-        return Ok(None);
-    }
+    let (cr, raw_cr, raw_breaks, crlf, line_start, dot_start) = if specials == eq {
+        (
+            0,
+            0,
+            0,
+            0,
+            entry_line_start,
+            if dot_unstuffing {
+                x86_dot_start_mask(input, src, entry_line_start, escaped)
+            } else {
+                0
+            },
+        )
+    } else {
+        let cr = unsafe { avx2_mask64(a, b, b'\r') };
+        let lf = specials & !eq & !cr;
+        let raw_cr = cr & !escaped;
+        let raw_lf = lf & !escaped;
+        let raw_breaks = raw_cr | raw_lf;
+        // NNTP line boundaries exist in the raw stream even when yEnc escaped
+        // the '\r', so pair detection uses the unmasked '\r' bits.
+        let pair_cr = if dot_unstuffing { cr } else { raw_cr };
+        let crlf = pair_cr & (lf >> 1);
+        let line_start = entry_line_start | (crlf << 2);
+        let dot_start = if dot_unstuffing {
+            x86_dot_start_mask(input, src, line_start, escaped)
+        } else {
+            0
+        };
+        (cr, raw_cr, raw_breaks, crlf, line_start, dot_start)
+    };
 
     let dot_before_break = dot_start & (raw_breaks >> 1);
     let dot_before_eq = dot_start & (eq >> 1);
     let line_start_eq = if dot_unstuffing { eq & line_start } else { 0 };
-    if dot_before_break != 0 || dot_before_eq != 0 || line_start_eq != 0 {
+    if dot_before_break != 0 || dot_before_eq != 0 || (line_start_eq & !(1u64 << 63)) != 0 {
         return Ok(None);
     }
 
     let skip = fixed_eq | raw_breaks | dot_start;
-
-    if skip == 0 {
+    if skip == 0 && escaped == 0 {
         let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
         let decoded_a = _mm256_add_epi8(a, sub42);
         let decoded_b = _mm256_add_epi8(b, sub42);
@@ -1192,13 +1343,18 @@ unsafe fn try_decode_avx2_block(
     };
     unsafe { compact_store_16_avx2(decoded_b, true, ((skip >> 48) & 0xffff) as u16, output, dst)? };
 
-    let mut next_state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
-    if dot_unstuffing && (cr & escaped) & (1 << 63) != 0 {
-        // Escaped CR at the window's last byte still opens an NNTP line
-        // boundary for dot-stuffing purposes.
-        next_state = DecoderState::Cr;
-    }
-    state.state = next_state;
+    state.state = x86_final_state_after_block(
+        fixed_eq,
+        dot_start,
+        raw_breaks,
+        raw_cr,
+        crlf,
+        skip,
+        line_start,
+        cr,
+        escaped,
+        dot_unstuffing,
+    );
     Ok(Some(64))
 }
 
@@ -1211,6 +1367,7 @@ unsafe fn try_decode_avx512_vbmi2_block(
     dst: &mut usize,
     state: &mut KernelState,
     dot_unstuffing: bool,
+    search_end: bool,
 ) -> Result<Option<usize>, YencError> {
     use std::arch::x86_64::*;
 
@@ -1218,50 +1375,77 @@ unsafe fn try_decode_avx512_vbmi2_block(
         return Ok(None);
     }
 
-    if !matches!(state.state, DecoderState::None | DecoderState::CrLf) {
-        return Ok(None);
-    }
-
     let a = unsafe { _mm256_loadu_si256(input.as_ptr().add(src) as *const __m256i) };
     let b = unsafe { _mm256_loadu_si256(input.as_ptr().add(src + 32) as *const __m256i) };
-    let eq = unsafe { avx2_mask64(a, b, b'=') };
-    let cr = unsafe { avx2_mask64(a, b, b'\r') };
-    let lf = unsafe { avx2_mask64(a, b, b'\n') };
-    let dot = unsafe { avx2_mask64(a, b, b'.') };
-
-    let fixed_eq = fix_eq_mask(eq, eq << 1);
-    if fixed_eq & (1u64 << 63) != 0 {
+    let Some((esc_first, dot0)) =
+        x86_block_entry_flags(input, src, state.state, dot_unstuffing, search_end)
+    else {
         return Ok(None);
+    };
+    let specials = unsafe { avx2_special_mask64(a, b) };
+
+    if specials == 0 && !dot0 && !esc_first {
+        let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
+        let decoded_a = _mm256_add_epi8(a, sub42);
+        let decoded_b = _mm256_add_epi8(b, sub42);
+        unsafe {
+            _mm256_storeu_si256(output.as_mut_ptr().add(*dst) as *mut __m256i, decoded_a);
+            _mm256_storeu_si256(
+                output.as_mut_ptr().add(*dst + 32) as *mut __m256i,
+                decoded_b,
+            );
+        }
+        *dst += 64;
+        state.state = DecoderState::None;
+        return Ok(Some(64));
     }
 
-    let escaped = fixed_eq << 1;
-    let raw_cr = cr & !escaped;
-    let raw_lf = lf & !escaped;
-    let raw_breaks = raw_cr | raw_lf;
-    // NNTP line boundaries exist in the raw stream even when yEnc escaped the
-    // '\r' (the scalar machine re-enters Cr after an escaped CR when
-    // dot-unstuffing), so pair detection uses the unmasked '\r' bits.
-    let pair_cr = if dot_unstuffing { cr } else { raw_cr };
-    let crlf = pair_cr & (lf >> 1);
-    let line_start = if state.state == DecoderState::CrLf {
-        1
-    } else {
-        0
-    } | (crlf << 2);
-    let dot_start = if dot_unstuffing {
-        dot & !escaped & line_start
+    let eq = if specials != 0 {
+        unsafe { avx2_mask64(a, b, b'=') }
     } else {
         0
     };
+    let esc_first = esc_first as u64;
+    let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+    let escaped = (fixed_eq << 1) | esc_first;
+    let entry_line_start = (state.state == DecoderState::CrLf) as u64;
 
-    if dot_start & (1u64 << 63) != 0 {
-        return Ok(None);
-    }
+    let (cr, raw_cr, raw_breaks, crlf, line_start, dot_start) = if specials == eq {
+        (
+            0,
+            0,
+            0,
+            0,
+            entry_line_start,
+            if dot_unstuffing {
+                x86_dot_start_mask(input, src, entry_line_start, escaped)
+            } else {
+                0
+            },
+        )
+    } else {
+        let cr = unsafe { avx2_mask64(a, b, b'\r') };
+        let lf = specials & !eq & !cr;
+        let raw_cr = cr & !escaped;
+        let raw_lf = lf & !escaped;
+        let raw_breaks = raw_cr | raw_lf;
+        // NNTP line boundaries exist in the raw stream even when yEnc escaped
+        // the '\r', so pair detection uses the unmasked '\r' bits.
+        let pair_cr = if dot_unstuffing { cr } else { raw_cr };
+        let crlf = pair_cr & (lf >> 1);
+        let line_start = entry_line_start | (crlf << 2);
+        let dot_start = if dot_unstuffing {
+            x86_dot_start_mask(input, src, line_start, escaped)
+        } else {
+            0
+        };
+        (cr, raw_cr, raw_breaks, crlf, line_start, dot_start)
+    };
 
     let dot_before_break = dot_start & (raw_breaks >> 1);
     let dot_before_eq = dot_start & (eq >> 1);
     let line_start_eq = if dot_unstuffing { eq & line_start } else { 0 };
-    if dot_before_break != 0 || dot_before_eq != 0 || line_start_eq != 0 {
+    if dot_before_break != 0 || dot_before_eq != 0 || (line_start_eq & !(1u64 << 63)) != 0 {
         return Ok(None);
     }
 
@@ -1285,18 +1469,205 @@ unsafe fn try_decode_avx512_vbmi2_block(
     unsafe {
         compact_store_32_avx512_vbmi2(decoded_b, ((!skip >> 32) & 0xffff_ffff) as u32, output, dst)?
     };
-    let mut next_state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
-    if dot_unstuffing && (cr & escaped) & (1 << 63) != 0 {
-        // Escaped CR at the window's last byte still opens an NNTP line
-        // boundary for dot-stuffing purposes.
-        next_state = DecoderState::Cr;
-    }
-    state.state = next_state;
+    state.state = x86_final_state_after_block(
+        fixed_eq,
+        dot_start,
+        raw_breaks,
+        raw_cr,
+        crlf,
+        skip,
+        line_start,
+        cr,
+        escaped,
+        dot_unstuffing,
+    );
     Ok(Some(64))
 }
 
 #[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn x86_block_entry_flags(
+    input: &[u8],
+    src: usize,
+    state: DecoderState,
+    dot_unstuffing: bool,
+    search_end: bool,
+) -> Option<(bool, bool)> {
+    if !matches!(
+        state,
+        DecoderState::None | DecoderState::CrLf | DecoderState::Eq | DecoderState::CrLfEq
+    ) {
+        return None;
+    }
+
+    if state == DecoderState::CrLfEq && search_end && dot_unstuffing && input[src] == b'y' {
+        return None;
+    }
+
+    let esc_first = matches!(state, DecoderState::Eq | DecoderState::CrLfEq);
+    let dot0 = dot_unstuffing && state == DecoderState::CrLf && input[src] == b'.';
+    Some((esc_first, dot0))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn x86_dot_start_mask(input: &[u8], src: usize, line_start: u64, escaped: u64) -> u64 {
+    let mut candidates = line_start & !escaped;
+    let mut dot_start = 0u64;
+    while candidates != 0 {
+        let bit = candidates.trailing_zeros() as usize;
+        if input[src + bit] == b'.' {
+            dot_start |= 1u64 << bit;
+        }
+        candidates &= candidates - 1;
+    }
+    dot_start
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn x86_final_state_after_block(
+    fixed_eq: u64,
+    dot_start: u64,
+    raw_breaks: u64,
+    raw_cr: u64,
+    crlf: u64,
+    skip: u64,
+    line_start: u64,
+    cr: u64,
+    escaped: u64,
+    dot_unstuffing: bool,
+) -> DecoderState {
+    const LAST: u64 = 1u64 << 63;
+
+    let mut next_state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
+    if fixed_eq & LAST != 0 {
+        next_state = if dot_unstuffing && line_start & LAST != 0 {
+            DecoderState::CrLfEq
+        } else {
+            DecoderState::Eq
+        };
+    } else if dot_start & LAST != 0 {
+        next_state = DecoderState::CrLfDot;
+    } else if dot_unstuffing && (cr & escaped) & LAST != 0 {
+        next_state = DecoderState::Cr;
+    }
+    next_state
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
+#[inline(always)]
+unsafe fn sse2_special_mask64(vectors: [std::arch::x86_64::__m128i; 4]) -> u64 {
+    use std::arch::x86_64::*;
+
+    let eq = _mm_set1_epi8(b'=' as i8);
+    let cr = _mm_set1_epi8(b'\r' as i8);
+    let lf = _mm_set1_epi8(b'\n' as i8);
+    let mask = |v| {
+        _mm_movemask_epi8(_mm_or_si128(
+            _mm_or_si128(_mm_cmpeq_epi8(v, eq), _mm_cmpeq_epi8(v, cr)),
+            _mm_cmpeq_epi8(v, lf),
+        )) as u16 as u64
+    };
+
+    mask(vectors[0])
+        | (mask(vectors[1]) << 16)
+        | (mask(vectors[2]) << 32)
+        | (mask(vectors[3]) << 48)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+#[inline(always)]
+unsafe fn ssse3_special_mask64(vectors: [std::arch::x86_64::__m128i; 4]) -> u64 {
+    use std::arch::x86_64::*;
+
+    let table = _mm_set_epi8(
+        -1,
+        b'=' as i8,
+        b'\r' as i8,
+        -1,
+        -1,
+        b'\n' as i8,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        b'.' as i8,
+    );
+    let clamp = _mm_set1_epi8(b'.' as i8);
+    let mask = |v| {
+        let cmp = _mm_cmpeq_epi8(v, _mm_shuffle_epi8(table, _mm_min_epu8(v, clamp)));
+        _mm_movemask_epi8(cmp) as u16 as u64
+    };
+
+    mask(vectors[0])
+        | (mask(vectors[1]) << 16)
+        | (mask(vectors[2]) << 32)
+        | (mask(vectors[3]) << 48)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline(always)]
+unsafe fn avx2_special_mask64(a: std::arch::x86_64::__m256i, b: std::arch::x86_64::__m256i) -> u64 {
+    use std::arch::x86_64::*;
+
+    let table = _mm256_set_epi8(
+        -1,
+        b'=' as i8,
+        b'\r' as i8,
+        -1,
+        -1,
+        b'\n' as i8,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        b'.' as i8,
+        -1,
+        b'=' as i8,
+        b'\r' as i8,
+        -1,
+        -1,
+        b'\n' as i8,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        b'.' as i8,
+    );
+    let clamp = _mm256_set1_epi8(b'.' as i8);
+    let mask_a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(
+        a,
+        _mm256_shuffle_epi8(table, _mm256_min_epu8(a, clamp)),
+    )) as u32 as u64;
+    let mask_b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(
+        b,
+        _mm256_shuffle_epi8(table, _mm256_min_epu8(b, clamp)),
+    )) as u32 as u64;
+    mask_a | (mask_b << 32)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[inline(always)]
 unsafe fn sse2_mask64(vectors: [std::arch::x86_64::__m128i; 4], byte: u8) -> u64 {
     use std::arch::x86_64::*;
 
@@ -1310,6 +1681,7 @@ unsafe fn sse2_mask64(vectors: [std::arch::x86_64::__m128i; 4], byte: u8) -> u64
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline(always)]
 unsafe fn avx2_mask64(
     a: std::arch::x86_64::__m256i,
     b: std::arch::x86_64::__m256i,
@@ -1586,6 +1958,7 @@ type DecodeBlock64 = unsafe fn(
     &mut usize,
     &mut KernelState,
     bool,
+    bool,
 ) -> Result<Option<usize>, YencError>;
 
 #[cfg(target_arch = "x86_64")]
@@ -1619,9 +1992,17 @@ unsafe fn decode_kernel_simd64(
 
     if input.len() > WIDTH * 2 {
         while (!search_end || state.end == DecodeEnd::None) && src + WIDTH <= simd_limit {
-            if let Some(consumed) =
-                unsafe { block(input, src, output, &mut dst, state, dot_unstuffing)? }
-            {
+            if let Some(consumed) = unsafe {
+                block(
+                    input,
+                    src,
+                    output,
+                    &mut dst,
+                    state,
+                    dot_unstuffing,
+                    search_end,
+                )?
+            } {
                 src += consumed;
                 continue;
             }
@@ -2432,18 +2813,13 @@ unsafe fn compact_store_16_avx2(
     let shuffle = unsafe {
         _mm_loadu_si128(compact_table_16()[(skip_mask & 0x7fff) as usize].as_ptr() as *const __m128i)
     };
-    let shuffle = if high_lane {
-        _mm256_inserti128_si256(_mm256_setzero_si256(), shuffle, 1)
+    let lane = if high_lane {
+        _mm256_extracti128_si256::<1>(decoded)
     } else {
-        _mm256_castsi128_si256(shuffle)
+        _mm256_castsi256_si128(decoded)
     };
-    let packed = _mm256_shuffle_epi8(decoded, shuffle);
-    let packed_lane = if high_lane {
-        _mm256_extracti128_si256::<1>(packed)
-    } else {
-        _mm256_castsi256_si128(packed)
-    };
-    unsafe { _mm_storeu_si128(output.as_mut_ptr().add(*dst) as *mut __m128i, packed_lane) };
+    let packed = _mm_shuffle_epi8(lane, shuffle);
+    unsafe { _mm_storeu_si128(output.as_mut_ptr().add(*dst) as *mut __m128i, packed) };
     *dst += keep;
     Ok(())
 }
@@ -3024,9 +3400,18 @@ mod tests {
             ..KernelState::body()
         };
         let consumed = unsafe {
-            try_decode_sse2_block(input, 0, &mut output, &mut dst, &mut state, dot_unstuffing)
-                .unwrap()
-        }?;
+            try_decode_sse2_block(
+                input,
+                0,
+                &mut output,
+                &mut dst,
+                &mut state,
+                dot_unstuffing,
+                true,
+            )
+            .unwrap()
+        }
+        .expect("sse2 block should consume");
         assert_eq!(consumed, 64);
         output.truncate(dst);
         Some((output, state))
@@ -3049,9 +3434,18 @@ mod tests {
             ..KernelState::body()
         };
         let consumed = unsafe {
-            try_decode_ssse3_block(input, 0, &mut output, &mut dst, &mut state, dot_unstuffing)
-                .unwrap()
-        }?;
+            try_decode_ssse3_block(
+                input,
+                0,
+                &mut output,
+                &mut dst,
+                &mut state,
+                dot_unstuffing,
+                true,
+            )
+            .unwrap()
+        }
+        .expect("ssse3 block should consume");
         assert_eq!(consumed, 64);
         output.truncate(dst);
         Some((output, state))
@@ -3074,9 +3468,18 @@ mod tests {
             ..KernelState::body()
         };
         let consumed = unsafe {
-            try_decode_sse41_block(input, 0, &mut output, &mut dst, &mut state, dot_unstuffing)
-                .unwrap()
-        }?;
+            try_decode_sse41_block(
+                input,
+                0,
+                &mut output,
+                &mut dst,
+                &mut state,
+                dot_unstuffing,
+                true,
+            )
+            .unwrap()
+        }
+        .expect("sse4.1 block should consume");
         assert_eq!(consumed, 64);
         output.truncate(dst);
         Some((output, state))
@@ -3103,9 +3506,18 @@ mod tests {
             ..KernelState::body()
         };
         let consumed = unsafe {
-            try_decode_avx_block(input, 0, &mut output, &mut dst, &mut state, dot_unstuffing)
-                .unwrap()
-        }?;
+            try_decode_avx_block(
+                input,
+                0,
+                &mut output,
+                &mut dst,
+                &mut state,
+                dot_unstuffing,
+                true,
+            )
+            .unwrap()
+        }
+        .expect("avx block should consume");
         assert_eq!(consumed, 64);
         output.truncate(dst);
         Some((output, state))
@@ -3128,9 +3540,18 @@ mod tests {
             ..KernelState::body()
         };
         let consumed = unsafe {
-            try_decode_avx2_block(input, 0, &mut output, &mut dst, &mut state, dot_unstuffing)
-                .unwrap()
-        }?;
+            try_decode_avx2_block(
+                input,
+                0,
+                &mut output,
+                &mut dst,
+                &mut state,
+                dot_unstuffing,
+                true,
+            )
+            .unwrap()
+        }
+        .expect("avx2 block should consume");
         assert_eq!(consumed, 64);
         output.truncate(dst);
         Some((output, state))
@@ -3165,12 +3586,54 @@ mod tests {
                 &mut dst,
                 &mut state,
                 dot_unstuffing,
+                true,
             )
             .unwrap()
-        }?;
+        }
+        .expect("avx512-vbmi2 block should consume");
         assert_eq!(consumed, 64);
         output.truncate(dst);
         Some((output, state))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn assert_x86_blocks_produce(
+        input: &[u8; 64],
+        initial_state: DecoderState,
+        dot_unstuffing: bool,
+        expected_output: &[u8],
+        expected_state: DecoderState,
+    ) {
+        let expected_state = KernelState {
+            state: expected_state,
+            ..KernelState::body()
+        };
+
+        let mut check = |name: &str, result: Option<(Vec<u8>, KernelState)>| {
+            if let Some((actual_output, actual_state)) = result {
+                assert_eq!(actual_output, expected_output, "{name} output");
+                assert_eq!(actual_state, expected_state, "{name} state");
+            }
+        };
+
+        check("sse2", unsafe {
+            sse2_block_with_state(input, initial_state, dot_unstuffing)
+        });
+        check("ssse3", unsafe {
+            ssse3_block_with_state(input, initial_state, dot_unstuffing)
+        });
+        check("sse4.1", unsafe {
+            sse41_block_with_state(input, initial_state, dot_unstuffing)
+        });
+        check("avx", unsafe {
+            avx_block_with_state(input, initial_state, dot_unstuffing)
+        });
+        check("avx2", unsafe {
+            avx2_block_with_state(input, initial_state, dot_unstuffing)
+        });
+        check("avx512-vbmi2", unsafe {
+            avx512_vbmi2_block_with_state(input, initial_state, dot_unstuffing)
+        });
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -3433,6 +3896,99 @@ mod tests {
     fn x86_rapidyenc_family_model_uses_extended_amd_family_bits() {
         let eax = (0xf << 8) | (0x5 << 20);
         assert_eq!(x86_rapidyenc_family_model_from_eax(eax), (0x5f, 0));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_blocks_consume_clean_window() {
+        let input = [b'A'; 64];
+        let expected = vec![b'A'.wrapping_sub(42); 64];
+
+        unsafe {
+            assert_x86_blocks_produce(
+                &input,
+                DecoderState::None,
+                false,
+                &expected,
+                DecoderState::None,
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_blocks_carry_trailing_escape() {
+        let mut input = [b'A'; 64];
+        input[63] = b'=';
+        let expected = vec![b'A'.wrapping_sub(42); 63];
+
+        unsafe {
+            assert_x86_blocks_produce(
+                &input,
+                DecoderState::None,
+                false,
+                &expected,
+                DecoderState::Eq,
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_blocks_carry_line_start_trailing_escape() {
+        let mut input = [b'A'; 64];
+        input[61] = b'\r';
+        input[62] = b'\n';
+        input[63] = b'=';
+        let expected = vec![b'A'.wrapping_sub(42); 61];
+
+        unsafe {
+            assert_x86_blocks_produce(
+                &input,
+                DecoderState::None,
+                true,
+                &expected,
+                DecoderState::CrLfEq,
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_blocks_carry_line_start_trailing_dot() {
+        let mut input = [b'A'; 64];
+        input[61] = b'\r';
+        input[62] = b'\n';
+        input[63] = b'.';
+        let expected = vec![b'A'.wrapping_sub(42); 61];
+
+        unsafe {
+            assert_x86_blocks_produce(
+                &input,
+                DecoderState::None,
+                true,
+                &expected,
+                DecoderState::CrLfDot,
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_blocks_decode_entry_escape_carry() {
+        let input = [b'C'; 64];
+        let mut expected = vec![b'C'.wrapping_sub(42); 64];
+        expected[0] = b'C'.wrapping_sub(106);
+
+        unsafe {
+            assert_x86_blocks_produce(
+                &input,
+                DecoderState::Eq,
+                false,
+                &expected,
+                DecoderState::None,
+            );
+        }
     }
 
     #[cfg(target_arch = "x86_64")]

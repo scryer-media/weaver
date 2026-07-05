@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use weaver_model::files::FileRole;
 use weaver_par2::{DiskFileAccess, Par2FileSet, verify_all};
 
 fn main() {
@@ -56,19 +55,17 @@ fn main() {
     println!("\nFilenames match disk: {}", has_matches);
 
     if !has_matches {
-        // Remap by volume number (same logic as pipeline/metadata.rs).
+        // Remap by RAR volume number so obfuscated names can line up with PAR2 entries.
         let mut disk_by_volume: HashMap<u32, String> = HashMap::new();
         for name in &rar_files {
-            let role = FileRole::from_filename(name);
-            if let FileRole::RarVolume { volume_number } = role {
+            if let Some(volume_number) = rar_volume_number(name) {
                 disk_by_volume.insert(volume_number, name.clone());
             }
         }
 
         let mut remapped = 0u32;
         for desc in par2_set.files.values_mut() {
-            let role = FileRole::from_filename(&desc.filename);
-            if let FileRole::RarVolume { volume_number } = role {
+            if let Some(volume_number) = rar_volume_number(&desc.filename) {
                 if let Some(real_name) = disk_by_volume.get(&volume_number) {
                     println!(
                         "  remap vol {}: {} -> {}",
@@ -128,4 +125,42 @@ fn main() {
         "\n  {} complete, {} missing, {} damaged",
         complete, missing, damaged
     );
+}
+
+fn rar_volume_number(name: &str) -> Option<u32> {
+    let name = name.trim_end_matches('_').to_ascii_lowercase();
+
+    if let Some(stem) = name.strip_suffix(".rar") {
+        if let Some((_, part_suffix)) = stem.rsplit_once(".part") {
+            let digits_len = part_suffix.bytes().take_while(u8::is_ascii_digit).count();
+            let marker_suffix = &part_suffix[digits_len..];
+            if digits_len > 0 && (marker_suffix.is_empty() || is_duplicate_marker(marker_suffix)) {
+                let volume_number = part_suffix[..digits_len].parse::<u32>().ok()?;
+                return volume_number.checked_sub(1);
+            }
+        }
+
+        return Some(0);
+    }
+
+    let (_, ext) = name.rsplit_once('.')?;
+    let mut chars = ext.chars();
+    let prefix = chars.next()?;
+    let digits = chars.as_str();
+    if matches!(prefix, 'r' | 's')
+        && digits.len() == 2
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return digits.parse::<u32>().ok().map(|volume| volume + 1);
+    }
+
+    None
+}
+
+fn is_duplicate_marker(suffix: &str) -> bool {
+    let Some(digits) = suffix.strip_prefix(".duplicate") else {
+        return false;
+    };
+
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }

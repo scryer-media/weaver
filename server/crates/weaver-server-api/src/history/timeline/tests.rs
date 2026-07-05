@@ -22,8 +22,6 @@ fn history(created_at: i64, completed_at: i64) -> JobHistoryRow {
         created_at,
         completed_at,
         metadata: None,
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     }
 }
 

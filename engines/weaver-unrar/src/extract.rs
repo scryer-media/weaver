@@ -540,17 +540,21 @@ pub fn extract_member_with_limits<R: Read + Seek>(
                         file_header.name, file_header.data_size
                     ),
                 })?;
-            let mut compressed = vec![0u8; data_size];
+            // read_to_end fills the reserved spare capacity directly, so the
+            // member-sized buffer is never memset first (vec![0; n] would
+            // zero it just to be immediately overwritten).
+            let mut compressed = Vec::with_capacity(data_size);
             if data_size > 0 {
-                reader.read_exact(&mut compressed).map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        RarError::TruncatedData {
-                            offset: file_header.data_offset,
-                        }
-                    } else {
-                        RarError::Io(e)
-                    }
-                })?;
+                let read = reader
+                    .by_ref()
+                    .take(data_size as u64)
+                    .read_to_end(&mut compressed)
+                    .map_err(RarError::Io)?;
+                if read < data_size {
+                    return Err(RarError::TruncatedData {
+                        offset: file_header.data_offset,
+                    });
+                }
             }
 
             // For compressed data, decompress first then verify CRC.

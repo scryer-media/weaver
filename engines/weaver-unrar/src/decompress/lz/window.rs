@@ -540,6 +540,29 @@ impl Window {
         self.total_written += 1;
     }
 
+    /// Write an up-to-8-byte literal batch from the parallel apply loop.
+    ///
+    /// A full batch away from the window edge compiles to one fixed 8-byte
+    /// store; the variable-length `put_bytes` path costs a memmove call per
+    /// batch, which dominates the apply phase on literal-heavy streams.
+    #[inline(always)]
+    pub fn put_literal_batch(&mut self, bytes: &[u8; 8], n: usize) {
+        debug_assert!((1..=8).contains(&n));
+        if n == 8
+            && let WindowStorage::Contiguous(buf) = &mut self.buf
+            && self.pos + 8 <= buf.len()
+        {
+            buf[self.pos..self.pos + 8].copy_from_slice(bytes);
+            self.pos += 8;
+            if self.pos == buf.len() {
+                self.pos = 0;
+            }
+            self.total_written += 8;
+            return;
+        }
+        self.put_bytes(&bytes[..n]);
+    }
+
     /// Write a contiguous slice of literal bytes to the window.
     #[inline]
     pub fn put_bytes(&mut self, bytes: &[u8]) {

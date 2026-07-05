@@ -12,16 +12,14 @@ const JOB_HISTORY_SELECT: &str =
     "SELECT job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
         optional_recovery_bytes, optional_recovery_downloaded_bytes,
         failed_bytes, health, category, output_dir, nzb_path,
-        created_at, completed_at, metadata,
-        last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms
+        created_at, completed_at, metadata
    FROM job_history";
 
 const JOB_HISTORY_SELECT_ALIASED: &str =
     "SELECT h.job_id, h.job_hash, h.name, h.status, h.error_message, h.total_bytes, h.downloaded_bytes,
         h.optional_recovery_bytes, h.optional_recovery_downloaded_bytes,
         h.failed_bytes, h.health, h.category, h.output_dir, h.nzb_path,
-        h.created_at, h.completed_at, h.metadata,
-        h.last_diagnostic_id, h.last_diagnostic_uploaded_at_epoch_ms
+        h.created_at, h.completed_at, h.metadata
    FROM ";
 
 impl Database {
@@ -350,8 +348,5 @@ pub(crate) fn job_history_row_from_sql(
         created_at: row.i64("created_at")?,
         completed_at: row.i64("completed_at")?,
         metadata: row.opt_text("metadata")?,
-        last_diagnostic_id: row.opt_text("last_diagnostic_id")?,
-        last_diagnostic_uploaded_at_epoch_ms: row
-            .opt_i64("last_diagnostic_uploaded_at_epoch_ms")?,
     })
 }

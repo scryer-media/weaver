@@ -90,7 +90,6 @@ fn config_roundtrip() {
         max_download_speed: Some(1_000_000),
         isp_bandwidth_cap: None,
         ip_replacement_trial_extra_connections: None,
-        diagnostic_upload_url: None,
         cleanup_after_extract: Some(false),
         config_path: None,
     };

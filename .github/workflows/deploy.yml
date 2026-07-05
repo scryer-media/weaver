@@ -20,6 +20,13 @@ env:
   RUST_TOOLCHAIN: "1.96"
   WEAVER_ENABLE_DIAGNOSTICS: "0"
   WEB_ARTIFACT_NAME: weaver-web-dist
+  RUST_TEST_BINARIES_ARTIFACT_NAME: weaver-rust-test-binaries
+  WEAVER_LFS_RUST_TEST_INCLUDE: engines/weaver-unrar/tests/fixtures/**,engines/weaver-par2/tests/fixtures/**,server/crates/weaver-server-core/tests/fixtures/**
+  WEAVER_LFS_PAR2_TEST_INCLUDE: engines/weaver-par2/tests/fixtures/**
+  WEAVER_LFS_UNRAR_TEST_INCLUDE: engines/weaver-unrar/tests/fixtures/**
+  WEAVER_LFS_ARM_TEST_INCLUDE: engines/weaver-unrar/tests/fixtures/**,engines/weaver-par2/tests/fixtures/**
+  WEAVER_LFS_SDE_INCLUDE: ci/vendor/intel-sde/**,engines/weaver-par2/tests/fixtures/**
+  E2E_LFS_PAR2_SMALL_REPAIR_INCLUDE: testdata/par2-small-repair/**
 
 jobs:
   # ── Parallel lint / check jobs (no dependencies) ─────────────────────────
@@ -61,8 +68,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
-        with:
-          lfs: true
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -101,12 +106,10 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
-      - name: Install musl target
-        run: rustup target add x86_64-unknown-linux-musl
-      - name: Install musl toolchain
+      - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools mold nasm
+          sudo apt-get install -y nasm
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -115,30 +118,23 @@ jobs:
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
-      - name: Set target CPU flags
-        run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-unknown-linux-musl" --lane portable)" >> "$GITHUB_ENV"
       - name: Run clippy
-        run: cargo clippy --workspace --locked --lib --bins --tests --examples --target x86_64-unknown-linux-musl -- -D warnings
+        run: cargo clippy --workspace --locked --lib --bins --tests --examples -- -D warnings
 
-  rust-test:
-    name: rust-test
+  rust-test-build:
+    name: rust-test-build
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [web-build]
     steps:
       - uses: actions/checkout@v6
-        with:
-          lfs: true
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install musl target
-        run: rustup target add x86_64-unknown-linux-musl
-      - name: Install musl toolchain
+      - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools mold nasm
+          sudo apt-get install -y nasm
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -147,11 +143,105 @@ jobs:
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
-      - name: Set target CPU flags
+      - name: Build Rust test binaries
         run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-unknown-linux-musl" --lane portable)" >> "$GITHUB_ENV"
-      - name: Run workspace tests
-        run: cargo test --workspace --locked --target x86_64-unknown-linux-musl
+          mkdir -p .ci/rust-tests
+          cargo metadata --locked --format-version 1 > .ci/rust-tests/cargo-metadata.json
+          cargo test \
+            --workspace \
+            --locked \
+            --no-run \
+            --no-fail-fast \
+            --features weaver-par2/slow-tests,weaver-unrar/slow-tests \
+            --message-format=json-render-diagnostics \
+            > .ci/rust-tests/cargo-test.json
+          python3 .github/scripts/rust-test-manifest.py collect \
+            --metadata .ci/rust-tests/cargo-metadata.json \
+            --cargo-json .ci/rust-tests/cargo-test.json \
+            --archive .ci/rust-tests/test-binaries.tar.gz \
+            --workspace "$GITHUB_WORKSPACE"
+      - name: Upload Rust test binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.RUST_TEST_BINARIES_ARTIFACT_NAME }}-${{ github.run_id }}
+          path: .ci/rust-tests/test-binaries.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  rust-test-regular:
+    name: rust-test-regular
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: [rust-test-build]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Hydrate Rust test fixtures
+        run: |
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_RUST_TEST_INCLUDE" --exclude=""
+      - name: Download Rust test binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.RUST_TEST_BINARIES_ARTIFACT_NAME }}-${{ github.run_id }}
+          path: .ci/rust-tests
+      - name: Unpack Rust test binaries
+        run: tar -xzf .ci/rust-tests/test-binaries.tar.gz -C .ci/rust-tests
+      - name: Run regular Rust tests
+        run: |
+          python3 .github/scripts/rust-test-manifest.py run \
+            --manifest .ci/rust-tests/manifest.json \
+            --lane regular \
+            --workspace "$GITHUB_WORKSPACE"
+
+  rust-test-par2-slow:
+    name: rust-test-par2-slow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: [rust-test-build]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Hydrate PAR2 fixtures
+        run: |
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_PAR2_TEST_INCLUDE" --exclude=""
+      - name: Download Rust test binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.RUST_TEST_BINARIES_ARTIFACT_NAME }}-${{ github.run_id }}
+          path: .ci/rust-tests
+      - name: Unpack Rust test binaries
+        run: tar -xzf .ci/rust-tests/test-binaries.tar.gz -C .ci/rust-tests
+      - name: Run PAR2 slow tests
+        run: |
+          python3 .github/scripts/rust-test-manifest.py run \
+            --manifest .ci/rust-tests/manifest.json \
+            --lane par2-slow \
+            --workspace "$GITHUB_WORKSPACE"
+
+  rust-test-unrar-slow:
+    name: rust-test-unrar-slow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    needs: [rust-test-build]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Hydrate unrar fixtures
+        run: |
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_UNRAR_TEST_INCLUDE" --exclude=""
+      - name: Download Rust test binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.RUST_TEST_BINARIES_ARTIFACT_NAME }}-${{ github.run_id }}
+          path: .ci/rust-tests
+      - name: Unpack Rust test binaries
+        run: tar -xzf .ci/rust-tests/test-binaries.tar.gz -C .ci/rust-tests
+      - name: Run unrar slow tests
+        run: |
+          python3 .github/scripts/rust-test-manifest.py run \
+            --manifest .ci/rust-tests/manifest.json \
+            --lane unrar-slow \
+            --workspace "$GITHUB_WORKSPACE"
 
   weaver-par2-rar-e2e:
     name: weaver-par2-rar-e2e
@@ -164,19 +254,22 @@ jobs:
       E2E_RUNTIME_PORTS_FILE: /tmp/weaver-e2e/runtime-ports.json
       E2E_VERBOSE: "0"
       E2E_WEAVER_IMAGE: scryer-e2e-weaver:${{ github.sha }}
-      WEAVER_BIN: ${{ github.workspace }}/weaver/target/x86_64-unknown-linux-musl/release/weaver
+      WEAVER_BIN: ${{ github.workspace }}/weaver/target/release/weaver
     steps:
       - name: Checkout Weaver
         uses: actions/checkout@v6
         with:
           path: weaver
-          lfs: true
       - name: Checkout e2e harness
         uses: actions/checkout@v6
         with:
           repository: scryer-media/e2e
           path: e2e
-          lfs: true
+      - name: Hydrate e2e PAR2/RAR fixture
+        working-directory: e2e
+        run: |
+          git lfs install --local
+          git lfs pull --include="$E2E_LFS_PAR2_SMALL_REPAIR_INCLUDE" --exclude=""
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
@@ -185,12 +278,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install musl target
-        run: rustup target add x86_64-unknown-linux-musl
-      - name: Install musl toolchain
+      - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools mold nasm
+          sudo apt-get install -y nasm
       - name: Download embedded web artifact
         uses: actions/download-artifact@v8
         with:
@@ -198,7 +289,10 @@ jobs:
           path: weaver/apps/weaver-web/dist
       - name: Build Weaver e2e binary
         working-directory: weaver
-        run: cargo build --release --locked -p weaver --target x86_64-unknown-linux-musl
+        run: |
+          cargo build --release --locked -p weaver
+          mkdir -p .ci/e2e
+          cp target/release/weaver .ci/e2e/weaver
       - name: Build weaver-e2e CLI
         working-directory: e2e
         run: |
@@ -227,25 +321,18 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
-        with:
-          lfs: true
+      - name: Hydrate ARM test fixtures
+        run: |
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_ARM_TEST_INCLUDE" --exclude=""
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install musl target
-        run: rustup target add aarch64-unknown-linux-musl
-      - name: Install musl toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools mold
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-      - name: Set target CPU flags
-        run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-unknown-linux-musl" --lane portable)" >> "$GITHUB_ENV"
       - name: Run ARM-specific crate tests (NEON, CLMUL, PMULL)
-        run: cargo test --locked -p weaver-par2 -p weaver-yenc -p weaver-unrar --features weaver-par2/slow-tests --target aarch64-unknown-linux-musl
+        run: cargo test --locked --no-fail-fast -p weaver-par2 -p weaver-yenc -p weaver-unrar --features weaver-par2/slow-tests,weaver-unrar/slow-tests
 
   rust-test-sde:
     name: rust-test-sde-${{ matrix.name }}
@@ -263,17 +350,17 @@ jobs:
             sde_arch: "-spr"
     steps:
       - uses: actions/checkout@v6
-        with:
-          lfs: true
+      - name: Hydrate SDE and PAR2 fixtures
+        run: |
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_SDE_INCLUDE" --exclude=""
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install musl target
-        run: rustup target add x86_64-unknown-linux-musl
-      - name: Install musl toolchain
+      - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools mold nasm
+          sudo apt-get install -y nasm
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -286,55 +373,61 @@ jobs:
           echo "/opt/sde-external-9.48.0-2024-11-25-lin" >> "$GITHUB_PATH"
       - name: Build accelerated SIMD tests (${{ matrix.name }})
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: ${{ matrix.rustflags }}
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           set -o pipefail
-          cargo test --package weaver-par2 --lib --test repair_stress --test real_world_generated --features slow-tests --no-run --locked --target x86_64-unknown-linux-musl --message-format=json \
+          cargo test --package weaver-par2 --lib --test repair_stress --test real_world_generated --features slow-tests --no-run --no-fail-fast --locked --message-format=json \
             | jq -r 'select(.executable != null and .profile.test == true) | .executable' \
             | sort -u > /tmp/test-bins.txt
-          cargo test --package weaver-yenc --lib --no-run --locked --target x86_64-unknown-linux-musl --message-format=json \
+          cargo test --package weaver-yenc --lib --no-run --no-fail-fast --locked --message-format=json \
             | jq -r 'select(.executable != null and .profile.test == true) | .executable' \
             >> /tmp/test-bins.txt
           sort -u -o /tmp/test-bins.txt /tmp/test-bins.txt
       - name: Run tests under Intel SDE (${{ matrix.name }})
         run: |
+          failures=0
+          run_sde() {
+            if ! sde64 ${{ matrix.sde_arch }} -- "$@"; then
+              failures=$((failures + 1))
+            fi
+          }
           while IFS= read -r bin; do
             echo "::group::$(basename "$bin")"
             case "$(basename "$bin")" in
               weaver_par2-*)
-                sde64 ${{ matrix.sde_arch }} -- "$bin" gf_simd::tests:: --test-threads=1
+                run_sde "$bin" gf_simd::tests:: --test-threads=1
                 ;;
               repair_stress-*)
-                sde64 ${{ matrix.sde_arch }} -- "$bin" repair_single_file_4mb_8_missing --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" repair_large_slices --exact --test-threads=1
+                run_sde "$bin" repair_single_file_4mb_8_missing --exact --test-threads=1
+                run_sde "$bin" repair_large_slices --exact --test-threads=1
                 ;;
               real_world_generated-*)
-                sde64 ${{ matrix.sde_arch }} -- "$bin" repairs_missing_middle_volume_and_extracts_rar5_lz --exact --test-threads=1
+                run_sde "$bin" repairs_missing_middle_volume_and_extracts_rar5_lz --exact --test-threads=1
                 ;;
               weaver_yenc-*)
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::decode_normal_run_dispatches --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse2_block_handles_dot_stuffed_line_start --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse2_block_preserves_trailing_cr_state --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::ssse3_block_compacts_escapes_and_line_breaks --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::ssse3_block_handles_dot_stuffed_line_start --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::ssse3_block_preserves_trailing_cr_state --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse41_block_compacts_escapes_and_line_breaks --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse41_block_handles_dot_stuffed_line_start --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse41_block_preserves_trailing_cr_state --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx_block_compacts_escapes_and_line_breaks --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx_block_handles_dot_stuffed_line_start --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx_block_preserves_trailing_cr_state --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx2_block_handles_dot_stuffed_line_start --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx2_block_preserves_trailing_cr_state --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_block_compacts_escapes_and_line_breaks --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_block_handles_dot_stuffed_line_start --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_block_preserves_trailing_cr_state --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_vbmi2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_vbmi2_block_handles_dot_stuffed_line_start --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_vbmi2_block_preserves_trailing_cr_state --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" decode::tests::decode_body_rapidyenc_generic_special_pattern --exact --test-threads=1
+                run_sde "$bin" simd::tests::decode_normal_run_dispatches --exact --test-threads=1
+                run_sde "$bin" simd::tests::sse2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                run_sde "$bin" simd::tests::sse2_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                run_sde "$bin" simd::tests::sse2_block_preserves_trailing_cr_state --exact --test-threads=1
+                run_sde "$bin" simd::tests::ssse3_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                run_sde "$bin" simd::tests::ssse3_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                run_sde "$bin" simd::tests::ssse3_block_preserves_trailing_cr_state --exact --test-threads=1
+                run_sde "$bin" simd::tests::sse41_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                run_sde "$bin" simd::tests::sse41_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                run_sde "$bin" simd::tests::sse41_block_preserves_trailing_cr_state --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx_block_preserves_trailing_cr_state --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx2_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx2_block_preserves_trailing_cr_state --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx512_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx512_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx512_block_preserves_trailing_cr_state --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx512_vbmi2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx512_vbmi2_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx512_vbmi2_block_preserves_trailing_cr_state --exact --test-threads=1
+                run_sde "$bin" decode::tests::decode_body_rapidyenc_generic_special_pattern --exact --test-threads=1
                 ;;
               *)
                 echo "unexpected SDE test binary: $(basename "$bin")" >&2
@@ -343,6 +436,10 @@ jobs:
             esac
             echo "::endgroup::"
           done < /tmp/test-bins.txt
+          if [ "$failures" -ne 0 ]; then
+            echo "$failures SDE test command(s) failed" >&2
+            exit 1
+          fi
 
   rust-yenc-simd-targets:
     name: rust-yenc-simd-${{ matrix.name }}
@@ -437,7 +534,7 @@ jobs:
         if: contains(matrix.target, '-musl')
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools mold
+          sudo apt-get install -y musl-tools
       - name: Install NASM (Linux x86_64)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get install -y nasm
@@ -514,7 +611,11 @@ jobs:
         run: |
           $flags = cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}" --lane "${{ matrix.lane }}"
           "RUSTFLAGS=$flags" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-      - name: Check native crypto crates
+      - name: Check native crypto crates (Linux)
+        if: runner.os == 'Linux'
+        run: cargo check --locked -p weaver-unrar -p weaver-par2 --target ${{ matrix.target }}
+      - name: Check native crypto crates (non-Linux)
+        if: runner.os != 'Linux'
         run: cargo check --locked -p weaver-unrar -p weaver-par2 --target ${{ matrix.target }}
       - name: Show Windows sccache stats
         if: always() && runner.os == 'Windows'
@@ -1438,11 +1539,14 @@ jobs:
       - rust-fmt
       - rust-clippy
       - rust-audit
-      - rust-test
+      - rust-test-regular
+      - rust-test-par2-slow
+      - rust-test-unrar-slow
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
       - rust-crypto-targets
+      - weaver-par2-rar-e2e
       - rust-package-linux-x86_64-portable
       - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable
@@ -1533,11 +1637,14 @@ jobs:
       - rust-fmt
       - rust-clippy
       - rust-audit
-      - rust-test
+      - rust-test-regular
+      - rust-test-par2-slow
+      - rust-test-unrar-slow
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
       - rust-crypto-targets
+      - weaver-par2-rar-e2e
       - rust-package-linux-x86_64-portable
       - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable
@@ -1638,11 +1745,14 @@ jobs:
       - rust-fmt
       - rust-clippy
       - rust-audit
-      - rust-test
+      - rust-test-regular
+      - rust-test-par2-slow
+      - rust-test-unrar-slow
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
       - rust-crypto-targets
+      - weaver-par2-rar-e2e
       - rust-package-linux-x86_64-portable
       - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable

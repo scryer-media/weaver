@@ -71,7 +71,6 @@ impl TestHarness {
             max_download_speed: None,
             isp_bandwidth_cap: None,
             ip_replacement_trial_extra_connections: None,
-            diagnostic_upload_url: None,
             cleanup_after_extract: Some(true),
             config_path: None,
         }));
@@ -274,8 +273,6 @@ fn history_row_with_output_dir(
         created_at: 1,
         completed_at: 2,
         metadata: None,
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     }
 }
 
@@ -317,7 +314,6 @@ async fn new_direct_pipeline_with_buffers(
         max_download_speed: None,
         isp_bandwidth_cap: None,
         ip_replacement_trial_extra_connections: None,
-        diagnostic_upload_url: None,
         cleanup_after_extract: Some(true),
         config_path: None,
     }));

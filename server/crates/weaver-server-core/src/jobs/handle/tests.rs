@@ -478,13 +478,6 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     };
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::StartDiagnosticRedownload {
-                    source_job_id,
-                    reply,
-                    ..
-                } => {
-                    let _ = reply.send(Ok(source_job_id));
-                }
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.

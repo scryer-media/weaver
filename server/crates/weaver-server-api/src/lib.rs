@@ -2,7 +2,6 @@ pub mod auth;
 pub mod backup;
 pub mod categories;
 pub mod context;
-mod feature_flags;
 pub mod history;
 pub mod jobs;
 mod observability;

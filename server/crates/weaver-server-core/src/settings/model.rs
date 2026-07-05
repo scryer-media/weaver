@@ -44,11 +44,6 @@ pub struct Config {
     /// Defaults to 0 and is capped at 1.
     #[serde(default)]
     pub ip_replacement_trial_extra_connections: Option<u8>,
-    /// Optional override for the diagnostic upload service base URL.
-    /// Defaults to https://diagnostics.scryer.media when unset.
-    #[serde(default)]
-    pub diagnostic_upload_url: Option<String>,
-
     /// Path to the config file on disk. Not serialized to TOML.
     #[serde(skip)]
     pub config_path: Option<PathBuf>,

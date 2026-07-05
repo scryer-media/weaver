@@ -20,11 +20,18 @@ use crate::gf;
 use crate::matrix;
 use crate::par2_set::Par2FileSet;
 use crate::types::{
-    CancellationToken, FileId, MAX_SLICES_PER_FILE, ProgressCallback, ProgressStage, ProgressUpdate,
+    CancellationToken, FileId, MAX_SLICES_PER_FILE, MAX_TOTAL_INPUT_SLICES, ProgressCallback,
+    ProgressStage, ProgressUpdate,
 };
 use crate::verify::{FileAccess, Repairability, VerificationResult};
 
 pub(crate) const DEFAULT_REPAIR_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+/// The decode matrix is a transient planning workspace whose size is set by
+/// the damage (missing^2 + missing*total words), not by streaming buffer
+/// tuning. Give it its own budget floor so tight slice-buffer limits do not
+/// refuse legitimately repairable sets; an explicitly larger `memory_limit`
+/// raises it further. Bounded in practice by the 32768-slice spec cap.
+const MATRIX_WORKSPACE_BUDGET_FLOOR: usize = 1024 * 1024 * 1024;
 const XOR_OUT_PAR_CHUNK: usize = 16;
 
 /// A plan for repairing missing/damaged slices.
@@ -124,6 +131,13 @@ pub fn plan_repair_with_memory_limit(
         }
     }
     let total_input_slices = global_to_file.len();
+    if total_input_slices > MAX_TOTAL_INPUT_SLICES {
+        return Err(Par2Error::ResourceLimitExceeded {
+            reason: format!(
+                "recovery set has {total_input_slices} input slices; PAR2 supports at most {MAX_TOTAL_INPUT_SLICES}"
+            ),
+        });
+    }
 
     // Identify missing slices (global indices).
     let mut missing_slices: Vec<(FileId, u32)> = Vec::new();
@@ -198,8 +212,11 @@ pub fn plan_repair_with_memory_limit(
         .filter(|global_idx| !missing_set.contains(global_idx))
         .collect();
 
-    // Try building the decode matrix, skipping singular recovery blocks.
+    // Try building the decode matrix, skipping corrupt or singular recovery
+    // blocks. Payload validation is lazy: only selected blocks are hashed,
+    // each at most once, so undamaged repairs never pay for unused volumes.
     let mut skip_set: HashSet<usize> = HashSet::new();
+    let mut validated_exponents: HashMap<u32, bool> = HashMap::new();
     let (recovery_exponents, input_factors, decode) = loop {
         let selected_indices: Vec<usize> = all_exponents
             .iter()
@@ -219,6 +236,38 @@ pub fn plan_repair_with_memory_limit(
                 available: selected.len() as u32,
                 deficit: (missing_count - selected.len()) as u32,
             });
+        }
+
+        let mut corrupt_selection = None;
+        for (position, &exponent) in selected.iter().enumerate() {
+            let valid = *validated_exponents.entry(exponent).or_insert_with(|| {
+                let slice = &par2_set.recovery_slices[&exponent];
+                match slice
+                    .data
+                    .validate_packet_hash(par2_set.recovery_set_id.as_bytes(), exponent)
+                {
+                    Ok(valid) => {
+                        if !valid {
+                            warn!(
+                                "recovery block exponent {exponent} failed packet hash validation, skipping"
+                            );
+                        }
+                        valid
+                    }
+                    Err(error) => {
+                        warn!("recovery block exponent {exponent} is unreadable ({error}), skipping");
+                        false
+                    }
+                }
+            });
+            if !valid {
+                corrupt_selection = Some(selected_indices[position]);
+                break;
+            }
+        }
+        if let Some(skip_idx) = corrupt_selection {
+            skip_set.insert(skip_idx);
+            continue;
         }
 
         match matrix::build_repair_matrix_with_bad_row(
@@ -372,11 +421,21 @@ fn check_cancel(options: &RepairOptions) -> Result<()> {
 
 fn estimated_in_memory_repair_bytes(plan: &RepairPlan) -> usize {
     let slice_size = plan.slice_size as usize;
+    // Prepared multiply tables are deduplicated per distinct factor value, so
+    // they are bounded by the field size rather than outputs*inputs.
+    let prepared_tables = 65_535usize
+        .min(
+            plan.input_factors
+                .rows
+                .saturating_mul(plan.input_factors.cols),
+        )
+        .saturating_mul(std::mem::size_of::<crate::gf_simd::PreparedInputFactor>());
     plan.input_factors
         .cols
         .saturating_mul(slice_size)
         .saturating_add(plan.missing_slices.len().saturating_mul(slice_size))
         .saturating_add(slice_size.saturating_mul(2))
+        .saturating_add(prepared_tables)
 }
 
 fn estimated_repair_matrix_bytes(total_inputs: usize, missing_rows: usize) -> usize {
@@ -395,11 +454,16 @@ fn repair_matrix_limit_reason(
     missing_count: usize,
     memory_limit: Option<usize>,
 ) -> Option<String> {
+    if total_input_slices > MAX_TOTAL_INPUT_SLICES {
+        return Some(format!(
+            "recovery set has {total_input_slices} input slices; PAR2 supports at most {MAX_TOTAL_INPUT_SLICES}"
+        ));
+    }
     let estimated = estimated_repair_matrix_bytes(total_input_slices, missing_count);
-    let limit = repair_memory_limit_bytes(memory_limit);
+    let limit = repair_memory_limit_bytes(memory_limit).max(MATRIX_WORKSPACE_BUDGET_FLOOR);
     (estimated > limit).then(|| {
         format!(
-            "repair matrix for {missing_count} missing slices would require {estimated} bytes, exceeding the {limit} byte repair memory limit"
+            "repair matrix for {missing_count} missing slices would require {estimated} bytes, exceeding the {limit} byte matrix workspace budget"
         )
     })
 }
@@ -568,7 +632,7 @@ fn accumulate_input_to_outputs(output_ptrs: &[usize], output_factors: &[OutputFa
         return;
     }
 
-    for factor_start in (0..output_factors.len()).step_by(XOR_OUT_PAR_CHUNK) {
+    let run_batch = |factor_start: usize| {
         let factor_end = (factor_start + XOR_OUT_PAR_CHUNK).min(output_factors.len());
         let mut pairs: Vec<crate::gf_simd::FactorDst<'_>> =
             Vec::with_capacity(factor_end - factor_start);
@@ -585,6 +649,21 @@ fn accumulate_input_to_outputs(output_ptrs: &[usize], output_factors: &[OutputFa
         }
 
         crate::gf_simd::mul_acc_multi_region(&mut pairs, src);
+    };
+
+    // Each batch touches a disjoint set of output buffers (an output index
+    // appears at most once per input in `grouped_output_factors`), so batches
+    // can run in parallel while sharing the read-only source chunk. This is
+    // what keeps the streamed repair path multi-core.
+    let batch_count = output_factors.len().div_ceil(XOR_OUT_PAR_CHUNK);
+    if batch_count > 1 && rayon::current_num_threads() > 1 {
+        (0..batch_count)
+            .into_par_iter()
+            .for_each(|batch| run_batch(batch * XOR_OUT_PAR_CHUNK));
+    } else {
+        for batch in 0..batch_count {
+            run_batch(batch * XOR_OUT_PAR_CHUNK);
+        }
     }
 }
 
@@ -962,22 +1041,26 @@ fn reconstruct_and_write_grouped_inputs(
     let word_count = slice_size / 2;
     let total_chunks_usize = word_count.div_ceil(chunk_words);
     let output_inputs = grouped_input_factors(&plan.decode_matrix);
-    let prepared_output_inputs: Vec<Vec<(u16, crate::gf_simd::PreparedInputFactor, u16)>> =
-        output_inputs
-            .iter()
-            .map(|inputs| {
-                inputs
-                    .iter()
-                    .map(|factor_input| {
-                        (
-                            factor_input.input_idx,
-                            crate::gf_simd::prepare_input_factor(factor_input.factor),
-                            factor_input.factor,
-                        )
-                    })
-                    .collect()
-            })
-            .collect();
+    // Deduplicate prepared multiply tables per distinct factor value; see the
+    // in-memory repair path for rationale.
+    let mut factor_slots: HashMap<u16, usize> = HashMap::new();
+    let mut prepared_factors: Vec<crate::gf_simd::PreparedInputFactor> = Vec::new();
+    let prepared_output_inputs: Vec<Vec<(u16, usize)>> = output_inputs
+        .iter()
+        .map(|inputs| {
+            inputs
+                .iter()
+                .map(|factor_input| {
+                    let slot = *factor_slots.entry(factor_input.factor).or_insert_with(|| {
+                        prepared_factors
+                            .push(crate::gf_simd::prepare_input_factor(factor_input.factor));
+                        prepared_factors.len() - 1
+                    });
+                    (factor_input.input_idx, slot)
+                })
+                .collect()
+        })
+        .collect();
 
     let mut repaired_slices: Vec<Vec<u8>> = vec![vec![0u8; slice_size]; n];
     let completed_outputs = AtomicU32::new(0);
@@ -996,10 +1079,10 @@ fn reconstruct_and_write_grouped_inputs(
                 let byte_len = (chunk_end - chunk_start) * 2;
 
                 chunk_inputs.clear();
-                for factor_input in decode_inputs {
+                for (input_idx, factor_slot) in decode_inputs {
                     chunk_inputs.push(crate::gf_simd::PreparedFactorSrc {
-                        prepared: &factor_input.1,
-                        src: &recovery_buffers[factor_input.0 as usize]
+                        prepared: &prepared_factors[*factor_slot],
+                        src: &recovery_buffers[*input_idx as usize]
                             [byte_start..byte_start + byte_len],
                     });
                 }
@@ -1265,21 +1348,31 @@ pub fn execute_repair_with_options(
                     });
                 }
             }
-            let prepared_output_inputs: Vec<Vec<(u16, crate::gf_simd::PreparedInputFactor)>> =
-                output_inputs
-                    .iter()
-                    .map(|inputs| {
-                        inputs
-                            .iter()
-                            .map(|factor_input| {
-                                (
-                                    factor_input.input_idx,
-                                    crate::gf_simd::prepare_input_factor(factor_input.factor),
-                                )
-                            })
-                            .collect()
-                    })
-                    .collect();
+            // Prepared multiply tables are keyed by factor value: a dense
+            // decode matrix repeats factors across (output, input) pairs, and
+            // preparing one table per pair multiplies memory (and cache
+            // pressure) by outputs*inputs. At most 65535 distinct factors
+            // exist, so the deduplicated pool stays a few megabytes.
+            let mut factor_slots: HashMap<u16, usize> = HashMap::new();
+            let mut prepared_factors: Vec<crate::gf_simd::PreparedInputFactor> = Vec::new();
+            let prepared_output_inputs: Vec<Vec<(u16, usize)>> = output_inputs
+                .iter()
+                .map(|inputs| {
+                    inputs
+                        .iter()
+                        .map(|factor_input| {
+                            let slot =
+                                *factor_slots.entry(factor_input.factor).or_insert_with(|| {
+                                    prepared_factors.push(crate::gf_simd::prepare_input_factor(
+                                        factor_input.factor,
+                                    ));
+                                    prepared_factors.len() - 1
+                                });
+                            (factor_input.input_idx, slot)
+                        })
+                        .collect()
+                })
+                .collect();
             let total_chunks_usize = (slice_size / 2).div_ceil(chunk_words);
             let completed_outputs = AtomicU32::new(0);
 
@@ -1296,9 +1389,9 @@ pub fn execute_repair_with_options(
                         let byte_len = (chunk_end - chunk_start) * 2;
 
                         chunk_inputs.clear();
-                        for (input_idx, prepared) in decode_inputs {
+                        for (input_idx, factor_slot) in decode_inputs {
                             chunk_inputs.push(crate::gf_simd::PreparedFactorSrc {
-                                prepared,
+                                prepared: &prepared_factors[*factor_slot],
                                 src: &input_buffers[*input_idx as usize]
                                     [byte_start..byte_start + byte_len],
                             });
@@ -1519,6 +1612,95 @@ mod tests {
         dir
     }
 
+    /// Like [`spill_recovery_slices_to_disk`], but records the PAR2 packet
+    /// hash the streaming scanner would have captured, enabling lazy payload
+    /// validation.
+    fn spill_recovery_slices_to_disk_with_hashes(set: &mut Par2FileSet) -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let rsid = *set.recovery_set_id.as_bytes();
+        for (exp, slice) in &mut set.recovery_slices {
+            let path = dir.path().join(format!("recovery_{exp}.bin"));
+            let bytes = slice.data.to_vec().unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+
+            let mut hash_input = Vec::new();
+            hash_input.extend_from_slice(&rsid);
+            hash_input.extend_from_slice(header::TYPE_RECOVERY);
+            hash_input.extend_from_slice(&exp.to_le_bytes());
+            hash_input.extend_from_slice(&bytes);
+            let packet_hash: [u8; 16] = Md5::digest(&hash_input).into();
+
+            slice.data = crate::packet::RecoverySliceData::file_backed_with_hash(
+                path,
+                0,
+                bytes.len(),
+                packet_hash,
+            );
+        }
+        dir
+    }
+
+    #[test]
+    fn plan_repair_skips_recovery_blocks_with_corrupt_payloads() {
+        let slice_size = 64u64;
+        let file_data: Vec<u8> = (0..256u32).map(|i| ((i * 11 + 3) % 256) as u8).collect();
+        let (mut par2_set, file_id) = setup_repairable_set(&file_data, slice_size, 4);
+        let spill_dir = spill_recovery_slices_to_disk_with_hashes(&mut par2_set);
+
+        // Corrupt the payloads of the two lowest exponents on disk. Selection
+        // prefers low exponents, so the plan must detect the damage and fall
+        // back to the clean blocks.
+        for exp in [0u32, 1] {
+            let path = spill_dir.path().join(format!("recovery_{exp}.bin"));
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[7] ^= 0xFF;
+            std::fs::write(&path, &bytes).unwrap();
+        }
+
+        let mut damaged = file_data.clone();
+        damaged[..64].fill(0);
+        damaged[128..192].fill(0);
+
+        let mut access = MemoryFileAccess::new();
+        access.add_file(file_id, damaged);
+
+        let result = verify::verify_all(&par2_set, &access);
+        assert_eq!(result.total_missing_blocks, 2);
+
+        let plan = plan_repair(&par2_set, &result).unwrap();
+        assert!(!plan.recovery_exponents.contains(&0));
+        assert!(!plan.recovery_exponents.contains(&1));
+
+        execute_repair(&plan, &par2_set, &mut access).unwrap();
+        let repaired = access.read_file(&file_id).unwrap();
+        assert_eq!(repaired, file_data);
+    }
+
+    #[test]
+    fn plan_repair_fails_when_all_recovery_payloads_are_corrupt() {
+        let slice_size = 64u64;
+        let file_data: Vec<u8> = (0..256u32).map(|i| ((i * 5 + 1) % 256) as u8).collect();
+        let (mut par2_set, file_id) = setup_repairable_set(&file_data, slice_size, 2);
+        let spill_dir = spill_recovery_slices_to_disk_with_hashes(&mut par2_set);
+
+        for exp in [0u32, 1] {
+            let path = spill_dir.path().join(format!("recovery_{exp}.bin"));
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[0] ^= 0x01;
+            std::fs::write(&path, &bytes).unwrap();
+        }
+
+        let mut damaged = file_data.clone();
+        damaged[..64].fill(0);
+
+        let mut access = MemoryFileAccess::new();
+        access.add_file(file_id, damaged);
+
+        let result = verify::verify_all(&par2_set, &access);
+        let err = plan_repair(&par2_set, &result).unwrap_err();
+        assert!(matches!(err, Par2Error::InsufficientRecoveryData { .. }));
+    }
+
     #[test]
     fn end_to_end_repair_single_damaged_slice() {
         // Create a file with 4 slices of 64 bytes each (256 bytes total).
@@ -1671,7 +1853,26 @@ mod tests {
     }
 
     #[test]
-    fn plan_repair_respects_configured_matrix_memory_limit() {
+    fn matrix_memory_budget_has_floor_but_still_caps() {
+        // A tiny slice-buffer limit no longer starves the transient decode
+        // matrix: planning small repairs succeeds even at absurd limits.
+        assert!(repair_matrix_limit_reason(4, 2, Some(8)).is_none());
+
+        // A matrix that exceeds even the budget floor is still refused...
+        let missing = 20_000usize;
+        let reason = repair_matrix_limit_reason(32_768, missing, Some(8)).unwrap();
+        assert!(reason.contains("matrix workspace budget"));
+
+        // ...unless the caller raises the limit explicitly.
+        assert!(repair_matrix_limit_reason(32_768, missing, Some(8 << 30)).is_none());
+
+        // Sets beyond the PAR2 total-slice cap are reported as such.
+        let reason = repair_matrix_limit_reason(40_000, 1, None).unwrap();
+        assert!(reason.contains("at most"));
+    }
+
+    #[test]
+    fn plan_repair_succeeds_with_tiny_configured_memory_limit() {
         let slice_size = 64u64;
         let file_data: Vec<u8> = (0..256u32).map(|i| (i % 256) as u8).collect();
         let (par2_set, file_id) = setup_repairable_set(&file_data, slice_size, 3);
@@ -1686,11 +1887,78 @@ mod tests {
         let result = verify::verify_all(&par2_set, &access);
         assert_eq!(result.total_missing_blocks, 2);
 
-        let err = plan_repair_with_memory_limit(&par2_set, &result, Some(8)).unwrap_err();
-        assert!(matches!(err, Par2Error::ResourceLimitExceeded { .. }));
-
-        let plan = plan_repair_with_memory_limit(&par2_set, &result, Some(64)).unwrap();
+        let plan = plan_repair_with_memory_limit(&par2_set, &result, Some(8)).unwrap();
         assert_eq!(plan.missing_slices.len(), 2);
+    }
+
+    #[test]
+    fn plan_repair_rejects_sets_over_total_slice_limit() {
+        let slice_size = 4u64;
+        let slices_per_file = 20_000u64;
+        let mut files = HashMap::new();
+        let mut recovery_file_ids = Vec::new();
+        let mut verifications = Vec::new();
+        for index in 0..2u8 {
+            let file_id = FileId::from_bytes([index + 1; 16]);
+            recovery_file_ids.push(file_id);
+            files.insert(
+                file_id,
+                crate::par2_set::FileDescription {
+                    file_id,
+                    hash_full: [0; 16],
+                    hash_16k: [0; 16],
+                    length: slice_size * slices_per_file,
+                    par2_name: format!("big{index}.dat"),
+                    filename: format!("big{index}.dat"),
+                },
+            );
+            let mut valid_slices = vec![true; slices_per_file as usize];
+            if index == 0 {
+                valid_slices[0] = false;
+            }
+            verifications.push(FileVerification {
+                file_id,
+                filename: format!("big{index}.dat"),
+                status: if index == 0 {
+                    FileStatus::Damaged(1)
+                } else {
+                    FileStatus::Complete
+                },
+                missing_slice_count: u32::from(index == 0),
+                valid_slices,
+            });
+        }
+
+        let mut recovery_slices = std::collections::BTreeMap::new();
+        recovery_slices.insert(
+            0,
+            RecoverySlice {
+                exponent: 0,
+                data: Bytes::from(vec![0u8; slice_size as usize]).into(),
+            },
+        );
+        let par2_set = Par2FileSet {
+            recovery_set_id: crate::types::RecoverySetId::from_bytes([9; 16]),
+            slice_size,
+            recovery_file_ids,
+            non_recovery_file_ids: Vec::new(),
+            files,
+            slice_checksums: HashMap::new(),
+            recovery_slices,
+            creator: None,
+        };
+        let result = VerificationResult {
+            files: verifications,
+            recovery_blocks_available: 1,
+            total_missing_blocks: 1,
+            repairable: Repairability::Repairable {
+                blocks_needed: 1,
+                blocks_available: 1,
+            },
+        };
+
+        let err = plan_repair(&par2_set, &result).unwrap_err();
+        assert!(matches!(err, Par2Error::ResourceLimitExceeded { .. }));
     }
 
     #[test]

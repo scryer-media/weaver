@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::history::types::{history_delete_row_state_from_core, history_diagnostic_run_from_core};
+use crate::history::types::history_delete_row_state_from_core;
 
 enum HistoryQueryPlan {
     Empty,
@@ -26,7 +26,6 @@ impl HistoryQuery {
     ) -> Result<Vec<HistoryItem>> {
         let offset = decode_offset_cursor(after.as_deref())
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
-        let diagnostics_active = history_diagnostics_active(ctx).await;
         let db = ctx.data::<Database>()?.clone();
         let plan = history_query_plan(filter.as_ref(), first, Some(offset));
         let HistoryQueryPlan::Query(history_filter) = plan else {
@@ -35,23 +34,14 @@ impl HistoryQuery {
         let items = tokio::task::spawn_blocking(move || {
             let rows = db.list_job_history(&history_filter)?;
             let delete_states = load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?;
-            let diagnostic_states = load_history_diagnostic_states(
-                &db,
-                rows.iter().map(|row| row.job_id),
-                diagnostics_active,
-            )?;
             Ok::<_, weaver_server_core::StateError>(
                 rows.into_iter()
                     .map(|row| {
-                        let diagnostic_run = diagnostic_states
-                            .get(&row.job_id)
-                            .cloned()
-                            .map(history_diagnostic_run_from_core);
                         let delete_state = delete_states
                             .get(&row.job_id)
                             .cloned()
                             .map(history_delete_row_state_from_core);
-                        history_item_from_row(&row, diagnostic_run, delete_state)
+                        history_item_from_row(&row, delete_state)
                     })
                     .collect::<Vec<_>>(),
             )
@@ -68,9 +58,8 @@ impl HistoryQuery {
         ctx: &Context<'_>,
         input: HistoryPageInput,
     ) -> Result<HistoryPage> {
-        let diagnostics_active = history_diagnostics_active(ctx).await;
         let db = ctx.data::<Database>()?.clone();
-        load_history_page(db, input, diagnostics_active).await
+        load_history_page(db, input).await
     }
     /// Public history facade for one completed or failed item.
     #[graphql(guard = "ReadGuard")]
@@ -86,18 +75,12 @@ impl HistoryQuery {
         }) {
             return Ok(None);
         }
-        let diagnostics_active = history_diagnostics_active(ctx).await;
         let db = ctx.data::<Database>()?.clone();
         let row = tokio::task::spawn_blocking(move || {
             let row = db.get_job_history_profiled(id, "db.get_job_history.api_history_item")?;
             let delete_states =
                 load_history_delete_states(&db, row.iter().map(|entry| entry.job_id))?;
-            let diagnostic_states = load_history_diagnostic_states(
-                &db,
-                row.iter().map(|entry| entry.job_id),
-                diagnostics_active,
-            )?;
-            Ok::<_, weaver_server_core::StateError>((row, delete_states, diagnostic_states))
+            Ok::<_, weaver_server_core::StateError>((row, delete_states))
         })
         .await
         .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
@@ -105,10 +88,6 @@ impl HistoryQuery {
         Ok(row.0.as_ref().map(|history_row| {
             history_item_from_row(
                 history_row,
-                row.2
-                    .get(&history_row.job_id)
-                    .cloned()
-                    .map(history_diagnostic_run_from_core),
                 row.1
                     .get(&history_row.job_id)
                     .cloned()
@@ -163,10 +142,9 @@ impl HistoryQuery {
         ctx: &Context<'_>,
         job_id: u64,
     ) -> Result<JobDetailSnapshot> {
-        let diagnostics_active = history_diagnostics_active(ctx).await;
         let handle = ctx.data::<SchedulerHandle>()?.clone();
         let db = ctx.data::<weaver_server_core::Database>()?.clone();
-        load_job_detail_snapshot(handle, db, job_id, diagnostics_active).await
+        load_job_detail_snapshot(handle, db, job_id).await
     }
     /// Active or recent background history delete operations.
     #[graphql(guard = "ReadGuard")]
@@ -243,7 +221,6 @@ pub(crate) async fn load_job_detail_snapshot(
     handle: SchedulerHandle,
     db: weaver_server_core::Database,
     job_id: u64,
-    diagnostics_active: bool,
 ) -> Result<JobDetailSnapshot> {
     let snapshot_started = Instant::now();
     let live_job = match handle.get_job(JobId(job_id)) {
@@ -253,43 +230,27 @@ pub(crate) async fn load_job_detail_snapshot(
     };
     let live_only = live_job.is_some();
 
-    let (events, history, delete_states, diagnostic_states) =
-        tokio::task::spawn_blocking(move || {
-            let events = db.get_job_events(job_id)?;
-            let history = if live_only {
-                None
-            } else {
-                db.get_job_history_profiled(
-                    job_id,
-                    "db.get_job_history.api_history_integration_events",
-                )?
-            };
-            let delete_states =
-                load_history_delete_states(&db, history.iter().map(|row| row.job_id))?;
-            let diagnostic_states = load_history_diagnostic_states(
-                &db,
-                history.iter().map(|row| row.job_id),
-                diagnostics_active,
-            )?;
-            Ok::<_, weaver_server_core::StateError>((
-                events,
-                history,
-                delete_states,
-                diagnostic_states,
-            ))
-        })
-        .await
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+    let (events, history, delete_states) = tokio::task::spawn_blocking(move || {
+        let events = db.get_job_events(job_id)?;
+        let history = if live_only {
+            None
+        } else {
+            db.get_job_history_profiled(
+                job_id,
+                "db.get_job_history.api_history_integration_events",
+            )?
+        };
+        let delete_states = load_history_delete_states(&db, history.iter().map(|row| row.job_id))?;
+        Ok::<_, weaver_server_core::StateError>((events, history, delete_states))
+    })
+    .await
+    .map_err(|error| async_graphql::Error::new(error.to_string()))?
+    .map_err(|error| async_graphql::Error::new(error.to_string()))?;
 
     let queue_item = live_job.as_ref().map(queue_item_from_job);
     let history_item = history.as_ref().map(|row| {
         history_item_from_row(
             row,
-            diagnostic_states
-                .get(&row.job_id)
-                .cloned()
-                .map(history_diagnostic_run_from_core),
             delete_states
                 .get(&row.job_id)
                 .cloned()
@@ -339,25 +300,11 @@ pub(crate) async fn load_job_detail_snapshot(
     })
 }
 
-async fn load_history_page(
-    db: Database,
-    input: HistoryPageInput,
-    diagnostics_active: bool,
-) -> Result<HistoryPage> {
+async fn load_history_page(db: Database, input: HistoryPageInput) -> Result<HistoryPage> {
     tokio::task::spawn_blocking(move || {
         let rows = db.list_job_history(&weaver_server_core::HistoryFilter::default())?;
         let delete_states = load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?;
-        let diagnostic_states = load_history_diagnostic_states(
-            &db,
-            rows.iter().map(|row| row.job_id),
-            diagnostics_active,
-        )?;
-        Ok::<_, weaver_server_core::StateError>(build_history_page(
-            rows,
-            delete_states,
-            diagnostic_states,
-            input,
-        ))
+        Ok::<_, weaver_server_core::StateError>(build_history_page(rows, delete_states, input))
     })
     .await
     .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
@@ -374,35 +321,6 @@ fn load_history_delete_states(
         return Ok(HashMap::new());
     }
     db.list_history_delete_row_states(&ids)
-}
-
-fn load_history_diagnostic_states(
-    db: &Database,
-    ids: impl Iterator<Item = u64>,
-    diagnostics_active: bool,
-) -> Result<HashMap<u64, weaver_server_core::DiagnosticRunRow>, weaver_server_core::StateError> {
-    if !diagnostics_active || !crate::feature_flags::DIAGNOSTICS_ENABLED {
-        return Ok(HashMap::new());
-    }
-    let ids = ids.collect::<Vec<_>>();
-    if ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    Ok(db
-        .list_pending_diagnostic_runs_for_sources(&ids)?
-        .into_iter()
-        .map(|row| (row.source_job_id, row))
-        .collect())
-}
-
-async fn history_diagnostics_active(_ctx: &Context<'_>) -> bool {
-    #[cfg(weaver_diagnostics)]
-    {
-        if let Some(manager) = _ctx.data_opt::<crate::history::diagnostics::DiagnosticManager>() {
-            return manager.has_active_runs().await;
-        }
-    }
-    false
 }
 
 fn history_query_plan(
@@ -463,7 +381,6 @@ fn history_query_plan(
 fn build_history_page(
     rows: Vec<JobHistoryRow>,
     delete_states: HashMap<u64, weaver_server_core::HistoryDeleteRowState>,
-    diagnostic_states: HashMap<u64, weaver_server_core::DiagnosticRunRow>,
     input: HistoryPageInput,
 ) -> HistoryPage {
     let page_size = sanitize_page_size(input.page_size);
@@ -476,15 +393,11 @@ fn build_history_page(
     let filtered_by_search: Vec<HistoryItem> = rows
         .into_iter()
         .map(|row| {
-            let diagnostic_run = diagnostic_states
-                .get(&row.job_id)
-                .cloned()
-                .map(history_diagnostic_run_from_core);
             let delete_state = delete_states
                 .get(&row.job_id)
                 .cloned()
                 .map(history_delete_row_state_from_core);
-            history_item_from_row(&row, diagnostic_run, delete_state)
+            history_item_from_row(&row, delete_state)
         })
         .filter(|item| history_matches_search(item, search.as_deref()))
         .collect();

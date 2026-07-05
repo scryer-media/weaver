@@ -96,11 +96,7 @@ const REBUILD_JOB_HISTORY_ATTRIBUTES_SQL: &str =
        AND json_array_length(attr.value) = 2
        AND json_type(attr.value, '$[0]') = 'text'
        AND json_type(attr.value, '$[1]') = 'text'
-       AND json_extract(attr.value, '$[0]') NOT IN (
-           '__weaver_client_request_id',
-           '__weaver_diagnostic_source_job_id',
-           '__weaver_diagnostic_include_server_hostnames'
-       )";
+       AND json_extract(attr.value, '$[0]') != '__weaver_client_request_id'";
 
 #[derive(Debug, Clone)]
 pub struct StableStateExport {
@@ -411,7 +407,18 @@ impl Database {
                                       failed_bytes, health, category, output_dir, nzb_path, created_at, completed_at, metadata)
                                      SELECT job_id, name, status, error_message, total_bytes, downloaded_bytes,
                                             {src_optional_recovery_bytes}, {src_optional_recovery_downloaded_bytes},
-                                            failed_bytes, health, category, output_dir, nzb_path, created_at, completed_at, metadata
+                                            failed_bytes, health, category, output_dir, nzb_path, created_at, completed_at,
+                                            CASE
+                                                WHEN metadata IS NULL OR NOT json_valid(metadata) THEN metadata
+                                                ELSE (
+                                                    SELECT COALESCE(json_group_array(json(attr.value)), '[]')
+                                                      FROM json_each(metadata) AS attr
+                                                     WHERE COALESCE(json_extract(attr.value, '$[0]'), '') NOT IN (
+                                                        '__weaver_diagnostic_source_job_id',
+                                                        '__weaver_diagnostic_include_server_hostnames'
+                                                     )
+                                                )
+                                            END AS metadata
                                      FROM src.job_history;
                                  INSERT INTO job_events (id, job_id, timestamp, kind, message, file_id)
                                      SELECT id, job_id, timestamp, kind, message, file_id FROM src.job_events;

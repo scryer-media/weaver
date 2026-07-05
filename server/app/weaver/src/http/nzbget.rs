@@ -548,7 +548,7 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         rows.iter()
             .filter(|row| seen_ids.insert(row.job_id))
             .map(|row| {
-                let item = history_item_from_row(row, None, None);
+                let item = history_item_from_row(row, None);
                 nzbget_history_item(&item)
             }),
     );

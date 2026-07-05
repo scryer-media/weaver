@@ -4277,6 +4277,17 @@ fn open_multi(dir: &str, filenames: &[&str]) -> weaver_unrar::RarArchive {
     weaver_unrar::RarArchive::open_volumes(readers).unwrap()
 }
 
+fn open_multi_paths(paths: &[std::path::PathBuf]) -> weaver_unrar::RarArchive {
+    let readers: Vec<Box<dyn weaver_unrar::ReadSeek>> = paths
+        .iter()
+        .map(|path| {
+            let data = std::fs::read(path).unwrap();
+            Box::new(Cursor::new(data)) as Box<dyn weaver_unrar::ReadSeek>
+        })
+        .collect();
+    weaver_unrar::RarArchive::open_volumes(readers).unwrap()
+}
+
 fn streaming_prefix_len_with_available_volumes(
     dir: &str,
     filenames: &[&str],
@@ -5962,6 +5973,41 @@ fn test_rar5_recovery_volumes_restore_missing_part() {
     let expected = std::fs::read(fixture("rar5", "rar5_recovery_volumes.part05.rar")).unwrap();
     let restored = std::fs::read(expected_path).unwrap();
     assert_eq!(restored, expected);
+
+    let mut expected_archive = open_multi(
+        "rar5",
+        &[
+            "rar5_recovery_volumes.part01.rar",
+            "rar5_recovery_volumes.part02.rar",
+            "rar5_recovery_volumes.part03.rar",
+            "rar5_recovery_volumes.part04.rar",
+            "rar5_recovery_volumes.part05.rar",
+            "rar5_recovery_volumes.part06.rar",
+            "rar5_recovery_volumes.part07.rar",
+            "rar5_recovery_volumes.part08.rar",
+            "rar5_recovery_volumes.part09.rar",
+            "rar5_recovery_volumes.part10.rar",
+        ],
+    );
+    let expected_payload = expected_archive
+        .extract_member(0, &weaver_unrar::ExtractOptions::default(), None)
+        .unwrap();
+    let restored_paths: Vec<_> = (1..=10)
+        .map(|volume| {
+            temp_dir
+                .path()
+                .join(format!("rar5_recovery_volumes.part{volume:02}.rar"))
+        })
+        .collect();
+    let mut restored_archive = open_multi_paths(&restored_paths);
+    assert_eq!(restored_archive.member_names(), vec!["payload.bin"]);
+    let restored_payload = restored_archive
+        .extract_member(0, &weaver_unrar::ExtractOptions::default(), None)
+        .unwrap();
+    assert_eq!(
+        restored_payload.to_bytes().unwrap(),
+        expected_payload.to_bytes().unwrap()
+    );
 }
 
 #[test]
@@ -6000,6 +6046,36 @@ fn test_rar3_recovery_volumes_restore_missing_part() {
     let expected = std::fs::read(fixture("rar4", "rar3_recovery_volumes.part3.rar")).unwrap();
     let restored = std::fs::read(expected_path).unwrap();
     assert_eq!(restored, expected);
+
+    let mut expected_archive = open_multi(
+        "rar4",
+        &[
+            "rar3_recovery_volumes.part1.rar",
+            "rar3_recovery_volumes.part2.rar",
+            "rar3_recovery_volumes.part3.rar",
+            "rar3_recovery_volumes.part4.rar",
+            "rar3_recovery_volumes.part5.rar",
+        ],
+    );
+    let expected_payload = expected_archive
+        .extract_member(0, &weaver_unrar::ExtractOptions::default(), None)
+        .unwrap();
+    let restored_paths: Vec<_> = (1..=5)
+        .map(|volume| {
+            temp_dir
+                .path()
+                .join(format!("rar3_recovery_volumes.part{volume}.rar"))
+        })
+        .collect();
+    let mut restored_archive = open_multi_paths(&restored_paths);
+    assert_eq!(restored_archive.member_names(), vec!["payload.bin"]);
+    let restored_payload = restored_archive
+        .extract_member(0, &weaver_unrar::ExtractOptions::default(), None)
+        .unwrap();
+    assert_eq!(
+        restored_payload.to_bytes().unwrap(),
+        expected_payload.to_bytes().unwrap()
+    );
 }
 
 // -- Comment archives ---------------------------------------------------------

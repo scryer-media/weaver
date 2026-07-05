@@ -22,8 +22,6 @@ fn sample_history() -> JobHistoryRow {
         created_at: 1700000000,
         completed_at: 1700001000,
         metadata: None,
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     }
 }
 
@@ -271,37 +269,29 @@ fn history_attribute_filters_exclude_hidden_metadata_keys() {
     let mut entry = sample_history();
     entry.metadata = Some(metadata_json(&[
         (CLIENT_REQUEST_ID_ATTRIBUTE_KEY, "req-1"),
-        (DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY, "42"),
-        (DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY, "false"),
         ("public", "yes"),
     ]));
     db.insert_job_history(&entry).unwrap();
 
-    for key in [
-        CLIENT_REQUEST_ID_ATTRIBUTE_KEY,
-        DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY,
-        DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY,
-    ] {
-        assert!(
-            db.list_job_history(&HistoryFilter {
-                metadata_has_key: Some(key.to_string()),
-                ..Default::default()
-            })
-            .unwrap()
-            .is_empty()
-        );
-        assert_eq!(
-            db.count_job_history(&HistoryFilter {
-                metadata_equals: Some(HistoryMetadataEquals {
-                    key: key.to_string(),
-                    value: "req-1".to_string(),
-                }),
-                ..Default::default()
-            })
-            .unwrap(),
-            0
-        );
-    }
+    assert!(
+        db.list_job_history(&HistoryFilter {
+            metadata_has_key: Some(CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string()),
+            ..Default::default()
+        })
+        .unwrap()
+        .is_empty()
+    );
+    assert_eq!(
+        db.count_job_history(&HistoryFilter {
+            metadata_equals: Some(HistoryMetadataEquals {
+                key: CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+                value: "req-1".to_string(),
+            }),
+            ..Default::default()
+        })
+        .unwrap(),
+        0
+    );
 
     assert_eq!(
         db.count_job_history(&HistoryFilter {

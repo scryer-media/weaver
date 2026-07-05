@@ -113,8 +113,6 @@ fn nzbget_history_row(
         created_at: 1_700_000_000,
         completed_at,
         metadata,
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     }
 }
 
@@ -139,7 +137,6 @@ fn test_config() -> SharedConfig {
         cleanup_after_extract: None,
         isp_bandwidth_cap: None,
         ip_replacement_trial_extra_connections: None,
-        diagnostic_upload_url: None,
         config_path: None,
     }))
 }
@@ -252,8 +249,6 @@ fn scheduler_handle_with_mock_commands_with_db(
                                 } else {
                                     serde_json::to_string(&job.metadata).ok()
                                 },
-                                last_diagnostic_id: None,
-                                last_diagnostic_uploaded_at_epoch_ms: None,
                             });
                         }
                         state.publish_jobs(jobs);
@@ -947,8 +942,6 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
         created_at: 1_700_000_000,
         completed_at: 1_700_000_100,
         metadata: Some(metadata),
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     })
     .unwrap();
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
@@ -969,8 +962,6 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
         created_at: 1_700_000_000,
         completed_at: 1_700_000_200,
         metadata: None,
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     })
     .unwrap();
     let app = nzbget_test_router(
@@ -1720,8 +1711,6 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
                 )])
                 .unwrap(),
             ),
-            last_diagnostic_id: None,
-            last_diagnostic_uploaded_at_epoch_ms: None,
         },
     )
     .unwrap();
@@ -1795,8 +1784,6 @@ async fn job_output_file_download_handler_streams_history_file() {
         created_at: 1_700_000_000,
         completed_at: 1_700_000_100,
         metadata: None,
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     })
     .unwrap();
     let app = job_nzb_test_router(db, handle);

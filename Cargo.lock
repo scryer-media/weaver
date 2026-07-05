@@ -4792,7 +4792,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
- "weaver-model",
  "weaver-reed-solomon",
  "weaver-unrar",
 ]

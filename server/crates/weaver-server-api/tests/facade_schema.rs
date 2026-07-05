@@ -20,8 +20,6 @@ impl DeepQuery {
     }
 }
 
-const DIAGNOSTICS_ENABLED: bool = cfg!(weaver_diagnostics);
-
 #[tokio::test]
 async fn public_facade_schema_exposes_core_surface() {
     let h = TestHarness::new().await;
@@ -77,28 +75,17 @@ async fn public_facade_schema_exposes_core_surface() {
         ),
         "acceptHistoryDelete mutation should be present"
     );
-    if DIAGNOSTICS_ENABLED {
-        assert!(
-            sdl.contains("startDiagnosticRedownload("),
-            "diagnostic redownload mutation should be present when diagnostics are enabled"
-        );
-    } else {
-        assert!(
-            !sdl.contains("startDiagnosticRedownload("),
-            "diagnostic redownload mutation should be hidden when diagnostics are disabled"
-        );
-    }
     assert!(
-        sdl.contains("diagnosticRun: HistoryDiagnosticRun"),
-        "history item should always expose diagnostic run state, falling back to null when diagnostics are disabled"
+        !sdl.contains("startDiagnosticRedownload("),
+        "diagnostic redownload mutation should not be present"
     );
     assert!(
-        sdl.contains("lastDiagnosticId: String"),
-        "history item should always expose the last diagnostic id, falling back to null when diagnostics are disabled"
+        !sdl.contains("HistoryDiagnosticRun"),
+        "diagnostic history type should not be present"
     );
     assert!(
-        sdl.contains("lastDiagnosticUploadedAt: DateTime"),
-        "history item should always expose the last diagnostic upload timestamp, falling back to null when diagnostics are disabled"
+        !sdl.contains("lastDiagnostic"),
+        "diagnostic history receipt fields should not be present"
     );
     assert!(
         !sdl.contains("submitNzbLegacy"),

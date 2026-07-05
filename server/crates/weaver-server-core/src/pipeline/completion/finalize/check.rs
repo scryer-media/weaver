@@ -8,7 +8,10 @@ use weaver_model::files::{
 };
 
 const PAR2_REPAIR_MEMORY_LIMIT_ENV: &str = "WEAVER_PAR2_REPAIR_MEMORY_LIMIT_BYTES";
-const DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+// Sizes the transient streaming repair buffers (the decode matrix has its own
+// budget floor inside weaver-par2). 512 MiB keeps chunk re-read amplification
+// low on heavily damaged jobs while staying modest for concurrent repairs.
+const DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 
 fn configured_par2_repair_memory_limit_bytes() -> usize {
     parse_par2_repair_memory_limit_bytes(

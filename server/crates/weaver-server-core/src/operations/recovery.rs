@@ -472,8 +472,6 @@ mod tests {
             created_at: 1_700_000_000,
             completed_at: 1_700_000_100,
             metadata: None,
-            last_diagnostic_id: None,
-            last_diagnostic_uploaded_at_epoch_ms: None,
         })
         .unwrap();
 

@@ -24,8 +24,6 @@ fn sample_history_row(job_id: u64, name: &str) -> JobHistoryRow {
         created_at: 1_717_171_700,
         completed_at: 1_717_171_760,
         metadata: None,
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     }
 }
 

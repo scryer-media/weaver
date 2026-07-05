@@ -2,6 +2,10 @@ use std::{fmt, sync::Arc};
 
 pub(crate) const MAX_SLICES_PER_FILE: usize = 32_768;
 
+/// The PAR2 spec caps a recovery set at 32768 input slices in total; the
+/// constant-assignment sequence has exactly that many valid entries.
+pub(crate) const MAX_TOTAL_INPUT_SLICES: usize = 32_768;
+
 /// 16-byte MD5-based file identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileId(pub(crate) [u8; 16]);

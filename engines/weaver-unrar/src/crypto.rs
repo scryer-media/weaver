@@ -897,7 +897,19 @@ impl Rar29Sha1 {
         self.transform_block(&block)
     }
 
+    /// One SHA-1 block. Returns the final 16 message-schedule words
+    /// W[64..80) — `process_rar29` writes them back over the input to
+    /// replicate WinRAR's buggy in-place RAR29 SHA-1.
     fn transform_block(&mut self, block: &[u8; 64]) -> [u32; 16] {
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        if sha1_hw_enabled() {
+            // SAFETY: the required target features were verified at runtime.
+            return unsafe { sha1_hw::transform_block(&mut self.state, block) };
+        }
+        self.transform_block_scalar(block)
+    }
+
+    fn transform_block_scalar(&mut self, block: &[u8; 64]) -> [u32; 16] {
         let mut workspace = [0u32; 16];
         for (word, chunk) in workspace.iter_mut().zip(block.chunks_exact(4)) {
             *word = u32::from_be_bytes(chunk.try_into().unwrap());
@@ -942,6 +954,362 @@ impl Rar29Sha1 {
         self.state[4] = self.state[4].wrapping_add(e);
 
         workspace
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn sha1_hw_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::arch::is_aarch64_feature_detected!("sha2"))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn sha1_hw_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("sha")
+            && std::arch::is_x86_feature_detected!("sse4.1")
+            && std::arch::is_x86_feature_detected!("ssse3")
+    })
+}
+
+/// x86 SHA-extension (SHA-NI) SHA-1 block transform — the x86 twin of the
+/// aarch64 module below; see its docs for the schedule-writeback contract.
+#[cfg(target_arch = "x86_64")]
+mod sha1_hw {
+    use std::arch::x86_64::*;
+
+    /// Process one 64-byte block, updating `state` and returning the final
+    /// 16 message-schedule words W[64..80).
+    #[target_feature(enable = "sha,sse4.1,ssse3")]
+    pub fn transform_block(state: &mut [u32; 5], block: &[u8; 64]) -> [u32; 16] {
+        unsafe {
+            // Byte shuffle producing big-endian dwords with W0 in the high
+            // lane: each message register holds [W3, W2, W1, W0].
+            let mask = _mm_set_epi64x(0x0001_0203_0405_0607, 0x0809_0a0b_0c0d_0e0f);
+
+            let mut abcd = _mm_loadu_si128(state.as_ptr() as *const __m128i);
+            abcd = _mm_shuffle_epi32::<0x1B>(abcd);
+            let mut e0 = _mm_set_epi32(state[4] as i32, 0, 0, 0);
+            let abcd_save = abcd;
+            let e_save = e0;
+            let mut e1;
+
+            let ptr = block.as_ptr() as *const __m128i;
+            let mut m0 = _mm_shuffle_epi8(_mm_loadu_si128(ptr), mask);
+            let mut m1 = _mm_shuffle_epi8(_mm_loadu_si128(ptr.add(1)), mask);
+            let mut m2 = _mm_shuffle_epi8(_mm_loadu_si128(ptr.add(2)), mask);
+            let mut m3 = _mm_shuffle_epi8(_mm_loadu_si128(ptr.add(3)), mask);
+
+            // Rounds 0-3
+            e0 = _mm_add_epi32(e0, m0);
+            e1 = abcd;
+            abcd = _mm_sha1rnds4_epu32::<0>(abcd, e0);
+            // Rounds 4-7
+            e1 = _mm_sha1nexte_epu32(e1, m1);
+            e0 = abcd;
+            abcd = _mm_sha1rnds4_epu32::<0>(abcd, e1);
+            m0 = _mm_sha1msg1_epu32(m0, m1);
+            // Rounds 8-11
+            e0 = _mm_sha1nexte_epu32(e0, m2);
+            e1 = abcd;
+            abcd = _mm_sha1rnds4_epu32::<0>(abcd, e0);
+            m1 = _mm_sha1msg1_epu32(m1, m2);
+            m0 = _mm_xor_si128(m0, m2);
+            // Rounds 12-15
+            e1 = _mm_sha1nexte_epu32(e1, m3);
+            e0 = abcd;
+            m0 = _mm_sha1msg2_epu32(m0, m3);
+            abcd = _mm_sha1rnds4_epu32::<0>(abcd, e1);
+            m2 = _mm_sha1msg1_epu32(m2, m3);
+            m1 = _mm_xor_si128(m1, m3);
+            // Rounds 16-19
+            e0 = _mm_sha1nexte_epu32(e0, m0);
+            e1 = abcd;
+            m1 = _mm_sha1msg2_epu32(m1, m0);
+            abcd = _mm_sha1rnds4_epu32::<0>(abcd, e0);
+            m3 = _mm_sha1msg1_epu32(m3, m0);
+            m2 = _mm_xor_si128(m2, m0);
+            // Rounds 20-23
+            e1 = _mm_sha1nexte_epu32(e1, m1);
+            e0 = abcd;
+            m2 = _mm_sha1msg2_epu32(m2, m1);
+            abcd = _mm_sha1rnds4_epu32::<1>(abcd, e1);
+            m0 = _mm_sha1msg1_epu32(m0, m1);
+            m3 = _mm_xor_si128(m3, m1);
+            // Rounds 24-27
+            e0 = _mm_sha1nexte_epu32(e0, m2);
+            e1 = abcd;
+            m3 = _mm_sha1msg2_epu32(m3, m2);
+            abcd = _mm_sha1rnds4_epu32::<1>(abcd, e0);
+            m1 = _mm_sha1msg1_epu32(m1, m2);
+            m0 = _mm_xor_si128(m0, m2);
+            // Rounds 28-31
+            e1 = _mm_sha1nexte_epu32(e1, m3);
+            e0 = abcd;
+            m0 = _mm_sha1msg2_epu32(m0, m3);
+            abcd = _mm_sha1rnds4_epu32::<1>(abcd, e1);
+            m2 = _mm_sha1msg1_epu32(m2, m3);
+            m1 = _mm_xor_si128(m1, m3);
+            // Rounds 32-35
+            e0 = _mm_sha1nexte_epu32(e0, m0);
+            e1 = abcd;
+            m1 = _mm_sha1msg2_epu32(m1, m0);
+            abcd = _mm_sha1rnds4_epu32::<1>(abcd, e0);
+            m3 = _mm_sha1msg1_epu32(m3, m0);
+            m2 = _mm_xor_si128(m2, m0);
+            // Rounds 36-39
+            e1 = _mm_sha1nexte_epu32(e1, m1);
+            e0 = abcd;
+            m2 = _mm_sha1msg2_epu32(m2, m1);
+            abcd = _mm_sha1rnds4_epu32::<1>(abcd, e1);
+            m0 = _mm_sha1msg1_epu32(m0, m1);
+            m3 = _mm_xor_si128(m3, m1);
+            // Rounds 40-43
+            e0 = _mm_sha1nexte_epu32(e0, m2);
+            e1 = abcd;
+            m3 = _mm_sha1msg2_epu32(m3, m2);
+            abcd = _mm_sha1rnds4_epu32::<2>(abcd, e0);
+            m1 = _mm_sha1msg1_epu32(m1, m2);
+            m0 = _mm_xor_si128(m0, m2);
+            // Rounds 44-47
+            e1 = _mm_sha1nexte_epu32(e1, m3);
+            e0 = abcd;
+            m0 = _mm_sha1msg2_epu32(m0, m3);
+            abcd = _mm_sha1rnds4_epu32::<2>(abcd, e1);
+            m2 = _mm_sha1msg1_epu32(m2, m3);
+            m1 = _mm_xor_si128(m1, m3);
+            // Rounds 48-51
+            e0 = _mm_sha1nexte_epu32(e0, m0);
+            e1 = abcd;
+            m1 = _mm_sha1msg2_epu32(m1, m0);
+            abcd = _mm_sha1rnds4_epu32::<2>(abcd, e0);
+            m3 = _mm_sha1msg1_epu32(m3, m0);
+            m2 = _mm_xor_si128(m2, m0);
+            // Rounds 52-55
+            e1 = _mm_sha1nexte_epu32(e1, m1);
+            e0 = abcd;
+            m2 = _mm_sha1msg2_epu32(m2, m1);
+            abcd = _mm_sha1rnds4_epu32::<2>(abcd, e1);
+            m0 = _mm_sha1msg1_epu32(m0, m1);
+            m3 = _mm_xor_si128(m3, m1);
+            // Rounds 56-59
+            e0 = _mm_sha1nexte_epu32(e0, m2);
+            e1 = abcd;
+            m3 = _mm_sha1msg2_epu32(m3, m2);
+            abcd = _mm_sha1rnds4_epu32::<2>(abcd, e0);
+            m1 = _mm_sha1msg1_epu32(m1, m2);
+            m0 = _mm_xor_si128(m0, m2);
+            // Rounds 60-63
+            e1 = _mm_sha1nexte_epu32(e1, m3);
+            e0 = abcd;
+            m0 = _mm_sha1msg2_epu32(m0, m3);
+            abcd = _mm_sha1rnds4_epu32::<3>(abcd, e1);
+            m2 = _mm_sha1msg1_epu32(m2, m3);
+            m1 = _mm_xor_si128(m1, m3);
+            // Rounds 64-67
+            e0 = _mm_sha1nexte_epu32(e0, m0);
+            e1 = abcd;
+            m1 = _mm_sha1msg2_epu32(m1, m0);
+            abcd = _mm_sha1rnds4_epu32::<3>(abcd, e0);
+            m3 = _mm_sha1msg1_epu32(m3, m0);
+            m2 = _mm_xor_si128(m2, m0);
+            // Rounds 68-71
+            e1 = _mm_sha1nexte_epu32(e1, m1);
+            e0 = abcd;
+            m2 = _mm_sha1msg2_epu32(m2, m1);
+            abcd = _mm_sha1rnds4_epu32::<3>(abcd, e1);
+            m3 = _mm_xor_si128(m3, m1);
+            // Rounds 72-75
+            e0 = _mm_sha1nexte_epu32(e0, m2);
+            e1 = abcd;
+            m3 = _mm_sha1msg2_epu32(m3, m2);
+            abcd = _mm_sha1rnds4_epu32::<3>(abcd, e0);
+            // Rounds 76-79
+            e1 = _mm_sha1nexte_epu32(e1, m3);
+            e0 = abcd;
+            abcd = _mm_sha1rnds4_epu32::<3>(abcd, e1);
+
+            // Combine with saved state.
+            e0 = _mm_sha1nexte_epu32(e0, e_save);
+            abcd = _mm_add_epi32(abcd, abcd_save);
+            abcd = _mm_shuffle_epi32::<0x1B>(abcd);
+            _mm_storeu_si128(state.as_mut_ptr() as *mut __m128i, abcd);
+            state[4] = _mm_extract_epi32::<3>(e0) as u32;
+
+            // Final schedule words: [W3,W2,W1,W0] lane order per register,
+            // so reverse each before storing.
+            let mut workspace = [0u32; 16];
+            let out = workspace.as_mut_ptr() as *mut __m128i;
+            _mm_storeu_si128(out, _mm_shuffle_epi32::<0x1B>(m0));
+            _mm_storeu_si128(out.add(1), _mm_shuffle_epi32::<0x1B>(m1));
+            _mm_storeu_si128(out.add(2), _mm_shuffle_epi32::<0x1B>(m2));
+            _mm_storeu_si128(out.add(3), _mm_shuffle_epi32::<0x1B>(m3));
+            workspace
+        }
+    }
+}
+
+/// ARMv8 crypto-extension SHA-1 block transform.
+///
+/// The RAR29 KDF runs 262,144 iterations, so the block transform dominates
+/// key derivation. The schedule the hardware path computes is the standard
+/// SHA-1 schedule; WinRAR's bug is only WHERE those words end up (written
+/// back over the input), so returning W[64..80) keeps bug-for-bug parity
+/// with the scalar path.
+#[cfg(target_arch = "aarch64")]
+mod sha1_hw {
+    use std::arch::aarch64::*;
+
+    /// Process one 64-byte block, updating `state` and returning the final
+    /// 16 message-schedule words W[64..80).
+    #[target_feature(enable = "sha2")]
+    pub fn transform_block(state: &mut [u32; 5], block: &[u8; 64]) -> [u32; 16] {
+        unsafe {
+            let k0 = vdupq_n_u32(0x5a82_7999);
+            let k1 = vdupq_n_u32(0x6ed9_eba1);
+            let k2 = vdupq_n_u32(0x8f1b_bcdc);
+            let k3 = vdupq_n_u32(0xca62_c1d6);
+
+            let mut m0 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr())));
+            let mut m1 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(16))));
+            let mut m2 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(32))));
+            let mut m3 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(48))));
+
+            let abcd_saved = vld1q_u32(state.as_ptr());
+            let e_saved = state[4];
+            let mut abcd = abcd_saved;
+            let mut e0 = e_saved;
+            let mut e1;
+
+            let mut t0 = vaddq_u32(m0, k0);
+            let mut t1 = vaddq_u32(m1, k0);
+
+            // Rounds 0-3
+            e1 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1cq_u32(abcd, e0, t0);
+            t0 = vaddq_u32(m2, k0);
+            m0 = vsha1su0q_u32(m0, m1, m2);
+            // Rounds 4-7
+            e0 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1cq_u32(abcd, e1, t1);
+            t1 = vaddq_u32(m3, k0);
+            m0 = vsha1su1q_u32(m0, m3);
+            m1 = vsha1su0q_u32(m1, m2, m3);
+            // Rounds 8-11
+            e1 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1cq_u32(abcd, e0, t0);
+            t0 = vaddq_u32(m0, k0);
+            m1 = vsha1su1q_u32(m1, m0);
+            m2 = vsha1su0q_u32(m2, m3, m0);
+            // Rounds 12-15
+            e0 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1cq_u32(abcd, e1, t1);
+            t1 = vaddq_u32(m1, k1);
+            m2 = vsha1su1q_u32(m2, m1);
+            m3 = vsha1su0q_u32(m3, m0, m1);
+            // Rounds 16-19
+            e1 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1cq_u32(abcd, e0, t0);
+            t0 = vaddq_u32(m2, k1);
+            m3 = vsha1su1q_u32(m3, m2);
+            m0 = vsha1su0q_u32(m0, m1, m2);
+            // Rounds 20-23
+            e0 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1pq_u32(abcd, e1, t1);
+            t1 = vaddq_u32(m3, k1);
+            m0 = vsha1su1q_u32(m0, m3);
+            m1 = vsha1su0q_u32(m1, m2, m3);
+            // Rounds 24-27
+            e1 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1pq_u32(abcd, e0, t0);
+            t0 = vaddq_u32(m0, k1);
+            m1 = vsha1su1q_u32(m1, m0);
+            m2 = vsha1su0q_u32(m2, m3, m0);
+            // Rounds 28-31
+            e0 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1pq_u32(abcd, e1, t1);
+            t1 = vaddq_u32(m1, k1);
+            m2 = vsha1su1q_u32(m2, m1);
+            m3 = vsha1su0q_u32(m3, m0, m1);
+            // Rounds 32-35
+            e1 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1pq_u32(abcd, e0, t0);
+            t0 = vaddq_u32(m2, k2);
+            m3 = vsha1su1q_u32(m3, m2);
+            m0 = vsha1su0q_u32(m0, m1, m2);
+            // Rounds 36-39
+            e0 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1pq_u32(abcd, e1, t1);
+            t1 = vaddq_u32(m3, k2);
+            m0 = vsha1su1q_u32(m0, m3);
+            m1 = vsha1su0q_u32(m1, m2, m3);
+            // Rounds 40-43
+            e1 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1mq_u32(abcd, e0, t0);
+            t0 = vaddq_u32(m0, k2);
+            m1 = vsha1su1q_u32(m1, m0);
+            m2 = vsha1su0q_u32(m2, m3, m0);
+            // Rounds 44-47
+            e0 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1mq_u32(abcd, e1, t1);
+            t1 = vaddq_u32(m1, k2);
+            m2 = vsha1su1q_u32(m2, m1);
+            m3 = vsha1su0q_u32(m3, m0, m1);
+            // Rounds 48-51
+            e1 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1mq_u32(abcd, e0, t0);
+            t0 = vaddq_u32(m2, k2);
+            m3 = vsha1su1q_u32(m3, m2);
+            m0 = vsha1su0q_u32(m0, m1, m2);
+            // Rounds 52-55
+            e0 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1mq_u32(abcd, e1, t1);
+            t1 = vaddq_u32(m3, k3);
+            m0 = vsha1su1q_u32(m0, m3);
+            m1 = vsha1su0q_u32(m1, m2, m3);
+            // Rounds 56-59
+            e1 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1mq_u32(abcd, e0, t0);
+            t0 = vaddq_u32(m0, k3);
+            m1 = vsha1su1q_u32(m1, m0);
+            m2 = vsha1su0q_u32(m2, m3, m0);
+            // Rounds 60-63
+            e0 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1pq_u32(abcd, e1, t1);
+            t1 = vaddq_u32(m1, k3);
+            m2 = vsha1su1q_u32(m2, m1);
+            m3 = vsha1su0q_u32(m3, m0, m1);
+            // Rounds 64-67
+            e1 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1pq_u32(abcd, e0, t0);
+            t0 = vaddq_u32(m2, k3);
+            m3 = vsha1su1q_u32(m3, m2);
+            // Rounds 68-71
+            e0 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1pq_u32(abcd, e1, t1);
+            t1 = vaddq_u32(m3, k3);
+            // Rounds 72-75
+            e1 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1pq_u32(abcd, e0, t0);
+            // Rounds 76-79
+            e0 = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+            abcd = vsha1pq_u32(abcd, e1, t1);
+
+            let mut new_state = [0u32; 5];
+            vst1q_u32(new_state.as_mut_ptr(), vaddq_u32(abcd_saved, abcd));
+            new_state[4] = e_saved.wrapping_add(e0);
+            *state = new_state;
+
+            // Final schedule words: m0..m3 hold W[64..80) after their last
+            // su0/su1 updates.
+            let mut workspace = [0u32; 16];
+            vst1q_u32(workspace.as_mut_ptr(), m0);
+            vst1q_u32(workspace.as_mut_ptr().add(4), m1);
+            vst1q_u32(workspace.as_mut_ptr().add(8), m2);
+            vst1q_u32(workspace.as_mut_ptr().add(12), m3);
+            workspace
+        }
     }
 }
 
@@ -1445,6 +1813,49 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The hardware SHA-1 path must match the scalar path exactly — both the
+    /// digest state and the returned final schedule words that feed the
+    /// RAR29 in-place corruption.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn rar29_sha1_hw_transform_matches_scalar() {
+        if !sha1_hw_enabled() {
+            eprintln!("skipping: SHA extensions not available");
+            return;
+        }
+
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for round in 0..4096 {
+            let mut block = [0u8; 64];
+            for chunk in block.chunks_exact_mut(8) {
+                chunk.copy_from_slice(&next().to_le_bytes());
+            }
+            let mut state = [0u32; 5];
+            for word in &mut state {
+                *word = next() as u32;
+            }
+
+            let mut scalar = Rar29Sha1::new();
+            scalar.state = state;
+            let mut hw = Rar29Sha1::new();
+            hw.state = state;
+
+            let ws_scalar = scalar.transform_block_scalar(&block);
+            // SAFETY: sha2 availability checked above.
+            let ws_hw = unsafe { sha1_hw::transform_block(&mut hw.state, &block) };
+
+            assert_eq!(scalar.state, hw.state, "state diverged at round {round}");
+            assert_eq!(ws_scalar, ws_hw, "schedule diverged at round {round}");
+        }
     }
 
     #[test]

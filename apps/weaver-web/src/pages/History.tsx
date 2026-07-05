@@ -5,7 +5,7 @@ import {
   type RowSelectionState,
   type SortingState,
 } from "@tanstack/react-table";
-import { Bug, ChevronDown, Download, ListFilter, RefreshCcw, Trash2 } from "lucide-react";
+import { ChevronDown, Download, ListFilter, RefreshCcw, Trash2 } from "lucide-react";
 import {
   useCallback,
   useDeferredValue,
@@ -28,16 +28,13 @@ import { PageHeader } from "@/components/PageHeader";
 import { JobStatusBadge } from "@/components/JobStatusBadge";
 import { formatBytes } from "@/components/SpeedDisplay";
 import { useTranslate } from "@/lib/context/translate-context";
-import { DIAGNOSTICS_ENABLED } from "@/lib/features";
 import { useTablePreferences } from "@/lib/hooks/use-table-preferences";
 import {
   formatJobReleaseName,
   type DeleteOperationData,
-  type DiagnosticRunData,
   normalizeFacadeJobStatus,
   normalizeGraphqlTimestamp,
 } from "@/lib/job-types";
-import { cn } from "@/lib/utils";
 import {
   ACCEPT_HISTORY_DELETE_MUTATION,
   HISTORY_FACADE_EVENTS_SUBSCRIPTION,
@@ -45,7 +42,6 @@ import {
   HISTORY_PAGE_QUERY,
   REDOWNLOAD_JOB_MUTATION,
   REPROCESS_JOB_MUTATION,
-  START_DIAGNOSTIC_REDOWNLOAD_MUTATION,
 } from "@/graphql/queries";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -63,17 +59,10 @@ type HistoryJob = {
   category: string | null;
   completedAt?: number | null;
   deleteOperation?: DeleteOperationData | null;
-  diagnosticRun?: DiagnosticRunData | null;
-  lastDiagnosticId?: string | null;
-  lastDiagnosticUploadedAt?: number | null;
 };
 type HistoryFilter = "all" | "success" | "failure";
-type FacadeHistoryJob = Omit<HistoryJob, "completedAt" | "diagnosticRun" | "lastDiagnosticUploadedAt"> & {
+type FacadeHistoryJob = Omit<HistoryJob, "completedAt"> & {
   completedAt?: string | number | null;
-  lastDiagnosticUploadedAt?: string | number | null;
-  diagnosticRun?: (Omit<DiagnosticRunData, "updatedAt"> & {
-    updatedAt?: string | number | null;
-  }) | null;
 };
 type HistoryPageCounts = {
   all: number;
@@ -146,13 +135,6 @@ function normalizeHistoryJob(job: FacadeHistoryJob): HistoryJob {
     ...job,
     status: normalizeFacadeJobStatus(job.status),
     completedAt: normalizeGraphqlTimestamp(job.completedAt),
-    lastDiagnosticUploadedAt: normalizeGraphqlTimestamp(job.lastDiagnosticUploadedAt),
-    diagnosticRun: job.diagnosticRun
-      ? {
-        ...job.diagnosticRun,
-        updatedAt: normalizeGraphqlTimestamp(job.diagnosticRun.updatedAt),
-      }
-      : null,
   };
 }
 
@@ -237,26 +219,6 @@ function sameDeleteOperationData(
     && left.errorMessage === right.errorMessage;
 }
 
-function sameDiagnosticRunData(
-  left: HistoryJob["diagnosticRun"],
-  right: HistoryJob["diagnosticRun"],
-): boolean {
-  if (left === right) {
-    return true;
-  }
-  if (!left || !right) {
-    return left == null && right == null;
-  }
-  return left.sourceJobId === right.sourceJobId
-    && left.diagnosticJobId === right.diagnosticJobId
-    && left.diagnosticId === right.diagnosticId
-    && left.stage === right.stage
-    && left.includeServerHostnames === right.includeServerHostnames
-    && left.rerunSucceeded === right.rerunSucceeded
-    && left.errorMessage === right.errorMessage
-    && left.updatedAt === right.updatedAt;
-}
-
 function sameHistoryJob(left: HistoryJob, right: HistoryJob): boolean {
   return left.id === right.id
     && left.name === right.name
@@ -267,10 +229,7 @@ function sameHistoryJob(left: HistoryJob, right: HistoryJob): boolean {
     && left.health === right.health
     && left.category === right.category
     && left.completedAt === right.completedAt
-    && sameDeleteOperationData(left.deleteOperation ?? null, right.deleteOperation ?? null)
-    && sameDiagnosticRunData(left.diagnosticRun ?? null, right.diagnosticRun ?? null)
-    && left.lastDiagnosticId === right.lastDiagnosticId
-    && left.lastDiagnosticUploadedAt === right.lastDiagnosticUploadedAt;
+    && sameDeleteOperationData(left.deleteOperation ?? null, right.deleteOperation ?? null);
 }
 
 function reconcileHistoryJobs(nextJobs: HistoryJob[], previousJobs: HistoryJob[]): HistoryJob[] {
@@ -343,63 +302,6 @@ function reconcileDeleteOperations(
     : reconciled;
 }
 
-function isDiagnosticRunActive(
-  diagnosticRun: HistoryJob["diagnosticRun"],
-) {
-  return DIAGNOSTICS_ENABLED
-    && diagnosticRun != null
-    && ["QUEUED", "RUNNING", "COLLECTING", "UPLOADING"].includes(diagnosticRun.stage);
-}
-
-function diagnosticStageLabel(
-  t: ReturnType<typeof useTranslate>,
-  stage: NonNullable<HistoryJob["diagnosticRun"]>["stage"],
-) {
-  switch (stage) {
-    case "QUEUED":
-      return t("history.diagnosticQueued");
-    case "RUNNING":
-      return t("history.diagnosticRunning");
-    case "COLLECTING":
-      return t("history.diagnosticCollecting");
-    case "UPLOADING":
-      return t("history.diagnosticUploading");
-    case "COMPLETE":
-      return t("history.diagnosticComplete");
-    case "FAILED":
-      return t("history.diagnosticFailed");
-    default:
-      return stage;
-  }
-}
-
-function formatDiagnosticSummary(
-  t: ReturnType<typeof useTranslate>,
-  job: HistoryJob,
-) {
-  if (!DIAGNOSTICS_ENABLED) {
-    return "";
-  }
-  const diagnosticRun = job.diagnosticRun;
-  if (diagnosticRun) {
-    const stageLabel = diagnosticStageLabel(t, diagnosticRun.stage);
-    if (diagnosticRun.diagnosticId) {
-      return t("history.diagnosticWithId", {
-        stage: stageLabel,
-        id: diagnosticRun.diagnosticId,
-      });
-    }
-    if (diagnosticRun.errorMessage) {
-      return `${stageLabel}: ${diagnosticRun.errorMessage}`;
-    }
-    return stageLabel;
-  }
-  if (job.lastDiagnosticId) {
-    return t("history.lastDiagnosticId", { id: job.lastDiagnosticId });
-  }
-  return "";
-}
-
 export function History() {
   const t = useTranslate();
   const previousDeleteOperationsRef = useRef<HistoryDeleteOperationSummary[]>([]);
@@ -414,15 +316,10 @@ export function History() {
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
   const [redownloadConfirmId, setRedownloadConfirmId] = useState<number | null>(null);
-  const [diagnosticConfirm, setDiagnosticConfirm] = useState<{
-    id: number;
-    includeServerHostnames: boolean;
-  } | null>(null);
   const [deleteBatchConfirm, setDeleteBatchConfirm] = useState(false);
   const [deleteAllConfirm, setDeleteAllConfirm] = useState(false);
   const [deleteFiles, setDeleteFiles] = useState(false);
   const [deleteAcceptError, setDeleteAcceptError] = useState<string | null>(null);
-  const [diagnosticAcceptError, setDiagnosticAcceptError] = useState<string | null>(null);
   const [acceptedDeleteLocks, setAcceptedDeleteLocks] = useState<Record<number, LocalDeleteLock>>(
     {},
   );
@@ -451,9 +348,6 @@ export function History() {
     useMutation<HistoryDeleteAcceptanceResponse>(ACCEPT_HISTORY_DELETE_MUTATION);
   const [reprocessState, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
   const [redownloadState, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
-  const [diagnosticStartState, startDiagnosticRedownload] = useMutation(
-    START_DIAGNOSTIC_REDOWNLOAD_MUTATION,
-  );
 
   const rawJobs = useMemo(() => {
     const nextJobs = ((data?.historyPage.items ?? []) as FacadeHistoryJob[]).map(normalizeHistoryJob);
@@ -547,13 +441,8 @@ export function History() {
   const actionsBusy =
     acceptDeleteState.fetching
     || reprocessState.fetching
-    || redownloadState.fetching
-    || diagnosticStartState.fetching;
+    || redownloadState.fetching;
   const activeHistoryFilterCount = countActiveHistoryFilters(historyPreferences.status);
-  const hasActiveDiagnosticRuns = useMemo(
-    () => DIAGNOSTICS_ENABLED && jobs.some((job) => isDiagnosticRunActive(job.diagnosticRun)),
-    [jobs],
-  );
 
   useEffect(() => {
     deleteOperationsFetchingRef.current = fetchingDeleteOperations;
@@ -607,7 +496,7 @@ export function History() {
   }, [rawJobs]);
 
   useEffect(() => {
-    if (!hasActiveDeleteOperations && !hasActiveDiagnosticRuns) {
+    if (!hasActiveDeleteOperations) {
       return;
     }
 
@@ -615,17 +504,12 @@ export function History() {
       if (hasActiveDeleteOperations && !deleteOperationsFetchingRef.current) {
         void reexecuteHistoryDeleteOperations({ requestPolicy: "network-only" });
       }
-      if (hasActiveDiagnosticRuns) {
-        void reexecuteHistoryPage({ requestPolicy: "network-only" });
-      }
     }, 1000);
 
     return () => window.clearInterval(intervalId);
   }, [
     hasActiveDeleteOperations,
-    hasActiveDiagnosticRuns,
     reexecuteHistoryDeleteOperations,
-    reexecuteHistoryPage,
   ]);
 
   useEffect(() => {
@@ -740,33 +624,8 @@ export function History() {
     [refetchHistoryPage, reprocessJob],
   );
 
-  const handleDiagnosticRedownload = useCallback(
-    async (jobId: number, includeServerHostnames: boolean) => {
-      if (!DIAGNOSTICS_ENABLED) {
-        return false;
-      }
-      setDiagnosticAcceptError(null);
-      const result = await startDiagnosticRedownload({
-        id: jobId,
-        includeServerHostnames,
-      });
-      if (result.error) {
-        setDiagnosticAcceptError(result.error.message ?? "Unable to start diagnostic rerun.");
-        return false;
-      }
-      setRowSelection((current) => removeRowSelectionIds(current, [jobId]));
-      await refetchHistoryPage();
-      return true;
-    },
-    [refetchHistoryPage, startDiagnosticRedownload],
-  );
-
   const isJobLocked = useCallback(
-    (job: HistoryJob) =>
-      Boolean(
-        job.deleteOperation?.locked
-          || (DIAGNOSTICS_ENABLED && isDiagnosticRunActive(job.diagnosticRun)),
-      ),
+    (job: HistoryJob) => Boolean(job.deleteOperation?.locked),
     [],
   );
 
@@ -813,7 +672,6 @@ export function History() {
     (job: HistoryJob, buttonSizeClassName: string, iconSizeClassName: string) => {
       const isRestartable = job.status === "FAILED" || job.status === "COMPLETE";
       const locked = isJobLocked(job);
-      const hasActiveDiagnostic = DIAGNOSTICS_ENABLED && isDiagnosticRunActive(job.diagnosticRun);
 
       return (
         <div
@@ -835,25 +693,6 @@ export function History() {
               >
                 <RefreshCcw className={iconSizeClassName} />
               </Button>
-              {DIAGNOSTICS_ENABLED ? (
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  title={t("action.diagnosticRedownload")}
-                  aria-label={t("action.diagnosticRedownload")}
-                  className={`${buttonSizeClassName} text-muted-foreground hover:bg-transparent hover:text-foreground`}
-                  disabled={actionsBusy || locked || hasActiveDiagnostic}
-                  onClick={() => {
-                    setDiagnosticAcceptError(null);
-                    setDiagnosticConfirm({
-                      id: job.id,
-                      includeServerHostnames: true,
-                    });
-                  }}
-                >
-                  <Bug className={iconSizeClassName} />
-                </Button>
-              ) : null}
               <Button
                 variant="ghost"
                 size="icon"
@@ -968,24 +807,6 @@ export function History() {
               </Link>
               {deleteOperation?.locked ? (
                 <span className="text-[9px] text-amber-500">Deleting…</span>
-              ) : DIAGNOSTICS_ENABLED && row.original.diagnosticRun ? (
-                <span
-                  className={cn(
-                    "block truncate text-[9px]",
-                    isDiagnosticRunActive(row.original.diagnosticRun)
-                      ? "text-sky-600"
-                      : row.original.diagnosticRun.stage === "FAILED"
-                        ? "text-destructive"
-                        : "text-muted-foreground",
-                  )}
-                  title={formatDiagnosticSummary(t, row.original)}
-                >
-                  {formatDiagnosticSummary(t, row.original)}
-                </span>
-              ) : DIAGNOSTICS_ENABLED && row.original.lastDiagnosticId ? (
-                <span className="block truncate text-[9px] text-muted-foreground">
-                  {t("history.lastDiagnosticId", { id: row.original.lastDiagnosticId })}
-                </span>
               ) : deleteOperation?.state === "FAILED" ? (
                 <span
                   className="block truncate text-[9px] text-destructive"
@@ -1018,10 +839,6 @@ export function History() {
             </div>
             {row.original.deleteOperation?.locked ? (
               <div className="text-[9px] text-amber-500">Locked</div>
-            ) : DIAGNOSTICS_ENABLED && row.original.diagnosticRun ? (
-              <div className="text-[9px] text-sky-600">
-                {diagnosticStageLabel(t, row.original.diagnosticRun.stage)}
-              </div>
             ) : null}
           </div>
         ),
@@ -1493,11 +1310,11 @@ export function History() {
               table={historyTable}
               tableClassName="table-fixed"
               wrapperClassName="max-h-[70vh]"
-              rowClassName={(row) => cn(
+              rowClassName={(row) => [
                 "text-[11px]",
-                row.getIsSelected() && "bg-muted/50",
-                row.original.deleteOperation?.locked && "bg-amber-500/5 opacity-75",
-              )}
+                row.getIsSelected() ? "bg-muted/50" : "",
+                row.original.deleteOperation?.locked ? "bg-amber-500/5 opacity-75" : "",
+              ].filter(Boolean).join(" ")}
               emptyState={
                 <div className="space-y-3 py-12 text-center">
                   <div className="text-sm text-muted-foreground">{t("history.noMatches")}</div>
@@ -1567,52 +1384,6 @@ export function History() {
         }}
         onCancel={() => setRedownloadConfirmId(null)}
       />
-
-      {DIAGNOSTICS_ENABLED ? (
-        <ConfirmDialog
-          open={diagnosticConfirm != null}
-          title={t("confirm.diagnosticRedownload")}
-          message={t("confirm.diagnosticRedownloadMessage")}
-          confirmLabel={t("confirm.diagnosticRedownloadConfirm")}
-          cancelLabel={t("confirm.diagnosticRedownloadDismiss")}
-          confirmDisabled={diagnosticStartState.fetching}
-          cancelDisabled={diagnosticStartState.fetching}
-          onConfirm={() => {
-            if (!diagnosticConfirm) {
-              return;
-            }
-            void handleDiagnosticRedownload(
-              diagnosticConfirm.id,
-              diagnosticConfirm.includeServerHostnames,
-            ).then((accepted) => {
-              if (accepted) {
-                setDiagnosticConfirm(null);
-              }
-            });
-          }}
-          onCancel={() => {
-            setDiagnosticAcceptError(null);
-            setDiagnosticConfirm(null);
-          }}
-        >
-          <label className="flex items-center gap-2">
-            <Checkbox
-              checked={diagnosticConfirm?.includeServerHostnames ?? true}
-              disabled={diagnosticStartState.fetching}
-              onCheckedChange={(value) => {
-                setDiagnosticConfirm((current) => (current ? {
-                  ...current,
-                  includeServerHostnames: value === true,
-                } : current));
-              }}
-            />
-            <span className="text-sm">{t("confirm.includeServerHostnames")}</span>
-          </label>
-          {diagnosticAcceptError ? (
-            <p className="text-sm text-destructive">{diagnosticAcceptError}</p>
-          ) : null}
-        </ConfirmDialog>
-      ) : null}
 
       <ConfirmDialog
         open={deleteBatchConfirm}

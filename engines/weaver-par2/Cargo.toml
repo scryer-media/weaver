@@ -13,7 +13,6 @@ slow-tests = []
 
 [dependencies]
 weaver-reed-solomon = { path = "../weaver-reed-solomon", default-features = false }
-weaver-model = { path = "../../shared/crates/weaver-model", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }

@@ -95,8 +95,6 @@ fn postgres_sample_history(job_id: crate::jobs::ids::JobId) -> JobHistoryRow {
         created_at: 1_700_000_000,
         completed_at: 1_700_000_100,
         metadata: Some("[[\"engine\",\"postgres\"]]".to_string()),
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     }
 }
 
@@ -622,8 +620,6 @@ fn is_boolean_column(table: &str, column: &str) -> bool {
             | ("active_volume_status", "deleted")
             | ("rss_feeds", "enabled")
             | ("rss_rules", "enabled")
-            | ("diagnostic_runs", "include_server_hostnames")
-            | ("diagnostic_runs", "rerun_succeeded")
     )
 }
 
@@ -1424,7 +1420,6 @@ async fn postgres_runtime_smoke_when_configured() {
             monthly_reset_day: 7,
         }),
         ip_replacement_trial_extra_connections: Some(1),
-        diagnostic_upload_url: Some("https://diagnostics.example.test".to_string()),
         config_path: None,
     };
     db.save_config(&config).unwrap();
@@ -1434,10 +1429,6 @@ async fn postgres_runtime_smoke_when_configured() {
     assert_eq!(loaded_config.complete_dir, config.complete_dir);
     assert_eq!(loaded_config.max_download_speed, config.max_download_speed);
     assert_eq!(loaded_config.cleanup_after_extract, Some(false));
-    assert_eq!(
-        loaded_config.diagnostic_upload_url.as_deref(),
-        Some("https://diagnostics.example.test")
-    );
     assert_eq!(
         loaded_config
             .isp_bandwidth_cap
@@ -1574,8 +1565,6 @@ async fn postgres_runtime_smoke_when_configured() {
             created_at: 1_700_000_000,
             completed_at: 1_700_000_100,
             metadata: Some("[[\"engine\",\"postgres\"]]".to_string()),
-            last_diagnostic_id: None,
-            last_diagnostic_uploaded_at_epoch_ms: None,
         },
     )
     .unwrap();

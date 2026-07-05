@@ -75,11 +75,6 @@ const en: LocaleDictionary = {
   "confirm.deleteAllHistoryMessage": "All completed and failed jobs will be permanently removed.",
   "confirm.deleteAllHistoryConfirm": "Delete All",
   "confirm.deleteAllHistoryDismiss": "Cancel",
-  "confirm.diagnosticRedownload": "Start diagnostic re-download?",
-  "confirm.diagnosticRedownloadMessage": "This will re-download the job in diagnostic mode so logs and troubleshooting artifacts can be collected.",
-  "confirm.diagnosticRedownloadConfirm": "Start Diagnostic Re-download",
-  "confirm.diagnosticRedownloadDismiss": "Cancel",
-  "confirm.includeServerHostnames": "Include server hostnames in the diagnostic bundle",
   "action.deleteAll": "Delete All",
 
   // Upload page

@@ -31,11 +31,9 @@ fn history_item_roundtrips_attributes_and_client_request_id() {
             ])
             .unwrap(),
         ),
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     };
 
-    let item = history_item_from_row(&row, None, None);
+    let item = history_item_from_row(&row, None);
     assert_eq!(item.state, QueueItemState::Failed);
     assert_eq!(item.client_request_id.as_deref(), Some("req-history"));
     assert_eq!(item.attributes.len(), 1);
@@ -66,11 +64,9 @@ fn history_item_builds_when_release_parse_is_not_media() {
         created_at: 1_700_000_000,
         completed_at: 1_700_000_100,
         metadata: None,
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     };
 
-    let item = history_item_from_row(&row, None, None);
+    let item = history_item_from_row(&row, None);
 
     assert_eq!(item.display_title, "ubuntu-24 04 2-live-server-amd64");
     assert_eq!(item.parsed_release, ParsedRelease::default());
@@ -102,11 +98,9 @@ fn history_filter_supports_exact_attribute_matches() {
             )])
             .unwrap(),
         ),
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     };
 
-    let item = history_item_from_row(&row, None, None);
+    let item = history_item_from_row(&row, None);
     let matches = QueueFilterInput {
         attribute_equals: Some(AttributeInput {
             key: "*scryer_title_id".to_string(),

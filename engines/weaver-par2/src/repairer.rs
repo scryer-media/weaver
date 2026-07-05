@@ -1512,7 +1512,12 @@ impl RepairState {
     fn verification_result(&self) -> VerificationResult {
         let mut files = Vec::new();
         let mut total_missing_blocks = 0u32;
-        let mut missing_unrepairable_block_metadata = self.discarded_recoverable_files > 0;
+        // Only files whose FileDesc packet is missing are truly unrepairable:
+        // without a length the global slice layout (and thus every RS
+        // constant) is unknown. A file that merely lost its IFSC packet still
+        // repairs positionally — all of its slices count as missing and the
+        // FileDesc full-file hash validates the reconstruction afterwards.
+        let missing_unrepairable_block_metadata = self.discarded_recoverable_files > 0;
 
         for file in self.files.iter().filter(|file| file.recoverable) {
             let mut valid_slices = vec![false; file.expected_block_count];
@@ -1529,9 +1534,6 @@ impl RepairState {
                 valid_slices.iter().filter(|valid| !**valid).count() as u32
             };
             total_missing_blocks = total_missing_blocks.saturating_add(missing);
-            if missing > 0 && file.block_count < file.expected_block_count {
-                missing_unrepairable_block_metadata = true;
-            }
 
             let status = if self.is_canonical_complete(file) {
                 FileStatus::Complete
@@ -4319,7 +4321,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_reports_resource_limited_when_matrix_budget_is_too_small() {
+    fn preview_survives_tiny_memory_limit_via_matrix_budget_floor() {
         let dir = tempdir().unwrap();
         let slice_size = 64u64;
         let file_data: Vec<u8> = (0..256u32).map(|i| (i % 251) as u8).collect();
@@ -4343,6 +4345,34 @@ mod tests {
         options.file_set = Some(set);
         options.repair = false;
         options.memory_limit = Some(8);
+
+        // The decode matrix no longer competes with the slice-buffer budget,
+        // so a tiny configured limit still previews as repairable.
+        let outcome = Par2Repairer::new(options).verify_or_repair().unwrap();
+        assert_eq!(outcome.status, Par2RepairStatus::RepairPossible);
+    }
+
+    #[test]
+    fn preview_reports_resource_limited_for_sets_over_total_slice_cap() {
+        let dir = tempdir().unwrap();
+        let slice_size = 4u64;
+        // Two files of 20000 slices each: 40000 total, over the 32768 cap.
+        let file_a = vec![0xA5u8; 80_000];
+        let file_b = vec![0x5Au8; 80_000];
+        let mut set = synthetic_set(&[("a.bin", &file_a), ("b.bin", &file_b)], slice_size);
+        for exponent in 0..40_000u32 {
+            set.recovery_slices.insert(
+                exponent,
+                crate::par2_set::RecoverySlice {
+                    exponent,
+                    data: vec![0u8; slice_size as usize].into(),
+                },
+            );
+        }
+
+        let mut options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        options.file_set = Some(set);
+        options.repair = false;
 
         let outcome = Par2Repairer::new(options).verify_or_repair().unwrap();
         assert_eq!(outcome.status, Par2RepairStatus::ResourceLimited);
@@ -5415,6 +5445,40 @@ mod tests {
         assert!(matches!(
             verification.repairable,
             Repairability::Insufficient { .. }
+        ));
+    }
+
+    #[test]
+    fn recoverable_file_without_ifsc_is_repairable_with_enough_parity() {
+        let dir = tempdir().unwrap();
+        let data = b"aaaabbbb".to_vec();
+        let mut set = synthetic_set(&[("target.bin", &data)], 4);
+        set.slice_checksums.clear();
+        for exponent in 0..2u32 {
+            set.recovery_slices.insert(
+                exponent,
+                crate::par2_set::RecoverySlice {
+                    exponent,
+                    data: bytes::Bytes::from(vec![0u8; 4]).into(),
+                },
+            );
+        }
+        fs::write(dir.path().join("target.bin"), b"ccccdddd").unwrap();
+
+        let mut state = RepairState::from_set(dir.path(), set).unwrap();
+        let options = Par2RepairerOptions::new(dir.path().to_path_buf(), Vec::new());
+        state.scan(&options).unwrap();
+        let verification = state.verification_result();
+
+        assert_eq!(state.inconsistent_packets, 1);
+        assert_eq!(state.files[0].block_count, 0);
+        assert_eq!(verification.total_missing_blocks, 2);
+        assert!(matches!(
+            verification.repairable,
+            Repairability::Repairable {
+                blocks_needed: 2,
+                blocks_available: 2
+            }
         ));
     }
 

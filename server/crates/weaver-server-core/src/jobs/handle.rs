@@ -254,13 +254,6 @@ pub enum SchedulerCommand {
         job_id: JobId,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Re-download a completed or failed job as a linked diagnostic rerun under a new job ID.
-    StartDiagnosticRedownload {
-        source_job_id: JobId,
-        diagnostic_job_id: JobId,
-        include_server_hostnames: bool,
-        reply: oneshot::Sender<Result<JobId, SchedulerError>>,
-    },
     /// Delete a completed/failed/cancelled job from history.
     DeleteHistory {
         job_id: JobId,
@@ -440,26 +433,6 @@ impl SchedulerHandle {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::RedownloadJob { job_id, reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
-    }
-
-    /// Start a linked diagnostic rerun of a completed or failed job under a new job ID.
-    pub async fn start_diagnostic_redownload(
-        &self,
-        source_job_id: JobId,
-        diagnostic_job_id: JobId,
-        include_server_hostnames: bool,
-    ) -> Result<JobId, SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::StartDiagnosticRedownload {
-                source_job_id,
-                diagnostic_job_id,
-                include_server_hostnames,
-                reply: tx,
-            })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?

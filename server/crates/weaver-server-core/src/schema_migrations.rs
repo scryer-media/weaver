@@ -22,7 +22,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 29;
+const CURRENT_SCHEMA_VERSION: i64 = 30;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1027,7 +1027,8 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(diagnostic_cols, 2);
+        assert_eq!(diagnostic_cols, 0);
+        assert!(!sqlite_table_exists(&pool, "diagnostic_runs").await);
 
         let nzb_cols: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('active_jobs') WHERE name = 'nzb_zstd'",
@@ -1206,8 +1207,12 @@ mod tests {
                 "req-1".to_string(),
             ),
             (
-                crate::history::DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY.to_string(),
+                "__weaver_diagnostic_source_job_id".to_string(),
                 "42".to_string(),
+            ),
+            (
+                "__weaver_diagnostic_include_server_hostnames".to_string(),
+                "false".to_string(),
             ),
         ])
         .unwrap();
@@ -1242,6 +1247,34 @@ mod tests {
         assert_eq!(
             rows,
             vec![("*scryer_title_id".to_string(), "title-a".to_string())]
+        );
+
+        apply_version_range(
+            &pool,
+            &catalog,
+            &payload,
+            MigrationInstallKind::Upgrade,
+            28,
+            30,
+        )
+        .await
+        .unwrap();
+
+        let stored_metadata: String =
+            sqlx::query_scalar("SELECT metadata FROM job_history WHERE job_id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let metadata_pairs: Vec<(String, String)> = serde_json::from_str(&stored_metadata).unwrap();
+        assert_eq!(
+            metadata_pairs,
+            vec![
+                ("*scryer_title_id".to_string(), "title-a".to_string()),
+                (
+                    crate::history::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+                    "req-1".to_string()
+                )
+            ]
         );
     }
 
@@ -1494,13 +1527,11 @@ mod tests {
                 &[
                     "optional_recovery_bytes",
                     "optional_recovery_downloaded_bytes",
-                    "last_diagnostic_id",
-                    "last_diagnostic_uploaded_at_epoch_ms",
                     "nzb_zstd"
                 ]
             )
             .await,
-            5
+            3
         );
         assert_eq!(
             pragma_column_count(

@@ -41,14 +41,11 @@ pub use operations::metrics::{
 };
 pub use operations::{
     AsyncOperationState, AsyncOperationTargetState, COUNTER_METRIC_KEYS, CounterRollupValue,
-    DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY, DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY,
-    DiagnosticRunInsertError, DiagnosticRunRow, DiagnosticRunStage, GAUGE_METRIC_KEYS,
-    GaugeRollupValue, HistoryDeleteOperationInsertError, HistoryDeleteOperationPayload,
-    HistoryDeleteOperationRow, HistoryDeleteOperationSummary, HistoryDeleteRowState,
-    HistoryDeleteTargetWork, JOB_STATUS_KEYS, MetricsHistoryChunkRow, MetricsHistoryQueryData,
-    MetricsHistoryQueryResult, MetricsHistoryTier, RawMetricsHistoryPoint,
-    RollupMetricsHistoryPoint, StableStateExport, diagnostic_cleanup_cutoff_ms,
-    diagnostic_include_server_hostnames, diagnostic_source_job_id, with_diagnostic_metadata,
+    GAUGE_METRIC_KEYS, GaugeRollupValue, HistoryDeleteOperationInsertError,
+    HistoryDeleteOperationPayload, HistoryDeleteOperationRow, HistoryDeleteOperationSummary,
+    HistoryDeleteRowState, HistoryDeleteTargetWork, JOB_STATUS_KEYS, MetricsHistoryChunkRow,
+    MetricsHistoryQueryData, MetricsHistoryQueryResult, MetricsHistoryTier, RawMetricsHistoryPoint,
+    RollupMetricsHistoryPoint, StableStateExport,
 };
 pub use persistence::{Database, StateError};
 pub use pipeline::Pipeline;

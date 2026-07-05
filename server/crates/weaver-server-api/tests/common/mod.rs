@@ -23,9 +23,6 @@ use weaver_server_core::jobs::model::{JobState, JobStatus, epoch_ms_now};
 use weaver_server_core::operations::metrics::PipelineMetrics;
 use weaver_server_core::pipeline::download::queue::DownloadQueue;
 use weaver_server_core::settings::{Config, SharedConfig};
-use weaver_server_core::{
-    DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY, DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY,
-};
 use weaver_server_core::{Database, JobHistoryRow};
 use weaver_server_core::{RestoreJobRequest, SchedulerCommand, SchedulerHandle};
 
@@ -156,7 +153,6 @@ impl TestHarness {
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
             ip_replacement_trial_extra_connections: None,
-            diagnostic_upload_url: None,
             config_path: None,
         };
         let shared_config: SharedConfig = Arc::new(RwLock::new(config));
@@ -672,78 +668,6 @@ fn spawn_test_scheduler(
                             job_id.0
                         ))),
                         None => Err(weaver_server_core::SchedulerError::JobNotFound(job_id)),
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::StartDiagnosticRedownload {
-                    source_job_id,
-                    diagnostic_job_id,
-                    include_server_hostnames,
-                    reply,
-                } => {
-                    let result = match jobs.get(&source_job_id) {
-                        Some(source_state) => {
-                            let mut spec = source_state.spec.clone();
-                            spec.metadata.push((
-                                DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY.to_string(),
-                                source_job_id.0.to_string(),
-                            ));
-                            spec.metadata.push((
-                                DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY.to_string(),
-                                include_server_hostnames.to_string(),
-                            ));
-
-                            let assembly = JobAssembly::new(diagnostic_job_id);
-                            let par2_bytes = spec.par2_bytes();
-                            let status = JobStatus::Queued;
-                            let (download_state, post_state, run_state, failure_error) =
-                                runtime_lanes_for_status(&status);
-                            let state = JobState {
-                                job_id: diagnostic_job_id,
-                                job_hash: [0; 32],
-                                spec,
-                                status,
-                                download_state,
-                                post_state,
-                                run_state,
-                                assembly,
-                                extraction_depth: 0,
-                                created_at: std::time::Instant::now(),
-                                created_at_epoch_ms: epoch_ms_now(),
-                                queued_repair_at_epoch_ms: None,
-                                queued_extract_at_epoch_ms: None,
-                                paused_resume_status: None,
-                                paused_resume_download_state: None,
-                                paused_resume_post_state: None,
-                                failure_error,
-                                working_dir: PathBuf::from("/tmp/test"),
-                                downloaded_bytes: 0,
-                                failed_bytes: 0,
-                                par2_bytes,
-                                health_probing: false,
-                                health_probe_round: 0,
-                                last_health_probe_failed_bytes: 0,
-                                next_health_probe_failed_bytes: 1,
-                                detected_archives: HashMap::new(),
-                                file_identities: HashMap::new(),
-                                held_segments: Vec::new(),
-                                download_queue: DownloadQueue::new(),
-                                recovery_queue: DownloadQueue::new(),
-                                staging_dir: None,
-                                restored_download_floor_bytes: 0,
-                            };
-                            let _ = event_tx.send(PipelineEvent::JobCreated {
-                                job_id: diagnostic_job_id,
-                                name: state.spec.name.clone(),
-                                total_files: state.spec.files.len() as u32,
-                                total_bytes: state.spec.total_bytes,
-                            });
-                            jobs.insert(diagnostic_job_id, state);
-                            Ok(diagnostic_job_id)
-                        }
-                        None => Err(weaver_server_core::SchedulerError::JobNotFound(
-                            source_job_id,
-                        )),
                     };
                     let _ = reply.send(result);
                 }

@@ -236,8 +236,6 @@ impl Pipeline {
             nzb_path: None,
             created_at,
             completed_at: now,
-            last_diagnostic_id: None,
-            last_diagnostic_uploaded_at_epoch_ms: None,
             metadata: if state.spec.metadata.is_empty() {
                 None
             } else {

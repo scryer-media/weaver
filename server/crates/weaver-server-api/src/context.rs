@@ -55,16 +55,6 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .expect("http client build should succeed");
-    #[cfg(weaver_diagnostics)]
-    let diagnostic_manager = crate::history::diagnostics::DiagnosticManager::new(
-        context.db.clone(),
-        context.handle.clone(),
-        context.config.clone(),
-        context.log_buffer.clone(),
-        http_client.clone(),
-    );
-    #[cfg(weaver_diagnostics)]
-    diagnostic_manager.spawn_worker();
     let staged_upload_manager = StagedUploadManager::new();
     staged_upload_manager.spawn_cleanup_worker();
 
@@ -85,7 +75,5 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
     .data(replay)
     .data(history_delete_manager)
     .data(staged_upload_manager);
-    #[cfg(weaver_diagnostics)]
-    let schema = schema.data(diagnostic_manager);
     schema.finish()
 }

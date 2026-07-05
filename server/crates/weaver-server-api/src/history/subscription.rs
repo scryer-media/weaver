@@ -34,10 +34,6 @@ impl HistorySubscription {
     ) -> Result<impl Stream<Item = JobDetailSnapshot>> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
         let db = ctx.data::<Database>()?.clone();
-        #[cfg(weaver_diagnostics)]
-        let diagnostics = ctx
-            .data_opt::<crate::history::diagnostics::DiagnosticManager>()
-            .cloned();
         let event_rx = handle.subscribe_events();
 
         let event_stream = tokio_stream::wrappers::BroadcastStream::new(event_rx)
@@ -64,20 +60,6 @@ impl HistorySubscription {
                     handle.clone(),
                     db.clone(),
                     job_id,
-                    {
-                        #[cfg(weaver_diagnostics)]
-                        {
-                            if let Some(manager) = &diagnostics {
-                                manager.has_active_runs().await
-                            } else {
-                                false
-                            }
-                        }
-                        #[cfg(not(weaver_diagnostics))]
-                        {
-                            false
-                        }
-                    },
                 ).await {
                     Ok(snapshot) => yield snapshot,
                     Err(error) => tracing::warn!(job_id, error = ?error, "failed to build job detail snapshot"),

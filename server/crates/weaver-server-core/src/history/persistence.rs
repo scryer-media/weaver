@@ -112,8 +112,8 @@ impl Database {
                             (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                              optional_recovery_bytes, optional_recovery_downloaded_bytes,
                              failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
-                             created_at, completed_at, metadata, last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms)
-                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
+                             created_at, completed_at, metadata)
+                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
                          ON CONFLICT(job_id) DO UPDATE SET
                             job_hash = excluded.job_hash,
                             name = excluded.name,
@@ -131,9 +131,7 @@ impl Database {
                             nzb_zstd = COALESCE(excluded.nzb_zstd, job_history.nzb_zstd),
                             created_at = excluded.created_at,
                             completed_at = excluded.completed_at,
-                            metadata = excluded.metadata,
-                            last_diagnostic_id = excluded.last_diagnostic_id,
-                            last_diagnostic_uploaded_at_epoch_ms = excluded.last_diagnostic_uploaded_at_epoch_ms",
+                            metadata = excluded.metadata",
                         &args,
                     )
                     .await?;
@@ -231,7 +229,5 @@ fn job_history_args(entry: &JobHistoryRow) -> Vec<SqlArg> {
         SqlArg::I64(entry.created_at),
         SqlArg::I64(entry.completed_at),
         SqlArg::OptText(entry.metadata.clone()),
-        SqlArg::OptText(entry.last_diagnostic_id.clone()),
-        SqlArg::OptI64(entry.last_diagnostic_uploaded_at_epoch_ms),
     ]
 }

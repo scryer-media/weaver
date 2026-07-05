@@ -56,7 +56,6 @@ fn sample_config() -> Config {
         max_download_speed: Some(42),
         isp_bandwidth_cap: None,
         ip_replacement_trial_extra_connections: None,
-        diagnostic_upload_url: None,
         cleanup_after_extract: Some(true),
         config_path: None,
     }
@@ -86,9 +85,10 @@ async fn export_and_import_stable_state_roundtrip() {
         nzb_path: Some("/old/data/.weaver-nzbs/77.nzb".into()),
         created_at: 1,
         completed_at: 2,
-        metadata: Some("[[\"k\",\"v\"]]".into()),
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
+        metadata: Some(
+            "[[\"k\",\"v\"],[\"__weaver_diagnostic_source_job_id\",\"77\"],[\"__weaver_diagnostic_include_server_hostnames\",\"false\"]]"
+                .into(),
+        ),
     })
     .unwrap();
     src.insert_job_events(&[JobEvent {
@@ -179,6 +179,7 @@ async fn export_and_import_stable_state_roundtrip() {
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].optional_recovery_bytes, 45);
     assert_eq!(history[0].optional_recovery_downloaded_bytes, 12);
+    assert_eq!(history[0].metadata.as_deref(), Some("[[\"k\",\"v\"]]"));
     assert_eq!(dest.get_job_events(77).unwrap().len(), 1);
     assert_eq!(dest.list_rss_feeds().unwrap().len(), 1);
     assert_eq!(dest.list_rss_rules(1).unwrap().len(), 1);
@@ -212,8 +213,6 @@ fn restore_target_is_not_pristine_with_history() {
         created_at: 1,
         completed_at: 1,
         metadata: None,
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     })
     .unwrap();
     assert!(!db.restore_target_is_pristine().unwrap());

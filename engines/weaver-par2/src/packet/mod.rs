@@ -349,7 +349,15 @@ fn parse_recovery_packet_from_reader(
 
     Ok(Packet::RecoverySlice(RecoverySlicePacket {
         exponent,
-        data: RecoverySliceData::file_backed(path.to_path_buf(), payload_offset, payload_len),
+        // The streaming scanner seeks past recovery payloads without hashing
+        // them, so keep the packet hash around for lazy validation at repair
+        // time (damaged .vol files are routine on Usenet).
+        data: RecoverySliceData::file_backed_with_hash(
+            path.to_path_buf(),
+            payload_offset,
+            payload_len,
+            header.packet_hash,
+        ),
     }))
 }
 

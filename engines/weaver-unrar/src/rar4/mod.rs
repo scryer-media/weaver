@@ -345,9 +345,19 @@ fn parse_rar4_encrypted_headers<R: Read + Seek>(
         let (key, iv) = kdf_cache.derive_key_rar4(password, Some(&salt));
         let mut decryptor = crate::crypto::Rar4CbcDecryptor::new(&key, &iv);
 
-        let raw = match header::read_raw_header_encrypted(reader, &mut decryptor)? {
-            Some(raw) => raw,
-            None => break,
+        let raw = match header::read_raw_header_encrypted(reader, &mut decryptor) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => break,
+            // A wrong password decrypts the header length field to garbage,
+            // which typically walks the reader off the end of the archive.
+            // Surface that as archive-level corruption, not a bare IO error.
+            Err(RarError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(RarError::CorruptArchive {
+                    detail: "RAR4 encrypted header truncated: damaged archive or wrong password"
+                        .into(),
+                });
+            }
+            Err(e) => return Err(e),
         };
 
         match raw.header_type {

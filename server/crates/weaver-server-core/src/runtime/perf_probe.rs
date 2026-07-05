@@ -480,7 +480,6 @@ fn classify_sql(template: &str) -> String {
         "job_events",
         "integration_events",
         "job_history",
-        "diagnostic_runs",
         "settings",
         "servers",
     ] {
