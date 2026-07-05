@@ -1,3 +1,4 @@
+pub mod env_seed;
 pub mod model;
 pub mod persistence;
 pub mod queries;

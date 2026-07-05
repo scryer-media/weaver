@@ -1290,8 +1290,14 @@ unsafe fn try_decode_avx2_block(
         return Ok(Some(64));
     }
 
+    // Keep the '=' compare vectors: the escape-offset fast path derives its
+    // lane selects from them without a scalar-to-vector round trip.
+    let eq_needle = _mm256_set1_epi8(b'=' as i8);
+    let eq_va = _mm256_cmpeq_epi8(a, eq_needle);
+    let eq_vb = _mm256_cmpeq_epi8(b, eq_needle);
     let eq = if specials != 0 {
-        unsafe { avx2_mask64(a, b, b'=') }
+        (_mm256_movemask_epi8(eq_va) as u32 as u64)
+            | ((_mm256_movemask_epi8(eq_vb) as u32 as u64) << 32)
     } else {
         0
     };
@@ -1340,10 +1346,18 @@ unsafe fn try_decode_avx2_block(
     }
 
     let skip = fixed_eq | raw_breaks | dot_start;
-    if skip == 0 && escaped == 0 {
-        let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
-        let decoded_a = _mm256_add_epi8(a, sub42);
-        let decoded_b = _mm256_add_epi8(b, sub42);
+    let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
+    let (decoded_a, decoded_b) = if escaped == 0 {
+        (_mm256_add_epi8(a, sub42), _mm256_add_epi8(b, sub42))
+    } else if esc_first == 0 && eq & (eq << 1) == 0 {
+        // No adjacent '=' and no carried-in escape: the offset select stays
+        // in the vector domain (NEON's vext shortcut, AVX2 spelling).
+        unsafe { avx2_decode_with_shifted_eq(a, b, eq_va, eq_vb) }
+    } else {
+        unsafe { avx2_decode_with_escape_mask(a, b, escaped) }
+    };
+
+    if skip == 0 {
         unsafe {
             _mm256_storeu_si256(output.as_mut_ptr().add(*dst) as *mut __m256i, decoded_a);
             _mm256_storeu_si256(
@@ -1356,19 +1370,24 @@ unsafe fn try_decode_avx2_block(
         return Ok(Some(64));
     }
 
-    let (decoded_a, decoded_b) = unsafe { avx2_decode_with_escape_mask(a, b, escaped) };
-    unsafe { compact_store_16_avx2(decoded_a, false, (skip & 0xffff) as u16, output, dst) };
-    unsafe { compact_store_16_avx2(decoded_a, true, ((skip >> 16) & 0xffff) as u16, output, dst) };
+    // Popcnt prefix-sum: the four store offsets derive straight from the
+    // group masks, so the compact stores issue independently.
+    let s0 = (skip & 0xffff) as u16;
+    let s1 = ((skip >> 16) & 0xffff) as u16;
+    let s2 = ((skip >> 32) & 0xffff) as u16;
+    let s3 = ((skip >> 48) & 0xffff) as u16;
+    let k0 = 16 - s0.count_ones() as usize;
+    let k1 = 16 - s1.count_ones() as usize;
+    let k2 = 16 - s2.count_ones() as usize;
+    let k3 = 16 - s3.count_ones() as usize;
+    let base = *dst;
     unsafe {
-        compact_store_16_avx2(
-            decoded_b,
-            false,
-            ((skip >> 32) & 0xffff) as u16,
-            output,
-            dst,
-        )
-    };
-    unsafe { compact_store_16_avx2(decoded_b, true, ((skip >> 48) & 0xffff) as u16, output, dst) };
+        compact_store_16_avx2_at(decoded_a, false, s0, output, base);
+        compact_store_16_avx2_at(decoded_a, true, s1, output, base + k0);
+        compact_store_16_avx2_at(decoded_b, false, s2, output, base + k0 + k1);
+        compact_store_16_avx2_at(decoded_b, true, s3, output, base + k0 + k1 + k2);
+    }
+    *dst = base + k0 + k1 + k2 + k3;
 
     state.state = x86_final_state_after_block(
         fixed_eq,
@@ -1742,6 +1761,38 @@ unsafe fn sse41_decode_with_escape_mask(
     let normal = _mm_set1_epi8(-42);
     let escaped_offset = _mm_set1_epi8(-106);
     _mm_add_epi8(block, _mm_blendv_epi8(normal, escaped_offset, mask))
+}
+
+/// Escape-offset application without leaving the vector domain: the escaped
+/// lanes are exactly the '=' compare vectors shifted one byte toward higher
+/// lanes ('a' top byte carries into 'b'). Callers must route windows with
+/// adjacent '=' runs or a carried-in escape (bit 0) to
+/// [`avx2_decode_with_escape_mask`] instead — the shift does not resolve
+/// chains and shifts a zero into byte 0.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn avx2_decode_with_shifted_eq(
+    a: std::arch::x86_64::__m256i,
+    b: std::arch::x86_64::__m256i,
+    eq_va: std::arch::x86_64::__m256i,
+    eq_vb: std::arch::x86_64::__m256i,
+) -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m256i) {
+    use std::arch::x86_64::*;
+
+    // 256-bit shift-left-by-one-byte: [0, a.low] / [a.high, b.low] feed the
+    // per-lane alignr so lane crossings carry correctly.
+    let carry_a = _mm256_permute2x128_si256::<0x08>(eq_va, eq_va);
+    let sel_a = _mm256_alignr_epi8::<15>(eq_va, carry_a);
+    let carry_b = _mm256_permute2x128_si256::<0x21>(eq_va, eq_vb);
+    let sel_b = _mm256_alignr_epi8::<15>(eq_vb, carry_b);
+
+    let normal = _mm256_set1_epi8(-42);
+    let escaped_offset = _mm256_set1_epi8(-106);
+    (
+        _mm256_add_epi8(a, _mm256_blendv_epi8(normal, escaped_offset, sel_a)),
+        _mm256_add_epi8(b, _mm256_blendv_epi8(normal, escaped_offset, sel_b)),
+    )
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2153,39 +2204,23 @@ unsafe fn try_decode_avx2_line(
         return Ok(None);
     }
 
+    // Single pass. The '=' at line_end-1 guard above already excludes every
+    // way a resolved escape can dangle past the line (fix_eq_mask only sets
+    // bits where '=' bytes sit), so no preflight over the chunks is needed;
+    // a raw CR/LF discovered mid-line rewinds the output cursor and hands the
+    // whole line back to the general path.
     let chunks = line_length / WIDTH;
-    let mut eq_masks = [0u64; MAX_LINE_CHUNKS];
-    for (chunk_idx, eq_slot) in eq_masks.iter_mut().take(chunks).enumerate() {
-        let chunk_src = src + chunk_idx * WIDTH;
-        let a = unsafe { _mm256_loadu_si256(input.as_ptr().add(chunk_src) as *const __m256i) };
-        let b = unsafe { _mm256_loadu_si256(input.as_ptr().add(chunk_src + 32) as *const __m256i) };
-        let crlf = unsafe { avx2_mask64(a, b, b'\r') | avx2_mask64(a, b, b'\n') };
-        if crlf != 0 {
-            return Ok(None);
-        }
-        *eq_slot = unsafe { avx2_mask64(a, b, b'=') };
-    }
-
-    let mut preflight_esc_first = 0u64;
-    for &eq in eq_masks.iter().take(chunks) {
-        let fixed_eq = fix_eq_mask(eq, (eq << 1) | preflight_esc_first);
-        preflight_esc_first = (fixed_eq & LAST != 0) as u64;
-    }
-    if preflight_esc_first != 0 {
-        return Ok(None);
-    }
-
     let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
+    let eq_needle = _mm256_set1_epi8(b'=' as i8);
+    let dst_start = *dst;
     let mut esc_first = 0u64;
-    for (chunk_idx, &eq) in eq_masks.iter().take(chunks).enumerate() {
+    for chunk_idx in 0..chunks {
         let chunk_src = src + chunk_idx * WIDTH;
         let a = unsafe { _mm256_loadu_si256(input.as_ptr().add(chunk_src) as *const __m256i) };
         let b = unsafe { _mm256_loadu_si256(input.as_ptr().add(chunk_src + 32) as *const __m256i) };
-        let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
-        let escaped = (fixed_eq << 1) | esc_first;
-        let skip = fixed_eq;
+        let specials = unsafe { avx2_special_mask64(a, b) };
 
-        if skip == 0 && escaped == 0 {
+        if specials == 0 && esc_first == 0 {
             unsafe {
                 _mm256_storeu_si256(
                     output.as_mut_ptr().add(*dst) as *mut __m256i,
@@ -2197,26 +2232,57 @@ unsafe fn try_decode_avx2_line(
                 );
             }
             *dst += WIDTH;
+            continue;
+        }
+
+        let eq_va = _mm256_cmpeq_epi8(a, eq_needle);
+        let eq_vb = _mm256_cmpeq_epi8(b, eq_needle);
+        let eq = (_mm256_movemask_epi8(eq_va) as u32 as u64)
+            | ((_mm256_movemask_epi8(eq_vb) as u32 as u64) << 32);
+        if specials != eq {
+            // Raw CR/LF inside the predicted line body.
+            *dst = dst_start;
+            return Ok(None);
+        }
+
+        let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+        let escaped = (fixed_eq << 1) | esc_first;
+        let skip = fixed_eq;
+
+        let (decoded_a, decoded_b) = if escaped == 0 {
+            (_mm256_add_epi8(a, sub42), _mm256_add_epi8(b, sub42))
+        } else if esc_first == 0 && eq & (eq << 1) == 0 {
+            unsafe { avx2_decode_with_shifted_eq(a, b, eq_va, eq_vb) }
         } else {
-            let (decoded_a, decoded_b) = unsafe { avx2_decode_with_escape_mask(a, b, escaped) };
+            unsafe { avx2_decode_with_escape_mask(a, b, escaped) }
+        };
+
+        if skip == 0 {
             unsafe {
-                compact_store_16_avx2(decoded_a, false, (skip & 0xffff) as u16, output, dst)
-            };
-            unsafe {
-                compact_store_16_avx2(decoded_a, true, ((skip >> 16) & 0xffff) as u16, output, dst)
-            };
-            unsafe {
-                compact_store_16_avx2(
+                _mm256_storeu_si256(output.as_mut_ptr().add(*dst) as *mut __m256i, decoded_a);
+                _mm256_storeu_si256(
+                    output.as_mut_ptr().add(*dst + 32) as *mut __m256i,
                     decoded_b,
-                    false,
-                    ((skip >> 32) & 0xffff) as u16,
-                    output,
-                    dst,
-                )
-            };
+                );
+            }
+            *dst += WIDTH;
+        } else {
+            let s0 = (skip & 0xffff) as u16;
+            let s1 = ((skip >> 16) & 0xffff) as u16;
+            let s2 = ((skip >> 32) & 0xffff) as u16;
+            let s3 = ((skip >> 48) & 0xffff) as u16;
+            let k0 = 16 - s0.count_ones() as usize;
+            let k1 = 16 - s1.count_ones() as usize;
+            let k2 = 16 - s2.count_ones() as usize;
+            let k3 = 16 - s3.count_ones() as usize;
+            let base = *dst;
             unsafe {
-                compact_store_16_avx2(decoded_b, true, ((skip >> 48) & 0xffff) as u16, output, dst)
-            };
+                compact_store_16_avx2_at(decoded_a, false, s0, output, base);
+                compact_store_16_avx2_at(decoded_a, true, s1, output, base + k0);
+                compact_store_16_avx2_at(decoded_b, false, s2, output, base + k0 + k1);
+                compact_store_16_avx2_at(decoded_b, true, s3, output, base + k0 + k1 + k2);
+            }
+            *dst = base + k0 + k1 + k2 + k3;
         }
 
         esc_first = (fixed_eq & LAST != 0) as u64;
@@ -2371,31 +2437,21 @@ unsafe fn try_decode_ssse3_line(
         }
     };
 
+    // Single pass; the '=' at line_end-1 guard above already excludes a
+    // dangling escape at line end, and a raw CR/LF mid-line rewinds the
+    // output cursor and hands the line back to the general path.
     let chunks = line_length / WIDTH;
-    let mut eq_masks = [0u64; MAX_LINE_CHUNKS];
-    for (chunk_idx, eq_slot) in eq_masks.iter_mut().take(chunks).enumerate() {
+    let sub42 = _mm_set1_epi8(42i8.wrapping_neg());
+    let dst_start = *dst;
+    let mut esc_first = 0u64;
+    for chunk_idx in 0..chunks {
         let vectors = load4(src + chunk_idx * WIDTH);
-        let crlf =
-            unsafe { sse2_mask64(vectors, b'\r') | sse2_mask64(vectors, b'\n') };
+        let crlf = unsafe { sse2_mask64(vectors, b'\r') | sse2_mask64(vectors, b'\n') };
         if crlf != 0 {
+            *dst = dst_start;
             return Ok(None);
         }
-        *eq_slot = unsafe { sse2_mask64(vectors, b'=') };
-    }
-
-    let mut preflight_esc_first = 0u64;
-    for &eq in eq_masks.iter().take(chunks) {
-        let fixed_eq = fix_eq_mask(eq, (eq << 1) | preflight_esc_first);
-        preflight_esc_first = (fixed_eq & LAST != 0) as u64;
-    }
-    if preflight_esc_first != 0 {
-        return Ok(None);
-    }
-
-    let sub42 = _mm_set1_epi8(42i8.wrapping_neg());
-    let mut esc_first = 0u64;
-    for (chunk_idx, &eq) in eq_masks.iter().take(chunks).enumerate() {
-        let vectors = load4(src + chunk_idx * WIDTH);
+        let eq = unsafe { sse2_mask64(vectors, b'=') };
         let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
         let escaped = (fixed_eq << 1) | esc_first;
         let skip = fixed_eq;
@@ -2570,32 +2626,23 @@ unsafe fn try_decode_avx512_vbmi2_line(
         return Ok(None);
     }
 
+    // Single pass; the '=' at line_end-1 guard above already excludes a
+    // dangling escape at line end, and a raw CR/LF mid-line rewinds the
+    // output cursor and hands the line back to the general path.
     let chunks = line_length / WIDTH;
-    let mut eq_masks = [0u64; MAX_LINE_CHUNKS];
-    for (chunk_idx, eq_slot) in eq_masks.iter_mut().take(chunks).enumerate() {
+    let sub42 = _mm512_set1_epi8(42i8.wrapping_neg());
+    let sub106 = _mm512_set1_epi8(106i8.wrapping_neg());
+    let dst_start = *dst;
+    let mut esc_first = 0u64;
+    for chunk_idx in 0..chunks {
         let v = unsafe { _mm512_loadu_si512(input.as_ptr().add(src + chunk_idx * WIDTH) as *const _) };
         let crlf = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\r' as i8))
             | _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8));
         if crlf != 0 {
+            *dst = dst_start;
             return Ok(None);
         }
-        *eq_slot = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'=' as i8));
-    }
-
-    let mut preflight_esc_first = 0u64;
-    for &eq in eq_masks.iter().take(chunks) {
-        let fixed_eq = fix_eq_mask(eq, (eq << 1) | preflight_esc_first);
-        preflight_esc_first = (fixed_eq & LAST != 0) as u64;
-    }
-    if preflight_esc_first != 0 {
-        return Ok(None);
-    }
-
-    let sub42 = _mm512_set1_epi8(42i8.wrapping_neg());
-    let sub106 = _mm512_set1_epi8(106i8.wrapping_neg());
-    let mut esc_first = 0u64;
-    for (chunk_idx, &eq) in eq_masks.iter().take(chunks).enumerate() {
-        let v = unsafe { _mm512_loadu_si512(input.as_ptr().add(src + chunk_idx * WIDTH) as *const _) };
+        let eq = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'=' as i8));
         let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
         let escaped = (fixed_eq << 1) | esc_first;
         let skip = fixed_eq;
@@ -2967,44 +3014,14 @@ unsafe fn try_decode_neon64_line(
         return Ok(None);
     }
 
+    // Single pass; the '=' at line_end-1 guard above already excludes a
+    // dangling escape at line end, and a raw CR/LF mid-line rewinds the
+    // output cursor and hands the line back to the general path.
     let constants = &ctx.constants;
     let chunks = line_length / WIDTH;
-    let mut eq_masks = [0u64; MAX_LINE_CHUNKS];
-    for (chunk_idx, eq_slot) in eq_masks.iter_mut().take(chunks).enumerate() {
-        let chunk_src = src + chunk_idx * WIDTH;
-        let a = unsafe { vld1q_u8(input.as_ptr().add(chunk_src)) };
-        let b = unsafe { vld1q_u8(input.as_ptr().add(chunk_src + 16)) };
-        let c = unsafe { vld1q_u8(input.as_ptr().add(chunk_src + 32)) };
-        let d = unsafe { vld1q_u8(input.as_ptr().add(chunk_src + 48)) };
-        let eq = [
-            unsafe { vceqq_u8(a, constants.eq) },
-            unsafe { vceqq_u8(b, constants.eq) },
-            unsafe { vceqq_u8(c, constants.eq) },
-            unsafe { vceqq_u8(d, constants.eq) },
-        ];
-        let crlf = [
-            unsafe { vorrq_u8(vceqq_u8(a, constants.cr), vceqq_u8(a, constants.lf)) },
-            unsafe { vorrq_u8(vceqq_u8(b, constants.cr), vceqq_u8(b, constants.lf)) },
-            unsafe { vorrq_u8(vceqq_u8(c, constants.cr), vceqq_u8(c, constants.lf)) },
-            unsafe { vorrq_u8(vceqq_u8(d, constants.cr), vceqq_u8(d, constants.lf)) },
-        ];
-        if unsafe { neon64_compare_mask64(crlf, constants.bit_weights) } != 0 {
-            return Ok(None);
-        }
-        *eq_slot = unsafe { neon64_compare_mask64(eq, constants.bit_weights) };
-    }
-
-    let mut preflight_esc_first = 0u64;
-    for &eq in eq_masks.iter().take(chunks) {
-        let fixed_eq = fix_eq_mask(eq, (eq << 1) | preflight_esc_first);
-        preflight_esc_first = (fixed_eq & LAST != 0) as u64;
-    }
-    if preflight_esc_first != 0 {
-        return Ok(None);
-    }
-
+    let dst_start = *dst;
     let mut esc_first = 0u64;
-    for (chunk_idx, &eq) in eq_masks.iter().take(chunks).enumerate() {
+    for chunk_idx in 0..chunks {
         let chunk_src = src + chunk_idx * WIDTH;
         let vectors = [
             unsafe { vld1q_u8(input.as_ptr().add(chunk_src)) },
@@ -3012,6 +3029,43 @@ unsafe fn try_decode_neon64_line(
             unsafe { vld1q_u8(input.as_ptr().add(chunk_src + 32)) },
             unsafe { vld1q_u8(input.as_ptr().add(chunk_src + 48)) },
         ];
+        let eq_vecs = [
+            unsafe { vceqq_u8(vectors[0], constants.eq) },
+            unsafe { vceqq_u8(vectors[1], constants.eq) },
+            unsafe { vceqq_u8(vectors[2], constants.eq) },
+            unsafe { vceqq_u8(vectors[3], constants.eq) },
+        ];
+        let crlf = [
+            unsafe {
+                vorrq_u8(
+                    vceqq_u8(vectors[0], constants.cr),
+                    vceqq_u8(vectors[0], constants.lf),
+                )
+            },
+            unsafe {
+                vorrq_u8(
+                    vceqq_u8(vectors[1], constants.cr),
+                    vceqq_u8(vectors[1], constants.lf),
+                )
+            },
+            unsafe {
+                vorrq_u8(
+                    vceqq_u8(vectors[2], constants.cr),
+                    vceqq_u8(vectors[2], constants.lf),
+                )
+            },
+            unsafe {
+                vorrq_u8(
+                    vceqq_u8(vectors[3], constants.cr),
+                    vceqq_u8(vectors[3], constants.lf),
+                )
+            },
+        ];
+        if unsafe { neon64_compare_mask64(crlf, constants.bit_weights) } != 0 {
+            *dst = dst_start;
+            return Ok(None);
+        }
+        let eq = unsafe { neon64_compare_mask64(eq_vecs, constants.bit_weights) };
         let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
         let escaped = (fixed_eq << 1) | esc_first;
         let skip = fixed_eq;
@@ -3037,7 +3091,45 @@ unsafe fn try_decode_neon64_line(
             }
             *dst += WIDTH;
         } else {
-            let decoded = unsafe { neon_decode_with_escape_mask(vectors, escaped, constants) };
+            let decoded = if esc_first == 0 && eq & (eq << 1) == 0 {
+                // No adjacent '=' and no carried-in escape: escaped positions
+                // are exactly the '=' compares shifted one lane, so the
+                // offset select never leaves the vector domain (same shortcut
+                // as the span block).
+                let zero = unsafe { vdupq_n_u8(0) };
+                let sel_a = unsafe { vextq_u8::<15>(zero, eq_vecs[0]) };
+                let sel_b = unsafe { vextq_u8::<15>(eq_vecs[0], eq_vecs[1]) };
+                let sel_c = unsafe { vextq_u8::<15>(eq_vecs[1], eq_vecs[2]) };
+                let sel_d = unsafe { vextq_u8::<15>(eq_vecs[2], eq_vecs[3]) };
+                [
+                    unsafe {
+                        vsubq_u8(
+                            vectors[0],
+                            vbslq_u8(sel_a, constants.escaped_offset, constants.normal_offset),
+                        )
+                    },
+                    unsafe {
+                        vsubq_u8(
+                            vectors[1],
+                            vbslq_u8(sel_b, constants.escaped_offset, constants.normal_offset),
+                        )
+                    },
+                    unsafe {
+                        vsubq_u8(
+                            vectors[2],
+                            vbslq_u8(sel_c, constants.escaped_offset, constants.normal_offset),
+                        )
+                    },
+                    unsafe {
+                        vsubq_u8(
+                            vectors[3],
+                            vbslq_u8(sel_d, constants.escaped_offset, constants.normal_offset),
+                        )
+                    },
+                ]
+            } else {
+                unsafe { neon_decode_with_escape_mask(vectors, escaped, constants) }
+            };
             let keeps = per_group_keeps(skip);
             unsafe {
                 compact_store_16(
@@ -3593,22 +3685,25 @@ unsafe fn compact_store_16_ssse3(
     *dst += keep;
 }
 
+/// Positional compact store: the caller supplies the output offset (from a
+/// popcnt prefix-sum over the group masks) so the four per-window stores have
+/// no serial dependency on each other.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn compact_store_16_avx2(
+#[inline]
+unsafe fn compact_store_16_avx2_at(
     decoded: std::arch::x86_64::__m256i,
     high_lane: bool,
     skip_mask: u16,
     output: &mut [u8],
-    dst: &mut usize,
+    at: usize,
 ) {
     use std::arch::x86_64::*;
 
     // The caller guarantees 64 spare output bytes per block, so each of the
-    // four stores can write a full 16-byte vector; bytes past `keep` are
-    // overwritten by the next store.
-    debug_assert!(output.len().saturating_sub(*dst) >= 16);
-    let keep = 16 - skip_mask.count_ones() as usize;
+    // four stores can write a full 16-byte vector; bytes past the group's
+    // keep count are overwritten by the next store.
+    debug_assert!(output.len().saturating_sub(at) >= 16);
     let shuffle = unsafe {
         _mm_loadu_si128(compact_table_16()[(skip_mask & 0x7fff) as usize].as_ptr() as *const __m128i)
     };
@@ -3618,8 +3713,7 @@ unsafe fn compact_store_16_avx2(
         _mm256_castsi256_si128(decoded)
     };
     let packed = _mm_shuffle_epi8(lane, shuffle);
-    unsafe { _mm_storeu_si128(output.as_mut_ptr().add(*dst) as *mut __m128i, packed) };
-    *dst += keep;
+    unsafe { _mm_storeu_si128(output.as_mut_ptr().add(at) as *mut __m128i, packed) };
 }
 
 #[cfg(target_arch = "aarch64")]
