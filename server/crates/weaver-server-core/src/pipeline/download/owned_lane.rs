@@ -215,6 +215,31 @@ fn run_owned_blocking_s2n_download_lane(
         );
         let is_recovery = compatibility.is_recovery;
         let exclude_servers = compatibility.exclude_servers.clone();
+
+        // Prefetch the next lease while this batch downloads. The refill
+        // response then overlaps the batch instead of serializing at the
+        // batch boundary behind the orchestrator's result-ingest loop, which
+        // stalled every lane at once when batches completed in lockstep.
+        let mut pending_refill: Option<oneshot::Receiver<DownloadLaneRefillResponse>> = None;
+        {
+            let (response_tx, response_rx) = oneshot::channel();
+            if refill_tx
+                .blocking_send(DownloadLaneRefillRequest {
+                    job_id,
+                    server_idx,
+                    remote_ip: lane.remote_ip(),
+                    supports_pipelining,
+                    current_mode: actual_mode,
+                    spillover_loan_kind,
+                    compatibility: compatibility.clone(),
+                    response_tx,
+                })
+                .is_ok()
+            {
+                pending_refill = Some(response_rx);
+            }
+        }
+
         let mut batch_clean_for_refill = true;
         let mut pending_works: VecDeque<DownloadWork> = works.into_iter().collect();
         let mut results = Vec::with_capacity(pending_works.len());
@@ -345,6 +370,7 @@ fn run_owned_blocking_s2n_download_lane(
 
         let stats = stats_delta(lane.stats(), stats_before);
         if send_owned_batch(&event_tx, results, unrequested_works, stats).is_err() {
+            drain_pending_refill(pending_refill.take(), &event_tx);
             break (
                 LaneParkReason::Error,
                 job_id,
@@ -355,6 +381,7 @@ fn run_owned_blocking_s2n_download_lane(
         }
 
         if !batch_clean_for_refill {
+            drain_pending_refill(pending_refill.take(), &event_tx);
             break (
                 LaneParkReason::Error,
                 job_id,
@@ -364,6 +391,7 @@ fn run_owned_blocking_s2n_download_lane(
             );
         }
         if yielded_for_hot_share {
+            drain_pending_refill(pending_refill.take(), &event_tx);
             break (
                 LaneParkReason::HotShareYield,
                 job_id,
@@ -373,20 +401,7 @@ fn run_owned_blocking_s2n_download_lane(
             );
         }
 
-        let (response_tx, response_rx) = oneshot::channel();
-        if refill_tx
-            .blocking_send(DownloadLaneRefillRequest {
-                job_id,
-                server_idx,
-                remote_ip: lane.remote_ip(),
-                supports_pipelining,
-                current_mode: actual_mode,
-                spillover_loan_kind,
-                compatibility,
-                response_tx,
-            })
-            .is_err()
-        {
+        let Some(response_rx) = pending_refill.take() else {
             break (
                 LaneParkReason::Error,
                 job_id,
@@ -394,7 +409,7 @@ fn run_owned_blocking_s2n_download_lane(
                 spillover_loan_kind,
                 false,
             );
-        }
+        };
 
         match response_rx.blocking_recv() {
             Ok(response) => {
@@ -403,6 +418,39 @@ fn run_owned_blocking_s2n_download_lane(
                 {
                     lease = next_lease;
                     continue;
+                }
+                // The prefetched refill was evaluated mid-batch, where
+                // transient decode/write pressure can deny it. Ask once more
+                // now that this batch's results are delivered — the
+                // pre-prefetch decision point — so a momentary pressure blip
+                // does not park a healthy lane.
+                let (retry_tx, retry_rx) = oneshot::channel();
+                let retry_sent = refill_tx
+                    .blocking_send(DownloadLaneRefillRequest {
+                        job_id,
+                        server_idx,
+                        remote_ip: lane.remote_ip(),
+                        supports_pipelining,
+                        current_mode: actual_mode,
+                        spillover_loan_kind,
+                        compatibility: compatibility.clone(),
+                        response_tx: retry_tx,
+                    })
+                    .is_ok();
+                if retry_sent && let Ok(retry) = retry_rx.blocking_recv() {
+                    if let Some(next_lease) = retry.lease
+                        && !next_lease.works.is_empty()
+                    {
+                        lease = next_lease;
+                        continue;
+                    }
+                    break (
+                        retry.park_reason,
+                        job_id,
+                        actual_mode,
+                        spillover_loan_kind,
+                        keep_cached_lane_after_park(retry.park_reason),
+                    );
                 }
                 break (
                     response.park_reason,
@@ -436,6 +484,30 @@ fn run_owned_blocking_s2n_download_lane(
         release_ip_replacement_burst: false,
     });
     crate::runtime::perf_probe::record("download.fetch_body.owned", fetch_started.elapsed());
+}
+
+/// Consume a prefetched refill response on a park/error path so its leased
+/// works are returned to the queue instead of being dropped. The orchestrator
+/// answers every refill request (or drops the sender on shutdown), so this
+/// cannot hang.
+fn drain_pending_refill(
+    pending_refill: Option<oneshot::Receiver<DownloadLaneRefillResponse>>,
+    event_tx: &mpsc::Sender<OwnedDownloadLaneEvent>,
+) {
+    let Some(response_rx) = pending_refill else {
+        return;
+    };
+    if let Ok(response) = response_rx.blocking_recv()
+        && let Some(lease) = response.lease
+        && !lease.works.is_empty()
+    {
+        let _ = send_owned_batch(
+            event_tx,
+            Vec::new(),
+            lease.works,
+            weaver_nntp::blocking::BlockingLaneStats::default(),
+        );
+    }
 }
 
 fn take_unrequested_tail(

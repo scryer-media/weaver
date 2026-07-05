@@ -751,10 +751,7 @@ unsafe fn decode_kernel_avx512_vbmi2(
     search_end: bool,
 ) -> Result<KernelOutcome, YencError> {
     unsafe {
-        // The AVX2 line-aware driver applies to this tier too: VBMI2 implies
-        // AVX2, and anything the line fast path declines still routes through
-        // this tier's own block fn.
-        decode_kernel_simd64_avx2_line_aware(
+        decode_kernel_simd64_vbmi2_line_aware(
             input,
             output,
             state,
@@ -1405,24 +1402,27 @@ unsafe fn try_decode_avx512_vbmi2_block(
         return Ok(None);
     }
 
-    let a = unsafe { _mm256_loadu_si256(input.as_ptr().add(src) as *const __m256i) };
-    let b = unsafe { _mm256_loadu_si256(input.as_ptr().add(src + 32) as *const __m256i) };
+    // Full-width 512-bit window: compares land directly in k-registers as the
+    // u64 bit masks the scalar logic wants (no movemask/combine), the escape
+    // offsets are one masked blend, and compaction is a single vpcompressb.
+    let v = unsafe { _mm512_loadu_si512(input.as_ptr().add(src) as *const _) };
     let Some((esc_first, dot0)) =
         x86_block_entry_flags(input, src, state.state, dot_unstuffing, search_end)
     else {
         return Ok(None);
     };
-    let specials = unsafe { avx2_special_mask64(a, b) };
 
+    let eq = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'=' as i8));
+    let cr = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\r' as i8));
+    let lf = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8));
+    let specials = eq | cr | lf;
+
+    let sub42 = _mm512_set1_epi8(42i8.wrapping_neg());
     if specials == 0 && !dot0 && !esc_first {
-        let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
-        let decoded_a = _mm256_add_epi8(a, sub42);
-        let decoded_b = _mm256_add_epi8(b, sub42);
         unsafe {
-            _mm256_storeu_si256(output.as_mut_ptr().add(*dst) as *mut __m256i, decoded_a);
-            _mm256_storeu_si256(
-                output.as_mut_ptr().add(*dst + 32) as *mut __m256i,
-                decoded_b,
+            _mm512_storeu_si512(
+                output.as_mut_ptr().add(*dst) as *mut _,
+                _mm512_add_epi8(v, sub42),
             );
         }
         *dst += 64;
@@ -1430,46 +1430,23 @@ unsafe fn try_decode_avx512_vbmi2_block(
         return Ok(Some(64));
     }
 
-    let eq = if specials != 0 {
-        unsafe { avx2_mask64(a, b, b'=') }
-    } else {
-        0
-    };
     let esc_first = esc_first as u64;
     let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
     let escaped = (fixed_eq << 1) | esc_first;
     let entry_line_start = (state.state == DecoderState::CrLf) as u64;
 
-    let (cr, raw_cr, raw_breaks, crlf, line_start, dot_start) = if specials == eq {
-        (
-            0,
-            0,
-            0,
-            0,
-            entry_line_start,
-            if dot_unstuffing {
-                x86_dot_start_mask(input, src, entry_line_start, escaped)
-            } else {
-                0
-            },
-        )
+    let raw_cr = cr & !escaped;
+    let raw_lf = lf & !escaped;
+    let raw_breaks = raw_cr | raw_lf;
+    // NNTP line boundaries exist in the raw stream even when yEnc escaped
+    // the '\r', so pair detection uses the unmasked '\r' bits.
+    let pair_cr = if dot_unstuffing { cr } else { raw_cr };
+    let crlf = pair_cr & (lf >> 1);
+    let line_start = entry_line_start | (crlf << 2);
+    let dot_start = if dot_unstuffing {
+        x86_dot_start_mask(input, src, line_start, escaped)
     } else {
-        let cr = unsafe { avx2_mask64(a, b, b'\r') };
-        let lf = specials & !eq & !cr;
-        let raw_cr = cr & !escaped;
-        let raw_lf = lf & !escaped;
-        let raw_breaks = raw_cr | raw_lf;
-        // NNTP line boundaries exist in the raw stream even when yEnc escaped
-        // the '\r', so pair detection uses the unmasked '\r' bits.
-        let pair_cr = if dot_unstuffing { cr } else { raw_cr };
-        let crlf = pair_cr & (lf >> 1);
-        let line_start = entry_line_start | (crlf << 2);
-        let dot_start = if dot_unstuffing {
-            x86_dot_start_mask(input, src, line_start, escaped)
-        } else {
-            0
-        };
-        (cr, raw_cr, raw_breaks, crlf, line_start, dot_start)
+        0
     };
 
     let dot_before_break = dot_start & (raw_breaks >> 1);
@@ -1480,25 +1457,28 @@ unsafe fn try_decode_avx512_vbmi2_block(
     }
 
     let skip = fixed_eq | raw_breaks | dot_start;
-    let (decoded_a, decoded_b) = unsafe { avx2_decode_with_escape_mask(a, b, escaped) };
+    let sub106 = _mm512_set1_epi8(106i8.wrapping_neg());
+    let decoded = _mm512_add_epi8(v, _mm512_mask_mov_epi8(sub42, escaped, sub106));
 
     if skip == 0 {
-        unsafe {
-            _mm256_storeu_si256(output.as_mut_ptr().add(*dst) as *mut __m256i, decoded_a);
-            _mm256_storeu_si256(
-                output.as_mut_ptr().add(*dst + 32) as *mut __m256i,
-                decoded_b,
-            );
-        }
+        unsafe { _mm512_storeu_si512(output.as_mut_ptr().add(*dst) as *mut _, decoded) };
         *dst += 64;
         state.state = DecoderState::None;
         return Ok(Some(64));
     }
 
-    unsafe { compact_store_32_avx512_vbmi2(decoded_a, (!skip & 0xffff_ffff) as u32, output, dst) };
+    // The entry check guarantees 64 spare output bytes, so the full-width
+    // compressed store is always in bounds; bytes past `keep` are overwritten
+    // by the next store.
+    let keep = !skip;
     unsafe {
-        compact_store_32_avx512_vbmi2(decoded_b, ((!skip >> 32) & 0xffff_ffff) as u32, output, dst)
-    };
+        _mm512_storeu_si512(
+            output.as_mut_ptr().add(*dst) as *mut _,
+            _mm512_maskz_compress_epi8(keep, decoded),
+        );
+    }
+    *dst += keep.count_ones() as usize;
+
     state.state = x86_final_state_after_block(
         fixed_eq,
         dot_start,
@@ -1724,26 +1704,6 @@ unsafe fn avx2_mask64(
     let mask_a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, needle)) as u32 as u64;
     let mask_b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, needle)) as u32 as u64;
     mask_a | (mask_b << 32)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f")]
-unsafe fn compact_store_32_avx512_vbmi2(
-    decoded: std::arch::x86_64::__m256i,
-    keep_mask: u32,
-    output: &mut [u8],
-    dst: &mut usize,
-) {
-    use std::arch::x86_64::*;
-
-    // The caller guarantees 64 spare output bytes per block, so both stores
-    // can write a full 32-byte vector; bytes past `keep` are overwritten by
-    // the next store.
-    debug_assert!(output.len().saturating_sub(*dst) >= 32);
-    let keep = keep_mask.count_ones() as usize;
-    let packed = _mm256_maskz_compress_epi8(keep_mask, decoded);
-    unsafe { _mm256_storeu_si256(output.as_mut_ptr().add(*dst) as *mut __m256i, packed) };
-    *dst += keep;
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2467,6 +2427,197 @@ unsafe fn try_decode_ssse3_line(
                 let group_skip = ((skip >> (group * 16)) & 0xffff) as u16;
                 unsafe { compact_store_16_ssse3(decoded, group_skip, output, dst) };
             }
+        }
+
+        esc_first = (fixed_eq & LAST != 0) as u64;
+    }
+
+    debug_assert_eq!(esc_first, 0);
+    state.state = DecoderState::CrLf;
+    Ok(Some(line_length + 2))
+}
+
+/// AVX-512/VBMI2 twin of [`decode_kernel_simd64_avx2_line_aware`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2")]
+unsafe fn decode_kernel_simd64_vbmi2_line_aware(
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut KernelState,
+    dot_unstuffing: bool,
+    preserve_pending: bool,
+    search_end: bool,
+    block: DecodeBlock64,
+) -> Result<KernelOutcome, YencError> {
+    const WIDTH: usize = 64;
+
+    let mut src = 0usize;
+    let mut dst = 0usize;
+    let mode = DecodeStepMode {
+        dot_unstuffing,
+        preserve_pending,
+        search_end,
+    };
+    let tail_buffer = if dot_unstuffing {
+        WIDTH - 1 + 4
+    } else {
+        WIDTH - 1
+    };
+    let simd_limit = input.len().saturating_sub(tail_buffer);
+
+    if input.len() > WIDTH * 2 {
+        while (!search_end || state.end == DecodeEnd::None) && src + WIDTH <= simd_limit {
+            if state.line_length.is_some()
+                && let Some(consumed) = unsafe {
+                    try_decode_avx512_vbmi2_line(
+                        input,
+                        src,
+                        output,
+                        &mut dst,
+                        state,
+                        dot_unstuffing,
+                        search_end,
+                        simd_limit,
+                    )?
+                }
+            {
+                src += consumed;
+                continue;
+            }
+
+            if let Some(consumed) = unsafe {
+                block(
+                    input,
+                    src,
+                    output,
+                    &mut dst,
+                    state,
+                    dot_unstuffing,
+                    search_end,
+                )?
+            } {
+                src += consumed;
+                continue;
+            }
+
+            if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+                break;
+            }
+        }
+    }
+
+    while (!search_end || state.end == DecodeEnd::None) && src < input.len() {
+        if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+            break;
+        }
+    }
+
+    Ok(KernelOutcome {
+        consumed: src,
+        written: dst,
+        end: state.end.into(),
+    })
+}
+
+/// AVX-512/VBMI2 twin of [`try_decode_avx2_line`]: same guards and bail
+/// conditions, one 512-bit vector per 64-byte chunk with k-register masks and
+/// full-width vpcompressb compaction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn try_decode_avx512_vbmi2_line(
+    input: &[u8],
+    src: usize,
+    output: &mut [u8],
+    dst: &mut usize,
+    state: &mut KernelState,
+    dot_unstuffing: bool,
+    search_end: bool,
+    simd_limit: usize,
+) -> Result<Option<usize>, YencError> {
+    use std::arch::x86_64::*;
+
+    const WIDTH: usize = 64;
+    const MAX_LINE_CHUNKS: usize = 16;
+    const LAST: u64 = 1u64 << 63;
+
+    let Some(line_length) = state.line_length else {
+        return Ok(None);
+    };
+    if state.state != DecoderState::CrLf
+        || line_length < WIDTH
+        || line_length % WIDTH != 0
+        || line_length / WIDTH > MAX_LINE_CHUNKS
+    {
+        return Ok(None);
+    }
+
+    let line_end = src.saturating_add(line_length);
+    let after_crlf = line_end.saturating_add(2);
+    if after_crlf > input.len() || after_crlf > simd_limit {
+        return Ok(None);
+    }
+    if input[line_end] != b'\r' || input[line_end + 1] != b'\n' {
+        return Ok(None);
+    }
+    if dot_unstuffing && input[src] == b'.' {
+        return Ok(None);
+    }
+    if search_end && dot_unstuffing && input[src] == b'=' && input[src + 1] == b'y' {
+        return Ok(None);
+    }
+    if input[line_end - 1] == b'=' || output.len().saturating_sub(*dst) < line_length {
+        return Ok(None);
+    }
+
+    let chunks = line_length / WIDTH;
+    let mut eq_masks = [0u64; MAX_LINE_CHUNKS];
+    for (chunk_idx, eq_slot) in eq_masks.iter_mut().take(chunks).enumerate() {
+        let v = unsafe { _mm512_loadu_si512(input.as_ptr().add(src + chunk_idx * WIDTH) as *const _) };
+        let crlf = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\r' as i8))
+            | _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8));
+        if crlf != 0 {
+            return Ok(None);
+        }
+        *eq_slot = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'=' as i8));
+    }
+
+    let mut preflight_esc_first = 0u64;
+    for &eq in eq_masks.iter().take(chunks) {
+        let fixed_eq = fix_eq_mask(eq, (eq << 1) | preflight_esc_first);
+        preflight_esc_first = (fixed_eq & LAST != 0) as u64;
+    }
+    if preflight_esc_first != 0 {
+        return Ok(None);
+    }
+
+    let sub42 = _mm512_set1_epi8(42i8.wrapping_neg());
+    let sub106 = _mm512_set1_epi8(106i8.wrapping_neg());
+    let mut esc_first = 0u64;
+    for (chunk_idx, &eq) in eq_masks.iter().take(chunks).enumerate() {
+        let v = unsafe { _mm512_loadu_si512(input.as_ptr().add(src + chunk_idx * WIDTH) as *const _) };
+        let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+        let escaped = (fixed_eq << 1) | esc_first;
+        let skip = fixed_eq;
+
+        if skip == 0 && escaped == 0 {
+            unsafe {
+                _mm512_storeu_si512(
+                    output.as_mut_ptr().add(*dst) as *mut _,
+                    _mm512_add_epi8(v, sub42),
+                );
+            }
+            *dst += WIDTH;
+        } else {
+            let decoded = _mm512_add_epi8(v, _mm512_mask_mov_epi8(sub42, escaped, sub106));
+            let keep = !skip;
+            unsafe {
+                _mm512_storeu_si512(
+                    output.as_mut_ptr().add(*dst) as *mut _,
+                    _mm512_maskz_compress_epi8(keep, decoded),
+                );
+            }
+            *dst += keep.count_ones() as usize;
         }
 
         esc_first = (fixed_eq & LAST != 0) as u64;

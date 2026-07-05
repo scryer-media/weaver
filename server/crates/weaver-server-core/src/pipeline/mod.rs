@@ -1483,6 +1483,9 @@ pub struct Pipeline {
     pub(super) job_transport_profiles: HashMap<JobId, JobTransportProfile>,
     /// Runtime-only lane/proof state for BODY dispatch.
     pub(super) download_lane_runtime: DownloadLaneRuntimeState,
+    /// Lane refill requests held under hard download pressure, answered as the
+    /// backlog drains so lanes resume without a park/redispatch round-trip.
+    pub(super) deferred_lane_refills: VecDeque<DownloadLaneRefillRequest>,
     /// User-enabled over-max burst budget for latent-IP replacement trials.
     pub(super) ip_replacement_trial_extra_connections: u8,
     /// Bounded per-server/per-IP BODY RTT EWMA state.

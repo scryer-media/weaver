@@ -49,8 +49,10 @@ fn configured_rar_max_dict_bytes() -> u64 {
 
 /// Apply the server's decode limits to a freshly opened archive.
 fn apply_server_rar_limits(archive: &mut weaver_unrar::RarArchive) {
-    let mut limits = weaver_unrar::Limits::default();
-    limits.max_dict_size = configured_rar_max_dict_bytes();
+    let limits = weaver_unrar::Limits {
+        max_dict_size: configured_rar_max_dict_bytes(),
+        ..Default::default()
+    };
     archive.set_limits(limits);
 }
 

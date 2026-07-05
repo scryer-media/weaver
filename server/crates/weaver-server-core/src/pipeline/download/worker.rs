@@ -45,6 +45,7 @@ const SOFT_PRESSURE_DISPATCH_MAX_DELAY: Duration = Duration::from_millis(150);
 const SOFT_PRESSURE_DISPATCH_MIN_DELAY: Duration = Duration::from_millis(1);
 const SAB_BODY_PIPELINE_DEPTH: usize = 2;
 const HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
+const HOT_SOFT_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 16;
 const HOT_DISPATCH_WARMUP_MIN_DURATION: Duration = Duration::from_secs(2);
 const HOT_DISPATCH_FORCE_UNDERFILL_AFTER: Duration = Duration::from_secs(5);
 const HOT_DISPATCH_MIN_SUCCESSFUL_PRIMARY_BODIES: u64 = 24;
@@ -1603,7 +1604,23 @@ impl Pipeline {
             compatibility,
             first,
             pressure,
+            false,
         )))
+    }
+
+    /// Soft pressure must not strip an established lane of its proven pipeline
+    /// depth on refill: sequential-mode batches add a full round-trip per body,
+    /// which costs more than the backlog it protects. The reduced refill runway
+    /// (see `download_lane_lease_work_limit`) is the soft-pressure throttle.
+    fn refill_mode_pressure(pressure: DownloadPressure) -> DownloadPressure {
+        if pressure.state == DownloadPressureState::Soft {
+            DownloadPressure {
+                state: DownloadPressureState::Clear,
+                ..pressure
+            }
+        } else {
+            pressure
+        }
     }
 
     fn try_lease_refill_download_batch(
@@ -1612,7 +1629,11 @@ impl Pipeline {
         compatibility: DownloadBatchCompatibility,
         pressure: DownloadPressure,
     ) -> Result<Option<DownloadBatchLease>, DispatchAttempt> {
-        let lane_mode = self.choose_download_lane_mode(job_id, compatibility.is_recovery, pressure);
+        let lane_mode = self.choose_download_lane_mode(
+            job_id,
+            compatibility.is_recovery,
+            Self::refill_mode_pressure(pressure),
+        );
         let Some(first) = self.pop_download_work_for_batch(job_id, Some(&compatibility)) else {
             return Ok(None);
         };
@@ -1626,6 +1647,7 @@ impl Pipeline {
             compatibility,
             first,
             pressure,
+            true,
         )))
     }
 
@@ -1702,8 +1724,9 @@ impl Pipeline {
         compatibility: DownloadBatchCompatibility,
         first: DownloadWork,
         pressure: DownloadPressure,
+        refill: bool,
     ) -> DownloadBatchLease {
-        let work_limit = self.download_lane_lease_work_limit(job_id, lane_mode, pressure);
+        let work_limit = self.download_lane_lease_work_limit(job_id, lane_mode, pressure, refill);
         let cap_for_restart_durable_lead = self.should_cap_lease_for_restart_durable_lead(job_id);
         let mut leased_undurable_bytes = if first.is_recovery {
             0
@@ -1738,8 +1761,16 @@ impl Pipeline {
             }
         }
 
-        let server_modes =
-            self.download_lane_server_modes(job_id, compatibility.is_recovery, pressure);
+        let server_modes_pressure = if refill {
+            Self::refill_mode_pressure(pressure)
+        } else {
+            pressure
+        };
+        let server_modes = self.download_lane_server_modes(
+            job_id,
+            compatibility.is_recovery,
+            server_modes_pressure,
+        );
         DownloadBatchLease {
             job_id,
             lane_mode,
@@ -1755,9 +1786,21 @@ impl Pipeline {
         job_id: JobId,
         lane_mode: DownloadLaneMode,
         pressure: DownloadPressure,
+        refill: bool,
     ) -> usize {
-        if pressure.state == DownloadPressureState::Clear && self.hot_dispatch_job == Some(job_id) {
-            return HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT.max(lane_mode.max_depth());
+        if self.hot_dispatch_job == Some(job_id) {
+            match pressure.state {
+                DownloadPressureState::Clear => {
+                    return HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT.max(lane_mode.max_depth());
+                }
+                // Refills keep an established lane fed with a reduced runway while the
+                // backlog drains; initial dispatch under soft pressure stays a minimal
+                // probe because it adds a new connection to an already-loaded pipeline.
+                DownloadPressureState::Soft if refill => {
+                    return HOT_SOFT_PRESSURE_LANE_LEASE_WORK_LIMIT.max(lane_mode.max_depth());
+                }
+                DownloadPressureState::Soft | DownloadPressureState::Hard => {}
+            }
         }
         lane_mode.max_depth()
     }
@@ -3161,6 +3204,11 @@ impl Pipeline {
                 stats,
                 ack,
             } => {
+                // Ack on receipt: the lane only needs delivery confirmation for
+                // backpressure, not completion of per-result ingest. Holding
+                // the ack through ingest serialized every lane behind this
+                // loop at batch boundaries and stalled all downloads at once.
+                let _ = ack.send(());
                 crate::runtime::perf_probe::record_value(
                     "download.owned_lane.batch.results",
                     results.len() as u64,
@@ -3204,7 +3252,6 @@ impl Pipeline {
                 for work in unrequested_works {
                     self.restore_owned_lane_unrequested_work(work);
                 }
-                let _ = ack.send(());
             }
         }
     }
@@ -4073,10 +4120,25 @@ impl Pipeline {
         }
 
         let pressure = self.refresh_download_pressure();
-        if allow_refill && pressure.state != DownloadPressureState::Clear {
-            self.hot_share_yield_signal.clear();
-            allow_refill = false;
-            park_reason = LaneParkReason::Pressure;
+        // Soft pressure shrinks the lease (see download_lane_lease_work_limit) instead of
+        // idling the lane. Hard pressure holds the request until the backlog drains: the
+        // lane blocks on its oneshot either way, and answering on the pressure transition
+        // avoids a park/redispatch round-trip per stall.
+        if allow_refill && pressure.state == DownloadPressureState::Hard {
+            self.deferred_lane_refills.push_back(DownloadLaneRefillRequest {
+                job_id,
+                server_idx,
+                remote_ip,
+                supports_pipelining,
+                current_mode,
+                spillover_loan_kind,
+                compatibility,
+                response_tx,
+            });
+            self.metrics
+                .download_lane_refill_deferred_total
+                .fetch_add(1, Ordering::Relaxed);
+            return;
         }
 
         if allow_refill {

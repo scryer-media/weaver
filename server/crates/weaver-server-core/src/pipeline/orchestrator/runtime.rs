@@ -104,6 +104,7 @@ impl Pipeline {
             hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
             job_transport_profiles: HashMap::new(),
             download_lane_runtime: DownloadLaneRuntimeState::default(),
+            deferred_lane_refills: std::collections::VecDeque::new(),
             ip_replacement_trial_extra_connections,
             ip_rtt_ewma: HashMap::new(),
             ip_replacement_retired_ips: HashSet::new(),
