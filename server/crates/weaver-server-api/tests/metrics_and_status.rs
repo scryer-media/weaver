@@ -92,6 +92,7 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         download_lane_lease_items_total: 0,
         download_lane_refill_granted_total: 0,
         download_lane_refill_parked_total: 0,
+        download_lane_refill_deferred_total: 0,
         download_pipeline_trial_success_total: 0,
         download_pipeline_trial_failure_total: 0,
         download_pipeline_proof_pass_total: 0,

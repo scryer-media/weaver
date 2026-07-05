@@ -17,6 +17,13 @@ use crate::args::{Cli, Command};
 
 const LOG_FILE_ENV: &str = "WEAVER_LOG_FILE";
 
+// musl's bundled allocator serializes multi-threaded allocation heavily; the
+// container (musl) builds swap in mimalloc. glibc/macOS builds keep the
+// system allocator.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all().thread_stack_size(8 * 1024 * 1024); // 8 MB - pipeline futures are large

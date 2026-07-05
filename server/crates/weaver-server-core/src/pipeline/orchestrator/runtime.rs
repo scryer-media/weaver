@@ -614,6 +614,9 @@ impl Pipeline {
                     }
                     _ = metrics_snapshot_interval.tick() => {
                         self.shared_state.refresh_metrics_snapshot();
+                        // Fallback wake for refills held under hard pressure, in
+                        // case the backlog drained without a download event.
+                        self.maybe_service_deferred_lane_refills();
                     }
                     _ = rate_sleep, if !rate_delay.is_zero() => {}
                     _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {}
@@ -795,6 +798,9 @@ impl Pipeline {
     }
 
     pub(crate) async fn drain(&mut self) {
+        // Unblock lanes waiting on deferred refills so they can finish their
+        // batches and exit; dropping the senders answers them with an error.
+        self.deferred_lane_refills.clear();
         self.drain_inflight_download_and_decode_work().await;
         self.flush_quiescent_write_backlog().await;
 

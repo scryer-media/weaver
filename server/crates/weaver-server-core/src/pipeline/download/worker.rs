@@ -45,7 +45,6 @@ const SOFT_PRESSURE_DISPATCH_MAX_DELAY: Duration = Duration::from_millis(150);
 const SOFT_PRESSURE_DISPATCH_MIN_DELAY: Duration = Duration::from_millis(1);
 const SAB_BODY_PIPELINE_DEPTH: usize = 2;
 const HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
-const HOT_SOFT_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 16;
 const HOT_DISPATCH_WARMUP_MIN_DURATION: Duration = Duration::from_secs(2);
 const HOT_DISPATCH_FORCE_UNDERFILL_AFTER: Duration = Duration::from_secs(5);
 const HOT_DISPATCH_MIN_SUCCESSFUL_PRIMARY_BODIES: u64 = 24;
@@ -1793,11 +1792,14 @@ impl Pipeline {
                 DownloadPressureState::Clear => {
                     return HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT.max(lane_mode.max_depth());
                 }
-                // Refills keep an established lane fed with a reduced runway while the
-                // backlog drains; initial dispatch under soft pressure stays a minimal
-                // probe because it adds a new connection to an already-loaded pipeline.
+                // Refills keep an established lane on its full runway under soft
+                // pressure; hard pressure is the flow control (those requests are
+                // deferred until the backlog drains, see
+                // handle_download_lane_refill_request). Initial dispatch under soft
+                // pressure stays a minimal probe because it adds a new connection
+                // to an already-loaded pipeline.
                 DownloadPressureState::Soft if refill => {
-                    return HOT_SOFT_PRESSURE_LANE_LEASE_WORK_LIMIT.max(lane_mode.max_depth());
+                    return HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT.max(lane_mode.max_depth());
                 }
                 DownloadPressureState::Soft | DownloadPressureState::Hard => {}
             }
@@ -4073,6 +4075,28 @@ impl Pipeline {
         self.publish_hot_dispatch_metrics(Instant::now());
     }
 
+    /// Answer refill requests that were held under hard download pressure.
+    /// Called from the backlog-drain paths and the periodic metrics tick; the
+    /// empty-queue check keeps it free on the hot path.
+    pub(crate) fn maybe_service_deferred_lane_refills(&mut self) {
+        if self.deferred_lane_refills.is_empty() {
+            return;
+        }
+        if self.refresh_download_pressure().state == DownloadPressureState::Hard {
+            return;
+        }
+        let mut pending = std::mem::take(&mut self.deferred_lane_refills);
+        while let Some(request) = pending.pop_front() {
+            self.handle_download_lane_refill_request(request);
+            if !self.deferred_lane_refills.is_empty() {
+                // Granting re-latched hard pressure and the handler re-deferred
+                // this request; stop and keep the rest queued in arrival order.
+                break;
+            }
+        }
+        self.deferred_lane_refills.append(&mut pending);
+    }
+
     pub(crate) fn handle_download_lane_refill_request(
         &mut self,
         request: DownloadLaneRefillRequest,
@@ -4125,16 +4149,17 @@ impl Pipeline {
         // lane blocks on its oneshot either way, and answering on the pressure transition
         // avoids a park/redispatch round-trip per stall.
         if allow_refill && pressure.state == DownloadPressureState::Hard {
-            self.deferred_lane_refills.push_back(DownloadLaneRefillRequest {
-                job_id,
-                server_idx,
-                remote_ip,
-                supports_pipelining,
-                current_mode,
-                spillover_loan_kind,
-                compatibility,
-                response_tx,
-            });
+            self.deferred_lane_refills
+                .push_back(DownloadLaneRefillRequest {
+                    job_id,
+                    server_idx,
+                    remote_ip,
+                    supports_pipelining,
+                    current_mode,
+                    spillover_loan_kind,
+                    compatibility,
+                    response_tx,
+                });
             self.metrics
                 .download_lane_refill_deferred_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -4348,6 +4373,7 @@ impl Pipeline {
     pub(crate) async fn handle_download_done(&mut self, result: DownloadResult) {
         self.release_download_result(&result);
         self.process_download_done(result).await;
+        self.maybe_service_deferred_lane_refills();
     }
 
     pub(crate) fn released_download_result_lead_bytes(result: &DownloadResult) -> u64 {
@@ -4407,6 +4433,7 @@ impl Pipeline {
         let lead_bytes = Self::released_download_result_lead_bytes(&result);
         self.process_download_done(result).await;
         self.finish_released_download_result_processing(job_id, lead_bytes);
+        self.maybe_service_deferred_lane_refills();
     }
 
     pub(crate) async fn process_download_done(&mut self, result: DownloadResult) {
