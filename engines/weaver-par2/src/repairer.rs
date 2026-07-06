@@ -507,11 +507,12 @@ impl Par2Repairer {
             &repair.staged_file_ids,
         );
         // Only staged files changed on disk; everything else keeps its
-        // analyze-phase verification. Staged files are re-verified from
-        // disk (full-hash semantics unchanged), one rayon task per file.
-        // A damaged file that somehow escaped staging keeps its Damaged
-        // analyze entry and fails the gate below, so the merge fails
-        // closed.
+        // analyze-phase verification. Staged files are fully read back and
+        // verified slice-by-slice against IFSC (spans in parallel — the
+        // serial whole-file MD5 chain was the last single-thread pass of a
+        // single-file repair). A damaged file that somehow escaped staging
+        // keeps its Damaged analyze entry and fails the gate below, so the
+        // merge fails closed.
         let staged_ids: Vec<FileId> = state
             .set
             .recovery_file_ids
@@ -520,7 +521,7 @@ impl Par2Repairer {
             .copied()
             .collect();
         let post_staged =
-            verify::verify_selected_file_ids_parallel(&state.set, &repaired_access, &staged_ids);
+            verify::verify_repaired_file_ids_parallel(&state.set, &repaired_access, &staged_ids);
         let post = verify::merge_verification_results(&state.set, &verification, post_staged);
         if post.total_missing_blocks > 0
             || !post
@@ -1277,6 +1278,10 @@ impl RepairState {
         let hash_table = &self.hash_table;
         let slice_size = self.set.slice_size;
 
+        // Parallelism runs on exactly one axis: across candidates here, or
+        // inside a single candidate's scan — never both (nested fan-out
+        // measured as an intermittent worker stack overflow via rayon's
+        // steal-on-block recursion).
         let results = if candidates.len() > 1 && rayon::current_num_threads() > 1 {
             candidates
                 .par_iter()
@@ -1290,6 +1295,7 @@ impl RepairState {
                         baseline_blocks,
                         hash_table,
                         slice_size,
+                        false,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -1306,6 +1312,7 @@ impl RepairState {
                         baseline_blocks,
                         hash_table,
                         slice_size,
+                        true,
                     )
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -1328,6 +1335,7 @@ impl RepairState {
         baseline_blocks: &[SourceBlock],
         hash_table: &VerificationHashTable,
         slice_size: u64,
+        inner_parallel: bool,
     ) -> Result<CandidateScanResult> {
         let path = &candidate.path;
         let kind = candidate.kind;
@@ -1414,6 +1422,7 @@ impl RepairState {
                     skip_data: options.scan_skip_data,
                     skip_leeway: options.scan_skip_leeway,
                 },
+                inner_parallel,
                 options.cancel.as_ref(),
             )?
         } else {
@@ -1864,44 +1873,50 @@ impl RepairState {
             Ok(())
         };
 
-        // The intact block copies run serially AHEAD of reconstruction.
-        // Overlapping them was measured as a net loss on heavily damaged
-        // sets: the ~GB-scale copy dirties page cache and competes for
-        // memory bandwidth with the DRAM-sensitive GF16 compute, costing
-        // more wall than the copy it hides.
-        copy_block_ranges(&block_copy_ranges)?;
-
-        let mut bytes_reconstructed = 0u64;
-        if verification.total_missing_blocks > 0 {
-            let mut access = RepairExecutionAccess::new(
-                install_dir.clone(),
-                &self.files,
-                &self.blocks,
-                &staged_file_ids,
-                self.set.slice_size,
-            )?;
-            let plan =
-                plan_repair_with_memory_limit(&self.set, verification, options.memory_limit)?;
-            bytes_reconstructed = plan
-                .missing_slices
-                .iter()
-                .filter_map(|(file_id, local)| {
-                    if let Some(idx) = self.block_index_by_file_slice.get(&(*file_id, *local)) {
-                        return Some(self.blocks[*idx].expected_len);
-                    }
-                    self.set.file_description(file_id).map(|desc| {
-                        let offset = *local as u64 * self.set.slice_size;
-                        desc.length.saturating_sub(offset).min(self.set.slice_size)
+        let reconstruct = || -> Result<u64> {
+            let mut bytes_reconstructed = 0u64;
+            if verification.total_missing_blocks > 0 {
+                let mut access = RepairExecutionAccess::new(
+                    install_dir.clone(),
+                    &self.files,
+                    &self.blocks,
+                    &staged_file_ids,
+                    self.set.slice_size,
+                )?;
+                let plan =
+                    plan_repair_with_memory_limit(&self.set, verification, options.memory_limit)?;
+                bytes_reconstructed = plan
+                    .missing_slices
+                    .iter()
+                    .filter_map(|(file_id, local)| {
+                        if let Some(idx) = self.block_index_by_file_slice.get(&(*file_id, *local)) {
+                            return Some(self.blocks[*idx].expected_len);
+                        }
+                        self.set.file_description(file_id).map(|desc| {
+                            let offset = *local as u64 * self.set.slice_size;
+                            desc.length.saturating_sub(offset).min(self.set.slice_size)
+                        })
                     })
-                })
-                .sum();
-            let repair_options = RepairOptions {
-                cancel: options.cancel.clone(),
-                progress: options.progress.clone(),
-                memory_limit: options.memory_limit,
-            };
-            execute_repair_with_options(&plan, &self.set, &mut access, &repair_options)?;
-        }
+                    .sum();
+                let repair_options = RepairOptions {
+                    cancel: options.cancel.clone(),
+                    progress: options.progress.clone(),
+                    memory_limit: options.memory_limit,
+                };
+                execute_repair_with_options(&plan, &self.set, &mut access, &repair_options)?;
+            }
+            Ok(bytes_reconstructed)
+        };
+
+        // The intact block copies run serially AHEAD of reconstruction:
+        // overlapping the two was measured twice as no better — first as a
+        // net loss (page-cache dirtying plus memory-bandwidth competition
+        // with the GF16 compute), then as noise-level even after the
+        // L1-resident compute tiles and the in-kernel copy changed the
+        // contention profile. The copy is not the bottleneck; keep it
+        // simple and ordered.
+        copy_block_ranges(&block_copy_ranges)?;
+        let bytes_reconstructed = reconstruct()?;
 
         Ok(RepairInstall {
             install_dir,
@@ -2514,6 +2529,7 @@ impl<'a> RollingBlockScanner<'a> {
             target_file,
             &mut state,
             scan_options,
+            true,
             None,
         )?;
         state.apply_to_blocks(blocks);
@@ -2529,15 +2545,20 @@ impl<'a> RollingBlockScanner<'a> {
         target_file: &SourceFileEntry,
         blocks: &mut ScanBlockState<'_>,
         scan_options: ScanSkipOptions,
+        inner_parallel: bool,
         cancel: Option<&CancellationToken>,
     ) -> Result<FileScanStats> {
         // Skip-data sampling is stateful and intentionally lossy, so it keeps
-        // the serial scanner; single-thread pools do too. The parallel scan
-        // stays opt-in until it clears its measured speed/RSS gate (see
-        // ordered_scan_parallel_enabled).
+        // the serial scanner; single-thread pools do too. `inner_parallel`
+        // is false when the caller is already fanning out across candidate
+        // files: parallelism runs on exactly one axis, because nesting the
+        // per-file fan-out inside the per-candidate fan-out lets a blocked
+        // worker steal other files' whole scan frames onto one stack —
+        // measured as an intermittent worker stack overflow on 16-file sets.
         if scan_options.skip_data
             || ordered_scan_force_serial()
             || !ordered_scan_parallel_enabled()
+            || !inner_parallel
             || rayon::current_num_threads() <= 1
         {
             return self.scan_file_ordered_canonical_serial(
@@ -3420,16 +3441,17 @@ fn ordered_scan_force_serial() -> bool {
     *FORCE_SERIAL
 }
 
-/// The parallel ordered scan is opt-in. Its first cut (whole-file mmap +
-/// padded-lane MD5 batching) measured ~1.4x slower than the serial cursor on
-/// a 2 GB damaged set while holding the entire file resident; it has since
-/// been reworked onto bounded buffered reads and single-shot MD5. It stays
-/// opt-in until it clears the recorded damaged-verify speed/RSS gate, at
-/// which point the default flips here.
+/// The parallel ordered scan is the default. Its first cut (whole-file
+/// mmap + padded-lane MD5 batching) measured slower than the serial cursor
+/// at 40x the memory and was made opt-in; the rework onto bounded buffered
+/// reads and single-shot MD5 then passed the recorded gate on the x86 box
+/// (damaged 2 GB verify: parallel 5.44 s / 81 MB max RSS vs serial 7.10 s /
+/// 53 MB), flipping the default here. `WEAVER_PAR2_PARALLEL_SCAN=0`
+/// disables it; `WEAVER_PAR2_SERIAL_SCAN=1` remains the hard force.
 fn ordered_scan_parallel_enabled() -> bool {
     static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var(ORDERED_SCAN_PARALLEL_ENV)
-            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        !std::env::var(ORDERED_SCAN_PARALLEL_ENV)
+            .is_ok_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
     });
     *ENABLED
 }

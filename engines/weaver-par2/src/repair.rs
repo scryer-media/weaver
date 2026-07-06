@@ -639,17 +639,6 @@ const COMPUTE_TILE_BYTES: usize = 4 * 1024;
 /// iterate every source per destination pass and so tolerate larger strips.
 const STREAM_STRIP_BYTES: usize = 32 * 1024;
 
-/// Experiment gate: warm the next output row's destination tile while the
-/// current row computes, covering the row-switch lines the in-row prefetch
-/// distance cannot. Off by default so baselines are unaffected; set
-/// `WEAVER_PAR2_PREFETCH_NEXT_TILE=1` to A/B on hardware.
-fn prefetch_next_tile_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("WEAVER_PAR2_PREFETCH_NEXT_TILE").is_some_and(|v| v == "1")
-    })
-}
-
 /// 64-byte-aligned backing for the folded staging streams so every 32-byte
 /// block sits cache-line aligned.
 #[repr(C, align(64))]
@@ -928,7 +917,6 @@ fn run_stream_batch_compute(
             };
             let output_block = outputs_n.div_ceil(blocks_per_tile).max(1);
             let task_count = tiles * blocks_per_tile;
-            let prefetch_next = prefetch_next_tile_enabled();
             (0..task_count).into_par_iter().for_each(|task| {
                 let tile = task / blocks_per_tile;
                 let block = task % blocks_per_tile;
@@ -941,16 +929,6 @@ fn run_stream_batch_compute(
                     .map(|g| &staging_bytes(&set.staging[g])[s0 * stride..s1 * stride])
                     .collect();
                 for (j, output_ptr) in output_ptrs.iter().copied().enumerate().take(j1).skip(j0) {
-                    if prefetch_next && j + 1 < j1 {
-                        // Safe: s0..s1 is in bounds for every output region,
-                        // and prefetch only hints the cache.
-                        unsafe {
-                            crate::gf_simd::prefetch_write_hint(
-                                (output_ptrs[j + 1] as *const u8).add(s0),
-                                (s1 - s0).min(256),
-                            );
-                        }
-                    }
                     // Safe: (tile, output) ranges have exactly one writer —
                     // tiles partition the region, output blocks partition the
                     // outputs, and batches are processed sequentially.
@@ -1549,6 +1527,124 @@ fn reconstruct_and_write_grouped_inputs(
     Ok(())
 }
 
+/// Optional Apple-GPU arm of the streaming compute. All platform gating
+/// lives here: on non-macOS builds every method is a no-op and the CPU
+/// path runs unchanged; on macOS a session engages only when a Metal
+/// device is present and the repair is large enough to amortize dispatch
+/// (see `weaver_reed_solomon::metal_gf16`). Any GPU error permanently
+/// disables the arm and the caller redoes the affected chunk on the CPU.
+struct GpuComputeArm {
+    #[cfg(target_os = "macos")]
+    session: Option<weaver_reed_solomon::metal_gf16::MetalGf16Session>,
+}
+
+impl GpuComputeArm {
+    #[cfg(target_os = "macos")]
+    fn engage(use_folded: bool, outputs: usize, max_byte_len: usize, effective_bytes: u64) -> Self {
+        // The folded path is x86-only, so `!use_folded` is the macOS shape;
+        // the guard keeps the invariant explicit.
+        let session = (!use_folded)
+            .then(|| {
+                weaver_reed_solomon::metal_gf16::MetalGf16Session::try_new(
+                    outputs,
+                    max_byte_len,
+                    effective_bytes,
+                )
+            })
+            .flatten();
+        if let Some(session) = &session {
+            info!(
+                device = %session.device_name(),
+                outputs,
+                "metal gf16 tier engaged for streaming repair"
+            );
+        }
+        Self { session }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn engage(
+        _use_folded: bool,
+        _outputs: usize,
+        _max_byte_len: usize,
+        _effective_bytes: u64,
+    ) -> Self {
+        Self {}
+    }
+
+    /// True when the GPU owns this chunk's accumulation.
+    fn begin_chunk(&mut self, _byte_len: usize) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(session) = self.session.as_mut() {
+                match session.begin_chunk(_byte_len) {
+                    Ok(()) => return true,
+                    Err(reason) => {
+                        warn!(reason, "metal gf16 begin_chunk failed; using CPU path");
+                        self.session = None;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Queue one source batch. `Err` means the GPU arm died mid-chunk and
+    /// the caller must redo the chunk on the CPU.
+    fn accumulate(
+        &mut self,
+        _set: &StreamBatchSet,
+        _plan: &RepairPlan,
+        _byte_len: usize,
+    ) -> std::result::Result<(), ()> {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(session) = self.session.as_mut() else {
+                return Err(());
+            };
+            let srcs: Vec<&[u8]> = _set.bufs[.._set.len]
+                .iter()
+                .map(|buf| &buf[.._byte_len])
+                .collect();
+            let matrix = &_plan.input_factors;
+            let start = _set.start;
+            if let Err(reason) = session.accumulate(&srcs, |j, s| matrix.get(j, start + s)) {
+                warn!(reason, "metal gf16 accumulate failed; redoing chunk on CPU");
+                self.session = None;
+                return Err(());
+            }
+            return Ok(());
+        }
+        #[allow(unreachable_code)]
+        Err(())
+    }
+
+    /// Drain the chunk's dispatches into the output rows.
+    fn finish_chunk(
+        &mut self,
+        _rows: &mut [Vec<u8>],
+        _byte_len: usize,
+    ) -> std::result::Result<(), ()> {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(session) = self.session.as_mut() else {
+                return Err(());
+            };
+            if let Err(reason) = session.finish_chunk(_rows) {
+                warn!(
+                    reason,
+                    "metal gf16 finish_chunk failed; redoing chunk on CPU"
+                );
+                self.session = None;
+                return Err(());
+            }
+            return Ok(());
+        }
+        #[allow(unreachable_code)]
+        Err(())
+    }
+}
+
 fn execute_repair_streaming(
     plan: &RepairPlan,
     par2_set: &Par2FileSet,
@@ -1587,6 +1683,10 @@ fn execute_repair_streaming(
         StreamBatchSet::new(max_byte_len, use_folded),
         StreamBatchSet::new(max_byte_len, use_folded),
     ];
+    let effective_bytes = (n as u64)
+        .saturating_mul(total_sources as u64)
+        .saturating_mul(plan.slice_size);
+    let mut gpu = GpuComputeArm::engage(use_folded, n, max_byte_len, effective_bytes);
 
     info!(
         missing_slices = n,
@@ -1596,7 +1696,8 @@ fn execute_repair_streaming(
         "repairing with streamed chunk path"
     );
 
-    for chunk_idx in 0..total_chunks_usize {
+    let mut chunk_idx = 0usize;
+    while chunk_idx < total_chunks_usize {
         check_cancel(options)?;
 
         let chunk_start = chunk_idx * chunk_words;
@@ -1612,9 +1713,13 @@ fn execute_repair_streaming(
             })
             .collect();
 
-        // Batched source loop with read/compute overlap: while a batch's
-        // multiply runs on the rayon pool, the caller thread fills the other
-        // buffer set with the next batch's source chunks.
+        // Batched source loop with read/compute overlap. CPU path: the
+        // batch's multiply runs on the rayon pool while the caller thread
+        // fills the other buffer set. GPU path: dispatches are queued
+        // asynchronously, so the caller thread fills the next batch while
+        // the GPU computes; a GPU failure redoes this whole chunk on the
+        // CPU (destinations are re-zeroed at the top of the loop).
+        let gpu_chunk = gpu.begin_chunk(byte_len);
         let batch_count = total_sources.div_ceil(STREAM_INPUT_BATCH);
         fill_stream_batch(
             &mut batch_sets[0],
@@ -1630,6 +1735,7 @@ fn execute_repair_streaming(
             use_folded,
             options,
         )?;
+        let mut gpu_failed = false;
         for batch_idx in 0..batch_count {
             check_cancel(options)?;
             let (set_a, set_b) = batch_sets.split_at_mut(1);
@@ -1640,19 +1746,11 @@ fn execute_repair_streaming(
             };
 
             let mut read_result: Result<()> = Ok(());
-            rayon::in_place_scope(|scope| {
-                let output_ptrs = &output_ptrs;
-                let memo = &memo;
-                scope.spawn(move |_| {
-                    run_stream_batch_compute(
-                        output_ptrs,
-                        current,
-                        plan,
-                        memo,
-                        byte_len,
-                        use_folded,
-                    );
-                });
+            if gpu_chunk {
+                if gpu.accumulate(current, plan, byte_len).is_err() {
+                    gpu_failed = true;
+                    break;
+                }
                 if batch_idx + 1 < batch_count {
                     let next_start = (batch_idx + 1) * STREAM_INPUT_BATCH;
                     let next_len = STREAM_INPUT_BATCH.min(total_sources - next_start);
@@ -1671,8 +1769,49 @@ fn execute_repair_streaming(
                         options,
                     );
                 }
-            });
+            } else {
+                rayon::in_place_scope(|scope| {
+                    let output_ptrs = &output_ptrs;
+                    let memo = &memo;
+                    scope.spawn(move |_| {
+                        run_stream_batch_compute(
+                            output_ptrs,
+                            current,
+                            plan,
+                            memo,
+                            byte_len,
+                            use_folded,
+                        );
+                    });
+                    if batch_idx + 1 < batch_count {
+                        let next_start = (batch_idx + 1) * STREAM_INPUT_BATCH;
+                        let next_len = STREAM_INPUT_BATCH.min(total_sources - next_start);
+                        read_result = fill_stream_batch(
+                            next,
+                            plan,
+                            par2_set,
+                            file_access,
+                            &mut recovery_files,
+                            available_inputs,
+                            next_start,
+                            next_len,
+                            byte_start,
+                            byte_len,
+                            use_folded,
+                            options,
+                        );
+                    }
+                });
+            }
             read_result?;
+        }
+        if gpu_chunk && !gpu_failed && gpu.finish_chunk(&mut chunk_output, byte_len).is_err() {
+            gpu_failed = true;
+        }
+        if gpu_failed {
+            // The arm is disabled; redo this chunk from batch zero on the
+            // CPU path.
+            continue;
         }
 
         if use_folded {
@@ -1710,6 +1849,7 @@ fn execute_repair_streaming(
                 total_bytes: Some(operation_total_bytes),
             });
         }
+        chunk_idx += 1;
     }
 
     info!("streaming repair complete: {} slices restored", n);

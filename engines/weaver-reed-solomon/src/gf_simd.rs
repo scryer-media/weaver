@@ -548,27 +548,6 @@ unsafe fn split_encode_scatter_avx2(src: &[u8], staging: &mut [u8], lane: usize,
     }
 }
 
-/// Hint an upcoming read-modify-write region toward cache. No-op outside
-/// x86_64. `ptr` may be unaligned; the prefetch itself never faults.
-///
-/// # Safety
-/// `ptr..ptr + len` must lie within one allocation (pointer arithmetic
-/// requirement); the memory may be concurrently written by other threads.
-#[inline]
-pub unsafe fn prefetch_write_hint(ptr: *const u8, len: usize) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        use std::arch::x86_64::{_MM_HINT_ET1, _mm_prefetch};
-        let mut line = 0usize;
-        while line < len {
-            _mm_prefetch::<{ _MM_HINT_ET1 }>(ptr.add(line) as *const i8);
-            line += 64;
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = (ptr, len);
-}
-
 /// Zero affine matrices: multiplying through them contributes nothing, which
 /// lets partially filled groups run the uniform six-wide kernel.
 pub const ZERO_AFFINE: AffineMulMatrices = AffineMulMatrices {

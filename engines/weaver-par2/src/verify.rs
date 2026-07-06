@@ -15,6 +15,8 @@ const VERIFY_SIMD_BATCH_MEMORY_BYTES: usize = 4 * 1024 * 1024;
 const VERIFY_SIMD_MAX_LANES: usize = 4;
 const QUICK_CHECK_16K_BYTES: usize = 16 * 1024;
 const VERIFY_FULL_HASH_CHUNK_BYTES: usize = 1024 * 1024;
+/// Read span per task for slice-parallel staged-file verification.
+const VERIFY_SPAN_TARGET_BYTES: usize = 4 * 1024 * 1024;
 
 /// Abstraction for file I/O during verification and repair.
 pub trait FileAccess {
@@ -764,8 +766,138 @@ pub fn verify_selected_file_ids_parallel(
         .par_iter()
         .map(|file_id| verify_selected_file_ids(par2, access, std::slice::from_ref(file_id)))
         .collect();
+    combine_partial_results(par2, partials)
+}
 
-    let mut files = Vec::with_capacity(file_ids.len());
+/// Post-repair verification for staged files: every byte is read back and
+/// checked against its IFSC slice checksum (MD5 + CRC32, tail padded),
+/// with slice spans verified concurrently. Coverage matches the serial
+/// full-hash pipeline — these are the same per-slice checksums that gate
+/// block reuse during scanning — but the whole-file MD5 chain (inherently
+/// serial) is replaced by slice-parallel hashing, so a repaired multi-GB
+/// file verifies at read speed. `Complete` from slice proof is sound here
+/// because a staged file's identity is definitional (the repair just built
+/// it from the set's own layout); the scanner's stricter full-MD5 rule
+/// exists to establish identity of found files, not to re-check content.
+/// Files without IFSC data or with zero length take the serial single-file
+/// pipeline, full-file MD5 included.
+pub fn verify_repaired_file_ids_parallel(
+    par2: &Par2FileSet,
+    access: &(dyn FileAccess + Sync),
+    file_ids: &[FileId],
+) -> VerificationResult {
+    use rayon::prelude::*;
+    // Parallelism runs on exactly one axis: across files when there are
+    // several, across a lone file's slice spans otherwise. Nesting the span
+    // fan-out inside the file fan-out lets a blocked worker steal other
+    // files' verification frames onto one stack — the same steal-on-block
+    // recursion that overflowed worker stacks in the candidate scanner.
+    let span_parallel = file_ids.len() == 1;
+    let partials: Vec<VerificationResult> = file_ids
+        .par_iter()
+        .map(|file_id| {
+            verify_repaired_file_sliced(par2, access, file_id, span_parallel).unwrap_or_else(|| {
+                verify_selected_file_ids(par2, access, std::slice::from_ref(file_id))
+            })
+        })
+        .collect();
+    combine_partial_results(par2, partials)
+}
+
+/// Slice-level readback verification of one staged file. Returns `None`
+/// when the file cannot take this path (no description, no or incomplete
+/// IFSC, zero length, or a length mismatch) — the caller falls back to the
+/// serial pipeline.
+fn verify_repaired_file_sliced(
+    par2: &Par2FileSet,
+    access: &(dyn FileAccess + Sync),
+    file_id: &FileId,
+    span_parallel: bool,
+) -> Option<VerificationResult> {
+    use rayon::prelude::*;
+    let desc = par2.file_description(file_id)?;
+    let checksums = par2.file_checksums(file_id)?;
+    let slice_size = par2.slice_size;
+    if desc.length == 0 || slice_size == 0 {
+        return None;
+    }
+    let expected_slices = bounded_slice_count(par2, desc.length)?;
+    if expected_slices == 0 || checksums.len() != expected_slices {
+        return None;
+    }
+    if access.file_length(file_id) != Some(desc.length) {
+        return None;
+    }
+
+    let span_slices =
+        ((VERIFY_SPAN_TARGET_BYTES as u64 / slice_size).max(1) as usize).min(expected_slices);
+    let spans: Vec<(usize, usize)> = (0..expected_slices)
+        .step_by(span_slices)
+        .map(|start| (start, span_slices.min(expected_slices - start)))
+        .collect();
+    let check_span = |&(start, count): &(usize, usize)| -> Vec<bool> {
+        let offset = start as u64 * slice_size;
+        let want = (desc.length - offset).min(count as u64 * slice_size);
+        let Ok(data) = access.read_file_range(file_id, offset, want) else {
+            return vec![false; count];
+        };
+        if data.len() as u64 != want {
+            return vec![false; count];
+        }
+        (0..count)
+            .map(|index| {
+                let lo = (index as u64 * slice_size).min(want) as usize;
+                let hi = ((index as u64 + 1) * slice_size).min(want) as usize;
+                let mut state = checksum::SliceChecksumState::new();
+                state.update(&data[lo..hi]);
+                let (crc32, md5) = state.finalize(Some(slice_size));
+                let expected = &checksums[start + index];
+                crc32 == expected.crc32 && md5 == expected.md5
+            })
+            .collect()
+    };
+    let per_span: Vec<Vec<bool>> = if span_parallel {
+        spans.par_iter().map(check_span).collect()
+    } else {
+        spans.iter().map(check_span).collect()
+    };
+
+    let valid_slices: Vec<bool> = per_span.concat();
+    let damaged = valid_slices.iter().filter(|valid| !**valid).count() as u32;
+    let status = if damaged == 0 {
+        FileStatus::Complete
+    } else {
+        FileStatus::Damaged(damaged)
+    };
+    let files = vec![FileVerification {
+        file_id: *file_id,
+        filename: desc.filename.clone(),
+        status,
+        valid_slices,
+        missing_slice_count: damaged,
+    }];
+    let recovery_blocks_available = par2.recovery_block_count();
+    let repairable = repairability_for_result_with_resource_limit(
+        &files,
+        damaged,
+        recovery_blocks_available,
+        None,
+    );
+    Some(VerificationResult {
+        files,
+        recovery_blocks_available,
+        total_missing_blocks: damaged,
+        repairable,
+    })
+}
+
+/// Fold per-file verification results into one set-level result, summing
+/// totals and reassessing repairability once over the combined files.
+fn combine_partial_results(
+    par2: &Par2FileSet,
+    partials: Vec<VerificationResult>,
+) -> VerificationResult {
+    let mut files = Vec::with_capacity(partials.len());
     let mut total_missing_blocks = 0u32;
     let mut resource_limit_reason = None;
     for partial in partials {
