@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use semver::Version;
@@ -150,6 +151,8 @@ struct WingetArgs {
 
 #[derive(Args)]
 struct ServeArgs {
+    #[arg(long, help = "Reset the dev SQLite database before starting Weaver")]
+    clean: bool,
     target: Option<String>,
 }
 
@@ -2427,7 +2430,65 @@ fn load_state_encryption_key(path: &Path) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
-    Ok(Some(fs::read_to_string(path)?.replace(['\r', '\n'], "")))
+    let key = fs::read_to_string(path)?
+        .replace(['\r', '\n'], "")
+        .trim()
+        .to_string();
+    Ok((!key.is_empty()).then_some(key))
+}
+
+fn ensure_state_encryption_key(key_path: &Path, db_path: &Path) -> Result<String> {
+    if let Ok(env_key) = std::env::var("WEAVER_ENCRYPTION_KEY") {
+        let env_key = env_key.trim().to_string();
+        if !env_key.is_empty() {
+            return Ok(env_key);
+        }
+    }
+
+    if let Some(key) = load_state_encryption_key(key_path)? {
+        return Ok(key);
+    }
+
+    if db_path.exists() {
+        bail!(
+            "dev state database exists at {} but no encryption key was found at {}; set \
+             WEAVER_ENCRYPTION_KEY to the original key or rerun with `cargo xtask serve --clean` \
+             to rebuild the dev database",
+            db_path.display(),
+            key_path.display()
+        );
+    }
+
+    let mut key_bytes = [0u8; 32];
+    getrandom::fill(&mut key_bytes).context("failed to generate dev encryption key")?;
+    let key = BASE64_STANDARD.encode(key_bytes);
+    if let Some(parent) = key_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(key_path, format!("{key}\n"))
+        .with_context(|| format!("failed to write {}", key_path.display()))?;
+    Ok(key)
+}
+
+fn reset_serve_database(db_path: &Path) -> Result<()> {
+    let cleanup_targets = [
+        db_path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", db_path.display())),
+        PathBuf::from(format!("{}-shm", db_path.display())),
+    ];
+
+    step(format!(
+        "Removing xtask serve database files under {}",
+        db_path.display()
+    ));
+    for path in cleanup_targets {
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+    ok("xtask serve database reset");
+    Ok(())
 }
 
 fn ensure_frontend_dependencies(ctx: &TaskContext, web_dir: &Path) -> Result<()> {
@@ -2470,31 +2531,29 @@ fn seed_runtime_dirs(db_path: &Path, data_dir: &Path) -> Result<()> {
 
 fn bootstrap_state_dir(
     ctx: &TaskContext,
+    backend_binary: &Path,
     state_dir: &Path,
     backend_port: u16,
     backend_log: &Path,
     encryption_key: Option<&str>,
-    rustflags: &str,
 ) -> Result<()> {
     if state_dir.join("weaver.db").exists() {
         return Ok(());
     }
 
-    println!("==> Bootstrapping dev state in {}", state_dir.display());
+    step(format!(
+        "Bootstrapping dev state in {}",
+        state_dir.display()
+    ));
     let log = OpenOptions::new()
         .create(true)
         .append(true)
         .open(backend_log)?;
     let log_err = log.try_clone()?;
-    let mut child = ctx.command_in("cargo", &ctx.repo_root);
+    let mut child = ctx.command(backend_binary);
     child
         .env("RUST_LOG", "warn")
-        .env("RUSTFLAGS", rustflags)
         .args([
-            "run",
-            "-p",
-            "weaver",
-            "--",
             "--config",
             &state_dir.display().to_string(),
             "serve",
@@ -2579,19 +2638,14 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     fs::write(&backend_log, "")?;
     fs::create_dir_all(&state_dir)?;
 
-    let encryption_key = load_state_encryption_key(&state_key_file)?;
-    bootstrap_state_dir(
-        ctx,
-        &state_dir,
-        backend_port,
-        &backend_log,
-        encryption_key.as_deref(),
-        &local_rustflags,
-    )?;
-    let encryption_key = load_state_encryption_key(&state_key_file)?;
-    seed_runtime_dirs(&state_dir.join("weaver.db"), &data_dir)?;
+    let db_path = state_dir.join("weaver.db");
+    if args.clean {
+        reset_serve_database(&db_path)?;
+    }
 
-    println!("==> Building Weaver backend...");
+    let encryption_key = ensure_state_encryption_key(&state_key_file, &db_path)?;
+    step("Building Weaver backend");
+    println!("   Rust build: cargo build --locked -p weaver");
     let mut build = ctx.command_in("cargo", &ctx.repo_root);
     build
         .env("WEAVER_ENABLE_DIAGNOSTICS", &diagnostics_enabled)
@@ -2599,10 +2653,25 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     build.args(["build", "--locked", "-p", "weaver"]);
     run_checked(&mut build)?;
 
-    println!(
-        "==> Starting Weaver backend from {} on :{backend_port}",
+    bootstrap_state_dir(
+        ctx,
+        &backend_binary,
+        &state_dir,
+        backend_port,
+        &backend_log,
+        Some(encryption_key.as_str()),
+    )?;
+    seed_runtime_dirs(&db_path, &data_dir)?;
+
+    step(format!(
+        "Starting Weaver backend from {} on :{backend_port}",
         backend_binary.display()
-    );
+    ));
+    println!("   Vite dev server: {frontend_url}");
+    println!("   Vite file watch: polling={vite_use_polling} interval_ms={vite_poll_interval}");
+    println!("   State: {}", state_dir.display());
+    println!("   Data: {}", data_dir.display());
+    println!("   Diagnostics enabled: {diagnostics_enabled}");
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -2621,9 +2690,7 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         ])
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
-    if let Some(key) = encryption_key.as_deref() {
-        backend.env("WEAVER_ENCRYPTION_KEY", key);
-    }
+    backend.env("WEAVER_ENCRYPTION_KEY", &encryption_key);
     let mut backend = backend.spawn()?;
     let backend_pid = backend.id();
     let backend_signal_forwarder = install_backend_signal_forwarder(backend_pid)?;
@@ -2642,8 +2709,6 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     println!("    State:    {}", state_dir.display());
     println!("    Data:     {}", data_dir.display());
     println!("    Log:      tail -f {}", backend_log.display());
-    println!("    Diagnostics enabled: {diagnostics_enabled}");
-    println!("    Vite file watch: polling={vite_use_polling} interval_ms={vite_poll_interval}");
     println!();
     println!("==> Starting Vite dev server with live updates...");
 
@@ -2894,9 +2959,7 @@ mod tests {
         assert!(manifest.contains("PackageIdentifier: ScryerMedia.Weaver"));
         assert!(manifest.contains("Publisher: Scryer Media"));
         assert!(manifest.contains("PackageName: Weaver"));
-        assert!(manifest.contains(
-            "License: GPL-3.0-or-later with UnRAR restriction"
-        ));
+        assert!(manifest.contains("License: GPL-3.0-or-later with UnRAR restriction"));
         assert!(manifest.contains("Moniker: weaver-usenet"));
         assert!(manifest.contains(
             "ReleaseNotesUrl: https://github.com/scryer-media/weaver/releases/tag/weaver-v0.6.6"

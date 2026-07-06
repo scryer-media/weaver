@@ -39,6 +39,11 @@ fn db_err(error: impl std::fmt::Display) -> StateError {
     StateError::Database(error.to_string())
 }
 
+/// Session-level advisory lock key serializing concurrent Postgres migrators
+/// (ASCII "weaver"). A session lock is connection-bound, so it is held on a
+/// dedicated pinned connection for the whole migration sequence.
+const WEAVER_MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x7765_6176_6572;
+
 pub(crate) async fn replay_catalog_into_fresh_db(
     pool: &PgPool,
     catalog: &CompiledMigrationCatalog,
@@ -82,29 +87,64 @@ pub(crate) async fn replay_catalog_into_fresh_db(
 pub(crate) async fn run_migrations(pool: &PgPool, mode: MigrationMode) -> Result<(), StateError> {
     let catalog = crate::schema_migrations::embedded_catalog()?;
 
-    if !matches!(mode, MigrationMode::ValidateOnly) {
-        ensure_migration_ledger_shape(pool).await?;
-    }
-
-    let applied = load_applied_migrations(pool).await?;
-    validate_known_migrations(&applied, &catalog)?;
-    let pending = list_pending_migrations_from_applied(&applied, &catalog);
-    if pending.is_empty() {
-        if !matches!(mode, MigrationMode::ValidateOnly) {
-            mirror_schema_version_to_latest_successful_migration(pool).await?;
-        }
-        return Ok(());
-    }
-
+    // Validation is read-only: no ledger DDL, no advisory lock, no mutation.
     if matches!(mode, MigrationMode::ValidateOnly) {
+        let applied = load_applied_migrations(pool).await?;
+        validate_known_migrations(&applied, &catalog)?;
+        let pending = list_pending_migrations_from_applied(&applied, &catalog);
+        if pending.is_empty() {
+            return Ok(());
+        }
         return Err(StateError::Database(format!(
             "database migration check failed; pending PostgreSQL migrations: {}",
             pending.join(", ")
         )));
     }
 
+    ensure_migration_ledger_shape(pool).await?;
+
+    // Serialize concurrent migrators. A session-level advisory lock is bound to
+    // its connection, so pin one connection and hold the lock across the whole
+    // sequence (individual steps still `pool.begin()` on other connections; the
+    // lock only blocks a second migrator). Release on every exit path.
+    let mut lock_conn = pool.acquire().await.map_err(db_err)?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(WEAVER_MIGRATION_ADVISORY_LOCK_KEY)
+        .execute(&mut *lock_conn)
+        .await
+        .map_err(db_err)?;
+
+    let result = run_migrations_locked(pool, &catalog).await;
+
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(WEAVER_MIGRATION_ADVISORY_LOCK_KEY)
+        .execute(&mut *lock_conn)
+        .await;
+    drop(lock_conn);
+
+    result
+}
+
+/// The mutating migration sequence, run while holding the advisory lock. The
+/// ledger is re-read here (after the lock is acquired) so a migrator that waited
+/// on the lock observes the winner's completed work and no-ops.
+async fn run_migrations_locked(
+    pool: &PgPool,
+    catalog: &CompiledMigrationCatalog,
+) -> Result<(), StateError> {
+    let applied = load_applied_migrations(pool).await?;
+    validate_known_migrations(&applied, catalog)?;
+    let pending = list_pending_migrations_from_applied(&applied, catalog);
+    if pending.is_empty() {
+        mirror_schema_version_to_latest_successful_migration(pool).await?;
+        return Ok(());
+    }
+
     let install_kind = detect_install_kind(pool, &applied).await?;
     let payload_bytes = crate::schema_migrations::embedded_payload_bytes()?;
+    // Parity with the SQLite runner: reject a corrupted/mismatched embedded
+    // payload before applying any step that slices into it.
+    crate::schema_migrations::validate_payload_checksum(catalog, &payload_bytes)?;
     match install_kind {
         MigrationInstallKind::FreshInstall => {
             let target_version = catalog.max_version();
@@ -115,10 +155,10 @@ pub(crate) async fn run_migrations(pool: &PgPool, mode: MigrationMode) -> Result
                         "missing PostgreSQL baseline through {target_version:04}"
                     ))
                 })?;
-            apply_postgres_baseline(pool, &catalog, &payload_bytes, baseline).await?;
+            apply_postgres_baseline(pool, catalog, &payload_bytes, baseline).await?;
             apply_version_range(
                 pool,
-                &catalog,
+                catalog,
                 &payload_bytes,
                 MigrationInstallKind::FreshInstall,
                 baseline.through_version + 1,
@@ -129,7 +169,7 @@ pub(crate) async fn run_migrations(pool: &PgPool, mode: MigrationMode) -> Result
         MigrationInstallKind::Upgrade => {
             apply_version_range(
                 pool,
-                &catalog,
+                catalog,
                 &payload_bytes,
                 MigrationInstallKind::Upgrade,
                 1,

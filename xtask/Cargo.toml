@@ -10,6 +10,7 @@ anyhow = { version = "1", default-features = false, features = ["std"] }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { workspace = true, features = ["derive"] }
+getrandom = { workspace = true }
 semver = { version = "1", default-features = false, features = ["std"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

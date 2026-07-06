@@ -282,7 +282,10 @@ impl Pipeline {
                     self.nntp = Arc::new(*new_client);
                     // Server indices and retention windows may have changed:
                     // recompute retention and drop queued failure exclusions,
-                    // whose indices refer to the old pool layout.
+                    // whose indices refer to the old pool layout. Bumping the
+                    // generation also invalidates the failure indices carried by
+                    // in-flight delayed retries when they re-enter the queue.
+                    self.pool_generation = self.pool_generation.wrapping_add(1);
                     self.clear_retention_exclude_cache();
                     for state in self.jobs.values_mut() {
                         state.download_queue.clear_exclude_servers();

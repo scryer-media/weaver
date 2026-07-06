@@ -123,7 +123,17 @@ async fn get_or_create_jwt_signing_secret_tx(
         SqlTx::Sqlite(_) => "SELECT value FROM settings WHERE key = {}",
     };
     if let Some(stored) = select_jwt_signing_secret_tx(tx, select_sql).await? {
-        let secret = decode_stored_jwt_signing_secret(&stored, encryption_key)?;
+        let secret = match decode_stored_jwt_signing_secret(&stored, encryption_key) {
+            Ok(secret) => secret,
+            Err(error) if is_encrypted(&stored) && encryption_key.is_some() => {
+                tracing::warn!(
+                    %error,
+                    "rotating JWT signing secret after decrypt failure; existing login sessions will be invalidated"
+                );
+                rotate_jwt_signing_secret_tx(tx, encryption_key).await?
+            }
+            Err(error) => return Err(error),
+        };
         if !is_encrypted(&stored) && encryption_key.is_some() {
             persist_jwt_signing_secret_tx(tx, &secret, encryption_key).await?;
         }
@@ -266,6 +276,33 @@ mod tests {
             .unwrap();
         let err = db.get_or_create_jwt_signing_secret().unwrap_err();
         assert!(err.to_string().contains("invalid JWT signing secret"));
+    }
+
+    #[test]
+    fn encrypted_jwt_signing_secret_with_wrong_key_is_rotated() {
+        let db = Database::open_in_memory().unwrap();
+        let stale_secret = [7u8; 32];
+        let wrong_key = crate::persistence::encryption::EncryptionKey::generate();
+        let stale_stored = crate::persistence::encryption::encrypt_value(
+            &wrong_key,
+            &encode_jwt_secret(&stale_secret),
+        )
+        .unwrap();
+        db.set_setting(JWT_SIGNING_SECRET_SETTING_KEY, &stale_stored)
+            .unwrap();
+
+        let rotated = db.get_or_create_jwt_signing_secret().unwrap();
+        assert_ne!(rotated, stale_secret);
+
+        let stored = db
+            .get_setting(JWT_SIGNING_SECRET_SETTING_KEY)
+            .unwrap()
+            .unwrap();
+        assert!(crate::persistence::encryption::is_encrypted(&stored));
+        assert_eq!(
+            decode_stored_jwt_signing_secret(&stored, db.encryption_key()).unwrap(),
+            rotated
+        );
     }
 
     #[test]

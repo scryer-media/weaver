@@ -5,7 +5,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use weaver_server_api::auth::CallerIdentity;
 
@@ -172,12 +172,41 @@ pub(super) async fn lookup_api_key_auth(
     Ok(Some(cached))
 }
 
+/// Debounce interval for `api_keys.last_used_at` writes. *arr pollers hit the
+/// API every few seconds; persisting a timestamp that granular is pointless and
+/// on Postgres it is a write round-trip + WAL flush per request.
+const API_KEY_TOUCH_MIN_INTERVAL_MS: i64 = 60_000;
+const API_KEY_TOUCH_MAX_KEYS: usize = 4096;
+
+fn api_key_touch_throttle() -> &'static Mutex<HashMap<i64, i64>> {
+    static THROTTLE: OnceLock<Mutex<HashMap<i64, i64>>> = OnceLock::new();
+    THROTTLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 pub(super) fn queue_touch_api_key_last_used(db: &Database, id: i64) {
-    let db_touch = db.clone();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
+
+    {
+        let mut throttle = api_key_touch_throttle()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(&last) = throttle.get(&id)
+            && now.saturating_sub(last) < API_KEY_TOUCH_MIN_INTERVAL_MS
+        {
+            return;
+        }
+        // The set of key ids is tiny in practice; this cap only guards against
+        // pathological churn.
+        if throttle.len() >= API_KEY_TOUCH_MAX_KEYS && !throttle.contains_key(&id) {
+            throttle.clear();
+        }
+        throttle.insert(id, now);
+    }
+
+    let db_touch = db.clone();
     tokio::task::spawn_blocking(move || {
         let _ = db_touch.touch_api_key_last_used(id, now);
     });

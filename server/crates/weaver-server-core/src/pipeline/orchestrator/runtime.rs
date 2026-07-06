@@ -159,6 +159,7 @@ impl Pipeline {
             decode_done_rx,
             retry_tx,
             retry_rx,
+            pool_generation: 0,
             probe_result_tx,
             probe_result_rx,
             extract_done_tx,
@@ -616,8 +617,8 @@ impl Pipeline {
                     Some(done) = self.move_done_rx.recv() => {
                         self.handle_move_to_complete_done(done);
                     }
-                    Some(work) = self.retry_rx.recv() => {
-                        self.requeue_retry_work(work);
+                    Some(retry) = self.retry_rx.recv() => {
+                        self.receive_retry_work(retry);
                     }
                     _ = metrics_snapshot_interval.tick() => {
                         self.sample_phase_progress();
@@ -779,6 +780,33 @@ impl Pipeline {
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
+    }
+
+    /// Re-enter a delayed retry into the download queue, dropping stale server
+    /// exclusions if the NNTP pool was rebuilt between scheduling and re-entry.
+    ///
+    /// `exclude_servers` holds pool indices computed under the generation the
+    /// retry was scheduled in. A `RebuildNntp` bumps `pool_generation` and can
+    /// reshape the pool (shrink/grow/reorder), so those indices may now point at
+    /// a different server — excluding the wrong one, or even falsely satisfying
+    /// the fill-servers-exhausted gate and spilling onto backfill. When the
+    /// generation no longer matches we discard the exclusions and let the retry
+    /// fall back to a clean attempt; retention excludes are recomputed fresh
+    /// from the new pool at order time, so nothing durable is lost.
+    pub(crate) fn receive_retry_work(&mut self, retry: crate::pipeline::RetryWork) {
+        let mut work = retry.work;
+        if retry.scheduled_pool_generation != self.pool_generation
+            && !work.exclude_servers.is_empty()
+        {
+            debug!(
+                segment = %work.segment_id,
+                scheduled_generation = retry.scheduled_pool_generation,
+                current_generation = self.pool_generation,
+                "dropping stale server exclusions on retry after NNTP pool rebuild"
+            );
+            work.exclude_servers.clear();
+        }
+        self.requeue_retry_work(work);
     }
 
     pub(crate) fn requeue_retry_work(&mut self, work: DownloadWork) {

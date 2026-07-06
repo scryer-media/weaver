@@ -1496,47 +1496,53 @@ impl Database {
         let set_name = set_name.to_string();
         let headers = headers.to_vec();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "save_archive_headers", |tx| {
-                let set_name = set_name.clone();
-                let headers = headers.clone();
-                Box::pin(async move {
-                    let sql = match tx {
-                        SqlTx::Postgres(_) => {
-                            "INSERT INTO active_archive_headers (job_id, set_name, headers)
+            let args = [
+                SqlArg::I64(job_id.0 as i64),
+                SqlArg::Text(set_name),
+                SqlArg::Bytes(headers),
+                SqlArg::I64(job_id.0 as i64),
+            ];
+            let affected = match datastore.engine() {
+                // The statement already guards itself with FOR KEY SHARE, so run
+                // it as a single autocommit statement instead of wrapping it in a
+                // redundant BEGIN/COMMIT round-trip.
+                SqlEngine::Postgres => {
+                    SqlRuntime::execute(
+                        datastore.read_exec(),
+                        "INSERT INTO active_archive_headers (job_id, set_name, headers)
                          SELECT {}, {}, {}
                          FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_archive_headers_parent
                          ON CONFLICT(job_id, set_name) DO UPDATE SET headers = excluded.headers
-                         WHERE active_archive_headers.headers <> excluded.headers"
-                        }
-                        SqlTx::Sqlite(_) => {
-                            "INSERT INTO active_archive_headers (job_id, set_name, headers)
-                         SELECT {}, {}, {}
-                         WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
-                         ON CONFLICT(job_id, set_name) DO UPDATE SET headers = excluded.headers
-                         WHERE active_archive_headers.headers <> excluded.headers"
-                        }
-                    };
-                    let affected = tx
-                        .execute(
-                            sql,
-                            &[
-                                SqlArg::I64(job_id.0 as i64),
-                                SqlArg::Text(set_name),
-                                SqlArg::Bytes(headers),
-                                SqlArg::I64(job_id.0 as i64),
-                            ],
-                        )
-                        .await?;
-                    let label = if affected == 0 {
-                        "persistence.archive_headers.upsert.unchanged"
-                    } else {
-                        "persistence.archive_headers.upsert.changed"
-                    };
-                    crate::runtime::perf_probe::record(label, std::time::Duration::ZERO);
-                    Ok(())
-                })
-            })
-            .await
+                         WHERE active_archive_headers.headers <> excluded.headers",
+                        &args,
+                    )
+                    .await?
+                }
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "save_archive_headers", |tx| {
+                        let args = args.clone();
+                        Box::pin(async move {
+                            tx.execute(
+                                "INSERT INTO active_archive_headers (job_id, set_name, headers)
+                                 SELECT {}, {}, {}
+                                 WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                                 ON CONFLICT(job_id, set_name) DO UPDATE SET headers = excluded.headers
+                                 WHERE active_archive_headers.headers <> excluded.headers",
+                                &args,
+                            )
+                            .await
+                        })
+                    })
+                    .await?
+                }
+            };
+            let label = if affected == 0 {
+                "persistence.archive_headers.upsert.unchanged"
+            } else {
+                "persistence.archive_headers.upsert.changed"
+            };
+            crate::runtime::perf_probe::record(label, std::time::Duration::ZERO);
+            Ok(())
         })
     }
 
@@ -1571,50 +1577,53 @@ impl Database {
         let set_name = set_name.to_string();
         let facts_blob = facts_blob.to_vec();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "save_rar_volume_facts", |tx| {
-                let set_name = set_name.clone();
-                let facts_blob = facts_blob.clone();
-                Box::pin(async move {
-                    let sql = match tx {
-                        SqlTx::Postgres(_) => {
-                            "INSERT INTO active_rar_volume_facts
+            let args = [
+                SqlArg::I64(job_id.0 as i64),
+                SqlArg::Text(set_name),
+                SqlArg::I64(volume_index as i64),
+                SqlArg::Bytes(facts_blob),
+                SqlArg::I64(job_id.0 as i64),
+            ];
+            let affected = match datastore.engine() {
+                SqlEngine::Postgres => {
+                    SqlRuntime::execute(
+                        datastore.read_exec(),
+                        "INSERT INTO active_rar_volume_facts
                          (job_id, set_name, volume_index, facts_blob)
                          SELECT {}, {}, {}, {}
                          FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_rar_volume_facts_parent
                          ON CONFLICT(job_id, set_name, volume_index) DO UPDATE SET facts_blob = excluded.facts_blob
-                         WHERE active_rar_volume_facts.facts_blob <> excluded.facts_blob"
-                        }
-                        SqlTx::Sqlite(_) => {
-                            "INSERT INTO active_rar_volume_facts
-                         (job_id, set_name, volume_index, facts_blob)
-                         SELECT {}, {}, {}, {}
-                         WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
-                         ON CONFLICT(job_id, set_name, volume_index) DO UPDATE SET facts_blob = excluded.facts_blob
-                         WHERE active_rar_volume_facts.facts_blob <> excluded.facts_blob"
-                        }
-                    };
-                    let affected = tx
-                        .execute(
-                            sql,
-                            &[
-                                SqlArg::I64(job_id.0 as i64),
-                                SqlArg::Text(set_name),
-                                SqlArg::I64(volume_index as i64),
-                                SqlArg::Bytes(facts_blob),
-                                SqlArg::I64(job_id.0 as i64),
-                            ],
-                        )
-                        .await?;
-                    let label = if affected == 0 {
-                        "persistence.rar_volume_facts.upsert.unchanged"
-                    } else {
-                        "persistence.rar_volume_facts.upsert.changed"
-                    };
-                    crate::runtime::perf_probe::record(label, std::time::Duration::ZERO);
-                    Ok(())
-                })
-            })
-            .await
+                         WHERE active_rar_volume_facts.facts_blob <> excluded.facts_blob",
+                        &args,
+                    )
+                    .await?
+                }
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "save_rar_volume_facts", |tx| {
+                        let args = args.clone();
+                        Box::pin(async move {
+                            tx.execute(
+                                "INSERT INTO active_rar_volume_facts
+                                 (job_id, set_name, volume_index, facts_blob)
+                                 SELECT {}, {}, {}, {}
+                                 WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                                 ON CONFLICT(job_id, set_name, volume_index) DO UPDATE SET facts_blob = excluded.facts_blob
+                                 WHERE active_rar_volume_facts.facts_blob <> excluded.facts_blob",
+                                &args,
+                            )
+                            .await
+                        })
+                    })
+                    .await?
+                }
+            };
+            let label = if affected == 0 {
+                "persistence.rar_volume_facts.upsert.unchanged"
+            } else {
+                "persistence.rar_volume_facts.upsert.changed"
+            };
+            crate::runtime::perf_probe::record(label, std::time::Duration::ZERO);
+            Ok(())
         })
     }
 

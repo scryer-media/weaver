@@ -5181,7 +5181,8 @@ async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
     let work = pipeline
         .retry_rx
         .try_recv()
-        .expect("pool capacity miss should requeue without poisoning health");
+        .expect("pool capacity miss should requeue without poisoning health")
+        .work;
     assert_eq!(work.segment_id, segment_id);
     assert_eq!(work.retry_count, MAX_SEGMENT_RETRIES);
     assert_eq!(work.exclude_servers, vec![0]);
@@ -5255,7 +5256,8 @@ async fn body_lane_unavailable_at_retry_limit_requeues_without_article_failure()
     let work = pipeline
         .retry_rx
         .try_recv()
-        .expect("pre-BODY lane miss should requeue without consuming article retry budget");
+        .expect("pre-BODY lane miss should requeue without consuming article retry budget")
+        .work;
     assert_eq!(work.segment_id, segment_id);
     assert_eq!(work.retry_count, MAX_SEGMENT_RETRIES + 1);
     assert_eq!(work.exclude_servers, vec![0, 1]);
@@ -5320,7 +5322,8 @@ async fn excluded_source_not_found_retries_without_marking_health_failure() {
     let work = pipeline
         .retry_rx
         .try_recv()
-        .expect("excluded-source miss should requeue the segment");
+        .expect("excluded-source miss should requeue the segment")
+        .work;
     assert_eq!(work.exclude_servers, vec![0]);
     assert_eq!(work.retry_count, 1);
 }
@@ -5582,7 +5585,8 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
     let work = pipeline
         .retry_rx
         .try_recv()
-        .expect("source miss should requeue against another server");
+        .expect("source miss should requeue against another server")
+        .work;
     assert_eq!(work.exclude_servers, vec![0]);
     assert_eq!(work.retry_count, 0);
 }
@@ -9473,7 +9477,8 @@ async fn decode_failure_retries_excluding_actual_source_server() {
     let work = pipeline
         .retry_rx
         .try_recv()
-        .expect("decode failure should schedule a retry");
+        .expect("decode failure should schedule a retry")
+        .work;
     assert_eq!(work.exclude_servers, vec![0]);
 }
 
@@ -9594,7 +9599,8 @@ async fn streamed_decode_failure_retries_excluding_actual_source_server() {
     let work = pipeline
         .retry_rx
         .try_recv()
-        .expect("streamed decode failure should schedule a retry");
+        .expect("streamed decode failure should schedule a retry")
+        .work;
     assert_eq!(work.exclude_servers, vec![0]);
 }
 
@@ -16819,6 +16825,96 @@ async fn promoted_recovery_retry_reenters_dispatchable_queue() {
         .expect("promoted recovery retry should be dispatchable");
     assert_eq!(queued.segment_id, segment_id);
     assert_eq!(queued.priority, super::repair::PROMOTED_RECOVERY_PRIORITY);
+}
+
+#[tokio::test]
+async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40041);
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let segment_id = SegmentId {
+        file_id,
+        segment_number: 0,
+    };
+    let spec = JobSpec {
+        name: "Stale Exclusion Rebuild".to_string(),
+        password: None,
+        total_bytes: 128,
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: "payload.bin".to_string(),
+            role: FileRole::from_filename("payload.bin"),
+            groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
+            segments: vec![segment_spec! {
+                number: 0,
+                bytes: 128,
+                message_id: "stale-exclusion@example.com".to_string(),
+            }],
+        }],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+    }
+
+    let make_work = || DownloadWork {
+        segment_id,
+        message_id: MessageId::new("stale-exclusion@example.com"),
+        groups: vec!["alt.binaries.test".to_string()],
+        priority: 100,
+        byte_estimate: 128,
+        retry_count: 1,
+        is_recovery: false,
+        exclude_servers: vec![0],
+    };
+
+    // A rebuild bumped the generation after this retry was scheduled under gen 0:
+    // its exclude index no longer refers to the server it was computed against,
+    // so the guard must drop it (the retry re-tries every server cleanly).
+    pipeline.pool_generation = 1;
+    pipeline.note_retry_scheduled(segment_id);
+    pipeline.receive_retry_work(super::RetryWork {
+        scheduled_pool_generation: 0,
+        work: make_work(),
+    });
+    let queued = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("stale retry should still requeue");
+    assert_eq!(queued.segment_id, segment_id);
+    assert!(
+        queued.exclude_servers.is_empty(),
+        "stale server exclusions must be dropped after a pool rebuild"
+    );
+
+    // No rebuild since scheduling: exclusions are still valid and preserved.
+    pipeline.note_retry_scheduled(segment_id);
+    pipeline.receive_retry_work(super::RetryWork {
+        scheduled_pool_generation: 1,
+        work: make_work(),
+    });
+    let queued = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("same-generation retry should requeue");
+    assert_eq!(
+        queued.exclude_servers,
+        vec![0],
+        "current-generation exclusions must be preserved"
+    );
 }
 
 #[tokio::test]

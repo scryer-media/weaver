@@ -750,6 +750,14 @@ pub(super) struct DownloadResult {
     pub(super) release_connection_slot: bool,
 }
 
+/// A delayed retry re-entering the download queue, tagged with the NNTP pool
+/// generation it was scheduled under so the orchestrator can drop stale
+/// `exclude_servers` indices after a `RebuildNntp` reshaped the pool.
+pub(in crate::pipeline) struct RetryWork {
+    pub(in crate::pipeline) scheduled_pool_generation: u64,
+    pub(in crate::pipeline) work: DownloadWork,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct DownloadLaneObservation {
     pub(super) server_idx: Option<usize>,
@@ -1580,8 +1588,14 @@ pub struct Pipeline {
     pub(super) decode_done_tx: mpsc::Sender<DecodeDone>,
     pub(super) decode_done_rx: mpsc::Receiver<DecodeDone>,
     /// Channel for delayed retries — segments sleep then come back here.
-    pub(super) retry_tx: mpsc::Sender<DownloadWork>,
-    pub(super) retry_rx: mpsc::Receiver<DownloadWork>,
+    pub(super) retry_tx: mpsc::Sender<RetryWork>,
+    pub(super) retry_rx: mpsc::Receiver<RetryWork>,
+    /// Monotonic NNTP pool generation, bumped on every `RebuildNntp`. Server
+    /// indices in `DownloadWork::exclude_servers` are only meaningful within
+    /// the generation they were computed under; delayed retries carry the
+    /// generation they were scheduled under so stale indices can be dropped
+    /// when they re-enter after a rebuild.
+    pub(super) pool_generation: u64,
     /// Channel for health probe results: (job_id, total_probes, missed_count).
     pub(super) probe_result_tx: mpsc::Sender<ProbeUpdate>,
     pub(super) probe_result_rx: mpsc::Receiver<ProbeUpdate>,

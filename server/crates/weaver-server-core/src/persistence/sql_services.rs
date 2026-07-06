@@ -20,6 +20,7 @@ const DEFAULT_SQLITE_MAX_CONNECTIONS: u32 = 16;
 const MAX_SQLITE_CONNECTIONS_CAP: u32 = 64;
 const DEFAULT_POSTGRES_MAX_CONNECTIONS: u32 = 16;
 const MAX_POSTGRES_CONNECTIONS_CAP: u32 = 128;
+const POSTGRES_WARM_MIN_CONNECTIONS: u32 = 2;
 const SLOW_STATEMENT_WARN_MS: u64 = 1000;
 
 #[derive(Clone)]
@@ -192,13 +193,23 @@ impl PostgresServices {
                 .map_err(|error: sqlx::Error| {
                     StateError::Database(format!("invalid PostgreSQL database URL: {error}"))
                 })?;
-        connect_options = connect_options.log_slow_statements(
-            LevelFilter::Warn,
-            Duration::from_millis(SLOW_STATEMENT_WARN_MS),
-        );
+        connect_options = connect_options
+            .application_name("weaver")
+            .log_slow_statements(
+                LevelFilter::Warn,
+                Duration::from_millis(SLOW_STATEMENT_WARN_MS),
+            );
 
+        let max_connections = postgres_max_connections_from_env();
         let pool = PgPoolOptions::new()
-            .max_connections(postgres_max_connections_from_env())
+            .max_connections(max_connections)
+            // Keep a small warm floor so bursty pipeline writes don't pay
+            // TCP+TLS+auth on a cold pool after every idle lull.
+            .min_connections(max_connections.min(POSTGRES_WARM_MIN_CONNECTIONS))
+            // Skip the liveness ping on every acquire: it adds a full round-trip
+            // to each statement. Stale connections instead surface as an error
+            // that the transient-retry wrapper re-runs on a fresh connection.
+            .test_before_acquire(false)
             .connect_with(connect_options)
             .await
             .map_err(|error| {

@@ -163,7 +163,14 @@ pub async fn replay_catalog_into_fresh_db(
     }
 
     let mut start_version = catalog.starting_version;
-    if enable_baselines && let Some(baseline) = catalog.latest_baseline_at_or_below(target_version)
+    // Scope the baseline lookup to SQLite, mirroring the Postgres runner
+    // (postgres_migrations.rs passes EngineScope::Postgres). The engine-agnostic
+    // `latest_baseline_at_or_below` requests `EngineScope::All`, which matches no
+    // engine-tagged baseline, so it silently returned None and replayed every
+    // migration individually.
+    if enable_baselines
+        && let Some(baseline) =
+            catalog.latest_baseline_at_or_below_for_engine(target_version, EngineScope::Sqlite)
     {
         apply_baseline(pool, catalog, payload_bytes, baseline).await?;
         start_version = baseline.through_version + 1;
@@ -193,7 +200,7 @@ pub(crate) fn embedded_payload_bytes() -> Result<Vec<u8>, StateError> {
     })
 }
 
-fn validate_payload_checksum(
+pub(crate) fn validate_payload_checksum(
     catalog: &CompiledMigrationCatalog,
     payload_bytes: &[u8],
 ) -> Result<(), StateError> {
@@ -922,6 +929,15 @@ mod tests {
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn current_schema_version_matches_embedded_catalog_max() {
+        // Guards against bumping the migration manifest (adding migration N)
+        // without bumping CURRENT_SCHEMA_VERSION, which silently shifts the
+        // legacy-adoption acceptance range.
+        let catalog = embedded_catalog().unwrap();
+        assert_eq!(CURRENT_SCHEMA_VERSION, catalog.max_version());
+    }
 
     type PausedActiveJobRow = (
         String,

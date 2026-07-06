@@ -1055,9 +1055,15 @@ impl Pipeline {
                     "decode failed — re-downloading"
                 );
                 let retry_tx = self.retry_tx.clone();
+                let scheduled_pool_generation = self.pool_generation;
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    let _ = retry_tx.send(work).await;
+                    let _ = retry_tx
+                        .send(crate::pipeline::RetryWork {
+                            scheduled_pool_generation,
+                            work,
+                        })
+                        .await;
                 });
             }
         }

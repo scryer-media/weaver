@@ -13,19 +13,33 @@
 //! Everything falls back to the CPU kernels when any of that fails —
 //! sessions surface errors instead of panicking.
 
-use metal::{
-    Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSRange,
+use objc2::{
+    rc::{Retained, autoreleasepool},
+    runtime::ProtocolObject,
 };
-use objc::rc::autoreleasepool;
-use std::sync::OnceLock;
+use objc2_foundation::{NSRange, NSString};
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+    MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResource, MTLResourceOptions, MTLSize,
+};
+use std::{ffi::c_void, ptr::NonNull, sync::OnceLock};
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {}
+
+type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
+type CommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
+type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
+type ComputePipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 
 /// Widest source batch a single dispatch accepts; sized to the streaming
 /// repair batch and to the 8.25 KiB of threadgroup memory its tables need.
 pub const MAX_SOURCES: usize = 66;
 
 const TABLE_WORDS_PER_FACTOR: usize = 64; // 4 nibble positions x 16 entries
-const PREFERRED_THREADS_PER_GROUP: u64 = 256;
+const PREFERRED_THREADS_PER_GROUP: usize = 256;
 
 /// Auto-engage threshold: outputs x sources x region bytes per repair.
 /// Below this the CPU path wins on dispatch + upload overhead.
@@ -129,7 +143,7 @@ struct MetalShared {
     device: Device,
     queue: CommandQueue,
     pipeline: ComputePipelineState,
-    threads_per_group: u64,
+    threads_per_group: usize,
 }
 
 unsafe impl Send for MetalShared {}
@@ -157,22 +171,26 @@ fn shared_context() -> Option<&'static MetalShared> {
             // inside a pool: these threads are plain Rust threads with no
             // ambient pool, so without one the objects leak until thread
             // exit.
-            autoreleasepool(|| {
+            autoreleasepool(|_| {
                 if matches!(metal_gate(), MetalGate::Off) {
                     return None;
                 }
-                let device = Device::system_default()?;
-                let queue = device.new_command_queue();
-                queue.set_label("weaver.gf16");
+                let device = MTLCreateSystemDefaultDevice()?;
+                let queue = device.newCommandQueue()?;
+                let queue_label = NSString::from_str("weaver.gf16");
+                queue.setLabel(Some(&queue_label));
+                let source = NSString::from_str(&shader_source());
+                let options = MTLCompileOptions::new();
                 let library = device
-                    .new_library_with_source(&shader_source(), &CompileOptions::new())
+                    .newLibraryWithSource_options_error(&source, Some(&options))
                     .ok()?;
-                let function = library.get_function("gf16_mulacc", None).ok()?;
+                let function_name = NSString::from_str("gf16_mulacc");
+                let function = library.newFunctionWithName(&function_name)?;
                 let pipeline = device
-                    .new_compute_pipeline_state_with_function(&function)
+                    .newComputePipelineStateWithFunction_error(&function)
                     .ok()?;
                 let threads_per_group =
-                    PREFERRED_THREADS_PER_GROUP.min(pipeline.max_total_threads_per_threadgroup());
+                    PREFERRED_THREADS_PER_GROUP.min(pipeline.maxTotalThreadsPerThreadgroup());
                 if threads_per_group == 0 {
                     return None;
                 }
@@ -190,7 +208,7 @@ fn shared_context() -> Option<&'static MetalShared> {
 /// Wait for a command buffer and require clean completion; a faulted or
 /// cancelled buffer means the destination contents cannot be trusted.
 fn wait_completed(cb: &CommandBuffer) -> bool {
-    cb.wait_until_completed();
+    cb.waitUntilCompleted();
     cb.status() == MTLCommandBufferStatus::Completed
 }
 
@@ -244,33 +262,34 @@ impl MetalGf16Session {
         }
 
         let opts = MTLResourceOptions::StorageModeShared;
-        let src_len = (MAX_SOURCES * max_region_bytes) as u64;
-        let factor_len = (outputs * MAX_SOURCES * 2) as u64;
-        let dst_len = (outputs as u64) * (max_region_bytes as u64);
-        let table_len = (65536 * TABLE_WORDS_PER_FACTOR * 2) as u64;
-        let max_len = shared.device.max_buffer_length();
+        let src_len = MAX_SOURCES * max_region_bytes;
+        let factor_len = outputs * MAX_SOURCES * 2;
+        let dst_len = outputs * max_region_bytes;
+        let table_len = 65536 * TABLE_WORDS_PER_FACTOR * 2;
+        let max_len = shared.device.maxBufferLength();
         if src_len > max_len || dst_len > max_len || factor_len > max_len || table_len > max_len {
             return None;
         }
 
-        autoreleasepool(|| {
-            let new_labeled = |len: u64, label: &str| {
-                let buf = shared.device.new_buffer(len, opts);
-                buf.set_label(label);
-                buf
+        autoreleasepool(|_| {
+            let new_labeled = |len: usize, label: &str| {
+                let buf = shared.device.newBufferWithLength_options(len, opts)?;
+                let label = NSString::from_str(label);
+                buf.setLabel(Some(&label));
+                Some(buf)
             };
             Some(Self {
                 shared,
                 src_bufs: [
-                    new_labeled(src_len, "weaver.gf16.src0"),
-                    new_labeled(src_len, "weaver.gf16.src1"),
+                    new_labeled(src_len, "weaver.gf16.src0")?,
+                    new_labeled(src_len, "weaver.gf16.src1")?,
                 ],
                 factor_bufs: [
-                    new_labeled(factor_len, "weaver.gf16.factors0"),
-                    new_labeled(factor_len, "weaver.gf16.factors1"),
+                    new_labeled(factor_len, "weaver.gf16.factors0")?,
+                    new_labeled(factor_len, "weaver.gf16.factors1")?,
                 ],
-                dst_buf: new_labeled(dst_len, "weaver.gf16.dst"),
-                table_buf: new_labeled(table_len, "weaver.gf16.tables"),
+                dst_buf: new_labeled(dst_len, "weaver.gf16.dst")?,
+                table_buf: new_labeled(table_len, "weaver.gf16.tables")?,
                 table_filled: vec![0u64; 65536 / 64],
                 pending: [None, None],
                 slot: 0,
@@ -287,7 +306,7 @@ impl MetalGf16Session {
             return;
         }
         self.table_filled[idx / 64] |= 1 << (idx % 64);
-        let base = self.table_buf.contents() as *mut u16;
+        let base = self.table_buf.contents().as_ptr() as *mut u16;
         for k in 0..4u32 {
             for x in 0..16u16 {
                 let value = gf16_mul(factor, x << (4 * k));
@@ -308,22 +327,21 @@ impl MetalGf16Session {
             return Err("chunk length unsupported by the metal session");
         }
         self.chunk_words = byte_len / 2;
-        autoreleasepool(|| {
-            let cb = self.shared.queue.new_command_buffer();
-            let blit = cb.new_blit_command_encoder();
-            blit.fill_buffer(
-                &self.dst_buf,
-                NSRange {
-                    location: 0,
-                    length: (self.outputs * byte_len) as u64,
-                },
-                0,
-            );
-            blit.end_encoding();
+        autoreleasepool(|_| {
+            let cb = self
+                .shared
+                .queue
+                .commandBuffer()
+                .ok_or("failed to create metal command buffer")?;
+            let blit = cb
+                .blitCommandEncoder()
+                .ok_or("failed to create metal blit encoder")?;
+            blit.fillBuffer_range_value(&self.dst_buf, NSRange::new(0, self.outputs * byte_len), 0);
+            blit.endEncoding();
             cb.commit();
             // Park it in the slot the next accumulate uses, so the normal
             // fence path waits it and checks its status.
-            if let Some(prev) = self.pending[self.slot].replace(cb.to_owned())
+            if let Some(prev) = self.pending[self.slot].replace(cb)
                 && !wait_completed(&prev)
             {
                 return Err("prior gpu dispatch failed");
@@ -362,7 +380,7 @@ impl MetalGf16Session {
         }
 
         // Factors first: fills the lazy table cache before the GPU reads it.
-        let factor_ptr = self.factor_bufs[slot].contents() as *mut u16;
+        let factor_ptr = self.factor_bufs[slot].contents().as_ptr() as *mut u16;
         for j in 0..self.outputs {
             for s in 0..sources {
                 let f = factor(j, s);
@@ -371,7 +389,7 @@ impl MetalGf16Session {
             }
         }
 
-        let src_ptr = self.src_bufs[slot].contents() as *mut u8;
+        let src_ptr = self.src_bufs[slot].contents().as_ptr() as *mut u8;
         for (s, src) in srcs.iter().enumerate() {
             if src.len() != byte_len {
                 return Err("source region length mismatch");
@@ -384,33 +402,51 @@ impl MetalGf16Session {
         let words = self.chunk_words as u32;
         let sources_u32 = sources as u32;
         let threads = self.shared.threads_per_group;
-        self.pending[slot] = Some(autoreleasepool(|| {
-            let cb = self.shared.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&self.shared.pipeline);
-            enc.set_buffer(0, Some(&self.src_bufs[slot]), 0);
-            enc.set_buffer(1, Some(&self.dst_buf), 0);
-            enc.set_buffer(2, Some(&self.table_buf), 0);
-            enc.set_buffer(3, Some(&self.factor_bufs[slot]), 0);
-            enc.set_bytes(4, 4, &words as *const u32 as *const _);
-            enc.set_bytes(5, 4, &sources_u32 as *const u32 as *const _);
-            let quads = (self.chunk_words as u64).div_ceil(4);
-            enc.dispatch_thread_groups(
-                MTLSize {
-                    width: quads.div_ceil(threads),
-                    height: self.outputs as u64,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: threads,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            enc.end_encoding();
-            cb.commit();
-            cb.to_owned()
-        }));
+        self.pending[slot] = Some(autoreleasepool(
+            |_| -> Result<CommandBuffer, &'static str> {
+                let cb = self
+                    .shared
+                    .queue
+                    .commandBuffer()
+                    .ok_or("failed to create metal command buffer")?;
+                let enc = cb
+                    .computeCommandEncoder()
+                    .ok_or("failed to create metal compute encoder")?;
+                enc.setComputePipelineState(&self.shared.pipeline);
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(&self.src_bufs[slot]), 0, 0);
+                    enc.setBuffer_offset_atIndex(Some(&self.dst_buf), 0, 1);
+                    enc.setBuffer_offset_atIndex(Some(&self.table_buf), 0, 2);
+                    enc.setBuffer_offset_atIndex(Some(&self.factor_bufs[slot]), 0, 3);
+                    enc.setBytes_length_atIndex(
+                        NonNull::from(&words).cast::<c_void>(),
+                        std::mem::size_of_val(&words),
+                        4,
+                    );
+                    enc.setBytes_length_atIndex(
+                        NonNull::from(&sources_u32).cast::<c_void>(),
+                        std::mem::size_of_val(&sources_u32),
+                        5,
+                    );
+                }
+                let quads = self.chunk_words.div_ceil(4);
+                enc.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: quads.div_ceil(threads),
+                        height: self.outputs,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: threads,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                enc.endEncoding();
+                cb.commit();
+                Ok(cb)
+            },
+        )?);
         Ok(())
     }
 
@@ -428,7 +464,7 @@ impl MetalGf16Session {
             }
         }
         let byte_len = self.chunk_words * 2;
-        let dst_ptr = self.dst_buf.contents() as *const u8;
+        let dst_ptr = self.dst_buf.contents().as_ptr() as *const u8;
         for (j, row) in dst_rows.iter_mut().enumerate() {
             if row.len() < byte_len {
                 return Err("output row shorter than chunk");
@@ -447,7 +483,7 @@ impl MetalGf16Session {
 
     /// Device name for engage-time logging.
     pub fn device_name(&self) -> String {
-        autoreleasepool(|| self.shared.device.name().to_string())
+        autoreleasepool(|_| self.shared.device.name().to_string())
     }
 }
 

@@ -36,8 +36,15 @@ impl HistorySubscription {
         let db = ctx.data::<Database>()?.clone();
         let event_rx = handle.subscribe_events();
 
-        let event_stream = tokio_stream::wrappers::BroadcastStream::new(event_rx)
-            .filter_map(|result| result.ok().map(|_| JobDetailTrigger::Event));
+        // Only events for THIS job should force a database reload; an unrelated
+        // job's event must not trigger a full re-read of this job's event log.
+        let event_stream =
+            tokio_stream::wrappers::BroadcastStream::new(event_rx).filter_map(move |result| {
+                result.ok().and_then(|event| {
+                    (PipelineEventGql::from(&event).job_id == Some(job_id))
+                        .then_some(JobDetailTrigger::Event)
+                })
+            });
         let heartbeat = tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(
             JOB_DETAIL_HEARTBEAT,
         ))
@@ -50,8 +57,17 @@ impl HistorySubscription {
 
         Ok(async_stream::stream! {
             tokio::pin!(triggers);
+            let mut terminal_settled = false;
 
             while let Some(trigger) = triggers.next().await {
+                // Once an archived (terminal) job has been loaded, its event log
+                // and history rows are immutable. Heartbeats must not keep
+                // re-reading the database for a detail tab left open on a
+                // finished job; only an explicit event for this job (e.g. a
+                // delete) forces a refresh.
+                if matches!(trigger, JobDetailTrigger::Heartbeat) && terminal_settled {
+                    continue;
+                }
                 if matches!(trigger, JobDetailTrigger::Event) {
                     tokio::time::sleep(JOB_DETAIL_SETTLE_DELAY).await;
                 }
@@ -61,7 +77,11 @@ impl HistorySubscription {
                     db.clone(),
                     job_id,
                 ).await {
-                    Ok(snapshot) => yield snapshot,
+                    Ok(snapshot) => {
+                        terminal_settled =
+                            snapshot.queue_item.is_none() && snapshot.history_item.is_some();
+                        yield snapshot;
+                    }
                     Err(error) => tracing::warn!(job_id, error = ?error, "failed to build job detail snapshot"),
                 }
             }

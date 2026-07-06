@@ -1168,9 +1168,15 @@ impl Pipeline {
         };
         self.note_retry_scheduled(segment_id);
         let retry_tx = self.retry_tx.clone();
+        let scheduled_pool_generation = self.pool_generation;
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            let _ = retry_tx.send(work).await;
+            let _ = retry_tx
+                .send(crate::pipeline::RetryWork {
+                    scheduled_pool_generation,
+                    work,
+                })
+                .await;
         });
         true
     }
@@ -4930,9 +4936,15 @@ impl Pipeline {
                                 "download failed, scheduling retry"
                             );
                             let retry_tx = self.retry_tx.clone();
+                            let scheduled_pool_generation = self.pool_generation;
                             tokio::spawn(async move {
                                 tokio::time::sleep(delay).await;
-                                let _ = retry_tx.send(work).await;
+                                let _ = retry_tx
+                                    .send(crate::pipeline::RetryWork {
+                                        scheduled_pool_generation,
+                                        work,
+                                    })
+                                    .await;
                             });
                         }
                     } else {

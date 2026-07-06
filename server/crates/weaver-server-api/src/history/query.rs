@@ -303,8 +303,18 @@ pub(crate) async fn load_job_detail_snapshot(
 async fn load_history_page(db: Database, input: HistoryPageInput) -> Result<HistoryPage> {
     tokio::task::spawn_blocking(move || {
         let rows = db.list_job_history(&weaver_server_core::HistoryFilter::default())?;
-        let delete_states = load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?;
-        Ok::<_, weaver_server_core::StateError>(build_history_page(rows, delete_states, input))
+        let mut page = build_history_page(rows, input);
+        // Delete-operation badges are only needed for the rows actually shown on
+        // this page. Load them for the page's job ids instead of issuing an
+        // `IN (…)` over every row in the history table.
+        let delete_states = load_history_delete_states(&db, page.items.iter().map(|item| item.id))?;
+        for item in &mut page.items {
+            item.delete_operation = delete_states
+                .get(&item.id)
+                .cloned()
+                .map(history_delete_row_state_from_core);
+        }
+        Ok::<_, weaver_server_core::StateError>(page)
     })
     .await
     .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
@@ -378,11 +388,7 @@ fn history_query_plan(
     HistoryQueryPlan::Query(history_filter)
 }
 
-fn build_history_page(
-    rows: Vec<JobHistoryRow>,
-    delete_states: HashMap<u64, weaver_server_core::HistoryDeleteRowState>,
-    input: HistoryPageInput,
-) -> HistoryPage {
+fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> HistoryPage {
     let page_size = sanitize_page_size(input.page_size);
     let page_index = input.page_index as usize;
     let search = normalize_history_search(input.search);
@@ -390,15 +396,12 @@ fn build_history_page(
     let sort_field = input.sort_field.unwrap_or(HistorySortField::CompletedAt);
     let sort_direction = input.sort_direction.unwrap_or(HistorySortDirection::Desc);
 
+    // Delete-operation badges are attached by the caller for the final page only
+    // (see `load_history_page`); they do not affect search, sort, status, or
+    // counts, so they are omitted here.
     let filtered_by_search: Vec<HistoryItem> = rows
         .into_iter()
-        .map(|row| {
-            let delete_state = delete_states
-                .get(&row.job_id)
-                .cloned()
-                .map(history_delete_row_state_from_core);
-            history_item_from_row(&row, delete_state)
-        })
+        .map(|row| history_item_from_row(&row, None))
         .filter(|item| history_matches_search(item, search.as_deref()))
         .collect();
 
