@@ -4,9 +4,9 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use sqlx::ConnectOptions;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::{ConnectOptions, Connection};
 use tracing::log::LevelFilter;
 
 use crate::persistence::database_target::DatabaseTarget;
@@ -21,6 +21,15 @@ const MAX_SQLITE_CONNECTIONS_CAP: u32 = 64;
 const DEFAULT_POSTGRES_MAX_CONNECTIONS: u32 = 16;
 const MAX_POSTGRES_CONNECTIONS_CAP: u32 = 128;
 const POSTGRES_WARM_MIN_CONNECTIONS: u32 = 2;
+/// The pg pool must hold at least this many connections: the migration runner
+/// pins one connection to hold a session advisory lock while the migration
+/// steps acquire another from the pool, so a pool of 1 would deadlock at
+/// startup.
+const MIN_POSTGRES_MAX_CONNECTIONS: u32 = 2;
+/// Only validate (ping) a pooled connection that has been idle at least this
+/// long — long enough that a proxy or idle-timeout may have dropped it. Hot
+/// connections skip the round-trip.
+const POSTGRES_PING_IDLE_THRESHOLD: Duration = Duration::from_secs(30);
 const SLOW_STATEMENT_WARN_MS: u64 = 1000;
 
 #[derive(Clone)]
@@ -206,10 +215,22 @@ impl PostgresServices {
             // Keep a small warm floor so bursty pipeline writes don't pay
             // TCP+TLS+auth on a cold pool after every idle lull.
             .min_connections(max_connections.min(POSTGRES_WARM_MIN_CONNECTIONS))
-            // Skip the liveness ping on every acquire: it adds a full round-trip
-            // to each statement. Stale connections instead surface as an error
-            // that the transient-retry wrapper re-runs on a fresh connection.
+            // Don't ping on every acquire — that adds a full round-trip to each
+            // statement.
             .test_before_acquire(false)
+            // Instead, validate only connections that have been idle long enough
+            // to plausibly have been dropped (proxy/idle-timeout/backend
+            // recycle). Hot connections skip the round-trip; a failed ping
+            // discards the connection so the caller transparently gets a fresh
+            // one instead of a hard error on the first use.
+            .before_acquire(|conn, meta| {
+                Box::pin(async move {
+                    if meta.idle_for >= POSTGRES_PING_IDLE_THRESHOLD {
+                        conn.ping().await?;
+                    }
+                    Ok(true)
+                })
+            })
             .connect_with(connect_options)
             .await
             .map_err(|error| {
@@ -308,7 +329,7 @@ pub(crate) fn postgres_max_connections_from_env() -> u32 {
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_POSTGRES_MAX_CONNECTIONS)
-        .clamp(1, MAX_POSTGRES_CONNECTIONS_CAP)
+        .clamp(MIN_POSTGRES_MAX_CONNECTIONS, MAX_POSTGRES_CONNECTIONS_CAP)
 }
 
 #[cfg(test)]

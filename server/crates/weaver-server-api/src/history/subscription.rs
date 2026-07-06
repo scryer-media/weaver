@@ -6,6 +6,10 @@ pub(crate) struct HistorySubscription;
 const JOB_DETAIL_HEARTBEAT: Duration = Duration::from_millis(500);
 const JOB_DETAIL_THROTTLE: Duration = Duration::from_millis(250);
 const JOB_DETAIL_SETTLE_DELAY: Duration = Duration::from_millis(25);
+/// Slow cadence at which a terminal (archived) job's detail is still re-read, to
+/// pick up DB-only changes that emit no pipeline event (e.g. a background
+/// history-delete operation) without the fast per-tab heartbeat load.
+const JOB_DETAIL_TERMINAL_HEARTBEAT: Duration = Duration::from_secs(5);
 
 #[Subscription]
 impl HistorySubscription {
@@ -41,7 +45,16 @@ impl HistorySubscription {
         let event_stream =
             tokio_stream::wrappers::BroadcastStream::new(event_rx).filter_map(move |result| {
                 result.ok().and_then(|event| {
-                    (PipelineEventGql::from(&event).job_id == Some(job_id))
+                    // Reload only on meaningful events for THIS job. `should_record_job_event`
+                    // is the same predicate that gates the persisted event log the detail view
+                    // reads, so it triggers exactly when the log or lifecycle changes while
+                    // excluding the high-frequency per-article/segment events (the broadcast
+                    // carries those too). Live progress is covered by the heartbeat. Uses the
+                    // core job_id accessor (all variants, no allocation).
+                    use weaver_server_core::events::publish::{
+                        pipeline_job_id, should_record_job_event,
+                    };
+                    (should_record_job_event(&event) && pipeline_job_id(&event) == Some(job_id))
                         .then_some(JobDetailTrigger::Event)
                 })
             });
@@ -58,14 +71,19 @@ impl HistorySubscription {
         Ok(async_stream::stream! {
             tokio::pin!(triggers);
             let mut terminal_settled = false;
+            let mut last_terminal_reload = tokio::time::Instant::now();
 
             while let Some(trigger) = triggers.next().await {
-                // Once an archived (terminal) job has been loaded, its event log
-                // and history rows are immutable. Heartbeats must not keep
-                // re-reading the database for a detail tab left open on a
-                // finished job; only an explicit event for this job (e.g. a
-                // delete) forces a refresh.
-                if matches!(trigger, JobDetailTrigger::Heartbeat) && terminal_settled {
+                // A terminal (archived) job's event log and history are
+                // immutable, so the fast per-tab heartbeat need not re-read the
+                // database. But DB-only changes that emit no pipeline event
+                // (e.g. a background history-delete) must still surface, so a
+                // terminal job is polled at a slow cadence instead of having its
+                // heartbeats suppressed outright.
+                if matches!(trigger, JobDetailTrigger::Heartbeat)
+                    && terminal_settled
+                    && last_terminal_reload.elapsed() < JOB_DETAIL_TERMINAL_HEARTBEAT
+                {
                     continue;
                 }
                 if matches!(trigger, JobDetailTrigger::Event) {
@@ -80,6 +98,9 @@ impl HistorySubscription {
                     Ok(snapshot) => {
                         terminal_settled =
                             snapshot.queue_item.is_none() && snapshot.history_item.is_some();
+                        if terminal_settled {
+                            last_terminal_reload = tokio::time::Instant::now();
+                        }
                         yield snapshot;
                     }
                     Err(error) => tracing::warn!(job_id, error = ?error, "failed to build job detail snapshot"),

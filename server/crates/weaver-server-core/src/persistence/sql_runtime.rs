@@ -194,23 +194,24 @@ impl SqlRuntime {
                 Ok(result.rows_affected())
             }
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
-                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
                 // Autocommit write: a bare statement's commit outcome is unknown
                 // on a dropped connection, so only retry guaranteed-rolled-back
                 // (serialization/deadlock) failures, not connection errors.
                 let result = run_with_postgres_retries("execute", false, || async {
+                    let started = Instant::now();
                     let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
-                    query.execute(pool).await.map_err(pg_db_err)
+                    let outcome = query.execute(pool).await.map_err(pg_db_err);
+                    // Record each attempt's real query time, excluding retry sleeps.
+                    crate::runtime::perf_probe::record_sql_statement(
+                        "postgres",
+                        "execute",
+                        template,
+                        started.elapsed(),
+                    );
+                    outcome
                 })
-                .await;
-                crate::runtime::perf_probe::record_sql_statement(
-                    "postgres",
-                    "execute",
-                    template,
-                    started.elapsed(),
-                );
-                let result = result?;
+                .await?;
                 Ok(result.rows_affected())
             }
             SqlExec::Tx(tx) => tx.execute(template, args).await,
@@ -241,25 +242,25 @@ impl SqlRuntime {
                 result
             }
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
-                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
                 // Read: idempotent, so retry connection errors as well.
-                let result = run_with_postgres_retries("fetch_optional", true, || async {
+                run_with_postgres_retries("fetch_optional", true, || async {
+                    let started = Instant::now();
                     let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
-                    query
+                    let outcome = query
                         .fetch_optional(pool)
                         .await
                         .map(|row| row.map(SqlRow::Postgres))
-                        .map_err(pg_db_err)
+                        .map_err(pg_db_err);
+                    crate::runtime::perf_probe::record_sql_statement(
+                        "postgres",
+                        "fetch_optional",
+                        template,
+                        started.elapsed(),
+                    );
+                    outcome
                 })
-                .await;
-                crate::runtime::perf_probe::record_sql_statement(
-                    "postgres",
-                    "fetch_optional",
-                    template,
-                    started.elapsed(),
-                );
-                result
+                .await
             }
             SqlExec::Tx(tx) => tx.fetch_optional(template, args).await,
         }
@@ -289,25 +290,25 @@ impl SqlRuntime {
                 result
             }
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
-                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
                 // Read: idempotent, so retry connection errors as well.
-                let result = run_with_postgres_retries("fetch_all", true, || async {
+                run_with_postgres_retries("fetch_all", true, || async {
+                    let started = Instant::now();
                     let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
-                    query
+                    let outcome = query
                         .fetch_all(pool)
                         .await
                         .map(|rows| rows.into_iter().map(SqlRow::Postgres).collect())
-                        .map_err(pg_db_err)
+                        .map_err(pg_db_err);
+                    crate::runtime::perf_probe::record_sql_statement(
+                        "postgres",
+                        "fetch_all",
+                        template,
+                        started.elapsed(),
+                    );
+                    outcome
                 })
-                .await;
-                crate::runtime::perf_probe::record_sql_statement(
-                    "postgres",
-                    "fetch_all",
-                    template,
-                    started.elapsed(),
-                );
-                result
+                .await
             }
             SqlExec::Tx(tx) => tx.fetch_all(template, args).await,
         }
@@ -322,12 +323,12 @@ impl SqlRuntime {
         T: Send,
         F: for<'tx, 'db> Fn(&'tx mut SqlTx<'db>) -> TxFuture<'tx, T> + Send + Sync,
     {
-        let started = Instant::now();
         let engine = datastore.engine().as_str();
-        let result = match datastore {
+        match datastore {
             StoreDatastore::Sqlite { pool, writer_gate } => {
+                let started = Instant::now();
                 let _guard = writer_gate.lock().await;
-                run_with_sqlite_busy_retries(op_name, || {
+                let result = run_with_sqlite_busy_retries(op_name, || {
                     let pool = pool.clone();
                     let op = &op;
                     async move {
@@ -340,26 +341,30 @@ impl SqlRuntime {
                         Ok(result)
                     }
                 })
-                .await
+                .await;
+                crate::runtime::perf_probe::record_sql_op(engine, op_name, started.elapsed());
+                result
             }
             StoreDatastore::Postgres { pool } => {
                 // Retry the whole transaction: a serialization/deadlock abort or
                 // a dropped connection invalidates the open transaction, so it
                 // must be re-`begin`'d. `op` is `Fn`, so re-invocation is sound.
                 run_with_postgres_retries(op_name, true, || async {
+                    let started = Instant::now();
                     let mut tx = SqlTx::Postgres(pool.begin().await.map_err(pg_db_err)?);
                     let result = {
                         let future = op(&mut tx);
                         future.await?
                     };
                     tx.commit().await?;
+                    // Record the successful attempt's real duration only (retry
+                    // sleeps and failed attempts are excluded).
+                    crate::runtime::perf_probe::record_sql_op(engine, op_name, started.elapsed());
                     Ok(result)
                 })
                 .await
             }
-        };
-        crate::runtime::perf_probe::record_sql_op(engine, op_name, started.elapsed());
-        result
+        }
     }
 }
 
@@ -847,7 +852,11 @@ pub(crate) fn is_postgres_connection_error(error: &StateError) -> bool {
         return false;
     };
     let normalized = message.to_ascii_lowercase();
-    normalized.contains("sqlstate=08")
+    // `connection_error` is the marker `pg_db_err` attaches to transport-level
+    // sqlx errors (Io/Tls/Protocol) that have no SQLSTATE — e.g. an abrupt EOF
+    // from a dropped backend or a stale pooled connection.
+    normalized.contains("connection_error")
+        || normalized.contains("sqlstate=08")
         || normalized.contains("connection reset")
         || normalized.contains("connection closed")
         || normalized.contains("broken pipe")
@@ -972,14 +981,25 @@ pub(crate) fn db_err(error: impl std::fmt::Display) -> StateError {
 /// `sqlstate=<code>;` so the transient-retry classifiers can recognize
 /// serialization/deadlock/connection failures after the error is stringified.
 pub(crate) fn pg_db_err(error: sqlx::Error) -> StateError {
-    let code = error
+    if let Some(code) = error
         .as_database_error()
         .and_then(|db| db.code())
-        .map(|code| code.into_owned());
-    match code {
-        Some(code) => StateError::Database(format!("sqlstate={code}; {error}")),
-        None => StateError::Database(error.to_string()),
+        .map(|code| code.into_owned())
+    {
+        return StateError::Database(format!("sqlstate={code}; {error}"));
     }
+    // Transport/pool failures carry no SQLSTATE. Crucially, an abruptly dropped
+    // backend (crash, kill, proxy/idle-timeout FIN, container restart) surfaces
+    // as `Error::Io(UnexpectedEof)` — NOT a `DatabaseError` — so it must be
+    // classified by the error variant, not by matching locale-dependent io
+    // message text. Tag it with a stable marker the retry classifier keys on.
+    if matches!(
+        &error,
+        sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::Protocol(_)
+    ) {
+        return StateError::Database(format!("connection_error; {error}"));
+    }
+    StateError::Database(error.to_string())
 }
 
 #[cfg(test)]
@@ -1057,5 +1077,18 @@ mod tests {
         assert!(!is_postgres_connection_error(&StateError::Database(
             "sqlstate=40001; could not serialize access".to_string()
         )));
+    }
+
+    #[test]
+    fn classifies_abrupt_eof_as_connection_error() {
+        // An abruptly dropped Postgres backend (crash/kill/proxy FIN) surfaces
+        // as Error::Io(UnexpectedEof) with no SQLSTATE; it must still be
+        // classified as a connection error so reads/transactions retry.
+        let mapped = pg_db_err(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "expected to read 5 bytes, got 0 bytes at EOF",
+        )));
+        assert!(is_postgres_connection_error(&mapped));
+        assert!(!is_postgres_rolled_back_transient(&mapped));
     }
 }
