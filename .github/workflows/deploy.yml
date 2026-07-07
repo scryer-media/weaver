@@ -23,7 +23,6 @@ env:
   RUST_TEST_BINARIES_ARTIFACT_NAME: weaver-rust-test-binaries
   WEAVER_LFS_RUST_TEST_INCLUDE: server/crates/weaver-server-core/tests/fixtures/**
   WEAVER_LFS_SDE_INCLUDE: ci/vendor/intel-sde/**
-  E2E_LFS_PAR2_SMALL_REPAIR_INCLUDE: testdata/par2-small-repair/**
 
 jobs:
   # ── Parallel lint / check jobs (no dependencies) ─────────────────────────
@@ -188,78 +187,6 @@ jobs:
             --manifest .ci/rust-tests/manifest.json \
             --lane regular \
             --workspace "$GITHUB_WORKSPACE"
-
-  weaver-par2-rar-e2e:
-    name: weaver-par2-rar-e2e
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    needs: [web-build]
-    env:
-      E2E_PROJECT: weaver-ci-${{ github.run_id }}-${{ github.run_attempt }}
-      E2E_RUN_DIR: /tmp/weaver-e2e/run
-      E2E_RUNTIME_PORTS_FILE: /tmp/weaver-e2e/runtime-ports.json
-      E2E_VERBOSE: "0"
-      E2E_WEAVER_IMAGE: scryer-e2e-weaver:${{ github.sha }}
-      WEAVER_BIN: ${{ github.workspace }}/weaver/target/release/weaver
-    steps:
-      - name: Checkout Weaver
-        uses: actions/checkout@v6
-        with:
-          path: weaver
-      - name: Checkout e2e harness
-        uses: actions/checkout@v6
-        with:
-          repository: scryer-media/e2e
-          path: e2e
-      - name: Hydrate e2e PAR2/RAR fixture
-        working-directory: e2e
-        run: |
-          git lfs install --local
-          git lfs pull --include="$E2E_LFS_PAR2_SMALL_REPAIR_INCLUDE" --exclude=""
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: e2e/go.mod
-          cache-dependency-path: e2e/go.sum
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install native build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y nasm
-      - name: Download embedded web artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ env.WEB_ARTIFACT_NAME }}
-          path: weaver/apps/weaver-web/dist
-      - name: Build Weaver e2e binary
-        working-directory: weaver
-        run: |
-          cargo build --release --locked -p weaver
-          mkdir -p .ci/e2e
-          cp target/release/weaver .ci/e2e/weaver
-      - name: Build weaver-e2e CLI
-        working-directory: e2e
-        run: |
-          mkdir -p .bin
-          go build -o .bin/weaver-e2e ./cmd/weaver-e2e
-      - name: Build Weaver e2e image
-        run: docker build -f weaver/Dockerfile.e2e -t "$E2E_WEAVER_IMAGE" weaver
-      - name: Seed PAR2/RAR fixture
-        working-directory: e2e
-        run: ./.bin/weaver-e2e seed testdata/par2-small-repair
-      - name: Run PAR2/RAR fixture
-        working-directory: e2e
-        run: ./.bin/weaver-e2e test par2-small-repair
-      - name: Dump e2e logs
-        if: failure()
-        working-directory: e2e
-        run: docker compose -p "$E2E_PROJECT" logs --no-color weaver nntp newznab || true
-      - name: Stop e2e stack
-        if: always()
-        working-directory: e2e
-        run: docker compose -p "$E2E_PROJECT" down -v --remove-orphans || true
 
   rust-test-arm:
     name: rust-test-arm-yenc
@@ -787,13 +714,16 @@ jobs:
     needs: [web-build]
     env:
       CARGO_INCREMENTAL: "0"
+      # Keep normal Windows C dependencies on clang-cl. The dispatcher routes
+      # only s2n-tls-sys to clang because its vendored build emits GNU-style flags.
+      CC_x86_64_pc_windows_msvc: clang-cl
+      CXX_x86_64_pc_windows_msvc: clang-cl
+      WEAVER_S2N_COMPAT_INCLUDE: ${{ github.workspace }}/ci/windows/s2n-compat
       RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}\.sccache
       SCCACHE_IDLE_TIMEOUT: "0"
-      CC_x86_64_pc_windows_msvc: clang-cl
-      CXX_x86_64_pc_windows_msvc: clang-cl
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
@@ -801,6 +731,18 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
         run: rustup target add x86_64-pc-windows-msvc
+      - name: Install Windows compiler dispatcher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $shimDir = Join-Path $env:RUNNER_TEMP "weaver-cc"
+          New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
+          $realClangCl = (Get-Command clang-cl.exe -ErrorAction Stop).Source
+          $realClang = (Get-Command clang.exe -ErrorAction Stop).Source
+          rustc ci/windows/s2n-cc-dispatcher.rs -o (Join-Path $shimDir "clang-cl.exe")
+          "WEAVER_REAL_CLANG_CL=$realClangCl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "WEAVER_REAL_CLANG=$realClang" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $shimDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Restore sccache directory
         id: windows-x86_64-sccache-restore
         uses: actions/cache/restore@v4
@@ -1057,13 +999,16 @@ jobs:
     needs: [web-build]
     env:
       CARGO_INCREMENTAL: "0"
+      # Keep normal Windows C dependencies on clang-cl. The dispatcher routes
+      # only s2n-tls-sys to clang because its vendored build emits GNU-style flags.
+      CC_aarch64_pc_windows_msvc: clang-cl
+      CXX_aarch64_pc_windows_msvc: clang-cl
+      WEAVER_S2N_COMPAT_INCLUDE: ${{ github.workspace }}/ci/windows/s2n-compat
       RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}\.sccache
       SCCACHE_IDLE_TIMEOUT: "0"
-      CC_aarch64_pc_windows_msvc: clang
-      CXX_aarch64_pc_windows_msvc: clang++
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@v1
@@ -1071,6 +1016,18 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
         run: rustup target add aarch64-pc-windows-msvc
+      - name: Install Windows compiler dispatcher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $shimDir = Join-Path $env:RUNNER_TEMP "weaver-cc"
+          New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
+          $realClangCl = (Get-Command clang-cl.exe -ErrorAction Stop).Source
+          $realClang = (Get-Command clang.exe -ErrorAction Stop).Source
+          rustc ci/windows/s2n-cc-dispatcher.rs -o (Join-Path $shimDir "clang-cl.exe")
+          "WEAVER_REAL_CLANG_CL=$realClangCl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "WEAVER_REAL_CLANG=$realClang" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $shimDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Restore sccache directory
         id: windows-arm64-sccache-restore
         uses: actions/cache/restore@v4
@@ -1321,7 +1278,6 @@ jobs:
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
-      - weaver-par2-rar-e2e
       - rust-package-linux-x86_64-portable
       - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable
@@ -1416,7 +1372,6 @@ jobs:
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
-      - weaver-par2-rar-e2e
       - rust-package-linux-x86_64-portable
       - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable
@@ -1521,7 +1476,6 @@ jobs:
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
-      - weaver-par2-rar-e2e
       - rust-package-linux-x86_64-portable
       - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable

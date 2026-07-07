@@ -3,6 +3,9 @@
 Weaver is licensed under GPL-3.0-or-later, with the additional UnRAR
 source-code restriction below for RAR extraction and recovery code.
 
+Weaver does not bundle or distribute UnRAR source code, but its
+implementation was inspired by the UnRAR source.
+
 ## UnRAR Source-Code Restriction
 
 UnRAR source code may be used in any software to handle
