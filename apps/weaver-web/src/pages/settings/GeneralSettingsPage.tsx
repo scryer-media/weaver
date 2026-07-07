@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery } from "urql";
-import { FolderOpen } from "lucide-react";
-import { DirectoryBrowserDialog } from "@/components/DirectoryBrowserDialog";
+import { FolderPathInput } from "@/components/FolderPathInput";
 import { formatSpeed } from "@/components/SpeedDisplay";
 import { PageHeader } from "@/components/PageHeader";
 import { SectionCard } from "@/components/SectionCard";
@@ -84,8 +83,6 @@ export function GeneralSettingsPage() {
   const [ipReplacementBurstSaved, setIpReplacementBurstSaved] = useState(false);
   const [storageSaveStatus, setStorageSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [storageSaveError, setStorageSaveError] = useState<string | null>(null);
-  const [browserTarget, setBrowserTarget] = useState<"intermediate" | "complete" | null>(null);
-  const [browsePath, setBrowsePath] = useState<string | null>(null);
   const speedSavedTimerRef = useRef<number | null>(null);
   const ipReplacementBurstSavedTimerRef = useRef<number | null>(null);
   const storageSaveTimerRef = useRef<number | null>(null);
@@ -347,46 +344,18 @@ export function GeneralSettingsPage() {
                 staticValue={settings.dataDir}
               />
               <SettingField label={t("settings.intermediateDir")} description={t("settings.intermediateDirDesc")}>
-                <div className="flex gap-2">
-                  <Input
-                    value={intermediateDir}
-                    onChange={(event) => setIntermediateDir(event.target.value)}
-                    placeholder={`${settings.dataDir}/intermediate`}
-                    className="font-mono"
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => {
-                      setBrowsePath(intermediateDir.trim() || null);
-                      setBrowserTarget("intermediate");
-                    }}
-                  >
-                    <FolderOpen className="size-4" />
-                    {t("categories.browse")}
-                  </Button>
-                </div>
+                <FolderPathInput
+                  value={intermediateDir}
+                  onChange={setIntermediateDir}
+                  placeholder={`${settings.dataDir}/intermediate`}
+                />
               </SettingField>
               <SettingField label={t("settings.completeDir")} description={t("settings.completeDirDesc")}>
-                <div className="flex gap-2">
-                  <Input
-                    value={completeDir}
-                    onChange={(event) => setCompleteDir(event.target.value)}
-                    placeholder={`${settings.dataDir}/complete`}
-                    className="font-mono"
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => {
-                      setBrowsePath(completeDir.trim() || null);
-                      setBrowserTarget("complete");
-                    }}
-                  >
-                    <FolderOpen className="size-4" />
-                    {t("categories.browse")}
-                  </Button>
-                </div>
+                <FolderPathInput
+                  value={completeDir}
+                  onChange={setCompleteDir}
+                  placeholder={`${settings.dataDir}/complete`}
+                />
               </SettingField>
               <SettingField label={t("settings.maxRetries")} description={t("settings.maxRetriesDesc")}>
                 <Input
@@ -458,17 +427,6 @@ export function GeneralSettingsPage() {
               ) : null}
             </div>
 
-            <DirectoryBrowserDialog
-              open={browserTarget != null}
-              path={browsePath}
-              onPathChange={setBrowsePath}
-              onClose={() => setBrowserTarget(null)}
-              onChoose={(nextPath) => {
-                if (browserTarget === "intermediate") setIntermediateDir(nextPath);
-                else if (browserTarget === "complete") setCompleteDir(nextPath);
-                setBrowserTarget(null);
-              }}
-            />
           </div>
         </SectionCard>
       ) : null}

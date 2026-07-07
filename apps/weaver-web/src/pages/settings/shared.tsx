@@ -9,6 +9,7 @@ import {
   DELETE_API_KEY_MUTATION,
 } from "@/graphql/queries";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { FolderPathInput } from "@/components/FolderPathInput";
 import { PageHeader } from "@/components/PageHeader";
 import { SectionCard } from "@/components/SectionCard";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -394,33 +395,27 @@ export function BackupRestoreSection({
 
           <div className="mt-3 space-y-1.5">
             <Label>{t("settings.restoreDataDir")}</Label>
-            <Input
-              type="text"
+            <FolderPathInput
               value={dataDir}
-              onChange={(e) => setDataDir(e.target.value)}
-              className="font-mono"
+              onChange={setDataDir}
             />
           </div>
 
           <div className="mt-3 space-y-1.5">
             <Label>{t("settings.restoreIntermediateDir")}</Label>
-            <Input
-              type="text"
+            <FolderPathInput
               value={restoreIntermediateDir}
-              onChange={(e) => setRestoreIntermediateDir(e.target.value)}
+              onChange={setRestoreIntermediateDir}
               placeholder={`${dataDir || currentDataDir}/intermediate`}
-              className="font-mono"
             />
           </div>
 
           <div className="mt-3 space-y-1.5">
             <Label>{t("settings.restoreCompleteDir")}</Label>
-            <Input
-              type="text"
+            <FolderPathInput
               value={restoreCompleteDir}
-              onChange={(e) => setRestoreCompleteDir(e.target.value)}
+              onChange={setRestoreCompleteDir}
               placeholder={`${dataDir || currentDataDir}/complete`}
-              className="font-mono"
             />
           </div>
 
@@ -486,17 +481,15 @@ export function BackupRestoreSection({
                       {entry.category_name}:{" "}
                       <span className="font-mono">{entry.current_dest_dir}</span>
                     </div>
-                    <Input
-                      type="text"
+                    <FolderPathInput
                       value={categoryRemaps[entry.category_name] ?? ""}
-                      onChange={(e) =>
+                      onChange={(destDir) =>
                         setCategoryRemaps((current) => ({
                           ...current,
-                          [entry.category_name]: e.target.value,
+                          [entry.category_name]: destDir,
                         }))
                       }
                       placeholder={t("settings.restoreRemapPlaceholder")}
-                      className="font-mono"
                     />
                   </div>
                 ))}

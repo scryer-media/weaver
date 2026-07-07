@@ -1,9 +1,8 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { useMutation, useQuery } from "urql";
-import { FolderOpen } from "lucide-react";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { DirectoryBrowserDialog } from "@/components/DirectoryBrowserDialog";
 import { EmptyState } from "@/components/EmptyState";
+import { FolderPathInput } from "@/components/FolderPathInput";
 import { PageHeader } from "@/components/PageHeader";
 import { SectionCard } from "@/components/SectionCard";
 import { Button } from "@/components/ui/button";
@@ -246,8 +245,6 @@ function CategoryFormCard({
 }) {
   const t = useTranslate();
   const [values, setValues] = useState(initialValues);
-  const [browserOpen, setBrowserOpen] = useState(false);
-  const [browsePath, setBrowsePath] = useState<string | null>(null);
 
   useEffect(() => {
     setValues(initialValues);
@@ -268,25 +265,10 @@ function CategoryFormCard({
             />
           </Field>
           <Field label={t("categories.destDir")} description={t("categories.destDirDesc")}>
-            <div className="flex gap-2">
-              <Input
-                value={values.destDir}
-                onChange={(event) =>
-                  setValues((current) => ({ ...current, destDir: event.target.value }))
-                }
-              />
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => {
-                  setBrowsePath(values.destDir.trim() || null);
-                  setBrowserOpen(true);
-                }}
-              >
-                <FolderOpen className="size-4" />
-                {t("categories.browse")}
-              </Button>
-            </div>
+            <FolderPathInput
+              value={values.destDir}
+              onChange={(destDir) => setValues((current) => ({ ...current, destDir }))}
+            />
           </Field>
           <Field label={t("categories.aliases")} description={t("categories.aliasesDesc")}>
             <Input
@@ -296,17 +278,6 @@ function CategoryFormCard({
             />
           </Field>
         </div>
-
-        <DirectoryBrowserDialog
-          open={browserOpen}
-          path={browsePath}
-          onPathChange={setBrowsePath}
-          onClose={() => setBrowserOpen(false)}
-          onChoose={(nextPath) => {
-            setValues((current) => ({ ...current, destDir: nextPath }));
-            setBrowserOpen(false);
-          }}
-        />
 
         <div className="flex flex-wrap gap-3">
           <Button onClick={() => void onSave(values)} disabled={!values.name.trim() || saving}>

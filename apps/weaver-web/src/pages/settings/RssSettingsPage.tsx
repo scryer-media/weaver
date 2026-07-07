@@ -2,8 +2,8 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import { useMutation, useQuery } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { DirectoryBrowserDialog } from "@/components/DirectoryBrowserDialog";
 import { EmptyState } from "@/components/EmptyState";
+import { FolderPathInput } from "@/components/FolderPathInput";
 import { PageHeader } from "@/components/PageHeader";
 import { SectionCard } from "@/components/SectionCard";
 import { formatBytes } from "@/components/SpeedDisplay";
@@ -299,8 +299,6 @@ export function RssSettingsPage() {
   );
   const [watchFolderScanReport, setWatchFolderScanReport] =
     useState<WatchFolderScanReport | null>(null);
-  const [showWatchFolderBrowser, setShowWatchFolderBrowser] = useState(false);
-  const [browsePath, setBrowsePath] = useState<string | null>(null);
   const isSavingFeed = addFeedState.fetching || updateFeedState.fetching;
   const isSavingRule = addRuleState.fetching || updateRuleState.fetching;
 
@@ -558,10 +556,6 @@ export function RssSettingsPage() {
         onChange={setWatchFolderValues}
         onSave={handleWatchFolderSave}
         onScan={handleWatchFolderScan}
-        onBrowse={() => {
-          setBrowsePath(watchFolderValues.path.trim() || null);
-          setShowWatchFolderBrowser(true);
-        }}
       />
 
       {showFeedForm ? (
@@ -807,18 +801,6 @@ export function RssSettingsPage() {
         onCancel={() => setClearSeenTarget(null)}
       />
 
-      {showWatchFolderBrowser ? (
-        <DirectoryBrowserDialog
-          open={showWatchFolderBrowser}
-          path={browsePath}
-          onPathChange={setBrowsePath}
-          onClose={() => setShowWatchFolderBrowser(false)}
-          onChoose={(path) => {
-            setWatchFolderValues((current) => ({ ...current, path }));
-            setShowWatchFolderBrowser(false);
-          }}
-        />
-      ) : null}
     </div>
   );
 }
@@ -831,7 +813,6 @@ function WatchFolderSettingsCard({
   onChange,
   onSave,
   onScan,
-  onBrowse,
 }: {
   values: WatchFolderFormValues;
   saving: boolean;
@@ -840,7 +821,6 @@ function WatchFolderSettingsCard({
   onChange: (values: WatchFolderFormValues) => void;
   onSave: (values: WatchFolderFormValues) => Promise<void>;
   onScan: () => Promise<void>;
-  onBrowse: () => void;
 }) {
   const t = useTranslate();
   const hasPath = values.path.trim().length > 0;
@@ -882,16 +862,11 @@ function WatchFolderSettingsCard({
           </Field>
 
           <Field label={t("watchFolder.folder")}>
-            <div className="flex gap-2">
-              <Input
-                value={values.path}
-                onChange={(event) => onChange({ ...values, path: event.target.value })}
-                className="font-mono"
-              />
-              <Button type="button" variant="outline" onClick={onBrowse}>
-                {t("watchFolder.browse")}
-              </Button>
-            </div>
+            <FolderPathInput
+              value={values.path}
+              onChange={(path) => onChange({ ...values, path })}
+              browseLabel={t("watchFolder.browse")}
+            />
           </Field>
 
           <Field label={t("watchFolder.pollInterval")}>
