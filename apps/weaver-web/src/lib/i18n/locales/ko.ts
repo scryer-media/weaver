@@ -229,7 +229,7 @@ const ko: LocaleDictionary = {
   "settings.themeSystem": "시스템",
   "settings.security": "보안",
   "settings.backupNav": "백업",
-  "settings.rss": "RSS + Watch Folder",
+  "settings.rss": "RSS",
   "settings.generalPageDesc": "다운로드 속도, 저장 경로, 정리 동작, 재시도 정책을 한 곳에서 조정하세요.",
   "settings.language": "언어",
   "settings.languageDesc": "Weaver 인터페이스의 표시 언어를 선택하세요.",
@@ -257,7 +257,7 @@ const ko: LocaleDictionary = {
   "settings.bandwidthCapReset": "다음 초기화",
   "settings.securityDesc": "관리자 및 통합 자격 증명을 관리합니다. 추가 보안 컨트롤은 향후 여기에 추가될 수 있습니다.",
   "settings.backupPageDesc": "안정된 상태의 백업을 내보내거나 리맵과 경로를 검토한 후 깨끗한 인스턴스에 복원하세요.",
-  "settings.rssDesc": "피드 폴링, 감시 폴더 가져오기, 카테고리 기본값, 자동 제출 규칙을 설정하세요.",
+  "settings.rssDesc": "피드 폴링, 카테고리 기본값, 자동 제출 규칙을 설정하세요.",
   "settings.categoriesDesc": "설정 영역을 벗어나지 않고 카테고리 이름, 별칭, 대상 재정의를 정의하세요.",
   "settings.serversDesc": "설정 내에서 공급자 연결, 백필 그룹, 연결 테스트를 관리하세요.",
 

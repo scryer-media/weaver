@@ -110,6 +110,13 @@ export const router = createBrowserRouter([
             ),
           },
           {
+            path: "watch-folder",
+            lazy: lazyNamedRoute(
+              () => import("@/pages/settings/WatchFolderSettingsPage"),
+              "WatchFolderSettingsPage",
+            ),
+          },
+          {
             path: "schedules",
             lazy: lazyNamedRoute(
               () => import("@/pages/settings/ScheduleSettingsPage"),

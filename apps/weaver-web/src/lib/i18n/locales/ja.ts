@@ -229,7 +229,7 @@ const ja: LocaleDictionary = {
   "settings.themeSystem": "システム",
   "settings.security": "セキュリティ",
   "settings.backupNav": "バックアップ",
-  "settings.rss": "RSS + Watch Folder",
+  "settings.rss": "RSS",
   "settings.generalPageDesc": "ダウンロード速度、ストレージパス、クリーンアップ動作、リトライポリシーをまとめて調整します。",
   "settings.language": "言語",
   "settings.languageDesc": "Weaver インターフェースの表示言語を選択します。",
@@ -257,7 +257,7 @@ const ja: LocaleDictionary = {
   "settings.bandwidthCapReset": "次回リセット",
   "settings.securityDesc": "管理者資格情報とインテグレーション認証情報を管理します。今後さらにセキュリティ機能が追加される予定です。",
   "settings.backupPageDesc": "安定状態のバックアップをエクスポートするか、リマップとパスを確認した上でクリーンなインスタンスに復元します。",
-  "settings.rssDesc": "フィードのポーリング、監視フォルダー取り込み、カテゴリ既定値、自動送信ルールを設定します。",
+  "settings.rssDesc": "フィードのポーリング、カテゴリ既定値、自動送信ルールを設定します。",
   "settings.categoriesDesc": "設定画面を離れずに、カテゴリ名、エイリアス、送信先の上書きを定義します。",
   "settings.serversDesc": "プロバイダー接続、バックフィルグループ、接続テストを設定から管理します。",
 

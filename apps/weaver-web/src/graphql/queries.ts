@@ -1046,16 +1046,6 @@ export const CHANGE_PASSWORD_MUTATION = gql`
 
 export const RSS_SETTINGS_QUERY = gql`
   query RssSettings {
-    settings {
-      watchFolder {
-        mode
-        path
-        pollIntervalSecs
-        stabilitySecs
-        categoryFromSubfolders
-        scanningPaused
-      }
-    }
     rssFeeds {
       ...RssFeedFields
     }
@@ -1070,6 +1060,21 @@ export const RSS_SETTINGS_QUERY = gql`
   ${RSS_FEED_FIELDS}
   ${RSS_SEEN_ITEM_FIELDS}
   ${CATEGORY_FIELDS}
+`;
+
+export const WATCH_FOLDER_SETTINGS_QUERY = gql`
+  query WatchFolderSettings {
+    settings {
+      watchFolder {
+        mode
+        path
+        pollIntervalSecs
+        stabilitySecs
+        categoryFromSubfolders
+        scanningPaused
+      }
+    }
+  }
 `;
 
 export const ADD_RSS_FEED_MUTATION = gql`

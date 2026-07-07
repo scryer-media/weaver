@@ -229,7 +229,7 @@ const de: LocaleDictionary = {
   "settings.themeSystem": "System",
   "settings.security": "Sicherheit",
   "settings.backupNav": "Backup",
-  "settings.rss": "RSS + Watch Folder",
+  "settings.rss": "RSS",
   "settings.generalPageDesc": "Downloadgeschwindigkeit, Speicherpfade, Bereinigungsverhalten und Wiederholungsrichtlinien an einem Ort konfigurieren.",
   "settings.language": "Sprache",
   "settings.languageDesc": "Wählen Sie die Anzeigesprache für die Weaver-Oberfläche.",
@@ -257,7 +257,7 @@ const de: LocaleDictionary = {
   "settings.bandwidthCapReset": "Nächste Zurücksetzung",
   "settings.securityDesc": "Administrator- und Integrationszugangsdaten verwalten. Weitere Sicherheitsoptionen können hier später ergänzt werden.",
   "settings.backupPageDesc": "Ein stabiles Backup exportieren oder eines in eine saubere Instanz wiederherstellen, nachdem Zuordnungen und Pfade überprüft wurden.",
-  "settings.rssDesc": "Feed-Abfrage, Watch-Folder-Importe, Kategorie-Standardwerte und Regeln für automatische Übermittlungen konfigurieren.",
+  "settings.rssDesc": "Feed-Abfrage, Kategorie-Standardwerte und Regeln für automatische Übermittlungen konfigurieren.",
   "settings.categoriesDesc": "Kategorienamen, Aliase und Zielverzeichnisse definieren, ohne den Einstellungsbereich zu verlassen.",
   "settings.serversDesc": "Anbieterverbindungen, Backfill-Gruppen und Verbindungstests innerhalb der Einstellungen verwalten.",
 

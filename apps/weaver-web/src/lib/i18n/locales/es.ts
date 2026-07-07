@@ -229,7 +229,7 @@ const es: LocaleDictionary = {
   "settings.themeSystem": "Sistema",
   "settings.security": "Seguridad",
   "settings.backupNav": "Copia de seguridad",
-  "settings.rss": "RSS + Watch Folder",
+  "settings.rss": "RSS",
   "settings.generalPageDesc": "Ajusta la velocidad de descarga, rutas de almacenamiento, comportamiento de limpieza y política de reintentos desde un solo lugar.",
   "settings.language": "Idioma",
   "settings.languageDesc": "Elige el idioma de la interfaz de Weaver.",
@@ -257,7 +257,7 @@ const es: LocaleDictionary = {
   "settings.bandwidthCapReset": "Próximo reinicio",
   "settings.securityDesc": "Gestiona las credenciales de administrador e integración. Más controles de seguridad podrán añadirse aquí en el futuro.",
   "settings.backupPageDesc": "Exporta una copia de seguridad estable o restaura una en una instancia limpia tras revisar las reasignaciones y rutas.",
-  "settings.rssDesc": "Configura el sondeo de feeds, la importación desde carpeta vigilada, categorías por defecto y reglas de envío automático.",
+  "settings.rssDesc": "Configura el sondeo de feeds, categorías por defecto y reglas de envío automático.",
   "settings.categoriesDesc": "Define nombres de categorías, alias y destinos personalizados sin salir de los ajustes.",
   "settings.serversDesc": "Gestiona conexiones de proveedores, grupos de respaldo y pruebas de conexión desde los ajustes.",
 

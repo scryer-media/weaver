@@ -25,6 +25,11 @@ export const settingsNav = [
     descriptionKey: "settings.rssDesc",
   },
   {
+    to: "/settings/watch-folder",
+    labelKey: "watchFolder.title",
+    descriptionKey: "watchFolder.desc",
+  },
+  {
     to: "/settings/schedules",
     labelKey: "schedule.title",
     descriptionKey: "schedule.desc",
