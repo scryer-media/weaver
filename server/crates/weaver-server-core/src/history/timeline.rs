@@ -162,6 +162,50 @@ impl Database {
         })
     }
 
+    /// Load the most recent events for a job, ordered oldest-first, capped at
+    /// `cap` rows.
+    ///
+    /// Unlike [`Database::get_job_events`], which scans a job's entire event log,
+    /// this reads only the newest `cap` rows (`ORDER BY id DESC LIMIT cap`) and
+    /// reverses them in Rust so the returned slice is still oldest-first. It is
+    /// intended for read-only views that re-poll frequently and only render the
+    /// tail of a potentially huge log (large RAR jobs write several rows per
+    /// extracted member). Callers that need the full log — such as the pipeline
+    /// restore path that scans for a finalization marker — must keep using
+    /// [`Database::get_job_events`].
+    pub fn get_job_events_latest(
+        &self,
+        job_id: u64,
+        cap: u32,
+    ) -> Result<Vec<JobEvent>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let mut rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id, timestamp, kind, message, file_id
+                   FROM job_events
+                  WHERE job_id = {}
+                  ORDER BY id DESC
+                  LIMIT {}",
+                &[SqlArg::I64(job_id as i64), SqlArg::I64(i64::from(cap))],
+            )
+            .await?;
+            // Restore ascending (oldest-first) order after the descending fetch.
+            rows.reverse();
+            rows.into_iter()
+                .map(|row| {
+                    Ok(JobEvent {
+                        job_id: row.i64("job_id")? as u64,
+                        timestamp: row.i64("timestamp")?,
+                        kind: row.text("kind")?,
+                        message: row.text("message")?,
+                        file_id: row.opt_text("file_id")?,
+                    })
+                })
+                .collect()
+        })
+    }
+
     /// Delete all events for a job.
     pub fn delete_job_events(&self, job_id: u64) -> Result<(), StateError> {
         let datastore = self.datastore();

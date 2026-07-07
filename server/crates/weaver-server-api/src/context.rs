@@ -39,6 +39,12 @@ pub struct SchemaContext {
     pub log_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
     /// Live NNTP pool for per-server health metrics. `None` in contexts without a pool (tests).
     pub nntp_pool: Option<Arc<NntpPool>>,
+    /// Whether to spawn the background history-delete worker. Always `true` in
+    /// production; tests that assert on a freshly-seeded QUEUED delete operation
+    /// set this `false` so the worker cannot claim the operation out from under
+    /// the assertion. The `HistoryDeleteManager` is still wired into the schema
+    /// so on-demand delete mutations work regardless.
+    pub spawn_history_delete_worker: bool,
 }
 
 pub fn build_schema(context: SchemaContext) -> WeaverSchema {
@@ -49,7 +55,9 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
         context.handle.clone(),
         replay.clone(),
     );
-    history_delete_manager.spawn_worker();
+    if context.spawn_history_delete_worker {
+        history_delete_manager.spawn_worker();
+    }
 
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))

@@ -36,7 +36,10 @@ impl Database {
             .unwrap_or_default()
             .as_millis() as i64;
         self.run_sql_blocking(async move {
-            let row = SqlRuntime::fetch_optional(
+            // Autocommit INSERT ... RETURNING: use the write-path helper so an
+            // ambiguous connection drop is not retried (which would duplicate the
+            // api_keys row), unlike the read-path `fetch_optional`.
+            let row = SqlRuntime::execute_returning(
                 datastore.read_exec(),
                 "INSERT INTO api_keys (name, key_hash, scope, created_at)
                  VALUES ({}, {}, {}, {})

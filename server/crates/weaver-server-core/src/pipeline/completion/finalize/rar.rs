@@ -1280,7 +1280,7 @@ impl Pipeline {
             self.extracted_members.remove(&job_id);
         }
         if !retry_members.is_empty() {
-            self.clear_persisted_extracted_members(job_id);
+            self.clear_persisted_extracted_members(job_id).await;
         }
 
         for set_name in &retry_sets {

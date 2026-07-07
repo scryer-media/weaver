@@ -100,6 +100,9 @@ impl Database {
     pub fn insert_job_history(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
         let datastore = self.datastore();
         let cache_entry = entry.clone();
+        // Capture the cache generation before the write so a delete racing this
+        // insert (invalidating after its commit) makes the re-cache a no-op.
+        let observed_generation = self.job_history_cache_generation();
         let args = job_history_args(entry);
         let attribute_entry = entry.clone();
         let result = self.run_sql_blocking(async move {
@@ -142,7 +145,7 @@ impl Database {
             .await
         });
         if result.is_ok() {
-            self.cache_job_history(cache_entry);
+            self.cache_job_history_at(cache_entry, observed_generation);
         }
         result
     }

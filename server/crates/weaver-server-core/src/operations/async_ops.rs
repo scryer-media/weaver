@@ -2,12 +2,20 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sqlx::{Postgres, QueryBuilder, Sqlite};
 
-use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
+use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRow, SqlRuntime, SqlTx};
 use crate::{Database, StateError};
 
 const HISTORY_DELETE_KIND: &str = "history_delete";
 const HISTORY_JOB_TARGET_KIND: &str = "history_job";
+
+// Per-dialect bind budgets for chunking large `IN (…)` id lists. A delete-all
+// over a very large history table can produce far more ids than sqlite's
+// variable limit (999), so id lists must be split into chunks that stay under
+// the budget once the query's fixed (non-id) binds are subtracted.
+const SQLITE_BATCH_BIND_LIMIT: usize = 900;
+const POSTGRES_BATCH_BIND_LIMIT: usize = 16_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AsyncOperationState {
@@ -180,6 +188,26 @@ fn id_args(ids: &[u64]) -> Vec<SqlArg> {
     ids.iter().map(|id| SqlArg::I64(*id as i64)).collect()
 }
 
+fn bind_budget_for_engine(engine: SqlEngine) -> usize {
+    match engine {
+        SqlEngine::Sqlite => SQLITE_BATCH_BIND_LIMIT,
+        SqlEngine::Postgres => POSTGRES_BATCH_BIND_LIMIT,
+    }
+}
+
+fn bind_budget_for_tx(tx: &SqlTx<'_>) -> usize {
+    match tx {
+        SqlTx::Sqlite(_) => SQLITE_BATCH_BIND_LIMIT,
+        SqlTx::Postgres(_) => POSTGRES_BATCH_BIND_LIMIT,
+    }
+}
+
+/// Maximum number of id binds per `IN (…)` chunk, leaving room for `fixed_binds`
+/// non-id parameters that every chunk carries (e.g. a `target_kind`).
+fn id_chunk_size(bind_budget: usize, fixed_binds: usize) -> usize {
+    bind_budget.saturating_sub(fixed_binds).max(1)
+}
+
 fn payload_json(delete_files: bool) -> Result<String, StateError> {
     serde_json::to_string(&HistoryDeleteOperationPayload { delete_files }).map_err(db_err)
 }
@@ -189,30 +217,45 @@ fn parse_payload(raw: &str) -> Result<HistoryDeleteOperationPayload, StateError>
 }
 
 async fn count_existing_history_rows(tx: &mut SqlTx<'_>, ids: &[u64]) -> Result<usize, StateError> {
-    let sql = format!(
-        "SELECT COUNT(*) AS count FROM job_history WHERE job_id IN ({})",
-        placeholders(ids.len())
-    );
-    let row = tx.fetch_optional(&sql, &id_args(ids)).await?;
-    Ok(row.map(|row| row.i64("count")).transpose()?.unwrap_or(0) as usize)
+    let chunk_size = id_chunk_size(bind_budget_for_tx(tx), 0);
+    let mut total = 0i64;
+    // `ids` is deduped by the caller, so chunks are disjoint and per-chunk counts
+    // sum to the exact total.
+    for chunk in ids.chunks(chunk_size) {
+        let sql = format!(
+            "SELECT COUNT(*) AS count FROM job_history WHERE job_id IN ({})",
+            placeholders(chunk.len())
+        );
+        let row = tx.fetch_optional(&sql, &id_args(chunk)).await?;
+        total += row.map(|row| row.i64("count")).transpose()?.unwrap_or(0);
+    }
+    Ok(total.max(0) as usize)
 }
 
 async fn count_locked_history_delete_targets(
     tx: &mut SqlTx<'_>,
     ids: &[u64],
 ) -> Result<usize, StateError> {
-    let sql = format!(
-        "SELECT COUNT(DISTINCT target_id) AS count
-         FROM async_operation_targets
-         WHERE target_kind = {{}}
-           AND state IN ('queued', 'running')
-           AND target_id IN ({})",
-        placeholders(ids.len())
-    );
-    let mut args = vec![SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string())];
-    args.extend(id_args(ids));
-    let row = tx.fetch_optional(&sql, &args).await?;
-    Ok(row.map(|row| row.i64("count")).transpose()?.unwrap_or(0) as usize)
+    // One fixed bind (`target_kind`) per chunk. `ids` is deduped and chunks are
+    // disjoint, so `COUNT(DISTINCT target_id)` per chunk sums to the exact total
+    // (no target_id can span two chunks).
+    let chunk_size = id_chunk_size(bind_budget_for_tx(tx), 1);
+    let mut total = 0i64;
+    for chunk in ids.chunks(chunk_size) {
+        let sql = format!(
+            "SELECT COUNT(DISTINCT target_id) AS count
+             FROM async_operation_targets
+             WHERE target_kind = {{}}
+               AND state IN ('queued', 'running')
+               AND target_id IN ({})",
+            placeholders(chunk.len())
+        );
+        let mut args = vec![SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string())];
+        args.extend(id_args(chunk));
+        let row = tx.fetch_optional(&sql, &args).await?;
+        total += row.map(|row| row.i64("count")).transpose()?.unwrap_or(0);
+    }
+    Ok(total.max(0) as usize)
 }
 
 async fn list_all_history_job_ids_tx(tx: &mut SqlTx<'_>) -> Result<Vec<u64>, StateError> {
@@ -268,23 +311,68 @@ async fn insert_history_delete_operation_tx(
         .ok_or_else(|| StateError::Database("failed to insert async operation".to_string()))?;
     let operation_id = row.i64("id")? as u64;
 
-    for (index, id) in ids.iter().enumerate() {
-        tx.execute(
-            "INSERT INTO async_operation_targets
-             (operation_id, target_kind, target_id, state, error_message, sort_order)
-             VALUES ({}, {}, {}, {}, NULL, {})",
-            &[
-                SqlArg::I64(operation_id as i64),
-                SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
-                SqlArg::I64(*id as i64),
-                SqlArg::Text(AsyncOperationTargetState::Queued.as_str().to_string()),
-                SqlArg::I64(index as i64),
-            ],
-        )
-        .await?;
-    }
+    bulk_insert_history_delete_targets_tx(tx, operation_id, ids).await?;
 
     Ok(operation_id)
+}
+
+/// Insert one `async_operation_targets` row per id using multi-row `VALUES`
+/// chunks (instead of one `INSERT` statement per id).
+///
+/// `sort_order` is the id's index in `ids`, preserving the exact ordering
+/// semantics of the previous per-statement loop. `error_message` is always
+/// `NULL` for a freshly queued target. Rows bind 6 parameters each
+/// (operation_id, target_kind, target_id, state, error_message, sort_order), so
+/// chunks stay under the dialect bind budget.
+async fn bulk_insert_history_delete_targets_tx(
+    tx: &mut SqlTx<'_>,
+    operation_id: u64,
+    ids: &[u64],
+) -> Result<(), StateError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    const BINDS_PER_ROW: usize = 6;
+    let chunk_size = (bind_budget_for_tx(tx) / BINDS_PER_ROW).max(1);
+    let state = AsyncOperationTargetState::Queued.as_str();
+    let prefix = "INSERT INTO async_operation_targets \
+                  (operation_id, target_kind, target_id, state, error_message, sort_order) ";
+
+    match tx {
+        SqlTx::Sqlite(tx) => {
+            for (chunk_index, chunk) in ids.chunks(chunk_size).enumerate() {
+                let base = chunk_index * chunk_size;
+                let mut builder = QueryBuilder::<Sqlite>::new(prefix);
+                builder.push_values(chunk.iter().enumerate(), |mut row, (offset, id)| {
+                    row.push_bind(operation_id as i64)
+                        .push_bind(HISTORY_JOB_TARGET_KIND)
+                        .push_bind(*id as i64)
+                        .push_bind(state)
+                        .push_bind(Option::<String>::None)
+                        .push_bind((base + offset) as i64);
+                });
+                builder.build().execute(&mut **tx).await.map_err(db_err)?;
+            }
+        }
+        SqlTx::Postgres(tx) => {
+            for (chunk_index, chunk) in ids.chunks(chunk_size).enumerate() {
+                let base = chunk_index * chunk_size;
+                let mut builder = QueryBuilder::<Postgres>::new(prefix);
+                builder.push_values(chunk.iter().enumerate(), |mut row, (offset, id)| {
+                    row.push_bind(operation_id as i64)
+                        .push_bind(HISTORY_JOB_TARGET_KIND)
+                        .push_bind(*id as i64)
+                        .push_bind(state)
+                        .push_bind(Option::<String>::None)
+                        .push_bind((base + offset) as i64);
+                });
+                builder.build().execute(&mut **tx).await.map_err(db_err)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 impl Database {
@@ -299,20 +387,25 @@ impl Database {
 
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let sql = format!(
-                "SELECT DISTINCT target_id
-                 FROM async_operation_targets
-                 WHERE target_kind = {{}}
-                   AND state IN ('queued', 'running')
-                   AND target_id IN ({})",
-                placeholders(ids.len())
-            );
-            let mut args = vec![SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string())];
-            args.extend(id_args(&ids));
-            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
-            rows.into_iter()
-                .map(|row| Ok(row.i64("target_id")? as u64))
-                .collect()
+            let chunk_size = id_chunk_size(bind_budget_for_engine(datastore.engine()), 1);
+            let mut locked = HashSet::new();
+            for chunk in ids.chunks(chunk_size) {
+                let sql = format!(
+                    "SELECT DISTINCT target_id
+                     FROM async_operation_targets
+                     WHERE target_kind = {{}}
+                       AND state IN ('queued', 'running')
+                       AND target_id IN ({})",
+                    placeholders(chunk.len())
+                );
+                let mut args = vec![SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string())];
+                args.extend(id_args(chunk));
+                let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+                for row in rows {
+                    locked.insert(row.i64("target_id")? as u64);
+                }
+            }
+            Ok(locked)
         })
     }
 
@@ -341,14 +434,20 @@ impl Database {
 
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let sql = format!(
-                "SELECT job_id FROM job_history WHERE job_id IN ({})",
-                placeholders(ids.len())
-            );
-            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &id_args(&ids)).await?;
-            rows.into_iter()
-                .map(|row| Ok(row.i64("job_id")? as u64))
-                .collect()
+            let chunk_size = id_chunk_size(bind_budget_for_engine(datastore.engine()), 0);
+            let mut present = BTreeSet::new();
+            for chunk in ids.chunks(chunk_size) {
+                let sql = format!(
+                    "SELECT job_id FROM job_history WHERE job_id IN ({})",
+                    placeholders(chunk.len())
+                );
+                let rows =
+                    SqlRuntime::fetch_all(datastore.read_exec(), &sql, &id_args(chunk)).await?;
+                for row in rows {
+                    present.insert(row.i64("job_id")? as u64);
+                }
+            }
+            Ok(present)
         })
     }
 
@@ -970,5 +1069,88 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].target_id, 11);
         assert_eq!(targets[0].state, AsyncOperationTargetState::Queued);
+    }
+
+    // Exceeds the sqlite bind budget (900) so the `IN (…)` builders and the
+    // target bulk-insert are forced across multiple chunks.
+    const CHUNKED_ID_COUNT: u64 = 2_500;
+
+    #[test]
+    fn insert_all_history_delete_operation_chunks_large_target_set() {
+        let db = Database::open_in_memory().unwrap();
+        for job_id in 1..=CHUNKED_ID_COUNT {
+            db.insert_job_history(&history(job_id, 1_000 + job_id as i64))
+                .unwrap();
+        }
+
+        let (operation_id, ids) = db.insert_all_history_delete_operation(true).unwrap();
+        assert_eq!(ids.len() as u64, CHUNKED_ID_COUNT);
+
+        // Every id became exactly one queued, locked target across all chunks.
+        let summaries = db.list_history_delete_operations(true).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, operation_id);
+        assert_eq!(u64::from(summaries[0].total_targets), CHUNKED_ID_COUNT);
+        assert_eq!(u64::from(summaries[0].queued_targets), CHUNKED_ID_COUNT);
+
+        // sort_order must be dense and unique 0..N across chunk boundaries so the
+        // claim order matches the (completed_at DESC, job_id DESC) input order.
+        let targets = db
+            .list_history_delete_operation_targets(operation_id, true)
+            .unwrap();
+        assert_eq!(targets.len() as u64, CHUNKED_ID_COUNT);
+        // `list_all_history_job_ids_tx` orders newest-first, so target index 0 is
+        // the highest job_id.
+        for (index, target) in targets.iter().enumerate() {
+            let expected = CHUNKED_ID_COUNT - index as u64;
+            assert_eq!(target.target_id, expected, "unexpected order at {index}");
+        }
+    }
+
+    #[test]
+    fn list_history_job_ids_chunks_large_input() {
+        let db = Database::open_in_memory().unwrap();
+        for job_id in 1..=CHUNKED_ID_COUNT {
+            db.insert_job_history(&history(job_id, 1_000 + job_id as i64))
+                .unwrap();
+        }
+
+        // Query for every present id plus a large block of absent ids; both the
+        // present and absent ids together exceed a single sqlite bind chunk.
+        let mut query_ids: Vec<u64> = (1..=CHUNKED_ID_COUNT).collect();
+        query_ids.extend(1_000_000..1_000_000 + CHUNKED_ID_COUNT);
+        let present = db.list_history_job_ids(&query_ids).unwrap();
+        assert_eq!(present.len() as u64, CHUNKED_ID_COUNT);
+        assert!(present.contains(&1));
+        assert!(present.contains(&CHUNKED_ID_COUNT));
+        assert!(!present.contains(&1_000_000));
+    }
+
+    #[test]
+    fn locked_target_lookup_chunks_large_input() {
+        let db = Database::open_in_memory().unwrap();
+        for job_id in 1..=CHUNKED_ID_COUNT {
+            db.insert_job_history(&history(job_id, 1_000 + job_id as i64))
+                .unwrap();
+        }
+        db.insert_all_history_delete_operation(false).unwrap();
+
+        let query_ids: Vec<u64> = (1..=CHUNKED_ID_COUNT).collect();
+        let locked = db
+            .list_history_delete_locked_target_ids(&query_ids)
+            .unwrap();
+        assert_eq!(locked.len() as u64, CHUNKED_ID_COUNT);
+        assert!(locked.contains(&1));
+        assert!(locked.contains(&CHUNKED_ID_COUNT));
+
+        // A fresh insert over the same (now locked) rows must be rejected, which
+        // exercises the chunked count_existing/count_locked paths in the tx.
+        let error = db
+            .insert_history_delete_operation(&query_ids, true)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HistoryDeleteOperationInsertError::LockedTargets
+        ));
     }
 }

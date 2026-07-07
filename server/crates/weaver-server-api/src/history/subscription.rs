@@ -96,8 +96,19 @@ impl HistorySubscription {
                     job_id,
                 ).await {
                     Ok(snapshot) => {
-                        terminal_settled =
-                            snapshot.queue_item.is_none() && snapshot.history_item.is_some();
+                        // A job with no live queue entry has settled to the slow
+                        // JOB_DETAIL_TERMINAL_HEARTBEAT cadence, whether it is
+                        // archived (history row present) OR fully gone (history
+                        // row deleted while this tab was open). Not gating on
+                        // `history_item.is_some()` is what keeps a just-deleted
+                        // job from flipping back to the 500ms heartbeat and
+                        // reloading the DB forever. This is safe for the brief
+                        // completion gap (queue entry removed before the archive
+                        // row is visible) because every real transition emits
+                        // pipeline events that pass the should_record_job_event
+                        // filter and force an immediate reload regardless of
+                        // settling.
+                        terminal_settled = snapshot.queue_item.is_none();
                         if terminal_settled {
                             last_terminal_reload = tokio::time::Instant::now();
                         }

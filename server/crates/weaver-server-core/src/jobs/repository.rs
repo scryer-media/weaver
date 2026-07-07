@@ -212,9 +212,13 @@ impl Database {
     ) -> Result<(), StateError> {
         let datastore = self.datastore();
         let args = history_args(history, job_id);
+        // Capture the cache generation before the archive read so a concurrent
+        // history-delete that bumps the generation makes the re-cache a no-op
+        // instead of resurrecting the just-deleted row.
+        let observed_generation = self.job_history_cache_generation();
         let result = self.run_sql_blocking(archive_job_sql(datastore, job_id, args));
         if let Ok(Some(row)) = &result {
-            self.cache_job_history(row.clone());
+            self.cache_job_history_at(row.clone(), observed_generation);
         }
         result.map(|_| ())
     }

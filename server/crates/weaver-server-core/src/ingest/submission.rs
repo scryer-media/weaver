@@ -232,7 +232,14 @@ async fn submit_prepared_nzb(
         options.category_resolution,
     )
     .await;
-    let job_id = db.reserve_next_job_id()?;
+    // Run the id-reservation write off the caller's async task (HTTP / RSS /
+    // watch-folder) so its DB round-trip doesn't park that worker thread.
+    let job_id = {
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || db.reserve_next_job_id())
+            .await
+            .expect("reserve_next_job_id task panicked")?
+    };
     let job_hash = persisted_nzb::hash_persisted_nzb_bytes(&nzb_zstd);
     let spec = nzb_to_submission_spec(
         &nzb,

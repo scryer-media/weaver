@@ -633,7 +633,10 @@ async fn delete_all_history_idempotent() {
 
 #[tokio::test]
 async fn history_page_exposes_delete_operation_state() {
-    let h = TestHarness::new().await;
+    // The worker must stay off: this test seeds a QUEUED delete operation and
+    // asserts it is still QUEUED, which the background worker would otherwise
+    // claim and flip to RUNNING.
+    let h = TestHarness::new_without_history_delete_worker().await;
     h.insert_history_row(&sample_history_row(
         1,
         "alpha.release",
@@ -679,7 +682,9 @@ async fn history_page_exposes_delete_operation_state() {
 
 #[tokio::test]
 async fn job_detail_snapshot_exposes_history_delete_state() {
-    let h = TestHarness::new().await;
+    // See history_page_exposes_delete_operation_state: the worker would race the
+    // seeded QUEUED operation, so keep it off for this initial-state assertion.
+    let h = TestHarness::new_without_history_delete_worker().await;
     h.insert_history_row(&sample_history_row(
         7,
         "detail.release",

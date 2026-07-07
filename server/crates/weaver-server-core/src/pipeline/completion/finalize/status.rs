@@ -87,27 +87,33 @@ impl Pipeline {
                     .map(|(_, post_state, _)| post_state.as_str().to_string())
             });
 
-        self.db_fire_and_forget(move |db| {
-            if let Err(error) = db.set_active_job_runtime(
-                job_id,
-                &status,
-                Some(&download_state),
-                Some(&post_state),
-                Some(&run_state),
-                error.as_deref(),
-                queued_repair_at_epoch_ms,
-                queued_extract_at_epoch_ms,
-                paused_resume_status.as_deref(),
-                paused_resume_download_state.as_deref(),
-                paused_resume_post_state.as_deref(),
-            ) {
-                tracing::error!(
-                    error = %error,
-                    status,
-                    "db write failed for active job runtime"
-                );
-            }
-        });
+        // Route through the ordered writer queue rather than a detached
+        // fire-and-forget task: two rapid runtime transitions for the same job
+        // (last-write-wins columns: run_state / paused_resume_* / status) must
+        // land in enqueue order, or a restored job could resume stale state.
+        if let Err(error) = self
+            .db
+            .try_queue_write("set_active_job_runtime", move |db| {
+                db.set_active_job_runtime(
+                    job_id,
+                    &status,
+                    Some(&download_state),
+                    Some(&post_state),
+                    Some(&run_state),
+                    error.as_deref(),
+                    queued_repair_at_epoch_ms,
+                    queued_extract_at_epoch_ms,
+                    paused_resume_status.as_deref(),
+                    paused_resume_download_state.as_deref(),
+                    paused_resume_post_state.as_deref(),
+                )
+            })
+        {
+            tracing::error!(
+                error = %error,
+                "failed to queue active job runtime write"
+            );
+        }
     }
 
     pub(crate) fn active_repair_jobs(&self) -> usize {
@@ -476,32 +482,48 @@ impl Pipeline {
             }
         }
         self.extracted_archives.remove(&job_id);
-        self.clear_persisted_extracted_members(job_id);
+        self.clear_persisted_extracted_members(job_id).await;
         let set_names = self.rar_set_names_for_job(job_id);
-        for member in &missing_members {
-            if let Err(error) = self.db.clear_member_chunks_for_all_sets(job_id, member) {
-                warn!(
-                    job_id = job_id.0,
-                    member = %member,
-                    error = %error,
-                    "failed to clear stale extracted member chunks after reconciliation"
-                );
-            }
+        let members_to_clear: Vec<String> = missing_members.clone();
+        if !members_to_clear.is_empty() {
+            self.db_blocking(move |db| {
+                for member in &members_to_clear {
+                    if let Err(error) = db.clear_member_chunks_for_all_sets(job_id, member) {
+                        warn!(
+                            job_id = job_id.0,
+                            member = %member,
+                            error = %error,
+                            "failed to clear stale extracted member chunks after reconciliation"
+                        );
+                    }
+                }
+            })
+            .await;
         }
 
-        if let Some(remaining_members) = self.extracted_members.get(&job_id) {
-            for member in remaining_members {
-                if let Some(path) = self.resolve_job_input_path(job_id, member)
-                    && let Err(error) = self.db.add_extracted_member(job_id, member, &path)
-                {
-                    warn!(
-                        job_id = job_id.0,
-                        member = %member,
-                        error = %error,
-                        "failed to rebuild persisted extracted member after reconciliation"
-                    );
-                }
-            }
+        let members_to_persist: Vec<(String, std::path::PathBuf)> = self
+            .extracted_members
+            .get(&job_id)
+            .map(|remaining_members| {
+                remaining_members
+                    .iter()
+                    .filter_map(|member| {
+                        self.resolve_job_input_path(job_id, member)
+                            .map(|path| (member.clone(), path))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !members_to_persist.is_empty()
+            && let Err(error) = self
+                .db_blocking(move |db| db.add_extracted_members(job_id, &members_to_persist))
+                .await
+        {
+            warn!(
+                job_id = job_id.0,
+                error = %error,
+                "failed to rebuild persisted extracted members after reconciliation"
+            );
         }
 
         for set_name in set_names {

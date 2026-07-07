@@ -10,6 +10,15 @@ enum HistoryQueryPlan {
     Query(weaver_server_core::HistoryFilter),
 }
 
+/// Upper bound on job-event rows loaded for the polled detail snapshot. Large
+/// RAR jobs write ~5-7 event rows per extracted member, so an unbounded read of
+/// a big job's log can be thousands of rows re-fetched a few times a second
+/// while a tab is open. 2000 is a generous tail — enough to render every
+/// lifecycle/verification/repair marker plus recent extraction activity — while
+/// capping the per-poll cost. Only the detail-view read is bounded; callers that
+/// must see the full log use `get_job_events`.
+const JOB_DETAIL_EVENT_CAP: u32 = 2000;
+
 #[derive(Default)]
 pub(crate) struct HistoryQuery;
 
@@ -231,7 +240,13 @@ pub(crate) async fn load_job_detail_snapshot(
     let live_only = live_job.is_some();
 
     let (events, history, delete_states) = tokio::task::spawn_blocking(move || {
-        let events = db.get_job_events(job_id)?;
+        // The detail view is a read-only, high-frequency poll (heartbeat + event
+        // triggers, up to a few Hz per open tab). Large RAR jobs write thousands
+        // of event rows, so read only the newest slice instead of scanning the
+        // whole log. This is the ONLY detail-snapshot event read switched to the
+        // capped variant; the pipeline restore path still uses get_job_events so
+        // it can scan the full log for its finalization marker.
+        let events = db.get_job_events_latest(job_id, JOB_DETAIL_EVENT_CAP)?;
         let history = if live_only {
             None
         } else {
@@ -302,11 +317,27 @@ pub(crate) async fn load_job_detail_snapshot(
 
 async fn load_history_page(db: Database, input: HistoryPageInput) -> Result<HistoryPage> {
     tokio::task::spawn_blocking(move || {
-        let rows = db.list_job_history(&weaver_server_core::HistoryFilter::default())?;
-        let mut page = build_history_page(rows, input);
+        // Two code paths, selected by whether the request's semantics map exactly
+        // onto SQL. The SQL path (`build_history_page_sql`) pushes the status
+        // filter, ordering, counts, and LIMIT/OFFSET into the database, backed by
+        // idx_job_history_completed_job, so the default History view and the
+        // completion-driven refetch never load the whole table. Any request that
+        // does NOT map exactly — a free-text search (its Rust semantics are
+        // `to_lowercase().contains()` over computed titles, which sqlite's
+        // ASCII-only LOWER and LIKE cannot reproduce) or a non-default sort key
+        // (not covered by the completed_at index) — keeps the original full-scan
+        // Rust path (`build_history_page`) so results stay byte-identical.
+        let mut page = if let Some(plan) = HistoryPageSqlPlan::for_input(&input) {
+            build_history_page_sql(&db, plan)?
+        } else {
+            let rows = db.list_job_history(&weaver_server_core::HistoryFilter::default())?;
+            build_history_page(rows, input)
+        };
         // Delete-operation badges are only needed for the rows actually shown on
         // this page. Load them for the page's job ids instead of issuing an
-        // `IN (…)` over every row in the history table.
+        // `IN (…)` over every row in the history table. Both paths share this tail
+        // so the response (page shape, counts, per-page delete states) is
+        // identical for identical data.
         let delete_states = load_history_delete_states(&db, page.items.iter().map(|item| item.id))?;
         for item in &mut page.items {
             item.delete_operation = delete_states
@@ -319,6 +350,119 @@ async fn load_history_page(db: Database, input: HistoryPageInput) -> Result<Hist
     .await
     .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
     .map_err(|error| graphql_error("INTERNAL", error.to_string()))
+}
+
+/// A History-page request whose semantics map exactly onto SQL filtering,
+/// ordering, counting, and pagination.
+///
+/// This is only constructed for requests with no free-text search and the
+/// default `completed_at DESC` ordering; see [`HistoryPageSqlPlan::for_input`].
+struct HistoryPageSqlPlan {
+    status: HistoryStatusFilter,
+    page_index: usize,
+    page_size: usize,
+}
+
+impl HistoryPageSqlPlan {
+    /// Returns a SQL plan when the request maps exactly onto SQL, or `None` when
+    /// the caller must fall back to the full-scan Rust path in
+    /// [`build_history_page`].
+    fn for_input(input: &HistoryPageInput) -> Option<Self> {
+        // A search term uses Rust `to_lowercase().contains()` over computed
+        // display titles; SQL LOWER/LIKE has ASCII-only + Unicode divergence and
+        // cannot see the computed fields, so it must not be approximated in SQL.
+        if normalize_history_search(input.search.clone()).is_some() {
+            return None;
+        }
+        // Only the default `completed_at DESC` ordering matches the indexed SQL
+        // order (idx_job_history_completed_job → completed_at DESC, job_id DESC).
+        // Any other sort field/direction is not indexed and its Rust tie-breaks
+        // differ, so it stays on the Rust path.
+        let sort_field = input.sort_field.unwrap_or(HistorySortField::CompletedAt);
+        let sort_direction = input.sort_direction.unwrap_or(HistorySortDirection::Desc);
+        if sort_field != HistorySortField::CompletedAt
+            || sort_direction != HistorySortDirection::Desc
+        {
+            return None;
+        }
+
+        Some(Self {
+            status: input.status.unwrap_or(HistoryStatusFilter::All),
+            page_index: input.page_index as usize,
+            page_size: sanitize_page_size(input.page_size),
+        })
+    }
+}
+
+/// SQL statuses that map to the "success" bucket (state == Completed): exactly
+/// `complete`. Kept in lockstep with `history_state_from_row`.
+const HISTORY_SUCCESS_STATUSES: &[&str] = &["complete"];
+/// Statuses that are NEITHER success nor paused, i.e. the "failure" bucket
+/// (state == Failed): every status except `complete` and `paused`. Expressed as
+/// an exclusion because `history_state_from_row` maps every unknown status to
+/// Failed, so an inclusion list could not be exhaustive.
+const HISTORY_NON_FAILURE_STATUSES: &[&str] = &["complete", "paused"];
+
+fn success_history_filter() -> weaver_server_core::HistoryFilter {
+    weaver_server_core::HistoryFilter {
+        statuses: Some(
+            HISTORY_SUCCESS_STATUSES
+                .iter()
+                .map(|status| status.to_string())
+                .collect(),
+        ),
+        ..Default::default()
+    }
+}
+
+fn failure_history_filter() -> weaver_server_core::HistoryFilter {
+    weaver_server_core::HistoryFilter {
+        status_not_in: Some(
+            HISTORY_NON_FAILURE_STATUSES
+                .iter()
+                .map(|status| status.to_string())
+                .collect(),
+        ),
+        ..Default::default()
+    }
+}
+
+fn build_history_page_sql(
+    db: &Database,
+    plan: HistoryPageSqlPlan,
+) -> Result<HistoryPage, weaver_server_core::StateError> {
+    // Counts are always computed over the entire (unfiltered-by-status) set, just
+    // like the Rust path computes them before applying the status filter.
+    let counts = HistoryPageCounts {
+        all: db.count_job_history(&weaver_server_core::HistoryFilter::default())?,
+        success: db.count_job_history(&success_history_filter())?,
+        failure: db.count_job_history(&failure_history_filter())?,
+    };
+
+    // The status filter selects which rows are paginated and counted for
+    // total_count. `All` needs no status predicate.
+    let mut items_filter = match plan.status {
+        HistoryStatusFilter::All => weaver_server_core::HistoryFilter::default(),
+        HistoryStatusFilter::Success => success_history_filter(),
+        HistoryStatusFilter::Failure => failure_history_filter(),
+    };
+
+    let total_count = db.count_job_history(&items_filter)?;
+
+    items_filter.limit = Some(plan.page_size as u32);
+    items_filter.offset =
+        Some(u32::try_from(plan.page_index.saturating_mul(plan.page_size)).unwrap_or(u32::MAX));
+    let rows = db.list_job_history(&items_filter)?;
+    let items = rows
+        .into_iter()
+        .map(|row| history_item_from_row(&row, None))
+        .collect();
+
+    Ok(HistoryPage {
+        items,
+        total_count,
+        counts,
+    })
 }
 
 fn load_history_delete_states(
@@ -583,5 +727,157 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         output_dir: row.output_dir.clone(),
         error,
         created_at_epoch_ms: row.created_at as f64 * 1000.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use weaver_server_core::JobHistoryRow;
+
+    fn history_row(job_id: u64, status: &str, completed_at: i64) -> JobHistoryRow {
+        JobHistoryRow {
+            job_id,
+            job_hash: None,
+            name: format!("Release.{job_id}.1080p.WEB"),
+            status: status.to_string(),
+            error_message: (status != "complete" && status != "paused").then(|| "boom".to_string()),
+            total_bytes: 1_000 + job_id,
+            downloaded_bytes: 1_000,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 1_000,
+            category: None,
+            output_dir: None,
+            nzb_path: None,
+            created_at: completed_at - 10,
+            completed_at,
+            metadata: None,
+        }
+    }
+
+    fn seed(db: &Database) {
+        // A mix that exercises every state bucket, including statuses that only
+        // arise via direct inserts (`cancelled`, `paused`) and map to Failed /
+        // Paused in `history_state_from_row`.
+        let rows = [
+            history_row(1, "complete", 1_000),
+            history_row(2, "failed", 1_100),
+            history_row(3, "complete", 1_200),
+            history_row(4, "cancelled", 1_300),
+            history_row(5, "paused", 1_400),
+            history_row(6, "complete", 1_500),
+            history_row(7, "failed", 1_600),
+        ];
+        for row in &rows {
+            db.insert_job_history(row).unwrap();
+        }
+    }
+
+    fn page_input(
+        page_index: u32,
+        page_size: u32,
+        status: Option<HistoryStatusFilter>,
+    ) -> HistoryPageInput {
+        HistoryPageInput {
+            page_index,
+            page_size,
+            search: None,
+            status,
+            sort_field: None,
+            sort_direction: None,
+        }
+    }
+
+    fn rust_page(db: &Database, input: HistoryPageInput) -> HistoryPage {
+        let rows = db
+            .list_job_history(&weaver_server_core::HistoryFilter::default())
+            .unwrap();
+        build_history_page(rows, input)
+    }
+
+    fn assert_parity(db: &Database, input: HistoryPageInput) {
+        let plan = HistoryPageSqlPlan::for_input(&input)
+            .expect("input should be SQL-eligible for this parity check");
+        let sql = build_history_page_sql(db, plan).unwrap();
+        let rust = rust_page(db, input);
+
+        assert_eq!(
+            sql.total_count, rust.total_count,
+            "total_count mismatch: sql={} rust={}",
+            sql.total_count, rust.total_count
+        );
+        assert_eq!(sql.counts.all, rust.counts.all, "counts.all mismatch");
+        assert_eq!(
+            sql.counts.success, rust.counts.success,
+            "counts.success mismatch"
+        );
+        assert_eq!(
+            sql.counts.failure, rust.counts.failure,
+            "counts.failure mismatch"
+        );
+        let sql_ids: Vec<u64> = sql.items.iter().map(|item| item.id).collect();
+        let rust_ids: Vec<u64> = rust.items.iter().map(|item| item.id).collect();
+        assert_eq!(sql_ids, rust_ids, "page item ids/order mismatch");
+        // Items are produced by the same `history_item_from_row`, so equal ids in
+        // equal order means byte-identical items for identical data.
+        assert_eq!(sql.items, rust.items, "page items mismatch");
+    }
+
+    #[test]
+    fn sql_path_matches_rust_path_across_status_and_pages() {
+        let db = Database::open_in_memory().unwrap();
+        seed(&db);
+
+        for status in [
+            None,
+            Some(HistoryStatusFilter::All),
+            Some(HistoryStatusFilter::Success),
+            Some(HistoryStatusFilter::Failure),
+        ] {
+            // Multiple page sizes, including one that splits the result set and
+            // one page fully past the end.
+            for (page_index, page_size) in [(0, 25), (0, 2), (1, 2), (2, 2), (5, 2)] {
+                assert_parity(&db, page_input(page_index, page_size, status));
+            }
+        }
+    }
+
+    #[test]
+    fn sql_path_matches_rust_path_on_empty_table() {
+        let db = Database::open_in_memory().unwrap();
+        assert_parity(&db, page_input(0, 25, None));
+        assert_parity(&db, page_input(0, 25, Some(HistoryStatusFilter::Failure)));
+    }
+
+    #[test]
+    fn search_term_forces_rust_path() {
+        let mut input = page_input(0, 25, None);
+        input.search = Some("release".to_string());
+        assert!(
+            HistoryPageSqlPlan::for_input(&input).is_none(),
+            "a free-text search term must not take the SQL path"
+        );
+        // Whitespace-only search is normalized away and stays SQL-eligible.
+        input.search = Some("   ".to_string());
+        assert!(HistoryPageSqlPlan::for_input(&input).is_some());
+    }
+
+    #[test]
+    fn non_default_sort_forces_rust_path() {
+        let mut input = page_input(0, 25, None);
+        input.sort_field = Some(HistorySortField::Name);
+        assert!(HistoryPageSqlPlan::for_input(&input).is_none());
+
+        let mut input = page_input(0, 25, None);
+        input.sort_direction = Some(HistorySortDirection::Asc);
+        assert!(HistoryPageSqlPlan::for_input(&input).is_none());
+
+        // Explicit default sort field + direction is still SQL-eligible.
+        let mut input = page_input(0, 25, None);
+        input.sort_field = Some(HistorySortField::CompletedAt);
+        input.sort_direction = Some(HistorySortDirection::Desc);
+        assert!(HistoryPageSqlPlan::for_input(&input).is_some());
     }
 }

@@ -51,11 +51,16 @@ pub async fn refresh_server_capabilities_from_config(config: &SharedConfig, db: 
         capability_updates.push((server.id, server.supports_pipelining));
 
         let persisted = server;
+        let server_id = persisted.id;
         let db = db.clone();
-        if let Err(join_error) =
-            tokio::task::spawn_blocking(move || db.update_server(&persisted)).await
-        {
-            tracing::error!(error = %join_error, "failed to persist server capabilities");
+        match tokio::task::spawn_blocking(move || db.update_server(&persisted)).await {
+            Ok(Err(error)) => {
+                tracing::error!(server_id, error = %error, "failed to persist server capabilities");
+            }
+            Err(join_error) => {
+                tracing::error!(server_id, error = %join_error, "failed to persist server capabilities");
+            }
+            Ok(Ok(())) => {}
         }
     }
 

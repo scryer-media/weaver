@@ -350,7 +350,14 @@ fn validate_known_migrations(
             continue;
         };
 
-        if row.checksum_algo != expected.checksum_algo.as_str() || row.checksum != expected.checksum
+        let checksum_matches = row.checksum_algo == expected.checksum_algo.as_str()
+            && row.checksum == expected.checksum;
+        if !checksum_matches
+            && !migration_assets::is_superseded_migration_checksum(
+                row.version,
+                &row.checksum_algo,
+                &row.checksum,
+            )
         {
             invalid_checksum.push(key);
         }
@@ -680,5 +687,252 @@ mod tests {
             "PostgreSQL-applicable Rust migration hooks need explicit implementations: {}",
             offenders.join(", ")
         );
+    }
+
+    /// Provisions an isolated schema on the server named by WEAVER_TEST_POSTGRES_URL
+    /// and returns an admin pool, the schema name, and a pool whose search_path is
+    /// pinned to that schema. Returns None (test skips) when the env var is unset or
+    /// empty, mirroring the pattern in persistence/connection/tests.rs.
+    async fn create_scoped_pool() -> Option<(PgPool, String, PgPool)> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let Ok(base_url) = std::env::var("WEAVER_TEST_POSTGRES_URL") else {
+            eprintln!("skipping postgres migration test; WEAVER_TEST_POSTGRES_URL is not set");
+            return None;
+        };
+        if base_url.trim().is_empty() {
+            eprintln!("skipping postgres migration test; WEAVER_TEST_POSTGRES_URL is empty");
+            return None;
+        }
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let schema = format!("weaver_mig_test_{}_{}", std::process::id(), suffix);
+        let admin_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&base_url)
+            .await
+            .unwrap();
+        sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin_pool)
+            .await
+            .unwrap();
+
+        let separator = if base_url.contains('?') { '&' } else { '?' };
+        let target_url = format!("{base_url}{separator}options=-csearch_path%3D{schema}");
+        let scoped_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&target_url)
+            .await
+            .unwrap();
+
+        Some((admin_pool, schema, scoped_pool))
+    }
+
+    async fn insert_v26_history_row(pool: &PgPool, job_id: i64, metadata: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO job_history
+                (job_id, name, status, total_bytes, downloaded_bytes,
+                 optional_recovery_bytes, optional_recovery_downloaded_bytes,
+                 failed_bytes, health, created_at, completed_at, metadata)
+             VALUES ($1, $2, 'complete', 0, 0, 0, 0, 0, 1000, 10, 20, $3)",
+        )
+        .bind(job_id)
+        .bind(format!("job-{job_id}"))
+        .bind(metadata)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A Postgres install upgrading from schema <= 26 that carries a corrupt
+    /// job_history.metadata row (unparseable text or valid-but-non-array JSON)
+    /// must not hard-fail on the 0027/0030 backfills. Corrupt rows contribute no
+    /// attributes and are left untouched; a well-formed array row backfills and
+    /// has its diagnostic-only keys stripped by 0030.
+    #[tokio::test]
+    async fn postgres_upgrade_from_v26_tolerates_corrupt_metadata_when_configured() {
+        let Some((admin_pool, schema, pool)) = create_scoped_pool().await else {
+            return;
+        };
+
+        let catalog = crate::schema_migrations::embedded_catalog().unwrap();
+        let payload = crate::schema_migrations::embedded_payload_bytes().unwrap();
+
+        // Build a schema stamped exactly through migration 26 (baseline 25 + 26),
+        // so run_migrations() below drives the real <=26 -> current upgrade path
+        // over pre-existing data, exactly reproducing the reported landmine.
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(26))
+            .await
+            .unwrap();
+        let stamped_max: i64 =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = TRUE")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stamped_max, 26, "test fixture must start at schema 26");
+
+        // Row 1: well-formed metadata array with a public attribute plus the two
+        // diagnostic-only keys that 0027 excludes and 0030 strips.
+        let good_metadata = serde_json::to_string(&vec![
+            ("*scryer_title_id".to_string(), "title-a".to_string()),
+            (
+                "__weaver_diagnostic_source_job_id".to_string(),
+                "42".to_string(),
+            ),
+            (
+                "__weaver_diagnostic_include_server_hostnames".to_string(),
+                "false".to_string(),
+            ),
+        ])
+        .unwrap();
+        insert_v26_history_row(&pool, 1, Some(&good_metadata)).await;
+        // Row 2: unparseable text - `::jsonb` would raise here pre-fix.
+        insert_v26_history_row(&pool, 2, Some("this is not json{")).await;
+        // Row 3: valid JSON but an object, not an array - jsonb_array_elements and
+        // jsonb_typeof(...::jsonb) would each mishandle/raise pre-fix.
+        insert_v26_history_row(&pool, 3, Some(r#"{"unexpected":"object"}"#)).await;
+        // Row 4: NULL metadata (the common case) must be untouched.
+        insert_v26_history_row(&pool, 4, None).await;
+
+        // The whole <=26 -> current upgrade must succeed despite the corrupt rows.
+        run_migrations(&pool, MigrationMode::Apply)
+            .await
+            .expect("upgrade across corrupt metadata rows must not fail");
+
+        let schema_version: i64 = sqlx::query_scalar("SELECT version FROM schema_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(schema_version, catalog.max_version());
+
+        // Only the good array row contributed an attribute, and the diagnostic
+        // keys were excluded (0027) / stripped (0030).
+        let attrs: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT job_id, key, value FROM job_history_attributes ORDER BY job_id, key",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            attrs,
+            vec![(1_i64, "*scryer_title_id".to_string(), "title-a".to_string())],
+            "corrupt rows must contribute no attributes; good row keeps only its public attr"
+        );
+
+        // 0030 rewrote the good row's metadata to drop the diagnostic keys, while
+        // leaving the corrupt/non-array/NULL rows byte-for-byte untouched.
+        let good_after: String =
+            sqlx::query_scalar("SELECT metadata FROM job_history WHERE job_id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let good_pairs: Vec<(String, String)> = serde_json::from_str(&good_after).unwrap();
+        assert_eq!(
+            good_pairs,
+            vec![("*scryer_title_id".to_string(), "title-a".to_string())]
+        );
+
+        let bad_text: String =
+            sqlx::query_scalar("SELECT metadata FROM job_history WHERE job_id = 2")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(bad_text, "this is not json{");
+
+        let object_text: String =
+            sqlx::query_scalar("SELECT metadata FROM job_history WHERE job_id = 3")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(object_text, r#"{"unexpected":"object"}"#);
+
+        let null_meta: Option<String> =
+            sqlx::query_scalar("SELECT metadata FROM job_history WHERE job_id = 4")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(null_meta, None);
+
+        pool.close().await;
+        sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin_pool)
+            .await
+            .unwrap();
+        admin_pool.close().await;
+    }
+
+    /// A weaver-v0.6.9 Postgres install already applied migration 27 and stored
+    /// its pre-edit checksum. After 0027's payload is edited in place the embedded
+    /// checksum differs, so without the supersede amnesty startup validation would
+    /// hard-fail with "checksum mismatch". This proves the amnesty lets such an
+    /// install continue and no-op cleanly.
+    #[tokio::test]
+    async fn postgres_supersede_amnesty_accepts_pre_edit_v27_ledger_when_configured() {
+        let Some((admin_pool, schema, pool)) = create_scoped_pool().await else {
+            return;
+        };
+
+        let catalog = crate::schema_migrations::embedded_catalog().unwrap();
+        let payload = crate::schema_migrations::embedded_payload_bytes().unwrap();
+
+        // Fully migrate to current, then rewrite the migration-27 ledger checksum
+        // to the pre-edit weaver-v0.6.9 value to emulate an install that applied
+        // the old payload before the fix shipped.
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, None)
+            .await
+            .unwrap();
+
+        const V27_PRE_EDIT_CHECKSUM_HEX: &str =
+            "e05da91d94e32687581efb95f0cbeb0562d3aa5617d74b2d3254395f3ea1d286";
+        let old_checksum = (0..V27_PRE_EDIT_CHECKSUM_HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&V27_PRE_EDIT_CHECKSUM_HEX[i..i + 2], 16).unwrap())
+            .collect::<Vec<u8>>();
+        // Sanity: the current embedded checksum must actually differ, otherwise
+        // this test proves nothing.
+        assert_ne!(
+            catalog.find_migration(27).unwrap().checksum,
+            old_checksum,
+            "embedded v27 checksum unexpectedly equals the pre-edit value"
+        );
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 27")
+            .bind(&old_checksum)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Read-only validation must accept the superseded checksum...
+        run_migrations(&pool, MigrationMode::ValidateOnly)
+            .await
+            .expect("validate-only must accept the superseded v27 ledger checksum");
+        // ...and a normal startup run must no-op without a checksum-mismatch error.
+        run_migrations(&pool, MigrationMode::Apply)
+            .await
+            .expect("apply must accept the superseded v27 ledger checksum");
+
+        // A genuinely wrong checksum for a different migration must still be
+        // rejected, confirming the amnesty is narrow.
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 26")
+            .bind(vec![0xAB_u8; 32])
+            .execute(&pool)
+            .await
+            .unwrap();
+        let err = run_migrations(&pool, MigrationMode::ValidateOnly)
+            .await
+            .expect_err("a corrupted v26 checksum must still be rejected");
+        assert!(
+            err.to_string().contains("checksum mismatch"),
+            "unexpected error: {err}"
+        );
+
+        pool.close().await;
+        sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin_pool)
+            .await
+            .unwrap();
+        admin_pool.close().await;
     }
 }

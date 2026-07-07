@@ -112,3 +112,54 @@ fn delete_events() {
     db.delete_job_events(1).unwrap();
     assert!(db.get_job_events(1).unwrap().is_empty());
 }
+
+#[test]
+fn get_job_events_latest_caps_and_keeps_ascending_order() {
+    let db = Database::open_in_memory().unwrap();
+    let events = (0..500)
+        .map(|index| JobEvent {
+            job_id: 1,
+            timestamp: 1000 + index,
+            kind: format!("EVENT_{index:03}"),
+            message: format!("message {index}"),
+            file_id: Some(format!("1:{index}")),
+        })
+        .collect::<Vec<_>>();
+    db.insert_job_events(&events).unwrap();
+    // An unrelated job's events must not leak into the capped read.
+    db.insert_job_event(2, 9999, "OTHER", "other job", None)
+        .unwrap();
+
+    let latest = db.get_job_events_latest(1, 100).unwrap();
+    // Only the newest `cap` rows are returned.
+    assert_eq!(latest.len(), 100);
+    // The returned slice is oldest-first (ascending id), so it must be the tail
+    // of the full log: events 400..=499.
+    for (offset, event) in latest.iter().enumerate() {
+        let index = 400 + offset;
+        assert_eq!(event.kind, format!("EVENT_{index:03}"));
+        assert_eq!(event.timestamp, 1000 + index as i64);
+    }
+    assert_eq!(latest.first().unwrap().kind, "EVENT_400");
+    assert_eq!(latest.last().unwrap().kind, "EVENT_499");
+}
+
+#[test]
+fn get_job_events_latest_returns_all_when_under_cap() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_event(1, 1000, "JOB_CREATED", "test", None)
+        .unwrap();
+    db.insert_job_event(1, 1001, "FILE_COMPLETE", "done", Some("1:0"))
+        .unwrap();
+
+    let latest = db.get_job_events_latest(1, 2000).unwrap();
+    let full = db.get_job_events(1).unwrap();
+    assert_eq!(latest.len(), full.len());
+    for (a, b) in latest.iter().zip(full.iter()) {
+        assert_eq!(a.kind, b.kind);
+        assert_eq!(a.timestamp, b.timestamp);
+        assert_eq!(a.file_id, b.file_id);
+    }
+    // Empty job yields an empty tail.
+    assert!(db.get_job_events_latest(99, 2000).unwrap().is_empty());
+}

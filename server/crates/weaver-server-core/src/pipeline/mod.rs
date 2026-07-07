@@ -1726,6 +1726,11 @@ pub struct Pipeline {
     pub(super) shared_state: SharedPipelineState,
     /// SQLite database for durable history.
     pub(super) db: crate::Database,
+    /// Tracks detached `db_fire_and_forget` writes so shutdown `drain` can join
+    /// them (bounded) instead of dropping in-flight writes. `db_fire_and_forget`
+    /// only has `&self`, so the JoinSet lives behind a shared mutex; the lock is
+    /// only ever held to spawn/drain, never across an await.
+    pub(super) fire_and_forget_tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
     /// Shared config for runtime category lookups (dest_dir overrides).
     pub(super) config: crate::settings::SharedConfig,
     /// Dedicated low-priority rayon thread pool for post-processing

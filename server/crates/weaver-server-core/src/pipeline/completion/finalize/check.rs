@@ -1232,24 +1232,28 @@ impl Pipeline {
             }
         }
 
-        for (file_id, filename, _total_bytes) in &files_to_complete {
-            crate::runtime::perf_probe::record(
-                "download.file_progress.complete_file_row_covers_restart",
-                std::time::Duration::ZERO,
-            );
-            let file_index = file_id.file_index;
-            let current_filename = filename.clone();
-            let current_hash = Self::expected_hash_for_verified_file(*file_id, &existing_hashes);
-            self.db_blocking(move |db| {
-                db.complete_file(job_id, file_index, &current_filename, &current_hash)
-            })
-            .await
-            .map_err(|error| {
-                format!(
-                    "failed to persist PAR2-reconciled file {}: {error}",
-                    filename
+        let complete_entries: Vec<(u32, String, Option<[u8; 16]>)> = files_to_complete
+            .iter()
+            .map(|(file_id, filename, _total_bytes)| {
+                crate::runtime::perf_probe::record(
+                    "download.file_progress.complete_file_row_covers_restart",
+                    std::time::Duration::ZERO,
+                );
+                (
+                    file_id.file_index,
+                    filename.clone(),
+                    Some(Self::expected_hash_for_verified_file(
+                        *file_id,
+                        &existing_hashes,
+                    )),
                 )
-            })?;
+            })
+            .collect();
+        self.db_blocking(move |db| db.complete_files(job_id, &complete_entries))
+            .await
+            .map_err(|error| format!("failed to persist PAR2-reconciled files: {error}"))?;
+
+        for (file_id, _filename, _total_bytes) in &files_to_complete {
             self.pending_file_progress.remove(file_id);
             self.persisted_file_progress.remove(file_id);
             self.file_hash_states.remove(file_id);

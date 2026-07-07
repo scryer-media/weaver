@@ -31,8 +31,11 @@ struct RestoreSkipPlan {
 }
 
 impl Pipeline {
-    fn restore_has_open_download_finalization(&self, job_id: JobId) -> bool {
-        let events = match self.db.get_job_events(job_id.0) {
+    async fn restore_has_open_download_finalization(&self, job_id: JobId) -> bool {
+        let events = match self
+            .db_blocking(move |db| db.get_job_events(job_id.0))
+            .await
+        {
             Ok(events) => events,
             Err(error) => {
                 error!(
@@ -65,8 +68,8 @@ impl Pipeline {
         finalization_open
     }
 
-    fn restore_download_finalization_runtime(&mut self, job_id: JobId) -> bool {
-        if !self.restore_has_open_download_finalization(job_id) {
+    async fn restore_download_finalization_runtime(&mut self, job_id: JobId) -> bool {
+        if !self.restore_has_open_download_finalization(job_id).await {
             self.jobs_finalizing_download.remove(&job_id);
             return false;
         }
@@ -226,20 +229,24 @@ impl Pipeline {
             .unwrap_or_else(|| PathBuf::from(format!("job-{}.nzb", job_id.0)))
     }
 
-    fn persist_file_identities(
+    async fn persist_file_identities(
         &self,
         job_id: JobId,
         identities: &HashMap<u32, ActiveFileIdentity>,
     ) {
-        for identity in identities.values() {
-            if let Err(error) = self.db.save_file_identity(job_id, identity) {
-                warn!(
-                    job_id = job_id.0,
-                    file_index = identity.file_index,
-                    error = %error,
-                    "failed to persist file identity"
-                );
-            }
+        if identities.is_empty() {
+            return;
+        }
+        let identities = identities.values().cloned().collect::<Vec<_>>();
+        if let Err(error) = self
+            .db_blocking(move |db| db.save_file_identities(job_id, &identities))
+            .await
+        {
+            warn!(
+                job_id = job_id.0,
+                error = %error,
+                "failed to persist file identities"
+            );
         }
     }
 
@@ -359,7 +366,7 @@ impl Pipeline {
         }
     }
 
-    fn reset_failed_job_runtime(&mut self, job_id: JobId) {
+    async fn reset_failed_job_runtime(&mut self, job_id: JobId) {
         self.remove_pending_completion_check(job_id);
         self.clear_par2_runtime_state(job_id);
         self.clear_job_extraction_runtime(job_id);
@@ -367,7 +374,10 @@ impl Pipeline {
         self.clear_job_write_backlog(job_id);
         self.replace_failed_extraction_members(job_id, HashSet::new());
         self.set_normalization_retried_state(job_id, false);
-        if let Err(error) = self.db.clear_verified_suspect_volumes(job_id) {
+        if let Err(error) = self
+            .db_blocking(move |db| db.clear_verified_suspect_volumes(job_id))
+            .await
+        {
             error!(
                 job_id = job_id.0,
                 error = %error,
@@ -627,33 +637,46 @@ impl Pipeline {
         );
 
         stage_start = std::time::Instant::now();
-        if let Err(error) = self.db.create_active_job_with_file_identities(
-            &crate::ActiveJob {
-                job_id,
-                nzb_hash,
-                nzb_path,
-                nzb_zstd,
-                output_dir: working_dir.clone(),
-                created_at,
-                category: spec.category.clone(),
-                metadata: spec.metadata.clone(),
-                status: initial_status.persisted_status(),
-                download_state: initial_download_state.as_str(),
-                post_state: initial_post_state.as_str(),
-                run_state: initial_run_state.as_str(),
-                paused_resume_status: options
-                    .initially_paused
-                    .then_some(JobStatus::Queued.persisted_status()),
-                paused_resume_download_state: options
-                    .initially_paused
-                    .then_some(crate::jobs::model::DownloadState::Queued.as_str()),
-                paused_resume_post_state: options
-                    .initially_paused
-                    .then_some(crate::jobs::model::PostState::Idle.as_str()),
-            },
-            &initial_file_identities,
-        ) {
-            error!(error = %error, "db write failed for create_active_job_with_file_identities");
+        let active_job = crate::ActiveJob {
+            job_id,
+            nzb_hash,
+            nzb_path,
+            nzb_zstd,
+            output_dir: working_dir.clone(),
+            created_at,
+            category: spec.category.clone(),
+            metadata: spec.metadata.clone(),
+            status: initial_status.persisted_status(),
+            download_state: initial_download_state.as_str(),
+            post_state: initial_post_state.as_str(),
+            run_state: initial_run_state.as_str(),
+            paused_resume_status: options
+                .initially_paused
+                .then_some(JobStatus::Queued.persisted_status()),
+            paused_resume_download_state: options
+                .initially_paused
+                .then_some(crate::jobs::model::DownloadState::Queued.as_str()),
+            paused_resume_post_state: options
+                .initially_paused
+                .then_some(crate::jobs::model::PostState::Idle.as_str()),
+        };
+        // Biggest single write on the add-job path: move it off the orchestrator
+        // loop so the round-trip doesn't park the worker thread. Preserve the
+        // prior logged-and-continued semantics (a failed persist does not abort
+        // the in-memory job creation below).
+        let db = self.db.clone();
+        match tokio::task::spawn_blocking(move || {
+            db.create_active_job_with_file_identities(&active_job, &initial_file_identities)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                error!(error = %error, "db write failed for create_active_job_with_file_identities");
+            }
+            Err(error) => {
+                error!(error = %error, "join failed for create_active_job_with_file_identities task");
+            }
         }
         crate::runtime::perf_probe::record(
             "pipeline.add_job.persist_active_job",
@@ -979,8 +1002,12 @@ impl Pipeline {
             };
             state.refresh_runtime_lanes_from_status();
             self.jobs.insert(job_id, state);
-            if let Some(state) = self.jobs.get(&job_id) {
-                self.persist_file_identities(job_id, &state.file_identities);
+            if let Some(file_identities) = self
+                .jobs
+                .get(&job_id)
+                .map(|state| state.file_identities.clone())
+            {
+                self.persist_file_identities(job_id, &file_identities).await;
             }
             self.note_download_activity(job_id);
         }
@@ -1010,11 +1037,11 @@ impl Pipeline {
                 Some("downloading"),
             );
             self.note_download_activity(job_id);
-            self.persist_file_identities(job_id, &file_identities);
+            self.persist_file_identities(job_id, &file_identities).await;
         }
 
         self.delete_failed_history_entry(job_id).await;
-        self.reset_failed_job_runtime(job_id);
+        self.reset_failed_job_runtime(job_id).await;
 
         if !self.job_order.contains(&job_id) {
             self.job_order.push(job_id);
@@ -1068,7 +1095,7 @@ impl Pipeline {
                 crate::jobs::AddJobOptions::default(),
             )
             .await?;
-            self.reset_failed_job_runtime(job_id);
+            self.reset_failed_job_runtime(job_id).await;
             self.reload_metadata_from_disk(job_id).await;
             info!(job_id = job_id.0, "re-downloading terminal job");
             return Ok(());
@@ -1114,7 +1141,7 @@ impl Pipeline {
             )
             .await?;
             self.delete_failed_history_entry(job_id).await;
-            self.reset_failed_job_runtime(job_id);
+            self.reset_failed_job_runtime(job_id).await;
             self.reload_metadata_from_disk(job_id).await;
 
             info!(job_id = job_id.0, "re-downloading terminal history job");
@@ -1167,7 +1194,7 @@ impl Pipeline {
         )
         .await?;
         self.delete_failed_history_entry(job_id).await;
-        self.reset_failed_job_runtime(job_id);
+        self.reset_failed_job_runtime(job_id).await;
         self.reload_metadata_from_disk(job_id).await;
 
         info!(job_id = job_id.0, "re-downloading terminal history job");
@@ -1475,11 +1502,15 @@ impl Pipeline {
         };
         state.refresh_runtime_lanes_from_status();
         self.jobs.insert(job_id, state);
-        self.restore_download_finalization_runtime(job_id);
+        self.restore_download_finalization_runtime(job_id).await;
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
-        if let Some(state) = self.jobs.get(&job_id) {
-            self.persist_file_identities(job_id, &state.file_identities);
+        if let Some(file_identities) = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.file_identities.clone())
+        {
+            self.persist_file_identities(job_id, &file_identities).await;
         }
         for set_name in &stale_rar_sets {
             self.clear_archive_set_for_source_retry(job_id, set_name);

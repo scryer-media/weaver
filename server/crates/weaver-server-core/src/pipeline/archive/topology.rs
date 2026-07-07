@@ -1664,7 +1664,10 @@ impl Pipeline {
 
     pub(crate) async fn restore_rar_state_for_job(&mut self, job_id: JobId) {
         let password_candidates = self.archive_password_candidates_for_job(job_id);
-        match self.db.load_all_archive_headers(job_id) {
+        match self
+            .db_blocking(move |db| db.load_all_archive_headers(job_id))
+            .await
+        {
             Ok(headers_by_set) => {
                 for (set_name, headers) in headers_by_set {
                     match Self::deserialize_rar_headers_with_password_candidates(
@@ -1700,7 +1703,10 @@ impl Pipeline {
             }
         }
 
-        let facts_by_set = match self.db.load_all_rar_volume_facts(job_id) {
+        let facts_by_set = match self
+            .db_blocking(move |db| db.load_all_rar_volume_facts(job_id))
+            .await
+        {
             Ok(facts) => facts,
             Err(error) => {
                 error!(

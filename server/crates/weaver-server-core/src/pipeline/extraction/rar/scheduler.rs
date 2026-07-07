@@ -1096,6 +1096,8 @@ impl Pipeline {
                             failed = ?outcome.failed,
                             "RAR batch extraction completed"
                         );
+                        let mut extracted_to_persist: Vec<(String, std::path::PathBuf)> =
+                            Vec::with_capacity(outcome.extracted.len());
                         for name in &outcome.extracted {
                             info!(
                                 job_id = job_id.0,
@@ -1115,20 +1117,23 @@ impl Pipeline {
                                     .unwrap_or_else(|| {
                                         self.deterministic_extraction_staging_dir(job_id)
                                     });
-                                let output_path = output_root.join(name);
-                                if let Err(error) =
-                                    self.db.add_extracted_member(job_id, name, &output_path)
-                                {
-                                    error!(
-                                        job_id = job_id.0,
-                                        set_name = %set_name,
-                                        member = %name,
-                                        error = %error,
-                                        "failed to persist extracted member"
-                                    );
-                                }
+                                extracted_to_persist.push((name.clone(), output_root.join(name)));
                             }
                             self.clear_failed_extraction_member(job_id, name);
+                        }
+                        if !extracted_to_persist.is_empty()
+                            && let Err(error) = self
+                                .db_blocking(move |db| {
+                                    db.add_extracted_members(job_id, &extracted_to_persist)
+                                })
+                                .await
+                        {
+                            error!(
+                                job_id = job_id.0,
+                                set_name = %set_name,
+                                error = %error,
+                                "failed to persist extracted members"
+                            );
                         }
                         for (member, error) in &outcome.failed {
                             if already_extracted.contains(member)
@@ -1366,6 +1371,8 @@ impl Pipeline {
                             set_state.extraction_generation.saturating_add(1);
                     }
                     self.mark_rar_unlock_priorities_dirty(job_id);
+                    let mut extracted_to_persist: Vec<(String, std::path::PathBuf)> =
+                        Vec::with_capacity(outcome.extracted.len());
                     for member in &outcome.extracted {
                         self.extracted_members
                             .entry(job_id)
@@ -1379,10 +1386,23 @@ impl Pipeline {
                                 .unwrap_or_else(|| {
                                     self.deterministic_extraction_staging_dir(job_id)
                                 });
-                            let output_path = output_root.join(member);
-                            let _ = self.db.add_extracted_member(job_id, member, &output_path);
+                            extracted_to_persist.push((member.clone(), output_root.join(member)));
                         }
                         self.clear_failed_extraction_member(job_id, member);
+                    }
+                    if !extracted_to_persist.is_empty()
+                        && let Err(error) = self
+                            .db_blocking(move |db| {
+                                db.add_extracted_members(job_id, &extracted_to_persist)
+                            })
+                            .await
+                    {
+                        error!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            error = %error,
+                            "failed to persist extracted members"
+                        );
                     }
 
                     let full_set_capacity_pressure = outcome

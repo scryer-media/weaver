@@ -48,6 +48,10 @@ impl Database {
             "db.get_job_history.cache_miss",
             std::time::Duration::ZERO,
         );
+        // Snapshot the cache generation before the read so a delete that races
+        // this read (invalidating after its own commit) makes the re-cache a
+        // no-op instead of resurrecting the deleted row from a stale read.
+        let observed_generation = self.job_history_cache_generation();
         let datastore = self.datastore();
         let row = self.run_sql_blocking(async move {
             SqlRuntime::fetch_optional(
@@ -60,7 +64,7 @@ impl Database {
             .transpose()
         })?;
         if let Some(row) = &row {
-            self.cache_job_history(row.clone());
+            self.cache_job_history_at(row.clone(), observed_generation);
         }
         Ok(row)
     }
@@ -266,6 +270,14 @@ fn append_history_row_filter_predicates(
             statuses.iter().cloned().map(SqlArg::Text).collect(),
         );
     }
+    if let Some(status_not_in) = &filter.status_not_in {
+        append_not_in_text_filter(
+            sql,
+            args,
+            "h.status",
+            status_not_in.iter().cloned().map(SqlArg::Text).collect(),
+        );
+    }
     if let Some(item_ids) = &filter.item_ids {
         append_in_i64_or_text_filter(
             sql,
@@ -298,6 +310,29 @@ fn append_in_i64_or_text_filter(
     sql.push_str(" AND ");
     sql.push_str(column);
     sql.push_str(" IN (");
+    sql.push_str(
+        &std::iter::repeat_n("{}", values.len())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    sql.push(')');
+    args.extend(values);
+}
+
+fn append_not_in_text_filter(
+    sql: &mut String,
+    args: &mut Vec<SqlArg>,
+    column: &str,
+    values: Vec<SqlArg>,
+) {
+    // An empty exclusion list excludes nothing, so the predicate is a no-op.
+    if values.is_empty() {
+        return;
+    }
+
+    sql.push_str(" AND ");
+    sql.push_str(column);
+    sql.push_str(" NOT IN (");
     sql.push_str(
         &std::iter::repeat_n("{}", values.len())
             .collect::<Vec<_>>()

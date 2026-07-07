@@ -22,10 +22,7 @@ env:
   WEB_ARTIFACT_NAME: weaver-web-dist
   RUST_TEST_BINARIES_ARTIFACT_NAME: weaver-rust-test-binaries
   WEAVER_LFS_RUST_TEST_INCLUDE: engines/weaver-unrar/tests/fixtures/**,engines/weaver-par2/tests/fixtures/**,server/crates/weaver-server-core/tests/fixtures/**
-  WEAVER_LFS_PAR2_TEST_INCLUDE: engines/weaver-par2/tests/fixtures/**
-  WEAVER_LFS_UNRAR_TEST_INCLUDE: engines/weaver-unrar/tests/fixtures/**
-  WEAVER_LFS_ARM_TEST_INCLUDE: engines/weaver-unrar/tests/fixtures/**,engines/weaver-par2/tests/fixtures/**
-  WEAVER_LFS_SDE_INCLUDE: ci/vendor/intel-sde/**,engines/weaver-par2/tests/fixtures/**
+  WEAVER_LFS_SDE_INCLUDE: ci/vendor/intel-sde/**
   E2E_LFS_PAR2_SMALL_REPAIR_INCLUDE: testdata/par2-small-repair/**
 
 jobs:
@@ -152,7 +149,6 @@ jobs:
             --locked \
             --no-run \
             --no-fail-fast \
-            --features weaver-par2/slow-tests,weaver-unrar/slow-tests \
             --message-format=json-render-diagnostics \
             > .ci/rust-tests/cargo-test.json
           python3 .github/scripts/rust-test-manifest.py collect \
@@ -191,56 +187,6 @@ jobs:
           python3 .github/scripts/rust-test-manifest.py run \
             --manifest .ci/rust-tests/manifest.json \
             --lane regular \
-            --workspace "$GITHUB_WORKSPACE"
-
-  rust-test-par2-slow:
-    name: rust-test-par2-slow
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    needs: [rust-test-build]
-    steps:
-      - uses: actions/checkout@v6
-      - name: Hydrate PAR2 fixtures
-        run: |
-          git lfs install --local
-          git lfs pull --include="$WEAVER_LFS_PAR2_TEST_INCLUDE" --exclude=""
-      - name: Download Rust test binaries
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ env.RUST_TEST_BINARIES_ARTIFACT_NAME }}-${{ github.run_id }}
-          path: .ci/rust-tests
-      - name: Unpack Rust test binaries
-        run: tar -xzf .ci/rust-tests/test-binaries.tar.gz -C .ci/rust-tests
-      - name: Run PAR2 slow tests
-        run: |
-          python3 .github/scripts/rust-test-manifest.py run \
-            --manifest .ci/rust-tests/manifest.json \
-            --lane par2-slow \
-            --workspace "$GITHUB_WORKSPACE"
-
-  rust-test-unrar-slow:
-    name: rust-test-unrar-slow
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    needs: [rust-test-build]
-    steps:
-      - uses: actions/checkout@v6
-      - name: Hydrate unrar fixtures
-        run: |
-          git lfs install --local
-          git lfs pull --include="$WEAVER_LFS_UNRAR_TEST_INCLUDE" --exclude=""
-      - name: Download Rust test binaries
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ env.RUST_TEST_BINARIES_ARTIFACT_NAME }}-${{ github.run_id }}
-          path: .ci/rust-tests
-      - name: Unpack Rust test binaries
-        run: tar -xzf .ci/rust-tests/test-binaries.tar.gz -C .ci/rust-tests
-      - name: Run unrar slow tests
-        run: |
-          python3 .github/scripts/rust-test-manifest.py run \
-            --manifest .ci/rust-tests/manifest.json \
-            --lane unrar-slow \
             --workspace "$GITHUB_WORKSPACE"
 
   weaver-par2-rar-e2e:
@@ -316,28 +262,22 @@ jobs:
         run: docker compose -p "$E2E_PROJECT" down -v --remove-orphans || true
 
   rust-test-arm:
-    name: rust-test-arm
+    name: rust-test-arm-yenc
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
-      - name: Hydrate ARM test fixtures
-        run: |
-          git lfs install --local
-          git lfs pull --include="$WEAVER_LFS_ARM_TEST_INCLUDE" --exclude=""
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-      - name: Run ARM-specific PAR2 crate tests (CLMUL, PMULL)
-        run: cargo test --locked --no-fail-fast -p weaver-par2 --no-default-features --features slow-tests
-      - name: Run ARM-specific yEnc/unrar crate tests (NEON)
-        run: cargo test --locked --no-fail-fast -p weaver-yenc -p weaver-unrar --features weaver-unrar/slow-tests
+      - name: Run ARM-specific yEnc crate tests (NEON)
+        run: cargo test --locked --no-fail-fast -p weaver-yenc
 
   rust-test-sde:
-    name: rust-test-sde-${{ matrix.name }}
+    name: rust-test-sde-yenc-${{ matrix.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -352,7 +292,7 @@ jobs:
             sde_arch: "-spr"
     steps:
       - uses: actions/checkout@v6
-      - name: Hydrate SDE and PAR2 fixtures
+      - name: Hydrate Intel SDE
         run: |
           git lfs install --local
           git lfs pull --include="$WEAVER_LFS_SDE_INCLUDE" --exclude=""
@@ -378,13 +318,9 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           set -o pipefail
-          cargo test --package weaver-par2 --lib --test repair_stress --test real_world_generated --features slow-tests --no-run --no-fail-fast --locked --target x86_64-unknown-linux-gnu --message-format=json \
-            | jq -r 'select(.executable != null and .profile.test == true) | .executable' \
-            | sort -u > /tmp/test-bins.txt
           cargo test --package weaver-yenc --lib --no-run --no-fail-fast --locked --target x86_64-unknown-linux-gnu --message-format=json \
             | jq -r 'select(.executable != null and .profile.test == true) | .executable' \
-            >> /tmp/test-bins.txt
-          sort -u -o /tmp/test-bins.txt /tmp/test-bins.txt
+            | sort -u > /tmp/test-bins.txt
       - name: Run tests under Intel SDE (${{ matrix.name }})
         run: |
           failures=0
@@ -396,16 +332,6 @@ jobs:
           while IFS= read -r bin; do
             echo "::group::$(basename "$bin")"
             case "$(basename "$bin")" in
-              weaver_par2-*)
-                run_sde "$bin" gf_simd::tests:: --test-threads=1
-                ;;
-              repair_stress-*)
-                run_sde "$bin" repair_single_file_4mb_8_missing --exact --test-threads=1
-                run_sde "$bin" repair_large_slices --exact --test-threads=1
-                ;;
-              real_world_generated-*)
-                run_sde "$bin" repairs_missing_middle_volume_and_extracts_rar5_lz --exact --test-threads=1
-                ;;
               weaver_yenc-*)
                 run_sde "$bin" simd::tests::decode_normal_run_dispatches --exact --test-threads=1
                 run_sde "$bin" simd::tests::sse2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
@@ -485,161 +411,6 @@ jobs:
             export "CARGO_TARGET_${TARGET_ENV}_RUSTFLAGS=$TARGET_RUSTFLAGS"
           fi
           cargo check --locked -p weaver-yenc --target ${{ matrix.target }}
-
-  rust-crypto-targets:
-    name: rust-crypto-${{ matrix.platform }}
-    runs-on: ${{ matrix.runs_on }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            platform: linux-x86_64-portable
-            runs_on: ubuntu-24.04
-            lane: portable
-          - target: x86_64-unknown-linux-musl
-            platform: linux-x86_64-haswell
-            runs_on: ubuntu-24.04
-            lane: haswell
-          - target: aarch64-unknown-linux-musl
-            platform: linux-arm64-portable
-            runs_on: ubuntu-24.04-arm
-            lane: portable
-          - target: aarch64-unknown-linux-musl
-            platform: linux-arm64-cortex-a76
-            runs_on: ubuntu-24.04-arm
-            lane: cortex-a76
-          - target: aarch64-apple-darwin
-            platform: darwin-arm64-portable
-            runs_on: macos-26
-            lane: portable
-          - target: aarch64-apple-darwin
-            platform: darwin-arm64-apple-m1
-            runs_on: macos-26
-            lane: apple-m1
-          - target: x86_64-apple-darwin
-            platform: darwin-x86_64-haswell
-            runs_on: macos-26
-            lane: haswell
-          - target: x86_64-pc-windows-msvc
-            platform: windows-x86_64
-            runs_on: windows-2025-vs2026
-            lane: portable
-          - target: aarch64-pc-windows-msvc
-            platform: windows-arm64
-            runs_on: windows-11-arm
-            lane: portable
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install target
-        run: rustup target add ${{ matrix.target }}
-      - name: Install musl toolchain
-        if: contains(matrix.target, '-musl')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-      - name: Install NASM (Linux x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get install -y nasm
-      - name: Install NASM (macOS x86_64)
-        if: matrix.target == 'x86_64-apple-darwin'
-        run: brew install nasm
-      - name: Install NASM (Windows x86_64)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $url = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip"
-          $expectedSha256 = "e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4"
-          Invoke-WebRequest $url -OutFile nasm.zip
-          $actualSha256 = (Get-FileHash nasm.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualSha256 -ne $expectedSha256) {
-            throw "NASM checksum mismatch: expected $expectedSha256, got $actualSha256"
-          }
-          Expand-Archive nasm.zip -DestinationPath C:\nasm
-          $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
-          $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-      - name: Exclude build dir from Windows Defender
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          try {
-            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
-          } catch {
-            Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
-          }
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
-          cache-on-failure: false
-          key: crypto-${{ matrix.platform }}
-      - name: Configure Windows sccache environment
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          "CARGO_INCREMENTAL=0" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "RUSTC_WRAPPER=sccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "SCCACHE_BASEDIRS=${{ github.workspace }}" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "SCCACHE_CACHE_SIZE=10G" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "SCCACHE_DIR=${{ github.workspace }}\.sccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "SCCACHE_IDLE_TIMEOUT=0" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-      - name: Restore Windows sccache directory
-        if: runner.os == 'Windows'
-        id: windows-crypto-sccache-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}\.sccache
-          key: gha-sccache-v1-weaver-crypto-${{ matrix.platform }}-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-v1-weaver-crypto-${{ matrix.platform }}-
-      - name: Install Windows sccache
-        if: runner.os == 'Windows'
-        uses: mozilla-actions/sccache-action@v0.0.10
-      - name: Prime Windows sccache server
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          sccache --start-server
-          sccache --zero-stats
-      - name: Verify target crypto config
-        run: cargo run -p xtask --locked -- verify-crypto-target --target "${{ matrix.target }}" --lane "${{ matrix.lane }}"
-      - name: Set target CPU flags (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}" --lane "${{ matrix.lane }}")" >> "$GITHUB_ENV"
-      - name: Set target CPU flags (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $flags = cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}" --lane "${{ matrix.lane }}"
-          "RUSTFLAGS=$flags" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-      - name: Check native crypto crates (Linux)
-        if: runner.os == 'Linux'
-        run: cargo check --locked -p weaver-unrar -p weaver-par2 --target ${{ matrix.target }}
-      - name: Check native crypto crates (non-Linux)
-        if: runner.os != 'Linux'
-        run: cargo check --locked -p weaver-unrar -p weaver-par2 --target ${{ matrix.target }}
-      - name: Show Windows sccache stats
-        if: always() && runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          if (Get-Command sccache -ErrorAction SilentlyContinue) {
-            sccache --show-stats
-          } else {
-            Write-Host "sccache not installed; skipping stats"
-          }
-      - name: Save Windows sccache directory
-        if: always() && runner.os == 'Windows' && steps.windows-crypto-sccache-restore.outcome == 'success'
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ github.workspace }}\.sccache
-          key: ${{ steps.windows-crypto-sccache-restore.outputs.cache-primary-key }}
 
   # ── Release packaging (tag pushes only) ──────────────────────────────────
 
@@ -1547,12 +1318,9 @@ jobs:
       - rust-clippy
       - rust-audit
       - rust-test-regular
-      - rust-test-par2-slow
-      - rust-test-unrar-slow
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
-      - rust-crypto-targets
       - weaver-par2-rar-e2e
       - rust-package-linux-x86_64-portable
       - rust-package-linux-x86_64-haswell
@@ -1645,12 +1413,9 @@ jobs:
       - rust-clippy
       - rust-audit
       - rust-test-regular
-      - rust-test-par2-slow
-      - rust-test-unrar-slow
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
-      - rust-crypto-targets
       - weaver-par2-rar-e2e
       - rust-package-linux-x86_64-portable
       - rust-package-linux-x86_64-haswell
@@ -1753,12 +1518,9 @@ jobs:
       - rust-clippy
       - rust-audit
       - rust-test-regular
-      - rust-test-par2-slow
-      - rust-test-unrar-slow
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
-      - rust-crypto-targets
       - weaver-par2-rar-e2e
       - rust-package-linux-x86_64-portable
       - rust-package-linux-x86_64-haswell

@@ -358,7 +358,14 @@ fn validate_known_migrations(
                 migration.checksum_algo.as_str()
             )));
         }
-        if row.success && row.checksum != migration.checksum {
+        if row.success
+            && row.checksum != migration.checksum
+            && !crate::migration_assets::is_superseded_migration_checksum(
+                row.version,
+                &row.checksum_algo,
+                &row.checksum,
+            )
+        {
             return Err(StateError::Database(format!(
                 "database migration {} checksum mismatch",
                 row.version
@@ -1683,6 +1690,52 @@ mod tests {
     #[test]
     fn checksum_algorithm_name_is_explicit() {
         assert_eq!(ChecksumAlgorithm::Blake3.as_str(), "blake3");
+    }
+
+    #[test]
+    fn superseded_v27_ledger_checksum_is_accepted_but_current_uses_normal_path() {
+        // A pre-edit weaver-v0.6.9 install stores this blake3 checksum for
+        // migration 27 in its ledger. Editing 0027's Postgres payload changes the
+        // embedded checksum, so this historical value must remain acceptable via
+        // the amnesty or every already-upgraded install would fail startup.
+        const V27_PRE_EDIT_CHECKSUM_HEX: &str =
+            "e05da91d94e32687581efb95f0cbeb0562d3aa5617d74b2d3254395f3ea1d286";
+        let old_checksum = (0..V27_PRE_EDIT_CHECKSUM_HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&V27_PRE_EDIT_CHECKSUM_HEX[i..i + 2], 16).unwrap())
+            .collect::<Vec<u8>>();
+
+        assert!(crate::migration_assets::is_superseded_migration_checksum(
+            27,
+            "blake3",
+            &old_checksum
+        ));
+
+        // The current embedded checksum is different and is NOT itself in the
+        // amnesty list (it validates through the normal equality path).
+        let catalog = embedded_catalog().unwrap();
+        let current = catalog.find_migration(27).unwrap();
+        assert_ne!(
+            crate::migration_assets::checksum_hex(&current.checksum),
+            V27_PRE_EDIT_CHECKSUM_HEX
+        );
+        assert!(!crate::migration_assets::is_superseded_migration_checksum(
+            27,
+            current.checksum_algo.as_str(),
+            &current.checksum
+        ));
+
+        // The amnesty is exact: a wrong version or a random checksum is rejected.
+        assert!(!crate::migration_assets::is_superseded_migration_checksum(
+            26,
+            "blake3",
+            &old_checksum
+        ));
+        assert!(!crate::migration_assets::is_superseded_migration_checksum(
+            27,
+            "blake3",
+            &[0xAB; 32]
+        ));
     }
 
     async fn pragma_column_count(pool: &sqlx::SqlitePool, table: &str, columns: &[&str]) -> i64 {

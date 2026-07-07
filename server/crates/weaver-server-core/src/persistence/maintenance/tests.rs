@@ -312,3 +312,49 @@ fn wal_checkpoint_truncates_only_without_active_jobs() {
     assert_eq!(report.active_job_count, 1);
     assert!(!report.wal_truncate_ran);
 }
+
+#[test]
+fn postgres_analyze_tables_are_well_formed() {
+    // The list must be non-empty and free of duplicates, and every hot table the
+    // pass claims to cover must be present. Postgres ANALYZE builds statements
+    // straight from these identifiers, so they must be stable, known names.
+    assert!(!POSTGRES_ANALYZE_TABLES.is_empty());
+
+    let unique: std::collections::HashSet<_> = POSTGRES_ANALYZE_TABLES.iter().collect();
+    assert_eq!(
+        unique.len(),
+        POSTGRES_ANALYZE_TABLES.len(),
+        "duplicate table in POSTGRES_ANALYZE_TABLES"
+    );
+
+    for expected in [
+        "job_events",
+        "job_history",
+        "job_history_attributes",
+        "active_file_progress",
+        "active_files",
+        "active_extracted",
+        "async_operation_targets",
+        "integration_events",
+        "metrics_history_chunks",
+    ] {
+        assert!(
+            POSTGRES_ANALYZE_TABLES.contains(&expected),
+            "missing hot table {expected}"
+        );
+    }
+
+    // VACUUM is owned by autovacuum; the analyze pass must never emit it.
+    for table in POSTGRES_ANALYZE_TABLES {
+        assert!(!table.contains(' '), "table name must be a bare identifier");
+    }
+}
+
+#[test]
+fn postgres_maintenance_pass_rejects_non_postgres_datastore() {
+    // The engine gate must refuse to run the Postgres pass against sqlite, the
+    // mirror of the sqlite pass's own guard.
+    let db = Database::open_in_memory().unwrap();
+    let error = db.run_postgres_maintenance_pass().unwrap_err();
+    assert!(matches!(error, StateError::Database(_)));
+}

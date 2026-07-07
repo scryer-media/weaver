@@ -160,11 +160,14 @@ impl Pipeline {
             } => {
                 let result = if let Some(state) = self.jobs.get_mut(&job_id) {
                     update.apply_to_spec(&mut state.spec);
-                    self.db_fire_and_forget(move |db| {
-                        if let Err(e) = db.update_active_job(job_id, &update) {
-                            error!(error = %e, "db write failed for UpdateJob");
-                        }
-                    });
+                    // Ordered writer queue, not fire-and-forget: category/metadata
+                    // are last-write-wins columns, so two quick UpdateJob calls
+                    // must persist in order to avoid a stale restored value.
+                    if let Err(e) = self.db.try_queue_write("update_active_job", move |db| {
+                        db.update_active_job(job_id, &update)
+                    }) {
+                        error!(error = %e, "failed to queue UpdateJob write");
+                    }
                     self.publish_snapshot();
                     Ok(())
                 } else {
@@ -371,8 +374,20 @@ impl Pipeline {
                         self.finished_jobs.retain(|j| j.job_id != job_id);
                         let db = self.db.clone();
                         tokio::task::spawn_blocking(move || {
-                            let _ = db.delete_job_history(job_id.0);
-                            let _ = db.delete_job_events(job_id.0);
+                            if let Err(error) = db.delete_job_history(job_id.0) {
+                                tracing::warn!(
+                                    job_id = job_id.0,
+                                    error = %error,
+                                    "failed to delete job history row on user delete"
+                                );
+                            }
+                            if let Err(error) = db.delete_job_events(job_id.0) {
+                                tracing::warn!(
+                                    job_id = job_id.0,
+                                    error = %error,
+                                    "failed to delete job events on user delete"
+                                );
+                            }
                         });
                         self.publish_snapshot();
                         Ok(())

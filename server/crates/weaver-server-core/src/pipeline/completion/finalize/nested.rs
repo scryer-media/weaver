@@ -307,8 +307,11 @@ impl Pipeline {
         Ok(())
     }
 
-    pub(super) fn clear_persisted_extracted_members(&self, job_id: JobId) {
-        if let Err(error) = self.db.clear_extracted_members(job_id) {
+    pub(super) async fn clear_persisted_extracted_members(&self, job_id: JobId) {
+        if let Err(error) = self
+            .db_blocking(move |db| db.clear_extracted_members(job_id))
+            .await
+        {
             warn!(
                 job_id = job_id.0,
                 error = %error,
@@ -317,7 +320,7 @@ impl Pipeline {
         }
     }
 
-    fn rebuild_assembly_from_staging(
+    async fn rebuild_assembly_from_staging(
         &mut self,
         job_id: JobId,
         nested_archives: &[NestedArchiveFile],
@@ -432,48 +435,52 @@ impl Pipeline {
             state.file_identities = file_identities.clone();
         }
 
-        for file_index in previous_detected_keys {
-            if detected_archives.contains_key(&file_index) {
-                continue;
+        // Batch the four per-inner-file identity writes into ONE off-loop task
+        // so the whole reindex costs a single worker hop instead of N blocking
+        // round-trips on the orchestrator loop. Inputs are collected above;
+        // per-item error messages are preserved verbatim.
+        let detected_archives_for_db = detected_archives.clone();
+        let file_identities_for_db = file_identities.clone();
+        self.db_blocking(move |db| {
+            for file_index in previous_detected_keys {
+                if detected_archives_for_db.contains_key(&file_index) {
+                    continue;
+                }
+                db.delete_detected_archive_identity(job_id, file_index)
+                    .map_err(|error| {
+                        format!(
+                            "failed to delete nested detected archive identity for file {file_index}: {error}"
+                        )
+                    })?;
             }
-            self.db
-                .delete_detected_archive_identity(job_id, file_index)
-                .map_err(|error| {
-                    format!(
-                        "failed to delete nested detected archive identity for file {file_index}: {error}"
-                    )
-                })?;
-        }
-        for (file_index, identity) in &detected_archives {
-            self.db
-                .save_detected_archive_identity(job_id, *file_index, identity)
-                .map_err(|error| {
-                    format!(
-                        "failed to save nested detected archive identity for file {file_index}: {error}"
-                    )
-                })?;
-        }
+            for (file_index, identity) in &detected_archives_for_db {
+                db.save_detected_archive_identity(job_id, *file_index, identity)
+                    .map_err(|error| {
+                        format!(
+                            "failed to save nested detected archive identity for file {file_index}: {error}"
+                        )
+                    })?;
+            }
 
-        for file_index in previous_identity_keys {
-            if file_identities.contains_key(&file_index) {
-                continue;
-            }
-            self.db
-                .delete_file_identity(job_id, file_index)
-                .map_err(|error| {
+            for file_index in previous_identity_keys {
+                if file_identities_for_db.contains_key(&file_index) {
+                    continue;
+                }
+                db.delete_file_identity(job_id, file_index).map_err(|error| {
                     format!("failed to delete nested file identity for file {file_index}: {error}")
                 })?;
-        }
-        for identity in file_identities.values() {
-            self.db
-                .save_file_identity(job_id, identity)
-                .map_err(|error| {
+            }
+            for identity in file_identities_for_db.values() {
+                db.save_file_identity(job_id, identity).map_err(|error| {
                     format!(
                         "failed to save nested file identity for file {}: {error}",
                         identity.file_index
                     )
                 })?;
-        }
+            }
+            Ok::<(), String>(())
+        })
+        .await?;
 
         Ok(to_extract)
     }
@@ -555,9 +562,11 @@ impl Pipeline {
         self.clear_job_extraction_runtime(job_id);
         self.clear_job_rar_runtime(job_id);
         self.replace_failed_extraction_members(job_id, HashSet::new());
-        self.clear_persisted_extracted_members(job_id);
+        self.clear_persisted_extracted_members(job_id).await;
 
-        let to_extract = self.rebuild_assembly_from_staging(job_id, &nested_archives)?;
+        let to_extract = self
+            .rebuild_assembly_from_staging(job_id, &nested_archives)
+            .await?;
         if to_extract.is_empty() {
             return Ok(NestedExtractionDecision::NoNestedArchives);
         }

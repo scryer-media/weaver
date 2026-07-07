@@ -15,10 +15,10 @@ weaver-server-core = { path = "../../crates/weaver-server-core", default-feature
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }
 weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
 weaver-yenc = { path = "../../../engines/weaver-yenc", default-features = false }
-weaver-par2 = { path = "../../../engines/weaver-par2", default-features = false, features = [
+weaver-par2 = { workspace = true, features = [
     "native-crypto",
 ] }
-weaver-unrar = { path = "../../../engines/weaver-unrar", default-features = false, features = [
+weaver-unrar = { workspace = true, features = [
     "native-crypto",
 ] }
 weaver-server-api = { path = "../../crates/weaver-server-api", default-features = false }

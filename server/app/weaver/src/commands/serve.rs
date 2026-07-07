@@ -111,9 +111,16 @@ pub(crate) async fn run(
     let pipeline_config = shared_config.clone();
 
     // Spawn event persistence subscriber (records meaningful events to SQLite).
-    {
-        wiring::spawn_event_persistence_task(event_tx.subscribe(), db.clone());
-    }
+    // Keep its handle and an explicit shutdown signal so the shutdown path can
+    // await its final writer-queue flush deterministically: the broadcast
+    // senders outlive the pipeline (held by `handle` and its service clones),
+    // so the task never sees the channel close on its own.
+    let event_persistence_shutdown = Arc::new(tokio::sync::Notify::new());
+    let event_persistence_task = wiring::spawn_event_persistence_task(
+        event_tx.subscribe(),
+        db.clone(),
+        event_persistence_shutdown.clone(),
+    );
 
     // Create and start the pipeline.
     let maintenance_complete_dir = complete_dir.clone();
@@ -150,6 +157,7 @@ pub(crate) async fn run(
         schedules: shared_schedules,
         log_buffer: log_ring_buffer,
         nntp_pool: Some(nntp_pool.clone()),
+        spawn_history_delete_worker: true,
     });
 
     let metrics_exporter = http::PrometheusMetricsExporter::new(handle.clone(), nntp_pool);
@@ -198,6 +206,7 @@ pub(crate) async fn run(
             if let Err(join_error) = pipeline_task.await {
                 error!(error = %join_error, "pipeline task failed during shutdown");
             }
+            finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
             server_task.abort();
             rss_task.abort();
             watch_folder.stop().await;
@@ -207,6 +216,7 @@ pub(crate) async fn run(
         }
         result = &mut pipeline_task => {
             let error = shutdown::pipeline_exit_error(result);
+            finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
             server_task.abort();
             rss_task.abort();
             watch_folder.stop().await;
@@ -219,6 +229,7 @@ pub(crate) async fn run(
             if let Err(join_error) = pipeline_task.await {
                 error!(error = %join_error, "pipeline task failed during HTTP shutdown");
             }
+            finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
             rss_task.abort();
             watch_folder.stop().await;
             metrics_history_task.abort();
@@ -228,6 +239,33 @@ pub(crate) async fn run(
                 Ok(Err(error)) => Err(error),
                 Err(join_error) => Err(format!("HTTP server task failed: {join_error}").into()),
             }
+        }
+    }
+}
+
+/// Signal the event-persistence task to stop and await its final
+/// `flush_write_queue`, bounded so a stuck flush cannot hang process exit.
+/// Called after the pipeline task has completed (its broadcast sender dropped),
+/// so the only remaining reason the task is still running is the long-lived
+/// senders held by `SchedulerHandle` and its service clones.
+async fn finalize_event_persistence(
+    task: tokio::task::JoinHandle<()>,
+    shutdown: &Arc<tokio::sync::Notify>,
+) {
+    const EVENT_PERSISTENCE_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    // `notify_one` (not `notify_waiters`) stores a permit if the task is mid-batch
+    // rather than parked on `notified()`, so the shutdown signal cannot be lost.
+    shutdown.notify_one();
+    match tokio::time::timeout(EVENT_PERSISTENCE_FLUSH_TIMEOUT, task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(join_error)) => {
+            error!(error = %join_error, "event persistence task failed during shutdown");
+        }
+        Err(_) => {
+            warn!(
+                timeout_secs = EVENT_PERSISTENCE_FLUSH_TIMEOUT.as_secs(),
+                "timed out flushing event persistence during shutdown"
+            );
         }
     }
 }

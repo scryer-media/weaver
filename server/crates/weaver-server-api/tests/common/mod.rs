@@ -135,8 +135,21 @@ impl TestHarness {
     }
 
     /// Create a new test harness with in-memory DB, default config, mock
-    /// scheduler, and a real GraphQL schema.
+    /// scheduler, and a real GraphQL schema. Spawns the background
+    /// history-delete worker, matching production.
     pub async fn new() -> Self {
+        Self::new_with_options(true).await
+    }
+
+    /// Like [`TestHarness::new`] but does not spawn the background
+    /// history-delete worker. Use this in tests that seed a delete operation and
+    /// assert on its initial `QUEUED` state, so the worker cannot claim the
+    /// operation (flipping it to `RUNNING`) before the assertion runs.
+    pub async fn new_without_history_delete_worker() -> Self {
+        Self::new_with_options(false).await
+    }
+
+    async fn new_with_options(spawn_history_delete_worker: bool) -> Self {
         let tempdir = tempfile::TempDir::new().expect("failed to create tempdir");
         let db = Database::open_in_memory().expect("failed to open in-memory DB");
 
@@ -183,6 +196,7 @@ impl TestHarness {
             log_buffer:
                 weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),
             nntp_pool: None,
+            spawn_history_delete_worker,
         });
 
         Self {

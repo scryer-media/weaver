@@ -36,13 +36,24 @@ impl Database {
         let datastore = self.datastore();
         let encryption_key = self.encryption_key().cloned();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "rotate_jwt_signing_secret", |tx| {
-                let encryption_key = encryption_key.clone();
-                Box::pin(
-                    async move { rotate_jwt_signing_secret_tx(tx, encryption_key.as_ref()).await },
-                )
-            })
-            .await
+            // Unconditional single-statement upsert (no read, no guard), so run it
+            // as one autocommit statement rather than wrapping it in a redundant
+            // BEGIN/COMMIT round-trip. Mirrors `set_auth_credentials`; the
+            // `rotate_jwt_signing_secret_tx` helper stays for the in-transaction
+            // reuse inside `get_or_create_jwt_signing_secret_tx`.
+            let generated = generate_jwt_secret();
+            let stored = encode_stored_jwt_signing_secret(&generated, encryption_key.as_ref())?;
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "INSERT INTO settings (key, value) VALUES ({}, {})
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                &[
+                    SqlArg::Text(JWT_SIGNING_SECRET_SETTING_KEY.to_string()),
+                    SqlArg::Text(stored),
+                ],
+            )
+            .await?;
+            Ok(generated)
         })
     }
 

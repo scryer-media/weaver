@@ -22,6 +22,25 @@ const INTERNAL_METADATA_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS weaver_int
 const LAST_FULL_VACUUM_KEY: &str = "sqlite_full_vacuum_success_epoch_secs";
 const INCREMENTAL_NO_PROGRESS_LIMIT: u64 = 2;
 
+/// Hot tables whose planner statistics are refreshed by the Postgres maintenance
+/// pass. These are the high-churn read/write tables behind the queue, history,
+/// event log, and async-operation surfaces; stale statistics on them are what
+/// make Postgres plan poorly (sqlite refreshes its own via VACUUM/analyze during
+/// the sqlite pass). Table identifiers are compile-time constants, never built
+/// from runtime input, so they are safe to interpolate into `ANALYZE` directly.
+/// VACUUM is intentionally omitted: Postgres autovacuum owns space reclamation.
+pub(crate) const POSTGRES_ANALYZE_TABLES: &[&str] = &[
+    "job_events",
+    "job_history",
+    "job_history_attributes",
+    "active_file_progress",
+    "active_files",
+    "active_extracted",
+    "async_operation_targets",
+    "integration_events",
+    "metrics_history_chunks",
+];
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DbMaintenanceOptions {
     pub reclaim_threshold_bytes: u64,
@@ -96,6 +115,16 @@ pub(crate) struct DbMaintenanceSnapshot {
     pub wal_size_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PostgresMaintenanceReport {
+    /// Tables that were successfully `ANALYZE`d.
+    pub analyzed_tables: Vec<&'static str>,
+    /// Tables whose `ANALYZE` failed, with the error text. A single table
+    /// failing does not abort the pass; the rest are still analyzed.
+    pub failed_tables: Vec<(&'static str, String)>,
+    pub elapsed_ms: u64,
+}
+
 impl DbMaintenanceSnapshot {
     async fn read(datastore: &StoreDatastore) -> Result<Self, StateError> {
         let page_stats = read_page_stats(datastore).await?;
@@ -158,6 +187,24 @@ impl Database {
                 ));
             }
             run_sqlite_maintenance_pass(&datastore, options).await
+        })
+    }
+
+    /// Refresh Postgres planner statistics for the hot tables via per-table
+    /// `ANALYZE`. Returns the report of which tables were analyzed. Requires a
+    /// Postgres datastore; sqlite uses [`Database::run_sqlite_maintenance_pass`]
+    /// instead.
+    pub(crate) fn run_postgres_maintenance_pass(
+        &self,
+    ) -> Result<PostgresMaintenanceReport, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            if datastore.engine() != SqlEngine::Postgres {
+                return Err(StateError::Database(
+                    "postgres maintenance requires a postgres datastore".to_string(),
+                ));
+            }
+            run_postgres_maintenance_pass(&datastore).await
         })
     }
 
@@ -327,6 +374,35 @@ async fn run_sqlite_maintenance_pass(
         wal_truncate_result,
     };
     log_report(&report);
+    Ok(report)
+}
+
+async fn run_postgres_maintenance_pass(
+    datastore: &StoreDatastore,
+) -> Result<PostgresMaintenanceReport, StateError> {
+    let started = Instant::now();
+    let mut report = PostgresMaintenanceReport::default();
+
+    for &table in POSTGRES_ANALYZE_TABLES {
+        // `table` is a compile-time constant from POSTGRES_ANALYZE_TABLES, so
+        // interpolating it into the statement carries no injection risk, and
+        // ANALYZE takes no bound parameters.
+        match SqlRuntime::execute(datastore.read_exec(), &format!("ANALYZE {table}"), &[]).await {
+            Ok(_) => report.analyzed_tables.push(table),
+            Err(error) => {
+                tracing::warn!(table, error = %error, "failed to ANALYZE postgres table during maintenance");
+                report.failed_tables.push((table, error.to_string()));
+            }
+        }
+    }
+
+    report.elapsed_ms = started.elapsed().as_millis() as u64;
+    tracing::info!(
+        analyzed_tables = report.analyzed_tables.len(),
+        failed_tables = report.failed_tables.len(),
+        elapsed_ms = report.elapsed_ms,
+        "postgres maintenance pass complete"
+    );
     Ok(report)
 }
 

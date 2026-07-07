@@ -4,6 +4,8 @@ impl Pipeline {
     const METRICS_SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
     const STATE_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const SHUTDOWN_DRAIN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    /// Bound on how long `drain` waits to join detached fire-and-forget writes.
+    const FIRE_AND_FORGET_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const DOWNLOAD_COMPLETION_DRAIN_LIMIT: usize = 128;
     const INITIAL_CONNECTION_RAMP_LIMIT: usize = 20;
 
@@ -220,6 +222,7 @@ impl Pipeline {
             finished_jobs: initial_history,
             shared_state,
             db,
+            fire_and_forget_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             config,
             pp_pool,
         };
@@ -253,15 +256,53 @@ impl Pipeline {
     {
         let db = self.db.clone();
         let started = Instant::now();
-        tokio::task::spawn_blocking(move || {
-            let task_started = Instant::now();
-            f(&db);
-            crate::runtime::perf_probe::record(
-                "pipeline.db_fire_and_forget.task",
-                task_started.elapsed(),
-            );
-        });
+        {
+            let mut tasks = self
+                .fire_and_forget_tasks
+                .lock()
+                .expect("fire-and-forget task set poisoned");
+            // Opportunistically reap finished handles so the set does not grow
+            // unbounded across a long-running pipeline; only spawn/drain here,
+            // never await while holding the lock.
+            while tasks.try_join_next().is_some() {}
+            tasks.spawn_blocking(move || {
+                let task_started = Instant::now();
+                f(&db);
+                crate::runtime::perf_probe::record(
+                    "pipeline.db_fire_and_forget.task",
+                    task_started.elapsed(),
+                );
+            });
+        }
         crate::runtime::perf_probe::record("pipeline.db_fire_and_forget.submit", started.elapsed());
+    }
+
+    /// Join all outstanding [`Self::db_fire_and_forget`] writes with a bounded
+    /// timeout so shutdown does not drop in-flight persistence. Called from
+    /// `drain` after the explicit awaited flushes. The JoinSet is moved out from
+    /// under the lock first so no lock is held across the await.
+    async fn join_fire_and_forget_tasks(&self) {
+        let mut tasks = {
+            let mut guard = self
+                .fire_and_forget_tasks
+                .lock()
+                .expect("fire-and-forget task set poisoned");
+            std::mem::take(&mut *guard)
+        };
+        if tasks.is_empty() {
+            return;
+        }
+        let drain = async { while tasks.join_next().await.is_some() {} };
+        if tokio::time::timeout(Self::FIRE_AND_FORGET_DRAIN_TIMEOUT, drain)
+            .await
+            .is_err()
+        {
+            warn!(
+                remaining = tasks.len(),
+                timeout_secs = Self::FIRE_AND_FORGET_DRAIN_TIMEOUT.as_secs(),
+                "timed out joining fire-and-forget database writes during shutdown"
+            );
+        }
     }
 
     pub fn nntp_pool(&self) -> Arc<weaver_nntp::pool::NntpPool> {
@@ -869,6 +910,11 @@ impl Pipeline {
         if let Err(error) = self.flush_download_bandwidth_usage() {
             warn!(error = %error, "failed to flush pending bandwidth usage during drain");
         }
+
+        // Join any detached fire-and-forget writes still in flight (e.g. file
+        // progress floors flushed above, or runtime writes) so shutdown does not
+        // drop them. Bounded so a stuck write cannot hang shutdown forever.
+        self.join_fire_and_forget_tasks().await;
     }
 
     fn has_download_or_decode_drain_work(&self) -> bool {

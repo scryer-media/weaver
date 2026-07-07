@@ -315,14 +315,26 @@ async fn extract_sqlite_index_expressions(
             continue;
         }
         let seqno = row.i64("seqno")?;
+        // `index_xinfo` exposes the per-column sort direction in the `desc`
+        // column (1 = DESC, 0 = ASC). Postgres renders the same direction in
+        // `pg_indexes.indexdef` (e.g. `completed_at DESC`), so both sides must
+        // encode it or descending indexes drift (see
+        // normalize_index_direction).
+        let descending = row.i64("desc")? != 0;
         let Some(column_name) = row.opt_text("name")? else {
-            parts.push((seqno, format!("sqlite-expression-{seqno}")));
+            parts.push((
+                seqno,
+                normalize_index_direction(&format!("sqlite-expression-{seqno}"), descending),
+            ));
             continue;
         };
         let collation = row.opt_text("coll")?.unwrap_or_default();
         parts.push((
             seqno,
-            normalize_sqlite_index_expression(table_name, &column_name, &collation),
+            normalize_index_direction(
+                &normalize_sqlite_index_expression(table_name, &column_name, &collation),
+                descending,
+            ),
         ));
     }
     parts.sort_by_key(|(seqno, _)| *seqno);
@@ -648,6 +660,53 @@ fn normalize_sqlite_index_expression(_table: &str, column: &str, collation: &str
     }
 }
 
+/// Append a canonical descending marker so both dialects encode index sort
+/// direction identically. Postgres only prints the non-default `DESC` in
+/// `pg_indexes.indexdef` (ascending is implicit), so ascending columns carry no
+/// suffix on either side and descending columns become `"<expr> desc"`.
+fn normalize_index_direction(expression: &str, descending: bool) -> String {
+    if descending {
+        format!("{} desc", expression.trim())
+    } else {
+        expression.trim().to_string()
+    }
+}
+
+/// Split a trailing Postgres sort-direction clause off an index-column
+/// expression, returning the bare expression plus whether it is descending. A
+/// default `NULLS FIRST/LAST` clause (which Postgres omits from `indexdef`) is
+/// dropped as well so it does not create spurious drift against SQLite, which
+/// never surfaces one.
+fn split_postgres_index_direction(expression: &str) -> (String, bool) {
+    let mut rest = expression.trim();
+    if let Some(stripped) = strip_trailing_keyword(rest, "nulls first")
+        .or_else(|| strip_trailing_keyword(rest, "nulls last"))
+    {
+        rest = stripped.trim_end();
+    }
+    if let Some(stripped) = strip_trailing_keyword(rest, "desc") {
+        return (stripped.trim_end().to_string(), true);
+    }
+    if let Some(stripped) = strip_trailing_keyword(rest, "asc") {
+        return (stripped.trim_end().to_string(), false);
+    }
+    (rest.to_string(), false)
+}
+
+/// Strip a whitespace-delimited trailing keyword (case-insensitive), returning
+/// the prefix when the keyword is present and preceded by whitespace (so column
+/// names ending in the keyword's letters, like `foodesc`, are not matched).
+fn strip_trailing_keyword<'a>(value: &'a str, keyword: &str) -> Option<&'a str> {
+    let trimmed = value.trim_end();
+    let prefix = trimmed.get(..trimmed.len().checked_sub(keyword.len())?)?;
+    let tail = &trimmed[prefix.len()..];
+    if tail.eq_ignore_ascii_case(keyword) && prefix.ends_with(char::is_whitespace) {
+        Some(prefix)
+    } else {
+        None
+    }
+}
+
 fn postgres_index_expressions(indexdef: &str) -> Vec<String> {
     let Some(using_pos) = indexdef.to_ascii_lowercase().find(" using ") else {
         return Vec::new();
@@ -667,17 +726,23 @@ fn postgres_index_expressions(indexdef: &str) -> Vec<String> {
 }
 
 fn normalize_postgres_index_expression(expression: &str) -> String {
+    // Peel off any trailing ASC/DESC (+ NULLS clause) before normalizing the
+    // bare column/expression, then re-encode the direction with the shared
+    // marker so it matches the SQLite side.
+    let (expression, descending) = split_postgres_index_direction(expression);
     let expression = expression
         .trim()
         .trim_matches('"')
         .replace('"', "")
         .to_ascii_lowercase();
     let expression = strip_outer_parentheses(&expression);
-    if expression.starts_with("lower(") && expression.ends_with(')') {
+    let base = if expression.starts_with("lower(") && expression.ends_with(')') {
         let inner = &expression[6..expression.len() - 1];
-        return format!("lower({})", normalize_postgres_expression_inner(inner));
-    }
-    normalize_postgres_expression_inner(&expression)
+        format!("lower({})", normalize_postgres_expression_inner(inner))
+    } else {
+        normalize_postgres_expression_inner(&expression)
+    };
+    normalize_index_direction(&base, descending)
 }
 
 fn normalize_postgres_expression_inner(expression: &str) -> String {
@@ -796,6 +861,50 @@ fn normalizes_quoted_numeric_defaults_as_numeric() {
             Some("'-1'::bigint".into())
         ),
         Some("-1".to_string())
+    );
+}
+
+#[test]
+fn descending_index_direction_canonicalizes_across_dialects() {
+    // A descending column produced by SQLite (`index_xinfo.desc = 1`) and the
+    // matching Postgres `indexdef` fragment must canonicalize to the same token,
+    // while ascending columns carry no direction suffix on either side.
+    let sqlite_desc = normalize_index_direction(
+        &normalize_sqlite_index_expression("job_history", "completed_at", "BINARY"),
+        true,
+    );
+    let postgres_desc = normalize_postgres_index_expression("completed_at DESC");
+    assert_eq!(sqlite_desc, "completed_at desc");
+    assert_eq!(sqlite_desc, postgres_desc);
+
+    let sqlite_asc = normalize_index_direction(
+        &normalize_sqlite_index_expression("job_history", "completed_at", "BINARY"),
+        false,
+    );
+    let postgres_asc = normalize_postgres_index_expression("completed_at");
+    assert_eq!(sqlite_asc, "completed_at");
+    assert_eq!(sqlite_asc, postgres_asc);
+
+    // A default NULLS clause on a descending Postgres column is dropped, and the
+    // NOCASE→lower() equivalence composes with the descending marker.
+    assert_eq!(
+        normalize_postgres_index_expression("completed_at DESC NULLS FIRST"),
+        "completed_at desc"
+    );
+    assert_eq!(
+        normalize_postgres_index_expression("lower(name) DESC"),
+        normalize_index_direction(
+            &normalize_sqlite_index_expression("categories", "name", "NOCASE"),
+            true,
+        )
+    );
+
+    // A column whose name merely ends in the letters of a direction keyword is
+    // not mistaken for one.
+    assert_eq!(
+        normalize_postgres_index_expression("codesc"),
+        "codesc",
+        "column name ending in 'desc' must not be parsed as a direction"
     );
 }
 
@@ -929,6 +1038,190 @@ async fn flush_write_queue_succeeds_without_raw_sqlite_connection() {
 fn writer_task_does_not_retain_database_sender() {
     let db = Database::open_in_memory().unwrap();
     assert_eq!(db.writer_tx.strong_count(), 1);
+}
+
+#[tokio::test]
+async fn writer_queue_write_and_events_execute_in_enqueue_order() {
+    // The single serialized writer consumer awaits each command before the next,
+    // so generic `Write` ops and `InsertJobEvents` must persist their rows in
+    // enqueue order. Each command inserts one job_event for the same job; because
+    // get_job_events returns rows in insertion order, the resulting sequence must
+    // match the order the commands were enqueued.
+    let db = Database::open_in_memory().unwrap();
+    let job_id = 4242_u64;
+
+    // Enqueue: Write(0), InsertJobEvents(1), Write(2), InsertJobEvents(3), Write(4).
+    for i in 0..5u64 {
+        let kind = format!("K{i}");
+        if i % 2 == 0 {
+            db.try_queue_write("order_probe", move |db| {
+                db.insert_job_event(job_id, i as i64, &kind, "w", None)
+            })
+            .unwrap();
+        } else {
+            db.queue_job_events(vec![JobEvent {
+                job_id,
+                timestamp: i as i64,
+                kind,
+                message: "e".to_string(),
+                file_id: None,
+            }])
+            .await
+            .unwrap();
+        }
+    }
+
+    db.flush_write_queue().await.unwrap();
+
+    let kinds: Vec<String> = db
+        .get_job_events(job_id)
+        .unwrap()
+        .into_iter()
+        .map(|event| event.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "K0".to_string(),
+            "K1".to_string(),
+            "K2".to_string(),
+            "K3".to_string(),
+            "K4".to_string(),
+        ],
+        "ordered writer queue did not preserve enqueue order across Write/InsertJobEvents"
+    );
+}
+
+#[tokio::test]
+async fn flush_write_queue_completes_after_queued_generic_write_runs() {
+    // flush_write_queue enqueues a Flush behind existing commands and waits for
+    // its reply, so a generic Write enqueued before the flush must have executed
+    // by the time the flush returns.
+    let db = Database::open_in_memory().unwrap();
+    let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ran_op = ran.clone();
+    db.try_queue_write("flush_probe", move |_db| {
+        ran_op.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap();
+
+    db.flush_write_queue().await.unwrap();
+    assert!(
+        ran.load(std::sync::atomic::Ordering::SeqCst),
+        "flush_write_queue returned before the queued generic write ran"
+    );
+}
+
+#[tokio::test]
+async fn try_queue_write_full_queue_resend_is_covered_by_flush() {
+    // Fill the bounded writer queue so subsequent try_queue_write calls take the
+    // Full re-send path (a background re-send tracked by pending_write_retries).
+    // flush_write_queue must wait for those re-sends via
+    // wait_for_pending_write_retries, so every write lands before it returns.
+    let db = Database::open_in_memory().unwrap();
+    let job_id = 7777_u64;
+
+    // A gate the first queued op blocks on, stalling the consumer so the queue
+    // backs up and try_send starts returning Full.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    db.try_queue_write("gate", move |_db| {
+        let _ = release_rx.lock().unwrap().recv();
+        Ok(())
+    })
+    .unwrap();
+
+    // Enqueue many more writes than the queue capacity (128) so a large share go
+    // through the Full re-send path while the consumer is gated.
+    let total = 400usize;
+    for i in 0..total {
+        let kind = format!("R{i:04}");
+        db.try_queue_write("overflow", move |db| {
+            db.insert_job_event(job_id, i as i64, &kind, "r", None)
+        })
+        .unwrap();
+    }
+
+    // At least some re-sends should be pending while the consumer is gated.
+    // (Not asserted as a hard count to avoid timing flakiness — the flush
+    // contract below is what matters.)
+
+    // Release the gate and flush; flush must wait for pending re-sends.
+    release_tx.send(()).unwrap();
+    db.flush_write_queue().await.unwrap();
+
+    assert_eq!(
+        db.get_job_events(job_id).unwrap().len(),
+        total,
+        "flush_write_queue did not cover writes queued through the Full re-send path"
+    );
+}
+
+#[test]
+fn stale_generation_insert_does_not_resurrect_deleted_job() {
+    // Reproduces the invalidation race: a reader captures the cache generation
+    // and reads a row, then a concurrent delete invalidates the cache before
+    // the reader inserts. The generation-guarded insert must be a no-op so the
+    // deleted job is not served from the cache indefinitely.
+    let db = Database::open_in_memory().unwrap();
+    let job_id = crate::jobs::ids::JobId(4242);
+    let row = postgres_sample_history(job_id);
+
+    // Reader path: seed the cache (simulates an earlier populate) and capture
+    // the generation *before* the delete happens. Seeding via the conditional
+    // insert at the current generation exercises the same path a reader uses.
+    let seed_generation = db.job_history_cache_generation();
+    db.cache_job_history_at(row.clone(), seed_generation);
+    let observed_generation = db.job_history_cache_generation();
+    assert!(db.get_cached_job_history(job_id.0).is_some());
+
+    // A concurrent delete invalidates the cache (bumps the generation).
+    db.invalidate_job_history_cache(job_id.0);
+    assert!(db.get_cached_job_history(job_id.0).is_none());
+
+    // The reader now tries to re-cache the row it read before the delete, using
+    // the stale generation. This must NOT put the deleted row back.
+    db.cache_job_history_at(row.clone(), observed_generation);
+    assert!(
+        db.get_cached_job_history(job_id.0).is_none(),
+        "stale-generation insert resurrected a deleted job in the cache"
+    );
+
+    // A fresh capture-then-insert (no intervening invalidation) still works, so
+    // the guard only rejects racing inserts, not legitimate ones.
+    let fresh_generation = db.job_history_cache_generation();
+    db.cache_job_history_at(row, fresh_generation);
+    assert!(db.get_cached_job_history(job_id.0).is_some());
+}
+
+#[test]
+fn public_delete_api_wins_race_against_stale_reader_insert() {
+    // Same race, driven through the public delete API (delete_job_history)
+    // rather than the low-level invalidate, to confirm the committed delete's
+    // invalidation defeats a stale reader re-cache captured before it.
+    let db = Database::open_in_memory().unwrap();
+    let job_id = crate::jobs::ids::JobId(9191);
+    let row = postgres_sample_history(job_id);
+
+    // Persist and cache the row so the delete has something to remove.
+    db.insert_job_history(&row).unwrap();
+    assert!(db.get_cached_job_history(job_id.0).is_some());
+
+    // Reader captures the generation and its stale row snapshot.
+    let observed_generation = db.job_history_cache_generation();
+    let stale_row = db.get_job_history(job_id.0).unwrap().expect("row present");
+
+    // Delete commits and invalidates the cache.
+    assert!(db.delete_job_history(job_id.0).unwrap());
+    assert!(db.get_cached_job_history(job_id.0).is_none());
+
+    // Stale reader insert with the pre-delete generation must be dropped.
+    db.cache_job_history_at(stale_row, observed_generation);
+    assert!(
+        db.get_cached_job_history(job_id.0).is_none(),
+        "stale reader insert resurrected a row deleted via the public API"
+    );
 }
 
 #[test]
@@ -1094,6 +1387,349 @@ async fn postgres_bulk_hot_paths_when_configured() {
         Some(HashSet::from([37_u32, 38_u32]))
     );
     assert_eq!(db.get_extraction_chunks(job_id, "set").unwrap().len(), 2);
+
+    drop(db);
+    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
+    admin_pool.close().await;
+}
+
+/// Exercise the write ops whose Postgres arms today run as guarded autocommit
+/// statements (converted from `run_in_transaction`) plus the bulk primitives, so
+/// those pg-only code paths — unreachable on the sqlite-default suite — are
+/// validated end to end against a real Postgres. Row effects are asserted with
+/// reads after each step so a failure localizes to the offending op.
+#[tokio::test]
+async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
+    let Some((admin_pool, schema, target_url)) =
+        create_postgres_test_schema("postgres_converted_autocommit").await
+    else {
+        return;
+    };
+
+    // A single job_id counter that never returns NULL for a boolean read via a
+    // WHERE-predicate COUNT (dialect-neutral: pg accepts a bare boolean, sqlite
+    // treats the 0/1 column truthily).
+    let mut db = Database::open_target(DatabaseTarget::PostgresUrl(target_url.clone())).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+
+    let job_id = crate::jobs::ids::JobId(720);
+    let set_name = "setA";
+
+    // --- create_active_job_with_file_identities ---------------------------
+    let identities = vec![
+        crate::jobs::record::ActiveFileIdentity {
+            file_index: 0,
+            source_filename: "vol0-source.rar".to_string(),
+            current_filename: "vol0-old.rar".to_string(),
+            canonical_filename: None,
+            classification: None,
+            classification_source: crate::jobs::record::FileIdentitySource::Declared,
+        },
+        crate::jobs::record::ActiveFileIdentity {
+            file_index: 1,
+            source_filename: "vol1-source.rar".to_string(),
+            current_filename: "vol1-old.rar".to_string(),
+            canonical_filename: None,
+            classification: None,
+            classification_source: crate::jobs::record::FileIdentitySource::Declared,
+        },
+    ];
+    db.create_active_job_with_file_identities(&postgres_sample_job(job_id), &identities)
+        .unwrap();
+    assert_eq!(db.load_active_jobs().unwrap().len(), 1);
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) AS value FROM active_file_identities WHERE job_id = {}",
+            vec![SqlArg::I64(job_id.0 as i64)],
+        ),
+        2
+    );
+
+    // --- complete_files (bulk, includes a None md5) -----------------------
+    db.complete_files(
+        job_id,
+        &[
+            (0, "vol0-old.rar".to_string(), Some([0x11; 16])),
+            (1, "vol1-old.rar".to_string(), None),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) AS value FROM active_files WHERE job_id = {}",
+            vec![SqlArg::I64(job_id.0 as i64)],
+        ),
+        2
+    );
+    // The None md5 must persist as NULL, not an empty/zeroed blob.
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) AS value FROM active_files
+              WHERE job_id = {} AND file_index = {} AND md5 IS NULL",
+            vec![SqlArg::I64(job_id.0 as i64), SqlArg::I64(1)],
+        ),
+        1
+    );
+
+    // --- save_file_identities (updates active_files.filename in place) ----
+    let renamed = vec![
+        crate::jobs::record::ActiveFileIdentity {
+            file_index: 0,
+            source_filename: "vol0-source.rar".to_string(),
+            current_filename: "vol0-new.rar".to_string(),
+            canonical_filename: Some("vol0.part01.rar".to_string()),
+            classification: None,
+            classification_source: crate::jobs::record::FileIdentitySource::Probe,
+        },
+        crate::jobs::record::ActiveFileIdentity {
+            file_index: 1,
+            source_filename: "vol1-source.rar".to_string(),
+            current_filename: "vol1-new.rar".to_string(),
+            canonical_filename: None,
+            classification: None,
+            classification_source: crate::jobs::record::FileIdentitySource::Probe,
+        },
+    ];
+    db.save_file_identities(job_id, &renamed).unwrap();
+    assert_eq!(
+        fetch_text(
+            &db,
+            "SELECT filename AS value FROM active_files WHERE job_id = {} AND file_index = {}",
+            vec![SqlArg::I64(job_id.0 as i64), SqlArg::I64(0)],
+        ),
+        "vol0-new.rar"
+    );
+    // The identity row itself must reflect the new canonical filename.
+    assert_eq!(
+        fetch_text(
+            &db,
+            "SELECT canonical_filename AS value FROM active_file_identities
+              WHERE job_id = {} AND file_index = {}",
+            vec![SqlArg::I64(job_id.0 as i64), SqlArg::I64(0)],
+        ),
+        "vol0.part01.rar"
+    );
+
+    // --- add_extracted_members (bulk + absent-job guard no-op) ------------
+    let extract_dir = tempfile::TempDir::new().unwrap();
+    let member_a = extract_dir.path().join("movie-a.mkv");
+    let member_b = extract_dir.path().join("movie-b.mkv");
+    std::fs::write(&member_a, b"aaaaa").unwrap();
+    std::fs::write(&member_b, b"bbbbbbb").unwrap();
+
+    // Absent job: the pg guard (FOR KEY SHARE CTE the INSERT selects FROM) must
+    // no-op even though the output files exist on disk.
+    let absent_job = crate::jobs::ids::JobId(999_720);
+    db.add_extracted_members(absent_job, &[("movie-a.mkv".to_string(), member_a.clone())])
+        .unwrap();
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) AS value FROM active_extracted WHERE job_id = {}",
+            vec![SqlArg::I64(absent_job.0 as i64)],
+        ),
+        0
+    );
+
+    db.add_extracted_members(
+        job_id,
+        &[
+            ("movie-a.mkv".to_string(), member_a.clone()),
+            ("movie-b.mkv".to_string(), member_b.clone()),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) AS value FROM active_extracted WHERE job_id = {}",
+            vec![SqlArg::I64(job_id.0 as i64)],
+        ),
+        2
+    );
+    // output_size must equal the on-disk byte length ("aaaaa" == 5).
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT output_size AS value FROM active_extracted
+              WHERE job_id = {} AND member_name = {}",
+            vec![
+                SqlArg::I64(job_id.0 as i64),
+                SqlArg::Text("movie-a.mkv".to_string()),
+            ],
+        ),
+        5
+    );
+
+    // --- set_volume_status ------------------------------------------------
+    db.set_volume_status(job_id, set_name, 0, true, true, false)
+        .unwrap();
+    db.set_volume_status(job_id, set_name, 1, true, false, true)
+        .unwrap();
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) AS value FROM active_volume_status WHERE job_id = {}",
+            vec![SqlArg::I64(job_id.0 as i64)],
+        ),
+        2
+    );
+    // The deleted volume must be visible via the typed reader.
+    assert_eq!(
+        db.load_deleted_volume_statuses(job_id).unwrap(),
+        vec![(set_name.to_string(), 1_u32)]
+    );
+
+    // --- insert_extraction_chunk (guard folded into FOR KEY SHARE CTE) ----
+    for volume_index in 0..2u32 {
+        db.insert_extraction_chunk(&crate::jobs::record::ActiveExtractionChunk {
+            job_id,
+            set_name: set_name.to_string(),
+            member_name: "movie-a.mkv".to_string(),
+            volume_index,
+            bytes_written: 100 + u64::from(volume_index),
+            temp_path: format!("/tmp/chunk-{volume_index}"),
+            start_offset: u64::from(volume_index) * 100,
+            end_offset: u64::from(volume_index) * 100 + 100,
+        })
+        .unwrap();
+    }
+    let chunks = db.get_extraction_chunks(job_id, set_name).unwrap();
+    assert_eq!(chunks.len(), 2);
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| !chunk.verified && !chunk.appended)
+    );
+
+    // --- mark_chunk_verified + mark_chunk_appended (UPDATE..FROM guard) ---
+    db.mark_chunk_verified(job_id, set_name, "movie-a.mkv", 0)
+        .unwrap();
+    db.mark_chunk_appended(job_id, set_name, "movie-a.mkv", 0)
+        .unwrap();
+    let chunks = db.get_extraction_chunks(job_id, set_name).unwrap();
+    let chunk0 = chunks
+        .iter()
+        .find(|chunk| chunk.volume_index == 0)
+        .expect("volume 0 chunk present");
+    let chunk1 = chunks
+        .iter()
+        .find(|chunk| chunk.volume_index == 1)
+        .expect("volume 1 chunk present");
+    assert!(
+        chunk0.verified && chunk0.appended,
+        "volume 0 should be flagged"
+    );
+    assert!(
+        !chunk1.verified && !chunk1.appended,
+        "volume 1 should be untouched"
+    );
+
+    // --- set_active_job_normalization_retried (plain autocommit UPDATE) ---
+    db.set_active_job_normalization_retried(job_id, true)
+        .unwrap();
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) AS value FROM active_jobs
+              WHERE job_id = {} AND normalization_retried",
+            vec![SqlArg::I64(job_id.0 as i64)],
+        ),
+        1
+    );
+
+    // --- converted delete/clear ops --------------------------------------
+    db.delete_file_identity(job_id, 1).unwrap();
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) AS value FROM active_file_identities WHERE job_id = {}",
+            vec![SqlArg::I64(job_id.0 as i64)],
+        ),
+        1
+    );
+
+    db.clear_extracted_members(job_id).unwrap();
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) AS value FROM active_extracted WHERE job_id = {}",
+            vec![SqlArg::I64(job_id.0 as i64)],
+        ),
+        0
+    );
+
+    db.clear_volume_status_for_set(job_id, set_name).unwrap();
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) AS value FROM active_volume_status WHERE job_id = {}",
+            vec![SqlArg::I64(job_id.0 as i64)],
+        ),
+        0
+    );
+
+    db.clear_member_chunks(job_id, set_name, "movie-a.mkv")
+        .unwrap();
+    assert_eq!(db.get_extraction_chunks(job_id, set_name).unwrap().len(), 0);
+
+    // --- insert_api_key (execute_returning) -------------------------------
+    let api_key_id = db
+        .insert_api_key("converted-ops", &[0x5a; 32], "integration")
+        .unwrap();
+    assert!(api_key_id > 0);
+    assert_eq!(
+        db.lookup_api_key(&[0x5a; 32])
+            .unwrap()
+            .expect("api key present")
+            .id,
+        api_key_id
+    );
+    assert_eq!(db.list_api_keys().unwrap().len(), 1);
+
+    // --- rotate_jwt_signing_secret (autocommit upsert) --------------------
+    let before = db.get_or_create_jwt_signing_secret().unwrap();
+    let rotated = db.rotate_jwt_signing_secret().unwrap();
+    assert_ne!(before, rotated, "rotation must produce a new secret");
+    assert_eq!(
+        db.get_or_create_jwt_signing_secret().unwrap(),
+        rotated,
+        "rotated secret must round-trip through the encrypted settings row"
+    );
+
+    // --- insert_history_delete_operation with >900 targets ----------------
+    // Chunked IN-list existence check + bulk multi-row target insert.
+    const TARGET_COUNT: u64 = 1500;
+    let target_ids: Vec<u64> = (1..=TARGET_COUNT).collect();
+    for &history_id in &target_ids {
+        db.insert_job_history(&postgres_sample_history(crate::jobs::ids::JobId(
+            history_id,
+        )))
+        .unwrap();
+    }
+    let operation_id = db
+        .insert_history_delete_operation(&target_ids, true)
+        .expect("history delete operation should be created");
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) AS value FROM async_operation_targets WHERE operation_id = {}",
+            vec![SqlArg::I64(operation_id as i64)],
+        ),
+        TARGET_COUNT as i64
+    );
+    // Spot-check the first and last target rows via the typed reader; every row
+    // is queued+locked immediately after insertion.
+    let states = db
+        .list_history_delete_row_states(&[1, TARGET_COUNT])
+        .unwrap();
+    assert_eq!(states.len(), 2);
+    assert_eq!(states[&1].operation_id, operation_id);
+    assert!(states[&1].locked && states[&1].delete_files);
+    assert!(states[&TARGET_COUNT].locked);
 
     drop(db);
     execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
@@ -1338,7 +1974,11 @@ async fn postgres_runtime_smoke_when_configured() {
         return;
     };
 
-    let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
+    let mut db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
+    // The config below carries server/RSS passwords; storing secrets requires an
+    // encryption key (see encryption::maybe_encrypt), so provide an ephemeral one
+    // exactly as the runtime setup does.
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     assert_json_arg_binds_as_text(&db);
 
     let latest_version = fetch_i64(

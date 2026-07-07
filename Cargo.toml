@@ -8,9 +8,6 @@ members = [
     "engines/weaver-nntp",
     "engines/weaver-nzb",
     "engines/weaver-yenc",
-    "engines/weaver-reed-solomon",
-    "engines/weaver-par2",
-    "engines/weaver-unrar",
 ]
 resolver = "2"
 
@@ -93,6 +90,8 @@ security-framework-sys = { version = "2", default-features = false }
 keyring = { version = "4", default-features = false, features = ["v1"] }
 keyring-core = { version = "1", default-features = false }
 windows-sys = { version = "0.61", default-features = false }
+weaver-par2 = { version = "0.1.0", default-features = false }
+weaver-unrar = { version = "0.1.0", default-features = false }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.12.0", default-features = false }
 
 [profile.release]
