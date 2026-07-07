@@ -2635,7 +2635,8 @@ unsafe fn try_decode_avx512_vbmi2_line(
     let dst_start = *dst;
     let mut esc_first = 0u64;
     for chunk_idx in 0..chunks {
-        let v = unsafe { _mm512_loadu_si512(input.as_ptr().add(src + chunk_idx * WIDTH) as *const _) };
+        let v =
+            unsafe { _mm512_loadu_si512(input.as_ptr().add(src + chunk_idx * WIDTH) as *const _) };
         let crlf = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\r' as i8))
             | _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8));
         if crlf != 0 {
@@ -5836,9 +5837,11 @@ mod tests {
             let payload: Vec<u8> = (0..len).map(|_| (lcg(&mut seed) % 256) as u8).collect();
             let body = encoded_body_for(&payload, 128);
             for &hint in &[Some(128u32), Some(64), Some(256)] {
-                for &(dot, preserve, search) in
-                    &[(true, true, true), (true, false, false), (false, true, false)]
-                {
+                for &(dot, preserve, search) in &[
+                    (true, true, true),
+                    (true, false, false),
+                    (false, true, false),
+                ] {
                     let simd = run_kernel_whole(&body, dot, preserve, search, false, hint);
                     let reference = run_kernel_whole(&body, dot, preserve, search, true, hint);
                     assert_eq!(

@@ -793,7 +793,7 @@ impl Pipeline {
     /// generation no longer matches we discard the exclusions and let the retry
     /// fall back to a clean attempt; retention excludes are recomputed fresh
     /// from the new pool at order time, so nothing durable is lost.
-    pub(crate) fn receive_retry_work(&mut self, retry: crate::pipeline::RetryWork) {
+    pub(in crate::pipeline) fn receive_retry_work(&mut self, retry: crate::pipeline::RetryWork) {
         let mut work = retry.work;
         if retry.scheduled_pool_generation != self.pool_generation
             && !work.exclude_servers.is_empty()

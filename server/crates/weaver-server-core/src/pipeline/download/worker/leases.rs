@@ -97,10 +97,6 @@ impl Pipeline {
         }
     }
 
-    /// Terminal-failure bookkeeping shared by missing-article exhaustion and
-    /// retry exhaustion: track failed bytes for health, release any promoted
-    /// recovery segment waiting on this one, and re-evaluate job health.
-
     pub(in crate::pipeline::download::worker) fn pop_download_work_for_batch(
         &mut self,
         job_id: JobId,
@@ -151,7 +147,6 @@ impl Pipeline {
     /// depth on refill: sequential-mode batches add a full round-trip per body,
     /// which costs more than the backlog it protects. The reduced refill runway
     /// (see `download_lane_lease_work_limit`) is the soft-pressure throttle.
-
     pub(in crate::pipeline::download::worker) fn try_lease_refill_download_batch(
         &mut self,
         job_id: JobId,

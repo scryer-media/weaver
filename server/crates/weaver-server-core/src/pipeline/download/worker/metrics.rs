@@ -88,32 +88,7 @@ impl Pipeline {
         }
     }
 
-    /// Dispatch downloads across eligible jobs with hot-job-first ordering.
-    ///
-    /// Eligible jobs are grouped by submitted priority metadata (`HIGH`,
-    /// `NORMAL`, `LOW`). Within the top runnable band, an already-active job
-    /// keeps ownership so pooled NNTP connections stay hot; otherwise the
-    /// earliest submitted runnable job becomes hot.
-    ///
-    /// This lets a newly submitted higher-priority job take newly freed slots
-    /// immediately while preserving already in-flight work on lower-priority
-    /// jobs. Within a priority band, the hot job gets all usable capacity
-    /// first; spare capacity is shared only after that job cannot fill another
-    /// slot from its own queue.
-    ///
-    /// A job is eligible if it is `Downloading` with queued segments, or in a
-    /// post-processing state (`QueuedExtract`/`Extracting`/`Verifying`/
-    /// `QueuedRepair`/`Repairing`) with promoted recovery segments in its
-    /// download queue.
-    ///
-    /// This is hot-job-first by default. The current hot job receives usable
-    /// capacity first; same/lower-band spillover is delayed until the hot job
-    /// has completed warmup and an unused-capacity window proves underfill.
-    ///
-    /// When a bandwidth cap is enabled and within 15% of exhaustion, reverts
-    /// to single-job dispatch to avoid wasting scarce remaining quota on
-    /// lower-priority work.
-
+    /// Update shared atomic queue depth metrics from per-job queues.
     pub(crate) fn update_queue_metrics(&self) {
         let (total, recovery) = self.jobs.values().fold((0usize, 0usize), |(t, r), s| {
             (

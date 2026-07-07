@@ -1588,8 +1588,8 @@ pub struct Pipeline {
     pub(super) decode_done_tx: mpsc::Sender<DecodeDone>,
     pub(super) decode_done_rx: mpsc::Receiver<DecodeDone>,
     /// Channel for delayed retries — segments sleep then come back here.
-    pub(super) retry_tx: mpsc::Sender<RetryWork>,
-    pub(super) retry_rx: mpsc::Receiver<RetryWork>,
+    pub(in crate::pipeline) retry_tx: mpsc::Sender<RetryWork>,
+    pub(in crate::pipeline) retry_rx: mpsc::Receiver<RetryWork>,
     /// Monotonic NNTP pool generation, bumped on every `RebuildNntp`. Server
     /// indices in `DownloadWork::exclude_servers` are only meaningful within
     /// the generation they were computed under; delayed retries carry the

@@ -856,20 +856,20 @@ fn reconcile_related_volume_residue_in_dir(
             continue;
         }
         if let Some((unmarked_name, marker)) = strip_terminal_marker(name) {
-            if let Some((key, volume_number)) = archive_set_key_from_marked_name(unmarked_name) {
-                if volume_number == 0 {
-                    marked_first_volumes.entry(key).or_insert(marker);
-                }
+            if let Some((key, volume_number)) = archive_set_key_from_marked_name(unmarked_name)
+                && volume_number == 0
+            {
+                marked_first_volumes.entry(key).or_insert(marker);
             }
             continue;
         }
         if should_ignore_file_name(name) {
             continue;
         }
-        if let Some((key, volume_number)) = archive_set_key(name) {
-            if volume_number != 0 {
-                unmarked_later_volumes.push((path, key));
-            }
+        if let Some((key, volume_number)) = archive_set_key(name)
+            && volume_number != 0
+        {
+            unmarked_later_volumes.push((path, key));
         }
     }
 
