@@ -4772,8 +4772,8 @@ async fn solid_rar_keeps_later_members_ready_after_earlier_failure() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30009);
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../engines/weaver-unrar/tests/fixtures/rar5/rar5_solid.rar");
+    let fixture_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar5/rar5_solid.rar");
     let fixture_bytes = tokio::fs::read(&fixture_path).await.unwrap();
     let archive =
         weaver_unrar::RarArchive::open(std::fs::File::open(&fixture_path).unwrap()).unwrap();
@@ -4829,8 +4829,8 @@ async fn solid_rar4_pipeline_extracts_large_fixture_end_to_end() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30010);
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../engines/weaver-unrar/tests/fixtures/rar4/rar4_solid.rar");
+    let fixture_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar4/rar4_solid.rar");
     let fixture_bytes = tokio::fs::read(&fixture_path).await.unwrap();
 
     let spec = rar_job_spec(

@@ -21,7 +21,7 @@ env:
   WEAVER_ENABLE_DIAGNOSTICS: "0"
   WEB_ARTIFACT_NAME: weaver-web-dist
   RUST_TEST_BINARIES_ARTIFACT_NAME: weaver-rust-test-binaries
-  WEAVER_LFS_RUST_TEST_INCLUDE: engines/weaver-unrar/tests/fixtures/**,engines/weaver-par2/tests/fixtures/**,server/crates/weaver-server-core/tests/fixtures/**
+  WEAVER_LFS_RUST_TEST_INCLUDE: server/crates/weaver-server-core/tests/fixtures/**
   WEAVER_LFS_SDE_INCLUDE: ci/vendor/intel-sde/**
   E2E_LFS_PAR2_SMALL_REPAIR_INCLUDE: testdata/par2-small-repair/**
 

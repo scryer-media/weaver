@@ -1,14 +1,5 @@
 ci/vendor/intel-sde/*.tar.xz filter=lfs diff=lfs merge=lfs -text
-engines/weaver-unrar/tests/fixtures/**/*.rar filter=lfs diff=lfs merge=lfs -text lockable
-engines/weaver-unrar/tests/fixtures/**/*.rev filter=lfs diff=lfs merge=lfs -text
-engines/weaver-unrar/tests/fixtures/**/*.exe filter=lfs diff=lfs merge=lfs -text
-engines/weaver-unrar/tests/fixtures/**/*.bin filter=lfs diff=lfs merge=lfs -text
-engines/weaver-unrar/tests/fixtures/**/*.mkv filter=lfs diff=lfs merge=lfs -text
-engines/weaver-unrar/tests/fixtures/**/*.wav filter=lfs diff=lfs merge=lfs -text
-engines/weaver-par2/tests/fixtures/**/*.rar filter=lfs diff=lfs merge=lfs -text
-engines/weaver-par2/tests/fixtures/**/*.par2 filter=lfs diff=lfs merge=lfs -text
-engines/weaver-par2/tests/fixtures/par2cmdline-turbo/**/*.tar.gz filter=lfs diff=lfs merge=lfs -text
-engines/weaver-par2/tests/fixtures/source/*.mkv filter=lfs diff=lfs merge=lfs -text
 server/crates/weaver-server-core/tests/fixtures/**/*.7z filter=lfs diff=lfs merge=lfs -text
 server/crates/weaver-server-core/tests/fixtures/**/*.7z.* filter=lfs diff=lfs merge=lfs -text
 server/crates/weaver-server-core/tests/fixtures/**/*.mkv filter=lfs diff=lfs merge=lfs -text
+server/crates/weaver-server-core/tests/fixtures/**/*.rar filter=lfs diff=lfs merge=lfs -text lockable

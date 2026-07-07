@@ -1226,8 +1226,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn rar_server_extraction_delegates_symlink_entries_to_unrar_crate() {
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../engines/weaver-unrar/tests/fixtures/rar5/rar5_symlink.rar");
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar5/rar5_symlink.rar");
         let file = std::fs::File::open(&fixture).unwrap();
         let mut archive = weaver_unrar::RarArchive::open(file).unwrap();
         let symlink_idx = archive
@@ -1282,8 +1282,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn full_set_reader_selection_scans_link_members_when_requested_members_is_empty() {
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../engines/weaver-unrar/tests/fixtures/rar5/rar5_symlink.rar");
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar5/rar5_symlink.rar");
         let file = std::fs::File::open(&fixture).unwrap();
         let archive = weaver_unrar::RarArchive::open(file).unwrap();
         let symlink_name = archive

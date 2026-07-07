@@ -1186,7 +1186,7 @@ async fn insert_active_job_with_persisted_nzb(
 fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../engines/weaver-unrar/tests/fixtures/rar5")
+            .join("tests/fixtures/rar5")
             .join(name),
     )
     .unwrap()
@@ -1195,7 +1195,7 @@ fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
 fn rar_original_fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../engines/weaver-unrar/tests/fixtures/originals")
+            .join("tests/fixtures/originals")
             .join(name),
     )
     .unwrap()

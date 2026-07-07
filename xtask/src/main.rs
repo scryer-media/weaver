@@ -3332,7 +3332,7 @@ mod tests {
     #[test]
     fn release_hygiene_flags_local_absolute_paths() {
         let violations = scan_release_hygiene_content(
-            Path::new("engines/weaver-par2/tests/support/benchmark_support.rs"),
+            Path::new("server/crates/weaver-server-core/src/pipeline/tests/rar_extraction.rs"),
             concat!(
                 "const DEFAULT: &str = \"",
                 "/",
@@ -3345,7 +3345,7 @@ mod tests {
             violations,
             vec![
                 concat!(
-                    "engines/weaver-par2/tests/support/benchmark_support.rs:1: local absolute path reference: const DEFAULT: &str = \"",
+                    "server/crates/weaver-server-core/src/pipeline/tests/rar_extraction.rs:1: local absolute path reference: const DEFAULT: &str = \"",
                     "/",
                     "Users/example/dev/supporting-codebases/par2cmdline-turbo/par2",
                     "\";"
@@ -3358,7 +3358,7 @@ mod tests {
     #[test]
     fn release_hygiene_flags_sibling_e2e_paths() {
         let violations = scan_release_hygiene_content(
-            Path::new("engines/weaver-par2/src/repairer.rs"),
+            Path::new("server/crates/weaver-server-core/src/pipeline/tests/rar_extraction.rs"),
             concat!(
                 "let fixture = manifest_dir.join(\"..",
                 "/../..",
@@ -3370,7 +3370,7 @@ mod tests {
             violations,
             vec![
                 concat!(
-                    "engines/weaver-par2/src/repairer.rs:1: sibling e2e repo reference: let fixture = manifest_dir.join(\"..",
+                    "server/crates/weaver-server-core/src/pipeline/tests/rar_extraction.rs:1: sibling e2e repo reference: let fixture = manifest_dir.join(\"..",
                     "/../..",
                     "/e2e/testdata\").join(name);"
                 )
@@ -3382,7 +3382,7 @@ mod tests {
     #[test]
     fn release_hygiene_allows_repo_local_paths() {
         let violations = scan_release_hygiene_content(
-            Path::new("engines/weaver-par2/src/repairer.rs"),
+            Path::new("server/crates/weaver-server-core/src/pipeline/tests/rar_extraction.rs"),
             "let fixture = manifest_dir.join(\"tests/fixtures\").join(name);",
         );
 
