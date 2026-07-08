@@ -4913,9 +4913,9 @@ dependencies = [
 
 [[package]]
 name = "weaver-par2"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f7332ee1d2de02271bbf702d4f1cb4e5f0cb91b18cbfe11350b52cd3f834151"
+checksum = "597f66a308380480edece973f9d2bf51498229302799cec17ff1d58ae2a7e9f7"
 dependencies = [
  "aws-lc-sys",
  "bytes",
@@ -4931,10 +4931,11 @@ dependencies = [
 
 [[package]]
 name = "weaver-reed-solomon"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891272735a8faa061b0042edc67b79a1fa560ba5e9228cb59bda8c1eb7272050"
+checksum = "257fca188ba59d9f2c2129685f5a1cba80cc16322488f2b54db0e4c12e9153f9"
 dependencies = [
+ "memmap2",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
