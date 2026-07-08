@@ -33,6 +33,7 @@ SUBNET_ID="${SUBNET_ID:-}"                        # optional; default subnet if 
 TERMINATE="${TERMINATE:-1}"
 VOLUME_GB="${VOLUME_GB:-30}"
 DRY_RUN="${DRY_RUN:-0}"
+BENCH_TAG="${BENCH_TAG:-avx2}"       # instance Name suffix + weaver-bench tag (avx2 | avx512)
 
 log(){ printf '\033[1;34m[aws-run]\033[0m %s\n' "$*"; }
 die(){ printf '\033[1;31m[aws-run:FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -41,7 +42,8 @@ command -v aws >/dev/null 2>&1 || die "awscli not found — install it and run: 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEAVER_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 [ -f "$WEAVER_ROOT/Cargo.toml" ] || die "expected weaver workspace root at $WEAVER_ROOT (no Cargo.toml)"
-[ -f "$SCRIPT_DIR/avx2-aws-userdata.sh" ] || die "missing avx2-aws-userdata.sh next to this script"
+USERDATA="${USERDATA:-$SCRIPT_DIR/avx2-aws-userdata.sh}"
+[ -f "$USERDATA" ] || die "missing user-data template: $USERDATA (set USERDATA=/abs/path)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 # ── 1. bundle THIS working tree (tracked + uncommitted WIP), via git so
@@ -80,7 +82,7 @@ sed -e "s|__S3_CODE__|$S3_CODE|g" \
     -e "s|__S3_RESULTS__|$S3_RESULTS|g" \
     -e "s|__GIT_URL__||g" -e "s|__GIT_REF__||g" \
     -e "s|__TERMINATE__|$TERMINATE|g" \
-    "$SCRIPT_DIR/avx2-aws-userdata.sh" > "$UD"
+    "$USERDATA" > "$UD"
 
 # ── 4. launch ────────────────────────────────────────────────────────────────
 RUN_ARGS=(
@@ -91,7 +93,7 @@ RUN_ARGS=(
   --user-data "file://$UD"
   --instance-initiated-shutdown-behavior terminate
   --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$VOLUME_GB,VolumeType=gp3}"
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=weaver-avx2-profile},{Key=weaver-bench,Value=avx2}]"
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=weaver-$BENCH_TAG-profile},{Key=weaver-bench,Value=$BENCH_TAG}]"
   --count 1
 )
 [ -n "$KEY_NAME" ]          && RUN_ARGS+=( --key-name "$KEY_NAME" )
