@@ -23,7 +23,7 @@ const DOTENV_FILE: &str = ".env";
 // the Windows system heap has the same reputation under threaded load, so
 // both build targets swap in mimalloc. glibc/macOS builds keep the system
 // allocator.
-#[cfg(any(target_env = "musl", target_os = "windows"))]
+#[cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))]
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

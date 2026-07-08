@@ -634,6 +634,10 @@ pub(super) unsafe fn decode_kernel_avx2(
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    dead_code,
+    reason = "retained for AVX2 line-aware kernel bring-up; dispatch still uses the rapidyenc AVX2 path"
+)]
 pub(super) unsafe fn try_decode_avx2_block(
     a: std::arch::x86_64::__m256i,
     b: std::arch::x86_64::__m256i,
@@ -874,6 +878,10 @@ pub(super) unsafe fn avx2_mask64(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[inline]
+#[allow(
+    dead_code,
+    reason = "retained for AVX2 line-aware kernel bring-up; dispatch still uses the rapidyenc AVX2 path"
+)]
 pub(super) unsafe fn avx2_decode_with_shifted_eq(
     a: std::arch::x86_64::__m256i,
     b: std::arch::x86_64::__m256i,
@@ -960,6 +968,10 @@ pub(super) unsafe fn avx2_decode_with_escape_mask(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
+#[allow(
+    dead_code,
+    reason = "retained for AVX2 line-aware kernel bring-up; dispatch still uses the rapidyenc AVX2 path"
+)]
 pub(super) unsafe fn decode_kernel_simd64_avx2_line_aware(
     input: &[u8],
     output: &mut [u8],
@@ -1078,6 +1090,10 @@ pub(super) unsafe fn decode_kernel_simd64_avx2_line_aware(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    dead_code,
+    reason = "retained for AVX2 line-aware kernel bring-up; dispatch still uses the rapidyenc AVX2 path"
+)]
 pub(super) unsafe fn try_decode_avx2_line(
     input: &[u8],
     src: usize,
@@ -1218,6 +1234,10 @@ pub(super) unsafe fn try_decode_avx2_line(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[inline]
+#[allow(
+    dead_code,
+    reason = "retained for AVX2 line-aware kernel bring-up; dispatch still uses the rapidyenc AVX2 path"
+)]
 pub(super) unsafe fn compact_store_16_avx2_at(
     decoded: std::arch::x86_64::__m256i,
     high_lane: bool,
