@@ -11,6 +11,9 @@ thiserror = { workspace = true }
 crc32fast = { workspace = true }
 memchr = { workspace = true }
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 criterion = "0.5"
 libloading = "0.8"

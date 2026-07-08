@@ -5062,6 +5062,7 @@ dependencies = [
 name = "weaver-yenc"
 version = "0.6.9"
 dependencies = [
+ "cc",
  "crc32fast",
  "criterion",
  "libloading",

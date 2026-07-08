@@ -109,9 +109,69 @@ fn time_fixture(name: &str, input: &[u8]) {
     println!(
         "{name:<12} min {min:>8.3} us  median {median:>8.3} us  ({gbps:.2} GB/s at min, {decoded} decoded)"
     );
+
+    #[cfg(rapidyenc_linked)]
+    {
+        let mut rout = vec![0u8; input.len() + 64];
+        // Byte-parity vs the real library before timing.
+        let rw = unsafe {
+            weaver_rapidyenc_decode(
+                input.as_ptr() as *const core::ffi::c_void,
+                rout.as_mut_ptr() as *mut core::ffi::c_void,
+                input.len() as u64,
+            )
+        } as usize;
+        assert_eq!(rw, decoded, "{name}: rapidyenc decoded length != weaver");
+        assert_eq!(&rout[..rw], &out[..decoded], "{name}: rapidyenc bytes != weaver");
+        for _ in 0..100 {
+            unsafe {
+                weaver_rapidyenc_decode(
+                    input.as_ptr() as *const core::ffi::c_void,
+                    rout.as_mut_ptr() as *mut core::ffi::c_void,
+                    input.len() as u64,
+                );
+            }
+        }
+        let mut rsamples = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = Instant::now();
+            let w = unsafe {
+                weaver_rapidyenc_decode(
+                    std::hint::black_box(input.as_ptr()) as *const core::ffi::c_void,
+                    rout.as_mut_ptr() as *mut core::ffi::c_void,
+                    input.len() as u64,
+                )
+            };
+            let dt = t.elapsed();
+            std::hint::black_box(w);
+            rsamples.push(dt.as_nanos() as u64);
+        }
+        rsamples.sort_unstable();
+        let rmin = rsamples[0] as f64 / 1000.0;
+        let rmedian = rsamples[iters / 2] as f64 / 1000.0;
+        let rgbps = decoded as f64 / (rmin * 1e-6) / 1e9;
+        println!(
+            "{:<12} min {rmin:>8.3} us  median {rmedian:>8.3} us  ({rgbps:.2} GB/s at min)  [weaver/rapidyenc = {:.2}x]",
+            "  rapidyenc", min / rmin
+        );
+    }
+}
+
+#[cfg(rapidyenc_linked)]
+unsafe extern "C" {
+    fn weaver_rapidyenc_decode_init();
+    fn weaver_rapidyenc_decode(
+        src: *const core::ffi::c_void,
+        dest: *mut core::ffi::c_void,
+        len: u64,
+    ) -> u64;
 }
 
 fn main() {
+    #[cfg(rapidyenc_linked)]
+    unsafe {
+        weaver_rapidyenc_decode_init();
+    }
     println!("weaver-yenc decode timing (min of 2000 iters, 768000-byte decode target)\n");
     time_fixture("realshape", &real_yenc_128col_body());
     time_fixture("clean", &clean_body());

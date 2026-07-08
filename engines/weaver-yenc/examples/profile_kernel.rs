@@ -7,6 +7,16 @@
 
 use weaver_yenc::decode::decode_rapidyenc;
 
+#[cfg(rapidyenc_linked)]
+unsafe extern "C" {
+    fn weaver_rapidyenc_decode_init();
+    fn weaver_rapidyenc_decode(
+        src: *const core::ffi::c_void,
+        dest: *mut core::ffi::c_void,
+        len: u64,
+    ) -> u64;
+}
+
 const DECODED_TARGET: usize = 768_000;
 
 fn real_yenc_128col_body() -> Vec<u8> {
@@ -86,7 +96,27 @@ fn main() {
         _ => real_yenc_128col_body(),
     };
     let mut out = vec![0u8; input.len() + 64];
-    eprintln!("profiling fixture={fixture} iters={iters} input_len={}", input.len());
+
+    #[cfg(rapidyenc_linked)]
+    if std::env::var_os("WEAVER_PROFILE_RAPIDYENC").is_some() {
+        unsafe { weaver_rapidyenc_decode_init() };
+        eprintln!("profiling RAPIDYENC fixture={fixture} iters={iters} input_len={}", input.len());
+        let mut acc = 0u64;
+        for _ in 0..iters {
+            acc = acc.wrapping_add(unsafe {
+                weaver_rapidyenc_decode(
+                    std::hint::black_box(input.as_ptr()) as *const core::ffi::c_void,
+                    out.as_mut_ptr() as *mut core::ffi::c_void,
+                    input.len() as u64,
+                )
+            });
+        }
+        std::hint::black_box(acc);
+        eprintln!("done acc={acc}");
+        return;
+    }
+
+    eprintln!("profiling WEAVER fixture={fixture} iters={iters} input_len={}", input.len());
     let mut acc = 0usize;
     for _ in 0..iters {
         acc = acc.wrapping_add(decode_rapidyenc(std::hint::black_box(&input), &mut out).unwrap());
