@@ -19,6 +19,22 @@ pub(super) unsafe fn decode_kernel_neon(
         search_end,
     };
 
+    // Hot path: faithful port of rapidyenc `do_decode_neon<isRaw=true,
+    // searchEnd=false>` (decoder_neon64.cc) — the flat, register-carried decode
+    // loop, mirroring `decode_kernel_avx2_raw` / `decode_kernel_avx512_raw`.
+    // Other combos (search_end, non-raw, or an entry state the head-switch
+    // doesn't cover) keep the general scaffolding driver below.
+    if dot_unstuffing
+        && !search_end
+        && input.len() > WIDTH * 2
+        && matches!(
+            state.state,
+            DecoderState::None | DecoderState::Eq | DecoderState::Cr | DecoderState::CrLf
+        )
+    {
+        return unsafe { decode_kernel_neon64_raw(input, output, state, mode) };
+    }
+
     // Long-span shape on AArch64: set up constants once,
     // then stay inside the NEON loop until scalar boundary handling is needed.
     let tail_buffer = if dot_unstuffing {
@@ -75,6 +91,330 @@ pub(super) unsafe fn decode_kernel_neon(
     }
 
     while (!search_end || state.end == DecodeEnd::None) && src < input.len() {
+        if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+            break;
+        }
+    }
+
+    Ok(KernelOutcome {
+        consumed: src,
+        written: dst,
+        end: state.end.into(),
+    })
+}
+
+/// Faithful port of rapidyenc `do_decode_neon<isRaw=true, searchEnd=false>`
+/// (decoder_neon64.cc): the flat, register-carried decode loop over 64-byte
+/// windows (4× `uint8x16`). Structurally a 1:1 clone of
+/// [`decode_kernel_avx2_raw`](super::x86_avx2) / `decode_kernel_avx512_raw`,
+/// differing only in the vector ops. The scalar `u64` bit-math (`fix_eq_mask`,
+/// `escaped`, `esc_first`, `skip`, entry/exit state) is byte-identical to those
+/// tiers, so all three share the same correctness envelope.
+///
+/// Register-carried state (oracle → here):
+/// - `escFirst` → `esc_first: u64`
+/// - `yencOffset` → `yenc_offset: uint8x16_t` (byte0 = 106 on a carried escape,
+///   else 42; lanes 1..15 = 42)
+/// - `nextMask`/`minMask` → `next_mask_mix: uint8x16_t`. Unlike AVX2/VBMI2
+///   (which clamp via `min_epu8` + a `min_mask`), NEON keeps `.` OUT of the
+///   specials LUT and injects a line-start dot by OR-ing `next_mask_mix` into
+///   `cmp_a` after the `vqtbx1q` merge (oracle line 96). It is consumed exactly
+///   once per window and recomputed (or zeroed) inside the `\r\n.` sub-branch.
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn decode_kernel_neon64_raw(
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut KernelState,
+    mode: DecodeStepMode,
+) -> Result<KernelOutcome, YencError> {
+    use std::arch::aarch64::*;
+    const WIDTH: usize = 64;
+
+    let mut src = 0usize;
+    let mut dst = 0usize;
+    // +2 dot lookahead loads read up to src+65 on the last window; the tail
+    // budget (identical to AVX2/VBMI2 raw) keeps them in bounds.
+    let tail = WIDTH - 1 + 4;
+    let simd_limit = input.len().saturating_sub(tail);
+
+    let constants = Neon64Constants::new();
+    let table = compact_table_16();
+    let zero = vdupq_n_u8(0);
+    let normal_offset = constants.normal_offset; // dup(42)
+    let escaped_offset = constants.escaped_offset; // dup(106)
+
+    // Entry state → escFirst / nextMask (oracle `_do_decode_simd` head switch).
+    let mut esc_first: u64 = (state.state == DecoderState::Eq) as u64;
+    let entry_next_mask: u16 = match state.state {
+        DecoderState::CrLf if input[0] == b'.' => 1,
+        DecoderState::Cr if input.len() >= 2 && input[0] == b'\n' && input[1] == b'.' => 2,
+        _ => 0,
+    };
+
+    // yenc_offset: byte0 = 106 (=42+64) if a `=` straddled in from the previous
+    // window, else 42; lanes 1..15 always 42 (oracle line 58).
+    let mut yenc_offset = if esc_first != 0 {
+        vsetq_lane_u8::<0>(42 + 64, normal_offset)
+    } else {
+        normal_offset
+    };
+    // next_mask_mix: a carried line-start dot. Values 1/2 survive the
+    // `& bit_weights` reduction at lanes 0/1 (oracle lines 53-57).
+    let mut next_mask_mix = match entry_next_mask {
+        1 => vsetq_lane_u8::<0>(1, zero),
+        2 => vsetq_lane_u8::<1>(2, zero),
+        _ => zero,
+    };
+
+    if input.len() > WIDTH * 2 {
+        while src + WIDTH <= simd_limit {
+            let a = vld1q_u8(input.as_ptr().add(src));
+            let b = vld1q_u8(input.as_ptr().add(src + 16));
+            let c = vld1q_u8(input.as_ptr().add(src + 32));
+            let d = vld1q_u8(input.as_ptr().add(src + 48));
+
+            let eq_a = vceqq_u8(a, constants.eq);
+            let eq_b = vceqq_u8(b, constants.eq);
+            let eq_c = vceqq_u8(c, constants.eq);
+            let eq_d = vceqq_u8(d, constants.eq);
+
+            // Fold the CR/LF compares into the `=` compare via one table lookup
+            // (oracle lines 71-95). `.` is deliberately absent from the table;
+            // stuffed dots enter the mask only via `next_mask_mix` (below) or
+            // the scalar `mask |= kill_dots << 2`.
+            let mut cmp_a = vqtbx1q_u8(eq_a, constants.crlf_table, a);
+            let cmp_b = vqtbx1q_u8(eq_b, constants.crlf_table, b);
+            let cmp_c = vqtbx1q_u8(eq_c, constants.crlf_table, c);
+            let cmp_d = vqtbx1q_u8(eq_d, constants.crlf_table, d);
+            // Inject the carried/straddled line-start dot (oracle line 96). This
+            // is the NEON replacement for the AVX2 `min_mask` clamp.
+            cmp_a = vorrq_u8(cmp_a, next_mask_mix);
+
+            let any = vorrq_u8(vorrq_u8(cmp_a, cmp_b), vorrq_u8(cmp_c, cmp_d));
+            if vmaxvq_u8(any) != 0 {
+                // Fused bit-weight reduction: lane 0 → specials mask, lane 1 →
+                // `=` mask (oracle lines 102-125).
+                let merged = vpaddq_u8(
+                    vpaddq_u8(
+                        vpaddq_u8(
+                            vandq_u8(cmp_a, constants.bit_weights),
+                            vandq_u8(cmp_b, constants.bit_weights),
+                        ),
+                        vpaddq_u8(
+                            vandq_u8(cmp_c, constants.bit_weights),
+                            vandq_u8(cmp_d, constants.bit_weights),
+                        ),
+                    ),
+                    vpaddq_u8(
+                        vpaddq_u8(
+                            vandq_u8(eq_a, constants.bit_weights),
+                            vandq_u8(eq_b, constants.bit_weights),
+                        ),
+                        vpaddq_u8(
+                            vandq_u8(eq_c, constants.bit_weights),
+                            vandq_u8(eq_d, constants.bit_weights),
+                        ),
+                    ),
+                );
+                let mut mask = vgetq_lane_u64::<0>(vreinterpretq_u64_u8(merged));
+                let mask_eq = vgetq_lane_u64::<1>(vreinterpretq_u64_u8(merged));
+
+                // Handle `\r\n.` dot-stuffing (oracle lines 129-289, isRaw path).
+                // A nonzero `next_mask_mix` always forces `mask != mask_eq` (it
+                // adds a dot bit the `=` mask lacks), so this branch is where the
+                // carry is consumed and reset — the invariant that keeps a stale
+                // carry from double-stripping a dot.
+                if mask != mask_eq {
+                    let tmp2 = vld1q_u8(input.as_ptr().add(src + 50));
+                    let cr_a = vceqq_u8(a, constants.cr);
+                    let cr_b = vceqq_u8(b, constants.cr);
+                    let cr_c = vceqq_u8(c, constants.cr);
+                    let cr_d = vceqq_u8(d, constants.cr);
+                    let m2cr_a = vandq_u8(cr_a, vceqq_u8(vextq_u8::<2>(a, b), constants.dot));
+                    let m2cr_b = vandq_u8(cr_b, vceqq_u8(vextq_u8::<2>(b, c), constants.dot));
+                    let m2cr_c = vandq_u8(cr_c, vceqq_u8(vextq_u8::<2>(c, d), constants.dot));
+                    let m2cr_d = vandq_u8(cr_d, vceqq_u8(tmp2, constants.dot));
+                    let m2cr_any = vorrq_u8(vorrq_u8(m2cr_a, m2cr_b), vorrq_u8(m2cr_c, m2cr_d));
+                    if vmaxvq_u8(m2cr_any) != 0 {
+                        let lf_a = vceqq_u8(vextq_u8::<1>(a, b), constants.lf);
+                        let lf_b = vceqq_u8(vextq_u8::<1>(b, c), constants.lf);
+                        let lf_c = vceqq_u8(vextq_u8::<1>(c, d), constants.lf);
+                        let lf_d = vceqq_u8(vld1q_u8(input.as_ptr().add(src + 49)), constants.lf);
+                        let m2nldot_a = vandq_u8(m2cr_a, lf_a);
+                        let m2nldot_b = vandq_u8(m2cr_b, lf_b);
+                        let m2nldot_c = vandq_u8(m2cr_c, lf_c);
+                        let m2nldot_d = vandq_u8(m2cr_d, lf_d);
+                        // Reduce the `\r\n.` matches to a u64 and strip the
+                        // stuffed dot (which sits 2 bytes after the `\r`).
+                        let kill_dots = neon64_compare_mask64(
+                            [m2nldot_a, m2nldot_b, m2nldot_c, m2nldot_d],
+                            constants.bit_weights,
+                        );
+                        mask |= kill_dots << 2;
+                        // Carry a straddling dot (CR at byte 62/63) to the next
+                        // window's byte 0/1 (oracle line 252).
+                        next_mask_mix = vextq_u8::<14>(m2nldot_d, zero);
+                    } else {
+                        // `\r\n` present but no stuffed dot: reset the carry.
+                        next_mask_mix = zero;
+                    }
+                }
+                // If `mask == mask_eq`, `next_mask_mix` was already zero (a
+                // nonzero carry would have forced `mask != mask_eq`), so leaving
+                // it untouched matches the oracle.
+
+                // Portable scalar escape bit-math — byte-identical to the AVX2 /
+                // VBMI2 raw ports.
+                let esc_first_in = esc_first;
+                let eq_shift1 = (mask_eq << 1) | esc_first_in;
+                let collision = (mask_eq & eq_shift1) != 0;
+                let fixed_eq = if collision {
+                    fix_eq_mask(mask_eq, eq_shift1)
+                } else {
+                    mask_eq
+                };
+                let escaped = (fixed_eq << 1) | esc_first_in;
+                esc_first = fixed_eq >> 63;
+
+                let decoded = if escaped == 0 {
+                    // No escaped bytes in this window: plain offset subtract.
+                    // Lane A uses `yenc_offset` (identical to `normal_offset`
+                    // here, since escaped==0 ⇒ esc_first_in==0).
+                    [
+                        vsubq_u8(a, yenc_offset),
+                        vsubq_u8(b, normal_offset),
+                        vsubq_u8(c, normal_offset),
+                        vsubq_u8(d, normal_offset),
+                    ]
+                } else if collision {
+                    // Consecutive `=` run: expand the chain-resolved `escaped`
+                    // mask (which already carries esc_first at bit 0) to a
+                    // per-lane select (oracle lines 315-354).
+                    neon_decode_with_escape_mask([a, b, c, d], escaped, &constants)
+                } else {
+                    // Isolated escapes: the escaped lanes are exactly the `=`
+                    // compares shifted one byte. Lane A uses the oracle's
+                    // `vext(dup42, cmpEqA, 15)` + `yenc_offset` 42-bit-trick so a
+                    // carried escape at byte 0 is applied via `yenc_offset`
+                    // (oracle lines 360-391).
+                    let sel_a = vextq_u8::<15>(normal_offset, eq_a);
+                    let sel_b = vextq_u8::<15>(eq_a, eq_b);
+                    let sel_c = vextq_u8::<15>(eq_b, eq_c);
+                    let sel_d = vextq_u8::<15>(eq_c, eq_d);
+                    [
+                        vsubq_u8(a, vbslq_u8(sel_a, escaped_offset, yenc_offset)),
+                        vsubq_u8(b, vbslq_u8(sel_b, escaped_offset, normal_offset)),
+                        vsubq_u8(c, vbslq_u8(sel_c, escaped_offset, normal_offset)),
+                        vsubq_u8(d, vbslq_u8(sel_d, escaped_offset, normal_offset)),
+                    ]
+                };
+
+                let skip = mask & !escaped;
+                // Rebuild yenc_offset byte0 for the next window's carried escape
+                // (oracle line 393).
+                yenc_offset = vsetq_lane_u8::<0>(((esc_first as u8) << 6) | 42, normal_offset);
+
+                if skip == 0 {
+                    vst1q_u8(output.as_mut_ptr().add(dst), decoded[0]);
+                    vst1q_u8(output.as_mut_ptr().add(dst + 16), decoded[1]);
+                    vst1q_u8(output.as_mut_ptr().add(dst + 32), decoded[2]);
+                    vst1q_u8(output.as_mut_ptr().add(dst + 48), decoded[3]);
+                    dst += WIDTH;
+                } else {
+                    // Four independent LUT-compaction stores; the entry gate +
+                    // tail guarantee ≥64 spare output bytes so each 16-byte
+                    // store can overwrite ahead.
+                    let keeps = per_group_keeps(skip);
+                    compact_store_16(
+                        decoded[0],
+                        (skip & 0xffff) as u16,
+                        keeps.0,
+                        table,
+                        output,
+                        &mut dst,
+                    );
+                    compact_store_16(
+                        decoded[1],
+                        ((skip >> 16) & 0xffff) as u16,
+                        keeps.1,
+                        table,
+                        output,
+                        &mut dst,
+                    );
+                    compact_store_16(
+                        decoded[2],
+                        ((skip >> 32) & 0xffff) as u16,
+                        keeps.2,
+                        table,
+                        output,
+                        &mut dst,
+                    );
+                    compact_store_16(
+                        decoded[3],
+                        ((skip >> 48) & 0xffff) as u16,
+                        keeps.3,
+                        table,
+                        output,
+                        &mut dst,
+                    );
+                }
+            } else {
+                // No specials (and no carried dot): bulk decode, subtract the
+                // carried offset on lane A and 42 on the rest (oracle lines
+                // 423-431).
+                vst1q_u8(output.as_mut_ptr().add(dst), vsubq_u8(a, yenc_offset));
+                vst1q_u8(
+                    output.as_mut_ptr().add(dst + 16),
+                    vsubq_u8(b, normal_offset),
+                );
+                vst1q_u8(
+                    output.as_mut_ptr().add(dst + 32),
+                    vsubq_u8(c, normal_offset),
+                );
+                vst1q_u8(
+                    output.as_mut_ptr().add(dst + 48),
+                    vsubq_u8(d, normal_offset),
+                );
+                dst += WIDTH;
+                esc_first = 0;
+                yenc_offset = normal_offset;
+            }
+            src += WIDTH;
+        }
+    }
+
+    // Derive the exit state from the trailing bytes (oracle-equivalent to the
+    // AVX2/VBMI2 raw ports' out_next_mask lookback) — but ONLY when the SIMD
+    // loop consumed at least one window. With no window consumed (len in
+    // {129,130} => simd_limit < WIDTH), `src` is still 0 and the entry state
+    // MUST survive untouched for the scalar epilogue, else a carried Cr/CrLf
+    // line-start (pending stuffed dot) is clobbered to None and mis-decoded.
+    if src > 0 {
+        let out_next_mask: u16 = if src >= 2 && src + 1 < input.len() {
+            if input[src - 2] == b'\r' && input[src - 1] == b'\n' && input[src] == b'.' {
+                1
+            } else if input[src - 1] == b'\r' && input[src] == b'\n' && input[src + 1] == b'.' {
+                2
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        state.state = if esc_first != 0 {
+            DecoderState::Eq
+        } else if out_next_mask == 1 {
+            DecoderState::CrLf
+        } else if out_next_mask == 2 {
+            DecoderState::Cr
+        } else {
+            DecoderState::None
+        };
+    }
+
+    while src < input.len() {
         if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
             break;
         }

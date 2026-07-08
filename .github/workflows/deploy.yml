@@ -309,10 +309,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: armv7-neon
-            target: armv7-unknown-linux-gnueabihf
-            target_env: ARMV7_UNKNOWN_LINUX_GNUEABIHF
-            rustflags: "-C target-feature=+neon"
           - name: riscv64gc
             target: riscv64gc-unknown-linux-gnu
             target_env: RISCV64GC_UNKNOWN_LINUX_GNU

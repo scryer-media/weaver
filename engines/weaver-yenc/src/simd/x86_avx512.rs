@@ -187,27 +187,34 @@ unsafe fn decode_kernel_avx512_raw(
         }
     }
 
-    let out_next_mask: u16 = if src >= 2 && src + 1 < input.len() {
-        if input[src - 2] == b'\r' && input[src - 1] == b'\n' && input[src] == b'.' {
-            1
-        } else if input[src - 1] == b'\r' && input[src] == b'\n' && input[src + 1] == b'.' {
-            2
+    // Only re-derive the carried state when the SIMD loop actually consumed at
+    // least one window. With no window consumed (len in {129,130} => simd_limit
+    // < WIDTH), `src` is still 0 and the entry state MUST survive untouched for
+    // the scalar epilogue — otherwise a carried Cr/CrLf line-start (with a
+    // pending stuffed dot) would be clobbered to None and mis-decoded.
+    if src > 0 {
+        let out_next_mask: u16 = if src >= 2 && src + 1 < input.len() {
+            if input[src - 2] == b'\r' && input[src - 1] == b'\n' && input[src] == b'.' {
+                1
+            } else if input[src - 1] == b'\r' && input[src] == b'\n' && input[src + 1] == b'.' {
+                2
+            } else {
+                0
+            }
         } else {
             0
-        }
-    } else {
-        0
-    };
+        };
 
-    state.state = if esc_first != 0 {
-        DecoderState::Eq
-    } else if out_next_mask == 1 {
-        DecoderState::CrLf
-    } else if out_next_mask == 2 {
-        DecoderState::Cr
-    } else {
-        DecoderState::None
-    };
+        state.state = if esc_first != 0 {
+            DecoderState::Eq
+        } else if out_next_mask == 1 {
+            DecoderState::CrLf
+        } else if out_next_mask == 2 {
+            DecoderState::Cr
+        } else {
+            DecoderState::None
+        };
+    }
 
     while src < input.len() {
         if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {

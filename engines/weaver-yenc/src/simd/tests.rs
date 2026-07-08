@@ -1352,7 +1352,7 @@ fn dispatch_kernel_matches_scalar_across_chunk_splits() {
     for round in 0..12 {
         let len = 1024 + (lcg(&mut seed) % 2048) as usize;
         let input = adversarial_stream(&mut seed, len);
-        for &chunk_len in &[1usize, 2, 3, 63, 64, 65, 127, 128, 257] {
+        for &chunk_len in &[1usize, 2, 3, 63, 64, 65, 127, 128, 129, 130, 257] {
             for &hint in &[None, Some(128u32)] {
                 for &(dot, search) in &[(true, true), (true, false), (false, false)] {
                     let simd = run_kernel_chunked(&input, chunk_len, dot, search, false, hint);
@@ -1365,6 +1365,26 @@ fn dispatch_kernel_matches_scalar_across_chunk_splits() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn dispatch_zero_window_preserves_crlf_entry_state() {
+    // Regression: an input of length 129 or 130 passes the flat raw-kernel gate
+    // (len > 128) but the SIMD loop consumes ZERO windows (simd_limit = len - 67
+    // < WIDTH = 64), leaving src == 0. The kernel must NOT clobber the CrLf entry
+    // state on that zero-window exit — body_with_line_length starts at CrLf, so a
+    // leading '.' is a stuffed dot that must be stripped. Before the fix the exit
+    // overwrote state to None and the scalar epilogue kept the '.' as data.
+    // Runs against whichever tier the CPU dispatches (AVX2 / AVX-512 / SSE / NEON).
+    for len in [129usize, 130] {
+        let mut input = vec![b'x'; len - 2];
+        input[0] = b'.'; // stuffed dot at the carried CrLf line start
+        input.extend_from_slice(b"\r\n");
+        assert_eq!(input.len(), len);
+        let simd = run_kernel_whole(&input, true, false, false, false, None).unwrap();
+        let reference = run_kernel_whole(&input, true, false, false, true, None).unwrap();
+        assert_eq!(simd, reference, "zero-window CrLf clobber at len={len}");
     }
 }
 

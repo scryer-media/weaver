@@ -377,24 +377,7 @@ fn decode_kernel(
         }
     }
 
-    #[cfg(all(target_arch = "arm", target_feature = "neon"))]
-    {
-        return unsafe {
-            decode_kernel_arm_neon(
-                input,
-                output,
-                state,
-                dot_unstuffing,
-                preserve_pending,
-                search_end,
-            )
-        };
-    }
-
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        all(target_arch = "arm", target_feature = "neon")
-    )))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
         decode_kernel_scalar(
             input,
@@ -407,11 +390,7 @@ fn decode_kernel(
     }
 }
 
-#[cfg(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    all(target_arch = "arm", target_feature = "neon")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 // Bit hack that resolves consecutive '=' escape runs.
 fn fix_eq_mask(mask: u64, mask_shift1: u64) -> u64 {
     let start = mask & !mask_shift1;
@@ -420,11 +399,7 @@ fn fix_eq_mask(mask: u64, mask_shift1: u64) -> u64 {
     (odd_groups ^ even) & mask
 }
 
-#[cfg(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    all(target_arch = "arm", target_feature = "neon")
-))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn final_state_after_block(
     raw_breaks: u64,
     raw_cr: u64,
@@ -511,11 +486,6 @@ pub fn decode_normal_run(
         return unsafe { decode_normal_run_neon(input, start, output, dst_start) };
     }
 
-    #[cfg(all(target_arch = "arm", target_feature = "neon"))]
-    {
-        return unsafe { decode_normal_run_arm_neon(input, start, output, dst_start) };
-    }
-
     #[cfg(target_arch = "riscv64")]
     {
         return decode_normal_run_riscv64(input, start, output, dst_start);
@@ -539,16 +509,11 @@ mod x86_sse;
 #[cfg(target_arch = "aarch64")]
 mod neon;
 
-#[cfg(all(target_arch = "arm", target_feature = "neon"))]
-mod neon_armv7;
-
 #[cfg(test)]
 mod tests;
 
 #[cfg(target_arch = "aarch64")]
 use neon::*;
-#[cfg(all(target_arch = "arm", target_feature = "neon"))]
-use neon_armv7::*;
 use scalar::*;
 #[cfg(target_arch = "x86_64")]
 use x86_avx2::*;

@@ -25,6 +25,22 @@ fn main() {
         return;
     }
 
+    // On aarch64 (Apple Silicon / Graviton) rapidyenc's decode dispatches to the
+    // NEON tier; NEON is baseline on ARMv8 so no -march flag is needed. Compile
+    // the dispatch + the aarch64 NEON decoder + the shim, then stop.
+    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+        cc::Build::new()
+            .cpp(true)
+            .include(&root)
+            .file(src.join("platform.cc"))
+            .file(src.join("decoder.cc"))
+            .file(src.join("decoder_neon64.cc"))
+            .file("rapidyenc_shim.cc")
+            .compile("rapidyenc_arm");
+        println!("cargo:rustc-cfg=rapidyenc_linked");
+        return;
+    }
+
     // Baseline group (x64 MSVC baseline is SSE2; SSSE3 intrinsics need no arch
     // flag on MSVC) + the shim.
     cc::Build::new()
