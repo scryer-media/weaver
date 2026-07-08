@@ -202,7 +202,10 @@ fn benches(c: &mut Criterion) {
         // Per-fixture parity gate: identical decoded bytes between the engines.
         let weaver_written = decode_rapidyenc(input, &mut weaver_out).unwrap();
         let rapid_written = rapidyenc.decode(input, &mut rapid_out);
-        assert_eq!(weaver_written, rapid_written, "{name} decoded length parity");
+        assert_eq!(
+            weaver_written, rapid_written,
+            "{name} decoded length parity"
+        );
         assert_eq!(
             &weaver_out[..weaver_written],
             &rapid_out[..rapid_written],

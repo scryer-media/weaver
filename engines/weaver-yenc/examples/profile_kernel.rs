@@ -84,10 +84,7 @@ fn esc_only_body() -> Vec<u8> {
 fn main() {
     let mut args = std::env::args().skip(1);
     let fixture = args.next().unwrap_or_else(|| "realshape".into());
-    let iters: usize = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(250_000);
+    let iters: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(250_000);
 
     let input = match fixture.as_str() {
         "crlf" => crlf_only_body(),
@@ -100,7 +97,10 @@ fn main() {
     #[cfg(rapidyenc_linked)]
     if std::env::var_os("WEAVER_PROFILE_RAPIDYENC").is_some() {
         unsafe { weaver_rapidyenc_decode_init() };
-        eprintln!("profiling RAPIDYENC fixture={fixture} iters={iters} input_len={}", input.len());
+        eprintln!(
+            "profiling RAPIDYENC fixture={fixture} iters={iters} input_len={}",
+            input.len()
+        );
         let mut acc = 0u64;
         for _ in 0..iters {
             acc = acc.wrapping_add(unsafe {
@@ -116,7 +116,10 @@ fn main() {
         return;
     }
 
-    eprintln!("profiling WEAVER fixture={fixture} iters={iters} input_len={}", input.len());
+    eprintln!(
+        "profiling WEAVER fixture={fixture} iters={iters} input_len={}",
+        input.len()
+    );
     let mut acc = 0usize;
     for _ in 0..iters {
         acc = acc.wrapping_add(decode_rapidyenc(std::hint::black_box(&input), &mut out).unwrap());

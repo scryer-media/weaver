@@ -122,7 +122,11 @@ fn time_fixture(name: &str, input: &[u8]) {
             )
         } as usize;
         assert_eq!(rw, decoded, "{name}: rapidyenc decoded length != weaver");
-        assert_eq!(&rout[..rw], &out[..decoded], "{name}: rapidyenc bytes != weaver");
+        assert_eq!(
+            &rout[..rw],
+            &out[..decoded],
+            "{name}: rapidyenc bytes != weaver"
+        );
         for _ in 0..100 {
             unsafe {
                 weaver_rapidyenc_decode(
@@ -152,7 +156,8 @@ fn time_fixture(name: &str, input: &[u8]) {
         let rgbps = decoded as f64 / (rmin * 1e-6) / 1e9;
         println!(
             "{:<12} min {rmin:>8.3} us  median {rmedian:>8.3} us  ({rgbps:.2} GB/s at min)  [weaver/rapidyenc = {:.2}x]",
-            "  rapidyenc", min / rmin
+            "  rapidyenc",
+            min / rmin
         );
     }
 }

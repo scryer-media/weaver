@@ -17,10 +17,8 @@ pub(super) fn span_end_state(win: &[u8], fixed_eq: u64, dot_unstuffing: bool) ->
     // a `\r\n=y` straddling the 64-byte window boundary is decoded as escaped
     // data instead of stopping at the control.
     if fixed_eq & LAST != 0 {
-        let crlf_before_eq = dot_unstuffing
-            && win[61] == b'\r'
-            && win[62] == b'\n'
-            && fixed_eq & (1u64 << 60) == 0; // '\r' at 61 not itself escaped
+        let crlf_before_eq =
+            dot_unstuffing && win[61] == b'\r' && win[62] == b'\n' && fixed_eq & (1u64 << 60) == 0; // '\r' at 61 not itself escaped
         return if crlf_before_eq {
             DecoderState::CrLfEq
         } else {

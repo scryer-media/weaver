@@ -525,17 +525,16 @@ pub fn decode_normal_run(
     decode_normal_run_scalar(input, start, output, dst_start)
 }
 
-
 mod scalar;
 
-#[cfg(target_arch = "x86_64")]
-mod x86_common;
-#[cfg(target_arch = "x86_64")]
-mod x86_sse;
 #[cfg(target_arch = "x86_64")]
 mod x86_avx2;
 #[cfg(target_arch = "x86_64")]
 mod x86_avx512;
+#[cfg(target_arch = "x86_64")]
+mod x86_common;
+#[cfg(target_arch = "x86_64")]
+mod x86_sse;
 
 #[cfg(target_arch = "aarch64")]
 mod neon;
@@ -546,16 +545,16 @@ mod neon_armv7;
 #[cfg(test)]
 mod tests;
 
-use scalar::*;
-#[cfg(target_arch = "x86_64")]
-use x86_common::*;
-#[cfg(target_arch = "x86_64")]
-use x86_sse::*;
-#[cfg(target_arch = "x86_64")]
-use x86_avx2::*;
-#[cfg(target_arch = "x86_64")]
-use x86_avx512::*;
 #[cfg(target_arch = "aarch64")]
 use neon::*;
 #[cfg(all(target_arch = "arm", target_feature = "neon"))]
 use neon_armv7::*;
+use scalar::*;
+#[cfg(target_arch = "x86_64")]
+use x86_avx2::*;
+#[cfg(target_arch = "x86_64")]
+use x86_avx512::*;
+#[cfg(target_arch = "x86_64")]
+use x86_common::*;
+#[cfg(target_arch = "x86_64")]
+use x86_sse::*;

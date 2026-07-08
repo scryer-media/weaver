@@ -35,9 +35,38 @@ unsafe fn decode_kernel_avx2_raw(
     let esc_off = _mm256_set1_epi8(-106);
     let table = compact_table_16();
     let special_lut = _mm256_set_epi8(
-        -1, b'=' as i8, b'\r' as i8, -1, -1, b'\n' as i8, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        b'.' as i8, -1, b'=' as i8, b'\r' as i8, -1, -1, b'\n' as i8, -1, -1, -1, -1, -1, -1, -1,
-        -1, -1, b'.' as i8,
+        -1,
+        b'=' as i8,
+        b'\r' as i8,
+        -1,
+        -1,
+        b'\n' as i8,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        b'.' as i8,
+        -1,
+        b'=' as i8,
+        b'\r' as i8,
+        -1,
+        -1,
+        b'\n' as i8,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        b'.' as i8,
     );
 
     // entry state → escFirst / nextMask (oracle _do_decode_simd switch subset).
@@ -58,11 +87,36 @@ unsafe fn decode_kernel_avx2_raw(
     };
     let mut min_mask = if entry_next_mask != 0 {
         _mm256_set_epi8(
-            b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8,
-            b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8,
-            b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8,
-            b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8, b'.' as i8,
-            b'.' as i8, b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
+            b'.' as i8,
             if entry_next_mask == 2 { 0 } else { b'.' as i8 },
             if entry_next_mask == 1 { 0 } else { b'.' as i8 },
         )
@@ -75,8 +129,12 @@ unsafe fn decode_kernel_avx2_raw(
             let a = _mm256_loadu_si256(input.as_ptr().add(src) as *const __m256i);
             let b = _mm256_loadu_si256(input.as_ptr().add(src + 32) as *const __m256i);
 
-            let cmp_a = _mm256_cmpeq_epi8(a, _mm256_shuffle_epi8(special_lut, _mm256_min_epu8(a, min_mask)));
-            let cmp_b = _mm256_cmpeq_epi8(b, _mm256_shuffle_epi8(special_lut, _mm256_min_epu8(b, dot)));
+            let cmp_a = _mm256_cmpeq_epi8(
+                a,
+                _mm256_shuffle_epi8(special_lut, _mm256_min_epu8(a, min_mask)),
+            );
+            let cmp_b =
+                _mm256_cmpeq_epi8(b, _mm256_shuffle_epi8(special_lut, _mm256_min_epu8(b, dot)));
             let mut mask: u64 = ((_mm256_movemask_epi8(cmp_b) as u32 as u64) << 32)
                 | (_mm256_movemask_epi8(cmp_a) as u32 as u64);
 
@@ -89,12 +147,20 @@ unsafe fn decode_kernel_avx2_raw(
                 if mask != mask_eq {
                     let tmp2a = _mm256_loadu_si256(input.as_ptr().add(src + 2) as *const __m256i);
                     let tmp2b = _mm256_loadu_si256(input.as_ptr().add(src + 34) as *const __m256i);
-                    let m2cr_a = _mm256_and_si256(_mm256_cmpeq_epi8(a, cr), _mm256_cmpeq_epi8(tmp2a, dot));
-                    let m2cr_b = _mm256_and_si256(_mm256_cmpeq_epi8(b, cr), _mm256_cmpeq_epi8(tmp2b, dot));
+                    let m2cr_a =
+                        _mm256_and_si256(_mm256_cmpeq_epi8(a, cr), _mm256_cmpeq_epi8(tmp2a, dot));
+                    let m2cr_b =
+                        _mm256_and_si256(_mm256_cmpeq_epi8(b, cr), _mm256_cmpeq_epi8(tmp2b, dot));
                     let partial = _mm256_movemask_epi8(_mm256_or_si256(m2cr_a, m2cr_b));
                     if partial != 0 {
-                        let m1lf_a = _mm256_cmpeq_epi8(lf, _mm256_loadu_si256(input.as_ptr().add(src + 1) as *const __m256i));
-                        let m1lf_b = _mm256_cmpeq_epi8(lf, _mm256_loadu_si256(input.as_ptr().add(src + 33) as *const __m256i));
+                        let m1lf_a = _mm256_cmpeq_epi8(
+                            lf,
+                            _mm256_loadu_si256(input.as_ptr().add(src + 1) as *const __m256i),
+                        );
+                        let m1lf_b = _mm256_cmpeq_epi8(
+                            lf,
+                            _mm256_loadu_si256(input.as_ptr().add(src + 33) as *const __m256i),
+                        );
                         let m1nl_a = _mm256_and_si256(m1lf_a, _mm256_cmpeq_epi8(a, cr));
                         let m1nl_b = _mm256_and_si256(m1lf_b, _mm256_cmpeq_epi8(b, cr));
                         let m2nldot_a = _mm256_and_si256(m2cr_a, m1nl_a);
@@ -144,36 +210,60 @@ unsafe fn decode_kernel_avx2_raw(
                 let skip = mask & !escaped;
                 yenc_offset = _mm256_xor_si256(
                     sub42,
-                    _mm256_zextsi128_si256(_mm_slli_epi16::<6>(_mm_cvtsi32_si128(esc_first as i32))),
+                    _mm256_zextsi128_si256(_mm_slli_epi16::<6>(_mm_cvtsi32_si128(
+                        esc_first as i32,
+                    ))),
                 );
 
                 let shuf_a = _mm256_inserti128_si256(
                     _mm256_castsi128_si256(_mm_loadu_si128(
                         table[(skip & 0x7fff) as usize].as_ptr() as *const __m128i,
                     )),
-                    _mm_loadu_si128(table[((skip >> 16) & 0x7fff) as usize].as_ptr() as *const __m128i),
+                    _mm_loadu_si128(
+                        table[((skip >> 16) & 0x7fff) as usize].as_ptr() as *const __m128i
+                    ),
                     1,
                 );
                 let packed_a = _mm256_shuffle_epi8(decoded_a, shuf_a);
-                _mm_storeu_si128(output.as_mut_ptr().add(dst) as *mut __m128i, _mm256_castsi256_si128(packed_a));
+                _mm_storeu_si128(
+                    output.as_mut_ptr().add(dst) as *mut __m128i,
+                    _mm256_castsi256_si128(packed_a),
+                );
                 dst += 16 - (skip & 0xffff).count_ones() as usize;
-                _mm_storeu_si128(output.as_mut_ptr().add(dst) as *mut __m128i, _mm256_extracti128_si256::<1>(packed_a));
+                _mm_storeu_si128(
+                    output.as_mut_ptr().add(dst) as *mut __m128i,
+                    _mm256_extracti128_si256::<1>(packed_a),
+                );
                 dst += 16 - ((skip >> 16) & 0xffff).count_ones() as usize;
                 let shuf_b = _mm256_inserti128_si256(
                     _mm256_castsi128_si256(_mm_loadu_si128(
                         table[((skip >> 32) & 0x7fff) as usize].as_ptr() as *const __m128i,
                     )),
-                    _mm_loadu_si128(table[((skip >> 48) & 0x7fff) as usize].as_ptr() as *const __m128i),
+                    _mm_loadu_si128(
+                        table[((skip >> 48) & 0x7fff) as usize].as_ptr() as *const __m128i
+                    ),
                     1,
                 );
                 let packed_b = _mm256_shuffle_epi8(decoded_b, shuf_b);
-                _mm_storeu_si128(output.as_mut_ptr().add(dst) as *mut __m128i, _mm256_castsi256_si128(packed_b));
+                _mm_storeu_si128(
+                    output.as_mut_ptr().add(dst) as *mut __m128i,
+                    _mm256_castsi256_si128(packed_b),
+                );
                 dst += 16 - ((skip >> 32) & 0xffff).count_ones() as usize;
-                _mm_storeu_si128(output.as_mut_ptr().add(dst) as *mut __m128i, _mm256_extracti128_si256::<1>(packed_b));
+                _mm_storeu_si128(
+                    output.as_mut_ptr().add(dst) as *mut __m128i,
+                    _mm256_extracti128_si256::<1>(packed_b),
+                );
                 dst += 16 - ((skip >> 48) & 0xffff).count_ones() as usize;
             } else {
-                _mm256_storeu_si256(output.as_mut_ptr().add(dst) as *mut __m256i, _mm256_add_epi8(a, yenc_offset));
-                _mm256_storeu_si256(output.as_mut_ptr().add(dst + 32) as *mut __m256i, _mm256_add_epi8(b, sub42));
+                _mm256_storeu_si256(
+                    output.as_mut_ptr().add(dst) as *mut __m256i,
+                    _mm256_add_epi8(a, yenc_offset),
+                );
+                _mm256_storeu_si256(
+                    output.as_mut_ptr().add(dst + 32) as *mut __m256i,
+                    _mm256_add_epi8(b, sub42),
+                );
                 dst += WIDTH;
                 esc_first = 0;
                 yenc_offset = sub42;
@@ -262,7 +352,11 @@ pub(super) unsafe fn decode_kernel_avx2(
 
     // Trailing bytes kept for the scalar epilogue so cross-window CRLF, dot,
     // and escape sequences stay exact.
-    let tail = if dot_unstuffing { WIDTH - 1 + 4 } else { WIDTH - 1 };
+    let tail = if dot_unstuffing {
+        WIDTH - 1 + 4
+    } else {
+        WIDTH - 1
+    };
     let simd_limit = input.len().saturating_sub(tail);
 
     if input.len() > WIDTH * 2 {
@@ -442,11 +536,7 @@ pub(super) unsafe fn decode_kernel_avx2(
                 let first_off = if esc_first & 1 != 0 {
                     _mm256_xor_si256(
                         sub42,
-                        _mm256_inserti128_si256(
-                            _mm256_setzero_si256(),
-                            _mm_cvtsi32_si128(0x40),
-                            0,
-                        ),
+                        _mm256_inserti128_si256(_mm256_setzero_si256(), _mm_cvtsi32_si128(0x40), 0),
                     )
                 } else {
                     sub42
@@ -460,10 +550,7 @@ pub(super) unsafe fn decode_kernel_avx2(
 
             if skip == 0 {
                 _mm256_storeu_si256(output.as_mut_ptr().add(dst) as *mut __m256i, decoded_a);
-                _mm256_storeu_si256(
-                    output.as_mut_ptr().add(dst + 32) as *mut __m256i,
-                    decoded_b,
-                );
+                _mm256_storeu_si256(output.as_mut_ptr().add(dst + 32) as *mut __m256i, decoded_b);
                 dst += WIDTH;
             } else {
                 // 2-lane compaction: one 256-bit shuffle folds the
@@ -474,7 +561,7 @@ pub(super) unsafe fn decode_kernel_avx2(
                         table[(skip & 0x7fff) as usize].as_ptr() as *const __m128i,
                     )),
                     _mm_loadu_si128(
-                        table[((skip >> 16) & 0x7fff) as usize].as_ptr() as *const __m128i,
+                        table[((skip >> 16) & 0x7fff) as usize].as_ptr() as *const __m128i
                     ),
                     1,
                 );
@@ -495,7 +582,7 @@ pub(super) unsafe fn decode_kernel_avx2(
                         table[((skip >> 32) & 0x7fff) as usize].as_ptr() as *const __m128i,
                     )),
                     _mm_loadu_si128(
-                        table[((skip >> 48) & 0x7fff) as usize].as_ptr() as *const __m128i,
+                        table[((skip >> 48) & 0x7fff) as usize].as_ptr() as *const __m128i
                     ),
                     1,
                 );
@@ -703,7 +790,10 @@ pub(super) unsafe fn try_decode_avx2_block(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[inline]
-pub(super) unsafe fn avx2_special_mask64(a: std::arch::x86_64::__m256i, b: std::arch::x86_64::__m256i) -> u64 {
+pub(super) unsafe fn avx2_special_mask64(
+    a: std::arch::x86_64::__m256i,
+    b: std::arch::x86_64::__m256i,
+) -> u64 {
     use std::arch::x86_64::*;
 
     let table = _mm256_set_epi8(
@@ -918,16 +1008,14 @@ pub(super) unsafe fn decode_kernel_simd64_avx2_line_aware(
             // recomputes the mask (an earlier revision probed then re-loaded
             // in the block, which double-costed every heavy chunk).
             let a = unsafe { _mm256_loadu_si256(input.as_ptr().add(src) as *const __m256i) };
-            let b =
-                unsafe { _mm256_loadu_si256(input.as_ptr().add(src + 32) as *const __m256i) };
+            let b = unsafe { _mm256_loadu_si256(input.as_ptr().add(src + 32) as *const __m256i) };
             let specials = unsafe { avx2_special_mask64(a, b) };
 
             // Fast path: mid-line (`state == None` ⇒ no carried `=` escape and
             // not at a line start, so no dot-stuffing) with no `= \r \n` byte
             // ⇒ pure data, bulk `add(-42)` + store, no call/`Result`/entry-flag
             // machinery.
-            if specials == 0 && state.state == DecoderState::None && dst + WIDTH <= output.len()
-            {
+            if specials == 0 && state.state == DecoderState::None && dst + WIDTH <= output.len() {
                 unsafe {
                     _mm256_storeu_si256(
                         output.as_mut_ptr().add(dst) as *mut __m256i,
