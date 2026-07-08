@@ -19,7 +19,7 @@ weaver-par2 = { workspace = true, features = [
     "native-crypto",
 ] }
 weaver-unrar = { workspace = true, features = [
-    "native-crypto",
+    "crypto-aws-lc",
 ] }
 weaver-server-api = { path = "../../crates/weaver-server-api", default-features = false }
 tokio = { workspace = true }
