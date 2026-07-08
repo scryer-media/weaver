@@ -298,7 +298,7 @@ impl Pipeline {
         }
     }
 
-    pub(in crate::pipeline::download::worker) fn should_use_owned_blocking_s2n_lane(
+    pub(in crate::pipeline::download::worker) fn should_use_owned_blocking_lane(
         &self,
         lease: &DownloadBatchLease,
     ) -> bool {
@@ -485,7 +485,7 @@ impl Pipeline {
                     job_id = lease.job_id.0,
                     works = lease.works.len(),
                     error = %error,
-                    "owned blocking s2n lane unavailable; falling back to async download lane"
+                    "owned blocking lane unavailable; falling back to async download lane"
                 );
                 crate::runtime::perf_probe::record_value(
                     "download.owned_lane.acquire_failed_fallback",

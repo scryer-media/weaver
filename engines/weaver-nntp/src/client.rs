@@ -194,8 +194,24 @@ pub enum BodyLaneMode {
     PipelineDepth4,
 }
 
-fn supports_blocking_s2n_body_lane(config: &ServerConfig) -> bool {
-    config.tls && !config.starttls && config.tls_ca_cert.is_some()
+fn supports_blocking_tls_body_lane(config: &ServerConfig) -> bool {
+    match crate::tls::selected_blocking_tls_backend() {
+        Ok(backend) => blocking_tls_lane_eligible(config, backend),
+        Err(_) => false,
+    }
+}
+
+fn blocking_tls_lane_eligible(config: &ServerConfig, backend: crate::tls::NntpTlsBackend) -> bool {
+    if !config.tls || config.starttls {
+        return false;
+    }
+    match backend {
+        // The rustls lane trusts webpki roots, so a pinned CA is optional.
+        crate::tls::NntpTlsBackend::ManualRustls => true,
+        // The s2n lane builds trust exclusively from a pinned CA PEM.
+        #[cfg(not(windows))]
+        crate::tls::NntpTlsBackend::S2n => config.tls_ca_cert.is_some(),
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1746,7 +1762,7 @@ impl NntpClient {
             };
             let (config, excluded_ips, address_offset) =
                 self.pool.blocking_connect_plan(server, &[])?;
-            if !supports_blocking_s2n_body_lane(&config) {
+            if !supports_blocking_tls_body_lane(&config) {
                 continue;
             }
             let started = Instant::now();
@@ -1784,7 +1800,7 @@ impl NntpClient {
                 let Ok((config, _, _)) = self.pool.blocking_connect_plan(server, &[]) else {
                     return false;
                 };
-                supports_blocking_s2n_body_lane(&config)
+                supports_blocking_tls_body_lane(&config)
             })
     }
 
@@ -3968,5 +3984,57 @@ mod tests {
                 inconclusive: true,
             }
         );
+    }
+
+    fn lane_config(tls: bool, starttls: bool, pinned_ca: bool) -> ServerConfig {
+        ServerConfig {
+            tls,
+            starttls,
+            tls_ca_cert: pinned_ca.then(|| std::path::PathBuf::from("/tmp/weaver-test-ca.pem")),
+            ..ServerConfig::default()
+        }
+    }
+
+    #[test]
+    fn blocking_tls_lane_eligibility_rejects_plain_and_starttls() {
+        use crate::tls::NntpTlsBackend;
+
+        assert!(!blocking_tls_lane_eligible(
+            &lane_config(false, false, true),
+            NntpTlsBackend::ManualRustls
+        ));
+        assert!(!blocking_tls_lane_eligible(
+            &lane_config(true, true, true),
+            NntpTlsBackend::ManualRustls
+        ));
+    }
+
+    #[test]
+    fn blocking_tls_lane_eligibility_rustls_works_without_pinned_ca() {
+        use crate::tls::NntpTlsBackend;
+
+        assert!(blocking_tls_lane_eligible(
+            &lane_config(true, false, false),
+            NntpTlsBackend::ManualRustls
+        ));
+        assert!(blocking_tls_lane_eligible(
+            &lane_config(true, false, true),
+            NntpTlsBackend::ManualRustls
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn blocking_tls_lane_eligibility_s2n_requires_pinned_ca() {
+        use crate::tls::NntpTlsBackend;
+
+        assert!(!blocking_tls_lane_eligible(
+            &lane_config(true, false, false),
+            NntpTlsBackend::S2n
+        ));
+        assert!(blocking_tls_lane_eligible(
+            &lane_config(true, false, true),
+            NntpTlsBackend::S2n
+        ));
     }
 }

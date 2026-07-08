@@ -13,7 +13,8 @@ impl DiskSpace {
     }
 }
 
-/// Query total/available capacity for the filesystem backing `path` via `statvfs`.
+/// Query total/available capacity for the filesystem backing `path`
+/// (`statvfs` on unix, `GetDiskFreeSpaceExW` on Windows).
 ///
 /// Returns `None` when the path cannot be stat'd (e.g. it does not exist yet) or on
 /// unsupported platforms. Mirrors the free-space check used by the download pipeline.
@@ -41,7 +42,38 @@ pub fn disk_space(path: &Path) -> Option<DiskSpace> {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return None;
+        }
+        wide.push(0);
+        let mut free_bytes_available = 0u64;
+        let mut total_bytes = 0u64;
+        let mut total_free_bytes = 0u64;
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path and the out-pointers
+        // are valid u64 slots for the duration of the call.
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free_bytes_available,
+                &mut total_bytes,
+                &mut total_free_bytes,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        Some(DiskSpace {
+            total_bytes,
+            available_bytes: free_bytes_available,
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         None

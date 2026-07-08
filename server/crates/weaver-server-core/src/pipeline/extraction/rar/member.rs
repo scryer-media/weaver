@@ -188,11 +188,7 @@ fn current_umask() -> u32 {
     })
 }
 
-#[cfg(not(unix))]
-fn current_umask() -> u32 {
-    0
-}
-
+#[cfg(unix)]
 fn rar_member_unix_output_mode(member: &weaver_unrar::MemberInfo) -> Option<u32> {
     match member.host_os {
         weaver_unrar::HostOs::Unix | weaver_unrar::HostOs::Darwin => {
@@ -1188,6 +1184,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn rar_member_mode_translation_matches_unrar_attribute_rules() {
         let readonly_file = metadata_test_member(

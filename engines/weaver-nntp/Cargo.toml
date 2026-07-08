@@ -11,9 +11,6 @@ weaver-yenc = { path = "../weaver-yenc", default-features = false }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
-s2n-tls = "0.3.39"
-s2n-tls-sys = "0.3.39"
-s2n-tls-tokio = "0.3.39"
 rustls-pemfile = { workspace = true }
 webpki-roots = { workspace = true, default-features = false }
 thiserror = { workspace = true }
@@ -24,6 +21,15 @@ socket2 = { workspace = true }
 memchr = { workspace = true }
 rand = { workspace = true }
 libc = { workspace = true }
+
+# s2n-tls is POSIX-only C; Windows builds use the rustls/aws-lc backend instead.
+[target.'cfg(not(windows))'.dependencies]
+s2n-tls = "0.3.39"
+s2n-tls-sys = "0.3.39"
+s2n-tls-tokio = "0.3.39"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 criterion = "0.5"

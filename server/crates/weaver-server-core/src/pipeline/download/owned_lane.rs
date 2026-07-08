@@ -117,7 +117,7 @@ fn run_owned_lane_worker(rx: std_mpsc::Receiver<OwnedLanePoolCommand>) {
     while let Ok(command) = rx.recv() {
         match command {
             OwnedLanePoolCommand::Run(run) => {
-                run_owned_blocking_s2n_download_lane(&mut cached_lane, run);
+                run_owned_blocking_download_lane(&mut cached_lane, run);
             }
             OwnedLanePoolCommand::Reset => {
                 park_cached_lane(&mut cached_lane);
@@ -143,10 +143,7 @@ fn park_cached_lane(cached_lane: &mut Option<CachedOwnedLane>) {
     }
 }
 
-fn run_owned_blocking_s2n_download_lane(
-    cached_lane: &mut Option<CachedOwnedLane>,
-    run: OwnedLaneRun,
-) {
+fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, run: OwnedLaneRun) {
     let fetch_started = Instant::now();
     let OwnedLaneRun {
         nntp,

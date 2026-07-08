@@ -1,5 +1,6 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
 use std::sync::OnceLock;
 
 use crate::runtime::file_cache;

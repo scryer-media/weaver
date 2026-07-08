@@ -714,11 +714,10 @@ jobs:
     needs: [web-build]
     env:
       CARGO_INCREMENTAL: "0"
-      # Keep normal Windows C dependencies on clang-cl. The dispatcher routes
-      # only s2n-tls-sys to clang because its vendored build emits GNU-style flags.
+      # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
+      # cfg(not(windows)) dependency and is never compiled here.
       CC_x86_64_pc_windows_msvc: clang-cl
       CXX_x86_64_pc_windows_msvc: clang-cl
-      WEAVER_S2N_COMPAT_INCLUDE: ${{ github.workspace }}/ci/windows/s2n-compat
       RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
@@ -731,18 +730,6 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
         run: rustup target add x86_64-pc-windows-msvc
-      - name: Install Windows compiler dispatcher
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $shimDir = Join-Path $env:RUNNER_TEMP "weaver-cc"
-          New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
-          $realClangCl = (Get-Command clang-cl.exe -ErrorAction Stop).Source
-          $realClang = (Get-Command clang.exe -ErrorAction Stop).Source
-          rustc ci/windows/s2n-cc-dispatcher.rs -o (Join-Path $shimDir "clang-cl.exe")
-          "WEAVER_REAL_CLANG_CL=$realClangCl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "WEAVER_REAL_CLANG=$realClang" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          $shimDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Restore sccache directory
         id: windows-x86_64-sccache-restore
         uses: actions/cache/restore@v4
@@ -999,11 +986,10 @@ jobs:
     needs: [web-build]
     env:
       CARGO_INCREMENTAL: "0"
-      # Keep normal Windows C dependencies on clang-cl. The dispatcher routes
-      # only s2n-tls-sys to clang because its vendored build emits GNU-style flags.
+      # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
+      # cfg(not(windows)) dependency and is never compiled here.
       CC_aarch64_pc_windows_msvc: clang-cl
       CXX_aarch64_pc_windows_msvc: clang-cl
-      WEAVER_S2N_COMPAT_INCLUDE: ${{ github.workspace }}/ci/windows/s2n-compat
       RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
@@ -1016,18 +1002,6 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
         run: rustup target add aarch64-pc-windows-msvc
-      - name: Install Windows compiler dispatcher
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $shimDir = Join-Path $env:RUNNER_TEMP "weaver-cc"
-          New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
-          $realClangCl = (Get-Command clang-cl.exe -ErrorAction Stop).Source
-          $realClang = (Get-Command clang.exe -ErrorAction Stop).Source
-          rustc ci/windows/s2n-cc-dispatcher.rs -o (Join-Path $shimDir "clang-cl.exe")
-          "WEAVER_REAL_CLANG_CL=$realClangCl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "WEAVER_REAL_CLANG=$realClang" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          $shimDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Restore sccache directory
         id: windows-arm64-sccache-restore
         uses: actions/cache/restore@v4

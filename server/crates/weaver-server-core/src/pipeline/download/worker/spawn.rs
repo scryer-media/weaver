@@ -248,7 +248,7 @@ impl Pipeline {
                 .all(|work| initial_lease.compatibility.matches(work))
         );
 
-        if self.should_use_owned_blocking_s2n_lane(&initial_lease) {
+        if self.should_use_owned_blocking_lane(&initial_lease) {
             if let Err(lease) = self.owned_download_lane_pool.submit(
                 Arc::clone(&self.nntp),
                 self.owned_download_lane_event_tx.clone(),
@@ -257,7 +257,7 @@ impl Pipeline {
                 Arc::clone(&self.hot_share_yield_signal),
                 initial_lease,
             ) {
-                warn!("owned blocking s2n lane pool stopped; falling back to async download lane");
+                warn!("owned blocking lane pool stopped; falling back to async download lane");
                 self.spawn_async_download_batch(lease);
             }
             return;

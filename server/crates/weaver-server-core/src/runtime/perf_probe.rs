@@ -410,7 +410,41 @@ fn timeval_to_duration(timeval: libc::timeval) -> Duration {
     Duration::new(seconds, micros.saturating_mul(1_000))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn process_cpu_usage() -> Option<CpuUsage> {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut times = [zero_filetime(); 4];
+    let [creation, exit, kernel, user] = &mut times;
+    // SAFETY: the pseudo-handle is always valid for the current process and
+    // all four out-pointers reference live FILETIME slots.
+    let rc = unsafe { GetProcessTimes(GetCurrentProcess(), creation, exit, kernel, user) };
+    if rc == 0 {
+        return None;
+    }
+    Some(CpuUsage {
+        user: filetime_to_duration(times[3]),
+        system: filetime_to_duration(times[2]),
+    })
+}
+
+#[cfg(windows)]
+fn zero_filetime() -> windows_sys::Win32::Foundation::FILETIME {
+    windows_sys::Win32::Foundation::FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }
+}
+
+/// FILETIME counts 100 ns ticks. Granularity is the scheduler tick (~15.6 ms),
+/// which is fine for the aggregated deltas the probes report.
+#[cfg(windows)]
+fn filetime_to_duration(filetime: windows_sys::Win32::Foundation::FILETIME) -> Duration {
+    let ticks = ((filetime.dwHighDateTime as u64) << 32) | filetime.dwLowDateTime as u64;
+    Duration::from_nanos(ticks.saturating_mul(100))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_cpu_usage() -> Option<CpuUsage> {
     None
 }
@@ -433,7 +467,22 @@ fn timespec_to_duration(timespec: libc::timespec) -> Option<Duration> {
     Some(Duration::new(seconds, nanos))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn thread_cpu_time() -> Option<Duration> {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+    let mut times = [zero_filetime(); 4];
+    let [creation, exit, kernel, user] = &mut times;
+    // SAFETY: the pseudo-handle is always valid for the current thread and
+    // all four out-pointers reference live FILETIME slots.
+    let rc = unsafe { GetThreadTimes(GetCurrentThread(), creation, exit, kernel, user) };
+    if rc == 0 {
+        return None;
+    }
+    Some(filetime_to_duration(times[2]).saturating_add(filetime_to_duration(times[3])))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn thread_cpu_time() -> Option<Duration> {
     None
 }

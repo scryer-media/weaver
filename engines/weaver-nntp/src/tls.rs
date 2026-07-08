@@ -4,8 +4,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{BufMut, BytesMut};
+#[cfg(not(windows))]
+use bytes::BufMut;
+use bytes::BytesMut;
+#[cfg(not(windows))]
 use s2n_tls::{config::Config as S2nConfig, security};
+#[cfg(not(windows))]
 use s2n_tls_tokio::{TlsConnector as S2nTlsConnector, TlsStream as S2nTlsStream};
 use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -15,6 +19,54 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, ClientConnection, RootCertStore};
 
 use crate::error::NntpError;
+
+/// Stream type behind the `S2nTls` variant. On Windows, where s2n-tls cannot
+/// compile, this aliases an uninhabited placeholder: the variant still
+/// typechecks (pin-project-lite cannot cfg-gate variants) but can never be
+/// constructed because backend selection rejects s2n there.
+#[cfg(not(windows))]
+type S2nTransportStream = S2nTlsStream<TcpStream>;
+#[cfg(windows)]
+type S2nTransportStream = UnsupportedTlsStream;
+
+#[cfg(windows)]
+pub enum UnsupportedTlsStream {}
+
+#[cfg(windows)]
+impl AsyncRead for UnsupportedTlsStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match *self.get_mut() {}
+    }
+}
+
+#[cfg(windows)]
+impl AsyncWrite for UnsupportedTlsStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match *self.get_mut() {}
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match *self.get_mut() {}
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match *self.get_mut() {}
+    }
+}
 
 pin_project_lite::pin_project! {
     /// A transport that is either a plain TCP connection or a TLS-wrapped one.
@@ -29,12 +81,12 @@ pin_project_lite::pin_project! {
         Tls { #[pin] inner: RustlsTlsStream<TcpStream>, remote_addr: SocketAddr },
         /// TLS-encrypted TCP driven directly through rustls.
         ManualTls { inner: ManualTlsStream, remote_addr: SocketAddr },
-        /// TLS-encrypted TCP through s2n-tls.
-        S2nTls { #[pin] inner: S2nTlsStream<TcpStream>, remote_addr: SocketAddr },
+        /// TLS-encrypted TCP through s2n-tls (non-Windows only).
+        S2nTls { #[pin] inner: S2nTransportStream, remote_addr: SocketAddr },
     }
 }
 
-const TLS_READ_BUFFER: usize = 256 * 1024;
+pub(crate) const TLS_READ_BUFFER: usize = 256 * 1024;
 const TLS_PLAINTEXT_DRAIN_CHUNK: usize = 16 * 1024;
 const TLS_BACKEND_ENV: &str = "WEAVER_NNTP_TLS_BACKEND";
 
@@ -52,12 +104,12 @@ pub struct TransportReadStats {
     pub plaintext_reader_would_block: u64,
     pub plaintext_bytes: u64,
     pub cached_plaintext_returns: u64,
-    pub s2n_read_calls: u64,
-    pub s2n_read_bytes: u64,
-    pub s2n_target_full_returns: u64,
-    pub s2n_pending_empty_returns: u64,
-    pub s2n_pending_after_bytes_returns: u64,
-    pub s2n_zero_returns: u64,
+    pub backend_recv_calls: u64,
+    pub backend_recv_bytes: u64,
+    pub backend_target_full_returns: u64,
+    pub backend_pending_empty_returns: u64,
+    pub backend_pending_after_bytes_returns: u64,
+    pub backend_zero_returns: u64,
 }
 
 impl TransportReadStats {
@@ -74,12 +126,12 @@ impl TransportReadStats {
         self.plaintext_reader_would_block += other.plaintext_reader_would_block;
         self.plaintext_bytes += other.plaintext_bytes;
         self.cached_plaintext_returns += other.cached_plaintext_returns;
-        self.s2n_read_calls += other.s2n_read_calls;
-        self.s2n_read_bytes += other.s2n_read_bytes;
-        self.s2n_target_full_returns += other.s2n_target_full_returns;
-        self.s2n_pending_empty_returns += other.s2n_pending_empty_returns;
-        self.s2n_pending_after_bytes_returns += other.s2n_pending_after_bytes_returns;
-        self.s2n_zero_returns += other.s2n_zero_returns;
+        self.backend_recv_calls += other.backend_recv_calls;
+        self.backend_recv_bytes += other.backend_recv_bytes;
+        self.backend_target_full_returns += other.backend_target_full_returns;
+        self.backend_pending_empty_returns += other.backend_pending_empty_returns;
+        self.backend_pending_after_bytes_returns += other.backend_pending_after_bytes_returns;
+        self.backend_zero_returns += other.backend_zero_returns;
     }
 }
 
@@ -88,8 +140,9 @@ pub struct TransportRead {
     pub stats: TransportReadStats,
 }
 
+#[cfg(not(windows))]
 async fn read_s2n_available_into(
-    inner: &mut S2nTlsStream<TcpStream>,
+    inner: &mut S2nTransportStream,
     dst: &mut BytesMut,
     target_read_size: usize,
 ) -> io::Result<TransportRead> {
@@ -100,7 +153,7 @@ async fn read_s2n_available_into(
         loop {
             let total = dst.len().saturating_sub(started_len);
             if total >= target_read_size {
-                stats.s2n_target_full_returns += 1;
+                stats.backend_target_full_returns += 1;
                 return std::task::Poll::Ready(Ok(total));
             }
 
@@ -110,25 +163,25 @@ async fn read_s2n_available_into(
                 std::task::Poll::Ready(Ok(())) => {
                     let n = read_buf.filled().len();
                     if n == 0 {
-                        stats.s2n_zero_returns += 1;
+                        stats.backend_zero_returns += 1;
                         return std::task::Poll::Ready(Ok(total));
                     }
                     unsafe {
                         dst.advance_mut(n);
                     }
-                    stats.s2n_read_calls += 1;
-                    stats.s2n_read_bytes += n as u64;
+                    stats.backend_recv_calls += 1;
+                    stats.backend_recv_bytes += n as u64;
                     stats.plaintext_bytes += n as u64;
                 }
                 std::task::Poll::Ready(Err(error)) => {
                     return std::task::Poll::Ready(Err(error));
                 }
                 std::task::Poll::Pending if total > 0 => {
-                    stats.s2n_pending_after_bytes_returns += 1;
+                    stats.backend_pending_after_bytes_returns += 1;
                     return std::task::Poll::Ready(Ok(total));
                 }
                 std::task::Poll::Pending => {
-                    stats.s2n_pending_empty_returns += 1;
+                    stats.backend_pending_empty_returns += 1;
                     return std::task::Poll::Pending;
                 }
             }
@@ -139,10 +192,60 @@ async fn read_s2n_available_into(
     Ok(TransportRead { bytes, stats })
 }
 
+#[cfg(windows)]
+async fn read_s2n_available_into(
+    inner: &mut S2nTransportStream,
+    _dst: &mut BytesMut,
+    _target_read_size: usize,
+) -> io::Result<TransportRead> {
+    match *inner {}
+}
+
 pub struct ManualTlsStream {
     tcp: TcpStream,
-    tls: ClientConnection,
+    session: RustlsSession,
     read_buffer: Vec<u8>,
+}
+
+/// Sync rustls record engine shared by the async `ManualTls` transport and the
+/// blocking owned-lane transport: turns ciphertext slices into plaintext
+/// appended to a `BytesMut` and surfaces pending outbound TLS bytes for the
+/// caller's IO flavor to write.
+pub(crate) struct RustlsSession {
+    tls: ClientConnection,
+}
+
+impl RustlsSession {
+    pub(crate) fn new(
+        config: Arc<ClientConfig>,
+        server_name: ServerName<'static>,
+    ) -> Result<Self, NntpError> {
+        Ok(Self {
+            tls: ClientConnection::new(config, server_name)?,
+        })
+    }
+
+    pub(crate) fn is_handshaking(&self) -> bool {
+        self.tls.is_handshaking()
+    }
+
+    /// Queue plaintext for encryption; drain the result with `next_outbound`.
+    pub(crate) fn buffer_plaintext(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.tls.writer().write_all(bytes)
+    }
+
+    /// Next chunk of pending outbound TLS bytes, or `None` once drained.
+    pub(crate) fn next_outbound(&mut self) -> io::Result<Option<Vec<u8>>> {
+        if !self.tls.wants_write() {
+            return Ok(None);
+        }
+        let mut outbound = Vec::new();
+        self.tls.write_tls(&mut outbound)?;
+        if outbound.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(outbound))
+    }
 }
 
 impl NntpTransport {
@@ -246,10 +349,10 @@ impl ManualTlsStream {
         config: Arc<ClientConfig>,
         server_name: ServerName<'static>,
     ) -> Result<Self, NntpError> {
-        let tls = ClientConnection::new(config, server_name)?;
+        let session = RustlsSession::new(config, server_name)?;
         let mut stream = Self {
             tcp,
-            tls,
+            session,
             read_buffer: vec![0u8; TLS_READ_BUFFER],
         };
         stream.complete_handshake().await.map_err(NntpError::Io)?;
@@ -259,10 +362,10 @@ impl ManualTlsStream {
     async fn complete_handshake(&mut self) -> io::Result<()> {
         let mut discarded = BytesMut::new();
 
-        while self.tls.is_handshaking() {
+        while self.session.is_handshaking() {
             self.flush_tls().await?;
 
-            if self.tls.is_handshaking() {
+            if self.session.is_handshaking() {
                 let n = self.tcp.read(&mut self.read_buffer).await?;
                 if n == 0 {
                     return Err(io::Error::new(
@@ -305,7 +408,7 @@ impl ManualTlsStream {
         mut stats: Option<&mut TransportReadStats>,
     ) -> io::Result<usize> {
         let started_len = dst.len();
-        let drained = self.drain_plaintext(dst, stats.as_deref_mut())?;
+        let drained = self.session.drain_plaintext(dst, stats.as_deref_mut())?;
         if drained > 0 {
             if let Some(stats) = stats.as_deref_mut() {
                 stats.cached_plaintext_returns += 1;
@@ -366,10 +469,7 @@ impl ManualTlsStream {
     }
 
     async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        {
-            let mut writer = self.tls.writer();
-            writer.write_all(bytes)?;
-        }
+        self.session.buffer_plaintext(bytes)?;
         self.flush_tls().await
     }
 
@@ -378,12 +478,7 @@ impl ManualTlsStream {
     }
 
     async fn flush_tls(&mut self) -> io::Result<()> {
-        while self.tls.wants_write() {
-            let mut outbound = Vec::new();
-            self.tls.write_tls(&mut outbound)?;
-            if outbound.is_empty() {
-                break;
-            }
+        while let Some(outbound) = self.session.next_outbound()? {
             self.tcp.write_all(&outbound).await?;
         }
         self.tcp.flush().await
@@ -395,13 +490,13 @@ impl ManualTlsStream {
         dst: &mut BytesMut,
         stats: Option<&mut TransportReadStats>,
     ) -> io::Result<usize> {
-        let buffer = std::mem::take(&mut self.read_buffer);
-        let result = self.feed_ciphertext_slice(&buffer[..bytes], dst, stats);
-        self.read_buffer = buffer;
-        result
+        self.session
+            .feed_ciphertext_slice(&self.read_buffer[..bytes], dst, stats)
     }
+}
 
-    fn feed_ciphertext_slice(
+impl RustlsSession {
+    pub(crate) fn feed_ciphertext_slice(
         &mut self,
         ciphertext: &[u8],
         dst: &mut BytesMut,
@@ -439,7 +534,7 @@ impl ManualTlsStream {
         Ok(plaintext_bytes)
     }
 
-    fn drain_plaintext(
+    pub(crate) fn drain_plaintext(
         &mut self,
         dst: &mut BytesMut,
         mut stats: Option<&mut TransportReadStats>,
@@ -594,31 +689,65 @@ pub fn build_tls_config(ca_cert_path: Option<&Path>) -> Result<Arc<ClientConfig>
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NntpTlsBackend {
+pub(crate) enum NntpTlsBackend {
     ManualRustls,
+    #[cfg(not(windows))]
     S2n,
 }
 
-fn selected_tls_backend() -> Result<NntpTlsBackend, NntpError> {
+/// Parse an explicit `WEAVER_NNTP_TLS_BACKEND` value.
+fn parse_tls_backend(value: &str) -> Result<NntpTlsBackend, NntpError> {
+    if value.eq_ignore_ascii_case("s2n") {
+        #[cfg(not(windows))]
+        return Ok(NntpTlsBackend::S2n);
+        #[cfg(windows)]
+        return Err(NntpError::MalformedResponse(format!(
+            "{TLS_BACKEND_ENV}=s2n is unavailable on Windows; rustls/aws-lc is the Windows backend"
+        )));
+    }
+    if value.eq_ignore_ascii_case("rustls")
+        || value.eq_ignore_ascii_case("manual-rustls")
+        || value.eq_ignore_ascii_case("manual_rustls")
+    {
+        return Ok(NntpTlsBackend::ManualRustls);
+    }
+    Err(NntpError::MalformedResponse(format!(
+        "unsupported {TLS_BACKEND_ENV} value {value:?}; expected s2n or manual-rustls"
+    )))
+}
+
+fn env_tls_backend() -> Result<Option<NntpTlsBackend>, NntpError> {
     match std::env::var(TLS_BACKEND_ENV) {
-        Ok(value) if value.eq_ignore_ascii_case("s2n") => Ok(NntpTlsBackend::S2n),
-        Ok(value)
-            if value.eq_ignore_ascii_case("rustls")
-                || value.eq_ignore_ascii_case("manual-rustls")
-                || value.eq_ignore_ascii_case("manual_rustls") =>
-        {
-            Ok(NntpTlsBackend::ManualRustls)
-        }
-        Ok(value) => Err(NntpError::MalformedResponse(format!(
-            "unsupported {TLS_BACKEND_ENV} value {value:?}; expected s2n or manual-rustls"
-        ))),
-        Err(std::env::VarError::NotPresent) => Ok(NntpTlsBackend::ManualRustls),
+        Ok(value) => parse_tls_backend(&value).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(NntpError::MalformedResponse(format!(
             "failed to read {TLS_BACKEND_ENV}: {error}"
         ))),
     }
 }
 
+fn selected_tls_backend() -> Result<NntpTlsBackend, NntpError> {
+    Ok(env_tls_backend()?.unwrap_or(NntpTlsBackend::ManualRustls))
+}
+
+/// Backend for the blocking owned BODY lane. Unlike the async default
+/// (manual rustls), unix defaults to s2n to preserve the tuned hot path;
+/// Windows always uses the rustls engine.
+pub(crate) fn selected_blocking_tls_backend() -> Result<NntpTlsBackend, NntpError> {
+    if let Some(backend) = env_tls_backend()? {
+        return Ok(backend);
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(NntpTlsBackend::S2n)
+    }
+    #[cfg(windows)]
+    {
+        Ok(NntpTlsBackend::ManualRustls)
+    }
+}
+
+#[cfg(not(windows))]
 pub(crate) fn build_s2n_tls_config(ca_cert_path: Option<&Path>) -> Result<S2nConfig, NntpError> {
     let ca_cert_path = ca_cert_path.ok_or_else(|| {
         NntpError::MalformedResponse(format!(
@@ -649,6 +778,7 @@ pub(crate) fn build_s2n_tls_config(ca_cert_path: Option<&Path>) -> Result<S2nCon
     Ok(config)
 }
 
+#[cfg(not(windows))]
 fn enable_s2n_recv_multi_record(config: &mut S2nConfig) -> Result<(), NntpError> {
     let config_ptr =
         unsafe { *(std::ptr::from_mut(config) as *mut std::ptr::NonNull<s2n_tls_sys::s2n_config>) };
@@ -662,14 +792,17 @@ fn enable_s2n_recv_multi_record(config: &mut S2nConfig) -> Result<(), NntpError>
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn s2n_config_error(context: &str, error: s2n_tls::error::Error) -> NntpError {
     NntpError::MalformedResponse(format!("s2n TLS config failed to {context}: {error}"))
 }
 
+#[cfg(not(windows))]
 fn s2n_handshake_error(error: s2n_tls::error::Error) -> NntpError {
     NntpError::MalformedResponse(format!("s2n TLS handshake failed: {error}"))
 }
 
+#[cfg(not(windows))]
 async fn connect_s2n_tls(
     tcp: TcpStream,
     tls_config: S2nConfig,
@@ -689,7 +822,7 @@ async fn connect_s2n_tls(
 }
 
 /// Create a `ServerName` from a hostname string.
-fn make_server_name(host: &str) -> Result<ServerName<'static>, NntpError> {
+pub(crate) fn make_server_name(host: &str) -> Result<ServerName<'static>, NntpError> {
     ServerName::try_from(host.to_string())
         .map_err(|_| NntpError::MalformedResponse(format!("invalid hostname for TLS: {host}")))
 }
@@ -793,6 +926,7 @@ pub async fn connect_tls_with_ip_policy(
                 remote_addr,
             })
         }
+        #[cfg(not(windows))]
         NntpTlsBackend::S2n => {
             let tls_config = build_s2n_tls_config(ca_cert_path)?;
             let s2n_tls = connect_s2n_tls(tcp, tls_config, host).await?;
@@ -853,6 +987,7 @@ pub async fn upgrade_starttls(
                 remote_addr,
             })
         }
+        #[cfg(not(windows))]
         NntpTlsBackend::S2n => {
             let tls_config = build_s2n_tls_config(ca_cert_path)?;
             let s2n_tls = connect_s2n_tls(tcp, tls_config, host).await?;
@@ -867,20 +1002,65 @@ pub async fn upgrade_starttls(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
     use std::sync::Arc;
+    #[cfg(not(windows))]
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(not(windows))]
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+    #[cfg(not(windows))]
     use tokio::sync::oneshot;
+    #[cfg(not(windows))]
     use tokio_rustls::TlsAcceptor;
+    #[cfg(not(windows))]
     use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
+    #[cfg(not(windows))]
     use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
+    #[cfg(not(windows))]
     const TLS_DRAIN_RECORD_BYTES: usize = 16 * 1024;
+    #[cfg(not(windows))]
     const TLS_DRAIN_RECORDS: usize = 8;
+    #[cfg(not(windows))]
     const TLS_DRAIN_PAYLOAD_BYTES: usize = TLS_DRAIN_RECORD_BYTES * TLS_DRAIN_RECORDS;
+    #[cfg(not(windows))]
     const TLS_TEST_BUFFER_BYTES: usize = 256 * 1024;
+
+    #[test]
+    fn parse_tls_backend_accepts_rustls_aliases() {
+        for value in ["rustls", "RUSTLS", "manual-rustls", "Manual_Rustls"] {
+            assert_eq!(
+                parse_tls_backend(value).unwrap(),
+                NntpTlsBackend::ManualRustls,
+                "value {value:?} should select the manual rustls backend"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_tls_backend_rejects_unknown_values() {
+        assert!(parse_tls_backend("openssl").is_err());
+        assert!(parse_tls_backend("").is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn parse_tls_backend_accepts_s2n_off_windows() {
+        assert_eq!(parse_tls_backend("s2n").unwrap(), NntpTlsBackend::S2n);
+        assert_eq!(parse_tls_backend("S2N").unwrap(), NntpTlsBackend::S2n);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_tls_backend_rejects_s2n_on_windows() {
+        let error = parse_tls_backend("s2n").unwrap_err();
+        assert!(
+            error.to_string().contains("unavailable on Windows"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn filter_and_rotate_addrs_excludes_ips_before_rotation() {
@@ -917,13 +1097,19 @@ mod tests {
         let keepalive = sock_ref.keepalive().unwrap();
         assert!(keepalive, "TCP keepalive should be enabled");
 
-        let ka_time = sock_ref.tcp_keepalive_time().unwrap();
-        assert_eq!(ka_time, Duration::from_mins(1));
+        // socket2 exposes no keepalive time/interval getters on Windows;
+        // setting them via `TcpKeepalive` above still works there.
+        #[cfg(not(windows))]
+        {
+            let ka_time = sock_ref.tcp_keepalive_time().unwrap();
+            assert_eq!(ka_time, Duration::from_mins(1));
 
-        let ka_interval = sock_ref.tcp_keepalive_interval().unwrap();
-        assert_eq!(ka_interval, Duration::from_secs(15));
+            let ka_interval = sock_ref.tcp_keepalive_interval().unwrap();
+            assert_eq!(ka_interval, Duration::from_secs(15));
+        }
     }
 
+    #[cfg(not(windows))]
     fn s2n_probe_tls_config() -> (Arc<RustlsServerConfig>, std::path::PathBuf) {
         let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
             .expect("generate test cert");
@@ -941,12 +1127,14 @@ mod tests {
             .with_single_cert(vec![cert_der], key_der)
             .expect("server TLS config");
 
+        static CA_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = CA_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let ca_path = std::env::temp_dir().join(format!(
-            "weaver-nntp-s2n-probe-ca-{}-{nonce}.pem",
+            "weaver-nntp-s2n-probe-ca-{}-{serial}-{nonce}.pem",
             std::process::id()
         ));
         std::fs::write(&ca_path, cert_pem).expect("write s2n probe CA PEM");
@@ -954,6 +1142,7 @@ mod tests {
         (Arc::new(server_config), ca_path)
     }
 
+    #[cfg(not(windows))]
     async fn spawn_tls_drain_server(
         server_config: Arc<RustlsServerConfig>,
     ) -> (SocketAddr, oneshot::Receiver<()>) {
@@ -979,6 +1168,7 @@ mod tests {
         (addr, flushed_rx)
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     #[ignore = "diagnostic read-shape probe; run explicitly with --ignored --nocapture"]
     async fn s2n_tls_drain_probe() {
@@ -1014,18 +1204,18 @@ mod tests {
         flushed_rx.await.expect("server flushed probe records");
         let _ = std::fs::remove_file(&ca_path);
         let bytes_per_read_call = aggregate
-            .s2n_read_bytes
-            .checked_div(aggregate.s2n_read_calls)
+            .backend_recv_bytes
+            .checked_div(aggregate.backend_recv_calls)
             .unwrap_or(0);
 
         println!(
-            "s2n_tls_drain_probe first_read_bytes={first_read_bytes} total_bytes={total} records={TLS_DRAIN_RECORDS} s2n_read_calls={} bytes_per_read_call={bytes_per_read_call}",
-            aggregate.s2n_read_calls
+            "s2n_tls_drain_probe first_read_bytes={first_read_bytes} total_bytes={total} records={TLS_DRAIN_RECORDS} backend_recv_calls={} bytes_per_read_call={bytes_per_read_call}",
+            aggregate.backend_recv_calls
         );
         assert_eq!(total, TLS_DRAIN_PAYLOAD_BYTES);
-        assert_eq!(aggregate.s2n_read_bytes as usize, total);
+        assert_eq!(aggregate.backend_recv_bytes as usize, total);
         assert!(
-            aggregate.s2n_read_calls < TLS_DRAIN_RECORDS as u64,
+            aggregate.backend_recv_calls < TLS_DRAIN_RECORDS as u64,
             "multi-record s2n recv should consume more than one TLS record per s2n_recv"
         );
     }

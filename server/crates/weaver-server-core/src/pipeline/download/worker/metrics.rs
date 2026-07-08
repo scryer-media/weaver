@@ -221,34 +221,34 @@ impl Pipeline {
                     io.transport_read.cached_plaintext_returns,
                 );
                 crate::runtime::perf_probe::record_value(
-                    "download.nntp.transport.s2n.read_calls",
-                    io.transport_read.s2n_read_calls,
+                    "download.nntp.transport.backend.recv_calls",
+                    io.transport_read.backend_recv_calls,
                 );
                 crate::runtime::perf_probe::record_value(
-                    "download.nntp.transport.s2n.read_bytes",
-                    io.transport_read.s2n_read_bytes,
+                    "download.nntp.transport.backend.recv_bytes",
+                    io.transport_read.backend_recv_bytes,
                 );
                 crate::runtime::perf_probe::record_value(
-                    "download.nntp.transport.s2n.target_full_returns",
-                    io.transport_read.s2n_target_full_returns,
+                    "download.nntp.transport.backend.target_full_returns",
+                    io.transport_read.backend_target_full_returns,
                 );
                 crate::runtime::perf_probe::record_value(
-                    "download.nntp.transport.s2n.pending_empty_returns",
-                    io.transport_read.s2n_pending_empty_returns,
+                    "download.nntp.transport.backend.pending_empty_returns",
+                    io.transport_read.backend_pending_empty_returns,
                 );
                 crate::runtime::perf_probe::record_value(
-                    "download.nntp.transport.s2n.pending_after_bytes_returns",
-                    io.transport_read.s2n_pending_after_bytes_returns,
+                    "download.nntp.transport.backend.pending_after_bytes_returns",
+                    io.transport_read.backend_pending_after_bytes_returns,
                 );
                 crate::runtime::perf_probe::record_value(
-                    "download.nntp.transport.s2n.zero_returns",
-                    io.transport_read.s2n_zero_returns,
+                    "download.nntp.transport.backend.zero_returns",
+                    io.transport_read.backend_zero_returns,
                 );
                 crate::runtime::perf_probe::record_value(
-                    "download.nntp.transport.s2n.bytes_per_read_call",
+                    "download.nntp.transport.backend.bytes_per_recv_call",
                     io.transport_read
-                        .s2n_read_bytes
-                        .checked_div(io.transport_read.s2n_read_calls)
+                        .backend_recv_bytes
+                        .checked_div(io.transport_read.backend_recv_calls)
                         .unwrap_or(0),
                 );
                 crate::runtime::perf_probe::record_value(

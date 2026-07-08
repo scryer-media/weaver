@@ -1,12 +1,18 @@
 use std::collections::VecDeque;
+#[cfg(not(windows))]
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+#[cfg(not(windows))]
 use std::os::fd::AsRawFd;
+#[cfg(not(windows))]
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
-use bytes::{BufMut, BytesMut};
+#[cfg(not(windows))]
+use bytes::BufMut;
+use bytes::BytesMut;
+#[cfg(not(windows))]
 use s2n_tls_sys as s2n;
 use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
@@ -24,7 +30,10 @@ use crate::fused_yenc::{
 };
 use crate::pool::{BlockingConnectionPermit, ServerId};
 use crate::response::parse_response;
-use crate::tls::TransportReadStats;
+use crate::tls::{
+    NntpTlsBackend, RustlsSession, TLS_READ_BUFFER, TransportReadStats, build_tls_config,
+    make_server_name, selected_blocking_tls_backend,
+};
 use crate::types::{ArticleId, Capabilities, Response};
 
 const MIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -39,6 +48,7 @@ pub struct BlockingLaneStats {
     pub decoded_articles: u64,
 }
 
+#[cfg(not(windows))]
 struct BlockingS2nStream {
     conn: RawS2nConnection,
     _config: RawS2nConfig,
@@ -46,15 +56,30 @@ struct BlockingS2nStream {
     stats: BlockingLaneStats,
 }
 
+/// Blocking rustls transport for the owned BODY lane. Mirrors the async
+/// `ManualTls` read shape — large buffered ciphertext reads decrypted in bulk
+/// through the shared `RustlsSession` engine — so throughput economics match
+/// the s2n lane rather than a per-record `rustls::StreamOwned` loop.
+struct BlockingManualTlsStream {
+    tcp: TcpStream,
+    session: RustlsSession,
+    read_buffer: Vec<u8>,
+    stats: BlockingLaneStats,
+}
+
 enum BlockingTransport {
     Plain(TcpStream),
+    Rustls(Box<BlockingManualTlsStream>),
+    #[cfg(not(windows))]
     S2n(BlockingS2nStream),
 }
 
+#[cfg(not(windows))]
 struct RawS2nConfig {
     ptr: NonNull<s2n::s2n_config>,
 }
 
+#[cfg(not(windows))]
 struct RawS2nConnection {
     ptr: NonNull<s2n::s2n_connection>,
 }
@@ -351,6 +376,17 @@ impl BlockingNntpConnection {
         excluded_ips: &[IpAddr],
         address_offset: usize,
     ) -> Result<Self> {
+        Self::connect_with_ip_policy_with_backend(config, excluded_ips, address_offset, None)
+    }
+
+    /// `backend_override` bypasses env/platform backend selection; tests use
+    /// it to exercise a specific TLS transport deterministically.
+    fn connect_with_ip_policy_with_backend(
+        config: &ServerConfig,
+        excluded_ips: &[IpAddr],
+        address_offset: usize,
+        backend_override: Option<NntpTlsBackend>,
+    ) -> Result<Self> {
         if config.starttls {
             return Err(NntpError::MalformedResponse(
                 "blocking owned lane does not support STARTTLS".to_string(),
@@ -369,7 +405,7 @@ impl BlockingNntpConnection {
                     tcp.set_write_timeout(Some(config.command_timeout.max(MIN_TIMEOUT)))
                         .map_err(NntpError::Io)?;
                     let remote_addr = tcp.peer_addr().unwrap_or(addr);
-                    return Self::from_tcp(config, tcp, remote_addr);
+                    return Self::from_tcp(config, tcp, remote_addr, backend_override);
                 }
                 Err(error) => last_error = Some(error),
             }
@@ -380,14 +416,34 @@ impl BlockingNntpConnection {
         })))
     }
 
-    fn from_tcp(config: &ServerConfig, tcp: TcpStream, remote_addr: SocketAddr) -> Result<Self> {
+    fn from_tcp(
+        config: &ServerConfig,
+        tcp: TcpStream,
+        remote_addr: SocketAddr,
+        backend_override: Option<NntpTlsBackend>,
+    ) -> Result<Self> {
         let transport = if config.tls {
-            BlockingTransport::S2n(BlockingS2nStream::connect(
-                tcp,
-                &config.host,
-                config.tls_ca_cert.as_deref(),
-                config.command_timeout.max(MIN_TIMEOUT),
-            )?)
+            let backend = match backend_override {
+                Some(backend) => backend,
+                None => selected_blocking_tls_backend()?,
+            };
+            match backend {
+                NntpTlsBackend::ManualRustls => {
+                    BlockingTransport::Rustls(Box::new(BlockingManualTlsStream::connect(
+                        tcp,
+                        &config.host,
+                        config.tls_ca_cert.as_deref(),
+                        config.command_timeout.max(MIN_TIMEOUT),
+                    )?))
+                }
+                #[cfg(not(windows))]
+                NntpTlsBackend::S2n => BlockingTransport::S2n(BlockingS2nStream::connect(
+                    tcp,
+                    &config.host,
+                    config.tls_ca_cert.as_deref(),
+                    config.command_timeout.max(MIN_TIMEOUT),
+                )?),
+            }
         } else {
             BlockingTransport::Plain(tcp)
         };
@@ -445,6 +501,8 @@ impl BlockingNntpConnection {
     pub fn stats(&self) -> BlockingLaneStats {
         match &self.transport {
             BlockingTransport::Plain(_) => BlockingLaneStats::default(),
+            BlockingTransport::Rustls(inner) => inner.stats,
+            #[cfg(not(windows))]
             BlockingTransport::S2n(inner) => inner.stats,
         }
     }
@@ -609,9 +667,9 @@ impl BlockingNntpConnection {
                     article.stats.leftover_bytes_after_terminator = self.read_buf.len() as u64;
                     article.stats.output_batches = article_chunks.len() as u64;
                     article.chunks = article_chunks;
-                    if let BlockingTransport::S2n(inner) = &mut self.transport {
-                        inner.stats.body_responses += 1;
-                        inner.stats.decoded_articles += 1;
+                    if let Some(lane_stats) = self.transport.lane_stats_mut() {
+                        lane_stats.body_responses += 1;
+                        lane_stats.decoded_articles += 1;
                     }
                     return Ok(article);
                 }
@@ -688,6 +746,8 @@ impl BlockingTransport {
                     },
                 ))
             }
+            BlockingTransport::Rustls(inner) => inner.read_into_buf(dst, target_read_size, timeout),
+            #[cfg(not(windows))]
             BlockingTransport::S2n(inner) => inner.read_into_buf(dst, target_read_size, timeout),
         }
     }
@@ -699,6 +759,8 @@ impl BlockingTransport {
                     .map_err(NntpError::Io)?;
                 tcp.write_all(bytes).map_err(NntpError::Io)
             }
+            BlockingTransport::Rustls(inner) => inner.write_all(bytes, timeout),
+            #[cfg(not(windows))]
             BlockingTransport::S2n(inner) => inner.write_all(bytes, timeout),
         }
     }
@@ -710,11 +772,149 @@ impl BlockingTransport {
                     .map_err(NntpError::Io)?;
                 tcp.flush().map_err(NntpError::Io)
             }
+            BlockingTransport::Rustls(inner) => inner.flush(timeout),
+            #[cfg(not(windows))]
             BlockingTransport::S2n(inner) => inner.flush(timeout),
+        }
+    }
+
+    fn lane_stats_mut(&mut self) -> Option<&mut BlockingLaneStats> {
+        match self {
+            BlockingTransport::Plain(_) => None,
+            BlockingTransport::Rustls(inner) => Some(&mut inner.stats),
+            #[cfg(not(windows))]
+            BlockingTransport::S2n(inner) => Some(&mut inner.stats),
         }
     }
 }
 
+impl BlockingManualTlsStream {
+    fn connect(
+        tcp: TcpStream,
+        host: &str,
+        ca_cert_path: Option<&std::path::Path>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        tcp.set_read_timeout(Some(timeout)).map_err(NntpError::Io)?;
+        tcp.set_write_timeout(Some(timeout))
+            .map_err(NntpError::Io)?;
+        tcp.set_nonblocking(false).map_err(NntpError::Io)?;
+
+        let config = build_tls_config(ca_cert_path)?;
+        let server_name = make_server_name(host)?;
+        let session = RustlsSession::new(config, server_name)?;
+        let mut stream = Self {
+            tcp,
+            session,
+            read_buffer: vec![0u8; TLS_READ_BUFFER],
+            stats: BlockingLaneStats::default(),
+        };
+        stream.complete_handshake().map_err(NntpError::Io)?;
+        Ok(stream)
+    }
+
+    fn complete_handshake(&mut self) -> io::Result<()> {
+        let mut discarded = BytesMut::new();
+
+        while self.session.is_handshaking() {
+            self.flush_outbound()?;
+
+            if self.session.is_handshaking() {
+                let n = self.tcp.read(&mut self.read_buffer)?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "server closed during TLS handshake",
+                    ));
+                }
+                self.session
+                    .feed_ciphertext_slice(&self.read_buffer[..n], &mut discarded, None)?;
+            }
+        }
+
+        self.flush_outbound()
+    }
+
+    fn flush_outbound(&mut self) -> io::Result<()> {
+        while let Some(outbound) = self.session.next_outbound()? {
+            self.tcp.write_all(&outbound)?;
+            self.stats.socket_writes += 1;
+        }
+        self.tcp.flush()
+    }
+
+    fn read_into_buf(
+        &mut self,
+        dst: &mut BytesMut,
+        target_read_size: usize,
+        timeout: Duration,
+    ) -> io::Result<(usize, TransportReadStats)> {
+        let mut stats = TransportReadStats::default();
+        let drained = self.session.drain_plaintext(dst, Some(&mut stats))?;
+        if drained > 0 {
+            stats.cached_plaintext_returns += 1;
+            return Ok((drained, stats));
+        }
+
+        self.tcp.set_read_timeout(Some(timeout))?;
+        let read_size = target_read_size.max(TLS_READ_BUFFER);
+        if self.read_buffer.len() < read_size {
+            self.read_buffer.resize(read_size, 0);
+        }
+
+        let started = Instant::now();
+        loop {
+            let n = self.tcp.read(&mut self.read_buffer[..read_size])?;
+            self.stats.socket_reads += 1;
+            stats.try_read_calls += 1;
+            if n == 0 {
+                stats.backend_zero_returns += 1;
+                return Ok((0, stats));
+            }
+            stats.try_read_bytes += n as u64;
+            self.stats.tls_recv_calls += 1;
+            let produced = self.session.feed_ciphertext_slice(
+                &self.read_buffer[..n],
+                dst,
+                Some(&mut stats),
+            )?;
+            if produced > 0 {
+                stats.backend_recv_calls += 1;
+                stats.backend_recv_bytes += produced as u64;
+                return Ok((produced, stats));
+            }
+            // Partial record buffered; keep reading. Each read is bounded by
+            // the socket timeout, this guard bounds pathological trickle.
+            stats.backend_pending_empty_returns += 1;
+            if started.elapsed() >= timeout {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "TLS record incomplete before read timeout",
+                ));
+            }
+        }
+    }
+
+    fn write_all(&mut self, bytes: &[u8], timeout: Duration) -> Result<()> {
+        self.tcp
+            .set_write_timeout(Some(timeout))
+            .map_err(NntpError::Io)?;
+        self.session
+            .buffer_plaintext(bytes)
+            .map_err(NntpError::Io)?;
+        self.stats.tls_send_calls += 1;
+        self.flush_outbound().map_err(NntpError::Io)
+    }
+
+    fn flush(&mut self, timeout: Duration) -> Result<()> {
+        self.tcp
+            .set_write_timeout(Some(timeout))
+            .map_err(NntpError::Io)?;
+        self.flush_outbound().map_err(NntpError::Io)
+    }
+}
+
+#[cfg(not(windows))]
 impl BlockingS2nStream {
     fn connect(
         tcp: TcpStream,
@@ -808,7 +1008,7 @@ impl BlockingS2nStream {
         let mut stats = TransportReadStats::default();
         loop {
             if total >= target {
-                stats.s2n_target_full_returns += 1;
+                stats.backend_target_full_returns += 1;
                 break;
             }
 
@@ -817,7 +1017,7 @@ impl BlockingS2nStream {
             let writable = dst.chunk_mut();
             let writable_len = writable.len().min(want);
             if writable_len == 0 {
-                stats.s2n_target_full_returns += 1;
+                stats.backend_target_full_returns += 1;
                 break;
             }
 
@@ -835,8 +1035,8 @@ impl BlockingS2nStream {
                 unsafe { dst.advance_mut(n) };
                 total += n;
                 self.stats.tls_recv_calls += 1;
-                stats.s2n_read_calls += 1;
-                stats.s2n_read_bytes += n as u64;
+                stats.backend_recv_calls += 1;
+                stats.backend_recv_bytes += n as u64;
                 stats.plaintext_bytes += n as u64;
 
                 if self.peek_plaintext() > 0 || self.peek_buffered_ciphertext() > 0 {
@@ -845,13 +1045,13 @@ impl BlockingS2nStream {
                 break;
             }
             if n == 0 {
-                stats.s2n_zero_returns += 1;
+                stats.backend_zero_returns += 1;
                 break;
             }
             if total == 0 {
-                stats.s2n_pending_empty_returns += 1;
+                stats.backend_pending_empty_returns += 1;
             } else {
-                stats.s2n_pending_after_bytes_returns += 1;
+                stats.backend_pending_after_bytes_returns += 1;
             }
             if s2n_retryable_blocked(blocked) {
                 if total > 0 {
@@ -925,6 +1125,7 @@ impl BlockingS2nStream {
     }
 }
 
+#[cfg(not(windows))]
 impl RawS2nConfig {
     fn new(ca_cert_path: Option<&std::path::Path>) -> Result<Self> {
         s2n_tls::init::init();
@@ -972,6 +1173,7 @@ impl RawS2nConfig {
 /// returning, trading larger reads for extra buffered-copy work. Off by
 /// default (single-record reads measured better under the previous allocator
 /// economics); env-gated so the trade can be re-measured without a rebuild.
+#[cfg(not(windows))]
 fn multi_record_receive_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -981,12 +1183,14 @@ fn multi_record_receive_enabled() -> bool {
     })
 }
 
+#[cfg(not(windows))]
 impl Drop for RawS2nConfig {
     fn drop(&mut self) {
         let _ = unsafe { s2n::s2n_config_free(self.as_ptr()) };
     }
 }
 
+#[cfg(not(windows))]
 impl RawS2nConnection {
     fn new_client() -> Result<Self> {
         s2n_tls::init::init();
@@ -1004,15 +1208,19 @@ impl RawS2nConnection {
     }
 }
 
+#[cfg(not(windows))]
 impl Drop for RawS2nConnection {
     fn drop(&mut self) {
         let _ = unsafe { s2n::s2n_connection_free(self.as_ptr()) };
     }
 }
 
+#[cfg(not(windows))]
 unsafe impl Send for RawS2nConfig {}
+#[cfg(not(windows))]
 unsafe impl Send for RawS2nConnection {}
 
+#[cfg(not(windows))]
 fn check_s2n_status(context: &str, rc: libc::c_int) -> Result<()> {
     if rc < 0 {
         return Err(s2n_last_error(
@@ -1023,6 +1231,7 @@ fn check_s2n_status(context: &str, rc: libc::c_int) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn s2n_last_error(context: &str, blocked: s2n::s2n_blocked_status::Type) -> NntpError {
     let errno = unsafe { *s2n::s2n_errno_location() };
     let kind = unsafe { s2n::s2n_error_get_type(errno) as s2n::s2n_error_type::Type };
@@ -1046,6 +1255,7 @@ fn s2n_last_error(context: &str, blocked: s2n::s2n_blocked_status::Type) -> Nntp
     ))
 }
 
+#[cfg(not(windows))]
 fn s2n_retryable_blocked(blocked: s2n::s2n_blocked_status::Type) -> bool {
     if blocked != s2n::s2n_blocked_status::NOT_BLOCKED {
         return true;
@@ -1055,14 +1265,17 @@ fn s2n_retryable_blocked(blocked: s2n::s2n_blocked_status::Type) -> bool {
     kind == s2n::s2n_error_type::BLOCKED
 }
 
+#[cfg(not(windows))]
 fn s2n_error_name(errno: libc::c_int) -> String {
     unsafe_cstr_to_string(unsafe { s2n::s2n_strerror_name(errno) })
 }
 
+#[cfg(not(windows))]
 fn s2n_error_message(errno: libc::c_int) -> String {
     unsafe_cstr_to_string(unsafe { s2n::s2n_strerror(errno, std::ptr::null()) })
 }
 
+#[cfg(not(windows))]
 fn unsafe_cstr_to_string(ptr: *const libc::c_char) -> String {
     if ptr.is_null() {
         return "<null>".to_string();
@@ -1072,6 +1285,7 @@ fn unsafe_cstr_to_string(ptr: *const libc::c_char) -> String {
         .into_owned()
 }
 
+#[cfg(not(windows))]
 fn nntp_error_to_io(error: NntpError) -> io::Error {
     match error {
         NntpError::Io(error) => error,
@@ -1230,7 +1444,9 @@ fn is_connection_error(err: &NntpError) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+    use std::sync::Arc;
+    #[cfg(not(windows))]
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1243,6 +1459,7 @@ mod tests {
         Truncated(Vec<u8>),
     }
 
+    #[cfg(not(windows))]
     fn s2n_test_guard() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
@@ -1252,6 +1469,21 @@ mod tests {
         let mut body = Vec::new();
         weaver_yenc::encode(data, &mut body, 128, "owned.bin").unwrap();
         body
+    }
+
+    // Nanosecond timestamps alone collide when TLS tests start in parallel;
+    // the serial keeps each fixture's CA file unique within the process.
+    fn unique_ca_path(label: &str) -> std::path::PathBuf {
+        static CA_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = CA_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "weaver-{label}-{}-{serial}-{nonce}.pem",
+            std::process::id()
+        ))
     }
 
     fn spawn_tls_nntp_server(
@@ -1277,15 +1509,8 @@ mod tests {
             .with_single_cert(vec![cert_der], key_der)
             .expect("server TLS config");
 
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let ca_path = std::env::temp_dir().join(format!(
-            "weaver-blocking-s2n-ca-{}-{nonce}.pem",
-            std::process::id()
-        ));
-        std::fs::write(&ca_path, cert_pem).expect("write blocking s2n CA PEM");
+        let ca_path = unique_ca_path("blocking-tls-ca");
+        std::fs::write(&ca_path, cert_pem).expect("write blocking TLS CA PEM");
 
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1388,14 +1613,36 @@ mod tests {
         (config, handle, ca_path)
     }
 
-    #[test]
-    fn blocking_s2n_fd_reads_pipelined_body_responses() {
-        let _guard = s2n_test_guard();
+    fn connect_with_backend(
+        config: &ServerConfig,
+        backend: NntpTlsBackend,
+    ) -> BlockingNntpConnection {
+        BlockingNntpConnection::connect_with_ip_policy_with_backend(config, &[], 0, Some(backend))
+            .unwrap()
+    }
+
+    fn tls_lane_reads_single_body_response(backend: NntpTlsBackend) {
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
+            "<solo@test>",
+            TestArticle::Body(b"single article body".to_vec()),
+        )]);
+        let mut conn = connect_with_backend(&config, backend);
+        conn.select_group("alt.test").unwrap();
+
+        let article = conn.stream_yenc_article("<solo@test>").unwrap();
+
+        assert_eq!(article.into_data(), b"single article body");
+        conn.quit().unwrap();
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
+    }
+
+    fn tls_lane_reads_pipelined_body_responses(backend: NntpTlsBackend) {
         let (config, handle, ca_path) = spawn_tls_nntp_server(vec![
             ("<one@test>", TestArticle::Body(b"first article".to_vec())),
             ("<two@test>", TestArticle::Body(b"second article".to_vec())),
         ]);
-        let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+        let mut conn = connect_with_backend(&config, backend);
         conn.select_group("alt.test").unwrap();
         conn.write_body_request("<one@test>").unwrap();
         conn.write_body_request("<two@test>").unwrap();
@@ -1413,14 +1660,12 @@ mod tests {
         let _ = std::fs::remove_file(ca_path);
     }
 
-    #[test]
-    fn blocking_s2n_reads_large_pipelined_body_responses() {
-        let _guard = s2n_test_guard();
+    fn tls_lane_reads_large_pipelined_body_responses(backend: NntpTlsBackend) {
         let (config, handle, ca_path) = spawn_tls_nntp_server(vec![
             ("<one@test>", TestArticle::Body(vec![b'a'; 128 * 1024])),
             ("<two@test>", TestArticle::Body(vec![b'b'; 128 * 1024])),
         ]);
-        let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+        let mut conn = connect_with_backend(&config, backend);
         conn.select_group("alt.test").unwrap();
         conn.write_body_request("<one@test>").unwrap();
         conn.write_body_request("<two@test>").unwrap();
@@ -1436,11 +1681,9 @@ mod tests {
         let _ = std::fs::remove_file(ca_path);
     }
 
-    #[test]
-    fn blocking_s2n_fd_reports_missing_article() {
-        let _guard = s2n_test_guard();
+    fn tls_lane_reports_missing_article(backend: NntpTlsBackend) {
         let (config, handle, ca_path) = spawn_tls_nntp_server(Vec::new());
-        let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+        let mut conn = connect_with_backend(&config, backend);
         conn.select_group("alt.test").unwrap();
 
         let error = conn.stream_yenc_article("<missing@test>").unwrap_err();
@@ -1455,14 +1698,12 @@ mod tests {
         let _ = std::fs::remove_file(ca_path);
     }
 
-    #[test]
-    fn blocking_s2n_fd_reports_truncated_response() {
-        let _guard = s2n_test_guard();
+    fn tls_lane_reports_truncated_response(backend: NntpTlsBackend) {
         let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
             "<truncated@test>",
             TestArticle::Truncated(b"incomplete article".to_vec()),
         )]);
-        let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+        let mut conn = connect_with_backend(&config, backend);
         conn.select_group("alt.test").unwrap();
 
         let error = conn.stream_yenc_article("<truncated@test>").unwrap_err();
@@ -1476,6 +1717,157 @@ mod tests {
         ));
         handle.join().unwrap();
         let _ = std::fs::remove_file(ca_path);
+    }
+
+    #[test]
+    fn blocking_rustls_reads_single_body_response() {
+        tls_lane_reads_single_body_response(NntpTlsBackend::ManualRustls);
+    }
+
+    #[test]
+    fn blocking_rustls_reads_pipelined_body_responses() {
+        tls_lane_reads_pipelined_body_responses(NntpTlsBackend::ManualRustls);
+    }
+
+    #[test]
+    fn blocking_rustls_reads_large_pipelined_body_responses() {
+        tls_lane_reads_large_pipelined_body_responses(NntpTlsBackend::ManualRustls);
+    }
+
+    #[test]
+    fn blocking_rustls_reports_missing_article() {
+        tls_lane_reports_missing_article(NntpTlsBackend::ManualRustls);
+    }
+
+    #[test]
+    fn blocking_rustls_reports_truncated_response() {
+        tls_lane_reports_truncated_response(NntpTlsBackend::ManualRustls);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn blocking_s2n_fd_reads_single_body_response() {
+        let _guard = s2n_test_guard();
+        tls_lane_reads_single_body_response(NntpTlsBackend::S2n);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn blocking_s2n_fd_reads_pipelined_body_responses() {
+        let _guard = s2n_test_guard();
+        tls_lane_reads_pipelined_body_responses(NntpTlsBackend::S2n);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn blocking_s2n_reads_large_pipelined_body_responses() {
+        let _guard = s2n_test_guard();
+        tls_lane_reads_large_pipelined_body_responses(NntpTlsBackend::S2n);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn blocking_s2n_fd_reports_missing_article() {
+        let _guard = s2n_test_guard();
+        tls_lane_reports_missing_article(NntpTlsBackend::S2n);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn blocking_s2n_fd_reports_truncated_response() {
+        let _guard = s2n_test_guard();
+        tls_lane_reports_truncated_response(NntpTlsBackend::S2n);
+    }
+
+    const TLS_DRAIN_RECORD_BYTES: usize = 16 * 1024;
+    const TLS_DRAIN_RECORDS: usize = 8;
+
+    fn spawn_raw_tls_drain_server() -> (u16, std::thread::JoinHandle<()>, std::path::PathBuf) {
+        let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate test cert");
+        let cert_der = certified_key.cert.der().clone();
+        let cert_pem = certified_key.cert.pem();
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            certified_key.key_pair.serialize_der(),
+        ));
+
+        let server_provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+        let server_config = RustlsServerConfig::builder_with_provider(Arc::new(server_provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("server TLS config");
+
+        let ca_path = unique_ca_path("blocking-rustls-drain-ca");
+        std::fs::write(&ca_path, cert_pem).expect("write drain CA PEM");
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let (socket, _) = listener.accept().await.unwrap();
+                let acceptor = TlsAcceptor::from(Arc::new(server_config));
+                let mut tls = acceptor.accept(socket).await.unwrap();
+                let record = vec![0x5Au8; TLS_DRAIN_RECORD_BYTES];
+                for _ in 0..TLS_DRAIN_RECORDS {
+                    tls.write_all(&record).await.unwrap();
+                    tls.flush().await.unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            });
+        });
+
+        (port, handle, ca_path)
+    }
+
+    #[test]
+    #[ignore = "diagnostic read-shape probe; run explicitly with --ignored --nocapture"]
+    fn rustls_blocking_drain_probe() {
+        let (port, handle, ca_path) = spawn_raw_tls_drain_server();
+        let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut stream = BlockingManualTlsStream::connect(
+            tcp,
+            "localhost",
+            Some(&ca_path),
+            Duration::from_secs(5),
+        )
+        .expect("blocking rustls connect");
+
+        let payload = TLS_DRAIN_RECORD_BYTES * TLS_DRAIN_RECORDS;
+        let mut read_buf = BytesMut::with_capacity(payload);
+        let mut total = 0usize;
+        let mut aggregate = TransportReadStats::default();
+        while total < payload {
+            let (n, stats) = stream
+                .read_into_buf(&mut read_buf, payload, Duration::from_secs(5))
+                .expect("blocking rustls read");
+            assert_ne!(n, 0, "TLS stream closed before probe payload");
+            total += n;
+            aggregate.add(stats);
+        }
+
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(&ca_path);
+        let bytes_per_socket_read = (total as u64)
+            .checked_div(aggregate.try_read_calls)
+            .unwrap_or(0);
+        println!(
+            "rustls_blocking_drain_probe total_bytes={total} records={TLS_DRAIN_RECORDS} socket_reads={} tls_record_reads={} bytes_per_socket_read={bytes_per_socket_read}",
+            aggregate.try_read_calls, aggregate.tls_read_calls
+        );
+        assert_eq!(total, payload);
+        assert!(
+            aggregate.try_read_calls < TLS_DRAIN_RECORDS as u64,
+            "buffered manual rustls should consume multiple TLS records per socket read"
+        );
     }
 
     #[test]

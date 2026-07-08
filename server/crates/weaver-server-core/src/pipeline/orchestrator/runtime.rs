@@ -1260,41 +1260,23 @@ fn buffer_pool_total_bytes(buffers: &Arc<BufferPool>) -> usize {
 }
 
 pub(crate) fn check_disk_space(output_dir: &std::path::Path, needed_bytes: u64) {
-    #[cfg(unix)]
-    {
-        let path_cstr = match std::ffi::CString::new(output_dir.to_str().unwrap_or(".").as_bytes())
-        {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-
-        unsafe {
-            let mut stat: libc::statvfs = std::mem::zeroed();
-            if libc::statvfs(path_cstr.as_ptr(), &mut stat) == 0 {
-                #[allow(clippy::unnecessary_cast)]
-                let available = stat.f_bavail as u64 * stat.f_frsize as u64;
-                if available < needed_bytes {
-                    let avail_mb = available / (1024 * 1024);
-                    let need_mb = needed_bytes / (1024 * 1024);
-                    warn!(
-                        available_mb = avail_mb,
-                        needed_mb = need_mb,
-                        "output directory may not have enough free disk space"
-                    );
-                } else {
-                    let avail_mb = available / (1024 * 1024);
-                    debug!(available_mb = avail_mb, "disk space check passed");
-                }
+    match crate::operations::disk_space(output_dir) {
+        Some(space) => {
+            let available = space.available_bytes;
+            if available < needed_bytes {
+                let avail_mb = available / (1024 * 1024);
+                let need_mb = needed_bytes / (1024 * 1024);
+                warn!(
+                    available_mb = avail_mb,
+                    needed_mb = need_mb,
+                    "output directory may not have enough free disk space"
+                );
             } else {
-                debug!("could not check free disk space (statvfs failed)");
+                let avail_mb = available / (1024 * 1024);
+                debug!(available_mb = avail_mb, "disk space check passed");
             }
         }
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = (output_dir, needed_bytes);
-        debug!("disk space check not available on this platform");
+        None => debug!("could not check free disk space"),
     }
 }
 

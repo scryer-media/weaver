@@ -35,7 +35,34 @@ fn thread_cpu_time() -> Option<Duration> {
     Some(Duration::new(seconds, nanos))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn thread_cpu_time() -> Option<Duration> {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+    const ZERO: windows_sys::Win32::Foundation::FILETIME =
+        windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+    let mut times = [ZERO; 4];
+    let [creation, exit, kernel, user] = &mut times;
+    // SAFETY: the pseudo-handle is always valid for the current thread and
+    // all four out-pointers reference live FILETIME slots.
+    let rc = unsafe { GetThreadTimes(GetCurrentThread(), creation, exit, kernel, user) };
+    if rc == 0 {
+        return None;
+    }
+    // FILETIME counts 100 ns ticks; kernel+user matches the unix
+    // CLOCK_THREAD_CPUTIME_ID semantics. Granularity is the scheduler tick
+    // (~15.6 ms), which is fine for the aggregated deltas reported here.
+    let ticks = |filetime: windows_sys::Win32::Foundation::FILETIME| {
+        ((filetime.dwHighDateTime as u64) << 32) | filetime.dwLowDateTime as u64
+    };
+    let total = ticks(times[2]).saturating_add(ticks(times[3]));
+    Some(Duration::from_nanos(total.saturating_mul(100)))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn thread_cpu_time() -> Option<Duration> {
     None
 }
@@ -1850,8 +1877,10 @@ mod tests {
             drain_calls += 1;
             total_socket_reads += socket_reads;
             total_tls_bytes += tls_bytes;
+            // A readiness wake can deliver only part of a TLS record; that
+            // consumes ciphertext without yielding plaintext yet.
             assert!(
-                output.len() > before,
+                output.len() > before || tls_bytes > 0,
                 "unbuffered probe made no progress while draining TLS payload"
             );
         }
