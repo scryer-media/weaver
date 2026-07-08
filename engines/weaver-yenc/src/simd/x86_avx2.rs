@@ -48,27 +48,75 @@ pub(super) unsafe fn decode_kernel_avx2(
         let mut carry_end = state.end;
 
         'span: while (!search_end || carry_end == DecodeEnd::None) && src + WIDTH <= simd_limit {
-            // Resolve any state the vector path can't carry directly (mid
-            // escape/CR straddles, a stuffed dot at a line start, a pending
-            // `=y`) with the scalar decoder, one step at a time.
-            let simple = matches!(carry_state, DecoderState::None | DecoderState::Eq);
-            let clean_line_start = carry_state == DecoderState::CrLf
-                && !(dot_unstuffing && input[src] == b'.')
-                && !(search_end && input[src] == b'=');
-            if !(simple || clean_line_start) {
-                state.state = carry_state;
-                state.end = carry_end;
-                let stepped = decode_scalar_step(input, &mut src, output, &mut dst, state, mode)?;
-                carry_state = state.state;
-                carry_end = state.end;
-                if !stepped {
-                    break 'span;
+            // 2-window ILP probe: mid-stream (`None`), decode two independent
+            // 64B windows per iteration so the scheduler packs their load+mask+
+            // add+store streams (tests whether cross-window unrolling helps this
+            // dispatch-width-bound loop, or whether the OOO engine already
+            // extracts that ILP). Byte-trivial: two clean windows = 128B of bulk
+            // `add(-42)`. Non-clean pairs fall through to the single-window path.
+            if carry_state == DecoderState::None && src + 2 * WIDTH <= simd_limit {
+                let a0 = _mm256_loadu_si256(input.as_ptr().add(src) as *const __m256i);
+                let b0 = _mm256_loadu_si256(input.as_ptr().add(src + 32) as *const __m256i);
+                let a1 = _mm256_loadu_si256(input.as_ptr().add(src + 64) as *const __m256i);
+                let b1 = _mm256_loadu_si256(input.as_ptr().add(src + 96) as *const __m256i);
+                if avx2_special_mask64(a0, b0) == 0 && avx2_special_mask64(a1, b1) == 0 {
+                    _mm256_storeu_si256(
+                        output.as_mut_ptr().add(dst) as *mut __m256i,
+                        _mm256_add_epi8(a0, sub42),
+                    );
+                    _mm256_storeu_si256(
+                        output.as_mut_ptr().add(dst + 32) as *mut __m256i,
+                        _mm256_add_epi8(b0, sub42),
+                    );
+                    _mm256_storeu_si256(
+                        output.as_mut_ptr().add(dst + 64) as *mut __m256i,
+                        _mm256_add_epi8(a1, sub42),
+                    );
+                    _mm256_storeu_si256(
+                        output.as_mut_ptr().add(dst + 96) as *mut __m256i,
+                        _mm256_add_epi8(b1, sub42),
+                    );
+                    src += 2 * WIDTH;
+                    dst += 2 * WIDTH;
+                    continue;
                 }
-                continue;
             }
 
-            let esc_first = (carry_state == DecoderState::Eq) as u64;
-            let at_line_start = (carry_state == DecoderState::CrLf) as u64;
+            // Fast dispatch on the dominant mid-stream state. `None` carries no
+            // escape and no line start, so there is nothing the vector path
+            // can't handle: skip the entire state machine (no `matches!`
+            // dispatch, no `input[src]` line-start probes, no esc/at-line flag
+            // materialization) and drop straight to load+mask. This mirrors
+            // rapidyenc, whose clean window is `mask==0 → store` with zero
+            // per-window scalar state handling; the enum dispatch below (with
+            // its one-step scalar bail for states the vector path can't carry —
+            // mid escape/CR straddles, a stuffed dot at a line start, a pending
+            // `=y`) runs only for the rare carried states.
+            let esc_first;
+            let at_line_start;
+            if carry_state == DecoderState::None {
+                esc_first = 0;
+                at_line_start = 0;
+            } else {
+                let simple = carry_state == DecoderState::Eq;
+                let clean_line_start = carry_state == DecoderState::CrLf
+                    && !(dot_unstuffing && input[src] == b'.')
+                    && !(search_end && input[src] == b'=');
+                if !(simple || clean_line_start) {
+                    state.state = carry_state;
+                    state.end = carry_end;
+                    let stepped =
+                        decode_scalar_step(input, &mut src, output, &mut dst, state, mode)?;
+                    carry_state = state.state;
+                    carry_end = state.end;
+                    if !stepped {
+                        break 'span;
+                    }
+                    continue;
+                }
+                esc_first = (carry_state == DecoderState::Eq) as u64;
+                at_line_start = (carry_state == DecoderState::CrLf) as u64;
+            }
 
             let a = _mm256_loadu_si256(input.as_ptr().add(src) as *const __m256i);
             let b = _mm256_loadu_si256(input.as_ptr().add(src + 32) as *const __m256i);

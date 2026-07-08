@@ -1,6 +1,8 @@
 // Minimal extern "C" shim over RapidYenc::decode for same-process A/B timing.
 // Compiled only when WEAVER_RAPIDYENC_SRC points at a rapidyenc checkout (see
 // build.rs); never part of normal builds.
+#include <cstddef>   // size_t — implicit under MSVC, required under g++/clang
+#include <cstdint>
 #include "src/decoder.h"
 
 extern "C" void weaver_rapidyenc_decode_init(void) {
