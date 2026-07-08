@@ -773,7 +773,7 @@ fn span_end_state(win: &[u8], fixed_eq: u64, dot_unstuffing: bool) -> DecoderSta
 /// (`\r\n.`) and end-marker (`=y`) cases fall back to the scalar decoder for
 /// that one window.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn decode_kernel_avx2(
     input: &[u8],
@@ -804,23 +804,36 @@ unsafe fn decode_kernel_avx2(
         let eq_needle = _mm256_set1_epi8(b'=' as i8);
         let table = compact_table_16();
 
-        'span: while (!search_end || state.end == DecodeEnd::None) && src + WIDTH <= simd_limit {
+        // Carry the decoder state in registers for the length of the span. The
+        // hot windows (bulk data, plain line breaks) only ever touch these
+        // locals; `state` is written back to memory just at the rare scalar
+        // bails below and once when the span loop exits, so the common path
+        // pays no `&mut KernelState` round-trip per 64 bytes.
+        let mut carry_state = state.state;
+        let mut carry_end = state.end;
+
+        'span: while (!search_end || carry_end == DecodeEnd::None) && src + WIDTH <= simd_limit {
             // Resolve any state the vector path can't carry directly (mid
             // escape/CR straddles, a stuffed dot at a line start, a pending
             // `=y`) with the scalar decoder, one step at a time.
-            let simple = matches!(state.state, DecoderState::None | DecoderState::Eq);
-            let clean_line_start = state.state == DecoderState::CrLf
+            let simple = matches!(carry_state, DecoderState::None | DecoderState::Eq);
+            let clean_line_start = carry_state == DecoderState::CrLf
                 && !(dot_unstuffing && input[src] == b'.')
                 && !(search_end && input[src] == b'=');
             if !(simple || clean_line_start) {
-                if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+                state.state = carry_state;
+                state.end = carry_end;
+                let stepped = decode_scalar_step(input, &mut src, output, &mut dst, state, mode)?;
+                carry_state = state.state;
+                carry_end = state.end;
+                if !stepped {
                     break 'span;
                 }
                 continue;
             }
 
-            let esc_first = (state.state == DecoderState::Eq) as u64;
-            let at_line_start = (state.state == DecoderState::CrLf) as u64;
+            let esc_first = (carry_state == DecoderState::Eq) as u64;
+            let at_line_start = (carry_state == DecoderState::CrLf) as u64;
 
             let a = _mm256_loadu_si256(input.as_ptr().add(src) as *const __m256i);
             let b = _mm256_loadu_si256(input.as_ptr().add(src + 32) as *const __m256i);
@@ -838,7 +851,7 @@ unsafe fn decode_kernel_avx2(
                 );
                 src += WIDTH;
                 dst += WIDTH;
-                state.state = DecoderState::None;
+                carry_state = DecoderState::None;
                 continue;
             }
 
@@ -846,7 +859,19 @@ unsafe fn decode_kernel_avx2(
             let eq_vb = _mm256_cmpeq_epi8(b, eq_needle);
             let eq = (_mm256_movemask_epi8(eq_va) as u32 as u64)
                 | ((_mm256_movemask_epi8(eq_vb) as u32 as u64) << 32);
-            let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+            // Isolated escapes (the common case) need neither `fix_eq_mask` nor
+            // a mask→vector reconstruction: the escape offsets fall straight out
+            // of the `=` compare vectors shifted one byte (see the decode
+            // selection below). Only genuine consecutive-`=` collisions
+            // (`eq & eq_shift1 != 0`, e.g. `==`, or a `=` right after the
+            // carried entry escape) need the bit correction + reverse-movemask.
+            let eq_shift1 = (eq << 1) | esc_first;
+            let collision = (eq & eq_shift1) != 0;
+            let fixed_eq = if collision {
+                fix_eq_mask(eq, eq_shift1)
+            } else {
+                eq
+            };
             let escaped = (fixed_eq << 1) | esc_first;
             // Real (unescaped) `\r`/`\n` break positions come straight out of
             // the specials mask; the char after each `=` is escaped data.
@@ -861,8 +886,19 @@ unsafe fn decode_kernel_avx2(
             // CRLF/line-start masks are computed only when the window actually
             // contains a `.`, keeping the common (bodydot-free) window cheap.
             let stuffed_dot = if dot_unstuffing {
-                let dots = avx2_mask64(a, b, b'.');
-                if dots != 0 {
+                let dot_needle = _mm256_set1_epi8(b'.' as i8);
+                let dcmp_a = _mm256_cmpeq_epi8(a, dot_needle);
+                let dcmp_b = _mm256_cmpeq_epi8(b, dot_needle);
+                let d_or = _mm256_or_si256(dcmp_a, dcmp_b);
+                // One `vptest` over the OR of the two `.` compares replaces two
+                // `vpmovmskb` on the dominant dot-free heavy window (crlf_only:
+                // every window; realshape: most). `testz == 0` means a `.` is
+                // present — only then materialize the bitmask and run the exact
+                // line-start path. Byte-exact: `dots` is the same movemask the
+                // old `avx2_mask64(a, b, '.')` produced.
+                if _mm256_testz_si256(d_or, d_or) == 0 {
+                    let dots = (_mm256_movemask_epi8(dcmp_a) as u32 as u64)
+                        | ((_mm256_movemask_epi8(dcmp_b) as u32 as u64) << 32);
                     let cr = avx2_mask64(a, b, b'\r');
                     let lf = specials & !eq & !cr;
                     let crlf = cr & (lf >> 1);
@@ -880,7 +916,12 @@ unsafe fn decode_kernel_avx2(
                 0
             };
             if stuffed_dot != 0 || eqy_any != 0 {
-                if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+                state.state = carry_state;
+                state.end = carry_end;
+                let stepped = decode_scalar_step(input, &mut src, output, &mut dst, state, mode)?;
+                carry_state = state.state;
+                carry_end = state.end;
+                if !stepped {
                     break 'span;
                 }
                 continue;
@@ -888,7 +929,12 @@ unsafe fn decode_kernel_avx2(
             // A `=` at a line start (`at_line_start` for byte 0) is a possible
             // control line — hand it to scalar as well.
             if search_end && at_line_start != 0 && eq & 1 != 0 {
-                if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+                state.state = carry_state;
+                state.end = carry_end;
+                let stepped = decode_scalar_step(input, &mut src, output, &mut dst, state, mode)?;
+                carry_state = state.state;
+                carry_end = state.end;
+                if !stepped {
                     break 'span;
                 }
                 continue;
@@ -897,8 +943,40 @@ unsafe fn decode_kernel_avx2(
             let skip = fixed_eq | breaks;
             let (decoded_a, decoded_b) = if escaped == 0 {
                 (_mm256_add_epi8(a, sub42), _mm256_add_epi8(b, sub42))
-            } else {
+            } else if collision {
+                // Rare: a consecutive-`=` run — resolve from the corrected mask.
                 avx2_decode_with_escape_mask(a, b, escaped)
+            } else {
+                // Common (isolated escapes): unescape straight from the `=`
+                // compare, shifted one byte. Lane A shifts `eq_va` via
+                // `vinserti128` (Zen2 lat1/tput0.5) instead of a lane-crossing
+                // `vperm2i128` (lat3/tput1); the fill lane is `eq_needle` (0x3D,
+                // high bit 0) so byte 0 reads not-escaped, and the carried entry
+                // escape is applied via `first_off`. Lane B recomputes the `=`
+                // compare on the byte-shifted window load (bytes [31..63),
+                // in-bounds) — avoiding a second lane-crossing shuffle entirely.
+                // Mirrors rapidyenc decoder_avx2_base.h:511-531.
+                let sel_a = _mm256_alignr_epi8::<15>(
+                    eq_va,
+                    _mm256_inserti128_si256(eq_needle, _mm256_castsi256_si128(eq_va), 1),
+                );
+                let sel_b = _mm256_cmpeq_epi8(
+                    _mm256_loadu_si256(input.as_ptr().add(src + 31) as *const __m256i),
+                    eq_needle,
+                );
+                let first_off = _mm256_xor_si256(
+                    sub42,
+                    _mm256_inserti128_si256(
+                        _mm256_setzero_si256(),
+                        _mm_cvtsi32_si128(((esc_first & 1) as i32) << 6),
+                        0,
+                    ),
+                );
+                let esc_off = _mm256_set1_epi8(-106);
+                (
+                    _mm256_add_epi8(a, _mm256_blendv_epi8(first_off, esc_off, sel_a)),
+                    _mm256_add_epi8(b, _mm256_blendv_epi8(sub42, esc_off, sel_b)),
+                )
             };
 
             if skip == 0 {
@@ -957,8 +1035,13 @@ unsafe fn decode_kernel_avx2(
 
             src += WIDTH;
             let win = &input[src - WIDTH..src];
-            state.state = span_end_state(win, fixed_eq, dot_unstuffing);
+            carry_state = span_end_state(win, fixed_eq, dot_unstuffing);
         }
+
+        // Publish the register-carried state back to `state` for the scalar
+        // tail and the returned outcome.
+        state.state = carry_state;
+        state.end = carry_end;
     }
 
     while (!search_end || state.end == DecodeEnd::None) && src < input.len() {
@@ -1482,7 +1565,7 @@ unsafe fn try_decode_avx_block(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
 unsafe fn try_decode_avx2_block(
@@ -1593,7 +1676,7 @@ unsafe fn try_decode_avx2_block(
     } else if esc_first == 0 && eq & (eq << 1) == 0 {
         // No adjacent '=' and no carried-in escape: the offset select stays
         // in the vector domain (NEON's vext shortcut, AVX2 spelling).
-        unsafe { avx2_decode_with_shifted_eq(a, b, eq_va, eq_vb) }
+        unsafe { avx2_decode_with_shifted_eq(a, b, eq_va, eq_vb, 0) }
     } else {
         unsafe { avx2_decode_with_escape_mask(a, b, escaped) }
     };
@@ -1886,7 +1969,7 @@ unsafe fn ssse3_special_mask64(vectors: [std::arch::x86_64::__m128i; 4]) -> u64 
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[inline]
 unsafe fn avx2_special_mask64(a: std::arch::x86_64::__m256i, b: std::arch::x86_64::__m256i) -> u64 {
     use std::arch::x86_64::*;
@@ -1952,7 +2035,7 @@ unsafe fn sse2_mask64(vectors: [std::arch::x86_64::__m128i; 4], byte: u8) -> u64
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[inline]
 unsafe fn avx2_mask64(
     a: std::arch::x86_64::__m256i,
@@ -2007,18 +2090,19 @@ unsafe fn sse41_decode_with_escape_mask(
 
 /// Escape-offset application without leaving the vector domain: the escaped
 /// lanes are exactly the '=' compare vectors shifted one byte toward higher
-/// lanes ('a' top byte carries into 'b'). Callers must route windows with
-/// adjacent '=' runs or a carried-in escape (bit 0) to
-/// [`avx2_decode_with_escape_mask`] instead — the shift does not resolve
-/// chains and shifts a zero into byte 0.
+/// lanes ('a' top byte carries into 'b'), plus the carried entry escape
+/// (`esc_first`) landing on byte 0. Callers must route windows with adjacent
+/// '=' runs to [`avx2_decode_with_escape_mask`] instead — the shift does not
+/// resolve consecutive-`=` chains.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[inline]
 unsafe fn avx2_decode_with_shifted_eq(
     a: std::arch::x86_64::__m256i,
     b: std::arch::x86_64::__m256i,
     eq_va: std::arch::x86_64::__m256i,
     eq_vb: std::arch::x86_64::__m256i,
+    esc_first: u64,
 ) -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m256i) {
     use std::arch::x86_64::*;
 
@@ -2029,16 +2113,27 @@ unsafe fn avx2_decode_with_shifted_eq(
     let carry_b = _mm256_permute2x128_si256::<0x21>(eq_va, eq_vb);
     let sel_b = _mm256_alignr_epi8::<15>(eq_vb, carry_b);
 
-    let normal = _mm256_set1_epi8(-42);
+    // The base (unescaped) offset is -42 everywhere, except byte 0 of lane A
+    // becomes -106 (= -42 - 64) when the previous window left a pending escape.
+    // -42 ^ 0x40 = -106, so drop 0x40 into byte 0 only (zero-extended so the
+    // upper lane stays -42). Byte 0's select bit is always zero, so blendv
+    // takes this base for it.
+    let byte0 = _mm256_inserti128_si256(
+        _mm256_setzero_si256(),
+        _mm_cvtsi32_si128(((esc_first & 1) as i32) << 6),
+        0,
+    );
+    let normal_a = _mm256_xor_si256(_mm256_set1_epi8(-42), byte0);
+    let normal_b = _mm256_set1_epi8(-42);
     let escaped_offset = _mm256_set1_epi8(-106);
     (
-        _mm256_add_epi8(a, _mm256_blendv_epi8(normal, escaped_offset, sel_a)),
-        _mm256_add_epi8(b, _mm256_blendv_epi8(normal, escaped_offset, sel_b)),
+        _mm256_add_epi8(a, _mm256_blendv_epi8(normal_a, escaped_offset, sel_a)),
+        _mm256_add_epi8(b, _mm256_blendv_epi8(normal_b, escaped_offset, sel_b)),
     )
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 // AVX2 escaped-byte offset path (mask expanded to a vector select).
 unsafe fn avx2_decode_with_escape_mask(
     a: std::arch::x86_64::__m256i,
@@ -2318,7 +2413,7 @@ unsafe fn decode_kernel_simd64(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 unsafe fn decode_kernel_simd64_avx2_line_aware(
     input: &[u8],
     output: &mut [u8],
@@ -2437,7 +2532,7 @@ unsafe fn decode_kernel_simd64_avx2_line_aware(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn try_decode_avx2_line(
     input: &[u8],
@@ -2532,7 +2627,7 @@ unsafe fn try_decode_avx2_line(
         let (decoded_a, decoded_b) = if escaped == 0 {
             (_mm256_add_epi8(a, sub42), _mm256_add_epi8(b, sub42))
         } else if esc_first == 0 && eq & (eq << 1) == 0 {
-            unsafe { avx2_decode_with_shifted_eq(a, b, eq_va, eq_vb) }
+            unsafe { avx2_decode_with_shifted_eq(a, b, eq_va, eq_vb, 0) }
         } else {
             unsafe { avx2_decode_with_escape_mask(a, b, escaped) }
         };
@@ -3969,7 +4064,7 @@ unsafe fn compact_store_16_ssse3(
 /// popcnt prefix-sum over the group masks) so the four per-window stores have
 /// no serial dependency on each other.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[inline]
 unsafe fn compact_store_16_avx2_at(
     decoded: std::arch::x86_64::__m256i,
@@ -4327,7 +4422,7 @@ unsafe fn decode_normal_run_avx(
 
 /// AVX2 implementation: process 32 bytes at a time.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 unsafe fn decode_normal_run_avx2(
     input: &[u8],
     start: usize,
