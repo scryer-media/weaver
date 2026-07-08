@@ -1096,7 +1096,10 @@ fn sse2_unshuf_table() -> &'static [[u8; 16]; 16] {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn sse_compact_vect(mask16: u32, mut data: std::arch::x86_64::__m128i) -> std::arch::x86_64::__m128i {
+unsafe fn sse_compact_vect(
+    mask16: u32,
+    mut data: std::arch::x86_64::__m128i,
+) -> std::arch::x86_64::__m128i {
     use std::arch::x86_64::*;
 
     let table = sse2_unshuf_table();
@@ -1259,8 +1262,8 @@ unsafe fn sse_raw_body<const FAST_MATCH: bool, const BLEND_ADD: bool>(
                 _mm_setzero_si128()
             };
 
-            let mut mask: u32 = (_mm_movemask_epi8(cmp_a) as u32)
-                | ((_mm_movemask_epi8(cmp_b) as u32) << 16);
+            let mut mask: u32 =
+                (_mm_movemask_epi8(cmp_a) as u32) | ((_mm_movemask_epi8(cmp_b) as u32) << 16);
 
             if mask != 0 {
                 if FAST_MATCH {
@@ -1272,10 +1275,8 @@ unsafe fn sse_raw_body<const FAST_MATCH: bool, const BLEND_ADD: bool>(
 
                 // --- \r\n. dot-unstuffing (isRaw) --------------------------
                 if mask != mask_eq {
-                    let tmp2a =
-                        _mm_loadu_si128(input.as_ptr().add(src + 2) as *const __m128i);
-                    let tmp2b =
-                        _mm_loadu_si128(input.as_ptr().add(src + 18) as *const __m128i);
+                    let tmp2a = _mm_loadu_si128(input.as_ptr().add(src + 2) as *const __m128i);
+                    let tmp2b = _mm_loadu_si128(input.as_ptr().add(src + 18) as *const __m128i);
                     if FAST_MATCH {
                         cmp_cr_a = _mm_cmpeq_epi8(o_data_a, cr);
                         cmp_cr_b = _mm_cmpeq_epi8(o_data_b, cr);
@@ -1405,10 +1406,7 @@ unsafe fn sse_raw_body<const FAST_MATCH: bool, const BLEND_ADD: bool>(
                 }
                 let data_b = _mm_add_epi8(o_data_b, sub42);
                 _mm_storeu_si128(output.as_mut_ptr().add(dst) as *mut __m128i, data_a);
-                _mm_storeu_si128(
-                    output.as_mut_ptr().add(dst + 16) as *mut __m128i,
-                    data_b,
-                );
+                _mm_storeu_si128(output.as_mut_ptr().add(dst + 16) as *mut __m128i, data_b);
                 dst += WIDTH;
                 esc_first = 0;
                 yenc_offset = sub42;
