@@ -119,6 +119,61 @@ fn real_yenc_128col_body() -> Vec<u8> {
     body
 }
 
+const DECODED_TARGET: usize = 768_000;
+
+/// M-phase fixture: no specials at all. One giant line of `'@'` (0x40, which is
+/// not `= \r \n` and decodes to 0x16); no CRLF, no escapes, no dots. Isolates
+/// pure fast-path + driver overhead — weaver and rapidyenc should be at parity
+/// here; if not, the cost is the loop structure, not the mask/branch handling.
+fn clean_body() -> Vec<u8> {
+    vec![0x40u8; DECODED_TARGET]
+}
+
+/// M-phase fixture: 128-column lines of `'@'` terminated by CRLF, no escapes
+/// and no dots. Isolates the CRLF (`specials != eq`) heavy branch — the prime
+/// suspect, since it fires on roughly every other 64-byte chunk.
+fn crlf_only_body() -> Vec<u8> {
+    let mut body = Vec::with_capacity(DECODED_TARGET + DECODED_TARGET / 64 + 64);
+    let mut produced = 0usize;
+    while produced < DECODED_TARGET {
+        let line = 128.min(DECODED_TARGET - produced);
+        body.extend(std::iter::repeat_n(0x40u8, line));
+        body.extend_from_slice(b"\r\n");
+        produced += line;
+    }
+    body
+}
+
+/// M-phase fixture: `'@'` body with ~0.4% `=@` escapes (each decodes to one
+/// byte), no CRLF, no dots. Isolates escape handling + the 32K-entry LUT
+/// compaction path — both engines use the same LUT, so expect near-parity.
+fn esc_only_body() -> Vec<u8> {
+    let mut body = Vec::with_capacity(DECODED_TARGET + DECODED_TARGET / 64);
+    for idx in 0..DECODED_TARGET {
+        if idx % 256 == 128 {
+            body.push(b'=');
+            body.push(0x40); // '=@' -> one decoded byte (0xD6)
+        } else {
+            body.push(0x40);
+        }
+    }
+    body
+}
+
+/// M-phase fixture: `'@'` body with ~0.4% literal `.` bytes, no CRLF. Body dots
+/// (never at line start here) are data, not stuffing. The specials mask flags
+/// only `= \r \n`, so this should stay on the fast path — if weaver lags,
+/// there is a hidden dot cost to find.
+fn dots_body() -> Vec<u8> {
+    let mut body = vec![0x40u8; DECODED_TARGET];
+    let mut idx = 128usize;
+    while idx < DECODED_TARGET {
+        body[idx] = b'.';
+        idx += 256;
+    }
+    body
+}
+
 fn benches(c: &mut Criterion) {
     let Some(rapidyenc) = Rapidyenc::load() else {
         eprintln!(
@@ -132,44 +187,50 @@ fn benches(c: &mut Criterion) {
         rapidyenc.decode_kernel, rapidyenc.crc_kernel
     );
 
-    let input = real_yenc_128col_body();
-    let mut weaver_out = vec![0u8; input.len() + 64];
-    let mut rapid_out = vec![0u8; input.len() + 64];
+    let fixtures: [(&str, Vec<u8>); 5] = [
+        ("realshape", real_yenc_128col_body()),
+        ("clean", clean_body()),
+        ("crlf_only", crlf_only_body()),
+        ("esc_only", esc_only_body()),
+        ("dots_body", dots_body()),
+    ];
 
-    // Parity gate: identical decoded bytes and identical CRC over them.
-    let weaver_written = decode_rapidyenc(&input, &mut weaver_out).unwrap();
-    let rapid_written = rapidyenc.decode(&input, &mut rapid_out);
-    assert_eq!(weaver_written, rapid_written, "decoded length parity");
-    assert_eq!(
-        &weaver_out[..weaver_written],
-        &rapid_out[..rapid_written],
-        "decoded byte parity"
-    );
-    let mut hasher = Crc32::new();
-    hasher.update(&weaver_out[..weaver_written]);
-    let weaver_crc = hasher.finalize();
-    let rapid_crc = rapidyenc.crc(&rapid_out[..rapid_written]);
-    assert_eq!(weaver_crc, rapid_crc, "crc parity");
-    eprintln!(
-        "parity ok: {} encoded -> {} decoded, crc {weaver_crc:08x}",
-        input.len(),
-        weaver_written
-    );
+    for (name, input) in &fixtures {
+        let mut weaver_out = vec![0u8; input.len() + 64];
+        let mut rapid_out = vec![0u8; input.len() + 64];
 
-    c.bench_function("parity_weaver_decode_realshape", |b| {
-        b.iter(|| {
-            let written = decode_rapidyenc(black_box(&input), &mut weaver_out).unwrap();
-            black_box(written);
+        // Per-fixture parity gate: identical decoded bytes between the engines.
+        let weaver_written = decode_rapidyenc(input, &mut weaver_out).unwrap();
+        let rapid_written = rapidyenc.decode(input, &mut rapid_out);
+        assert_eq!(weaver_written, rapid_written, "{name} decoded length parity");
+        assert_eq!(
+            &weaver_out[..weaver_written],
+            &rapid_out[..rapid_written],
+            "{name} decoded byte parity"
+        );
+        eprintln!(
+            "parity ok [{name}]: {} encoded -> {} decoded",
+            input.len(),
+            weaver_written
+        );
+
+        c.bench_function(&format!("parity_weaver_decode_{name}"), |b| {
+            b.iter(|| {
+                black_box(decode_rapidyenc(black_box(input), &mut weaver_out).unwrap());
+            });
         });
-    });
-    c.bench_function("parity_rapidyenc_decode_realshape", |b| {
-        b.iter(|| {
-            let written = rapidyenc.decode(black_box(&input), &mut rapid_out);
-            black_box(written);
+        c.bench_function(&format!("parity_rapidyenc_decode_{name}"), |b| {
+            b.iter(|| {
+                black_box(rapidyenc.decode(black_box(input), &mut rapid_out));
+            });
         });
-    });
+    }
 
-    let decoded = &weaver_out[..weaver_written];
+    // CRC parity over the realshape decoded bytes (unchanged).
+    let realshape = &fixtures[0].1;
+    let mut weaver_out = vec![0u8; realshape.len() + 64];
+    let written = decode_rapidyenc(realshape, &mut weaver_out).unwrap();
+    let decoded = &weaver_out[..written];
     c.bench_function("parity_crc32fast_decoded", |b| {
         b.iter(|| {
             let mut hasher = Crc32::new();

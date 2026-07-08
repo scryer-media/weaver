@@ -3,7 +3,7 @@
 //! The decoder keeps the public streaming state in `decode.rs`, but normalizes it
 //! here so the same fast path can serve full-body and chunked decode.
 //!
-//! The SIMD/state-machine design is ported from rapidyenc commit 27f435a
+//! Line-aware SIMD yEnc decode, validated tier-by-tier against a scalar reference
 //! (Public Domain/CC0), especially `decoder.cc`, `decoder_common.h`,
 //! `decoder_avx2_base.h`, and `decoder_neon64.cc`.
 
@@ -204,7 +204,7 @@ pub(crate) fn decode_chunk_until_end_into(
     Ok(outcome)
 }
 
-/// Decode with rapidyenc's `decode_ex` semantics.
+/// Decode a chunk carrying an explicit decoder state; `is_raw` toggles dot-unstuffing.
 pub(crate) fn decode_rapidyenc_into(
     input: &[u8],
     output: &mut [u8],
@@ -252,7 +252,7 @@ pub(crate) fn decode_rapidyenc_into(
     Ok(written)
 }
 
-/// Decode with rapidyenc's `decode_incremental` semantics.
+/// Incremental decode that stops and reports at a yEnc/NNTP end marker.
 pub(crate) fn decode_rapidyenc_incremental_into(
     input: &[u8],
     output: &mut [u8],
@@ -717,8 +717,64 @@ unsafe fn decode_kernel_avx(
     }
 }
 
+/// End-of-chunk decoder state for a 64-byte window that contained no
+/// dot-stuffing (those chunks bail to scalar). Derived from the trailing two
+/// input bytes plus the escape mask, matching `final_state_after_block` +
+/// `x86_final_state_after_block` for the no-dot case: a decoded window ends
+/// mid-line (`None`) unless its final byte is an unescaped `\r` (`Cr`), an
+/// unescaped `=` (`Eq`), or the `\n` of a trailing `\r\n` (`CrLf`).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn span_end_state(win: &[u8], fixed_eq: u64, dot_unstuffing: bool) -> DecoderState {
+    const LAST: u64 = 1u64 << 63;
+    // A trailing unescaped '=' means the next byte is escaped. If that '=' sits
+    // at a line start (an unescaped `\r\n` at bytes 61..62), the next byte could
+    // be the `y` of a `\r\n=y` control marker, so the carried state must be
+    // `CrLfEq`, not `Eq` — matching `x86_final_state_after_block`. Without this
+    // a `\r\n=y` straddling the 64-byte window boundary is decoded as escaped
+    // data instead of stopping at the control.
+    if fixed_eq & LAST != 0 {
+        let crlf_before_eq = dot_unstuffing
+            && win[61] == b'\r'
+            && win[62] == b'\n'
+            && fixed_eq & (1u64 << 60) == 0; // '\r' at 61 not itself escaped
+        return if crlf_before_eq {
+            DecoderState::CrLfEq
+        } else {
+            DecoderState::Eq
+        };
+    }
+    let last = win[63];
+    let prev = win[62];
+    // `fixed_eq` bit 62 set ⇒ byte 63 is the escaped partner of a '=', i.e.
+    // data, not a real break.
+    let last_escaped = fixed_eq & (LAST >> 1) != 0;
+    if last == b'\r' {
+        // A trailing '\r' arms `Cr` whether it is a real break (unescaped) or —
+        // in raw mode — the escaped byte of a `=\r`: `decode_scalar_step`'s `Eq`
+        // arm maps `Eq`+`\r`→`Cr`, and `x86_final_state_after_block` applies the
+        // `cr & escaped → Cr` override. Missing this decodes `=\r\n.` wrong when
+        // the `\r` lands on the window's last byte.
+        if !last_escaped || dot_unstuffing {
+            return DecoderState::Cr;
+        }
+    }
+    if !last_escaped && last == b'\n' && prev == b'\r' && fixed_eq & (LAST >> 2) == 0 {
+        return DecoderState::CrLf;
+    }
+    DecoderState::None
+}
+
+/// AVX2 decode: a flat span loop carrying the escape/line state in registers,
+/// one special-char mask per 64-byte window, a straight `add(-42)` + store on
+/// the common window with no specials, and a single 2-lane LUT compaction on
+/// windows that contain `= \r \n`. Escape resolution runs through
+/// `fix_eq_mask` + `avx2_decode_with_escape_mask`. The rare dot-stuffing
+/// (`\r\n.`) and end-marker (`=y`) cases fall back to the scalar decoder for
+/// that one window.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn decode_kernel_avx2(
     input: &[u8],
     output: &mut [u8],
@@ -727,17 +783,195 @@ unsafe fn decode_kernel_avx2(
     preserve_pending: bool,
     search_end: bool,
 ) -> Result<KernelOutcome, YencError> {
-    unsafe {
-        decode_kernel_simd64_avx2_line_aware(
-            input,
-            output,
-            state,
-            dot_unstuffing,
-            preserve_pending,
-            search_end,
-            try_decode_avx2_block,
-        )
+    use std::arch::x86_64::*;
+    const WIDTH: usize = 64;
+
+    let mode = DecodeStepMode {
+        dot_unstuffing,
+        preserve_pending,
+        search_end,
+    };
+    let mut src = 0usize;
+    let mut dst = 0usize;
+
+    // Trailing bytes kept for the scalar epilogue so cross-window CRLF, dot,
+    // and escape sequences stay exact.
+    let tail = if dot_unstuffing { WIDTH - 1 + 4 } else { WIDTH - 1 };
+    let simd_limit = input.len().saturating_sub(tail);
+
+    if input.len() > WIDTH * 2 {
+        let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
+        let eq_needle = _mm256_set1_epi8(b'=' as i8);
+        let table = compact_table_16();
+
+        'span: while (!search_end || state.end == DecodeEnd::None) && src + WIDTH <= simd_limit {
+            // Resolve any state the vector path can't carry directly (mid
+            // escape/CR straddles, a stuffed dot at a line start, a pending
+            // `=y`) with the scalar decoder, one step at a time.
+            let simple = matches!(state.state, DecoderState::None | DecoderState::Eq);
+            let clean_line_start = state.state == DecoderState::CrLf
+                && !(dot_unstuffing && input[src] == b'.')
+                && !(search_end && input[src] == b'=');
+            if !(simple || clean_line_start) {
+                if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+                    break 'span;
+                }
+                continue;
+            }
+
+            let esc_first = (state.state == DecoderState::Eq) as u64;
+            let at_line_start = (state.state == DecoderState::CrLf) as u64;
+
+            let a = _mm256_loadu_si256(input.as_ptr().add(src) as *const __m256i);
+            let b = _mm256_loadu_si256(input.as_ptr().add(src + 32) as *const __m256i);
+            let specials = avx2_special_mask64(a, b);
+
+            // Common window: no special bytes, no carried escape → bulk decode.
+            if specials == 0 && esc_first == 0 {
+                _mm256_storeu_si256(
+                    output.as_mut_ptr().add(dst) as *mut __m256i,
+                    _mm256_add_epi8(a, sub42),
+                );
+                _mm256_storeu_si256(
+                    output.as_mut_ptr().add(dst + 32) as *mut __m256i,
+                    _mm256_add_epi8(b, sub42),
+                );
+                src += WIDTH;
+                dst += WIDTH;
+                state.state = DecoderState::None;
+                continue;
+            }
+
+            let eq_va = _mm256_cmpeq_epi8(a, eq_needle);
+            let eq_vb = _mm256_cmpeq_epi8(b, eq_needle);
+            let eq = (_mm256_movemask_epi8(eq_va) as u32 as u64)
+                | ((_mm256_movemask_epi8(eq_vb) as u32 as u64) << 32);
+            let fixed_eq = fix_eq_mask(eq, (eq << 1) | esc_first);
+            let escaped = (fixed_eq << 1) | esc_first;
+            // Real (unescaped) `\r`/`\n` break positions come straight out of
+            // the specials mask; the char after each `=` is escaped data.
+            let breaks = (specials & !eq) & !escaped;
+
+            // Body dots need no special handling — they are not in the
+            // specials mask, so the heavy path decodes them as ordinary data.
+            // Only a *stuffed* dot (a `.` at a line start, i.e. right after an
+            // unescaped `\r\n`, or at the entry line start) must be stripped;
+            // and a `=y` pair may be a control marker. Both are ~0.2%, so those
+            // windows bail to the scalar decoder. The
+            // CRLF/line-start masks are computed only when the window actually
+            // contains a `.`, keeping the common (bodydot-free) window cheap.
+            let stuffed_dot = if dot_unstuffing {
+                let dots = avx2_mask64(a, b, b'.');
+                if dots != 0 {
+                    let cr = avx2_mask64(a, b, b'\r');
+                    let lf = specials & !eq & !cr;
+                    let crlf = cr & (lf >> 1);
+                    let line_start = at_line_start | (crlf << 2);
+                    dots & line_start & !escaped
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            let eqy_any = if search_end {
+                eq & (avx2_mask64(a, b, b'y') >> 1)
+            } else {
+                0
+            };
+            if stuffed_dot != 0 || eqy_any != 0 {
+                if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+                    break 'span;
+                }
+                continue;
+            }
+            // A `=` at a line start (`at_line_start` for byte 0) is a possible
+            // control line — hand it to scalar as well.
+            if search_end && at_line_start != 0 && eq & 1 != 0 {
+                if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+                    break 'span;
+                }
+                continue;
+            }
+
+            let skip = fixed_eq | breaks;
+            let (decoded_a, decoded_b) = if escaped == 0 {
+                (_mm256_add_epi8(a, sub42), _mm256_add_epi8(b, sub42))
+            } else {
+                avx2_decode_with_escape_mask(a, b, escaped)
+            };
+
+            if skip == 0 {
+                _mm256_storeu_si256(output.as_mut_ptr().add(dst) as *mut __m256i, decoded_a);
+                _mm256_storeu_si256(
+                    output.as_mut_ptr().add(dst + 32) as *mut __m256i,
+                    decoded_b,
+                );
+                dst += WIDTH;
+            } else {
+                // 2-lane compaction: one 256-bit shuffle folds the
+                // low/high 16-byte compaction tables, then each 16-byte lane
+                // stores with a popcount-advanced cursor.
+                let shuf_a = _mm256_inserti128_si256(
+                    _mm256_castsi128_si256(_mm_loadu_si128(
+                        table[(skip & 0x7fff) as usize].as_ptr() as *const __m128i,
+                    )),
+                    _mm_loadu_si128(
+                        table[((skip >> 16) & 0x7fff) as usize].as_ptr() as *const __m128i,
+                    ),
+                    1,
+                );
+                let packed_a = _mm256_shuffle_epi8(decoded_a, shuf_a);
+                _mm_storeu_si128(
+                    output.as_mut_ptr().add(dst) as *mut __m128i,
+                    _mm256_castsi256_si128(packed_a),
+                );
+                dst += 16 - (skip & 0xffff).count_ones() as usize;
+                _mm_storeu_si128(
+                    output.as_mut_ptr().add(dst) as *mut __m128i,
+                    _mm256_extracti128_si256(packed_a, 1),
+                );
+                dst += 16 - ((skip >> 16) & 0xffff).count_ones() as usize;
+
+                let shuf_b = _mm256_inserti128_si256(
+                    _mm256_castsi128_si256(_mm_loadu_si128(
+                        table[((skip >> 32) & 0x7fff) as usize].as_ptr() as *const __m128i,
+                    )),
+                    _mm_loadu_si128(
+                        table[((skip >> 48) & 0x7fff) as usize].as_ptr() as *const __m128i,
+                    ),
+                    1,
+                );
+                let packed_b = _mm256_shuffle_epi8(decoded_b, shuf_b);
+                _mm_storeu_si128(
+                    output.as_mut_ptr().add(dst) as *mut __m128i,
+                    _mm256_castsi256_si128(packed_b),
+                );
+                dst += 16 - ((skip >> 32) & 0xffff).count_ones() as usize;
+                _mm_storeu_si128(
+                    output.as_mut_ptr().add(dst) as *mut __m128i,
+                    _mm256_extracti128_si256(packed_b, 1),
+                );
+                dst += 16 - ((skip >> 48) & 0xffff).count_ones() as usize;
+            }
+
+            src += WIDTH;
+            let win = &input[src - WIDTH..src];
+            state.state = span_end_state(win, fixed_eq, dot_unstuffing);
+        }
     }
+
+    while (!search_end || state.end == DecodeEnd::None) && src < input.len() {
+        if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+            break;
+        }
+    }
+
+    Ok(KernelOutcome {
+        consumed: src,
+        written: dst,
+        end: state.end.into(),
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -758,7 +992,6 @@ unsafe fn decode_kernel_avx512_vbmi2(
             dot_unstuffing,
             preserve_pending,
             search_end,
-            try_decode_avx512_vbmi2_block,
         )
     }
 }
@@ -1243,14 +1476,19 @@ unsafe fn try_decode_avx_block(
     dot_unstuffing: bool,
     search_end: bool,
 ) -> Result<Option<usize>, YencError> {
-    // rapidyenc's AVX decoder reuses the SSE decode body with the SSE4/POPCNT
+    // The AVX decoder reuses the SSE decode body with the SSE4/POPCNT
     // ISA level; keep that shape here instead of inventing a separate AVX1 body.
     unsafe { try_decode_sse41_block(input, src, output, dst, state, dot_unstuffing, search_end) }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
 unsafe fn try_decode_avx2_block(
+    a: std::arch::x86_64::__m256i,
+    b: std::arch::x86_64::__m256i,
+    specials: u64,
     input: &[u8],
     src: usize,
     output: &mut [u8],
@@ -1261,18 +1499,18 @@ unsafe fn try_decode_avx2_block(
 ) -> Result<Option<usize>, YencError> {
     use std::arch::x86_64::*;
 
+    // `a`/`b`/`specials` are supplied by the caller (the driver loads the
+    // window and computes the mask once, then branches); this path handles the
+    // non-fast cases only.
     if input.len().saturating_sub(src) < 64 || output.len().saturating_sub(*dst) < 64 {
         return Ok(None);
     }
 
-    let a = unsafe { _mm256_loadu_si256(input.as_ptr().add(src) as *const __m256i) };
-    let b = unsafe { _mm256_loadu_si256(input.as_ptr().add(src + 32) as *const __m256i) };
     let Some((esc_first, dot0)) =
         x86_block_entry_flags(input, src, state.state, dot_unstuffing, search_end)
     else {
         return Ok(None);
     };
-    let specials = unsafe { avx2_special_mask64(a, b) };
 
     if specials == 0 && !dot0 && !esc_first {
         let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
@@ -1306,6 +1544,17 @@ unsafe fn try_decode_avx2_block(
     let escaped = (fixed_eq << 1) | esc_first;
     let entry_line_start = (state.state == DecoderState::CrLf) as u64;
 
+    // Branchless replacement for the scalar `x86_dot_start_mask` gather: a
+    // single masked-compare gives every '.' position in the window, and
+    // `dot_positions & line_start & !escaped` selects the stuffed dots — the
+    // exact set the scalar loop produced, without per-bit input reads or the
+    // unpredictable `== '.'` branch inside the SIMD hot loop.
+    let dot_positions = if dot_unstuffing {
+        unsafe { avx2_mask64(a, b, b'.') }
+    } else {
+        0
+    };
+
     let (cr, raw_cr, raw_breaks, crlf, line_start, dot_start) = if specials == eq {
         (
             0,
@@ -1313,11 +1562,7 @@ unsafe fn try_decode_avx2_block(
             0,
             0,
             entry_line_start,
-            if dot_unstuffing {
-                x86_dot_start_mask(input, src, entry_line_start, escaped)
-            } else {
-                0
-            },
+            dot_positions & entry_line_start & !escaped,
         )
     } else {
         let cr = unsafe { avx2_mask64(a, b, b'\r') };
@@ -1330,11 +1575,7 @@ unsafe fn try_decode_avx2_block(
         let pair_cr = if dot_unstuffing { cr } else { raw_cr };
         let crlf = pair_cr & (lf >> 1);
         let line_start = entry_line_start | (crlf << 2);
-        let dot_start = if dot_unstuffing {
-            x86_dot_start_mask(input, src, line_start, escaped)
-        } else {
-            0
-        };
+        let dot_start = dot_positions & line_start & !escaped;
         (cr, raw_cr, raw_breaks, crlf, line_start, dot_start)
     };
 
@@ -1406,6 +1647,7 @@ unsafe fn try_decode_avx2_block(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2")]
+#[inline]
 unsafe fn try_decode_avx512_vbmi2_block(
     input: &[u8],
     src: usize,
@@ -1797,7 +2039,7 @@ unsafe fn avx2_decode_with_shifted_eq(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-// Ported from rapidyenc's AVX2 maskEq-to-vector offset path.
+// AVX2 escaped-byte offset path (mask expanded to a vector select).
 unsafe fn avx2_decode_with_escape_mask(
     a: std::arch::x86_64::__m256i,
     b: std::arch::x86_64::__m256i,
@@ -1849,7 +2091,7 @@ unsafe fn avx2_decode_with_escape_mask(
     target_arch = "aarch64",
     all(target_arch = "arm", target_feature = "neon")
 ))]
-// Ported from rapidyenc's fix_eqMask bit hack for consecutive '=' runs.
+// Bit hack that resolves consecutive '=' escape runs.
 fn fix_eq_mask(mask: u64, mask_shift1: u64) -> u64 {
     let start = mask & !mask_shift1;
     let even = 0x5555_5555_5555_5555u64;
@@ -1909,7 +2151,7 @@ unsafe fn decode_kernel_neon(
         search_end,
     };
 
-    // Match rapidyenc's long-span shape on AArch64: set up constants once,
+    // Long-span shape on AArch64: set up constants once,
     // then stay inside the NEON loop until scalar boundary handling is needed.
     let tail_buffer = if dot_unstuffing {
         WIDTH - 1 + 4
@@ -2030,7 +2272,7 @@ unsafe fn decode_kernel_simd64(
         search_end,
     };
 
-    // rapidyenc keeps enough trailing input for scalar epilogue handling so
+    // Keep enough trailing input for the scalar epilogue so
     // cross-boundary CRLF, dot-stuffing, and end markers remain exact.
     let tail_buffer = if dot_unstuffing {
         WIDTH - 1 + 4
@@ -2084,7 +2326,6 @@ unsafe fn decode_kernel_simd64_avx2_line_aware(
     dot_unstuffing: bool,
     preserve_pending: bool,
     search_end: bool,
-    block: DecodeBlock64,
 ) -> Result<KernelOutcome, YencError> {
     const WIDTH: usize = 64;
 
@@ -2103,7 +2344,13 @@ unsafe fn decode_kernel_simd64_avx2_line_aware(
     let simd_limit = input.len().saturating_sub(tail_buffer);
 
     if input.len() > WIDTH * 2 {
+        use std::arch::x86_64::*;
+        // Hoisted once: the decode offset stays register-resident
+        // across the whole span rather than rebuilding it per chunk.
+        let sub42 = _mm256_set1_epi8(42i8.wrapping_neg());
         while (!search_end || state.end == DecodeEnd::None) && src + WIDTH <= simd_limit {
+            // Whole-line path first — fires only at a CRLF boundary
+            // (`state == CrLf`), so it never overlaps the fast path below.
             if state.line_length.is_some()
                 && let Some(consumed) = unsafe {
                     try_decode_avx2_line(
@@ -2122,8 +2369,41 @@ unsafe fn decode_kernel_simd64_avx2_line_aware(
                 continue;
             }
 
+            // One 64-byte window, one special-mask, then branch — the
+            // Both arms reuse `a`/`b`/`specials`; nothing
+            // recomputes the mask (an earlier revision probed then re-loaded
+            // in the block, which double-costed every heavy chunk).
+            let a = unsafe { _mm256_loadu_si256(input.as_ptr().add(src) as *const __m256i) };
+            let b =
+                unsafe { _mm256_loadu_si256(input.as_ptr().add(src + 32) as *const __m256i) };
+            let specials = unsafe { avx2_special_mask64(a, b) };
+
+            // Fast path: mid-line (`state == None` ⇒ no carried `=` escape and
+            // not at a line start, so no dot-stuffing) with no `= \r \n` byte
+            // ⇒ pure data, bulk `add(-42)` + store, no call/`Result`/entry-flag
+            // machinery.
+            if specials == 0 && state.state == DecoderState::None && dst + WIDTH <= output.len()
+            {
+                unsafe {
+                    _mm256_storeu_si256(
+                        output.as_mut_ptr().add(dst) as *mut __m256i,
+                        _mm256_add_epi8(a, sub42),
+                    );
+                    _mm256_storeu_si256(
+                        output.as_mut_ptr().add(dst + 32) as *mut __m256i,
+                        _mm256_add_epi8(b, sub42),
+                    );
+                }
+                src += WIDTH;
+                dst += WIDTH;
+                continue;
+            }
+
             if let Some(consumed) = unsafe {
-                block(
+                try_decode_avx2_block(
+                    a,
+                    b,
+                    specials,
                     input,
                     src,
                     output,
@@ -2503,7 +2783,6 @@ unsafe fn decode_kernel_simd64_vbmi2_line_aware(
     dot_unstuffing: bool,
     preserve_pending: bool,
     search_end: bool,
-    block: DecodeBlock64,
 ) -> Result<KernelOutcome, YencError> {
     const WIDTH: usize = 64;
 
@@ -2542,7 +2821,7 @@ unsafe fn decode_kernel_simd64_vbmi2_line_aware(
             }
 
             if let Some(consumed) = unsafe {
-                block(
+                try_decode_avx512_vbmi2_block(
                     input,
                     src,
                     output,
@@ -2871,7 +3150,7 @@ struct Neon64Constants {
     lf: std::arch::aarch64::uint8x16_t,
     dot: std::arch::aarch64::uint8x16_t,
     // Table-lookup rows marking '\n' (10) and '\r' (13) so one vqtbx1q merges
-    // the CR/LF compares into the '=' compare (rapidyenc's specials gate).
+    // the CR/LF compares into the '=' compare (the specials gate).
     crlf_table: std::arch::aarch64::uint8x16_t,
     bit_weights: std::arch::aarch64::uint8x16_t,
     selector: std::arch::aarch64::uint8x16_t,
@@ -3197,8 +3476,8 @@ unsafe fn decode_neon64_span_block(
     debug_assert!(input.len().saturating_sub(block_src) > 64);
     debug_assert!(output.len().saturating_sub(*dst) >= 64);
 
-    // Escape carried in from the previous window's trailing '=' (rapidyenc's
-    // escFirst): bit 0 of this window is the escaped partner byte.
+    // Escape carried in from the previous window's trailing '=' (the escFirst
+    // bit): bit 0 of this window is the escaped partner byte.
     let esc_first = matches!(state.state, DecoderState::Eq | DecoderState::CrLfEq);
     if esc_first
         && search_end
@@ -3406,7 +3685,7 @@ unsafe fn decode_neon64_span_block(
     } else if esc_first == 0 && eq & (eq << 1) == 0 {
         // No adjacent '=' and no carried-in escape: escaped positions are
         // exactly the '=' compares shifted one lane, so the offset select
-        // never leaves the vector domain (rapidyenc's shortcut path).
+        // never leaves the vector domain (the shortcut path).
         let zero = unsafe { vdupq_n_u8(0) };
         let sel_a = unsafe { vextq_u8::<15>(zero, eq_a) };
         let sel_b = unsafe { vextq_u8::<15>(eq_a, eq_b) };
@@ -3483,7 +3762,7 @@ unsafe fn decode_neon64_span_block(
     let mut next_state = final_state_after_block(raw_breaks, raw_cr, crlf << 1, !skip);
     if fixed_eq & (1 << 63) != 0 {
         // Escape at the window's last byte: its partner is in the next
-        // window; carry through the state machine (rapidyenc's escFirst).
+        // window; carry through the state machine (the escFirst bit).
         next_state = if dot_unstuffing && line_start & (1 << 63) != 0 {
             DecoderState::CrLfEq
         } else {
@@ -3503,7 +3782,7 @@ unsafe fn decode_neon64_span_block(
 }
 
 #[cfg(all(target_arch = "arm", target_feature = "neon"))]
-// ARMv7 companion to rapidyenc's 32-byte NEON decoder mask path.
+// ARMv7 companion to the 32-byte NEON decoder mask path.
 unsafe fn arm_neon_compare_mask32(vectors: [std::arch::arm::uint8x16_t; 2]) -> u64 {
     use std::arch::arm::*;
 
@@ -3521,7 +3800,7 @@ unsafe fn arm_neon_compare_mask32(vectors: [std::arch::arm::uint8x16_t; 2]) -> u
 }
 
 #[cfg(all(target_arch = "arm", target_feature = "neon"))]
-// ARMv7 companion to rapidyenc NEON's maskEqTemp/vtbl escaped-byte offset path.
+// ARMv7 companion to the NEON maskEqTemp/vtbl escaped-byte offset path.
 unsafe fn arm_neon_decode_with_escape_mask(
     vectors: [std::arch::arm::uint8x16_t; 2],
     escaped: u64,
@@ -3547,7 +3826,7 @@ unsafe fn arm_neon_decode_with_escape_mask(
 }
 
 #[cfg(target_arch = "aarch64")]
-// Ported from rapidyenc NEON64's maskEqTemp/vqtbl escaped-byte offset path.
+// NEON64 maskEqTemp/vqtbl escaped-byte offset path.
 #[inline(always)]
 unsafe fn neon_decode_with_escape_mask(
     vectors: [std::arch::aarch64::uint8x16_t; 4],
@@ -3867,7 +4146,7 @@ fn dispatch_x86_decode_normal_run() -> DecodeRunFn {
 
 #[cfg(target_arch = "x86_64")]
 fn x86_prefers_sse2_over_ssse3() -> bool {
-    let (family, model) = x86_rapidyenc_family_model();
+    let (family, model) = x86_cpu_family_model();
     x86_family_model_prefers_sse2_over_ssse3(family, model)
 }
 
@@ -3875,8 +4154,8 @@ fn x86_prefers_sse2_over_ssse3() -> bool {
 fn x86_family_model_prefers_sse2_over_ssse3(family: u32, model: u32) -> bool {
     matches!(
         (family, model),
-        // Ported from rapidyenc's Bonnell/Silvermont and AMD Bobcat guardrail:
-        // these cores have very slow PSHUFB/PBLENDVB, so rapidyenc pretends
+        // Bonnell/Silvermont and AMD Bobcat guardrail:
+        // these cores have very slow PSHUFB/PBLENDVB, so we pretend
         // SSSE3 does not exist and stays on SSE2.
         (
             6,
@@ -3887,7 +4166,7 @@ fn x86_family_model_prefers_sse2_over_ssse3(family: u32, model: u32) -> bool {
 
 #[cfg(target_arch = "x86_64")]
 fn x86_prefers_ssse3_over_sse41() -> bool {
-    let (family, model) = x86_rapidyenc_family_model();
+    let (family, model) = x86_cpu_family_model();
     x86_family_model_prefers_ssse3_over_sse41(family, model)
 }
 
@@ -3895,22 +4174,22 @@ fn x86_prefers_ssse3_over_sse41() -> bool {
 fn x86_family_model_prefers_ssse3_over_sse41(family: u32, model: u32) -> bool {
     matches!(
         (family, model),
-        // Ported from rapidyenc's Goldmont/Goldmont Plus/Tremont guardrail:
+        // Goldmont/Goldmont Plus/Tremont guardrail:
         // keep PSHUFB compaction but avoid the SSE4.1 PBLENDVB path.
         (6, 0x5c | 0x5f | 0x7a | 0x9c)
     )
 }
 
 #[cfg(target_arch = "x86_64")]
-fn x86_rapidyenc_family_model() -> (u32, u32) {
+fn x86_cpu_family_model() -> (u32, u32) {
     use std::arch::x86_64::__cpuid;
 
     let leaf = __cpuid(1);
-    x86_rapidyenc_family_model_from_eax(leaf.eax)
+    x86_cpu_family_model_from_eax(leaf.eax)
 }
 
 #[cfg(target_arch = "x86_64")]
-fn x86_rapidyenc_family_model_from_eax(eax: u32) -> (u32, u32) {
+fn x86_cpu_family_model_from_eax(eax: u32) -> (u32, u32) {
     let family = ((eax >> 8) & 0xf) + ((eax >> 16) & 0xff0);
     let model = ((eax >> 4) & 0xf) + ((eax >> 12) & 0xf0);
     (family, model)
@@ -4433,7 +4712,14 @@ mod tests {
             ..KernelState::body()
         };
         let consumed = unsafe {
+            use std::arch::x86_64::*;
+            let a = _mm256_loadu_si256(input.as_ptr() as *const __m256i);
+            let b = _mm256_loadu_si256(input.as_ptr().add(32) as *const __m256i);
+            let specials = avx2_special_mask64(a, b);
             try_decode_avx2_block(
+                a,
+                b,
+                specials,
                 input,
                 0,
                 &mut output,
@@ -4839,7 +5125,7 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn x86_dispatch_guardrails_match_rapidyenc_model_lists() {
+    fn x86_dispatch_guardrails_match_reference_model_lists() {
         for model in [
             0x1c, 0x26, 0x27, 0x35, 0x36, 0x37, 0x4a, 0x4c, 0x4d, 0x5a, 0x5d,
         ] {
@@ -4858,9 +5144,9 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn x86_rapidyenc_family_model_uses_extended_amd_family_bits() {
+    fn x86_cpu_family_model_uses_extended_amd_family_bits() {
         let eax = (0xf << 8) | (0x5 << 20);
-        assert_eq!(x86_rapidyenc_family_model_from_eax(eax), (0x5f, 0));
+        assert_eq!(x86_cpu_family_model_from_eax(eax), (0x5f, 0));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -5624,11 +5910,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dispatch_kernel_handles_boundary_specials_like_scalar() {
-        // Deterministic windows that pin the block-boundary carries: escapes,
-        // line-start escapes and dots, and escaped CRs at the 64-byte edge,
-        // plus control lines and terminators mid-window.
+    // Deterministic windows that pin the block-boundary carries: escapes,
+    // line-start escapes and dots, and escaped CRs at the 64-byte edge, plus
+    // control lines and terminators mid-window. Shared by the differential
+    // assertion and the divergence-dump diagnostic.
+    fn boundary_special_cases() -> Vec<Vec<u8>> {
         let mut cases: Vec<Vec<u8>> = Vec::new();
 
         // '=' as the final byte of the first 64-byte window.
@@ -5698,6 +5984,40 @@ mod tests {
         case.extend_from_slice(&[b'O'; 96]);
         cases.push(case);
 
+        // Dot-stuffed control terminator "\r\n.=y" (CrLfDot→=y path).
+        let mut case = vec![b'P'; 40];
+        case.extend_from_slice(b"\r\n.=yend after dot-stuffed control");
+        case.extend_from_slice(&[b'Q'; 96]);
+        cases.push(case);
+
+        // Escaped LF "=\n" at the window edge (data, not a break).
+        let mut case = vec![b'R'; 62];
+        case.extend_from_slice(b"=\n");
+        case.extend_from_slice(b"continues-same-line");
+        case.extend_from_slice(&[b'S'; 96]);
+        cases.push(case);
+
+        // Pending escape as the final byte of the whole stream.
+        let mut case = vec![b'T'; 130];
+        case.push(b'=');
+        cases.push(case);
+
+        // Pending CR as the final byte of the whole stream.
+        let mut case = vec![b'U'; 130];
+        case.push(b'\r');
+        cases.push(case);
+
+        // "\r\n." exactly at the window/simd-limit tail edge.
+        let mut case = vec![b'V'; 125];
+        case.extend_from_slice(b"\r\n.tail");
+        cases.push(case);
+
+        cases
+    }
+
+    #[test]
+    fn dispatch_kernel_handles_boundary_specials_like_scalar() {
+        let cases = boundary_special_cases();
         for (idx, input) in cases.iter().enumerate() {
             for &hint in &[None, Some(64u32)] {
                 for &(dot, preserve, search) in &[
@@ -5725,6 +6045,51 @@ mod tests {
                              preserve={preserve} search={search}: simd={simd:?} \
                              reference={reference:?}"
                         ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Diagnostic (run with `--ignored --nocapture`): dumps the first byte
+    /// where the AVX2 kernel diverges from the scalar oracle across the same
+    /// boundary corpus, with surrounding context, to pinpoint port bugs.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "diagnostic; run explicitly"]
+    fn dump_avx2_divergence() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("no avx2; skipping");
+            return;
+        }
+        let cases = boundary_special_cases();
+        for (idx, input) in cases.iter().enumerate() {
+            for &hint in &[None, Some(64u32)] {
+                for &(dot, preserve, search) in &[
+                    (true, true, true),
+                    (true, true, false),
+                    (true, false, true),
+                    (false, true, false),
+                ] {
+                    let simd = run_kernel_whole(input, dot, preserve, search, false, hint);
+                    let reference = run_kernel_whole(input, dot, preserve, search, true, hint);
+                    if let (Ok(s), Ok(r)) = (&simd, &reference)
+                        && s.0 != r.0
+                    {
+                        let at = s.0.iter().zip(&r.0).position(|(a, b)| a != b).unwrap_or(
+                            s.0.len().min(r.0.len()),
+                        );
+                        let lo = at.saturating_sub(4);
+                        eprintln!(
+                            "DIVERGE case={idx} hint={hint:?} dot={dot} preserve={preserve} search={search}\n  \
+                             inlen={} first_diff_out={at} simd_len={} ref_len={}\n  \
+                             simd_out[{lo}..]={:?}\n  ref_out [{lo}..]={:?}\n  \
+                             simd_state={:?} ref_state={:?} simd_end={:?} ref_end={:?}",
+                            input.len(), s.0.len(), r.0.len(),
+                            &s.0[lo..(at + 8).min(s.0.len())],
+                            &r.0[lo..(at + 8).min(r.0.len())],
+                            s.3.state, r.3.state, s.2, r.2,
+                        );
                     }
                 }
             }
