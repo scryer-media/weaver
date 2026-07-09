@@ -8,10 +8,6 @@ fi
 
 home_dir="${HOME:-}"
 
-if [ -z "$current_user" ] && [ -z "$home_dir" ]; then
-  exit 0
-fi
-
 tmp_output="$(mktemp "${TMPDIR:-/tmp}/scryer-pre-commit.XXXXXX")"
 trap 'rm -f "$tmp_output"' EXIT HUP INT TERM
 
@@ -22,6 +18,10 @@ git diff --cached --no-color --unified=0 --diff-filter=ACMR -- . | awk \
     BEGIN {
       current_file = "unknown"
       user_lower = tolower(current_user)
+      unix_users_token = "/" "Users/"
+      unix_home_token = "/" "home/"
+      windows_users_backslash_token = "C:" "\\" "Users" "\\"
+      windows_users_slash_token = "C:/" "Users/"
     }
     /^\+\+\+ b\// {
       current_file = substr($0, 7)
@@ -35,6 +35,10 @@ git diff --cached --no-color --unified=0 --diff-filter=ACMR -- . | awk \
         next
       }
       if (home_dir != "" && index(added_line, home_dir) > 0) {
+        printf "%s:%s\n", current_file, added_line
+        next
+      }
+      if (index(added_line, unix_users_token) > 0 || index(added_line, unix_home_token) > 0 || index(added_line, windows_users_backslash_token) > 0 || index(added_line, windows_users_slash_token) > 0) {
         printf "%s:%s\n", current_file, added_line
       }
     }

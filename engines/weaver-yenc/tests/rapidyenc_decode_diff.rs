@@ -347,9 +347,10 @@ fn rapidyenc_chunk_boundaries_match_local_oracle() -> Result<(), Box<dyn Error>>
 }
 
 fn rapidyenc_root() -> Option<PathBuf> {
-    let root = std::env::var_os("RAPIDYENC_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/jeremy/dev/supporting-codebases/rapidyenc"));
+    let Some(root) = std::env::var_os("RAPIDYENC_ROOT").map(PathBuf::from) else {
+        eprintln!("skipping rapidyenc differential tests; RAPIDYENC_ROOT is not set");
+        return None;
+    };
     if root.join("rapidyenc.cc").is_file() && root.join("src/decoder.cc").is_file() {
         Some(root)
     } else {

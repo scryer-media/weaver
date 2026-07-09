@@ -21,7 +21,8 @@ GIT_URL="__GIT_URL__"         # fallback if S3_CODE empty
 GIT_REF="__GIT_REF__"
 TERMINATE="__TERMINATE__"     # 1 = shutdown -h (terminate) when done
 RUN_USER="ubuntu"
-HOME_DIR="/home/$RUN_USER"
+HOME_DIR="$(getent passwd "$RUN_USER" | cut -d: -f6)"
+[ -n "$HOME_DIR" ] || HOME_DIR="$(eval echo "~$RUN_USER")"
 WEAVER_DIR="$HOME_DIR/weaver"
 
 # Everything from here is logged to the console (cloud-init-output.log).

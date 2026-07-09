@@ -27,7 +27,7 @@ set -euo pipefail
 # Robust to being launched from a context that doesn't export HOME (systemd,
 # SSM RunShellScript, detached setsid, …): derive it from the passwd db.
 : "${HOME:=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)}"
-: "${HOME:=/home/$(id -un 2>/dev/null || echo ubuntu)}"
+: "${HOME:=$(eval echo "~$(id -un 2>/dev/null || echo ubuntu)")}"
 export HOME
 
 WEAVER_DIR="${WEAVER_DIR:-$HOME/weaver}"

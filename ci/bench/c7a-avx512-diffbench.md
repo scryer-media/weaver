@@ -39,10 +39,9 @@ cases, real masking/permute behavior, alignment/store faults) and tells us nothi
 about performance. **c7a replaces the `sde64 -spr` wrapper with a real Zen 4 core.**
 
 This run also gives first-real-silicon coverage of the Zen 4 **GFNI + AVX-512 GF16
-tier** in the rarpar workspace (stretch section §7) — the 285H has GFNI but no
-AVX-512, so weaver's `gfni,avx512bw,avx512vl` GF16 path
-(`/Users/jeremy/dev/scryer-media/rarpar/crates/weaver-reed-solomon/src/gf_simd.rs`)
-has likewise never run natively.
+tier** in the sibling rarpar workspace (stretch section §7) — the 285H has GFNI
+but no AVX-512, so rarpar's `gfni,avx512bw,avx512vl` GF16 path
+(`crates/weaver-reed-solomon/src/gf_simd.rs`) has likewise never run natively.
 
 ---
 
@@ -96,9 +95,8 @@ discovery env var**:
 ### 3a. Differential correctness — compiles rapidyenc **from source**
 `engines/weaver-yenc/tests/rapidyenc_decode_diff.rs`
 
-- Discovery env: **`RAPIDYENC_ROOT`** (`tests/rapidyenc_decode_diff.rs:350`), default
-  hardcoded mac path `/Users/jeremy/dev/supporting-codebases/rapidyenc`
-  (`:352`) — **must be overridden on the box.**
+- Discovery env: **`RAPIDYENC_ROOT`** (`tests/rapidyenc_decode_diff.rs:350`).
+  It must point at a rapidyenc checkout on the box.
 - It compiles a tiny oracle with **`$CXX`** (default `c++`,
   `tests/rapidyenc_decode_diff.rs:146`) linking
   `rapidyenc.cc` + `src/decoder.cc` from `RAPIDYENC_ROOT`
@@ -147,8 +145,7 @@ and 3b needs the built `.so`** — the bootstrap produces both.
 ## 4. rapidyenc oracle build (cmake)
 
 Reference: `https://github.com/animetosho/rapidyenc`.
-`CMakeLists.txt` builds a shared lib by default (`option(DISABLE_SHARED ... OFF)` at
-`/Users/jeremy/dev/supporting-codebases/rapidyenc/CMakeLists.txt:11`) via
+`CMakeLists.txt` builds a shared lib by default (`option(DISABLE_SHARED ... OFF)`) via
 `add_library(rapidyenc_shared SHARED ...)` (`:269`) with `OUTPUT_NAME rapidyenc`
 (`:271`) → on Linux the artifact is **`build/librapidyenc.so`** (the dev mac produced
 `build/librapidyenc.dylib`, confirmed present).
@@ -229,8 +226,8 @@ Env overrides (both scripts, all have defaults):
 
 ## 7. (Stretch / optional) PAR2 GFNI + CRC on Zen 4 — rarpar workspace
 
-The rarpar workspace (`/Users/jeremy/dev/scryer-media/rarpar`) carries GF16 /
-Reed-Solomon tiers that gate on **GFNI + AVX-512**:
+The sibling rarpar workspace carries GF16 / Reed-Solomon tiers that gate on
+**GFNI + AVX-512**:
 
 - `crates/weaver-reed-solomon/src/gf_simd.rs` — `#[target_feature(enable =
   "gfni,avx2")]` and `#[target_feature(enable = "gfni,avx512bw,avx512vl")]` GF16
@@ -262,8 +259,7 @@ cargo bench -p weaver-unrar --bench archive_hotspots --target x86_64-unknown-lin
 referenced in `scryer-docs/plans/124-weaver-yenc-x86-decode-inline-plan.md` and
 `scryer-docs/weaver_comp_.md` are **not driven by a repo bench target I could ground
 to an exact command**. `TODO(verify on box)`: locate the external-A/B harness (the
-par2cmdline-turbo / unrar-7.x oracles live under
-`/Users/jeremy/dev/supporting-codebases/par2cmdline-turbo` and `.../unrar`) and add
+par2cmdline-turbo / unrar-7.x oracles live in local supporting checkouts) and add
 its concrete invocation here before running — do not invent flags. The internal
 Criterion benches above are the grounded, safe-to-run stretch coverage.
 
