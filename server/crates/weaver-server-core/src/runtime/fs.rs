@@ -199,7 +199,11 @@ fn normalize_extracted_tree_unix(path: &Path) -> io::Result<()> {
         gid: libc::gid_t,
         umask: u32,
     ) -> io::Result<()> {
-        let metadata = std::fs::symlink_metadata(path)?;
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let path_c = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -210,7 +214,11 @@ fn normalize_extracted_tree_unix(path: &Path) -> io::Result<()> {
         if metadata.uid() != uid || metadata.gid() != gid {
             let chown_result = unsafe { libc::lchown(path_c.as_ptr(), uid, gid) };
             if chown_result != 0 {
-                return Err(io::Error::last_os_error());
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::NotFound {
+                    return Ok(());
+                }
+                return Err(error);
             }
         }
 
@@ -221,11 +229,26 @@ fn normalize_extracted_tree_unix(path: &Path) -> io::Result<()> {
         let mode = (if metadata.is_dir() { 0o777 } else { 0o666 }) & !umask;
         let mut permissions = metadata.permissions();
         permissions.set_mode(mode);
-        std::fs::set_permissions(path, permissions)?;
+        if let Err(error) = std::fs::set_permissions(path, permissions) {
+            if error.kind() == io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(error);
+        }
 
         if metadata.is_dir() {
-            for entry in std::fs::read_dir(path)? {
-                normalize_one(&entry?.path(), uid, gid, umask)?;
+            let entries = match std::fs::read_dir(path) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                normalize_one(&entry.path(), uid, gid, umask)?;
             }
         }
 
@@ -472,6 +495,15 @@ mod tests {
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
             0o666 & !mask
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_extracted_tree_treats_missing_paths_as_already_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vanished");
+
+        normalize_extracted_tree(&root).unwrap();
     }
 
     #[cfg(unix)]
