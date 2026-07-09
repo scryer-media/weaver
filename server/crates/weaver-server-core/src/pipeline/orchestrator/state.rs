@@ -49,6 +49,16 @@ impl Pipeline {
             .store(self.write_buffered_segments, Ordering::Relaxed);
     }
 
+    pub(crate) fn publish_active_stage_metrics(&self) {
+        self.metrics
+            .active_downloads
+            .store(self.active_downloads, Ordering::Relaxed);
+        self.metrics.active_decodes.store(
+            self.active_decodes_by_job.values().sum::<usize>(),
+            Ordering::Relaxed,
+        );
+    }
+
     pub(crate) fn clear_job_write_backlog(&mut self, job_id: JobId) {
         let file_ids: Vec<NzbFileId> = self
             .write_buffers
@@ -84,6 +94,9 @@ impl Pipeline {
     pub(crate) fn clear_job_rar_runtime(&mut self, job_id: JobId) {
         self.eagerly_deleted.remove(&job_id);
         self.rar_sets.retain(|(jid, _), _| *jid != job_id);
+        self.clear_rar_unlock_priorities(job_id);
+        self.pending_rar_capacity_retries
+            .retain(|(jid, _, _)| *jid != job_id);
         self.rar_waiting_members
             .retain(|(jid, _, _), _| *jid != job_id);
         self.normalization_retried.remove(&job_id);

@@ -38,11 +38,13 @@
 //! # }
 //! ```
 
+pub mod blocking;
 pub mod client;
 pub mod codec;
 pub mod commands;
 pub mod connection;
 pub mod error;
+pub mod fused_yenc;
 pub mod health;
 pub mod pool;
 pub mod response;
@@ -50,7 +52,11 @@ pub mod tls;
 pub mod types;
 
 // Re-export primary types for convenience.
-pub use client::{DecodedBody, DecodedBodyError, NntpClient};
+pub use blocking::{BlockingBodyLane, BlockingLaneStats, BlockingNntpConnection};
+pub use client::{
+    BodyLaneBatchStats, BodyLaneLease, BodyLaneMode, DecodedBody, DecodedBodyError,
+    DecodedBodyTrace, NntpClient,
+};
 pub use codec::StreamChunk;
 pub use connection::{NntpConnection, ServerConfig};
 pub use error::{NntpError, Result};

@@ -6,6 +6,10 @@ pub(crate) struct HistorySubscription;
 const JOB_DETAIL_HEARTBEAT: Duration = Duration::from_millis(500);
 const JOB_DETAIL_THROTTLE: Duration = Duration::from_millis(250);
 const JOB_DETAIL_SETTLE_DELAY: Duration = Duration::from_millis(25);
+/// Slow cadence at which a terminal (archived) job's detail is still re-read, to
+/// pick up DB-only changes that emit no pipeline event (e.g. a background
+/// history-delete operation) without the fast per-tab heartbeat load.
+const JOB_DETAIL_TERMINAL_HEARTBEAT: Duration = Duration::from_secs(5);
 
 #[Subscription]
 impl HistorySubscription {
@@ -34,14 +38,26 @@ impl HistorySubscription {
     ) -> Result<impl Stream<Item = JobDetailSnapshot>> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
         let db = ctx.data::<Database>()?.clone();
-        #[cfg(weaver_diagnostics)]
-        let diagnostics = ctx
-            .data_opt::<crate::history::diagnostics::DiagnosticManager>()
-            .cloned();
         let event_rx = handle.subscribe_events();
 
-        let event_stream = tokio_stream::wrappers::BroadcastStream::new(event_rx)
-            .filter_map(|result| result.ok().map(|_| JobDetailTrigger::Event));
+        // Only events for THIS job should force a database reload; an unrelated
+        // job's event must not trigger a full re-read of this job's event log.
+        let event_stream =
+            tokio_stream::wrappers::BroadcastStream::new(event_rx).filter_map(move |result| {
+                result.ok().and_then(|event| {
+                    // Reload only on meaningful events for THIS job. `should_record_job_event`
+                    // is the same predicate that gates the persisted event log the detail view
+                    // reads, so it triggers exactly when the log or lifecycle changes while
+                    // excluding the high-frequency per-article/segment events (the broadcast
+                    // carries those too). Live progress is covered by the heartbeat. Uses the
+                    // core job_id accessor (all variants, no allocation).
+                    use weaver_server_core::events::publish::{
+                        pipeline_job_id, should_record_job_event,
+                    };
+                    (should_record_job_event(&event) && pipeline_job_id(&event) == Some(job_id))
+                        .then_some(JobDetailTrigger::Event)
+                })
+            });
         let heartbeat = tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(
             JOB_DETAIL_HEARTBEAT,
         ))
@@ -54,8 +70,22 @@ impl HistorySubscription {
 
         Ok(async_stream::stream! {
             tokio::pin!(triggers);
+            let mut terminal_settled = false;
+            let mut last_terminal_reload = tokio::time::Instant::now();
 
             while let Some(trigger) = triggers.next().await {
+                // A terminal (archived) job's event log and history are
+                // immutable, so the fast per-tab heartbeat need not re-read the
+                // database. But DB-only changes that emit no pipeline event
+                // (e.g. a background history-delete) must still surface, so a
+                // terminal job is polled at a slow cadence instead of having its
+                // heartbeats suppressed outright.
+                if matches!(trigger, JobDetailTrigger::Heartbeat)
+                    && terminal_settled
+                    && last_terminal_reload.elapsed() < JOB_DETAIL_TERMINAL_HEARTBEAT
+                {
+                    continue;
+                }
                 if matches!(trigger, JobDetailTrigger::Event) {
                     tokio::time::sleep(JOB_DETAIL_SETTLE_DELAY).await;
                 }
@@ -64,22 +94,26 @@ impl HistorySubscription {
                     handle.clone(),
                     db.clone(),
                     job_id,
-                    {
-                        #[cfg(weaver_diagnostics)]
-                        {
-                            if let Some(manager) = &diagnostics {
-                                manager.has_active_runs().await
-                            } else {
-                                false
-                            }
-                        }
-                        #[cfg(not(weaver_diagnostics))]
-                        {
-                            false
-                        }
-                    },
                 ).await {
-                    Ok(snapshot) => yield snapshot,
+                    Ok(snapshot) => {
+                        // A job with no live queue entry has settled to the slow
+                        // JOB_DETAIL_TERMINAL_HEARTBEAT cadence, whether it is
+                        // archived (history row present) OR fully gone (history
+                        // row deleted while this tab was open). Not gating on
+                        // `history_item.is_some()` is what keeps a just-deleted
+                        // job from flipping back to the 500ms heartbeat and
+                        // reloading the DB forever. This is safe for the brief
+                        // completion gap (queue entry removed before the archive
+                        // row is visible) because every real transition emits
+                        // pipeline events that pass the should_record_job_event
+                        // filter and force an immediate reload regardless of
+                        // settling.
+                        terminal_settled = snapshot.queue_item.is_none();
+                        if terminal_settled {
+                            last_terminal_reload = tokio::time::Instant::now();
+                        }
+                        yield snapshot;
+                    }
                     Err(error) => tracing::warn!(job_id, error = ?error, "failed to build job detail snapshot"),
                 }
             }

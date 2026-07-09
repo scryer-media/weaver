@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use semver::Version;
@@ -35,7 +36,18 @@ const TCP_PORT_PROBE_TIMEOUT: StdDuration = StdDuration::from_millis(200);
 const RELEASE_DRY_RUN_CACHE_FILE: &str = "tmp/xtask-release-dry-run.json";
 const RELEASE_DRY_RUN_CACHE_DIR: &str = "tmp/xtask-release-dry-run-cache";
 const BACKEND_SHUTDOWN_GRACE_PERIOD: StdDuration = StdDuration::from_secs(5);
-const RELEASE_ALLOWED_CARGO_AUDIT_IDS: &[&str] = &["RUSTSEC-2023-0071", "RUSTSEC-2025-0134"];
+const RELEASE_ALLOWED_CARGO_AUDIT_IDS: &[ReleaseAuditAllow] = &[
+    ReleaseAuditAllow {
+        id: "RUSTSEC-2023-0071",
+        expires_on: "2026-09-30",
+        reason: "transitive dependency still under review; release must revisit before expiry",
+    },
+    ReleaseAuditAllow {
+        id: "RUSTSEC-2025-0134",
+        expires_on: "2026-09-30",
+        reason: "slab advisory suppression is temporary while upstream dependency path is updated",
+    },
+];
 const RELEASE_LOCAL_PATH_TOKENS: &[&str] = &[
     concat!("/", "Users/"),
     concat!("/", "home/"),
@@ -50,6 +62,12 @@ const WINGET_PORTABLE_COMMAND_ALIAS: &str = "weaver";
 const WINGET_MANIFEST_VERSION: &str = "1.12.0";
 const WINGET_WINDOWS_X64_ASSET: &str = "weaver-windows-x86_64.zip";
 const WINGET_WINDOWS_ARM64_ASSET: &str = "weaver-windows-arm64.zip";
+
+struct ReleaseAuditAllow {
+    id: &'static str,
+    expires_on: &'static str,
+    reason: &'static str,
+}
 
 #[cfg(unix)]
 static SIGNAL_FORWARD_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
@@ -104,6 +122,7 @@ struct CiArgs {
 
 #[derive(Subcommand)]
 enum CiCommand {
+    Audit,
     Clippy(ClippyArgs),
     Winget(WingetArgs),
 }
@@ -132,6 +151,8 @@ struct WingetArgs {
 
 #[derive(Args)]
 struct ServeArgs {
+    #[arg(long, help = "Reset the dev SQLite database before starting Weaver")]
+    clean: bool,
     target: Option<String>,
 }
 
@@ -370,6 +391,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Release(args) => run_release(&ctx, args),
         Commands::Ci(args) => match args.command {
+            CiCommand::Audit => run_cargo_audit_validation(&ctx, "ci-audit"),
             CiCommand::Clippy(args) => run_clippy_ci(&ctx, args),
             CiCommand::Winget(args) => run_ci_winget(&ctx, args),
         },
@@ -498,7 +520,9 @@ fn native_crypto_supported_target(target: &str) -> bool {
 
 fn release_lane_supported_for_target(target: &str, lane: ReleaseLane) -> bool {
     match lane {
-        ReleaseLane::Portable => native_crypto_supported_target(target),
+        ReleaseLane::Portable => {
+            native_crypto_supported_target(target) && !target.starts_with("x86_64-apple-")
+        }
         ReleaseLane::Haswell => {
             target.starts_with("x86_64-apple-") || target.starts_with("x86_64-unknown-linux-musl")
         }
@@ -1573,7 +1597,7 @@ PublisherSupportUrl: https://github.com/scryer-media/weaver/issues\n\
 Author: Scryer Media\n\
 PackageName: {WINGET_PACKAGE_NAME}\n\
 PackageUrl: https://github.com/scryer-media/weaver\n\
-License: GPL-3.0\n\
+License: GPL-3.0-or-later with UnRAR restriction\n\
 LicenseUrl: https://github.com/scryer-media/weaver/blob/main/LICENSE\n\
 Copyright: Copyright (c) Scryer Media\n\
 ShortDescription: High-performance Usenet binary downloader.\n\
@@ -1934,6 +1958,44 @@ fn run_weaver_web_validation(ctx: &TaskContext, prefix: &'static str) -> Result<
     Ok(())
 }
 
+fn release_allowed_cargo_audit_ids() -> Result<Vec<&'static str>> {
+    let today = Utc::now().date_naive();
+    let mut ids = Vec::with_capacity(RELEASE_ALLOWED_CARGO_AUDIT_IDS.len());
+    for advisory in RELEASE_ALLOWED_CARGO_AUDIT_IDS {
+        let expires_on = NaiveDate::parse_from_str(advisory.expires_on, "%Y-%m-%d")
+            .with_context(|| format!("invalid expiry for {}", advisory.id))?;
+        if today > expires_on {
+            bail!(
+                "cargo audit allowlist entry {} expired on {}: {}",
+                advisory.id,
+                advisory.expires_on,
+                advisory.reason
+            );
+        }
+        ids.push(advisory.id);
+    }
+    Ok(ids)
+}
+
+fn run_cargo_audit_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+    prefixed_step(prefix, "Running cargo audit");
+    if !command_available("cargo-audit")? {
+        warn("cargo-audit not installed — installing");
+        let mut install = ctx.command_in("cargo", &ctx.repo_root);
+        install.args(["install", "--locked", "cargo-audit"]);
+        run_streaming(&mut install, prefix)?;
+    }
+    let mut audit = ctx.command_in("cargo", &ctx.repo_root);
+    audit.arg("audit");
+    let allowed_advisories = release_allowed_cargo_audit_ids()?;
+    for advisory in allowed_advisories {
+        audit.args(["--ignore", advisory]);
+    }
+    run_streaming(&mut audit, prefix)?;
+    prefixed_ok(prefix, "cargo audit passed");
+    Ok(())
+}
+
 fn run_weaver_rust_prep_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
     prefixed_step(prefix, "Running cargo fmt --all");
     let mut fmt_fix = ctx.command_in("cargo", &ctx.repo_root);
@@ -1953,20 +2015,7 @@ fn run_weaver_rust_prep_validation(ctx: &TaskContext, prefix: &'static str) -> R
     run_streaming(&mut update, prefix)?;
     prefixed_ok(prefix, "Cargo.lock updated");
 
-    prefixed_step(prefix, "Running cargo audit");
-    if !command_available("cargo-audit")? {
-        warn("cargo-audit not installed — installing");
-        let mut install = ctx.command_in("cargo", &ctx.repo_root);
-        install.args(["install", "--locked", "cargo-audit"]);
-        run_streaming(&mut install, prefix)?;
-    }
-    let mut audit = ctx.command_in("cargo", &ctx.repo_root);
-    audit.arg("audit");
-    for advisory in RELEASE_ALLOWED_CARGO_AUDIT_IDS {
-        audit.args(["--ignore", advisory]);
-    }
-    run_streaming(&mut audit, prefix)?;
-    prefixed_ok(prefix, "cargo audit passed");
+    run_cargo_audit_validation(ctx, prefix)?;
 
     Ok(())
 }
@@ -2381,7 +2430,65 @@ fn load_state_encryption_key(path: &Path) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
-    Ok(Some(fs::read_to_string(path)?.replace(['\r', '\n'], "")))
+    let key = fs::read_to_string(path)?
+        .replace(['\r', '\n'], "")
+        .trim()
+        .to_string();
+    Ok((!key.is_empty()).then_some(key))
+}
+
+fn ensure_state_encryption_key(key_path: &Path, db_path: &Path) -> Result<String> {
+    if let Ok(env_key) = std::env::var("WEAVER_ENCRYPTION_KEY") {
+        let env_key = env_key.trim().to_string();
+        if !env_key.is_empty() {
+            return Ok(env_key);
+        }
+    }
+
+    if let Some(key) = load_state_encryption_key(key_path)? {
+        return Ok(key);
+    }
+
+    if db_path.exists() {
+        bail!(
+            "dev state database exists at {} but no encryption key was found at {}; set \
+             WEAVER_ENCRYPTION_KEY to the original key or rerun with `cargo xtask serve --clean` \
+             to rebuild the dev database",
+            db_path.display(),
+            key_path.display()
+        );
+    }
+
+    let mut key_bytes = [0u8; 32];
+    getrandom::fill(&mut key_bytes).context("failed to generate dev encryption key")?;
+    let key = BASE64_STANDARD.encode(key_bytes);
+    if let Some(parent) = key_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(key_path, format!("{key}\n"))
+        .with_context(|| format!("failed to write {}", key_path.display()))?;
+    Ok(key)
+}
+
+fn reset_serve_database(db_path: &Path) -> Result<()> {
+    let cleanup_targets = [
+        db_path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", db_path.display())),
+        PathBuf::from(format!("{}-shm", db_path.display())),
+    ];
+
+    step(format!(
+        "Removing xtask serve database files under {}",
+        db_path.display()
+    ));
+    for path in cleanup_targets {
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+    ok("xtask serve database reset");
+    Ok(())
 }
 
 fn ensure_frontend_dependencies(ctx: &TaskContext, web_dir: &Path) -> Result<()> {
@@ -2424,31 +2531,29 @@ fn seed_runtime_dirs(db_path: &Path, data_dir: &Path) -> Result<()> {
 
 fn bootstrap_state_dir(
     ctx: &TaskContext,
+    backend_binary: &Path,
     state_dir: &Path,
     backend_port: u16,
     backend_log: &Path,
     encryption_key: Option<&str>,
-    rustflags: &str,
 ) -> Result<()> {
     if state_dir.join("weaver.db").exists() {
         return Ok(());
     }
 
-    println!("==> Bootstrapping dev state in {}", state_dir.display());
+    step(format!(
+        "Bootstrapping dev state in {}",
+        state_dir.display()
+    ));
     let log = OpenOptions::new()
         .create(true)
         .append(true)
         .open(backend_log)?;
     let log_err = log.try_clone()?;
-    let mut child = ctx.command_in("cargo", &ctx.repo_root);
+    let mut child = ctx.command(backend_binary);
     child
         .env("RUST_LOG", "warn")
-        .env("RUSTFLAGS", rustflags)
         .args([
-            "run",
-            "-p",
-            "weaver",
-            "--",
             "--config",
             &state_dir.display().to_string(),
             "serve",
@@ -2533,19 +2638,14 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     fs::write(&backend_log, "")?;
     fs::create_dir_all(&state_dir)?;
 
-    let encryption_key = load_state_encryption_key(&state_key_file)?;
-    bootstrap_state_dir(
-        ctx,
-        &state_dir,
-        backend_port,
-        &backend_log,
-        encryption_key.as_deref(),
-        &local_rustflags,
-    )?;
-    let encryption_key = load_state_encryption_key(&state_key_file)?;
-    seed_runtime_dirs(&state_dir.join("weaver.db"), &data_dir)?;
+    let db_path = state_dir.join("weaver.db");
+    if args.clean {
+        reset_serve_database(&db_path)?;
+    }
 
-    println!("==> Building Weaver backend...");
+    let encryption_key = ensure_state_encryption_key(&state_key_file, &db_path)?;
+    step("Building Weaver backend");
+    println!("   Rust build: cargo build --locked -p weaver");
     let mut build = ctx.command_in("cargo", &ctx.repo_root);
     build
         .env("WEAVER_ENABLE_DIAGNOSTICS", &diagnostics_enabled)
@@ -2553,10 +2653,25 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     build.args(["build", "--locked", "-p", "weaver"]);
     run_checked(&mut build)?;
 
-    println!(
-        "==> Starting Weaver backend from {} on :{backend_port}",
+    bootstrap_state_dir(
+        ctx,
+        &backend_binary,
+        &state_dir,
+        backend_port,
+        &backend_log,
+        Some(encryption_key.as_str()),
+    )?;
+    seed_runtime_dirs(&db_path, &data_dir)?;
+
+    step(format!(
+        "Starting Weaver backend from {} on :{backend_port}",
         backend_binary.display()
-    );
+    ));
+    println!("   Vite dev server: {frontend_url}");
+    println!("   Vite file watch: polling={vite_use_polling} interval_ms={vite_poll_interval}");
+    println!("   State: {}", state_dir.display());
+    println!("   Data: {}", data_dir.display());
+    println!("   Diagnostics enabled: {diagnostics_enabled}");
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -2575,9 +2690,7 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         ])
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
-    if let Some(key) = encryption_key.as_deref() {
-        backend.env("WEAVER_ENCRYPTION_KEY", key);
-    }
+    backend.env("WEAVER_ENCRYPTION_KEY", &encryption_key);
     let mut backend = backend.spawn()?;
     let backend_pid = backend.id();
     let backend_signal_forwarder = install_backend_signal_forwarder(backend_pid)?;
@@ -2596,8 +2709,6 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     println!("    State:    {}", state_dir.display());
     println!("    Data:     {}", data_dir.display());
     println!("    Log:      tail -f {}", backend_log.display());
-    println!("    Diagnostics enabled: {diagnostics_enabled}");
-    println!("    Vite file watch: polling={vite_use_polling} interval_ms={vite_poll_interval}");
     println!();
     println!("==> Starting Vite dev server with live updates...");
 
@@ -2848,7 +2959,7 @@ mod tests {
         assert!(manifest.contains("PackageIdentifier: ScryerMedia.Weaver"));
         assert!(manifest.contains("Publisher: Scryer Media"));
         assert!(manifest.contains("PackageName: Weaver"));
-        assert!(manifest.contains("License: GPL-3.0"));
+        assert!(manifest.contains("License: GPL-3.0-or-later with UnRAR restriction"));
         assert!(manifest.contains("Moniker: weaver-usenet"));
         assert!(manifest.contains(
             "ReleaseNotesUrl: https://github.com/scryer-media/weaver/releases/tag/weaver-v0.6.6"
@@ -3099,7 +3210,6 @@ mod tests {
                 ReleaseLane::Portable,
                 "--cfg aes_armv8 -C target-feature=+crt-static -C linker=rust-lld",
             ),
-            ("x86_64-apple-darwin", ReleaseLane::Portable, ""),
             (
                 "x86_64-apple-darwin",
                 ReleaseLane::Haswell,
@@ -3139,6 +3249,14 @@ mod tests {
                 "unsupported lane apple-m1 for rustflags target aarch64-unknown-linux-musl"
             )
         );
+
+        let error =
+            ci_rustflags_for_target("x86_64-apple-darwin", ReleaseLane::Portable).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported lane portable for rustflags target x86_64-apple-darwin")
+        );
     }
 
     #[test]
@@ -3168,7 +3286,6 @@ mod tests {
     #[test]
     fn verify_crypto_target_accepts_supported_release_targets() {
         for (target, lane) in [
-            ("x86_64-apple-darwin", ReleaseLane::Portable),
             ("x86_64-apple-darwin", ReleaseLane::Haswell),
             ("aarch64-apple-darwin", ReleaseLane::Portable),
             ("aarch64-apple-darwin", ReleaseLane::AppleM1),
@@ -3203,12 +3320,19 @@ mod tests {
                 "unsupported lane haswell for native crypto target x86_64-pc-windows-msvc"
             )
         );
+
+        let error = verify_crypto_target("x86_64-apple-darwin", ReleaseLane::Portable).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported lane portable for native crypto target x86_64-apple-darwin")
+        );
     }
 
     #[test]
     fn release_hygiene_flags_local_absolute_paths() {
         let violations = scan_release_hygiene_content(
-            Path::new("engines/weaver-par2/tests/support/benchmark_support.rs"),
+            Path::new("server/crates/weaver-server-core/src/pipeline/tests/rar_extraction.rs"),
             concat!(
                 "const DEFAULT: &str = \"",
                 "/",
@@ -3221,7 +3345,7 @@ mod tests {
             violations,
             vec![
                 concat!(
-                    "engines/weaver-par2/tests/support/benchmark_support.rs:1: local absolute path reference: const DEFAULT: &str = \"",
+                    "server/crates/weaver-server-core/src/pipeline/tests/rar_extraction.rs:1: local absolute path reference: const DEFAULT: &str = \"",
                     "/",
                     "Users/example/dev/supporting-codebases/par2cmdline-turbo/par2",
                     "\";"
@@ -3234,7 +3358,7 @@ mod tests {
     #[test]
     fn release_hygiene_flags_sibling_e2e_paths() {
         let violations = scan_release_hygiene_content(
-            Path::new("engines/weaver-par2/src/repairer.rs"),
+            Path::new("server/crates/weaver-server-core/src/pipeline/tests/rar_extraction.rs"),
             concat!(
                 "let fixture = manifest_dir.join(\"..",
                 "/../..",
@@ -3246,7 +3370,7 @@ mod tests {
             violations,
             vec![
                 concat!(
-                    "engines/weaver-par2/src/repairer.rs:1: sibling e2e repo reference: let fixture = manifest_dir.join(\"..",
+                    "server/crates/weaver-server-core/src/pipeline/tests/rar_extraction.rs:1: sibling e2e repo reference: let fixture = manifest_dir.join(\"..",
                     "/../..",
                     "/e2e/testdata\").join(name);"
                 )
@@ -3258,7 +3382,7 @@ mod tests {
     #[test]
     fn release_hygiene_allows_repo_local_paths() {
         let violations = scan_release_hygiene_content(
-            Path::new("engines/weaver-par2/src/repairer.rs"),
+            Path::new("server/crates/weaver-server-core/src/pipeline/tests/rar_extraction.rs"),
             "let fixture = manifest_dir.join(\"tests/fixtures\").join(name);",
         );
 

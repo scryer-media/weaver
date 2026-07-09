@@ -50,8 +50,11 @@ async fn feed_item_parsing_prefers_enclosure_and_supports_direct_link_fallback()
               </channel>
             </rss>"#
             .to_string();
-    let feed = feed_rs::parser::parse(Cursor::new(rss.as_bytes())).unwrap();
-    let item = feed_item_from_entry(feed.entries.into_iter().next().unwrap());
+    let item = parse_feed_items(rss.as_bytes())
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
     assert_eq!(
         item.download_url.as_deref(),
         Some("https://example.com/download.nzb")
@@ -67,8 +70,11 @@ async fn feed_item_parsing_prefers_enclosure_and_supports_direct_link_fallback()
                 <link href="https://example.com/api?t=get&id=1" />
               </entry>
             </feed>"#;
-    let feed = feed_rs::parser::parse(Cursor::new(atom.as_bytes())).unwrap();
-    let item = feed_item_from_entry(feed.entries.into_iter().next().unwrap());
+    let item = parse_feed_items(atom.as_bytes())
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
     assert_eq!(
         item.download_url.as_deref(),
         Some("https://example.com/api?t=get&id=1")
@@ -401,8 +407,9 @@ fn build_service(
         retry: None,
         max_download_speed: None,
         isp_bandwidth_cap: None,
-        diagnostic_upload_url: None,
+        ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(true),
+        watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         config_path: None,
     }));
     let handle = test_scheduler_handle(submissions);

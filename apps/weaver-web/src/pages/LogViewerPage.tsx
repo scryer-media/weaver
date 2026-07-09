@@ -2,27 +2,28 @@ import { startTransition, useCallback, useEffect, useMemo, useRef, useState } fr
 import { useQuery } from "urql";
 import { getGraphqlWsClient } from "@/graphql/client";
 import { SERVICE_LOGS_QUERY } from "@/graphql/queries";
-import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { SegmentedControl } from "@/components/ui/segmented-control";
 import { useTranslate } from "@/lib/context/translate-context";
 import { useIsMobile } from "@/lib/hooks/use-mobile";
+import { cn } from "@/lib/utils";
 
 const LOG_LEVEL_COLORS: Record<string, string> = {
-  error: "text-red-400",
-  warn: "text-amber-400",
-  info: "text-zinc-400",
-  debug: "text-emerald-400/70",
-  trace: "text-zinc-600",
+  error: "text-log-error",
+  warn: "text-log-warn",
+  info: "text-log-info",
+  debug: "text-log-debug",
+  trace: "text-log-trace",
 };
+
+const LEVEL_OPTIONS = [
+  { value: "all", label: "All" },
+  { value: "error", label: "ERROR" },
+  { value: "warn", label: "WARN" },
+  { value: "info", label: "INFO" },
+  { value: "debug", label: "DEBUG" },
+  { value: "trace", label: "TRACE" },
+];
 
 const RAW_BUFFER_MAX = 2000;
 const LIVE_TAIL_LINES = 300;
@@ -173,7 +174,7 @@ function HighlightedLine({ entry }: { entry: LogLineEntry }) {
   }
 
   const lvl = parsed.level.toLowerCase();
-  const levelColor = LOG_LEVEL_COLORS[lvl] ?? "text-zinc-300";
+  const levelColor = LOG_LEVEL_COLORS[lvl] ?? "text-muted-foreground";
 
   // Build message fragments with highlighted key=value spans
   const fragments: React.ReactNode[] = [];
@@ -188,7 +189,7 @@ function HighlightedLine({ entry }: { entry: LogLineEntry }) {
     }
     fragments.push(
       <span key={`k${kv.start}`}>
-        <span className="text-teal-700 dark:text-teal-300">{kv.key}</span>
+        <span className="text-status-copying">{kv.key}</span>
         <span className="text-muted-foreground/50">=</span>
         <span className="text-foreground/80">{kv.value}</span>
       </span>,
@@ -207,7 +208,7 @@ function HighlightedLine({ entry }: { entry: LogLineEntry }) {
     <span>
       <span className="text-muted-foreground/50">{parsed.timestamp}</span>
       {" "}
-      <span className={levelColor}>{parsed.level.padStart(5)}</span>
+      <span className={cn(levelColor, "font-semibold")}>{parsed.level.padStart(5)}</span>
       {" "}
       <span className="text-muted-foreground/70">{parsed.target}</span>
       <span className="text-muted-foreground/50">:</span>
@@ -415,50 +416,41 @@ export function LogViewerPage() {
     return `Live mode is showing the latest ${snapshot.lines.length} lines from ${snapshot.bufferedCount} buffered entries. Pause or filter to inspect more history.`;
   }, [snapshot.bufferedCount, snapshot.liveTailing, snapshot.lines.length]);
 
+  const indicatorLabel = paused ? "Paused" : connected ? "Live" : "Disconnected";
+  const indicatorDotClass = connected && !paused ? "bg-status-completed animate-status-pulse" : "bg-muted-foreground";
+
   return (
     <div className="space-y-4">
-      <PageHeader title={t("nav.logs")} />
+      <h1 className="font-space-grotesk text-[34px] font-bold leading-none tracking-tight">
+        {t("nav.logs")}
+      </h1>
 
-      <div className="grid gap-3 sm:flex sm:flex-wrap sm:items-end">
-        <div className="space-y-1">
-          <Label className="text-xs text-muted-foreground">Level</Label>
-          <Select value={level} onValueChange={setLevel}>
-            <SelectTrigger className="w-full sm:w-[100px]">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All</SelectItem>
-              <SelectItem value="error">Error</SelectItem>
-              <SelectItem value="warn">Warn</SelectItem>
-              <SelectItem value="info">Info</SelectItem>
-              <SelectItem value="debug">Debug</SelectItem>
-              <SelectItem value="trace">Trace</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="space-y-1">
-          <Label className="text-xs text-muted-foreground">Search</Label>
-          <Input
-            type="search"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="filter..."
-            className="h-8 w-full text-sm sm:w-48"
-          />
-        </div>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+      <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
+        <SegmentedControl
+          value={level}
+          onValueChange={setLevel}
+          options={LEVEL_OPTIONS}
+          size="sm"
+          ariaLabel="Level"
+        />
+        <input
+          type="search"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search message, target, fields…"
+          className="h-8 w-full rounded-inner border border-border bg-card px-3 font-mono text-[13px] text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:w-64"
+        />
+        <div className="flex gap-2">
           <Button
             size="sm"
-            variant="secondary"
-            className="w-full sm:w-auto"
+            variant="outline"
             onClick={() => setPaused((p) => !p)}
           >
             {paused ? "Resume" : "Pause"}
           </Button>
           <Button
             size="sm"
-            variant="secondary"
-            className="w-full sm:w-auto"
+            variant="outline"
             onClick={() => {
               if (ingestTimerRef.current) {
                 clearTimeout(ingestTimerRef.current);
@@ -480,22 +472,22 @@ export function LogViewerPage() {
             Clear
           </Button>
         </div>
-        <div className="flex items-center gap-1.5 text-xs text-muted-foreground sm:ml-auto">
-          <span
-            className={`inline-block size-2 rounded-full ${connected ? "bg-green-400" : "bg-red-400"}`}
-          />
-          {connected ? "Live" : "Disconnected"}
-          {paused && <span className="text-yellow-400">(paused)</span>}
+        <div className="flex items-center gap-1.5 text-[13px] text-muted-foreground sm:ml-auto">
+          <span className={cn("size-2 rounded-pill", indicatorDotClass)} />
+          {indicatorLabel}
         </div>
       </div>
       {liveTailNotice ? (
-        <p className="text-xs text-muted-foreground">{liveTailNotice}</p>
+        <p className="text-[13px] text-muted-foreground">{liveTailNotice}</p>
       ) : null}
 
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className={`overflow-y-auto rounded-lg border border-border bg-card text-xs leading-5 ${isMobile ? "h-[50vh] min-h-[260px]" : "h-[28rem] min-h-[320px]"}`}
+        className={cn(
+          "overflow-y-auto rounded-inner border border-border bg-background/40 text-xs leading-5",
+          isMobile ? "h-[50vh] min-h-[260px]" : "h-[28rem] min-h-[320px]",
+        )}
         style={{
           fontFamily:
             "'Fira Code', 'Fira Mono', 'JetBrains Mono', 'Source Code Pro', 'Cascadia Code', 'Consolas', monospace",
@@ -506,11 +498,8 @@ export function LogViewerPage() {
         ) : (
           <div className="space-y-0.5 p-2">
             {snapshot.lines.map((line, i) => (
-              <div key={line.id} className="flex items-start gap-3 rounded-sm px-1 hover:bg-muted/30">
-                <span
-                  className="shrink-0 select-none text-right tabular-nums text-muted-foreground/40"
-                  style={{ minWidth: "4ch" }}
-                >
+              <div key={line.id} className="flex items-start gap-3 rounded-sm px-1 hover:bg-accent/40">
+                <span className="w-10 shrink-0 select-none text-right tabular-nums text-muted-foreground/40">
                   {i + 1}
                 </span>
                 <div className="min-w-0 flex-1 whitespace-pre-wrap break-all">
@@ -522,7 +511,7 @@ export function LogViewerPage() {
         )}
       </div>
 
-      <p className="text-xs text-muted-foreground">
+      <p className="text-[12.5px] text-muted-foreground">
         {snapshot.lines.length} shown
         {` · ${snapshot.matchedCount} matching`}
         {` · ${snapshot.bufferedCount} buffered`}

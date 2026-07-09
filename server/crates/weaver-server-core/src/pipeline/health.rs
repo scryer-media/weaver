@@ -106,7 +106,7 @@ impl Pipeline {
     pub(super) fn check_health(&mut self, job_id: JobId) {
         // Extract all needed values upfront so the borrow on self.jobs is dropped
         // before we call activate_health_probes or mutate state.
-        let (health, critical, failed_bytes, total, needs_probes) = {
+        let (health, critical, failed_bytes, total, par2_bytes, needs_probes, health_probing) = {
             let state = match self.jobs.get(&job_id) {
                 Some(s) => s,
                 None => return,
@@ -127,17 +127,56 @@ impl Pipeline {
 
             let critical = Self::critical_health_milli(total, par2_bytes);
 
+            let critical_failed_bytes =
+                total.saturating_sub(((total as u128 * critical as u128) / 1000) as u64);
+            let within_critical_probe_fence =
+                state.failed_bytes <= critical_failed_bytes.saturating_add(1);
             let needs_probes = health < 980
                 && !state.health_probing
-                && state.failed_bytes >= state.next_health_probe_failed_bytes;
-            (health, critical, state.failed_bytes, total, needs_probes)
+                && state.failed_bytes >= state.next_health_probe_failed_bytes
+                && (health > critical || within_critical_probe_fence);
+            (
+                health,
+                critical,
+                state.failed_bytes,
+                total,
+                par2_bytes,
+                needs_probes,
+                state.health_probing,
+            )
         };
+
+        if health <= critical && par2_bytes > 0 {
+            info!(
+                job_id = job_id.0,
+                health_pct = health as f64 / 10.0,
+                critical_pct = critical as f64 / 10.0,
+                failed_bytes,
+                total_bytes = total,
+                par2_bytes,
+                "deferring health failure to PAR2 recovery evaluation"
+            );
+            self.schedule_job_completion_check(job_id);
+            return;
+        }
 
         // Activate health probes when health drops 2% — sample segments across the
         // NZB to get a fast overall health estimate instead of waiting for sequential
         // processing to naturally reach damaged areas.
-        if needs_probes {
-            self.activate_health_probes(job_id);
+        if needs_probes && self.activate_health_probes(job_id) {
+            return;
+        }
+
+        if health_probing && health <= critical {
+            info!(
+                job_id = job_id.0,
+                health_pct = health as f64 / 10.0,
+                critical_pct = critical as f64 / 10.0,
+                failed_bytes,
+                total_bytes = total,
+                "deferring health failure while probe confirmation is pending"
+            );
+            return;
         }
 
         if health <= critical {
@@ -190,7 +229,12 @@ impl Pipeline {
         }
 
         // All probes missed → release is completely gone.
-        if done && !inconclusive && missed == total && total > 0 {
+        let par2_recovery_potential = self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| state.par2_bytes > 0);
+
+        if done && !inconclusive && missed == total && total > 0 && !par2_recovery_potential {
             let error = format!(
                 "health probe: all {} samples missing — release is unavailable",
                 total
@@ -290,17 +334,32 @@ impl Pipeline {
         self.pending_concat.remove(&job_id);
         self.active_download_passes.remove(&job_id);
         self.jobs_finalizing_download.remove(&job_id);
+        self.pending_released_download_results_by_job
+            .remove(&job_id);
+        self.pending_released_download_result_bytes_by_job
+            .remove(&job_id);
         self.active_downloads_by_job.remove(&job_id);
+        self.active_download_connections_by_job.remove(&job_id);
         self.active_downloads_by_file
             .retain(|file_id, _| file_id.job_id != job_id);
         self.active_decodes_by_job.remove(&job_id);
         self.active_decodes_by_file
             .retain(|file_id, _| file_id.job_id != job_id);
+        self.file_hash_states
+            .retain(|file_id, _| file_id.job_id != job_id);
+        self.expected_file_crcs
+            .retain(|file_id, _| file_id.job_id != job_id);
+        self.file_hash_reread_required
+            .retain(|file_id| file_id.job_id != job_id);
         self.pending_retries_by_job.remove(&job_id);
         self.pending_retries_by_segment
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+        self.rate_limit_reservations
+            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
         self.remove_pending_completion_check(job_id);
         self.clear_par2_runtime_state(job_id);
+        self.clear_job_phase_progress_runtime(job_id);
+        self.clear_job_retention_excludes(job_id);
         self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
         self.record_job_history(job_id);
@@ -327,7 +386,7 @@ impl Pipeline {
     /// e.g. 150k segs × 8% = ~12k probes / 50 per batch = ~240 batched checks.
     /// If every single probe returns 430 across the usable server set, the job
     /// is failed immediately.
-    pub(super) fn activate_health_probes(&mut self, job_id: JobId) {
+    pub(super) fn activate_health_probes(&mut self, job_id: JobId) -> bool {
         // Set the flag and status, then collect probes separately to avoid borrow conflicts.
         let probe_round = match self.jobs.get_mut(&job_id) {
             Some(s) => {
@@ -336,7 +395,7 @@ impl Pipeline {
                 s.health_probe_round = s.health_probe_round.wrapping_add(1);
                 probe_round
             }
-            None => return,
+            None => return false,
         };
         self.transition_postprocessing_status(job_id, JobStatus::Checking, Some("checking"));
 
@@ -367,7 +426,7 @@ impl Pipeline {
             if !self.job_has_pending_download_pipeline_work(job_id) {
                 self.schedule_job_completion_check(job_id);
             }
-            return;
+            return false;
         }
 
         // Rotate evenly strided samples across rounds so repeat probes widen
@@ -465,5 +524,6 @@ impl Pipeline {
                 })
                 .await;
         });
+        true
     }
 }

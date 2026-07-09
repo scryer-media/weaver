@@ -66,11 +66,98 @@ fn sample_snapshot(
         bytes_decoded,
         bytes_committed,
         download_queue_depth: queue_depth,
+        active_downloads: 0,
+        active_decodes: 0,
         decode_pending: queue_depth / 2,
+        decode_pending_bytes: 0,
+        decode_active_bytes: 0,
         commit_pending: queue_depth / 3,
         write_buffered_bytes: current_download_speed * 2,
         write_buffered_segments: queue_depth + 1,
         direct_write_evictions: 0,
+        decode_pressure_soft_limit_bytes: 0,
+        decode_pressure_hard_limit_bytes: 0,
+        write_pressure_soft_limit_bytes: 0,
+        write_pressure_hard_limit_bytes: 0,
+        download_pressure_state: crate::DownloadPressureState::Clear,
+        download_pressure_reason: crate::DownloadPressureReason::None,
+        download_pressure_stalls_total: 0,
+        download_pressure_stall_duration_ms: 0,
+        download_pressure_current_stall_ms: 0,
+        download_restart_durable_lead_blocked_total: 0,
+        hot_dispatch_job_id: 0,
+        hot_dispatch_mode: crate::DispatchShareMode::Exclusive,
+        hot_dispatch_underfill_ms: 0,
+        hot_dispatch_lent_connections: 0,
+        hot_dispatch_warmup_complete: false,
+        hot_dispatch_last_spillover_decision: crate::SpilloverDecision::None,
+        hot_dispatch_spillover_blocked_warmup_total: 0,
+        hot_dispatch_spillover_blocked_pressure_total: 0,
+        hot_dispatch_spillover_blocked_near_cap_total: 0,
+        hot_dispatch_spillover_blocked_hot_can_use_capacity_total: 0,
+        hot_dispatch_spillover_blocked_best_mode_pending_total: 0,
+        hot_dispatch_spillover_blocked_recent_expansion_helped_total: 0,
+        hot_dispatch_spillover_blocked_cap_speed_total: 0,
+        hot_dispatch_spillover_allowed_underfill_total: 0,
+        hot_dispatch_spillover_allowed_measured_underfill_total: 0,
+        hot_dispatch_spillover_allowed_bounded_same_band_total: 0,
+        hot_dispatch_spillover_reclaimed_total: 0,
+        hot_dispatch_hot_speed_bps: 0,
+        hot_dispatch_exclusive_peak_bps: 0,
+        hot_dispatch_spillover_pre_speed_bps: 0,
+        hot_dispatch_spillover_post_speed_bps: 0,
+        hot_dispatch_spillover_active_loans: 0,
+        hot_dispatch_spillover_reclaimed_speed_harm_total: 0,
+        hot_dispatch_recent_expansion_improvement_pct: 0,
+        hot_dispatch_best_mode_block_reason: 0,
+        hot_dispatch_last_expansion_kind: 0,
+        hot_dispatch_last_expansion_before_bps: 0,
+        hot_dispatch_last_expansion_after_bps: 0,
+        download_lanes_active: 0,
+        download_lanes_sequential_active: 0,
+        download_lanes_depth2_active: 0,
+        download_lanes_depth4_active: 0,
+        download_lanes_idle_active: 0,
+        download_lanes_awaiting_work_active: 0,
+        download_lanes_binding_server_active: 0,
+        download_lanes_acquired_active: 0,
+        download_lanes_issuing_active: 0,
+        download_lanes_draining_active: 0,
+        download_lanes_yield_after_batch_active: 0,
+        download_lanes_parking_active: 0,
+        download_lanes_recovering_active: 0,
+        download_lane_parks_no_work_total: 0,
+        download_lane_parks_pressure_total: 0,
+        download_lane_parks_probe_yield_total: 0,
+        download_lane_parks_hot_reclaim_total: 0,
+        download_lane_parks_hot_share_yield_total: 0,
+        download_lane_parks_spillover_withdraw_total: 0,
+        download_lane_parks_spillover_speed_harm_total: 0,
+        download_lane_parks_ip_replacement_retired_total: 0,
+        download_lane_parks_server_tier_changed_total: 0,
+        download_lane_parks_proof_failure_total: 0,
+        download_lane_parks_error_total: 0,
+        download_lane_lease_items_total: 0,
+        download_lane_refill_granted_total: 0,
+        download_lane_refill_parked_total: 0,
+        download_lane_refill_deferred_total: 0,
+        download_pipeline_trial_success_total: 0,
+        download_pipeline_trial_failure_total: 0,
+        download_pipeline_proof_pass_total: 0,
+        download_pipeline_cooldown_total: 0,
+        download_pipeline_replay_items_total: 0,
+        ip_replacement_trial_extra_connections: 0,
+        ip_replacement_burst_active: false,
+        ip_replacement_over_max_connections: 0,
+        ip_rtt_ewma_entries: 0,
+        ip_rtt_ewma_slowest_ms: 0,
+        ip_replacement_trials_started_total: 0,
+        ip_replacement_trials_rejected_total: 0,
+        ip_replacement_trials_accepted_total: 0,
+        ip_replacement_trials_blocked_total: 0,
+        ip_replacement_trials_acquire_failed_total: 0,
+        ip_replacement_trials_same_ip_rejected_total: 0,
+        ip_replacement_old_connections_retired_total: 0,
         segments_downloaded: bytes_downloaded / 100,
         segments_decoded: bytes_decoded / 100,
         segments_committed: bytes_committed / 100,
@@ -82,12 +169,84 @@ fn sample_snapshot(
         disk_write_latency_us: 200,
         segments_retried: 0,
         segments_failed_permanent: 0,
+        download_failures_article_not_found: 0,
+        download_failures_capacity_unavailable: 0,
+        download_failures_transient: 0,
+        download_failures_auth: 0,
+        download_failures_permanent: 0,
         current_download_speed,
         crc_errors: 0,
         recovery_queue_depth: 0,
         articles_per_sec,
         decode_rate_mbps,
     }
+}
+
+#[test]
+fn raw_metrics_history_point_deserializes_legacy_metric_array_lengths() {
+    #[derive(serde::Serialize)]
+    struct LegacyRawMetricsHistoryPoint {
+        timestamp_epoch_sec: i64,
+        counter_values: [f64; 11],
+        gauge_values: [f64; 13],
+        job_status_values: [f64; 12],
+    }
+
+    let legacy = LegacyRawMetricsHistoryPoint {
+        timestamp_epoch_sec: 123,
+        counter_values: [1.0; 11],
+        gauge_values: [2.0; 13],
+        job_status_values: [3.0; 12],
+    };
+
+    let encoded = rmp_serde::to_vec(&legacy).unwrap();
+    let decoded: RawMetricsHistoryPoint = rmp_serde::from_slice(&encoded).unwrap();
+
+    assert_eq!(decoded.timestamp_epoch_sec, 123);
+    assert_eq!(decoded.counter_values[10], 1.0);
+    assert_eq!(decoded.counter_values[11], 0.0);
+    assert_eq!(decoded.gauge_values[12], 2.0);
+    assert_eq!(decoded.gauge_values[13], 0.0);
+    assert_eq!(decoded.job_status_values[11], 3.0);
+}
+
+#[test]
+fn rollup_metrics_history_point_deserializes_legacy_metric_array_lengths() {
+    #[derive(serde::Serialize)]
+    struct LegacyRollupMetricsHistoryPoint {
+        timestamp_epoch_sec: i64,
+        counter_values: [CounterRollupValue; 11],
+        gauge_values: [GaugeRollupValue; 13],
+        job_status_values: [GaugeRollupValue; 12],
+    }
+
+    let counter = CounterRollupValue {
+        end: 1.0,
+        avg_rate: 2.0,
+        peak_rate: 3.0,
+        avg_rate_weight_sec: 4.0,
+    };
+    let gauge = GaugeRollupValue {
+        avg: 5.0,
+        peak: 6.0,
+        sample_count: 7,
+    };
+    let legacy = LegacyRollupMetricsHistoryPoint {
+        timestamp_epoch_sec: 456,
+        counter_values: [counter; 11],
+        gauge_values: [gauge; 13],
+        job_status_values: [gauge; 12],
+    };
+
+    let encoded = rmp_serde::to_vec(&legacy).unwrap();
+    let decoded: RollupMetricsHistoryPoint = rmp_serde::from_slice(&encoded).unwrap();
+
+    assert_eq!(decoded.timestamp_epoch_sec, 456);
+    assert_eq!(decoded.counter_values[10], counter);
+    assert_eq!(decoded.counter_values[11], CounterRollupValue::default());
+    assert_eq!(decoded.gauge_values[12], gauge);
+    assert_eq!(decoded.gauge_values[13], GaugeRollupValue::default());
+    assert_eq!(decoded.job_status_values[11], gauge);
 }
 
 fn job_info(job_id: u64, status: JobStatus) -> JobInfo {
@@ -104,6 +263,7 @@ fn job_info(job_id: u64, status: JobStatus) -> JobInfo {
         downloaded_bytes: 0,
         optional_recovery_bytes: 0,
         optional_recovery_downloaded_bytes: 0,
+        phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
         password: None,

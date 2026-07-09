@@ -100,6 +100,9 @@ impl Database {
     pub fn insert_job_history(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
         let datastore = self.datastore();
         let cache_entry = entry.clone();
+        // Capture the cache generation before the write so a delete racing this
+        // insert (invalidating after its commit) makes the re-cache a no-op.
+        let observed_generation = self.job_history_cache_generation();
         let args = job_history_args(entry);
         let attribute_entry = entry.clone();
         let result = self.run_sql_blocking(async move {
@@ -112,8 +115,8 @@ impl Database {
                             (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                              optional_recovery_bytes, optional_recovery_downloaded_bytes,
                              failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
-                             created_at, completed_at, metadata, last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms)
-                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
+                             created_at, completed_at, metadata)
+                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
                          ON CONFLICT(job_id) DO UPDATE SET
                             job_hash = excluded.job_hash,
                             name = excluded.name,
@@ -131,9 +134,7 @@ impl Database {
                             nzb_zstd = COALESCE(excluded.nzb_zstd, job_history.nzb_zstd),
                             created_at = excluded.created_at,
                             completed_at = excluded.completed_at,
-                            metadata = excluded.metadata,
-                            last_diagnostic_id = excluded.last_diagnostic_id,
-                            last_diagnostic_uploaded_at_epoch_ms = excluded.last_diagnostic_uploaded_at_epoch_ms",
+                            metadata = excluded.metadata",
                         &args,
                     )
                     .await?;
@@ -144,7 +145,7 @@ impl Database {
             .await
         });
         if result.is_ok() {
-            self.cache_job_history(cache_entry);
+            self.cache_job_history_at(cache_entry, observed_generation);
         }
         result
     }
@@ -231,7 +232,5 @@ fn job_history_args(entry: &JobHistoryRow) -> Vec<SqlArg> {
         SqlArg::I64(entry.created_at),
         SqlArg::I64(entry.completed_at),
         SqlArg::OptText(entry.metadata.clone()),
-        SqlArg::OptText(entry.last_diagnostic_id.clone()),
-        SqlArg::OptI64(entry.last_diagnostic_uploaded_at_epoch_ms),
     ]
 }

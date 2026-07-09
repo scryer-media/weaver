@@ -7,6 +7,41 @@ use weaver_model::files::{
     reserve_download_filename, sanitize_download_filename,
 };
 
+const PAR2_REPAIR_MEMORY_LIMIT_ENV: &str = "WEAVER_PAR2_REPAIR_MEMORY_LIMIT_BYTES";
+// Sizes the transient streaming repair buffers (the decode matrix has its own
+// budget floor inside weaver-par2). 64 MiB measured within noise of far
+// larger budgets on heavily damaged sets once streaming repair got its
+// batched kernels, so the default stays small and repairs coexist with
+// concurrent downloads; the env override remains for tuning.
+const DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+fn default_par2_repair_memory_limit_bytes() -> usize {
+    DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
+}
+
+fn configured_par2_repair_memory_limit_bytes() -> usize {
+    parse_par2_repair_memory_limit_bytes(
+        std::env::var(PAR2_REPAIR_MEMORY_LIMIT_ENV).ok().as_deref(),
+    )
+}
+
+fn parse_par2_repair_memory_limit_bytes(raw: Option<&str>) -> usize {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return default_par2_repair_memory_limit_bytes();
+    };
+    match value.parse::<usize>() {
+        Ok(bytes) if bytes > 0 => bytes,
+        _ => {
+            let default_bytes = default_par2_repair_memory_limit_bytes();
+            warn!(
+                env = PAR2_REPAIR_MEMORY_LIMIT_ENV,
+                value, default_bytes, "invalid PAR2 repair memory limit; using default"
+            );
+            default_bytes
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CleanPar2IntegrityGate {
     None,
@@ -164,6 +199,25 @@ impl Pipeline {
         set_names
     }
 
+    fn job_has_idle_startable_rar_work(&self, job_id: JobId) -> bool {
+        self.rar_sets
+            .iter()
+            .filter(|((rar_job_id, _), _)| *rar_job_id == job_id)
+            .any(|((_, set_name), set_state)| {
+                set_state.active_workers == 0
+                    && set_state.in_flight_members.is_empty()
+                    && set_state.plan.as_ref().is_some_and(|plan| {
+                        plan.ready_members.iter().any(|ready_member| {
+                            self.rar_ready_member_is_startable_for_batch_extraction(
+                                job_id,
+                                set_name,
+                                &ready_member.name,
+                            )
+                        })
+                    })
+            })
+    }
+
     pub(crate) fn job_has_live_rar_waiting_for_missing_volumes(&self, job_id: JobId) -> bool {
         let current_set_names = self.current_rar_set_names_for_job(job_id);
 
@@ -237,6 +291,12 @@ impl Pipeline {
             .copied()
             .unwrap_or(0)
             > 0;
+        let has_released_download_results = self
+            .pending_released_download_results_by_job
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0)
+            > 0;
         let has_pending_decode = self
             .pending_decode
             .iter()
@@ -250,6 +310,7 @@ impl Pipeline {
             || has_inflight_downloads
             || has_inflight_decodes
             || has_delayed_retries
+            || has_released_download_results
             || has_pending_decode
             || has_buffered_segments
     }
@@ -653,6 +714,7 @@ impl Pipeline {
 
     async fn run_par2_repairer(
         &mut self,
+        job_id: JobId,
         par2_set: Arc<weaver_par2::Par2FileSet>,
         working_dir: std::path::PathBuf,
         repair: bool,
@@ -666,23 +728,53 @@ impl Pipeline {
             }
         }
 
-        let repair_result = tokio::task::spawn_blocking(move || {
+        let memory_limit = configured_par2_repair_memory_limit_bytes();
+        // The analyze pass's scan carries into the execute pass so the
+        // repair does not re-scan sources the analysis just hashed. The
+        // engine re-stats every observed file and rescans on any drift.
+        let scan_carry = self
+            .par2_runtime(job_id)
+            .and_then(|runtime| runtime.scan_carry.clone());
+        let phase_counters = repair.then(|| self.phase_begin(job_id, JobPhase::Repairing, None));
+        let mut repair_task = tokio::task::spawn_blocking(move || {
             if repair {
                 crate::e2e_failpoint::maybe_delay("repair.task_start");
             }
             let mut options = weaver_par2::Par2RepairerOptions::new(working_dir, Vec::new());
             options.file_set = Some((*par2_set).clone());
             options.repair = repair;
+            options.memory_limit = Some(memory_limit);
+            options.scan_carry = scan_carry;
+            if let Some(counters) = phase_counters {
+                options.progress = Some(Arc::new(move |update: weaver_par2::ProgressUpdate| {
+                    if !matches!(
+                        update.stage,
+                        weaver_par2::ProgressStage::Repairing
+                            | weaver_par2::ProgressStage::WritingRepaired
+                    ) {
+                        return;
+                    }
+                    counters
+                        .completed_bytes
+                        .fetch_max(update.bytes_processed, Ordering::Relaxed);
+                    if let Some(total_bytes) = update.total_bytes {
+                        counters
+                            .total_bytes
+                            .fetch_max(total_bytes, Ordering::Relaxed);
+                    }
+                }));
+            }
             let repairer = weaver_par2::Par2Repairer::new(options);
-            let outcome = repairer
-                .verify_or_repair()
+            let (outcome, carry) = repairer
+                .verify_or_repair_carrying()
                 .map_err(|e| format!("PAR2 repairer failed: {e}"))?;
             if repair {
                 match outcome.status {
                     weaver_par2::Par2RepairStatus::Verified
                     | weaver_par2::Par2RepairStatus::Repaired => {}
                     weaver_par2::Par2RepairStatus::RepairPossible
-                    | weaver_par2::Par2RepairStatus::Insufficient => {
+                    | weaver_par2::Par2RepairStatus::Insufficient
+                    | weaver_par2::Par2RepairStatus::ResourceLimited => {
                         return Err(format!(
                             "PAR2 repairer did not complete repair: {:?}",
                             outcome.status
@@ -690,12 +782,32 @@ impl Pipeline {
                     }
                 }
             }
-            Ok(outcome)
-        })
-        .await;
+            Ok((outcome, carry))
+        });
+        let repair_result = if repair {
+            loop {
+                tokio::select! {
+                    result = &mut repair_task => break result,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                        self.sample_phase_progress();
+                    }
+                }
+            }
+        } else {
+            repair_task.await
+        };
+
+        if repair {
+            self.phase_end(job_id, JobPhase::Repairing);
+        }
 
         match repair_result {
-            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Ok((outcome, carry))) => {
+                // Keep the analyze pass's scan for the execute pass; after a
+                // repair the files just changed, so drop any stored carry.
+                self.ensure_par2_runtime(job_id).scan_carry = if repair { None } else { carry };
+                Ok(outcome)
+            }
             Ok(Err(error)) => Err(error),
             Err(error) => Err(format!("repair task panicked: {error}")),
         }
@@ -727,7 +839,9 @@ impl Pipeline {
         self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
         info!(job_id = job_id.0, "par2 damaged-path analysis started");
 
-        let outcome_result = self.run_par2_repairer(par2_set, working_dir, false).await;
+        let outcome_result = self
+            .run_par2_repairer(job_id, par2_set, working_dir, false)
+            .await;
 
         self.metrics.verify_active.fetch_sub(1, Ordering::Relaxed);
 
@@ -854,13 +968,6 @@ impl Pipeline {
     }
 
     fn emit_job_verification_started(&self, job_id: JobId) {
-        #[cfg(test)]
-        eprintln!(
-            "emit_job_verification_started job={} status={:?}\n{:?}",
-            job_id.0,
-            self.jobs.get(&job_id).map(|state| &state.status),
-            std::backtrace::Backtrace::force_capture()
-        );
         let _ = self
             .event_tx
             .send(PipelineEvent::JobVerificationStarted { job_id });
@@ -1125,27 +1232,32 @@ impl Pipeline {
             }
         }
 
-        for (file_id, filename, _total_bytes) in &files_to_complete {
-            crate::runtime::perf_probe::record(
-                "download.file_progress.complete_file_row_covers_restart",
-                std::time::Duration::ZERO,
-            );
-            let file_index = file_id.file_index;
-            let current_filename = filename.clone();
-            let current_hash = Self::expected_hash_for_verified_file(*file_id, &existing_hashes);
-            self.db_blocking(move |db| {
-                db.complete_file(job_id, file_index, &current_filename, &current_hash)
-            })
-            .await
-            .map_err(|error| {
-                format!(
-                    "failed to persist PAR2-reconciled file {}: {error}",
-                    filename
+        let complete_entries: Vec<(u32, String, Option<[u8; 16]>)> = files_to_complete
+            .iter()
+            .map(|(file_id, filename, _total_bytes)| {
+                crate::runtime::perf_probe::record(
+                    "download.file_progress.complete_file_row_covers_restart",
+                    std::time::Duration::ZERO,
+                );
+                (
+                    file_id.file_index,
+                    filename.clone(),
+                    Some(Self::expected_hash_for_verified_file(
+                        *file_id,
+                        &existing_hashes,
+                    )),
                 )
-            })?;
+            })
+            .collect();
+        self.db_blocking(move |db| db.complete_files(job_id, &complete_entries))
+            .await
+            .map_err(|error| format!("failed to persist PAR2-reconciled files: {error}"))?;
+
+        for (file_id, _filename, _total_bytes) in &files_to_complete {
             self.pending_file_progress.remove(file_id);
             self.persisted_file_progress.remove(file_id);
             self.file_hash_states.remove(file_id);
+            self.expected_file_crcs.remove(file_id);
             self.file_hash_reread_required.remove(file_id);
             self.refresh_archive_state_for_completed_file(job_id, *file_id, true)
                 .await;
@@ -1610,10 +1722,11 @@ impl Pipeline {
             self.emit_download_pipeline_drained_if_pending(job_id);
         }
         let only_rar_archives = self.job_has_only_rar_archives(job_id);
+        let par2_primary_payload_ready = !has_incomplete_data_files || download_pipeline_exhausted;
         let par2_validation_needed = par2_loaded
             && !par2_bypassed
             && !self.par2_verified.contains(&job_id)
-            && download_pipeline_exhausted
+            && par2_primary_payload_ready
             && !self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id);
         let rar_waiting_for_missing_volumes = download_pipeline_exhausted
             && only_rar_archives
@@ -1635,7 +1748,11 @@ impl Pipeline {
             && (has_crc_failures
                 || (has_incomplete_data_files && download_pipeline_exhausted)
                 || rar_waiting_for_missing_volumes
-                || matches!(current_status, JobStatus::Repairing));
+                || matches!(current_status, JobStatus::Repairing)
+                || matches!(
+                    clean_par2_integrity_gate,
+                    CleanPar2IntegrityGate::WeakTransform | CleanPar2IntegrityGate::None
+                ));
         let quick_par2_verification_allowed = par2_validation_needed
             && !matches!(current_status, JobStatus::Repairing)
             && !(has_incomplete_data_files && download_pipeline_exhausted)
@@ -1649,15 +1766,27 @@ impl Pipeline {
             || (has_incomplete_data_files && download_pipeline_exhausted)
             || rar_waiting_for_missing_volumes
             || par2_validation_needed;
-
-        if download_pipeline_exhausted && only_rar_archives {
-            let promoted_recovery = self.promoted_recovery_pipeline_state(job_id);
+        let exhausted_rar_activity = if download_pipeline_exhausted && only_rar_archives {
             let inflight_extractions = self
                 .inflight_extractions
                 .get(&job_id)
                 .map_or(0, HashSet::len);
             let has_active_rar_workers = self.has_active_rar_workers(job_id);
-            let has_active_extraction_tasks = has_active_rar_workers || inflight_extractions > 0;
+            Some((
+                inflight_extractions,
+                has_active_rar_workers,
+                has_active_rar_workers || inflight_extractions > 0,
+            ))
+        } else {
+            None
+        };
+        let has_exhausted_rar_active_extraction_tasks =
+            exhausted_rar_activity.is_some_and(|(_, _, active)| active);
+
+        if download_pipeline_exhausted && only_rar_archives {
+            let promoted_recovery = self.promoted_recovery_pipeline_state(job_id);
+            let (inflight_extractions, has_active_rar_workers, has_active_extraction_tasks) =
+                exhausted_rar_activity.unwrap_or((0, false, false));
             let only_archive_residuals =
                 self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id);
             let mut rar_set_state = self
@@ -1745,11 +1874,52 @@ impl Pipeline {
             return;
         }
 
+        if download_pipeline_exhausted
+            && only_rar_archives
+            && !has_crc_failures
+            && !par2_validation_needed
+            && !has_exhausted_rar_active_extraction_tasks
+            && self.job_has_idle_startable_rar_work(job_id)
+            && matches!(
+                current_status,
+                JobStatus::Downloading | JobStatus::QueuedExtract | JobStatus::Extracting
+            )
+        {
+            info!(
+                job_id = job_id.0,
+                status = ?current_status,
+                "restarting idle RAR extraction work"
+            );
+            self.try_rar_extraction(job_id).await;
+            return;
+        }
+
         if !has_crc_failures
             && self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id)
         {
             self.finalize_completed_archive_job(job_id).await;
             return;
+        }
+
+        if download_pipeline_exhausted
+            && only_rar_archives
+            && has_crc_failures
+            && !has_exhausted_rar_active_extraction_tasks
+            && matches!(
+                current_status,
+                JobStatus::QueuedExtract | JobStatus::Extracting
+            )
+        {
+            info!(
+                job_id = job_id.0,
+                status = ?current_status,
+                "normalizing idle RAR extraction status before repair evaluation"
+            );
+            self.transition_postprocessing_status(
+                job_id,
+                JobStatus::Downloading,
+                Some("downloading"),
+            );
         }
 
         if rar_waiting_for_missing_volumes && self.job_has_incoherent_rar_waiting_state(job_id) {
@@ -1767,10 +1937,15 @@ impl Pipeline {
                 return;
             }
 
-            if self.has_active_rar_workers(job_id) {
+            let has_active_extraction_tasks = if download_pipeline_exhausted && only_rar_archives {
+                has_exhausted_rar_active_extraction_tasks
+            } else {
+                self.job_has_active_extraction_tasks(job_id)
+            };
+            if has_active_extraction_tasks {
                 info!(
                     job_id = job_id.0,
-                    "deferring verify — active RAR extraction workers"
+                    "deferring verify — active extraction workers"
                 );
                 return;
             }
@@ -1778,6 +1953,7 @@ impl Pipeline {
             let par2_set = self.par2_set(job_id).cloned();
             if quick_par2_verification_allowed && let Some(par2_set) = par2_set.as_ref() {
                 let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
+                Self::trip_par2_verification_started_failpoint();
                 match self
                     .quick_verify_par2_with_placement(
                         job_id,
@@ -1951,7 +2127,17 @@ impl Pipeline {
                         | weaver_par2::verify::Repairability::Insufficient {
                             blocks_needed, ..
                         } => *blocks_needed,
+                        weaver_par2::verify::Repairability::ResourceLimited { .. } => 0,
                     };
+
+                    if let weaver_par2::verify::Repairability::ResourceLimited { reason } =
+                        &verification.repairable
+                    {
+                        let msg = format!("PAR2 verification resource limit exceeded: {reason}");
+                        warn!(job_id = job_id.0, error = %msg);
+                        self.fail_job(job_id, msg);
+                        return;
+                    }
 
                     if !par2_verification_needs_repair(verification) {
                         info!(job_id = job_id.0, "PAR2 analysis passed — no repair needed");
@@ -2057,8 +2243,13 @@ impl Pipeline {
                     if recovery_now < blocks_needed {
                         let promoted = self.promote_recovery_targeted(job_id, blocks_needed);
                         let targeted_total = self.recovery_blocks_available_or_targeted(job_id);
+                        let recovery_still_settling = promoted > 0
+                            || self.job_has_pending_download_pipeline_work(job_id)
+                            || self
+                                .promoted_recovery_pipeline_state(job_id)
+                                .has_pending_work();
 
-                        if targeted_total < blocks_needed {
+                        if targeted_total < blocks_needed && !recovery_still_settling {
                             let msg = format!(
                                 "not repairable: {blocks_needed} damaged slices, \
                                  only {targeted_total} recovery blocks available in NZB"
@@ -2087,6 +2278,7 @@ impl Pipeline {
                     if matches!(
                         &verification.repairable,
                         weaver_par2::verify::Repairability::Insufficient { .. }
+                            | weaver_par2::verify::Repairability::ResourceLimited { .. }
                     ) {
                         let msg = format!(
                             "not repairable: PAR2 analysis found incomplete critical repair metadata or unusable recovery despite {recovery_now} available recovery blocks"
@@ -2101,7 +2293,7 @@ impl Pipeline {
                     }
 
                     match self
-                        .run_par2_repairer(Arc::clone(&par2_set), working_dir.clone(), true)
+                        .run_par2_repairer(job_id, Arc::clone(&par2_set), working_dir.clone(), true)
                         .await
                     {
                         Ok(outcome) => {
@@ -2211,13 +2403,17 @@ impl Pipeline {
                     }
                 }
 
+                let emit_verification_events = !has_crc_failures
+                    || !self.par2_verified.contains(&job_id)
+                    || authoritative_par2_verification_needed
+                    || matches!(current_status, JobStatus::Repairing);
                 let (verification, placement_plan) = match self
                     .verify_par2_with_placement(
                         job_id,
                         Arc::clone(&par2_set),
                         working_dir.clone(),
                         matches!(current_status, JobStatus::Repairing),
-                        true,
+                        emit_verification_events,
                     )
                     .await
                 {
@@ -2231,6 +2427,15 @@ impl Pipeline {
                 let damaged = verification.total_missing_blocks;
                 let recovery_now = verification.recovery_blocks_available;
                 let total_recovery_capacity = self.total_recovery_block_capacity(job_id);
+
+                if let weaver_par2::verify::Repairability::ResourceLimited { reason } =
+                    &verification.repairable
+                {
+                    let msg = format!("PAR2 verification resource limit exceeded: {reason}");
+                    warn!(job_id = job_id.0, error = %msg);
+                    self.fail_job(job_id, msg);
+                    return;
+                }
 
                 if !par2_verification_needs_repair(&verification) {
                     info!(
@@ -2347,7 +2552,12 @@ impl Pipeline {
                     }
 
                     let repair_preview = match self
-                        .run_par2_repairer(Arc::clone(&par2_set), working_dir.clone(), false)
+                        .run_par2_repairer(
+                            job_id,
+                            Arc::clone(&par2_set),
+                            working_dir.clone(),
+                            false,
+                        )
                         .await
                     {
                         Ok(outcome) => outcome,
@@ -2374,6 +2584,15 @@ impl Pipeline {
                     let damaged = repairer_damaged;
                     let recovery_now = repairer_recovery_now;
 
+                    if let weaver_par2::verify::Repairability::ResourceLimited { reason } =
+                        &repair_preview.verification.repairable
+                    {
+                        let msg = format!("PAR2 verification resource limit exceeded: {reason}");
+                        warn!(job_id = job_id.0, error = %msg);
+                        self.fail_job(job_id, msg);
+                        return;
+                    }
+
                     if total_recovery_capacity < damaged {
                         self.fail_job(
                             job_id,
@@ -2387,11 +2606,16 @@ impl Pipeline {
                     if recovery_now < damaged {
                         let promoted = self.promote_recovery_targeted(job_id, damaged);
                         let targeted_total = self.recovery_blocks_available_or_targeted(job_id);
+                        let recovery_still_settling = promoted > 0
+                            || self.job_has_pending_download_pipeline_work(job_id)
+                            || self
+                                .promoted_recovery_pipeline_state(job_id)
+                                .has_pending_work();
 
                         // If all available/targeted recovery is still insufficient,
                         // fail immediately instead of waiting for downloads that
                         // won't help.
-                        if targeted_total < damaged {
+                        if targeted_total < damaged && !recovery_still_settling {
                             let msg = format!(
                                 "not repairable: {damaged} damaged slices, \
                                  only {targeted_total} recovery blocks available in NZB"
@@ -2422,7 +2646,7 @@ impl Pipeline {
                     }
 
                     match self
-                        .run_par2_repairer(Arc::clone(&par2_set), working_dir.clone(), true)
+                        .run_par2_repairer(job_id, Arc::clone(&par2_set), working_dir.clone(), true)
                         .await
                     {
                         Ok(outcome) => {
@@ -2550,6 +2774,18 @@ impl Pipeline {
                     }
                 }
             } else {
+                if !par2_bypassed && self.promote_par2_metadata(job_id) {
+                    info!(
+                        job_id = job_id.0,
+                        "waiting for PAR2 metadata download before repair evaluation"
+                    );
+                    self.transition_postprocessing_status(
+                        job_id,
+                        JobStatus::Downloading,
+                        Some("downloading"),
+                    );
+                    return;
+                }
                 if has_incomplete_data_files {
                     let msg = format!(
                         "download incomplete after exhausting retries: {complete_data_files}/{total_data_files} data files complete and no PAR2 metadata is available for repair"
@@ -2604,6 +2840,18 @@ impl Pipeline {
             }
         } else if has_incomplete_data_files {
             if !download_pipeline_exhausted || self.job_has_active_extraction_tasks(job_id) {
+                return;
+            }
+            if !par2_bypassed && self.promote_par2_metadata(job_id) {
+                info!(
+                    job_id = job_id.0,
+                    "waiting for PAR2 metadata download before incomplete-download failure"
+                );
+                self.transition_postprocessing_status(
+                    job_id,
+                    JobStatus::Downloading,
+                    Some("downloading"),
+                );
                 return;
             }
             let repair_context = if par2_bypassed {
@@ -2787,6 +3035,15 @@ impl Pipeline {
                 }
             }
             ExtractionReadiness::Blocked { reason } => {
+                if reason.starts_with("archive topology not yet available") {
+                    info!(
+                        job_id = job_id.0,
+                        reason = %reason,
+                        "deferring completion until archive topology is available"
+                    );
+                    self.schedule_job_completion_check(job_id);
+                    return;
+                }
                 self.fail_job(job_id, reason);
             }
             ExtractionReadiness::Partial {
@@ -2844,6 +3101,39 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn par2_repair_memory_limit_defaults_when_unset() {
+        assert_eq!(
+            parse_par2_repair_memory_limit_bytes(None),
+            DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
+        );
+        assert_eq!(
+            parse_par2_repair_memory_limit_bytes(Some("  ")),
+            DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
+        );
+    }
+
+    #[test]
+    fn par2_repair_memory_limit_accepts_positive_bytes() {
+        assert_eq!(
+            parse_par2_repair_memory_limit_bytes(Some("134217728")),
+            134_217_728
+        );
+    }
+
+    #[test]
+    fn par2_repair_memory_limit_rejects_invalid_or_zero_values() {
+        let default_bytes = default_par2_repair_memory_limit_bytes();
+        assert_eq!(
+            parse_par2_repair_memory_limit_bytes(Some("not-bytes")),
+            default_bytes
+        );
+        assert_eq!(
+            parse_par2_repair_memory_limit_bytes(Some("0")),
+            default_bytes
+        );
+    }
 
     #[test]
     fn incomplete_promoted_recovery_without_concrete_work_is_not_pending() {

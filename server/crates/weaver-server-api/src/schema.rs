@@ -32,8 +32,8 @@ use crate::rss::types::{RssFeed, RssSeenItem};
 use crate::servers::types::Server;
 use crate::settings::types::GeneralSettings;
 use crate::system::types::{
-    DirectoryBrowseResult, MetricsHistoryResult, ServiceLogsPayload, SystemMetricsSnapshot,
-    SystemStatus,
+    DirectoryBrowseResult, DiskUsage, MetricsHistoryResult, ServerHealth, ServiceLogsPayload,
+    SystemMetricsSnapshot, SystemStatus,
 };
 use crate::system::types::{DownloadBlock, Metrics, PipelineEventGql};
 

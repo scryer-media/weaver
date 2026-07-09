@@ -10,9 +10,11 @@ function DetailItem({
   value: string;
 }) {
   return (
-    <div className="space-y-1">
-      <div className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">{label}</div>
-      <div className="text-sm text-foreground">{value}</div>
+    <div className="space-y-1.5">
+      <div className="text-[10.5px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+        {label}
+      </div>
+      <div className="text-[15px] font-semibold text-foreground">{value}</div>
     </div>
   );
 }
@@ -72,11 +74,16 @@ export function ParsedReleaseDetails({
 
   return (
     <div className={cn("space-y-4", compact && "space-y-3")}>
-      <div className="space-y-1">
-        <div className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+      <div className="space-y-1.5">
+        <div className="text-[10.5px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
           Original NZB Title
         </div>
-        <div className={cn("break-words text-sm text-foreground", compact && "text-[13px]")}>
+        <div
+          className={cn(
+            "break-words font-mono text-sm text-foreground",
+            compact && "text-[13px]",
+          )}
+        >
           {originalTitle}
         </div>
       </div>

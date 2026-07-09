@@ -128,6 +128,21 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
         }
     }
 
+    pub fn take_oldest_buffered_batch(&mut self, max_segments: usize) -> Vec<(u64, T)> {
+        let mut drained = Vec::new();
+        if max_segments == 0 {
+            return drained;
+        }
+
+        while drained.len() < max_segments {
+            let Some((offset, chunk)) = self.take_oldest_buffered() else {
+                break;
+            };
+            drained.push((offset, chunk));
+        }
+        drained
+    }
+
     /// Record that an out-of-order range has already been persisted directly.
     pub fn mark_persisted(&mut self, offset: u64, len: usize) {
         match self.pending.insert(offset, PendingChunk::Persisted { len }) {

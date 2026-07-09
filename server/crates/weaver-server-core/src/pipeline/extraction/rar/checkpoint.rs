@@ -9,6 +9,7 @@ pub(crate) struct DirectOutputWriter {
     pub(crate) bytes_written: u64,
     pub(crate) volume_index: u32,
     pub(crate) checkpoint: Option<Arc<ExtractionCheckpointState>>,
+    pub(crate) phase_attempt: Option<Arc<PhaseAttemptCounters>>,
 }
 
 impl std::io::Write for DirectOutputWriter {
@@ -16,6 +17,9 @@ impl std::io::Write for DirectOutputWriter {
         if let Some(shared) = &self.shared {
             let written = shared.borrow_mut().inner.write(buf)?;
             self.bytes_written += written as u64;
+            if let Some(attempt) = &self.phase_attempt {
+                attempt.record_completed(written as u64);
+            }
             Ok(written)
         } else {
             self.bytes_written += buf.len() as u64;
@@ -34,8 +38,13 @@ impl std::io::Write for DirectOutputWriter {
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         if let Some(shared) = &self.shared {
             shared.borrow_mut().inner.write_all(buf)?;
+            self.bytes_written += buf.len() as u64;
+            if let Some(attempt) = &self.phase_attempt {
+                attempt.record_completed(buf.len() as u64);
+            }
+        } else {
+            self.bytes_written += buf.len() as u64;
         }
-        self.bytes_written += buf.len() as u64;
         Ok(())
     }
 }

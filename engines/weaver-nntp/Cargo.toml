@@ -3,7 +3,7 @@ name = "weaver-nntp"
 description = "Async NNTP protocol client with TLS and connection pooling"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [dependencies]
@@ -20,9 +20,20 @@ pin-project-lite = { workspace = true, default-features = false }
 socket2 = { workspace = true }
 memchr = { workspace = true }
 rand = { workspace = true }
+libc = { workspace = true }
+
+# s2n-tls is POSIX-only C; Windows builds use the rustls/aws-lc backend instead.
+[target.'cfg(not(windows))'.dependencies]
+s2n-tls = "0.3.39"
+s2n-tls-sys = "0.3.39"
+s2n-tls-tokio = "0.3.39"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 criterion = "0.5"
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 
 [[bench]]
 name = "multiline_decode"

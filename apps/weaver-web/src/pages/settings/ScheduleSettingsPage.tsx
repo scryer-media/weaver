@@ -3,8 +3,8 @@ import { useMutation, useQuery } from "urql";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
+import { SectionCard } from "@/components/SectionCard";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { formatSpeed } from "@/components/SpeedDisplay";
+import { cn } from "@/lib/utils";
 import {
   SCHEDULES_QUERY,
   CREATE_SCHEDULE_MUTATION,
@@ -148,26 +149,27 @@ export function ScheduleSettingsPage() {
   };
 
   return (
-    <div className="space-y-6">
+    <div className="max-w-[1180px] space-y-6">
       <PageHeader
         title={t("schedule.title")}
         description={t("schedule.desc")}
       />
 
-      <Card>
-        <CardHeader className="flex flex-row items-center justify-between">
-          <CardTitle>{t("schedule.entries")}</CardTitle>
+      <SectionCard
+        title={t("schedule.entries")}
+        actions={
           <Button size="sm" onClick={openCreate}>
             <Plus className="mr-1 h-4 w-4" />
             {t("schedule.add")}
           </Button>
-        </CardHeader>
-        <CardContent className="space-y-4">
+        }
+      >
+        <div className="space-y-4">
           {showForm && (
-            <div className="rounded-lg border border-border bg-muted/30 p-4 space-y-4">
+            <div className="space-y-4 rounded-inner border border-border bg-background/40 p-5">
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label>{t("schedule.time")}</Label>
+                  <Label className="text-sm font-semibold">{t("schedule.time")}</Label>
                   <Input
                     type="time"
                     value={formTime}
@@ -175,7 +177,7 @@ export function ScheduleSettingsPage() {
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label>{t("schedule.action")}</Label>
+                  <Label className="text-sm font-semibold">{t("schedule.action")}</Label>
                   <Select value={formAction} onValueChange={setFormAction}>
                     <SelectTrigger>
                       <SelectValue />
@@ -184,6 +186,12 @@ export function ScheduleSettingsPage() {
                       <SelectItem value="pause">{t("schedule.actionPause")}</SelectItem>
                       <SelectItem value="resume">{t("schedule.actionResume")}</SelectItem>
                       <SelectItem value="speed_limit">{t("schedule.actionSpeedLimit")}</SelectItem>
+                      <SelectItem value="pause_watch_folder_scanning">
+                        {t("schedule.actionPauseWatchFolder")}
+                      </SelectItem>
+                      <SelectItem value="resume_watch_folder_scanning">
+                        {t("schedule.actionResumeWatchFolder")}
+                      </SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -191,7 +199,7 @@ export function ScheduleSettingsPage() {
 
               {formAction === "speed_limit" && (
                 <div className="space-y-2">
-                  <Label>{t("schedule.speedLimit")}</Label>
+                  <Label className="text-sm font-semibold">{t("schedule.speedLimit")}</Label>
                   <div className="flex items-center gap-2">
                     <Input
                       type="number"
@@ -206,7 +214,7 @@ export function ScheduleSettingsPage() {
                       disabled={formSpeedUnlimited}
                     />
                     <span className="text-sm text-muted-foreground">MB/s</span>
-                    <label className="flex items-center gap-1.5 text-sm cursor-pointer ml-2">
+                    <label className="ml-2 flex cursor-pointer items-center gap-1.5 text-sm">
                       <Checkbox
                         checked={formSpeedUnlimited}
                         onCheckedChange={(checked) => setFormSpeedUnlimited(checked === true)}
@@ -218,12 +226,12 @@ export function ScheduleSettingsPage() {
               )}
 
               <div className="space-y-2">
-                <Label>{t("schedule.days")}</Label>
+                <Label className="text-sm font-semibold">{t("schedule.days")}</Label>
                 <div className="flex gap-2">
                   {ALL_DAYS.map((day) => (
                     <label
                       key={day}
-                      className="flex items-center gap-1.5 text-sm cursor-pointer"
+                      className="flex cursor-pointer items-center gap-1.5 text-sm"
                     >
                       <Checkbox
                         checked={formDays.includes(day)}
@@ -233,11 +241,11 @@ export function ScheduleSettingsPage() {
                     </label>
                   ))}
                 </div>
-                <p className="text-xs text-muted-foreground">{t("schedule.daysHint")}</p>
+                <p className="text-[12.5px] text-muted-foreground">{t("schedule.daysHint")}</p>
               </div>
 
               <div className="space-y-2">
-                <Label>{t("schedule.label")}</Label>
+                <Label className="text-sm font-semibold">{t("schedule.label")}</Label>
                 <Input
                   value={formLabel}
                   onChange={(e) => setFormLabel(e.target.value)}
@@ -270,27 +278,35 @@ export function ScheduleSettingsPage() {
           {schedules.map((entry) => (
             <div
               key={entry.id}
-              className="flex items-center justify-between rounded-lg border border-border p-3"
+              className="flex items-center justify-between gap-4 rounded-inner border border-border p-4"
             >
               <div className="flex items-center gap-3">
-                <Switch
-                  checked={entry.enabled}
-                  onCheckedChange={(checked) =>
-                    handleToggle(entry.id, checked)
-                  }
-                />
+                <span
+                  className={cn(
+                    "inline-flex items-center rounded-pill px-2.5 py-[3px] text-[10.5px] font-bold uppercase tracking-[0.06em]",
+                    entry.enabled
+                      ? "bg-status-completed/15 text-status-completed"
+                      : "bg-muted text-muted-foreground",
+                  )}
+                >
+                  {entry.enabled ? t("label.enabled") : t("label.disabled")}
+                </span>
                 <div>
-                  <div className="flex items-center gap-2 text-sm font-medium">
+                  <div className="flex items-center gap-2 text-sm font-semibold">
                     <span className="font-mono">{entry.time}</span>
                     <span className="capitalize">
                       {entry.actionType === "speed_limit"
                         ? `${t("schedule.actionSpeedLimit")}: ${entry.speedLimitBytes === 0 || entry.speedLimitBytes == null ? t("settings.unlimited") : formatSpeed(entry.speedLimitBytes)}`
                         : entry.actionType === "pause"
                           ? t("schedule.actionPause")
-                          : t("schedule.actionResume")}
+                          : entry.actionType === "resume"
+                            ? t("schedule.actionResume")
+                            : entry.actionType === "pause_watch_folder_scanning"
+                              ? t("schedule.actionPauseWatchFolder")
+                              : t("schedule.actionResumeWatchFolder")}
                     </span>
                   </div>
-                  <div className="text-xs text-muted-foreground">
+                  <div className="mt-1 text-xs text-muted-foreground">
                     {entry.days.length > 0
                       ? entry.days.map((d) => DAY_LABELS[d] ?? d).join(", ")
                       : t("schedule.everyDay")}
@@ -299,6 +315,12 @@ export function ScheduleSettingsPage() {
                 </div>
               </div>
               <div className="flex items-center gap-1">
+                <Switch
+                  checked={entry.enabled}
+                  onCheckedChange={(checked) =>
+                    handleToggle(entry.id, checked)
+                  }
+                />
                 <Button
                   size="icon"
                   variant="ghost"
@@ -316,8 +338,8 @@ export function ScheduleSettingsPage() {
               </div>
             </div>
           ))}
-        </CardContent>
-      </Card>
+        </div>
+      </SectionCard>
     </div>
   );
 }

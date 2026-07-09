@@ -62,6 +62,11 @@ fn run_repair(args: Par2Args) -> Result<i32, Box<dyn std::error::Error>> {
             println!("repair completed in {:.2?}", started.elapsed());
             return Ok(1);
         }
+        weaver_par2::Repairability::ResourceLimited { reason } => {
+            println!("repair not possible: verification resource limit exceeded: {reason}");
+            println!("repair completed in {:.2?}", started.elapsed());
+            return Ok(1);
+        }
         weaver_par2::Repairability::Repairable { .. } => {}
     }
 
@@ -370,6 +375,9 @@ fn print_verification_report(
             "repairability: insufficient (need {}, have {}, deficit {})",
             blocks_needed, blocks_available, deficit
         ),
+        weaver_par2::Repairability::ResourceLimited { reason } => {
+            println!("repairability: resource-limited ({reason})")
+        }
     }
 }
 

@@ -8,7 +8,6 @@ use crate::persistence::{Database, DatabaseWriterExecutor};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct OrphanActiveStateCounts {
-    pub active_segments: usize,
     pub active_file_progress: usize,
     pub active_files: usize,
     pub active_file_identities: usize,
@@ -26,8 +25,7 @@ pub struct OrphanActiveStateCounts {
 
 impl OrphanActiveStateCounts {
     pub fn total_removed(self) -> usize {
-        self.active_segments
-            + self.active_file_progress
+        self.active_file_progress
             + self.active_files
             + self.active_file_identities
             + self.active_par2
@@ -45,8 +43,7 @@ impl OrphanActiveStateCounts {
 
 const INLINE_INCREMENTAL_VACUUM_PAGES: u64 = 256;
 
-const ACTIVE_JOB_CHILD_TABLES: [&str; 14] = [
-    "active_segments",
+const ACTIVE_JOB_CHILD_TABLES: [&str; 13] = [
     "active_file_progress",
     "active_files",
     "active_file_identities",
@@ -144,8 +141,6 @@ fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> 
         SqlArg::I64(history.created_at),
         SqlArg::I64(history.completed_at),
         SqlArg::OptText(history.metadata.clone()),
-        SqlArg::OptText(history.last_diagnostic_id.clone()),
-        SqlArg::OptI64(history.last_diagnostic_uploaded_at_epoch_ms),
     ]
 }
 
@@ -164,12 +159,12 @@ async fn archive_job_sql(
                  (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                   optional_recovery_bytes, optional_recovery_downloaded_bytes,
                   failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
-                  created_at, completed_at, metadata, last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms)
+                  created_at, completed_at, metadata)
                  VALUES ({}, COALESCE({}, (SELECT nzb_hash FROM active_jobs WHERE job_id = {})),
                          {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                          COALESCE({}, (SELECT nzb_path FROM active_jobs WHERE job_id = {})),
                          (SELECT nzb_zstd FROM active_jobs WHERE job_id = {}),
-                         {}, {}, {}, {}, {})
+                         {}, {}, {})
                  ON CONFLICT(job_id) DO UPDATE SET
                     job_hash = excluded.job_hash,
                     name = excluded.name,
@@ -187,14 +182,11 @@ async fn archive_job_sql(
                     nzb_zstd = COALESCE(excluded.nzb_zstd, job_history.nzb_zstd),
                     created_at = excluded.created_at,
                     completed_at = excluded.completed_at,
-                    metadata = excluded.metadata,
-                    last_diagnostic_id = excluded.last_diagnostic_id,
-                    last_diagnostic_uploaded_at_epoch_ms = excluded.last_diagnostic_uploaded_at_epoch_ms
+                    metadata = excluded.metadata
                  RETURNING job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                     optional_recovery_bytes, optional_recovery_downloaded_bytes,
                     failed_bytes, health, category, output_dir, nzb_path,
-                    created_at, completed_at, metadata,
-                    last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms",
+                    created_at, completed_at, metadata",
                 &args,
             )
             .await?
@@ -220,9 +212,13 @@ impl Database {
     ) -> Result<(), StateError> {
         let datastore = self.datastore();
         let args = history_args(history, job_id);
+        // Capture the cache generation before the archive read so a concurrent
+        // history-delete that bumps the generation makes the re-cache a no-op
+        // instead of resurrecting the just-deleted row.
+        let observed_generation = self.job_history_cache_generation();
         let result = self.run_sql_blocking(archive_job_sql(datastore, job_id, args));
         if let Ok(Some(row)) = &result {
-            self.cache_job_history(row.clone());
+            self.cache_job_history_at(row.clone(), observed_generation);
         }
         result.map(|_| ())
     }
@@ -250,7 +246,6 @@ impl Database {
                 SqlRuntime::run_in_transaction(&datastore, "prune_orphan_active_state", |tx| {
                     Box::pin(async move {
                         Ok(OrphanActiveStateCounts {
-                            active_segments: delete_orphan_rows(tx, "active_segments").await?,
                             active_file_progress: delete_orphan_rows(tx, "active_file_progress")
                                 .await?,
                             active_files: delete_orphan_rows(tx, "active_files").await?,

@@ -7,7 +7,9 @@ use axum::response::IntoResponse;
 use weaver_nntp::pool::NntpPool;
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::security::RuntimeSecurityConfig;
-use weaver_server_core::{JobInfo, JobStatus, MetricsSnapshot, SchedulerHandle};
+use weaver_server_core::{
+    DownloadPressureState, JobInfo, JobStatus, MetricsSnapshot, SchedulerHandle,
+};
 
 #[derive(Clone)]
 pub(crate) struct PrometheusMetricsExporter {
@@ -67,15 +69,15 @@ pub(super) async fn metrics_handler(
 }
 
 pub(super) struct ServerHealthInfo {
-    label: String,
-    state: &'static str,
-    success_count: u64,
-    failure_count: u64,
-    consecutive_failures: u32,
-    latency_ms: f64,
-    connections_available: usize,
-    connections_max: usize,
-    premature_deaths: usize,
+    pub(super) label: String,
+    pub(super) state: &'static str,
+    pub(super) success_count: u64,
+    pub(super) failure_count: u64,
+    pub(super) consecutive_failures: u32,
+    pub(super) latency_ms: f64,
+    pub(super) connections_available: usize,
+    pub(super) connections_max: usize,
+    pub(super) premature_deaths: usize,
 }
 
 async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
@@ -298,6 +300,31 @@ pub(super) fn render_prometheus_metrics(
         snapshot.segments_failed_permanent,
     );
 
+    out.push_str(
+        "# HELP weaver_pipeline_download_failures_total Failed article download attempts by kind.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_failures_total counter\n");
+    for (kind, value) in [
+        (
+            "article_not_found",
+            snapshot.download_failures_article_not_found,
+        ),
+        (
+            "capacity_unavailable",
+            snapshot.download_failures_capacity_unavailable,
+        ),
+        ("transient", snapshot.download_failures_transient),
+        ("auth", snapshot.download_failures_auth),
+        ("permanent", snapshot.download_failures_permanent),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_failures_total",
+            &[("kind", kind)],
+            value,
+        );
+    }
+
     out.push_str("# HELP weaver_pipeline_articles_not_found_total Total articles not found.\n");
     out.push_str("# TYPE weaver_pipeline_articles_not_found_total counter\n");
     append_metric(
@@ -330,12 +357,48 @@ pub(super) fn render_prometheus_metrics(
         snapshot.download_queue_depth,
     );
 
+    out.push_str("# HELP weaver_pipeline_active_downloads Active article downloads.\n");
+    out.push_str("# TYPE weaver_pipeline_active_downloads gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_active_downloads",
+        snapshot.active_downloads,
+    );
+
+    out.push_str("# HELP weaver_pipeline_active_decodes Active decode tasks.\n");
+    out.push_str("# TYPE weaver_pipeline_active_decodes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_active_decodes",
+        snapshot.active_decodes,
+    );
+
     out.push_str("# HELP weaver_pipeline_decode_pending Decode pending queue depth.\n");
     out.push_str("# TYPE weaver_pipeline_decode_pending gauge\n");
     append_metric(
         &mut out,
         "weaver_pipeline_decode_pending",
         snapshot.decode_pending,
+    );
+
+    out.push_str(
+        "# HELP weaver_pipeline_decode_pending_bytes Raw article bytes queued for decode.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_decode_pending_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_decode_pending_bytes",
+        snapshot.decode_pending_bytes,
+    );
+
+    out.push_str(
+        "# HELP weaver_pipeline_decode_active_bytes Raw article bytes currently being decoded.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_decode_active_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_decode_active_bytes",
+        snapshot.decode_active_bytes,
     );
 
     out.push_str("# HELP weaver_pipeline_commit_pending Commit pending queue depth.\n");
@@ -368,6 +431,543 @@ pub(super) fn render_prometheus_metrics(
         &mut out,
         "weaver_pipeline_write_buffered_segments",
         snapshot.write_buffered_segments,
+    );
+
+    out.push_str("# HELP weaver_pipeline_decode_pressure_soft_limit_bytes Decode soft pressure limit in bytes.\n");
+    out.push_str("# TYPE weaver_pipeline_decode_pressure_soft_limit_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_decode_pressure_soft_limit_bytes",
+        snapshot.decode_pressure_soft_limit_bytes,
+    );
+
+    out.push_str("# HELP weaver_pipeline_decode_pressure_hard_limit_bytes Decode hard pressure limit in bytes.\n");
+    out.push_str("# TYPE weaver_pipeline_decode_pressure_hard_limit_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_decode_pressure_hard_limit_bytes",
+        snapshot.decode_pressure_hard_limit_bytes,
+    );
+
+    out.push_str("# HELP weaver_pipeline_write_pressure_soft_limit_bytes Write soft pressure limit in bytes.\n");
+    out.push_str("# TYPE weaver_pipeline_write_pressure_soft_limit_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_write_pressure_soft_limit_bytes",
+        snapshot.write_pressure_soft_limit_bytes,
+    );
+
+    out.push_str("# HELP weaver_pipeline_write_pressure_hard_limit_bytes Write hard pressure limit in bytes.\n");
+    out.push_str("# TYPE weaver_pipeline_write_pressure_hard_limit_bytes gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_write_pressure_hard_limit_bytes",
+        snapshot.write_pressure_hard_limit_bytes,
+    );
+
+    out.push_str("# HELP weaver_pipeline_download_pressure_state Download backpressure state.\n");
+    out.push_str("# TYPE weaver_pipeline_download_pressure_state gauge\n");
+    for state in ["clear", "soft", "hard"] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_pressure_state",
+            &[("state", state)],
+            u8::from(snapshot.download_pressure_state.as_str() == state),
+        );
+    }
+
+    out.push_str("# HELP weaver_pipeline_download_pressure_reason Download backpressure reason.\n");
+    out.push_str("# TYPE weaver_pipeline_download_pressure_reason gauge\n");
+    for reason in ["none", "decode", "write", "decode_and_write"] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_pressure_reason",
+            &[("reason", reason)],
+            u8::from(snapshot.download_pressure_reason.as_str() == reason),
+        );
+    }
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_job_id Current hot-dispatch job id, or 0 when no job owns hot dispatch.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_job_id gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_job_id",
+        snapshot.hot_dispatch_job_id,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_mode Current hot-dispatch sharing mode.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_mode gauge\n");
+    for mode in ["exclusive", "shared"] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_hot_dispatch_mode",
+            &[("mode", mode)],
+            u8::from(snapshot.hot_dispatch_mode.as_str() == mode),
+        );
+    }
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_underfill_milliseconds Current hot-job unused-capacity underfill window age.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_underfill_milliseconds gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_underfill_milliseconds",
+        snapshot.hot_dispatch_underfill_ms,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_lent_connections Active NNTP connection tasks lent to spillover jobs.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_lent_connections gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_lent_connections",
+        snapshot.hot_dispatch_lent_connections,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_warmup_complete Whether the current hot-dispatch warmup gate is complete.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_warmup_complete gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_warmup_complete",
+        u8::from(snapshot.hot_dispatch_warmup_complete),
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_last_spillover_decision Last hot-dispatch spillover decision.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_last_spillover_decision gauge\n");
+    for decision in [
+        "none",
+        "blocked_warmup",
+        "blocked_pressure",
+        "blocked_near_cap",
+        "blocked_hot_can_use_capacity",
+        "allowed_underfill",
+        "reclaimed",
+        "blocked_best_mode_pending",
+        "blocked_recent_expansion_helped",
+        "blocked_cap_speed",
+        "allowed_measured_underfill",
+        "reclaimed_speed_harm",
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_hot_dispatch_last_spillover_decision",
+            &[("decision", decision)],
+            u8::from(snapshot.hot_dispatch_last_spillover_decision.as_str() == decision),
+        );
+    }
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_spillover_decisions_total Hot-dispatch spillover decisions by reason.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_spillover_decisions_total counter\n");
+    for (decision, value) in [
+        (
+            "blocked_warmup",
+            snapshot.hot_dispatch_spillover_blocked_warmup_total,
+        ),
+        (
+            "blocked_pressure",
+            snapshot.hot_dispatch_spillover_blocked_pressure_total,
+        ),
+        (
+            "blocked_near_cap",
+            snapshot.hot_dispatch_spillover_blocked_near_cap_total,
+        ),
+        (
+            "blocked_hot_can_use_capacity",
+            snapshot.hot_dispatch_spillover_blocked_hot_can_use_capacity_total,
+        ),
+        (
+            "blocked_best_mode_pending",
+            snapshot.hot_dispatch_spillover_blocked_best_mode_pending_total,
+        ),
+        (
+            "blocked_recent_expansion_helped",
+            snapshot.hot_dispatch_spillover_blocked_recent_expansion_helped_total,
+        ),
+        (
+            "blocked_cap_speed",
+            snapshot.hot_dispatch_spillover_blocked_cap_speed_total,
+        ),
+        (
+            "allowed_underfill",
+            snapshot.hot_dispatch_spillover_allowed_underfill_total,
+        ),
+        ("reclaimed", snapshot.hot_dispatch_spillover_reclaimed_total),
+        (
+            "allowed_measured_underfill",
+            snapshot.hot_dispatch_spillover_allowed_measured_underfill_total,
+        ),
+        (
+            "reclaimed_speed_harm",
+            snapshot.hot_dispatch_spillover_reclaimed_speed_harm_total,
+        ),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_hot_dispatch_spillover_decisions_total",
+            &[("decision", decision)],
+            value,
+        );
+    }
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_speed_bytes_per_second Two-second hot-job BODY throughput.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_speed_bytes_per_second gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_speed_bytes_per_second",
+        snapshot.hot_dispatch_hot_speed_bps,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_last_expansion_kind Last hot-job expansion event kind code.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_last_expansion_kind gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_last_expansion_kind",
+        snapshot.hot_dispatch_last_expansion_kind,
+    );
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_last_expansion_speed_bytes_per_second Last hot-job expansion before/after speeds.\n");
+    out.push_str(
+        "# TYPE weaver_pipeline_hot_dispatch_last_expansion_speed_bytes_per_second gauge\n",
+    );
+    append_labeled_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_last_expansion_speed_bytes_per_second",
+        &[("phase", "before")],
+        snapshot.hot_dispatch_last_expansion_before_bps,
+    );
+    append_labeled_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_last_expansion_speed_bytes_per_second",
+        &[("phase", "after")],
+        snapshot.hot_dispatch_last_expansion_after_bps,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_exclusive_peak_bytes_per_second Peak hot-job speed observed while exclusive.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_exclusive_peak_bytes_per_second gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_exclusive_peak_bytes_per_second",
+        snapshot.hot_dispatch_exclusive_peak_bps,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_spillover_speed_bytes_per_second Hot-job speed before and after current spillover loan.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_spillover_speed_bytes_per_second gauge\n");
+    for (phase, value) in [
+        ("pre_lend", snapshot.hot_dispatch_spillover_pre_speed_bps),
+        ("post_lend", snapshot.hot_dispatch_spillover_post_speed_bps),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_hot_dispatch_spillover_speed_bytes_per_second",
+            &[("phase", phase)],
+            value,
+        );
+    }
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_spillover_active_loans Active measured spillover loans.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_spillover_active_loans gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_spillover_active_loans",
+        snapshot.hot_dispatch_spillover_active_loans,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_recent_expansion_improvement_percent Best recent lane/pipeline expansion improvement percent.\n");
+    out.push_str(
+        "# TYPE weaver_pipeline_hot_dispatch_recent_expansion_improvement_percent gauge\n",
+    );
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_recent_expansion_improvement_percent",
+        snapshot.hot_dispatch_recent_expansion_improvement_pct,
+    );
+
+    out.push_str("# HELP weaver_pipeline_hot_dispatch_best_mode_block_reason Last best-mode spillover block reason code.\n");
+    out.push_str("# TYPE weaver_pipeline_hot_dispatch_best_mode_block_reason gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_hot_dispatch_best_mode_block_reason",
+        snapshot.hot_dispatch_best_mode_block_reason,
+    );
+
+    out.push_str(
+        "# HELP weaver_pipeline_download_lanes_active Active article download lanes by mode.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_lanes_active gauge\n");
+    for (mode, value) in [
+        ("sequential", snapshot.download_lanes_sequential_active),
+        ("pipeline_depth2", snapshot.download_lanes_depth2_active),
+        ("pipeline_depth4", snapshot.download_lanes_depth4_active),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_lanes_active",
+            &[("mode", mode)],
+            value,
+        );
+    }
+    out.push_str(
+        "# HELP weaver_pipeline_download_lane_states_active Active article download lanes by scheduler state.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_lane_states_active gauge\n");
+    for (state, value) in [
+        ("idle", snapshot.download_lanes_idle_active),
+        (
+            "awaiting_work",
+            snapshot.download_lanes_awaiting_work_active,
+        ),
+        (
+            "binding_server",
+            snapshot.download_lanes_binding_server_active,
+        ),
+        ("acquired", snapshot.download_lanes_acquired_active),
+        ("issuing", snapshot.download_lanes_issuing_active),
+        ("draining", snapshot.download_lanes_draining_active),
+        (
+            "yield_after_batch",
+            snapshot.download_lanes_yield_after_batch_active,
+        ),
+        ("parking", snapshot.download_lanes_parking_active),
+        ("recovering", snapshot.download_lanes_recovering_active),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_lane_states_active",
+            &[("state", state)],
+            value,
+        );
+    }
+    out.push_str(
+        "# HELP weaver_pipeline_download_lanes_active_total Total active article download lanes.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_lanes_active_total gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_download_lanes_active_total",
+        snapshot.download_lanes_active,
+    );
+
+    out.push_str(
+        "# HELP weaver_pipeline_download_lane_parks_total Article download lane parks by reason.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_lane_parks_total counter\n");
+    for (reason, value) in [
+        ("no_work", snapshot.download_lane_parks_no_work_total),
+        ("pressure", snapshot.download_lane_parks_pressure_total),
+        (
+            "probe_yield",
+            snapshot.download_lane_parks_probe_yield_total,
+        ),
+        (
+            "hot_reclaim",
+            snapshot.download_lane_parks_hot_reclaim_total,
+        ),
+        (
+            "spillover_withdraw",
+            snapshot.download_lane_parks_spillover_withdraw_total,
+        ),
+        (
+            "spillover_speed_harm",
+            snapshot.download_lane_parks_spillover_speed_harm_total,
+        ),
+        (
+            "ip_replacement_retired",
+            snapshot.download_lane_parks_ip_replacement_retired_total,
+        ),
+        (
+            "server_tier_changed",
+            snapshot.download_lane_parks_server_tier_changed_total,
+        ),
+        (
+            "proof_failure",
+            snapshot.download_lane_parks_proof_failure_total,
+        ),
+        ("error", snapshot.download_lane_parks_error_total),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_lane_parks_total",
+            &[("reason", reason)],
+            value,
+        );
+    }
+
+    out.push_str(
+        "# HELP weaver_pipeline_download_lane_lease_items_total Article work items leased to download lanes.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_lane_lease_items_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_download_lane_lease_items_total",
+        snapshot.download_lane_lease_items_total,
+    );
+
+    out.push_str(
+        "# HELP weaver_pipeline_download_lane_refills_total Lane refill scheduler decisions.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_lane_refills_total counter\n");
+    for (result, value) in [
+        ("granted", snapshot.download_lane_refill_granted_total),
+        ("parked", snapshot.download_lane_refill_parked_total),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_lane_refills_total",
+            &[("result", result)],
+            value,
+        );
+    }
+
+    out.push_str("# HELP weaver_pipeline_body_proof_events_total BODY pipelining proof events.\n");
+    out.push_str("# TYPE weaver_pipeline_body_proof_events_total counter\n");
+    for (event, value) in [
+        (
+            "trial_success",
+            snapshot.download_pipeline_trial_success_total,
+        ),
+        (
+            "trial_failure",
+            snapshot.download_pipeline_trial_failure_total,
+        ),
+        ("proof_pass", snapshot.download_pipeline_proof_pass_total),
+        ("cooldown", snapshot.download_pipeline_cooldown_total),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_body_proof_events_total",
+            &[("event", event)],
+            value,
+        );
+    }
+
+    out.push_str("# HELP weaver_pipeline_body_replay_items_total BODY items returned unresolved after a lane reset/failure.\n");
+    out.push_str("# TYPE weaver_pipeline_body_replay_items_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_body_replay_items_total",
+        snapshot.download_pipeline_replay_items_total,
+    );
+
+    out.push_str("# HELP weaver_ip_replacement_trial_extra_connections Configured over-max IP replacement trial burst budget.\\n");
+    out.push_str("# TYPE weaver_ip_replacement_trial_extra_connections gauge\\n");
+    append_metric(
+        &mut out,
+        "weaver_ip_replacement_trial_extra_connections",
+        snapshot.ip_replacement_trial_extra_connections,
+    );
+    out.push_str("# HELP weaver_ip_replacement_burst_active Whether an over-max IP replacement trial is active.\\n");
+    out.push_str("# TYPE weaver_ip_replacement_burst_active gauge\\n");
+    append_metric(
+        &mut out,
+        "weaver_ip_replacement_burst_active",
+        u64::from(snapshot.ip_replacement_burst_active),
+    );
+    out.push_str("# HELP weaver_ip_replacement_over_max_connections Current over-max IP replacement trial connections.\\n");
+    out.push_str("# TYPE weaver_ip_replacement_over_max_connections gauge\\n");
+    append_metric(
+        &mut out,
+        "weaver_ip_replacement_over_max_connections",
+        snapshot.ip_replacement_over_max_connections,
+    );
+    out.push_str(
+        "# HELP weaver_ip_rtt_ewma_entries Number of tracked per-server/per-IP BODY RTT EWMAs.\\n",
+    );
+    out.push_str("# TYPE weaver_ip_rtt_ewma_entries gauge\\n");
+    append_metric(
+        &mut out,
+        "weaver_ip_rtt_ewma_entries",
+        snapshot.ip_rtt_ewma_entries,
+    );
+    out.push_str("# HELP weaver_ip_rtt_ewma_slowest_ms Slowest tracked per-IP BODY RTT EWMA in milliseconds.\\n");
+    out.push_str("# TYPE weaver_ip_rtt_ewma_slowest_ms gauge\\n");
+    append_metric(
+        &mut out,
+        "weaver_ip_rtt_ewma_slowest_ms",
+        snapshot.ip_rtt_ewma_slowest_ms,
+    );
+    out.push_str("# HELP weaver_ip_replacement_trials_total IP replacement trial outcomes.\\n");
+    out.push_str("# TYPE weaver_ip_replacement_trials_total counter\\n");
+    for (outcome, value) in [
+        ("started", snapshot.ip_replacement_trials_started_total),
+        ("rejected", snapshot.ip_replacement_trials_rejected_total),
+        ("accepted", snapshot.ip_replacement_trials_accepted_total),
+        ("blocked", snapshot.ip_replacement_trials_blocked_total),
+        (
+            "acquire_failed",
+            snapshot.ip_replacement_trials_acquire_failed_total,
+        ),
+        (
+            "same_ip_rejected",
+            snapshot.ip_replacement_trials_same_ip_rejected_total,
+        ),
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_ip_replacement_trials_total",
+            &[("outcome", outcome)],
+            value,
+        );
+    }
+    out.push_str("# HELP weaver_ip_replacement_old_connections_retired_total Old-IP connections retired after accepted replacement trials.\\n");
+    out.push_str("# TYPE weaver_ip_replacement_old_connections_retired_total counter\\n");
+    append_metric(
+        &mut out,
+        "weaver_ip_replacement_old_connections_retired_total",
+        snapshot.ip_replacement_old_connections_retired_total,
+    );
+
+    out.push_str("# HELP weaver_pipeline_download_observed_limiter Observed downloader limiter derived from pressure, queue, and server permits.\n");
+    out.push_str("# TYPE weaver_pipeline_download_observed_limiter gauge\n");
+    let observed_limiter =
+        observed_download_limiter(snapshot, pipeline_paused, download_block, server_health);
+    for limiter in [
+        "active",
+        "decode_lagging",
+        "dispatch_limited",
+        "gated",
+        "idle",
+        "network_limited",
+        "pressure_limited",
+    ] {
+        append_labeled_metric(
+            &mut out,
+            "weaver_pipeline_download_observed_limiter",
+            &[("limiter", limiter)],
+            u8::from(observed_limiter == limiter),
+        );
+    }
+
+    out.push_str(
+        "# HELP weaver_pipeline_download_pressure_stalls_total Hard pressure stalls started.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_pressure_stalls_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_download_pressure_stalls_total",
+        snapshot.download_pressure_stalls_total,
+    );
+
+    out.push_str(
+        "# HELP weaver_pipeline_download_restart_durable_lead_blocked_total Restart durable lead dispatch blocks.\n",
+    );
+    out.push_str("# TYPE weaver_pipeline_download_restart_durable_lead_blocked_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_download_restart_durable_lead_blocked_total",
+        snapshot.download_restart_durable_lead_blocked_total,
+    );
+
+    out.push_str("# HELP weaver_pipeline_download_pressure_stall_duration_seconds Completed hard pressure stall duration.\n");
+    out.push_str("# TYPE weaver_pipeline_download_pressure_stall_duration_seconds counter\n");
+    append_metric_f64(
+        &mut out,
+        "weaver_pipeline_download_pressure_stall_duration_seconds",
+        snapshot.download_pressure_stall_duration_ms as f64 / 1000.0,
+    );
+
+    out.push_str("# HELP weaver_pipeline_download_pressure_current_stall_seconds Current hard pressure stall duration.\n");
+    out.push_str("# TYPE weaver_pipeline_download_pressure_current_stall_seconds gauge\n");
+    append_metric_f64(
+        &mut out,
+        "weaver_pipeline_download_pressure_current_stall_seconds",
+        snapshot.download_pressure_current_stall_ms as f64 / 1000.0,
     );
 
     out.push_str("# HELP weaver_pipeline_direct_write_evictions_total Direct write evictions.\n");
@@ -561,6 +1161,60 @@ pub(super) fn render_prometheus_metrics(
     }
 
     out
+}
+
+fn observed_download_limiter(
+    snapshot: &MetricsSnapshot,
+    pipeline_paused: bool,
+    download_block: &DownloadBlockState,
+    server_health: &[ServerHealthInfo],
+) -> &'static str {
+    if pipeline_paused || !matches!(download_block.kind, DownloadBlockKind::None) {
+        return "gated";
+    }
+    let required_queue_depth = snapshot
+        .download_queue_depth
+        .saturating_sub(snapshot.recovery_queue_depth);
+    if required_queue_depth == 0 && snapshot.active_downloads == 0 {
+        return "idle";
+    }
+    if snapshot.download_pressure_state != DownloadPressureState::Clear {
+        return "pressure_limited";
+    }
+    let decode_backlog_bytes = snapshot
+        .decode_pending_bytes
+        .saturating_add(snapshot.decode_active_bytes);
+    let decode_lagging_backlog =
+        decode_backlog_bytes >= (snapshot.decode_pressure_soft_limit_bytes / 2).max(1);
+    if decode_lagging_backlog {
+        return "decode_lagging";
+    }
+    if snapshot.decode_pending_bytes > 0 && snapshot.current_download_speed > 0 {
+        let decode_bytes_per_second = snapshot.decode_rate_mbps.max(0.0) * 1024.0 * 1024.0;
+        if (snapshot.current_download_speed as f64) > decode_bytes_per_second * 1.2 {
+            return "decode_lagging";
+        }
+    }
+
+    let total_connections = server_health
+        .iter()
+        .map(|server| server.connections_max)
+        .sum::<usize>();
+    let available_connections = server_health
+        .iter()
+        .map(|server| server.connections_available)
+        .sum::<usize>();
+    if required_queue_depth > 0
+        && snapshot.active_downloads > 0
+        && total_connections > 0
+        && available_connections == 0
+    {
+        return "network_limited";
+    }
+    if snapshot.active_downloads > 0 {
+        return "active";
+    }
+    "dispatch_limited"
 }
 
 fn append_metric<T: std::fmt::Display>(out: &mut String, name: &str, value: T) {

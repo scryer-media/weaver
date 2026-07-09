@@ -21,6 +21,8 @@ pub struct DownloadWork {
 /// Lower priority number = higher scheduling priority (downloaded first).
 struct PrioritizedWork {
     priority: u32,
+    /// Optional intra-priority rank for deterministic dynamic ordering.
+    rank: Option<u32>,
     /// Tie-breaker: insertion order (lower = earlier).
     sequence: u64,
     work: DownloadWork,
@@ -28,7 +30,9 @@ struct PrioritizedWork {
 
 impl PartialEq for PrioritizedWork {
     fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority && self.sequence == other.sequence
+        self.priority == other.priority
+            && self.rank == other.rank
+            && self.sequence == other.sequence
     }
 }
 
@@ -42,8 +46,11 @@ impl PartialOrd for PrioritizedWork {
 
 impl Ord for PrioritizedWork {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let self_rank = self.rank.unwrap_or(u32::MAX);
+        let other_rank = other.rank.unwrap_or(u32::MAX);
         self.priority
             .cmp(&other.priority)
+            .then(self_rank.cmp(&other_rank))
             .then(self.sequence.cmp(&other.sequence))
     }
 }
@@ -52,6 +59,10 @@ impl Ord for PrioritizedWork {
 pub struct DownloadQueue {
     heap: BinaryHeap<Reverse<PrioritizedWork>>,
     next_sequence: u64,
+    /// Queued items carrying failure exclusions — escalated work that may
+    /// need a backfill lane. Maintained on push/pop; recounted on the rare
+    /// bulk-removal paths.
+    excluded_work: usize,
 }
 
 impl DownloadQueue {
@@ -59,6 +70,7 @@ impl DownloadQueue {
         Self {
             heap: BinaryHeap::new(),
             next_sequence: 0,
+            excluded_work: 0,
         }
     }
 
@@ -66,15 +78,84 @@ impl DownloadQueue {
         let priority = work.priority;
         let sequence = self.next_sequence;
         self.next_sequence += 1;
+        if !work.exclude_servers.is_empty() {
+            self.excluded_work += 1;
+        }
         self.heap.push(Reverse(PrioritizedWork {
             priority,
+            rank: None,
             sequence,
             work,
         }));
     }
 
     pub fn pop(&mut self) -> Option<DownloadWork> {
-        self.heap.pop().map(|Reverse(pw)| pw.work)
+        let work = self.heap.pop().map(|Reverse(pw)| pw.work);
+        if let Some(work) = &work
+            && !work.exclude_servers.is_empty()
+        {
+            self.excluded_work = self.excluded_work.saturating_sub(1);
+        }
+        work
+    }
+
+    /// Number of queued items with failure exclusions.
+    pub fn excluded_work_count(&self) -> usize {
+        self.excluded_work
+    }
+
+    /// Drop failure exclusions from all queued work. Used when the server
+    /// config is rebuilt: exclusion indices refer to the old pool layout and
+    /// would mis-target (or spuriously exhaust) servers in the new one.
+    pub fn clear_exclude_servers(&mut self) {
+        if self.excluded_work == 0 {
+            return;
+        }
+        let items: Vec<_> = self.heap.drain().collect();
+        for Reverse(mut pw) in items {
+            pw.work.exclude_servers.clear();
+            self.heap.push(Reverse(pw));
+        }
+        self.excluded_work = 0;
+    }
+
+    fn recount_excluded_work(&mut self) {
+        self.excluded_work = self
+            .heap
+            .iter()
+            .filter(|item| !item.0.work.exclude_servers.is_empty())
+            .count();
+    }
+
+    pub fn pop_next_pipelining_compatible_with(
+        &mut self,
+        anchor: &DownloadWork,
+    ) -> Option<DownloadWork> {
+        self.pop_next_matching(|work| {
+            work.priority == anchor.priority
+                && work.is_recovery == anchor.is_recovery
+                && work.groups == anchor.groups
+                && work.exclude_servers == anchor.exclude_servers
+        })
+    }
+
+    pub fn pop_next_matching(
+        &mut self,
+        mut matches: impl FnMut(&DownloadWork) -> bool,
+    ) -> Option<DownloadWork> {
+        self.heap
+            .peek()
+            .is_some_and(|Reverse(pw)| matches(&pw.work))
+            .then(|| self.pop())?
+    }
+
+    pub fn peek_next_matching(
+        &self,
+        mut matches: impl FnMut(&DownloadWork) -> bool,
+    ) -> Option<&DownloadWork> {
+        self.heap
+            .peek()
+            .and_then(|Reverse(pw)| matches(&pw.work).then_some(&pw.work))
     }
 
     pub fn len(&self) -> usize {
@@ -102,6 +183,7 @@ impl DownloadQueue {
 
     /// Remove and return all queued segments.
     pub fn drain_all(&mut self) -> Vec<DownloadWork> {
+        self.excluded_work = 0;
         self.heap.drain().map(|Reverse(pw)| pw.work).collect()
     }
 
@@ -113,6 +195,7 @@ impl DownloadQueue {
                 self.heap.push(item);
             }
         }
+        self.recount_excluded_work();
     }
 
     /// Remove and return all queued segments for a given job.
@@ -126,6 +209,7 @@ impl DownloadQueue {
                 self.heap.push(item);
             }
         }
+        self.recount_excluded_work();
         drained
     }
 
@@ -136,10 +220,44 @@ impl DownloadQueue {
         for Reverse(mut pw) in items {
             if pw.work.segment_id.file_id.job_id == job_id {
                 pw.priority = new_priority_base;
+                pw.rank = None;
                 pw.work.priority = new_priority_base;
             }
             self.heap.push(Reverse(pw));
         }
+    }
+
+    /// Recompute priorities for selected queued work while preserving insertion
+    /// order for work that ends up with the same priority.
+    pub fn reprioritize_matching(
+        &mut self,
+        mut priority_for: impl FnMut(&DownloadWork) -> Option<u32>,
+    ) -> usize {
+        self.reprioritize_matching_with_rank(|work| {
+            priority_for(work).map(|priority| (priority, None))
+        })
+    }
+
+    /// Recompute priorities and optional intra-priority ranks for selected queued
+    /// work. Unranked equal-priority work remains ordered by original insertion.
+    pub fn reprioritize_matching_with_rank(
+        &mut self,
+        mut priority_for: impl FnMut(&DownloadWork) -> Option<(u32, Option<u32>)>,
+    ) -> usize {
+        let items: Vec<_> = self.heap.drain().collect();
+        let mut changed = 0;
+        for Reverse(mut pw) in items {
+            if let Some((priority, rank)) = priority_for(&pw.work)
+                && (pw.priority != priority || pw.rank != rank)
+            {
+                pw.priority = priority;
+                pw.rank = rank;
+                pw.work.priority = priority;
+                changed += 1;
+            }
+            self.heap.push(Reverse(pw));
+        }
+        changed
     }
 }
 

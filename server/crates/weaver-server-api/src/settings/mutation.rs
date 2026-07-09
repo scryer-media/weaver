@@ -5,8 +5,11 @@ use async_graphql::{Context, MaybeUndefined, Object, Result};
 
 use crate::auth::AdminGuard;
 use crate::observability::{persist_then_update_config, spawn_blocking_db};
-use crate::settings::types::{GeneralSettings, GeneralSettingsInput};
+use crate::settings::types::{
+    GeneralSettings, GeneralSettingsInput, WatchFolderScanReport, WatchFolderSettingsInput,
+};
 use weaver_server_core::settings::SharedConfig;
+use weaver_server_core::watch_folder::{WatchFolderConfig, WatchFolderMode, WatchFolderService};
 use weaver_server_core::{Database, SchedulerHandle};
 
 static SETTINGS_MUTATION_GUARD: LazyLock<tokio::sync::Mutex<()>> =
@@ -33,7 +36,25 @@ impl SettingsMutation {
         let cleanup_after_extract = input.cleanup_after_extract;
         let max_download_speed = input.max_download_speed;
         let max_retries = input.max_retries;
+        let ip_replacement_trial_extra_connections = input.ip_replacement_trial_extra_connections;
         let isp_bandwidth_cap = input.isp_bandwidth_cap.clone();
+        let watch_folder_update = input
+            .watch_folder
+            .clone()
+            .map(normalize_watch_folder_update)
+            .transpose()?;
+        if let Some(ref watch) = watch_folder_update {
+            let mut candidate = {
+                let cfg = config.read().await;
+                cfg.watch_folder.clone()
+            };
+            apply_watch_folder_update(&mut candidate, watch);
+            candidate.validate().map_err(async_graphql::Error::new)?;
+        }
+        let should_reconcile_watch_folder = watch_folder_update.is_some();
+        if ip_replacement_trial_extra_connections.unwrap_or(0) > 1 {
+            return Err("ip_replacement_trial_extra_connections must be 0 or 1".into());
+        }
         let should_update_paths =
             !normalized_intermediate_dir.is_undefined() || !normalized_complete_dir.is_undefined();
 
@@ -44,6 +65,8 @@ impl SettingsMutation {
             max_download_speed,
             max_retries,
             isp_bandwidth_cap.clone(),
+            ip_replacement_trial_extra_connections,
+            watch_folder_update.clone(),
         );
         let settings_persist = {
             let db = db.clone();
@@ -111,6 +134,42 @@ impl SettingsMutation {
                                 &cap.monthly_reset_day.to_string(),
                             )?;
                         }
+                        if let Some(v) = persist_input.6 {
+                            db.set_setting(
+                                "ip_replacement_trial_extra_connections",
+                                &v.to_string(),
+                            )?;
+                        }
+                        if let Some(ref watch) = persist_input.7 {
+                            if let Some(mode) = watch.mode {
+                                db.set_setting("watch_folder.mode", mode.as_str())?;
+                            }
+                            match &watch.path {
+                                MaybeUndefined::Undefined => {}
+                                MaybeUndefined::Null => db.delete_setting("watch_folder.path")?,
+                                MaybeUndefined::Value(path) => {
+                                    db.set_setting("watch_folder.path", path)?
+                                }
+                            }
+                            if let Some(value) = watch.poll_interval_secs {
+                                db.set_setting(
+                                    "watch_folder.poll_interval_secs",
+                                    &value.to_string(),
+                                )?;
+                            }
+                            if let Some(value) = watch.stability_secs {
+                                db.set_setting("watch_folder.stability_secs", &value.to_string())?;
+                            }
+                            if let Some(value) = watch.category_from_subfolders {
+                                db.set_setting(
+                                    "watch_folder.category_from_subfolders",
+                                    &value.to_string(),
+                                )?;
+                            }
+                            if let Some(value) = watch.scanning_paused {
+                                db.set_setting("watch_folder.scanning_paused", &value.to_string())?;
+                            }
+                        }
                         Ok(())
                     },
                 )
@@ -156,6 +215,12 @@ impl SettingsMutation {
                 if let Some(cap) = isp_bandwidth_cap {
                     cfg.isp_bandwidth_cap = Some(cap.into());
                 }
+                if let Some(extra) = ip_replacement_trial_extra_connections {
+                    cfg.ip_replacement_trial_extra_connections = Some(extra);
+                }
+                if let Some(ref watch) = watch_folder_update {
+                    apply_watch_folder_update(&mut cfg.watch_folder, watch);
+                }
 
                 let runtime_paths = should_update_paths.then(|| {
                     (
@@ -171,7 +236,10 @@ impl SettingsMutation {
                     cleanup_after_extract: cfg.cleanup_after_extract(),
                     max_download_speed: cfg.max_download_speed.unwrap_or(0),
                     max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
+                    ip_replacement_trial_extra_connections: cfg
+                        .ip_replacement_trial_extra_connections(),
                     isp_bandwidth_cap: cfg.isp_bandwidth_cap.as_ref().map(Into::into),
+                    watch_folder: (&cfg.watch_folder).into(),
                 };
                 (settings, runtime_paths)
             },
@@ -185,6 +253,11 @@ impl SettingsMutation {
         if let Some(cap) = input.isp_bandwidth_cap {
             let _ = handle.set_bandwidth_cap_policy(Some(cap.into())).await;
         }
+        if let Some(extra) = ip_replacement_trial_extra_connections {
+            let _ = handle
+                .set_ip_replacement_trial_extra_connections(extra)
+                .await;
+        }
 
         // Apply directory changes immediately so new jobs use them without restart.
         if let Some((data_dir, intermediate_dir, complete_dir)) = runtime_paths {
@@ -192,9 +265,27 @@ impl SettingsMutation {
                 .update_runtime_paths(data_dir, intermediate_dir, complete_dir)
                 .await;
         }
+        if should_reconcile_watch_folder {
+            let watch_folder = ctx.data::<WatchFolderService>()?;
+            watch_folder
+                .reconcile_from_config()
+                .await
+                .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        }
 
         Ok(settings)
     }
+
+    #[graphql(guard = "AdminGuard")]
+    async fn scan_watch_folder(&self, ctx: &Context<'_>) -> Result<WatchFolderScanReport> {
+        let watch_folder = ctx.data::<WatchFolderService>()?;
+        let report = watch_folder
+            .scan_now()
+            .await
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        Ok(report.into())
+    }
+
     #[graphql(guard = "AdminGuard")]
     async fn create_schedule(
         &self,
@@ -320,6 +411,69 @@ fn normalize_settings_path_update(input: &MaybeUndefined<String>) -> MaybeUndefi
     }
 }
 
+#[derive(Debug, Clone)]
+struct NormalizedWatchFolderSettingsInput {
+    mode: Option<WatchFolderMode>,
+    path: MaybeUndefined<String>,
+    poll_interval_secs: Option<u64>,
+    stability_secs: Option<u64>,
+    category_from_subfolders: Option<bool>,
+    scanning_paused: Option<bool>,
+}
+
+fn normalize_watch_folder_update(
+    input: WatchFolderSettingsInput,
+) -> Result<NormalizedWatchFolderSettingsInput> {
+    let mode = input
+        .mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            WatchFolderMode::parse(value).ok_or_else(|| {
+                async_graphql::Error::new("watch_folder.mode must be off, polling, or realtime")
+            })
+        })
+        .transpose()?;
+    if input.poll_interval_secs == Some(0) {
+        return Err("watch_folder.poll_interval_secs must be greater than 0".into());
+    }
+    Ok(NormalizedWatchFolderSettingsInput {
+        mode,
+        path: normalize_settings_path_update(&input.path),
+        poll_interval_secs: input.poll_interval_secs,
+        stability_secs: input.stability_secs,
+        category_from_subfolders: input.category_from_subfolders,
+        scanning_paused: input.scanning_paused,
+    })
+}
+
+fn apply_watch_folder_update(
+    config: &mut WatchFolderConfig,
+    update: &NormalizedWatchFolderSettingsInput,
+) {
+    if let Some(mode) = update.mode {
+        config.mode = mode;
+    }
+    match &update.path {
+        MaybeUndefined::Undefined => {}
+        MaybeUndefined::Null => config.path = None,
+        MaybeUndefined::Value(path) => config.path = Some(path.clone()),
+    }
+    if let Some(value) = update.poll_interval_secs {
+        config.poll_interval_secs = value;
+    }
+    if let Some(value) = update.stability_secs {
+        config.stability_secs = value;
+    }
+    if let Some(value) = update.category_from_subfolders {
+        config.category_from_subfolders = value;
+    }
+    if let Some(value) = update.scanning_paused {
+        config.scanning_paused = value;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -345,7 +499,8 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
-            diagnostic_upload_url: None,
+            ip_replacement_trial_extra_connections: None,
+            watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             config_path: None,
         }))
     }

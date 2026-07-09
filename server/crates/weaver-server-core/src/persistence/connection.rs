@@ -17,8 +17,8 @@ use crate::persistence::sql_services::DatabaseServices;
 pub use crate::auth::{ApiKeyRow, AuthCredentials};
 pub use crate::history::{HistoryFilter, IntegrationEventRow, JobEvent, JobHistoryRow};
 pub use crate::jobs::{
-    ActiveFileIdentity, ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment,
-    ExtractionChunk, RecoveredJob,
+    ActiveFileIdentity, ActiveFileProgress, ActiveJob, ActivePar2File, ExtractionChunk,
+    RecoveredJob,
 };
 pub use crate::operations::{
     MetricsHistoryChunkRow, MetricsHistoryQueryData, MetricsHistoryQueryResult,
@@ -405,13 +405,22 @@ impl DatabaseWriterExecutor {
         self.sql_worker.block_on(future)
     }
 
-    pub(crate) fn cache_job_history(&self, row: JobHistoryRow) {
+    pub(crate) fn job_history_cache_generation(&self) -> u64 {
         self.job_history_cache
             .lock()
             .expect("job history cache poisoned")
-            .insert(row);
+            .generation()
+    }
+
+    pub(crate) fn cache_job_history_at(&self, row: JobHistoryRow, observed_generation: u64) {
+        self.job_history_cache
+            .lock()
+            .expect("job history cache poisoned")
+            .insert_if_generation(row, observed_generation);
     }
 }
+
+type WriteOp = Box<dyn FnOnce(&Database) -> Result<(), StateError> + Send + 'static>;
 
 enum DbWriteCommand {
     ArchiveJob {
@@ -420,6 +429,16 @@ enum DbWriteCommand {
     },
     InsertJobEvents {
         events: Vec<crate::history::JobEvent>,
+    },
+    /// A generic ordered write. Executed on the single serialized writer
+    /// consumer (awaited before the next command like the other arms), so
+    /// same-key state transitions land in enqueue order. `op` runs on a
+    /// `Database` clone the writer task holds, letting it call methods that
+    /// live on `Database` (e.g. `set_active_job_runtime` / `update_active_job`)
+    /// without duplicating them onto `DatabaseWriterExecutor`.
+    Write {
+        label: &'static str,
+        op: WriteOp,
     },
     Flush {
         reply: oneshot::Sender<()>,
@@ -430,11 +449,20 @@ enum DbWriteCommand {
 struct JobHistoryCache {
     rows: BTreeMap<u64, JobHistoryRow>,
     insertion_order: VecDeque<u64>,
+    /// Bumped on every invalidation (`remove`/`clear`). A cache-populate site
+    /// that captured a generation *before* its DB read may only insert when the
+    /// generation still matches; otherwise an intervening delete has moved the
+    /// cache forward and the row it read is stale, so the insert is dropped.
+    generation: u64,
 }
 
 impl JobHistoryCache {
     fn get(&self, job_id: u64) -> Option<JobHistoryRow> {
         self.rows.get(&job_id).cloned()
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
     }
 
     fn insert(&mut self, row: JobHistoryRow) {
@@ -450,15 +478,27 @@ impl JobHistoryCache {
         }
     }
 
+    /// Insert a row read from the database only if no invalidation happened
+    /// since `observed_generation` was captured. Guards the read-then-cache
+    /// race with a concurrent delete: a reader that fetched the row just before
+    /// a delete would otherwise re-populate it after the delete's invalidation.
+    fn insert_if_generation(&mut self, row: JobHistoryRow, observed_generation: u64) {
+        if self.generation == observed_generation {
+            self.insert(row);
+        }
+    }
+
     fn remove(&mut self, job_id: u64) {
         self.rows.remove(&job_id);
         self.insertion_order
             .retain(|cached_id| *cached_id != job_id);
+        self.generation = self.generation.wrapping_add(1);
     }
 
     fn clear(&mut self) {
         self.rows.clear();
         self.insertion_order.clear();
+        self.generation = self.generation.wrapping_add(1);
     }
 }
 
@@ -468,8 +508,12 @@ pub struct Database {
     sql_services: DatabaseServices,
     sql_worker: DatabaseRuntimeWorker,
     writer_tx: mpsc::Sender<DbWriteCommand>,
-    pending_archive_retries: Arc<AtomicUsize>,
-    pending_archive_notify: Arc<Notify>,
+    /// Count of in-flight background re-sends into the bounded writer queue
+    /// (archive jobs and generic ordered writes) spawned when `try_send` hit a
+    /// full queue. `flush_write_queue` waits for this to reach zero before its
+    /// own `Flush` so a re-send in progress is not skipped at shutdown.
+    pending_write_retries: Arc<AtomicUsize>,
+    pending_write_notify: Arc<Notify>,
     job_history_cache: Arc<Mutex<JobHistoryCache>>,
     encryption_key: Option<crate::persistence::encryption::EncryptionKey>,
     _ephemeral_dir: Option<Arc<tempfile::TempDir>>,
@@ -491,8 +535,8 @@ impl Database {
             sql_services,
             sql_worker,
             writer_tx,
-            pending_archive_retries: Arc::new(AtomicUsize::new(0)),
-            pending_archive_notify: Arc::new(Notify::new()),
+            pending_write_retries: Arc::new(AtomicUsize::new(0)),
+            pending_write_notify: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
             encryption_key: None,
             _ephemeral_dir: None,
@@ -515,8 +559,8 @@ impl Database {
             sql_services,
             sql_worker,
             writer_tx,
-            pending_archive_retries: Arc::new(AtomicUsize::new(0)),
-            pending_archive_notify: Arc::new(Notify::new()),
+            pending_write_retries: Arc::new(AtomicUsize::new(0)),
+            pending_write_notify: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
             encryption_key: Some(crate::persistence::encryption::EncryptionKey::generate()),
             _ephemeral_dir: Some(tempdir),
@@ -536,11 +580,25 @@ impl Database {
             .get(job_id)
     }
 
-    pub(crate) fn cache_job_history(&self, row: JobHistoryRow) {
+    /// Snapshot the cache invalidation generation before a DB read whose result
+    /// will be cached. Pair with [`Self::cache_job_history_at`] to insert only
+    /// if no invalidation raced the read.
+    pub(crate) fn job_history_cache_generation(&self) -> u64 {
         self.job_history_cache
             .lock()
             .expect("job history cache poisoned")
-            .insert(row);
+            .generation()
+    }
+
+    /// Cache a freshly-read row only if the cache generation still matches
+    /// `observed_generation` (captured before the read). Drops the insert when a
+    /// concurrent delete has invalidated the cache in between, preventing a
+    /// deleted job from being resurrected in the cache.
+    pub(crate) fn cache_job_history_at(&self, row: JobHistoryRow, observed_generation: u64) {
+        self.job_history_cache
+            .lock()
+            .expect("job history cache poisoned")
+            .insert_if_generation(row, observed_generation);
     }
 
     pub(crate) fn invalidate_job_history_cache(&self, job_id: u64) {
@@ -604,16 +662,49 @@ impl Database {
         })
     }
 
+    /// Build a `Database` handle for the writer task to run generic `Write`
+    /// ops against. It shares the sql services/worker/cache but carries a
+    /// *detached* `writer_tx` (a throwaway channel whose receiver is dropped),
+    /// so it does NOT hold the real writer channel open. That keeps the
+    /// all-senders-dropped shutdown contract intact — the real queue still
+    /// closes when every external `Database` handle drops — while letting
+    /// `Write` ops call methods that live only on `Database`
+    /// (`set_active_job_runtime`, `update_active_job`), which touch only
+    /// `datastore()` / `run_sql_blocking()` and never `writer_tx`.
+    fn writer_task_handle(&self) -> Database {
+        let (detached_tx, _detached_rx) = mpsc::channel(1);
+        Database {
+            sql_services: self.sql_services.clone(),
+            sql_worker: self.sql_worker.clone(),
+            writer_tx: detached_tx,
+            pending_write_retries: self.pending_write_retries.clone(),
+            pending_write_notify: self.pending_write_notify.clone(),
+            job_history_cache: self.job_history_cache.clone(),
+            encryption_key: self.encryption_key.clone(),
+            _ephemeral_dir: self._ephemeral_dir.clone(),
+        }
+    }
+
     fn spawn_writer_task(&self, mut rx: mpsc::Receiver<DbWriteCommand>) {
         let writer = DatabaseWriterExecutor::from_database(self);
+        // Handle used only to execute generic `Write` ops; carries a detached
+        // sender so it never keeps the real writer channel open (see above).
+        let writer_db = self.writer_task_handle();
         let worker = async move {
             while let Some(command) = rx.recv().await {
                 match command {
                     DbWriteCommand::ArchiveJob { job_id, history } => {
                         let writer = writer.clone();
                         tokio::task::spawn_blocking(move || {
+                            // Capture the cache generation *before* the archive
+                            // read so a concurrent history-delete that bumps the
+                            // generation makes the conditional insert a no-op,
+                            // rather than resurrecting the just-deleted row.
+                            let observed_generation = writer.job_history_cache_generation();
                             match writer.archive_job(job_id, history.as_ref()) {
-                                Ok(Some(row)) => writer.cache_job_history(row),
+                                Ok(Some(row)) => {
+                                    writer.cache_job_history_at(row, observed_generation)
+                                }
                                 Ok(None) => {}
                                 Err(error) => {
                                     tracing::warn!(
@@ -635,6 +726,20 @@ impl Database {
                                     count = events.len(),
                                     error = %error,
                                     "failed to persist job events on database writer path"
+                                );
+                            }
+                        })
+                        .await
+                        .ok();
+                    }
+                    DbWriteCommand::Write { label, op } => {
+                        let writer_db = writer_db.clone();
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(error) = op(&writer_db) {
+                                tracing::warn!(
+                                    label,
+                                    error = %error,
+                                    "failed to run ordered database write"
                                 );
                             }
                         })
@@ -670,20 +775,56 @@ impl Database {
             job_id,
             history: Box::new(history),
         };
+        self.try_send_with_retry(command, "archive")
+    }
+
+    /// Queue a generic ordered write. Runs on the single serialized writer
+    /// consumer (awaited before the next command), so two writes to the same
+    /// row land in enqueue order — closing the same-key reorder hazard that
+    /// detached `db_fire_and_forget` tasks have. Backpressure matches
+    /// [`Self::try_queue_archive_job`]: on a full queue, a background re-send is
+    /// spawned and tracked by `pending_write_retries` so `flush_write_queue`
+    /// waits for it. `op` runs against a `Database` handle inside the writer
+    /// task; use it to call methods that live on `Database`.
+    pub fn try_queue_write(
+        &self,
+        label: &'static str,
+        op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
+    ) -> Result<(), StateError> {
+        let command = DbWriteCommand::Write {
+            label,
+            op: Box::new(op),
+        };
+        self.try_send_with_retry(command, label)
+    }
+
+    /// Shared enqueue path for ordered writer commands. Tries a non-blocking
+    /// send; on a full queue spawns a background re-send tracked by
+    /// `pending_write_retries`/`pending_write_notify` (so a flush cannot race
+    /// past an in-flight re-send), falling back to a blocking send off-runtime.
+    fn try_send_with_retry(
+        &self,
+        command: DbWriteCommand,
+        context: &'static str,
+    ) -> Result<(), StateError> {
         match self.writer_tx.try_send(command) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
                 let tx = self.writer_tx.clone();
-                let pending_archive_retries = self.pending_archive_retries.clone();
-                let pending_archive_notify = self.pending_archive_notify.clone();
+                let pending_write_retries = self.pending_write_retries.clone();
+                let pending_write_notify = self.pending_write_notify.clone();
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    pending_archive_retries.fetch_add(1, Ordering::AcqRel);
+                    pending_write_retries.fetch_add(1, Ordering::AcqRel);
                     handle.spawn(async move {
                         let send_result = tx.send(command).await;
-                        pending_archive_retries.fetch_sub(1, Ordering::AcqRel);
-                        pending_archive_notify.notify_waiters();
+                        pending_write_retries.fetch_sub(1, Ordering::AcqRel);
+                        pending_write_notify.notify_waiters();
                         if let Err(error) = send_result {
-                            tracing::warn!(error = %error, "database writer queue closed while retrying archive enqueue");
+                            tracing::warn!(
+                                context,
+                                error = %error,
+                                "database writer queue closed while retrying enqueue"
+                            );
                         }
                     });
                     Ok(())
@@ -724,7 +865,10 @@ impl Database {
     }
 
     pub async fn flush_write_queue(&self) -> Result<(), StateError> {
-        self.wait_for_pending_archive_retries().await;
+        // Drain any in-flight background re-sends (archive jobs and generic
+        // writes) into the queue first, so the `Flush` we enqueue below sits
+        // behind every write that had already been accepted for the queue.
+        self.wait_for_pending_write_retries().await;
         let (reply, rx) = oneshot::channel();
         self.writer_tx
             .send(DbWriteCommand::Flush { reply })
@@ -734,13 +878,13 @@ impl Database {
             .map_err(|_| StateError::Database("database writer flush failed".to_string()))
     }
 
-    async fn wait_for_pending_archive_retries(&self) {
+    async fn wait_for_pending_write_retries(&self) {
         loop {
-            if self.pending_archive_retries.load(Ordering::Acquire) == 0 {
+            if self.pending_write_retries.load(Ordering::Acquire) == 0 {
                 return;
             }
-            let notified = self.pending_archive_notify.notified();
-            if self.pending_archive_retries.load(Ordering::Acquire) == 0 {
+            let notified = self.pending_write_notify.notified();
+            if self.pending_write_retries.load(Ordering::Acquire) == 0 {
                 return;
             }
             notified.await;
@@ -778,7 +922,9 @@ impl Database {
 
             for (id, plaintext) in &server_rows {
                 let val = Some(plaintext.clone());
-                if let Some(encrypted) = maybe_encrypt(Some(&key), &val) {
+                if let Some(encrypted) =
+                    maybe_encrypt(Some(&key), &val).map_err(StateError::Database)?
+                {
                     SqlRuntime::execute(
                         datastore.read_exec(),
                         "UPDATE servers SET password = {} WHERE id = {}",
@@ -809,7 +955,9 @@ impl Database {
 
             for (id, plaintext) in &feed_rows {
                 let val = Some(plaintext.clone());
-                if let Some(encrypted) = maybe_encrypt(Some(&key), &val) {
+                if let Some(encrypted) =
+                    maybe_encrypt(Some(&key), &val).map_err(StateError::Database)?
+                {
                     SqlRuntime::execute(
                         datastore.read_exec(),
                         "UPDATE rss_feeds SET password = {} WHERE id = {}",

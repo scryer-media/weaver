@@ -17,4 +17,7 @@ pub enum NzbError {
 
     #[error("NZB contains no files")]
     EmptyNzb,
+
+    #[error("NZB resource limit exceeded: {0}")]
+    ResourceLimit(String),
 }

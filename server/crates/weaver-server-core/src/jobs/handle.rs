@@ -9,12 +9,14 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod};
 use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::DetectedArchiveIdentity;
-use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::record::ActiveFileIdentity;
 
 use crate::jobs::error::SchedulerError;
 use crate::jobs::model::{JobSpec, JobStatus, JobUpdate};
 use crate::operations::metrics::{MetricsSnapshot, PipelineMetrics};
+
+pub const FINISHED_JOBS_RUNTIME_CAP: usize = 1_000;
 
 /// Shared read-only view of pipeline state for the control plane.
 ///
@@ -143,7 +145,6 @@ pub struct RestoreJobRequest {
     pub job_id: JobId,
     pub job_hash: [u8; 32],
     pub spec: JobSpec,
-    pub committed_segments: HashSet<SegmentId>,
     pub complete_files: HashSet<NzbFileId>,
     pub file_progress: HashMap<u32, u64>,
     pub detected_archives: HashMap<u32, DetectedArchiveIdentity>,
@@ -161,6 +162,11 @@ pub struct RestoreJobRequest {
     pub working_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AddJobOptions {
+    pub initially_paused: bool,
+}
+
 pub enum SchedulerCommand {
     /// Submit a new job.
     AddJob {
@@ -168,6 +174,7 @@ pub enum SchedulerCommand {
         spec: JobSpec,
         nzb_path: PathBuf,
         nzb_zstd: Vec<u8>,
+        options: AddJobOptions,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
     /// Restore a job from the journal (crash recovery).
@@ -203,6 +210,11 @@ pub enum SchedulerCommand {
     /// Set global speed limit (bytes/sec). 0 means unlimited.
     SetSpeedLimit {
         bytes_per_sec: u64,
+        reply: oneshot::Sender<()>,
+    },
+    /// Set global over-max latent-IP replacement burst budget. v1 allows 0 or 1.
+    SetIpReplacementTrialExtraConnections {
+        extra_connections: u8,
         reply: oneshot::Sender<()>,
     },
     /// Apply a scheduled action (pause, resume, or speed limit).
@@ -242,13 +254,6 @@ pub enum SchedulerCommand {
         job_id: JobId,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Re-download a completed or failed job as a linked diagnostic rerun under a new job ID.
-    StartDiagnosticRedownload {
-        source_job_id: JobId,
-        diagnostic_job_id: JobId,
-        include_server_hostnames: bool,
-        reply: oneshot::Sender<Result<JobId, SchedulerError>>,
-    },
     /// Delete a completed/failed/cancelled job from history.
     DeleteHistory {
         job_id: JobId,
@@ -279,6 +284,8 @@ pub struct JobInfo {
     pub downloaded_bytes: u64,
     pub optional_recovery_bytes: u64,
     pub optional_recovery_downloaded_bytes: u64,
+    #[serde(default)]
+    pub phase_progress: Vec<crate::jobs::phase_progress::JobPhaseProgress>,
     /// Bytes from segments that are permanently lost (430 / max retries).
     pub failed_bytes: u64,
     /// Job health 0-1000 (1000 = perfect). Drops as articles fail.
@@ -328,6 +335,19 @@ impl SchedulerHandle {
         nzb_path: PathBuf,
         nzb_zstd: Vec<u8>,
     ) -> Result<(), SchedulerError> {
+        self.add_job_with_options(job_id, spec, nzb_path, nzb_zstd, AddJobOptions::default())
+            .await
+    }
+
+    /// Submit a new download job with explicit scheduler options.
+    pub async fn add_job_with_options(
+        &self,
+        job_id: JobId,
+        spec: JobSpec,
+        nzb_path: PathBuf,
+        nzb_zstd: Vec<u8>,
+        options: AddJobOptions,
+    ) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::AddJob {
@@ -335,6 +355,7 @@ impl SchedulerHandle {
                 spec,
                 nzb_path,
                 nzb_zstd,
+                options,
                 reply: tx,
             })
             .await
@@ -414,26 +435,6 @@ impl SchedulerHandle {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::RedownloadJob { job_id, reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
-    }
-
-    /// Start a linked diagnostic rerun of a completed or failed job under a new job ID.
-    pub async fn start_diagnostic_redownload(
-        &self,
-        source_job_id: JobId,
-        diagnostic_job_id: JobId,
-        include_server_hostnames: bool,
-    ) -> Result<JobId, SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::StartDiagnosticRedownload {
-                source_job_id,
-                diagnostic_job_id,
-                include_server_hostnames,
-                reply: tx,
-            })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
@@ -542,6 +543,22 @@ impl SchedulerHandle {
         self.cmd_tx
             .send(SchedulerCommand::SetSpeedLimit {
                 bytes_per_sec,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        Ok(())
+    }
+
+    pub async fn set_ip_replacement_trial_extra_connections(
+        &self,
+        extra_connections: u8,
+    ) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::SetIpReplacementTrialExtraConnections {
+                extra_connections: extra_connections.min(1),
                 reply: tx,
             })
             .await

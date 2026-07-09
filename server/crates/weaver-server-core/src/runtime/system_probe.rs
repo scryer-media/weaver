@@ -171,6 +171,18 @@ fn detect_memory() -> MemoryProfile {
     }
 }
 
+/// Total memory the process can actually use: physical total, clamped by any
+/// cgroup v2 limit (containers see the host's /proc/meminfo, not their own
+/// budget). Used for memory-scaled policy defaults (e.g. the RAR
+/// dictionary-size ceiling).
+pub(crate) fn detect_total_memory_bytes() -> Option<u64> {
+    let total = detect_memory_bytes().map(|(total, _)| total)?;
+    Some(match detect_cgroup_memory_limit() {
+        Some(limit) => total.min(limit),
+        None => total,
+    })
+}
+
 /// Returns (total_bytes, available_bytes).
 fn detect_memory_bytes() -> Option<(u64, u64)> {
     #[cfg(target_os = "macos")]
@@ -366,9 +378,58 @@ fn benchmark_random_read_iops(dir: &Path) -> Option<f64> {
     }
 }
 
-/// Windows fallback: assume SSD-class IOPS since we cannot easily benchmark
-/// without pread(). The tuner will adjust based on observed throughput.
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn benchmark_random_read_iops(dir: &Path) -> Option<f64> {
+    use std::io::Write;
+    use std::os::windows::fs::FileExt;
+
+    let tmp_path = dir.join(".weaver-iops-probe");
+
+    // Write a 4 MB file of zeros.
+    let mut file = std::fs::File::create(&tmp_path).ok()?;
+    let buf = vec![0u8; 4 * 1024 * 1024];
+    file.write_all(&buf).ok()?;
+    file.sync_all().ok()?;
+    drop(file);
+
+    // Re-open read-only and benchmark random positional reads (`seek_read`
+    // is the Windows analog of pread: it does not move the file cursor).
+    let fd = std::fs::File::open(&tmp_path).ok()?;
+
+    const READ_SIZE: usize = 4096;
+    const NUM_READS: usize = 200;
+    const FILE_SIZE: usize = 4 * 1024 * 1024;
+    const MAX_OFFSET: usize = FILE_SIZE - READ_SIZE;
+
+    // Simple deterministic pseudo-random offsets (aligned to 4 KB).
+    let mut read_buf = [0u8; READ_SIZE];
+    let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_BABEu64;
+
+    let start = std::time::Instant::now();
+    for _ in 0..NUM_READS {
+        // xorshift64
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        let offset = ((rng_state as usize) % (MAX_OFFSET / READ_SIZE)) * READ_SIZE;
+
+        let _ = fd.seek_read(&mut read_buf, offset as u64);
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+
+    drop(fd);
+    let _ = std::fs::remove_file(&tmp_path);
+
+    if elapsed > 0.0 {
+        Some(NUM_READS as f64 / elapsed)
+    } else {
+        Some(NUM_READS as f64 * 1_000_000.0) // sub-microsecond → very fast
+    }
+}
+
+/// Fallback for platforms without a positional-read benchmark: assume
+/// SSD-class IOPS. The tuner will adjust based on observed throughput.
+#[cfg(not(any(unix, windows)))]
 fn benchmark_random_read_iops(_dir: &Path) -> Option<f64> {
     Some(50_000.0)
 }
@@ -571,6 +632,7 @@ fn linux_filesystem_type(path: &Path) -> FilesystemType {
 }
 
 /// Map a filesystem name string to our enum.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn parse_filesystem_type(s: &str) -> FilesystemType {
     let lower = s.to_lowercase();
     if lower.contains("apfs") {

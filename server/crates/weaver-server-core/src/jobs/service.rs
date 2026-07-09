@@ -12,11 +12,10 @@ use crate::jobs::model::{JobSpec, JobState, JobStatus};
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
 use crate::jobs::working_dir::{compute_working_dir, working_dir_marker_path};
 use crate::pipeline::{Pipeline, check_disk_space};
-use crate::{DownloadQueue, DownloadWork, RestoreJobRequest, with_diagnostic_metadata};
+use crate::{DownloadQueue, DownloadWork, RestoreJobRequest};
 
 #[derive(Debug, Default)]
 struct RestoreSkipStats {
-    legacy_segments: usize,
     complete_files: usize,
     complete_file_segments: usize,
     checkpoint_segments: usize,
@@ -32,8 +31,11 @@ struct RestoreSkipPlan {
 }
 
 impl Pipeline {
-    fn restore_has_open_download_finalization(&self, job_id: JobId) -> bool {
-        let events = match self.db.get_job_events(job_id.0) {
+    async fn restore_has_open_download_finalization(&self, job_id: JobId) -> bool {
+        let events = match self
+            .db_blocking(move |db| db.get_job_events(job_id.0))
+            .await
+        {
             Ok(events) => events,
             Err(error) => {
                 error!(
@@ -66,8 +68,8 @@ impl Pipeline {
         finalization_open
     }
 
-    fn restore_download_finalization_runtime(&mut self, job_id: JobId) -> bool {
-        if !self.restore_has_open_download_finalization(job_id) {
+    async fn restore_download_finalization_runtime(&mut self, job_id: JobId) -> bool {
+        if !self.restore_has_open_download_finalization(job_id).await {
             self.jobs_finalizing_download.remove(&job_id);
             return false;
         }
@@ -227,20 +229,24 @@ impl Pipeline {
             .unwrap_or_else(|| PathBuf::from(format!("job-{}.nzb", job_id.0)))
     }
 
-    fn persist_file_identities(
+    async fn persist_file_identities(
         &self,
         job_id: JobId,
         identities: &HashMap<u32, ActiveFileIdentity>,
     ) {
-        for identity in identities.values() {
-            if let Err(error) = self.db.save_file_identity(job_id, identity) {
-                warn!(
-                    job_id = job_id.0,
-                    file_index = identity.file_index,
-                    error = %error,
-                    "failed to persist file identity"
-                );
-            }
+        if identities.is_empty() {
+            return;
+        }
+        let identities = identities.values().cloned().collect::<Vec<_>>();
+        if let Err(error) = self
+            .db_blocking(move |db| db.save_file_identities(job_id, &identities))
+            .await
+        {
+            warn!(
+                job_id = job_id.0,
+                error = %error,
+                "failed to persist file identities"
+            );
         }
     }
 
@@ -360,7 +366,7 @@ impl Pipeline {
         }
     }
 
-    fn reset_failed_job_runtime(&mut self, job_id: JobId) {
+    async fn reset_failed_job_runtime(&mut self, job_id: JobId) {
         self.remove_pending_completion_check(job_id);
         self.clear_par2_runtime_state(job_id);
         self.clear_job_extraction_runtime(job_id);
@@ -368,7 +374,10 @@ impl Pipeline {
         self.clear_job_write_backlog(job_id);
         self.replace_failed_extraction_members(job_id, HashSet::new());
         self.set_normalization_retried_state(job_id, false);
-        if let Err(error) = self.db.clear_verified_suspect_volumes(job_id) {
+        if let Err(error) = self
+            .db_blocking(move |db| db.clear_verified_suspect_volumes(job_id))
+            .await
+        {
             error!(
                 job_id = job_id.0,
                 error = %error,
@@ -464,18 +473,14 @@ impl Pipeline {
     async fn build_restore_skip_plan(
         job_id: JobId,
         spec: &JobSpec,
-        legacy_segments: &HashSet<SegmentId>,
         complete_files: &HashSet<NzbFileId>,
         recovered_file_progress: &HashMap<u32, u64>,
         file_identities: &HashMap<u32, ActiveFileIdentity>,
         working_dir: &std::path::Path,
     ) -> RestoreSkipPlan {
-        let mut skip = legacy_segments.clone();
+        let mut skip = HashSet::new();
         let mut file_progress = HashMap::new();
-        let mut stats = RestoreSkipStats {
-            legacy_segments: legacy_segments.len(),
-            ..RestoreSkipStats::default()
-        };
+        let mut stats = RestoreSkipStats::default();
 
         for (file_index, file_spec) in spec.files.iter().enumerate() {
             let file_index = file_index as u32;
@@ -572,6 +577,7 @@ impl Pipeline {
         spec: JobSpec,
         nzb_path: PathBuf,
         nzb_zstd: Vec<u8>,
+        options: crate::jobs::AddJobOptions,
     ) -> Result<(), crate::SchedulerError> {
         let started = std::time::Instant::now();
         let _profile_scope = crate::runtime::perf_probe::scope("pipeline.add_job.total");
@@ -609,26 +615,68 @@ impl Pipeline {
             Self::build_job_assembly(job_id, &spec, &HashSet::new());
         let file_identities = Self::build_initial_file_identities(&spec, &HashMap::new());
         let initial_file_identities = file_identities.values().cloned().collect::<Vec<_>>();
+        let (initial_status, initial_download_state, initial_post_state, initial_run_state) =
+            if options.initially_paused {
+                (
+                    JobStatus::Paused,
+                    crate::jobs::model::DownloadState::Queued,
+                    crate::jobs::model::PostState::Idle,
+                    crate::jobs::model::RunState::Paused,
+                )
+            } else {
+                (
+                    JobStatus::Queued,
+                    crate::jobs::model::DownloadState::Queued,
+                    crate::jobs::model::PostState::Idle,
+                    crate::jobs::model::RunState::Active,
+                )
+            };
         crate::runtime::perf_probe::record(
             "pipeline.add_job.build_runtime_inputs",
             stage_start.elapsed(),
         );
 
         stage_start = std::time::Instant::now();
-        if let Err(error) = self.db.create_active_job_with_file_identities(
-            &crate::ActiveJob {
-                job_id,
-                nzb_hash,
-                nzb_path,
-                nzb_zstd,
-                output_dir: working_dir.clone(),
-                created_at,
-                category: spec.category.clone(),
-                metadata: spec.metadata.clone(),
-            },
-            &initial_file_identities,
-        ) {
-            error!(error = %error, "db write failed for create_active_job_with_file_identities");
+        let active_job = crate::ActiveJob {
+            job_id,
+            nzb_hash,
+            nzb_path,
+            nzb_zstd,
+            output_dir: working_dir.clone(),
+            created_at,
+            category: spec.category.clone(),
+            metadata: spec.metadata.clone(),
+            status: initial_status.persisted_status(),
+            download_state: initial_download_state.as_str(),
+            post_state: initial_post_state.as_str(),
+            run_state: initial_run_state.as_str(),
+            paused_resume_status: options
+                .initially_paused
+                .then_some(JobStatus::Queued.persisted_status()),
+            paused_resume_download_state: options
+                .initially_paused
+                .then_some(crate::jobs::model::DownloadState::Queued.as_str()),
+            paused_resume_post_state: options
+                .initially_paused
+                .then_some(crate::jobs::model::PostState::Idle.as_str()),
+        };
+        // Biggest single write on the add-job path: move it off the orchestrator
+        // loop so the round-trip doesn't park the worker thread. Preserve the
+        // prior logged-and-continued semantics (a failed persist does not abort
+        // the in-memory job creation below).
+        let db = self.db.clone();
+        match tokio::task::spawn_blocking(move || {
+            db.create_active_job_with_file_identities(&active_job, &initial_file_identities)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                error!(error = %error, "db write failed for create_active_job_with_file_identities");
+            }
+            Err(error) => {
+                error!(error = %error, "join failed for create_active_job_with_file_identities task");
+            }
         }
         crate::runtime::perf_probe::record(
             "pipeline.add_job.persist_active_job",
@@ -658,19 +706,23 @@ impl Pipeline {
             job_id,
             job_hash: nzb_hash,
             spec,
-            status: JobStatus::Queued,
-            download_state: crate::jobs::model::DownloadState::Queued,
-            post_state: crate::jobs::model::PostState::Idle,
-            run_state: crate::jobs::model::RunState::Active,
+            status: initial_status,
+            download_state: initial_download_state,
+            post_state: initial_post_state,
+            run_state: initial_run_state,
             assembly,
             extraction_depth: 0,
             created_at: std::time::Instant::now(),
             created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
             queued_repair_at_epoch_ms: None,
             queued_extract_at_epoch_ms: None,
-            paused_resume_status: None,
-            paused_resume_download_state: None,
-            paused_resume_post_state: None,
+            paused_resume_status: options.initially_paused.then_some(JobStatus::Queued),
+            paused_resume_download_state: options
+                .initially_paused
+                .then_some(crate::jobs::model::DownloadState::Queued),
+            paused_resume_post_state: options
+                .initially_paused
+                .then_some(crate::jobs::model::PostState::Idle),
             failure_error: None,
             working_dir: working_dir.clone(),
             downloaded_bytes: 0,
@@ -950,8 +1002,12 @@ impl Pipeline {
             };
             state.refresh_runtime_lanes_from_status();
             self.jobs.insert(job_id, state);
-            if let Some(state) = self.jobs.get(&job_id) {
-                self.persist_file_identities(job_id, &state.file_identities);
+            if let Some(file_identities) = self
+                .jobs
+                .get(&job_id)
+                .map(|state| state.file_identities.clone())
+            {
+                self.persist_file_identities(job_id, &file_identities).await;
             }
             self.note_download_activity(job_id);
         }
@@ -981,11 +1037,11 @@ impl Pipeline {
                 Some("downloading"),
             );
             self.note_download_activity(job_id);
-            self.persist_file_identities(job_id, &file_identities);
+            self.persist_file_identities(job_id, &file_identities).await;
         }
 
         self.delete_failed_history_entry(job_id).await;
-        self.reset_failed_job_runtime(job_id);
+        self.reset_failed_job_runtime(job_id).await;
 
         if !self.job_order.contains(&job_id) {
             self.job_order.push(job_id);
@@ -1031,8 +1087,15 @@ impl Pipeline {
             self.db
                 .delete_active_job(job_id)
                 .map_err(crate::SchedulerError::State)?;
-            self.add_job(job_id, spec, nzb_path, nzb_zstd).await?;
-            self.reset_failed_job_runtime(job_id);
+            self.add_job(
+                job_id,
+                spec,
+                nzb_path,
+                nzb_zstd,
+                crate::jobs::AddJobOptions::default(),
+            )
+            .await?;
+            self.reset_failed_job_runtime(job_id).await;
             self.reload_metadata_from_disk(job_id).await;
             info!(job_id = job_id.0, "re-downloading terminal job");
             return Ok(());
@@ -1069,9 +1132,16 @@ impl Pipeline {
 
             self.remove_redownload_artifacts(job_id, &working_dir, None)
                 .await;
-            self.add_job(job_id, spec, nzb_path, nzb_zstd).await?;
+            self.add_job(
+                job_id,
+                spec,
+                nzb_path,
+                nzb_zstd,
+                crate::jobs::AddJobOptions::default(),
+            )
+            .await?;
             self.delete_failed_history_entry(job_id).await;
-            self.reset_failed_job_runtime(job_id);
+            self.reset_failed_job_runtime(job_id).await;
             self.reload_metadata_from_disk(job_id).await;
 
             info!(job_id = job_id.0, "re-downloading terminal history job");
@@ -1115,144 +1185,21 @@ impl Pipeline {
 
         self.remove_redownload_artifacts(job_id, &working_dir, None)
             .await;
-        self.add_job(job_id, spec, nzb_path, nzb_zstd).await?;
+        self.add_job(
+            job_id,
+            spec,
+            nzb_path,
+            nzb_zstd,
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await?;
         self.delete_failed_history_entry(job_id).await;
-        self.reset_failed_job_runtime(job_id);
+        self.reset_failed_job_runtime(job_id).await;
         self.reload_metadata_from_disk(job_id).await;
 
         info!(job_id = job_id.0, "re-downloading terminal history job");
 
         Ok(())
-    }
-
-    pub(crate) async fn start_diagnostic_redownload(
-        &mut self,
-        source_job_id: JobId,
-        diagnostic_job_id: JobId,
-        include_server_hostnames: bool,
-    ) -> Result<JobId, crate::SchedulerError> {
-        if let Some(state) = self.jobs.get(&source_job_id) {
-            if !Self::is_restartable_terminal_status(&state.status) {
-                return Err(crate::SchedulerError::Conflict(format!(
-                    "job {} is not complete or failed",
-                    source_job_id.0
-                )));
-            }
-
-            let category = state.spec.category.clone();
-            let metadata = with_diagnostic_metadata(
-                state.spec.metadata.clone(),
-                source_job_id.0,
-                include_server_hostnames,
-            );
-            let (source_nzb_path, nzb_zstd) = self
-                .db
-                .load_active_job_persisted_nzb(source_job_id)
-                .map_err(crate::SchedulerError::State)?
-                .ok_or(crate::SchedulerError::JobNotFound(source_job_id))?;
-            let (nzb, source_nzb_path, nzb_zstd) =
-                self.load_restart_nzb(source_job_id, &source_nzb_path, nzb_zstd)?;
-            let spec = crate::ingest::nzb_to_spec(&nzb, &source_nzb_path, category, metadata);
-
-            self.add_job(diagnostic_job_id, spec, source_nzb_path, nzb_zstd)
-                .await?;
-            self.reload_metadata_from_disk(diagnostic_job_id).await;
-            info!(
-                source_job_id = source_job_id.0,
-                diagnostic_job_id = diagnostic_job_id.0,
-                "started diagnostic re-download from terminal runtime job"
-            );
-            return Ok(diagnostic_job_id);
-        }
-
-        let history_row = self.load_history_row(source_job_id).await?;
-        if let Some(row) = history_row.as_ref() {
-            let status =
-                crate::job_status_from_persisted_str(&row.status, row.error_message.as_deref());
-            if !Self::is_restartable_terminal_status(&status) {
-                return Err(crate::SchedulerError::Conflict(format!(
-                    "job {} is not complete or failed",
-                    source_job_id.0
-                )));
-            }
-
-            let (preferred_nzb_path, nzb_zstd) = self
-                .db
-                .load_history_job_persisted_nzb(source_job_id.0)
-                .map_err(crate::SchedulerError::State)?
-                .unwrap_or_else(|| {
-                    (
-                        self.persisted_nzb_path_for_job(source_job_id, Some(row)),
-                        None,
-                    )
-                });
-            let (nzb, source_nzb_path, nzb_zstd) =
-                self.load_restart_nzb(source_job_id, &preferred_nzb_path, nzb_zstd)?;
-            let metadata = row
-                .metadata
-                .as_deref()
-                .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
-                .unwrap_or_default();
-            let metadata =
-                with_diagnostic_metadata(metadata, source_job_id.0, include_server_hostnames);
-            let spec =
-                crate::ingest::nzb_to_spec(&nzb, &source_nzb_path, row.category.clone(), metadata);
-
-            self.add_job(diagnostic_job_id, spec, source_nzb_path, nzb_zstd)
-                .await?;
-            self.reload_metadata_from_disk(diagnostic_job_id).await;
-            info!(
-                source_job_id = source_job_id.0,
-                diagnostic_job_id = diagnostic_job_id.0,
-                "started diagnostic re-download from history job"
-            );
-            return Ok(diagnostic_job_id);
-        }
-
-        let history_entry = self
-            .finished_jobs
-            .iter()
-            .find(|job| job.job_id == source_job_id);
-        let Some(info) = history_entry else {
-            return Err(crate::SchedulerError::JobNotFound(source_job_id));
-        };
-        if !Self::is_restartable_terminal_status(&info.status) {
-            return Err(crate::SchedulerError::Conflict(format!(
-                "job {} is not complete or failed",
-                source_job_id.0
-            )));
-        }
-
-        let (source_nzb_path, nzb_zstd) = self
-            .db
-            .load_history_job_persisted_nzb(source_job_id.0)
-            .map_err(crate::SchedulerError::State)?
-            .unwrap_or_else(|| {
-                (
-                    self.persisted_nzb_path_for_job(source_job_id, history_row.as_ref()),
-                    None,
-                )
-            });
-        let (nzb, source_nzb_path, nzb_zstd) =
-            self.load_restart_nzb(source_job_id, &source_nzb_path, nzb_zstd)?;
-        let metadata = with_diagnostic_metadata(
-            info.metadata.clone(),
-            source_job_id.0,
-            include_server_hostnames,
-        );
-        let spec =
-            crate::ingest::nzb_to_spec(&nzb, &source_nzb_path, info.category.clone(), metadata);
-
-        self.add_job(diagnostic_job_id, spec, source_nzb_path, nzb_zstd)
-            .await?;
-        self.reload_metadata_from_disk(diagnostic_job_id).await;
-        info!(
-            source_job_id = source_job_id.0,
-            diagnostic_job_id = diagnostic_job_id.0,
-            "started diagnostic re-download from finished job cache"
-        );
-
-        Ok(diagnostic_job_id)
     }
 
     async fn restore_par2_state_from_disk(&mut self, job_id: JobId) {
@@ -1351,7 +1298,6 @@ impl Pipeline {
             job_id,
             job_hash,
             spec,
-            committed_segments,
             complete_files,
             file_progress,
             detected_archives,
@@ -1383,7 +1329,6 @@ impl Pipeline {
             );
         }
 
-        let committed_count = committed_segments.len();
         let mut file_identities = if file_identities.is_empty() {
             Self::build_initial_file_identities(&spec, &detected_archives)
         } else {
@@ -1394,7 +1339,6 @@ impl Pipeline {
         let restore_skip_plan = Self::build_restore_skip_plan(
             job_id,
             &spec,
-            &committed_segments,
             &complete_files,
             &file_progress,
             &file_identities,
@@ -1558,11 +1502,15 @@ impl Pipeline {
         };
         state.refresh_runtime_lanes_from_status();
         self.jobs.insert(job_id, state);
-        self.restore_download_finalization_runtime(job_id);
+        self.restore_download_finalization_runtime(job_id).await;
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
-        if let Some(state) = self.jobs.get(&job_id) {
-            self.persist_file_identities(job_id, &state.file_identities);
+        if let Some(file_identities) = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.file_identities.clone())
+        {
+            self.persist_file_identities(job_id, &file_identities).await;
         }
         for set_name in &stale_rar_sets {
             self.clear_archive_set_for_source_retry(job_id, set_name);
@@ -1585,7 +1533,14 @@ impl Pipeline {
             }
         }
         self.reload_metadata_from_disk(job_id).await;
-        for file_index in refreshed_rar_files {
+        let mut archive_refresh_file_indices = refreshed_rar_files;
+        archive_refresh_file_indices.extend(
+            complete_files
+                .iter()
+                .filter(|file_id| file_id.job_id == job_id)
+                .map(|file_id| file_id.file_index),
+        );
+        for file_index in archive_refresh_file_indices {
             self.refresh_archive_state_for_completed_file(
                 job_id,
                 NzbFileId { job_id, file_index },
@@ -1623,7 +1578,6 @@ impl Pipeline {
 
         info!(
             job_id = job_id.0,
-            committed_count,
             downloaded_bytes,
             restored_download_floor_bytes,
             status = ?status,
@@ -1631,7 +1585,6 @@ impl Pipeline {
             queued_extract_at_epoch_ms = queued_extract_at_epoch_ms.unwrap_or(0.0),
             queue_depth,
             restore_skip_segments = restore_skip_plan.skip.len(),
-            legacy_restore_segments = restore_skip_plan.stats.legacy_segments,
             complete_restore_files = restore_skip_plan.stats.complete_files,
             complete_restore_segments = restore_skip_plan.stats.complete_file_segments,
             checkpoint_restore_segments = restore_skip_plan.stats.checkpoint_segments,
@@ -1675,6 +1628,7 @@ mod tests {
                 filename: "episode.bin".to_string(),
                 role: FileRole::Standalone,
                 groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
                 segments: vec![
                     SegmentSpec {
                         ordinal: 0,
@@ -1722,7 +1676,6 @@ mod tests {
         let plan = Pipeline::build_restore_skip_plan(
             job_id,
             &spec,
-            &HashSet::new(),
             &complete_files,
             &HashMap::new(),
             &HashMap::new(),
@@ -1752,7 +1705,6 @@ mod tests {
             job_id,
             &spec,
             &HashSet::new(),
-            &HashSet::new(),
             &HashMap::from([(0u32, 30u64)]),
             &HashMap::new(),
             temp_dir.path(),
@@ -1780,7 +1732,6 @@ mod tests {
             job_id,
             &spec,
             &HashSet::new(),
-            &HashSet::new(),
             &HashMap::from([(0u32, 25u64)]),
             &HashMap::new(),
             temp_dir.path(),
@@ -1805,7 +1756,6 @@ mod tests {
             job_id,
             &spec,
             &HashSet::new(),
-            &HashSet::new(),
             &HashMap::from([(0u32, 50u64)]),
             &HashMap::new(),
             temp_dir.path(),
@@ -1826,7 +1776,6 @@ mod tests {
         let plan = Pipeline::build_restore_skip_plan(
             job_id,
             &spec,
-            &HashSet::new(),
             &HashSet::new(),
             &HashMap::from([(0u32, 50u64)]),
             &HashMap::new(),

@@ -116,6 +116,7 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             downloaded_bytes: 0,
             optional_recovery_bytes: 0,
             optional_recovery_downloaded_bytes: 0,
+            phase_progress: Vec::new(),
             failed_bytes: 0,
             health: 1000,
             password: state.spec.password.clone(),
@@ -204,6 +205,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     job_id,
                     spec,
                     nzb_path: _,
+                    options,
                     reply,
                     ..
                 } => {
@@ -213,9 +215,22 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     }
                     let assembly = JobAssembly::new(job_id);
                     let par2_bytes = spec.par2_bytes();
-                    let status = JobStatus::Queued;
+                    let status = if options.initially_paused {
+                        JobStatus::Paused
+                    } else {
+                        JobStatus::Queued
+                    };
                     let (download_state, post_state, run_state, failure_error) =
-                        runtime_lanes_for_status(&status);
+                        if options.initially_paused {
+                            (
+                                crate::jobs::model::DownloadState::Queued,
+                                crate::jobs::model::PostState::Idle,
+                                crate::jobs::model::RunState::Paused,
+                                None,
+                            )
+                        } else {
+                            runtime_lanes_for_status(&status)
+                        };
                     let state = JobState {
                         job_id,
                         job_hash: [0; 32],
@@ -230,9 +245,13 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         created_at_epoch_ms: epoch_ms_now(),
                         queued_repair_at_epoch_ms: None,
                         queued_extract_at_epoch_ms: None,
-                        paused_resume_status: None,
-                        paused_resume_download_state: None,
-                        paused_resume_post_state: None,
+                        paused_resume_status: options.initially_paused.then_some(JobStatus::Queued),
+                        paused_resume_download_state: options
+                            .initially_paused
+                            .then_some(crate::jobs::model::DownloadState::Queued),
+                        paused_resume_post_state: options
+                            .initially_paused
+                            .then_some(crate::jobs::model::PostState::Idle),
                         failure_error,
                         working_dir: PathBuf::from("/tmp/test"),
                         downloaded_bytes: 0,
@@ -262,6 +281,17 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 SchedulerCommand::PauseJob { job_id, reply } => {
                     let result = match jobs.get_mut(&job_id) {
                         Some(state) => {
+                            let previous_download_state = state.download_state;
+                            let previous_post_state = state.post_state;
+                            state.paused_resume_status =
+                                Some(crate::jobs::model::derive_legacy_job_status(
+                                    previous_download_state,
+                                    previous_post_state,
+                                    crate::jobs::model::RunState::Active,
+                                    None,
+                                ));
+                            state.paused_resume_download_state = Some(previous_download_state);
+                            state.paused_resume_post_state = Some(previous_post_state);
                             let (download_state, post_state, run_state, _) =
                                 runtime_lanes_for_status(&JobStatus::Paused);
                             state.download_state = download_state;
@@ -278,8 +308,20 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 SchedulerCommand::ResumeJob { job_id, reply } => {
                     let result = match jobs.get_mut(&job_id) {
                         Some(state) => {
-                            let (download_state, post_state, run_state, _) =
-                                runtime_lanes_for_status(&JobStatus::Downloading);
+                            let resume_status = state
+                                .paused_resume_status
+                                .take()
+                                .unwrap_or(JobStatus::Downloading);
+                            let (default_download_state, default_post_state, run_state, _) =
+                                runtime_lanes_for_status(&resume_status);
+                            let download_state = state
+                                .paused_resume_download_state
+                                .take()
+                                .unwrap_or(default_download_state);
+                            let post_state = state
+                                .paused_resume_post_state
+                                .take()
+                                .unwrap_or(default_post_state);
                             state.download_state = download_state;
                             state.post_state = post_state;
                             state.run_state = run_state;
@@ -308,6 +350,9 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetSpeedLimit { reply, .. } => {
+                    let _ = reply.send(());
+                }
+                SchedulerCommand::SetIpReplacementTrialExtraConnections { reply, .. } => {
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetBandwidthCapPolicy { reply, .. } => {
@@ -434,13 +479,6 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     };
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::StartDiagnosticRedownload {
-                    source_job_id,
-                    reply,
-                    ..
-                } => {
-                    let _ = reply.send(Ok(source_job_id));
-                }
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.
@@ -512,6 +550,44 @@ async fn add_and_list_jobs() {
 }
 
 #[tokio::test]
+async fn add_job_with_options_can_start_paused_and_resume_to_queued() {
+    let (handle, task) = test_scheduler();
+
+    handle
+        .add_job_with_options(
+            JobId(1),
+            make_spec("Paused First"),
+            PathBuf::from("paused.nzb"),
+            sample_nzb_zstd(),
+            AddJobOptions {
+                initially_paused: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    let info = handle.get_job(JobId(1)).unwrap();
+    assert_eq!(info.status, JobStatus::Paused);
+    assert_eq!(
+        info.download_state,
+        crate::jobs::model::DownloadState::Queued
+    );
+    assert_eq!(info.run_state, crate::jobs::model::RunState::Paused);
+
+    handle.resume_job(JobId(1)).await.unwrap();
+    let info = handle.get_job(JobId(1)).unwrap();
+    assert_eq!(info.status, JobStatus::Queued);
+    assert_eq!(
+        info.download_state,
+        crate::jobs::model::DownloadState::Queued
+    );
+    assert_eq!(info.run_state, crate::jobs::model::RunState::Active);
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn pause_resume() {
     let (handle, task) = test_scheduler();
 
@@ -531,7 +607,7 @@ async fn pause_resume() {
 
     handle.resume_job(JobId(1)).await.unwrap();
     let info = handle.get_job(JobId(1)).unwrap();
-    assert_eq!(info.status, JobStatus::Downloading);
+    assert_eq!(info.status, JobStatus::Queued);
 
     handle.shutdown().await.unwrap();
     task.await.unwrap();
@@ -568,7 +644,6 @@ async fn redownload_failed_job() {
             job_id: JobId(1),
             job_hash: [0; 32],
             spec: make_spec("Failed Job"),
-            committed_segments: HashSet::new(),
             file_progress: HashMap::new(),
             complete_files: HashSet::new(),
             detected_archives: HashMap::new(),

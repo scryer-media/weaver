@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, broadcast, mpsc};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{http, shutdown, wiring};
 use weaver_server_core::events::model::PipelineEvent;
@@ -69,14 +69,31 @@ pub(crate) async fn run(
     shared_state.publish_jobs(initial_history.clone());
 
     let rss = weaver_server_api::RssService::new(handle.clone(), shared_config.clone(), db.clone());
+    let watch_folder = weaver_server_core::watch_folder::WatchFolderService::new(
+        db.clone(),
+        handle.clone(),
+        shared_config.clone(),
+    );
     let backup = weaver_server_api::BackupService::new(
         handle.clone(),
         shared_config.clone(),
         db.clone(),
         rss.clone(),
     );
+    let jwt_secret = db.get_or_create_jwt_signing_secret()?;
+    let auth_credentials = db.get_auth_credentials()?;
+    let login_enabled = auth_credentials.is_some();
+    if let Some(message) = security.strict_security_violation(login_enabled) {
+        return Err(message.into());
+    }
+    if security.exposes_admin_without_login(login_enabled) {
+        warn!(
+            bind_address = %security.http_bind_address,
+            "Weaver HTTP admin is bound beyond loopback without login protection"
+        );
+    }
     let login_auth_cache =
-        weaver_server_core::auth::LoginAuthCache::from_credentials(db.get_auth_credentials()?);
+        weaver_server_core::auth::LoginAuthCache::from_credentials(auth_credentials, jwt_secret);
     let api_key_cache =
         weaver_server_core::auth::ApiKeyCache::from_rows(db.list_api_key_auth_rows()?);
 
@@ -85,28 +102,25 @@ pub(crate) async fn run(
         let initial = db.list_schedules().unwrap_or_default();
         std::sync::Arc::new(tokio::sync::RwLock::new(initial))
     };
-    weaver_server_core::bandwidth::schedule::spawn_evaluator(
+    weaver_server_core::bandwidth::schedule::spawn_evaluator_with_watch_folder(
         handle.clone(),
         shared_schedules.clone(),
+        Some(watch_folder.clone()),
     );
 
-    // Build GraphQL schema with shared config and database.
     let pipeline_config = shared_config.clone();
-    let schema = weaver_server_api::build_schema(weaver_server_api::SchemaContext {
-        handle: handle.clone(),
-        config: shared_config.clone(),
-        db: db.clone(),
-        auth_cache: login_auth_cache.clone(),
-        api_key_cache: api_key_cache.clone(),
-        rss: rss.clone(),
-        schedules: shared_schedules,
-        log_buffer: log_ring_buffer,
-    });
 
     // Spawn event persistence subscriber (records meaningful events to SQLite).
-    {
-        wiring::spawn_event_persistence_task(event_tx.subscribe(), db.clone());
-    }
+    // Keep its handle and an explicit shutdown signal so the shutdown path can
+    // await its final writer-queue flush deterministically: the broadcast
+    // senders outlive the pipeline (held by `handle` and its service clones),
+    // so the task never sees the channel close on its own.
+    let event_persistence_shutdown = Arc::new(tokio::sync::Notify::new());
+    let event_persistence_task = wiring::spawn_event_persistence_task(
+        event_tx.subscribe(),
+        db.clone(),
+        event_persistence_shutdown.clone(),
+    );
 
     // Create and start the pipeline.
     let maintenance_complete_dir = complete_dir.clone();
@@ -130,6 +144,22 @@ pub(crate) async fn run(
     .await?;
 
     let nntp_pool = pipeline.nntp_pool();
+
+    // Build the GraphQL schema now that the live NNTP pool exists (for server-health metrics).
+    let schema = weaver_server_api::build_schema(weaver_server_api::SchemaContext {
+        handle: handle.clone(),
+        config: shared_config.clone(),
+        db: db.clone(),
+        auth_cache: login_auth_cache.clone(),
+        api_key_cache: api_key_cache.clone(),
+        rss: rss.clone(),
+        watch_folder: watch_folder.clone(),
+        schedules: shared_schedules,
+        log_buffer: log_ring_buffer,
+        nntp_pool: Some(nntp_pool.clone()),
+        spawn_history_delete_worker: true,
+    });
+
     let metrics_exporter = http::PrometheusMetricsExporter::new(handle.clone(), nntp_pool);
 
     let mut pipeline_task = tokio::spawn(async move {
@@ -137,6 +167,7 @@ pub(crate) async fn run(
     });
 
     let rss_task = rss.start_background_loop();
+    watch_folder.reconcile_from_config().await?;
     let metrics_history_task = shutdown::spawn_metrics_history_task(handle.clone(), db.clone());
     let maintenance_task = weaver_server_core::operations::spawn_maintenance_worker(
         db.clone(),
@@ -163,11 +194,7 @@ pub(crate) async fn run(
     // long restore passes do not block process readiness.
     for candidate in to_restore {
         match handle.restore_job(candidate.request).await {
-            Ok(()) => info!(
-                job_id = candidate.job_id.0,
-                committed_count = candidate.committed_count,
-                "job restored"
-            ),
+            Ok(()) => info!(job_id = candidate.job_id.0, "job restored"),
             Err(e) => error!(job_id = candidate.job_id.0, error = %e, "failed to restore job"),
         }
     }
@@ -179,16 +206,20 @@ pub(crate) async fn run(
             if let Err(join_error) = pipeline_task.await {
                 error!(error = %join_error, "pipeline task failed during shutdown");
             }
+            finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
             server_task.abort();
             rss_task.abort();
+            watch_folder.stop().await;
             metrics_history_task.abort();
             maintenance_task.abort();
             Ok(())
         }
         result = &mut pipeline_task => {
             let error = shutdown::pipeline_exit_error(result);
+            finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
             server_task.abort();
             rss_task.abort();
+            watch_folder.stop().await;
             metrics_history_task.abort();
             maintenance_task.abort();
             Err(error.into())
@@ -198,7 +229,9 @@ pub(crate) async fn run(
             if let Err(join_error) = pipeline_task.await {
                 error!(error = %join_error, "pipeline task failed during HTTP shutdown");
             }
+            finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
             rss_task.abort();
+            watch_folder.stop().await;
             metrics_history_task.abort();
             maintenance_task.abort();
             match result {
@@ -206,6 +239,33 @@ pub(crate) async fn run(
                 Ok(Err(error)) => Err(error),
                 Err(join_error) => Err(format!("HTTP server task failed: {join_error}").into()),
             }
+        }
+    }
+}
+
+/// Signal the event-persistence task to stop and await its final
+/// `flush_write_queue`, bounded so a stuck flush cannot hang process exit.
+/// Called after the pipeline task has completed (its broadcast sender dropped),
+/// so the only remaining reason the task is still running is the long-lived
+/// senders held by `SchedulerHandle` and its service clones.
+async fn finalize_event_persistence(
+    task: tokio::task::JoinHandle<()>,
+    shutdown: &Arc<tokio::sync::Notify>,
+) {
+    const EVENT_PERSISTENCE_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    // `notify_one` (not `notify_waiters`) stores a permit if the task is mid-batch
+    // rather than parked on `notified()`, so the shutdown signal cannot be lost.
+    shutdown.notify_one();
+    match tokio::time::timeout(EVENT_PERSISTENCE_FLUSH_TIMEOUT, task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(join_error)) => {
+            error!(error = %join_error, "event persistence task failed during shutdown");
+        }
+        Err(_) => {
+            warn!(
+                timeout_secs = EVENT_PERSISTENCE_FLUSH_TIMEOUT.as_secs(),
+                "timed out flushing event persistence during shutdown"
+            );
         }
     }
 }

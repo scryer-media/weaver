@@ -3,6 +3,7 @@ use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidt
 use crate::persistence::Database;
 use crate::settings::record::SettingRecord;
 use crate::settings::{BufferPoolOverrides, Config, RetryOverrides, TunerOverrides};
+use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
 impl Database {
     /// Load a full `Config` from the settings and servers tables.
@@ -24,10 +25,35 @@ impl Database {
         let max_download_speed = settings
             .get("max_download_speed")
             .and_then(|v| v.parse().ok());
+        let ip_replacement_trial_extra_connections = settings
+            .get("ip_replacement_trial_extra_connections")
+            .and_then(|v| v.parse().ok());
         let cleanup_after_extract = settings
             .get("cleanup_after_extract")
             .and_then(|v| v.parse().ok());
-        let diagnostic_upload_url = settings.get("diagnostic_upload_url").cloned();
+        let watch_folder = WatchFolderConfig {
+            mode: settings
+                .get("watch_folder.mode")
+                .and_then(|v| WatchFolderMode::parse(v))
+                .unwrap_or_default(),
+            path: settings.get("watch_folder.path").cloned(),
+            poll_interval_secs: settings
+                .get("watch_folder.poll_interval_secs")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+            stability_secs: settings
+                .get("watch_folder.stability_secs")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3),
+            category_from_subfolders: settings
+                .get("watch_folder.category_from_subfolders")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(true),
+            scanning_paused: settings
+                .get("watch_folder.scanning_paused")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(false),
+        };
         let isp_bandwidth_cap = {
             let enabled = settings
                 .get("bandwidth_cap.enabled")
@@ -99,23 +125,15 @@ impl Database {
             let max_dl = settings
                 .get("tuner.max_concurrent_downloads")
                 .and_then(|v| v.parse().ok());
-            let max_dq = settings
-                .get("tuner.max_decode_queue")
-                .and_then(|v| v.parse().ok());
             let decode_threads = settings
                 .get("tuner.decode_thread_count")
                 .and_then(|v| v.parse().ok());
             let extract_threads = settings
                 .get("tuner.extract_thread_count")
                 .and_then(|v| v.parse().ok());
-            if max_dl.is_some()
-                || max_dq.is_some()
-                || decode_threads.is_some()
-                || extract_threads.is_some()
-            {
+            if max_dl.is_some() || decode_threads.is_some() || extract_threads.is_some() {
                 Some(TunerOverrides {
                     max_concurrent_downloads: max_dl,
-                    max_decode_queue: max_dq,
                     decode_thread_count: decode_threads,
                     extract_thread_count: extract_threads,
                 })
@@ -157,7 +175,8 @@ impl Database {
             max_download_speed,
             cleanup_after_extract,
             isp_bandwidth_cap,
-            diagnostic_upload_url,
+            ip_replacement_trial_extra_connections,
+            watch_folder,
             config_path: None,
         })
     }
@@ -177,9 +196,30 @@ impl Database {
         if let Some(cleanup) = config.cleanup_after_extract {
             self.set_setting("cleanup_after_extract", &cleanup.to_string())?;
         }
-        if let Some(ref diagnostic_upload_url) = config.diagnostic_upload_url {
-            self.set_setting("diagnostic_upload_url", diagnostic_upload_url)?;
+        if let Some(extra) = config.ip_replacement_trial_extra_connections {
+            self.set_setting("ip_replacement_trial_extra_connections", &extra.to_string())?;
         }
+        self.set_setting("watch_folder.mode", config.watch_folder.mode.as_str())?;
+        match config.watch_folder.normalized_path() {
+            Some(path) => self.set_setting("watch_folder.path", &path)?,
+            None => self.delete_setting("watch_folder.path")?,
+        }
+        self.set_setting(
+            "watch_folder.poll_interval_secs",
+            &config.watch_folder.poll_interval_secs.to_string(),
+        )?;
+        self.set_setting(
+            "watch_folder.stability_secs",
+            &config.watch_folder.stability_secs.to_string(),
+        )?;
+        self.set_setting(
+            "watch_folder.category_from_subfolders",
+            &config.watch_folder.category_from_subfolders.to_string(),
+        )?;
+        self.set_setting(
+            "watch_folder.scanning_paused",
+            &config.watch_folder.scanning_paused.to_string(),
+        )?;
         if let Some(ref cap) = config.isp_bandwidth_cap {
             self.set_setting("bandwidth_cap.enabled", &cap.enabled.to_string())?;
             self.set_setting("bandwidth_cap.period", bandwidth_cap_period_str(cap.period))?;
@@ -213,9 +253,6 @@ impl Database {
         if let Some(ref tuner) = config.tuner {
             if let Some(v) = tuner.max_concurrent_downloads {
                 self.set_setting("tuner.max_concurrent_downloads", &v.to_string())?;
-            }
-            if let Some(v) = tuner.max_decode_queue {
-                self.set_setting("tuner.max_decode_queue", &v.to_string())?;
             }
             if let Some(v) = tuner.decode_thread_count {
                 self.set_setting("tuner.decode_thread_count", &v.to_string())?;

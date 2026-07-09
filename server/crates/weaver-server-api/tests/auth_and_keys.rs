@@ -24,8 +24,6 @@ fn sample_history_row(job_id: u64, name: &str) -> JobHistoryRow {
         created_at: 1_717_171_700,
         completed_at: 1_717_171_760,
         metadata: None,
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     }
 }
 
@@ -255,6 +253,7 @@ async fn change_password_correct() {
         .await;
     assert_no_errors(&resp);
     let old_hash = h.db.get_auth_credentials().unwrap().unwrap().password_hash;
+    let old_jwt_secret = h.auth_cache.snapshot().unwrap().jwt_secret;
 
     // Change password.
     let resp = h
@@ -268,6 +267,7 @@ async fn change_password_correct() {
     assert_ne!(creds.password_hash, old_hash);
     let cached = h.auth_cache.snapshot().unwrap();
     assert_eq!(cached.password_hash, creds.password_hash);
+    assert_ne!(cached.jwt_secret, old_jwt_secret);
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-import { RotateCcw, UploadCloud, X } from "lucide-react";
+import { FileText, RotateCcw, UploadCloud, X } from "lucide-react";
 import type { Ref } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { useUploadNzb, type UploadNzbEntry } from "@/features/upload/hooks/use-upload-nzb";
@@ -14,6 +14,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { STATUS_SOFT_CLASS, STATUS_TEXT_CLASS } from "@/lib/status-tokens";
 import { cn } from "@/lib/utils";
 
 const NO_CATEGORY_VALUE = "__none__";
@@ -40,15 +41,15 @@ function statusClassName(entry: UploadNzbEntry): string {
   switch (entry.status) {
     case "queued":
     case "staging":
-      return "border-primary/30 bg-primary/10 text-primary";
+      return cn(STATUS_TEXT_CLASS.queued, STATUS_SOFT_CLASS.queued, "border-transparent");
     case "staged":
-      return "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300";
+      return cn(STATUS_TEXT_CLASS.completed, STATUS_SOFT_CLASS.completed, "border-transparent");
     case "submitting":
-      return "border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-300";
+      return cn(STATUS_TEXT_CLASS.downloading, STATUS_SOFT_CLASS.downloading, "border-transparent");
     case "failed":
-      return "border-destructive/30 bg-destructive/10 text-destructive";
+      return cn(STATUS_TEXT_CLASS.failed, STATUS_SOFT_CLASS.failed, "border-transparent");
     case "submitted":
-      return "border-muted bg-muted/30 text-muted-foreground";
+      return "border-transparent bg-muted/30 text-muted-foreground";
     default:
       return "border-border bg-background text-foreground";
   }
@@ -98,11 +99,17 @@ export function UploadNzbForm({
   });
 
   return (
-    <Card className={cn(layout === "dialog" ? "border-0 bg-transparent shadow-none" : "")}>
+    <Card
+      className={cn(
+        layout === "dialog" ? "border-0 bg-transparent shadow-none backdrop-blur-none" : "",
+      )}
+    >
       {layout === "page" ? (
         <CardHeader>
-          <CardTitle>{t("upload.title")}</CardTitle>
-          <CardDescription>{t("upload.accepts")}</CardDescription>
+          <CardTitle className="font-space-grotesk text-lg font-bold">
+            {t("upload.title")}
+          </CardTitle>
+          <CardDescription className="mt-1.5 text-[13px]">{t("upload.accepts")}</CardDescription>
         </CardHeader>
       ) : null}
       <CardContent className={cn(layout === "dialog" ? "px-0 pb-0" : "")}>
@@ -120,9 +127,9 @@ export function UploadNzbForm({
           <button
             type="button"
             className={cn(
-              "flex w-full min-w-0 cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed px-6 py-10 text-center transition-colors",
+              "flex min-h-[280px] w-full min-w-0 cursor-pointer flex-col items-center justify-center rounded-card border-2 border-dashed px-6 py-10 text-center transition-colors",
               dragging
-                ? "border-primary bg-primary/10"
+                ? "border-primary bg-primary/8"
                 : "border-border bg-background/60 hover:border-primary/40 hover:bg-accent/20",
             )}
             onClick={openPicker}
@@ -141,10 +148,10 @@ export function UploadNzbForm({
               className="hidden"
               onChange={onFileInputChange}
             />
-            <UploadCloud className="mb-3 size-10 text-primary" />
+            <UploadCloud className="mb-4 size-14 text-primary" />
             {entries.length > 0 ? (
               <>
-                <div className="text-base font-medium text-foreground">
+                <div className="font-space-grotesk text-base font-bold text-foreground">
                   {entries.length === 1
                     ? t("upload.selectedSingle")
                     : t("upload.selectedMultiple", { count: entries.length })}
@@ -163,40 +170,45 @@ export function UploadNzbForm({
               </>
             ) : (
               <>
-                <div className="text-base font-medium text-foreground">{t("upload.dropzone")}</div>
-                <div className="mt-1 text-sm text-muted-foreground">{t("upload.accepts")}</div>
+                <div className="font-space-grotesk text-base font-bold text-foreground">
+                  {t("upload.dropzone")}
+                </div>
+                <div className="mt-1.5 text-sm text-muted-foreground">{t("upload.accepts")}</div>
               </>
             )}
           </button>
 
           {entries.length > 0 ? (
-            <div className="max-h-80 space-y-2 overflow-auto rounded-2xl border border-border/70 bg-background/70 p-3">
+            <div className="max-h-80 space-y-2 overflow-auto rounded-card border border-border bg-background/40 p-3">
               {entries.map((entry) => (
                 <div
                   key={entry.localId}
-                  className="rounded-xl border border-border/50 bg-card px-3 py-3"
+                  className="rounded-inner border border-border bg-card px-3 py-3"
                 >
                   <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <div
-                        className="max-w-full text-sm font-medium text-foreground [overflow-wrap:anywhere]"
-                        title={entry.file.name}
-                      >
-                        {entry.displayName ?? formatNzbNameForDisplay(entry.file.name)}
-                      </div>
-                      <div className="mt-1 max-w-full text-xs text-muted-foreground [overflow-wrap:anywhere]">
-                        {entry.file.name}
-                      </div>
-                      {entry.error ? (
-                        <div className="mt-2 text-xs text-destructive [overflow-wrap:anywhere]">
-                          {entry.error}
+                    <div className="flex min-w-0 items-start gap-2.5">
+                      <FileText className="mt-0.5 size-4 shrink-0 text-primary" />
+                      <div className="min-w-0">
+                        <div
+                          className="max-w-full truncate font-mono text-sm font-medium text-foreground"
+                          title={entry.file.name}
+                        >
+                          {entry.displayName ?? formatNzbNameForDisplay(entry.file.name)}
                         </div>
-                      ) : null}
+                        <div className="mt-1 max-w-full truncate font-mono text-xs text-muted-foreground">
+                          {entry.file.name}
+                        </div>
+                        {entry.error ? (
+                          <div className="mt-2 text-xs text-destructive [overflow-wrap:anywhere]">
+                            {entry.error}
+                          </div>
+                        ) : null}
+                      </div>
                     </div>
                     <div className="flex shrink-0 items-start gap-2">
                       <div
                         className={cn(
-                          "rounded-full border px-2 py-1 text-[11px] font-medium uppercase tracking-wide",
+                          "rounded-chip border px-2 py-1 text-[10.5px] font-semibold uppercase tracking-[0.13em]",
                           statusClassName(entry),
                         )}
                       >
@@ -205,11 +217,22 @@ export function UploadNzbForm({
                       <div className="pt-1 text-xs text-muted-foreground">
                         {(entry.file.size / 1024).toFixed(1)} KB
                       </div>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="size-6 shrink-0"
+                        onClick={() => removeFile(entry.localId)}
+                        aria-label={t("upload.removeFile")}
+                        title={t("upload.removeFile")}
+                      >
+                        <X className="size-3.5" />
+                      </Button>
                     </div>
                   </div>
 
-                  <div className="mt-3 flex items-center justify-end gap-2">
-                    {entry.status === "failed" ? (
+                  {entry.status === "failed" ? (
+                    <div className="mt-3 flex items-center justify-end">
                       <Button
                         type="button"
                         variant="outline"
@@ -219,27 +242,28 @@ export function UploadNzbForm({
                         <RotateCcw className="mr-2 size-4" />
                         {t("upload.retryFile")}
                       </Button>
-                    ) : null}
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      className="size-8 shrink-0"
-                      onClick={() => removeFile(entry.localId)}
-                      aria-label={t("upload.removeFile")}
-                      title={t("upload.removeFile")}
-                    >
-                      <X className="size-4" />
-                    </Button>
-                  </div>
+                    </div>
+                  ) : null}
                 </div>
               ))}
+              <button
+                type="button"
+                className="w-full px-1 py-1.5 text-left text-sm font-medium text-primary hover:underline"
+                onClick={openPicker}
+              >
+                + Add more files
+              </button>
             </div>
           ) : null}
 
           <div className="grid gap-4 sm:grid-cols-3">
             <div className="space-y-2">
-              <Label htmlFor={`upload-password-${layout}`}>{t("upload.passwordLabel")}</Label>
+              <Label
+                htmlFor={`upload-password-${layout}`}
+                className="text-sm font-semibold"
+              >
+                {t("upload.passwordLabel")}
+              </Label>
               <Input
                 id={`upload-password-${layout}`}
                 type="text"
@@ -250,7 +274,9 @@ export function UploadNzbForm({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor={`upload-category-${layout}`}>{t("table.category")}</Label>
+              <Label htmlFor={`upload-category-${layout}`} className="text-sm font-semibold">
+                {t("table.category")}
+              </Label>
               <Select value={category} onValueChange={setCategory}>
                 <SelectTrigger id={`upload-category-${layout}`}>
                   <SelectValue placeholder={t("upload.noCategory")} />
@@ -267,7 +293,9 @@ export function UploadNzbForm({
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor={`upload-priority-${layout}`}>{t("upload.priorityLabel")}</Label>
+              <Label htmlFor={`upload-priority-${layout}`} className="text-sm font-semibold">
+                {t("upload.priorityLabel")}
+              </Label>
               <Select value={priority} onValueChange={setPriority}>
                 <SelectTrigger id={`upload-priority-${layout}`}>
                   <SelectValue />
@@ -286,7 +314,7 @@ export function UploadNzbForm({
           ) : null}
 
           {error ? (
-            <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+            <div className="rounded-inner border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
               {error}
             </div>
           ) : null}

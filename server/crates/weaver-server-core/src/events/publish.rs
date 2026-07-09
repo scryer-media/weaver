@@ -17,6 +17,7 @@ pub fn should_record_job_event(event: &PipelineEvent) -> bool {
             | PipelineEvent::VerificationStarted { .. }
             | PipelineEvent::VerificationComplete { .. }
             | PipelineEvent::ExtractionProgress { .. }
+            | PipelineEvent::PhaseProgressUpdated { .. }
             | PipelineEvent::RepairConfidenceUpdated { .. }
     )
 }
@@ -51,7 +52,8 @@ pub fn pipeline_job_id(event: &PipelineEvent) -> Option<u64> {
         | PipelineEvent::ExtractionComplete { job_id }
         | PipelineEvent::ExtractionFailed { job_id, .. }
         | PipelineEvent::MoveToCompleteStarted { job_id }
-        | PipelineEvent::MoveToCompleteFinished { job_id } => Some(job_id.0),
+        | PipelineEvent::MoveToCompleteFinished { job_id }
+        | PipelineEvent::PhaseProgressUpdated { job_id } => Some(job_id.0),
         PipelineEvent::FileClassified { file_id, .. }
         | PipelineEvent::VerificationStarted { file_id }
         | PipelineEvent::VerificationComplete { file_id, .. }

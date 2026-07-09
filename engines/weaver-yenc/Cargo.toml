@@ -3,7 +3,7 @@ name = "weaver-yenc"
 description = "yEnc encoding and decoding with streaming CRC verification"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [dependencies]
@@ -11,10 +11,19 @@ thiserror = { workspace = true }
 crc32fast = { workspace = true }
 memchr = { workspace = true }
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 criterion = "0.5"
+libloading = "0.8"
 
 [[bench]]
 name = "decode_simd"
 path = "benches/decode_simd.rs"
+harness = false
+
+[[bench]]
+name = "rapidyenc_parity"
+path = "benches/rapidyenc_parity.rs"
 harness = false

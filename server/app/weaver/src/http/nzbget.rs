@@ -10,12 +10,13 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::warn;
+use std::collections::HashSet;
 
 use weaver_server_api::{
-    Attribute, AttributeInput, CLIENT_REQUEST_ID_ATTRIBUTE_KEY, PRIORITY_ATTRIBUTE_KEY, QueueItem,
-    QueueItemState, fetch_nzb_from_url, history_item_from_row, queue_item_from_job,
-    submit_metadata, submit_nzb_bytes,
+    Attribute, AttributeInput, CLIENT_REQUEST_ID_ATTRIBUTE_KEY, CategoryResolutionMode,
+    PRIORITY_ATTRIBUTE_KEY, QueueItem, QueueItemState, SubmissionOptions, SubmitNzbError,
+    fetch_nzb_from_url, history_item_from_row, queue_item_from_job, submit_metadata,
+    submit_nzb_bytes_with_options,
 };
 use weaver_server_core::auth::{ApiKeyCache, CallerScope, LoginAuthCache};
 use weaver_server_core::settings::model::SharedConfig;
@@ -279,9 +280,10 @@ struct AppendRequest {
 async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
     let request = parse_append_params(params)?;
     let (nzb_bytes, fetched_filename) = if is_http_url(&request.content_or_url) {
-        fetch_nzb_from_url(&ctx.http_client, &request.content_or_url)
-            .await
-            .map_err(|error| RpcError::invalid_parameter(error.to_string()))?
+        match fetch_nzb_from_url(&ctx.http_client, &request.content_or_url).await {
+            Ok(fetched) => fetched,
+            Err(error) => return append_rejection_result(error),
+        }
     } else {
         let bytes = BASE64_STANDARD
             .decode(&request.content_or_url)
@@ -315,7 +317,7 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
 
     let metadata = submit_metadata(Some(attributes), client_request_id)
         .map_err(RpcError::invalid_parameter)?;
-    let submitted = submit_nzb_bytes(
+    let submitted = submit_nzb_bytes_with_options(
         &ctx.db,
         &ctx.handle,
         &ctx.config,
@@ -324,21 +326,52 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
         None,
         request.category,
         metadata,
+        SubmissionOptions {
+            category_resolution: CategoryResolutionMode::PreserveSubmitted,
+            add_paused: request.add_paused,
+        },
     )
-    .await
-    .map_err(|error| RpcError::invalid_parameter(error.to_string()))?;
+    .await;
 
-    if request.add_paused
-        && let Err(error) = ctx.handle.pause_job(submitted.job_id).await
-    {
-        warn!(
-            job_id = submitted.job_id.0,
-            error = %error,
-            "accepted NZBGet append but could not apply AddPaused"
-        );
+    match submitted {
+        Ok(submitted) => Ok(json!(submitted.job_id.0)),
+        Err(error) => append_rejection_result(error),
     }
+}
 
-    Ok(json!(submitted.job_id.0))
+fn append_rejection_result(error: SubmitNzbError) -> Result<Value, RpcError> {
+    match error {
+        SubmitNzbError::Parse(_) | SubmitNzbError::Empty | SubmitNzbError::NotXml => Ok(json!(0)),
+        error => Err(RpcError::invalid_parameter(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod append_rejection_tests {
+    use super::*;
+
+    #[test]
+    fn append_rejection_result_returns_zero_for_parse_empty_and_notxml() {
+        let parse_error = weaver_nzb::parse_nzb(b"not an nzb").unwrap_err();
+        assert_eq!(
+            append_rejection_result(SubmitNzbError::Parse(parse_error)).unwrap(),
+            json!(0)
+        );
+        assert_eq!(
+            append_rejection_result(SubmitNzbError::Empty).unwrap(),
+            json!(0)
+        );
+        assert_eq!(
+            append_rejection_result(SubmitNzbError::NotXml).unwrap(),
+            json!(0)
+        );
+
+        let error =
+            append_rejection_result(SubmitNzbError::Fetch("not allowed".into())).unwrap_err();
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("not allowed"));
+    }
 }
 
 fn parse_append_params(params: Option<Value>) -> Result<AppendRequest, RpcError> {
@@ -376,8 +409,10 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         .sum::<u64>();
     let metrics = ctx.handle.get_metrics();
     let download_rate = metrics.current_download_speed;
+    let arr_download_rate = download_rate.min(i32::MAX as u64);
     let config = ctx.config.read().await;
     let download_limit = config.max_download_speed.unwrap_or(0);
+    let arr_download_limit = download_limit.min(i32::MAX as u64);
     let (remaining_lo, remaining_hi) = size_parts(remaining);
     let (downloaded_lo, downloaded_hi) = size_parts(downloaded);
     let (rate_lo, rate_hi) = size_parts(download_rate);
@@ -389,13 +424,13 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         "DownloadedSizeLo": downloaded_lo,
         "DownloadedSizeHi": downloaded_hi,
         "DownloadedSizeMB": bytes_to_mib(downloaded),
-        "DownloadRate": download_rate,
+        "DownloadRate": arr_download_rate,
         "DownloadRateLo": rate_lo,
         "DownloadRateHi": rate_hi,
-        "AverageDownloadRate": download_rate,
+        "AverageDownloadRate": arr_download_rate,
         "AverageDownloadRateLo": rate_lo,
         "AverageDownloadRateHi": rate_hi,
-        "DownloadLimit": download_limit,
+        "DownloadLimit": arr_download_limit,
         "DownloadPaused": ctx.handle.is_globally_paused(),
         "ServerPaused": false,
         "Download2Paused": false,
@@ -491,17 +526,90 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     .await
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?;
-    let items = rows
+    let terminal_items = ctx
+        .handle
+        .list_jobs()
         .iter()
-        .map(|row| {
-            let item = history_item_from_row(row, None, None);
-            nzbget_history_item(&item)
+        .map(queue_item_from_job)
+        .filter(|item| {
+            matches!(
+                item.state,
+                QueueItemState::Completed | QueueItemState::Failed
+            )
         })
         .collect::<Vec<_>>();
+    let mut seen_ids = HashSet::with_capacity(rows.len() + terminal_items.len());
+    let mut items = terminal_items
+        .iter()
+        .filter(|item| seen_ids.insert(item.id))
+        .map(nzbget_history_queue_item)
+        .collect::<Vec<_>>();
+    items.extend(
+        rows.iter()
+            .filter(|row| seen_ids.insert(row.job_id))
+            .map(|row| {
+                let item = history_item_from_row(row, None);
+                nzbget_history_item(&item)
+            }),
+    );
     Ok(Value::Array(items))
 }
 
 fn nzbget_history_item(item: &weaver_server_api::HistoryItem) -> Value {
+    let total = item.total_bytes;
+    let (file_lo, file_hi) = size_parts(total);
+    let cancelled = item
+        .attention
+        .as_ref()
+        .is_some_and(|attention| attention.code == "CANCELLED");
+    let failed = item.state == QueueItemState::Failed && !cancelled;
+    let par_status = if cancelled {
+        "NONE"
+    } else if failed {
+        "FAILURE"
+    } else {
+        "SUCCESS"
+    };
+    let unpack_status = if cancelled || failed {
+        "NONE"
+    } else {
+        "SUCCESS"
+    };
+    let move_status = if cancelled { "NONE" } else { "SUCCESS" };
+    let script_status = if cancelled { "NONE" } else { "SUCCESS" };
+    let delete_status = if cancelled { "MANUAL" } else { "NONE" };
+    let status = if cancelled {
+        "DELETED"
+    } else if failed {
+        "FAILURE"
+    } else {
+        "SUCCESS"
+    };
+    let output_dir = item.output_dir.clone().unwrap_or_default();
+
+    json!({
+        "ID": item.id,
+        "NZBID": item.id,
+        "Name": item.name,
+        "Category": item.category.clone().unwrap_or_default(),
+        "FileSizeLo": file_lo,
+        "FileSizeHi": file_hi,
+        "FileSizeMB": bytes_to_mib(total),
+        "DestDir": output_dir,
+        "FinalDir": output_dir,
+        "ParStatus": par_status,
+        "UnpackStatus": unpack_status,
+        "MoveStatus": move_status,
+        "ScriptStatus": script_status,
+        "DeleteStatus": delete_status,
+        "MarkStatus": "NONE",
+        "Status": status,
+        "Message": item.error.clone().unwrap_or_default(),
+        "Parameters": response_parameters(item.client_request_id.as_deref(), &item.attributes),
+    })
+}
+
+fn nzbget_history_queue_item(item: &QueueItem) -> Value {
     let total = item.total_bytes;
     let (file_lo, file_hi) = size_parts(total);
     let failed = item.state == QueueItemState::Failed;
@@ -542,7 +650,7 @@ async fn config(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         config_entry("AppendCategoryDir", "yes"),
     ];
 
-    let categories = if config.categories.is_empty() {
+    let raw_categories = if config.categories.is_empty() {
         ["tv", "Movies", "Music", "Books", "Prowlarr"]
             .into_iter()
             .map(|name| {
@@ -569,6 +677,7 @@ async fn config(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
             })
             .collect::<Vec<_>>()
     };
+    let categories = nzbget_config_categories(raw_categories);
 
     for (index, (name, dest_dir, aliases)) in categories.iter().enumerate() {
         let prefix = format!("Category{}.", index + 1);
@@ -580,6 +689,61 @@ async fn config(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     }
 
     Ok(Value::Array(entries))
+}
+
+fn nzbget_config_categories(
+    raw_categories: Vec<(String, String, String)>,
+) -> Vec<(String, String, String)> {
+    let mut categories = Vec::new();
+    let mut seen_names = HashSet::new();
+
+    for (name, dest_dir, aliases) in raw_categories {
+        push_nzbget_config_category(
+            &mut categories,
+            &mut seen_names,
+            name.clone(),
+            dest_dir.clone(),
+            aliases.clone(),
+        );
+
+        let lowercase_name = name.to_ascii_lowercase();
+        if lowercase_name != name {
+            push_nzbget_config_category(
+                &mut categories,
+                &mut seen_names,
+                lowercase_name,
+                dest_dir.clone(),
+                String::new(),
+            );
+        }
+
+        for alias in aliases.split(',').map(str::trim) {
+            if alias.is_empty() || alias.contains('*') || alias.contains('?') {
+                continue;
+            }
+            push_nzbget_config_category(
+                &mut categories,
+                &mut seen_names,
+                alias.to_string(),
+                dest_dir.clone(),
+                String::new(),
+            );
+        }
+    }
+
+    categories
+}
+
+fn push_nzbget_config_category(
+    categories: &mut Vec<(String, String, String)>,
+    seen_names: &mut HashSet<String>,
+    name: String,
+    dest_dir: String,
+    aliases: String,
+) {
+    if seen_names.insert(name.clone()) {
+        categories.push((name, dest_dir, aliases));
+    }
 }
 
 async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
@@ -600,7 +764,7 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
 
     for job_id in ids {
         let result = match command.as_str() {
-            "GroupFinalDelete" => ctx.handle.cancel_job(job_id).await,
+            "GroupFinalDelete" => group_final_delete(ctx, job_id).await,
             "HistoryDelete" => ctx.handle.delete_history(job_id, false).await,
             "HistoryRedownload" => ctx.handle.redownload_job(job_id).await,
             other => return Err(RpcError::invalid_action(other)),
@@ -617,6 +781,14 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
     }
 
     Ok(json!(true))
+}
+
+async fn group_final_delete(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+) -> Result<(), SchedulerError> {
+    ctx.handle.cancel_job(job_id).await?;
+    ctx.handle.delete_history(job_id, false).await
 }
 
 fn positional_params(params: Option<Value>) -> Result<Vec<Value>, RpcError> {

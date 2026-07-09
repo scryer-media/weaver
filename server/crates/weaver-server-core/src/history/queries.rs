@@ -12,16 +12,14 @@ const JOB_HISTORY_SELECT: &str =
     "SELECT job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
         optional_recovery_bytes, optional_recovery_downloaded_bytes,
         failed_bytes, health, category, output_dir, nzb_path,
-        created_at, completed_at, metadata,
-        last_diagnostic_id, last_diagnostic_uploaded_at_epoch_ms
+        created_at, completed_at, metadata
    FROM job_history";
 
 const JOB_HISTORY_SELECT_ALIASED: &str =
     "SELECT h.job_id, h.job_hash, h.name, h.status, h.error_message, h.total_bytes, h.downloaded_bytes,
         h.optional_recovery_bytes, h.optional_recovery_downloaded_bytes,
         h.failed_bytes, h.health, h.category, h.output_dir, h.nzb_path,
-        h.created_at, h.completed_at, h.metadata,
-        h.last_diagnostic_id, h.last_diagnostic_uploaded_at_epoch_ms
+        h.created_at, h.completed_at, h.metadata
    FROM ";
 
 impl Database {
@@ -50,6 +48,10 @@ impl Database {
             "db.get_job_history.cache_miss",
             std::time::Duration::ZERO,
         );
+        // Snapshot the cache generation before the read so a delete that races
+        // this read (invalidating after its own commit) makes the re-cache a
+        // no-op instead of resurrecting the deleted row from a stale read.
+        let observed_generation = self.job_history_cache_generation();
         let datastore = self.datastore();
         let row = self.run_sql_blocking(async move {
             SqlRuntime::fetch_optional(
@@ -62,7 +64,7 @@ impl Database {
             .transpose()
         })?;
         if let Some(row) = &row {
-            self.cache_job_history(row.clone());
+            self.cache_job_history_at(row.clone(), observed_generation);
         }
         Ok(row)
     }
@@ -268,6 +270,14 @@ fn append_history_row_filter_predicates(
             statuses.iter().cloned().map(SqlArg::Text).collect(),
         );
     }
+    if let Some(status_not_in) = &filter.status_not_in {
+        append_not_in_text_filter(
+            sql,
+            args,
+            "h.status",
+            status_not_in.iter().cloned().map(SqlArg::Text).collect(),
+        );
+    }
     if let Some(item_ids) = &filter.item_ids {
         append_in_i64_or_text_filter(
             sql,
@@ -300,6 +310,29 @@ fn append_in_i64_or_text_filter(
     sql.push_str(" AND ");
     sql.push_str(column);
     sql.push_str(" IN (");
+    sql.push_str(
+        &std::iter::repeat_n("{}", values.len())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    sql.push(')');
+    args.extend(values);
+}
+
+fn append_not_in_text_filter(
+    sql: &mut String,
+    args: &mut Vec<SqlArg>,
+    column: &str,
+    values: Vec<SqlArg>,
+) {
+    // An empty exclusion list excludes nothing, so the predicate is a no-op.
+    if values.is_empty() {
+        return;
+    }
+
+    sql.push_str(" AND ");
+    sql.push_str(column);
+    sql.push_str(" NOT IN (");
     sql.push_str(
         &std::iter::repeat_n("{}", values.len())
             .collect::<Vec<_>>()
@@ -350,8 +383,5 @@ pub(crate) fn job_history_row_from_sql(
         created_at: row.i64("created_at")?,
         completed_at: row.i64("completed_at")?,
         metadata: row.opt_text("metadata")?,
-        last_diagnostic_id: row.opt_text("last_diagnostic_id")?,
-        last_diagnostic_uploaded_at_epoch_ms: row
-            .opt_i64("last_diagnostic_uploaded_at_epoch_ms")?,
     })
 }

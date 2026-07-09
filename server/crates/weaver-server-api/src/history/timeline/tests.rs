@@ -22,8 +22,6 @@ fn history(created_at: i64, completed_at: i64) -> JobHistoryRow {
         created_at,
         completed_at,
         metadata: None,
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     }
 }
 
@@ -115,6 +113,7 @@ fn job(status: JobStatus) -> JobInfo {
         downloaded_bytes: 0,
         optional_recovery_bytes: 0,
         optional_recovery_downloaded_bytes: 0,
+        phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
         password: None,

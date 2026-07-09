@@ -22,6 +22,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
     } = runtime;
     let base_url_ext = super::assets::BaseUrl(Arc::new(base_url.clone()));
     let session_token = super::SessionToken(Arc::new(generate_api_key()));
+    let login_limiter = super::auth::LoginRateLimiter::default();
     let backup_upload_limit =
         usize::try_from(security.backup_upload_limit_bytes).unwrap_or(usize::MAX);
     let request_auth = super::RequestAuthContext {
@@ -75,6 +76,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .layer(Extension(backup))
         .layer(Extension(db))
         .layer(Extension(auth_cache))
+        .layer(Extension(login_limiter))
         .layer(Extension(api_key_cache))
         .layer(Extension(nzbget_context))
         .layer(Extension(request_auth))

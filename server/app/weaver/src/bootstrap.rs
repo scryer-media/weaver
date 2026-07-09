@@ -2,9 +2,10 @@ use std::path::Path;
 
 use tracing::{error, info, warn};
 
-use weaver_server_core::Database;
 use weaver_server_core::persistence::setup::default_data_dir_for_config_path;
 use weaver_server_core::settings::Config;
+use weaver_server_core::settings::env_seed::{EnvSeedConfig, EnvSeedError};
+use weaver_server_core::{Database, StateError};
 
 pub(crate) fn open_db_and_config(
     config_path: &Path,
@@ -20,6 +21,37 @@ pub(crate) fn reset_login_if_requested(db: &mut Database) {
             Err(e) => error!("failed to reset login credentials: {e}"),
         }
     }
+}
+
+pub(crate) fn parse_env_seed_from_process() -> Result<EnvSeedConfig, EnvSeedError> {
+    weaver_server_core::settings::env_seed::parse_env_seed(std::env::vars())
+}
+
+pub(crate) fn apply_core_env_seed(
+    db: &Database,
+    config: &mut Config,
+    seed: &EnvSeedConfig,
+) -> Result<usize, StateError> {
+    let seeded = weaver_server_core::settings::env_seed::apply_core_seed(db, config, seed)?;
+    if seeded > 0 {
+        info!(
+            settings = seeded,
+            "seeded missing config settings from environment"
+        );
+    }
+    Ok(seeded)
+}
+
+pub(crate) fn apply_server_env_seed(
+    db: &Database,
+    config: &mut Config,
+    seed: &EnvSeedConfig,
+) -> Result<usize, StateError> {
+    let seeded = weaver_server_core::settings::env_seed::apply_server_seed(db, config, seed)?;
+    if seeded > 0 {
+        info!(servers = seeded, "seeded NNTP servers from environment");
+    }
+    Ok(seeded)
 }
 
 pub(crate) fn default_data_dir_from_config_path(config_path: &Path, config: &mut Config) {
@@ -90,7 +122,8 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
-            diagnostic_upload_url: None,
+            ip_replacement_trial_extra_connections: None,
+            watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             config_path: None,
         }
     }

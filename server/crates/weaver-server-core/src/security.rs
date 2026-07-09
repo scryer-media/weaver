@@ -12,7 +12,11 @@ pub const ENV_BACKUP_UPLOAD_LIMIT_BYTES: &str = "WEAVER_BACKUP_UPLOAD_LIMIT_BYTE
 pub const ENV_NZB_UPLOAD_LIMIT_BYTES: &str = "WEAVER_NZB_UPLOAD_LIMIT_BYTES";
 pub const ENV_NZB_DECOMPRESSED_LIMIT_BYTES: &str = "WEAVER_NZB_DECOMPRESSED_LIMIT_BYTES";
 pub const ENV_RSS_ALLOW_PRIVATE_NETWORK: &str = "WEAVER_RSS_ALLOW_PRIVATE_NETWORK";
+pub const ENV_STRICT_SECURITY: &str = "WEAVER_STRICT_SECURITY";
 
+// Keep the default bind broad for Docker and homelab deployments. Production-style
+// guardrails live in WEAVER_STRICT_SECURITY rather than silently narrowing this.
+pub const DEFAULT_HTTP_BIND_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 pub const DEFAULT_BACKUP_UPLOAD_LIMIT_BYTES: u64 = 2_147_483_648;
 pub const DEFAULT_NZB_UPLOAD_LIMIT_BYTES: u64 = 268_435_456;
 pub const DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES: u64 = 536_870_912;
@@ -27,15 +31,13 @@ pub struct RuntimeSecurityConfig {
     pub nzb_upload_limit_bytes: u64,
     pub nzb_decompressed_limit_bytes: u64,
     pub rss_allow_private_network: bool,
+    pub strict_security: bool,
 }
 
 impl RuntimeSecurityConfig {
     pub fn from_env() -> Result<Self, SecurityConfigError> {
         Ok(Self {
-            http_bind_address: parse_ip_env(
-                ENV_HTTP_BIND_ADDRESS,
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            )?,
+            http_bind_address: parse_ip_env(ENV_HTTP_BIND_ADDRESS, DEFAULT_HTTP_BIND_ADDRESS)?,
             metrics_auth_required: parse_bool_env(ENV_METRICS_AUTH_REQUIRED, true)?,
             cors_allowed_origins: parse_origin_list_env(ENV_CORS_ALLOWED_ORIGINS)?,
             secure_cookies: parse_bool_env(ENV_SECURE_COOKIES, false)?,
@@ -52,18 +54,33 @@ impl RuntimeSecurityConfig {
                 DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES,
             )?,
             rss_allow_private_network: parse_bool_env(ENV_RSS_ALLOW_PRIVATE_NETWORK, false)?,
+            strict_security: parse_bool_env(ENV_STRICT_SECURITY, false)?,
         })
     }
 
     pub fn from_env_or_default_for_tests() -> Self {
         Self::from_env().unwrap_or_default()
     }
+
+    pub fn exposes_admin_without_login(&self, login_enabled: bool) -> bool {
+        !login_enabled && !self.http_bind_address.is_loopback()
+    }
+
+    pub fn strict_security_violation(&self, login_enabled: bool) -> Option<String> {
+        if self.strict_security && self.exposes_admin_without_login(login_enabled) {
+            return Some(format!(
+                "{ENV_STRICT_SECURITY}=1 refuses {ENV_HTTP_BIND_ADDRESS}={} without login auth enabled",
+                self.http_bind_address
+            ));
+        }
+        None
+    }
 }
 
 impl Default for RuntimeSecurityConfig {
     fn default() -> Self {
         Self {
-            http_bind_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            http_bind_address: DEFAULT_HTTP_BIND_ADDRESS,
             metrics_auth_required: true,
             cors_allowed_origins: Vec::new(),
             secure_cookies: false,
@@ -71,6 +88,7 @@ impl Default for RuntimeSecurityConfig {
             nzb_upload_limit_bytes: DEFAULT_NZB_UPLOAD_LIMIT_BYTES,
             nzb_decompressed_limit_bytes: DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES,
             rss_allow_private_network: false,
+            strict_security: false,
         }
     }
 }
@@ -281,6 +299,7 @@ mod tests {
             ENV_NZB_UPLOAD_LIMIT_BYTES,
             ENV_NZB_DECOMPRESSED_LIMIT_BYTES,
             ENV_RSS_ALLOW_PRIVATE_NETWORK,
+            ENV_STRICT_SECURITY,
         ] {
             unsafe { env::remove_var(name) };
         }
@@ -293,6 +312,7 @@ mod tests {
 
         let config = RuntimeSecurityConfig::from_env().unwrap();
 
+        assert_eq!(config.http_bind_address, DEFAULT_HTTP_BIND_ADDRESS);
         assert_eq!(config.http_bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert!(config.metrics_auth_required);
         assert!(config.cors_allowed_origins.is_empty());
@@ -310,6 +330,7 @@ mod tests {
             DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES
         );
         assert!(!config.rss_allow_private_network);
+        assert!(!config.strict_security);
     }
 
     #[test]
@@ -328,6 +349,7 @@ mod tests {
             env::set_var(ENV_NZB_UPLOAD_LIMIT_BYTES, "11");
             env::set_var(ENV_NZB_DECOMPRESSED_LIMIT_BYTES, "12");
             env::set_var(ENV_RSS_ALLOW_PRIVATE_NETWORK, "1");
+            env::set_var(ENV_STRICT_SECURITY, "on");
         }
 
         let config = RuntimeSecurityConfig::from_env().unwrap();
@@ -343,8 +365,56 @@ mod tests {
         assert_eq!(config.nzb_upload_limit_bytes, 11);
         assert_eq!(config.nzb_decompressed_limit_bytes, 12);
         assert!(config.rss_allow_private_network);
+        assert!(config.strict_security);
 
         clear_env();
+    }
+
+    #[test]
+    fn security_env_allows_explicit_all_interfaces_bind() {
+        let _guard = env_lock();
+        clear_env();
+        unsafe {
+            env::set_var(ENV_HTTP_BIND_ADDRESS, "0.0.0.0");
+        }
+
+        let config = RuntimeSecurityConfig::from_env().unwrap();
+
+        assert_eq!(config.http_bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+
+        clear_env();
+    }
+
+    #[test]
+    fn open_admin_warning_predicate_tracks_bind_and_login() {
+        let default = RuntimeSecurityConfig::default();
+        assert!(default.exposes_admin_without_login(false));
+        assert!(!default.exposes_admin_without_login(true));
+
+        let loopback = RuntimeSecurityConfig {
+            http_bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ..RuntimeSecurityConfig::default()
+        };
+        assert!(!loopback.exposes_admin_without_login(false));
+    }
+
+    #[test]
+    fn strict_security_refuses_exposed_admin_without_login() {
+        let exposed = RuntimeSecurityConfig {
+            http_bind_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            strict_security: true,
+            ..RuntimeSecurityConfig::default()
+        };
+
+        assert!(exposed.strict_security_violation(false).is_some());
+        assert!(exposed.strict_security_violation(true).is_none());
+
+        let loopback = RuntimeSecurityConfig {
+            http_bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            strict_security: true,
+            ..RuntimeSecurityConfig::default()
+        };
+        assert!(loopback.strict_security_violation(false).is_none());
     }
 
     #[test]

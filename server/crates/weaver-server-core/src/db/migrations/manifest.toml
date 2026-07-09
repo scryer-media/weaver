@@ -95,6 +95,67 @@ file = "migrations/0027_history_poll_indexes/postgres.sql"
 engine = "postgres"
 scope = "all"
 
+[[migration]]
+version = 28
+description = "restart active jobs without active segment rows"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "restart_active_jobs_drop_active_segments_v28"
+scope = "all"
+
+[[migration]]
+version = 29
+description = "optional completed file md5"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0029_optional_completed_file_md5/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0029_optional_completed_file_md5/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 30
+description = "remove diagnostic redownload"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0030_remove_diagnostic_redownload/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0030_remove_diagnostic_redownload/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 31
+description = "server backfill and retention"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0031_server_backfill_retention/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0031_server_backfill_retention/postgres.sql"
+engine = "postgres"
+scope = "all"
+
 [[baseline]]
 through_version = 21
 file = "migrations/0021_legacy_schema_parity/fresh.sql"

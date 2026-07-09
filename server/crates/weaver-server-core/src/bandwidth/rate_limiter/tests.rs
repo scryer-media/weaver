@@ -78,3 +78,28 @@ fn negative_balance_recovery() {
     assert!(wait >= Duration::from_millis(900));
     assert!(wait <= Duration::from_millis(1_100));
 }
+
+#[test]
+fn refund_reduces_wait_without_exceeding_capacity() {
+    let mut bucket = TokenBucket::new(1_000);
+    bucket.consume(1_500);
+    assert!(bucket.should_wait());
+
+    bucket.refund(600);
+    assert!(!bucket.should_wait());
+
+    bucket.refund(10_000);
+    bucket.consume(1_001);
+    assert!(bucket.should_wait());
+}
+
+#[test]
+fn reconcile_adjusts_estimate_to_actual_bytes() {
+    let mut bucket = TokenBucket::new(1_000);
+    bucket.consume(500);
+    bucket.reconcile(500, 1_200);
+    assert!(bucket.should_wait());
+
+    bucket.reconcile(1_200, 100);
+    assert!(!bucket.should_wait());
+}

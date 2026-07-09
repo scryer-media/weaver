@@ -7,6 +7,7 @@ use crate::runtime::{file_cache, fs as runtime_fs};
 fn move_path_with_copy_fallback(
     src: &std::path::Path,
     dst: &std::path::Path,
+    phase_counters: &PhaseCounters,
 ) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(src)?;
 
@@ -31,14 +32,22 @@ fn move_path_with_copy_fallback(
         })?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
-            move_path_with_copy_fallback(&entry.path(), &dst.join(entry.file_name()))?;
+            move_path_with_copy_fallback(
+                &entry.path(),
+                &dst.join(entry.file_name()),
+                phase_counters,
+            )?;
         }
         std::fs::remove_dir(src)?;
         return Ok(());
     }
 
     let parent_fingerprint = runtime_fs::prepare_destination_parent(dst)?;
-    match file_cache::copy_large_file(src, dst) {
+    match file_cache::copy_large_file_with_progress(src, dst, |copied| {
+        phase_counters
+            .completed_bytes
+            .fetch_add(copied, Ordering::Relaxed);
+    }) {
         Ok(_) => {}
         Err(error) => {
             if error.kind() != std::io::ErrorKind::AlreadyExists {
@@ -69,13 +78,40 @@ fn cleanup_copy_destination_if_parent_matches(
 fn move_path_with_safe_rename_or_copy_fallback(
     src: &std::path::Path,
     dst: &std::path::Path,
+    phase_counters: Arc<PhaseCounters>,
 ) -> Result<(), (std::io::Error, std::io::Error)> {
+    let path_bytes = path_regular_file_bytes(src).unwrap_or(0);
     match runtime_fs::rename_no_overwrite(src, dst) {
-        Ok(()) => Ok(()),
-        Err(rename_err) => {
-            move_path_with_copy_fallback(src, dst).map_err(|copy_err| (rename_err, copy_err))
+        Ok(()) => {
+            if path_bytes > 0 {
+                phase_counters
+                    .completed_bytes
+                    .fetch_add(path_bytes, Ordering::Relaxed);
+            }
+            Ok(())
         }
+        Err(rename_err) => move_path_with_copy_fallback(src, dst, &phase_counters)
+            .map_err(|copy_err| (rename_err, copy_err)),
     }
+}
+
+fn path_regular_file_bytes(path: &std::path::Path) -> std::io::Result<u64> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(0);
+    }
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        total = total.saturating_add(path_regular_file_bytes(&entry.path())?);
+    }
+    Ok(total)
 }
 
 async fn run_move_to_complete(
@@ -83,6 +119,7 @@ async fn run_move_to_complete(
     working_dir: PathBuf,
     staging_dir: Option<PathBuf>,
     dest: PathBuf,
+    phase_counters: Arc<PhaseCounters>,
 ) -> Result<MoveToCompleteResult, String> {
     // Verify at least one source directory exists before creating
     // the destination, so a missing source doesn't leave behind an
@@ -95,6 +132,19 @@ async fn run_move_to_complete(
             working_dir.display()
         ));
     }
+
+    let total_bytes = {
+        let working_dir = working_dir.clone();
+        let staging_dir = staging_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            move_sources_regular_file_bytes(&working_dir, staging_dir.as_deref())
+        })
+        .await
+        .unwrap_or(0)
+    };
+    phase_counters
+        .total_bytes
+        .store(total_bytes, Ordering::Relaxed);
 
     if let Err(error) = tokio::fs::create_dir_all(&dest).await {
         return Err(format!(
@@ -129,8 +179,9 @@ async fn run_move_to_complete(
             let dst = dest.join(&file_name);
             let src_fb = src.clone();
             let dst_fb = dst.clone();
+            let counters = Arc::clone(&phase_counters);
             match tokio::task::spawn_blocking(move || {
-                move_path_with_safe_rename_or_copy_fallback(&src_fb, &dst_fb)
+                move_path_with_safe_rename_or_copy_fallback(&src_fb, &dst_fb, counters)
             })
             .await
             {
@@ -172,8 +223,9 @@ async fn run_move_to_complete(
             }
             let src_fb = src.clone();
             let dst_fb = dst.clone();
+            let counters = Arc::clone(&phase_counters);
             match tokio::task::spawn_blocking(move || {
-                move_path_with_safe_rename_or_copy_fallback(&src_fb, &dst_fb)
+                move_path_with_safe_rename_or_copy_fallback(&src_fb, &dst_fb, counters)
             })
             .await
             {
@@ -249,6 +301,36 @@ async fn run_move_to_complete(
     Ok(MoveToCompleteResult {
         moved_entries: moved,
     })
+}
+
+fn move_sources_regular_file_bytes(
+    working_dir: &std::path::Path,
+    staging_dir: Option<&std::path::Path>,
+) -> u64 {
+    let mut total = 0u64;
+    if let Some(staging) = staging_dir
+        && let Ok(entries) = std::fs::read_dir(staging)
+    {
+        for entry in entries.flatten() {
+            if entry.file_name() == ".weaver-chunks" {
+                continue;
+            }
+            total = total.saturating_add(path_regular_file_bytes(&entry.path()).unwrap_or(0));
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(working_dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            if file_name == ".weaver-chunks"
+                || file_name == ".weaver-staging"
+                || file_name == WORKING_DIR_MARKER
+            {
+                continue;
+            }
+            total = total.saturating_add(path_regular_file_bytes(&entry.path()).unwrap_or(0));
+        }
+    }
+    total
 }
 
 impl Pipeline {
@@ -343,6 +425,9 @@ impl Pipeline {
             )
         };
 
+        self.phase_end(job_id, JobPhase::Extracting);
+        self.phase_end(job_id, JobPhase::Repairing);
+        let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
         self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
 
         let dest = self
@@ -365,7 +450,14 @@ impl Pipeline {
         );
         tokio::spawn(async move {
             let move_started = Instant::now();
-            let result = run_move_to_complete(job_id, working_dir, staging_dir, dest.clone()).await;
+            let result = run_move_to_complete(
+                job_id,
+                working_dir,
+                staging_dir,
+                dest.clone(),
+                phase_counters,
+            )
+            .await;
             match &result {
                 Ok(outcome) => info!(
                     job_id = job_id.0,
@@ -399,6 +491,7 @@ impl Pipeline {
             dest,
             result,
         } = done;
+        self.phase_end(job_id, JobPhase::Moving);
         self.inflight_moves.remove(&job_id);
         self.reserved_complete_destinations.remove(&job_id);
 
@@ -420,6 +513,7 @@ impl Pipeline {
                     .send(PipelineEvent::MoveToCompleteFinished { job_id });
                 self.transition_completed_runtime(job_id);
                 if self.active_download_passes.remove(&job_id) {
+                    self.phase_end(job_id, JobPhase::Downloading);
                     let _ = self.event_tx.send(PipelineEvent::DownloadFinished {
                         job_id,
                         finalization_pending: false,

@@ -18,6 +18,7 @@ pub mod schema_migrations;
 pub mod security;
 pub mod servers;
 pub mod settings;
+pub mod watch_folder;
 
 pub use auth::{ApiKeyRow, AuthCredentials};
 pub use bandwidth::rate_limiter::TokenBucket;
@@ -28,24 +29,25 @@ pub use history::{
     public_history_attributes, split_history_metadata,
 };
 pub use jobs::{
-    ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment, DownloadBlockKind,
-    DownloadBlockState, DownloadState, ExtractionChunk, FieldUpdate, FileSpec, JobId, JobInfo,
-    JobSpec, JobState, JobStatus, JobUpdate, MessageId, NzbFileId, PostState, RecoveredJob,
-    RestoreJobRequest, RunState, SchedulerCommand, SchedulerError, SchedulerHandle, SegmentId,
-    SegmentSpec, ServerId, SharedPipelineState, derive_legacy_job_status, epoch_ms_now,
-    job_status_from_persisted_str, runtime_lanes_from_status_snapshot,
+    ActiveFileProgress, ActiveJob, ActivePar2File, DownloadBlockKind, DownloadBlockState,
+    DownloadState, ExtractionChunk, FieldUpdate, FileSpec, JobId, JobInfo, JobPhase,
+    JobPhaseProgress, JobSpec, JobState, JobStatus, JobUpdate, MessageId, NzbFileId, PhaseCounters,
+    PostState, RecoveredJob, RestoreJobRequest, RunState, SchedulerCommand, SchedulerError,
+    SchedulerHandle, SegmentId, SegmentSpec, ServerId, SharedPipelineState,
+    derive_legacy_job_status, epoch_ms_now, job_status_from_persisted_str,
+    runtime_lanes_from_status_snapshot,
 };
-pub use operations::metrics::{MetricsSnapshot, PipelineMetrics};
+pub use operations::metrics::{
+    DispatchShareMode, DownloadPressureReason, DownloadPressureState, MetricsSnapshot,
+    PipelineMetrics, SpilloverDecision,
+};
 pub use operations::{
     AsyncOperationState, AsyncOperationTargetState, COUNTER_METRIC_KEYS, CounterRollupValue,
-    DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY, DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY,
-    DiagnosticRunInsertError, DiagnosticRunRow, DiagnosticRunStage, GAUGE_METRIC_KEYS,
-    GaugeRollupValue, HistoryDeleteOperationInsertError, HistoryDeleteOperationPayload,
-    HistoryDeleteOperationRow, HistoryDeleteOperationSummary, HistoryDeleteRowState,
-    HistoryDeleteTargetWork, JOB_STATUS_KEYS, MetricsHistoryChunkRow, MetricsHistoryQueryData,
-    MetricsHistoryQueryResult, MetricsHistoryTier, RawMetricsHistoryPoint,
-    RollupMetricsHistoryPoint, StableStateExport, diagnostic_cleanup_cutoff_ms,
-    diagnostic_include_server_hostnames, diagnostic_source_job_id, with_diagnostic_metadata,
+    GAUGE_METRIC_KEYS, GaugeRollupValue, HistoryDeleteOperationInsertError,
+    HistoryDeleteOperationPayload, HistoryDeleteOperationRow, HistoryDeleteOperationSummary,
+    HistoryDeleteRowState, HistoryDeleteTargetWork, JOB_STATUS_KEYS, MetricsHistoryChunkRow,
+    MetricsHistoryQueryData, MetricsHistoryQueryResult, MetricsHistoryTier, RawMetricsHistoryPoint,
+    RollupMetricsHistoryPoint, StableStateExport,
 };
 pub use persistence::{Database, StateError};
 pub use pipeline::Pipeline;

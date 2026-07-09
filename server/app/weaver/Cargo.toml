@@ -3,7 +3,7 @@ name = "weaver"
 description = "Unified Usenet binary downloader, repair, and extraction engine"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [[bin]]
@@ -15,11 +15,11 @@ weaver-server-core = { path = "../../crates/weaver-server-core", default-feature
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }
 weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
 weaver-yenc = { path = "../../../engines/weaver-yenc", default-features = false }
-weaver-par2 = { path = "../../../engines/weaver-par2", default-features = false, features = [
+weaver-par2 = { workspace = true, features = [
     "native-crypto",
 ] }
-weaver-rar = { path = "../../../engines/weaver-rar", default-features = false, features = [
-    "native-crypto",
+weaver-unrar = { workspace = true, features = [
+    "crypto-aws-lc",
 ] }
 weaver-server-api = { path = "../../crates/weaver-server-api", default-features = false }
 tokio = { workspace = true }
@@ -27,6 +27,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 toml = { workspace = true }
+dotenvy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true, default-features = false }
@@ -57,3 +58,6 @@ embed-resource = "3.0.9"
 
 [dev-dependencies]
 tower = { workspace = true, default-features = false }
+
+[target.'cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false }

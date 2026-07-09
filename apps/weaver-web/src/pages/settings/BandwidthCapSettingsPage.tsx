@@ -2,8 +2,10 @@ import { useEffect, useState, type ReactNode } from "react";
 import { useMutation, useQuery } from "urql";
 import { formatBytes } from "@/components/SpeedDisplay";
 import { PageHeader } from "@/components/PageHeader";
+import { SectionCard } from "@/components/SectionCard";
+import { SettingsInnerBox } from "@/pages/settings/shared";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
@@ -162,100 +164,101 @@ export function BandwidthCapSettingsPage() {
       })
     : "\u2014";
 
+  const usageFillPct = downloadBlock?.capEnabled
+    ? Math.min(
+        100,
+        Math.max(
+          0,
+          ((downloadBlock?.usedBytes ?? 0) / Math.max(downloadBlock?.limitBytes ?? 1, 1)) * 100,
+        ),
+      )
+    : 0;
+  const usageBarClass =
+    usageFillPct >= 90
+      ? "bg-status-failed"
+      : usageFillPct >= 70
+        ? "bg-status-paused"
+        : "bg-status-completed";
+
   return (
-    <div className="space-y-6">
+    <div className="max-w-[1180px] space-y-6">
       <PageHeader
         title={t("settings.bandwidthCap")}
         description={t("settings.bandwidthCapDesc")}
       />
 
-      <Card>
-        <CardHeader>
-          <CardTitle>{t("settings.bandwidthCapCurrentWindow")}</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="text-xs text-muted-foreground">
-            {t("settings.bandwidthCapTimezone", {
-              timezone: downloadBlock?.timezoneName ?? "\u2014",
-            })}
-          </div>
-          <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-            <div>
-              <div className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
-                {t("settings.bandwidthCapUsed")}
-              </div>
-              <div className="mt-1 text-base font-semibold text-foreground">
-                {formatBytes(downloadBlock?.usedBytes ?? 0)}
-              </div>
+      <SectionCard title={t("settings.bandwidthCapCurrentWindow")}>
+        <div className="text-xs text-muted-foreground">
+          {t("settings.bandwidthCapTimezone", {
+            timezone: downloadBlock?.timezoneName ?? "\u2014",
+          })}
+        </div>
+        <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <div>
+            <div className="text-[10.5px] font-semibold uppercase tracking-[0.13em] text-muted-foreground">
+              {t("settings.bandwidthCapUsed")}
             </div>
-            <div>
-              <div className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
-                {t("settings.bandwidthCapRemaining")}
-              </div>
-              <div className="mt-1 text-base font-semibold text-foreground">
-                {downloadBlock?.capEnabled
-                  ? formatBytes(downloadBlock?.remainingBytes ?? 0)
-                  : "\u2014"}
-              </div>
-            </div>
-            <div>
-              <div className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
-                {t("settings.bandwidthCapLimit")}
-              </div>
-              <div className="mt-1 text-base font-semibold text-foreground">
-                {downloadBlock?.capEnabled
-                  ? formatBytes(downloadBlock?.limitBytes ?? 0)
-                  : "\u2014"}
-              </div>
-            </div>
-            <div>
-              <div className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
-                {t("settings.bandwidthCapReset")}
-              </div>
-              <div className="mt-1 text-base font-semibold text-foreground">
-                {capResetAt}
-              </div>
+            <div className="mt-1 text-base font-semibold text-foreground">
+              {formatBytes(downloadBlock?.usedBytes ?? 0)}
             </div>
           </div>
-          <div className="mt-4 h-2 overflow-hidden rounded-full bg-muted">
-            <div
-              className="h-full bg-primary transition-all"
-              style={{
-                width: downloadBlock?.capEnabled
-                  ? `${Math.min(
-                      100,
-                      Math.max(
-                        0,
-                        ((downloadBlock?.usedBytes ?? 0) / Math.max(downloadBlock?.limitBytes ?? 1, 1))
-                          * 100,
-                      ),
-                    )}%`
-                  : "0%",
-              }}
-            />
+          <div>
+            <div className="text-[10.5px] font-semibold uppercase tracking-[0.13em] text-muted-foreground">
+              {t("settings.bandwidthCapRemaining")}
+            </div>
+            <div className="mt-1 text-base font-semibold text-foreground">
+              {downloadBlock?.capEnabled
+                ? formatBytes(downloadBlock?.remainingBytes ?? 0)
+                : "\u2014"}
+            </div>
           </div>
-        </CardContent>
-      </Card>
+          <div>
+            <div className="text-[10.5px] font-semibold uppercase tracking-[0.13em] text-muted-foreground">
+              {t("settings.bandwidthCapLimit")}
+            </div>
+            <div className="mt-1 text-base font-semibold text-foreground">
+              {downloadBlock?.capEnabled
+                ? formatBytes(downloadBlock?.limitBytes ?? 0)
+                : "\u2014"}
+            </div>
+          </div>
+          <div>
+            <div className="text-[10.5px] font-semibold uppercase tracking-[0.13em] text-muted-foreground">
+              {t("settings.bandwidthCapReset")}
+            </div>
+            <div className="mt-1 text-base font-semibold text-foreground">
+              {capResetAt}
+            </div>
+          </div>
+        </div>
+        <div className="mt-4 h-2 overflow-hidden rounded-pill bg-muted">
+          <div
+            className={cn("h-full transition-all", usageBarClass)}
+            style={{
+              width: downloadBlock?.capEnabled ? `${usageFillPct}%` : "0%",
+            }}
+          />
+        </div>
+      </SectionCard>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>{t("settings.bandwidthCapConfiguration")}</CardTitle>
-          <CardDescription>{t("settings.bandwidthCapEnabledDesc")}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-5">
-          <div className="flex flex-col gap-4 rounded-2xl border border-border/70 bg-background/70 p-4 sm:flex-row sm:items-center sm:justify-between">
+      <SectionCard
+        title={t("settings.bandwidthCapConfiguration")}
+        description={t("settings.bandwidthCapEnabledDesc")}
+      >
+        <div className="space-y-5">
+          <div className="flex items-center justify-between gap-4 rounded-inner border border-border p-5">
             <div>
-              <div className="text-sm font-medium text-foreground">
+              <div className="text-sm font-semibold text-foreground">
                 {t("settings.bandwidthCapEnabled")}
               </div>
-              <div className="text-xs text-muted-foreground">
+              <div className="mt-1 text-[12.5px] text-muted-foreground">
                 {t("settings.bandwidthCapEnabledDesc")}
               </div>
             </div>
             <Switch checked={capEnabled} onCheckedChange={setCapEnabled} />
           </div>
 
-          <div className="grid gap-4 xl:grid-cols-2">
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             <SettingField
               label={t("settings.bandwidthCapPeriod")}
               description={t("settings.bandwidthCapPeriodDesc")}
@@ -361,13 +364,13 @@ export function BandwidthCapSettingsPage() {
               {t("settings.save")}
             </Button>
             {settingsSaved ? (
-              <span className="text-sm text-emerald-600 dark:text-emerald-300">
+              <span className="text-sm text-status-completed">
                 {t("settings.saved")}
               </span>
             ) : null}
           </div>
-        </CardContent>
-      </Card>
+        </div>
+      </SectionCard>
     </div>
   );
 }
@@ -382,10 +385,10 @@ function SettingField({
   children?: ReactNode;
 }) {
   return (
-    <div className="rounded-2xl border border-border/70 bg-background/70 p-4">
-      <Label className="mb-2">{label}</Label>
+    <SettingsInnerBox>
+      <Label className="mb-2 text-sm font-semibold">{label}</Label>
       {children}
-      <p className="mt-2 text-xs text-muted-foreground">{description}</p>
-    </div>
+      <p className="mt-2 text-[12.5px] text-muted-foreground">{description}</p>
+    </SettingsInnerBox>
   );
 }

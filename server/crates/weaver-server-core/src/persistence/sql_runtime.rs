@@ -24,6 +24,12 @@ const SQLITE_BUSY_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_millis(1000),
 ];
 const SQLITE_BUSY_RETRY_HARD_CAP: Duration = Duration::from_secs(120);
+const POSTGRES_TRANSIENT_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(10),
+    Duration::from_millis(50),
+    Duration::from_millis(150),
+    Duration::from_millis(400),
+];
 
 pub(crate) type SqlResult<T> = Result<T, StateError>;
 
@@ -188,20 +194,83 @@ impl SqlRuntime {
                 Ok(result.rows_affected())
             }
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
-                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
-                let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
-                let result = query.execute(pool).await.map_err(db_err);
-                crate::runtime::perf_probe::record_sql_statement(
-                    "postgres",
-                    "execute",
-                    template,
-                    started.elapsed(),
-                );
-                let result = result?;
+                // Autocommit write: a bare statement's commit outcome is unknown
+                // on a dropped connection, so only retry guaranteed-rolled-back
+                // (serialization/deadlock) failures, not connection errors.
+                let result = run_with_postgres_retries("execute", false, || async {
+                    let started = Instant::now();
+                    let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
+                    let outcome = query.execute(pool).await.map_err(pg_db_err);
+                    // Record each attempt's real query time, excluding retry sleeps.
+                    crate::runtime::perf_probe::record_sql_statement(
+                        "postgres",
+                        "execute",
+                        template,
+                        started.elapsed(),
+                    );
+                    outcome
+                })
+                .await?;
                 Ok(result.rows_affected())
             }
             SqlExec::Tx(tx) => tx.execute(template, args).await,
+        }
+    }
+
+    /// Autocommit write that returns a row (e.g. `INSERT ... RETURNING`). Unlike
+    /// [`Self::fetch_optional`], this uses the WRITE retry policy (retry mode
+    /// `false`): a bare write's commit outcome is unknown on a dropped
+    /// connection, so only guaranteed-rolled-back failures are retried, never
+    /// connection errors — retrying those would duplicate the inserted row.
+    pub(crate) async fn execute_returning(
+        exec: SqlExec<'_, '_>,
+        template: &str,
+        args: &[SqlArg],
+    ) -> SqlResult<Option<SqlRow>> {
+        match exec {
+            SqlExec::Target(SqlTarget::Sqlite(pool)) => {
+                let started = Instant::now();
+                let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
+                let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
+                let result = query
+                    .fetch_optional(pool)
+                    .await
+                    .map(|row| row.map(SqlRow::Sqlite))
+                    .map_err(db_err);
+                crate::runtime::perf_probe::record_sql_statement(
+                    "sqlite",
+                    "execute_returning",
+                    template,
+                    started.elapsed(),
+                );
+                result
+            }
+            SqlExec::Target(SqlTarget::Postgres(pool)) => {
+                let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
+                // Autocommit write: same outcome-unknown reasoning as `execute`,
+                // so only retry guaranteed-rolled-back failures, not connection
+                // errors.
+                run_with_postgres_retries("execute_returning", false, || async {
+                    let started = Instant::now();
+                    let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
+                    let outcome = query
+                        .fetch_optional(pool)
+                        .await
+                        .map(|row| row.map(SqlRow::Postgres))
+                        .map_err(pg_db_err);
+                    // Record each attempt's real query time, excluding retry sleeps.
+                    crate::runtime::perf_probe::record_sql_statement(
+                        "postgres",
+                        "execute_returning",
+                        template,
+                        started.elapsed(),
+                    );
+                    outcome
+                })
+                .await
+            }
+            SqlExec::Tx(tx) => tx.fetch_optional(template, args).await,
         }
     }
 
@@ -229,21 +298,25 @@ impl SqlRuntime {
                 result
             }
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
-                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
-                let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
-                let result = query
-                    .fetch_optional(pool)
-                    .await
-                    .map(|row| row.map(SqlRow::Postgres))
-                    .map_err(db_err);
-                crate::runtime::perf_probe::record_sql_statement(
-                    "postgres",
-                    "fetch_optional",
-                    template,
-                    started.elapsed(),
-                );
-                result
+                // Read: idempotent, so retry connection errors as well.
+                run_with_postgres_retries("fetch_optional", true, || async {
+                    let started = Instant::now();
+                    let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
+                    let outcome = query
+                        .fetch_optional(pool)
+                        .await
+                        .map(|row| row.map(SqlRow::Postgres))
+                        .map_err(pg_db_err);
+                    crate::runtime::perf_probe::record_sql_statement(
+                        "postgres",
+                        "fetch_optional",
+                        template,
+                        started.elapsed(),
+                    );
+                    outcome
+                })
+                .await
             }
             SqlExec::Tx(tx) => tx.fetch_optional(template, args).await,
         }
@@ -273,21 +346,25 @@ impl SqlRuntime {
                 result
             }
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
-                let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
-                let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
-                let result = query
-                    .fetch_all(pool)
-                    .await
-                    .map(|rows| rows.into_iter().map(SqlRow::Postgres).collect())
-                    .map_err(db_err);
-                crate::runtime::perf_probe::record_sql_statement(
-                    "postgres",
-                    "fetch_all",
-                    template,
-                    started.elapsed(),
-                );
-                result
+                // Read: idempotent, so retry connection errors as well.
+                run_with_postgres_retries("fetch_all", true, || async {
+                    let started = Instant::now();
+                    let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
+                    let outcome = query
+                        .fetch_all(pool)
+                        .await
+                        .map(|rows| rows.into_iter().map(SqlRow::Postgres).collect())
+                        .map_err(pg_db_err);
+                    crate::runtime::perf_probe::record_sql_statement(
+                        "postgres",
+                        "fetch_all",
+                        template,
+                        started.elapsed(),
+                    );
+                    outcome
+                })
+                .await
             }
             SqlExec::Tx(tx) => tx.fetch_all(template, args).await,
         }
@@ -302,12 +379,12 @@ impl SqlRuntime {
         T: Send,
         F: for<'tx, 'db> Fn(&'tx mut SqlTx<'db>) -> TxFuture<'tx, T> + Send + Sync,
     {
-        let started = Instant::now();
         let engine = datastore.engine().as_str();
-        let result = match datastore {
+        match datastore {
             StoreDatastore::Sqlite { pool, writer_gate } => {
+                let started = Instant::now();
                 let _guard = writer_gate.lock().await;
-                run_with_sqlite_busy_retries(op_name, || {
+                let result = run_with_sqlite_busy_retries(op_name, || {
                     let pool = pool.clone();
                     let op = &op;
                     async move {
@@ -320,20 +397,42 @@ impl SqlRuntime {
                         Ok(result)
                     }
                 })
-                .await
+                .await;
+                crate::runtime::perf_probe::record_sql_op(engine, op_name, started.elapsed());
+                result
             }
             StoreDatastore::Postgres { pool } => {
-                let mut tx = SqlTx::Postgres(pool.begin().await.map_err(db_err)?);
-                let result = {
-                    let future = op(&mut tx);
-                    future.await?
-                };
-                tx.commit().await?;
-                Ok(result)
+                // Phase-aware retry. A begin/op failure applied nothing durable,
+                // so it is retried under the ordinary rules (connection errors +
+                // guaranteed-rolled-back class 40). A COMMIT failure is only
+                // retried when it is guaranteed rolled back (40001/40P01); a
+                // connection-class error at COMMIT leaves the outcome UNKNOWN —
+                // the server may have committed before the ack was lost — so
+                // re-running would duplicate plain INSERT batches. `op` is `Fn`,
+                // so re-invocation before commit is sound.
+                run_postgres_transaction_with_retries(op_name, || async {
+                    let started = Instant::now();
+                    let mut tx =
+                        SqlTx::Postgres(pool.begin().await.map_err(|e| {
+                            PostgresTxError::new(TxPhase::BeforeCommit, pg_db_err(e))
+                        })?);
+                    let result = {
+                        let future = op(&mut tx);
+                        future
+                            .await
+                            .map_err(|e| PostgresTxError::new(TxPhase::BeforeCommit, e))?
+                    };
+                    tx.commit()
+                        .await
+                        .map_err(|e| PostgresTxError::new(TxPhase::Commit, e))?;
+                    // Record the successful attempt's real duration only (retry
+                    // sleeps and failed attempts are excluded).
+                    crate::runtime::perf_probe::record_sql_op(engine, op_name, started.elapsed());
+                    Ok(result)
+                })
+                .await
             }
-        };
-        crate::runtime::perf_probe::record_sql_op(engine, op_name, started.elapsed());
-        result
+        }
     }
 }
 
@@ -358,7 +457,7 @@ impl<'db> SqlTx<'db> {
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
                 let query = bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args);
-                let result = query.execute(&mut **tx).await.map_err(db_err);
+                let result = query.execute(&mut **tx).await.map_err(pg_db_err);
                 crate::runtime::perf_probe::record_sql_statement(
                     "postgres",
                     "tx_execute",
@@ -402,7 +501,7 @@ impl<'db> SqlTx<'db> {
                     .fetch_optional(&mut **tx)
                     .await
                     .map(|row| row.map(SqlRow::Postgres))
-                    .map_err(db_err);
+                    .map_err(pg_db_err);
                 crate::runtime::perf_probe::record_sql_statement(
                     "postgres",
                     "tx_fetch_optional",
@@ -445,7 +544,7 @@ impl<'db> SqlTx<'db> {
                     .fetch_all(&mut **tx)
                     .await
                     .map(|rows| rows.into_iter().map(SqlRow::Postgres).collect())
-                    .map_err(db_err);
+                    .map_err(pg_db_err);
                 crate::runtime::perf_probe::record_sql_statement(
                     "postgres",
                     "tx_fetch_all",
@@ -460,7 +559,7 @@ impl<'db> SqlTx<'db> {
     pub(crate) async fn commit(self) -> SqlResult<()> {
         match self {
             SqlTx::Sqlite(tx) => tx.commit().await.map_err(db_err),
-            SqlTx::Postgres(tx) => tx.commit().await.map_err(db_err),
+            SqlTx::Postgres(tx) => tx.commit().await.map_err(pg_db_err),
         }
     }
 }
@@ -781,21 +880,216 @@ fn opt_bool_from_pg_row(row: &PgRow, column: &str) -> SqlResult<Option<bool>> {
     row.try_get(column).map_err(db_err)
 }
 
+/// SQLite extended result codes that mean "retry later, the DB is momentarily
+/// busy/locked": SQLITE_BUSY (5) and its BUSY_RECOVERY/BUSY_SNAPSHOT/BUSY_TIMEOUT
+/// variants (261/517/773), plus SQLITE_LOCKED (6) and LOCKED_SHAREDCACHE (262).
+/// These are the ONLY codes safe to spin on — a disk I/O error (e.g. code 522,
+/// SQLITE_IOERR_SHORT_READ) must surface immediately, not retry for 120s.
+const SQLITE_BUSY_TRANSIENT_CODES: [u32; 6] = [5, 261, 517, 773, 6, 262];
+
 pub(crate) fn is_transient_sqlite_busy(error: &StateError) -> bool {
     let StateError::Database(message) = error else {
         return false;
     };
 
     let normalized = message.to_ascii_lowercase();
-    normalized.contains("sqlite_code=5")
-        || normalized.contains("sqlite_code=517")
-        || normalized.contains("database is locked")
+    normalized.contains("database is locked")
         || normalized.contains("database table is locked")
         || normalized.contains("database schema is locked")
         || normalized.contains("sqlite_busy")
         || normalized.contains("busy_snapshot")
-        || normalized.contains("code: 5")
-        || normalized.contains("code: 517")
+        // Boundary-aware numeric match on both marker shapes. A plain
+        // `contains("code: 5")` would also match "code: 522" (a disk I/O error)
+        // and spin futilely, so parse the digit run and compare exact codes.
+        || contains_sqlite_code(&normalized, "sqlite_code=", SQLITE_BUSY_TRANSIENT_CODES.as_slice())
+        || contains_sqlite_code(&normalized, "code: ", SQLITE_BUSY_TRANSIENT_CODES.as_slice())
+}
+
+/// Scan `haystack` for every occurrence of `marker`, parse the contiguous digit
+/// run that immediately follows it as a `u32`, and return true if any parsed
+/// value is in `codes`. The match is boundary-aware: the digit run ends at the
+/// first non-digit, so `"code: 5)"` yields 5 while `"code: 522"` yields 522.
+fn contains_sqlite_code(haystack: &str, marker: &str, codes: &[u32]) -> bool {
+    let mut rest = haystack;
+    while let Some(pos) = rest.find(marker) {
+        let after = &rest[pos + marker.len()..];
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(code) = digits.parse::<u32>()
+            && codes.contains(&code)
+        {
+            return true;
+        }
+        // Advance past this marker to find any later occurrences.
+        rest = &after[digits.len()..];
+    }
+    false
+}
+
+/// Postgres errors that are always safe to retry because the failed transaction
+/// is guaranteed to have rolled back: serialization failures (SQLSTATE 40001)
+/// and deadlocks (40P01). The code is preserved by [`pg_db_err`].
+pub(crate) fn is_postgres_rolled_back_transient(error: &StateError) -> bool {
+    let StateError::Database(message) = error else {
+        return false;
+    };
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("sqlstate=40001")
+        || normalized.contains("sqlstate=40p01")
+        || normalized.contains("deadlock detected")
+        || normalized.contains("could not serialize access")
+}
+
+/// Postgres connection-level failures (SQLSTATE class 08 or a dropped socket).
+/// Retrying is safe for reads and for whole transactions (a lost connection
+/// aborts an open transaction) but NOT for a bare autocommit write, whose
+/// commit outcome is unknown.
+pub(crate) fn is_postgres_connection_error(error: &StateError) -> bool {
+    let StateError::Database(message) = error else {
+        return false;
+    };
+    let normalized = message.to_ascii_lowercase();
+    // `connection_error` is the marker `pg_db_err` attaches to transport-level
+    // sqlx errors (Io/Tls/Protocol) that have no SQLSTATE — e.g. an abrupt EOF
+    // from a dropped backend or a stale pooled connection.
+    normalized.contains("connection_error")
+        || normalized.contains("sqlstate=08")
+        || normalized.contains("connection reset")
+        || normalized.contains("connection closed")
+        || normalized.contains("broken pipe")
+        || normalized.contains("terminating connection")
+        || normalized.contains("server closed the connection")
+        || normalized.contains("no connection to the server")
+}
+
+async fn run_with_postgres_retries<T, Op, Fut>(
+    op_name: &str,
+    retry_connection_errors: bool,
+    mut op: Op,
+) -> SqlResult<T>
+where
+    Op: FnMut() -> Fut,
+    Fut: Future<Output = SqlResult<T>>,
+{
+    let mut attempt = 0usize;
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let retryable = is_postgres_rolled_back_transient(&error)
+                    || (retry_connection_errors && is_postgres_connection_error(&error));
+                if retryable && attempt < POSTGRES_TRANSIENT_RETRY_DELAYS.len() {
+                    let delay = POSTGRES_TRANSIENT_RETRY_DELAYS[attempt];
+                    tracing::debug!(
+                        operation = op_name,
+                        attempt = attempt + 1,
+                        retry_after_ms = delay.as_millis() as u64,
+                        error = %error,
+                        "retrying transient postgres error"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+/// Which phase of a Postgres transaction produced an error. The retry decision
+/// keys on this flag *structurally* — never on the error message — because a
+/// connection-class failure at COMMIT stringifies with the same `connection_error`
+/// marker as one before COMMIT, yet only the pre-commit case is safe to retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TxPhase {
+    /// `pool.begin()` or a statement inside `op(&mut tx)` failed. Nothing was
+    /// committed, so the whole transaction can be re-`begin`'d and re-applied.
+    BeforeCommit,
+    /// `tx.commit()` failed. If the failure is not guaranteed-rolled-back, the
+    /// commit outcome is UNKNOWN and the transaction must NOT be retried.
+    Commit,
+}
+
+/// A transaction error tagged with the phase it originated in.
+struct PostgresTxError {
+    phase: TxPhase,
+    error: StateError,
+}
+
+impl PostgresTxError {
+    fn new(phase: TxPhase, error: StateError) -> Self {
+        Self { phase, error }
+    }
+}
+
+/// Pure retry-eligibility decision for a phase-tagged Postgres transaction error.
+///
+/// * `BeforeCommit` — nothing durable was applied, so retry on either a
+///   guaranteed-rolled-back class-40 abort or any connection-level failure.
+/// * `Commit` — retry ONLY when the failure is guaranteed rolled back
+///   (serialization/deadlock raised at COMMIT). A connection-class error here
+///   means the commit's outcome is unknown, so it is not retried.
+fn postgres_tx_retry_eligible(phase: TxPhase, error: &StateError) -> bool {
+    match phase {
+        TxPhase::BeforeCommit => {
+            is_postgres_rolled_back_transient(error) || is_postgres_connection_error(error)
+        }
+        TxPhase::Commit => is_postgres_rolled_back_transient(error),
+    }
+}
+
+/// Run a Postgres transaction (`begin` + `op` + `commit`) with phase-aware
+/// transient retries bounded by [`POSTGRES_TRANSIENT_RETRY_DELAYS`]. The closure
+/// tags each failure with the phase it came from via [`PostgresTxError`]; the
+/// retry decision consults that flag through [`postgres_tx_retry_eligible`], so a
+/// connection error at COMMIT (outcome unknown) is surfaced rather than retried.
+async fn run_postgres_transaction_with_retries<T, Op, Fut>(
+    op_name: &str,
+    mut op: Op,
+) -> SqlResult<T>
+where
+    Op: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, PostgresTxError>>,
+{
+    let mut attempt = 0usize;
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(PostgresTxError { phase, error }) => {
+                let eligible = postgres_tx_retry_eligible(phase, &error);
+                if eligible && attempt < POSTGRES_TRANSIENT_RETRY_DELAYS.len() {
+                    let delay = POSTGRES_TRANSIENT_RETRY_DELAYS[attempt];
+                    tracing::debug!(
+                        operation = op_name,
+                        attempt = attempt + 1,
+                        phase = ?phase,
+                        retry_after_ms = delay.as_millis() as u64,
+                        error = %error,
+                        "retrying transient postgres transaction error"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                } else if phase == TxPhase::Commit && is_postgres_connection_error(&error) {
+                    // The connection dropped after COMMIT was sent but before the
+                    // ack: the server may already have committed. Do not retry —
+                    // re-running would duplicate the writes. Make the ambiguity
+                    // explicit so callers/logs can tell this apart from a clean
+                    // failure that applied nothing.
+                    return Err(commit_outcome_unknown(op_name, error));
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+/// Rewrite a commit-phase connection error so its message clearly conveys that
+/// the commit's outcome is unknown (the write may or may not have landed).
+fn commit_outcome_unknown(op_name: &str, error: StateError) -> StateError {
+    StateError::Database(format!(
+        "commit_outcome_unknown; transaction `{op_name}` lost its connection at COMMIT, so it may or may not have committed: {error}"
+    ))
 }
 
 pub(crate) async fn run_with_sqlite_busy_retries<T, Op, Fut>(
@@ -875,6 +1169,38 @@ pub(crate) fn db_err(error: impl std::fmt::Display) -> StateError {
     StateError::Database(error.to_string())
 }
 
+/// Map a Postgres `sqlx::Error` to `StateError`, prefixing the SQLSTATE code as
+/// `sqlstate=<code>;` so the transient-retry classifiers can recognize
+/// serialization/deadlock/connection failures after the error is stringified.
+pub(crate) fn pg_db_err(error: sqlx::Error) -> StateError {
+    if let Some(code) = error
+        .as_database_error()
+        .and_then(|db| db.code())
+        .map(|code| code.into_owned())
+    {
+        return StateError::Database(format!("sqlstate={code}; {error}"));
+    }
+    // Transport/pool failures carry no SQLSTATE. Crucially, an abruptly dropped
+    // backend (crash, kill, proxy/idle-timeout FIN, container restart) surfaces
+    // as `Error::Io(UnexpectedEof)` — NOT a `DatabaseError` — so it must be
+    // classified by the error variant, not by matching locale-dependent io
+    // message text. Tag it with a stable marker the retry classifier keys on.
+    if matches!(
+        &error,
+        sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::Protocol(_)
+    ) {
+        return StateError::Database(format!("connection_error; {error}"));
+    }
+    // A pool acquire timeout never sent a statement, so it is safe to retry for
+    // reads and whole transactions (both re-acquire on the next attempt). It is
+    // NEVER retried for a bare autocommit write because those run with retry
+    // mode `false`, which ignores connection-class errors.
+    if matches!(&error, sqlx::Error::PoolTimedOut) {
+        return StateError::Database(format!("connection_error; {error}"));
+    }
+    StateError::Database(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,5 +1246,183 @@ mod tests {
         assert!(!is_transient_sqlite_busy(&StateError::Database(
             "syntax error".to_string()
         )));
+    }
+
+    #[test]
+    fn detects_rolled_back_postgres_transients() {
+        assert!(is_postgres_rolled_back_transient(&StateError::Database(
+            "sqlstate=40P01; deadlock detected".to_string()
+        )));
+        assert!(is_postgres_rolled_back_transient(&StateError::Database(
+            "sqlstate=40001; could not serialize access".to_string()
+        )));
+        // A connection drop is not "guaranteed rolled back" for a bare write.
+        assert!(!is_postgres_rolled_back_transient(&StateError::Database(
+            "sqlstate=08006; connection reset".to_string()
+        )));
+        assert!(!is_postgres_rolled_back_transient(&StateError::Database(
+            "syntax error".to_string()
+        )));
+    }
+
+    #[test]
+    fn detects_postgres_connection_errors() {
+        assert!(is_postgres_connection_error(&StateError::Database(
+            "sqlstate=08006; server closed the connection unexpectedly".to_string()
+        )));
+        assert!(is_postgres_connection_error(&StateError::Database(
+            "connection reset by peer".to_string()
+        )));
+        assert!(!is_postgres_connection_error(&StateError::Database(
+            "sqlstate=40001; could not serialize access".to_string()
+        )));
+    }
+
+    #[test]
+    fn classifies_abrupt_eof_as_connection_error() {
+        // An abruptly dropped Postgres backend (crash/kill/proxy FIN) surfaces
+        // as Error::Io(UnexpectedEof) with no SQLSTATE; it must still be
+        // classified as a connection error so reads/transactions retry.
+        let mapped = pg_db_err(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "expected to read 5 bytes, got 0 bytes at EOF",
+        )));
+        assert!(is_postgres_connection_error(&mapped));
+        assert!(!is_postgres_rolled_back_transient(&mapped));
+    }
+
+    #[test]
+    fn classifies_pool_timeout_as_connection_error() {
+        // A pool acquire timeout sent no statement, so it is retryable for reads
+        // and whole transactions (both re-acquire); it must be tagged like other
+        // connection errors so those paths retry.
+        let mapped = pg_db_err(sqlx::Error::PoolTimedOut);
+        assert!(is_postgres_connection_error(&mapped));
+        assert!(!is_postgres_rolled_back_transient(&mapped));
+    }
+
+    #[test]
+    fn phase_aware_retry_op_phase_connection_error_is_retried() {
+        // A connection error before COMMIT applied nothing durable → retry.
+        let error = StateError::Database("connection_error; unexpected end of file".to_string());
+        assert!(postgres_tx_retry_eligible(TxPhase::BeforeCommit, &error));
+    }
+
+    #[test]
+    fn phase_aware_retry_commit_phase_connection_error_is_not_retried() {
+        // A connection error AT COMMIT leaves the outcome unknown → do NOT retry,
+        // even though the message carries the `connection_error` marker.
+        let error = StateError::Database("connection_error; broken pipe".to_string());
+        assert!(!postgres_tx_retry_eligible(TxPhase::Commit, &error));
+    }
+
+    #[test]
+    fn phase_aware_retry_commit_phase_serialization_is_retried() {
+        // A 40001 raised at COMMIT is guaranteed rolled back → retry.
+        let error = StateError::Database("sqlstate=40001; could not serialize access".to_string());
+        assert!(postgres_tx_retry_eligible(TxPhase::Commit, &error));
+        // ...and it is retried before COMMIT too.
+        assert!(postgres_tx_retry_eligible(TxPhase::BeforeCommit, &error));
+    }
+
+    #[test]
+    fn phase_aware_retry_op_phase_deadlock_is_retried() {
+        let error = StateError::Database("sqlstate=40P01; deadlock detected".to_string());
+        assert!(postgres_tx_retry_eligible(TxPhase::BeforeCommit, &error));
+        assert!(postgres_tx_retry_eligible(TxPhase::Commit, &error));
+    }
+
+    #[tokio::test]
+    async fn phase_aware_retry_bounds_op_phase_attempts() {
+        // An always-failing op-phase connection error should be attempted exactly
+        // 1 + POSTGRES_TRANSIENT_RETRY_DELAYS.len() times, then surface.
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result: SqlResult<()> = run_postgres_transaction_with_retries("test_op", || {
+            let attempts = &attempts;
+            async move {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(PostgresTxError::new(
+                    TxPhase::BeforeCommit,
+                    StateError::Database("connection_error; broken pipe".to_string()),
+                ))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1 + POSTGRES_TRANSIENT_RETRY_DELAYS.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_aware_retry_commit_connection_error_surfaces_immediately() {
+        // A commit-phase connection error must NOT be retried and must surface a
+        // message that conveys the commit outcome is unknown.
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result: SqlResult<()> = run_postgres_transaction_with_retries("test_commit", || {
+            let attempts = &attempts;
+            async move {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(PostgresTxError::new(
+                    TxPhase::Commit,
+                    StateError::Database(
+                        "connection_error; server closed the connection".to_string(),
+                    ),
+                ))
+            }
+        })
+        .await;
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let StateError::Database(message) = result.unwrap_err() else {
+            panic!("expected a Database error");
+        };
+        assert!(
+            message.contains("commit_outcome_unknown"),
+            "message should flag commit-outcome-unknown, got: {message}"
+        );
+    }
+
+    #[test]
+    fn sqlite_busy_classifier_is_boundary_aware() {
+        // BUSY (5) and LOCKED-family codes match on both marker shapes...
+        assert!(is_transient_sqlite_busy(&StateError::Database(
+            "error returned from database: (code: 5) database is locked".to_string()
+        )));
+        assert!(is_transient_sqlite_busy(&StateError::Database(
+            "(code: 517) busy_snapshot".to_string()
+        )));
+        assert!(is_transient_sqlite_busy(&StateError::Database(
+            "sqlite_code=261 busy_recovery".to_string()
+        )));
+        assert!(is_transient_sqlite_busy(&StateError::Database(
+            "sqlite_code=6 locked".to_string()
+        )));
+        // ...but a disk I/O error (522, SQLITE_IOERR_SHORT_READ) must NOT — it
+        // would otherwise spin for the whole 120s hard cap before surfacing.
+        assert!(!is_transient_sqlite_busy(&StateError::Database(
+            "error returned from database: (code: 522) disk I/O error".to_string()
+        )));
+        // A truncated/partial numeric prefix must not match by accident.
+        assert!(!is_transient_sqlite_busy(&StateError::Database(
+            "(code: 50) something".to_string()
+        )));
+        assert!(!is_transient_sqlite_busy(&StateError::Database(
+            "sqlite_code=522 disk".to_string()
+        )));
+    }
+
+    #[test]
+    fn contains_sqlite_code_parses_digit_boundary() {
+        assert!(contains_sqlite_code("(code: 5)", "code: ", &[5]));
+        assert!(contains_sqlite_code("code: 517 foo", "code: ", &[517]));
+        assert!(!contains_sqlite_code("code: 522", "code: ", &[5, 517]));
+        assert!(!contains_sqlite_code("code: 50", "code: ", &[5]));
+        // A later valid marker still matches after an earlier non-matching one.
+        assert!(contains_sqlite_code(
+            "code: 522 then code: 5)",
+            "code: ",
+            &[5]
+        ));
     }
 }

@@ -132,13 +132,37 @@ pub(crate) async fn run(
             if let Err(join_error) = pipeline_task.await {
                 error!(error = %join_error, "pipeline task failed during shutdown");
             }
+            flush_writer_queue_on_exit(db).await;
             log_task.abort();
             Ok(())
         }
         result = &mut pipeline_task => {
             let error = shutdown::pipeline_exit_error(result);
+            flush_writer_queue_on_exit(db).await;
             log_task.abort();
             Err(error.into())
+        }
+    }
+}
+
+/// Drain the database writer queue before the standalone `download` command
+/// exits. The pipeline it runs enqueues durable writes onto that queue
+/// (job-history archival via `try_queue_archive_job`, active-runtime state via
+/// `try_queue_write`); unlike `serve`, this path has no event-persistence task
+/// to run the final flush, so it must flush here or those writes can be dropped
+/// at process exit. Bounded so a stuck flush cannot hang the CLI.
+async fn flush_writer_queue_on_exit(db: &Database) {
+    const WRITER_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    match tokio::time::timeout(WRITER_FLUSH_TIMEOUT, db.flush_write_queue()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "failed to flush database writer queue on exit");
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = WRITER_FLUSH_TIMEOUT.as_secs(),
+                "timed out flushing database writer queue on exit"
+            );
         }
     }
 }

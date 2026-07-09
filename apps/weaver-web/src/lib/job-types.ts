@@ -46,15 +46,17 @@ export interface DeleteOperationData {
   errorMessage?: string | null;
 }
 
-export interface DiagnosticRunData {
-  sourceJobId: number;
-  diagnosticJobId: number;
-  diagnosticId?: string | null;
-  stage: "QUEUED" | "RUNNING" | "COLLECTING" | "UPLOADING" | "COMPLETE" | "FAILED";
-  includeServerHostnames: boolean;
-  rerunSucceeded?: boolean | null;
-  errorMessage?: string | null;
-  updatedAt?: number | null;
+export type JobPhase = "DOWNLOADING" | "REPAIRING" | "EXTRACTING" | "MOVING";
+
+export interface JobPhaseProgressData {
+  phase: JobPhase;
+  completedBytes: number;
+  totalBytes: number;
+  progressPercent: number;
+  rateBps?: number | null;
+  estimatedRemainingMs?: number | null;
+  startedAtEpochMs: number;
+  updatedAtEpochMs: number;
 }
 
 export interface JobData {
@@ -70,6 +72,7 @@ export interface JobData {
   downloadedBytes: number;
   optionalRecoveryBytes: number;
   optionalRecoveryDownloadedBytes: number;
+  phaseProgress: JobPhaseProgressData[];
   failedBytes: number;
   health: number;
   hasPassword: boolean;
@@ -80,22 +83,16 @@ export interface JobData {
   outputDir?: string | null;
   metadata: { key: string; value: string }[];
   deleteOperation?: DeleteOperationData | null;
-  diagnosticRun?: DiagnosticRunData | null;
-  lastDiagnosticId?: string | null;
-  lastDiagnosticUploadedAt?: number | null;
 }
 
-export interface GraphqlJobData extends Omit<JobData, "progress" | "createdAt" | "completedAt" | "metadata" | "diagnosticRun" | "lastDiagnosticUploadedAt"> {
+export interface GraphqlJobData extends Omit<JobData, "progress" | "phaseProgress" | "createdAt" | "completedAt" | "metadata"> {
   progress?: number | null;
   progressPercent?: number | null;
   createdAt?: string | number | null;
   completedAt?: string | number | null;
-  lastDiagnosticUploadedAt?: string | number | null;
   metadata?: { key: string; value: string }[];
   attributes?: { key: string; value: string }[];
-  diagnosticRun?: (Omit<DiagnosticRunData, "updatedAt"> & {
-    updatedAt?: string | number | null;
-  }) | null;
+  phaseProgress?: JobPhaseProgressData[] | null;
 }
 
 export function normalizeFacadeJobStatus(status: string): string {
@@ -140,16 +137,10 @@ export function normalizeJobData<T extends GraphqlJobData>(job: T): T & JobData 
     ...job,
     status: normalizeFacadeJobStatus(job.status),
     progress: normalizeFacadeJobProgress(job.progressPercent, job.progress),
+    phaseProgress: job.phaseProgress ?? [],
     createdAt: normalizeGraphqlTimestamp(job.createdAt),
     completedAt: normalizeGraphqlTimestamp(job.completedAt),
-    lastDiagnosticUploadedAt: normalizeGraphqlTimestamp(job.lastDiagnosticUploadedAt),
     metadata: job.metadata ?? job.attributes ?? [],
-    diagnosticRun: job.diagnosticRun
-      ? {
-        ...job.diagnosticRun,
-        updatedAt: normalizeGraphqlTimestamp(job.diagnosticRun.updatedAt),
-      }
-      : null,
   };
 }
 

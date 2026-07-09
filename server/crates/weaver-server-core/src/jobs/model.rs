@@ -134,6 +134,9 @@ pub struct FileSpec {
     pub role: FileRole,
     /// Newsgroups to try.
     pub groups: Vec<String>,
+    /// Unix epoch seconds from the NZB `<file date="…">` attribute; `None`
+    /// when absent or unparseable. Drives per-server retention skipping.
+    pub posted_at_epoch: Option<u64>,
     /// Segments (articles) that make up this file.
     pub segments: Vec<SegmentSpec>,
 }
@@ -170,6 +173,25 @@ pub enum JobStatus {
         error: String,
     },
     Paused,
+}
+
+impl JobStatus {
+    pub fn persisted_status(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Downloading => "downloading",
+            Self::Checking => "checking",
+            Self::Verifying => "verifying",
+            Self::QueuedRepair => "queued_repair",
+            Self::Repairing => "repairing",
+            Self::QueuedExtract => "queued_extract",
+            Self::Extracting => "extracting",
+            Self::Moving => "moving",
+            Self::Complete => "complete",
+            Self::Failed { .. } => "failed",
+            Self::Paused => "paused",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,11 +414,7 @@ pub fn runtime_lanes_from_status_snapshot(
             RunState::Active,
         ),
         JobStatus::Failed { .. } => (DownloadState::Failed, PostState::Failed, RunState::Active),
-        JobStatus::Paused => (
-            DownloadState::Downloading,
-            PostState::Idle,
-            RunState::Paused,
-        ),
+        JobStatus::Paused => (DownloadState::Queued, PostState::Idle, RunState::Paused),
     }
 }
 

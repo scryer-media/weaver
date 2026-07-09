@@ -7,8 +7,8 @@ use crate::jobs::assembly::{DetectedArchiveIdentity, DetectedArchiveKind};
 use crate::jobs::{ActiveFileIdentity, FileIdentitySource};
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::{
-    ActiveFileProgress, ActiveJob, ActivePar2File, CommittedSegment, Database, ExtractionChunk,
-    HistoryFilter, HistoryMetadataEquals, JobHistoryRow, JobId,
+    ActiveFileProgress, ActiveJob, ActivePar2File, Database, ExtractionChunk, HistoryFilter,
+    HistoryMetadataEquals, JobHistoryRow, JobId,
 };
 
 fn fetch_i64(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) -> i64 {
@@ -83,20 +83,14 @@ fn sample_job(id: u64) -> ActiveJob {
         created_at: 1700000000 + id,
         category: None,
         metadata: vec![],
+        status: "queued",
+        download_state: "queued",
+        post_state: "idle",
+        run_state: "active",
+        paused_resume_status: None,
+        paused_resume_download_state: None,
+        paused_resume_post_state: None,
     }
-}
-
-fn sample_segments(job_id: u64, count: u32) -> Vec<CommittedSegment> {
-    (0..count)
-        .map(|i| CommittedSegment {
-            job_id: JobId(job_id),
-            file_index: 0,
-            segment_number: i,
-            file_offset: i as u64 * 768000,
-            decoded_size: 768000,
-            crc32: 0xDEADBEEF,
-        })
-        .collect()
 }
 
 #[test]
@@ -109,7 +103,6 @@ fn create_and_load_active_job() {
     let job = &jobs[&JobId(1)];
     assert_eq!(job.nzb_path, PathBuf::from("/tmp/test_1.nzb"));
     assert_eq!(job.status, "queued");
-    assert!(job.committed_segments.is_empty());
     assert!(job.complete_files.is_empty());
 }
 
@@ -159,16 +152,6 @@ fn create_active_job_with_file_identities_roundtrips_initial_state() {
 }
 
 #[test]
-fn commit_and_load_segments() {
-    let db = Database::open_in_memory().unwrap();
-    db.create_active_job(&sample_job(1)).unwrap();
-    db.commit_segments(&sample_segments(1, 50)).unwrap();
-
-    let jobs = db.load_active_jobs().unwrap();
-    assert_eq!(jobs[&JobId(1)].committed_segments.len(), 50);
-}
-
-#[test]
 fn upsert_and_load_file_progress() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
@@ -192,29 +175,6 @@ fn upsert_and_load_file_progress() {
         Some(8 * 1024 * 1024)
     );
     assert_eq!(jobs[&JobId(1)].file_progress.get(&1).copied(), Some(1024));
-}
-
-#[test]
-fn duplicate_segments_ignored() {
-    let db = Database::open_in_memory().unwrap();
-    db.create_active_job(&sample_job(1)).unwrap();
-    let segs = sample_segments(1, 3);
-    db.commit_segments(&segs).unwrap();
-    db.commit_segments(&segs).unwrap(); // duplicates
-
-    let jobs = db.load_active_jobs().unwrap();
-    assert_eq!(jobs[&JobId(1)].committed_segments.len(), 3);
-}
-
-#[test]
-fn bulk_segments_cross_sqlite_bind_chunk_boundary() {
-    let db = Database::open_in_memory().unwrap();
-    db.create_active_job(&sample_job(1)).unwrap();
-
-    db.commit_segments(&sample_segments(1, 225)).unwrap();
-
-    let jobs = db.load_active_jobs().unwrap();
-    assert_eq!(jobs[&JobId(1)].committed_segments.len(), 225);
 }
 
 #[test]
@@ -267,25 +227,6 @@ fn bulk_file_progress_same_batch_duplicates_keep_max() {
 
     let jobs = db.load_active_jobs().unwrap();
     assert_eq!(jobs[&JobId(1)].file_progress.get(&0).copied(), Some(2048));
-}
-
-#[test]
-#[ignore = "performance guard; run explicitly when comparing DB write throughput"]
-fn perf_commit_10k_segments() {
-    let db = Database::open_in_memory().unwrap();
-    db.create_active_job(&sample_job(1)).unwrap();
-    let segments = sample_segments(1, 10_000);
-
-    let started = Instant::now();
-    db.commit_segments(&segments).unwrap();
-    let elapsed = started.elapsed();
-
-    eprintln!(
-        "commit_segments: {} rows in {:?} ({:.0} rows/sec)",
-        segments.len(),
-        elapsed,
-        segments.len() as f64 / elapsed.as_secs_f64()
-    );
 }
 
 #[test]
@@ -433,7 +374,6 @@ fn detected_archive_identities_roundtrip() {
 fn archive_job_moves_to_history() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
-    db.commit_segments(&sample_segments(1, 10)).unwrap();
 
     let history = JobHistoryRow {
         job_id: 1,
@@ -462,8 +402,6 @@ fn archive_job_moves_to_history() {
             ])
             .unwrap(),
         ),
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     };
     db.archive_job(JobId(1), &history).unwrap();
 
@@ -519,8 +457,6 @@ fn archive_job_conflict_preserves_persisted_nzb_bytes_when_active_row_is_gone() 
         created_at: 1_700_000_001,
         completed_at: 1_700_000_010,
         metadata: None,
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     };
     db.archive_job(JobId(1), &history).unwrap();
     let (_, expected_nzb_zstd) = db.load_history_job_persisted_nzb(1).unwrap().unwrap();
@@ -540,7 +476,6 @@ fn archive_job_conflict_preserves_persisted_nzb_bytes_when_active_row_is_gone() 
 fn delete_active_job_cleans_all() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
-    db.commit_segments(&sample_segments(1, 5)).unwrap();
     db.upsert_file_progress_batch(&[ActiveFileProgress {
         job_id: JobId(1),
         file_index: 0,
@@ -595,8 +530,6 @@ fn max_job_id_all_spans_both_tables() {
         created_at: 0,
         completed_at: 0,
         metadata: None,
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     };
     db.insert_job_history(&history).unwrap();
 
@@ -608,14 +541,12 @@ fn multiple_jobs_isolated() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
     db.create_active_job(&sample_job(2)).unwrap();
-    db.commit_segments(&sample_segments(1, 3)).unwrap();
-    db.commit_segments(&sample_segments(2, 5)).unwrap();
 
     db.delete_active_job(JobId(1)).unwrap();
 
     let jobs = db.load_active_jobs().unwrap();
     assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[&JobId(2)].committed_segments.len(), 5);
+    assert!(jobs.contains_key(&JobId(2)));
 }
 
 #[test]
@@ -1010,8 +941,6 @@ fn archive_job_uses_requested_job_id_for_history_row() {
             created_at: 1_700_000_001,
             completed_at: 1_700_000_010,
             metadata: None,
-            last_diagnostic_id: None,
-            last_diagnostic_uploaded_at_epoch_ms: None,
         },
     )
     .unwrap();
@@ -1047,13 +976,10 @@ fn late_active_state_writes_noop_after_archive() {
             created_at: 1_700_000_001,
             completed_at: 1_700_000_010,
             metadata: None,
-            last_diagnostic_id: None,
-            last_diagnostic_uploaded_at_epoch_ms: None,
         },
     )
     .unwrap();
 
-    db.commit_segments(&sample_segments(1, 3)).unwrap();
     db.upsert_file_progress_batch(&[ActiveFileProgress {
         job_id: JobId(1),
         file_index: 0,
@@ -1110,7 +1036,6 @@ fn late_active_state_writes_noop_after_archive() {
         .unwrap();
 
     for table in [
-        "active_segments",
         "active_file_progress",
         "active_files",
         "active_par2",
@@ -1133,7 +1058,6 @@ fn late_active_state_writes_noop_after_archive() {
 fn prune_orphan_active_state_removes_only_orphans() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
-    db.commit_segments(&sample_segments(1, 1)).unwrap();
     db.upsert_file_progress_batch(&[ActiveFileProgress {
         job_id: JobId(1),
         file_index: 0,
@@ -1141,13 +1065,6 @@ fn prune_orphan_active_state_removes_only_orphans() {
     }])
     .unwrap();
 
-    execute_sql(
-        &db,
-        "INSERT INTO active_segments
-         (job_id, file_index, segment_number, file_offset, decoded_size, crc32)
-         VALUES (99, 0, 0, 0, 10, 123)",
-        vec![],
-    );
     execute_sql(
         &db,
         "INSERT INTO active_file_progress
@@ -1170,22 +1087,286 @@ fn prune_orphan_active_state_removes_only_orphans() {
     );
 
     let counts = db.prune_orphan_active_state().unwrap();
-    assert_eq!(counts.active_segments, 1);
     assert_eq!(counts.active_file_progress, 1);
     assert_eq!(counts.active_archive_headers, 1);
     assert_eq!(counts.active_detected_archives, 1);
-    assert_eq!(counts.total_removed(), 4);
+    assert_eq!(counts.total_removed(), 3);
 
-    let remaining_segments = fetch_i64(
-        &db,
-        "SELECT COUNT(*) FROM active_segments WHERE job_id = 1",
-        vec![],
-    );
     let remaining_progress = fetch_i64(
         &db,
         "SELECT COUNT(*) FROM active_file_progress WHERE job_id = 1",
         vec![],
     );
-    assert_eq!(remaining_segments, 1);
     assert_eq!(remaining_progress, 1);
+}
+
+fn bulk_identity(file_index: u32, current_filename: &str) -> ActiveFileIdentity {
+    ActiveFileIdentity {
+        file_index,
+        source_filename: format!("source-{file_index}.bin"),
+        current_filename: current_filename.to_string(),
+        canonical_filename: None,
+        classification: Some(DetectedArchiveIdentity {
+            kind: DetectedArchiveKind::Rar,
+            set_name: "show".to_string(),
+            volume_index: Some(file_index),
+        }),
+        classification_source: FileIdentitySource::Probe,
+    }
+}
+
+#[test]
+fn add_extracted_members_bulk_inserts_and_is_idempotent() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut entries = Vec::new();
+    for name in ["a.mkv", "b.mkv", "c.mkv"] {
+        let path = temp_dir.path().join(name);
+        std::fs::write(&path, b"data").unwrap();
+        entries.push((name.to_string(), path));
+    }
+
+    db.add_extracted_members(JobId(1), &entries).unwrap();
+    let count = fetch_i64(
+        &db,
+        "SELECT COUNT(*) FROM active_extracted WHERE job_id = 1",
+        vec![],
+    );
+    assert_eq!(count, 3);
+
+    // Re-running must be a no-op (ON CONFLICT DO NOTHING), not an error.
+    db.add_extracted_members(JobId(1), &entries).unwrap();
+    let count = fetch_i64(
+        &db,
+        "SELECT COUNT(*) FROM active_extracted WHERE job_id = 1",
+        vec![],
+    );
+    assert_eq!(count, 3);
+
+    let jobs = db.load_active_jobs().unwrap();
+    for name in ["a.mkv", "b.mkv", "c.mkv"] {
+        assert!(jobs[&JobId(1)].extracted_members.contains(name));
+    }
+}
+
+#[test]
+fn add_extracted_members_skips_missing_stat_but_persists_rest() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let good = temp_dir.path().join("good.mkv");
+    std::fs::write(&good, b"data").unwrap();
+    let missing = temp_dir.path().join("missing.mkv");
+
+    // A member whose output cannot be stat'd is skipped, the rest still land.
+    db.add_extracted_members(
+        JobId(1),
+        &[
+            ("good.mkv".to_string(), good),
+            ("missing.mkv".to_string(), missing),
+        ],
+    )
+    .unwrap();
+
+    let jobs = db.load_active_jobs().unwrap();
+    assert!(jobs[&JobId(1)].extracted_members.contains("good.mkv"));
+    assert!(!jobs[&JobId(1)].extracted_members.contains("missing.mkv"));
+}
+
+#[test]
+fn add_extracted_members_guards_absent_job() {
+    let db = Database::open_in_memory().unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("orphan.mkv");
+    std::fs::write(&path, b"data").unwrap();
+
+    // No active job row exists, so the guard must reject the insert silently.
+    db.add_extracted_members(JobId(999), &[("orphan.mkv".to_string(), path)])
+        .unwrap();
+    let count = fetch_i64(&db, "SELECT COUNT(*) FROM active_extracted", vec![]);
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn add_extracted_members_chunks_beyond_sqlite_bind_limit() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let payload = temp_dir.path().join("payload.bin");
+    std::fs::write(&payload, b"x").unwrap();
+
+    // 1500 rows at 4 binds/row far exceeds the ~900 SQLite bind budget, so this
+    // exercises multi-chunk insertion.
+    let entries: Vec<(String, PathBuf)> = (0..1500)
+        .map(|i| (format!("member-{i}.bin"), payload.clone()))
+        .collect();
+    db.add_extracted_members(JobId(1), &entries).unwrap();
+
+    let count = fetch_i64(
+        &db,
+        "SELECT COUNT(*) FROM active_extracted WHERE job_id = 1",
+        vec![],
+    );
+    assert_eq!(count, 1500);
+}
+
+#[test]
+fn save_file_identities_bulk_upserts_and_updates_active_files_filename() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    // active_files rows must exist for the sibling filename update to match.
+    db.complete_file(JobId(1), 0, "old-0.rar", &[0x10; 16])
+        .unwrap();
+    db.complete_file(JobId(1), 1, "old-1.rar", &[0x11; 16])
+        .unwrap();
+
+    let identities = vec![
+        bulk_identity(0, "show.part01.rar"),
+        bulk_identity(1, "show.part02.rar"),
+    ];
+    db.save_file_identities(JobId(1), &identities).unwrap();
+
+    let jobs = db.load_active_jobs().unwrap();
+    let recovered = &jobs[&JobId(1)];
+    assert_eq!(recovered.file_identities.len(), 2);
+    assert_eq!(
+        recovered
+            .file_identities
+            .get(&0)
+            .map(|i| i.current_filename.as_str()),
+        Some("show.part01.rar")
+    );
+    // The sibling active_files.filename update mirrors save_file_identity.
+    assert_eq!(
+        fetch_text(
+            &db,
+            "SELECT filename FROM active_files WHERE job_id = {} AND file_index = {}",
+            vec![SqlArg::I64(1), SqlArg::I64(0)],
+            "filename",
+        ),
+        "show.part01.rar"
+    );
+    assert_eq!(
+        fetch_text(
+            &db,
+            "SELECT filename FROM active_files WHERE job_id = {} AND file_index = {}",
+            vec![SqlArg::I64(1), SqlArg::I64(1)],
+            "filename",
+        ),
+        "show.part02.rar"
+    );
+
+    // Re-running with a new current_filename upserts in place (idempotent shape).
+    let identities = vec![bulk_identity(0, "show.part1.rar")];
+    db.save_file_identities(JobId(1), &identities).unwrap();
+    let jobs = db.load_active_jobs().unwrap();
+    assert_eq!(
+        jobs[&JobId(1)]
+            .file_identities
+            .get(&0)
+            .map(|i| i.current_filename.as_str()),
+        Some("show.part1.rar")
+    );
+    assert_eq!(
+        fetch_text(
+            &db,
+            "SELECT filename FROM active_files WHERE job_id = {} AND file_index = {}",
+            vec![SqlArg::I64(1), SqlArg::I64(0)],
+            "filename",
+        ),
+        "show.part1.rar"
+    );
+}
+
+#[test]
+fn save_file_identities_guards_absent_job() {
+    let db = Database::open_in_memory().unwrap();
+    // No active job row: neither the identity upsert nor the filename update runs.
+    db.save_file_identities(JobId(404), &[bulk_identity(0, "ghost.rar")])
+        .unwrap();
+    let count = fetch_i64(&db, "SELECT COUNT(*) FROM active_file_identities", vec![]);
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn save_file_identities_chunks_beyond_sqlite_bind_limit() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    // 1200 identities at 9 binds/row exceeds the ~900 SQLite bind budget.
+    let identities: Vec<ActiveFileIdentity> = (0..1200)
+        .map(|i| bulk_identity(i, &format!("file-{i}.rar")))
+        .collect();
+    db.save_file_identities(JobId(1), &identities).unwrap();
+
+    let count = fetch_i64(
+        &db,
+        "SELECT COUNT(*) FROM active_file_identities WHERE job_id = 1",
+        vec![],
+    );
+    assert_eq!(count, 1200);
+}
+
+#[test]
+fn complete_files_bulk_upserts_hashes_and_is_idempotent() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+
+    let entries = vec![
+        (0u32, "data.rar".to_string(), Some([0x11; 16])),
+        (1u32, "data.r00".to_string(), None),
+    ];
+    db.complete_files(JobId(1), &entries).unwrap();
+
+    let jobs = db.load_active_jobs().unwrap();
+    assert_eq!(jobs[&JobId(1)].complete_files.len(), 2);
+    let hashes = db.load_complete_file_hashes(JobId(1)).unwrap();
+    assert_eq!(hashes[&0], [0x11; 16]);
+    // The hashless entry is complete but carries no md5.
+    assert!(!hashes.contains_key(&1));
+
+    // Re-run upserts the filename/hash in place.
+    let entries = vec![(0u32, "data-renamed.rar".to_string(), Some([0x22; 16]))];
+    db.complete_files(JobId(1), &entries).unwrap();
+    assert_eq!(
+        fetch_text(
+            &db,
+            "SELECT filename FROM active_files WHERE job_id = {} AND file_index = {}",
+            vec![SqlArg::I64(1), SqlArg::I64(0)],
+            "filename",
+        ),
+        "data-renamed.rar"
+    );
+    let hashes = db.load_complete_file_hashes(JobId(1)).unwrap();
+    assert_eq!(hashes[&0], [0x22; 16]);
+}
+
+#[test]
+fn complete_files_guards_absent_job() {
+    let db = Database::open_in_memory().unwrap();
+    db.complete_files(
+        JobId(7),
+        &[(0u32, "ghost.rar".to_string(), Some([0x01; 16]))],
+    )
+    .unwrap();
+    let count = fetch_i64(&db, "SELECT COUNT(*) FROM active_files", vec![]);
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn complete_files_chunks_beyond_sqlite_bind_limit() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    // 1500 files at 4 binds/row exceeds the ~900 SQLite bind budget.
+    let entries: Vec<(u32, String, Option<[u8; 16]>)> = (0..1500)
+        .map(|i| (i, format!("file-{i}.rar"), Some([(i % 256) as u8; 16])))
+        .collect();
+    db.complete_files(JobId(1), &entries).unwrap();
+
+    let count = fetch_i64(
+        &db,
+        "SELECT COUNT(*) FROM active_files WHERE job_id = 1",
+        vec![],
+    );
+    assert_eq!(count, 1500);
 }

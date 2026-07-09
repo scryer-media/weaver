@@ -1,22 +1,4 @@
 import { gql } from "urql";
-import { DIAGNOSTICS_ENABLED } from "@/lib/features";
-
-const DIAGNOSTIC_HISTORY_FIELDS = DIAGNOSTICS_ENABLED
-  ? `
-    lastDiagnosticId
-    lastDiagnosticUploadedAt
-    diagnosticRun {
-      sourceJobId
-      diagnosticJobId
-      diagnosticId
-      stage
-      includeServerHostnames
-      rerunSucceeded
-      errorMessage
-      updatedAt
-    }
-  `
-  : "";
 
 const FACADE_QUEUE_ITEM_FIELDS = `
   fragment FacadeQueueItemFields on QueueItem {
@@ -33,6 +15,16 @@ const FACADE_QUEUE_ITEM_FIELDS = `
     downloadedBytes
     optionalRecoveryBytes
     optionalRecoveryDownloadedBytes
+    phaseProgress {
+      phase
+      completedBytes
+      totalBytes
+      progressPercent
+      rateBps
+      estimatedRemainingMs
+      startedAtEpochMs
+      updatedAtEpochMs
+    }
     failedBytes
     health
     hasPassword
@@ -66,7 +58,6 @@ export const FACADE_HISTORY_ITEM_FIELDS = `
     outputDir
     createdAt
     completedAt
-    ${DIAGNOSTIC_HISTORY_FIELDS}
     deleteOperation {
       operationId
       state
@@ -92,7 +83,6 @@ export const HISTORY_TABLE_ITEM_FIELDS = `
     health
     category
     completedAt
-    ${DIAGNOSTIC_HISTORY_FIELDS}
     deleteOperation {
       operationId
       state
@@ -153,6 +143,8 @@ const SERVER_FIELDS = `
     active
     supportsPipelining
     priority
+    backfill
+    retentionDays
   }
 `;
 
@@ -167,6 +159,8 @@ const SERVER_DETAILS_FIELDS = `
     active
     supportsPipelining
     priority
+    backfill
+    retentionDays
   }
 `;
 
@@ -233,8 +227,17 @@ const GENERAL_SETTINGS_FIELDS = `
     cleanupAfterExtract
     maxDownloadSpeed
     maxRetries
+    ipReplacementTrialExtraConnections
     ispBandwidthCap {
       ...IspBandwidthCapFields
+    }
+    watchFolder {
+      mode
+      path
+      pollIntervalSecs
+      stabilitySecs
+      categoryFromSubfolders
+      scanningPaused
     }
   }
 `;
@@ -272,11 +275,24 @@ const METRICS_FIELDS = `
     bytesDecoded
     bytesCommitted
     downloadQueueDepth
+    activeDownloads
+    activeDecodes
     decodePending
+    decodePendingBytes
+    decodeActiveBytes
     commitPending
     writeBufferedBytes
     writeBufferedSegments
     directWriteEvictions
+    decodePressureSoftLimitBytes
+    decodePressureHardLimitBytes
+    writePressureSoftLimitBytes
+    writePressureHardLimitBytes
+    downloadPressureState
+    downloadPressureReason
+    downloadPressureStallsTotal
+    downloadPressureStallDurationMs
+    downloadPressureCurrentStallMs
     segmentsDownloaded
     segmentsDecoded
     segmentsCommitted
@@ -288,6 +304,11 @@ const METRICS_FIELDS = `
     diskWriteLatencyUs
     segmentsRetried
     segmentsFailedPermanent
+    downloadFailuresArticleNotFound
+    downloadFailuresCapacityUnavailable
+    downloadFailuresTransient
+    downloadFailuresAuth
+    downloadFailuresPermanent
     currentDownloadSpeed
     crcErrors
     recoveryQueueDepth
@@ -520,6 +541,37 @@ export const LIVE_METRICS_QUERY = gql`
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
+export const DISK_USAGE_QUERY = gql`
+  query DiskUsage {
+    diskUsage {
+      label
+      path
+      totalBytes
+      usedBytes
+      freeBytes
+    }
+  }
+`;
+
+export const SERVER_HEALTH_QUERY = gql`
+  query ServerHealth {
+    serverHealth {
+      host
+      port
+      label
+      tier
+      state
+      connectionsActive
+      connectionsMax
+      latencyMs
+      successCount
+      failureCount
+      consecutiveFailures
+      prematureDeaths
+    }
+  }
+`;
+
 export const METRICS_HISTORY_QUERY = gql`
   query MetricsHistory($range: MetricsHistoryRangeGql!) {
     metricsHistory(range: $range) {
@@ -567,26 +619,6 @@ export const REDOWNLOAD_JOB_MUTATION = gql`
     redownloadJob(id: $id)
   }
 `;
-
-export const START_DIAGNOSTIC_REDOWNLOAD_MUTATION = DIAGNOSTICS_ENABLED
-  ? gql`
-      mutation StartDiagnosticRedownload($id: Int!, $includeServerHostnames: Boolean!) {
-        startDiagnosticRedownload(
-          id: $id
-          includeServerHostnames: $includeServerHostnames
-        ) {
-          sourceJobId
-          diagnosticJobId
-          stage
-          includeServerHostnames
-        }
-      }
-    `
-  : gql`
-      mutation DiagnosticsDisabled {
-        __typename
-      }
-    `;
 
 export const DELETE_HISTORY_MUTATION = gql`
   mutation DeleteHistory($id: Int!, $deleteFiles: Boolean) {
@@ -1030,6 +1062,21 @@ export const RSS_SETTINGS_QUERY = gql`
   ${CATEGORY_FIELDS}
 `;
 
+export const WATCH_FOLDER_SETTINGS_QUERY = gql`
+  query WatchFolderSettings {
+    settings {
+      watchFolder {
+        mode
+        path
+        pollIntervalSecs
+        stabilitySecs
+        categoryFromSubfolders
+        scanningPaused
+      }
+    }
+  }
+`;
+
 export const ADD_RSS_FEED_MUTATION = gql`
   mutation AddRssFeed($input: RssFeedInput!) {
     addRssFeed(input: $input) {
@@ -1113,6 +1160,32 @@ export const DELETE_RSS_SEEN_ITEM_MUTATION = gql`
 export const CLEAR_RSS_SEEN_ITEMS_MUTATION = gql`
   mutation ClearRssSeenItems($feedId: Int) {
     clearRssSeenItems(feedId: $feedId)
+  }
+`;
+
+export const SCAN_WATCH_FOLDER_MUTATION = gql`
+  mutation ScanWatchFolder {
+    scanWatchFolder {
+      discoveredFiles
+      queuedNzbs
+      skippedInputs {
+        path
+        reason
+      }
+      permanentErrors {
+        path
+        reason
+      }
+      transientErrors {
+        path
+        reason
+      }
+      markerRenamedSources {
+        from
+        to
+        marker
+      }
+    }
   }
 `;
 

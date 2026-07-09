@@ -17,7 +17,7 @@ fn login_auth_cache_roundtrip() {
     let cache = LoginAuthCache::default();
     assert!(cache.snapshot().is_none());
 
-    let auth = CachedLoginAuth::new("admin", "$argon2id$hash");
+    let auth = CachedLoginAuth::new("admin", "$argon2id$hash", [9u8; 32]);
     cache.replace(Some(auth.clone()));
     assert_eq!(cache.snapshot(), Some(auth));
 

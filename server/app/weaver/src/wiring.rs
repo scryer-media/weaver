@@ -83,11 +83,16 @@ pub(crate) async fn detect_server_capabilities(config: &mut Config, db: &Databas
         }
 
         let persisted = server.clone();
+        let server_id = persisted.id;
         let db = db.clone();
-        if let Err(join_error) =
-            tokio::task::spawn_blocking(move || db.update_server(&persisted)).await
-        {
-            error!(error = %join_error, "failed to persist server capabilities");
+        match tokio::task::spawn_blocking(move || db.update_server(&persisted)).await {
+            Ok(Err(error)) => {
+                error!(server_id, error = %error, "failed to persist server capabilities");
+            }
+            Err(join_error) => {
+                error!(server_id, error = %join_error, "failed to persist server capabilities");
+            }
+            Ok(Ok(())) => {}
         }
     }
 }
@@ -124,6 +129,8 @@ pub(crate) fn build_nntp_client(config: &Config, profile: &SystemProfile) -> Nnt
             },
             max_connections: server.connections as usize,
             group: server.priority,
+            backfill: server.backfill,
+            retention_days: server.retention_days,
         })
         .collect();
 
@@ -135,21 +142,32 @@ pub(crate) fn build_nntp_client(config: &Config, profile: &SystemProfile) -> Nnt
     })
 }
 
+/// Spawn the event-persistence subscriber and return its `JoinHandle` so the
+/// shutdown path can await the final `flush_write_queue`. `shutdown` is an
+/// explicit exit signal: the broadcast channel's senders (held by the long-lived
+/// `SchedulerHandle` and its clones in the GraphQL schema, RSS/backup/watch
+/// services, etc.) outlive the pipeline, so `rx.recv()` never observes `Closed`
+/// at shutdown — the caller notifies `shutdown` to make the task drain and exit.
 pub(crate) fn spawn_event_persistence_task(
     event_rx: broadcast::Receiver<PipelineEvent>,
     db: Database,
-) {
+    shutdown: Arc<tokio::sync::Notify>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(panic) = tokio::spawn(persist_events(event_rx, db)).await {
+        if let Err(panic) = tokio::spawn(persist_events(event_rx, db, shutdown)).await {
             tracing::error!(
                 error = %panic,
                 "CRITICAL: event persistence task panicked - events will not be recorded"
             );
         }
-    });
+    })
 }
 
-async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database) {
+async fn persist_events(
+    mut rx: broadcast::Receiver<PipelineEvent>,
+    db: Database,
+    shutdown: Arc<tokio::sync::Notify>,
+) {
     use weaver_server_api::PipelineEventGql;
 
     let mut batch: Vec<weaver_server_core::JobEvent> = Vec::new();
@@ -165,6 +183,7 @@ async fn persist_events(mut rx: broadcast::Receiver<PipelineEvent>, db: Database
                 flush_job_event_batch(&db, &mut batch).await;
                 continue;
             }
+            _ = shutdown.notified() => break,
         };
 
         match recv {
@@ -226,7 +245,8 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let (tx, rx) = broadcast::channel(8);
 
-        let task = tokio::spawn(persist_events(rx, db.clone()));
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(persist_events(rx, db.clone(), shutdown));
         tx.send(PipelineEvent::JobCreated {
             job_id: JobId(7),
             name: "test-job".to_string(),
@@ -254,7 +274,8 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let (tx, rx) = broadcast::channel(64);
 
-        let task = tokio::spawn(persist_events(rx, db.clone()));
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(persist_events(rx, db.clone(), shutdown));
         let sender_tx = tx.clone();
         let sender = tokio::spawn(async move {
             for _ in 0..30 {

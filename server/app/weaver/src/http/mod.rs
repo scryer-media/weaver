@@ -129,7 +129,11 @@ pub async fn run_server(
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
         format!("failed to bind to {addr}: {e} — is another process using this port?")
     })?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

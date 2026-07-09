@@ -11,7 +11,7 @@ export function BackupSettingsPage() {
   const [{ data }] = useQuery({ query: SETTINGS_QUERY });
 
   return (
-    <div>
+    <div className="max-w-[1180px]">
       <SettingsPageHeader
         title={t("settings.backupNav")}
         description={t("settings.backupPageDesc")}

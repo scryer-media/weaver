@@ -4,8 +4,8 @@ import { useMutation, useQuery } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
+import { SectionCard } from "@/components/SectionCard";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -26,6 +26,7 @@ import {
   UPDATE_SERVER_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { cn } from "@/lib/utils";
 
 type Server = {
   id: number;
@@ -36,6 +37,8 @@ type Server = {
   active: boolean;
   supportsPipelining: boolean;
   priority: number;
+  backfill: boolean;
+  retentionDays: number;
 };
 
 type ServerDetails = Server & {
@@ -51,6 +54,8 @@ type ServerFormValues = {
   connections: number;
   active: boolean;
   priority: number;
+  backfill: boolean;
+  retentionDays: number;
 };
 
 const defaultForm: ServerFormValues = {
@@ -62,6 +67,8 @@ const defaultForm: ServerFormValues = {
   connections: 20,
   active: true,
   priority: 0,
+  backfill: false,
+  retentionDays: 0,
 };
 
 export function Servers({ embedded = false }: { embedded?: boolean }) {
@@ -142,6 +149,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
       connections: values.connections,
       active: values.active,
       priority: values.priority,
+      backfill: values.backfill,
+      retentionDays: values.retentionDays,
     };
 
     if (editingServerId != null) {
@@ -206,6 +215,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
         connections: values.connections,
         active: values.active,
         priority: values.priority,
+        backfill: values.backfill,
+        retentionDays: values.retentionDays,
       },
     });
     setTestResult(result.data?.testConnection ?? null);
@@ -228,12 +239,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
 
       {showForm ? (
         editingServerId != null && !editingServerDetail ? (
-          <Card>
-            <CardHeader>
-              <CardTitle>{t("servers.editServer")}</CardTitle>
-              <CardDescription>{t("settings.serversDesc")}</CardDescription>
-            </CardHeader>
-            <CardContent className="flex items-center justify-between gap-4">
+          <SectionCard title={t("servers.editServer")} description={t("settings.serversDesc")}>
+            <div className="flex items-center justify-between gap-4">
               <div className="flex items-center gap-3 text-sm text-muted-foreground">
                 {editingServerFetching ? <Loader2 className="size-4 animate-spin" /> : null}
                 <span>
@@ -245,8 +252,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
               <Button variant="ghost" onClick={closeForm}>
                 {t("action.cancel")}
               </Button>
-            </CardContent>
-          </Card>
+            </div>
+          </SectionCard>
         ) : (
           <ServerFormCard
             initialValues={
@@ -260,6 +267,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                     connections: editingServerDetail.connections,
                     active: editingServerDetail.active,
                     priority: editingServerDetail.priority,
+                    backfill: editingServerDetail.backfill,
+                    retentionDays: editingServerDetail.retentionDays,
                   }
                 : editingServer
                   ? {
@@ -271,6 +280,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                       connections: editingServer.connections,
                       active: editingServer.active,
                       priority: editingServer.priority,
+                      backfill: editingServer.backfill,
+                      retentionDays: editingServer.retentionDays,
                     }
                   : defaultForm
             }
@@ -295,17 +306,17 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
         />
       ) : (
         groupedServers.map(([priority, items]) => (
-          <Card key={priority}>
-            <CardHeader>
-              <CardTitle>{t("servers.group")} {priority}</CardTitle>
-              <CardDescription>{t("servers.groupDescription")}</CardDescription>
-            </CardHeader>
-            <CardContent className="px-0 pb-0">
+          <SectionCard
+            key={priority}
+            title={`${t("servers.group")} ${priority}`}
+            description={t("servers.groupDescription")}
+            contentClassName="-mx-5 -mb-5 sm:-mx-6 sm:-mb-6"
+          >
+            <div className="overflow-x-auto">
               <Table>
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
                     <TableHead>{t("servers.host")}</TableHead>
-                    <TableHead>{t("servers.port")}</TableHead>
                     <TableHead>{t("servers.connections")}</TableHead>
                     <TableHead>{t("servers.tls")}</TableHead>
                     <TableHead>{t("servers.active")}</TableHead>
@@ -315,9 +326,49 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                 <TableBody>
                   {items.map((server) => (
                     <TableRow key={server.id}>
-                      <TableCell className="font-medium">{server.host}</TableCell>
-                      <TableCell>{server.port}</TableCell>
-                      <TableCell>{server.connections}</TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-2.5">
+                          <span
+                            className={cn(
+                              "size-2 shrink-0 rounded-pill",
+                              server.active ? "bg-status-completed animate-status-pulse" : "bg-muted-foreground/40",
+                            )}
+                            aria-hidden="true"
+                          />
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span
+                                className={cn(
+                                  "rounded-chip px-1.5 py-px text-[10px] font-bold uppercase tracking-[0.06em]",
+                                  server.backfill
+                                    ? "bg-status-queued/15 text-status-queued"
+                                    : priority === 0
+                                      ? "bg-priority-high/15 text-priority-high"
+                                      : "bg-secondary text-muted-foreground",
+                                )}
+                              >
+                                {server.backfill
+                                  ? t("servers.backfillBadge")
+                                  : priority === 0
+                                    ? "Primary"
+                                    : "Backup"}
+                              </span>
+                              {server.retentionDays > 0 ? (
+                                <span className="text-[10px] text-muted-foreground">
+                                  {t("servers.retentionBadge").replace(
+                                    "{days}",
+                                    String(server.retentionDays),
+                                  )}
+                                </span>
+                              ) : null}
+                            </div>
+                            <div className="mt-1 truncate font-mono text-[13px] text-foreground">
+                              {server.host}:{server.port}
+                            </div>
+                          </div>
+                        </div>
+                      </TableCell>
+                      <TableCell className="tabular-nums">{server.connections}</TableCell>
                       <TableCell>{server.tls ? t("label.enabled") : t("label.disabled")}</TableCell>
                       <TableCell>{server.active ? t("label.enabled") : t("label.disabled")}</TableCell>
                       <TableCell>
@@ -336,8 +387,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                   ))}
                 </TableBody>
               </Table>
-            </CardContent>
-          </Card>
+            </div>
+          </SectionCard>
         ))
       )}
 
@@ -410,12 +461,11 @@ function ServerFormCard({
   };
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{editing ? t("servers.editServer") : t("servers.addServer")}</CardTitle>
-        <CardDescription>{t("settings.serversDesc")}</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-5">
+    <SectionCard
+      title={editing ? t("servers.editServer") : t("servers.addServer")}
+      description={t("settings.serversDesc")}
+    >
+      <div className="space-y-5">
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
           <Field label={t("servers.host")}>
             <Input
@@ -462,9 +512,22 @@ function ServerFormCard({
               onChange={(event) => setValues((current) => ({ ...current, priority: Number(event.target.value) }))}
             />
           </Field>
+          <Field label={t("servers.retention")} description={t("servers.retentionDescription")}>
+            <Input
+              type="number"
+              min={0}
+              value={values.retentionDays}
+              onChange={(event) =>
+                setValues((current) => ({
+                  ...current,
+                  retentionDays: Math.max(0, Number(event.target.value) || 0),
+                }))
+              }
+            />
+          </Field>
         </div>
 
-        <div className="flex flex-wrap gap-6 rounded-2xl border border-border/70 bg-background/70 p-4">
+        <div className="flex flex-wrap gap-6 rounded-inner border border-border bg-background/40 p-4">
           <ToggleField
             label={t("servers.tls")}
             checked={values.tls}
@@ -474,6 +537,12 @@ function ServerFormCard({
             label={t("servers.active")}
             checked={values.active}
             onCheckedChange={(checked) => setValues((current) => ({ ...current, active: checked }))}
+          />
+          <ToggleField
+            label={t("servers.backfill")}
+            description={t("servers.backfillDescription")}
+            checked={values.backfill}
+            onCheckedChange={(checked) => setValues((current) => ({ ...current, backfill: checked }))}
           />
         </div>
 
@@ -488,7 +557,14 @@ function ServerFormCard({
         />
 
         {testResult ? (
-          <div className={testResult.success ? "rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4 text-sm text-emerald-700 dark:text-emerald-300" : "rounded-2xl border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive"}>
+          <div
+            className={cn(
+              "rounded-inner border p-4 text-sm",
+              testResult.success
+                ? "border-status-completed/30 bg-status-completed/10 text-status-completed"
+                : "border-destructive/30 bg-destructive/10 text-destructive",
+            )}
+          >
             {testResult.success
               ? `${t("servers.testSuccess")} (${testResult.latencyMs}ms${testResult.supportsPipelining ? ", pipelining supported" : ""})`
               : `${t("servers.testFailed")}: ${testResult.message}`}
@@ -496,7 +572,7 @@ function ServerFormCard({
         ) : null}
 
         {saveError ? (
-          <div className="rounded-2xl border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+          <div className="rounded-inner border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
             {saveError}
           </div>
         ) : null}
@@ -512,8 +588,8 @@ function ServerFormCard({
             {t("action.cancel")}
           </Button>
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </SectionCard>
   );
 }
 
@@ -537,17 +613,22 @@ function Field({
 
 function ToggleField({
   label,
+  description,
   checked,
   onCheckedChange,
 }: {
   label: string;
+  description?: string;
   checked: boolean;
   onCheckedChange: (checked: boolean) => void;
 }) {
   return (
-    <Label className="gap-3">
-      <Checkbox checked={checked} onCheckedChange={(value) => onCheckedChange(value === true)} />
-      {label}
-    </Label>
+    <div className="space-y-1">
+      <Label className="gap-3">
+        <Checkbox checked={checked} onCheckedChange={(value) => onCheckedChange(value === true)} />
+        {label}
+      </Label>
+      {description ? <p className="text-xs text-muted-foreground">{description}</p> : null}
+    </div>
   );
 }

@@ -4,7 +4,8 @@ import { ChevronRight, Download } from "lucide-react";
 import { useMutation, useQuery, useSubscription } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { JobProgress } from "@/components/JobProgress";
-import { JobStatusBadge } from "@/components/JobStatusBadge";
+import { JobStatusBadgeGroup } from "@/components/JobStatusBadge";
+import { getJobStages } from "@/lib/job-stages";
 import { PageHeader } from "@/components/PageHeader";
 import { PipelineTimelineCard } from "@/components/PipelineTimelineCard";
 import type { JobTimelineData } from "@/components/PipelineTimelineCard";
@@ -319,8 +320,8 @@ export function JobDetail() {
       />
 
       {deleteLocked ? (
-        <Card className="border-amber-500/30 bg-amber-500/5">
-          <CardContent className="py-4 text-sm text-amber-700">
+        <Card className="border-status-paused/30 bg-status-paused/5">
+          <CardContent className="py-4 text-sm text-status-paused">
             This history item is already being deleted in the background. It will disappear when the delete completes.
           </CardContent>
         </Card>
@@ -331,9 +332,9 @@ export function JobDetail() {
         <CardHeader>
           <div className="flex items-start justify-between gap-4">
             <div className="flex min-w-0 flex-1 flex-wrap items-center gap-3">
-              <JobStatusBadge status={job.status} />
+              <JobStatusBadgeGroup statuses={getJobStages(job)} />
               {job.hasPassword ? (
-                <span className="text-xs text-amber-500">{t("job.passwordProtected")}</span>
+                <span className="text-xs text-status-paused">{t("job.passwordProtected")}</span>
               ) : null}
             </div>
             {showEta ? (
@@ -372,7 +373,7 @@ export function JobDetail() {
                 label={t("label.savedBandwidth")}
                 value={formatBytes(savedBandwidthBytes)}
                 detail={savedBandwidthDetail}
-                className={savedBandwidthBytes > 0 ? "text-emerald-600 dark:text-emerald-300" : undefined}
+                className={savedBandwidthBytes > 0 ? "text-status-completed" : undefined}
               />
             ) : null}
           </div>
@@ -388,8 +389,8 @@ export function JobDetail() {
       {/* Timeline */}
       <PipelineTimelineCard timeline={timeline} />
 
-      {/* Release details (collapsed) */}
-      <CollapsibleCard title="Release Details">
+      {/* Release details */}
+      <CollapsibleCard title="Release Details" defaultOpen>
         <ParsedReleaseDetails
           originalTitle={job.originalTitle}
           parsedRelease={job.parsedRelease}
@@ -397,8 +398,8 @@ export function JobDetail() {
         />
       </CollapsibleCard>
 
-      {/* Metadata (collapsed) */}
-      <CollapsibleCard title={t("job.metadata")} noPadding hidden={job.metadata.length === 0}>
+      {/* Metadata */}
+      <CollapsibleCard title={t("job.metadata")} defaultOpen noPadding hidden={job.metadata.length === 0}>
         <Table>
           <TableBody>
             {job.metadata.map((entry: { key: string; value: string }) => (
@@ -546,32 +547,43 @@ function MetricTile({
   className?: string;
 }) {
   return (
-    <div className="rounded-2xl border border-border/70 bg-background/70 p-4">
-      <div className="text-xs uppercase tracking-[0.16em] text-muted-foreground">{label}</div>
-      <div className={`mt-2 text-lg font-semibold tabular-nums ${className ?? "text-foreground"}`}>{value}</div>
-      {detail ? <div className="mt-1 text-xs text-muted-foreground">{detail}</div> : null}
+    <div className="rounded-inner border border-border bg-background/40 p-4">
+      <div className="text-[10.5px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+        {label}
+      </div>
+      <div
+        className={cn(
+          "mt-2 font-space-grotesk text-[22px] font-bold leading-none tracking-tight tabular-nums",
+          className ?? "text-foreground",
+        )}
+      >
+        {value}
+      </div>
+      {detail ? <div className="mt-1.5 text-xs text-muted-foreground">{detail}</div> : null}
     </div>
   );
 }
 
 function healthColor(health: number): string {
-  if (health >= 980) return "text-emerald-600 dark:text-emerald-300";
-  if (health >= 950) return "text-amber-600 dark:text-amber-300";
-  return "text-red-600 dark:text-red-300";
+  if (health >= 980) return "text-status-completed";
+  if (health >= 950) return "text-status-paused";
+  return "text-status-failed";
 }
 
 function CollapsibleCard({
   title,
   noPadding,
   hidden,
+  defaultOpen = false,
   children,
 }: {
   title: string;
   noPadding?: boolean;
   hidden?: boolean;
+  defaultOpen?: boolean;
   children: React.ReactNode;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(defaultOpen);
   if (hidden) return null;
   return (
     <Card>
@@ -613,11 +625,16 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
   const isTerminal = status === "COMPLETE" || status === "FAILED";
   const [downloadingPath, setDownloadingPath] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [filesOpenOverride, setFilesOpenOverride] = useState<boolean | null>(null);
   const [{ data, fetching }] = useQuery<{ jobOutputFiles: OutputResult | null }>({
     query: JOB_OUTPUT_FILES_QUERY,
     variables: { jobId },
     pause: !isTerminal,
   });
+
+  useEffect(() => {
+    setFilesOpenOverride(null);
+  }, [jobId]);
 
   if (!isTerminal) return null;
 
@@ -665,34 +682,54 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
     }, 1000);
   }
 
+  const filesOpen = filesOpenOverride ?? (result.files.length <= 10);
+  const outputFilesRegionId = `job-${jobId}-output-files`;
+  const outputFileCountLabel = `${result.files.length} file${result.files.length !== 1 ? "s" : ""}`;
+
   return (
     <Card>
       <CardHeader>
-        <div className="flex items-center justify-between">
-          <CardTitle>Output Files</CardTitle>
+        <button
+          type="button"
+          className="flex w-full items-start justify-between gap-3 text-left"
+          aria-expanded={filesOpen}
+          aria-controls={outputFilesRegionId}
+          title={filesOpen ? "Collapse output files" : "Expand output files"}
+          onClick={() => setFilesOpenOverride(!filesOpen)}
+        >
+          <div className="flex min-w-0 items-center gap-2">
+            <ChevronRight
+              className={cn(
+                "size-4 shrink-0 text-muted-foreground transition-transform",
+                filesOpen && "rotate-90",
+              )}
+            />
+            <CardTitle>Output Files</CardTitle>
+          </div>
           <span className="text-xs text-muted-foreground">
-            {result.files.length} file{result.files.length !== 1 ? "s" : ""} &middot; {formatBytes(result.totalBytes)}
+            {outputFileCountLabel} &middot; {formatBytes(result.totalBytes)}
           </span>
-        </div>
+        </button>
         <div className="font-mono text-xs text-muted-foreground">{result.outputDir}</div>
         {downloadError ? <p className="text-sm text-destructive">{downloadError}</p> : null}
       </CardHeader>
-      <CardContent className="px-0 pb-0">
-        <Table>
-          <TableHeader>
-            <TableRow className="hover:bg-transparent">
-              <TableHead className="text-xs">Name</TableHead>
-              <TableHead className="w-[120px] text-right text-xs">Size</TableHead>
+      {filesOpen ? (
+        <CardContent id={outputFilesRegionId} className="px-0 pb-0">
+          <Table>
+            <TableHeader>
+              <TableRow className="hover:bg-transparent">
+                <TableHead className="text-xs">Name</TableHead>
+                <TableHead className="w-[120px] text-right text-xs">Size</TableHead>
                 <TableHead className="w-[52px] text-right text-xs">&nbsp;</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {result.files.map((file) => (
-              <TableRow key={file.path}>
-                <TableCell className="font-mono text-xs">{file.name}</TableCell>
-                <TableCell className="text-right text-xs text-muted-foreground">
-                  {formatBytes(file.sizeBytes)}
-                </TableCell>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {result.files.map((file) => (
+                <TableRow key={file.path}>
+                  <TableCell className="font-mono text-xs">{file.name}</TableCell>
+                  <TableCell className="text-right text-xs text-muted-foreground">
+                    {formatBytes(file.sizeBytes)}
+                  </TableCell>
                   <TableCell className="text-right">
                     <Button
                       type="button"
@@ -709,11 +746,12 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
                       <Download className="size-4" />
                     </Button>
                   </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      </CardContent>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </CardContent>
+      ) : null}
     </Card>
   );
 }

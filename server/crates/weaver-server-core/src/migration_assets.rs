@@ -478,6 +478,56 @@ pub fn checksum_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|value| format!("{value:02x}")).collect()
 }
 
+/// Historical per-migration ledger checksums that must remain acceptable after a
+/// migration's already-shipped payload is deliberately superseded in place.
+///
+/// The per-migration checksum is derived from the migration's SQL (see
+/// `compile_migration`) and is persisted in every install's `_sqlx_migrations`
+/// ledger when the migration is applied. On every subsequent startup the runners
+/// (`schema_migrations::validate_known_migrations` and
+/// `postgres_migrations::validate_known_migrations`) compare the ledger value
+/// against the freshly recomputed embedded value. Editing a released migration's
+/// payload therefore changes its checksum and would otherwise brick every install
+/// that already applied it with a "checksum mismatch" hard failure.
+///
+/// Each entry here whitelists exactly one prior `(version, algo, checksum)` for a
+/// migration whose payload we intentionally rewrote. This only ever *additionally
+/// accepts* a specific known-old value for a specific version; it never weakens
+/// detection of any other unexpected/corrupt ledger checksum.
+///
+/// Entry rationale:
+/// - v27 "history poll indexes": shipped in weaver-v0.6.9. Its Postgres backfill
+///   used `h.metadata::jsonb` / `jsonb_array_elements(...)`, which raise on
+///   corrupt (unparseable or non-array) `job_history.metadata` rows and abort the
+///   upgrade. The payload was rewritten to skip such rows (matching the SQLite
+///   payload). Because the per-migration checksum spans both the SQLite and
+///   Postgres steps, editing the Postgres step shifts the checksum for BOTH
+///   engines' installs, so this one entry protects v27 SQLite and Postgres alike.
+const SUPERSEDED_MIGRATION_LEDGER_CHECKSUMS: &[(i64, ChecksumAlgorithm, &str)] = &[(
+    27,
+    ChecksumAlgorithm::Blake3,
+    "e05da91d94e32687581efb95f0cbeb0562d3aa5617d74b2d3254395f3ea1d286",
+)];
+
+/// Returns true if `checksum` (with algorithm `checksum_algo`) is an explicitly
+/// whitelisted historical ledger checksum for migration `version` whose payload
+/// was superseded in place. Used by the runners to avoid bricking installs that
+/// already applied the pre-edit payload.
+pub(crate) fn is_superseded_migration_checksum(
+    version: i64,
+    checksum_algo: &str,
+    checksum: &[u8],
+) -> bool {
+    let actual_hex = checksum_hex(checksum);
+    SUPERSEDED_MIGRATION_LEDGER_CHECKSUMS
+        .iter()
+        .any(|(entry_version, entry_algo, entry_hex)| {
+            *entry_version == version
+                && entry_algo.as_str() == checksum_algo
+                && entry_hex.eq_ignore_ascii_case(&actual_hex)
+        })
+}
+
 pub fn migration_key_from_version_and_desc(version: i64, description: &str) -> String {
     format!("{version:04}_{}", description.replace(' ', "_"))
 }

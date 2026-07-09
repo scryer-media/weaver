@@ -182,13 +182,23 @@ impl Pipeline {
         self.active_download_passes.remove(&job_id);
         self.jobs_finalizing_download.remove(&job_id);
         self.active_downloads_by_job.remove(&job_id);
+        self.active_download_connections_by_job.remove(&job_id);
         self.job_last_download_activity.remove(&job_id);
         self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
         self.clear_job_progress_floor_runtime(job_id);
+        self.clear_job_phase_progress_runtime(job_id);
+        self.clear_job_retention_excludes(job_id);
         self.decode_retries
             .retain(|seg_id, _| seg_id.file_id.job_id != job_id);
+        self.rate_limit_reservations
+            .retain(|seg_id, _| seg_id.file_id.job_id != job_id);
         self.update_queue_metrics();
+    }
+
+    pub(crate) fn enforce_finished_jobs_runtime_cap(&mut self) {
+        self.finished_jobs
+            .truncate(crate::jobs::FINISHED_JOBS_RUNTIME_CAP);
     }
 
     pub(crate) fn record_job_history(&mut self, job_id: JobId) {
@@ -228,8 +238,6 @@ impl Pipeline {
             nzb_path: None,
             created_at,
             completed_at: now,
-            last_diagnostic_id: None,
-            last_diagnostic_uploaded_at_epoch_ms: None,
             metadata: if state.spec.metadata.is_empty() {
                 None
             } else {
@@ -242,32 +250,37 @@ impl Pipeline {
             state.assembly.optional_recovery_bytes();
         let (download_state, post_state, run_state) =
             crate::jobs::model::runtime_lanes_from_status_snapshot(&state.status);
-        self.finished_jobs.push(JobInfo {
-            job_id,
-            job_hash: Some(state.job_hash),
-            name: state.spec.name.clone(),
-            error: if let JobStatus::Failed { error } = &state.status {
-                Some(error.clone())
-            } else {
-                None
+        self.finished_jobs.insert(
+            0,
+            JobInfo {
+                job_id,
+                job_hash: Some(state.job_hash),
+                name: state.spec.name.clone(),
+                error: if let JobStatus::Failed { error } = &state.status {
+                    Some(error.clone())
+                } else {
+                    None
+                },
+                status: state.status.clone(),
+                download_state,
+                post_state,
+                run_state,
+                progress: Self::effective_progress(state),
+                total_bytes: total,
+                downloaded_bytes: Self::effective_downloaded_bytes(state),
+                optional_recovery_bytes,
+                optional_recovery_downloaded_bytes,
+                phase_progress: Vec::new(),
+                failed_bytes: state.failed_bytes,
+                health,
+                password: state.spec.password.clone(),
+                category: state.spec.category.clone(),
+                metadata: state.spec.metadata.clone(),
+                output_dir: Some(state.working_dir.display().to_string()),
+                created_at_epoch_ms: state.created_at_epoch_ms,
             },
-            status: state.status.clone(),
-            download_state,
-            post_state,
-            run_state,
-            progress: Self::effective_progress(state),
-            total_bytes: total,
-            downloaded_bytes: Self::effective_downloaded_bytes(state),
-            optional_recovery_bytes,
-            optional_recovery_downloaded_bytes,
-            failed_bytes: state.failed_bytes,
-            health,
-            password: state.spec.password.clone(),
-            category: state.spec.category.clone(),
-            metadata: state.spec.metadata.clone(),
-            output_dir: Some(state.working_dir.display().to_string()),
-            created_at_epoch_ms: state.created_at_epoch_ms,
-        });
+        );
+        self.enforce_finished_jobs_runtime_cap();
 
         let archive_started = Instant::now();
         if let Err(e) = self.db.try_queue_archive_job(job_id, row) {

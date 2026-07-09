@@ -16,8 +16,23 @@ use tracing_subscriber::util::SubscriberInitExt;
 use crate::args::{Cli, Command};
 
 const LOG_FILE_ENV: &str = "WEAVER_LOG_FILE";
+const DOTENV_FILE: &str = ".env";
+
+// musl's bundled allocator serializes multi-threaded allocation heavily
+// (measured −18% CPU on the container download benchmark when replaced), and
+// the Windows system heap has the same reputation under threaded load, so
+// both build targets swap in mimalloc. glibc/macOS builds keep the system
+// allocator.
+#[cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
+    if let Err(error) = load_cwd_dotenv() {
+        eprintln!("failed to load {DOTENV_FILE}: {error}");
+        std::process::exit(1);
+    }
+
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all().thread_stack_size(8 * 1024 * 1024); // 8 MB - pipeline futures are large
     weaver_server_core::runtime::affinity::install_tokio_worker_affinity(&mut builder);
@@ -82,6 +97,7 @@ async fn async_main() {
         .with(buffer_layer)
         .with(log_file_layer)
         .init();
+    install_panic_hook();
 
     let command = match command {
         Command::Par2 { command } => match commands::par2::run(command) {
@@ -101,20 +117,35 @@ async fn async_main() {
             std::process::exit(1);
         }
     };
+    let env_seed = match bootstrap::parse_env_seed_from_process() {
+        Ok(seed) => seed,
+        Err(error) => {
+            error!("invalid environment config: {error}");
+            std::process::exit(1);
+        }
+    };
 
     bootstrap::reset_login_if_requested(&mut db);
+    if let Err(error) = bootstrap::apply_core_env_seed(&db, &mut config, &env_seed) {
+        error!("failed to seed config settings from environment: {error}");
+        std::process::exit(1);
+    }
     bootstrap::default_data_dir_from_config_path(&config_path, &mut config);
+
+    let data_dir = PathBuf::from(&config.data_dir);
+    if let Err(error) = bootstrap::bootstrap_encryption(&data_dir, &mut db, &mut config) {
+        error!("failed to bootstrap encryption key: {error}");
+        std::process::exit(1);
+    }
+    if let Err(error) = bootstrap::apply_server_env_seed(&db, &mut config, &env_seed) {
+        error!("failed to seed servers from environment: {error}");
+        std::process::exit(1);
+    }
 
     if let Err(errors) = bootstrap::validate_config(&config) {
         for message in &errors {
             error!("config: {message}");
         }
-        std::process::exit(1);
-    }
-
-    let data_dir = PathBuf::from(&config.data_dir);
-    if let Err(error) = bootstrap::bootstrap_encryption(&data_dir, &mut db, &mut config) {
-        error!("failed to bootstrap encryption key: {error}");
         std::process::exit(1);
     }
 
@@ -156,6 +187,44 @@ async fn async_main() {
         }
         Command::Par2 { .. } => unreachable!("par2 command handled before config startup"),
     }
+}
+
+fn load_cwd_dotenv() -> Result<bool, dotenvy::Error> {
+    load_dotenv_path(Path::new(DOTENV_FILE))
+}
+
+fn load_dotenv_path(path: &Path) -> Result<bool, dotenvy::Error> {
+    match dotenvy::from_path(path) {
+        Ok(_) => Ok(true),
+        Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+
+        if let Some(location) = info.location() {
+            error!(
+                panic.message = payload,
+                panic.file = location.file(),
+                panic.line = location.line(),
+                panic.column = location.column(),
+                "unexpected panic"
+            );
+        } else {
+            error!(panic.message = payload, "unexpected panic");
+        }
+
+        default_hook(info);
+    }));
 }
 
 struct ResolvedLogFileConfig {
@@ -225,5 +294,114 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogFileMakeWriter {
 
     fn make_writer(&'a self) -> Self::Writer {
         self.0.make_writer()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex};
+
+    use super::*;
+
+    static DOTENV_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    struct CurrentDirGuard {
+        previous: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn enter(path: &std::path::Path) -> Self {
+            let previous = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { previous }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_dotenv_is_ignored() {
+        let _lock = DOTENV_TEST_LOCK.lock().unwrap();
+        let tempdir = tempfile::tempdir().unwrap();
+
+        let loaded = load_dotenv_path(&tempdir.path().join(".env")).unwrap();
+
+        assert!(!loaded);
+    }
+
+    #[test]
+    fn cwd_dotenv_is_loaded() {
+        let _lock = DOTENV_TEST_LOCK.lock().unwrap();
+        let key = "WEAVER_DOTENV_TEST_CWD";
+        let _env_guard = EnvVarGuard::remove(key);
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join(".env"), format!("{key}=loaded\n")).unwrap();
+        let _cwd_guard = CurrentDirGuard::enter(tempdir.path());
+
+        let loaded = load_cwd_dotenv().unwrap();
+
+        assert!(loaded);
+        assert_eq!(std::env::var(key).unwrap(), "loaded");
+    }
+
+    #[test]
+    fn dotenv_parse_errors_are_fatal() {
+        let _lock = DOTENV_TEST_LOCK.lock().unwrap();
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join(".env");
+        std::fs::write(&path, "BROKEN=\"unterminated\n").unwrap();
+
+        let error = load_dotenv_path(&path).unwrap_err();
+
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn process_env_wins_over_dotenv() {
+        let _lock = DOTENV_TEST_LOCK.lock().unwrap();
+        let key = "WEAVER_DOTENV_TEST_PRECEDENCE";
+        let _env_guard = EnvVarGuard::set(key, "process");
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join(".env");
+        std::fs::write(&path, format!("{key}=dotenv\n")).unwrap();
+
+        let loaded = load_dotenv_path(&path).unwrap();
+
+        assert!(loaded);
+        assert_eq!(std::env::var(key).unwrap(), "process");
     }
 }

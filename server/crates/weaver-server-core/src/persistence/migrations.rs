@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::StateError;
 
-use crate::jobs::{ActiveJob, CommittedSegment};
+use crate::jobs::ActiveJob;
 use crate::persistence::Database;
 
 // --- Legacy journal types (kept for one-time migration from binary journal) ---
@@ -107,7 +107,6 @@ struct LegacyRecoveredJob {
     job_id: JobId,
     nzb_path: PathBuf,
     output_dir: PathBuf,
-    committed_segments: HashSet<SegmentId>,
     complete_files: HashSet<NzbFileId>,
     status: PersistedJobStatus,
     created_at: u64,
@@ -134,7 +133,6 @@ fn recover_legacy(entries: Vec<JournalEntry>) -> HashMap<JobId, LegacyRecoveredJ
                         job_id,
                         nzb_path,
                         output_dir,
-                        committed_segments: HashSet::new(),
                         complete_files: HashSet::new(),
                         status: PersistedJobStatus::Downloading,
                         created_at,
@@ -143,11 +141,7 @@ fn recover_legacy(entries: Vec<JournalEntry>) -> HashMap<JobId, LegacyRecoveredJ
                     },
                 );
             }
-            JournalEntry::SegmentCommitted { segment_id, .. } => {
-                if let Some(job) = jobs.get_mut(&segment_id.file_id.job_id) {
-                    job.committed_segments.insert(segment_id);
-                }
-            }
+            JournalEntry::SegmentCommitted { .. } => {}
             JournalEntry::FileComplete { file_id, .. } => {
                 if let Some(job) = jobs.get_mut(&file_id.job_id) {
                     job.complete_files.insert(file_id);
@@ -293,6 +287,13 @@ impl Database {
                 created_at: job.created_at,
                 category: job.category.clone(),
                 metadata: job.metadata.clone(),
+                status: "queued",
+                download_state: "queued",
+                post_state: "idle",
+                run_state: "active",
+                paused_resume_status: None,
+                paused_resume_download_state: None,
+                paused_resume_post_state: None,
             })?;
 
             // Map the PersistedJobStatus to a string for the active table.
@@ -309,21 +310,6 @@ impl Database {
                 PersistedJobStatus::Cancelled => ("cancelled", None),
             };
             self.set_active_job_status(job.job_id, status_str, error_str)?;
-
-            // Batch-insert segments.
-            let segments: Vec<CommittedSegment> = job
-                .committed_segments
-                .iter()
-                .map(|seg| CommittedSegment {
-                    job_id: seg.file_id.job_id,
-                    file_index: seg.file_id.file_index,
-                    segment_number: seg.segment_number,
-                    file_offset: 0,  // offset not recoverable from HashSet
-                    decoded_size: 0, // size not recoverable from HashSet
-                    crc32: 0,        // crc not recoverable from HashSet
-                })
-                .collect();
-            self.commit_segments(&segments)?;
 
             // Insert completed files.
             for file_id in &job.complete_files {

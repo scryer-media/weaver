@@ -20,6 +20,9 @@ env:
   RUST_TOOLCHAIN: "1.96"
   WEAVER_ENABLE_DIAGNOSTICS: "0"
   WEB_ARTIFACT_NAME: weaver-web-dist
+  RUST_TEST_BINARIES_ARTIFACT_NAME: weaver-rust-test-binaries
+  WEAVER_LFS_RUST_TEST_INCLUDE: server/crates/weaver-server-core/tests/fixtures/**
+  WEAVER_LFS_SDE_INCLUDE: ci/vendor/intel-sde/**
 
 jobs:
   # ── Parallel lint / check jobs (no dependencies) ─────────────────────────
@@ -61,8 +64,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
-        with:
-          lfs: true
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -86,7 +87,7 @@ jobs:
         with:
           tool: cargo-audit
       - name: Run cargo audit
-        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2025-0134
+        run: cargo run -p xtask --locked -- ci audit
 
   # ── Jobs that need the web artifact ──────────────────────────────────────
 
@@ -101,12 +102,10 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
-      - name: Install musl target
-        run: rustup target add x86_64-unknown-linux-musl
-      - name: Install musl toolchain
+      - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools mold nasm
+          sudo apt-get install -y nasm
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -115,30 +114,23 @@ jobs:
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
-      - name: Set target CPU flags
-        run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-unknown-linux-musl" --lane portable)" >> "$GITHUB_ENV"
       - name: Run clippy
-        run: cargo clippy --workspace --locked --lib --bins --tests --examples --target x86_64-unknown-linux-musl -- -D warnings
+        run: cargo clippy --workspace --locked --lib --bins --tests --examples -- -D warnings
 
-  rust-test:
-    name: rust-test
+  rust-test-build:
+    name: rust-test-build
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [web-build]
     steps:
       - uses: actions/checkout@v6
-        with:
-          lfs: true
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install musl target
-        run: rustup target add x86_64-unknown-linux-musl
-      - name: Install musl toolchain
+      - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools mold nasm
+          sudo apt-get install -y nasm
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -147,40 +139,72 @@ jobs:
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
-      - name: Set target CPU flags
+      - name: Build Rust test binaries
         run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-unknown-linux-musl" --lane portable)" >> "$GITHUB_ENV"
-      - name: Run workspace tests
-        run: cargo test --workspace --locked --target x86_64-unknown-linux-musl
+          mkdir -p .ci/rust-tests
+          cargo metadata --locked --format-version 1 > .ci/rust-tests/cargo-metadata.json
+          cargo test \
+            --workspace \
+            --locked \
+            --no-run \
+            --no-fail-fast \
+            --message-format=json-render-diagnostics \
+            > .ci/rust-tests/cargo-test.json
+          python3 .github/scripts/rust-test-manifest.py collect \
+            --metadata .ci/rust-tests/cargo-metadata.json \
+            --cargo-json .ci/rust-tests/cargo-test.json \
+            --archive .ci/rust-tests/test-binaries.tar.gz \
+            --workspace "$GITHUB_WORKSPACE"
+      - name: Upload Rust test binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.RUST_TEST_BINARIES_ARTIFACT_NAME }}-${{ github.run_id }}
+          path: .ci/rust-tests/test-binaries.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  rust-test-regular:
+    name: rust-test-regular
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: [rust-test-build]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Hydrate Rust test fixtures
+        run: |
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_RUST_TEST_INCLUDE" --exclude=""
+      - name: Download Rust test binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.RUST_TEST_BINARIES_ARTIFACT_NAME }}-${{ github.run_id }}
+          path: .ci/rust-tests
+      - name: Unpack Rust test binaries
+        run: tar -xzf .ci/rust-tests/test-binaries.tar.gz -C .ci/rust-tests
+      - name: Run regular Rust tests
+        run: |
+          python3 .github/scripts/rust-test-manifest.py run \
+            --manifest .ci/rust-tests/manifest.json \
+            --lane regular \
+            --workspace "$GITHUB_WORKSPACE"
 
   rust-test-arm:
-    name: rust-test-arm
+    name: rust-test-arm-yenc
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
-        with:
-          lfs: true
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install musl target
-        run: rustup target add aarch64-unknown-linux-musl
-      - name: Install musl toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools mold
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-      - name: Set target CPU flags
-        run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "aarch64-unknown-linux-musl" --lane portable)" >> "$GITHUB_ENV"
-      - name: Run ARM-specific crate tests (NEON, CLMUL, PMULL)
-        run: cargo test --locked -p weaver-par2 -p weaver-yenc -p weaver-rar --features weaver-par2/slow-tests --target aarch64-unknown-linux-musl
+      - name: Run ARM-specific yEnc crate tests (NEON)
+        run: cargo test --locked --no-fail-fast -p weaver-yenc
 
   rust-test-sde:
-    name: rust-test-sde-${{ matrix.name }}
+    name: rust-test-sde-yenc-${{ matrix.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -195,17 +219,17 @@ jobs:
             sde_arch: "-spr"
     steps:
       - uses: actions/checkout@v6
-        with:
-          lfs: true
+      - name: Hydrate Intel SDE
+        run: |
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_SDE_INCLUDE" --exclude=""
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install musl target
-        run: rustup target add x86_64-unknown-linux-musl
-      - name: Install musl toolchain
+      - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools mold nasm
+          sudo apt-get install -y nasm
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -218,55 +242,52 @@ jobs:
           echo "/opt/sde-external-9.48.0-2024-11-25-lin" >> "$GITHUB_PATH"
       - name: Build accelerated SIMD tests (${{ matrix.name }})
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: ${{ matrix.rustflags }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           set -o pipefail
-          cargo test --package weaver-par2 --lib --test repair_stress --test real_world_generated --features slow-tests --no-run --locked --target x86_64-unknown-linux-musl --message-format=json \
+          cargo test --package weaver-yenc --lib --no-run --no-fail-fast --locked --target x86_64-unknown-linux-gnu --message-format=json \
             | jq -r 'select(.executable != null and .profile.test == true) | .executable' \
             | sort -u > /tmp/test-bins.txt
-          cargo test --package weaver-yenc --lib --no-run --locked --target x86_64-unknown-linux-musl --message-format=json \
-            | jq -r 'select(.executable != null and .profile.test == true) | .executable' \
-            >> /tmp/test-bins.txt
-          sort -u -o /tmp/test-bins.txt /tmp/test-bins.txt
       - name: Run tests under Intel SDE (${{ matrix.name }})
         run: |
+          failures=0
+          run_sde() {
+            if ! sde64 ${{ matrix.sde_arch }} -- "$@"; then
+              failures=$((failures + 1))
+            fi
+          }
           while IFS= read -r bin; do
             echo "::group::$(basename "$bin")"
             case "$(basename "$bin")" in
-              weaver_par2-*)
-                sde64 ${{ matrix.sde_arch }} -- "$bin" gf_simd::tests:: --test-threads=1
-                ;;
-              repair_stress-*)
-                sde64 ${{ matrix.sde_arch }} -- "$bin" repair_single_file_4mb_8_missing --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" repair_large_slices --exact --test-threads=1
-                ;;
-              real_world_generated-*)
-                sde64 ${{ matrix.sde_arch }} -- "$bin" repairs_missing_middle_volume_and_extracts_rar5_lz --exact --test-threads=1
-                ;;
               weaver_yenc-*)
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::decode_normal_run_dispatches --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse2_block_handles_dot_stuffed_line_start --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse2_block_preserves_trailing_cr_state --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::ssse3_block_compacts_escapes_and_line_breaks --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::ssse3_block_handles_dot_stuffed_line_start --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::ssse3_block_preserves_trailing_cr_state --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse41_block_compacts_escapes_and_line_breaks --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse41_block_handles_dot_stuffed_line_start --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::sse41_block_preserves_trailing_cr_state --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx_block_compacts_escapes_and_line_breaks --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx_block_handles_dot_stuffed_line_start --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx_block_preserves_trailing_cr_state --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx2_block_handles_dot_stuffed_line_start --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx2_block_preserves_trailing_cr_state --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_block_compacts_escapes_and_line_breaks --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_block_handles_dot_stuffed_line_start --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_block_preserves_trailing_cr_state --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_vbmi2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_vbmi2_block_handles_dot_stuffed_line_start --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" simd::tests::avx512_vbmi2_block_preserves_trailing_cr_state --exact --test-threads=1
-                sde64 ${{ matrix.sde_arch }} -- "$bin" decode::tests::decode_body_rapidyenc_generic_special_pattern --exact --test-threads=1
+                run_sde "$bin" simd::tests::decode_normal_run_dispatches --exact --test-threads=1
+                run_sde "$bin" simd::tests::sse2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                run_sde "$bin" simd::tests::sse2_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                run_sde "$bin" simd::tests::sse2_block_preserves_trailing_cr_state --exact --test-threads=1
+                run_sde "$bin" simd::tests::ssse3_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                run_sde "$bin" simd::tests::ssse3_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                run_sde "$bin" simd::tests::ssse3_block_preserves_trailing_cr_state --exact --test-threads=1
+                run_sde "$bin" simd::tests::sse41_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                run_sde "$bin" simd::tests::sse41_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                run_sde "$bin" simd::tests::sse41_block_preserves_trailing_cr_state --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx_block_preserves_trailing_cr_state --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx2_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx2_block_preserves_trailing_cr_state --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx512_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx512_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx512_block_preserves_trailing_cr_state --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx512_vbmi2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx512_vbmi2_block_handles_dot_stuffed_line_start --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx512_vbmi2_block_preserves_trailing_cr_state --exact --test-threads=1
+                run_sde "$bin" simd::tests::forced_tier_kernels_match_scalar_with_line_hints --exact --test-threads=1
+                run_sde "$bin" simd::tests::dispatch_kernel_matches_scalar_on_adversarial_streams --exact --test-threads=1
+                run_sde "$bin" simd::tests::dispatch_kernel_matches_scalar_across_chunk_splits --exact --test-threads=1
+                run_sde "$bin" simd::tests::dispatch_kernel_matches_scalar_on_hinted_encoded_streams --exact --test-threads=1
+                run_sde "$bin" simd::tests::dispatch_kernel_handles_boundary_specials_like_scalar --exact --test-threads=1
+                run_sde "$bin" decode::tests::decode_body_rapidyenc_generic_special_pattern --exact --test-threads=1
                 ;;
               *)
                 echo "unexpected SDE test binary: $(basename "$bin")" >&2
@@ -275,6 +296,10 @@ jobs:
             esac
             echo "::endgroup::"
           done < /tmp/test-bins.txt
+          if [ "$failures" -ne 0 ]; then
+            echo "$failures SDE test command(s) failed" >&2
+            exit 1
+          fi
 
   rust-yenc-simd-targets:
     name: rust-yenc-simd-${{ matrix.name }}
@@ -284,10 +309,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: armv7-neon
-            target: armv7-unknown-linux-gnueabihf
-            target_env: ARMV7_UNKNOWN_LINUX_GNUEABIHF
-            rustflags: "-C target-feature=+neon"
           - name: riscv64gc
             target: riscv64gc-unknown-linux-gnu
             target_env: RISCV64GC_UNKNOWN_LINUX_GNU
@@ -313,161 +334,6 @@ jobs:
             export "CARGO_TARGET_${TARGET_ENV}_RUSTFLAGS=$TARGET_RUSTFLAGS"
           fi
           cargo check --locked -p weaver-yenc --target ${{ matrix.target }}
-
-  rust-crypto-targets:
-    name: rust-crypto-${{ matrix.platform }}
-    runs-on: ${{ matrix.runs_on }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            platform: linux-x86_64-portable
-            runs_on: ubuntu-24.04
-            lane: portable
-          - target: x86_64-unknown-linux-musl
-            platform: linux-x86_64-haswell
-            runs_on: ubuntu-24.04
-            lane: haswell
-          - target: aarch64-unknown-linux-musl
-            platform: linux-arm64-portable
-            runs_on: ubuntu-24.04-arm
-            lane: portable
-          - target: aarch64-unknown-linux-musl
-            platform: linux-arm64-cortex-a76
-            runs_on: ubuntu-24.04-arm
-            lane: cortex-a76
-          - target: aarch64-apple-darwin
-            platform: darwin-arm64-portable
-            runs_on: macos-26
-            lane: portable
-          - target: aarch64-apple-darwin
-            platform: darwin-arm64-apple-m1
-            runs_on: macos-26
-            lane: apple-m1
-          - target: x86_64-apple-darwin
-            platform: darwin-x86_64-portable
-            runs_on: macos-26
-            lane: portable
-          - target: x86_64-apple-darwin
-            platform: darwin-x86_64-haswell
-            runs_on: macos-26
-            lane: haswell
-          - target: x86_64-pc-windows-msvc
-            platform: windows-x86_64
-            runs_on: windows-2025-vs2026
-            lane: portable
-          - target: aarch64-pc-windows-msvc
-            platform: windows-arm64
-            runs_on: windows-11-arm
-            lane: portable
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install target
-        run: rustup target add ${{ matrix.target }}
-      - name: Install musl toolchain
-        if: contains(matrix.target, '-musl')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools mold
-      - name: Install NASM (Linux x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get install -y nasm
-      - name: Install NASM (macOS x86_64)
-        if: matrix.target == 'x86_64-apple-darwin'
-        run: brew install nasm
-      - name: Install NASM (Windows x86_64)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $url = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip"
-          $expectedSha256 = "e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4"
-          Invoke-WebRequest $url -OutFile nasm.zip
-          $actualSha256 = (Get-FileHash nasm.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualSha256 -ne $expectedSha256) {
-            throw "NASM checksum mismatch: expected $expectedSha256, got $actualSha256"
-          }
-          Expand-Archive nasm.zip -DestinationPath C:\nasm
-          $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
-          $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-      - name: Exclude build dir from Windows Defender
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          try {
-            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
-          } catch {
-            Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
-          }
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
-          cache-on-failure: false
-          key: crypto-${{ matrix.platform }}
-      - name: Configure Windows sccache environment
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          "CARGO_INCREMENTAL=0" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "RUSTC_WRAPPER=sccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "SCCACHE_BASEDIRS=${{ github.workspace }}" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "SCCACHE_CACHE_SIZE=10G" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "SCCACHE_DIR=${{ github.workspace }}\.sccache" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "SCCACHE_IDLE_TIMEOUT=0" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-      - name: Restore Windows sccache directory
-        if: runner.os == 'Windows'
-        id: windows-crypto-sccache-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}\.sccache
-          key: gha-sccache-v1-weaver-crypto-${{ matrix.platform }}-${{ github.run_id }}
-          restore-keys: |
-            gha-sccache-v1-weaver-crypto-${{ matrix.platform }}-
-      - name: Install Windows sccache
-        if: runner.os == 'Windows'
-        uses: mozilla-actions/sccache-action@v0.0.10
-      - name: Prime Windows sccache server
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          sccache --start-server
-          sccache --zero-stats
-      - name: Verify target crypto config
-        run: cargo run -p xtask --locked -- verify-crypto-target --target "${{ matrix.target }}" --lane "${{ matrix.lane }}"
-      - name: Set target CPU flags (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}" --lane "${{ matrix.lane }}")" >> "$GITHUB_ENV"
-      - name: Set target CPU flags (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $flags = cargo run -p xtask --locked -- print-rustflags --ci --target "${{ matrix.target }}" --lane "${{ matrix.lane }}"
-          "RUSTFLAGS=$flags" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-      - name: Check native crypto crates
-        run: cargo check --locked -p weaver-rar -p weaver-par2 --target ${{ matrix.target }}
-      - name: Show Windows sccache stats
-        if: always() && runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          if (Get-Command sccache -ErrorAction SilentlyContinue) {
-            sccache --show-stats
-          } else {
-            Write-Host "sccache not installed; skipping stats"
-          }
-      - name: Save Windows sccache directory
-        if: always() && runner.os == 'Windows' && steps.windows-crypto-sccache-restore.outcome == 'success'
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ github.workspace }}\.sccache
-          key: ${{ steps.windows-crypto-sccache-restore.outputs.cache-primary-key }}
 
   # ── Release packaging (tag pushes only) ──────────────────────────────────
 
@@ -652,68 +518,6 @@ jobs:
         with:
           name: weaver-linux-arm64-cortex-a76-${{ github.run_id }}
           path: weaver-linux-arm64-cortex-a76.tar.gz
-          if-no-files-found: error
-          retention-days: 14
-
-  rust-package-darwin-x86_64-portable:
-    name: rust-package-darwin-x86_64-portable
-    runs-on: macos-26
-    timeout-minutes: 60
-    needs: [web-build]
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Install target
-        run: rustup target add x86_64-apple-darwin
-      - name: Install NASM
-        run: brew install nasm
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
-          cache-on-failure: false
-          key: package-darwin-x86_64-portable
-      - name: Download embedded web artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ env.WEB_ARTIFACT_NAME }}
-          path: apps/weaver-web/dist
-      - name: Set target CPU flags
-        run: |
-          printf 'RUSTFLAGS=%s\n' "$(cargo run -p xtask --locked -- print-rustflags --ci --target "x86_64-apple-darwin" --lane portable)" >> "$GITHUB_ENV"
-      - name: Build release binary
-        run: cargo build -p weaver --release --locked --target x86_64-apple-darwin
-      - name: Codesign binary
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-        env:
-          CERT_P12: ${{ secrets.APPLE_SIGNING_CERT_P12 }}
-          CERT_PASSWORD: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
-        run: |
-          KEYCHAIN="build.keychain-db"
-          KEYCHAIN_PASS="ci-ephemeral"
-          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security set-keychain-settings -lut 900 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          echo -n "$CERT_P12" | base64 --decode > /tmp/cert.p12
-          security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --force target/x86_64-apple-darwin/release/weaver
-          codesign --verify --verbose target/x86_64-apple-darwin/release/weaver
-          rm /tmp/cert.p12
-          security delete-keychain "$KEYCHAIN"
-      - name: Package tarball
-        run: |
-          mkdir -p dist/package
-          cp target/x86_64-apple-darwin/release/weaver dist/package/weaver
-          tar -czf weaver-darwin-x86_64-portable.tar.gz -C dist/package .
-          test -f weaver-darwin-x86_64-portable.tar.gz
-      - name: Upload release package
-        uses: actions/upload-artifact@v7
-        with:
-          name: weaver-darwin-x86_64-portable-${{ github.run_id }}
-          path: weaver-darwin-x86_64-portable.tar.gz
           if-no-files-found: error
           retention-days: 14
 
@@ -906,6 +710,10 @@ jobs:
     needs: [web-build]
     env:
       CARGO_INCREMENTAL: "0"
+      # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
+      # cfg(not(windows)) dependency and is never compiled here.
+      CC_x86_64_pc_windows_msvc: clang-cl
+      CXX_x86_64_pc_windows_msvc: clang-cl
       RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
@@ -1174,6 +982,10 @@ jobs:
     needs: [web-build]
     env:
       CARGO_INCREMENTAL: "0"
+      # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
+      # cfg(not(windows)) dependency and is never compiled here.
+      CC_aarch64_pc_windows_msvc: clang-cl
+      CXX_aarch64_pc_windows_msvc: clang-cl
       RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
@@ -1432,11 +1244,10 @@ jobs:
       - rust-fmt
       - rust-clippy
       - rust-audit
-      - rust-test
+      - rust-test-regular
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
-      - rust-crypto-targets
       - rust-package-linux-x86_64-portable
       - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable
@@ -1527,11 +1338,10 @@ jobs:
       - rust-fmt
       - rust-clippy
       - rust-audit
-      - rust-test
+      - rust-test-regular
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
-      - rust-crypto-targets
       - rust-package-linux-x86_64-portable
       - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable
@@ -1632,16 +1442,14 @@ jobs:
       - rust-fmt
       - rust-clippy
       - rust-audit
-      - rust-test
+      - rust-test-regular
       - rust-test-arm
       - rust-test-sde
       - rust-yenc-simd-targets
-      - rust-crypto-targets
       - rust-package-linux-x86_64-portable
       - rust-package-linux-x86_64-haswell
       - rust-package-linux-arm64-portable
       - rust-package-linux-arm64-cortex-a76
-      - rust-package-darwin-x86_64-portable
       - rust-package-darwin-x86_64-haswell
       - rust-package-darwin-arm64-portable
       - rust-package-darwin-arm64-apple-m1
@@ -1670,11 +1478,6 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: weaver-linux-arm64-cortex-a76-${{ github.run_id }}
-          path: artifacts
-      - name: Download darwin x86_64 portable artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: weaver-darwin-x86_64-portable-${{ github.run_id }}
           path: artifacts
       - name: Download darwin x86_64 haswell artifact
         uses: actions/download-artifact@v8
@@ -1720,7 +1523,6 @@ jobs:
           LINUX_X86_HASWELL_SHA=$(shasum -a 256 artifacts/weaver-linux-x86_64-haswell.tar.gz | cut -d ' ' -f1)
           LINUX_ARM_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-linux-arm64-portable.tar.gz | cut -d ' ' -f1)
           LINUX_ARM_CORTEX_A76_SHA=$(shasum -a 256 artifacts/weaver-linux-arm64-cortex-a76.tar.gz | cut -d ' ' -f1)
-          DARWIN_X86_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-darwin-x86_64-portable.tar.gz | cut -d ' ' -f1)
           DARWIN_X86_HASWELL_SHA=$(shasum -a 256 artifacts/weaver-darwin-x86_64-haswell.tar.gz | cut -d ' ' -f1)
           DARWIN_ARM_PORTABLE_SHA=$(shasum -a 256 artifacts/weaver-darwin-arm64-portable.tar.gz | cut -d ' ' -f1)
           DARWIN_ARM_APPLE_M1_SHA=$(shasum -a 256 artifacts/weaver-darwin-arm64-apple-m1.tar.gz | cut -d ' ' -f1)
@@ -1807,7 +1609,10 @@ jobs:
                     sysctl_values["machdep.cpu.leaf7_features"],
                   ),
                 )
-                normalized.superset?(X86_HASWELL_FEATURES.to_set) ? "haswell" : "portable"
+                unless normalized.superset?(X86_HASWELL_FEATURES.to_set)
+                  raise "macOS x86_64 release requires Haswell CPU features; no portable macOS x86_64 artifact is published"
+                end
+                "haswell"
               when ["linux", "x86_64"]
                 normalized = normalize_x86_features(cpuinfo_feature_tokens(linux_cpuinfo))
                 normalized.superset?(X86_HASWELL_FEATURES.to_set) ? "haswell" : "portable"
@@ -1838,7 +1643,6 @@ jobs:
               when ["linux", "x86_64", "haswell"] then "weaver-linux-x86_64-haswell.tar.gz"
               when ["linux", "arm64", "portable"] then "weaver-linux-arm64-portable.tar.gz"
               when ["linux", "arm64", "cortex-a76"] then "weaver-linux-arm64-cortex-a76.tar.gz"
-              when ["macos", "x86_64", "portable"] then "weaver-darwin-x86_64-portable.tar.gz"
               when ["macos", "x86_64", "haswell"] then "weaver-darwin-x86_64-haswell.tar.gz"
               when ["macos", "arm64", "portable"] then "weaver-darwin-arm64-portable.tar.gz"
               when ["macos", "arm64", "apple-m1"] then "weaver-darwin-arm64-apple-m1.tar.gz"
@@ -1973,7 +1777,6 @@ jobs:
               "weaver-linux-x86_64-haswell.tar.gz" => "${LINUX_X86_HASWELL_SHA}",
               "weaver-linux-arm64-portable.tar.gz" => "${LINUX_ARM_PORTABLE_SHA}",
               "weaver-linux-arm64-cortex-a76.tar.gz" => "${LINUX_ARM_CORTEX_A76_SHA}",
-              "weaver-darwin-x86_64-portable.tar.gz" => "${DARWIN_X86_PORTABLE_SHA}",
               "weaver-darwin-x86_64-haswell.tar.gz" => "${DARWIN_X86_HASWELL_SHA}",
               "weaver-darwin-arm64-portable.tar.gz" => "${DARWIN_ARM_PORTABLE_SHA}",
               "weaver-darwin-arm64-apple-m1.tar.gz" => "${DARWIN_ARM_APPLE_M1_SHA}",
@@ -2073,6 +1876,16 @@ jobs:
             raise "#{label}: expected #{expected.inspect}, got #{actual.inspect}" unless expected == actual
           end
 
+          def assert_raises_message(expected_message, label)
+            yield
+          rescue RuntimeError => error
+            unless error.message.include?(expected_message)
+              raise "#{label}: expected error containing #{expected_message.inspect}, got #{error.message.inspect}"
+            end
+          else
+            raise "#{label}: expected error containing #{expected_message.inspect}"
+          end
+
           linux_x86_full = <<~CPUINFO
             flags : sse3 ssse3 sse4_1 sse4_2 avx avx2 bmi1 bmi2 f16c fma lzcnt movbe pclmulqdq popcnt rdrand xsave xsaveopt
           CPUINFO
@@ -2112,7 +1925,9 @@ jobs:
           assert_equal("cortex-a76", WeaverUsenetReleaseSelection.detect_lane(os: "linux", arch: "arm64", linux_cpuinfo: linux_arm_full), "linux arm optimized lane")
           assert_equal("portable", WeaverUsenetReleaseSelection.detect_lane(os: "linux", arch: "arm64", linux_cpuinfo: linux_arm_portable), "linux arm portable lane")
           assert_equal("haswell", WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "x86_64", sysctl_values: macos_x86_full), "macos x86 optimized lane")
-          assert_equal("portable", WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "x86_64", sysctl_values: macos_x86_portable), "macos x86 portable lane")
+          assert_raises_message("macOS x86_64 release requires Haswell CPU features", "macos x86 pre-Haswell lane") do
+            WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "x86_64", sysctl_values: macos_x86_portable)
+          end
           assert_equal("apple-m1", WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "arm64", sysctl_values: macos_arm_full), "macos arm optimized lane")
           assert_equal("portable", WeaverUsenetReleaseSelection.detect_lane(os: "macos", arch: "arm64", sysctl_values: macos_arm_portable), "macos arm portable lane")
 
@@ -2121,7 +1936,6 @@ jobs:
             "weaver-linux-x86_64-haswell.tar.gz" => "linux-x86-haswell",
             "weaver-linux-arm64-portable.tar.gz" => "linux-arm-portable",
             "weaver-linux-arm64-cortex-a76.tar.gz" => "linux-arm-cortex-a76",
-            "weaver-darwin-x86_64-portable.tar.gz" => "darwin-x86-portable",
             "weaver-darwin-x86_64-haswell.tar.gz" => "darwin-x86-haswell",
             "weaver-darwin-arm64-portable.tar.gz" => "darwin-arm-portable",
             "weaver-darwin-arm64-apple-m1.tar.gz" => "darwin-arm-apple-m1",
@@ -2138,8 +1952,8 @@ jobs:
             "linux arm sha",
           )
           assert_equal(
-            "darwin-x86-portable",
-            WeaverUsenetReleaseSelection.asset_sha256(os: "macos", arch: "x86_64", lane: "portable", checksums: checksums),
+            "darwin-x86-haswell",
+            WeaverUsenetReleaseSelection.asset_sha256(os: "macos", arch: "x86_64", lane: "haswell", checksums: checksums),
             "macos x86 sha",
           )
           RUBY

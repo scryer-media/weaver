@@ -20,6 +20,8 @@ struct Profiler {
     started_cpu: Option<CpuUsage>,
     last_emit: Mutex<Instant>,
     buckets: Mutex<BTreeMap<String, Bucket>>,
+    cpu_buckets: Mutex<BTreeMap<String, Bucket>>,
+    value_buckets: Mutex<BTreeMap<String, Bucket>>,
     interval: Duration,
     top_n: usize,
 }
@@ -54,11 +56,34 @@ pub(crate) fn record_owned(label: String, elapsed: Duration) {
     profiler().record(label, elapsed);
 }
 
+pub(crate) fn record_cpu_sample(label: &'static str, elapsed: Duration) {
+    if !enabled() {
+        return;
+    }
+    profiler().record_cpu(label.to_string(), elapsed);
+}
+
+pub(crate) fn record_value(label: &'static str, value: u64) {
+    if !enabled() {
+        return;
+    }
+    profiler().record_value(label.to_string(), value);
+}
+
 pub(crate) fn scope(label: &'static str) -> Scope {
     Scope {
         label,
         started: Instant::now(),
         enabled: enabled(),
+    }
+}
+
+pub(crate) fn cpu_scope(label: &'static str) -> CpuScope {
+    let enabled = enabled();
+    CpuScope {
+        label,
+        started: enabled.then(thread_cpu_time).flatten(),
+        enabled,
     }
 }
 
@@ -96,6 +121,27 @@ impl Drop for Scope {
     }
 }
 
+pub(crate) struct CpuScope {
+    label: &'static str,
+    started: Option<Duration>,
+    enabled: bool,
+}
+
+impl Drop for CpuScope {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let Some(started) = self.started else {
+            return;
+        };
+        let Some(current) = thread_cpu_time() else {
+            return;
+        };
+        profiler().record_cpu(self.label.to_string(), current.saturating_sub(started));
+    }
+}
+
 fn profiler() -> &'static Profiler {
     static PROFILER: OnceLock<Profiler> = OnceLock::new();
     PROFILER.get_or_init(|| {
@@ -116,6 +162,8 @@ fn profiler() -> &'static Profiler {
             started_cpu: process_cpu_usage(),
             last_emit: Mutex::new(now),
             buckets: Mutex::new(BTreeMap::new()),
+            cpu_buckets: Mutex::new(BTreeMap::new()),
+            value_buckets: Mutex::new(BTreeMap::new()),
             interval,
             top_n,
         }
@@ -131,6 +179,36 @@ impl Profiler {
             bucket.count = bucket.count.saturating_add(1);
             bucket.total_ns = bucket.total_ns.saturating_add(elapsed_ns);
             bucket.max_ns = bucket.max_ns.max(elapsed_ns);
+        }
+        self.emit_if_due();
+    }
+
+    fn record_cpu(&self, label: String, elapsed: Duration) {
+        {
+            let mut buckets = self
+                .cpu_buckets
+                .lock()
+                .expect("perf probe cpu buckets poisoned");
+            let bucket = buckets.entry(label).or_default();
+            let elapsed_ns = elapsed.as_nanos();
+            bucket.count = bucket.count.saturating_add(1);
+            bucket.total_ns = bucket.total_ns.saturating_add(elapsed_ns);
+            bucket.max_ns = bucket.max_ns.max(elapsed_ns);
+        }
+        self.emit_if_due();
+    }
+
+    fn record_value(&self, label: String, value: u64) {
+        {
+            let mut buckets = self
+                .value_buckets
+                .lock()
+                .expect("perf probe value buckets poisoned");
+            let bucket = buckets.entry(label).or_default();
+            let value = u128::from(value);
+            bucket.count = bucket.count.saturating_add(1);
+            bucket.total_ns = bucket.total_ns.saturating_add(value);
+            bucket.max_ns = bucket.max_ns.max(value);
         }
         self.emit_if_due();
     }
@@ -203,6 +281,72 @@ impl Profiler {
                 "weaver hot-path profile bucket"
             );
         }
+
+        let mut cpu_rows = {
+            let buckets = self
+                .cpu_buckets
+                .lock()
+                .expect("perf probe cpu buckets poisoned");
+            buckets
+                .iter()
+                .map(|(label, bucket)| (label.clone(), bucket.clone()))
+                .collect::<Vec<_>>()
+        };
+        cpu_rows.sort_by(|(_, left), (_, right)| {
+            right
+                .total_ns
+                .cmp(&left.total_ns)
+                .then_with(|| right.max_ns.cmp(&left.max_ns))
+        });
+        for (label, bucket) in cpu_rows.into_iter().take(self.top_n) {
+            let avg_ns = if bucket.count == 0 {
+                0
+            } else {
+                bucket.total_ns / u128::from(bucket.count)
+            };
+            tracing::info!(
+                target: "weaver::perf_probe",
+                bucket = %label,
+                count = bucket.count,
+                cpu_total_ms = ns_to_ms(bucket.total_ns),
+                cpu_avg_us = ns_to_us(avg_ns),
+                cpu_max_ms = ns_to_ms(bucket.max_ns),
+                "weaver hot-path CPU bucket"
+            );
+        }
+
+        let mut value_rows = {
+            let buckets = self
+                .value_buckets
+                .lock()
+                .expect("perf probe value buckets poisoned");
+            buckets
+                .iter()
+                .map(|(label, bucket)| (label.clone(), bucket.clone()))
+                .collect::<Vec<_>>()
+        };
+        value_rows.sort_by(|(_, left), (_, right)| {
+            right
+                .total_ns
+                .cmp(&left.total_ns)
+                .then_with(|| right.max_ns.cmp(&left.max_ns))
+        });
+        for (label, bucket) in value_rows.into_iter().take(self.top_n) {
+            let avg = if bucket.count == 0 {
+                0
+            } else {
+                bucket.total_ns / u128::from(bucket.count)
+            };
+            tracing::info!(
+                target: "weaver::perf_probe",
+                bucket = %label,
+                count = bucket.count,
+                total = bucket.total_ns,
+                avg = avg,
+                max = bucket.max_ns,
+                "weaver hot-path value bucket"
+            );
+        }
     }
 }
 
@@ -266,8 +410,80 @@ fn timeval_to_duration(timeval: libc::timeval) -> Duration {
     Duration::new(seconds, micros.saturating_mul(1_000))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn process_cpu_usage() -> Option<CpuUsage> {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut times = [zero_filetime(); 4];
+    let [creation, exit, kernel, user] = &mut times;
+    // SAFETY: the pseudo-handle is always valid for the current process and
+    // all four out-pointers reference live FILETIME slots.
+    let rc = unsafe { GetProcessTimes(GetCurrentProcess(), creation, exit, kernel, user) };
+    if rc == 0 {
+        return None;
+    }
+    Some(CpuUsage {
+        user: filetime_to_duration(times[3]),
+        system: filetime_to_duration(times[2]),
+    })
+}
+
+#[cfg(windows)]
+fn zero_filetime() -> windows_sys::Win32::Foundation::FILETIME {
+    windows_sys::Win32::Foundation::FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }
+}
+
+/// FILETIME counts 100 ns ticks. Granularity is the scheduler tick (~15.6 ms),
+/// which is fine for the aggregated deltas the probes report.
+#[cfg(windows)]
+fn filetime_to_duration(filetime: windows_sys::Win32::Foundation::FILETIME) -> Duration {
+    let ticks = ((filetime.dwHighDateTime as u64) << 32) | filetime.dwLowDateTime as u64;
+    Duration::from_nanos(ticks.saturating_mul(100))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_cpu_usage() -> Option<CpuUsage> {
+    None
+}
+
+#[cfg(unix)]
+fn thread_cpu_time() -> Option<Duration> {
+    let mut timespec = MaybeUninit::<libc::timespec>::uninit();
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, timespec.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let timespec = unsafe { timespec.assume_init() };
+    timespec_to_duration(timespec)
+}
+
+#[cfg(unix)]
+fn timespec_to_duration(timespec: libc::timespec) -> Option<Duration> {
+    let seconds = u64::try_from(timespec.tv_sec).ok()?;
+    let nanos = u32::try_from(timespec.tv_nsec).ok()?.min(999_999_999);
+    Some(Duration::new(seconds, nanos))
+}
+
+#[cfg(windows)]
+fn thread_cpu_time() -> Option<Duration> {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+    let mut times = [zero_filetime(); 4];
+    let [creation, exit, kernel, user] = &mut times;
+    // SAFETY: the pseudo-handle is always valid for the current thread and
+    // all four out-pointers reference live FILETIME slots.
+    let rc = unsafe { GetThreadTimes(GetCurrentThread(), creation, exit, kernel, user) };
+    if rc == 0 {
+        return None;
+    }
+    Some(filetime_to_duration(times[2]).saturating_add(filetime_to_duration(times[3])))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn thread_cpu_time() -> Option<Duration> {
     None
 }
 
@@ -278,11 +494,6 @@ fn classify_sql(template: &str) -> String {
     }
     if lower.contains("with active_file_complete_active") {
         return "complete_file".to_string();
-    }
-    if lower.contains("with d0 as (delete from active_segments")
-        && lower.contains("d_job as (delete from active_jobs")
-    {
-        return "active_job_rows.delete".to_string();
     }
     if lower.contains("with active_extracted_member_active") {
         return "add_extracted_member".to_string();
@@ -304,11 +515,9 @@ fn classify_sql(template: &str) -> String {
     for table in [
         "active_file_progress",
         "active_file_identities",
-        "active_segments",
         "active_par2_files",
-        "active_par2_metadata",
         "active_failed_extractions",
-        "active_extracted_members",
+        "active_extracted",
         "active_extraction_chunks",
         "active_rar_verified_suspect",
         "active_rar_volume_facts",
@@ -320,7 +529,6 @@ fn classify_sql(template: &str) -> String {
         "job_events",
         "integration_events",
         "job_history",
-        "diagnostic_runs",
         "settings",
         "servers",
     ] {

@@ -1,12 +1,11 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { useMutation, useQuery } from "urql";
-import { FolderOpen } from "lucide-react";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { DirectoryBrowserDialog } from "@/components/DirectoryBrowserDialog";
 import { EmptyState } from "@/components/EmptyState";
+import { FolderPathInput } from "@/components/FolderPathInput";
 import { PageHeader } from "@/components/PageHeader";
+import { SectionCard } from "@/components/SectionCard";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -152,8 +151,12 @@ export function Categories({ embedded = false }: { embedded?: boolean }) {
         />
       ) : (
         <>
-          <Card className="hidden md:block">
-            <CardContent className="px-0 pb-0">
+          <SectionCard
+            title={t("categories.title")}
+            className="hidden md:block"
+            contentClassName="-mx-5 -mb-5 sm:-mx-6 sm:-mb-6"
+          >
+            <div className="overflow-x-auto">
               <Table>
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
@@ -167,7 +170,9 @@ export function Categories({ embedded = false }: { embedded?: boolean }) {
                   {categories.map((category) => (
                     <TableRow key={category.id}>
                       <TableCell className="font-medium">{category.name}</TableCell>
-                      <TableCell>{category.destDir || "\u2014"}</TableCell>
+                      <TableCell className="font-mono text-[13px] text-muted-foreground">
+                        {category.destDir || "\u2014"}
+                      </TableCell>
                       <TableCell>{category.aliases || "\u2014"}</TableCell>
                       <TableCell>
                         <div className="flex flex-wrap gap-2">
@@ -183,17 +188,17 @@ export function Categories({ embedded = false }: { embedded?: boolean }) {
                   ))}
                 </TableBody>
               </Table>
-            </CardContent>
-          </Card>
+            </div>
+          </SectionCard>
 
           <div className="space-y-3 md:hidden">
             {categories.map((category) => (
-              <Card key={category.id}>
-                <CardContent className="space-y-3">
+              <div key={category.id} className="rounded-card border border-border bg-card p-5">
+                <div className="space-y-3">
                   <div>
                     <div className="font-medium text-foreground">{category.name}</div>
                     <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
-                      <span>{category.destDir || "\u2014"}</span>
+                      <span className="font-mono">{category.destDir || "\u2014"}</span>
                       <span>{category.aliases || "\u2014"}</span>
                     </div>
                   </div>
@@ -205,8 +210,8 @@ export function Categories({ embedded = false }: { embedded?: boolean }) {
                       {t("action.delete")}
                     </Button>
                   </div>
-                </CardContent>
-              </Card>
+                </div>
+              </div>
             ))}
           </div>
         </>
@@ -240,20 +245,17 @@ function CategoryFormCard({
 }) {
   const t = useTranslate();
   const [values, setValues] = useState(initialValues);
-  const [browserOpen, setBrowserOpen] = useState(false);
-  const [browsePath, setBrowsePath] = useState<string | null>(null);
 
   useEffect(() => {
     setValues(initialValues);
   }, [initialValues]);
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{editing ? t("categories.editCategory") : t("categories.addCategory")}</CardTitle>
-        <CardDescription>{t("settings.categoriesDesc")}</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-5">
+    <SectionCard
+      title={editing ? t("categories.editCategory") : t("categories.addCategory")}
+      description={t("settings.categoriesDesc")}
+    >
+      <div className="space-y-5">
         <div className="grid gap-4 xl:grid-cols-3">
           <Field label={t("categories.name")}>
             <Input
@@ -263,25 +265,10 @@ function CategoryFormCard({
             />
           </Field>
           <Field label={t("categories.destDir")} description={t("categories.destDirDesc")}>
-            <div className="flex gap-2">
-              <Input
-                value={values.destDir}
-                onChange={(event) =>
-                  setValues((current) => ({ ...current, destDir: event.target.value }))
-                }
-              />
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => {
-                  setBrowsePath(values.destDir.trim() || null);
-                  setBrowserOpen(true);
-                }}
-              >
-                <FolderOpen className="size-4" />
-                {t("categories.browse")}
-              </Button>
-            </div>
+            <FolderPathInput
+              value={values.destDir}
+              onChange={(destDir) => setValues((current) => ({ ...current, destDir }))}
+            />
           </Field>
           <Field label={t("categories.aliases")} description={t("categories.aliasesDesc")}>
             <Input
@@ -292,17 +279,6 @@ function CategoryFormCard({
           </Field>
         </div>
 
-        <DirectoryBrowserDialog
-          open={browserOpen}
-          path={browsePath}
-          onPathChange={setBrowsePath}
-          onClose={() => setBrowserOpen(false)}
-          onChoose={(nextPath) => {
-            setValues((current) => ({ ...current, destDir: nextPath }));
-            setBrowserOpen(false);
-          }}
-        />
-
         <div className="flex flex-wrap gap-3">
           <Button onClick={() => void onSave(values)} disabled={!values.name.trim() || saving}>
             {editing ? t("settings.save") : t("categories.addCategory")}
@@ -311,8 +287,8 @@ function CategoryFormCard({
             {t("action.cancel")}
           </Button>
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </SectionCard>
   );
 }
 

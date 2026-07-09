@@ -1,7 +1,4 @@
 pub const CLIENT_REQUEST_ID_ATTRIBUTE_KEY: &str = "__weaver_client_request_id";
-pub const DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY: &str = "__weaver_diagnostic_source_job_id";
-pub const DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY: &str =
-    "__weaver_diagnostic_include_server_hostnames";
 
 pub fn parse_history_metadata(metadata: Option<&str>) -> Vec<(String, String)> {
     metadata
@@ -10,12 +7,7 @@ pub fn parse_history_metadata(metadata: Option<&str>) -> Vec<(String, String)> {
 }
 
 pub fn is_public_history_attribute_key(key: &str) -> bool {
-    !matches!(
-        key,
-        CLIENT_REQUEST_ID_ATTRIBUTE_KEY
-            | DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY
-            | DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY
-    )
+    key != CLIENT_REQUEST_ID_ATTRIBUTE_KEY
 }
 
 pub fn public_history_attributes(metadata: &[(String, String)]) -> Vec<(String, String)> {

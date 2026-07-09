@@ -319,7 +319,7 @@ That means:
 
 ### Engine Boundaries Stay Explicit
 
-Engine crates should remain sharp and boring:
+Engine crates should remain sharp and focused:
 
 - NNTP
 - NZB

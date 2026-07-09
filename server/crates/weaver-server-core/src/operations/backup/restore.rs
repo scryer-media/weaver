@@ -229,6 +229,7 @@ fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
         downloaded_bytes: row.downloaded_bytes,
         optional_recovery_bytes: row.optional_recovery_bytes,
         optional_recovery_downloaded_bytes: row.optional_recovery_downloaded_bytes,
+        phase_progress: Vec::new(),
         failed_bytes: row.failed_bytes,
         health: row.health,
         password: None,
@@ -271,8 +272,6 @@ mod tests {
             created_at: 1,
             completed_at: 2,
             metadata: None,
-            last_diagnostic_id: None,
-            last_diagnostic_uploaded_at_epoch_ms: None,
         });
         assert_eq!(repairing.status, crate::JobStatus::Repairing);
         assert_eq!(repairing.download_state, crate::DownloadState::Complete);
@@ -296,8 +295,6 @@ mod tests {
             created_at: 1,
             completed_at: 2,
             metadata: None,
-            last_diagnostic_id: None,
-            last_diagnostic_uploaded_at_epoch_ms: None,
         });
         assert_eq!(moving.status, crate::JobStatus::Moving);
         assert_eq!(moving.download_state, crate::DownloadState::Complete);

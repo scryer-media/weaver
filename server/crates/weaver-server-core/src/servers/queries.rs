@@ -12,7 +12,7 @@ impl Database {
         self.run_sql_blocking(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT id, host, port, tls, username, password, connections, active, supports_pipelining, priority, tls_ca_cert
+                "SELECT id, host, port, tls, username, password, connections, active, supports_pipelining, priority, backfill, retention_days, tls_ca_cert
                    FROM servers ORDER BY priority, id",
                 &[],
             )
@@ -31,6 +31,8 @@ impl Database {
                         active: row.bool("active")?,
                         supports_pipelining: row.bool("supports_pipelining")?,
                         priority: row.i32("priority")? as u32,
+                        backfill: row.bool("backfill")?,
+                        retention_days: row.i32("retention_days")? as u32,
                         tls_ca_cert: row.opt_text("tls_ca_cert")?,
                     };
                     record.password = maybe_decrypt(encryption_key.as_ref(), record.password);

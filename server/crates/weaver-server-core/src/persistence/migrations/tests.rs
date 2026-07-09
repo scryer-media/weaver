@@ -110,7 +110,7 @@ fn migrate_journal_to_sqlite() {
     std::fs::create_dir_all(&dir).unwrap();
     let journal_path = dir.join("weaver.journal");
 
-    // Build a journal with 1 job, 3 segments, 1 completed file.
+    // Build a journal with 1 job, legacy segment events, and 1 completed file.
     let mut data = Vec::new();
     let nzb_path = dir.join("test.nzb");
     std::fs::write(&nzb_path, sample_nzb_bytes()).unwrap();
@@ -173,7 +173,6 @@ fn migrate_journal_to_sqlite() {
     let job = &jobs[&JobId(1)];
     assert_eq!(job.nzb_path, nzb_path);
     assert_eq!(job.status, "verifying");
-    assert_eq!(job.committed_segments.len(), 3);
     assert_eq!(job.complete_files.len(), 1);
     assert_eq!(job.category, Some("movies".to_string()));
 

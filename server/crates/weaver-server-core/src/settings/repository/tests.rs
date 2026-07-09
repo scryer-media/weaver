@@ -31,6 +31,8 @@ fn server_crud() {
         active: true,
         supports_pipelining: false,
         priority: 0,
+        backfill: false,
+        retention_days: 0,
         tls_ca_cert: None,
     };
 
@@ -78,6 +80,8 @@ fn config_roundtrip() {
             active: true,
             supports_pipelining: true,
             priority: 0,
+            backfill: false,
+            retention_days: 0,
             tls_ca_cert: None,
         }],
         categories: vec![CategoryConfig {
@@ -89,8 +93,16 @@ fn config_roundtrip() {
         retry: None,
         max_download_speed: Some(1_000_000),
         isp_bandwidth_cap: None,
-        diagnostic_upload_url: None,
+        ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(false),
+        watch_folder: crate::watch_folder::WatchFolderConfig {
+            mode: crate::watch_folder::WatchFolderMode::Polling,
+            path: Some("/incoming/nzbs".to_string()),
+            poll_interval_secs: 45,
+            stability_secs: 2,
+            category_from_subfolders: true,
+            scanning_paused: false,
+        },
         config_path: None,
     };
 
@@ -105,6 +117,13 @@ fn config_roundtrip() {
     assert_eq!(loaded.complete_dir, Some("/tmp/complete".to_string()));
     assert_eq!(loaded.max_download_speed, Some(1_000_000));
     assert_eq!(loaded.cleanup_after_extract, Some(false));
+    assert_eq!(loaded.watch_folder.path.as_deref(), Some("/incoming/nzbs"));
+    assert_eq!(
+        loaded.watch_folder.mode,
+        crate::watch_folder::WatchFolderMode::Polling
+    );
+    assert_eq!(loaded.watch_folder.poll_interval_secs, 45);
+    assert_eq!(loaded.watch_folder.stability_secs, 2);
     assert_eq!(loaded.servers.len(), 1);
     assert_eq!(loaded.servers[0].host, "news.test.com");
     assert!(loaded.servers[0].supports_pipelining);

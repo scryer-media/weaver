@@ -48,7 +48,6 @@ const RESTORE_PRISTINE_TABLES: &[&str] = &[
     "job_history_attributes",
     "job_events",
     "active_jobs",
-    "active_segments",
     "active_file_progress",
     "active_files",
     "active_file_identities",
@@ -97,11 +96,7 @@ const REBUILD_JOB_HISTORY_ATTRIBUTES_SQL: &str =
        AND json_array_length(attr.value) = 2
        AND json_type(attr.value, '$[0]') = 'text'
        AND json_type(attr.value, '$[1]') = 'text'
-       AND json_extract(attr.value, '$[0]') NOT IN (
-           '__weaver_client_request_id',
-           '__weaver_diagnostic_source_job_id',
-           '__weaver_diagnostic_include_server_hostnames'
-       )";
+       AND json_extract(attr.value, '$[0]') != '__weaver_client_request_id'";
 
 #[derive(Debug, Clone)]
 pub struct StableStateExport {
@@ -387,6 +382,26 @@ impl Database {
                             } else {
                                 "0"
                             };
+                            let src_server_backfill =
+                                if table_has_column(&mut conn, "src", "servers", "backfill")
+                                    .await?
+                                {
+                                    "backfill"
+                                } else {
+                                    "0"
+                                };
+                            let src_server_retention_days = if table_has_column(
+                                &mut conn,
+                                "src",
+                                "servers",
+                                "retention_days",
+                            )
+                            .await?
+                            {
+                                "retention_days"
+                            } else {
+                                "0"
+                            };
 
                             let mut tx = conn.begin().await.map_err(db_err)?;
                             for table in CLEAR_IMPORT_TABLES {
@@ -400,8 +415,8 @@ impl Database {
                             let import_sql = format!(
                                 "INSERT INTO settings (key, value)
                                      SELECT key, value FROM src.settings;
-                                 INSERT INTO servers (id, host, port, tls, username, password, connections, active, supports_pipelining, priority)
-                                     SELECT id, host, port, tls, username, password, connections, active, supports_pipelining, priority FROM src.servers;
+                                 INSERT INTO servers (id, host, port, tls, username, password, connections, active, supports_pipelining, priority, backfill, retention_days)
+                                     SELECT id, host, port, tls, username, password, connections, active, supports_pipelining, priority, {src_server_backfill}, {src_server_retention_days} FROM src.servers;
                                  INSERT INTO categories (id, name, dest_dir, aliases)
                                      SELECT id, name, dest_dir, aliases FROM src.categories;
                                  INSERT INTO api_keys (id, name, key_hash, scope, created_at, last_used_at)
@@ -412,7 +427,18 @@ impl Database {
                                       failed_bytes, health, category, output_dir, nzb_path, created_at, completed_at, metadata)
                                      SELECT job_id, name, status, error_message, total_bytes, downloaded_bytes,
                                             {src_optional_recovery_bytes}, {src_optional_recovery_downloaded_bytes},
-                                            failed_bytes, health, category, output_dir, nzb_path, created_at, completed_at, metadata
+                                            failed_bytes, health, category, output_dir, nzb_path, created_at, completed_at,
+                                            CASE
+                                                WHEN metadata IS NULL OR NOT json_valid(metadata) THEN metadata
+                                                ELSE (
+                                                    SELECT COALESCE(json_group_array(json(attr.value)), '[]')
+                                                      FROM json_each(metadata) AS attr
+                                                     WHERE COALESCE(json_extract(attr.value, '$[0]'), '') NOT IN (
+                                                        '__weaver_diagnostic_source_job_id',
+                                                        '__weaver_diagnostic_include_server_hostnames'
+                                                     )
+                                                )
+                                            END AS metadata
                                      FROM src.job_history;
                                  INSERT INTO job_events (id, job_id, timestamp, kind, message, file_id)
                                      SELECT id, job_id, timestamp, kind, message, file_id FROM src.job_events;

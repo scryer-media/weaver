@@ -97,8 +97,9 @@ fn sample_config() -> Config {
         retry: None,
         max_download_speed: Some(1234),
         isp_bandwidth_cap: None,
-        diagnostic_upload_url: None,
+        ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(true),
+        watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         config_path: None,
     }
 }
@@ -123,8 +124,6 @@ fn populate_source_db(db: &Database) {
         created_at: 1,
         completed_at: 2,
         metadata: None,
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     })
     .unwrap();
 }
@@ -274,8 +273,9 @@ async fn restore_requires_category_remap_for_external_paths() {
             retry: None,
             max_download_speed: None,
             isp_bandwidth_cap: None,
-            diagnostic_upload_url: None,
+            ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
+            watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             config_path: None,
         })
         .unwrap();
@@ -293,8 +293,9 @@ async fn restore_requires_category_remap_for_external_paths() {
             retry: None,
             max_download_speed: None,
             isp_bandwidth_cap: None,
-            diagnostic_upload_url: None,
+            ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
+            watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             config_path: None,
         },
     );
@@ -349,8 +350,9 @@ async fn restore_rewrites_paths_and_refreshes_runtime() {
             retry: None,
             max_download_speed: None,
             isp_bandwidth_cap: None,
-            diagnostic_upload_url: None,
+            ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
+            watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             config_path: None,
         })
         .unwrap();
@@ -368,8 +370,9 @@ async fn restore_rewrites_paths_and_refreshes_runtime() {
             retry: None,
             max_download_speed: None,
             isp_bandwidth_cap: None,
-            diagnostic_upload_url: None,
+            ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
+            watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             config_path: None,
         },
     );

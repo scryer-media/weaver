@@ -32,23 +32,41 @@ pub fn spawn_maintenance_worker(
 }
 
 async fn run_maintenance_pass(db: Database, complete_dir: PathBuf) {
-    if db.datastore().engine() == SqlEngine::Sqlite {
-        let sqlite_db = db.clone();
-        match tokio::task::spawn_blocking(move || {
-            sqlite_db.run_sqlite_maintenance_pass(DbMaintenanceOptions::default())
-        })
-        .await
-        {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(error = %error, "sqlite maintenance pass failed");
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "sqlite maintenance worker panicked");
+    match db.datastore().engine() {
+        SqlEngine::Sqlite => {
+            let sqlite_db = db.clone();
+            match tokio::task::spawn_blocking(move || {
+                sqlite_db.run_sqlite_maintenance_pass(DbMaintenanceOptions::default())
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "sqlite maintenance pass failed");
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "sqlite maintenance worker panicked");
+                }
             }
         }
-    } else {
-        tracing::debug!("skipping sqlite maintenance for non-sqlite datastore");
+        SqlEngine::Postgres => {
+            // Postgres autovacuum reclaims space, but it will not refresh planner
+            // statistics on a predictable cadence for our churny hot tables, so
+            // run per-table ANALYZE at the same maintenance interval. ANALYZE is
+            // cheap; VACUUM is intentionally left to autovacuum.
+            let postgres_db = db.clone();
+            match tokio::task::spawn_blocking(move || postgres_db.run_postgres_maintenance_pass())
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "postgres maintenance pass failed");
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "postgres maintenance worker panicked");
+                }
+            }
+        }
     }
 
     match tokio::task::spawn_blocking(move || run_staging_cleanup(&db, &complete_dir)).await {

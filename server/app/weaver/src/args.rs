@@ -32,15 +32,18 @@ impl Cli {
 fn default_implicit_config_path() -> PathBuf {
     #[cfg(windows)]
     {
-        return windows_implicit_config_path(
+        windows_implicit_config_path(
             PathBuf::from(DEFAULT_CONFIG_FILE).exists(),
             PathBuf::from("weaver.db").exists(),
             std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
             std::env::var_os("APPDATA").map(PathBuf::from),
-        );
+        )
     }
 
-    PathBuf::from(DEFAULT_CONFIG_FILE)
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(DEFAULT_CONFIG_FILE)
+    }
 }
 
 #[cfg(windows)]

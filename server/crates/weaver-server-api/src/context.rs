@@ -1,9 +1,12 @@
+use std::sync::Arc;
 use std::time::Duration;
 
-use async_graphql::Schema;
+use async_graphql::{Schema, SchemaBuilder};
+use weaver_nntp::pool::NntpPool;
 use weaver_server_core::Database;
 use weaver_server_core::auth::ApiKeyCache;
 use weaver_server_core::settings::SharedConfig;
+use weaver_server_core::watch_folder::WatchFolderService;
 
 use crate::auth::LoginAuthCache;
 use crate::jobs::replay::QueueEventReplay;
@@ -12,6 +15,17 @@ use crate::rss::RssService;
 use crate::schema::{MutationRoot, QueryRoot, SubscriptionRoot};
 
 pub type WeaverSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
+pub const GRAPHQL_MAX_COMPLEXITY: usize = 512;
+pub const GRAPHQL_MAX_DEPTH: usize = 16;
+
+pub fn apply_graphql_query_guards<Query, Mutation, Subscription>(
+    builder: SchemaBuilder<Query, Mutation, Subscription>,
+) -> SchemaBuilder<Query, Mutation, Subscription> {
+    builder
+        .disable_introspection()
+        .limit_complexity(GRAPHQL_MAX_COMPLEXITY)
+        .limit_depth(GRAPHQL_MAX_DEPTH)
+}
 
 pub struct SchemaContext {
     pub handle: weaver_server_core::SchedulerHandle,
@@ -20,8 +34,17 @@ pub struct SchemaContext {
     pub auth_cache: LoginAuthCache,
     pub api_key_cache: ApiKeyCache,
     pub rss: RssService,
+    pub watch_folder: WatchFolderService,
     pub schedules: weaver_server_core::bandwidth::schedule::SharedSchedules,
     pub log_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
+    /// Live NNTP pool for per-server health metrics. `None` in contexts without a pool (tests).
+    pub nntp_pool: Option<Arc<NntpPool>>,
+    /// Whether to spawn the background history-delete worker. Always `true` in
+    /// production; tests that assert on a freshly-seeded QUEUED delete operation
+    /// set this `false` so the worker cannot claim the operation out from under
+    /// the assertion. The `HistoryDeleteManager` is still wired into the schema
+    /// so on-demand delete mutations work regardless.
+    pub spawn_history_delete_worker: bool,
 }
 
 pub fn build_schema(context: SchemaContext) -> WeaverSchema {
@@ -32,7 +55,9 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
         context.handle.clone(),
         replay.clone(),
     );
-    history_delete_manager.spawn_worker();
+    if context.spawn_history_delete_worker {
+        history_delete_manager.spawn_worker();
+    }
 
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -44,37 +69,27 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .expect("http client build should succeed");
-    #[cfg(weaver_diagnostics)]
-    let diagnostic_manager = crate::history::diagnostics::DiagnosticManager::new(
-        context.db.clone(),
-        context.handle.clone(),
-        context.config.clone(),
-        context.log_buffer.clone(),
-        http_client.clone(),
-    );
-    #[cfg(weaver_diagnostics)]
-    diagnostic_manager.spawn_worker();
     let staged_upload_manager = StagedUploadManager::new();
     staged_upload_manager.spawn_cleanup_worker();
 
-    let schema = Schema::build(
+    let schema = apply_graphql_query_guards(Schema::build(
         QueryRoot::default(),
         MutationRoot::default(),
         SubscriptionRoot::default(),
-    )
+    ))
     .data(context.handle)
     .data(context.config)
     .data(context.db)
     .data(context.auth_cache)
     .data(context.api_key_cache)
     .data(context.rss)
+    .data(context.watch_folder)
     .data(context.schedules)
     .data(http_client)
     .data(context.log_buffer)
+    .data(context.nntp_pool)
     .data(replay)
     .data(history_delete_manager)
     .data(staged_upload_manager);
-    #[cfg(weaver_diagnostics)]
-    let schema = schema.data(diagnostic_manager);
     schema.finish()
 }

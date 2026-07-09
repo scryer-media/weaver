@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use super::ApiKeyAuthRow;
-use super::service::derive_jwt_secret;
 use crate::auth::repository::AuthCredentials;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,19 +12,20 @@ pub struct CachedLoginAuth {
 }
 
 impl CachedLoginAuth {
-    pub fn new(username: impl Into<String>, password_hash: impl Into<String>) -> Self {
-        let username = username.into();
-        let password_hash = password_hash.into();
-        let jwt_secret = derive_jwt_secret(&password_hash);
+    pub fn new(
+        username: impl Into<String>,
+        password_hash: impl Into<String>,
+        jwt_secret: [u8; 32],
+    ) -> Self {
         Self {
-            username,
-            password_hash,
+            username: username.into(),
+            password_hash: password_hash.into(),
             jwt_secret,
         }
     }
 
-    pub fn from_credentials(credentials: AuthCredentials) -> Self {
-        Self::new(credentials.username, credentials.password_hash)
+    pub fn from_credentials(credentials: AuthCredentials, jwt_secret: [u8; 32]) -> Self {
+        Self::new(credentials.username, credentials.password_hash, jwt_secret)
     }
 }
 
@@ -33,9 +33,9 @@ impl CachedLoginAuth {
 pub struct LoginAuthCache(Arc<RwLock<Option<CachedLoginAuth>>>);
 
 impl LoginAuthCache {
-    pub fn from_credentials(credentials: Option<AuthCredentials>) -> Self {
+    pub fn from_credentials(credentials: Option<AuthCredentials>, jwt_secret: [u8; 32]) -> Self {
         let cache = Self::default();
-        cache.replace_credentials(credentials);
+        cache.replace_credentials(credentials, jwt_secret);
         cache
     }
 
@@ -53,8 +53,11 @@ impl LoginAuthCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = auth;
     }
 
-    pub fn replace_credentials(&self, credentials: Option<AuthCredentials>) {
-        self.replace(credentials.map(CachedLoginAuth::from_credentials));
+    pub fn replace_credentials(&self, credentials: Option<AuthCredentials>, jwt_secret: [u8; 32]) {
+        self.replace(
+            credentials
+                .map(|credentials| CachedLoginAuth::from_credentials(credentials, jwt_secret)),
+        );
     }
 
     pub fn clear(&self) {

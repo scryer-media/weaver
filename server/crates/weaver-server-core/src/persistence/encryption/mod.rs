@@ -119,21 +119,20 @@ pub fn is_encrypted(value: &str) -> bool {
 }
 
 /// Encrypt a value if it's not already encrypted. Returns as-is if already encrypted or empty/None.
-pub(crate) fn maybe_encrypt(key: Option<&EncryptionKey>, value: &Option<String>) -> Option<String> {
-    let v = value.as_deref()?;
+pub(crate) fn maybe_encrypt(
+    key: Option<&EncryptionKey>,
+    value: &Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(v) = value.as_deref() else {
+        return Ok(None);
+    };
     if v.is_empty() || is_encrypted(v) {
-        return Some(v.to_string());
+        return Ok(Some(v.to_string()));
     }
     let Some(key) = key else {
-        return Some(v.to_string());
+        return Err("encryption key is required to store secrets".to_string());
     };
-    match encrypt_value(key, v) {
-        Ok(encrypted) => Some(encrypted),
-        Err(e) => {
-            tracing::warn!("failed to encrypt value: {e}");
-            Some(v.to_string())
-        }
-    }
+    encrypt_value(key, v).map(Some)
 }
 
 /// Encrypt a secret for new writes. Plaintext compatibility is read-only: callers
@@ -175,13 +174,25 @@ pub(crate) fn maybe_decrypt(key: Option<&EncryptionKey>, value: Option<String>) 
 /// Ensure an encryption master key is available.
 ///
 /// Priority:
-/// 1. Platform keystores (Docker secret, OS keychain, key file)
-/// 2. `WEAVER_ENCRYPTION_KEY` env var escape hatch
+/// 1. `WEAVER_ENCRYPTION_KEY` env var explicit override
+/// 2. Platform keystores (Docker secret, OS keychain, key file)
 /// 3. Auto-generate an in-memory ephemeral key, warn
 pub fn ensure_encryption_key(data_dir: Option<PathBuf>) -> Result<EncryptionKey, String> {
+    // 1. Env var explicit override. Non-interactive tooling and profiling
+    // should be able to avoid platform keychain prompts entirely.
+    if let Ok(env_key) = std::env::var("WEAVER_ENCRYPTION_KEY") {
+        let trimmed = env_key.trim().to_string();
+        if !trimmed.is_empty() {
+            let key = EncryptionKey::from_base64(&trimmed)
+                .map_err(|e| format!("invalid WEAVER_ENCRYPTION_KEY: {e}"))?;
+            tracing::info!("using encryption master key from WEAVER_ENCRYPTION_KEY");
+            return Ok(key);
+        }
+    }
+
     let stores = keystore::platform_keystores(data_dir);
 
-    // 1. Persistent platform keystores
+    // 2. Persistent platform keystores
     for store in &stores {
         match store.get_key() {
             Ok(Some(key_b64)) => {
@@ -195,17 +206,6 @@ pub fn ensure_encryption_key(data_dir: Option<PathBuf>) -> Result<EncryptionKey,
                 tracing::warn!("could not read from {}: {e}", store.name());
                 continue;
             }
-        }
-    }
-
-    // 2. Env var escape hatch.
-    if let Ok(env_key) = std::env::var("WEAVER_ENCRYPTION_KEY") {
-        let trimmed = env_key.trim().to_string();
-        if !trimmed.is_empty() {
-            let key = EncryptionKey::from_base64(&trimmed)
-                .map_err(|e| format!("invalid WEAVER_ENCRYPTION_KEY: {e}"))?;
-            tracing::info!("using encryption master key from WEAVER_ENCRYPTION_KEY");
-            return Ok(key);
         }
     }
 

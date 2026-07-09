@@ -3,8 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use weaver_server_core::history::timeline::JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER;
 use weaver_server_core::{
-    AsyncOperationState, AsyncOperationTargetState, DiagnosticRunRow,
-    DiagnosticRunStage as CoreDiagnosticRunStage,
+    AsyncOperationState, AsyncOperationTargetState,
     HistoryDeleteOperationSummary as CoreHistoryDeleteOperationSummary,
     HistoryDeleteRowState as CoreHistoryDeleteRowState, JobHistoryRow, parse_history_metadata,
     split_history_metadata,
@@ -40,41 +39,8 @@ pub struct HistoryItem {
     pub output_dir: Option<String>,
     pub created_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
-    pub last_diagnostic_id: Option<String>,
-    pub last_diagnostic_uploaded_at: Option<DateTime<Utc>>,
-    pub diagnostic_run: Option<HistoryDiagnosticRun>,
     pub attention: Option<QueueAttention>,
     pub delete_operation: Option<HistoryDeleteRowState>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
-pub enum HistoryDiagnosticStage {
-    Queued,
-    Running,
-    Collecting,
-    Uploading,
-    Complete,
-    Failed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SimpleObject, Serialize, Deserialize)]
-pub struct HistoryDiagnosticRun {
-    pub source_job_id: u64,
-    pub diagnostic_job_id: u64,
-    pub diagnostic_id: Option<String>,
-    pub stage: HistoryDiagnosticStage,
-    pub include_server_hostnames: bool,
-    pub rerun_succeeded: Option<bool>,
-    pub error_message: Option<String>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
-pub struct DiagnosticRedownloadAcceptance {
-    pub source_job_id: u64,
-    pub diagnostic_job_id: u64,
-    pub stage: HistoryDiagnosticStage,
-    pub include_server_hostnames: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
@@ -278,6 +244,7 @@ pub enum EventKind {
     SegmentFailedPermanent,
     GlobalPaused,
     GlobalResumed,
+    PhaseProgressUpdated,
 }
 
 impl std::str::FromStr for EventKind {
@@ -414,7 +381,6 @@ pub struct JobTimeline {
 
 pub fn history_item_from_row(
     row: &JobHistoryRow,
-    diagnostic_run: Option<HistoryDiagnosticRun>,
     delete_operation: Option<HistoryDeleteRowState>,
 ) -> HistoryItem {
     let metadata_pairs = parse_history_metadata(row.metadata.as_deref());
@@ -453,35 +419,8 @@ pub fn history_item_from_row(
         output_dir: row.output_dir.clone(),
         created_at: secs_to_datetime(row.created_at),
         completed_at: secs_to_datetime(row.completed_at),
-        last_diagnostic_id: row.last_diagnostic_id.clone(),
-        last_diagnostic_uploaded_at: row.last_diagnostic_uploaded_at_epoch_ms.map(ms_to_datetime),
-        diagnostic_run,
         attention: attention_for_history_row(row, state),
         delete_operation,
-    }
-}
-
-pub fn history_diagnostic_run_from_core(row: DiagnosticRunRow) -> HistoryDiagnosticRun {
-    HistoryDiagnosticRun {
-        source_job_id: row.source_job_id,
-        diagnostic_job_id: row.diagnostic_job_id,
-        diagnostic_id: row.diagnostic_id,
-        stage: history_diagnostic_stage_from_core(row.stage),
-        include_server_hostnames: row.include_server_hostnames,
-        rerun_succeeded: row.rerun_succeeded,
-        error_message: row.error_message,
-        updated_at: ms_to_datetime(row.updated_at_epoch_ms),
-    }
-}
-
-pub fn history_diagnostic_stage_from_core(stage: CoreDiagnosticRunStage) -> HistoryDiagnosticStage {
-    match stage {
-        CoreDiagnosticRunStage::Queued => HistoryDiagnosticStage::Queued,
-        CoreDiagnosticRunStage::Running => HistoryDiagnosticStage::Running,
-        CoreDiagnosticRunStage::Collecting => HistoryDiagnosticStage::Collecting,
-        CoreDiagnosticRunStage::Uploading => HistoryDiagnosticStage::Uploading,
-        CoreDiagnosticRunStage::Complete => HistoryDiagnosticStage::Complete,
-        CoreDiagnosticRunStage::Failed => HistoryDiagnosticStage::Failed,
     }
 }
 
@@ -578,10 +517,6 @@ fn split_attributes(metadata: &[(String, String)]) -> (Option<String>, Vec<Attri
 
 fn secs_to_datetime(secs: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(secs, 0).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
-}
-
-fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 
 fn attention_for_history_row(row: &JobHistoryRow, state: QueueItemState) -> Option<QueueAttention> {

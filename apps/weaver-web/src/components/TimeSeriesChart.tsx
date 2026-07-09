@@ -39,9 +39,9 @@ function readThemeColors(themeMode: "light" | "dark") {
           teal: "#2dd4bf",
           orange: "#fb923c",
           violet: "#a78bfa",
-          magenta: "#e879f9",
+          magenta: "#d946ef",
           red: "#f87171",
-          amber: "#fbbf24",
+          amber: "#f5a623",
           indigo: "#818cf8",
           green: "#4ade80",
         }
@@ -290,7 +290,7 @@ export function TimeSeriesChart({
   return (
     <div className={cn("space-y-4", className)}>
       <div
-        className="relative overflow-hidden rounded-2xl border border-border/70 bg-field/60 p-2"
+        className="relative overflow-hidden rounded-inner border border-border bg-background/40 p-2"
         style={{ height }}
       >
         {hasData ? <div ref={hostRef} className="h-full w-full" /> : null}
@@ -305,17 +305,17 @@ export function TimeSeriesChart({
         {resolvedSeries.map((item, index) => (
           <div
             key={`${item.label}-${index}`}
-            className="rounded-2xl border border-border/60 bg-background/60 px-3 py-2"
+            className="rounded-inner border border-border p-3"
           >
-            <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
+            <div className="flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-[0.13em] text-muted-foreground">
               <span
-                className="h-2.5 w-2.5 rounded-full"
+                className="h-2.5 w-2.5 shrink-0 rounded-pill"
                 style={{ backgroundColor: item.color }}
                 aria-hidden
               />
-              <span>{item.label}</span>
+              <span className="truncate">{item.label}</span>
             </div>
-            <div className="mt-2 text-sm font-semibold text-foreground">
+            <div className="mt-2 font-space-grotesk text-lg font-bold leading-none tracking-tight text-foreground">
               {formatMetricValue(item.format, latestValues[index] ?? 0)}
             </div>
           </div>

@@ -1,5 +1,7 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::sync::OnceLock;
 
 use crate::runtime::file_cache;
 
@@ -163,6 +165,91 @@ pub(crate) fn destination_parent_matches(
 ) -> io::Result<bool> {
     let parent = dst.parent().unwrap_or_else(|| Path::new("."));
     directory_fingerprint_from_path(parent).map(|actual| &actual == expected)
+}
+
+pub(crate) fn normalize_extracted_tree(path: &Path) -> io::Result<()> {
+    if let Err(error) = std::fs::symlink_metadata(path) {
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(error);
+    }
+
+    #[cfg(unix)]
+    {
+        normalize_extracted_tree_unix(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn normalize_extracted_tree_unix(path: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn normalize_one(
+        path: &Path,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+        umask: u32,
+    ) -> io::Result<()> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        let path_c = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path contains NUL byte: {}", path.display()),
+            )
+        })?;
+
+        if metadata.uid() != uid || metadata.gid() != gid {
+            let chown_result = unsafe { libc::lchown(path_c.as_ptr(), uid, gid) };
+            if chown_result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+
+        let mode = (if metadata.is_dir() { 0o777 } else { 0o666 }) & !umask;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(mode);
+        std::fs::set_permissions(path, permissions)?;
+
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                normalize_one(&entry?.path(), uid, gid, umask)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    normalize_one(
+        path,
+        unsafe { libc::geteuid() },
+        unsafe { libc::getegid() },
+        current_umask(),
+    )
+}
+
+#[cfg(unix)]
+fn current_umask() -> u32 {
+    static UMASK: OnceLock<u32> = OnceLock::new();
+    *UMASK.get_or_init(|| {
+        let mask = unsafe { libc::umask(0o022) };
+        unsafe {
+            libc::umask(mask);
+        }
+        mask as u32
+    })
 }
 
 fn path_equivalence_key(path: &Path) -> String {
@@ -353,5 +440,65 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read(&dst).unwrap(), b"existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_extracted_tree_applies_runtime_umask_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("out");
+        let dir = root.join("nested");
+        let file = dir.join("movie.mkv");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, b"media").unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        normalize_extracted_tree(&root).unwrap();
+
+        let mask = current_umask();
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o777 & !mask
+        );
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o777 & !mask
+        );
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o666 & !mask
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_extracted_tree_does_not_follow_symlink_targets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("out");
+        let target = temp.path().join("target.bin");
+        let link = root.join("link.bin");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&target, b"target").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        normalize_extracted_tree(&root).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

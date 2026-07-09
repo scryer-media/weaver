@@ -127,6 +127,65 @@ async fn update_max_download_speed() {
 }
 
 #[tokio::test]
+async fn update_watch_folder_settings() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                updateSettings(input: {
+                    watchFolder: {
+                        mode: "polling",
+                        path: "/tmp/watch-nzbs",
+                        pollIntervalSecs: 30,
+                        stabilitySecs: 5,
+                        categoryFromSubfolders: false,
+                        scanningPaused: true
+                    }
+                }) {
+                    watchFolder {
+                        mode
+                        path
+                        pollIntervalSecs
+                        stabilitySecs
+                        categoryFromSubfolders
+                        scanningPaused
+                    }
+                }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let watch = &data["updateSettings"]["watchFolder"];
+    assert_eq!(watch["mode"].as_str().unwrap(), "polling");
+    assert_eq!(watch["path"].as_str().unwrap(), "/tmp/watch-nzbs");
+    assert_eq!(watch["pollIntervalSecs"].as_u64().unwrap(), 30);
+    assert_eq!(watch["stabilitySecs"].as_u64().unwrap(), 5);
+    assert!(!watch["categoryFromSubfolders"].as_bool().unwrap());
+    assert!(watch["scanningPaused"].as_bool().unwrap());
+
+    let resp = h
+        .execute(
+            r#"{
+                settings {
+                    watchFolder {
+                        mode
+                        path
+                        pollIntervalSecs
+                        stabilitySecs
+                        categoryFromSubfolders
+                        scanningPaused
+                    }
+                }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(&data["settings"]["watchFolder"], watch);
+}
+
+#[tokio::test]
 async fn settings_persist_across_queries() {
     let h = TestHarness::new().await;
 

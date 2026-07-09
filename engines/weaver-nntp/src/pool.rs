@@ -1,8 +1,11 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
@@ -38,8 +41,18 @@ pub struct NntpPool {
     stale_check_age: Duration,
     /// Priority group for each server (parallel to pools/configs).
     groups: Vec<u32>,
+    /// Backfill flag for each server (parallel to pools/configs).
+    backfill: Vec<bool>,
+    /// Retention window in days for each server (parallel to pools/configs).
+    retention_days: Vec<u32>,
     /// Maximum connections per server (parallel to pools/configs).
     max_connections: Vec<usize>,
+    retired_ips: Arc<Mutex<HashSet<(usize, IpAddr)>>>,
+    connect_cursors: Vec<AtomicUsize>,
+}
+
+pub struct BlockingConnectionPermit {
+    _permit: OwnedSemaphorePermit,
 }
 
 /// Configuration for creating an NNTP pool.
@@ -67,8 +80,27 @@ impl Default for PoolConfig {
 pub struct ServerPoolConfig {
     pub server: ServerConfig,
     pub max_connections: usize,
-    /// Priority group (0 = primary, 1+ = backfill). Lower values tried first.
+    /// Priority group. Lower values tried first within a tier.
     pub group: u32,
+    /// Backfill servers are ordered after every fill server and are only
+    /// reachable once all fill servers are excluded for a request.
+    pub backfill: bool,
+    /// Days of retention this server is expected to hold (0 = unlimited).
+    /// Inert metadata for the pool: callers translate it into per-request
+    /// exclusions; carrying it here keeps it aligned with server indices.
+    pub retention_days: u32,
+}
+
+impl Default for ServerPoolConfig {
+    fn default() -> Self {
+        Self {
+            server: ServerConfig::default(),
+            max_connections: 1,
+            group: 0,
+            backfill: false,
+            retention_days: 0,
+        }
+    }
 }
 
 impl NntpPool {
@@ -80,11 +112,24 @@ impl NntpPool {
         let mut semaphores = Vec::with_capacity(server_count);
         let mut last_connect_failure = Vec::with_capacity(server_count);
         let mut groups = Vec::with_capacity(server_count);
+        let mut backfill = Vec::with_capacity(server_count);
+        let mut retention_days = Vec::with_capacity(server_count);
         let mut max_connections = Vec::with_capacity(server_count);
+        let mut connect_cursors = Vec::with_capacity(server_count);
+
+        // A config where every server is backfill has no fill tier to
+        // exhaust; treat it as an all-fill config so downloads can proceed.
+        let all_backfill = server_count > 0 && config.servers.iter().all(|spc| spc.backfill);
+        if all_backfill {
+            warn!("every configured server is marked backfill; treating all servers as fill");
+        }
 
         for spc in &config.servers {
             groups.push(spc.group);
+            backfill.push(spc.backfill && !all_backfill);
+            retention_days.push(spc.retention_days);
             max_connections.push(spc.max_connections);
+            connect_cursors.push(AtomicUsize::new(0));
             semaphores.push(Arc::new(Semaphore::new(spc.max_connections)));
             configs.push(spc.server.clone());
             pools.push(Arc::new(Mutex::new(ServerPool {
@@ -112,8 +157,38 @@ impl NntpPool {
             reconnect_delay: config.reconnect_delay,
             stale_check_age: config.stale_check_age,
             groups,
+            backfill,
+            retention_days,
             max_connections,
+            retired_ips: Arc::new(Mutex::new(HashSet::new())),
+            connect_cursors,
         }
+    }
+
+    fn next_connect_offset(&self, idx: usize) -> usize {
+        self.connect_cursors[idx].fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn retired_ips_for_server(&self, idx: usize) -> Vec<IpAddr> {
+        self.retired_ips
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(server_idx, ip)| (*server_idx == idx).then_some(*ip))
+            .collect()
+    }
+
+    async fn connect_server_excluding(
+        &self,
+        idx: usize,
+        excluded_ips: &[IpAddr],
+    ) -> Result<NntpConnection> {
+        let mut exclusions = self.retired_ips_for_server(idx).await;
+        exclusions.extend(excluded_ips.iter().copied());
+        exclusions.sort_unstable();
+        exclusions.dedup();
+        let offset = self.next_connect_offset(idx);
+        NntpConnection::connect_with_ip_policy(&self.configs[idx], &exclusions, offset).await
     }
 
     /// Acquire a connection from a specific server.
@@ -134,14 +209,38 @@ impl NntpPool {
             .await
             .map_err(|_| NntpError::PoolShutdown)?;
 
-        self.acquire_with_permit(idx, permit).await
+        self.acquire_with_permit(idx, Some(permit)).await
+    }
+
+    /// Acquire an explicit over-max connection from a specific server.
+    pub async fn acquire_extra(&self, server: ServerId) -> Result<PooledConnection> {
+        self.acquire_extra_excluding(server, &[]).await
+    }
+
+    /// Acquire an explicit over-max connection, excluding specific remote IPs.
+    pub async fn acquire_extra_excluding(
+        &self,
+        server: ServerId,
+        excluded_ips: &[IpAddr],
+    ) -> Result<PooledConnection> {
+        if self.shutdown.is_cancelled() {
+            return Err(NntpError::PoolShutdown);
+        }
+
+        let idx = server.0;
+        if idx >= self.pools.len() {
+            return Err(NntpError::PoolExhausted);
+        }
+
+        self.acquire_fresh_with_permit(idx, None, excluded_ips)
+            .await
     }
 
     /// Internal: acquire a connection using an already-obtained permit.
     async fn acquire_with_permit(
         &self,
         idx: usize,
-        permit: tokio::sync::OwnedSemaphorePermit,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<PooledConnection> {
         // Try to get a healthy idle connection, with stale-check loop.
         let conn = loop {
@@ -190,7 +289,7 @@ impl NntpPool {
                     }
 
                     debug!(server = idx, "creating new connection");
-                    match NntpConnection::connect(&self.configs[idx]).await {
+                    match self.connect_server_excluding(idx, &[]).await {
                         Ok(c) => {
                             // Clear the failure timestamp on success.
                             let mut last_failure = self.last_connect_failure[idx].lock().await;
@@ -216,7 +315,56 @@ impl NntpPool {
         Ok(PooledConnection {
             conn: Some(conn),
             pool: self.pools[idx].clone(),
+            retired_ips: self.retired_ips.clone(),
             server_idx: idx,
+            return_to_pool: permit.is_some(),
+            _permit: permit,
+        })
+    }
+
+    async fn acquire_fresh_with_permit(
+        &self,
+        idx: usize,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        excluded_ips: &[IpAddr],
+    ) -> Result<PooledConnection> {
+        {
+            let last_failure = self.last_connect_failure[idx].lock().await;
+            if let Some(ts) = *last_failure {
+                let elapsed = ts.elapsed();
+                if elapsed < self.reconnect_delay {
+                    let remaining = self.reconnect_delay - elapsed;
+                    drop(last_failure);
+                    tokio::time::sleep(remaining).await;
+                }
+            }
+        }
+
+        debug!(server = idx, "creating fresh over-max connection");
+        let conn = match self.connect_server_excluding(idx, excluded_ips).await {
+            Ok(conn) => {
+                let mut last_failure = self.last_connect_failure[idx].lock().await;
+                *last_failure = None;
+                conn
+            }
+            Err(error) => {
+                let mut last_failure = self.last_connect_failure[idx].lock().await;
+                *last_failure = Some(Instant::now());
+                return Err(error);
+            }
+        };
+
+        {
+            let mut pool = self.pools[idx].lock().await;
+            pool.active_count += 1;
+        }
+
+        Ok(PooledConnection {
+            conn: Some(conn),
+            pool: self.pools[idx].clone(),
+            retired_ips: self.retired_ips.clone(),
+            server_idx: idx,
+            return_to_pool: permit.is_some(),
             _permit: permit,
         })
     }
@@ -237,7 +385,7 @@ impl NntpPool {
         // Try non-blocking acquire on each server in group+health order.
         for idx in &ordered {
             match self.semaphores[*idx].clone().try_acquire_owned() {
-                Ok(permit) => match self.acquire_with_permit(*idx, permit).await {
+                Ok(permit) => match self.acquire_with_permit(*idx, Some(permit)).await {
                     Ok(conn) => return Ok(conn),
                     Err(e) => {
                         warn!(server = idx, error = %e, "failed to acquire from server, trying next");
@@ -249,12 +397,18 @@ impl NntpPool {
         }
 
         // All available servers at capacity or no available servers;
-        // fall back to blocking on the first available, or server 0 if all disabled.
+        // fall back to blocking on the first available, or the first fill
+        // server if all are disabled — generic callers must never be handed
+        // a backfill connection.
         if let Some(&first) = ordered.first() {
             self.acquire(ServerId(first)).await
         } else {
-            // All servers disabled — fall back to server 0.
-            self.acquire(ServerId(0)).await
+            let fallback = self
+                .backfill
+                .iter()
+                .position(|backfill| !*backfill)
+                .unwrap_or(0);
+            self.acquire(ServerId(fallback)).await
         }
     }
 
@@ -274,6 +428,12 @@ impl NntpPool {
             std::collections::BTreeMap::new();
         for idx in 0..self.server_count() {
             if !health.is_available(idx) {
+                continue;
+            }
+            // acquire_any serves ordinary callers with no failure history;
+            // backfill servers are only reachable through the per-request
+            // exclusion ladder (build_server_order).
+            if self.backfill[idx] {
                 continue;
             }
             let entry = groups.entry(self.groups[idx]).or_default();
@@ -352,6 +512,43 @@ impl NntpPool {
         &self.groups
     }
 
+    /// Backfill flag for each server (indexed by pool position). An
+    /// all-backfill config is normalized to all-fill at construction.
+    pub fn server_backfill_flags(&self) -> &[bool] {
+        &self.backfill
+    }
+
+    /// Retention window in days for each server (0 = unlimited), indexed by
+    /// pool position.
+    pub fn server_retention_days(&self) -> &[u32] {
+        &self.retention_days
+    }
+
+    /// Whether any configured server is a backfill server.
+    pub fn has_backfill_servers(&self) -> bool {
+        self.backfill.iter().any(|backfill| *backfill)
+    }
+
+    /// Total configured connections across fill (non-backfill) servers.
+    pub fn fill_connection_capacity(&self) -> usize {
+        self.backfill
+            .iter()
+            .zip(&self.max_connections)
+            .filter(|(backfill, _)| !**backfill)
+            .map(|(_, max)| *max)
+            .sum()
+    }
+
+    /// Whether every fill (non-backfill) server is in `exclude` — the gate
+    /// that makes backfill servers reachable for a request.
+    pub fn fill_servers_exhausted(&self, exclude: &[usize]) -> bool {
+        self.backfill
+            .iter()
+            .enumerate()
+            .filter(|(_, backfill)| !**backfill)
+            .all(|(idx, _)| exclude.contains(&idx))
+    }
+
     /// Access the health tracker for observability.
     pub fn health(&self) -> &Arc<Mutex<HealthTracker>> {
         &self.health
@@ -362,6 +559,45 @@ impl NntpPool {
         &self.configs
     }
 
+    pub fn try_acquire_blocking_permit(
+        &self,
+        server: ServerId,
+    ) -> Result<BlockingConnectionPermit> {
+        let idx = server.0;
+        if idx >= self.semaphores.len() {
+            return Err(NntpError::PoolExhausted);
+        }
+        let permit = self.semaphores[idx]
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| NntpError::TooManyConnections)?;
+        Ok(BlockingConnectionPermit { _permit: permit })
+    }
+
+    pub fn blocking_connect_plan(
+        &self,
+        server: ServerId,
+        excluded_ips: &[IpAddr],
+    ) -> Result<(ServerConfig, Vec<IpAddr>, usize)> {
+        let idx = server.0;
+        if idx >= self.configs.len() {
+            return Err(NntpError::PoolExhausted);
+        }
+        let mut exclusions = Vec::new();
+        if let Ok(retired) = self.retired_ips.try_lock() {
+            exclusions.extend(
+                retired
+                    .iter()
+                    .filter_map(|(server_idx, ip)| (*server_idx == idx).then_some(*ip)),
+            );
+        }
+        exclusions.extend(excluded_ips.iter().copied());
+        exclusions.sort_unstable();
+        exclusions.dedup();
+        let offset = self.next_connect_offset(idx);
+        Ok((self.configs[idx].clone(), exclusions, offset))
+    }
+
     /// Returns `(available_permits, max_connections)` for the given server.
     ///
     /// This is lock-free — it reads semaphore permits and the pre-stored
@@ -370,6 +606,19 @@ impl NntpPool {
         let available = self.semaphores[idx].available_permits();
         let max = self.max_connections[idx];
         (available, max)
+    }
+
+    pub async fn retire_ip(&self, server: ServerId, ip: IpAddr) {
+        let idx = server.0;
+        if idx >= self.pools.len() {
+            return;
+        }
+        {
+            let mut retired = self.retired_ips.lock().await;
+            retired.insert((idx, ip));
+        }
+        let mut pool = self.pools[idx].lock().await;
+        pool.idle.retain(|conn| conn.remote_ip() != ip);
     }
 
     /// Take a healthy idle connection, evicting stale/poisoned ones.
@@ -393,11 +642,24 @@ impl NntpPool {
 pub struct PooledConnection {
     conn: Option<NntpConnection>,
     pool: Arc<Mutex<ServerPool>>,
+    retired_ips: Arc<Mutex<HashSet<(usize, IpAddr)>>>,
     server_idx: usize,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    return_to_pool: bool,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl PooledConnection {
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.conn
+            .as_ref()
+            .expect("pooled connection is present")
+            .remote_addr()
+    }
+
+    pub fn remote_ip(&self) -> IpAddr {
+        self.remote_addr().ip()
+    }
+
     /// Explicitly discard this connection instead of returning it to the pool.
     /// Use when the connection is in a bad state.
     pub fn discard(mut self) {
@@ -431,23 +693,33 @@ impl Drop for PooledConnection {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             let pool = self.pool.clone();
+            let retired_ips = self.retired_ips.clone();
             let server_idx = self.server_idx;
             let poisoned = conn.is_poisoned();
+            let return_to_pool = self.return_to_pool;
 
-            if conn.is_healthy() {
+            if conn.is_healthy() && return_to_pool {
                 // tokio::spawn can fail during runtime shutdown; if so, the
                 // connection is simply dropped (permit released by _permit).
                 drop(tokio::spawn(async move {
                     let mut pool = pool.lock().await;
                     pool.active_count = pool.active_count.saturating_sub(1);
-                    pool.idle.push_back(conn);
-                    trace!(server = server_idx, "returned connection to pool");
+                    let retired = retired_ips.lock().await;
+                    if retired.contains(&(server_idx, conn.remote_ip())) {
+                        trace!(server = server_idx, "dropped retired-ip connection");
+                    } else {
+                        drop(retired);
+                        pool.idle.push_back(conn);
+                        trace!(server = server_idx, "returned connection to pool");
+                    }
                 }));
             } else {
                 drop(tokio::spawn(async move {
                     let mut pool = pool.lock().await;
                     pool.active_count = pool.active_count.saturating_sub(1);
-                    if poisoned {
+                    if conn.is_healthy() {
+                        trace!(server = server_idx, "dropped non-poolable connection");
+                    } else if poisoned {
                         trace!(server = server_idx, "dropped poisoned connection");
                     } else {
                         trace!(server = server_idx, "dropped unhealthy connection");
@@ -474,6 +746,7 @@ mod tests {
                 },
                 max_connections: max_per_server,
                 group: 0,
+                ..ServerPoolConfig::default()
             }],
             max_idle_age: Duration::from_mins(5),
             health_config: HealthConfig::default(),
@@ -499,6 +772,7 @@ mod tests {
                     },
                     max_connections: 10,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
                 ServerPoolConfig {
                     server: ServerConfig {
@@ -507,6 +781,7 @@ mod tests {
                     },
                     max_connections: 5,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
             ],
             max_idle_age: Duration::from_mins(5),
@@ -516,6 +791,42 @@ mod tests {
         };
         let pool = NntpPool::new(config);
         assert_eq!(pool.server_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn acquire_any_order_skips_backfill_servers() {
+        let config = PoolConfig {
+            servers: vec![
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "fill.example.com".into(),
+                        ..Default::default()
+                    },
+                    max_connections: 2,
+                    group: 0,
+                    ..ServerPoolConfig::default()
+                },
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "backfill.example.com".into(),
+                        ..Default::default()
+                    },
+                    max_connections: 2,
+                    group: 1,
+                    backfill: true,
+                    ..ServerPoolConfig::default()
+                },
+            ],
+            ..PoolConfig::default()
+        };
+        let pool = NntpPool::new(config);
+        assert_eq!(
+            pool.acquire_any_order().await,
+            vec![0],
+            "ordinary callers must never be handed a backfill connection"
+        );
+        assert!(pool.fill_servers_exhausted(&[0]));
+        assert!(!pool.fill_servers_exhausted(&[]));
     }
 
     #[tokio::test]
@@ -546,6 +857,7 @@ mod tests {
                     },
                     max_connections: 5,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
                 ServerPoolConfig {
                     server: ServerConfig {
@@ -554,6 +866,7 @@ mod tests {
                     },
                     max_connections: 5,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
             ],
             max_idle_age: Duration::from_mins(5),
@@ -583,6 +896,7 @@ mod tests {
                 },
                 max_connections: 2,
                 group: 0,
+                ..ServerPoolConfig::default()
             }],
             max_idle_age: Duration::from_mins(5),
             health_config: HealthConfig::default(),
@@ -625,6 +939,7 @@ mod tests {
                 },
                 max_connections: 2,
                 group: 0,
+                ..ServerPoolConfig::default()
             }],
             max_idle_age: Duration::from_mins(5),
             health_config: HealthConfig::default(),
@@ -681,6 +996,7 @@ mod tests {
                     },
                     max_connections: 0,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
                 ServerPoolConfig {
                     server: ServerConfig {
@@ -689,6 +1005,7 @@ mod tests {
                     },
                     max_connections: 1,
                     group: 1,
+                    ..ServerPoolConfig::default()
                 },
             ],
             max_idle_age: Duration::from_mins(5),
@@ -713,6 +1030,7 @@ mod tests {
                     },
                     max_connections: 0,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
                 ServerPoolConfig {
                     server: ServerConfig {
@@ -721,6 +1039,7 @@ mod tests {
                     },
                     max_connections: 1,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
             ],
             max_idle_age: Duration::from_mins(5),
@@ -754,6 +1073,7 @@ mod tests {
                     },
                     max_connections: 10,
                     group: 0,
+                    ..ServerPoolConfig::default()
                 },
                 ServerPoolConfig {
                     server: ServerConfig {
@@ -762,6 +1082,7 @@ mod tests {
                     },
                     max_connections: 5,
                     group: 1,
+                    ..ServerPoolConfig::default()
                 },
             ],
             max_idle_age: Duration::from_mins(5),

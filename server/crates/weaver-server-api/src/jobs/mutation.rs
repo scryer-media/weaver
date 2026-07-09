@@ -4,8 +4,6 @@ use async_graphql::{Context, Object, Result, UploadValue};
 use base64::Engine;
 
 use crate::auth::{CallerIdentity, ControlGuard, graphql_error};
-#[cfg(weaver_diagnostics)]
-use crate::history::types::DiagnosticRedownloadAcceptance;
 use crate::history::types::{
     AcceptHistoryDeleteInput, HistoryCommandResult, HistoryDeleteAcceptance, HistoryItem,
     history_delete_row_state_from_core, history_item_from_row,
@@ -231,21 +229,6 @@ impl JobsMutation {
         let handle = ctx.data::<SchedulerHandle>()?;
         handle.redownload_job(JobId(id)).await?;
         Ok(true)
-    }
-    /// Re-download a terminal history item under a fresh linked job ID and collect a
-    /// diagnostic bundle for support.
-    #[cfg(weaver_diagnostics)]
-    #[graphql(guard = "ControlGuard")]
-    async fn start_diagnostic_redownload(
-        &self,
-        ctx: &Context<'_>,
-        id: u64,
-        #[graphql(default = true)] include_server_hostnames: bool,
-    ) -> Result<DiagnosticRedownloadAcceptance> {
-        let manager = ctx.data::<crate::history::diagnostics::DiagnosticManager>()?;
-        manager
-            .start_diagnostic_redownload(id, include_server_hostnames)
-            .await
     }
     /// Delete a completed/failed/cancelled job from history.
     /// Returns the remaining history jobs after deletion.
@@ -715,23 +698,14 @@ async fn history_items_from_db(db: Database) -> Result<Vec<HistoryItem>> {
         let rows = db.list_job_history(&weaver_server_core::HistoryFilter::default())?;
         let ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
         let delete_states = db.list_history_delete_row_states(&ids)?;
-        let diagnostic_states = db
-            .list_pending_diagnostic_runs()?
-            .into_iter()
-            .map(|row| (row.source_job_id, row))
-            .collect::<std::collections::HashMap<_, _>>();
         Ok::<_, weaver_server_core::StateError>(
             rows.into_iter()
                 .map(|row| {
-                    let diagnostic_run = diagnostic_states
-                        .get(&row.job_id)
-                        .cloned()
-                        .map(crate::history::types::history_diagnostic_run_from_core);
                     let delete_state = delete_states
                         .get(&row.job_id)
                         .cloned()
                         .map(history_delete_row_state_from_core);
-                    history_item_from_row(&row, diagnostic_run, delete_state)
+                    history_item_from_row(&row, delete_state)
                 })
                 .collect(),
         )

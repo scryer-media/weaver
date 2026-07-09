@@ -1,8 +1,8 @@
 use tracing::{info, warn};
 
 use crate::rss::model::{
-    RSS_SEEN_RETENTION_SECS, RSS_SYNC_TICK_SECS, compile_rules, evaluate_item,
-    feed_item_from_entry, is_due, unix_now_secs,
+    RSS_SEEN_RETENTION_SECS, RSS_SYNC_TICK_SECS, compile_rules, evaluate_item, is_due,
+    parse_feed_items, unix_now_secs,
 };
 use crate::rss::service::{
     DueSyncOutcome, RssFeedSyncReport, RssService, RssServiceError, RssSyncReport,
@@ -202,8 +202,7 @@ impl RssService {
             .bytes()
             .await
             .map_err(|e| RssServiceError::Http(e.to_string()))?;
-        let parsed = feed_rs::parser::parse(std::io::Cursor::new(body))
-            .map_err(|e| RssServiceError::Parse(e.to_string()))?;
+        let items = parse_feed_items(&body).map_err(RssServiceError::Parse)?;
 
         let rules = self
             .inner
@@ -215,12 +214,11 @@ impl RssService {
         let mut report = RssFeedSyncReport {
             feed_id: feed.id,
             feed_name: feed.name.clone(),
-            items_fetched: parsed.entries.len() as u32,
+            items_fetched: items.len() as u32,
             ..Default::default()
         };
 
-        for entry in parsed.entries {
-            let item = feed_item_from_entry(entry);
+        for item in items {
             if self
                 .inner
                 .db

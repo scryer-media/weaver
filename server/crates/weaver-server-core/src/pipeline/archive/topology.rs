@@ -5,11 +5,309 @@ use crate::jobs::assembly::{
 };
 use crate::jobs::ids::{JobId, NzbFileId};
 use crate::pipeline::{
-    ComputedRarSetState, Pipeline, RarRefreshDone, RarRefreshRequest, RefreshReason,
+    ComputedRarSetState, Pipeline, RarCapacityRetryKind, RarRefreshDone, RarRefreshError,
+    RarRefreshRequest, RefreshReason,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
+
+fn open_rar_volume_file(path: &Path) -> std::io::Result<Box<dyn weaver_unrar::ReadSeek>> {
+    #[cfg(test)]
+    {
+        rar_refresh_open_tracking::open(path)
+    }
+    #[cfg(not(test))]
+    {
+        Ok(Box::new(std::fs::File::open(path)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::rar_state::RarSetState;
+    use std::io::Cursor;
+    use weaver_par2::checksum;
+
+    const TEST_RAR5_SIG: [u8; 8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
+
+    fn encode_test_rar_vint(mut value: u64) -> Vec<u8> {
+        let mut result = Vec::new();
+        loop {
+            let mut byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            result.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+        result
+    }
+
+    fn build_test_rar_header(
+        header_type: u64,
+        common_flags: u64,
+        type_body: &[u8],
+        extra: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_test_rar_vint(header_type));
+
+        let mut flags = common_flags;
+        if !extra.is_empty() {
+            flags |= 0x0001;
+        }
+        body.extend_from_slice(&encode_test_rar_vint(flags));
+        if !extra.is_empty() {
+            body.extend_from_slice(&encode_test_rar_vint(extra.len() as u64));
+        }
+        body.extend_from_slice(type_body);
+        body.extend_from_slice(extra);
+
+        let header_size = body.len() as u64;
+        let header_size_bytes = encode_test_rar_vint(header_size);
+        let crc = checksum::crc32(&[header_size_bytes.as_slice(), body.as_slice()].concat());
+
+        let mut result = Vec::new();
+        result.extend_from_slice(&crc.to_le_bytes());
+        result.extend_from_slice(&header_size_bytes);
+        result.extend_from_slice(&body);
+        result
+    }
+
+    fn build_test_rar_main_header(archive_flags: u64, volume_number: Option<u64>) -> Vec<u8> {
+        let mut type_body = Vec::new();
+        type_body.extend_from_slice(&encode_test_rar_vint(archive_flags));
+        if let Some(volume_number) = volume_number {
+            type_body.extend_from_slice(&encode_test_rar_vint(volume_number));
+        }
+        build_test_rar_header(1, 0, &type_body, &[])
+    }
+
+    fn build_test_rar_end_header(more_volumes: bool) -> Vec<u8> {
+        let end_flags: u64 = if more_volumes { 0x0001 } else { 0 };
+        build_test_rar_header(5, 0, &encode_test_rar_vint(end_flags), &[])
+    }
+
+    fn build_test_rar_file_header(
+        filename: &str,
+        common_flags_extra: u64,
+        data_size: u64,
+        unpacked_size: u64,
+        data_crc: Option<u32>,
+    ) -> Vec<u8> {
+        let file_flags: u64 = if data_crc.is_some() { 0x0004 } else { 0 };
+        let mut type_body = Vec::new();
+        type_body.extend_from_slice(&encode_test_rar_vint(file_flags));
+        type_body.extend_from_slice(&encode_test_rar_vint(unpacked_size));
+        type_body.extend_from_slice(&encode_test_rar_vint(0o644));
+        if let Some(data_crc) = data_crc {
+            type_body.extend_from_slice(&data_crc.to_le_bytes());
+        }
+        type_body.extend_from_slice(&encode_test_rar_vint(0));
+        type_body.extend_from_slice(&encode_test_rar_vint(1));
+        type_body.extend_from_slice(&encode_test_rar_vint(filename.len() as u64));
+        type_body.extend_from_slice(filename.as_bytes());
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_test_rar_vint(2));
+        body.extend_from_slice(&encode_test_rar_vint(0x0002 | common_flags_extra));
+        body.extend_from_slice(&encode_test_rar_vint(data_size));
+        body.extend_from_slice(&type_body);
+
+        let header_size = body.len() as u64;
+        let header_size_bytes = encode_test_rar_vint(header_size);
+        let crc = checksum::crc32(&[header_size_bytes.as_slice(), body.as_slice()].concat());
+
+        let mut result = Vec::new();
+        result.extend_from_slice(&crc.to_le_bytes());
+        result.extend_from_slice(&header_size_bytes);
+        result.extend_from_slice(&body);
+        result
+    }
+
+    fn build_many_volume_rar_set(volume_count: usize) -> Vec<(String, Vec<u8>)> {
+        assert!(volume_count >= 2);
+        let filename = "big.bin";
+        let payload = vec![b'x'; volume_count];
+        let payload_crc = checksum::crc32(&payload);
+
+        (0..volume_count)
+            .map(|volume| {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&TEST_RAR5_SIG);
+                bytes.extend_from_slice(&build_test_rar_main_header(
+                    if volume == 0 { 0x0001 } else { 0x0001 | 0x0002 },
+                    (volume > 0).then_some(volume as u64),
+                ));
+
+                let split_flags = match volume {
+                    0 => 0x0010,
+                    v if v + 1 == volume_count => 0x0008,
+                    _ => 0x0010 | 0x0008,
+                };
+                bytes.extend_from_slice(&build_test_rar_file_header(
+                    filename,
+                    split_flags,
+                    1,
+                    payload.len() as u64,
+                    (volume + 1 == volume_count).then_some(payload_crc),
+                ));
+                bytes.push(payload[volume]);
+                bytes.extend_from_slice(&build_test_rar_end_header(volume + 1 != volume_count));
+
+                (format!("show.part{volume:03}.rar"), bytes)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rar_refresh_compute_bounds_live_source_readers_for_many_volumes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let volume_count = 260usize;
+        let files = build_many_volume_rar_set(volume_count);
+
+        let first_archive = weaver_unrar::RarArchive::open(Cursor::new(files[0].1.clone()))
+            .expect("volume 0 should parse");
+        let cached_headers = first_archive.serialize_headers();
+
+        let mut volume_map = HashMap::new();
+        let mut volume_paths = BTreeMap::new();
+        let mut facts = BTreeMap::new();
+        for (volume, (filename, bytes)) in files.iter().enumerate() {
+            let path = temp_dir.path().join(filename);
+            std::fs::write(&path, bytes).unwrap();
+            volume_map.insert(filename.clone(), volume as u32);
+            volume_paths.insert(volume as u32, path);
+            facts.insert(
+                volume as u32,
+                weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None)
+                    .expect("synthetic RAR volume facts should parse"),
+            );
+        }
+
+        let input = RarSetComputeInput {
+            job_id: JobId(99),
+            set_name: "show".to_string(),
+            existing: RarSetState::default(),
+            volume_map,
+            volume_paths,
+            password_candidates: Vec::new(),
+            extracted: HashSet::new(),
+            failed: HashSet::new(),
+            facts,
+            verified_suspect_volumes: HashSet::new(),
+            worker_active: false,
+            cached_headers: Some(cached_headers),
+            extraction_generation: 0,
+            reason: RefreshReason::CoverageExpansion,
+        };
+
+        let _tracking = rar_refresh_open_tracking::start();
+        let computed = Pipeline::compute_rar_set_state_blocking(input)
+            .expect("bounded refresh compute should integrate all volumes");
+
+        assert!(
+            rar_refresh_open_tracking::peak() <= 1,
+            "refresh retained {} live source readers",
+            rar_refresh_open_tracking::peak()
+        );
+        assert_eq!(
+            computed.plan.topology.complete_volumes.len(),
+            volume_count,
+            "bounded refresh should preserve complete-volume coverage"
+        );
+        assert_eq!(
+            computed
+                .plan
+                .ready_members
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["big.bin"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod rar_refresh_open_tracking {
+    use std::cell::Cell;
+    use std::io::{Read, Seek};
+    use std::path::Path;
+
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static ACTIVE: Cell<usize> = const { Cell::new(0) };
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) struct Guard {
+        previous: bool,
+    }
+
+    pub(super) fn start() -> Guard {
+        let previous = ENABLED.with(|enabled| {
+            let previous = enabled.get();
+            enabled.set(true);
+            previous
+        });
+        ACTIVE.with(|active| active.set(0));
+        PEAK.with(|peak| peak.set(0));
+        Guard { previous }
+    }
+
+    pub(super) fn peak() -> usize {
+        PEAK.with(Cell::get)
+    }
+
+    pub(super) fn open(path: &Path) -> std::io::Result<Box<dyn weaver_unrar::ReadSeek>> {
+        let file = std::fs::File::open(path)?;
+        let counted = ENABLED.with(Cell::get);
+        if counted {
+            ACTIVE.with(|active| {
+                let next = active.get() + 1;
+                active.set(next);
+                PEAK.with(|peak| peak.set(peak.get().max(next)));
+            });
+        }
+        Ok(Box::new(TrackedReader { file, counted }))
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ENABLED.with(|enabled| enabled.set(self.previous));
+        }
+    }
+
+    struct TrackedReader {
+        file: std::fs::File,
+        counted: bool,
+    }
+
+    impl Drop for TrackedReader {
+        fn drop(&mut self) {
+            if self.counted {
+                ACTIVE.with(|active| active.set(active.get().saturating_sub(1)));
+            }
+        }
+    }
+
+    impl Read for TrackedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.file.read(buf)
+        }
+    }
+
+    impl Seek for TrackedReader {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.file.seek(pos)
+        }
+    }
+}
 
 pub(crate) type ArchiveMember = JobArchiveMember;
 pub(crate) type ArchivePendingSpan = JobArchivePendingSpan;
@@ -39,8 +337,8 @@ pub(in crate::pipeline) enum CachedRarSnapshotAlignment {
 }
 
 pub(in crate::pipeline) fn cached_rar_snapshot_alignment_with_volume_facts(
-    facts: &BTreeMap<u32, weaver_rar::RarVolumeFacts>,
-    archive: &weaver_rar::RarArchive,
+    facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
+    archive: &weaver_unrar::RarArchive,
 ) -> CachedRarSnapshotAlignment {
     let metadata = archive.metadata();
     let mut saw_stale_growth = false;
@@ -52,7 +350,7 @@ pub(in crate::pipeline) fn cached_rar_snapshot_alignment_with_volume_facts(
                 continue;
             }
 
-            let name = weaver_rar::sanitize_path(&member.name);
+            let name = weaver_unrar::sanitize_path(&member.name);
             let mut observed_last = first_volume;
             let mut observed_complete = false;
             let mut next_volume = first_volume + 1;
@@ -61,7 +359,7 @@ pub(in crate::pipeline) fn cached_rar_snapshot_alignment_with_volume_facts(
                 let Some(next_member) = next_facts.members.iter().find(|candidate| {
                     !candidate.is_directory
                         && candidate.split_before
-                        && weaver_rar::sanitize_path(&candidate.name) == name
+                        && weaver_unrar::sanitize_path(&candidate.name) == name
                 }) else {
                     break;
                 };
@@ -110,7 +408,7 @@ fn cached_rar_plan_is_incoherent(
     plan: &RarDerivedPlan,
     failed: &HashSet<String>,
     worker_active: bool,
-    facts: &BTreeMap<u32, weaver_rar::RarVolumeFacts>,
+    facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
     volume_paths: &BTreeMap<u32, PathBuf>,
 ) -> bool {
     matches!(plan.phase, RarSetPhase::WaitingForVolumes)
@@ -130,7 +428,7 @@ fn cached_rar_plan_is_incoherent(
 
 pub(in crate::pipeline) fn ownerless_present_member_volumes(
     plan: &RarDerivedPlan,
-    facts: &BTreeMap<u32, weaver_rar::RarVolumeFacts>,
+    facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
 ) -> Vec<u32> {
     let mut volumes: Vec<u32> = plan
         .delete_decisions
@@ -139,7 +437,7 @@ pub(in crate::pipeline) fn ownerless_present_member_volumes(
             let has_named_member = facts.get(volume).is_some_and(|volume_facts| {
                 volume_facts.members.iter().any(|member| {
                     (!member.is_directory || member.data_size > 0)
-                        && !weaver_rar::sanitize_path(&member.name).is_empty()
+                        && !weaver_unrar::sanitize_path(&member.name).is_empty()
                 })
             });
             (decision.owners.is_empty() && has_named_member).then_some(*volume)
@@ -151,7 +449,7 @@ pub(in crate::pipeline) fn ownerless_present_member_volumes(
 
 fn present_waiting_rar_volumes(
     plan: &RarDerivedPlan,
-    facts: &BTreeMap<u32, weaver_rar::RarVolumeFacts>,
+    facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
     volume_paths: &BTreeMap<u32, PathBuf>,
 ) -> Vec<u32> {
     let mut volumes: Vec<u32> = plan
@@ -180,10 +478,11 @@ struct RarSetComputeInput {
     password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
     extracted: HashSet<String>,
     failed: HashSet<String>,
-    facts: BTreeMap<u32, weaver_rar::RarVolumeFacts>,
+    facts: BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
     verified_suspect_volumes: HashSet<u32>,
     worker_active: bool,
     cached_headers: Option<Vec<u8>>,
+    extraction_generation: u64,
     reason: RefreshReason,
 }
 
@@ -217,7 +516,7 @@ impl Pipeline {
     pub(crate) async fn parse_rar_volume_facts_from_path(
         path: PathBuf,
         password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
-    ) -> Result<weaver_rar::RarVolumeFacts, String> {
+    ) -> Result<weaver_unrar::RarVolumeFacts, String> {
         tokio::task::spawn_blocking(move || {
             let context = format!("failed to parse RAR volume facts from {}", path.display());
             Self::try_rar_password_candidates(&context, &password_candidates, |password| {
@@ -227,7 +526,7 @@ impl Pipeline {
                         path.display()
                     ))
                 })?;
-                weaver_rar::RarArchive::parse_volume_facts(file, password)
+                weaver_unrar::RarArchive::parse_volume_facts(file, password)
                     .map_err(crate::pipeline::RarPasswordAttemptError::from)
             })
             .map(|selection| selection.value)
@@ -242,7 +541,7 @@ impl Pipeline {
         set_name: &str,
         filename: &str,
         observed_volume: Option<u32>,
-        facts: weaver_rar::RarVolumeFacts,
+        facts: weaver_unrar::RarVolumeFacts,
     ) -> Result<bool, String> {
         if let Some(expected_volume) = observed_volume
             && facts.volume_number != expected_volume
@@ -429,6 +728,7 @@ impl Pipeline {
                 "RAR set entered fallback full-set mode"
             );
         }
+        self.mark_rar_unlock_priorities_dirty(job_id);
     }
 
     pub(in crate::pipeline) async fn recompute_rar_set_state(
@@ -447,7 +747,9 @@ impl Pipeline {
                 self.apply_computed_rar_set_state(job_id, set_name, computed);
                 Ok(())
             }
-            Err(error) => self.apply_failed_rar_set_compute(job_id, set_name, existing, error),
+            Err(error) => {
+                self.apply_failed_rar_set_compute(job_id, set_name, existing, error.to_string())
+            }
         }
     }
 
@@ -478,6 +780,7 @@ impl Pipeline {
         let facts = existing.facts.clone();
         let verified_suspect_volumes = existing.verified_suspect_volumes.clone();
         let worker_active = existing.active_workers > 0;
+        let extraction_generation = existing.extraction_generation;
         let cached_headers = self.load_rar_snapshot(job_id, set_name);
 
         Some(RarSetComputeInput {
@@ -493,14 +796,18 @@ impl Pipeline {
             verified_suspect_volumes,
             worker_active,
             cached_headers,
+            extraction_generation,
             reason,
         })
     }
 
-    async fn run_rar_set_compute(input: RarSetComputeInput) -> Result<ComputedRarSetState, String> {
+    async fn run_rar_set_compute(
+        input: RarSetComputeInput,
+    ) -> Result<ComputedRarSetState, RarRefreshError> {
         tokio::task::spawn_blocking(move || Self::compute_rar_set_state_blocking(input))
             .await
-            .map_err(|e| format!("RAR plan task panicked: {e}"))?
+            .map_err(|e| RarRefreshError::Other(format!("RAR plan task panicked: {e}")))?
+            .map_err(RarRefreshError::from_message)
     }
 
     fn compute_rar_set_state_blocking(
@@ -523,7 +830,7 @@ impl Pipeline {
         } = input;
 
         let open_from_volume_zero =
-            || -> Result<crate::pipeline::ArchivePasswordSelection<weaver_rar::RarArchive>, String> {
+            || -> Result<crate::pipeline::ArchivePasswordSelection<weaver_unrar::RarArchive>, String> {
             let first_path = volume_paths.get(&0).ok_or_else(|| {
                 format!(
                     "RAR set '{set_name_owned}' cannot be rebuilt without cached headers or volume 0"
@@ -533,17 +840,27 @@ impl Pipeline {
                 &set_name_owned,
                 first_path,
                 &password_candidates,
-                std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+                std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
             )
         };
 
-        let attach_volumes_and_build_plan = |mut archive: weaver_rar::RarArchive,
+        let attach_volumes_and_build_plan = |mut archive: weaver_unrar::RarArchive,
                                              rebuild_source: RarTopologyRebuildSource,
                                              using_cached_headers: bool,
                                              force_refresh_all_volumes: bool|
          -> Result<_, String> {
             for (volume_number, path) in &volume_paths {
-                let volume_file = match std::fs::File::open(path) {
+                let volume_needs_refresh =
+                    force_refresh_all_volumes || !facts.contains_key(volume_number);
+                if archive.has_volume(*volume_number as usize) && !volume_needs_refresh {
+                    archive.attach_volume_reader(
+                        *volume_number as usize,
+                        Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+                    );
+                    continue;
+                }
+
+                let volume_file = match open_rar_volume_file(path) {
                     Ok(file) => file,
                     Err(error)
                         if using_cached_headers && error.kind() == std::io::ErrorKind::NotFound =>
@@ -551,35 +868,42 @@ impl Pipeline {
                         continue;
                     }
                     Err(error) => {
-                        return Err(format!(
-                            "failed to open RAR volume {volume_number} for set '{set_name_owned}': {error}"
+                        let context = format!(
+                            "failed to open RAR volume {volume_number} for set '{set_name_owned}'"
+                        );
+                        return Err(crate::pipeline::capacity::format_fd_capacity_error(
+                            &context, &error,
                         ));
                     }
                 };
-                let volume_needs_refresh =
-                    force_refresh_all_volumes || !facts.contains_key(volume_number);
                 if using_cached_headers
                     && volume_needs_refresh
                     && archive.has_volume(*volume_number as usize)
                 {
                     archive
-                        .refresh_volume(*volume_number as usize, Box::new(volume_file))
+                        .refresh_volume(*volume_number as usize, volume_file)
                         .map_err(|e| {
                             format!(
                                 "failed to refresh cached RAR volume {volume_number} for set '{set_name_owned}': {e}"
                             )
                         })?;
                 } else if archive.has_volume(*volume_number as usize) {
-                    archive.attach_volume_reader(*volume_number as usize, Box::new(volume_file));
+                    archive.attach_volume_reader(*volume_number as usize, volume_file);
                 } else {
                     archive
-                        .add_volume(*volume_number as usize, Box::new(volume_file))
+                        .add_volume(*volume_number as usize, volume_file)
                         .map_err(|e| {
                             format!(
                                 "failed to integrate RAR volume {volume_number} for set '{set_name_owned}': {e}"
                             )
                         })?;
                 }
+                // Refresh planning is metadata-only. Keep presence visible to
+                // the planner without retaining one source FD per volume.
+                archive.attach_volume_reader(
+                    *volume_number as usize,
+                    Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+                );
             }
 
             let plan = rar_state::build_plan(
@@ -613,7 +937,7 @@ impl Pipeline {
                     &set_name_owned,
                     &headers,
                     &password_candidates,
-                    std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+                    std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
                 ) {
                     Ok(selection) => selection,
                     Err(error) => {
@@ -778,26 +1102,27 @@ impl Pipeline {
             rebuild_source = computed.rebuild_source.as_str(),
             "RAR plan rebuilt"
         );
-        let refreshed_through_volume = computed
+        let refreshed_volumes: BTreeSet<u32> = computed
             .plan
             .topology
             .complete_volumes
             .iter()
             .copied()
-            .max()
-            .unwrap_or(0);
+            .collect();
+        let latest_refreshed_volume = refreshed_volumes.iter().next_back().copied().unwrap_or(0);
         self.set_rar_snapshot(job_id, set_name, computed.headers);
         self.apply_rar_plan(job_id, set_name, computed.plan);
         if let Some(refresh_state) = self
             .rar_refresh_state
             .get_mut(&(job_id, set_name.to_string()))
         {
-            refresh_state.refreshed_through_volume = refresh_state
-                .refreshed_through_volume
-                .max(refreshed_through_volume);
+            // Per-set refreshes are serialized; exact replacement here is only
+            // safe while that invariant holds. Concurrent refreshes would need
+            // generation/staleness guards before applying computed plans.
+            refresh_state.refreshed_volumes = refreshed_volumes;
             refresh_state.latest_completed_volume = refresh_state
                 .latest_completed_volume
-                .max(refreshed_through_volume);
+                .max(latest_refreshed_volume);
         }
     }
 
@@ -818,6 +1143,7 @@ impl Pipeline {
             is_solid: false,
             ready_members: Vec::new(),
             member_names: Vec::new(),
+            member_dependencies: HashMap::new(),
             waiting_on_volumes: HashSet::new(),
             deletion_eligible: HashSet::new(),
             delete_decisions: BTreeMap::new(),
@@ -860,17 +1186,16 @@ impl Pipeline {
             target_completed_volume,
             reason,
         };
-        let current_plan_through = self
+        let current_plan_volumes: BTreeSet<u32> = self
             .rar_sets
             .get(&key)
             .and_then(|state| state.plan.as_ref())
-            .and_then(|plan| plan.topology.complete_volumes.iter().copied().max())
-            .unwrap_or(0);
+            .map(|plan| plan.topology.complete_volumes.iter().copied().collect())
+            .unwrap_or_default();
         let mut launch = None;
         {
             let state = self.rar_refresh_state.entry(key.clone()).or_default();
-            state.refreshed_through_volume =
-                state.refreshed_through_volume.max(current_plan_through);
+            state.refreshed_volumes = current_plan_volumes;
             state.latest_completed_volume =
                 state.latest_completed_volume.max(target_completed_volume);
             if reason >= RefreshReason::IdentityRebind {
@@ -891,9 +1216,14 @@ impl Pipeline {
                     "coalesced RAR refresh request"
                 );
             } else {
-                state.in_flight = Some(request);
+                let mut launch_request = request;
+                if let Some(mut queued) = state.queued.take() {
+                    queued.merge(launch_request);
+                    launch_request = queued;
+                }
+                state.in_flight = Some(launch_request);
                 state.last_error = None;
-                launch = Some(request);
+                launch = Some(launch_request);
             }
         }
 
@@ -902,7 +1232,33 @@ impl Pipeline {
         }
     }
 
-    fn spawn_rar_refresh(&mut self, job_id: JobId, set_name: String, request: RarRefreshRequest) {
+    pub(in crate::pipeline) fn launch_queued_rar_capacity_refresh(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+    ) {
+        let key = (job_id, set_name.to_string());
+        let mut launch = None;
+        if let Some(state) = self.rar_refresh_state.get_mut(&key)
+            && state.in_flight.is_none()
+            && let Some(request) = state.queued.take()
+        {
+            state.in_flight = Some(request);
+            state.last_error = None;
+            launch = Some(request);
+        }
+
+        if let Some(request) = launch {
+            self.spawn_rar_refresh(job_id, set_name.to_string(), request);
+        }
+    }
+
+    pub(in crate::pipeline) fn spawn_rar_refresh(
+        &mut self,
+        job_id: JobId,
+        set_name: String,
+        request: RarRefreshRequest,
+    ) {
         let Some(input) = self.prepare_rar_set_compute_input(job_id, &set_name, request.reason)
         else {
             if let Some(state) = self.rar_refresh_state.get_mut(&(job_id, set_name)) {
@@ -910,6 +1266,40 @@ impl Pipeline {
             }
             return;
         };
+        if input.cached_headers.is_none() && !input.volume_paths.contains_key(&0) {
+            // The compute path is guaranteed to fail this state ("cannot be
+            // rebuilt without cached headers or volume 0"). Park instead of
+            // burning a blocking task per completed volume; the volume-0
+            // completion or the next identity rebind re-enqueues a refresh.
+            // With downloads still running that re-enqueue is guaranteed, so
+            // parking is routine; with none left it may never come, so say so
+            // loudly.
+            let active_downloads = self
+                .active_downloads_by_job
+                .get(&job_id)
+                .copied()
+                .unwrap_or(0);
+            if active_downloads == 0 {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    reason = ?request.reason,
+                    "RAR refresh parked waiting on volume 0 with no active downloads"
+                );
+            } else {
+                debug!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    reason = ?request.reason,
+                    "RAR refresh parked waiting on volume 0"
+                );
+            }
+            if let Some(state) = self.rar_refresh_state.get_mut(&(job_id, set_name)) {
+                state.in_flight = None;
+            }
+            return;
+        }
+        let extraction_generation = input.extraction_generation;
         let refresh_done_tx = self.rar_refresh_done_tx.clone();
         tokio::spawn(async move {
             let result = Self::run_rar_set_compute(input).await;
@@ -918,6 +1308,7 @@ impl Pipeline {
                     job_id,
                     set_name,
                     request,
+                    extraction_generation,
                     result,
                 })
                 .await;
@@ -926,12 +1317,29 @@ impl Pipeline {
 
     pub(in crate::pipeline) async fn handle_rar_refresh_done(&mut self, done: RarRefreshDone) {
         let key = (done.job_id, done.set_name.clone());
+        let current_generation = self
+            .rar_sets
+            .get(&key)
+            .map(|set_state| set_state.extraction_generation);
+        let stale_refresh =
+            current_generation.is_some_and(|generation| generation > done.extraction_generation);
+        if stale_refresh {
+            debug!(
+                job_id = done.job_id.0,
+                set_name = %done.set_name,
+                reason = ?done.request.reason,
+                refresh_generation = done.extraction_generation,
+                current_generation = ?current_generation,
+                "discarding stale RAR refresh result"
+            );
+        }
         let error = match done.result {
-            Ok(computed) => {
+            Ok(computed) if !stale_refresh => {
                 self.apply_computed_rar_set_state(done.job_id, &done.set_name, computed);
                 None
             }
-            Err(error) => {
+            Ok(_) => None,
+            Err(error) if !stale_refresh => {
                 warn!(
                     job_id = done.job_id.0,
                     set_name = %done.set_name,
@@ -941,36 +1349,147 @@ impl Pipeline {
                 );
                 Some(error)
             }
+            Err(error) => {
+                debug!(
+                    job_id = done.job_id.0,
+                    set_name = %done.set_name,
+                    reason = ?done.request.reason,
+                    error = %error,
+                    "discarding stale RAR refresh error"
+                );
+                None
+            }
         };
-        let success = error.is_none();
+        let success = error.is_none() && !stale_refresh;
+        let capacity_pressure = error
+            .as_ref()
+            .is_some_and(RarRefreshError::is_capacity_pressure);
+        let live_fact_volumes: BTreeSet<u32> = self
+            .rar_sets
+            .get(&key)
+            .map(|set_state| set_state.facts.keys().copied().collect())
+            .unwrap_or_default();
+        let latest_live_volume = live_fact_volumes.iter().next_back().copied().unwrap_or(0);
+        let active_rar_workers = self.rar_sets.get(&key).is_some_and(|set_state| {
+            set_state.active_workers > 0 || !set_state.in_flight_members.is_empty()
+        });
 
         let mut follow_up = None;
+        let mut schedule_capacity_retry = false;
         if let Some(state) = self.rar_refresh_state.get_mut(&key) {
             state.in_flight = None;
-            if let Some(error) = error.as_ref() {
-                state.last_error = Some(error.clone());
-            } else {
-                state.last_error = None;
-            }
-
-            if let Some(queued) = state.queued.take() {
-                let still_needed = queued.target_completed_volume > state.refreshed_through_volume
-                    || queued.reason > done.request.reason
-                    || state.structure_dirty
-                    || !success;
-                if still_needed {
-                    state.in_flight = Some(queued);
-                    follow_up = Some(queued);
+            if stale_refresh {
+                let mut request = state
+                    .queued
+                    .take()
+                    .filter(|queued| queued.reason != RefreshReason::PostExtraction);
+                if request.is_none() && done.request.reason != RefreshReason::PostExtraction {
+                    request = Some(RarRefreshRequest {
+                        target_completed_volume: state
+                            .latest_completed_volume
+                            .max(latest_live_volume)
+                            .max(done.request.target_completed_volume),
+                        reason: done.request.reason,
+                    });
                 }
-            }
+                if request.is_none() && state.structure_dirty {
+                    request = Some(RarRefreshRequest {
+                        target_completed_volume: state
+                            .latest_completed_volume
+                            .max(latest_live_volume)
+                            .max(done.request.target_completed_volume),
+                        reason: RefreshReason::CoverageExpansion,
+                    });
+                }
+                if let Some(mut request) = request {
+                    request.target_completed_volume = request
+                        .target_completed_volume
+                        .max(state.latest_completed_volume)
+                        .max(latest_live_volume);
+                    if active_rar_workers {
+                        state.queued = Some(request);
+                    } else {
+                        state.in_flight = Some(request);
+                        follow_up = Some(request);
+                    }
+                }
+            } else {
+                if let Some(error) = error.as_ref() {
+                    state.last_error = Some(error.clone());
+                } else {
+                    state.last_error = None;
+                }
 
-            if follow_up.is_none() && success {
-                state.structure_dirty = false;
+                let coverage_gap =
+                    success && !live_fact_volumes.is_subset(&state.refreshed_volumes);
+                if let Some(mut queued) = state.queued.take() {
+                    if coverage_gap || capacity_pressure {
+                        queued.target_completed_volume = queued
+                            .target_completed_volume
+                            .max(state.latest_completed_volume)
+                            .max(latest_live_volume);
+                        queued.reason = queued.reason.max(RefreshReason::CoverageExpansion);
+                    }
+                    let still_needed = coverage_gap
+                        || queued.reason > done.request.reason
+                        || state.structure_dirty
+                        || !success;
+                    if capacity_pressure {
+                        state.queued = Some(queued);
+                        schedule_capacity_retry = true;
+                    } else if still_needed {
+                        state.in_flight = Some(queued);
+                        follow_up = Some(queued);
+                    }
+                } else if coverage_gap {
+                    let request = RarRefreshRequest {
+                        target_completed_volume: state
+                            .latest_completed_volume
+                            .max(latest_live_volume)
+                            .max(done.request.target_completed_volume),
+                        reason: RefreshReason::CoverageExpansion,
+                    };
+                    state.in_flight = Some(request);
+                    follow_up = Some(request);
+                } else if capacity_pressure {
+                    let request = RarRefreshRequest {
+                        target_completed_volume: state
+                            .latest_completed_volume
+                            .max(latest_live_volume)
+                            .max(done.request.target_completed_volume),
+                        reason: done.request.reason.max(RefreshReason::CoverageExpansion),
+                    };
+                    state.queued = Some(request);
+                    schedule_capacity_retry = true;
+                }
+
+                if follow_up.is_none() && success {
+                    state.structure_dirty = false;
+                }
             }
         }
 
         if let Some(request) = follow_up {
-            self.spawn_rar_refresh(done.job_id, done.set_name, request);
+            let can_extract_covered_spans =
+                success && request.reason <= RefreshReason::CoverageExpansion;
+            self.spawn_rar_refresh(done.job_id, done.set_name.clone(), request);
+            if can_extract_covered_spans {
+                self.purge_empty_rar_set_if_idle(done.job_id, &done.set_name);
+                self.try_rar_extraction(done.job_id).await;
+                if self.rar_sets.contains_key(&key) {
+                    self.try_delete_volumes(done.job_id, &done.set_name);
+                }
+                self.check_job_completion(done.job_id).await;
+            }
+            return;
+        }
+
+        if schedule_capacity_retry {
+            self.schedule_rar_capacity_retry(
+                done.job_id,
+                &done.set_name,
+                RarCapacityRetryKind::Refresh,
+            );
             return;
         }
 
@@ -1145,14 +1664,17 @@ impl Pipeline {
 
     pub(crate) async fn restore_rar_state_for_job(&mut self, job_id: JobId) {
         let password_candidates = self.archive_password_candidates_for_job(job_id);
-        match self.db.load_all_archive_headers(job_id) {
+        match self
+            .db_blocking(move |db| db.load_all_archive_headers(job_id))
+            .await
+        {
             Ok(headers_by_set) => {
                 for (set_name, headers) in headers_by_set {
                     match Self::deserialize_rar_headers_with_password_candidates(
                         &set_name,
                         &headers,
                         &password_candidates,
-                        std::sync::Arc::new(weaver_rar::crypto::KdfCache::new()),
+                        std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
                     ) {
                         Ok(_) => {
                             self.rar_sets
@@ -1181,7 +1703,10 @@ impl Pipeline {
             }
         }
 
-        let facts_by_set = match self.db.load_all_rar_volume_facts(job_id) {
+        let facts_by_set = match self
+            .db_blocking(move |db| db.load_all_rar_volume_facts(job_id))
+            .await
+        {
             Ok(facts) => facts,
             Err(error) => {
                 error!(
@@ -1198,7 +1723,7 @@ impl Pipeline {
             state.facts.clear();
             state.volume_files.clear();
             for (volume_index, blob) in facts_rows {
-                match rmp_serde::from_slice::<weaver_rar::RarVolumeFacts>(&blob) {
+                match rmp_serde::from_slice::<weaver_unrar::RarVolumeFacts>(&blob) {
                     Ok(facts) => {
                         if facts.volume_number != volume_index {
                             warn!(

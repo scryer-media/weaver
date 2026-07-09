@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 use crate::bandwidth::IspBandwidthCapConfig;
 use crate::categories::CategoryConfig;
 use crate::servers::ServerConfig;
+use crate::watch_folder::WatchFolderConfig;
 
 /// Shared config handle for runtime reads and writes.
 pub type SharedConfig = Arc<RwLock<Config>>;
@@ -40,11 +41,13 @@ pub struct Config {
     /// Optional ISP bandwidth cap policy.
     #[serde(default)]
     pub isp_bandwidth_cap: Option<IspBandwidthCapConfig>,
-    /// Optional override for the diagnostic upload service base URL.
-    /// Defaults to https://diagnostics.scryer.media when unset.
+    /// Optional global burst for make-before-break latent-IP replacement trials.
+    /// Defaults to 0 and is capped at 1.
     #[serde(default)]
-    pub diagnostic_upload_url: Option<String>,
-
+    pub ip_replacement_trial_extra_connections: Option<u8>,
+    /// Watched-folder NZB intake settings.
+    #[serde(default)]
+    pub watch_folder: WatchFolderConfig,
     /// Path to the config file on disk. Not serialized to TOML.
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
@@ -73,6 +76,12 @@ impl Config {
         self.cleanup_after_extract.unwrap_or(true)
     }
 
+    pub fn ip_replacement_trial_extra_connections(&self) -> u8 {
+        self.ip_replacement_trial_extra_connections
+            .unwrap_or(0)
+            .min(1)
+    }
+
     /// Validate the configuration, returning any issues found.
     /// Empty server list is allowed (users add servers via UI).
     pub fn validate(&self) -> Result<(), Vec<String>> {
@@ -92,6 +101,14 @@ impl Config {
 
         if self.data_dir.is_empty() {
             errors.push("data_dir must not be empty".to_string());
+        }
+
+        if self.ip_replacement_trial_extra_connections.unwrap_or(0) > 1 {
+            errors.push("ip_replacement_trial_extra_connections must be 0 or 1".to_string());
+        }
+
+        if let Err(error) = self.watch_folder.validate() {
+            errors.push(error);
         }
 
         if errors.is_empty() {
@@ -161,7 +178,6 @@ pub struct RetryOverrides {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunerOverrides {
     pub max_concurrent_downloads: Option<usize>,
-    pub max_decode_queue: Option<usize>,
     pub decode_thread_count: Option<usize>,
     /// Number of threads in the post-processing pool (extraction, PAR2 verify/repair).
     /// Defaults to `(physical_cores / 2).max(1)`.

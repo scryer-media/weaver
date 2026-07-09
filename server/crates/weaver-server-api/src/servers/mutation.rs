@@ -218,6 +218,8 @@ struct NormalizedServerInput {
     connections: u16,
     active: bool,
     priority: u16,
+    backfill: bool,
+    retention_days: u32,
     tls_ca_cert: Option<PathBuf>,
 }
 
@@ -242,6 +244,8 @@ impl NormalizedServerInput {
             connections: input.connections,
             active: input.active,
             priority: input.priority,
+            backfill: input.backfill,
+            retention_days: input.retention_days,
             tls_ca_cert: normalize_optional_string(input.tls_ca_cert).map(PathBuf::from),
         })
     }
@@ -258,6 +262,8 @@ impl NormalizedServerInput {
             active: self.active,
             supports_pipelining: false,
             priority: self.priority as u32,
+            backfill: self.backfill,
+            retention_days: self.retention_days,
             tls_ca_cert: self.tls_ca_cert.clone(),
         }
     }
@@ -317,7 +323,8 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
-            diagnostic_upload_url: None,
+            ip_replacement_trial_extra_connections: None,
+            watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             config_path: None,
         }))
     }
@@ -349,6 +356,8 @@ mod tests {
                             active: true,
                             supports_pipelining: true,
                             priority: 0,
+                            backfill: false,
+                            retention_days: 0,
                             tls_ca_cert: None,
                         });
                     },

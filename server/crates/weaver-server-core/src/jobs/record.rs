@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::jobs::assembly::DetectedArchiveIdentity;
-use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+use crate::jobs::ids::{JobId, NzbFileId};
 
 #[derive(Debug, Clone)]
 pub struct ActiveJob {
@@ -14,16 +14,13 @@ pub struct ActiveJob {
     pub created_at: u64,
     pub category: Option<String>,
     pub metadata: Vec<(String, String)>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CommittedSegment {
-    pub job_id: JobId,
-    pub file_index: u32,
-    pub segment_number: u32,
-    pub file_offset: u64,
-    pub decoded_size: u32,
-    pub crc32: u32,
+    pub status: &'static str,
+    pub download_state: &'static str,
+    pub post_state: &'static str,
+    pub run_state: &'static str,
+    pub paused_resume_status: Option<&'static str>,
+    pub paused_resume_download_state: Option<&'static str>,
+    pub paused_resume_post_state: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +69,6 @@ pub struct RecoveredJob {
     pub nzb_path: PathBuf,
     pub nzb_zstd: Option<Vec<u8>>,
     pub output_dir: PathBuf,
-    pub committed_segments: HashSet<SegmentId>,
     pub file_progress: HashMap<u32, u64>,
     pub detected_archives: HashMap<u32, DetectedArchiveIdentity>,
     pub file_identities: HashMap<u32, ActiveFileIdentity>,

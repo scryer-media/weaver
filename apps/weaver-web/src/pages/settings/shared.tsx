@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { CheckIcon, CopyIcon } from "lucide-react";
 import { useLocation } from "react-router";
 import { useMutation, useQuery } from "urql";
@@ -9,16 +9,12 @@ import {
   DELETE_API_KEY_MUTATION,
 } from "@/graphql/queries";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { FolderPathInput } from "@/components/FolderPathInput";
 import { PageHeader } from "@/components/PageHeader";
+import { SectionCard } from "@/components/SectionCard";
 import { useTranslate } from "@/lib/context/translate-context";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -45,6 +41,21 @@ export function SettingsPageHeader({
   description?: string;
 }) {
   return <PageHeader title={title} description={description} className="mb-6" />;
+}
+
+/** Boxed sub-card used throughout Settings for grouped fields / rows. */
+export function SettingsInnerBox({
+  className,
+  children,
+}: {
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className={cn("rounded-inner border border-border bg-background/40 p-5", className)}>
+      {children}
+    </div>
+  );
 }
 
 type BackupStatusResponse = {
@@ -83,6 +94,9 @@ type ApiKeyScope = "CONTROL" | "READ" | "ADMIN";
 const API_KEY_GENERATE_PARAM = "apiKeyGenerate";
 const API_KEY_NAME_PARAM = "apiKeyName";
 const API_KEY_SCOPE_PARAM = "apiKeyScope";
+const API_KEY_GENERATE_PARAMS = [API_KEY_GENERATE_PARAM, "createApiKey"] as const;
+const API_KEY_NAME_PARAMS = [API_KEY_NAME_PARAM, "name"] as const;
+const API_KEY_SCOPE_PARAMS = [API_KEY_SCOPE_PARAM, "scope"] as const;
 
 function parseApiKeyScope(value: string | null): ApiKeyScope | null {
   switch (value?.trim().toLowerCase()) {
@@ -100,6 +114,22 @@ function parseApiKeyScope(value: string | null): ApiKeyScope | null {
 
 function isTruthyQueryParam(value: string | null) {
   return value === "1" || value?.trim().toLowerCase() === "true";
+}
+
+function firstQueryParam(params: URLSearchParams, names: readonly string[]) {
+  for (const name of names) {
+    const value = params.get(name);
+    if (value !== null) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function deleteQueryParams(params: URLSearchParams, names: readonly string[]) {
+  for (const name of names) {
+    params.delete(name);
+  }
 }
 
 export function BackupRestoreSection({
@@ -277,94 +307,84 @@ export function BackupRestoreSection({
     restoreBusy;
 
   return (
-    <section className="rounded-2xl border border-border bg-card p-5 shadow-sm sm:p-6">
-      <div className="mb-5 max-w-3xl">
-        <h2 className="text-lg font-semibold text-card-foreground">
-          {t("settings.backupTitle")}
-        </h2>
-        <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          {t("settings.backupDesc")}
-        </p>
-      </div>
-
+    <SectionCard title={t("settings.backupTitle")} description={t("settings.backupDesc")}>
       <div className="grid gap-4 2xl:grid-cols-2">
-        <div className="rounded-xl border border-border bg-background/60 p-4">
-          <h3 className="mb-2 text-sm font-semibold text-foreground">
+        <SettingsInnerBox>
+          <h3 className="text-sm font-semibold text-foreground">
             {t("settings.backupExport")}
           </h3>
-          <p className="mb-3 text-xs text-muted-foreground">
+          <p className="mt-1 text-[12.5px] text-muted-foreground">
             {t("settings.backupExportDesc")}
           </p>
-          <label className="mb-1 block text-xs text-muted-foreground">
-            {t("settings.backupPassword")}
-          </label>
-          <input
-            type="password"
-            value={backupPassword}
-            onChange={(e) => setBackupPassword(e.target.value)}
-            placeholder={t("settings.backupPasswordPlaceholder")}
-            className="mb-3 w-full rounded-md border border-input bg-field px-3 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring"
-          />
-          <button
+          <div className="mt-4 space-y-1.5">
+            <Label>{t("settings.backupPassword")}</Label>
+            <Input
+              type="password"
+              value={backupPassword}
+              onChange={(e) => setBackupPassword(e.target.value)}
+              placeholder={t("settings.backupPasswordPlaceholder")}
+            />
+          </div>
+          <Button
+            className="mt-3"
             onClick={handleDownloadBackup}
             disabled={backupBusy || status?.busy}
-            className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {backupBusy ? t("settings.backupDownloading") : t("settings.backupDownload")}
-          </button>
-          {backupMessage && <p className="mt-3 text-xs text-green-600">{backupMessage}</p>}
+          </Button>
+          {backupMessage && <p className="mt-3 text-xs text-status-completed">{backupMessage}</p>}
           {backupError && <p className="mt-3 text-xs text-destructive">{backupError}</p>}
-        </div>
+        </SettingsInnerBox>
 
-        <div className="rounded-xl border border-border bg-background/60 p-4">
-          <h3 className="mb-2 text-sm font-semibold text-foreground">
+        <SettingsInnerBox>
+          <h3 className="text-sm font-semibold text-foreground">
             {t("settings.restoreTitle")}
           </h3>
-          <p className="mb-3 text-xs text-muted-foreground">{t("settings.restoreDesc")}</p>
+          <p className="mt-1 text-[12.5px] text-muted-foreground">{t("settings.restoreDesc")}</p>
 
-          <label className="mb-1 block text-xs text-muted-foreground">
-            {t("settings.restoreFile")}
-          </label>
-          <input
-            type="file"
-            accept=".tar.zst,.age,.db,.zst"
-            onChange={(e) => {
-              setRestoreFile(e.target.files?.[0] ?? null);
-              setInspectResult(null);
-              setRestoreError(null);
-              setRestoreMessage(null);
-            }}
-            className="mb-3 block w-full text-sm text-foreground"
-          />
+          <div className="mt-4 space-y-1.5">
+            <Label>{t("settings.restoreFile")}</Label>
+            <input
+              type="file"
+              accept=".tar.zst,.age,.db,.zst"
+              onChange={(e) => {
+                setRestoreFile(e.target.files?.[0] ?? null);
+                setInspectResult(null);
+                setRestoreError(null);
+                setRestoreMessage(null);
+              }}
+              className="block w-full text-sm text-foreground file:mr-3 file:rounded-inner file:border file:border-border file:bg-card file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-foreground"
+            />
+          </div>
 
-          <label className="mb-1 block text-xs text-muted-foreground">
-            {t("settings.backupPassword")}
-          </label>
-          <input
-            type="password"
-            value={restorePassword}
-            onChange={(e) => setRestorePassword(e.target.value)}
-            placeholder={t("settings.restorePasswordPlaceholder")}
-            className="mb-3 w-full rounded-md border border-input bg-field px-3 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring"
-          />
+          <div className="mt-3 space-y-1.5">
+            <Label>{t("settings.backupPassword")}</Label>
+            <Input
+              type="password"
+              value={restorePassword}
+              onChange={(e) => setRestorePassword(e.target.value)}
+              placeholder={t("settings.restorePasswordPlaceholder")}
+            />
+          </div>
 
-          <div className="mb-3 flex flex-wrap gap-2">
-            <button
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <Button
+              variant="secondary"
               onClick={handleAnalyzeBackup}
               disabled={!restoreFile || inspectBusy || !!status?.busy}
-              className="rounded-md bg-secondary px-4 py-2 text-sm font-medium text-secondary-foreground hover:bg-secondary/80 disabled:opacity-50"
             >
               {inspectBusy ? t("settings.restoreAnalyzing") : t("settings.restoreAnalyze")}
-            </button>
+            </Button>
             {statusLoading ? (
-              <span className="self-center text-xs text-muted-foreground">
+              <span className="text-xs text-muted-foreground">
                 {t("label.loading")}
               </span>
             ) : (
               <span
-                className={`self-center text-xs ${
-                  status?.can_restore ? "text-muted-foreground" : "text-destructive"
-                }`}
+                className={cn(
+                  "text-xs",
+                  status?.can_restore ? "text-muted-foreground" : "text-destructive",
+                )}
               >
                 {status?.can_restore
                   ? t("settings.restoreAllowed")
@@ -373,55 +393,53 @@ export function BackupRestoreSection({
             )}
           </div>
 
-          <label className="mb-1 block text-xs text-muted-foreground">
-            {t("settings.restoreDataDir")}
-          </label>
-          <input
-            type="text"
-            value={dataDir}
-            onChange={(e) => setDataDir(e.target.value)}
-            className="mb-3 w-full rounded-md border border-input bg-field px-3 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring"
-          />
+          <div className="mt-3 space-y-1.5">
+            <Label>{t("settings.restoreDataDir")}</Label>
+            <FolderPathInput
+              value={dataDir}
+              onChange={setDataDir}
+            />
+          </div>
 
-          <label className="mb-1 block text-xs text-muted-foreground">
-            {t("settings.restoreIntermediateDir")}
-          </label>
-          <input
-            type="text"
-            value={restoreIntermediateDir}
-            onChange={(e) => setRestoreIntermediateDir(e.target.value)}
-            placeholder={`${dataDir || currentDataDir}/intermediate`}
-            className="mb-3 w-full rounded-md border border-input bg-field px-3 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring"
-          />
+          <div className="mt-3 space-y-1.5">
+            <Label>{t("settings.restoreIntermediateDir")}</Label>
+            <FolderPathInput
+              value={restoreIntermediateDir}
+              onChange={setRestoreIntermediateDir}
+              placeholder={`${dataDir || currentDataDir}/intermediate`}
+            />
+          </div>
 
-          <label className="mb-1 block text-xs text-muted-foreground">
-            {t("settings.restoreCompleteDir")}
-          </label>
-          <input
-            type="text"
-            value={restoreCompleteDir}
-            onChange={(e) => setRestoreCompleteDir(e.target.value)}
-            placeholder={`${dataDir || currentDataDir}/complete`}
-            className="mb-3 w-full rounded-md border border-input bg-field px-3 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring"
-          />
+          <div className="mt-3 space-y-1.5">
+            <Label>{t("settings.restoreCompleteDir")}</Label>
+            <FolderPathInput
+              value={restoreCompleteDir}
+              onChange={setRestoreCompleteDir}
+              placeholder={`${dataDir || currentDataDir}/complete`}
+            />
+          </div>
 
           {inspectResult && (
-            <div className="mb-3 rounded-md border border-border bg-field/40 p-3">
-              <div className="mb-2 text-sm font-medium text-foreground">
+            <div className="mt-3 rounded-inner border border-border bg-card/60 p-3">
+              <div className="text-sm font-medium text-foreground">
                 {t("settings.restorePreview")}
               </div>
-              <div className="space-y-1 text-xs text-muted-foreground">
+              <div className="mt-2 space-y-1 text-xs text-muted-foreground">
                 <div>
                   {t("settings.restoreSourceDataDir")}:{" "}
-                  {inspectResult.manifest.source_paths.data_dir}
+                  <span className="font-mono">{inspectResult.manifest.source_paths.data_dir}</span>
                 </div>
                 <div>
                   {t("settings.restoreSourceCompleteDir")}:{" "}
-                  {inspectResult.manifest.source_paths.complete_dir}
+                  <span className="font-mono">
+                    {inspectResult.manifest.source_paths.complete_dir}
+                  </span>
                 </div>
                 <div>
                   {t("settings.restoreSourceIntermediateDir")}:{" "}
-                  {inspectResult.manifest.source_paths.intermediate_dir}
+                  <span className="font-mono">
+                    {inspectResult.manifest.source_paths.intermediate_dir}
+                  </span>
                 </div>
                 <div>
                   {t("settings.restoreSchema")}:{" "}
@@ -449,30 +467,29 @@ export function BackupRestoreSection({
           )}
 
           {remapRequirements.length > 0 && (
-            <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/10 p-3">
-              <div className="mb-2 text-sm font-medium text-foreground">
+            <div className="mt-3 rounded-inner border border-status-paused/40 bg-status-paused/10 p-3">
+              <div className="text-sm font-medium text-foreground">
                 {t("settings.restoreRemapsTitle")}
               </div>
-              <div className="mb-2 text-xs text-muted-foreground">
+              <div className="mt-1 text-xs text-muted-foreground">
                 {t("settings.restoreRemapsDesc")}
               </div>
-              <div className="space-y-3">
+              <div className="mt-3 space-y-3">
                 {remapRequirements.map((entry) => (
                   <div key={entry.category_name}>
                     <div className="mb-1 text-xs text-muted-foreground">
-                      {entry.category_name}: {entry.current_dest_dir}
+                      {entry.category_name}:{" "}
+                      <span className="font-mono">{entry.current_dest_dir}</span>
                     </div>
-                    <input
-                      type="text"
+                    <FolderPathInput
                       value={categoryRemaps[entry.category_name] ?? ""}
-                      onChange={(e) =>
+                      onChange={(destDir) =>
                         setCategoryRemaps((current) => ({
                           ...current,
-                          [entry.category_name]: e.target.value,
+                          [entry.category_name]: destDir,
                         }))
                       }
                       placeholder={t("settings.restoreRemapPlaceholder")}
-                      className="w-full rounded-md border border-input bg-field px-3 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring"
                     />
                   </div>
                 ))}
@@ -480,17 +497,18 @@ export function BackupRestoreSection({
             </div>
           )}
 
-          <button
+          <Button
+            className="mt-3"
+            variant="destructive"
             onClick={() => setRestoreConfirmOpen(true)}
             disabled={restoreDisabled}
-            className="rounded-md bg-destructive px-4 py-2 text-sm font-medium text-white hover:opacity-90 disabled:opacity-50"
           >
             {restoreBusy ? t("settings.restoreRunning") : t("settings.restoreButton")}
-          </button>
+          </Button>
 
-          {restoreMessage && <p className="mt-3 text-xs text-green-600">{restoreMessage}</p>}
+          {restoreMessage && <p className="mt-3 text-xs text-status-completed">{restoreMessage}</p>}
           {restoreError && <p className="mt-3 text-xs text-destructive">{restoreError}</p>}
-        </div>
+        </SettingsInnerBox>
       </div>
 
       <ConfirmDialog
@@ -502,7 +520,7 @@ export function BackupRestoreSection({
         onConfirm={() => void executeRestore()}
         onCancel={() => setRestoreConfirmOpen(false)}
       />
-    </section>
+    </SectionCard>
   );
 }
 
@@ -581,22 +599,22 @@ export function ApiKeysSection() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    if (!isTruthyQueryParam(params.get(API_KEY_GENERATE_PARAM))) {
+    if (!isTruthyQueryParam(firstQueryParam(params, API_KEY_GENERATE_PARAMS))) {
       return;
     }
 
-    const name = params.get(API_KEY_NAME_PARAM)?.trim() ?? "";
+    const name = firstQueryParam(params, API_KEY_NAME_PARAMS)?.trim() ?? "";
     if (!name) {
       return;
     }
 
-    const scope = parseApiKeyScope(params.get(API_KEY_SCOPE_PARAM)) ?? "CONTROL";
+    const scope = parseApiKeyScope(firstQueryParam(params, API_KEY_SCOPE_PARAMS)) ?? "CONTROL";
     setNewKeyName(name);
     setNewKeyScope(scope);
 
-    params.delete(API_KEY_GENERATE_PARAM);
-    params.delete(API_KEY_NAME_PARAM);
-    params.delete(API_KEY_SCOPE_PARAM);
+    deleteQueryParams(params, API_KEY_GENERATE_PARAMS);
+    deleteQueryParams(params, API_KEY_NAME_PARAMS);
+    deleteQueryParams(params, API_KEY_SCOPE_PARAMS);
 
     const nextSearch = params.toString();
     const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ""}${window.location.hash}`;
@@ -647,12 +665,8 @@ export function ApiKeysSection() {
   };
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{t("settings.apiKeys")}</CardTitle>
-        <CardDescription>{t("settings.apiKeysDesc")}</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-5">
+    <SectionCard title={t("settings.apiKeys")} description={t("settings.apiKeysDesc")}>
+      <div className="space-y-5">
       {keys.length === 0 ? (
         <p className="text-sm text-muted-foreground">
           {t("settings.apiKeyNone")}
@@ -669,12 +683,12 @@ export function ApiKeysSection() {
             }) => (
               <div
                 key={key.id}
-                className="flex items-center justify-between rounded-xl border border-border/70 px-3 py-3"
+                className="flex items-center justify-between gap-4 rounded-inner border border-border px-4 py-3"
               >
                 <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium text-foreground">{key.name}</div>
-                  <div className="flex gap-3 text-xs text-muted-foreground">
-                    <span className="rounded bg-muted px-1.5 py-0.5">
+                  <div className="text-sm font-semibold text-foreground">{key.name}</div>
+                  <div className="mt-1 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+                    <span className="rounded-chip bg-muted px-1.5 py-0.5 text-[10.5px] font-semibold uppercase tracking-[0.1em]">
                       {key.scope === "ADMIN"
                         ? t("settings.scopeAdmin")
                         : key.scope === "READ"
@@ -797,8 +811,8 @@ export function ApiKeysSection() {
           </div>
         </DialogContent>
       </Dialog>
-      </CardContent>
-    </Card>
+      </div>
+    </SectionCard>
   );
 }
 

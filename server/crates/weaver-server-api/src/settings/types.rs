@@ -12,7 +12,9 @@ pub struct GeneralSettings {
     pub cleanup_after_extract: bool,
     pub max_download_speed: u64,
     pub max_retries: u32,
+    pub ip_replacement_trial_extra_connections: u8,
     pub isp_bandwidth_cap: Option<IspBandwidthCapSettings>,
+    pub watch_folder: WatchFolderSettings,
 }
 
 #[derive(Debug, InputObject)]
@@ -22,7 +24,117 @@ pub struct GeneralSettingsInput {
     pub cleanup_after_extract: Option<bool>,
     pub max_download_speed: Option<u64>,
     pub max_retries: Option<u32>,
+    pub ip_replacement_trial_extra_connections: Option<u8>,
     pub isp_bandwidth_cap: Option<IspBandwidthCapSettingsInput>,
+    pub watch_folder: Option<WatchFolderSettingsInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+pub struct WatchFolderSettings {
+    pub mode: String,
+    pub path: Option<String>,
+    pub poll_interval_secs: u64,
+    pub stability_secs: u64,
+    pub category_from_subfolders: bool,
+    pub scanning_paused: bool,
+}
+
+impl From<&weaver_server_core::watch_folder::WatchFolderConfig> for WatchFolderSettings {
+    fn from(value: &weaver_server_core::watch_folder::WatchFolderConfig) -> Self {
+        Self {
+            mode: value.mode.as_str().to_string(),
+            path: value.path.clone(),
+            poll_interval_secs: value.poll_interval_secs,
+            stability_secs: value.stability_secs,
+            category_from_subfolders: value.category_from_subfolders,
+            scanning_paused: value.scanning_paused,
+        }
+    }
+}
+
+#[derive(Debug, Clone, InputObject)]
+pub struct WatchFolderSettingsInput {
+    pub mode: Option<String>,
+    pub path: MaybeUndefined<String>,
+    pub poll_interval_secs: Option<u64>,
+    pub stability_secs: Option<u64>,
+    pub category_from_subfolders: Option<bool>,
+    pub scanning_paused: Option<bool>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct WatchFolderScanIssue {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct WatchFolderMarkerRename {
+    pub from: String,
+    pub to: String,
+    pub marker: String,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct WatchFolderScanReport {
+    pub discovered_files: Vec<String>,
+    pub queued_nzbs: Vec<String>,
+    pub skipped_inputs: Vec<WatchFolderScanIssue>,
+    pub permanent_errors: Vec<WatchFolderScanIssue>,
+    pub transient_errors: Vec<WatchFolderScanIssue>,
+    pub marker_renamed_sources: Vec<WatchFolderMarkerRename>,
+}
+
+impl From<weaver_server_core::watch_folder::WatchFolderScanReport> for WatchFolderScanReport {
+    fn from(value: weaver_server_core::watch_folder::WatchFolderScanReport) -> Self {
+        Self {
+            discovered_files: value.discovered_files,
+            queued_nzbs: value.queued_nzbs,
+            skipped_inputs: value
+                .skipped_inputs
+                .into_iter()
+                .map(WatchFolderScanIssue::from)
+                .collect(),
+            permanent_errors: value
+                .permanent_errors
+                .into_iter()
+                .map(WatchFolderScanIssue::from)
+                .collect(),
+            transient_errors: value
+                .transient_errors
+                .into_iter()
+                .map(WatchFolderScanIssue::from)
+                .collect(),
+            marker_renamed_sources: value
+                .marker_renamed_sources
+                .into_iter()
+                .map(
+                    <WatchFolderMarkerRename as From<
+                        weaver_server_core::watch_folder::MarkerRename,
+                    >>::from,
+                )
+                .collect(),
+        }
+    }
+}
+
+impl From<weaver_server_core::watch_folder::ScanIssue> for WatchFolderScanIssue {
+    fn from(value: weaver_server_core::watch_folder::ScanIssue) -> Self {
+        Self {
+            path: value.path,
+            reason: value.reason,
+        }
+    }
+}
+
+impl From<weaver_server_core::watch_folder::MarkerRename> for WatchFolderMarkerRename {
+    fn from(value: weaver_server_core::watch_folder::MarkerRename) -> Self {
+        Self {
+            from: value.from,
+            to: value.to,
+            marker: value.marker,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
@@ -153,6 +265,12 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
         let (action_type, speed_limit_bytes) = match &e.action {
             weaver_server_core::bandwidth::ScheduleAction::Pause => ("pause".into(), None),
             weaver_server_core::bandwidth::ScheduleAction::Resume => ("resume".into(), None),
+            weaver_server_core::bandwidth::ScheduleAction::PauseWatchFolderScanning => {
+                ("pause_watch_folder_scanning".into(), None)
+            }
+            weaver_server_core::bandwidth::ScheduleAction::ResumeWatchFolderScanning => {
+                ("resume_watch_folder_scanning".into(), None)
+            }
             weaver_server_core::bandwidth::ScheduleAction::SpeedLimit { bytes_per_sec } => {
                 ("speed_limit".into(), Some(*bytes_per_sec))
             }
@@ -190,6 +308,8 @@ impl ScheduleInput {
         let action = match self.action_type.as_str() {
             "pause" => ScheduleAction::Pause,
             "resume" => ScheduleAction::Resume,
+            "pause_watch_folder_scanning" => ScheduleAction::PauseWatchFolderScanning,
+            "resume_watch_folder_scanning" => ScheduleAction::ResumeWatchFolderScanning,
             "speed_limit" => ScheduleAction::SpeedLimit {
                 bytes_per_sec: self.speed_limit_bytes.unwrap_or(0),
             },

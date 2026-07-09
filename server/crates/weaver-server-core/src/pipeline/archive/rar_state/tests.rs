@@ -1,7 +1,7 @@
 use super::*;
 use std::io::Cursor;
 use weaver_par2::checksum;
-use weaver_rar::RarArchive;
+use weaver_unrar::RarArchive;
 
 const TEST_RAR5_SIG: [u8; 8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
 
@@ -73,6 +73,24 @@ fn build_test_rar_file_header(
     unpacked_size: u64,
     data_crc: Option<u32>,
 ) -> Vec<u8> {
+    build_test_rar_file_header_with_extra(
+        filename,
+        common_flags_extra,
+        data_size,
+        unpacked_size,
+        data_crc,
+        &[],
+    )
+}
+
+fn build_test_rar_file_header_with_extra(
+    filename: &str,
+    common_flags_extra: u64,
+    data_size: u64,
+    unpacked_size: u64,
+    data_crc: Option<u32>,
+    extra: &[u8],
+) -> Vec<u8> {
     let file_flags: u64 = if data_crc.is_some() { 0x0004 } else { 0 };
     let mut type_body = Vec::new();
     type_body.extend_from_slice(&encode_test_rar_vint(file_flags));
@@ -86,21 +104,37 @@ fn build_test_rar_file_header(
     type_body.extend_from_slice(&encode_test_rar_vint(filename.len() as u64));
     type_body.extend_from_slice(filename.as_bytes());
 
+    let mut file_body = Vec::new();
+    file_body.extend_from_slice(&encode_test_rar_vint(data_size));
+    file_body.extend_from_slice(&type_body);
+
+    build_test_rar_header(2, 0x0002 | common_flags_extra, &file_body, extra)
+}
+
+fn build_test_extra_record(record_type: u64, body: &[u8]) -> Vec<u8> {
+    let type_bytes = encode_test_rar_vint(record_type);
+    let record_size = type_bytes.len() + body.len();
+    let mut data = Vec::new();
+    data.extend_from_slice(&encode_test_rar_vint(record_size as u64));
+    data.extend_from_slice(&type_bytes);
+    data.extend_from_slice(body);
+    data
+}
+
+fn build_test_file_version_extra(version: u64) -> Vec<u8> {
     let mut body = Vec::new();
-    body.extend_from_slice(&encode_test_rar_vint(2));
-    body.extend_from_slice(&encode_test_rar_vint(0x0002 | common_flags_extra));
-    body.extend_from_slice(&encode_test_rar_vint(data_size));
-    body.extend_from_slice(&type_body);
+    body.extend_from_slice(&encode_test_rar_vint(0));
+    body.extend_from_slice(&encode_test_rar_vint(version));
+    build_test_extra_record(0x04, &body)
+}
 
-    let header_size = body.len() as u64;
-    let header_size_bytes = encode_test_rar_vint(header_size);
-    let crc = checksum::crc32(&[header_size_bytes.as_slice(), body.as_slice()].concat());
-
-    let mut result = Vec::new();
-    result.extend_from_slice(&crc.to_le_bytes());
-    result.extend_from_slice(&header_size_bytes);
-    result.extend_from_slice(&body);
-    result
+fn build_test_redirection_extra(redir_type: u64, target: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&encode_test_rar_vint(redir_type));
+    body.extend_from_slice(&encode_test_rar_vint(0));
+    body.extend_from_slice(&encode_test_rar_vint(target.len() as u64));
+    body.extend_from_slice(target.as_bytes());
+    build_test_extra_record(0x05, &body)
 }
 
 fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
@@ -174,6 +208,34 @@ fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     ]
 }
 
+fn build_solid_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
+    let mut files = build_multifile_multivolume_rar_set();
+    let solid_flag = 0x0004;
+
+    for (volume, (_, bytes)) in files.iter_mut().enumerate() {
+        let mut solid_bytes = Vec::new();
+        solid_bytes.extend_from_slice(&TEST_RAR5_SIG);
+        let flags = if volume == 0 {
+            0x0001 | solid_flag
+        } else {
+            0x0001 | 0x0002 | solid_flag
+        };
+        let volume_number = (volume != 0).then_some(volume as u64);
+        solid_bytes.extend_from_slice(&build_test_rar_main_header(flags, volume_number));
+
+        let main_header_len = TEST_RAR5_SIG.len()
+            + build_test_rar_main_header(
+                if volume == 0 { 0x0001 } else { 0x0001 | 0x0002 },
+                volume_number,
+            )
+            .len();
+        solid_bytes.extend_from_slice(&bytes[main_header_len..]);
+        *bytes = solid_bytes;
+    }
+
+    files
+}
+
 #[test]
 fn push_unique_ready_member_preserves_order_and_dedupes_names() {
     let mut ready_members = Vec::new();
@@ -188,6 +250,231 @@ fn push_unique_ready_member_preserves_order_and_dedupes_names() {
         .map(|member| member.name.as_str())
         .collect();
     assert_eq!(names, vec!["E10.mkv", "E11.mkv"]);
+}
+
+#[test]
+fn build_plan_skips_versioned_members_like_unrar_default_extraction() {
+    let payload = b"python launcher\n";
+    let payload_crc = checksum::crc32(payload);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&TEST_RAR5_SIG);
+    bytes.extend_from_slice(&build_test_rar_main_header(0, None));
+    bytes.extend_from_slice(&build_test_rar_file_header_with_extra(
+        "bin/2to3",
+        0,
+        payload.len() as u64,
+        payload.len() as u64,
+        Some(payload_crc),
+        &build_test_file_version_extra(1),
+    ));
+    bytes.extend_from_slice(payload);
+    bytes.extend_from_slice(&build_test_rar_file_header(
+        "bin/2to3",
+        0,
+        payload.len() as u64,
+        payload.len() as u64,
+        Some(payload_crc),
+    ));
+    bytes.extend_from_slice(payload);
+    bytes.extend_from_slice(&build_test_rar_end_header(false));
+
+    let archive = RarArchive::open(Cursor::new(bytes.clone())).unwrap();
+    let metadata = archive.metadata();
+    let metadata_names = metadata
+        .members
+        .iter()
+        .map(|member| (member.name.as_str(), member.version))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        metadata_names,
+        vec![("bin/2to3;1", Some(1)), ("bin/2to3", None)]
+    );
+
+    let facts = BTreeMap::from([(
+        0,
+        RarArchive::parse_volume_facts(Cursor::new(bytes), None).unwrap(),
+    )]);
+    let volume_map = HashMap::from([("versioned.rar".to_string(), 0)]);
+    let plan = build_plan(
+        volume_map,
+        &facts,
+        &archive,
+        &HashSet::new(),
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(plan.member_names, vec!["bin/2to3"]);
+    assert_eq!(
+        plan.ready_members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bin/2to3"]
+    );
+    assert_eq!(
+        plan.topology
+            .members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bin/2to3"]
+    );
+}
+
+#[test]
+fn build_plan_records_file_copy_dependency_and_waits_for_source() {
+    let source_payload = b"source";
+    let source_crc = checksum::crc32(source_payload);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&TEST_RAR5_SIG);
+    bytes.extend_from_slice(&build_test_rar_main_header(0, None));
+    bytes.extend_from_slice(&build_test_rar_file_header(
+        "source.bin",
+        0,
+        source_payload.len() as u64,
+        source_payload.len() as u64,
+        Some(source_crc),
+    ));
+    bytes.extend_from_slice(source_payload);
+    bytes.extend_from_slice(&build_test_rar_file_header_with_extra(
+        "copy.bin",
+        0,
+        0,
+        0,
+        Some(checksum::crc32(&[])),
+        &build_test_redirection_extra(5, "source.bin"),
+    ));
+    bytes.extend_from_slice(&build_test_rar_end_header(false));
+
+    let archive = RarArchive::open(Cursor::new(bytes.clone())).unwrap();
+    let facts = BTreeMap::from([(
+        0,
+        RarArchive::parse_volume_facts(Cursor::new(bytes), None).unwrap(),
+    )]);
+    let volume_map = HashMap::from([("filecopy.rar".to_string(), 0)]);
+    let plan = build_plan(
+        volume_map.clone(),
+        &facts,
+        &archive,
+        &HashSet::new(),
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(
+        plan.member_dependencies.get("copy.bin"),
+        Some(&RarMemberDependency {
+            source_member: "source.bin".to_string(),
+            source_first_volume: 0,
+            source_last_volume: 0,
+        })
+    );
+    assert_eq!(
+        plan.ready_members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["source.bin"]
+    );
+
+    let plan_after_source = build_plan(
+        volume_map,
+        &facts,
+        &archive,
+        &HashSet::from(["source.bin".to_string()]),
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        plan_after_source
+            .ready_members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["copy.bin"]
+    );
+}
+
+#[test]
+fn build_plan_file_copy_dependency_uses_first_duplicate_source_like_unrar() {
+    let first_payload = b"first";
+    let second_payload = b"second";
+
+    let mut part01 = Vec::new();
+    part01.extend_from_slice(&TEST_RAR5_SIG);
+    part01.extend_from_slice(&build_test_rar_main_header(0x0001, None));
+    part01.extend_from_slice(&build_test_rar_file_header(
+        "source.bin",
+        0,
+        first_payload.len() as u64,
+        first_payload.len() as u64,
+        Some(checksum::crc32(first_payload)),
+    ));
+    part01.extend_from_slice(first_payload);
+    part01.extend_from_slice(&build_test_rar_end_header(true));
+
+    let mut part02 = Vec::new();
+    part02.extend_from_slice(&TEST_RAR5_SIG);
+    part02.extend_from_slice(&build_test_rar_main_header(0x0001 | 0x0002, Some(1)));
+    part02.extend_from_slice(&build_test_rar_file_header(
+        "source.bin",
+        0,
+        second_payload.len() as u64,
+        second_payload.len() as u64,
+        Some(checksum::crc32(second_payload)),
+    ));
+    part02.extend_from_slice(second_payload);
+    part02.extend_from_slice(&build_test_rar_file_header_with_extra(
+        "copy.bin",
+        0,
+        0,
+        0,
+        Some(checksum::crc32(&[])),
+        &build_test_redirection_extra(5, "source.bin"),
+    ));
+    part02.extend_from_slice(&build_test_rar_end_header(false));
+
+    let mut archive = RarArchive::open(Cursor::new(part01.clone())).unwrap();
+    archive
+        .add_volume(1, Box::new(Cursor::new(part02.clone())))
+        .unwrap();
+    let facts = BTreeMap::from([
+        (
+            0,
+            RarArchive::parse_volume_facts(Cursor::new(part01), None).unwrap(),
+        ),
+        (
+            1,
+            RarArchive::parse_volume_facts(Cursor::new(part02), None).unwrap(),
+        ),
+    ]);
+    let volume_map = HashMap::from([
+        ("dup.part01.rar".to_string(), 0),
+        ("dup.part02.rar".to_string(), 1),
+    ]);
+
+    let plan = build_plan(
+        volume_map,
+        &facts,
+        &archive,
+        &HashSet::new(),
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(
+        plan.member_dependencies.get("copy.bin"),
+        Some(&RarMemberDependency {
+            source_member: "source.bin".to_string(),
+            source_first_volume: 0,
+            source_last_volume: 0,
+        })
+    );
 }
 
 #[test]
@@ -227,6 +514,92 @@ fn build_plan_claims_missing_continuation_volumes_for_pending_owners() {
     assert_eq!(decision.owners, vec!["E02.mkv".to_string()]);
     assert_eq!(decision.pending_owners, vec!["E02.mkv".to_string()]);
     assert!(!decision.ownership_eligible);
+}
+
+#[test]
+fn build_plan_solid_waits_instead_of_starting_ready_prefix() {
+    let files = build_solid_multifile_multivolume_rar_set();
+    let mut archive = RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+    archive
+        .add_volume(1, Box::new(Cursor::new(files[1].1.clone())))
+        .unwrap();
+    archive
+        .add_volume(2, Box::new(Cursor::new(files[2].1.clone())))
+        .unwrap();
+
+    let present_volumes = [0usize, 1, 2];
+    let facts: BTreeMap<u32, RarVolumeFacts> = present_volumes
+        .iter()
+        .map(|&volume| {
+            (
+                volume as u32,
+                RarArchive::parse_volume_facts(Cursor::new(files[volume].1.clone()), None).unwrap(),
+            )
+        })
+        .collect();
+    let volume_map = present_volumes
+        .iter()
+        .map(|&volume| (files[volume].0.clone(), volume as u32))
+        .collect();
+
+    let plan = build_plan(
+        volume_map,
+        &facts,
+        &archive,
+        &HashSet::new(),
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+
+    assert!(plan.is_solid);
+    assert!(plan.ready_members.is_empty());
+    assert!(plan.waiting_on_volumes.contains(&3));
+    assert_eq!(plan.phase, RarSetPhase::WaitingForVolumes);
+}
+
+#[test]
+fn build_plan_keeps_fully_extracted_set_complete_when_source_fact_is_missing() {
+    let files = build_multifile_multivolume_rar_set();
+    let mut archive = RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+    for (volume, (_, bytes)) in files.iter().enumerate().skip(1) {
+        archive
+            .add_volume(volume, Box::new(Cursor::new(bytes.clone())))
+            .unwrap();
+    }
+
+    let mut facts: BTreeMap<u32, RarVolumeFacts> = files
+        .iter()
+        .enumerate()
+        .map(|(volume, (_, bytes))| {
+            (
+                volume as u32,
+                RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None).unwrap(),
+            )
+        })
+        .collect();
+    facts.remove(&1);
+    let volume_map = files
+        .iter()
+        .enumerate()
+        .map(|(volume, (filename, _))| (filename.clone(), volume as u32))
+        .collect();
+    let extracted = HashSet::from(["E01.mkv".to_string(), "E02.mkv".to_string()]);
+
+    let plan = build_plan(
+        volume_map,
+        &facts,
+        &archive,
+        &extracted,
+        &HashSet::new(),
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(plan.phase, RarSetPhase::Complete);
+    assert!(plan.waiting_on_volumes.is_empty());
+    assert!(plan.topology.unresolved_spans.is_empty());
+    assert!(!plan.deletion_eligible.contains(&1));
 }
 
 #[test]
@@ -335,7 +708,7 @@ fn build_plan_uses_volume_facts_for_incremental_ownership_only() {
     cached["members"] = serde_json::json!([]);
     let archive = RarArchive::deserialize_headers_with_password(
         &rmp_serde::to_vec(
-            &serde_json::from_value::<weaver_rar::CachedArchiveHeaders>(cached).unwrap(),
+            &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
         )
         .unwrap(),
         None::<String>,

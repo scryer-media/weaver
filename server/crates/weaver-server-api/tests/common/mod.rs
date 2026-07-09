@@ -23,9 +23,6 @@ use weaver_server_core::jobs::model::{JobState, JobStatus, epoch_ms_now};
 use weaver_server_core::operations::metrics::PipelineMetrics;
 use weaver_server_core::pipeline::download::queue::DownloadQueue;
 use weaver_server_core::settings::{Config, SharedConfig};
-use weaver_server_core::{
-    DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY, DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY,
-};
 use weaver_server_core::{Database, JobHistoryRow};
 use weaver_server_core::{RestoreJobRequest, SchedulerCommand, SchedulerHandle};
 
@@ -138,8 +135,21 @@ impl TestHarness {
     }
 
     /// Create a new test harness with in-memory DB, default config, mock
-    /// scheduler, and a real GraphQL schema.
+    /// scheduler, and a real GraphQL schema. Spawns the background
+    /// history-delete worker, matching production.
     pub async fn new() -> Self {
+        Self::new_with_options(true).await
+    }
+
+    /// Like [`TestHarness::new`] but does not spawn the background
+    /// history-delete worker. Use this in tests that seed a delete operation and
+    /// assert on its initial `QUEUED` state, so the worker cannot claim the
+    /// operation (flipping it to `RUNNING`) before the assertion runs.
+    pub async fn new_without_history_delete_worker() -> Self {
+        Self::new_with_options(false).await
+    }
+
+    async fn new_with_options(spawn_history_delete_worker: bool) -> Self {
         let tempdir = tempfile::TempDir::new().expect("failed to create tempdir");
         let db = Database::open_in_memory().expect("failed to open in-memory DB");
 
@@ -155,14 +165,21 @@ impl TestHarness {
             max_download_speed: None,
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
-            diagnostic_upload_url: None,
+            ip_replacement_trial_extra_connections: None,
+            watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             config_path: None,
         };
         let shared_config: SharedConfig = Arc::new(RwLock::new(config));
 
         let (handle, metrics, shared_state, scheduler_task) = spawn_test_scheduler(db.clone());
         let rss = RssService::new(handle.clone(), shared_config.clone(), db.clone());
-        let auth_cache = LoginAuthCache::from_credentials(None);
+        let watch_folder = weaver_server_core::watch_folder::WatchFolderService::new(
+            db.clone(),
+            handle.clone(),
+            shared_config.clone(),
+        );
+        let auth_cache =
+            LoginAuthCache::from_credentials(None, db.get_or_create_jwt_signing_secret().unwrap());
         let api_key_cache = ApiKeyCache::from_rows(vec![]);
         let shared_schedules: weaver_server_core::bandwidth::schedule::SharedSchedules =
             Arc::new(RwLock::new(vec![]));
@@ -174,9 +191,12 @@ impl TestHarness {
             auth_cache: auth_cache.clone(),
             api_key_cache,
             rss,
+            watch_folder,
             schedules: shared_schedules,
             log_buffer:
                 weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),
+            nntp_pool: None,
+            spawn_history_delete_worker,
         });
 
         Self {
@@ -550,6 +570,9 @@ fn spawn_test_scheduler(
                 SchedulerCommand::SetSpeedLimit { reply, .. } => {
                     let _ = reply.send(());
                 }
+                SchedulerCommand::SetIpReplacementTrialExtraConnections { reply, .. } => {
+                    let _ = reply.send(());
+                }
                 SchedulerCommand::SetBandwidthCapPolicy { reply, .. } => {
                     let _ = reply.send(Ok(()));
                 }
@@ -670,78 +693,6 @@ fn spawn_test_scheduler(
                     };
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::StartDiagnosticRedownload {
-                    source_job_id,
-                    diagnostic_job_id,
-                    include_server_hostnames,
-                    reply,
-                } => {
-                    let result = match jobs.get(&source_job_id) {
-                        Some(source_state) => {
-                            let mut spec = source_state.spec.clone();
-                            spec.metadata.push((
-                                DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY.to_string(),
-                                source_job_id.0.to_string(),
-                            ));
-                            spec.metadata.push((
-                                DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY.to_string(),
-                                include_server_hostnames.to_string(),
-                            ));
-
-                            let assembly = JobAssembly::new(diagnostic_job_id);
-                            let par2_bytes = spec.par2_bytes();
-                            let status = JobStatus::Queued;
-                            let (download_state, post_state, run_state, failure_error) =
-                                runtime_lanes_for_status(&status);
-                            let state = JobState {
-                                job_id: diagnostic_job_id,
-                                job_hash: [0; 32],
-                                spec,
-                                status,
-                                download_state,
-                                post_state,
-                                run_state,
-                                assembly,
-                                extraction_depth: 0,
-                                created_at: std::time::Instant::now(),
-                                created_at_epoch_ms: epoch_ms_now(),
-                                queued_repair_at_epoch_ms: None,
-                                queued_extract_at_epoch_ms: None,
-                                paused_resume_status: None,
-                                paused_resume_download_state: None,
-                                paused_resume_post_state: None,
-                                failure_error,
-                                working_dir: PathBuf::from("/tmp/test"),
-                                downloaded_bytes: 0,
-                                failed_bytes: 0,
-                                par2_bytes,
-                                health_probing: false,
-                                health_probe_round: 0,
-                                last_health_probe_failed_bytes: 0,
-                                next_health_probe_failed_bytes: 1,
-                                detected_archives: HashMap::new(),
-                                file_identities: HashMap::new(),
-                                held_segments: Vec::new(),
-                                download_queue: DownloadQueue::new(),
-                                recovery_queue: DownloadQueue::new(),
-                                staging_dir: None,
-                                restored_download_floor_bytes: 0,
-                            };
-                            let _ = event_tx.send(PipelineEvent::JobCreated {
-                                job_id: diagnostic_job_id,
-                                name: state.spec.name.clone(),
-                                total_files: state.spec.files.len() as u32,
-                                total_bytes: state.spec.total_bytes,
-                            });
-                            jobs.insert(diagnostic_job_id, state);
-                            Ok(diagnostic_job_id)
-                        }
-                        None => Err(weaver_server_core::SchedulerError::JobNotFound(
-                            source_job_id,
-                        )),
-                    };
-                    let _ = reply.send(result);
-                }
                 SchedulerCommand::UpdateJob {
                     job_id,
                     update,
@@ -786,6 +737,7 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             downloaded_bytes: 0,
             optional_recovery_bytes: 0,
             optional_recovery_downloaded_bytes: 0,
+            phase_progress: Vec::new(),
             failed_bytes: 0,
             health: 1000,
             password: state.spec.password.clone(),

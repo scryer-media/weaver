@@ -93,8 +93,11 @@ pub fn bootstrap_encryption(
     db: &mut Database,
     config: &mut Config,
 ) -> Result<(), String> {
-    let key = crate::persistence::encryption::ensure_encryption_key(Some(data_dir.to_path_buf()))?;
-    db.set_encryption_key(key);
+    if db.encryption_key().is_none() {
+        let key =
+            crate::persistence::encryption::ensure_encryption_key(Some(data_dir.to_path_buf()))?;
+        db.set_encryption_key(key);
+    }
     if let Err(e) = db.migrate_plaintext_credentials() {
         error!("failed to encrypt existing passwords: {e}");
     }
@@ -195,6 +198,21 @@ active = true
         assert!(!data_dir.join("encryption.key").exists());
         assert!(migrated_path.exists());
         assert!(!dir.path().join("weaver.toml.toml.migrated").exists());
+    }
+
+    #[test]
+    fn bootstrap_encryption_reuses_toml_import_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let toml_path = dir.path().join("weaver.toml");
+        write_test_config(&toml_path, &data_dir);
+
+        let (mut db, mut config) = open_db_and_config(&toml_path).unwrap();
+
+        bootstrap_encryption(&data_dir, &mut db, &mut config).unwrap();
+
+        assert_eq!(config.servers[0].password, Some("pass".to_string()));
+        assert!(!data_dir.join("encryption.key").exists());
     }
 
     #[test]

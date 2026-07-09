@@ -113,13 +113,16 @@ impl AuthMutation {
         let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?.clone();
         let username_for_db = username.clone();
         let hash_for_db = hash.clone();
-        tokio::task::spawn_blocking(move || {
-            db.set_auth_credentials(&username_for_db, &hash_for_db)
+        let jwt_secret = tokio::task::spawn_blocking(move || {
+            db.set_auth_credentials(&username_for_db, &hash_for_db)?;
+            db.rotate_jwt_signing_secret()
         })
         .await
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
         .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-        auth_cache.replace(Some(crate::auth::CachedLoginAuth::new(username, hash)));
+        auth_cache.replace(Some(crate::auth::CachedLoginAuth::new(
+            username, hash, jwt_secret,
+        )));
         info!("login protection enabled");
         Ok(true)
     }
@@ -128,10 +131,14 @@ impl AuthMutation {
     async fn disable_login(&self, ctx: &Context<'_>) -> Result<bool> {
         let db = ctx.data::<Database>()?.clone();
         let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?.clone();
-        tokio::task::spawn_blocking(move || db.clear_auth_credentials())
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        tokio::task::spawn_blocking(move || {
+            db.clear_auth_credentials()?;
+            db.rotate_jwt_signing_secret()?;
+            Ok::<_, weaver_server_core::StateError>(())
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         auth_cache.clear();
         info!("login protection disabled");
         Ok(true)
@@ -171,13 +178,17 @@ impl AuthMutation {
                 .map_err(async_graphql::Error::new)?;
         let username = creds.username.clone();
         let new_hash_for_db = new_hash.clone();
-        tokio::task::spawn_blocking(move || db2.set_auth_credentials(&username, &new_hash_for_db))
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let jwt_secret = tokio::task::spawn_blocking(move || {
+            db2.set_auth_credentials(&username, &new_hash_for_db)?;
+            db2.rotate_jwt_signing_secret()
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         auth_cache.replace(Some(crate::auth::CachedLoginAuth::new(
             creds.username,
             new_hash,
+            jwt_secret,
         )));
         info!("login password changed");
         Ok(true)

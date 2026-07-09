@@ -1,25 +1,8 @@
+import type { ReactNode } from "react";
 import { Progress } from "@/components/ui/progress";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
+import { progressDisplayKind, statusBgClass } from "@/lib/status-tokens";
 import { cn } from "@/lib/utils";
-
-function statusColor(status?: string): string {
-  switch (status) {
-    case "VERIFYING":
-      return "bg-amber-500";
-    case "REPAIRING":
-      return "bg-orange-500";
-    case "EXTRACTING":
-      return "bg-violet-500";
-    case "COMPLETE":
-      return "bg-emerald-500";
-    case "FAILED":
-      return "bg-red-500";
-    case "PAUSED":
-      return "bg-slate-500";
-    default:
-      return "bg-primary";
-  }
-}
 
 export function JobProgress({
   progress,
@@ -29,6 +12,7 @@ export function JobProgress({
   failedBytes,
   showLabel = true,
   compact = false,
+  label,
 }: {
   progress: number;
   status?: string;
@@ -37,25 +21,44 @@ export function JobProgress({
   failedBytes?: number;
   showLabel?: boolean;
   compact?: boolean;
+  /** Override the derived label (e.g. "Extracting 42%"). */
+  label?: ReactNode;
 }) {
-  const displayedProgress =
-    getDisplayedJobProgress({ progress, status, totalBytes, downloadedBytes, failedBytes }) * 100;
+  const fraction = getDisplayedJobProgress({
+    progress,
+    status,
+    totalBytes,
+    downloadedBytes,
+    failedBytes,
+  });
+  const kind = progressDisplayKind(status, fraction);
+  const pct = fraction * 100;
+  const barColor = statusBgClass(status);
+  const height = compact ? "h-1.5" : "h-2";
+  const derivedLabel =
+    kind === "empty" ? "—" : kind === "indeterminate" ? "…" : `${pct.toFixed(compact ? 0 : 1)}%`;
 
   return (
     <div className={cn("flex items-center gap-3", compact && "gap-2")}>
-      <Progress
-        value={displayedProgress}
-        className={cn(compact && "h-1.5")}
-        indicatorClassName={statusColor(status)}
-      />
+      {kind === "indeterminate" ? (
+        <div className={cn("relative w-full overflow-hidden rounded-pill bg-secondary", height)}>
+          <div className={cn("progress-indeterminate absolute inset-0 rounded-pill opacity-90", barColor)} />
+        </div>
+      ) : (
+        <Progress
+          value={kind === "empty" ? 0 : pct}
+          className={cn("rounded-pill bg-secondary", height)}
+          indicatorClassName={cn("rounded-pill", barColor)}
+        />
+      )}
       {showLabel ? (
         <span
           className={cn(
-            "w-12 text-right text-xs tabular-nums text-muted-foreground",
-            compact && "w-10 text-[10px]",
+            "text-right text-xs tabular-nums text-muted-foreground",
+            compact ? "w-10 text-[10px]" : "w-12",
           )}
         >
-          {displayedProgress.toFixed(1)}%
+          {label ?? derivedLabel}
         </span>
       ) : null}
     </div>

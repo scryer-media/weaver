@@ -3,6 +3,42 @@ use crate::error::YencError;
 use crate::header;
 use crate::types::{DecodeResult, YencMetadata};
 
+/// Decoder state equivalent to rapidyenc's public `RapidYencDecoderState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RapidyencDecodeState {
+    /// Previous decoded position is at a CRLF line boundary.
+    #[default]
+    CrLf,
+    /// Previous input ended after an escape marker.
+    Eq,
+    /// Previous input ended after a carriage return.
+    Cr,
+    /// No special boundary state is pending.
+    None,
+    /// Previous input ended after a raw `\r\n.` prefix.
+    CrLfDot,
+    /// Previous input ended after a raw `\r\n.\r` prefix.
+    CrLfDotCr,
+    /// Previous input ended after a line-start escape marker.
+    CrLfEq,
+}
+
+/// End marker reported by rapidyenc-style incremental decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RapidyencDecodeEnd {
+    None,
+    Control,
+    Article,
+}
+
+/// Progress reported by rapidyenc-style incremental decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RapidyencDecodeProgress {
+    pub source_consumed: usize,
+    pub bytes_written: usize,
+    pub end: RapidyencDecodeEnd,
+}
+
 /// Options for decoding.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DecodeOptions {
@@ -38,6 +74,99 @@ pub fn decode_nntp(input: &[u8], output: &mut [u8]) -> Result<DecodeResult, Yenc
     )
 }
 
+/// Decode a raw NNTP yEnc article, appending decoded bytes to `output`.
+///
+/// Unlike [`decode_nntp`], the destination does not need to be pre-sized (or
+/// zero-initialized): decoded bytes are written straight into the vector's
+/// spare capacity. Decoded output never exceeds the encoded input, so one
+/// `input.len()` reservation is always sufficient.
+pub fn decode_nntp_append(input: &[u8], output: &mut Vec<u8>) -> Result<DecodeResult, YencError> {
+    let start = output.len();
+    output.reserve(input.len());
+    let spare = output.spare_capacity_mut();
+    // SAFETY: the decode writes at most `input.len()` initialized bytes into
+    // this spare region and reports exactly how many bytes were written.
+    let out =
+        unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), input.len()) };
+    let result = decode_with_options(
+        input,
+        out,
+        DecodeOptions {
+            dot_unstuffing: true,
+        },
+    )?;
+    // SAFETY: the first `bytes_written` bytes of the spare region were
+    // initialized by the decode, and `bytes_written <= input.len()`.
+    unsafe {
+        output.set_len(start + result.bytes_written);
+    }
+    Ok(result)
+}
+
+/// Decode bytes with rapidyenc's `rapidyenc_decode` semantics.
+pub fn decode_rapidyenc(input: &[u8], output: &mut [u8]) -> Result<usize, YencError> {
+    let mut state = RapidyencDecodeState::default();
+    decode_rapidyenc_ex(true, input, output, &mut state)
+}
+
+/// Decode bytes with rapidyenc's `rapidyenc_decode_ex` semantics.
+pub fn decode_rapidyenc_ex(
+    is_raw: bool,
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut RapidyencDecodeState,
+) -> Result<usize, YencError> {
+    crate::simd::decode_rapidyenc_into(input, output, is_raw, state)
+}
+
+/// Decode bytes with rapidyenc's raw incremental end-detecting semantics.
+pub fn decode_rapidyenc_incremental(
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut RapidyencDecodeState,
+) -> Result<RapidyencDecodeProgress, YencError> {
+    let outcome = crate::simd::decode_rapidyenc_incremental_into(input, output, state)?;
+    Ok(RapidyencDecodeProgress {
+        source_consumed: outcome.consumed,
+        bytes_written: outcome.written,
+        end: outcome.end,
+    })
+}
+
+/// Decode a raw NNTP yEnc body chunk into `output`, stopping at the next yEnc
+/// control line.
+///
+/// This is the lower-level streaming hook used when an outer NNTP parser owns
+/// response-boundary handling. It appends decoded bytes to `output`, updates
+/// `decode_state` and CRC, performs NNTP dot-unstuffing, and reports exact
+/// source bytes consumed.
+pub fn decode_body_chunk_until_control(
+    decode_state: &mut DecodeState,
+    input: &[u8],
+    output: &mut Vec<u8>,
+) -> Result<RapidyencDecodeProgress, YencError> {
+    decode_body_chunk_until_end(decode_state, input, output)
+}
+
+fn validate_ypart_decoded_size(
+    metadata: &YencMetadata,
+    bytes_written: usize,
+) -> Result<(), YencError> {
+    if metadata.part.is_some()
+        && let (Some(begin), Some(end)) = (metadata.begin, metadata.end)
+    {
+        let expected_size = end - begin + 1;
+        if bytes_written as u64 != expected_size {
+            return Err(YencError::SizeMismatch {
+                expected: expected_size,
+                actual: bytes_written as u64,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Decode a complete yEnc article with custom options.
 pub fn decode_with_options(
     input: &[u8],
@@ -50,7 +179,13 @@ pub fn decode_with_options(
     let data = &input[parsed.data_start..data_end];
 
     let mut crc = Crc32::new();
-    let bytes_written = decode_body(data, output, &mut crc, options)?;
+    let bytes_written = decode_body_with_line_length(
+        data,
+        output,
+        &mut crc,
+        options,
+        Some(parsed.metadata.line_length),
+    )?;
 
     let part_crc = crc.finalize();
 
@@ -69,6 +204,8 @@ pub fn decode_with_options(
             actual: bytes_written as u64,
         });
     }
+
+    validate_ypart_decoded_size(&parsed.metadata, bytes_written)?;
 
     // For single-part articles, also validate =ybegin size vs =yend size.
     if parsed.metadata.part.is_none()
@@ -90,10 +227,14 @@ pub fn decode_with_options(
         expected_file_crc
     };
 
-    let crc_valid = match expected_crc_to_check {
-        Some(expected) => part_crc == expected,
-        None => true, // No expected CRC means we can't validate, treat as valid.
-    };
+    if let Some(expected) = expected_crc_to_check
+        && part_crc != expected
+    {
+        return Err(YencError::CrcMismatch {
+            expected,
+            actual: part_crc,
+        });
+    }
 
     Ok(DecodeResult {
         metadata: parsed.metadata,
@@ -101,7 +242,7 @@ pub fn decode_with_options(
         part_crc,
         expected_part_crc,
         expected_file_crc,
-        crc_valid,
+        crc_valid: true,
         has_trailer: parsed.yend.is_some(),
     })
 }
@@ -111,6 +252,82 @@ pub fn decode_with_options(
 pub struct DecodedArticle {
     pub data: Vec<u8>,
     pub result: DecodeResult,
+}
+
+/// Finalize a caller-owned streaming yEnc decode using the same validation
+/// rules as [`StreamingArticleDecoder`].
+pub fn finish_streaming_article(
+    metadata: YencMetadata,
+    yend: Option<header::YendFields>,
+    decode_state: DecodeState,
+    output: Vec<u8>,
+) -> Result<DecodedArticle, YencError> {
+    let result = finish_streaming_result(metadata, yend, decode_state)?;
+
+    Ok(DecodedArticle {
+        data: output,
+        result,
+    })
+}
+
+pub fn finish_streaming_result(
+    metadata: YencMetadata,
+    yend: Option<header::YendFields>,
+    decode_state: DecodeState,
+) -> Result<DecodeResult, YencError> {
+    let bytes_written = decode_state.bytes_decoded as usize;
+    let part_crc = decode_state.finalize_crc();
+
+    let (expected_part_crc, expected_file_crc, yend_size, has_trailer) = if let Some(yend) = yend {
+        (yend.pcrc32, yend.crc32, yend.size, true)
+    } else {
+        (None, None, None, false)
+    };
+
+    if let Some(expected_size) = yend_size
+        && bytes_written as u64 != expected_size
+    {
+        return Err(YencError::SizeMismatch {
+            expected: expected_size,
+            actual: bytes_written as u64,
+        });
+    }
+
+    validate_ypart_decoded_size(&metadata, bytes_written)?;
+
+    if metadata.part.is_none()
+        && let Some(expected_size) = yend_size
+        && metadata.size != expected_size
+    {
+        return Err(YencError::SizeMismatch {
+            expected: metadata.size,
+            actual: expected_size,
+        });
+    }
+
+    let expected_crc_to_check = if metadata.part.is_some() {
+        expected_part_crc
+    } else {
+        expected_file_crc
+    };
+    if let Some(expected) = expected_crc_to_check
+        && part_crc != expected
+    {
+        return Err(YencError::CrcMismatch {
+            expected,
+            actual: part_crc,
+        });
+    }
+
+    Ok(DecodeResult {
+        metadata,
+        bytes_written,
+        part_crc,
+        expected_part_crc,
+        expected_file_crc,
+        crc_valid: true,
+        has_trailer,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +350,7 @@ pub struct StreamingArticleDecoder {
     metadata: Option<YencMetadata>,
     yend_line: Option<Vec<u8>>,
     decode_state: DecodeState,
-    decode_buf: Vec<u8>,
+    output_reserved: bool,
 }
 
 impl StreamingArticleDecoder {
@@ -145,7 +362,7 @@ impl StreamingArticleDecoder {
             metadata: None,
             yend_line: None,
             decode_state: DecodeState::new(),
-            decode_buf: Vec::new(),
+            output_reserved: false,
         }
     }
 
@@ -164,7 +381,20 @@ impl StreamingArticleDecoder {
             });
         }
 
-        self.pending.extend_from_slice(input);
+        if self.stage == StreamingStage::Body && self.pending.is_empty() {
+            self.reserve_output_if_known(output);
+            let progress = decode_body_chunk_until_end(&mut self.decode_state, input, output)?;
+            if progress.end == RapidyencDecodeEnd::Control {
+                self.pending.extend_from_slice(b"=y");
+                self.pending
+                    .extend_from_slice(&input[progress.source_consumed..]);
+                self.stage = StreamingStage::Trailer;
+            } else {
+                return Ok(());
+            }
+        } else {
+            self.pending.extend_from_slice(input);
+        }
 
         loop {
             let progressed = match self.stage {
@@ -182,64 +412,48 @@ impl StreamingArticleDecoder {
         Ok(())
     }
 
+    fn reserve_output_if_known(&mut self, output: &mut Vec<u8>) {
+        const MAX_ARTICLE_RESERVE: usize = 16 * 1024 * 1024;
+
+        if self.output_reserved {
+            return;
+        }
+        self.output_reserved = true;
+
+        let Some(metadata) = self.metadata.as_ref() else {
+            return;
+        };
+
+        let expected = match (metadata.begin, metadata.end) {
+            (Some(begin), Some(end)) if end >= begin => end - begin + 1,
+            (Some(_), Some(_)) => return,
+            _ if metadata.part.is_none() => metadata.size,
+            _ => return,
+        };
+        let Ok(expected) = usize::try_from(expected) else {
+            return;
+        };
+        if expected == 0 || expected > MAX_ARTICLE_RESERVE || expected <= output.capacity() {
+            return;
+        }
+
+        output.reserve_exact(expected - output.capacity());
+    }
+
     pub fn finish(mut self, output: Vec<u8>) -> Result<DecodedArticle, YencError> {
         let metadata = self.metadata.take().ok_or(YencError::MissingHeader)?;
-        let bytes_written = self.decode_state.bytes_decoded as usize;
-        let part_crc = self.decode_state.finalize_crc();
 
-        let (expected_part_crc, expected_file_crc, yend_size, has_trailer) =
-            if let Some(yend_line) = self.yend_line.take() {
-                let mut scratch = self.header_bytes;
-                scratch.extend_from_slice(b"x\r\n");
-                scratch.extend_from_slice(&yend_line);
-                let parsed = header::parse_headers(&scratch)?;
-                let yend = parsed.yend.ok_or(YencError::MissingTrailer)?;
-                (yend.pcrc32, yend.crc32, yend.size, true)
-            } else {
-                (None, None, None, false)
-            };
-
-        if let Some(expected_size) = yend_size
-            && bytes_written as u64 != expected_size
-        {
-            return Err(YencError::SizeMismatch {
-                expected: expected_size,
-                actual: bytes_written as u64,
-            });
-        }
-
-        if metadata.part.is_none()
-            && let Some(expected_size) = yend_size
-            && metadata.size != expected_size
-        {
-            return Err(YencError::SizeMismatch {
-                expected: metadata.size,
-                actual: expected_size,
-            });
-        }
-
-        let expected_crc_to_check = if metadata.part.is_some() {
-            expected_part_crc
+        let yend = if let Some(yend_line) = self.yend_line.take() {
+            let mut scratch = self.header_bytes;
+            scratch.extend_from_slice(b"x\r\n");
+            scratch.extend_from_slice(&yend_line);
+            let parsed = header::parse_headers(&scratch)?;
+            Some(parsed.yend.ok_or(YencError::MissingTrailer)?)
         } else {
-            expected_file_crc
-        };
-        let crc_valid = match expected_crc_to_check {
-            Some(expected) => part_crc == expected,
-            None => true,
+            None
         };
 
-        Ok(DecodedArticle {
-            data: output,
-            result: DecodeResult {
-                metadata,
-                bytes_written,
-                part_crc,
-                expected_part_crc,
-                expected_file_crc,
-                crc_valid,
-                has_trailer,
-            },
-        })
+        finish_streaming_article(metadata, yend, self.decode_state, output)
     }
 
     fn process_header(&mut self) -> Result<bool, YencError> {
@@ -252,6 +466,8 @@ impl StreamingArticleDecoder {
 
         match header::parse_headers(&self.header_bytes) {
             Ok(parsed) => {
+                self.decode_state
+                    .set_line_length_hint(Some(parsed.metadata.line_length));
                 self.metadata = Some(parsed.metadata);
                 self.stage = StreamingStage::Body;
             }
@@ -266,21 +482,19 @@ impl StreamingArticleDecoder {
         if self.pending.is_empty() {
             return Ok(false);
         }
+        self.reserve_output_if_known(output);
 
-        if let Some(marker_start) = find_line_start(&self.pending, b"=yend ") {
-            if marker_start > 0 {
-                let body_len = marker_start;
-                let body = self.pending[..body_len].to_vec();
-                self.decode_body_chunk(&body, output)?;
-            }
-            let rest = self.pending.split_off(marker_start);
-            self.pending = rest;
+        let progress = decode_body_chunk_until_end(&mut self.decode_state, &self.pending, output)?;
+        if progress.end == RapidyencDecodeEnd::Control {
+            let rest = self.pending.split_off(progress.source_consumed);
+            self.pending.clear();
+            self.pending.extend_from_slice(b"=y");
+            self.pending.extend_from_slice(&rest);
             self.stage = StreamingStage::Trailer;
             return Ok(true);
         }
 
-        let body = std::mem::take(&mut self.pending);
-        self.decode_body_chunk(&body, output)?;
+        self.pending.clear();
         Ok(false)
     }
 
@@ -302,27 +516,43 @@ impl StreamingArticleDecoder {
 
         Ok(true)
     }
+}
 
-    fn decode_body_chunk(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), YencError> {
-        if input.is_empty() {
-            return Ok(());
-        }
-
-        if self.decode_buf.len() < input.len() {
-            self.decode_buf.resize(input.len(), 0);
-        }
-
-        let written = decode_chunk(
-            input,
-            &mut self.decode_buf[..input.len()],
-            &mut self.decode_state,
-            DecodeOptions {
-                dot_unstuffing: true,
-            },
-        )?;
-        output.extend_from_slice(&self.decode_buf[..written]);
-        Ok(())
+fn decode_body_chunk_until_end(
+    decode_state: &mut DecodeState,
+    input: &[u8],
+    output: &mut Vec<u8>,
+) -> Result<RapidyencDecodeProgress, YencError> {
+    if input.is_empty() {
+        return Ok(RapidyencDecodeProgress {
+            source_consumed: 0,
+            bytes_written: 0,
+            end: RapidyencDecodeEnd::None,
+        });
     }
+
+    let start = output.len();
+    output.reserve(input.len());
+    let spare = output.spare_capacity_mut();
+    // SAFETY: `decode_chunk_until_end` writes at most `input.len()` initialized
+    // bytes into this spare region and reports exactly how many bytes were
+    // written.
+    let out =
+        unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), input.len()) };
+    let progress = decode_chunk_until_end(
+        input,
+        out,
+        decode_state,
+        DecodeOptions {
+            dot_unstuffing: true,
+        },
+    )?;
+    // SAFETY: The first `bytes_written` bytes of the spare region were
+    // initialized by `decode_chunk_until_end`, and `bytes_written <= input.len()`.
+    unsafe {
+        output.set_len(start + progress.bytes_written);
+    }
+    Ok(progress)
 }
 
 impl Default for StreamingArticleDecoder {
@@ -335,26 +565,6 @@ fn next_line_len(buf: &[u8]) -> Option<usize> {
     memchr::memchr(b'\n', buf).map(|idx| idx + 1)
 }
 
-fn find_line_start(buf: &[u8], prefix: &[u8]) -> Option<usize> {
-    if buf.starts_with(prefix) {
-        return Some(0);
-    }
-
-    let mut pos = 0usize;
-    while pos < buf.len() {
-        let Some(rel) = memchr::memchr(b'\n', &buf[pos..]) else {
-            break;
-        };
-        let abs = pos + rel + 1;
-        if abs < buf.len() && buf[abs..].starts_with(prefix) {
-            return Some(abs);
-        }
-        pos = abs;
-    }
-
-    None
-}
-
 /// Decode raw yEnc-encoded data (no headers/trailers) from `input` into `output`.
 ///
 /// Updates the CRC hasher with decoded bytes. Returns the number of bytes written.
@@ -364,7 +574,22 @@ pub fn decode_body(
     crc: &mut Crc32,
     options: DecodeOptions,
 ) -> Result<usize, YencError> {
-    let written = crate::simd::decode_body_into(input, output, options.dot_unstuffing)?;
+    decode_body_with_line_length(input, output, crc, options, None)
+}
+
+fn decode_body_with_line_length(
+    input: &[u8],
+    output: &mut [u8],
+    crc: &mut Crc32,
+    options: DecodeOptions,
+    line_length: Option<u32>,
+) -> Result<usize, YencError> {
+    let written = crate::simd::decode_body_into_with_line_length(
+        input,
+        output,
+        options.dot_unstuffing,
+        line_length,
+    )?;
 
     // CRC is updated once at the end for better hardware utilization
     // (crc32fast's PCLMULQDQ path needs >= 128 bytes).
@@ -393,9 +618,13 @@ pub struct DecodeState {
     /// to decide whether this is a real CRLF line boundary.
     pub(crate) cr_pending: bool,
     /// Running CRC32 state.
-    pub(crate) crc: crc32fast::Hasher,
+    pub(crate) crc: Crc32,
+    /// Trusted encoded-column line length hint from `=ybegin line=...`.
+    pub(crate) line_length_hint: Option<usize>,
     /// Total bytes decoded so far across all chunks.
     pub bytes_decoded: u64,
+    /// Number of CRC update calls made while streaming this body.
+    pub crc_update_calls: u64,
 }
 
 impl DecodeState {
@@ -406,9 +635,18 @@ impl DecodeState {
             at_line_start: true,
             dot_pending: false,
             cr_pending: false,
-            crc: crc32fast::Hasher::new(),
+            crc: Crc32::new(),
+            line_length_hint: None,
             bytes_decoded: 0,
+            crc_update_calls: 0,
         }
+    }
+
+    /// Provide the encoded-column line length from `=ybegin line=...`.
+    pub fn set_line_length_hint(&mut self, line_length: Option<u32>) {
+        self.line_length_hint = line_length
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|&value| value > 0);
     }
 
     /// Finalize and return the CRC32 of all decoded data. Consumes the state.
@@ -419,7 +657,7 @@ impl DecodeState {
     /// Get the current CRC32 value without consuming the state.
     /// (clones the hasher internally)
     pub fn current_crc(&self) -> u32 {
-        self.crc.clone().finalize()
+        self.crc.current()
     }
 }
 
@@ -447,10 +685,33 @@ pub fn decode_chunk(
     // Final CRC update for any remaining decoded bytes in this chunk.
     if written > 0 {
         state.crc.update(&output[..written]);
+        state.crc_update_calls += 1;
     }
 
     state.bytes_decoded += written as u64;
     Ok(written)
+}
+
+fn decode_chunk_until_end(
+    input: &[u8],
+    output: &mut [u8],
+    state: &mut DecodeState,
+    options: DecodeOptions,
+) -> Result<RapidyencDecodeProgress, YencError> {
+    let outcome =
+        crate::simd::decode_chunk_until_end_into(input, output, state, options.dot_unstuffing)?;
+
+    if outcome.written > 0 {
+        state.crc.update(&output[..outcome.written]);
+        state.crc_update_calls += 1;
+    }
+
+    state.bytes_decoded += outcome.written as u64;
+    Ok(RapidyencDecodeProgress {
+        source_consumed: outcome.consumed,
+        bytes_written: outcome.written,
+        end: outcome.end,
+    })
 }
 
 #[cfg(test)]
@@ -521,14 +782,6 @@ mod tests {
 
             if dot_unstuffing && at_crlf && byte == b'.' {
                 src += 1;
-                if src >= input.len() {
-                    break;
-                }
-
-                let next = input[src];
-                if matches!(next, b'\r' | b'\n') {
-                    break;
-                }
                 at_crlf = false;
                 continue;
             }
@@ -573,6 +826,40 @@ mod tests {
     }
 
     #[test]
+    fn decode_nntp_append_matches_slice_decode() {
+        let mut seed = 0xa11a_c0de_5eed_f00du64;
+        for len in [0usize, 1, 63, 128, 4096, 40_000] {
+            let original: Vec<u8> = (0..len).map(|_| lcg_next(&mut seed)).collect();
+            let mut article = Vec::new();
+            crate::encode::encode(&original, &mut article, 128, "append.bin").unwrap();
+
+            let mut slice_out = vec![0u8; article.len() + 64];
+            let slice_result = decode_nntp(&article, &mut slice_out).unwrap();
+            slice_out.truncate(slice_result.bytes_written);
+
+            // Append into an empty vector and into one carrying a prefix.
+            let mut appended = Vec::new();
+            let append_result = decode_nntp_append(&article, &mut appended).unwrap();
+            assert_eq!(appended, slice_out);
+            assert_eq!(append_result.bytes_written, slice_result.bytes_written);
+            assert_eq!(append_result.part_crc, slice_result.part_crc);
+
+            let mut prefixed = b"prefix".to_vec();
+            decode_nntp_append(&article, &mut prefixed).unwrap();
+            assert_eq!(&prefixed[..6], b"prefix");
+            assert_eq!(&prefixed[6..], slice_out.as_slice());
+        }
+    }
+
+    #[test]
+    fn decode_nntp_append_leaves_output_untouched_on_error() {
+        let mut prefixed = b"keep".to_vec();
+        let err = decode_nntp_append(b"not a yenc article", &mut prefixed);
+        assert!(err.is_err());
+        assert_eq!(prefixed, b"keep");
+    }
+
+    #[test]
     fn streaming_article_decoder_single_chunk() {
         let original = b"Hello streamed yEnc";
         let mut article =
@@ -587,6 +874,30 @@ mod tests {
 
         assert_eq!(decoded.data, original);
         assert_eq!(decoded.result.bytes_written, original.len());
+    }
+
+    #[test]
+    fn streaming_article_decoder_crc_mismatch_errors() {
+        let original = b"Hello streamed yEnc";
+        let mut article =
+            format!("=ybegin line=128 size={} name=test.bin\r\n", original.len()).into_bytes();
+        article.extend_from_slice(&encode_raw(original));
+        article.extend_from_slice(
+            format!("\r\n=yend size={} crc32=DEADBEEF\r\n", original.len()).as_bytes(),
+        );
+
+        let mut decoder = StreamingArticleDecoder::new();
+        let mut output = Vec::new();
+        decoder.feed_chunk(&article, &mut output).unwrap();
+        let err = decoder.finish(output).unwrap_err();
+
+        assert!(matches!(
+            err,
+            YencError::CrcMismatch {
+                expected: 0xDEADBEEF,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -801,11 +1112,12 @@ mod tests {
 
     #[test]
     fn decode_body_dot_unstuffing_nntp_terminator() {
-        // A line with just "." signals end of NNTP body.
+        // raw rapidyenc-style body decode strips the NNTP terminator's dot
+        // but does not stop; end detection is handled by incremental decode.
         let mut encoded = Vec::new();
         encoded.extend(yenc_encode_byte(b'A'));
         encoded.extend_from_slice(b"\r\n.\r\n");
-        encoded.extend(yenc_encode_byte(b'B')); // should not be decoded
+        encoded.extend(yenc_encode_byte(b'B'));
 
         let mut output = vec![0u8; 64];
         let mut crc = Crc32::new();
@@ -813,8 +1125,9 @@ mod tests {
             dot_unstuffing: true,
         };
         let n = decode_body(&encoded, &mut output, &mut crc, opts).unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(n, 2);
         assert_eq!(output[0], b'A');
+        assert_eq!(output[1], b'B');
     }
 
     #[test]
@@ -847,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_full_crc_mismatch_still_decodes() {
+    fn decode_full_crc_mismatch_errors() {
         let original = b"Test data";
         let encoded_data = encode_raw(original);
 
@@ -859,13 +1172,75 @@ mod tests {
         article.extend_from_slice(b"\r\n=yend size=9 crc32=DEADBEEF\r\n");
 
         let mut output = vec![0u8; 1024];
+        let err = decode(&article, &mut output).unwrap_err();
+
+        assert!(matches!(
+            err,
+            YencError::CrcMismatch {
+                expected: 0xDEADBEEF,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_multipart_checks_pcrc32_and_carries_file_crc32() {
+        let original = b"Test data";
+        let encoded_data = encode_raw(original);
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(original);
+        let part_crc = hasher.finalize();
+
+        let mut article = Vec::new();
+        article.extend_from_slice(
+            format!(
+                "=ybegin part=1 total=2 line=128 size={} name=test.bin\r\n",
+                original.len() * 2
+            )
+            .as_bytes(),
+        );
+        article.extend_from_slice(format!("=ypart begin=1 end={}\r\n", original.len()).as_bytes());
+        article.extend_from_slice(&encoded_data);
+        article.extend_from_slice(
+            format!(
+                "\r\n=yend size={} part=1 pcrc32={part_crc:08x} crc32=DEADBEEF\r\n",
+                original.len()
+            )
+            .as_bytes(),
+        );
+
+        let mut output = vec![0u8; 1024];
         let result = decode(&article, &mut output).unwrap();
 
-        // Data should still be decoded.
         assert_eq!(result.bytes_written, original.len());
         assert_eq!(&output[..result.bytes_written], original.as_slice());
-        // But CRC should be invalid.
-        assert!(!result.crc_valid);
+        assert_eq!(result.part_crc, part_crc);
+        assert_eq!(result.expected_part_crc, Some(part_crc));
+        assert_eq!(result.expected_file_crc, Some(0xDEADBEEF));
+        assert!(result.crc_valid);
+    }
+
+    #[test]
+    fn decode_multipart_ypart_range_size_mismatch_errors() {
+        let original = b"Test data";
+        let encoded_data = encode_raw(original);
+
+        let mut article = Vec::new();
+        article.extend_from_slice(b"=ybegin part=1 total=2 line=128 size=20 name=test.bin\r\n");
+        article.extend_from_slice(b"=ypart begin=1 end=8\r\n");
+        article.extend_from_slice(&encoded_data);
+        article.extend_from_slice(format!("\r\n=yend size={}\r\n", original.len()).as_bytes());
+
+        let mut output = vec![0u8; 1024];
+        let err = decode(&article, &mut output).unwrap_err();
+
+        assert!(matches!(
+            err,
+            YencError::SizeMismatch {
+                expected: 8,
+                actual: 9,
+            }
+        ));
     }
 
     #[test]
@@ -1355,6 +1730,8 @@ mod tests {
                 b'.'.wrapping_sub(42),
                 b'C'.wrapping_sub(42),
                 b'D'.wrapping_sub(42),
+                b'E'.wrapping_sub(42),
+                b'F'.wrapping_sub(42),
             ]
         );
     }
@@ -1373,7 +1750,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(decoded, vec![b'A'.wrapping_sub(42), b'B'.wrapping_sub(42)]);
+            assert_eq!(decoded, reference_decode_body(input, true).unwrap());
         }
     }
 

@@ -2,10 +2,7 @@ mod common;
 
 use common::{TestHarness, assert_no_errors, response_data};
 use tokio::time::{Duration, sleep};
-use weaver_server_core::{
-    CLIENT_REQUEST_ID_ATTRIBUTE_KEY, DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY,
-    DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY, JobHistoryRow,
-};
+use weaver_server_core::{CLIENT_REQUEST_ID_ATTRIBUTE_KEY, JobHistoryRow};
 
 fn sample_history_row(job_id: u64, name: &str, status: &str, completed_at: i64) -> JobHistoryRow {
     JobHistoryRow {
@@ -33,8 +30,6 @@ fn sample_history_row(job_id: u64, name: &str, status: &str, completed_at: i64) 
         created_at: completed_at - 60,
         completed_at,
         metadata: None,
-        last_diagnostic_id: None,
-        last_diagnostic_uploaded_at_epoch_ms: None,
     }
 }
 
@@ -505,14 +500,6 @@ async fn history_items_hidden_metadata_keys_are_not_attributes() {
                 CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
                 "req-1".to_string(),
             ),
-            (
-                DIAGNOSTIC_SOURCE_JOB_ATTRIBUTE_KEY.to_string(),
-                "42".to_string(),
-            ),
-            (
-                DIAGNOSTIC_INCLUDE_SERVER_HOSTNAMES_ATTRIBUTE_KEY.to_string(),
-                "false".to_string(),
-            ),
             ("public".to_string(), "yes".to_string()),
         ])
         .unwrap(),
@@ -523,7 +510,6 @@ async fn history_items_hidden_metadata_keys_are_not_attributes() {
         .execute(
             r#"{
               hiddenClient: historyItems(filter: { hasAttributeKey: "__weaver_client_request_id" }, first: 10) { id }
-              hiddenDiagnostic: historyItems(filter: { hasAttributeKey: "__weaver_diagnostic_source_job_id" }, first: 10) { id }
               publicMatch: historyItems(filter: { hasAttributeKey: "public" }, first: 10) {
                 id
                 attributes { key value }
@@ -536,7 +522,6 @@ async fn history_items_hidden_metadata_keys_are_not_attributes() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert!(data["hiddenClient"].as_array().unwrap().is_empty());
-    assert!(data["hiddenDiagnostic"].as_array().unwrap().is_empty());
     assert_eq!(data["hiddenCount"].as_u64().unwrap(), 0);
     let public = data["publicMatch"].as_array().unwrap();
     assert_eq!(public.len(), 1);
@@ -648,7 +633,10 @@ async fn delete_all_history_idempotent() {
 
 #[tokio::test]
 async fn history_page_exposes_delete_operation_state() {
-    let h = TestHarness::new().await;
+    // The worker must stay off: this test seeds a QUEUED delete operation and
+    // asserts it is still QUEUED, which the background worker would otherwise
+    // claim and flip to RUNNING.
+    let h = TestHarness::new_without_history_delete_worker().await;
     h.insert_history_row(&sample_history_row(
         1,
         "alpha.release",
@@ -694,7 +682,9 @@ async fn history_page_exposes_delete_operation_state() {
 
 #[tokio::test]
 async fn job_detail_snapshot_exposes_history_delete_state() {
-    let h = TestHarness::new().await;
+    // See history_page_exposes_delete_operation_state: the worker would race the
+    // seeded QUEUED operation, so keep it off for this initial-state assertion.
+    let h = TestHarness::new_without_history_delete_worker().await;
     h.insert_history_row(&sample_history_row(
         7,
         "detail.release",

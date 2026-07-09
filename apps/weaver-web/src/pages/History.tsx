@@ -5,7 +5,7 @@ import {
   type RowSelectionState,
   type SortingState,
 } from "@tanstack/react-table";
-import { Bug, ChevronDown, Download, ListFilter, RefreshCcw, Trash2 } from "lucide-react";
+import { Download, RefreshCcw, Search, Trash2 } from "lucide-react";
 import {
   useCallback,
   useDeferredValue,
@@ -13,7 +13,6 @@ import {
   useMemo,
   useRef,
   useState,
-  type KeyboardEvent,
 } from "react";
 import { Link } from "react-router";
 import { useMutation, useQuery, useSubscription } from "urql";
@@ -22,22 +21,20 @@ import { DataTable } from "@/components/data-table/DataTable";
 import type { DataTableColumnMeta } from "@/components/data-table/DataTable";
 import { DataTableColumnHeader } from "@/components/data-table/DataTableColumnHeader";
 import { DataTablePagination } from "@/components/data-table/DataTablePagination";
-import { DataTableToolbar } from "@/components/data-table/DataTableToolbar";
 import { EmptyState } from "@/components/EmptyState";
-import { PageHeader } from "@/components/PageHeader";
+import { FilterChip } from "@/components/FilterChip";
 import { JobStatusBadge } from "@/components/JobStatusBadge";
 import { formatBytes } from "@/components/SpeedDisplay";
+import { cn } from "@/lib/utils";
+import { STATUS_BG_CLASS, STATUS_TEXT_CLASS } from "@/lib/status-tokens";
 import { useTranslate } from "@/lib/context/translate-context";
-import { DIAGNOSTICS_ENABLED } from "@/lib/features";
 import { useTablePreferences } from "@/lib/hooks/use-table-preferences";
 import {
   formatJobReleaseName,
   type DeleteOperationData,
-  type DiagnosticRunData,
   normalizeFacadeJobStatus,
   normalizeGraphqlTimestamp,
 } from "@/lib/job-types";
-import { cn } from "@/lib/utils";
 import {
   ACCEPT_HISTORY_DELETE_MUTATION,
   HISTORY_FACADE_EVENTS_SUBSCRIPTION,
@@ -45,12 +42,11 @@ import {
   HISTORY_PAGE_QUERY,
   REDOWNLOAD_JOB_MUTATION,
   REPROCESS_JOB_MUTATION,
-  START_DIAGNOSTIC_REDOWNLOAD_MUTATION,
 } from "@/graphql/queries";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Input } from "@/components/ui/input";
 
 type HistoryJob = {
   id: number;
@@ -63,17 +59,10 @@ type HistoryJob = {
   category: string | null;
   completedAt?: number | null;
   deleteOperation?: DeleteOperationData | null;
-  diagnosticRun?: DiagnosticRunData | null;
-  lastDiagnosticId?: string | null;
-  lastDiagnosticUploadedAt?: number | null;
 };
 type HistoryFilter = "all" | "success" | "failure";
-type FacadeHistoryJob = Omit<HistoryJob, "completedAt" | "diagnosticRun" | "lastDiagnosticUploadedAt"> & {
+type FacadeHistoryJob = Omit<HistoryJob, "completedAt"> & {
   completedAt?: string | number | null;
-  lastDiagnosticUploadedAt?: string | number | null;
-  diagnosticRun?: (Omit<DiagnosticRunData, "updatedAt"> & {
-    updatedAt?: string | number | null;
-  }) | null;
 };
 type HistoryPageCounts = {
   all: number;
@@ -127,32 +116,11 @@ const DEFAULT_HISTORY_PREFERENCES: HistoryTablePreferences = {
   sorting: DEFAULT_HISTORY_SORTING,
 };
 
-function countActiveHistoryFilters(status: HistoryFilter) {
-  return status === "all" ? 0 : 1;
-}
-
-function handleHistoryFilterOptionKeyDown(
-  event: KeyboardEvent<HTMLDivElement>,
-  onActivate: () => void,
-) {
-  if (event.key === "Enter" || event.key === " ") {
-    event.preventDefault();
-    onActivate();
-  }
-}
-
 function normalizeHistoryJob(job: FacadeHistoryJob): HistoryJob {
   return {
     ...job,
     status: normalizeFacadeJobStatus(job.status),
     completedAt: normalizeGraphqlTimestamp(job.completedAt),
-    lastDiagnosticUploadedAt: normalizeGraphqlTimestamp(job.lastDiagnosticUploadedAt),
-    diagnosticRun: job.diagnosticRun
-      ? {
-        ...job.diagnosticRun,
-        updatedAt: normalizeGraphqlTimestamp(job.diagnosticRun.updatedAt),
-      }
-      : null,
   };
 }
 
@@ -237,26 +205,6 @@ function sameDeleteOperationData(
     && left.errorMessage === right.errorMessage;
 }
 
-function sameDiagnosticRunData(
-  left: HistoryJob["diagnosticRun"],
-  right: HistoryJob["diagnosticRun"],
-): boolean {
-  if (left === right) {
-    return true;
-  }
-  if (!left || !right) {
-    return left == null && right == null;
-  }
-  return left.sourceJobId === right.sourceJobId
-    && left.diagnosticJobId === right.diagnosticJobId
-    && left.diagnosticId === right.diagnosticId
-    && left.stage === right.stage
-    && left.includeServerHostnames === right.includeServerHostnames
-    && left.rerunSucceeded === right.rerunSucceeded
-    && left.errorMessage === right.errorMessage
-    && left.updatedAt === right.updatedAt;
-}
-
 function sameHistoryJob(left: HistoryJob, right: HistoryJob): boolean {
   return left.id === right.id
     && left.name === right.name
@@ -267,10 +215,7 @@ function sameHistoryJob(left: HistoryJob, right: HistoryJob): boolean {
     && left.health === right.health
     && left.category === right.category
     && left.completedAt === right.completedAt
-    && sameDeleteOperationData(left.deleteOperation ?? null, right.deleteOperation ?? null)
-    && sameDiagnosticRunData(left.diagnosticRun ?? null, right.diagnosticRun ?? null)
-    && left.lastDiagnosticId === right.lastDiagnosticId
-    && left.lastDiagnosticUploadedAt === right.lastDiagnosticUploadedAt;
+    && sameDeleteOperationData(left.deleteOperation ?? null, right.deleteOperation ?? null);
 }
 
 function reconcileHistoryJobs(nextJobs: HistoryJob[], previousJobs: HistoryJob[]): HistoryJob[] {
@@ -343,63 +288,6 @@ function reconcileDeleteOperations(
     : reconciled;
 }
 
-function isDiagnosticRunActive(
-  diagnosticRun: HistoryJob["diagnosticRun"],
-) {
-  return DIAGNOSTICS_ENABLED
-    && diagnosticRun != null
-    && ["QUEUED", "RUNNING", "COLLECTING", "UPLOADING"].includes(diagnosticRun.stage);
-}
-
-function diagnosticStageLabel(
-  t: ReturnType<typeof useTranslate>,
-  stage: NonNullable<HistoryJob["diagnosticRun"]>["stage"],
-) {
-  switch (stage) {
-    case "QUEUED":
-      return t("history.diagnosticQueued");
-    case "RUNNING":
-      return t("history.diagnosticRunning");
-    case "COLLECTING":
-      return t("history.diagnosticCollecting");
-    case "UPLOADING":
-      return t("history.diagnosticUploading");
-    case "COMPLETE":
-      return t("history.diagnosticComplete");
-    case "FAILED":
-      return t("history.diagnosticFailed");
-    default:
-      return stage;
-  }
-}
-
-function formatDiagnosticSummary(
-  t: ReturnType<typeof useTranslate>,
-  job: HistoryJob,
-) {
-  if (!DIAGNOSTICS_ENABLED) {
-    return "";
-  }
-  const diagnosticRun = job.diagnosticRun;
-  if (diagnosticRun) {
-    const stageLabel = diagnosticStageLabel(t, diagnosticRun.stage);
-    if (diagnosticRun.diagnosticId) {
-      return t("history.diagnosticWithId", {
-        stage: stageLabel,
-        id: diagnosticRun.diagnosticId,
-      });
-    }
-    if (diagnosticRun.errorMessage) {
-      return `${stageLabel}: ${diagnosticRun.errorMessage}`;
-    }
-    return stageLabel;
-  }
-  if (job.lastDiagnosticId) {
-    return t("history.lastDiagnosticId", { id: job.lastDiagnosticId });
-  }
-  return "";
-}
-
 export function History() {
   const t = useTranslate();
   const previousDeleteOperationsRef = useRef<HistoryDeleteOperationSummary[]>([]);
@@ -414,15 +302,10 @@ export function History() {
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
   const [redownloadConfirmId, setRedownloadConfirmId] = useState<number | null>(null);
-  const [diagnosticConfirm, setDiagnosticConfirm] = useState<{
-    id: number;
-    includeServerHostnames: boolean;
-  } | null>(null);
   const [deleteBatchConfirm, setDeleteBatchConfirm] = useState(false);
   const [deleteAllConfirm, setDeleteAllConfirm] = useState(false);
   const [deleteFiles, setDeleteFiles] = useState(false);
   const [deleteAcceptError, setDeleteAcceptError] = useState<string | null>(null);
-  const [diagnosticAcceptError, setDiagnosticAcceptError] = useState<string | null>(null);
   const [acceptedDeleteLocks, setAcceptedDeleteLocks] = useState<Record<number, LocalDeleteLock>>(
     {},
   );
@@ -451,9 +334,6 @@ export function History() {
     useMutation<HistoryDeleteAcceptanceResponse>(ACCEPT_HISTORY_DELETE_MUTATION);
   const [reprocessState, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
   const [redownloadState, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
-  const [diagnosticStartState, startDiagnosticRedownload] = useMutation(
-    START_DIAGNOSTIC_REDOWNLOAD_MUTATION,
-  );
 
   const rawJobs = useMemo(() => {
     const nextJobs = ((data?.historyPage.items ?? []) as FacadeHistoryJob[]).map(normalizeHistoryJob);
@@ -547,13 +427,7 @@ export function History() {
   const actionsBusy =
     acceptDeleteState.fetching
     || reprocessState.fetching
-    || redownloadState.fetching
-    || diagnosticStartState.fetching;
-  const activeHistoryFilterCount = countActiveHistoryFilters(historyPreferences.status);
-  const hasActiveDiagnosticRuns = useMemo(
-    () => DIAGNOSTICS_ENABLED && jobs.some((job) => isDiagnosticRunActive(job.diagnosticRun)),
-    [jobs],
-  );
+    || redownloadState.fetching;
 
   useEffect(() => {
     deleteOperationsFetchingRef.current = fetchingDeleteOperations;
@@ -607,7 +481,7 @@ export function History() {
   }, [rawJobs]);
 
   useEffect(() => {
-    if (!hasActiveDeleteOperations && !hasActiveDiagnosticRuns) {
+    if (!hasActiveDeleteOperations) {
       return;
     }
 
@@ -615,17 +489,12 @@ export function History() {
       if (hasActiveDeleteOperations && !deleteOperationsFetchingRef.current) {
         void reexecuteHistoryDeleteOperations({ requestPolicy: "network-only" });
       }
-      if (hasActiveDiagnosticRuns) {
-        void reexecuteHistoryPage({ requestPolicy: "network-only" });
-      }
     }, 1000);
 
     return () => window.clearInterval(intervalId);
   }, [
     hasActiveDeleteOperations,
-    hasActiveDiagnosticRuns,
     reexecuteHistoryDeleteOperations,
-    reexecuteHistoryPage,
   ]);
 
   useEffect(() => {
@@ -740,33 +609,8 @@ export function History() {
     [refetchHistoryPage, reprocessJob],
   );
 
-  const handleDiagnosticRedownload = useCallback(
-    async (jobId: number, includeServerHostnames: boolean) => {
-      if (!DIAGNOSTICS_ENABLED) {
-        return false;
-      }
-      setDiagnosticAcceptError(null);
-      const result = await startDiagnosticRedownload({
-        id: jobId,
-        includeServerHostnames,
-      });
-      if (result.error) {
-        setDiagnosticAcceptError(result.error.message ?? "Unable to start diagnostic rerun.");
-        return false;
-      }
-      setRowSelection((current) => removeRowSelectionIds(current, [jobId]));
-      await refetchHistoryPage();
-      return true;
-    },
-    [refetchHistoryPage, startDiagnosticRedownload],
-  );
-
   const isJobLocked = useCallback(
-    (job: HistoryJob) =>
-      Boolean(
-        job.deleteOperation?.locked
-          || (DIAGNOSTICS_ENABLED && isDiagnosticRunActive(job.diagnosticRun)),
-      ),
+    (job: HistoryJob) => Boolean(job.deleteOperation?.locked),
     [],
   );
 
@@ -813,11 +657,10 @@ export function History() {
     (job: HistoryJob, buttonSizeClassName: string, iconSizeClassName: string) => {
       const isRestartable = job.status === "FAILED" || job.status === "COMPLETE";
       const locked = isJobLocked(job);
-      const hasActiveDiagnostic = DIAGNOSTICS_ENABLED && isDiagnosticRunActive(job.diagnosticRun);
 
       return (
         <div
-          className="flex h-full w-full items-center justify-end gap-1 px-2 py-1.5"
+          className="flex h-full w-full items-center justify-end gap-1 px-2 py-1.5 opacity-60 transition-opacity group-hover/row:opacity-100"
           data-row-click-ignore="true"
         >
           {isRestartable ? (
@@ -835,25 +678,6 @@ export function History() {
               >
                 <RefreshCcw className={iconSizeClassName} />
               </Button>
-              {DIAGNOSTICS_ENABLED ? (
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  title={t("action.diagnosticRedownload")}
-                  aria-label={t("action.diagnosticRedownload")}
-                  className={`${buttonSizeClassName} text-muted-foreground hover:bg-transparent hover:text-foreground`}
-                  disabled={actionsBusy || locked || hasActiveDiagnostic}
-                  onClick={() => {
-                    setDiagnosticAcceptError(null);
-                    setDiagnosticConfirm({
-                      id: job.id,
-                      includeServerHostnames: true,
-                    });
-                  }}
-                >
-                  <Bug className={iconSizeClassName} />
-                </Button>
-              ) : null}
               <Button
                 variant="ghost"
                 size="icon"
@@ -962,33 +786,15 @@ export function History() {
             <div className="min-w-0">
               <Link
                 to={`/jobs/${row.original.id}`}
-                className="flex min-h-6 w-full items-center truncate text-[11px] font-medium leading-tight text-foreground"
+                className="line-clamp-2 w-full break-words text-[13px] font-medium leading-snug text-foreground hover:underline"
               >
                 {displayName}
               </Link>
               {deleteOperation?.locked ? (
-                <span className="text-[9px] text-amber-500">Deleting…</span>
-              ) : DIAGNOSTICS_ENABLED && row.original.diagnosticRun ? (
-                <span
-                  className={cn(
-                    "block truncate text-[9px]",
-                    isDiagnosticRunActive(row.original.diagnosticRun)
-                      ? "text-sky-600"
-                      : row.original.diagnosticRun.stage === "FAILED"
-                        ? "text-destructive"
-                        : "text-muted-foreground",
-                  )}
-                  title={formatDiagnosticSummary(t, row.original)}
-                >
-                  {formatDiagnosticSummary(t, row.original)}
-                </span>
-              ) : DIAGNOSTICS_ENABLED && row.original.lastDiagnosticId ? (
-                <span className="block truncate text-[9px] text-muted-foreground">
-                  {t("history.lastDiagnosticId", { id: row.original.lastDiagnosticId })}
-                </span>
+                <span className="text-[10.5px] text-status-paused">Deleting…</span>
               ) : deleteOperation?.state === "FAILED" ? (
                 <span
-                  className="block truncate text-[9px] text-destructive"
+                  className="block truncate text-[10.5px] text-status-failed"
                   title={deleteOperation.errorMessage ?? "Delete failed"}
                 >
                   {deleteOperation.errorMessage ?? "Delete failed"}
@@ -998,120 +804,89 @@ export function History() {
           );
         },
         meta: {
-          headerClassName: "h-7 min-w-[260px] px-2 text-left",
-          cellClassName: "min-w-[260px] px-2 py-1.5 text-left",
+          headerClassName: "min-w-[280px] px-4 text-left",
+          cellClassName: "min-w-[280px] px-4 py-3 text-left align-top",
         } satisfies DataTableColumnMeta,
       },
       {
         accessorKey: "status",
-        header: ({ column }) => (
-          <DataTableColumnHeader
-            column={column}
-            title={t("table.status")}
-            className="justify-center text-center"
-          />
-        ),
+        header: ({ column }) => <DataTableColumnHeader column={column} title={t("table.status")} />,
         cell: ({ row }) => (
-          <div className="space-y-1 text-center">
-            <div className="flex justify-center">
-              <JobStatusBadge status={row.original.status} compact className="px-1.5" />
-            </div>
+          <div className="space-y-1">
+            <JobStatusBadge status={row.original.status} />
             {row.original.deleteOperation?.locked ? (
-              <div className="text-[9px] text-amber-500">Locked</div>
-            ) : DIAGNOSTICS_ENABLED && row.original.diagnosticRun ? (
-              <div className="text-[9px] text-sky-600">
-                {diagnosticStageLabel(t, row.original.diagnosticRun.stage)}
-              </div>
+              <div className="text-[10.5px] text-status-paused">Locked</div>
             ) : null}
           </div>
         ),
         meta: {
-          headerClassName: "h-7 w-[120px] px-2 text-center",
-          cellClassName: "px-2 py-1.5 text-center",
+          headerClassName: "w-[130px] px-4 text-left",
+          cellClassName: "px-4 py-3 text-left align-top",
         } satisfies DataTableColumnMeta,
       },
       {
         id: "completedAt",
         accessorFn: (job) => job.completedAt ?? 0,
-        header: ({ column }) => (
-          <DataTableColumnHeader
-            column={column}
-            title={t("table.time")}
-            className="justify-center text-center"
-          />
-        ),
+        header: ({ column }) => <DataTableColumnHeader column={column} title={t("table.time")} />,
         cell: ({ row }) => (
           <div
-            className="text-center text-[10px] text-muted-foreground"
+            className="whitespace-nowrap text-[13px] text-muted-foreground"
             title={formatHistoryTimestamp(row.original.completedAt ?? null)}
           >
             {formatHistoryTimestamp(row.original.completedAt ?? null, timestampFormatter)}
           </div>
         ),
         meta: {
-          headerClassName: "h-7 min-w-[180px] px-2 text-center",
-          cellClassName: "min-w-[180px] px-2 py-1.5 text-center",
+          headerClassName: "min-w-[180px] px-4 text-left",
+          cellClassName: "min-w-[180px] px-4 py-3 text-left align-top",
         } satisfies DataTableColumnMeta,
       },
       {
         accessorKey: "health",
-        header: ({ column }) => (
-          <DataTableColumnHeader
-            column={column}
-            title={t("table.health")}
-            className="justify-center text-center"
-          />
-        ),
-        cell: ({ row }) => (
-          <div className="text-center text-[10px] text-muted-foreground">
-            {(row.original.health / 10).toFixed(1)}%
-          </div>
-        ),
+        header: ({ column }) => <DataTableColumnHeader column={column} title={t("table.health")} />,
+        cell: ({ row }) => {
+          const healthPct = row.original.health / 10;
+          const healthToken = healthPct >= 99 ? "completed" : healthPct >= 50 ? "paused" : "failed";
+          return (
+            <div className="flex items-center gap-1.5 text-[13px] text-muted-foreground">
+              <span className={cn("size-2 shrink-0 rounded-pill", STATUS_BG_CLASS[healthToken])} />
+              <span className={STATUS_TEXT_CLASS[healthToken]}>{healthPct.toFixed(1)}%</span>
+            </div>
+          );
+        },
         meta: {
-          headerClassName: "h-7 w-[96px] px-2 text-center",
-          cellClassName: "w-[96px] px-2 py-1.5 text-center",
+          headerClassName: "w-[110px] px-4 text-left",
+          cellClassName: "w-[110px] px-4 py-3 text-left align-top",
         } satisfies DataTableColumnMeta,
       },
       {
         id: "size",
         accessorFn: (job) => job.totalBytes,
-        header: ({ column }) => (
-          <DataTableColumnHeader
-            column={column}
-            title={t("table.size")}
-            className="justify-center text-center"
-          />
-        ),
+        header: ({ column }) => <DataTableColumnHeader column={column} title={t("table.size")} />,
         cell: ({ row }) => (
-          <div className="text-center text-[10px] text-muted-foreground">
+          <div className="whitespace-nowrap text-[13px] text-muted-foreground">
             {formatBytes(row.original.totalBytes)}
           </div>
         ),
         meta: {
-          headerClassName: "h-7 w-[120px] px-2 text-center",
-          cellClassName: "w-[120px] px-2 py-1.5 text-center",
+          headerClassName: "w-[110px] px-4 text-left",
+          cellClassName: "w-[110px] px-4 py-3 text-left align-top",
         } satisfies DataTableColumnMeta,
       },
       {
         accessorKey: "category",
-        header: ({ column }) => (
-          <DataTableColumnHeader
-            column={column}
-            title={t("table.category")}
-            className="justify-center text-center"
-          />
-        ),
+        header: ({ column }) => <DataTableColumnHeader column={column} title={t("table.category")} />,
         cell: ({ row }) => (
           <div
-            className="truncate text-center text-[10px] text-muted-foreground"
+            className="truncate text-[13px] text-muted-foreground"
             title={row.original.category ?? "\u2014"}
           >
             {row.original.category ?? "\u2014"}
           </div>
         ),
         meta: {
-          headerClassName: "h-7 min-w-[120px] px-2 text-center",
-          cellClassName: "min-w-[120px] px-2 py-1.5 text-center",
+          headerClassName: "min-w-[120px] px-4 text-left",
+          cellClassName: "min-w-[120px] px-4 py-3 text-left align-top",
         } satisfies DataTableColumnMeta,
       },
       {
@@ -1120,8 +895,8 @@ export function History() {
         header: () => <div className="text-right">{t("table.actions")}</div>,
         cell: ({ row }) => renderActions(row.original, "size-8", "size-4"),
         meta: {
-          headerClassName: "h-7 w-[184px] px-2 text-right",
-          cellClassName: "w-[184px] p-0 text-right",
+          headerClassName: "w-[144px] px-4 text-right",
+          cellClassName: "w-[144px] p-0 text-right align-top",
         } satisfies DataTableColumnMeta,
       },
     ],
@@ -1266,30 +1041,34 @@ export function History() {
 
   return (
     <div className="space-y-6">
-      <PageHeader
-        title={t("history.title")}
-        description={t("history.empty")}
-        actions={
-          counts.all > 0 ? (
-            <div className="flex gap-2">
-              <Button
-                variant="destructive"
-                disabled={hasActiveDeleteOperations || acceptDeleteState.fetching}
-                onClick={() => {
-                  setDeleteAcceptError(null);
-                  setDeleteAllConfirm(true);
-                }}
-              >
-                <Trash2 className="size-4" />
-                {t("action.deleteAll")}
-              </Button>
-            </div>
-          ) : undefined
-        }
-      />
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <h1 className="font-space-grotesk text-[34px] font-bold leading-none tracking-tight">
+            {t("history.title")}
+          </h1>
+          <p className="mt-2 text-[13px] text-muted-foreground">
+            {counts.success} {t("history.filterSuccess").toLowerCase()} · {counts.failure} {t("history.filterFailure").toLowerCase()} · {counts.all} total
+          </p>
+        </div>
+        {counts.all > 0 ? (
+          <div className="flex gap-3">
+            <Button
+              variant="destructive"
+              disabled={hasActiveDeleteOperations || acceptDeleteState.fetching}
+              onClick={() => {
+                setDeleteAcceptError(null);
+                setDeleteAllConfirm(true);
+              }}
+            >
+              <Trash2 className="size-4" />
+              {t("action.deleteAll")}
+            </Button>
+          </div>
+        ) : null}
+      </div>
 
       {hasActiveDeleteOperations ? (
-        <Card className="sticky top-4 z-10 border-amber-500/30 bg-amber-500/5">
+        <Card className="sticky top-4 z-10 rounded-card border-status-paused/30 bg-status-paused/5">
           <CardContent className="flex flex-wrap items-center justify-between gap-3 py-4">
             <div className="space-y-1">
               <div className="text-sm font-medium text-foreground">Deleting history items</div>
@@ -1307,7 +1086,7 @@ export function History() {
                   : ""}
               </div>
             </div>
-            <div className="text-sm font-medium text-amber-600">
+            <div className="text-sm font-medium text-status-paused">
               Rows stay visible until each delete finishes
             </div>
           </CardContent>
@@ -1315,7 +1094,7 @@ export function History() {
       ) : null}
 
       {fetching && !data ? (
-        <Card>
+        <Card className="rounded-card">
           <CardContent className="py-12 text-center text-muted-foreground">
             {t("label.loading")}
           </CardContent>
@@ -1323,180 +1102,112 @@ export function History() {
       ) : showEmptyState ? (
         <EmptyState title={t("history.title")} description={t("history.empty")} />
       ) : (
-        <Card>
-          <CardContent className="space-y-4 px-0 pb-0 pt-6">
-            <div className="px-6">
-              <DataTableToolbar
-                className="lg:min-h-11"
-                searchValue={historyPreferences.search}
-                onSearchChange={(value) => {
+        <div className="space-y-4">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <div className="relative w-full sm:max-w-[260px]">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={historyPreferences.search}
+                onChange={(event) => {
+                  const value = event.target.value;
                   setHistoryPreferences((current) => ({
                     ...current,
                     search: value,
                   }));
                   setPageIndex(0);
                 }}
-                searchPlaceholder={t("history.searchPlaceholder")}
-                searchContainerClassName="max-w-[280px]"
-                searchInputClassName="h-10"
-                centerContainerClassName="min-h-10"
-                centerContent={selectedCount > 0 ? (
-                  <div className="inline-flex h-10 min-w-0 items-center justify-center gap-1.5 rounded-md border border-border/70 bg-muted/20 px-2">
-                    <span className="shrink-0 px-1 text-xs font-medium text-muted-foreground">
-                      {t("bulk.selected", { count: selectedCount })}
-                    </span>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-8 gap-1.5 px-2 text-muted-foreground hover:text-foreground"
-                      disabled={actionsBusy || selectedRestartableIds.length === 0}
-                      onClick={() => {
-                        void handleBatchReprocess(selectedRestartableIds);
-                      }}
-                    >
-                      <RefreshCcw className="size-4" />
-                      <span>{t("action.reprocess")}</span>
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-8 gap-1.5 px-2 text-muted-foreground hover:text-foreground"
-                      disabled={actionsBusy || selectedRestartableIds.length === 0}
-                      onClick={() => {
-                        void handleBatchRedownload(selectedRestartableIds);
-                      }}
-                    >
-                      <Download className="size-4" />
-                      <span>{t("action.redownload")}</span>
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-8 gap-1.5 px-2 text-destructive hover:text-destructive"
-                      aria-label={t("action.delete")}
-                      title={t("action.delete")}
-                      disabled={acceptDeleteState.fetching || selectedActionIds.length === 0}
-                      onClick={() => {
-                        setDeleteAcceptError(null);
-                        setDeleteBatchConfirm(true);
-                      }}
-                    >
-                      <Trash2 className="size-4" />
-                      <span>{t("action.delete")}</span>
-                    </Button>
-                  </div>
-                ) : null}
-              >
-                <Popover>
-                  <PopoverTrigger asChild>
-                    <Button variant="outline" className="h-10 w-full justify-between gap-3 sm:w-[176px]">
-                      <span className="inline-flex items-center gap-2">
-                        <ListFilter className="size-4 text-muted-foreground" />
-                        <span>{t("table.filters")}</span>
-                      </span>
-                      <span className="inline-flex items-center gap-2">
-                        {activeHistoryFilterCount > 0 ? (
-                          <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-foreground">
-                            {activeHistoryFilterCount}
-                          </span>
-                        ) : (
-                          <span className="text-[11px] text-muted-foreground">
-                            {t("history.filterAll")}
-                          </span>
-                        )}
-                        <ChevronDown className="size-4 text-muted-foreground" />
-                      </span>
-                    </Button>
-                  </PopoverTrigger>
-                  <PopoverContent className="w-[288px] p-0">
-                    <div className="space-y-4 p-4">
-                      <div className="space-y-2">
-                        <div className="px-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
-                          {t("table.status")}
-                        </div>
-                        <div
-                          role="button"
-                          tabIndex={0}
-                          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent/40"
-                          onClick={() => {
-                            setHistoryPreferences((current) => ({ ...current, status: "all" }));
-                            setPageIndex(0);
-                          }}
-                          onKeyDown={(event) => {
-                            handleHistoryFilterOptionKeyDown(event, () => {
-                              setHistoryPreferences((current) => ({ ...current, status: "all" }));
-                              setPageIndex(0);
-                            });
-                          }}
-                        >
-                          <Checkbox
-                            className="pointer-events-none"
-                            tabIndex={-1}
-                            aria-hidden="true"
-                            checked={historyPreferences.status === "all"}
-                          />
-                          <span className="text-sm">{t("history.filterAll")}</span>
-                        </div>
-                        <div
-                          role="button"
-                          tabIndex={0}
-                          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent/40"
-                          onClick={() => {
-                            setHistoryPreferences((current) => ({ ...current, status: "success" }));
-                            setPageIndex(0);
-                          }}
-                          onKeyDown={(event) => {
-                            handleHistoryFilterOptionKeyDown(event, () => {
-                              setHistoryPreferences((current) => ({ ...current, status: "success" }));
-                              setPageIndex(0);
-                            });
-                          }}
-                        >
-                          <Checkbox
-                            className="pointer-events-none"
-                            tabIndex={-1}
-                            aria-hidden="true"
-                            checked={historyPreferences.status === "success"}
-                          />
-                          <span className="text-sm">{t("history.filterSuccess")} ({counts.success})</span>
-                        </div>
-                        <div
-                          role="button"
-                          tabIndex={0}
-                          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent/40"
-                          onClick={() => {
-                            setHistoryPreferences((current) => ({ ...current, status: "failure" }));
-                            setPageIndex(0);
-                          }}
-                          onKeyDown={(event) => {
-                            handleHistoryFilterOptionKeyDown(event, () => {
-                              setHistoryPreferences((current) => ({ ...current, status: "failure" }));
-                              setPageIndex(0);
-                            });
-                          }}
-                        >
-                          <Checkbox
-                            className="pointer-events-none"
-                            tabIndex={-1}
-                            aria-hidden="true"
-                            checked={historyPreferences.status === "failure"}
-                          />
-                          <span className="text-sm">{t("history.filterFailure")} ({counts.failure})</span>
-                        </div>
-                      </div>
-                    </div>
-                  </PopoverContent>
-                </Popover>
-              </DataTableToolbar>
+                placeholder={t("history.searchPlaceholder")}
+                className="h-9 rounded-inner pl-8"
+              />
             </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              {selectedCount > 0 ? (
+                <div className="inline-flex h-9 min-w-0 items-center justify-center gap-1.5 rounded-inner border border-border bg-card px-2">
+                  <span className="shrink-0 px-1 text-xs font-medium text-muted-foreground">
+                    {t("bulk.selected", { count: selectedCount })}
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 gap-1.5 px-2 text-muted-foreground hover:text-foreground"
+                    disabled={actionsBusy || selectedRestartableIds.length === 0}
+                    onClick={() => {
+                      void handleBatchReprocess(selectedRestartableIds);
+                    }}
+                  >
+                    <RefreshCcw className="size-4" />
+                    <span>{t("action.reprocess")}</span>
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 gap-1.5 px-2 text-muted-foreground hover:text-foreground"
+                    disabled={actionsBusy || selectedRestartableIds.length === 0}
+                    onClick={() => {
+                      void handleBatchRedownload(selectedRestartableIds);
+                    }}
+                  >
+                    <Download className="size-4" />
+                    <span>{t("action.redownload")}</span>
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 gap-1.5 px-2 text-destructive hover:text-destructive"
+                    aria-label={t("action.delete")}
+                    title={t("action.delete")}
+                    disabled={acceptDeleteState.fetching || selectedActionIds.length === 0}
+                    onClick={() => {
+                      setDeleteAcceptError(null);
+                      setDeleteBatchConfirm(true);
+                    }}
+                  >
+                    <Trash2 className="size-4" />
+                    <span>{t("action.delete")}</span>
+                  </Button>
+                </div>
+              ) : null}
+
+              <FilterChip
+                label={t("history.filterAll")}
+                active={historyPreferences.status === "all"}
+                count={counts.all}
+                onClick={() => {
+                  setHistoryPreferences((current) => ({ ...current, status: "all" }));
+                  setPageIndex(0);
+                }}
+              />
+              <FilterChip
+                label={t("history.filterSuccess")}
+                active={historyPreferences.status === "success"}
+                count={counts.success}
+                onClick={() => {
+                  setHistoryPreferences((current) => ({ ...current, status: "success" }));
+                  setPageIndex(0);
+                }}
+              />
+              <FilterChip
+                label={t("history.filterFailure")}
+                active={historyPreferences.status === "failure"}
+                count={counts.failure}
+                onClick={() => {
+                  setHistoryPreferences((current) => ({ ...current, status: "failure" }));
+                  setPageIndex(0);
+                }}
+              />
+            </div>
+          </div>
+
+          <div className="rounded-card border border-border bg-card overflow-x-auto">
             <DataTable
               table={historyTable}
               tableClassName="table-fixed"
               wrapperClassName="max-h-[70vh]"
               rowClassName={(row) => cn(
-                "text-[11px]",
-                row.getIsSelected() && "bg-muted/50",
-                row.original.deleteOperation?.locked && "bg-amber-500/5 opacity-75",
+                "text-[13px]",
+                row.getIsSelected() && "bg-primary/[0.06]",
+                row.original.deleteOperation?.locked && "bg-status-paused/5 opacity-75",
               )}
               emptyState={
                 <div className="space-y-3 py-12 text-center">
@@ -1517,8 +1228,8 @@ export function History() {
               previousLabel={t("action.previous")}
               nextLabel={t("action.next")}
             />
-          </CardContent>
-        </Card>
+          </div>
+        </div>
       )}
 
       <ConfirmDialog
@@ -1567,52 +1278,6 @@ export function History() {
         }}
         onCancel={() => setRedownloadConfirmId(null)}
       />
-
-      {DIAGNOSTICS_ENABLED ? (
-        <ConfirmDialog
-          open={diagnosticConfirm != null}
-          title={t("confirm.diagnosticRedownload")}
-          message={t("confirm.diagnosticRedownloadMessage")}
-          confirmLabel={t("confirm.diagnosticRedownloadConfirm")}
-          cancelLabel={t("confirm.diagnosticRedownloadDismiss")}
-          confirmDisabled={diagnosticStartState.fetching}
-          cancelDisabled={diagnosticStartState.fetching}
-          onConfirm={() => {
-            if (!diagnosticConfirm) {
-              return;
-            }
-            void handleDiagnosticRedownload(
-              diagnosticConfirm.id,
-              diagnosticConfirm.includeServerHostnames,
-            ).then((accepted) => {
-              if (accepted) {
-                setDiagnosticConfirm(null);
-              }
-            });
-          }}
-          onCancel={() => {
-            setDiagnosticAcceptError(null);
-            setDiagnosticConfirm(null);
-          }}
-        >
-          <label className="flex items-center gap-2">
-            <Checkbox
-              checked={diagnosticConfirm?.includeServerHostnames ?? true}
-              disabled={diagnosticStartState.fetching}
-              onCheckedChange={(value) => {
-                setDiagnosticConfirm((current) => (current ? {
-                  ...current,
-                  includeServerHostnames: value === true,
-                } : current));
-              }}
-            />
-            <span className="text-sm">{t("confirm.includeServerHostnames")}</span>
-          </label>
-          {diagnosticAcceptError ? (
-            <p className="text-sm text-destructive">{diagnosticAcceptError}</p>
-          ) : null}
-        </ConfirmDialog>
-      ) : null}
 
       <ConfirmDialog
         open={deleteBatchConfirm}

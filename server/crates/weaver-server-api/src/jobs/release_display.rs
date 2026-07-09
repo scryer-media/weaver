@@ -1,5 +1,5 @@
-use std::collections::BTreeSet;
-use std::sync::OnceLock;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Mutex, OnceLock};
 
 use chrono::NaiveDate;
 use regex::Regex;
@@ -12,6 +12,7 @@ use weaver_server_core::ingest::{derive_release_name, original_release_title};
 use super::types::{ParsedEpisode, ParsedRelease};
 
 const MIN_PARSE_CONFIDENCE_FOR_DISPLAY_NAME: f32 = 0.4;
+const RELEASE_DISPLAY_CACHE_MAX_ENTRIES: usize = 512;
 
 pub(crate) struct ReleaseDisplayInput<'a> {
     pub job_name: &'a str,
@@ -19,13 +20,55 @@ pub(crate) struct ReleaseDisplayInput<'a> {
     pub category: Option<&'a str>,
 }
 
+#[derive(Clone)]
 pub(crate) struct ReleaseDisplayInfo {
     pub original_title: String,
     pub display_title: String,
     pub parsed_release: ParsedRelease,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReleaseDisplayCacheKey {
+    job_name: String,
+    metadata: Vec<(String, String)>,
+    category: Option<String>,
+}
+
+impl ReleaseDisplayCacheKey {
+    fn from_input(input: &ReleaseDisplayInput<'_>) -> Self {
+        Self {
+            job_name: input.job_name.to_owned(),
+            metadata: input.metadata.to_vec(),
+            category: input.category.map(str::to_owned),
+        }
+    }
+}
+
 pub(crate) fn release_display_info(input: ReleaseDisplayInput<'_>) -> ReleaseDisplayInfo {
+    let cache_key = ReleaseDisplayCacheKey::from_input(&input);
+    if let Ok(cache) = release_display_cache().lock()
+        && let Some(cached) = cache.get(&cache_key)
+    {
+        return cached.clone();
+    }
+
+    let display = compute_release_display_info(input);
+    if let Ok(mut cache) = release_display_cache().lock() {
+        if cache.len() >= RELEASE_DISPLAY_CACHE_MAX_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(cache_key, display.clone());
+    }
+    display
+}
+
+fn release_display_cache() -> &'static Mutex<HashMap<ReleaseDisplayCacheKey, ReleaseDisplayInfo>> {
+    static CACHE: OnceLock<Mutex<HashMap<ReleaseDisplayCacheKey, ReleaseDisplayInfo>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn compute_release_display_info(input: ReleaseDisplayInput<'_>) -> ReleaseDisplayInfo {
     let original_title = original_release_title(input.job_name, input.metadata);
     let raw = if original_title.trim().is_empty() {
         input.job_name

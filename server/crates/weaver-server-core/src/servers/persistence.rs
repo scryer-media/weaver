@@ -15,8 +15,8 @@ impl Database {
             SqlRuntime::execute(
                 datastore.read_exec(),
                 "INSERT INTO servers
-                    (id, host, port, tls, username, password, connections, active, supports_pipelining, priority, tls_ca_cert)
-                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    (id, host, port, tls, username, password, connections, active, supports_pipelining, priority, backfill, retention_days, tls_ca_cert)
+                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                 &server_args(record, encrypted_password),
             )
             .await?;
@@ -39,7 +39,8 @@ impl Database {
                 datastore.read_exec(),
                 "UPDATE servers
                     SET host = {}, port = {}, tls = {}, username = {}, password = {},
-                        connections = {}, active = {}, supports_pipelining = {}, priority = {}, tls_ca_cert = {}
+                        connections = {}, active = {}, supports_pipelining = {}, priority = {},
+                        backfill = {}, retention_days = {}, tls_ca_cert = {}
                   WHERE id = {}",
                 &args,
             )
@@ -74,6 +75,8 @@ pub(crate) fn server_args(record: ServerRecord, password: Option<String>) -> Vec
         SqlArg::Bool(record.active),
         SqlArg::Bool(record.supports_pipelining),
         SqlArg::I64(i64::from(record.priority)),
+        SqlArg::Bool(record.backfill),
+        SqlArg::I64(i64::from(record.retention_days)),
         SqlArg::OptText(record.tls_ca_cert),
     ]
 }

@@ -6,8 +6,7 @@ use crate::jobs::assembly::DetectedArchiveIdentity;
 use crate::jobs::ids::JobId;
 use crate::jobs::model::{FieldUpdate, JobUpdate};
 use crate::jobs::record::{
-    ActiveExtractionChunk, ActiveFileIdentity, ActiveFileProgress, ActiveJob, CommittedSegment,
-    ExtractionChunk,
+    ActiveExtractionChunk, ActiveFileIdentity, ActiveFileProgress, ActiveJob, ExtractionChunk,
 };
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, SqlTx};
@@ -110,56 +109,6 @@ async fn active_job_ids_tx(
         }
     }
     Ok(active)
-}
-
-async fn bulk_insert_segments_tx(
-    tx: &mut SqlTx<'_>,
-    segments: &[CommittedSegment],
-) -> Result<(), StateError> {
-    if segments.is_empty() {
-        return Ok(());
-    }
-
-    let chunk_size = max_rows_for_tx(tx, 6);
-    match tx {
-        SqlTx::Sqlite(tx) => {
-            for chunk in segments.chunks(chunk_size) {
-                let mut builder = QueryBuilder::<Sqlite>::new(
-                    "INSERT INTO active_segments
-                     (job_id, file_index, segment_number, file_offset, decoded_size, crc32) ",
-                );
-                builder.push_values(chunk, |mut row, seg| {
-                    row.push_bind(seg.job_id.0 as i64)
-                        .push_bind(seg.file_index as i64)
-                        .push_bind(seg.segment_number as i64)
-                        .push_bind(seg.file_offset as i64)
-                        .push_bind(seg.decoded_size as i64)
-                        .push_bind(seg.crc32 as i64);
-                });
-                builder.push(" ON CONFLICT(job_id, file_index, segment_number) DO NOTHING");
-                builder.build().execute(&mut **tx).await.map_err(db_err)?;
-            }
-        }
-        SqlTx::Postgres(tx) => {
-            for chunk in segments.chunks(chunk_size) {
-                let mut builder = QueryBuilder::<Postgres>::new(
-                    "INSERT INTO active_segments
-                     (job_id, file_index, segment_number, file_offset, decoded_size, crc32) ",
-                );
-                builder.push_values(chunk, |mut row, seg| {
-                    row.push_bind(seg.job_id.0 as i64)
-                        .push_bind(seg.file_index as i64)
-                        .push_bind(seg.segment_number as i64)
-                        .push_bind(seg.file_offset as i64)
-                        .push_bind(seg.decoded_size as i64)
-                        .push_bind(seg.crc32 as i64);
-                });
-                builder.push(" ON CONFLICT(job_id, file_index, segment_number) DO NOTHING");
-                builder.build().execute(&mut **tx).await.map_err(db_err)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 async fn bulk_upsert_file_progress_tx(
@@ -455,6 +404,120 @@ async fn bulk_upsert_file_identities_tx(
     Ok(())
 }
 
+/// Update `active_files.filename` for each identity's `current_filename`, the
+/// sibling write [`Database::save_file_identity`] performs alongside the
+/// identity upsert. Rows whose `active_files` entry does not yet exist (file
+/// not completed) are simply not matched, exactly as the single-row path. Runs
+/// inside the caller's transaction: Postgres batches with `UPDATE ... FROM
+/// (VALUES ...)`, SQLite issues per-row updates (local to the serialized
+/// writer, so the extra statements are cheap).
+async fn bulk_update_active_files_filenames_tx(
+    tx: &mut SqlTx<'_>,
+    job_id: JobId,
+    identities: &[ActiveFileIdentity],
+) -> Result<(), StateError> {
+    if identities.is_empty() {
+        return Ok(());
+    }
+
+    if matches!(tx, SqlTx::Sqlite(_)) {
+        for identity in identities {
+            tx.execute(
+                "UPDATE active_files SET filename = {}
+                 WHERE job_id = {} AND file_index = {}",
+                &[
+                    SqlArg::Text(identity.current_filename.clone()),
+                    SqlArg::I64(job_id.0 as i64),
+                    SqlArg::I64(identity.file_index as i64),
+                ],
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+
+    if let SqlTx::Postgres(tx) = tx {
+        // 3 binds per row (job_id, file_index, filename).
+        let chunk_size = (POSTGRES_BATCH_BIND_LIMIT / 3).max(1);
+        for chunk in identities.chunks(chunk_size) {
+            let mut builder = QueryBuilder::<Postgres>::new(
+                "UPDATE active_files SET filename = v.filename FROM (",
+            );
+            builder.push_values(chunk, |mut row, identity| {
+                row.push_bind(job_id.0 as i64)
+                    .push_bind(identity.file_index as i64)
+                    .push_bind(identity.current_filename.clone());
+            });
+            builder.push(
+                ") AS v(job_id, file_index, filename)
+                 WHERE active_files.job_id = v.job_id
+                   AND active_files.file_index = v.file_index",
+            );
+            builder.build().execute(&mut **tx).await.map_err(db_err)?;
+        }
+    }
+    Ok(())
+}
+
+/// Build the Postgres autocommit statement that inserts `row_count` extracted
+/// members guarded by a `FOR KEY SHARE` lock on the owning job. `$1` is the
+/// guard `job_id`; each row then binds `(job_id, member_name, output_path,
+/// output_size)`. Explicit casts on the first VALUES row give Postgres the
+/// column types it cannot infer from all-parameter rows.
+fn build_extracted_members_pg_sql(row_count: usize) -> String {
+    let mut values = String::new();
+    for row in 0..row_count {
+        if row > 0 {
+            values.push_str(", ");
+        }
+        if row == 0 {
+            values.push_str("({}::bigint, {}::text, {}::text, {}::bigint)");
+        } else {
+            values.push_str("({}, {}, {}, {})");
+        }
+    }
+    format!(
+        "WITH active_extracted_members_active AS (
+             SELECT 1 FROM active_jobs WHERE job_id = {{}} FOR KEY SHARE
+         )
+         INSERT INTO active_extracted (job_id, member_name, output_path, output_size)
+         SELECT d.job_id, d.member_name, d.output_path, d.output_size
+         FROM (VALUES {values}) AS d(job_id, member_name, output_path, output_size),
+              active_extracted_members_active
+         ON CONFLICT(job_id, member_name) DO NOTHING"
+    )
+}
+
+/// Build the Postgres autocommit statement that upserts `row_count` completed
+/// files guarded by a `FOR KEY SHARE` lock on the owning job, mirroring the
+/// single-row [`Database::complete_file_with_optional_hash`] shape. `$1` is the
+/// guard `job_id`; each row then binds `(job_id, file_index, filename, md5)`.
+fn build_complete_files_pg_sql(row_count: usize) -> String {
+    let mut values = String::new();
+    for row in 0..row_count {
+        if row > 0 {
+            values.push_str(", ");
+        }
+        if row == 0 {
+            values.push_str("({}::bigint, {}::bigint, {}::text, {}::bytea)");
+        } else {
+            values.push_str("({}, {}, {}, {})");
+        }
+    }
+    format!(
+        "WITH active_complete_files_active AS (
+             SELECT 1 FROM active_jobs WHERE job_id = {{}} FOR KEY SHARE
+         )
+         INSERT INTO active_files (job_id, file_index, filename, md5)
+         SELECT d.job_id, d.file_index, d.filename, d.md5
+         FROM (VALUES {values}) AS d(job_id, file_index, filename, md5),
+              active_complete_files_active
+         ON CONFLICT(job_id, file_index) DO UPDATE SET
+            filename = excluded.filename,
+            md5 = excluded.md5"
+    )
+}
+
 impl Database {
     pub fn create_active_job(&self, job: &ActiveJob) -> Result<(), StateError> {
         let datastore = self.datastore();
@@ -464,9 +527,16 @@ impl Database {
             SqlArg::Text(job.nzb_path.to_str().unwrap_or("").to_string()),
             SqlArg::Bytes(job.nzb_zstd.clone()),
             SqlArg::Text(job.output_dir.to_str().unwrap_or("").to_string()),
+            SqlArg::Text(job.status.to_string()),
+            SqlArg::Text(job.download_state.to_string()),
+            SqlArg::Text(job.post_state.to_string()),
+            SqlArg::Text(job.run_state.to_string()),
             SqlArg::I64(job.created_at as i64),
             SqlArg::OptText(job.category.clone()),
             SqlArg::OptText(metadata_json(&job.metadata)?),
+            SqlArg::OptText(job.paused_resume_status.map(str::to_string)),
+            SqlArg::OptText(job.paused_resume_download_state.map(str::to_string)),
+            SqlArg::OptText(job.paused_resume_post_state.map(str::to_string)),
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "create_active_job", |tx| {
@@ -474,8 +544,8 @@ impl Database {
                 Box::pin(async move {
                     tx.execute(
                         "INSERT INTO active_jobs
-                         (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata)
-                         VALUES ({}, {}, {}, {}, {}, 'queued', 'queued', 'idle', 'active', {}, {}, {})",
+                         (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state)
+                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                         &args,
                     )
                     .await?;
@@ -500,9 +570,16 @@ impl Database {
             SqlArg::Text(job.nzb_path.to_str().unwrap_or("").to_string()),
             SqlArg::Bytes(job.nzb_zstd.clone()),
             SqlArg::Text(job.output_dir.to_str().unwrap_or("").to_string()),
+            SqlArg::Text(job.status.to_string()),
+            SqlArg::Text(job.download_state.to_string()),
+            SqlArg::Text(job.post_state.to_string()),
+            SqlArg::Text(job.run_state.to_string()),
             SqlArg::I64(job.created_at as i64),
             SqlArg::OptText(job.category.clone()),
             SqlArg::OptText(metadata_json(&job.metadata)?),
+            SqlArg::OptText(job.paused_resume_status.map(str::to_string)),
+            SqlArg::OptText(job.paused_resume_download_state.map(str::to_string)),
+            SqlArg::OptText(job.paused_resume_post_state.map(str::to_string)),
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(
@@ -514,8 +591,8 @@ impl Database {
                     Box::pin(async move {
                         tx.execute(
                             "INSERT INTO active_jobs
-                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata)
-                             VALUES ({}, {}, {}, {}, {}, 'queued', 'queued', 'idle', 'active', {}, {}, {})",
+                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state)
+                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                             &args,
                         )
                         .await?;
@@ -674,34 +751,6 @@ impl Database {
         })
     }
 
-    pub fn commit_segments(&self, segments: &[CommittedSegment]) -> Result<(), StateError> {
-        if segments.is_empty() {
-            return Ok(());
-        }
-
-        let datastore = self.datastore();
-        let segments = segments.to_vec();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "commit_segments", |tx| {
-                let segments = segments.clone();
-                Box::pin(async move {
-                    let job_ids = segments
-                        .iter()
-                        .map(|segment| segment.job_id)
-                        .collect::<HashSet<_>>();
-                    let active_job_ids = active_job_ids_tx(tx, &job_ids).await?;
-                    let active_segments = segments
-                        .into_iter()
-                        .filter(|segment| active_job_ids.contains(&segment.job_id))
-                        .collect::<Vec<_>>();
-                    bulk_insert_segments_tx(tx, &active_segments).await?;
-                    Ok(())
-                })
-            })
-            .await
-        })
-    }
-
     pub fn upsert_file_progress_batch(
         &self,
         progress: &[ActiveFileProgress],
@@ -747,18 +796,42 @@ impl Database {
     pub fn clear_file_progress(&self, job_id: JobId, file_index: u32) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "clear_file_progress", |tx| {
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "clear_file_progress", |tx| {
+                        Box::pin(async move {
+                            lock_active_job_for_write_tx(tx, job_id).await?;
+                            tx.execute(
+                                "DELETE FROM active_file_progress WHERE job_id = {} AND file_index = {}",
+                                &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(file_index as i64)],
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // Deleting child rows of a gone job already deletes nothing, and a
+                // racing archive's cascade delete is idempotent with this one, so
+                // the FOR KEY SHARE guard adds nothing: run a plain autocommit
+                // DELETE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "DELETE FROM active_file_progress WHERE job_id = {} AND file_index = {}",
                         &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(file_index as i64)],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "clear_file_progress",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -769,9 +842,19 @@ impl Database {
         filename: &str,
         md5: &[u8; 16],
     ) -> Result<(), StateError> {
+        self.complete_file_with_optional_hash(job_id, file_index, filename, Some(md5))
+    }
+
+    pub fn complete_file_with_optional_hash(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+        filename: &str,
+        md5: Option<&[u8; 16]>,
+    ) -> Result<(), StateError> {
         let datastore = self.datastore();
         let filename = filename.to_string();
-        let md5 = md5.to_vec();
+        let md5 = md5.map(|md5| md5.to_vec());
         self.run_sql_blocking(async move {
             match datastore.engine() {
                 SqlEngine::Sqlite => {
@@ -790,7 +873,7 @@ impl Database {
                                         SqlArg::I64(job_id.0 as i64),
                                         SqlArg::I64(file_index as i64),
                                         SqlArg::Text(filename),
-                                        SqlArg::Bytes(md5),
+                                        SqlArg::OptBytes(md5),
                                     ],
                                 )
                                 .await?;
@@ -821,7 +904,7 @@ impl Database {
                             SqlArg::I64(job_id.0 as i64),
                             SqlArg::I64(file_index as i64),
                             SqlArg::Text(filename),
-                            SqlArg::Bytes(md5),
+                            SqlArg::OptBytes(md5),
                         ],
                     )
                     .await
@@ -837,6 +920,91 @@ impl Database {
         })
     }
 
+    /// Complete a batch of files for a single job, the bulk counterpart to
+    /// [`Self::complete_file_with_optional_hash`]. Each entry is
+    /// `(file_index, filename, optional md5)`; the guard semantics match the
+    /// single-file path (an absent `active_jobs` row inserts nothing). Postgres
+    /// runs one autocommit `FOR KEY SHARE`-guarded multi-row upsert per chunk;
+    /// SQLite guards once inside a transaction then bulk-upserts in chunks.
+    pub fn complete_files(
+        &self,
+        job_id: JobId,
+        entries: &[(u32, String, Option<[u8; 16]>)],
+    ) -> Result<(), StateError> {
+        // 4 value binds per row (job_id, file_index, filename, md5) plus the
+        // single guard bind reused across the chunk.
+        const BINDS_PER_ROW: usize = 4;
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let datastore = self.datastore();
+        let entries = entries.to_vec();
+        self.run_sql_blocking(async move {
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    let chunk_size = (SQLITE_BATCH_BIND_LIMIT / BINDS_PER_ROW).max(1);
+                    SqlRuntime::run_in_transaction(&datastore, "complete_files", |tx| {
+                        let entries = entries.clone();
+                        Box::pin(async move {
+                            if !active_job_exists_tx(tx, job_id).await? {
+                                return Ok(());
+                            }
+                            let SqlTx::Sqlite(tx) = tx else {
+                                return Ok(());
+                            };
+                            for chunk in entries.chunks(chunk_size) {
+                                let mut builder = QueryBuilder::<Sqlite>::new(
+                                    "INSERT INTO active_files (job_id, file_index, filename, md5) ",
+                                );
+                                builder.push_values(
+                                    chunk,
+                                    |mut row, (file_index, filename, md5)| {
+                                        row.push_bind(job_id.0 as i64)
+                                            .push_bind(*file_index as i64)
+                                            .push_bind(filename.clone())
+                                            .push_bind(md5.map(|md5| md5.to_vec()));
+                                    },
+                                );
+                                builder.push(
+                                    " ON CONFLICT(job_id, file_index) DO UPDATE SET
+                                        filename = excluded.filename,
+                                        md5 = excluded.md5",
+                                );
+                                builder.build().execute(&mut **tx).await.map_err(db_err)?;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                SqlEngine::Postgres => {
+                    let chunk_size = (POSTGRES_BATCH_BIND_LIMIT / BINDS_PER_ROW).max(1);
+                    let started = std::time::Instant::now();
+                    for chunk in entries.chunks(chunk_size) {
+                        let sql = build_complete_files_pg_sql(chunk.len());
+                        let mut args = Vec::with_capacity(1 + chunk.len() * BINDS_PER_ROW);
+                        args.push(SqlArg::I64(job_id.0 as i64));
+                        for (file_index, filename, md5) in chunk {
+                            args.push(SqlArg::I64(job_id.0 as i64));
+                            args.push(SqlArg::I64(*file_index as i64));
+                            args.push(SqlArg::Text(filename.clone()));
+                            args.push(SqlArg::OptBytes(md5.map(|md5| md5.to_vec())));
+                        }
+                        SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
+                    }
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "complete_files",
+                        started.elapsed(),
+                    );
+                    Ok(())
+                }
+            }
+        })
+    }
+
     pub fn mark_file_incomplete(&self, job_id: JobId, file_index: u32) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
@@ -844,7 +1012,6 @@ impl Database {
                 Box::pin(async move {
                     lock_active_job_for_write_tx(tx, job_id).await?;
                     for table in [
-                        "active_segments",
                         "active_file_progress",
                         "active_files",
                         "active_detected_archives",
@@ -961,21 +1128,80 @@ impl Database {
         })
     }
 
-    pub fn delete_file_identity(&self, job_id: JobId, file_index: u32) -> Result<(), StateError> {
+    /// Persist a batch of file identities for a single job in ONE transaction.
+    ///
+    /// This is the bulk counterpart to [`Self::save_file_identity`]: it upserts
+    /// every `active_file_identities` row via [`bulk_upsert_file_identities_tx`]
+    /// AND performs the sibling `active_files.filename` update that the bulk tx
+    /// helper omits, so callers converting a per-identity loop keep identical
+    /// semantics. Postgres runs one `UPDATE ... FROM (VALUES ...)` per chunk;
+    /// SQLite issues per-row `UPDATE`s inside the same transaction (cheap and
+    /// local to the serialized writer).
+    pub fn save_file_identities(
+        &self,
+        job_id: JobId,
+        identities: &[ActiveFileIdentity],
+    ) -> Result<(), StateError> {
+        if identities.is_empty() {
+            return Ok(());
+        }
+
         let datastore = self.datastore();
+        let identities = identities.to_vec();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "delete_file_identity", |tx| {
+            SqlRuntime::run_in_transaction(&datastore, "save_file_identities", |tx| {
+                let identities = identities.clone();
                 Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
-                        "DELETE FROM active_file_identities WHERE job_id = {} AND file_index = {}",
-                        &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(file_index as i64)],
-                    )
-                    .await?;
+                    if !active_job_exists_tx(tx, job_id).await? {
+                        return Ok(());
+                    }
+                    bulk_upsert_file_identities_tx(tx, job_id, &identities).await?;
+                    bulk_update_active_files_filenames_tx(tx, job_id, &identities).await?;
                     Ok(())
                 })
             })
             .await
+        })
+    }
+
+    pub fn delete_file_identity(&self, job_id: JobId, file_index: u32) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "delete_file_identity", |tx| {
+                        Box::pin(async move {
+                            lock_active_job_for_write_tx(tx, job_id).await?;
+                            tx.execute(
+                                "DELETE FROM active_file_identities WHERE job_id = {} AND file_index = {}",
+                                &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(file_index as i64)],
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // DELETE of a gone job's child rows is already a no-op and is
+                // idempotent with a racing archive cascade, so the lock adds
+                // nothing: plain autocommit DELETE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
+                        "DELETE FROM active_file_identities WHERE job_id = {} AND file_index = {}",
+                        &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(file_index as i64)],
+                    )
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "delete_file_identity",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -987,28 +1213,59 @@ impl Database {
     ) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "set_par2_metadata", |tx| {
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            let args = [
+                SqlArg::I64(job_id.0 as i64),
+                SqlArg::I64(slice_size as i64),
+                SqlArg::I64(recovery_block_count as i64),
+                SqlArg::I64(job_id.0 as i64),
+            ];
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "set_par2_metadata", |tx| {
+                        let args = args.clone();
+                        Box::pin(async move {
+                            lock_active_job_for_write_tx(tx, job_id).await?;
+                            tx.execute(
+                                "INSERT INTO active_par2 (job_id, slice_size, recovery_block_count)
+                                 SELECT {}, {}, {}
+                                 WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                                 ON CONFLICT(job_id) DO UPDATE SET
+                                    slice_size = excluded.slice_size,
+                                    recovery_block_count = excluded.recovery_block_count",
+                                &args,
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // The FOR KEY SHARE existence guard folds into the statement as a
+                // CTE the INSERT selects FROM: it no-ops the write when the job
+                // row is gone and blocks a concurrent archive/delete of the parent
+                // for the statement's duration.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "INSERT INTO active_par2 (job_id, slice_size, recovery_block_count)
                          SELECT {}, {}, {}
-                         WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                         FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_par2_parent
                          ON CONFLICT(job_id) DO UPDATE SET
                             slice_size = excluded.slice_size,
                             recovery_block_count = excluded.recovery_block_count",
-                        &[
-                            SqlArg::I64(job_id.0 as i64),
-                            SqlArg::I64(slice_size as i64),
-                            SqlArg::I64(recovery_block_count as i64),
-                            SqlArg::I64(job_id.0 as i64),
-                        ],
+                        &args,
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "set_par2_metadata",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1023,33 +1280,64 @@ impl Database {
         let datastore = self.datastore();
         let filename = filename.to_string();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "upsert_par2_file", |tx| {
-                let filename = filename.clone();
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            let args = [
+                SqlArg::I64(job_id.0 as i64),
+                SqlArg::I64(file_index as i64),
+                SqlArg::Text(filename),
+                SqlArg::I64(recovery_block_count as i64),
+                SqlArg::Bool(promoted),
+                SqlArg::I64(job_id.0 as i64),
+            ];
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "upsert_par2_file", |tx| {
+                        let args = args.clone();
+                        Box::pin(async move {
+                            lock_active_job_for_write_tx(tx, job_id).await?;
+                            tx.execute(
+                                "INSERT INTO active_par2_files
+                                 (job_id, file_index, filename, recovery_block_count, promoted)
+                                 SELECT {}, {}, {}, {}, {}
+                                 WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                                 ON CONFLICT(job_id, file_index) DO UPDATE SET
+                                    filename = excluded.filename,
+                                    recovery_block_count = excluded.recovery_block_count,
+                                    promoted = excluded.promoted",
+                                &args,
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // Guard folded into a FOR KEY SHARE CTE the INSERT selects FROM:
+                // no-ops when the job row is gone and blocks a concurrent
+                // archive/delete of the parent for the statement's duration.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "INSERT INTO active_par2_files
                          (job_id, file_index, filename, recovery_block_count, promoted)
                          SELECT {}, {}, {}, {}, {}
-                         WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                         FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_par2_files_parent
                          ON CONFLICT(job_id, file_index) DO UPDATE SET
                             filename = excluded.filename,
                             recovery_block_count = excluded.recovery_block_count,
                             promoted = excluded.promoted",
-                        &[
-                            SqlArg::I64(job_id.0 as i64),
-                            SqlArg::I64(file_index as i64),
-                            SqlArg::Text(filename),
-                            SqlArg::I64(recovery_block_count as i64),
-                            SqlArg::Bool(promoted),
-                            SqlArg::I64(job_id.0 as i64),
-                        ],
+                        &args,
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "upsert_par2_file",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1061,22 +1349,53 @@ impl Database {
     ) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "set_par2_file_promotion", |tx| {
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
-                        "UPDATE active_par2_files SET promoted = {} WHERE job_id = {} AND file_index = {}",
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "set_par2_file_promotion", |tx| {
+                        Box::pin(async move {
+                            lock_active_job_for_write_tx(tx, job_id).await?;
+                            tx.execute(
+                                "UPDATE active_par2_files SET promoted = {} WHERE job_id = {} AND file_index = {}",
+                                &[
+                                    SqlArg::Bool(promoted),
+                                    SqlArg::I64(job_id.0 as i64),
+                                    SqlArg::I64(file_index as i64),
+                                ],
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // Fold the FOR KEY SHARE guard into the UPDATE via a FROM join: the
+                // join both no-ops the write when the parent job row is gone AND
+                // blocks a concurrent archive/delete of it for the statement's
+                // duration.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
+                        "UPDATE active_par2_files SET promoted = {}
+                         FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_par2_files_parent
+                         WHERE active_par2_files.job_id = {} AND active_par2_files.file_index = {}",
                         &[
                             SqlArg::Bool(promoted),
+                            SqlArg::I64(job_id.0 as i64),
                             SqlArg::I64(job_id.0 as i64),
                             SqlArg::I64(file_index as i64),
                         ],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "set_par2_file_promotion",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1116,26 +1435,53 @@ impl Database {
         let datastore = self.datastore();
         let member_name = member_name.to_string();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "add_failed_extraction", |tx| {
-                let member_name = member_name.clone();
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            let args = [
+                SqlArg::I64(job_id.0 as i64),
+                SqlArg::Text(member_name),
+                SqlArg::I64(job_id.0 as i64),
+            ];
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "add_failed_extraction", |tx| {
+                        let args = args.clone();
+                        Box::pin(async move {
+                            lock_active_job_for_write_tx(tx, job_id).await?;
+                            tx.execute(
+                                "INSERT INTO active_failed_extractions (job_id, member_name)
+                                 SELECT {}, {}
+                                 WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                                 ON CONFLICT(job_id, member_name) DO NOTHING",
+                                &args,
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // Guard folded into a FOR KEY SHARE CTE the INSERT selects FROM:
+                // no-ops when the job row is gone and blocks a concurrent
+                // archive/delete of the parent for the statement's duration.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "INSERT INTO active_failed_extractions (job_id, member_name)
                          SELECT {}, {}
-                         WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                         FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_failed_extractions_parent
                          ON CONFLICT(job_id, member_name) DO NOTHING",
-                        &[
-                            SqlArg::I64(job_id.0 as i64),
-                            SqlArg::Text(member_name),
-                            SqlArg::I64(job_id.0 as i64),
-                        ],
+                        &args,
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "add_failed_extraction",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1147,20 +1493,44 @@ impl Database {
         let datastore = self.datastore();
         let member_name = member_name.to_string();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "remove_failed_extraction", |tx| {
-                let member_name = member_name.clone();
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "remove_failed_extraction", |tx| {
+                        let member_name = member_name.clone();
+                        Box::pin(async move {
+                            lock_active_job_for_write_tx(tx, job_id).await?;
+                            tx.execute(
+                                "DELETE FROM active_failed_extractions
+                                 WHERE job_id = {} AND member_name = {}",
+                                &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(member_name)],
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // DELETE of a gone job's child rows is already a no-op and is
+                // idempotent with a racing archive cascade, so the lock adds
+                // nothing: plain autocommit DELETE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "DELETE FROM active_failed_extractions
                          WHERE job_id = {} AND member_name = {}",
                         &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(member_name)],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "remove_failed_extraction",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1171,25 +1541,51 @@ impl Database {
     ) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(
-                &datastore,
-                "set_active_job_normalization_retried",
-                |tx| {
-                    Box::pin(async move {
-                        lock_active_job_for_write_tx(tx, job_id).await?;
-                        tx.execute(
-                            "UPDATE active_jobs SET normalization_retried = {} WHERE job_id = {}",
-                            &[
-                                SqlArg::Bool(normalization_retried),
-                                SqlArg::I64(job_id.0 as i64),
-                            ],
-                        )
-                        .await?;
-                        Ok(())
-                    })
-                },
-            )
-            .await
+            let args = [
+                SqlArg::Bool(normalization_retried),
+                SqlArg::I64(job_id.0 as i64),
+            ];
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(
+                        &datastore,
+                        "set_active_job_normalization_retried",
+                        |tx| {
+                            let args = args.clone();
+                            Box::pin(async move {
+                                lock_active_job_for_write_tx(tx, job_id).await?;
+                                tx.execute(
+                                    "UPDATE active_jobs SET normalization_retried = {} WHERE job_id = {}",
+                                    &args,
+                                )
+                                .await?;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                }
+                // The UPDATE targets the active_jobs row itself, so it already
+                // takes that row's lock for its duration and no-ops when the row
+                // is gone: the separate guard is redundant here (mirrors
+                // `set_active_job_runtime`). Run a plain autocommit UPDATE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
+                        "UPDATE active_jobs SET normalization_retried = {} WHERE job_id = {}",
+                        &args,
+                    )
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "set_active_job_normalization_retried",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1229,18 +1625,45 @@ impl Database {
     pub fn clear_verified_suspect_volumes(&self, job_id: JobId) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "clear_verified_suspect_volumes", |tx| {
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(
+                        &datastore,
+                        "clear_verified_suspect_volumes",
+                        |tx| {
+                            Box::pin(async move {
+                                lock_active_job_for_write_tx(tx, job_id).await?;
+                                tx.execute(
+                                    "DELETE FROM active_rar_verified_suspect WHERE job_id = {}",
+                                    &[SqlArg::I64(job_id.0 as i64)],
+                                )
+                                .await?;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                }
+                // DELETE of a gone job's child rows is already a no-op and is
+                // idempotent with a racing archive cascade, so the lock adds
+                // nothing: plain autocommit DELETE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "DELETE FROM active_rar_verified_suspect WHERE job_id = {}",
                         &[SqlArg::I64(job_id.0 as i64)],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "clear_verified_suspect_volumes",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1250,72 +1673,129 @@ impl Database {
         member_name: &str,
         output_path: &Path,
     ) -> Result<(), StateError> {
+        self.add_extracted_members(
+            job_id,
+            std::slice::from_ref(&(member_name.to_string(), output_path.to_path_buf())),
+        )
+    }
+
+    /// Persist a batch of extracted archive members for a single job.
+    ///
+    /// Each `output_path` is stat'd (blocking IO — callers run this via
+    /// `spawn_blocking`) to record its on-disk size; an entry whose stat fails
+    /// is skipped and logged rather than failing the whole batch, matching the
+    /// per-member error tolerance of the RAR extraction scheduler. Surviving
+    /// rows are inserted multi-row in bind-budget-sized chunks: Postgres runs
+    /// one autocommit statement per chunk guarded by a `FOR KEY SHARE` CTE on
+    /// `active_jobs`; SQLite guards once inside a transaction then bulk-inserts,
+    /// mirroring [`Self::replace_verified_suspect_volumes`].
+    pub fn add_extracted_members(
+        &self,
+        job_id: JobId,
+        entries: &[(String, std::path::PathBuf)],
+    ) -> Result<(), StateError> {
+        // 4 value binds per row (job_id, member_name, output_path, output_size)
+        // plus the single guard bind ($1) reused across every row in a chunk.
+        const BINDS_PER_ROW: usize = 4;
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // Stat each output before touching the DB; tolerate individual failures
+        // exactly as the previous per-member loop did.
+        let mut rows: Vec<(String, String, i64)> = Vec::with_capacity(entries.len());
+        for (member_name, output_path) in entries {
+            let output_size = match std::fs::metadata(output_path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = job_id.0,
+                        member = %member_name,
+                        path = %output_path.display(),
+                        error = %error,
+                        "skipping extracted member whose output could not be stat'd"
+                    );
+                    continue;
+                }
+            };
+            let output_size = match i64::try_from(output_size) {
+                Ok(value) => value,
+                Err(_) => {
+                    tracing::warn!(
+                        job_id = job_id.0,
+                        member = %member_name,
+                        path = %output_path.display(),
+                        "skipping extracted member whose output is too large to persist"
+                    );
+                    continue;
+                }
+            };
+            rows.push((
+                member_name.clone(),
+                output_path.to_string_lossy().to_string(),
+                output_size,
+            ));
+        }
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
         let datastore = self.datastore();
-        let member_name = member_name.to_string();
-        let output_size = std::fs::metadata(output_path)?.len();
-        let output_size = i64::try_from(output_size).map_err(|_| {
-            StateError::Database(format!(
-                "extracted member output is too large to persist: {}",
-                output_path.display()
-            ))
-        })?;
-        let output_path = output_path.to_string_lossy().to_string();
         self.run_sql_blocking(async move {
             match datastore.engine() {
                 SqlEngine::Sqlite => {
-                    SqlRuntime::run_in_transaction(&datastore, "add_extracted_member", |tx| {
-                        let member_name = member_name.clone();
-                        let output_path = output_path.clone();
+                    let chunk_size = (SQLITE_BATCH_BIND_LIMIT / BINDS_PER_ROW).max(1);
+                    SqlRuntime::run_in_transaction(&datastore, "add_extracted_members", |tx| {
+                        let rows = rows.clone();
                         Box::pin(async move {
-                            tx.execute(
-                                "INSERT INTO active_extracted (job_id, member_name, output_path, output_size)
-                                 SELECT {}, {}, {}, {}
-                                 WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
-                                 ON CONFLICT(job_id, member_name) DO NOTHING",
-                                &[
-                                    SqlArg::I64(job_id.0 as i64),
-                                    SqlArg::Text(member_name),
-                                    SqlArg::Text(output_path),
-                                    SqlArg::I64(output_size),
-                                    SqlArg::I64(job_id.0 as i64),
-                                ],
-                            )
-                            .await?;
+                            if !active_job_exists_tx(tx, job_id).await? {
+                                return Ok(());
+                            }
+                            let SqlTx::Sqlite(tx) = tx else {
+                                return Ok(());
+                            };
+                            for chunk in rows.chunks(chunk_size) {
+                                let mut builder = QueryBuilder::<Sqlite>::new(
+                                    "INSERT INTO active_extracted
+                                     (job_id, member_name, output_path, output_size) ",
+                                );
+                                builder.push_values(chunk, |mut row, entry| {
+                                    row.push_bind(job_id.0 as i64)
+                                        .push_bind(entry.0.clone())
+                                        .push_bind(entry.1.clone())
+                                        .push_bind(entry.2);
+                                });
+                                builder.push(" ON CONFLICT(job_id, member_name) DO NOTHING");
+                                builder.build().execute(&mut **tx).await.map_err(db_err)?;
+                            }
                             Ok(())
                         })
                     })
                     .await
                 }
                 SqlEngine::Postgres => {
+                    let chunk_size = (POSTGRES_BATCH_BIND_LIMIT / BINDS_PER_ROW).max(1);
                     let started = std::time::Instant::now();
-                    let result = SqlRuntime::execute(
-                        datastore.read_exec(),
-                        "WITH active_extracted_member_active AS (
-                             SELECT 1
-                             FROM active_jobs
-                             WHERE job_id = {}
-                             FOR KEY SHARE
-                         )
-                         INSERT INTO active_extracted (job_id, member_name, output_path, output_size)
-                         SELECT {}, {}, {}, {}
-                         FROM active_extracted_member_active
-                         ON CONFLICT(job_id, member_name) DO NOTHING",
-                        &[
-                            SqlArg::I64(job_id.0 as i64),
-                            SqlArg::I64(job_id.0 as i64),
-                            SqlArg::Text(member_name),
-                            SqlArg::Text(output_path),
-                            SqlArg::I64(output_size),
-                        ],
-                    )
-                    .await
-                    .map(|_| ());
+                    for chunk in rows.chunks(chunk_size) {
+                        let sql = build_extracted_members_pg_sql(chunk.len());
+                        let mut args = Vec::with_capacity(1 + chunk.len() * BINDS_PER_ROW);
+                        args.push(SqlArg::I64(job_id.0 as i64));
+                        for (member_name, output_path, output_size) in chunk {
+                            args.push(SqlArg::I64(job_id.0 as i64));
+                            args.push(SqlArg::Text(member_name.clone()));
+                            args.push(SqlArg::Text(output_path.clone()));
+                            args.push(SqlArg::I64(*output_size));
+                        }
+                        SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
+                    }
                     crate::runtime::perf_probe::record_sql_op(
                         "postgres",
-                        "add_extracted_member",
+                        "add_extracted_members",
                         started.elapsed(),
                     );
-                    result
+                    Ok(())
                 }
             }
         })
@@ -1324,18 +1804,41 @@ impl Database {
     pub fn clear_extracted_members(&self, job_id: JobId) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "clear_extracted_members", |tx| {
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "clear_extracted_members", |tx| {
+                        Box::pin(async move {
+                            lock_active_job_for_write_tx(tx, job_id).await?;
+                            tx.execute(
+                                "DELETE FROM active_extracted WHERE job_id = {}",
+                                &[SqlArg::I64(job_id.0 as i64)],
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // DELETE of a gone job's child rows is already a no-op and is
+                // idempotent with a racing archive cascade, so the lock adds
+                // nothing: plain autocommit DELETE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "DELETE FROM active_extracted WHERE job_id = {}",
                         &[SqlArg::I64(job_id.0 as i64)],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "clear_extracted_members",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1343,38 +1846,72 @@ impl Database {
         let datastore = self.datastore();
         let chunk = chunk.clone();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "insert_extraction_chunk", |tx| {
-                let chunk = chunk.clone();
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, chunk.job_id).await?;
-                    tx.execute(
+            let job_id = chunk.job_id;
+            let args = [
+                SqlArg::I64(chunk.job_id.0 as i64),
+                SqlArg::Text(chunk.set_name),
+                SqlArg::Text(chunk.member_name),
+                SqlArg::I64(chunk.volume_index as i64),
+                SqlArg::I64(chunk.bytes_written as i64),
+                SqlArg::Text(chunk.temp_path),
+                SqlArg::I64(chunk.start_offset as i64),
+                SqlArg::I64(chunk.end_offset as i64),
+                SqlArg::I64(chunk.job_id.0 as i64),
+            ];
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "insert_extraction_chunk", |tx| {
+                        let args = args.clone();
+                        Box::pin(async move {
+                            lock_active_job_for_write_tx(tx, job_id).await?;
+                            tx.execute(
+                                "INSERT INTO active_extraction_chunks
+                                 (job_id, set_name, member_name, volume_index, bytes_written, temp_path,
+                                  start_offset, end_offset)
+                                 SELECT {}, {}, {}, {}, {}, {}, {}, {}
+                                 WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                                 ON CONFLICT(job_id, set_name, member_name, volume_index) DO UPDATE SET
+                                    bytes_written = excluded.bytes_written,
+                                    temp_path = excluded.temp_path,
+                                    start_offset = excluded.start_offset,
+                                    end_offset = excluded.end_offset",
+                                &args,
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // Guard folded into a FOR KEY SHARE CTE the INSERT selects FROM:
+                // no-ops when the job row is gone and blocks a concurrent
+                // archive/delete of the parent for the statement's duration.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "INSERT INTO active_extraction_chunks
                          (job_id, set_name, member_name, volume_index, bytes_written, temp_path,
                           start_offset, end_offset)
                          SELECT {}, {}, {}, {}, {}, {}, {}, {}
-                         WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                         FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_extraction_chunks_parent
                          ON CONFLICT(job_id, set_name, member_name, volume_index) DO UPDATE SET
                             bytes_written = excluded.bytes_written,
                             temp_path = excluded.temp_path,
                             start_offset = excluded.start_offset,
                             end_offset = excluded.end_offset",
-                        &[
-                            SqlArg::I64(chunk.job_id.0 as i64),
-                            SqlArg::Text(chunk.set_name),
-                            SqlArg::Text(chunk.member_name),
-                            SqlArg::I64(chunk.volume_index as i64),
-                            SqlArg::I64(chunk.bytes_written as i64),
-                            SqlArg::Text(chunk.temp_path),
-                            SqlArg::I64(chunk.start_offset as i64),
-                            SqlArg::I64(chunk.end_offset as i64),
-                            SqlArg::I64(chunk.job_id.0 as i64),
-                        ],
+                        &args,
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "insert_extraction_chunk",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1389,26 +1926,60 @@ impl Database {
         let set_name = set_name.to_string();
         let member_name = member_name.to_string();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "mark_chunk_verified", |tx| {
-                let set_name = set_name.clone();
-                let member_name = member_name.clone();
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "mark_chunk_verified", |tx| {
+                        let set_name = set_name.clone();
+                        let member_name = member_name.clone();
+                        Box::pin(async move {
+                            lock_active_job_for_write_tx(tx, job_id).await?;
+                            tx.execute(
+                                "UPDATE active_extraction_chunks SET verified = TRUE
+                                 WHERE job_id = {} AND set_name = {} AND member_name = {} AND volume_index = {}",
+                                &[
+                                    SqlArg::I64(job_id.0 as i64),
+                                    SqlArg::Text(set_name),
+                                    SqlArg::Text(member_name),
+                                    SqlArg::I64(volume_index as i64),
+                                ],
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // Fold the FOR KEY SHARE guard into the UPDATE via a FROM join: it
+                // no-ops the write when the parent job row is gone AND blocks a
+                // concurrent archive/delete of it for the statement's duration.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "UPDATE active_extraction_chunks SET verified = TRUE
-                         WHERE job_id = {} AND set_name = {} AND member_name = {} AND volume_index = {}",
+                         FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_extraction_chunks_parent
+                         WHERE active_extraction_chunks.job_id = {}
+                           AND active_extraction_chunks.set_name = {}
+                           AND active_extraction_chunks.member_name = {}
+                           AND active_extraction_chunks.volume_index = {}",
                         &[
+                            SqlArg::I64(job_id.0 as i64),
                             SqlArg::I64(job_id.0 as i64),
                             SqlArg::Text(set_name),
                             SqlArg::Text(member_name),
                             SqlArg::I64(volume_index as i64),
                         ],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "mark_chunk_verified",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1462,26 +2033,60 @@ impl Database {
         let set_name = set_name.to_string();
         let member_name = member_name.to_string();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "mark_chunk_appended", |tx| {
-                let set_name = set_name.clone();
-                let member_name = member_name.clone();
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "mark_chunk_appended", |tx| {
+                        let set_name = set_name.clone();
+                        let member_name = member_name.clone();
+                        Box::pin(async move {
+                            lock_active_job_for_write_tx(tx, job_id).await?;
+                            tx.execute(
+                                "UPDATE active_extraction_chunks SET appended = TRUE
+                                 WHERE job_id = {} AND set_name = {} AND member_name = {} AND volume_index = {}",
+                                &[
+                                    SqlArg::I64(job_id.0 as i64),
+                                    SqlArg::Text(set_name),
+                                    SqlArg::Text(member_name),
+                                    SqlArg::I64(volume_index as i64),
+                                ],
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // Fold the FOR KEY SHARE guard into the UPDATE via a FROM join: it
+                // no-ops the write when the parent job row is gone AND blocks a
+                // concurrent archive/delete of it for the statement's duration.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "UPDATE active_extraction_chunks SET appended = TRUE
-                         WHERE job_id = {} AND set_name = {} AND member_name = {} AND volume_index = {}",
+                         FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_extraction_chunks_parent
+                         WHERE active_extraction_chunks.job_id = {}
+                           AND active_extraction_chunks.set_name = {}
+                           AND active_extraction_chunks.member_name = {}
+                           AND active_extraction_chunks.volume_index = {}",
                         &[
+                            SqlArg::I64(job_id.0 as i64),
                             SqlArg::I64(job_id.0 as i64),
                             SqlArg::Text(set_name),
                             SqlArg::Text(member_name),
                             SqlArg::I64(volume_index as i64),
                         ],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "mark_chunk_appended",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1495,12 +2100,35 @@ impl Database {
         let set_name = set_name.to_string();
         let member_name = member_name.to_string();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "clear_member_chunks", |tx| {
-                let set_name = set_name.clone();
-                let member_name = member_name.clone();
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "clear_member_chunks", |tx| {
+                        let set_name = set_name.clone();
+                        let member_name = member_name.clone();
+                        Box::pin(async move {
+                            lock_active_job_for_write_tx(tx, job_id).await?;
+                            tx.execute(
+                                "DELETE FROM active_extraction_chunks
+                                 WHERE job_id = {} AND set_name = {} AND member_name = {}",
+                                &[
+                                    SqlArg::I64(job_id.0 as i64),
+                                    SqlArg::Text(set_name),
+                                    SqlArg::Text(member_name),
+                                ],
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // DELETE of a gone job's child rows is already a no-op and is
+                // idempotent with a racing archive cascade, so the lock adds
+                // nothing: plain autocommit DELETE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "DELETE FROM active_extraction_chunks
                          WHERE job_id = {} AND set_name = {} AND member_name = {}",
                         &[
@@ -1509,11 +2137,16 @@ impl Database {
                             SqlArg::Text(member_name),
                         ],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "clear_member_chunks",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1525,20 +2158,48 @@ impl Database {
         let datastore = self.datastore();
         let member_name = member_name.to_string();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "clear_member_chunks_for_all_sets", |tx| {
-                let member_name = member_name.clone();
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(
+                        &datastore,
+                        "clear_member_chunks_for_all_sets",
+                        |tx| {
+                            let member_name = member_name.clone();
+                            Box::pin(async move {
+                                lock_active_job_for_write_tx(tx, job_id).await?;
+                                tx.execute(
+                                    "DELETE FROM active_extraction_chunks
+                                     WHERE job_id = {} AND member_name = {}",
+                                    &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(member_name)],
+                                )
+                                .await?;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                }
+                // DELETE of a gone job's child rows is already a no-op and is
+                // idempotent with a racing archive cascade, so the lock adds
+                // nothing: plain autocommit DELETE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "DELETE FROM active_extraction_chunks
                          WHERE job_id = {} AND member_name = {}",
                         &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(member_name)],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "clear_member_chunks_for_all_sets",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1552,47 +2213,53 @@ impl Database {
         let set_name = set_name.to_string();
         let headers = headers.to_vec();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "save_archive_headers", |tx| {
-                let set_name = set_name.clone();
-                let headers = headers.clone();
-                Box::pin(async move {
-                    let sql = match tx {
-                        SqlTx::Postgres(_) => {
-                            "INSERT INTO active_archive_headers (job_id, set_name, headers)
+            let args = [
+                SqlArg::I64(job_id.0 as i64),
+                SqlArg::Text(set_name),
+                SqlArg::Bytes(headers),
+                SqlArg::I64(job_id.0 as i64),
+            ];
+            let affected = match datastore.engine() {
+                // The statement already guards itself with FOR KEY SHARE, so run
+                // it as a single autocommit statement instead of wrapping it in a
+                // redundant BEGIN/COMMIT round-trip.
+                SqlEngine::Postgres => {
+                    SqlRuntime::execute(
+                        datastore.read_exec(),
+                        "INSERT INTO active_archive_headers (job_id, set_name, headers)
                          SELECT {}, {}, {}
                          FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_archive_headers_parent
                          ON CONFLICT(job_id, set_name) DO UPDATE SET headers = excluded.headers
-                         WHERE active_archive_headers.headers <> excluded.headers"
-                        }
-                        SqlTx::Sqlite(_) => {
-                            "INSERT INTO active_archive_headers (job_id, set_name, headers)
-                         SELECT {}, {}, {}
-                         WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
-                         ON CONFLICT(job_id, set_name) DO UPDATE SET headers = excluded.headers
-                         WHERE active_archive_headers.headers <> excluded.headers"
-                        }
-                    };
-                    let affected = tx
-                        .execute(
-                            sql,
-                            &[
-                                SqlArg::I64(job_id.0 as i64),
-                                SqlArg::Text(set_name),
-                                SqlArg::Bytes(headers),
-                                SqlArg::I64(job_id.0 as i64),
-                            ],
-                        )
-                        .await?;
-                    let label = if affected == 0 {
-                        "persistence.archive_headers.upsert.unchanged"
-                    } else {
-                        "persistence.archive_headers.upsert.changed"
-                    };
-                    crate::runtime::perf_probe::record(label, std::time::Duration::ZERO);
-                    Ok(())
-                })
-            })
-            .await
+                         WHERE active_archive_headers.headers <> excluded.headers",
+                        &args,
+                    )
+                    .await?
+                }
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "save_archive_headers", |tx| {
+                        let args = args.clone();
+                        Box::pin(async move {
+                            tx.execute(
+                                "INSERT INTO active_archive_headers (job_id, set_name, headers)
+                                 SELECT {}, {}, {}
+                                 WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                                 ON CONFLICT(job_id, set_name) DO UPDATE SET headers = excluded.headers
+                                 WHERE active_archive_headers.headers <> excluded.headers",
+                                &args,
+                            )
+                            .await
+                        })
+                    })
+                    .await?
+                }
+            };
+            let label = if affected == 0 {
+                "persistence.archive_headers.upsert.unchanged"
+            } else {
+                "persistence.archive_headers.upsert.changed"
+            };
+            crate::runtime::perf_probe::record(label, std::time::Duration::ZERO);
+            Ok(())
         })
     }
 
@@ -1600,19 +2267,42 @@ impl Database {
         let datastore = self.datastore();
         let set_name = set_name.to_string();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "delete_archive_headers", |tx| {
-                let set_name = set_name.clone();
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "delete_archive_headers", |tx| {
+                        let set_name = set_name.clone();
+                        Box::pin(async move {
+                            lock_active_job_for_write_tx(tx, job_id).await?;
+                            tx.execute(
+                                "DELETE FROM active_archive_headers WHERE job_id = {} AND set_name = {}",
+                                &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(set_name)],
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // DELETE of a gone job's child rows is already a no-op and is
+                // idempotent with a racing archive cascade, so the lock adds
+                // nothing: plain autocommit DELETE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "DELETE FROM active_archive_headers WHERE job_id = {} AND set_name = {}",
                         &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(set_name)],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "delete_archive_headers",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1627,50 +2317,53 @@ impl Database {
         let set_name = set_name.to_string();
         let facts_blob = facts_blob.to_vec();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "save_rar_volume_facts", |tx| {
-                let set_name = set_name.clone();
-                let facts_blob = facts_blob.clone();
-                Box::pin(async move {
-                    let sql = match tx {
-                        SqlTx::Postgres(_) => {
-                            "INSERT INTO active_rar_volume_facts
+            let args = [
+                SqlArg::I64(job_id.0 as i64),
+                SqlArg::Text(set_name),
+                SqlArg::I64(volume_index as i64),
+                SqlArg::Bytes(facts_blob),
+                SqlArg::I64(job_id.0 as i64),
+            ];
+            let affected = match datastore.engine() {
+                SqlEngine::Postgres => {
+                    SqlRuntime::execute(
+                        datastore.read_exec(),
+                        "INSERT INTO active_rar_volume_facts
                          (job_id, set_name, volume_index, facts_blob)
                          SELECT {}, {}, {}, {}
                          FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_rar_volume_facts_parent
                          ON CONFLICT(job_id, set_name, volume_index) DO UPDATE SET facts_blob = excluded.facts_blob
-                         WHERE active_rar_volume_facts.facts_blob <> excluded.facts_blob"
-                        }
-                        SqlTx::Sqlite(_) => {
-                            "INSERT INTO active_rar_volume_facts
-                         (job_id, set_name, volume_index, facts_blob)
-                         SELECT {}, {}, {}, {}
-                         WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
-                         ON CONFLICT(job_id, set_name, volume_index) DO UPDATE SET facts_blob = excluded.facts_blob
-                         WHERE active_rar_volume_facts.facts_blob <> excluded.facts_blob"
-                        }
-                    };
-                    let affected = tx
-                        .execute(
-                            sql,
-                            &[
-                                SqlArg::I64(job_id.0 as i64),
-                                SqlArg::Text(set_name),
-                                SqlArg::I64(volume_index as i64),
-                                SqlArg::Bytes(facts_blob),
-                                SqlArg::I64(job_id.0 as i64),
-                            ],
-                        )
-                        .await?;
-                    let label = if affected == 0 {
-                        "persistence.rar_volume_facts.upsert.unchanged"
-                    } else {
-                        "persistence.rar_volume_facts.upsert.changed"
-                    };
-                    crate::runtime::perf_probe::record(label, std::time::Duration::ZERO);
-                    Ok(())
-                })
-            })
-            .await
+                         WHERE active_rar_volume_facts.facts_blob <> excluded.facts_blob",
+                        &args,
+                    )
+                    .await?
+                }
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "save_rar_volume_facts", |tx| {
+                        let args = args.clone();
+                        Box::pin(async move {
+                            tx.execute(
+                                "INSERT INTO active_rar_volume_facts
+                                 (job_id, set_name, volume_index, facts_blob)
+                                 SELECT {}, {}, {}, {}
+                                 WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                                 ON CONFLICT(job_id, set_name, volume_index) DO UPDATE SET facts_blob = excluded.facts_blob
+                                 WHERE active_rar_volume_facts.facts_blob <> excluded.facts_blob",
+                                &args,
+                            )
+                            .await
+                        })
+                    })
+                    .await?
+                }
+            };
+            let label = if affected == 0 {
+                "persistence.rar_volume_facts.upsert.unchanged"
+            } else {
+                "persistence.rar_volume_facts.upsert.changed"
+            };
+            crate::runtime::perf_probe::record(label, std::time::Duration::ZERO);
+            Ok(())
         })
     }
 
@@ -1683,47 +2376,67 @@ impl Database {
         let datastore = self.datastore();
         let detected = detected.clone();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "save_detected_archive_identity", |tx| {
-                let detected = detected.clone();
-                Box::pin(async move {
-                    let sql = match tx {
-                        SqlTx::Postgres(_) => {
-                            "INSERT INTO active_detected_archives
+            let args = [
+                SqlArg::I64(job_id.0 as i64),
+                SqlArg::I64(file_index as i64),
+                SqlArg::Text(detected.kind.as_str().to_string()),
+                SqlArg::Text(detected.set_name),
+                SqlArg::OptI64(detected.volume_index.map(|value| value as i64)),
+                SqlArg::I64(job_id.0 as i64),
+            ];
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(
+                        &datastore,
+                        "save_detected_archive_identity",
+                        |tx| {
+                            let args = args.clone();
+                            Box::pin(async move {
+                                tx.execute(
+                                    "INSERT INTO active_detected_archives
+                                     (job_id, file_index, kind, set_name, volume_index)
+                                     SELECT {}, {}, {}, {}, {}
+                                     WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                                     ON CONFLICT(job_id, file_index) DO UPDATE SET
+                                        kind = excluded.kind,
+                                        set_name = excluded.set_name,
+                                        volume_index = excluded.volume_index",
+                                    &args,
+                                )
+                                .await?;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                }
+                // Guard folded into a FOR KEY SHARE CTE the INSERT selects FROM:
+                // no-ops when the job row is gone and blocks a concurrent
+                // archive/delete of the parent for the statement's duration.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
+                        "INSERT INTO active_detected_archives
                          (job_id, file_index, kind, set_name, volume_index)
                          SELECT {}, {}, {}, {}, {}
                          FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_detected_archive_parent
                          ON CONFLICT(job_id, file_index) DO UPDATE SET
                             kind = excluded.kind,
                             set_name = excluded.set_name,
-                            volume_index = excluded.volume_index"
-                        }
-                        SqlTx::Sqlite(_) => {
-                            "INSERT INTO active_detected_archives
-                         (job_id, file_index, kind, set_name, volume_index)
-                         SELECT {}, {}, {}, {}, {}
-                         WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
-                         ON CONFLICT(job_id, file_index) DO UPDATE SET
-                            kind = excluded.kind,
-                            set_name = excluded.set_name,
-                            volume_index = excluded.volume_index"
-                        }
-                    };
-                    tx.execute(
-                        sql,
-                        &[
-                            SqlArg::I64(job_id.0 as i64),
-                            SqlArg::I64(file_index as i64),
-                            SqlArg::Text(detected.kind.as_str().to_string()),
-                            SqlArg::Text(detected.set_name),
-                            SqlArg::OptI64(detected.volume_index.map(|value| value as i64)),
-                            SqlArg::I64(job_id.0 as i64),
-                        ],
+                            volume_index = excluded.volume_index",
+                        &args,
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "save_detected_archive_identity",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1734,36 +2447,90 @@ impl Database {
     ) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "delete_detected_archive_identity", |tx| {
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(
+                        &datastore,
+                        "delete_detected_archive_identity",
+                        |tx| {
+                            Box::pin(async move {
+                                lock_active_job_for_write_tx(tx, job_id).await?;
+                                tx.execute(
+                                    "DELETE FROM active_detected_archives WHERE job_id = {} AND file_index = {}",
+                                    &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(file_index as i64)],
+                                )
+                                .await?;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                }
+                // DELETE of a gone job's child rows is already a no-op and is
+                // idempotent with a racing archive cascade, so the lock adds
+                // nothing: plain autocommit DELETE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "DELETE FROM active_detected_archives WHERE job_id = {} AND file_index = {}",
                         &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(file_index as i64)],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "delete_detected_archive_identity",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
     pub fn delete_all_rar_volume_facts(&self, job_id: JobId) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "delete_all_rar_volume_facts", |tx| {
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(
+                        &datastore,
+                        "delete_all_rar_volume_facts",
+                        |tx| {
+                            Box::pin(async move {
+                                lock_active_job_for_write_tx(tx, job_id).await?;
+                                tx.execute(
+                                    "DELETE FROM active_rar_volume_facts WHERE job_id = {}",
+                                    &[SqlArg::I64(job_id.0 as i64)],
+                                )
+                                .await?;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                }
+                // DELETE of a gone job's child rows is already a no-op and is
+                // idempotent with a racing archive cascade, so the lock adds
+                // nothing: plain autocommit DELETE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "DELETE FROM active_rar_volume_facts WHERE job_id = {}",
                         &[SqlArg::I64(job_id.0 as i64)],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "delete_all_rar_volume_facts",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1775,19 +2542,46 @@ impl Database {
         let datastore = self.datastore();
         let set_name = set_name.to_string();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "delete_rar_volume_facts_for_set", |tx| {
-                let set_name = set_name.clone();
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(
+                        &datastore,
+                        "delete_rar_volume_facts_for_set",
+                        |tx| {
+                            let set_name = set_name.clone();
+                            Box::pin(async move {
+                                lock_active_job_for_write_tx(tx, job_id).await?;
+                                tx.execute(
+                                    "DELETE FROM active_rar_volume_facts WHERE job_id = {} AND set_name = {}",
+                                    &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(set_name)],
+                                )
+                                .await?;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                }
+                // DELETE of a gone job's child rows is already a no-op and is
+                // idempotent with a racing archive cascade, so the lock adds
+                // nothing: plain autocommit DELETE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "DELETE FROM active_rar_volume_facts WHERE job_id = {} AND set_name = {}",
                         &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(set_name)],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "delete_rar_volume_facts_for_set",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1803,16 +2597,48 @@ impl Database {
         let datastore = self.datastore();
         let set_name = set_name.to_string();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "set_volume_status", |tx| {
-                let set_name = set_name.clone();
-                Box::pin(async move {
-                    if !active_job_exists_tx(tx, job_id).await? {
-                        return Ok(());
-                    }
-                    tx.execute(
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "set_volume_status", |tx| {
+                        let set_name = set_name.clone();
+                        Box::pin(async move {
+                            if !active_job_exists_tx(tx, job_id).await? {
+                                return Ok(());
+                            }
+                            tx.execute(
+                                "INSERT INTO active_volume_status
+                                 (job_id, set_name, volume_index, extracted, par2_clean, deleted)
+                                 VALUES ({}, {}, {}, {}, {}, {})
+                                 ON CONFLICT(job_id, set_name, volume_index) DO UPDATE SET
+                                    extracted = excluded.extracted,
+                                    par2_clean = excluded.par2_clean,
+                                    deleted = excluded.deleted",
+                                &[
+                                    SqlArg::I64(job_id.0 as i64),
+                                    SqlArg::Text(set_name),
+                                    SqlArg::I64(volume_index as i64),
+                                    SqlArg::Bool(extracted),
+                                    SqlArg::Bool(par2_clean),
+                                    SqlArg::Bool(deleted),
+                                ],
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // Guard folded into a FOR KEY SHARE CTE the INSERT selects FROM:
+                // no-ops when the job row is gone and blocks a concurrent
+                // archive/delete of the parent for the statement's duration.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "INSERT INTO active_volume_status
                          (job_id, set_name, volume_index, extracted, par2_clean, deleted)
-                         VALUES ({}, {}, {}, {}, {}, {})
+                         SELECT {}, {}, {}, {}, {}, {}
+                         FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_volume_status_parent
                          ON CONFLICT(job_id, set_name, volume_index) DO UPDATE SET
                             extracted = excluded.extracted,
                             par2_clean = excluded.par2_clean,
@@ -1824,13 +2650,19 @@ impl Database {
                             SqlArg::Bool(extracted),
                             SqlArg::Bool(par2_clean),
                             SqlArg::Bool(deleted),
+                            SqlArg::I64(job_id.0 as i64),
                         ],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "set_volume_status",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1842,19 +2674,46 @@ impl Database {
         let datastore = self.datastore();
         let set_name = set_name.to_string();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "clear_volume_status_for_set", |tx| {
-                let set_name = set_name.clone();
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(
+                        &datastore,
+                        "clear_volume_status_for_set",
+                        |tx| {
+                            let set_name = set_name.clone();
+                            Box::pin(async move {
+                                lock_active_job_for_write_tx(tx, job_id).await?;
+                                tx.execute(
+                                    "DELETE FROM active_volume_status WHERE job_id = {} AND set_name = {}",
+                                    &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(set_name)],
+                                )
+                                .await?;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                }
+                // DELETE of a gone job's child rows is already a no-op and is
+                // idempotent with a racing archive cascade, so the lock adds
+                // nothing: plain autocommit DELETE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "DELETE FROM active_volume_status WHERE job_id = {} AND set_name = {}",
                         &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(set_name)],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "clear_volume_status_for_set",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1866,23 +2725,46 @@ impl Database {
         let datastore = self.datastore();
         let set_name = set_name.to_string();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(
-                &datastore,
-                "clear_verified_suspect_volumes_for_set",
-                |tx| {
-                    let set_name = set_name.clone();
-                    Box::pin(async move {
-                        lock_active_job_for_write_tx(tx, job_id).await?;
-                        tx.execute(
-                            "DELETE FROM active_rar_verified_suspect WHERE job_id = {} AND set_name = {}",
-                            &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(set_name)],
-                        )
-                        .await?;
-                        Ok(())
-                    })
-                },
-            )
-            .await
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(
+                        &datastore,
+                        "clear_verified_suspect_volumes_for_set",
+                        |tx| {
+                            let set_name = set_name.clone();
+                            Box::pin(async move {
+                                lock_active_job_for_write_tx(tx, job_id).await?;
+                                tx.execute(
+                                    "DELETE FROM active_rar_verified_suspect WHERE job_id = {} AND set_name = {}",
+                                    &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(set_name)],
+                                )
+                                .await?;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                }
+                // DELETE of a gone job's child rows is already a no-op and is
+                // idempotent with a racing archive cascade, so the lock adds
+                // nothing: plain autocommit DELETE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
+                        "DELETE FROM active_rar_verified_suspect WHERE job_id = {} AND set_name = {}",
+                        &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(set_name)],
+                    )
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "clear_verified_suspect_volumes_for_set",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 
@@ -1894,19 +2776,46 @@ impl Database {
         let datastore = self.datastore();
         let set_name = set_name.to_string();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "clear_extraction_chunks_for_set", |tx| {
-                let set_name = set_name.clone();
-                Box::pin(async move {
-                    lock_active_job_for_write_tx(tx, job_id).await?;
-                    tx.execute(
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(
+                        &datastore,
+                        "clear_extraction_chunks_for_set",
+                        |tx| {
+                            let set_name = set_name.clone();
+                            Box::pin(async move {
+                                lock_active_job_for_write_tx(tx, job_id).await?;
+                                tx.execute(
+                                    "DELETE FROM active_extraction_chunks WHERE job_id = {} AND set_name = {}",
+                                    &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(set_name)],
+                                )
+                                .await?;
+                                Ok(())
+                            })
+                        },
+                    )
+                    .await
+                }
+                // DELETE of a gone job's child rows is already a no-op and is
+                // idempotent with a racing archive cascade, so the lock adds
+                // nothing: plain autocommit DELETE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
                         "DELETE FROM active_extraction_chunks WHERE job_id = {} AND set_name = {}",
                         &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(set_name)],
                     )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "clear_extraction_chunks_for_set",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
         })
     }
 }

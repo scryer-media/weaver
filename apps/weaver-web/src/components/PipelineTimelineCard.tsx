@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 import { useTranslate } from "@/lib/context/translate-context";
+import { STATUS_BG_CLASS, type StatusToken } from "@/lib/status-tokens";
 
 export interface TimelineSpan {
   startedAt: number;
@@ -129,39 +130,30 @@ function stageSpanSubtitle(
   return span.label && span.label !== stageTitle ? stageTitle : null;
 }
 
+const LANE_STATUS_TOKEN: Record<TimelineLane["stage"], StatusToken> = {
+  PENDING_DOWNLOAD: "queued",
+  DOWNLOADING: "downloading",
+  FINALIZING_DOWNLOAD: "copying",
+  PAUSED: "paused",
+  VERIFYING: "verifying",
+  REPAIRING: "repairing",
+  EXTRACTING: "extracting",
+  INTERRUPTED: "failed",
+  FINAL_MOVE: "completed",
+};
+
+const MEMBER_SPAN_STATUS_TOKEN: Record<ExtractionMemberSpan["kind"], StatusToken> = {
+  WAITING_FOR_VOLUME: "queued",
+  APPENDING: "copying",
+  EXTRACTING: "extracting",
+};
+
 function laneColor(stage: TimelineLane["stage"]): string {
-  switch (stage) {
-    case "PENDING_DOWNLOAD":
-      return "bg-slate-400/75";
-    case "DOWNLOADING":
-      return "bg-sky-500/90";
-    case "FINALIZING_DOWNLOAD":
-      return "bg-teal-500/90";
-    case "PAUSED":
-      return "bg-cyan-500/85";
-    case "VERIFYING":
-      return "bg-amber-500/90";
-    case "REPAIRING":
-      return "bg-orange-500/90";
-    case "EXTRACTING":
-      return "bg-violet-500/90";
-    case "INTERRUPTED":
-      return "bg-rose-500/70";
-    case "FINAL_MOVE":
-      return "bg-emerald-500/90";
-  }
+  return STATUS_BG_CLASS[LANE_STATUS_TOKEN[stage]];
 }
 
 function spanColor(kind: ExtractionMemberSpan["kind"]): string {
-  switch (kind) {
-    case "WAITING_FOR_VOLUME":
-      return "bg-slate-300/85";
-    case "APPENDING":
-      return "bg-teal-500/90";
-    case "EXTRACTING":
-    default:
-      return "bg-violet-500/90";
-  }
+  return STATUS_BG_CLASS[MEMBER_SPAN_STATUS_TOKEN[kind]];
 }
 
 function stateVariant(
@@ -275,16 +267,19 @@ function formatTime(ms: number) {
 }
 
 function rowTimingLabel(
-  t: ReturnType<typeof useTranslate>,
   spans: { startedAt: number; endedAt: number | null }[],
 ) {
-  const latestEndedAt = spans.reduce<number | null>(
-    (latest, span) =>
-      span.endedAt == null ? latest : latest == null || span.endedAt > latest ? span.endedAt : latest,
-    null,
-  );
+  let latestEndedAt: number | null = null;
+  for (const span of spans) {
+    if (span.endedAt == null) {
+      return "-";
+    }
+    if (latestEndedAt == null || span.endedAt > latestEndedAt) {
+      latestEndedAt = span.endedAt;
+    }
+  }
   if (latestEndedAt == null) {
-    return t("timeline.active");
+    return "-";
   }
   return formatTime(latestEndedAt);
 }
@@ -332,9 +327,9 @@ function memberName(member: string) {
 function DetailList({ items }: { items: DetailItem[] }) {
   return (
     <div className="grid gap-1.5">
-      {items.map((item) => (
+      {items.map((item, index) => (
         <div
-          key={`${item.label}:${item.value}`}
+          key={`${index}:${item.label}`}
           className="grid grid-cols-[7rem_minmax(0,1fr)] gap-3"
         >
           <div className="text-[11px] uppercase tracking-[0.12em] text-muted-foreground/80">
@@ -397,9 +392,9 @@ function TimelineSpanPopover({
         >
           <span
             className={cn(
-              "absolute inset-0 rounded-[3px] border border-background/50 shadow-sm",
+              "absolute inset-x-0 top-1/2 h-[9px] -translate-y-1/2 rounded-[2px] border border-background/40 shadow-sm",
               span.colorClass,
-              span.state === "FAILED" && "bg-destructive/85",
+              span.state === "FAILED" && "bg-status-failed",
               span.dashed && "border-dashed",
             )}
           />
@@ -443,7 +438,7 @@ function TimelineSpanPopover({
             },
             {
               label: t("timeline.ended"),
-              value: formatTime(span.endedAt ?? axisEnd),
+              value: span.endedAt == null ? "-" : formatTime(span.endedAt),
             },
             {
               label: t("timeline.spanDuration"),
@@ -626,7 +621,7 @@ function SharedPlot({
                         <div
                           className={cn(
                             "pointer-events-none absolute top-1/2 z-20 h-4 w-[2px] -translate-x-1/2 -translate-y-1/2 bg-foreground/80",
-                            span.state === "FAILED" && "bg-destructive",
+                            span.state === "FAILED" && "bg-status-failed",
                           )}
                           style={pointStyle(span.endedAt, axisStart, axisEnd)}
                         />
@@ -666,7 +661,7 @@ function memberRows(
           },
           {
             label: t("timeline.ended"),
-            value: rowTimingLabel(t, member.spans),
+            value: rowTimingLabel(member.spans),
           },
           {
             label: t("timeline.set"),
@@ -769,7 +764,7 @@ export function PipelineTimelineCard({
         },
         {
           label: t("timeline.ended"),
-          value: rowTimingLabel(t, lane.spans),
+          value: rowTimingLabel(lane.spans),
         },
         ...(detail
           ? [

@@ -18,6 +18,19 @@ pub fn build_postprocess_pool(thread_count: usize) -> Arc<rayon::ThreadPool> {
                         libc::setpriority(libc::PRIO_PROCESS, 0, 10);
                     }
                 }
+                #[cfg(windows)]
+                {
+                    use windows_sys::Win32::System::Threading::{
+                        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+                    };
+                    // Mirrors the unix nice(10): download/decode threads win
+                    // when CPU is contended.
+                    // SAFETY: the pseudo-handle is always valid for the
+                    // current thread.
+                    unsafe {
+                        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                    }
+                }
             })
             .build()
             .expect("failed to build post-processing thread pool"),

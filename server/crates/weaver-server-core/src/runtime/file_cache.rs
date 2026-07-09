@@ -7,6 +7,17 @@ pub(crate) const LARGE_FILE_CACHE_ADVICE_MIN_BYTES: u64 = 64 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 
 pub(crate) fn copy_large_file(src: &Path, dst: &Path) -> io::Result<u64> {
+    copy_large_file_with_progress(src, dst, |_| {})
+}
+
+pub(crate) fn copy_large_file_with_progress<F>(
+    src: &Path,
+    dst: &Path,
+    mut on_copied: F,
+) -> io::Result<u64>
+where
+    F: FnMut(u64),
+{
     let metadata = fs::metadata(src)?;
     let mut input = File::open(src)?;
     advise_open_file_sequential(&input, src, 0, metadata.len());
@@ -25,6 +36,7 @@ pub(crate) fn copy_large_file(src: &Path, dst: &Path) -> io::Result<u64> {
         }
         output.write_all(&buf[..read])?;
         copied += read as u64;
+        on_copied(read as u64);
     }
     output.flush()?;
     fs::set_permissions(dst, metadata.permissions())?;

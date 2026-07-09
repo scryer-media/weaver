@@ -8,9 +8,12 @@ impl Pipeline {
                 spec,
                 nzb_path,
                 nzb_zstd,
+                options,
                 reply,
             } => {
-                let result = self.add_job(job_id, spec, nzb_path, nzb_zstd).await;
+                let result = self
+                    .add_job(job_id, spec, nzb_path, nzb_zstd, options)
+                    .await;
                 if result.is_ok() {
                     self.publish_snapshot();
                 }
@@ -74,8 +77,6 @@ impl Pipeline {
                         nzb_path: None,
                         created_at,
                         completed_at: now,
-                        last_diagnostic_id: None,
-                        last_diagnostic_uploaded_at_epoch_ms: None,
                         metadata: if state.spec.metadata.is_empty() {
                             None
                         } else {
@@ -100,6 +101,7 @@ impl Pipeline {
                     self.active_download_passes.remove(&job_id);
                     self.jobs_finalizing_download.remove(&job_id);
                     self.active_downloads_by_job.remove(&job_id);
+                    self.active_download_connections_by_job.remove(&job_id);
                     self.active_downloads_by_file
                         .retain(|file_id, _| file_id.job_id != job_id);
                     self.active_decodes_by_job.remove(&job_id);
@@ -108,10 +110,14 @@ impl Pipeline {
                     self.pending_retries_by_job.remove(&job_id);
                     self.pending_retries_by_segment
                         .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+                    self.rate_limit_reservations
+                        .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
                     self.job_last_download_activity.remove(&job_id);
                     self.clear_job_rar_runtime(job_id);
                     self.clear_job_write_backlog(job_id);
                     self.clear_job_progress_floor_runtime(job_id);
+                    self.clear_job_phase_progress_runtime(job_id);
+                    self.clear_job_retention_excludes(job_id);
 
                     let working_dir = state.working_dir.clone();
                     let staging_dir = state.staging_dir.clone();
@@ -154,11 +160,14 @@ impl Pipeline {
             } => {
                 let result = if let Some(state) = self.jobs.get_mut(&job_id) {
                     update.apply_to_spec(&mut state.spec);
-                    self.db_fire_and_forget(move |db| {
-                        if let Err(e) = db.update_active_job(job_id, &update) {
-                            error!(error = %e, "db write failed for UpdateJob");
-                        }
-                    });
+                    // Ordered writer queue, not fire-and-forget: category/metadata
+                    // are last-write-wins columns, so two quick UpdateJob calls
+                    // must persist in order to avoid a stale restored value.
+                    if let Err(e) = self.db.try_queue_write("update_active_job", move |db| {
+                        db.update_active_job(job_id, &update)
+                    }) {
+                        error!(error = %e, "failed to queue UpdateJob write");
+                    }
                     self.publish_snapshot();
                     Ok(())
                 } else {
@@ -200,6 +209,23 @@ impl Pipeline {
                 self.rate_limiter.set_rate(bytes_per_sec);
                 let _ = reply.send(());
             }
+            SchedulerCommand::SetIpReplacementTrialExtraConnections {
+                extra_connections,
+                reply,
+            } => {
+                self.ip_replacement_trial_extra_connections = extra_connections.min(1);
+                if self.ip_replacement_trial_extra_connections == 0 {
+                    self.ip_replacement_burst_active = false;
+                    self.ip_rtt_ewma.clear();
+                    self.ip_replacement_retired_ips.clear();
+                    self.metrics.set_ip_replacement_burst_active(false);
+                    self.metrics.set_ip_rtt_ewma_summary(0, 0);
+                }
+                self.metrics.set_ip_replacement_trial_extra_connections(
+                    self.ip_replacement_trial_extra_connections,
+                );
+                let _ = reply.send(());
+            }
             SchedulerCommand::SetBandwidthCapPolicy { policy, reply } => {
                 let result = self.apply_bandwidth_cap_policy(policy);
                 let _ = reply.send(result);
@@ -230,6 +256,13 @@ impl Pipeline {
                         self.shared_state.set_download_block(block);
                         info!(bytes_per_sec, "schedule: set speed limit");
                     }
+                    ScheduleAction::PauseWatchFolderScanning
+                    | ScheduleAction::ResumeWatchFolderScanning => {
+                        warn!(
+                            action = ?action,
+                            "watch folder schedule action reached download pipeline"
+                        );
+                    }
                 }
                 let _ = reply.send(());
             }
@@ -250,6 +283,20 @@ impl Pipeline {
             } => {
                 if let Ok(new_client) = client.downcast::<NntpClient>() {
                     self.nntp = Arc::new(*new_client);
+                    // Server indices and retention windows may have changed:
+                    // recompute retention and drop queued failure exclusions,
+                    // whose indices refer to the old pool layout. Bumping the
+                    // generation also invalidates the failure indices carried by
+                    // in-flight delayed retries when they re-enter the queue.
+                    self.pool_generation = self.pool_generation.wrapping_add(1);
+                    self.clear_retention_exclude_cache();
+                    for state in self.jobs.values_mut() {
+                        state.download_queue.clear_exclude_servers();
+                        state.recovery_queue.clear_exclude_servers();
+                    }
+                    self.owned_download_lane_pool.reset();
+                    self.owned_download_lane_pool
+                        .resize(total_connections.max(1));
                     self.connection_ramp = total_connections.min(5);
                     self.tuner.set_connection_limit(total_connections);
                     info!(
@@ -291,24 +338,6 @@ impl Pipeline {
                 }
                 let _ = reply.send(result);
             }
-            SchedulerCommand::StartDiagnosticRedownload {
-                source_job_id,
-                diagnostic_job_id,
-                include_server_hostnames,
-                reply,
-            } => {
-                let result = self
-                    .start_diagnostic_redownload(
-                        source_job_id,
-                        diagnostic_job_id,
-                        include_server_hostnames,
-                    )
-                    .await;
-                if result.is_ok() {
-                    self.publish_snapshot();
-                }
-                let _ = reply.send(result);
-            }
             SchedulerCommand::DeleteHistory {
                 job_id,
                 delete_files,
@@ -345,8 +374,20 @@ impl Pipeline {
                         self.finished_jobs.retain(|j| j.job_id != job_id);
                         let db = self.db.clone();
                         tokio::task::spawn_blocking(move || {
-                            let _ = db.delete_job_history(job_id.0);
-                            let _ = db.delete_job_events(job_id.0);
+                            if let Err(error) = db.delete_job_history(job_id.0) {
+                                tracing::warn!(
+                                    job_id = job_id.0,
+                                    error = %error,
+                                    "failed to delete job history row on user delete"
+                                );
+                            }
+                            if let Err(error) = db.delete_job_events(job_id.0) {
+                                tracing::warn!(
+                                    job_id = job_id.0,
+                                    error = %error,
+                                    "failed to delete job events on user delete"
+                                );
+                            }
                         });
                         self.publish_snapshot();
                         Ok(())

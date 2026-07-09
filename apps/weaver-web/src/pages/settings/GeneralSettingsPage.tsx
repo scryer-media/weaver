@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery } from "urql";
-import { FolderOpen } from "lucide-react";
-import { DirectoryBrowserDialog } from "@/components/DirectoryBrowserDialog";
+import { FolderPathInput } from "@/components/FolderPathInput";
 import { formatSpeed } from "@/components/SpeedDisplay";
 import { PageHeader } from "@/components/PageHeader";
+import { SectionCard } from "@/components/SectionCard";
+import { SettingsInnerBox } from "@/pages/settings/shared";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
@@ -32,6 +32,7 @@ type GeneralSettings = {
   cleanupAfterExtract: boolean;
   maxDownloadSpeed: number;
   maxRetries: number;
+  ipReplacementTrialExtraConnections: number;
 };
 
 type StorageBehaviorDraft = {
@@ -77,12 +78,13 @@ export function GeneralSettingsPage() {
   const [completeDir, setCompleteDir] = useState("");
   const [cleanup, setCleanup] = useState(true);
   const [maxRetries, setMaxRetries] = useState(3);
+  const [ipReplacementBurst, setIpReplacementBurst] = useState(0);
   const [speedSaved, setSpeedSaved] = useState(false);
+  const [ipReplacementBurstSaved, setIpReplacementBurstSaved] = useState(false);
   const [storageSaveStatus, setStorageSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [storageSaveError, setStorageSaveError] = useState<string | null>(null);
-  const [browserTarget, setBrowserTarget] = useState<"intermediate" | "complete" | null>(null);
-  const [browsePath, setBrowsePath] = useState<string | null>(null);
   const speedSavedTimerRef = useRef<number | null>(null);
+  const ipReplacementBurstSavedTimerRef = useRef<number | null>(null);
   const storageSaveTimerRef = useRef<number | null>(null);
   const storageSavedTimerRef = useRef<number | null>(null);
   const pendingStorageSaveRef = useRef<StorageBehaviorDraft | null>(null);
@@ -101,6 +103,7 @@ export function GeneralSettingsPage() {
     setCompleteDir(settings.completeDir ?? "");
     setCleanup(settings.cleanupAfterExtract ?? true);
     setMaxRetries(settings.maxRetries ?? 3);
+    setIpReplacementBurst(settings.ipReplacementTrialExtraConnections ?? 0);
   }, [settings]);
 
   useEffect(() => {
@@ -110,6 +113,9 @@ export function GeneralSettingsPage() {
       }
       if (speedSavedTimerRef.current !== null) {
         window.clearTimeout(speedSavedTimerRef.current);
+      }
+      if (ipReplacementBurstSavedTimerRef.current !== null) {
+        window.clearTimeout(ipReplacementBurstSavedTimerRef.current);
       }
       if (storageSavedTimerRef.current !== null) {
         window.clearTimeout(storageSavedTimerRef.current);
@@ -131,6 +137,17 @@ export function GeneralSettingsPage() {
     }
     setSpeedSaved(true);
     speedSavedTimerRef.current = window.setTimeout(() => setSpeedSaved(false), 2000);
+  }, []);
+
+  const pulseIpReplacementBurstSaved = useCallback(() => {
+    if (ipReplacementBurstSavedTimerRef.current !== null) {
+      window.clearTimeout(ipReplacementBurstSavedTimerRef.current);
+    }
+    setIpReplacementBurstSaved(true);
+    ipReplacementBurstSavedTimerRef.current = window.setTimeout(
+      () => setIpReplacementBurstSaved(false),
+      2000,
+    );
   }, []);
 
   const currentStorageDraft = useMemo(
@@ -235,48 +252,52 @@ export function GeneralSettingsPage() {
     }
   };
 
+  const applyIpReplacementBurst = async () => {
+    const value = Math.max(0, Math.min(1, Math.trunc(ipReplacementBurst)));
+    const result = await updateSettings({
+      input: {
+        ipReplacementTrialExtraConnections: value,
+      },
+    });
+
+    if (result.data?.updateSettings) {
+      applyUpdatedSettings(result.data.updateSettings);
+      pulseIpReplacementBurstSaved();
+    }
+  };
+
   return (
-    <div className="space-y-6">
+    <div className="max-w-[1180px] space-y-6">
       <PageHeader
         title={t("settings.general")}
         description={t("settings.generalPageDesc")}
       />
 
-      <Card>
-        <CardHeader>
-          <CardTitle>{t("settings.language")}</CardTitle>
-          <CardDescription>{t("settings.languageDesc")}</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Select value={uiLanguage} onValueChange={setLanguagePreference}>
-            <SelectTrigger className="w-[220px]">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {AVAILABLE_LANGUAGES.map((lang) => (
-                <SelectItem key={lang.code} value={lang.code}>
-                  {lang.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </CardContent>
-      </Card>
+      <SectionCard title={t("settings.language")} description={t("settings.languageDesc")}>
+        <Select value={uiLanguage} onValueChange={setLanguagePreference}>
+          <SelectTrigger className="w-[220px]">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {AVAILABLE_LANGUAGES.map((lang) => (
+              <SelectItem key={lang.code} value={lang.code}>
+                {lang.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </SectionCard>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>{t("settings.speedLimit")}</CardTitle>
-          <CardDescription>{t("settings.speedLimitDesc")}</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-5">
-          <div className="rounded-2xl border border-border/70 bg-background/70 px-4 py-4">
-            <div className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+      <SectionCard title={t("settings.speedLimit")} description={t("settings.speedLimitDesc")}>
+        <div className="space-y-5">
+          <SettingsInnerBox>
+            <div className="text-[10.5px] font-semibold uppercase tracking-[0.13em] text-muted-foreground">
               {t("metrics.downloadSpeed")}
             </div>
-            <div className="mt-2 text-2xl font-semibold text-foreground">
+            <div className="mt-2 font-space-grotesk text-[26px] font-bold leading-none tracking-tight text-foreground">
               {speedValue === 0 ? t("settings.unlimited") : formatSpeed(speedValue)}
             </div>
-          </div>
+          </SettingsInnerBox>
 
           <div>
             <input
@@ -302,21 +323,20 @@ export function GeneralSettingsPage() {
               {t("settings.resetSpeedLimit")}
             </Button>
             {speedSaved ? (
-              <span className="text-sm text-emerald-600 dark:text-emerald-300">
+              <span className="text-sm text-status-completed">
                 {t("settings.saved")}
               </span>
             ) : null}
           </div>
-        </CardContent>
-      </Card>
+        </div>
+      </SectionCard>
 
       {settings ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>{t("settings.storageAndBehavior")}</CardTitle>
-            <CardDescription>{t("settings.storageAndBehaviorDesc")}</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-5">
+        <SectionCard
+          title={t("settings.storageAndBehavior")}
+          description={t("settings.storageAndBehaviorDesc")}
+        >
+          <div className="space-y-5">
             <div className="grid gap-4 xl:grid-cols-2">
               <SettingField
                 label={t("settings.dataDir")}
@@ -324,44 +344,18 @@ export function GeneralSettingsPage() {
                 staticValue={settings.dataDir}
               />
               <SettingField label={t("settings.intermediateDir")} description={t("settings.intermediateDirDesc")}>
-                <div className="flex gap-2">
-                  <Input
-                    value={intermediateDir}
-                    onChange={(event) => setIntermediateDir(event.target.value)}
-                    placeholder={`${settings.dataDir}/intermediate`}
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => {
-                      setBrowsePath(intermediateDir.trim() || null);
-                      setBrowserTarget("intermediate");
-                    }}
-                  >
-                    <FolderOpen className="size-4" />
-                    {t("categories.browse")}
-                  </Button>
-                </div>
+                <FolderPathInput
+                  value={intermediateDir}
+                  onChange={setIntermediateDir}
+                  placeholder={`${settings.dataDir}/intermediate`}
+                />
               </SettingField>
               <SettingField label={t("settings.completeDir")} description={t("settings.completeDirDesc")}>
-                <div className="flex gap-2">
-                  <Input
-                    value={completeDir}
-                    onChange={(event) => setCompleteDir(event.target.value)}
-                    placeholder={`${settings.dataDir}/complete`}
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => {
-                      setBrowsePath(completeDir.trim() || null);
-                      setBrowserTarget("complete");
-                    }}
-                  >
-                    <FolderOpen className="size-4" />
-                    {t("categories.browse")}
-                  </Button>
-                </div>
+                <FolderPathInput
+                  value={completeDir}
+                  onChange={setCompleteDir}
+                  placeholder={`${settings.dataDir}/complete`}
+                />
               </SettingField>
               <SettingField label={t("settings.maxRetries")} description={t("settings.maxRetriesDesc")}>
                 <Input
@@ -373,14 +367,46 @@ export function GeneralSettingsPage() {
                   className="max-w-32"
                 />
               </SettingField>
+              <SettingField
+                label={t("settings.ipReplacementTrialExtraConnections")}
+                description={t("settings.ipReplacementTrialExtraConnectionsDesc")}
+              >
+                <div className="flex flex-wrap items-center gap-3">
+                  <Input
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={1}
+                    value={ipReplacementBurst}
+                    onChange={(event) => {
+                      const value = Number(event.target.value);
+                      setIpReplacementBurst(Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0);
+                    }}
+                    className="max-w-24"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => void applyIpReplacementBurst()}
+                    disabled={updateState.fetching}
+                  >
+                    {t("settings.save")}
+                  </Button>
+                  {ipReplacementBurstSaved ? (
+                    <span className="text-sm text-status-completed">
+                      {t("settings.saved")}
+                    </span>
+                  ) : null}
+                </div>
+              </SettingField>
             </div>
 
-            <div className="flex flex-col gap-4 rounded-2xl border border-border/70 bg-background/70 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center justify-between gap-4 rounded-inner border border-border p-5">
               <div>
-                <div className="text-sm font-medium text-foreground">
+                <div className="text-sm font-semibold text-foreground">
                   {t("settings.cleanupAfterExtract")}
                 </div>
-                <div className="text-xs text-muted-foreground">
+                <div className="mt-1 text-[12.5px] text-muted-foreground">
                   {t("settings.cleanupDesc")}
                 </div>
               </div>
@@ -392,7 +418,7 @@ export function GeneralSettingsPage() {
                 <span className="text-sm text-muted-foreground">{t("settings.saving")}</span>
               ) : null}
               {storageSaveStatus === "saved" ? (
-                <span className="text-sm text-emerald-600 dark:text-emerald-300">
+                <span className="text-sm text-status-completed">
                   {t("settings.saved")}
                 </span>
               ) : null}
@@ -401,19 +427,8 @@ export function GeneralSettingsPage() {
               ) : null}
             </div>
 
-            <DirectoryBrowserDialog
-              open={browserTarget != null}
-              path={browsePath}
-              onPathChange={setBrowsePath}
-              onClose={() => setBrowserTarget(null)}
-              onChoose={(nextPath) => {
-                if (browserTarget === "intermediate") setIntermediateDir(nextPath);
-                else if (browserTarget === "complete") setCompleteDir(nextPath);
-                setBrowserTarget(null);
-              }}
-            />
-          </CardContent>
-        </Card>
+          </div>
+        </SectionCard>
       ) : null}
     </div>
   );
@@ -431,16 +446,16 @@ function SettingField({
   staticValue?: string;
 }) {
   return (
-    <div className="rounded-2xl border border-border/70 bg-background/70 p-4">
-      <Label className="mb-2">{label}</Label>
+    <div className="rounded-inner border border-border p-5">
+      <Label className="mb-2 text-sm font-semibold">{label}</Label>
       {staticValue ? (
-        <div className="rounded-md border border-input bg-field/50 px-3 py-2 text-sm text-muted-foreground">
+        <div className="rounded-inner border border-input bg-field/50 px-3 py-2 font-mono text-sm text-muted-foreground">
           {staticValue}
         </div>
       ) : (
         children
       )}
-      <p className="mt-2 text-xs text-muted-foreground">{description}</p>
+      <p className="mt-2 text-[12.5px] text-muted-foreground">{description}</p>
     </div>
   );
 }

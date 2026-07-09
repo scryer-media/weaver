@@ -22,6 +22,8 @@ pub struct ScheduleEntry {
 pub enum ScheduleAction {
     Pause,
     Resume,
+    PauseWatchFolderScanning,
+    ResumeWatchFolderScanning,
     SpeedLimit {
         /// Bytes per second. 0 = unlimited.
         bytes_per_sec: u64,
