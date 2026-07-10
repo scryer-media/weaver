@@ -51,7 +51,8 @@ impl PhaseAttemptCounters {
         if bytes == 0 {
             return;
         }
-        self.reserved_total_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.reserved_total_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
         self.phase.total_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
