@@ -10,11 +10,6 @@ async fn phase_end_removes_only_the_ended_phase_snapshot() {
     repairing.completed_bytes.store(25, Ordering::Relaxed);
     let extracting = pipeline.phase_begin(job_id, JobPhase::Extracting, Some(200));
     extracting.completed_bytes.store(50, Ordering::Relaxed);
-    pipeline.phase_extraction_member_totals.insert((
-        job_id,
-        "set.rar".to_string(),
-        "member.mkv".to_string(),
-    ));
 
     pipeline.sample_phase_progress();
     assert_eq!(
@@ -27,12 +22,6 @@ async fn phase_end_removes_only_the_ended_phase_snapshot() {
     let remaining = pipeline.phase_progress_snapshots.get(&job_id).unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].phase, JobPhase::Repairing);
-    assert!(
-        !pipeline
-            .phase_extraction_member_totals
-            .iter()
-            .any(|(phase_job_id, _, _)| *phase_job_id == job_id)
-    );
 }
 
 #[tokio::test]

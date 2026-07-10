@@ -1,35 +1,92 @@
 use super::*;
 
 #[tokio::test]
-async fn extraction_member_total_reservation_is_idempotent_across_retries() {
+async fn extraction_reserves_member_totals_at_open() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(101);
     let counters = pipeline.phase_begin(job_id, JobPhase::Extracting, None);
 
-    pipeline.phase_reserve_extraction_member_total(
-        job_id,
-        "movie.part01.rar",
-        "movie.mkv",
-        1_000,
-        &counters,
-    );
-    pipeline.phase_reserve_extraction_member_total(
-        job_id,
-        "movie.part01.rar",
-        "movie.mkv",
-        1_000,
-        &counters,
-    );
-    pipeline.phase_reserve_extraction_member_total(
-        job_id,
-        "movie.part01.rar",
-        "sample.srt",
-        25,
-        &counters,
-    );
+    let files = build_multifile_multivolume_rar_set();
+    let volume_paths = files
+        .iter()
+        .enumerate()
+        .map(|(volume, (filename, bytes))| {
+            let path = temp_dir.path().join(filename);
+            std::fs::write(&path, bytes).unwrap();
+            (volume as u32, path)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut archive =
+        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+    for (volume, (_, bytes)) in files.iter().enumerate().skip(1) {
+        archive
+            .add_volume(volume, Box::new(std::io::Cursor::new(bytes.clone())))
+            .unwrap();
+    }
+    let options = weaver_unrar::ExtractOptions {
+        verify: true,
+        password: None,
+        restore_owners: false,
+    };
+    let output_dir = temp_dir.path().join("out");
+    std::fs::create_dir_all(&output_dir).unwrap();
 
-    assert_eq!(counters.total_bytes.load(Ordering::Relaxed), 1_025);
+    // Nothing is known at phase begin — topology may not exist yet. Each
+    // member's size lands when its extraction opens.
+    assert_eq!(counters.total_bytes.load(Ordering::Relaxed), 0);
+
+    let idx = archive.find_member_sanitized("E01.mkv").unwrap();
+    let attempt = std::sync::Arc::new(crate::jobs::PhaseAttemptCounters::new(
+        std::sync::Arc::clone(&counters),
+    ));
+    let (_, written_a, unpacked_a) = Pipeline::extract_rar_member_to_output(
+        &mut archive,
+        crate::pipeline::extraction::RarExtractionContext::new(
+            &volume_paths,
+            &pipeline.event_tx,
+            job_id,
+            "show",
+            &output_dir,
+            &options,
+        )
+        .with_phase_attempt(Some(attempt)),
+        idx,
+    )
+    .unwrap();
+    assert!(unpacked_a > 0);
+    assert_eq!(written_a, unpacked_a);
+    assert_eq!(counters.total_bytes.load(Ordering::Relaxed), unpacked_a);
+    assert_eq!(counters.completed_bytes.load(Ordering::Relaxed), written_a);
+
+    // A second member grows the same live total — the bar hones in, never
+    // restarts.
+    let idx = archive.find_member_sanitized("E02.mkv").unwrap();
+    let attempt = std::sync::Arc::new(crate::jobs::PhaseAttemptCounters::new(
+        std::sync::Arc::clone(&counters),
+    ));
+    let (_, written_b, unpacked_b) = Pipeline::extract_rar_member_to_output(
+        &mut archive,
+        crate::pipeline::extraction::RarExtractionContext::new(
+            &volume_paths,
+            &pipeline.event_tx,
+            job_id,
+            "show",
+            &output_dir,
+            &options,
+        )
+        .with_phase_attempt(Some(attempt)),
+        idx,
+    )
+    .unwrap();
+    assert_eq!(
+        counters.total_bytes.load(Ordering::Relaxed),
+        unpacked_a + unpacked_b
+    );
+    assert_eq!(
+        counters.completed_bytes.load(Ordering::Relaxed),
+        written_a + written_b
+    );
 }
 
 #[tokio::test]

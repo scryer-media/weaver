@@ -627,19 +627,11 @@ impl Pipeline {
                 let event_tx = self.event_tx.clone();
                 let attempted = members_to_extract.clone();
                 let extract_done_tx = self.extract_done_tx.clone();
+                // Totals are reserved per member at extraction open (see
+                // extract_rar_member_to_output) — topology is often not
+                // rebuilt yet at scheduling time, so it cannot be trusted for
+                // sizes here.
                 let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
-                let already_extracted_for_totals = self
-                    .extracted_members
-                    .get(&job_id)
-                    .cloned()
-                    .unwrap_or_default();
-                self.phase_reserve_topology_extraction_totals(
-                    job_id,
-                    &set_name,
-                    members_to_extract.iter().map(String::as_str),
-                    &already_extracted_for_totals,
-                    &phase_counters,
-                );
                 let set_name_owned = set_name.clone();
                 let set_name_for_task = set_name.clone();
                 let set_name_for_archive = set_name.clone();

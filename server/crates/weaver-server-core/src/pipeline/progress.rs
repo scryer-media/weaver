@@ -52,10 +52,6 @@ impl Pipeline {
 
     pub(crate) fn phase_end(&mut self, job_id: JobId, phase: JobPhase) {
         if self.phase_progress.remove(&(job_id, phase)).is_some() {
-            if phase == JobPhase::Extracting {
-                self.phase_extraction_member_totals
-                    .retain(|(jid, _, _)| *jid != job_id);
-            }
             if let Some(phases) = self.phase_progress_snapshots.get_mut(&job_id) {
                 phases.retain(|progress| progress.phase != phase);
                 if phases.is_empty() {
@@ -98,65 +94,6 @@ impl Pipeline {
         self.phase_progress.retain(|(jid, _), _| *jid != job_id);
         self.phase_progress_snapshots.remove(&job_id);
         self.phase_publish_state.remove(&job_id);
-        self.phase_extraction_member_totals
-            .retain(|(jid, _, _)| *jid != job_id);
-    }
-
-    pub(crate) fn phase_reserve_extraction_member_total(
-        &mut self,
-        job_id: JobId,
-        set_name: &str,
-        member_name: &str,
-        bytes: u64,
-        counters: &Arc<PhaseCounters>,
-    ) {
-        if bytes == 0 {
-            return;
-        }
-        if self.phase_extraction_member_totals.insert((
-            job_id,
-            set_name.to_string(),
-            member_name.to_string(),
-        )) {
-            counters.total_bytes.fetch_add(bytes, Ordering::Relaxed);
-        }
-    }
-
-    pub(crate) fn phase_reserve_topology_extraction_totals<'a>(
-        &mut self,
-        job_id: JobId,
-        set_name: &str,
-        member_names: impl IntoIterator<Item = &'a str>,
-        already_extracted: &HashSet<String>,
-        counters: &Arc<PhaseCounters>,
-    ) {
-        let Some(topology) = self
-            .jobs
-            .get(&job_id)
-            .and_then(|state| state.assembly.archive_topology_for(set_name))
-        else {
-            return;
-        };
-        let requested = member_names
-            .into_iter()
-            .map(str::to_string)
-            .collect::<HashSet<_>>();
-        let totals = topology
-            .members
-            .iter()
-            .filter(|member| requested.is_empty() || requested.contains(&member.name))
-            .filter(|member| !already_extracted.contains(&member.name))
-            .map(|member| (member.name.clone(), member.unpacked_size))
-            .collect::<Vec<_>>();
-        for (member_name, bytes) in totals {
-            self.phase_reserve_extraction_member_total(
-                job_id,
-                set_name,
-                &member_name,
-                bytes,
-                counters,
-            );
-        }
     }
 
     pub(crate) fn sample_phase_progress(&mut self) {

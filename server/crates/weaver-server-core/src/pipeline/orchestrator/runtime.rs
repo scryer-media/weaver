@@ -201,7 +201,6 @@ impl Pipeline {
             phase_progress: HashMap::new(),
             phase_progress_snapshots: HashMap::new(),
             phase_publish_state: HashMap::new(),
-            phase_extraction_member_totals: HashSet::new(),
             job_retention_exclude_cache: HashMap::new(),
             last_no_eligible_server_warn: None,
             inflight_moves: HashSet::new(),

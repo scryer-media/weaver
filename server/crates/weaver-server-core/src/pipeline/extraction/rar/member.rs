@@ -30,6 +30,12 @@ impl PhaseAttemptRollbackGuard {
         self.attempt.as_ref().map(Arc::clone)
     }
 
+    fn reserve_total(&self, bytes: u64) {
+        if let Some(attempt) = &self.attempt {
+            attempt.reserve_total(bytes);
+        }
+    }
+
     fn record_and_commit(mut self, bytes: u64) {
         if let Some(attempt) = self.attempt.take() {
             attempt.record_completed(bytes);
@@ -361,6 +367,16 @@ impl Pipeline {
             apply_rar_member_filesystem_metadata(&member, &dir_path)?;
             return Ok((member_name, 0, unpacked_size));
         }
+
+        // Reserve this member's share of the Extracting total here, at open
+        // time: the archive topology is often absent when the batch is
+        // scheduled (it is only rebuilt from volume 0 afterwards), so a
+        // scheduling-time reservation silently contributes nothing and the
+        // phase never publishes a bar. The size is always known on the open
+        // archive, and the total only grows — member by member — honoring the
+        // hone-in rule. Rolled back with the attempt on failure, so a retry
+        // reserving again does not double-count.
+        phase_guard.reserve_total(unpacked_size);
 
         let safe_member_name = safe_member_path.to_string_lossy().replace('\\', "/");
         let (out_path, partial_path) = Self::member_output_paths(output_dir, &safe_member_name);
