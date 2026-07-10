@@ -9,6 +9,7 @@ import {
   duplicateFingerprintKindI18nKey,
   duplicateLifecycleI18nKey,
   submissionOutcomeI18nKey,
+  submissionStatusCanForceRetry,
   submissionStatusIsDurable,
 } from "../src/features/duplicates/duplicate-presentation.ts";
 import { duplicateSubmissionInput } from "../src/features/upload/duplicate-submission.ts";
@@ -67,6 +68,13 @@ test("every structured submission status has a localized outcome mapping", () =>
     assert.match(submissionOutcomeI18nKey(status), /^upload\.outcome/);
     assert.equal(submissionStatusIsDurable(status), durable);
   }
+});
+
+test("only policy-blocked submissions offer a force retry", () => {
+  assert.equal(submissionStatusCanForceRetry("BLOCKED"), true);
+  assert.equal(submissionStatusCanForceRetry("IDEMPOTENCY_CONFLICT"), false);
+  assert.equal(submissionStatusCanForceRetry("ACCEPTED"), false);
+  assert.equal(submissionStatusCanForceRetry(undefined), false);
 });
 
 test("compact list duplicate evidence maps to localized action and reason keys", () => {

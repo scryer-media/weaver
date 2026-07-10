@@ -34,6 +34,10 @@ export function submissionStatusIsDurable(status: string | null | undefined): bo
   ]);
 }
 
+export function submissionStatusCanForceRetry(status: string | null | undefined): boolean {
+  return matchesSubmissionStatus(status, ["BLOCKED"]);
+}
+
 export function semanticStateI18nKey(state: string | null | undefined): string {
   return `duplicate.semanticState.${normalizeEnumValue(state)}`;
 }

@@ -523,8 +523,14 @@ export function useUploadNzb(options?: {
     [handleFiles],
   );
 
-  const submit = useCallback(async () => {
-    const readyEntries = entriesRef.current.filter((entry) => entry.status === "staged" && entry.stagedUploadId);
+  const submit = useCallback(async (submitOptions?: { force?: boolean; localIds?: string[] }) => {
+    const selectedIds = submitOptions?.localIds ? new Set(submitOptions.localIds) : null;
+    const readyEntries = entriesRef.current.filter(
+      (entry) =>
+        entry.status === "staged" &&
+        entry.stagedUploadId &&
+        (!selectedIds || selectedIds.has(entry.localId)),
+    );
     const hasPendingStages = entriesRef.current.some(
       (entry) => entry.status === "queued" || entry.status === "staging",
     );
@@ -551,7 +557,7 @@ export function useUploadNzb(options?: {
         category,
         priority,
         duplicate: duplicateSubmissionInput({
-          force,
+          force: submitOptions?.force || force,
           mode: duplicateMode,
           key: duplicateKey,
           score: duplicateScore,
@@ -708,6 +714,7 @@ export function useUploadNzb(options?: {
     handleFiles,
     removeFile,
     retryFile,
+    forceSubmitFile: (localId: string) => submit({ force: true, localIds: [localId] }),
     openPicker: () => fileInputRef.current?.click(),
     submit,
     onFileInputChange: (event: ChangeEvent<HTMLInputElement>) => {

@@ -5,6 +5,7 @@ import { useUploadNzb, type UploadNzbEntry } from "@/features/upload/hooks/use-u
 import {
   semanticStateI18nKey,
   submissionOutcomeI18nKey,
+  submissionStatusCanForceRetry,
 } from "@/features/duplicates/duplicate-presentation";
 import { formatNzbNameForDisplay } from "@/lib/format-nzb-name";
 import { Button } from "@/components/ui/button";
@@ -104,6 +105,7 @@ export function UploadNzbForm({
     handleFiles,
     removeFile,
     retryFile,
+    forceSubmitFile,
     openPicker,
     submit,
     onFileInputChange,
@@ -259,7 +261,21 @@ export function UploadNzbForm({
                     </div>
                   </div>
 
-                  {entry.status === "failed" ? (
+                  {entry.status === "staged" &&
+                  submissionStatusCanForceRetry(entry.submissionStatus) ? (
+                    <div className="mt-3 flex items-center justify-end">
+                      <Button
+                        type="button"
+                        variant="default"
+                        size="sm"
+                        disabled={staging || fetching}
+                        onClick={() => void forceSubmitFile(entry.localId)}
+                      >
+                        <UploadCloud className="mr-2 size-4" />
+                        {t("upload.force")}
+                      </Button>
+                    </div>
+                  ) : entry.status === "failed" ? (
                     <div className="mt-3 flex items-center justify-end">
                       <Button
                         type="button"
