@@ -6,7 +6,8 @@ use async_graphql::{Context, MaybeUndefined, Object, Result};
 use crate::auth::AdminGuard;
 use crate::observability::{persist_then_update_config, spawn_blocking_db};
 use crate::settings::types::{
-    GeneralSettings, GeneralSettingsInput, WatchFolderScanReport, WatchFolderSettingsInput,
+    DuplicatePolicySettingsInput, GeneralSettings, GeneralSettingsInput, WatchFolderScanReport,
+    WatchFolderSettingsInput,
 };
 use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::watch_folder::{WatchFolderConfig, WatchFolderMode, WatchFolderService};
@@ -38,6 +39,7 @@ impl SettingsMutation {
         let max_retries = input.max_retries;
         let ip_replacement_trial_extra_connections = input.ip_replacement_trial_extra_connections;
         let isp_bandwidth_cap = input.isp_bandwidth_cap.clone();
+        let duplicate_policy_update = input.duplicate_policy.clone();
         let watch_folder_update = input
             .watch_folder
             .clone()
@@ -67,6 +69,7 @@ impl SettingsMutation {
             isp_bandwidth_cap.clone(),
             ip_replacement_trial_extra_connections,
             watch_folder_update.clone(),
+            duplicate_policy_update.clone(),
         );
         let settings_persist = {
             let db = db.clone();
@@ -170,6 +173,45 @@ impl SettingsMutation {
                                 db.set_setting("watch_folder.scanning_paused", &value.to_string())?;
                             }
                         }
+                        if let Some(ref duplicate_policy) = persist_input.8 {
+                            if let Some(value) = duplicate_policy.strict_active_or_success {
+                                db.set_setting(
+                                    "duplicate_policy.strict_active_or_success",
+                                    weaver_server_core::jobs::DuplicateAction::from(value).as_str(),
+                                )?;
+                            }
+                            if let Some(value) = duplicate_policy.strict_failed_or_cancelled {
+                                db.set_setting(
+                                    "duplicate_policy.strict_failed_or_cancelled",
+                                    weaver_server_core::jobs::DuplicateAction::from(value).as_str(),
+                                )?;
+                            }
+                            if let Some(value) = duplicate_policy.article_layout_active_or_success {
+                                db.set_setting(
+                                    "duplicate_policy.article_layout_active_or_success",
+                                    weaver_server_core::jobs::DuplicateAction::from(value).as_str(),
+                                )?;
+                            }
+                            if let Some(value) = duplicate_policy.article_layout_failed_or_cancelled
+                            {
+                                db.set_setting(
+                                    "duplicate_policy.article_layout_failed_or_cancelled",
+                                    weaver_server_core::jobs::DuplicateAction::from(value).as_str(),
+                                )?;
+                            }
+                            if let Some(value) = duplicate_policy.article_set {
+                                db.set_setting(
+                                    "duplicate_policy.article_set",
+                                    weaver_server_core::jobs::DuplicateAction::from(value).as_str(),
+                                )?;
+                            }
+                            if let Some(value) = duplicate_policy.normalized_name {
+                                db.set_setting(
+                                    "duplicate_policy.normalized_name",
+                                    weaver_server_core::jobs::DuplicateAction::from(value).as_str(),
+                                )?;
+                            }
+                        }
                         Ok(())
                     },
                 )
@@ -221,6 +263,9 @@ impl SettingsMutation {
                 if let Some(ref watch) = watch_folder_update {
                     apply_watch_folder_update(&mut cfg.watch_folder, watch);
                 }
+                if let Some(ref duplicate_policy) = duplicate_policy_update {
+                    apply_duplicate_policy_update(&mut cfg.duplicate_policy, duplicate_policy);
+                }
 
                 let runtime_paths = should_update_paths.then(|| {
                     (
@@ -240,6 +285,7 @@ impl SettingsMutation {
                         .ip_replacement_trial_extra_connections(),
                     isp_bandwidth_cap: cfg.isp_bandwidth_cap.as_ref().map(Into::into),
                     watch_folder: (&cfg.watch_folder).into(),
+                    duplicate_policy: cfg.duplicate_policy.into(),
                 };
                 (settings, runtime_paths)
             },
@@ -474,6 +520,30 @@ fn apply_watch_folder_update(
     }
 }
 
+fn apply_duplicate_policy_update(
+    policy: &mut weaver_server_core::jobs::DuplicatePolicy,
+    update: &DuplicatePolicySettingsInput,
+) {
+    if let Some(value) = update.strict_active_or_success {
+        policy.strict_active_or_success = value.into();
+    }
+    if let Some(value) = update.strict_failed_or_cancelled {
+        policy.strict_failed_or_cancelled = value.into();
+    }
+    if let Some(value) = update.article_layout_active_or_success {
+        policy.article_layout_active_or_success = value.into();
+    }
+    if let Some(value) = update.article_layout_failed_or_cancelled {
+        policy.article_layout_failed_or_cancelled = value.into();
+    }
+    if let Some(value) = update.article_set {
+        policy.article_set = value.into();
+    }
+    if let Some(value) = update.normalized_name {
+        policy.normalized_name = value.into();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -501,6 +571,7 @@ mod tests {
             isp_bandwidth_cap: None,
             ip_replacement_trial_extra_connections: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
             config_path: None,
         }))
     }

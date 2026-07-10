@@ -139,6 +139,7 @@ fn sample_config() -> Config {
         ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+        duplicate_policy: Default::default(),
         config_path: None,
     }
 }
@@ -347,6 +348,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: Default::default(),
             config_path: None,
         })
         .unwrap();
@@ -367,6 +369,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: Default::default(),
             config_path: None,
         },
     );
@@ -439,6 +442,7 @@ async fn restore_rewrites_paths_and_refreshes_runtime() {
             ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: Default::default(),
             config_path: None,
         })
         .unwrap();
@@ -459,6 +463,7 @@ async fn restore_rewrites_paths_and_refreshes_runtime() {
             ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: Default::default(),
             config_path: None,
         },
     );

@@ -1494,6 +1494,9 @@ pub struct Pipeline {
     pub(super) metrics: Arc<PipelineMetrics>,
     /// Per-job state.
     pub(super) jobs: HashMap<JobId, JobState>,
+    /// Typed terminal provenance retained until the ordered history archive has
+    /// durably updated duplicate-promotion eligibility.
+    pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,
     /// Winning archive password candidate per job/RAR set, kept process-local and redacted.
     pub(super) archive_password_winners: HashMap<(JobId, String), ArchivePasswordCandidate>,
     /// Job dispatch order (FIFO by submission). First Downloading job is active.
@@ -1704,8 +1707,6 @@ pub struct Pipeline {
     pub(super) phase_progress_snapshots: HashMap<JobId, Vec<JobPhaseProgress>>,
     /// Per-job queue-event coalescing state for sampled phase progress.
     pub(super) phase_publish_state: HashMap<JobId, progress::PhasePublishState>,
-    /// Extraction member totals already reserved into the live Extracting phase.
-    pub(super) phase_extraction_member_totals: HashSet<(JobId, String, String)>,
     /// Cached per-job retention exclusions (pool server indices whose
     /// retention window is older than the job). TTL'd; cleared on NNTP
     /// client rebuilds and job removal.

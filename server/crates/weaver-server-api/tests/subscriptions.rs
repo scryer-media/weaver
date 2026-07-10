@@ -442,7 +442,11 @@ async fn queue_events_replay_buffered_state_change_after_cursor() {
                 kind
                 itemId
                 state
-                item {{ id state }}
+                item {{
+                    id
+                    state
+                    duplicateSummary {{ lifecycle action primaryReason }}
+                }}
             }}
         }}"#,
         cursor_before
@@ -466,6 +470,11 @@ async fn queue_events_replay_buffered_state_change_after_cursor() {
     assert_eq!(data["queueEvents"]["itemId"].as_u64().unwrap(), item_id);
     assert_eq!(data["queueEvents"]["state"].as_str().unwrap(), "PAUSED");
     assert_eq!(
+        data["queueEvents"]["item"]["duplicateSummary"]["action"].as_str(),
+        Some("ACCEPT")
+    );
+    assert!(data["queueEvents"]["item"]["duplicateSummary"]["primaryReason"].is_null());
+    assert_eq!(
         data["queueEvents"]["cursor"].as_str(),
         Some(expected_cursor.as_str())
     );
@@ -474,6 +483,55 @@ async fn queue_events_replay_buffered_state_change_after_cursor() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn queue_events_enrich_live_item_without_erasing_duplicate_summary() {
+    let h = TestHarness::new().await;
+    let item_id = h.submit_test_nzb("event-live-duplicate-summary").await;
+    let cursor_before = latest_queue_cursor(&h).await;
+    let request = Request::new(format!(
+        r#"subscription {{
+            queueEvents(after: "{cursor_before}") {{
+                kind
+                itemId
+                state
+                item {{
+                    id
+                    duplicateSummary {{ lifecycle action primaryReason }}
+                }}
+            }}
+        }}"#,
+    ))
+    .data(CallerScope::Read);
+    let schema = h.schema.clone();
+    let mut stream = schema.execute_stream(request);
+
+    let next_event = async {
+        tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("queueEvents should emit a live state change")
+            .expect("queueEvents stream should stay open")
+    };
+    let pause = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.execute(&format!(
+            "mutation {{ pauseQueueItem(id: {item_id}) {{ success }} }}"
+        ))
+        .await
+    };
+    let (response, pause) = tokio::join!(next_event, pause);
+
+    assert!(pause.errors.is_empty());
+    assert!(response.errors.is_empty());
+    let data = response.data.into_json().unwrap();
+    assert_eq!(data["queueEvents"]["itemId"].as_u64(), Some(item_id));
+    assert_eq!(data["queueEvents"]["state"].as_str(), Some("PAUSED"));
+    assert_eq!(
+        data["queueEvents"]["item"]["duplicateSummary"]["action"].as_str(),
+        Some("ACCEPT")
+    );
+    assert!(data["queueEvents"]["item"]["duplicateSummary"]["primaryReason"].is_null());
 }
 
 #[tokio::test]

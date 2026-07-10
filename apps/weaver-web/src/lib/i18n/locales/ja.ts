@@ -1,4 +1,5 @@
 import type { LocaleDictionary } from "../types";
+import { duplicateLocaleEntries } from "../duplicate-locales";
 
 const ja: LocaleDictionary = {
   // Brand
@@ -648,6 +649,41 @@ const ja: LocaleDictionary = {
   "schedule.empty": "スケジュールなし",
   "schedule.emptyDesc": "スケジュールルールを追加して、特定の時間にダウンロードを自動的に一時停止または制限します。",
   "schedule.everyDay": "毎日",
+
+  "settings.duplicateHandling": "重複処理",
+  "settings.duplicateHandlingDesc": "新しい NZB が保存済みの重複証拠と一致した場合の動作を選びます。ブロックは拒否、警告は受理、保留は一時停止で受理します。",
+  "settings.duplicateStrictActiveOrSuccess": "厳密な記事レイアウト — 実行中または成功",
+  "settings.duplicateStrictActiveOrSuccessDesc": "すべての記事と宣言バイト数が実行中または成功したジョブと一致する場合に使用します。",
+  "settings.duplicateStrictFailedOrCancelled": "厳密な記事レイアウト — 失敗またはキャンセル",
+  "settings.duplicateStrictFailedOrCancelledDesc": "すべての記事と宣言バイト数が失敗またはキャンセルしたジョブと一致する場合に使用します。",
+  "settings.duplicateArticleLayoutActiveOrSuccess": "記事レイアウト — 実行中または成功",
+  "settings.duplicateArticleLayoutActiveOrSuccessDesc": "記事順序は一致するが、宣言バイト数が実行中または成功したジョブと異なる場合に使用します。",
+  "settings.duplicateArticleLayoutFailedOrCancelled": "記事レイアウト — 失敗またはキャンセル",
+  "settings.duplicateArticleLayoutFailedOrCancelledDesc": "記事順序は一致するが、宣言バイト数が失敗またはキャンセルしたジョブと異なる場合に使用します。",
+  "settings.duplicateArticleSet": "記事セット",
+  "settings.duplicateArticleSetDesc": "同じ一意の記事 ID が別のレイアウトにある場合に使用します。",
+  "settings.duplicateNormalizedName": "正規化された名前",
+  "settings.duplicateNormalizedNameDesc": "より強い記事証拠なしに正規化されたリリース名が一致する場合に使用します。",
+  "settings.duplicateActionAccept": "受理",
+  "settings.duplicateActionWarn": "警告して受理",
+  "settings.duplicateActionPause": "一時停止で受理",
+  "settings.duplicateActionBlock": "ブロック",
+  "settings.duplicatePolicySaved": "重複ポリシーを保存しました。",
+  "settings.duplicatePolicySaveFailed": "重複ポリシーを保存できませんでした。",
+  "upload.duplicateHandling": "重複処理",
+  "upload.force": "送信を強制",
+  "upload.forceDesc": "意味的および記事フィンガープリントの重複ポリシーを無視して送信を受理します。冪等性の競合は引き続き適用されます。",
+  "upload.duplicateMode": "重複モード",
+  "upload.duplicateModeEnforce": "記事ポリシーを適用",
+  "upload.duplicateModeScore": "候補を採点",
+  "upload.duplicateModeAll": "すべての候補を保持",
+  "upload.duplicateModeForce": "送信を強制",
+  "upload.duplicateKey": "重複キー",
+  "upload.duplicateKeyPlaceholder": "任意の候補グループ",
+  "upload.duplicateScore": "重複スコア",
+  "upload.duplicateScorePlaceholder": "0",
+  "upload.duplicateScoreHint": "同じ重複キーでは高いスコアが優先され、同点の場合は既存の候補が維持されます。",
+  ...duplicateLocaleEntries.jpn,
 };
 
 export default ja;

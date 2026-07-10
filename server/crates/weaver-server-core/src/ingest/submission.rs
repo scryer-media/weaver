@@ -7,16 +7,22 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 use crate::Database;
-use crate::SchedulerHandle;
 use crate::jobs::JobSpec;
 use crate::jobs::ids::JobId;
 use crate::security::{ResolvedFetchTarget, RuntimeSecurityConfig, resolve_fetch_target};
 use crate::settings::SharedConfig;
+use crate::{SchedulerError, SchedulerHandle};
 use weaver_nzb::Nzb;
 
 use super::persisted_nzb;
 use crate::ingest::{append_original_title_metadata, derive_release_name, nzb_password_candidates};
-use crate::jobs::{FileSpec, SegmentSpec};
+use crate::jobs::{
+    CallerScopedIdempotency, DuplicateAction, DuplicateAdmission, DuplicateAdmissionRequest,
+    DuplicateBackfillEntry, DuplicateDecision, DuplicateMode, FileSpec, FingerprintEvidence,
+    SegmentSpec, SemanticAdmission, SemanticCandidateSource, SemanticDuplicate,
+    SemanticDuplicateLifecycleEvent, SemanticPromotionClaim, SubmissionOrigin,
+    record_duplicate_admission_metric, record_semantic_duplicate_lifecycle_metric,
+};
 use weaver_model::files::{FileRole, unique_download_filenames};
 
 static NEXT_API_JOB_ID: AtomicU64 = AtomicU64::new(10_000);
@@ -28,6 +34,28 @@ pub struct SubmittedJob {
     pub job_hash: [u8; 32],
     pub spec: JobSpec,
     pub created_at_epoch_ms: f64,
+    pub duplicate_outcome: SubmissionDuplicateOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmissionDuplicateOutcome {
+    Accepted {
+        decision: DuplicateDecision,
+        semantic: Option<SemanticAdmission>,
+    },
+    Parked {
+        decision: DuplicateDecision,
+        semantic: SemanticAdmission,
+    },
+    IdempotentReplay,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DuplicateBackfillReport {
+    pub scanned: usize,
+    pub backfilled: usize,
+    pub skipped: usize,
+    pub completed: bool,
 }
 
 struct PreparedSubmission {
@@ -45,10 +73,14 @@ pub enum CategoryResolutionMode {
     PreserveSubmitted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionOptions {
     pub category_resolution: CategoryResolutionMode,
     pub add_paused: bool,
+    pub duplicate_mode: DuplicateMode,
+    pub semantic_duplicate: Option<SemanticDuplicate>,
+    pub origin: SubmissionOrigin,
+    pub idempotency: Option<CallerScopedIdempotency>,
 }
 
 impl Default for SubmissionOptions {
@@ -56,6 +88,10 @@ impl Default for SubmissionOptions {
         Self {
             category_resolution: CategoryResolutionMode::ResolveConfigured,
             add_paused: false,
+            duplicate_mode: DuplicateMode::Enforce,
+            semantic_duplicate: None,
+            origin: SubmissionOrigin::Api,
+            idempotency: None,
         }
     }
 }
@@ -78,6 +114,10 @@ pub enum SubmitNzbError {
     Fetch(String),
     #[error("NZB response was not valid XML")]
     NotXml,
+    #[error("duplicate submission blocked")]
+    DuplicateBlocked { decision: DuplicateDecision },
+    #[error("idempotency key is already bound to job {job_id}")]
+    IdempotencyConflict { job_id: u64 },
 }
 
 pub fn init_job_counter(start: u64) {
@@ -232,14 +272,6 @@ async fn submit_prepared_nzb(
         options.category_resolution,
     )
     .await;
-    // Run the id-reservation write off the caller's async task (HTTP / RSS /
-    // watch-folder) so its DB round-trip doesn't park that worker thread.
-    let job_id = {
-        let db = db.clone();
-        tokio::task::spawn_blocking(move || db.reserve_next_job_id())
-            .await
-            .expect("reserve_next_job_id task panicked")?
-    };
     let job_hash = persisted_nzb::hash_persisted_nzb_bytes(&nzb_zstd);
     let spec = nzb_to_submission_spec(
         &nzb,
@@ -248,6 +280,169 @@ async fn submit_prepared_nzb(
         resolved_category,
         metadata,
     );
+    // Fingerprints are CPU-heavy canonical encodings of the validated parser
+    // result. Keep them off HTTP/RSS/watch-folder async workers and the
+    // scheduler loop.
+    let evidence = {
+        let spec = spec.clone();
+        tokio::task::spawn_blocking(move || {
+            FingerprintEvidence::from_validated_spec(&spec, job_hash)
+        })
+        .await
+        .map_err(|error| {
+            SubmitNzbError::State(crate::StateError::Database(format!(
+                "fingerprint worker panicked: {error}"
+            )))
+        })?
+    };
+    let duplicate_policy = {
+        let cfg = config.read().await;
+        cfg.duplicate_policy
+    };
+    let admission = {
+        let db = db.clone();
+        let request = DuplicateAdmissionRequest {
+            evidence,
+            mode: options.duplicate_mode,
+            semantic: options.semantic_duplicate.clone(),
+            semantic_source: options
+                .semantic_duplicate
+                .as_ref()
+                .map(|_| SemanticCandidateSource {
+                    nzb_zstd: nzb_zstd.clone(),
+                    filename: filename.clone(),
+                    password: spec.password.clone(),
+                    category: spec.category.clone(),
+                    metadata: spec.metadata.clone(),
+                }),
+            origin: options.origin.clone(),
+            idempotency: options.idempotency.clone(),
+            policy: duplicate_policy,
+        };
+        tokio::task::spawn_blocking(move || db.admit_duplicate_submission(&request))
+            .await
+            .map_err(|error| {
+                SubmitNzbError::State(crate::StateError::Database(format!(
+                    "duplicate admission worker panicked: {error}"
+                )))
+            })??
+    };
+    let (
+        job_id,
+        duplicate_pause,
+        created_at_epoch_ms,
+        duplicate_outcome,
+        superseded_job_id,
+        semantic_materialization_generation,
+        materialization_decision,
+        materialization_semantic,
+    ) = match admission {
+        DuplicateAdmission::Accepted {
+            job_id,
+            decision,
+            created_at,
+            semantic,
+        } => {
+            let status = if decision.force_bypassed {
+                "force_accepted"
+            } else {
+                match decision.action {
+                    DuplicateAction::Accept => "accepted",
+                    DuplicateAction::Warn => "warned",
+                    DuplicateAction::Pause => "paused",
+                    DuplicateAction::Block => "blocked",
+                }
+            };
+            record_duplicate_admission_metric(&options.origin, status);
+            let materialization_decision = decision.clone();
+            let materialization_semantic = semantic.clone();
+            let superseded_job_id = semantic
+                .as_ref()
+                .and_then(|semantic| semantic.superseded_job_id);
+            let semantic_materialization_generation = semantic
+                .as_ref()
+                .filter(|semantic| {
+                    matches!(semantic.state, crate::jobs::SemanticCandidateState::Active)
+                })
+                .map(|semantic| semantic.materialization_generation);
+            (
+                job_id,
+                matches!(decision.action, DuplicateAction::Pause),
+                created_at as f64 * 1000.0,
+                SubmissionDuplicateOutcome::Accepted { decision, semantic },
+                superseded_job_id,
+                semantic_materialization_generation,
+                materialization_decision,
+                materialization_semantic,
+            )
+        }
+        DuplicateAdmission::Parked {
+            job_id,
+            decision,
+            created_at,
+            semantic,
+        } => {
+            record_duplicate_admission_metric(&options.origin, "parked");
+            return Ok(SubmittedJob {
+                job_id,
+                job_hash,
+                spec,
+                created_at_epoch_ms: created_at as f64 * 1000.0,
+                duplicate_outcome: SubmissionDuplicateOutcome::Parked { decision, semantic },
+            });
+        }
+        DuplicateAdmission::Idempotent { job_id, created_at } => {
+            record_duplicate_admission_metric(&options.origin, "idempotent_replay");
+            return Ok(SubmittedJob {
+                job_id,
+                job_hash,
+                spec,
+                created_at_epoch_ms: created_at as f64 * 1000.0,
+                duplicate_outcome: SubmissionDuplicateOutcome::IdempotentReplay,
+            });
+        }
+        DuplicateAdmission::IdempotencyConflict { job_id } => {
+            record_duplicate_admission_metric(&options.origin, "idempotency_conflict");
+            return Err(SubmitNzbError::IdempotencyConflict { job_id: job_id.0 });
+        }
+        DuplicateAdmission::Blocked { decision } => {
+            record_duplicate_admission_metric(&options.origin, "blocked");
+            return Err(SubmitNzbError::DuplicateBlocked { decision });
+        }
+    };
+    if let Some(superseded_job_id) = superseded_job_id {
+        match handle.cancel_semantic_superseded(superseded_job_id).await {
+            Ok(()) | Err(crate::SchedulerError::JobNotFound(_)) => {}
+            Err(crate::SchedulerError::Conflict(error)) => {
+                let rollback_db = db.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    rollback_db.rollback_semantic_supersession(job_id, superseded_job_id)
+                })
+                .await;
+                let release_db = db.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    release_db.release_duplicate_admission(job_id)
+                })
+                .await;
+                return Err(SubmitNzbError::Scheduler(crate::SchedulerError::Conflict(
+                    error,
+                )));
+            }
+            Err(error) => {
+                let rollback_db = db.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    rollback_db.rollback_semantic_supersession(job_id, superseded_job_id)
+                })
+                .await;
+                let release_db = db.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    release_db.release_duplicate_admission(job_id)
+                })
+                .await;
+                return Err(error.into());
+            }
+        }
+    }
     let nzb_path = PathBuf::from(
         filename
             .clone()
@@ -261,11 +456,34 @@ async fn submit_prepared_nzb(
             nzb_path.clone(),
             nzb_zstd,
             crate::jobs::AddJobOptions {
-                initially_paused: options.add_paused,
+                initially_paused: options.add_paused || duplicate_pause,
+                semantic_materialization_generation,
+                semantic_promotion_generation: None,
             },
         )
         .await
     {
+        if matches!(error, SchedulerError::SemanticSuperseded)
+            && let Some(mut semantic) = materialization_semantic
+        {
+            // The higher-score submit has already durably parked this source and
+            // invalidated its materialization generation.  Releasing the admission
+            // here would delete the only retained fallback payload.
+            semantic.state = crate::jobs::SemanticCandidateState::Parked;
+            record_duplicate_admission_metric(&options.origin, "parked");
+            return Ok(SubmittedJob {
+                job_id,
+                job_hash,
+                spec,
+                created_at_epoch_ms,
+                duplicate_outcome: SubmissionDuplicateOutcome::Parked {
+                    decision: materialization_decision,
+                    semantic,
+                },
+            });
+        }
+        let db = db.clone();
+        let _ = tokio::task::spawn_blocking(move || db.release_duplicate_admission(job_id)).await;
         return Err(error.into());
     }
 
@@ -283,8 +501,271 @@ async fn submit_prepared_nzb(
         job_id,
         job_hash,
         spec,
-        created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
+        created_at_epoch_ms,
+        duplicate_outcome,
     })
+}
+
+/// Materializes a durable SCORE claim without re-entering normal duplicate
+/// admission. This keeps the candidate's reserved job ID/source stable across
+/// retry and creates no work directory until scheduler enqueue succeeds.
+pub async fn materialize_semantic_promotion(
+    db: &Database,
+    handle: &SchedulerHandle,
+    claim: SemanticPromotionClaim,
+) -> Result<JobId, SubmitNzbError> {
+    if handle.get_job(claim.job_id).is_ok() {
+        let job_id = claim.job_id;
+        let generation = claim.generation;
+        let db = db.clone();
+        let completed = tokio::task::spawn_blocking(move || {
+            db.complete_semantic_promotion_claim(job_id, generation)
+        })
+        .await
+        .map_err(|error| {
+            SubmitNzbError::State(crate::StateError::Database(format!(
+                "promotion completion worker panicked: {error}"
+            )))
+        })??;
+        if !completed {
+            return Err(crate::SchedulerError::SemanticSuperseded.into());
+        }
+        return Ok(job_id);
+    }
+
+    let SemanticPromotionClaim {
+        job_id,
+        generation,
+        source,
+        ..
+    } = claim;
+    let nzb = match persisted_nzb::parse_persisted_nzb_bytes(&source.nzb_zstd) {
+        Ok(nzb) => nzb,
+        Err(persisted_nzb::PersistedNzbError::Io(error)) => {
+            record_semantic_duplicate_lifecycle_metric(
+                SemanticDuplicateLifecycleEvent::PromotionFailure,
+            );
+            let db = db.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                db.release_semantic_promotion_claim(job_id, generation)
+            })
+            .await;
+            return Err(SubmitNzbError::Save(error));
+        }
+        Err(persisted_nzb::PersistedNzbError::Parse(error)) => {
+            record_semantic_duplicate_lifecycle_metric(
+                SemanticDuplicateLifecycleEvent::PromotionFailure,
+            );
+            let db = db.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                db.release_semantic_promotion_claim(job_id, generation)
+            })
+            .await;
+            return Err(SubmitNzbError::Parse(error));
+        }
+    };
+    if nzb.files.is_empty() {
+        record_semantic_duplicate_lifecycle_metric(
+            SemanticDuplicateLifecycleEvent::PromotionFailure,
+        );
+        let db = db.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            db.release_semantic_promotion_claim(job_id, generation)
+        })
+        .await;
+        return Err(SubmitNzbError::Empty);
+    }
+
+    let spec = nzb_to_submission_spec(
+        &nzb,
+        source.filename.as_deref(),
+        source.password,
+        source.category,
+        source.metadata,
+    );
+    let nzb_path = PathBuf::from(
+        source
+            .filename
+            .unwrap_or_else(|| format!("job-{}.nzb", job_id.0)),
+    );
+    if let Err(error) = handle
+        .add_job_with_options(
+            job_id,
+            spec,
+            nzb_path,
+            source.nzb_zstd,
+            crate::jobs::AddJobOptions {
+                semantic_promotion_generation: Some(generation),
+                ..crate::jobs::AddJobOptions::default()
+            },
+        )
+        .await
+    {
+        record_semantic_duplicate_lifecycle_metric(
+            SemanticDuplicateLifecycleEvent::PromotionFailure,
+        );
+        let db = db.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            db.release_semantic_promotion_claim(job_id, generation)
+        })
+        .await;
+        return Err(error.into());
+    }
+    let db = db.clone();
+    let completed = tokio::task::spawn_blocking(move || {
+        db.complete_semantic_promotion_claim(job_id, generation)
+    })
+    .await
+    .map_err(|error| {
+        SubmitNzbError::State(crate::StateError::Database(format!(
+            "promotion completion worker panicked: {error}"
+        )))
+    })??;
+    if !completed {
+        return Err(crate::SchedulerError::SemanticSuperseded.into());
+    }
+    Ok(job_id)
+}
+
+/// Replays durable promotion claims after scheduler restoration. Claims whose
+/// job is already restored are completed without a duplicate enqueue; failed
+/// materializations are returned to parked state by the materializer.
+pub async fn reconcile_semantic_promotions(
+    db: &Database,
+    handle: &SchedulerHandle,
+) -> Result<usize, SubmitNzbError> {
+    let db_for_claims = db.clone();
+    let claims =
+        tokio::task::spawn_blocking(move || db_for_claims.reconcile_semantic_promotion_claims(64))
+            .await
+            .map_err(|error| {
+                SubmitNzbError::State(crate::StateError::Database(format!(
+                    "promotion recovery worker panicked: {error}"
+                )))
+            })??;
+    let mut materialized = 0;
+    for claim in claims {
+        match materialize_semantic_promotion(db, handle, claim).await {
+            Ok(_) => materialized += 1,
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to recover semantic promotion claim")
+            }
+        }
+    }
+    Ok(materialized)
+}
+
+/// Parses one ordered historical NZB page off the async and scheduler threads,
+/// then commits its fingerprints and checkpoint atomically. Missing or malformed
+/// payloads advance the cursor with a bounded count so startup recovery cannot
+/// loop forever on old broken history.
+pub async fn run_duplicate_fingerprint_backfill_batch(
+    db: &Database,
+) -> Result<DuplicateBackfillReport, SubmitNzbError> {
+    const BATCH_SIZE: usize = 64;
+    let db_for_state = db.clone();
+    let state = tokio::task::spawn_blocking(move || db_for_state.duplicate_backfill_state())
+        .await
+        .map_err(|error| {
+            SubmitNzbError::State(crate::StateError::Database(format!(
+                "duplicate backfill state worker panicked: {error}"
+            )))
+        })??;
+    if state
+        .as_ref()
+        .is_some_and(|state| state.completed_at.is_some())
+    {
+        return Ok(DuplicateBackfillReport {
+            completed: true,
+            ..DuplicateBackfillReport::default()
+        });
+    }
+    let cursor = state.and_then(|state| state.cursor_job_id);
+    let db_for_sources = db.clone();
+    let sources = tokio::task::spawn_blocking(move || {
+        db_for_sources.load_duplicate_backfill_sources(cursor, BATCH_SIZE)
+    })
+    .await
+    .map_err(|error| {
+        SubmitNzbError::State(crate::StateError::Database(format!(
+            "duplicate backfill source worker panicked: {error}"
+        )))
+    })??;
+    let scanned = sources.len();
+    let next_cursor = sources.last().map(|source| source.job_id);
+    let completed = scanned < BATCH_SIZE;
+    let (entries, skipped) = tokio::task::spawn_blocking(move || {
+        let mut entries = Vec::with_capacity(sources.len());
+        let mut skipped = 0;
+        for source in sources {
+            let Some(nzb_zstd) = source.nzb_zstd else {
+                skipped += 1;
+                continue;
+            };
+            let Ok(nzb) = persisted_nzb::parse_persisted_nzb_bytes(&nzb_zstd) else {
+                skipped += 1;
+                continue;
+            };
+            if nzb.files.is_empty() {
+                skipped += 1;
+                continue;
+            }
+            let spec = nzb_to_submission_spec(&nzb, None, None, None, Vec::new());
+            let raw_job_hash = source
+                .raw_job_hash
+                .unwrap_or_else(|| persisted_nzb::hash_persisted_nzb_bytes(&nzb_zstd));
+            entries.push(DuplicateBackfillEntry {
+                job_id: source.job_id,
+                lifecycle: source.lifecycle,
+                created_at: source.created_at,
+                evidence: FingerprintEvidence::from_validated_spec(&spec, raw_job_hash),
+            });
+        }
+        (entries, skipped)
+    })
+    .await
+    .map_err(|error| {
+        SubmitNzbError::State(crate::StateError::Database(format!(
+            "duplicate backfill parser worker panicked: {error}"
+        )))
+    })?;
+    let backfilled = entries.len();
+    let db_for_commit = db.clone();
+    tokio::task::spawn_blocking(move || {
+        db_for_commit.commit_duplicate_backfill_batch(&entries, next_cursor, completed)
+    })
+    .await
+    .map_err(|error| {
+        SubmitNzbError::State(crate::StateError::Database(format!(
+            "duplicate backfill commit worker panicked: {error}"
+        )))
+    })??;
+    Ok(DuplicateBackfillReport {
+        scanned,
+        backfilled,
+        skipped,
+        completed,
+    })
+}
+
+/// Bounded startup catch-up. Subsequent starts resume from the durable cursor;
+/// a complete marker prevents any further scans.
+pub async fn reconcile_duplicate_fingerprint_backfill(
+    db: &Database,
+    max_batches: usize,
+) -> Result<DuplicateBackfillReport, SubmitNzbError> {
+    let mut total = DuplicateBackfillReport::default();
+    for _ in 0..max_batches.max(1) {
+        let report = run_duplicate_fingerprint_backfill_batch(db).await?;
+        total.scanned += report.scanned;
+        total.backfilled += report.backfilled;
+        total.skipped += report.skipped;
+        total.completed = report.completed;
+        if report.completed {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -473,6 +954,35 @@ pub async fn submit_uploaded_nzb_reader<R>(
 where
     R: Read + Send + 'static,
 {
+    submit_uploaded_nzb_reader_with_options(
+        db,
+        handle,
+        config,
+        source,
+        filename,
+        password,
+        category,
+        metadata,
+        SubmissionOptions::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_uploaded_nzb_reader_with_options<R>(
+    db: &Database,
+    handle: &SchedulerHandle,
+    config: &SharedConfig,
+    source: R,
+    filename: Option<String>,
+    password: Option<String>,
+    category: Option<String>,
+    metadata: Vec<(String, String)>,
+    options: SubmissionOptions,
+) -> Result<SubmittedJob, SubmitNzbError>
+where
+    R: Read + Send + 'static,
+{
     let submit_started = Instant::now();
     let persist_result = tokio::task::spawn_blocking(move || {
         let mut source = source;
@@ -502,7 +1012,7 @@ where
             metadata,
             submit_started,
         },
-        SubmissionOptions::default(),
+        options,
     )
     .await
 }
@@ -517,6 +1027,32 @@ pub async fn submit_staged_nzb_zstd(
     password: Option<String>,
     category: Option<String>,
     metadata: Vec<(String, String)>,
+) -> Result<SubmittedJob, SubmitNzbError> {
+    submit_staged_nzb_zstd_with_options(
+        db,
+        handle,
+        config,
+        nzb_zstd,
+        filename,
+        password,
+        category,
+        metadata,
+        SubmissionOptions::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_staged_nzb_zstd_with_options(
+    db: &Database,
+    handle: &SchedulerHandle,
+    config: &SharedConfig,
+    nzb_zstd: Vec<u8>,
+    filename: Option<String>,
+    password: Option<String>,
+    category: Option<String>,
+    metadata: Vec<(String, String)>,
+    options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
     let submit_started = Instant::now();
     let nzb = match persisted_nzb::parse_persisted_nzb_bytes(&nzb_zstd) {
@@ -541,7 +1077,7 @@ pub async fn submit_staged_nzb_zstd(
             metadata,
             submit_started,
         },
-        SubmissionOptions::default(),
+        options,
     )
     .await
 }

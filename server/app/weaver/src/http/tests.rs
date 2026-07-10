@@ -138,6 +138,7 @@ fn test_config() -> SharedConfig {
         isp_bandwidth_cap: None,
         ip_replacement_trial_extra_connections: None,
         watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
+        duplicate_policy: Default::default(),
         config_path: None,
     }))
 }
@@ -218,7 +219,7 @@ fn scheduler_handle_with_mock_commands_with_db(
                     });
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::CancelJob { job_id, reply } => {
+                SchedulerCommand::CancelJob { job_id, reply, .. } => {
                     let mut jobs = state.list_jobs();
                     let original_len = jobs.len();
                     let cancelled = jobs.iter().find(|job| job.job_id == job_id).cloned();

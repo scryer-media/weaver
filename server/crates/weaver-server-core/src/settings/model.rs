@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 
 use crate::bandwidth::IspBandwidthCapConfig;
 use crate::categories::CategoryConfig;
+use crate::jobs::DuplicatePolicy;
 use crate::servers::ServerConfig;
 use crate::watch_folder::WatchFolderConfig;
 
@@ -48,6 +49,9 @@ pub struct Config {
     /// Watched-folder NZB intake settings.
     #[serde(default)]
     pub watch_folder: WatchFolderConfig,
+    /// Duplicate admission handling policy.
+    #[serde(default)]
+    pub duplicate_policy: DuplicatePolicy,
     /// Path to the config file on disk. Not serialized to TOML.
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
@@ -223,6 +227,7 @@ mod tests {
             isp_bandwidth_cap: None,
             ip_replacement_trial_extra_connections: None,
             watch_folder: WatchFolderConfig::default(),
+            duplicate_policy: DuplicatePolicy::default(),
             config_path: None,
         }
     }

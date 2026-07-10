@@ -1,6 +1,7 @@
 use super::*;
 use crate::jobs::types::{
-    PreparedQueueFilter, matches_queue_event_filter_prepared, matches_queue_filter_prepared,
+    DuplicateSummaryInfo, PreparedQueueFilter, load_duplicate_summaries_chunked,
+    matches_queue_event_filter_prepared, matches_queue_filter_prepared,
 };
 
 #[derive(Default)]
@@ -53,12 +54,13 @@ impl JobsSubscription {
         &self,
         ctx: &Context<'_>,
         filter: Option<QueueFilterInput>,
-    ) -> Result<impl Stream<Item = QueueSnapshot>> {
+    ) -> Result<impl Stream<Item = Result<QueueSnapshot>>> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
         let config = ctx
             .data::<weaver_server_core::settings::SharedConfig>()?
             .clone();
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
+        let db = ctx.data::<Database>()?.clone();
         let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
         let event_rx = handle.subscribe_events();
 
@@ -75,9 +77,10 @@ impl JobsSubscription {
             let handle = handle.clone();
             let config = config.clone();
             let replay = replay.clone();
+            let db = db.clone();
             let prepared_filter = prepared_filter.clone();
             async move {
-                let items: Vec<QueueItem> = handle
+                let mut items: Vec<QueueItem> = handle
                     .list_jobs()
                     .into_iter()
                     .filter(|info| {
@@ -90,10 +93,11 @@ impl JobsSubscription {
                     .map(|info| queue_item_from_job(&info))
                     .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
                     .collect();
+                attach_duplicate_summaries(db, &mut items).await?;
                 let metrics = handle.get_metrics();
                 let latest_cursor = replay.latest_cursor().await;
                 let cfg = config.read().await;
-                QueueSnapshot {
+                Ok(QueueSnapshot {
                     summary: queue_summary(&items, &metrics),
                     metrics: metrics_from_snapshot(&metrics),
                     global_state: global_queue_state(
@@ -104,7 +108,7 @@ impl JobsSubscription {
                     items,
                     latest_cursor,
                     generated_at: chrono::Utc::now(),
-                }
+                })
             }
         });
 
@@ -120,10 +124,11 @@ impl JobsSubscription {
         ctx: &Context<'_>,
         after: Option<String>,
         filter: Option<QueueFilterInput>,
-    ) -> Result<impl Stream<Item = QueueEvent>> {
+    ) -> Result<impl Stream<Item = Result<QueueEvent>>> {
         let after = decode_event_cursor(after.as_deref())
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
+        let db = ctx.data::<Database>()?.clone();
         let mut rx = replay.subscribe();
         let initial = replay
             .replay_after(after)
@@ -141,7 +146,7 @@ impl JobsSubscription {
                 }
                 last_seen = notification.id;
                 if matches_queue_event_filter_prepared(&notification.event, prepared_filter.as_ref()) {
-                    yield notification.event;
+                    yield enrich_queue_event(db.clone(), notification.event).await;
                 }
             }
 
@@ -153,7 +158,7 @@ impl JobsSubscription {
                         }
                         last_seen = notification.id;
                         if matches_queue_event_filter_prepared(&notification.event, prepared_filter.as_ref()) {
-                            yield notification.event;
+                            yield enrich_queue_event(db.clone(), notification.event).await;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -169,7 +174,7 @@ impl JobsSubscription {
                                     }
                                     last_seen = notification.id;
                                     if matches_queue_event_filter_prepared(&notification.event, prepared_filter.as_ref()) {
-                                        yield notification.event;
+                                        yield enrich_queue_event(db.clone(), notification.event).await;
                                     }
                                 }
                             }
@@ -187,6 +192,36 @@ impl JobsSubscription {
             }
         })
     }
+}
+
+async fn attach_duplicate_summaries(db: Database, items: &mut [QueueItem]) -> Result<()> {
+    let job_ids = items
+        .iter()
+        .map(|item| weaver_server_core::jobs::ids::JobId(item.id))
+        .collect::<Vec<_>>();
+    let summaries =
+        tokio::task::spawn_blocking(move || load_duplicate_summaries_chunked(&db, job_ids))
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+    for item in items {
+        if let Some(summary) = summaries.get(&weaver_server_core::jobs::ids::JobId(item.id)) {
+            // Preserve an event's already-enriched summary if the current
+            // lookup has no row, rather than replacing a client badge with
+            // null during a transient/replayed state transition.
+            item.duplicate_summary = Some(DuplicateSummaryInfo::from_summary(summary));
+        }
+    }
+    Ok(())
+}
+
+async fn enrich_queue_event(db: Database, mut event: QueueEvent) -> Result<QueueEvent> {
+    if let Some(item) = event.item.as_mut() {
+        // Queue events represent one item each, so this is a single bounded
+        // lookup rather than an N+1 list resolver.
+        attach_duplicate_summaries(db, std::slice::from_mut(item)).await?;
+    }
+    Ok(event)
 }
 
 #[derive(Clone, Copy)]

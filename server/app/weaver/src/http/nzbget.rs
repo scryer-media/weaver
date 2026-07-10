@@ -296,7 +296,19 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
         key: PRIORITY_ATTRIBUTE_KEY.to_string(),
         value: priority_label(request.priority).to_string(),
     }];
-    if let Some(value) = request.dupe_key.filter(|value| !value.trim().is_empty()) {
+    let dupe_key = request
+        .dupe_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let dupe_mode = request
+        .dupe_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(value) = dupe_key.clone() {
         attributes.push(AttributeInput {
             key: "nzbget.dupe_key".to_string(),
             value,
@@ -308,7 +320,7 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
             value: value.to_string(),
         });
     }
-    if let Some(value) = request.dupe_mode.filter(|value| !value.trim().is_empty()) {
+    if let Some(value) = dupe_mode.clone() {
         attributes.push(AttributeInput {
             key: "nzbget.dupe_mode".to_string(),
             value,
@@ -329,6 +341,19 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
         SubmissionOptions {
             category_resolution: CategoryResolutionMode::PreserveSubmitted,
             add_paused: request.add_paused,
+            duplicate_mode: nzbget_duplicate_mode(
+                dupe_mode.as_deref(),
+                dupe_key.is_some(),
+                request.dupe_score.is_some(),
+            ),
+            semantic_duplicate: dupe_key.as_deref().and_then(|key| {
+                weaver_server_core::SemanticDuplicate::from_source(
+                    key,
+                    request.dupe_score.unwrap_or_default(),
+                )
+            }),
+            origin: weaver_server_core::SubmissionOrigin::NzbGet,
+            ..SubmissionOptions::default()
         },
     )
     .await;
@@ -342,8 +367,21 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
 fn append_rejection_result(error: SubmitNzbError) -> Result<Value, RpcError> {
     match error {
         SubmitNzbError::Parse(_) | SubmitNzbError::Empty | SubmitNzbError::NotXml => Ok(json!(0)),
+        SubmitNzbError::DuplicateBlocked { .. } => Ok(json!(0)),
         error => Err(RpcError::invalid_parameter(error.to_string())),
     }
+}
+
+fn nzbget_duplicate_mode(
+    requested_mode: Option<&str>,
+    _has_dupe_key: bool,
+    _has_dupe_score: bool,
+) -> weaver_server_core::DuplicateMode {
+    requested_mode
+        .and_then(weaver_server_core::DuplicateMode::from_persisted)
+        // NZBGet defaults every append to SCORE. Without a non-empty key this
+        // only leaves semantic grouping absent; fingerprint policy still runs.
+        .unwrap_or(weaver_server_core::DuplicateMode::Score)
 }
 
 #[cfg(test)]
@@ -371,6 +409,32 @@ mod append_rejection_tests {
             append_rejection_result(SubmitNzbError::Fetch("not allowed".into())).unwrap_err();
         assert_eq!(error.code, 2);
         assert!(error.message.contains("not allowed"));
+    }
+
+    #[test]
+    fn nzbget_dupe_metadata_defaults_to_score_and_modes_are_case_insensitive() {
+        use weaver_server_core::DuplicateMode;
+
+        assert_eq!(
+            nzbget_duplicate_mode(None, true, false),
+            DuplicateMode::Score
+        );
+        assert_eq!(
+            nzbget_duplicate_mode(None, false, true),
+            DuplicateMode::Score
+        );
+        assert_eq!(
+            nzbget_duplicate_mode(Some("aLl"), true, true),
+            DuplicateMode::All
+        );
+        assert_eq!(
+            nzbget_duplicate_mode(Some("FoRcE"), true, true),
+            DuplicateMode::Force
+        );
+        assert_eq!(
+            nzbget_duplicate_mode(None, false, false),
+            DuplicateMode::Score
+        );
     }
 }
 

@@ -43,6 +43,7 @@ fn submit_upload(
         "#,
     )
     .data(CallerScope::Local)
+    .data(local_identity(7))
     .variables(Variables::from_json(json!({
         "input": {
             "nzbUpload": null
@@ -813,10 +814,147 @@ async fn history_events_stale_cursor_are_empty_for_compat() {
 async fn submit_duplicate_nzbs() {
     let h = TestHarness::new().await;
     let id1 = h.submit_test_nzb("duplicate-nzb").await;
-    let id2 = h.submit_test_nzb("duplicate-nzb").await;
+    let nzb_b64 = encode_nzb(&minimal_nzb("duplicate-nzb"));
+    let resp = h
+        .execute(&format!(
+            r#"
+            mutation {{
+              submitNzb(input: {{ nzbBase64: "{nzb_b64}", filename: "duplicate-nzb.nzb" }}) {{
+                accepted
+                status
+                errorCode
+                item {{ id }}
+                duplicateDecision {{ action forceBypassed matches {{ jobId fingerprintKind lifecycle }} }}
+              }}
+            }}
+        "#
+        ))
+        .await;
 
     assert!(id1 > 0);
-    assert!(id2 > 0);
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let result = &data["submitNzb"];
+    assert!(!result["accepted"].as_bool().unwrap());
+    assert_eq!(result["status"].as_str().unwrap(), "BLOCKED");
+    assert_eq!(result["errorCode"].as_str().unwrap(), "DUPLICATE_BLOCKED");
+    assert!(result["item"].is_null());
+    assert_eq!(
+        result["duplicateDecision"]["action"].as_str().unwrap(),
+        "BLOCK"
+    );
+}
+
+#[tokio::test]
+async fn graphql_score_submission_returns_a_parked_candidate_without_queue_item() {
+    let h = TestHarness::new().await;
+    let winner_b64 = encode_nzb(&minimal_nzb("semantic-winner"));
+    let loser_b64 = encode_nzb(&minimal_nzb("semantic-loser"));
+
+    let winner = h
+        .execute(&format!(
+            r#"
+            mutation {{
+              submitNzb(input: {{
+                nzbBase64: "{winner_b64}", filename: "semantic-winner.nzb",
+                dupeKey: "  Group－A ", dupeScore: 10, dupeMode: SCORE
+              }}) {{
+                accepted status jobId item {{ id }}
+                semanticDuplicate {{ normalizedKey score state }}
+              }}
+            }}
+        "#
+        ))
+        .await;
+    assert_no_errors(&winner);
+    let winner = response_data(&winner);
+    assert_eq!(winner["submitNzb"]["status"].as_str(), Some("ACCEPTED"));
+    assert_eq!(
+        winner["submitNzb"]["semanticDuplicate"]["state"].as_str(),
+        Some("ACTIVE")
+    );
+    assert_eq!(
+        winner["submitNzb"]["semanticDuplicate"]["normalizedKey"].as_str(),
+        Some("group-a")
+    );
+    let winner_id = winner["submitNzb"]["jobId"]
+        .as_u64()
+        .expect("SCORE winner must reserve a job id");
+
+    let loser = h
+        .execute(&format!(
+            r#"
+            mutation {{
+              submitNzb(input: {{
+                nzbBase64: "{loser_b64}", filename: "semantic-loser.nzb",
+                dupeKey: "group-a", dupeScore: 10, dupeMode: SCORE
+              }}) {{
+                accepted status item {{ id }} message
+                semanticDuplicate {{ normalizedKey score state }}
+              }}
+            }}
+        "#
+        ))
+        .await;
+    assert_no_errors(&loser);
+    let loser = response_data(&loser);
+    assert_eq!(loser["submitNzb"]["accepted"].as_bool(), Some(true));
+    assert_eq!(loser["submitNzb"]["status"].as_str(), Some("PARKED"));
+    assert!(loser["submitNzb"]["item"].is_null());
+    assert_eq!(
+        loser["submitNzb"]["semanticDuplicate"]["state"].as_str(),
+        Some("PARKED")
+    );
+
+    let snapshot = h
+        .execute(&format!(
+            r#"{{
+                duplicateSnapshot(id: {winner_id}) {{
+                    jobId lifecycle normalizedName
+                    semantic {{ groupId normalizedKey score state terminalCause promotionState }}
+                }}
+            }}"#
+        ))
+        .await;
+    assert_no_errors(&snapshot);
+    let snapshot = response_data(&snapshot);
+    assert_eq!(
+        snapshot["duplicateSnapshot"]["jobId"].as_u64(),
+        Some(winner_id)
+    );
+    assert_eq!(
+        snapshot["duplicateSnapshot"]["semantic"]["state"].as_str(),
+        Some("ACTIVE")
+    );
+    assert_eq!(
+        snapshot["duplicateSnapshot"]["semantic"]["promotionState"].as_str(),
+        Some("NONE")
+    );
+}
+
+#[tokio::test]
+async fn mark_duplicate_bad_requires_a_semantic_candidate_before_cancelling() {
+    let h = TestHarness::new().await;
+    let id = h.submit_test_nzb("not-a-semantic-candidate").await;
+
+    let response = h
+        .execute(&format!(
+            r#"mutation {{ markDuplicateBad(id: {id}) {{ accepted jobId message }} }}"#
+        ))
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    assert_eq!(data["markDuplicateBad"]["accepted"].as_bool(), Some(false));
+
+    let queue = h.execute("{ queueItems { id } }").await;
+    assert_no_errors(&queue);
+    assert!(
+        response_data(&queue)["queueItems"]
+            .as_array()
+            .expect("queueItems array")
+            .iter()
+            .any(|item| item["id"].as_u64() == Some(id))
+    );
 }
 
 // ---------------------------------------------------------------------------

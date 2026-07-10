@@ -1,4 +1,5 @@
 import type { LocaleDictionary } from "../types";
+import { duplicateLocaleEntries } from "../duplicate-locales";
 
 const fr: LocaleDictionary = {
   // Brand
@@ -650,6 +651,41 @@ const fr: LocaleDictionary = {
   "schedule.empty": "Aucune planification",
   "schedule.emptyDesc": "Ajoutez une règle de planification pour mettre en pause ou limiter automatiquement les téléchargements à des heures précises.",
   "schedule.everyDay": "Tous les jours",
+
+  "settings.duplicateHandling": "Gestion des doublons",
+  "settings.duplicateHandlingDesc": "Définissez l'action lorsqu'un nouveau NZB correspond à une preuve de doublon durable. Bloquer le refuse ; avertir l'accepte ; pause l'accepte en pause.",
+  "settings.duplicateStrictActiveOrSuccess": "Disposition stricte des articles — actif ou réussi",
+  "settings.duplicateStrictActiveOrSuccessDesc": "À utiliser lorsque chaque article et octet déclaré correspond à une tâche active ou réussie.",
+  "settings.duplicateStrictFailedOrCancelled": "Disposition stricte des articles — échoué ou annulé",
+  "settings.duplicateStrictFailedOrCancelledDesc": "À utiliser lorsque chaque article et octet déclaré correspond à une tâche échouée ou annulée.",
+  "settings.duplicateArticleLayoutActiveOrSuccess": "Disposition des articles — actif ou réussi",
+  "settings.duplicateArticleLayoutActiveOrSuccessDesc": "À utiliser lorsque l'ordre des articles correspond mais que les octets déclarés diffèrent pour une tâche active ou réussie.",
+  "settings.duplicateArticleLayoutFailedOrCancelled": "Disposition des articles — échoué ou annulé",
+  "settings.duplicateArticleLayoutFailedOrCancelledDesc": "À utiliser lorsque l'ordre des articles correspond mais que les octets déclarés diffèrent pour une tâche échouée ou annulée.",
+  "settings.duplicateArticleSet": "Ensemble d'articles",
+  "settings.duplicateArticleSetDesc": "À utiliser lorsque les mêmes ID d'articles uniques existent avec une disposition différente.",
+  "settings.duplicateNormalizedName": "Nom normalisé",
+  "settings.duplicateNormalizedNameDesc": "À utiliser lorsque les noms de version normalisés correspondent sans preuve d'article plus forte.",
+  "settings.duplicateActionAccept": "Accepter",
+  "settings.duplicateActionWarn": "Avertir et accepter",
+  "settings.duplicateActionPause": "Accepter en pause",
+  "settings.duplicateActionBlock": "Bloquer",
+  "settings.duplicatePolicySaved": "Politique de doublons enregistrée.",
+  "settings.duplicatePolicySaveFailed": "Impossible d'enregistrer la politique de doublons.",
+  "upload.duplicateHandling": "Gestion des doublons",
+  "upload.force": "Forcer l'envoi",
+  "upload.forceDesc": "Accepte cet envoi malgré la politique de doublons sémantique et d'articles. Les conflits d'idempotence restent applicables.",
+  "upload.duplicateMode": "Mode de doublon",
+  "upload.duplicateModeEnforce": "Appliquer la politique d'articles",
+  "upload.duplicateModeScore": "Noter les candidats",
+  "upload.duplicateModeAll": "Conserver tous les candidats",
+  "upload.duplicateModeForce": "Forcer l'envoi",
+  "upload.duplicateKey": "Clé de doublon",
+  "upload.duplicateKeyPlaceholder": "Groupe de candidats facultatif",
+  "upload.duplicateScore": "Score de doublon",
+  "upload.duplicateScorePlaceholder": "0",
+  "upload.duplicateScoreHint": "Les scores les plus élevés gagnent pour la même clé ; en cas d'égalité, le candidat existant est conservé.",
+  ...duplicateLocaleEntries.fra,
 };
 
 export default fr;

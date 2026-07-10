@@ -41,6 +41,7 @@ import { EmptyState } from "@/components/EmptyState";
 import { FilterChip } from "@/components/FilterChip";
 import { JobPhaseProgressBars } from "@/components/JobPhaseProgressBars";
 import { JobStatusBadgeGroup } from "@/components/JobStatusBadge";
+import { DuplicateSummaryBadge } from "@/features/duplicates/DuplicateSummaryBadge";
 import { PageHeader } from "@/components/PageHeader";
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { formatBytes, formatSpeed } from "@/components/SpeedDisplay";
@@ -303,9 +304,11 @@ const QueueCellSelect = memo(function QueueCellSelect({
 const QueueNameCell = memo(function QueueNameCell({
   jobId,
   displayName,
+  duplicateSummary,
 }: {
   jobId: number;
   displayName: string;
+  duplicateSummary?: JobData["duplicateSummary"];
 }) {
   return (
     <div className="min-w-0">
@@ -315,6 +318,7 @@ const QueueNameCell = memo(function QueueNameCell({
       >
         {displayName}
       </Link>
+      <DuplicateSummaryBadge summary={duplicateSummary} />
     </div>
   );
 });
@@ -954,7 +958,13 @@ export function JobList() {
         id: "name",
         accessorKey: "displayName",
         header: ({ column }) => <DataTableColumnHeader column={column} title={t("table.name")} />,
-        cell: ({ row }) => <QueueNameCell jobId={row.original.id} displayName={row.original.displayName} />,
+        cell: ({ row }) => (
+          <QueueNameCell
+            jobId={row.original.id}
+            displayName={row.original.displayName}
+            duplicateSummary={row.original.duplicateSummary}
+          />
+        ),
         meta: {
           headerClassName: "h-7 w-[34%] px-2 text-left",
           cellClassName: "w-[34%] px-2 py-1.5 text-left",
@@ -1821,13 +1831,16 @@ export function JobList() {
                           />
                         ))}
                       </span>
-                      <Link
-                        to={`/jobs/${job.id}`}
-                        title={job.displayName}
-                        className="min-w-0 flex-[1.6] truncate text-[13px] font-medium text-foreground"
-                      >
-                        {job.displayName}
-                      </Link>
+                      <div className="min-w-0 flex-[1.6]">
+                        <Link
+                          to={`/jobs/${job.id}`}
+                          title={job.displayName}
+                          className="block truncate text-[13px] font-medium text-foreground"
+                        >
+                          {job.displayName}
+                        </Link>
+                        <DuplicateSummaryBadge summary={job.duplicateSummary} />
+                      </div>
                       <div className="hidden min-w-[130px] flex-1 sm:block">
                         <JobPhaseProgressBars compact phaseProgress={job.phaseProgress} />
                       </div>

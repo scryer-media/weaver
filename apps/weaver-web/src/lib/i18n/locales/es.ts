@@ -1,4 +1,5 @@
 import type { LocaleDictionary } from "../types";
+import { duplicateLocaleEntries } from "../duplicate-locales";
 
 const es: LocaleDictionary = {
   // Brand
@@ -650,6 +651,42 @@ const es: LocaleDictionary = {
   "schedule.empty": "Sin programaciones",
   "schedule.emptyDesc": "Añade una regla de programación para pausar o limitar las descargas automáticamente a horas específicas.",
   "schedule.everyDay": "Todos los días",
+
+  // Duplicados
+  "settings.duplicateHandling": "Gestión de duplicados",
+  "settings.duplicateHandlingDesc": "Elige qué ocurre cuando un NZB nuevo coincide con evidencia de duplicado guardada. Bloquear lo rechaza; advertir lo acepta; pausar lo acepta pausado.",
+  "settings.duplicateStrictActiveOrSuccess": "Diseño estricto de artículos — activo o correcto",
+  "settings.duplicateStrictActiveOrSuccessDesc": "Se usa cuando cada artículo y byte declarado coincide con una tarea activa o correcta.",
+  "settings.duplicateStrictFailedOrCancelled": "Diseño estricto de artículos — fallido o cancelado",
+  "settings.duplicateStrictFailedOrCancelledDesc": "Se usa cuando cada artículo y byte declarado coincide con una tarea fallida o cancelada.",
+  "settings.duplicateArticleLayoutActiveOrSuccess": "Diseño de artículos — activo o correcto",
+  "settings.duplicateArticleLayoutActiveOrSuccessDesc": "Se usa cuando el orden de artículos coincide pero los bytes declarados difieren en una tarea activa o correcta.",
+  "settings.duplicateArticleLayoutFailedOrCancelled": "Diseño de artículos — fallido o cancelado",
+  "settings.duplicateArticleLayoutFailedOrCancelledDesc": "Se usa cuando el orden de artículos coincide pero los bytes declarados difieren en una tarea fallida o cancelada.",
+  "settings.duplicateArticleSet": "Conjunto de artículos",
+  "settings.duplicateArticleSetDesc": "Se usa cuando existen los mismos ID de artículo únicos con un diseño diferente.",
+  "settings.duplicateNormalizedName": "Nombre normalizado",
+  "settings.duplicateNormalizedNameDesc": "Se usa cuando los nombres de lanzamiento normalizados coinciden sin evidencia de artículos más fuerte.",
+  "settings.duplicateActionAccept": "Aceptar",
+  "settings.duplicateActionWarn": "Advertir y aceptar",
+  "settings.duplicateActionPause": "Aceptar pausado",
+  "settings.duplicateActionBlock": "Bloquear",
+  "settings.duplicatePolicySaved": "Política de duplicados guardada.",
+  "settings.duplicatePolicySaveFailed": "No se pudo guardar la política de duplicados.",
+  "upload.duplicateHandling": "Gestión de duplicados",
+  "upload.force": "Forzar envío",
+  "upload.forceDesc": "Acepta este envío pese a la política de duplicados semántica y de artículos. Los conflictos de idempotencia se mantienen.",
+  "upload.duplicateMode": "Modo de duplicado",
+  "upload.duplicateModeEnforce": "Aplicar política de artículos",
+  "upload.duplicateModeScore": "Puntuar candidatos",
+  "upload.duplicateModeAll": "Conservar todos los candidatos",
+  "upload.duplicateModeForce": "Forzar envío",
+  "upload.duplicateKey": "Clave de duplicado",
+  "upload.duplicateKeyPlaceholder": "Grupo de candidatos opcional",
+  "upload.duplicateScore": "Puntuación de duplicado",
+  "upload.duplicateScorePlaceholder": "0",
+  "upload.duplicateScoreHint": "Las puntuaciones más altas ganan dentro de la misma clave de duplicado; en empate se conserva el candidato existente.",
+  ...duplicateLocaleEntries.spa,
 };
 
 export default es;

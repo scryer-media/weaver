@@ -82,6 +82,7 @@ impl TestHarness {
             ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: Default::default(),
             config_path: None,
         }));
 
@@ -327,6 +328,7 @@ async fn new_direct_pipeline_with_buffers(
         ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+        duplicate_policy: Default::default(),
         config_path: None,
     }));
 

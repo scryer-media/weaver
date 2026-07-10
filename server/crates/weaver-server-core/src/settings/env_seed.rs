@@ -781,6 +781,7 @@ mod tests {
             isp_bandwidth_cap: None,
             ip_replacement_trial_extra_connections: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: Default::default(),
             config_path: None,
         };
         db.save_config(&existing).unwrap();

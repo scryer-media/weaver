@@ -12,6 +12,9 @@ pub enum SchedulerError {
     #[error("{0}")]
     Conflict(String),
 
+    #[error("semantic candidate was superseded before materialization")]
+    SemanticSuperseded,
+
     #[error("{0}")]
     InvalidInput(String),
 

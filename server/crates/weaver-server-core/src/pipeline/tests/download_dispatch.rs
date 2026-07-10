@@ -5046,6 +5046,8 @@ async fn add_job_with_options_initially_paused_publishes_queued_lane_from_real_p
             sample_nzb_zstd(),
             crate::jobs::AddJobOptions {
                 initially_paused: true,
+                semantic_materialization_generation: None,
+                semantic_promotion_generation: None,
             },
         )
         .await

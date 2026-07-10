@@ -1,5 +1,6 @@
 use crate::StateError;
 use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday};
+use crate::jobs::{DuplicateAction, DuplicatePolicy};
 use crate::persistence::Database;
 use crate::settings::record::SettingRecord;
 use crate::settings::{BufferPoolOverrides, Config, RetryOverrides, TunerOverrides};
@@ -163,6 +164,37 @@ impl Database {
             }
         };
 
+        let default_duplicate_policy = DuplicatePolicy::default();
+        let duplicate_policy = DuplicatePolicy {
+            strict_active_or_success: setting_duplicate_action(
+                &settings,
+                "duplicate_policy.strict_active_or_success",
+            )
+            .unwrap_or(default_duplicate_policy.strict_active_or_success),
+            strict_failed_or_cancelled: setting_duplicate_action(
+                &settings,
+                "duplicate_policy.strict_failed_or_cancelled",
+            )
+            .unwrap_or(default_duplicate_policy.strict_failed_or_cancelled),
+            article_layout_active_or_success: setting_duplicate_action(
+                &settings,
+                "duplicate_policy.article_layout_active_or_success",
+            )
+            .unwrap_or(default_duplicate_policy.article_layout_active_or_success),
+            article_layout_failed_or_cancelled: setting_duplicate_action(
+                &settings,
+                "duplicate_policy.article_layout_failed_or_cancelled",
+            )
+            .unwrap_or(default_duplicate_policy.article_layout_failed_or_cancelled),
+            article_set: setting_duplicate_action(&settings, "duplicate_policy.article_set")
+                .unwrap_or(default_duplicate_policy.article_set),
+            normalized_name: setting_duplicate_action(
+                &settings,
+                "duplicate_policy.normalized_name",
+            )
+            .unwrap_or(default_duplicate_policy.normalized_name),
+        };
+
         Ok(Config {
             data_dir,
             intermediate_dir,
@@ -177,6 +209,7 @@ impl Database {
             isp_bandwidth_cap,
             ip_replacement_trial_extra_connections,
             watch_folder,
+            duplicate_policy,
             config_path: None,
         })
     }
@@ -219,6 +252,36 @@ impl Database {
         self.set_setting(
             "watch_folder.scanning_paused",
             &config.watch_folder.scanning_paused.to_string(),
+        )?;
+        self.set_setting(
+            "duplicate_policy.strict_active_or_success",
+            config.duplicate_policy.strict_active_or_success.as_str(),
+        )?;
+        self.set_setting(
+            "duplicate_policy.strict_failed_or_cancelled",
+            config.duplicate_policy.strict_failed_or_cancelled.as_str(),
+        )?;
+        self.set_setting(
+            "duplicate_policy.article_layout_active_or_success",
+            config
+                .duplicate_policy
+                .article_layout_active_or_success
+                .as_str(),
+        )?;
+        self.set_setting(
+            "duplicate_policy.article_layout_failed_or_cancelled",
+            config
+                .duplicate_policy
+                .article_layout_failed_or_cancelled
+                .as_str(),
+        )?;
+        self.set_setting(
+            "duplicate_policy.article_set",
+            config.duplicate_policy.article_set.as_str(),
+        )?;
+        self.set_setting(
+            "duplicate_policy.normalized_name",
+            config.duplicate_policy.normalized_name.as_str(),
         )?;
         if let Some(ref cap) = config.isp_bandwidth_cap {
             self.set_setting("bandwidth_cap.enabled", &cap.enabled.to_string())?;
@@ -276,6 +339,15 @@ impl Database {
 
         Ok(())
     }
+}
+
+fn setting_duplicate_action(
+    settings: &std::collections::HashMap<String, String>,
+    key: &str,
+) -> Option<DuplicateAction> {
+    settings
+        .get(key)
+        .and_then(|value| DuplicateAction::from_persisted(value))
 }
 
 fn parse_bandwidth_cap_period(value: &str) -> Option<IspBandwidthCapPeriod> {

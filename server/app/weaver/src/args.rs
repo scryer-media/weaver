@@ -78,6 +78,10 @@ pub(crate) enum Command {
         /// Output directory (overrides config).
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Bypass semantic duplicate blocking for this submission.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Start the HTTP server with GraphQL API.

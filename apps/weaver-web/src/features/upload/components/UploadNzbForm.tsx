@@ -2,11 +2,16 @@ import { FileText, RotateCcw, UploadCloud, X } from "lucide-react";
 import type { Ref } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { useUploadNzb, type UploadNzbEntry } from "@/features/upload/hooks/use-upload-nzb";
+import {
+  semanticStateI18nKey,
+  submissionOutcomeI18nKey,
+} from "@/features/duplicates/duplicate-presentation";
 import { formatNzbNameForDisplay } from "@/lib/format-nzb-name";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -31,7 +36,9 @@ function statusLabel(entry: UploadNzbEntry, t: ReturnType<typeof useTranslate>):
     case "submitting":
       return t("upload.statusSubmitting");
     case "submitted":
-      return t("upload.statusSubmitted");
+      return entry.submissionStatus
+        ? t(submissionOutcomeI18nKey(entry.submissionStatus))
+        : t("upload.statusSubmitted");
     default:
       return entry.status;
   }
@@ -81,10 +88,18 @@ export function UploadNzbForm({
     password,
     priority,
     category,
+    force,
+    duplicateMode,
+    duplicateKey,
+    duplicateScore,
     setCategory,
     setDragging,
     setPassword,
     setPriority,
+    setForce,
+    setDuplicateMode,
+    setDuplicateKey,
+    setDuplicateScore,
     handleDrop,
     handleFiles,
     removeFile,
@@ -203,6 +218,19 @@ export function UploadNzbForm({
                             {entry.error}
                           </div>
                         ) : null}
+                        {entry.submissionStatus ? (
+                          <div className="mt-2 text-xs text-muted-foreground">
+                            {t(submissionOutcomeI18nKey(entry.submissionStatus))}
+                            {entry.semanticDuplicate ? (
+                              <span className="ml-1">
+                                {t("upload.semanticCandidate", {
+                                  score: entry.semanticDuplicate.score,
+                                  state: t(semanticStateI18nKey(entry.semanticDuplicate.state)),
+                                })}
+                              </span>
+                            ) : null}
+                          </div>
+                        ) : null}
                       </div>
                     </div>
                     <div className="flex shrink-0 items-start gap-2">
@@ -308,6 +336,89 @@ export function UploadNzbForm({
               </Select>
             </div>
           </div>
+
+          <details className="rounded-inner border border-border bg-background/30 p-4">
+            <summary className="cursor-pointer text-sm font-semibold text-foreground">
+              {t("upload.duplicateHandling")}
+            </summary>
+            <div className="mt-4 space-y-4">
+              <div className="flex items-start justify-between gap-4 rounded-inner border border-border p-3">
+                <div>
+                  <Label htmlFor={`upload-force-${layout}`} className="text-sm font-semibold">
+                    {t("upload.force")}
+                  </Label>
+                  <p className="mt-1 text-xs text-muted-foreground">{t("upload.forceDesc")}</p>
+                </div>
+                <Switch
+                  id={`upload-force-${layout}`}
+                  checked={force}
+                  onCheckedChange={(checked) => {
+                    setForce(checked);
+                    setDuplicateMode(checked ? "FORCE" : "ENFORCE");
+                  }}
+                />
+              </div>
+
+              <div className="grid gap-4 sm:grid-cols-3">
+                <div className="space-y-2">
+                  <Label htmlFor={`upload-duplicate-mode-${layout}`} className="text-sm font-semibold">
+                    {t("upload.duplicateMode")}
+                  </Label>
+                  <Select
+                    value={duplicateMode}
+                    onValueChange={(value) => {
+                      const mode = value as "ENFORCE" | "SCORE" | "ALL" | "FORCE";
+                      setDuplicateMode(mode);
+                      setForce(mode === "FORCE");
+                    }}
+                    disabled={force}
+                  >
+                    <SelectTrigger id={`upload-duplicate-mode-${layout}`}>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="ENFORCE">{t("upload.duplicateModeEnforce")}</SelectItem>
+                      <SelectItem value="SCORE">{t("upload.duplicateModeScore")}</SelectItem>
+                      <SelectItem value="ALL">{t("upload.duplicateModeAll")}</SelectItem>
+                      <SelectItem value="FORCE">{t("upload.duplicateModeForce")}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                {duplicateMode === "SCORE" && !force ? (
+                  <>
+                    <div className="space-y-2">
+                      <Label htmlFor={`upload-duplicate-key-${layout}`} className="text-sm font-semibold">
+                        {t("upload.duplicateKey")}
+                      </Label>
+                      <Input
+                        id={`upload-duplicate-key-${layout}`}
+                        value={duplicateKey}
+                        onChange={(event) => setDuplicateKey(event.target.value)}
+                        placeholder={t("upload.duplicateKeyPlaceholder")}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor={`upload-duplicate-score-${layout}`} className="text-sm font-semibold">
+                        {t("upload.duplicateScore")}
+                      </Label>
+                      <Input
+                        id={`upload-duplicate-score-${layout}`}
+                        type="number"
+                        step="1"
+                        value={duplicateScore}
+                        onChange={(event) => setDuplicateScore(event.target.value)}
+                        placeholder={t("upload.duplicateScorePlaceholder")}
+                      />
+                    </div>
+                  </>
+                ) : null}
+              </div>
+              {duplicateMode === "SCORE" && !force ? (
+                <p className="text-xs text-muted-foreground">{t("upload.duplicateScoreHint")}</p>
+              ) : null}
+            </div>
+          </details>
 
           {entries.length > 1 ? (
             <div className="text-sm text-muted-foreground">{t("upload.sharedSettingsHint")}</div>

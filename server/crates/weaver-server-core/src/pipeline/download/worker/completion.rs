@@ -678,6 +678,23 @@ impl Pipeline {
                     self.maybe_finish_download_pass(job_id);
                     return;
                 }
+                let terminal_cause = match &failure.kind {
+                    DownloadFailureKind::ArticleNotFound => {
+                        crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth
+                    }
+                    DownloadFailureKind::Auth
+                    | DownloadFailureKind::ServerQuota
+                    | DownloadFailureKind::CapacityUnavailable
+                    | DownloadFailureKind::LaneUnavailable
+                    | DownloadFailureKind::Transient
+                    | DownloadFailureKind::Unrequested => {
+                        crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage
+                    }
+                    DownloadFailureKind::Permanent => {
+                        crate::jobs::SemanticTerminalCause::DecodeOrCorruptData
+                    }
+                };
+                self.semantic_terminal_causes.insert(job_id, terminal_cause);
                 match &failure.kind {
                     DownloadFailureKind::ArticleNotFound => self
                         .metrics

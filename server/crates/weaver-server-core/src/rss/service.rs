@@ -9,7 +9,8 @@ use tracing::warn;
 #[cfg(test)]
 use crate::RssRuleAction;
 use crate::SchedulerHandle;
-use crate::ingest::submit_nzb_bytes;
+use crate::ingest::{SubmissionOptions, submit_nzb_bytes_with_options};
+use crate::jobs::{CallerScopedIdempotency, SubmissionOrigin};
 use crate::rss::model::{FeedItem, apply_basic_auth, build_submission_metadata};
 #[cfg(test)]
 use crate::rss::model::{compile_rules, evaluate_item, parse_feed_items, unix_now_secs};
@@ -151,7 +152,9 @@ impl RssService {
         };
 
         let metadata = build_submission_metadata(feed, rule, item);
-        let submitted = submit_nzb_bytes(
+        let idempotency =
+            CallerScopedIdempotency::new(format!("rss:feed:{}", feed.id), item.item_id.clone());
+        let submitted = submit_nzb_bytes_with_options(
             &self.inner.db,
             &self.inner.handle,
             &self.inner.config,
@@ -160,6 +163,11 @@ impl RssService {
             None,
             category,
             metadata,
+            SubmissionOptions {
+                origin: SubmissionOrigin::Rss,
+                idempotency,
+                ..SubmissionOptions::default()
+            },
         )
         .await
         .map_err(|e| e.to_string())?;

@@ -270,6 +270,28 @@ fn render_prometheus_metrics_with_transfers(
         );
     }
 
+    out.push_str("# HELP weaver_duplicate_admission_decisions_total Duplicate admission decisions by intake origin and public status.\n");
+    out.push_str("# TYPE weaver_duplicate_admission_decisions_total counter\n");
+    for metric in weaver_server_core::jobs::duplicate_admission_metrics_snapshot() {
+        append_labeled_metric(
+            &mut out,
+            "weaver_duplicate_admission_decisions_total",
+            &[("origin", metric.origin), ("status", metric.status)],
+            metric.count,
+        );
+    }
+
+    out.push_str("# HELP weaver_semantic_duplicate_lifecycle_total Semantic duplicate arbitration lifecycle events.\n");
+    out.push_str("# TYPE weaver_semantic_duplicate_lifecycle_total counter\n");
+    for metric in weaver_server_core::jobs::semantic_duplicate_lifecycle_metrics_snapshot() {
+        append_labeled_metric(
+            &mut out,
+            "weaver_semantic_duplicate_lifecycle_total",
+            &[("event", metric.event)],
+            metric.count,
+        );
+    }
+
     out.push_str(
         "# HELP weaver_pipeline_bytes_downloaded_total Total bytes downloaded by the pipeline.\n",
     );
