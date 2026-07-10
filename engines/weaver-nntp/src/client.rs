@@ -17,7 +17,9 @@ use crate::fused_yenc::{FusedYencArticleStats, FusedYencError};
 use crate::health::{CooldownReason, ServerState};
 use crate::pool::{NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig};
 use crate::tls::TransportReadStats;
-use crate::transfer::{QuotaRejection, ServerTransferSnapshot, StableServerId};
+use crate::transfer::{
+    ActiveTransferBudget, QuotaRejection, ServerTransferSnapshot, StableServerId,
+};
 
 /// Configuration for the high-level NNTP client.
 pub struct NntpClientConfig {
@@ -29,9 +31,9 @@ pub struct NntpClientConfig {
     /// before failing over to the next server. A value of 1 means try once,
     /// then retry once (2 total attempts per server).
     pub max_retries_per_server: u32,
-    /// Per-article soft timeout. If a fetch from a single server exceeds this
-    /// duration, the client fails over to the next server. This is separate
-    /// from the connection-level `command_timeout` (hard ceiling per connection).
+    /// Per-article active-time budget. Deliberate local rate-limit waits are
+    /// excluded; exceeding the budget triggers failover to the next server.
+    /// This is separate from the connection-level `command_timeout`.
     pub soft_timeout: Duration,
 }
 
@@ -60,7 +62,7 @@ impl NntpClientConfig {
 pub struct NntpClient {
     pool: Arc<NntpPool>,
     max_retries_per_server: u32,
-    /// Per-article soft timeout — triggers failover to the next server.
+    /// Per-article active-time budget, excluding deliberate local rate waits.
     soft_timeout: Duration,
 }
 
@@ -538,10 +540,12 @@ impl BodyLaneLease {
         let mut batch_clean_so_far = true;
         for (response_idx, message_id) in message_ids.iter().take(requested).enumerate() {
             let item_started = Instant::now();
+            let mut budget = ActiveTransferBudget::new(self.client.soft_timeout);
             let result = NntpClient::read_decoded_pipelined_body(
                 self.conn
                     .as_mut()
                     .expect("connection is available while reading pipeline body"),
+                &mut budget,
             )
             .await;
             let elapsed = item_started.elapsed();
@@ -681,15 +685,18 @@ impl BodyLaneLease {
         message_id: &str,
         estimated_body_bytes: u64,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
+        let mut budget = ActiveTransferBudget::new(self.client.soft_timeout);
         let Some(conn) = self.conn.as_mut() else {
             return Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed));
         };
 
-        // The connection applies its timeout only while waiting on network
-        // reads. Shared transfer-policy waits therefore cannot trigger soft
-        // failover, health degradation, or IP replacement.
         let stream_result = conn
-            .stream_yenc_article_with_estimate(message_id, estimated_body_bytes, |_| Ok(()))
+            .stream_yenc_article_with_active_budget(
+                message_id,
+                estimated_body_bytes,
+                &mut budget,
+                |_| Ok(()),
+            )
             .await;
 
         match stream_result {
@@ -1640,9 +1647,11 @@ impl NntpClient {
                 pending_now.iter().copied().take(admitted).enumerate()
             {
                 let item_started = Instant::now();
+                let mut budget = ActiveTransferBudget::new(self.soft_timeout);
                 let result = Self::read_decoded_pipelined_body(
                     conn.as_mut()
                         .expect("connection is available while reading"),
+                    &mut budget,
                 )
                 .await;
                 let elapsed = item_started.elapsed();
@@ -2109,6 +2118,7 @@ impl NntpClient {
                 &excluded_ips,
                 address_offset,
                 groups,
+                self.soft_timeout,
                 permit,
             ) {
                 Ok(lane) => return Ok(lane),
@@ -2580,8 +2590,8 @@ impl NntpClient {
     /// errors up to `max_retries_per_server` times.
     ///
     /// Connection acquisition, group setup, and retry delay are bounded by a
-    /// per-attempt soft timeout. BODY reads use the connection timeout so
-    /// deliberate transfer-policy waits are outside that deadline.
+    /// per-attempt soft timeout. BODY payload reads use an active-time budget
+    /// that excludes deliberate transfer-policy waits.
     async fn fetch_from_server_with_groups(
         &self,
         server: ServerId,
@@ -2643,10 +2653,10 @@ impl NntpClient {
                 Ok(true) => {}
             }
 
-            // BODY applies its own network-read timeout and excludes deliberate
-            // transfer-policy waits. Wrapping the whole future in the soft
-            // deadline would misclassify throttling as a server failure.
-            let result = conn.body_by_id_raw(message_id).await;
+            let mut budget = ActiveTransferBudget::new(self.soft_timeout);
+            let result = conn
+                .body_by_id_raw_with_active_budget(message_id, &mut budget)
+                .await;
             match result {
                 Ok(response) => return Ok((response.data, remote_ip)),
                 Err(NntpError::ArticleNotFound)
@@ -2734,9 +2744,10 @@ impl NntpClient {
                 Ok(true) => {}
             }
 
-            // The connection times only network reads. Wrapping the whole BODY
-            // future would make deliberate rate waits look like soft failures.
-            let stream_result = conn.stream_yenc_article(message_id, |_| Ok(())).await;
+            let mut budget = ActiveTransferBudget::new(self.soft_timeout);
+            let stream_result = conn
+                .stream_yenc_article_with_active_budget(message_id, 0, &mut budget, |_| Ok(()))
+                .await;
 
             match stream_result {
                 Ok(article) => {
@@ -2786,8 +2797,11 @@ impl NntpClient {
 
     async fn read_decoded_pipelined_body(
         conn: &mut PooledConnection,
+        budget: &mut ActiveTransferBudget,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        let stream_result = conn.stream_next_yenc_article(|_| Ok(())).await;
+        let stream_result = conn
+            .stream_next_yenc_article_with_active_budget(budget, |_| Ok(()))
+            .await;
 
         match stream_result {
             Ok(article) => Ok(DecodedBody {
@@ -2893,8 +2907,8 @@ impl NntpClient {
     /// Fetch from a specific server, retrying on transient errors.
     ///
     /// Connection acquisition and retry delay are bounded by a per-attempt
-    /// soft timeout. BODY reads use the connection timeout so deliberate
-    /// transfer-policy waits are outside that deadline.
+    /// soft timeout. BODY payload reads use an active-time budget that excludes
+    /// deliberate transfer-policy waits.
     async fn fetch_from_server(
         &self,
         server: ServerId,
@@ -2908,7 +2922,11 @@ impl NntpClient {
             let mut conn = self.acquire_before_deadline(server, deadline).await?;
 
             let result = match kind {
-                FetchKind::Body => conn.body_by_id_raw(message_id).await,
+                FetchKind::Body => {
+                    let mut budget = ActiveTransferBudget::new(self.soft_timeout);
+                    conn.body_by_id_raw_with_active_budget(message_id, &mut budget)
+                        .await
+                }
                 FetchKind::Head | FetchKind::Article => {
                     match tokio::time::timeout_at(deadline, async {
                         match kind {
@@ -3083,6 +3101,155 @@ mod tests {
                     socket.flush().await.unwrap();
                 }
             }
+        });
+
+        port
+    }
+
+    async fn spawn_trickling_body_server(line_delay: Duration) -> u16 {
+        const LINE: &[u8] = b"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\r\n";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"200 ready\r\n").await.unwrap();
+
+            let capabilities = read_command_line(&mut socket).await;
+            assert!(capabilities.starts_with("CAPABILITIES"));
+            socket
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+
+            let body = read_command_line(&mut socket).await;
+            assert!(body.starts_with("BODY "));
+            socket
+                .write_all(b"222 1 <trickle@example.com>\r\n=ybegin line=128 size=2560 name=x\r\n")
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            for _ in 0..20 {
+                tokio::time::sleep(line_delay).await;
+                if socket.write_all(LINE).await.is_err() || socket.flush().await.is_err() {
+                    return;
+                }
+            }
+            let _ = socket.write_all(b"=yend size=2560\r\n.\r\n").await;
+            let _ = socket.flush().await;
+        });
+
+        port
+    }
+
+    async fn spawn_delayed_body_initial_server(delay: Duration) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"200 ready\r\n").await.unwrap();
+
+            let capabilities = read_command_line(&mut socket).await;
+            assert!(capabilities.starts_with("CAPABILITIES"));
+            socket
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+
+            let body = read_command_line(&mut socket).await;
+            assert!(body.starts_with("BODY "));
+            tokio::time::sleep(delay).await;
+            let _ = socket
+                .write_all(
+                    b"222 1 <delayed@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
+                )
+                .await;
+            let _ = socket.flush().await;
+        });
+
+        port
+    }
+
+    async fn spawn_delayed_reauth_server(delay: Duration) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"200 ready\r\n").await.unwrap();
+
+            let capabilities = read_command_line(&mut socket).await;
+            assert!(capabilities.starts_with("CAPABILITIES"));
+            socket
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+
+            let initial_user = read_command_line(&mut socket).await;
+            assert!(initial_user.starts_with("AUTHINFO USER "));
+            socket
+                .write_all(b"281 authentication accepted\r\n")
+                .await
+                .unwrap();
+
+            let authenticated_capabilities = read_command_line(&mut socket).await;
+            assert!(authenticated_capabilities.starts_with("CAPABILITIES"));
+            socket
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+
+            let body = read_command_line(&mut socket).await;
+            assert!(body.starts_with("BODY "));
+            socket
+                .write_all(b"480 authentication required\r\n")
+                .await
+                .unwrap();
+
+            let user = read_command_line(&mut socket).await;
+            assert!(user.starts_with("AUTHINFO USER "));
+            tokio::time::sleep(delay).await;
+            let _ = socket.write_all(b"381 password required\r\n").await;
+            let _ = socket.flush().await;
+        });
+
+        port
+    }
+
+    async fn spawn_unterminated_body_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"200 ready\r\n").await.unwrap();
+
+            let capabilities = read_command_line(&mut socket).await;
+            assert!(capabilities.starts_with("CAPABILITIES"));
+            socket
+                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                .await
+                .unwrap();
+
+            let group = read_command_line(&mut socket).await;
+            assert!(group.starts_with("GROUP "));
+            socket
+                .write_all(b"211 1 1 1 alt.binaries.test\r\n")
+                .await
+                .unwrap();
+
+            let body = read_command_line(&mut socket).await;
+            assert!(body.starts_with("BODY "));
+            socket
+                .write_all(b"222 1 <unterminated@example.com>\r\n")
+                .await
+                .unwrap();
+            socket.write_all(&vec![b'x'; 64 * 1024]).await.unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
         });
 
         port
@@ -4247,6 +4414,225 @@ mod tests {
             crate::health::ServerState::Healthy
         );
         assert!(control.snapshot().lifetime_body_bytes > 1_000);
+    }
+
+    #[tokio::test]
+    async fn remote_trickle_consumes_active_budget_and_fails_over() {
+        let primary_port = spawn_trickling_body_server(Duration::from_millis(20)).await;
+        let mut backup_response =
+            b"222 1 <trickle@example.com>\r\n=ybegin line=128 size=128 name=x\r\n".to_vec();
+        backup_response.extend(std::iter::repeat_n(b'k', 128));
+        backup_response.extend_from_slice(b"\r\n=yend size=128\r\n.\r\n");
+        let backup_response: &'static [u8] = Box::leak(backup_response.into_boxed_slice());
+        let backup_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: backup_response,
+            },
+        ])
+        .await;
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![
+                scripted_server(primary_port, 0),
+                scripted_server(backup_port, 1),
+            ],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_millis(75),
+        });
+
+        let trace = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.fetch_body_decoded_with_groups_traced("<trickle@example.com>", &[]),
+        )
+        .await
+        .expect("trickle failover must complete before the watchdog");
+        let decoded = trace.result.expect("backup should satisfy the BODY fetch");
+        assert_eq!(decoded.decoded.concat(), vec![b'A'; 128]);
+        assert_eq!(trace.attempts.len(), 2);
+        assert_eq!(
+            trace.attempts[0].outcome,
+            FetchAttemptOutcome::TransientFailure
+        );
+        assert!(
+            trace.attempts[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("soft timeout"))
+        );
+        assert_eq!(trace.attempts[1].outcome, FetchAttemptOutcome::Success);
+        assert!(matches!(
+            client.pool.health().lock().await.server(0).state(),
+            crate::health::ServerState::CoolingDown {
+                reason: CooldownReason::Transport,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn delayed_body_initial_consumes_active_budget_and_fails_over() {
+        let primary_port = spawn_delayed_body_initial_server(Duration::from_millis(300)).await;
+        let backup_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: b"222 1 <delayed@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
+            },
+        ])
+        .await;
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![
+                scripted_server(primary_port, 0),
+                scripted_server(backup_port, 1),
+            ],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_millis(75),
+        });
+
+        let trace = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.fetch_body_decoded_with_groups_traced("<delayed@example.com>", &[]),
+        )
+        .await
+        .expect("initial-response failover must complete before the watchdog");
+
+        assert_eq!(trace.result.unwrap().decoded.concat(), vec![b'A']);
+        assert_eq!(trace.attempts.len(), 2);
+        assert!(
+            trace.attempts[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("soft timeout"))
+        );
+        assert_eq!(trace.attempts[1].outcome, FetchAttemptOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn delayed_reauth_consumes_active_budget_and_fails_over() {
+        let primary_port = spawn_delayed_reauth_server(Duration::from_millis(300)).await;
+        let backup_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: b"222 1 <reauth@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
+            },
+        ])
+        .await;
+        let mut primary = scripted_server(primary_port, 0);
+        primary.server.username = Some("user".to_string());
+        primary.server.password = Some("pass".to_string());
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![primary, scripted_server(backup_port, 1)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_millis(75),
+        });
+
+        let trace = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.fetch_body_decoded_with_groups_traced("<reauth@example.com>", &[]),
+        )
+        .await
+        .expect("re-auth failover must complete before the watchdog");
+
+        assert_eq!(trace.result.unwrap().decoded.concat(), vec![b'A']);
+        assert_eq!(trace.attempts.len(), 2);
+        assert!(
+            trace.attempts[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("soft timeout"))
+        );
+        assert_eq!(trace.attempts[1].outcome, FetchAttemptOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn raw_timeout_cleanup_preserves_rate_debt_without_waiting() {
+        let primary_port = spawn_unterminated_body_server().await;
+        let backup_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("GROUP "),
+                response: b"211 1 1 1 alt.binaries.test\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: b"222 1 <unterminated@example.com>\r\nbackup\r\n.\r\n",
+            },
+        ])
+        .await;
+
+        let transfers = crate::transfer::ServerTransferRegistry::new();
+        let control = transfers.configure(
+            crate::transfer::StableServerId(105),
+            crate::transfer::ServerTransferConfig {
+                rate_bytes_per_sec: 1,
+                quota: None,
+            },
+        );
+        let mut primary = scripted_server(primary_port, 0);
+        primary.stable_id = crate::transfer::StableServerId(105);
+        primary.transfer_control = Some(control.clone());
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![primary, scripted_server(backup_port, 1)],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_millis(75),
+        });
+
+        let trace = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.fetch_body_with_groups_traced(
+                "<unterminated@example.com>",
+                &[String::from("alt.binaries.test")],
+            ),
+        )
+        .await
+        .expect("raw timeout cleanup must not wait on the rate limiter");
+
+        assert_eq!(trace.result.unwrap().as_ref(), b"backup\r\n");
+        assert_eq!(trace.attempts.len(), 2);
+        assert!(
+            trace.attempts[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("soft timeout"))
+        );
+        let snapshot = control.snapshot();
+        assert!(snapshot.lifetime_body_bytes >= 64 * 1024);
+        assert_eq!(snapshot.throttle_wait, Duration::ZERO);
     }
 
     #[tokio::test]

@@ -63,6 +63,37 @@ pub struct ServerTransferSnapshot {
     pub throttle_wait: Duration,
 }
 
+/// Per-BODY elapsed-time budget that excludes deliberate local rate-limit waits.
+#[derive(Debug)]
+pub(crate) struct ActiveTransferBudget {
+    started: Instant,
+    limit: Duration,
+    excluded_wait: Duration,
+}
+
+impl ActiveTransferBudget {
+    pub(crate) fn new(limit: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            limit,
+            excluded_wait: Duration::ZERO,
+        }
+    }
+
+    pub(crate) fn exclude_wait(&mut self, waited: Duration) {
+        self.excluded_wait = self.excluded_wait.saturating_add(waited);
+    }
+
+    pub(crate) fn remaining(&self) -> Duration {
+        self.limit
+            .saturating_sub(self.started.elapsed().saturating_sub(self.excluded_wait))
+    }
+
+    pub(crate) fn limit(&self) -> Duration {
+        self.limit
+    }
+}
+
 /// Admission failure for a BODY request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaRejection {
@@ -893,6 +924,13 @@ impl BodyTransferPermit {
         };
         self.throttle_wait = self.throttle_wait.saturating_add(waited);
         waited
+    }
+
+    /// Charge received bytes and preserve rate debt without delaying cleanup.
+    pub(crate) fn record_without_wait(&mut self, bytes: usize) {
+        let bytes = bytes as u64;
+        self.record_bytes(bytes);
+        let _ = self.control.reserve_rate(bytes);
     }
 
     /// Charge bytes and wait on the shared blocking aggregate limiter.
