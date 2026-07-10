@@ -84,6 +84,10 @@ impl Pipeline {
         dirs: &BTreeSet<PathBuf>,
     ) -> Result<(), crate::SchedulerError> {
         for dir in dirs {
+            // Failed jobs never pass through the finalize close, so drop any
+            // cached write handles before their dirs (and paths) are freed
+            // for reuse.
+            crate::pipeline::close_cached_write_handles_under(dir).await;
             match tokio::fs::remove_dir_all(dir).await {
                 Ok(()) => {
                     info!(dir = %dir.display(), "removed historical intermediate directory");

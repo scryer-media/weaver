@@ -18,7 +18,7 @@ const BANDWIDTH_DISPLAY_USAGE_FLUSH_BYTES: u64 = 1024 * 1024 * 1024;
 const BANDWIDTH_DISPLAY_USAGE_FLUSH_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BandwidthCapWindow {
+pub(crate) struct BandwidthCapWindow {
     period: Range<DateTime<Local>>,
 }
 
@@ -29,11 +29,11 @@ impl BandwidthCapWindow {
         }
     }
 
-    fn starts_at(&self) -> DateTime<Local> {
+    pub(crate) fn starts_at(&self) -> DateTime<Local> {
         self.period.start
     }
 
-    fn ends_at(&self) -> DateTime<Local> {
+    pub(crate) fn ends_at(&self) -> DateTime<Local> {
         self.period.end
     }
 
@@ -397,7 +397,10 @@ fn compute_monthly_window(
     BandwidthCapWindow::new(start, end)
 }
 
-fn compute_window(now: DateTime<Local>, policy: &IspBandwidthCapConfig) -> BandwidthCapWindow {
+pub(crate) fn compute_window(
+    now: DateTime<Local>,
+    policy: &IspBandwidthCapConfig,
+) -> BandwidthCapWindow {
     match policy.period {
         IspBandwidthCapPeriod::Daily => compute_daily_window(now, policy.reset_time_minutes_local),
         IspBandwidthCapPeriod::Weekly => compute_weekly_window(

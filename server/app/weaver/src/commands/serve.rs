@@ -39,7 +39,19 @@ pub(crate) async fn run(
 
     // Detect server capabilities (pipelining, etc.) and build NNTP client.
     wiring::detect_server_capabilities(&mut config, &db).await;
-    let nntp = wiring::build_nntp_client(&config, &profile);
+    let policy_db = db.clone();
+    let policy_servers = config.servers.clone();
+    let server_transfer_policy = Arc::new(
+        tokio::task::spawn_blocking(move || {
+            weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+                policy_db,
+                &policy_servers,
+            )
+        })
+        .await??,
+    );
+    let server_transfer_maintenance = server_transfer_policy.spawn_maintenance();
+    let nntp = wiring::build_nntp_client(&config, &profile, &server_transfer_policy);
     let total_connections: usize = config
         .servers
         .iter()
@@ -57,6 +69,8 @@ pub(crate) async fn run(
     // SharedPipelineState starts empty; initial_history is published below after recovery.
     let shared_state = weaver_server_core::SharedPipelineState::new(metrics, vec![]);
     let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
+    handle.set_server_transfer_policy(Arc::clone(&server_transfer_policy));
+    handle.set_nntp_pool(Arc::clone(nntp.pool()));
 
     let recovered_state =
         weaver_server_core::operations::recover_server_state(&db, &data_dir, &intermediate_dir)
@@ -150,6 +164,7 @@ pub(crate) async fn run(
         handle: handle.clone(),
         config: shared_config.clone(),
         db: db.clone(),
+        server_transfer_policy: Arc::clone(&server_transfer_policy),
         auth_cache: login_auth_cache.clone(),
         api_key_cache: api_key_cache.clone(),
         rss: rss.clone(),
@@ -160,7 +175,11 @@ pub(crate) async fn run(
         spawn_history_delete_worker: true,
     });
 
-    let metrics_exporter = http::PrometheusMetricsExporter::new(handle.clone(), nntp_pool);
+    let metrics_exporter = http::PrometheusMetricsExporter::new(
+        handle.clone(),
+        nntp_pool,
+        Arc::clone(&server_transfer_policy),
+    );
 
     let mut pipeline_task = tokio::spawn(async move {
         pipeline.run().await;
@@ -212,6 +231,12 @@ pub(crate) async fn run(
             watch_folder.stop().await;
             metrics_history_task.abort();
             maintenance_task.abort();
+            server_transfer_maintenance.abort();
+            wiring::flush_server_transfer_usage(
+                Arc::clone(&server_transfer_policy),
+                "serve shutdown",
+            )
+            .await;
             Ok(())
         }
         result = &mut pipeline_task => {
@@ -222,6 +247,12 @@ pub(crate) async fn run(
             watch_folder.stop().await;
             metrics_history_task.abort();
             maintenance_task.abort();
+            server_transfer_maintenance.abort();
+            wiring::flush_server_transfer_usage(
+                Arc::clone(&server_transfer_policy),
+                "serve pipeline exit",
+            )
+            .await;
             Err(error.into())
         }
         result = &mut server_task => {
@@ -234,6 +265,12 @@ pub(crate) async fn run(
             watch_folder.stop().await;
             metrics_history_task.abort();
             maintenance_task.abort();
+            server_transfer_maintenance.abort();
+            wiring::flush_server_transfer_usage(
+                Arc::clone(&server_transfer_policy),
+                "serve HTTP exit",
+            )
+            .await;
             match result {
                 Ok(Ok(())) => Err("HTTP server exited unexpectedly".into()),
                 Ok(Err(error)) => Err(error),

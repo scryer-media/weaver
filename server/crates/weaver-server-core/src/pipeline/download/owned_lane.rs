@@ -129,12 +129,45 @@ fn run_owned_lane_worker(rx: std_mpsc::Receiver<OwnedLanePoolCommand>) {
 
 impl CachedOwnedLane {
     fn matches(&self, nntp: &Arc<weaver_nntp::NntpClient>, lease: &DownloadBatchLease) -> bool {
-        Arc::ptr_eq(&self.nntp, nntp)
-            && self.groups == lease.compatibility.groups
-            && !lease
-                .effective_exclude_servers
-                .contains(&self.lane.server_id().0)
+        let server = self.lane.server_id();
+        if !Arc::ptr_eq(&self.nntp, nntp)
+            || self.groups != lease.compatibility.groups
+            || lease.effective_exclude_servers.contains(&server.0)
+        {
+            return false;
+        }
+
+        let estimate = Pipeline::bandwidth_reservation_estimate(
+            lease
+                .works
+                .first()
+                .expect("owned download lease must contain work")
+                .byte_estimate,
+        );
+        let cached_rejection = nntp.server_quota_rejection(server, estimate);
+        if cached_rejection.is_none() {
+            return true;
+        }
+        let selection = nntp.blocking_body_server_selection_with_estimate(
+            &lease.effective_exclude_servers,
+            estimate,
+        );
+        cached_lane_matches_selection(server, true, &selection)
     }
+}
+
+fn cached_lane_matches_selection(
+    server: weaver_nntp::pool::ServerId,
+    cached_quota_blocked: bool,
+    selection: &weaver_nntp::client::BodyServerSelection,
+) -> bool {
+    if selection.eligible.contains(&server) {
+        return true;
+    }
+    if selection.eligible.is_empty() {
+        return cached_quota_blocked || selection.quota_blocked.is_none();
+    }
+    false
 }
 
 fn park_cached_lane(cached_lane: &mut Option<CachedOwnedLane>) {
@@ -163,9 +196,17 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
     }
 
     if cached_lane.is_none() {
-        match nntp.try_acquire_blocking_body_lane(
+        let initial_estimate = Pipeline::bandwidth_reservation_estimate(
+            lease
+                .works
+                .first()
+                .expect("owned download lease must contain work")
+                .byte_estimate,
+        );
+        match nntp.try_acquire_blocking_body_lane_with_estimate(
             &lease.compatibility.groups,
             &lease.effective_exclude_servers,
+            initial_estimate,
         ) {
             Ok(lane) => {
                 *cached_lane = Some(CachedOwnedLane {
@@ -239,6 +280,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         }
 
         let mut batch_clean_for_refill = true;
+        let mut policy_blocked_for_refill = false;
         let mut pending_works: VecDeque<DownloadWork> = works.into_iter().collect();
         let mut results = Vec::with_capacity(pending_works.len());
         let mut unrequested_works = Vec::new();
@@ -267,7 +309,14 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             match actual_mode {
                 DownloadLaneMode::Sequential => {
                     for (idx, message_id) in message_ids.iter().enumerate() {
-                        let trace = lane.fetch_decoded_sequential(message_id);
+                        let estimate = Pipeline::bandwidth_reservation_estimate(
+                            works_by_index[idx]
+                                .as_ref()
+                                .expect("owned download work exists until its BODY result")
+                                .byte_estimate,
+                        );
+                        let trace =
+                            lane.fetch_decoded_sequential_with_estimate(message_id, estimate);
                         nntp.record_blocking_attempts(&trace.attempts);
                         completed += 1;
                         let work = works_by_index[idx]
@@ -290,14 +339,36 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                             is_recovery,
                             &exclude_servers,
                         );
-                        batch_clean_for_refill &= result.data.is_ok();
+                        let policy_outcome = matches!(
+                            &result.data,
+                            Err(DownloadError::Fetch(failure))
+                                if matches!(
+                                    failure.kind,
+                                    DownloadFailureKind::ServerQuota
+                                        | DownloadFailureKind::Unrequested
+                                )
+                        );
+                        batch_clean_for_refill &= result.data.is_ok() || policy_outcome;
+                        policy_blocked_for_refill |= policy_outcome;
                         results.push(result);
                     }
                 }
                 DownloadLaneMode::PipelineDepth2 | DownloadLaneMode::PipelineDepth4 => {
-                    for (idx, trace, meta) in
-                        lane.fetch_decoded_pipeline(&message_ids, actual_mode.max_depth())
-                    {
+                    let estimated_body_bytes = works_by_index
+                        .iter()
+                        .map(|work| {
+                            Pipeline::bandwidth_reservation_estimate(
+                                work.as_ref()
+                                    .expect("owned download work exists before BODY issue")
+                                    .byte_estimate,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    for (idx, trace, meta) in lane.fetch_decoded_pipeline_with_estimates(
+                        &message_ids,
+                        &estimated_body_bytes,
+                        actual_mode.max_depth(),
+                    ) {
                         nntp.record_blocking_attempts(&trace.attempts);
                         completed += 1;
                         let work = works_by_index[idx]
@@ -321,7 +392,18 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                             is_recovery,
                             &exclude_servers,
                         );
-                        batch_clean_for_refill &= result.data.is_ok() && meta.batch_clean;
+                        let policy_outcome = matches!(
+                            &result.data,
+                            Err(DownloadError::Fetch(failure))
+                                if matches!(
+                                    failure.kind,
+                                    DownloadFailureKind::ServerQuota
+                                        | DownloadFailureKind::Unrequested
+                                )
+                        );
+                        batch_clean_for_refill &=
+                            (result.data.is_ok() || policy_outcome) && meta.batch_clean;
+                        policy_blocked_for_refill |= policy_outcome;
                         results.push(result);
                     }
                 }
@@ -346,7 +428,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 ));
             }
 
-            if !batch_clean_for_refill {
+            if !batch_clean_for_refill || policy_blocked_for_refill {
                 break;
             }
 
@@ -364,6 +446,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             &mut pending_works,
             batch_clean_for_refill,
             yielded_for_hot_share,
+            policy_blocked_for_refill,
         ));
 
         let stats = stats_delta(lane.stats(), stats_before);
@@ -386,6 +469,16 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 actual_mode,
                 spillover_loan_kind,
                 false,
+            );
+        }
+        if policy_blocked_for_refill {
+            drain_pending_refill(pending_refill.take(), &event_tx);
+            break (
+                LaneParkReason::ServerQuota,
+                job_id,
+                actual_mode,
+                spillover_loan_kind,
+                keep_cached_lane_after_park(LaneParkReason::ServerQuota),
             );
         }
         if yielded_for_hot_share {
@@ -512,8 +605,9 @@ fn take_unrequested_tail(
     pending_works: &mut VecDeque<DownloadWork>,
     batch_clean_for_refill: bool,
     yielded_for_hot_share: bool,
+    policy_blocked_for_refill: bool,
 ) -> Vec<DownloadWork> {
-    if batch_clean_for_refill && !yielded_for_hot_share {
+    if batch_clean_for_refill && !yielded_for_hot_share && !policy_blocked_for_refill {
         return Vec::new();
     }
     pending_works.drain(..).collect()
@@ -528,6 +622,7 @@ fn keep_cached_lane_after_park(reason: LaneParkReason) -> bool {
             | LaneParkReason::HotReclaim
             | LaneParkReason::SpilloverWithdraw
             | LaneParkReason::SpilloverSpeedHarm
+            | LaneParkReason::ServerQuota
     )
 }
 
@@ -580,8 +675,18 @@ fn result_from_trace(
     let retry_count = work.retry_count;
     let (data, attempts, source_server_idx) =
         Pipeline::download_data_from_decoded_trace(segment_id, trace);
-    observation.batch_clean &= data.is_ok();
-    observation.connection_discarded |= data.is_err();
+    let policy_outcome = matches!(
+        &data,
+        Err(DownloadError::Fetch(failure))
+            if matches!(
+                failure.kind,
+                DownloadFailureKind::ServerQuota | DownloadFailureKind::Unrequested
+            )
+    );
+    if !policy_outcome {
+        observation.batch_clean &= data.is_ok();
+        observation.connection_discarded |= data.is_err();
+    }
     DownloadResult {
         segment_id,
         data,
@@ -610,10 +715,10 @@ fn unresolved_result(
 ) -> DownloadResult {
     DownloadResult {
         segment_id: work.segment_id,
-        data: Err(DownloadError::Fetch(DownloadFailure {
-            kind: DownloadFailureKind::Transient,
-            message: message.to_string(),
-        })),
+        data: Err(DownloadError::Fetch(DownloadFailure::new(
+            DownloadFailureKind::Transient,
+            message,
+        ))),
         attempts: Vec::new(),
         lane_observation: Some(DownloadLaneObservation {
             server_idx: Some(server_idx),
@@ -663,7 +768,7 @@ mod tests {
     fn owned_hot_lane_yield_returns_unrequested_tail_without_retry() {
         let mut pending_works = VecDeque::from([tail_work(2, 4), tail_work(3, 7)]);
 
-        let tail = take_unrequested_tail(&mut pending_works, true, true);
+        let tail = take_unrequested_tail(&mut pending_works, true, true, false);
 
         assert!(pending_works.is_empty());
         assert_eq!(tail.len(), 2);
@@ -671,5 +776,119 @@ mod tests {
         assert_eq!(tail[0].retry_count, 4);
         assert_eq!(tail[1].segment_id.segment_number, 3);
         assert_eq!(tail[1].retry_count, 7);
+    }
+
+    #[test]
+    fn owned_quota_park_returns_unrequested_tail_without_dirtying_batch() {
+        let mut pending_works = VecDeque::from([tail_work(4, 2), tail_work(5, 2)]);
+
+        let tail = take_unrequested_tail(&mut pending_works, true, false, true);
+
+        assert!(pending_works.is_empty());
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].segment_id.segment_number, 4);
+        assert_eq!(tail[1].segment_id.segment_number, 5);
+    }
+
+    #[test]
+    fn owned_quota_result_keeps_connection_observation_clean() {
+        let transfers = weaver_nntp::transfer::ServerTransferRegistry::new();
+        let control = transfers.configure(
+            weaver_nntp::transfer::StableServerId(77),
+            weaver_nntp::transfer::ServerTransferConfig {
+                rate_bytes_per_sec: 0,
+                quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
+                    limit_bytes: 1,
+                    generation: 1,
+                    retry_at: Some(Instant::now() + Duration::from_secs(30)),
+                }),
+            },
+        );
+        let _reservation = control.try_reserve(1).unwrap();
+        let rejection = control.try_reserve(1).err().unwrap();
+        let result = result_from_trace(
+            tail_work(6, 0),
+            weaver_nntp::client::DecodedBodyTrace {
+                attempts: Vec::new(),
+                result: Err(weaver_nntp::client::DecodedBodyError::Nntp(
+                    weaver_nntp::NntpError::quota_blocked(rejection),
+                )),
+            },
+            DownloadLaneObservation {
+                server_idx: Some(0),
+                mode: DownloadLaneMode::Sequential,
+                supports_pipelining: true,
+                rtt: None,
+                batch_complete: true,
+                batch_clean: true,
+                batch_response_count: 0,
+                unresolved_count: 0,
+                connection_discarded: false,
+            },
+            false,
+            &[],
+        );
+
+        assert!(matches!(
+            result.data,
+            Err(DownloadError::Fetch(DownloadFailure {
+                kind: DownloadFailureKind::ServerQuota,
+                ..
+            }))
+        ));
+        let observation = result.lane_observation.unwrap();
+        assert!(observation.batch_clean);
+        assert!(!observation.connection_discarded);
+        assert_eq!(observation.unresolved_count, 0);
+    }
+
+    #[test]
+    fn owned_quota_cache_survives_wait_and_reset_but_reselects_another_fill() {
+        let transfers = weaver_nntp::transfer::ServerTransferRegistry::new();
+        let control = transfers.configure(
+            weaver_nntp::transfer::StableServerId(78),
+            weaver_nntp::transfer::ServerTransferConfig {
+                rate_bytes_per_sec: 0,
+                quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
+                    limit_bytes: 1,
+                    generation: 1,
+                    retry_at: Some(Instant::now() + Duration::from_secs(30)),
+                }),
+            },
+        );
+        let _reservation = control.try_reserve(1).unwrap();
+        let rejection = control.try_reserve(1).err().unwrap();
+        let cached_server = weaver_nntp::pool::ServerId(0);
+
+        let all_blocked = weaver_nntp::client::BodyServerSelection {
+            eligible: Vec::new(),
+            quota_blocked: Some(rejection.clone()),
+        };
+        assert!(keep_cached_lane_after_park(LaneParkReason::ServerQuota));
+        assert!(cached_lane_matches_selection(
+            cached_server,
+            true,
+            &all_blocked
+        ));
+
+        let after_reset = weaver_nntp::client::BodyServerSelection {
+            eligible: vec![cached_server],
+            quota_blocked: None,
+        };
+        assert!(cached_lane_matches_selection(
+            cached_server,
+            false,
+            &after_reset
+        ));
+
+        let alternate_fill = weaver_nntp::client::BodyServerSelection {
+            eligible: vec![weaver_nntp::pool::ServerId(1)],
+            quota_blocked: Some(rejection),
+        };
+        assert!(!cached_lane_matches_selection(
+            cached_server,
+            true,
+            &alternate_fill
+        ));
     }
 }

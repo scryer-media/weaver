@@ -12,6 +12,7 @@ mod progress;
 mod repair;
 
 pub(crate) use orchestrator::check_disk_space;
+pub(crate) use orchestrator::{close_cached_write_handles_under, release_cached_write_handle};
 #[cfg(test)]
 use orchestrator::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};
 use orchestrator::{is_terminal_status, write_segment_to_disk, write_segments_to_disk};
@@ -781,6 +782,7 @@ pub(super) enum DownloadPayload {
 pub(super) enum DownloadFailureKind {
     ArticleNotFound,
     CapacityUnavailable,
+    ServerQuota,
     LaneUnavailable,
     Unrequested,
     Transient,
@@ -792,6 +794,8 @@ pub(super) enum DownloadFailureKind {
 pub(super) struct DownloadFailure {
     pub(super) kind: DownloadFailureKind,
     pub(super) message: String,
+    pub(super) retry_after: Option<Duration>,
+    pub(super) quota_rejection: Option<weaver_nntp::transfer::QuotaRejection>,
 }
 
 impl DownloadFailure {
@@ -799,6 +803,23 @@ impl DownloadFailure {
         Self {
             kind,
             message: message.into(),
+            retry_after: None,
+            quota_rejection: None,
+        }
+    }
+
+    pub(super) fn server_quota(
+        message: impl Into<String>,
+        rejection: weaver_nntp::transfer::QuotaRejection,
+    ) -> Self {
+        let retry_after = rejection
+            .retry_at
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        Self {
+            kind: DownloadFailureKind::ServerQuota,
+            message: message.into(),
+            retry_after,
+            quota_rejection: Some(rejection),
         }
     }
 
@@ -811,6 +832,9 @@ impl DownloadFailure {
                 "failed to acquire BODY lane",
             );
         };
+        if let NntpError::QuotaBlocked(rejection) = error {
+            return Self::server_quota(error.to_string(), rejection.as_ref().clone());
+        }
 
         let kind = match error {
             NntpError::AuthenticationFailed
@@ -831,6 +855,13 @@ impl DownloadFailure {
 
     pub(super) fn from_nntp(error: weaver_nntp::NntpError) -> Self {
         use weaver_nntp::NntpError;
+
+        if let NntpError::QuotaBlocked(rejection) = &error {
+            return Self::server_quota(error.to_string(), rejection.as_ref().clone());
+        }
+        if matches!(&error, NntpError::BodyNotRequestedDueToQuota { .. }) {
+            return Self::new(DownloadFailureKind::Unrequested, error.to_string());
+        }
 
         let kind = match &error {
             NntpError::ArticleNotFound
@@ -1538,6 +1569,8 @@ pub struct Pipeline {
     pub(super) pending_retries_by_job: HashMap<JobId, usize>,
     /// Delayed retry tasks by exact segment.
     pub(super) pending_retries_by_segment: HashMap<SegmentId, usize>,
+    /// Work parked specifically on per-server quota capacity or policy changes.
+    pub(super) server_quota_parked: HashSet<SegmentId>,
     /// Directory for active downloads (per-job subdirectories).
     pub(super) intermediate_dir: PathBuf,
     /// Directory for completed downloads (category subdirectories).

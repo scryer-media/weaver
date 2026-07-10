@@ -151,8 +151,14 @@ impl SystemQuery {
     /// Live per-server NNTP health (connections, latency, state) for the monitoring dashboard.
     #[graphql(guard = "ReadGuard")]
     async fn server_health(&self, ctx: &Context<'_>) -> Result<Vec<ServerHealth>> {
-        match ctx.data::<Option<Arc<NntpPool>>>()? {
-            Some(pool) => Ok(collect_server_health(pool).await),
+        let live_pool = ctx
+            .data::<weaver_server_core::SchedulerHandle>()?
+            .nntp_pool();
+        let fallback_pool = ctx
+            .data_opt::<Option<Arc<NntpPool>>>()
+            .and_then(Clone::clone);
+        match live_pool.or(fallback_pool) {
+            Some(pool) => Ok(collect_server_health(&pool).await),
             None => Ok(Vec::new()),
         }
     }

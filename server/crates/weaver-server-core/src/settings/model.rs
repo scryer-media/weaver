@@ -97,6 +97,9 @@ impl Config {
                     server.host
                 ));
             }
+            if let Err(error) = server.validate_download_limits() {
+                errors.push(format!("server[{i}] ({}) {error}", server.host));
+            }
         }
 
         if self.data_dir.is_empty() {
@@ -182,4 +185,66 @@ pub struct TunerOverrides {
     /// Number of threads in the post-processing pool (extraction, PAR2 verify/repair).
     /// Defaults to `(physical_cores / 2).max(1)`.
     pub extract_thread_count: Option<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::servers::{MAX_PERSISTED_SERVER_DOWNLOAD_BYTES, ServerDownloadQuotaConfig};
+
+    fn config_with_server() -> Config {
+        Config {
+            data_dir: "/tmp/weaver".to_string(),
+            intermediate_dir: None,
+            complete_dir: None,
+            buffer_pool: None,
+            tuner: None,
+            servers: vec![ServerConfig {
+                id: 1,
+                host: "news.example.com".to_string(),
+                port: 563,
+                tls: true,
+                username: None,
+                password: None,
+                connections: 4,
+                active: false,
+                supports_pipelining: false,
+                priority: 0,
+                backfill: false,
+                retention_days: 0,
+                max_download_speed: 0,
+                download_quota: ServerDownloadQuotaConfig::default(),
+                tls_ca_cert: None,
+            }],
+            categories: vec![],
+            retry: None,
+            max_download_speed: None,
+            cleanup_after_extract: None,
+            isp_bandwidth_cap: None,
+            ip_replacement_trial_extra_connections: None,
+            watch_folder: WatchFolderConfig::default(),
+            config_path: None,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_server_download_limits_outside_database_range() {
+        let mut config = config_with_server();
+        config.servers[0].max_download_speed = MAX_PERSISTED_SERVER_DOWNLOAD_BYTES + 1;
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("max download speed exceeds database range"))
+        );
+
+        config.servers[0].max_download_speed = 0;
+        config.servers[0].download_quota.limit_bytes = MAX_PERSISTED_SERVER_DOWNLOAD_BYTES + 1;
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("download quota limit exceeds database range"))
+        );
+    }
 }

@@ -1609,6 +1609,11 @@ impl Pipeline {
                         }
                     }
 
+                    // Queued behind the file's final write on its owner
+                    // thread, so the fd is released before verification,
+                    // repair, or the final move touch this path.
+                    crate::pipeline::release_cached_write_handle(file_path);
+
                     let expected_file_crc = self.expected_file_crcs.get(&file_id).copied();
                     let file_checksum = match self
                         .finalize_completed_file_hash(

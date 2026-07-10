@@ -1,5 +1,19 @@
 use super::*;
 
+pub(in crate::pipeline) fn lane_acquire_failure_for_work(
+    failure: &DownloadFailure,
+    work_index: usize,
+) -> DownloadFailure {
+    if failure.kind == DownloadFailureKind::ServerQuota && work_index != 0 {
+        DownloadFailure::new(
+            DownloadFailureKind::Unrequested,
+            "BODY not requested because the lease's first work exceeded server quota",
+        )
+    } else {
+        failure.clone()
+    }
+}
+
 impl Pipeline {
     pub(in crate::pipeline::download::worker) fn spawn_decode_task(
         &self,
@@ -288,11 +302,27 @@ impl Pipeline {
             let park_reason: LaneParkReason;
 
             let mut lane = None;
-            let mut acquire_error = None;
-            for server in nntp
-                .body_server_order(&lease.effective_exclude_servers)
-                .await
-            {
+            let initial_estimate = Self::bandwidth_reservation_estimate(
+                lease
+                    .works
+                    .first()
+                    .expect("download lease must contain work")
+                    .byte_estimate,
+            );
+            let selection = nntp
+                .body_server_selection_with_estimate(
+                    &lease.effective_exclude_servers,
+                    initial_estimate,
+                )
+                .await;
+            let mut acquire_error = if selection.eligible.is_empty() {
+                selection
+                    .quota_blocked
+                    .map(weaver_nntp::NntpError::quota_blocked)
+            } else {
+                None
+            };
+            for server in selection.eligible {
                 match nntp
                     .acquire_body_lane(server, &lease.compatibility.groups)
                     .await
@@ -307,16 +337,22 @@ impl Pipeline {
 
             let Some(mut lane) = lane else {
                 let failure = DownloadFailure::from_lane_acquire_failure(acquire_error.as_ref());
+                let policy_blocked = failure.kind == DownloadFailureKind::ServerQuota;
                 let is_recovery = lease.compatibility.is_recovery;
                 let exclude_servers = lease.compatibility.exclude_servers.clone();
                 let mode = lease.lane_mode;
                 let spillover_loan_kind = lease.spillover_loan_kind;
                 let job_id = lease.job_id;
-                for work in lease.works {
+                for (work_index, work) in lease.works.into_iter().enumerate() {
+                    let work_failure = lane_acquire_failure_for_work(&failure, work_index);
+                    let policy_outcome = matches!(
+                        work_failure.kind,
+                        DownloadFailureKind::ServerQuota | DownloadFailureKind::Unrequested
+                    );
                     let _ = tx
                         .send(DownloadResult {
                             segment_id: work.segment_id,
-                            data: Err(DownloadError::Fetch(failure.clone())),
+                            data: Err(DownloadError::Fetch(work_failure)),
                             attempts: Vec::new(),
                             lane_observation: Some(DownloadLaneObservation {
                                 server_idx: None,
@@ -324,9 +360,9 @@ impl Pipeline {
                                 supports_pipelining: false,
                                 rtt: None,
                                 batch_complete: true,
-                                batch_clean: false,
+                                batch_clean: policy_outcome,
                                 batch_response_count: 0,
-                                unresolved_count: 1,
+                                unresolved_count: u64::from(!policy_outcome),
                                 connection_discarded: false,
                             }),
                             source_server_idx: None,
@@ -342,7 +378,11 @@ impl Pipeline {
                         job_id,
                         mode,
                         spillover_loan_kind,
-                        reason: LaneParkReason::Error,
+                        reason: if policy_blocked {
+                            LaneParkReason::ServerQuota
+                        } else {
+                            LaneParkReason::Error
+                        },
                         release_connection_slot: true,
                         release_ip_replacement_burst: false,
                     })
@@ -374,6 +414,7 @@ impl Pipeline {
                 let is_recovery = compatibility.is_recovery;
                 let exclude_servers = compatibility.exclude_servers.clone();
                 let mut batch_clean_for_refill = true;
+                let mut policy_blocked_for_refill = false;
                 let mut pending_works: std::collections::VecDeque<DownloadWork> =
                     works.into_iter().collect();
 
@@ -400,7 +441,15 @@ impl Pipeline {
                     match actual_mode {
                         DownloadLaneMode::Sequential => {
                             for (idx, message_id) in message_ids.iter().enumerate() {
-                                let trace = lane.fetch_decoded_sequential(message_id).await;
+                                let estimate = Self::bandwidth_reservation_estimate(
+                                    works_by_index[idx]
+                                        .as_ref()
+                                        .expect("download work exists until its BODY result")
+                                        .byte_estimate,
+                                );
+                                let trace = lane
+                                    .fetch_decoded_sequential_with_estimate(message_id, estimate)
+                                    .await;
                                 completed += 1;
                                 let work = works_by_index[idx]
                                     .take()
@@ -409,8 +458,18 @@ impl Pipeline {
                                 let retry_count = work.retry_count;
                                 let (data, attempts, source_server_idx) =
                                     Self::download_data_from_decoded_trace(segment_id, trace);
-                                let batch_clean = data.is_ok();
+                                let policy_outcome = matches!(
+                                    &data,
+                                    Err(DownloadError::Fetch(failure))
+                                        if matches!(
+                                            failure.kind,
+                                            DownloadFailureKind::ServerQuota
+                                                | DownloadFailureKind::Unrequested
+                                        )
+                                );
+                                let batch_clean = data.is_ok() || policy_outcome;
                                 batch_clean_for_refill &= batch_clean;
+                                policy_blocked_for_refill |= policy_outcome;
                                 let observation = DownloadLaneObservation {
                                     server_idx: Some(server_idx),
                                     mode: DownloadLaneMode::Sequential,
@@ -441,9 +500,20 @@ impl Pipeline {
                             let rtt = lane.rtt_ewma();
                             let tx_for_trace = tx.clone();
                             let exclude_servers_for_trace = exclude_servers.clone();
+                            let estimated_body_bytes = works_by_index
+                                .iter()
+                                .map(|work| {
+                                    Self::bandwidth_reservation_estimate(
+                                        work.as_ref()
+                                            .expect("download work exists before BODY issue")
+                                            .byte_estimate,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
                             let stats = if actual_mode == DownloadLaneMode::PipelineDepth4 {
-                                lane.fetch_decoded_pipeline_depth4(
+                                lane.fetch_decoded_pipeline_depth4_with_estimates(
                                     &message_ids,
+                                    &estimated_body_bytes,
                                     |idx, trace, meta| {
                                         completed += 1;
                                         let work = works_by_index[idx].take().expect(
@@ -455,6 +525,15 @@ impl Pipeline {
                                             Self::download_data_from_decoded_trace(
                                                 segment_id, trace,
                                             );
+                                        policy_blocked_for_refill |= matches!(
+                                            &data,
+                                            Err(DownloadError::Fetch(failure))
+                                                if matches!(
+                                                    failure.kind,
+                                                    DownloadFailureKind::ServerQuota
+                                                        | DownloadFailureKind::Unrequested
+                                                )
+                                        );
                                         let observation = DownloadLaneObservation {
                                             server_idx: Some(server_idx),
                                             mode: actual_mode,
@@ -489,8 +568,9 @@ impl Pipeline {
                                 )
                                 .await
                             } else {
-                                lane.fetch_decoded_pipeline_depth2(
+                                lane.fetch_decoded_pipeline_depth2_with_estimates(
                                     &message_ids,
+                                    &estimated_body_bytes,
                                     |idx, trace, meta| {
                                         completed += 1;
                                         let work = works_by_index[idx].take().expect(
@@ -502,6 +582,15 @@ impl Pipeline {
                                             Self::download_data_from_decoded_trace(
                                                 segment_id, trace,
                                             );
+                                        policy_blocked_for_refill |= matches!(
+                                            &data,
+                                            Err(DownloadError::Fetch(failure))
+                                                if matches!(
+                                                    failure.kind,
+                                                    DownloadFailureKind::ServerQuota
+                                                        | DownloadFailureKind::Unrequested
+                                                )
+                                        );
                                         let observation = DownloadLaneObservation {
                                             server_idx: Some(server_idx),
                                             mode: actual_mode,
@@ -552,10 +641,10 @@ impl Pipeline {
                         let _ = tx
                             .send(DownloadResult {
                                 segment_id: work.segment_id,
-                                data: Err(DownloadError::Fetch(DownloadFailure {
-                                    kind: DownloadFailureKind::Transient,
-                                    message: "batch ended without result".to_string(),
-                                })),
+                                data: Err(DownloadError::Fetch(DownloadFailure::new(
+                                    DownloadFailureKind::Transient,
+                                    "batch ended without result",
+                                ))),
                                 attempts: Vec::new(),
                                 lane_observation: Some(DownloadLaneObservation {
                                     server_idx: Some(server_idx),
@@ -577,22 +666,22 @@ impl Pipeline {
                             .await;
                     }
 
-                    if !batch_clean_for_refill {
+                    if !batch_clean_for_refill || policy_blocked_for_refill {
                         break;
                     }
                 }
 
-                if !batch_clean_for_refill {
+                if !batch_clean_for_refill || policy_blocked_for_refill {
+                    let policy_only = batch_clean_for_refill && policy_blocked_for_refill;
                     let tail_count = pending_works.len() as u64;
                     for work in pending_works {
                         let _ = tx
                             .send(DownloadResult {
                                 segment_id: work.segment_id,
-                                data: Err(DownloadError::Fetch(DownloadFailure {
-                                    kind: DownloadFailureKind::Unrequested,
-                                    message: "lane parked before leased article was requested"
-                                        .to_string(),
-                                })),
+                                data: Err(DownloadError::Fetch(DownloadFailure::new(
+                                    DownloadFailureKind::Unrequested,
+                                    "lane parked before leased article was requested",
+                                ))),
                                 attempts: Vec::new(),
                                 lane_observation: Some(DownloadLaneObservation {
                                     server_idx: Some(server_idx),
@@ -600,10 +689,10 @@ impl Pipeline {
                                     supports_pipelining,
                                     rtt: lane.rtt_ewma(),
                                     batch_complete: true,
-                                    batch_clean: false,
+                                    batch_clean: policy_only,
                                     batch_response_count: 0,
-                                    unresolved_count: tail_count,
-                                    connection_discarded: true,
+                                    unresolved_count: if policy_only { 0 } else { tail_count },
+                                    connection_discarded: !policy_only,
                                 }),
                                 source_server_idx: None,
                                 origin: DownloadResultOrigin::from_recovery(is_recovery),
@@ -613,7 +702,11 @@ impl Pipeline {
                             })
                             .await;
                     }
-                    park_reason = LaneParkReason::Error;
+                    park_reason = if policy_only {
+                        LaneParkReason::ServerQuota
+                    } else {
+                        LaneParkReason::Error
+                    };
                     break;
                 }
 

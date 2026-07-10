@@ -40,7 +40,19 @@ pub(crate) async fn run(
 
     // Detect server capabilities (pipelining, etc.) and build NNTP client.
     wiring::detect_server_capabilities(config, db).await;
-    let nntp = wiring::build_nntp_client(config, &profile);
+    let policy_db = db.clone();
+    let policy_servers = config.servers.clone();
+    let server_transfer_policy = std::sync::Arc::new(
+        tokio::task::spawn_blocking(move || {
+            weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+                policy_db,
+                &policy_servers,
+            )
+        })
+        .await??,
+    );
+    let server_transfer_maintenance = server_transfer_policy.spawn_maintenance();
+    let nntp = wiring::build_nntp_client(config, &profile, &server_transfer_policy);
     let initial_global_paused = weaver_server_core::runtime::load_global_pause_from_db(db).await?;
 
     // Set up scheduler channels and shared control-plane state.
@@ -49,6 +61,8 @@ pub(crate) async fn run(
     let metrics = weaver_server_core::PipelineMetrics::new();
     let shared_state = weaver_server_core::SharedPipelineState::new(metrics, vec![]);
     let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
+    handle.set_server_transfer_policy(std::sync::Arc::clone(&server_transfer_policy));
+    handle.set_nntp_pool(std::sync::Arc::clone(nntp.pool()));
 
     // Subscribe to events for progress logging.
     let mut event_rx = event_tx.subscribe();
@@ -133,12 +147,24 @@ pub(crate) async fn run(
                 error!(error = %join_error, "pipeline task failed during shutdown");
             }
             flush_writer_queue_on_exit(db).await;
+            server_transfer_maintenance.abort();
+            wiring::flush_server_transfer_usage(
+                std::sync::Arc::clone(&server_transfer_policy),
+                "download command shutdown",
+            )
+            .await;
             log_task.abort();
             Ok(())
         }
         result = &mut pipeline_task => {
             let error = shutdown::pipeline_exit_error(result);
             flush_writer_queue_on_exit(db).await;
+            server_transfer_maintenance.abort();
+            wiring::flush_server_transfer_usage(
+                std::sync::Arc::clone(&server_transfer_policy),
+                "download command pipeline exit",
+            )
+            .await;
             log_task.abort();
             Err(error.into())
         }

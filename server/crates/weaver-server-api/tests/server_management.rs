@@ -7,6 +7,8 @@ use common::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Duration;
+use weaver_nntp::transfer::StableServerId;
+use weaver_server_api::auth::CallerScope;
 
 struct ScriptStep {
     expect_prefix: Option<&'static str>,
@@ -146,6 +148,156 @@ async fn add_server_basic() {
     assert_eq!(server["port"].as_u64().unwrap(), port as u64);
     assert!(!server["tls"].as_bool().unwrap());
     assert_eq!(server["connections"].as_u64().unwrap(), 5);
+}
+
+#[tokio::test]
+async fn server_download_limits_roundtrip_preserve_and_reset() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                addServer(input: {
+                    host: "news.example.com",
+                    port: 119,
+                    tls: false,
+                    connections: 5,
+                    active: false,
+                    maxDownloadSpeed: 2500000,
+                    downloadQuota: {
+                        enabled: true,
+                        limitBytes: 9000000,
+                        period: WEEKLY,
+                        resetTimeMinutesLocal: 375,
+                        weeklyResetWeekday: THU,
+                        monthlyResetDay: 31
+                    }
+                }) {
+                    id
+                    maxDownloadSpeed
+                    downloadQuota {
+                        enabled
+                        limitBytes
+                        period
+                        resetTimeMinutesLocal
+                        weeklyResetWeekday
+                        monthlyResetDay
+                        lifetimeBytes
+                        usedBytes
+                        reservedBytes
+                        remainingBytes
+                        blocked
+                        windowStartsAtEpochMs
+                        windowEndsAtEpochMs
+                        timezoneName
+                    }
+                }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let added = &response_data(&resp)["addServer"];
+    let id = added["id"].as_u64().unwrap();
+    assert_eq!(added["maxDownloadSpeed"].as_u64(), Some(2_500_000));
+    let quota = &added["downloadQuota"];
+    assert!(quota["enabled"].as_bool().unwrap());
+    assert_eq!(quota["limitBytes"].as_u64(), Some(9_000_000));
+    assert_eq!(quota["period"].as_str(), Some("WEEKLY"));
+    assert_eq!(quota["resetTimeMinutesLocal"].as_u64(), Some(375));
+    assert_eq!(quota["weeklyResetWeekday"].as_str(), Some("THU"));
+    assert_eq!(quota["monthlyResetDay"].as_u64(), Some(31));
+    assert_eq!(quota["remainingBytes"].as_u64(), Some(9_000_000));
+    assert_eq!(quota["usedBytes"].as_u64(), Some(0));
+    assert!(
+        quota["timezoneName"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{
+                updateServer(id: {id}, input: {{
+                    host: "news.example.com",
+                    port: 119,
+                    tls: false,
+                    connections: 8,
+                    active: false
+                }}) {{
+                    maxDownloadSpeed
+                    downloadQuota {{ enabled limitBytes period remainingBytes }}
+                }}
+            }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let updated = &response_data(&resp)["updateServer"];
+    assert_eq!(updated["maxDownloadSpeed"].as_u64(), Some(2_500_000));
+    assert_eq!(
+        updated["downloadQuota"]["limitBytes"].as_u64(),
+        Some(9_000_000)
+    );
+    assert_eq!(updated["downloadQuota"]["period"].as_str(), Some("WEEKLY"));
+
+    let server_id = u32::try_from(id).unwrap();
+    let control = h
+        .server_transfer_policy
+        .transfer_registry()
+        .control(StableServerId(server_id));
+    let mut permit = control.try_reserve(1_000_000).unwrap();
+    permit.record_blocking(1_000_000);
+    permit.finish();
+    let before_reset = h.server_transfer_policy.snapshot(server_id).unwrap();
+    assert_eq!(before_reset.lifetime_bytes, 1_000_000);
+    assert_eq!(before_reset.used_bytes, 1_000_000);
+
+    let reset_mutation = format!(
+        r#"mutation {{
+                resetServerDownloadQuotaUsage(id: {id}) {{
+                    id
+                    downloadQuota {{ lifetimeBytes usedBytes reservedBytes remainingBytes blocked }}
+                }}
+            }}"#
+    );
+    let forbidden = h.execute_as(&reset_mutation, CallerScope::Control).await;
+    assert_has_errors(&forbidden);
+    assert!(format!("{:?}", forbidden.errors).contains("FORBIDDEN"));
+    assert_eq!(
+        h.server_transfer_policy
+            .snapshot(server_id)
+            .unwrap()
+            .used_bytes,
+        1_000_000
+    );
+
+    let resp = h.execute(&reset_mutation).await;
+    assert_no_errors(&resp);
+    let reset = &response_data(&resp)["resetServerDownloadQuotaUsage"]["downloadQuota"];
+    assert_eq!(reset["lifetimeBytes"].as_u64(), Some(1_000_000));
+    assert_eq!(reset["usedBytes"].as_u64(), Some(0));
+    assert_eq!(reset["reservedBytes"].as_u64(), Some(0));
+    assert_eq!(reset["remainingBytes"].as_u64(), Some(9_000_000));
+    assert!(!reset["blocked"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn enabled_server_download_quota_requires_positive_limit() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                addServer(input: {
+                    host: "news.example.com",
+                    port: 119,
+                    tls: false,
+                    connections: 5,
+                    active: false,
+                    downloadQuota: { enabled: true, limitBytes: 0 }
+                }) { id }
+            }"#,
+        )
+        .await;
+    assert_has_errors(&resp);
+    assert!(resp.errors[0].message.contains("greater than zero"));
 }
 
 #[tokio::test]

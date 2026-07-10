@@ -49,13 +49,14 @@ pub mod health;
 pub mod pool;
 pub mod response;
 pub mod tls;
+pub mod transfer;
 pub mod types;
 
 // Re-export primary types for convenience.
 pub use blocking::{BlockingBodyLane, BlockingLaneStats, BlockingNntpConnection};
 pub use client::{
-    BodyLaneBatchStats, BodyLaneLease, BodyLaneMode, DecodedBody, DecodedBodyError,
-    DecodedBodyTrace, NntpClient,
+    BodyLaneBatchStats, BodyLaneLease, BodyLaneMode, BodyServerSelection, DecodedBody,
+    DecodedBodyError, DecodedBodyTrace, NntpClient,
 };
 pub use codec::StreamChunk;
 pub use connection::{NntpConnection, ServerConfig};

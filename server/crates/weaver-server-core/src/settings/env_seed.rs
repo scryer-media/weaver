@@ -3,8 +3,9 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::StateError;
+use crate::bandwidth::IspBandwidthCapWeekday;
 use crate::persistence::Database;
-use crate::servers::ServerConfig;
+use crate::servers::{ServerConfig, ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod};
 use crate::settings::Config;
 
 pub const ENV_DATA_DIR: &str = "WEAVER_DATA_DIR";
@@ -24,6 +25,15 @@ const SERVER_FIELD_ACTIVE: &str = "ACTIVE";
 const SERVER_FIELD_PRIORITY: &str = "PRIORITY";
 const SERVER_FIELD_BACKFILL: &str = "BACKFILL";
 const SERVER_FIELD_RETENTION_DAYS: &str = "RETENTION_DAYS";
+const SERVER_FIELD_MAX_DOWNLOAD_SPEED: &str = "MAX_DOWNLOAD_SPEED";
+const SERVER_FIELD_DOWNLOAD_QUOTA_ENABLED: &str = "DOWNLOAD_QUOTA_ENABLED";
+const SERVER_FIELD_DOWNLOAD_QUOTA_LIMIT_BYTES: &str = "DOWNLOAD_QUOTA_LIMIT_BYTES";
+const SERVER_FIELD_DOWNLOAD_QUOTA_PERIOD: &str = "DOWNLOAD_QUOTA_PERIOD";
+const SERVER_FIELD_DOWNLOAD_QUOTA_RESET_TIME_MINUTES_LOCAL: &str =
+    "DOWNLOAD_QUOTA_RESET_TIME_MINUTES_LOCAL";
+const SERVER_FIELD_DOWNLOAD_QUOTA_WEEKLY_RESET_WEEKDAY: &str =
+    "DOWNLOAD_QUOTA_WEEKLY_RESET_WEEKDAY";
+const SERVER_FIELD_DOWNLOAD_QUOTA_MONTHLY_RESET_DAY: &str = "DOWNLOAD_QUOTA_MONTHLY_RESET_DAY";
 const SERVER_FIELD_TLS_CA_CERT: &str = "TLS_CA_CERT";
 
 #[derive(Debug, Clone, Default)]
@@ -96,6 +106,13 @@ struct PartialServerSeed {
     priority: Option<u32>,
     backfill: Option<bool>,
     retention_days: Option<u32>,
+    max_download_speed: Option<u64>,
+    download_quota_enabled: Option<bool>,
+    download_quota_limit_bytes: Option<u64>,
+    download_quota_period: Option<ServerDownloadQuotaPeriod>,
+    download_quota_reset_time_minutes_local: Option<u16>,
+    download_quota_weekly_reset_weekday: Option<IspBandwidthCapWeekday>,
+    download_quota_monthly_reset_day: Option<u8>,
     tls_ca_cert: Option<PathBuf>,
 }
 
@@ -259,6 +276,30 @@ fn parse_servers(vars: &HashMap<String, String>) -> Result<Vec<ServerConfig>, En
             SERVER_FIELD_RETENTION_DAYS => {
                 partial.retention_days = Some(parse_u32_value(key, value)?);
             }
+            SERVER_FIELD_MAX_DOWNLOAD_SPEED => {
+                partial.max_download_speed = Some(parse_u64_value(key, value)?);
+            }
+            SERVER_FIELD_DOWNLOAD_QUOTA_ENABLED => {
+                partial.download_quota_enabled = Some(parse_bool_value(key, value)?);
+            }
+            SERVER_FIELD_DOWNLOAD_QUOTA_LIMIT_BYTES => {
+                partial.download_quota_limit_bytes = Some(parse_u64_value(key, value)?);
+            }
+            SERVER_FIELD_DOWNLOAD_QUOTA_PERIOD => {
+                partial.download_quota_period = Some(parse_quota_period_value(key, value)?);
+            }
+            SERVER_FIELD_DOWNLOAD_QUOTA_RESET_TIME_MINUTES_LOCAL => {
+                partial.download_quota_reset_time_minutes_local =
+                    Some(parse_reset_minutes_value(key, value)?);
+            }
+            SERVER_FIELD_DOWNLOAD_QUOTA_WEEKLY_RESET_WEEKDAY => {
+                partial.download_quota_weekly_reset_weekday =
+                    Some(parse_quota_weekday_value(key, value)?);
+            }
+            SERVER_FIELD_DOWNLOAD_QUOTA_MONTHLY_RESET_DAY => {
+                partial.download_quota_monthly_reset_day =
+                    Some(parse_monthly_reset_day_value(key, value)?);
+            }
             SERVER_FIELD_TLS_CA_CERT => {
                 partial.tls_ca_cert = normalize_optional_string(value).map(PathBuf::from);
             }
@@ -286,8 +327,17 @@ fn parse_servers(vars: &HashMap<String, String>) -> Result<Vec<ServerConfig>, En
         let tls = partial.tls.unwrap_or(true);
         let port = partial.port.unwrap_or(if tls { 563 } else { 119 });
         let connections = partial.connections.unwrap_or(10);
-
-        servers.push(ServerConfig {
+        let download_quota = ServerDownloadQuotaConfig {
+            enabled: partial.download_quota_enabled.unwrap_or(false),
+            limit_bytes: partial.download_quota_limit_bytes.unwrap_or(0),
+            period: partial.download_quota_period.unwrap_or_default(),
+            reset_time_minutes_local: partial.download_quota_reset_time_minutes_local.unwrap_or(0),
+            weekly_reset_weekday: partial
+                .download_quota_weekly_reset_weekday
+                .unwrap_or(IspBandwidthCapWeekday::Mon),
+            monthly_reset_day: partial.download_quota_monthly_reset_day.unwrap_or(1),
+        };
+        let server = ServerConfig {
             id: index,
             host,
             port,
@@ -300,8 +350,14 @@ fn parse_servers(vars: &HashMap<String, String>) -> Result<Vec<ServerConfig>, En
             priority: partial.priority.unwrap_or(0),
             backfill: partial.backfill.unwrap_or(false),
             retention_days: partial.retention_days.unwrap_or(0),
+            max_download_speed: partial.max_download_speed.unwrap_or(0),
+            download_quota,
             tls_ca_cert: partial.tls_ca_cert,
-        });
+        };
+        server.validate_download_limits().map_err(|error| {
+            EnvSeedError::new(format!("WEAVER_SERVER_{index} download limits: {error}"))
+        })?;
+        servers.push(server);
     }
 
     Ok(servers)
@@ -384,6 +440,56 @@ fn parse_u64_value(name: &str, value: &str) -> Result<u64, EnvSeedError> {
         .map_err(|_| EnvSeedError::new(format!("{name} must be an unsigned integer")))
 }
 
+fn parse_quota_period_value(
+    name: &str,
+    value: &str,
+) -> Result<ServerDownloadQuotaPeriod, EnvSeedError> {
+    let value = value.trim().to_ascii_lowercase();
+    ServerDownloadQuotaPeriod::parse(&value).ok_or_else(|| {
+        EnvSeedError::new(format!(
+            "{name} must be one_time, daily, weekly, or monthly"
+        ))
+    })
+}
+
+fn parse_quota_weekday_value(
+    name: &str,
+    value: &str,
+) -> Result<IspBandwidthCapWeekday, EnvSeedError> {
+    let value = value.trim().to_ascii_lowercase();
+    crate::servers::record::parse_quota_weekday(&value).ok_or_else(|| {
+        EnvSeedError::new(format!(
+            "{name} must be mon, tue, wed, thu, fri, sat, or sun"
+        ))
+    })
+}
+
+fn parse_reset_minutes_value(name: &str, value: &str) -> Result<u16, EnvSeedError> {
+    let value = value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| EnvSeedError::new(format!("{name} must be an integer from 0 to 1439")))?;
+    if value >= 24 * 60 {
+        return Err(EnvSeedError::new(format!(
+            "{name} must be an integer from 0 to 1439"
+        )));
+    }
+    Ok(value)
+}
+
+fn parse_monthly_reset_day_value(name: &str, value: &str) -> Result<u8, EnvSeedError> {
+    let value = value
+        .trim()
+        .parse::<u8>()
+        .map_err(|_| EnvSeedError::new(format!("{name} must be an integer from 1 to 31")))?;
+    if !(1..=31).contains(&value) {
+        return Err(EnvSeedError::new(format!(
+            "{name} must be an integer from 1 to 31"
+        )));
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +513,41 @@ mod tests {
         assert!(server.active);
         assert_eq!(server.priority, 0);
         assert!(!server.supports_pipelining);
+        assert_eq!(server.max_download_speed, 0);
+        assert_eq!(server.download_quota, ServerDownloadQuotaConfig::default());
+    }
+
+    #[test]
+    fn parses_server_download_limits() {
+        let seed = parse(&[
+            ("WEAVER_SERVER_1_HOSTNAME", "news.example.com"),
+            ("WEAVER_SERVER_1_MAX_DOWNLOAD_SPEED", "2500000"),
+            ("WEAVER_SERVER_1_DOWNLOAD_QUOTA_ENABLED", "true"),
+            ("WEAVER_SERVER_1_DOWNLOAD_QUOTA_LIMIT_BYTES", "9000000"),
+            ("WEAVER_SERVER_1_DOWNLOAD_QUOTA_PERIOD", "weekly"),
+            (
+                "WEAVER_SERVER_1_DOWNLOAD_QUOTA_RESET_TIME_MINUTES_LOCAL",
+                "375",
+            ),
+            ("WEAVER_SERVER_1_DOWNLOAD_QUOTA_WEEKLY_RESET_WEEKDAY", "thu"),
+            ("WEAVER_SERVER_1_DOWNLOAD_QUOTA_MONTHLY_RESET_DAY", "31"),
+        ])
+        .unwrap();
+
+        let server = &seed.servers[0];
+        assert_eq!(server.max_download_speed, 2_500_000);
+        assert!(server.download_quota.enabled);
+        assert_eq!(server.download_quota.limit_bytes, 9_000_000);
+        assert_eq!(
+            server.download_quota.period,
+            ServerDownloadQuotaPeriod::Weekly
+        );
+        assert_eq!(server.download_quota.reset_time_minutes_local, 375);
+        assert_eq!(
+            server.download_quota.weekly_reset_weekday,
+            IspBandwidthCapWeekday::Thu
+        );
+        assert_eq!(server.download_quota.monthly_reset_day, 31);
     }
 
     #[test]
@@ -478,6 +619,53 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("unsigned integer")
+        );
+        assert!(
+            parse(&[
+                ("WEAVER_SERVER_1_HOSTNAME", "news"),
+                ("WEAVER_SERVER_1_DOWNLOAD_QUOTA_ENABLED", "true")
+            ])
+            .unwrap_err()
+            .to_string()
+            .contains("greater than zero")
+        );
+        assert!(
+            parse(&[
+                ("WEAVER_SERVER_1_HOSTNAME", "news"),
+                (
+                    "WEAVER_SERVER_1_DOWNLOAD_QUOTA_RESET_TIME_MINUTES_LOCAL",
+                    "1440"
+                )
+            ])
+            .unwrap_err()
+            .to_string()
+            .contains("0 to 1439")
+        );
+
+        let outside_database_range = ((i64::MAX as u64) + 1).to_string();
+        assert!(
+            parse(&[
+                ("WEAVER_SERVER_1_HOSTNAME", "news"),
+                (
+                    "WEAVER_SERVER_1_MAX_DOWNLOAD_SPEED",
+                    outside_database_range.as_str()
+                )
+            ])
+            .unwrap_err()
+            .to_string()
+            .contains("max download speed exceeds database range")
+        );
+        assert!(
+            parse(&[
+                ("WEAVER_SERVER_1_HOSTNAME", "news"),
+                (
+                    "WEAVER_SERVER_1_DOWNLOAD_QUOTA_LIMIT_BYTES",
+                    outside_database_range.as_str()
+                )
+            ])
+            .unwrap_err()
+            .to_string()
+            .contains("download quota limit exceeds database range")
         );
     }
 
@@ -577,6 +765,8 @@ mod tests {
                 priority: 0,
                 backfill: false,
                 retention_days: 0,
+                max_download_speed: 0,
+                download_quota: ServerDownloadQuotaConfig::default(),
                 tls_ca_cert: None,
             }],
             categories: vec![CategoryConfig {

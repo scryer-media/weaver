@@ -17,6 +17,7 @@ use crate::fused_yenc::{FusedYencArticleStats, FusedYencError};
 use crate::health::{CooldownReason, ServerState};
 use crate::pool::{NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig};
 use crate::tls::TransportReadStats;
+use crate::transfer::{QuotaRejection, ServerTransferSnapshot, StableServerId};
 
 /// Configuration for the high-level NNTP client.
 pub struct NntpClientConfig {
@@ -99,6 +100,7 @@ pub struct DecodedBodyIo {
     pub encoded_bytes_consumed: u64,
     pub decoded_bytes_written: u64,
     pub transport_read: TransportReadStats,
+    pub throttle_wait: Duration,
 }
 
 /// Errors from the streamed BODY decode path.
@@ -139,6 +141,7 @@ fn decoded_io_from_fused_stats(stats: &FusedYencArticleStats) -> DecodedBodyIo {
         encoded_bytes_consumed: stats.encoded_bytes_consumed,
         decoded_bytes_written: stats.decoded_bytes_written,
         transport_read: stats.transport_read,
+        throttle_wait: stats.throttle_wait,
     }
 }
 
@@ -161,6 +164,8 @@ pub struct ProbeBatchResult {
 pub enum FetchAttemptOutcome {
     Success,
     NotFound,
+    QuotaBlocked,
+    QuotaUnrequested,
     AuthenticationFailure,
     TransientFailure,
     PermanentFailure,
@@ -185,6 +190,39 @@ pub struct FetchBodyTrace {
 pub struct DecodedBodyTrace {
     pub attempts: Vec<FetchAttemptTrace>,
     pub result: std::result::Result<DecodedBody, DecodedBodyError>,
+}
+
+/// BODY servers that can be leased now, plus the most useful quota block when
+/// quota filtering removed an otherwise eligible server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyServerSelection {
+    pub eligible: Vec<ServerId>,
+    /// Prefers the earliest scheduled retry; manual-only blocks are retained
+    /// when no scheduled retry is available.
+    pub quota_blocked: Option<QuotaRejection>,
+}
+
+fn retain_earliest_quota_rejection(
+    selected: &mut Option<QuotaRejection>,
+    mut candidate: QuotaRejection,
+) {
+    let first_blocked_registry_revision = selected
+        .as_ref()
+        .map_or(candidate.registry_capacity_revision, |current| {
+            current.registry_capacity_revision
+        });
+    let replace = match selected.as_ref() {
+        None => true,
+        Some(current) => match (current.retry_at, candidate.retry_at) {
+            (None, Some(_)) => true,
+            (Some(current), Some(candidate)) => candidate < current,
+            (None, None) | (Some(_), None) => false,
+        },
+    };
+    if replace {
+        candidate.registry_capacity_revision = first_blocked_registry_revision;
+        *selected = Some(candidate);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,7 +254,13 @@ fn blocking_tls_lane_eligible(config: &ServerConfig, backend: crate::tls::NntpTl
 
 #[derive(Debug, Default, Clone)]
 pub struct BodyLaneBatchStats {
+    /// Work offered to this lane, capped by pipeline depth.
+    pub offered: usize,
+    /// BODY commands actually admitted and issued.
     pub requested: usize,
+    /// Offered work left unrequested after quota admission stopped the prefix.
+    pub unrequested: usize,
+    pub quota_rejection: Option<QuotaRejection>,
     pub completed: usize,
     pub unresolved: usize,
     pub connection_discarded: bool,
@@ -260,6 +304,17 @@ impl BodyLaneLease {
         self.server_id
     }
 
+    pub fn stable_server_id(&self) -> Option<StableServerId> {
+        self.client.pool.stable_server_id(self.server_id)
+    }
+
+    pub fn transfer_snapshot(&self) -> Option<ServerTransferSnapshot> {
+        self.client
+            .pool
+            .server_transfer_control(self.server_id)
+            .map(|control| control.snapshot())
+    }
+
     pub fn remote_ip(&self) -> IpAddr {
         self.remote_ip
     }
@@ -289,11 +344,27 @@ impl BodyLaneLease {
     }
 
     pub async fn fetch_decoded_sequential(&mut self, message_id: &str) -> DecodedBodyTrace {
+        self.fetch_decoded_sequential_with_estimate(message_id, 0)
+            .await
+    }
+
+    pub async fn fetch_decoded_sequential_with_estimate(
+        &mut self,
+        message_id: &str,
+        estimated_body_bytes: u64,
+    ) -> DecodedBodyTrace {
         self.mode = BodyLaneMode::Sequential;
         let started = Instant::now();
-        let result = self.read_decoded_body(message_id).await;
+        let result = self
+            .read_decoded_body(message_id, estimated_body_bytes)
+            .await;
         let elapsed = started.elapsed();
-        self.observe_rtt(elapsed);
+        let policy_elapsed = result.as_ref().map_or(elapsed, |decoded| {
+            elapsed.saturating_sub(decoded.io.throttle_wait)
+        });
+        if result.is_ok() {
+            self.observe_rtt(policy_elapsed);
+        }
 
         if result.as_ref().is_err_and(
             |error| matches!(error, DecodedBodyError::Nntp(e) if is_connection_error(e)),
@@ -302,8 +373,14 @@ impl BodyLaneLease {
             self.discard_current().await;
         }
 
-        self.trace_item(message_id, DecodedBatchItem { elapsed, result })
-            .await
+        self.trace_item(
+            message_id,
+            DecodedBatchItem {
+                elapsed: policy_elapsed,
+                result,
+            },
+        )
+        .await
     }
 
     pub async fn fetch_decoded_pipeline_depth2<F, Fut>(
@@ -315,8 +392,23 @@ impl BodyLaneLease {
         F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
         Fut: Future<Output = ()>,
     {
+        self.fetch_decoded_pipeline_depth2_with_estimates(message_ids, &[], on_trace)
+            .await
+    }
+
+    pub async fn fetch_decoded_pipeline_depth2_with_estimates<F, Fut>(
+        &mut self,
+        message_ids: &[String],
+        estimated_body_bytes: &[u64],
+        on_trace: F,
+    ) -> BodyLaneBatchStats
+    where
+        F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         self.mode = BodyLaneMode::PipelineDepth2;
-        self.fetch_decoded_pipeline(message_ids, 2, on_trace).await
+        self.fetch_decoded_pipeline(message_ids, estimated_body_bytes, 2, on_trace)
+            .await
     }
 
     pub async fn fetch_decoded_pipeline_depth4<F, Fut>(
@@ -328,13 +420,29 @@ impl BodyLaneLease {
         F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
         Fut: Future<Output = ()>,
     {
+        self.fetch_decoded_pipeline_depth4_with_estimates(message_ids, &[], on_trace)
+            .await
+    }
+
+    pub async fn fetch_decoded_pipeline_depth4_with_estimates<F, Fut>(
+        &mut self,
+        message_ids: &[String],
+        estimated_body_bytes: &[u64],
+        on_trace: F,
+    ) -> BodyLaneBatchStats
+    where
+        F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         self.mode = BodyLaneMode::PipelineDepth4;
-        self.fetch_decoded_pipeline(message_ids, 4, on_trace).await
+        self.fetch_decoded_pipeline(message_ids, estimated_body_bytes, 4, on_trace)
+            .await
     }
 
     async fn fetch_decoded_pipeline<F, Fut>(
         &mut self,
         message_ids: &[String],
+        estimated_body_bytes: &[u64],
         max_depth: usize,
         mut on_trace: F,
     ) -> BodyLaneBatchStats
@@ -342,33 +450,53 @@ impl BodyLaneLease {
         F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
         Fut: Future<Output = ()>,
     {
-        let requested = message_ids.len().min(max_depth);
+        let offered = message_ids.len().min(max_depth);
         let batch_started = Instant::now();
         let mut stats = BodyLaneBatchStats {
-            requested,
+            offered,
             ..BodyLaneBatchStats::default()
         };
-        if requested == 0 {
+        if offered == 0 {
             return stats;
         }
 
         let request_write_error = if let Some(conn) = self.conn.as_mut() {
             let mut error = None;
-            for message_id in &message_ids[..requested] {
-                if let Err(write_error) = conn.write_body_request(message_id).await {
-                    error = Some(write_error);
-                    break;
+            for (idx, message_id) in message_ids[..offered].iter().enumerate() {
+                let estimate = estimated_body_bytes.get(idx).copied().unwrap_or(0);
+                match conn
+                    .write_body_request_with_estimate(message_id, estimate)
+                    .await
+                {
+                    Ok(()) => stats.requested += 1,
+                    Err(NntpError::QuotaBlocked(rejection)) => {
+                        stats.quota_rejection = Some(*rejection);
+                        stats.unrequested = offered.saturating_sub(stats.requested);
+                        break;
+                    }
+                    Err(write_error) => {
+                        error = Some(write_error);
+                        break;
+                    }
                 }
             }
-            if error.is_none()
+            if stats.requested > 0
+                && error.is_none()
                 && let Err(flush_error) = conn.flush_commands().await
             {
                 error = Some(flush_error);
             }
             error
         } else {
+            stats.requested = offered;
             Some(NntpError::ConnectionClosed)
         };
+
+        let requested = stats.requested;
+        if requested == 0 && stats.quota_rejection.is_none() {
+            stats.elapsed = batch_started.elapsed();
+            return stats;
+        }
 
         if let Some(error) = request_write_error {
             let elapsed = batch_started.elapsed();
@@ -410,31 +538,29 @@ impl BodyLaneLease {
         let mut batch_clean_so_far = true;
         for (response_idx, message_id) in message_ids.iter().take(requested).enumerate() {
             let item_started = Instant::now();
-            let item_deadline = TokioInstant::now() + self.client.soft_timeout;
-            let result = match tokio::time::timeout_at(
-                item_deadline,
-                NntpClient::read_decoded_pipelined_body(
-                    self.conn
-                        .as_mut()
-                        .expect("connection is available while reading pipeline body"),
-                ),
+            let result = NntpClient::read_decoded_pipelined_body(
+                self.conn
+                    .as_mut()
+                    .expect("connection is available while reading pipeline body"),
             )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    stats.connection_discarded = true;
-                    self.discard_current().await;
-                    closed_early = true;
-                    Err(DecodedBodyError::Nntp(self.client.soft_timeout_error()))
-                }
-            };
+            .await;
             let elapsed = item_started.elapsed();
-            self.observe_rtt(elapsed);
+            let policy_elapsed = result.as_ref().map_or(elapsed, |decoded| {
+                elapsed.saturating_sub(decoded.io.throttle_wait)
+            });
+            if result.is_ok() {
+                self.observe_rtt(policy_elapsed);
+            }
             let poisoned = self.conn.as_ref().is_some_and(|conn| conn.is_poisoned());
 
             let trace = self
-                .trace_item(message_id, DecodedBatchItem { elapsed, result })
+                .trace_item(
+                    message_id,
+                    DecodedBatchItem {
+                        elapsed: policy_elapsed,
+                        result,
+                    },
+                )
                 .await;
             stats.completed += 1;
             batch_clean_so_far &= trace.result.is_ok();
@@ -450,7 +576,8 @@ impl BodyLaneLease {
             } else {
                 0
             };
-            let is_batch_complete = closed_early || response_idx + 1 == requested;
+            let is_batch_complete =
+                closed_early || (response_idx + 1 == requested && stats.quota_rejection.is_none());
             let meta = BodyLaneTraceMeta {
                 batch_complete: is_batch_complete,
                 batch_clean: batch_clean_so_far && !closed_early,
@@ -503,6 +630,48 @@ impl BodyLaneLease {
             }
         }
 
+        if let Some(source) = stats.quota_rejection.clone() {
+            let control = self.client.pool.server_transfer_control(self.server_id);
+            for (tail_idx, message_id) in
+                message_ids.iter().enumerate().take(offered).skip(requested)
+            {
+                let estimate = estimated_body_bytes.get(tail_idx).copied().unwrap_or(0);
+                let error = if tail_idx == requested {
+                    NntpError::quota_blocked(source.clone())
+                } else if let Some(rejection) = control
+                    .as_ref()
+                    .and_then(|control| control.quota_rejection_for(estimate))
+                {
+                    NntpError::quota_blocked(rejection)
+                } else {
+                    NntpError::body_not_requested_due_to_quota(source.clone(), estimate)
+                };
+                let trace = self
+                    .trace_item(
+                        message_id,
+                        DecodedBatchItem {
+                            elapsed: Duration::ZERO,
+                            result: Err(DecodedBodyError::Nntp(error)),
+                        },
+                    )
+                    .await;
+                stats.completed += 1;
+                let batch_complete = !closed_early && tail_idx + 1 == offered;
+                on_trace(
+                    tail_idx,
+                    trace,
+                    BodyLaneTraceMeta {
+                        batch_complete,
+                        batch_clean: batch_clean_so_far,
+                        batch_response_count: if batch_complete { requested as u64 } else { 0 },
+                        unresolved_count: 0,
+                        connection_discarded: stats.connection_discarded,
+                    },
+                )
+                .await;
+            }
+        }
+
         stats.elapsed = batch_started.elapsed();
         stats
     }
@@ -510,24 +679,18 @@ impl BodyLaneLease {
     async fn read_decoded_body(
         &mut self,
         message_id: &str,
+        estimated_body_bytes: u64,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        let deadline = TokioInstant::now() + self.client.soft_timeout;
-
         let Some(conn) = self.conn.as_mut() else {
             return Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed));
         };
 
-        let stream_result = match tokio::time::timeout_at(deadline, async {
-            conn.stream_yenc_article(message_id, |_| Ok(())).await
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                self.discard_current().await;
-                return Err(DecodedBodyError::Nntp(self.client.soft_timeout_error()));
-            }
-        };
+        // The connection applies its timeout only while waiting on network
+        // reads. Shared transfer-policy waits therefore cannot trigger soft
+        // failover, health degradation, or IP replacement.
+        let stream_result = conn
+            .stream_yenc_article_with_estimate(message_id, estimated_body_bytes, |_| Ok(()))
+            .await;
 
         match stream_result {
             Ok(article) => Ok(DecodedBody {
@@ -619,11 +782,76 @@ impl NntpClient {
     }
 
     pub async fn body_server_order(&self, exclude: &[usize]) -> Vec<ServerId> {
-        self.build_server_order(exclude)
-            .await
-            .into_iter()
-            .map(ServerId)
-            .collect()
+        self.body_server_selection(exclude).await.eligible
+    }
+
+    pub async fn body_server_selection(&self, exclude: &[usize]) -> BodyServerSelection {
+        self.body_server_selection_with_estimate(exclude, 0).await
+    }
+
+    pub async fn body_server_selection_with_estimate(
+        &self,
+        exclude: &[usize],
+        requested_body_bytes: u64,
+    ) -> BodyServerSelection {
+        let mut eligible = Vec::new();
+        let mut quota_blocked = None;
+        for idx in self.build_server_order(exclude).await {
+            let server = ServerId(idx);
+            if let Some(rejection) = self
+                .pool
+                .server_transfer_control(server)
+                .and_then(|control| control.quota_rejection_for(requested_body_bytes))
+            {
+                retain_earliest_quota_rejection(&mut quota_blocked, rejection);
+                continue;
+            }
+            eligible.push(server);
+        }
+        BodyServerSelection {
+            eligible,
+            quota_blocked,
+        }
+    }
+
+    /// Return the current request-specific quota rejection for one server.
+    /// Cached owned lanes use this to revalidate admission without touching
+    /// connection health or acquiring a new lane.
+    pub fn server_quota_rejection(
+        &self,
+        server: ServerId,
+        requested_body_bytes: u64,
+    ) -> Option<QuotaRejection> {
+        self.pool
+            .server_transfer_control(server)
+            .and_then(|control| control.quota_rejection_for(requested_body_bytes))
+    }
+
+    /// True only when the active pool contains at least one normal fill server
+    /// and every such fill is at its absolute quota limit. Backfill servers do
+    /// not participate in this global presentation predicate.
+    pub fn all_normal_fill_servers_quota_blocked(&self) -> bool {
+        let backfill = self.pool.server_backfill_flags();
+        let mut saw_fill = false;
+        for (idx, is_backfill) in backfill
+            .iter()
+            .copied()
+            .enumerate()
+            .take(self.pool.server_count())
+        {
+            if is_backfill {
+                continue;
+            }
+            saw_fill = true;
+            if !self
+                .pool
+                .server_transfer_control(ServerId(idx))
+                .is_some_and(|control| control.snapshot().quota_blocked)
+            {
+                return false;
+            }
+        }
+        saw_fill
     }
 
     pub async fn acquire_body_lane(
@@ -938,6 +1166,17 @@ impl NntpClient {
                     last_error = Some(NntpError::NoSuchArticle {
                         message_id: message_id.to_string(),
                     });
+                    continue;
+                }
+                Err(e @ NntpError::QuotaBlocked(_)) => {
+                    attempts.push(FetchAttemptTrace {
+                        server_idx: idx,
+                        remote_ip: None,
+                        elapsed: Duration::ZERO,
+                        outcome: FetchAttemptOutcome::QuotaBlocked,
+                        error: Some(e.to_string()),
+                    });
+                    last_error = Some(e);
                     continue;
                 }
                 Err(e @ NntpError::SoftTimeout(_)) => {
@@ -1299,14 +1538,24 @@ impl NntpClient {
             }
 
             let mut request_write_error = None;
-            for message_id in &pending_ids {
-                if let Err(error) = conn.write_body_request(message_id).await {
-                    request_write_error = Some(error);
-                    break;
+            let mut admitted = 0usize;
+            let mut quota_rejection = None;
+            for (pending_idx, message_id) in pending_ids.iter().enumerate() {
+                match conn.write_body_request(message_id).await {
+                    Ok(()) => admitted += 1,
+                    Err(NntpError::QuotaBlocked(rejection)) => {
+                        quota_rejection = Some((pending_idx, rejection));
+                        break;
+                    }
+                    Err(error) => {
+                        request_write_error = Some(error);
+                        break;
+                    }
                 }
             }
 
-            if request_write_error.is_none()
+            if admitted > 0
+                && request_write_error.is_none()
                 && let Err(error) = conn.flush_commands().await
             {
                 request_write_error = Some(error);
@@ -1349,37 +1598,60 @@ impl NntpClient {
                 continue;
             }
 
-            let mut conn = Some(conn);
-            let mut closed_early = false;
-            for (response_idx, message_idx) in pending_now.iter().copied().enumerate() {
-                let item_started = Instant::now();
-                let item_deadline = TokioInstant::now() + self.soft_timeout;
-                let item = match tokio::time::timeout_at(
-                    item_deadline,
-                    Self::read_decoded_pipelined_body(
-                        conn.as_mut()
-                            .expect("connection is available while reading"),
-                    ),
-                )
-                .await
+            if let Some((pending_idx, rejection)) = quota_rejection {
+                let message_idx = pending_now[pending_idx];
+                let item = DecodedBatchItem {
+                    elapsed: Duration::ZERO,
+                    result: Err(DecodedBodyError::Nntp(NntpError::QuotaBlocked(rejection))),
+                };
+                match self
+                    .classify_decoded_batch_item(
+                        idx,
+                        remote_ip,
+                        &message_ids[message_idx],
+                        item,
+                        &mut attempts_by_index[message_idx],
+                        &mut last_errors[message_idx],
+                    )
+                    .await
                 {
-                    Ok(result) => DecodedBatchItem {
-                        elapsed: item_started.elapsed(),
-                        result,
-                    },
-                    Err(_) => {
-                        self.discard_connection_error(
-                            idx,
-                            conn.take()
-                                .expect("timed out connection is still owned by batch reader"),
+                    DecodedBatchDisposition::Terminal(result) => {
+                        on_trace(
+                            message_idx,
+                            DecodedBodyTrace {
+                                attempts: std::mem::take(&mut attempts_by_index[message_idx]),
+                                result,
+                            },
                         )
                         .await;
-                        closed_early = true;
-                        DecodedBatchItem {
-                            elapsed: item_started.elapsed(),
-                            result: Err(DecodedBodyError::Nntp(self.soft_timeout_error())),
-                        }
                     }
+                    DecodedBatchDisposition::Retry => pending.push(message_idx),
+                }
+                pending.extend(pending_now.iter().copied().skip(pending_idx + 1));
+            }
+
+            if admitted == 0 {
+                continue;
+            }
+
+            let mut conn = Some(conn);
+            let mut closed_early = false;
+            for (response_idx, message_idx) in
+                pending_now.iter().copied().take(admitted).enumerate()
+            {
+                let item_started = Instant::now();
+                let result = Self::read_decoded_pipelined_body(
+                    conn.as_mut()
+                        .expect("connection is available while reading"),
+                )
+                .await;
+                let elapsed = item_started.elapsed();
+                let policy_elapsed = result.as_ref().map_or(elapsed, |decoded| {
+                    elapsed.saturating_sub(decoded.io.throttle_wait)
+                });
+                let item = DecodedBatchItem {
+                    elapsed: policy_elapsed,
+                    result,
                 };
 
                 let poisoned = conn.as_ref().is_some_and(|conn| conn.is_poisoned());
@@ -1415,7 +1687,12 @@ impl NntpClient {
                 }
 
                 if closed_early {
-                    for unread_idx in pending_now.iter().copied().skip(response_idx + 1) {
+                    for unread_idx in pending_now
+                        .iter()
+                        .copied()
+                        .take(admitted)
+                        .skip(response_idx + 1)
+                    {
                         let item = DecodedBatchItem {
                             elapsed: item_started.elapsed(),
                             result: Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed)),
@@ -1528,6 +1805,28 @@ impl NntpClient {
                 }));
                 DecodedBatchDisposition::Retry
             }
+            Err(DecodedBodyError::Nntp(NntpError::QuotaBlocked(rejection))) => {
+                attempts.push(FetchAttemptTrace {
+                    server_idx,
+                    remote_ip,
+                    elapsed,
+                    outcome: FetchAttemptOutcome::QuotaBlocked,
+                    error: Some("server download quota blocked".to_string()),
+                });
+                *last_error = Some(DecodedBodyError::Nntp(NntpError::QuotaBlocked(rejection)));
+                DecodedBatchDisposition::Retry
+            }
+            Err(DecodedBodyError::Nntp(error @ NntpError::BodyNotRequestedDueToQuota { .. })) => {
+                attempts.push(FetchAttemptTrace {
+                    server_idx,
+                    remote_ip,
+                    elapsed,
+                    outcome: FetchAttemptOutcome::QuotaUnrequested,
+                    error: Some("BODY was not issued after quota rejection".to_string()),
+                });
+                *last_error = Some(DecodedBodyError::Nntp(error));
+                DecodedBatchDisposition::Retry
+            }
             Err(DecodedBodyError::Nntp(e @ NntpError::SoftTimeout(_))) => {
                 attempts.push(FetchAttemptTrace {
                     server_idx,
@@ -1613,7 +1912,7 @@ impl NntpClient {
                 .await
             {
                 Ok(decoded) => {
-                    let elapsed = start.elapsed();
+                    let elapsed = start.elapsed().saturating_sub(decoded.io.throttle_wait);
                     self.record_server_success(idx, elapsed).await;
                     attempts.push(FetchAttemptTrace {
                         server_idx: idx,
@@ -1655,6 +1954,17 @@ impl NntpClient {
                     last_error = Some(DecodedBodyError::Nntp(NntpError::NoSuchArticle {
                         message_id: message_id.to_string(),
                     }));
+                    continue;
+                }
+                Err(DecodedBodyError::Nntp(e @ NntpError::QuotaBlocked(_))) => {
+                    attempts.push(FetchAttemptTrace {
+                        server_idx: idx,
+                        remote_ip: None,
+                        elapsed: Duration::ZERO,
+                        outcome: FetchAttemptOutcome::QuotaBlocked,
+                        error: Some(e.to_string()),
+                    });
+                    last_error = Some(DecodedBodyError::Nntp(e));
                     continue;
                 }
                 Err(DecodedBodyError::Nntp(e @ NntpError::SoftTimeout(_))) => {
@@ -1755,7 +2065,32 @@ impl NntpClient {
         groups: &[String],
         exclude: &[usize],
     ) -> Result<crate::blocking::BlockingBodyLane> {
-        for server in self.blocking_body_server_order(exclude) {
+        self.try_acquire_blocking_body_lane_with_estimate(groups, exclude, 0)
+    }
+
+    /// Inspect the synchronous owned-lane candidates without acquiring a
+    /// connection permit or opening a connection.
+    pub fn blocking_body_server_selection_with_estimate(
+        &self,
+        exclude: &[usize],
+        requested_body_bytes: u64,
+    ) -> BodyServerSelection {
+        self.blocking_body_server_selection(exclude, requested_body_bytes)
+    }
+
+    pub fn try_acquire_blocking_body_lane_with_estimate(
+        &self,
+        groups: &[String],
+        exclude: &[usize],
+        requested_body_bytes: u64,
+    ) -> Result<crate::blocking::BlockingBodyLane> {
+        let selection = self.blocking_body_server_selection(exclude, requested_body_bytes);
+        if selection.eligible.is_empty()
+            && let Some(rejection) = selection.quota_blocked
+        {
+            return Err(NntpError::quota_blocked(rejection));
+        }
+        for server in selection.eligible {
             let permit = match self.pool.try_acquire_blocking_permit(server) {
                 Ok(permit) => permit,
                 Err(_) => continue,
@@ -1768,6 +2103,8 @@ impl NntpClient {
             let started = Instant::now();
             match crate::blocking::BlockingBodyLane::connect(
                 server,
+                self.pool.stable_server_id(server).unwrap_or_default(),
+                self.pool.server_transfer_control(server),
                 &config,
                 &excluded_ips,
                 address_offset,
@@ -1791,7 +2128,8 @@ impl NntpClient {
     }
 
     pub fn has_blocking_body_lane_candidate(&self, exclude: &[usize]) -> bool {
-        self.blocking_body_server_order(exclude)
+        self.blocking_body_server_selection(exclude, 0)
+            .eligible
             .into_iter()
             .any(|server| {
                 if self.pool.server_load(server.0).0 == 0 {
@@ -1824,22 +2162,33 @@ impl NntpClient {
                         .blocking_lock()
                         .record_cooldown(attempt.server_idx, CooldownReason::Transport);
                 }
-                FetchAttemptOutcome::NotFound | FetchAttemptOutcome::PermanentFailure => {}
+                FetchAttemptOutcome::NotFound
+                | FetchAttemptOutcome::QuotaBlocked
+                | FetchAttemptOutcome::QuotaUnrequested
+                | FetchAttemptOutcome::PermanentFailure => {}
             }
         }
     }
 
-    fn blocking_body_server_order(&self, exclude: &[usize]) -> Vec<ServerId> {
+    fn blocking_body_server_selection(
+        &self,
+        exclude: &[usize],
+        requested_body_bytes: u64,
+    ) -> BodyServerSelection {
         let server_count = self.pool.server_count();
         let server_groups = self.pool.server_groups();
         let backfill_flags = self.pool.server_backfill_flags();
         let backfill_unlocked = self.pool.fill_servers_exhausted(exclude);
         let Ok(mut health) = self.pool.health().try_lock() else {
-            return Vec::new();
+            return BodyServerSelection {
+                eligible: Vec::new(),
+                quota_blocked: None,
+            };
         };
         health.check_reenable_all();
 
         let mut candidates = Vec::with_capacity(server_count);
+        let mut quota_blocked = None;
         for (idx, group) in server_groups.iter().copied().enumerate().take(server_count) {
             if exclude.contains(&idx) || !health.is_available(idx) {
                 continue;
@@ -1847,6 +2196,14 @@ impl NntpClient {
             // Backfill servers only serve requests whose fill tier is
             // exhausted; health never unlocks them (see build_server_order).
             if backfill_flags[idx] && !backfill_unlocked {
+                continue;
+            }
+            if let Some(rejection) = self
+                .pool
+                .server_transfer_control(ServerId(idx))
+                .and_then(|control| control.quota_rejection_for(requested_body_bytes))
+            {
+                retain_earliest_quota_rejection(&mut quota_blocked, rejection);
                 continue;
             }
             let candidate = {
@@ -1874,10 +2231,14 @@ impl NntpClient {
                 .then(a.2.cmp(&b.2))
                 .then_with(|| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal))
         });
-        candidates
+        let eligible = candidates
             .into_iter()
             .map(|(_, _, _, _, idx)| ServerId(idx))
-            .collect()
+            .collect();
+        BodyServerSelection {
+            eligible,
+            quota_blocked,
+        }
     }
 
     fn record_blocking_connect_failure(&self, server_idx: usize, error: &NntpError) {
@@ -1986,34 +2347,35 @@ impl NntpClient {
         let mut backfill_groups: std::collections::BTreeMap<u32, GroupCandidates> =
             std::collections::BTreeMap::new();
         for idx in 0..server_count {
-            if !exclude.contains(&idx) && health.is_available(idx) {
-                if backfill_flags[idx] && !backfill_unlocked {
-                    continue;
-                }
-                let tier = if backfill_flags[idx] {
-                    &mut backfill_groups
-                } else {
-                    &mut fill_groups
-                };
-                let entry = tier.entry(server_groups[idx]).or_default();
-                let ready = self.pool.server_load(idx).0 > 0;
-                match health.server(idx).state() {
-                    ServerState::Healthy => {
-                        if ready {
-                            entry.ready_healthy.push(idx);
-                        } else {
-                            entry.waiting_healthy.push(idx);
-                        }
+            if exclude.contains(&idx) || !health.is_available(idx) {
+                continue;
+            }
+            if backfill_flags[idx] && !backfill_unlocked {
+                continue;
+            }
+            let tier = if backfill_flags[idx] {
+                &mut backfill_groups
+            } else {
+                &mut fill_groups
+            };
+            let entry = tier.entry(server_groups[idx]).or_default();
+            let ready = self.pool.server_load(idx).0 > 0;
+            match health.server(idx).state() {
+                ServerState::Healthy => {
+                    if ready {
+                        entry.ready_healthy.push(idx);
+                    } else {
+                        entry.waiting_healthy.push(idx);
                     }
-                    ServerState::Degraded { .. } => {
-                        if ready {
-                            entry.ready_degraded.push(idx);
-                        } else {
-                            entry.waiting_degraded.push(idx);
-                        }
-                    }
-                    ServerState::CoolingDown { .. } | ServerState::Disabled { .. } => {}
                 }
+                ServerState::Degraded { .. } => {
+                    if ready {
+                        entry.ready_degraded.push(idx);
+                    } else {
+                        entry.waiting_degraded.push(idx);
+                    }
+                }
+                ServerState::CoolingDown { .. } | ServerState::Disabled { .. } => {}
             }
         }
         drop(health);
@@ -2142,6 +2504,10 @@ impl NntpClient {
                     });
                     continue;
                 }
+                Err(e @ NntpError::QuotaBlocked(_)) => {
+                    last_error = Some(e);
+                    continue;
+                }
                 Err(e @ NntpError::SoftTimeout(_)) => {
                     warn!(
                         server = idx,
@@ -2213,19 +2579,19 @@ impl NntpClient {
     /// Once a group is selected, issues the BODY command. Retries on transient
     /// errors up to `max_retries_per_server` times.
     ///
-    /// The entire operation is bounded by the soft timeout — if it fires, the
-    /// current connection is discarded and the caller should fail over to the
-    /// next server.
+    /// Connection acquisition, group setup, and retry delay are bounded by a
+    /// per-attempt soft timeout. BODY reads use the connection timeout so
+    /// deliberate transfer-policy waits are outside that deadline.
     async fn fetch_from_server_with_groups(
         &self,
         server: ServerId,
         message_id: &str,
         groups: &[String],
     ) -> Result<(Bytes, Option<IpAddr>)> {
-        let deadline = TokioInstant::now() + self.soft_timeout;
         let mut attempts = 0u32;
 
         loop {
+            let deadline = TokioInstant::now() + self.soft_timeout;
             let mut conn = self.acquire_before_deadline(server, deadline).await?;
             let remote_ip = Some(conn.remote_ip());
 
@@ -2277,14 +2643,10 @@ impl NntpClient {
                 Ok(true) => {}
             }
 
-            let result =
-                match tokio::time::timeout_at(deadline, conn.body_by_id_raw(message_id)).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        self.discard_connection_error(server.0, conn).await;
-                        return Err(self.soft_timeout_error());
-                    }
-                };
+            // BODY applies its own network-read timeout and excludes deliberate
+            // transfer-policy waits. Wrapping the whole future in the soft
+            // deadline would misclassify throttling as a server failure.
+            let result = conn.body_by_id_raw(message_id).await;
             match result {
                 Ok(response) => return Ok((response.data, remote_ip)),
                 Err(NntpError::ArticleNotFound)
@@ -2330,10 +2692,10 @@ impl NntpClient {
         message_id: &str,
         groups: &[String],
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        let deadline = TokioInstant::now() + self.soft_timeout;
         let mut attempts = 0u32;
 
         loop {
+            let deadline = TokioInstant::now() + self.soft_timeout;
             let mut conn = self
                 .acquire_before_deadline(server, deadline)
                 .await
@@ -2372,17 +2734,9 @@ impl NntpClient {
                 Ok(true) => {}
             }
 
-            let stream_result = match tokio::time::timeout_at(deadline, async {
-                conn.stream_yenc_article(message_id, |_| Ok(())).await
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    self.discard_connection_error(server.0, conn).await;
-                    return Err(DecodedBodyError::Nntp(self.soft_timeout_error()));
-                }
-            };
+            // The connection times only network reads. Wrapping the whole BODY
+            // future would make deliberate rate waits look like soft failures.
+            let stream_result = conn.stream_yenc_article(message_id, |_| Ok(())).await;
 
             match stream_result {
                 Ok(article) => {
@@ -2538,33 +2892,39 @@ impl NntpClient {
 
     /// Fetch from a specific server, retrying on transient errors.
     ///
-    /// Bounded by the soft timeout — if exceeded, the current connection is
-    /// discarded and `SoftTimeout` is returned to trigger failover at the caller.
+    /// Connection acquisition and retry delay are bounded by a per-attempt
+    /// soft timeout. BODY reads use the connection timeout so deliberate
+    /// transfer-policy waits are outside that deadline.
     async fn fetch_from_server(
         &self,
         server: ServerId,
         message_id: &str,
         kind: FetchKind,
     ) -> Result<Bytes> {
-        let deadline = TokioInstant::now() + self.soft_timeout;
         let mut attempts = 0u32;
 
         loop {
+            let deadline = TokioInstant::now() + self.soft_timeout;
             let mut conn = self.acquire_before_deadline(server, deadline).await?;
 
-            let result = match tokio::time::timeout_at(deadline, async {
-                match kind {
-                    FetchKind::Body => conn.body_by_id_raw(message_id).await,
-                    FetchKind::Head => conn.head_by_id(message_id).await,
-                    FetchKind::Article => conn.article_by_id(message_id).await,
-                }
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    self.discard_connection_error(server.0, conn).await;
-                    return Err(self.soft_timeout_error());
+            let result = match kind {
+                FetchKind::Body => conn.body_by_id_raw(message_id).await,
+                FetchKind::Head | FetchKind::Article => {
+                    match tokio::time::timeout_at(deadline, async {
+                        match kind {
+                            FetchKind::Head => conn.head_by_id(message_id).await,
+                            FetchKind::Article => conn.article_by_id(message_id).await,
+                            FetchKind::Body => unreachable!(),
+                        }
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            self.discard_connection_error(server.0, conn).await;
+                            return Err(self.soft_timeout_error());
+                        }
+                    }
                 }
             };
 
@@ -3209,6 +3569,369 @@ mod tests {
         NntpClient::from_pool(pool.into())
     }
 
+    fn quota_selection_client(
+        backfill_flags: &[bool],
+        blocked: &[(usize, Option<Instant>)],
+    ) -> NntpClient {
+        let transfers = crate::transfer::ServerTransferRegistry::new();
+        let servers = backfill_flags
+            .iter()
+            .enumerate()
+            .map(|(idx, &backfill)| {
+                let stable_id = StableServerId(1_000 + idx as u32);
+                let transfer_control = blocked
+                    .iter()
+                    .find(|(blocked_idx, _)| *blocked_idx == idx)
+                    .map(|(_, retry_at)| {
+                        transfers.configure(
+                            stable_id,
+                            crate::transfer::ServerTransferConfig {
+                                rate_bytes_per_sec: 0,
+                                quota: Some(crate::transfer::QuotaRuntimeConfig {
+                                    limit_bytes: 0,
+                                    generation: 1,
+                                    retry_at: *retry_at,
+                                }),
+                            },
+                        )
+                    });
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: format!("selection-{idx}.example.com"),
+                        ..Default::default()
+                    },
+                    stable_id,
+                    transfer_control,
+                    max_connections: 1,
+                    group: 0,
+                    backfill,
+                    ..ServerPoolConfig::default()
+                }
+            })
+            .collect();
+        NntpClient::new(NntpClientConfig {
+            servers,
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(1),
+        })
+    }
+
+    #[tokio::test]
+    async fn estimate_selection_fails_over_large_request_but_keeps_smaller_work_moving() {
+        let transfers = crate::transfer::ServerTransferRegistry::new();
+        let limited_id = StableServerId(2_000);
+        let limited = transfers.configure(
+            limited_id,
+            crate::transfer::ServerTransferConfig {
+                rate_bytes_per_sec: 0,
+                quota: Some(crate::transfer::QuotaRuntimeConfig {
+                    limit_bytes: 100,
+                    generation: 1,
+                    retry_at: None,
+                }),
+            },
+        );
+        let mut used = limited.try_reserve(60).unwrap();
+        used.record_blocking(60);
+        used.finish();
+        assert!(!limited.snapshot().quota_blocked);
+
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "limited.example.com".into(),
+                        ..Default::default()
+                    },
+                    stable_id: limited_id,
+                    transfer_control: Some(limited),
+                    max_connections: 1,
+                    group: 0,
+                    ..ServerPoolConfig::default()
+                },
+                ServerPoolConfig {
+                    server: ServerConfig {
+                        host: "unlimited.example.com".into(),
+                        ..Default::default()
+                    },
+                    stable_id: StableServerId(2_001),
+                    max_connections: 1,
+                    group: 1,
+                    ..ServerPoolConfig::default()
+                },
+            ],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(1),
+        });
+
+        let large = client.body_server_selection_with_estimate(&[], 41).await;
+        assert_eq!(large.eligible, vec![ServerId(1)]);
+        let rejection = large.quota_blocked.unwrap();
+        assert_eq!(rejection.stable_server_id, limited_id);
+        assert_eq!(rejection.requested_body_bytes, 41);
+        assert!(!rejection.snapshot.quota_blocked);
+        assert_eq!(
+            client
+                .server_quota_rejection(ServerId(0), 41)
+                .unwrap()
+                .requested_body_bytes,
+            41
+        );
+        assert!(client.server_quota_rejection(ServerId(0), 40).is_none());
+        assert!(client.server_quota_rejection(ServerId(1), 41).is_none());
+        let blocking_large = client.blocking_body_server_selection_with_estimate(&[], 41);
+        assert_eq!(blocking_large.eligible, vec![ServerId(1)]);
+        assert_eq!(
+            blocking_large.quota_blocked.unwrap().stable_server_id,
+            limited_id
+        );
+
+        let small = client.body_server_selection_with_estimate(&[], 40).await;
+        assert_eq!(small.eligible, vec![ServerId(0), ServerId(1)]);
+        assert!(small.quota_blocked.is_none());
+        assert!(!client.all_normal_fill_servers_quota_blocked());
+    }
+
+    #[test]
+    fn global_quota_predicate_requires_every_normal_fill_and_ignores_backfill() {
+        let blocked_fill = quota_selection_client(&[false, true], &[(0, None)]);
+        assert!(blocked_fill.all_normal_fill_servers_quota_blocked());
+
+        let mixed_fills = quota_selection_client(&[false, false], &[(0, None)]);
+        assert!(!mixed_fills.all_normal_fill_servers_quota_blocked());
+
+        let empty_pool = quota_selection_client(&[], &[]);
+        assert!(!empty_pool.all_normal_fill_servers_quota_blocked());
+    }
+
+    #[tokio::test]
+    async fn quota_stopped_pipeline_reports_every_unissued_item_without_poisoning_lane() {
+        let port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: b"222 1 <first@quota-tail>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
+            },
+        ])
+        .await;
+
+        let transfers = crate::transfer::ServerTransferRegistry::new();
+        let stable_id = crate::transfer::StableServerId(303);
+        let control = transfers.configure(
+            stable_id,
+            crate::transfer::ServerTransferConfig {
+                rate_bytes_per_sec: 0,
+                quota: Some(crate::transfer::QuotaRuntimeConfig {
+                    limit_bytes: 500,
+                    generation: 1,
+                    retry_at: None,
+                }),
+            },
+        );
+        let mut server = scripted_server(port, 0);
+        server.stable_id = stable_id;
+        server.transfer_control = Some(control);
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![server],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(1),
+        });
+        let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
+        let message_ids = vec![
+            String::from("<first@quota-tail>"),
+            String::from("<blocked@quota-tail>"),
+            String::from("<fits-after-refund@quota-tail>"),
+        ];
+        let estimates = [400, 200, 50];
+        let mut seen = Vec::new();
+
+        let stats = lane
+            .fetch_decoded_pipeline_depth4_with_estimates(
+                &message_ids,
+                &estimates,
+                |idx, trace, meta| {
+                    seen.push((idx, trace, meta));
+                    std::future::ready(())
+                },
+            )
+            .await;
+
+        assert_eq!(stats.offered, 3);
+        assert_eq!(stats.requested, 1);
+        assert_eq!(stats.unrequested, 2);
+        assert_eq!(stats.completed, 3);
+        assert_eq!(stats.unresolved, 0);
+        assert_eq!(
+            seen.iter().map(|(idx, _, _)| *idx).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(seen[0].1.attempts[0].outcome, FetchAttemptOutcome::Success);
+        assert_eq!(
+            seen[1].1.attempts[0].outcome,
+            FetchAttemptOutcome::QuotaBlocked
+        );
+        assert_eq!(
+            seen[2].1.attempts[0].outcome,
+            FetchAttemptOutcome::QuotaUnrequested
+        );
+        assert!(matches!(
+            &seen[2].1.result,
+            Err(DecodedBodyError::Nntp(
+                NntpError::BodyNotRequestedDueToQuota {
+                    preceding_rejection,
+                    requested_body_bytes: 50,
+                }
+            )) if preceding_rejection.requested_body_bytes == 200
+        ));
+        assert!(seen[1].2.batch_clean);
+        assert!(!seen[1].2.connection_discarded);
+        assert!(!seen[1].2.batch_complete);
+        assert!(seen[2].2.batch_clean);
+        assert!(!seen[2].2.connection_discarded);
+        assert!(seen[2].2.batch_complete);
+        assert_eq!(seen[2].2.unresolved_count, 0);
+
+        lane.park();
+    }
+
+    #[test]
+    fn earliest_quota_selection_preserves_first_blocked_registry_revision() {
+        let transfers = crate::transfer::ServerTransferRegistry::new();
+        let later = Instant::now() + Duration::from_secs(120);
+        let earlier = Instant::now() + Duration::from_secs(60);
+        let first = transfers.configure(
+            StableServerId(3_000),
+            crate::transfer::ServerTransferConfig {
+                rate_bytes_per_sec: 0,
+                quota: Some(crate::transfer::QuotaRuntimeConfig {
+                    limit_bytes: 0,
+                    generation: 1,
+                    retry_at: Some(later),
+                }),
+            },
+        );
+        let first_rejection = first.quota_rejection_for(1).unwrap();
+        let second = transfers.configure(
+            StableServerId(3_001),
+            crate::transfer::ServerTransferConfig {
+                rate_bytes_per_sec: 0,
+                quota: Some(crate::transfer::QuotaRuntimeConfig {
+                    limit_bytes: 0,
+                    generation: 1,
+                    retry_at: Some(earlier),
+                }),
+            },
+        );
+        let second_rejection = second.quota_rejection_for(1).unwrap();
+        assert_ne!(
+            first_rejection.registry_capacity_revision,
+            second_rejection.registry_capacity_revision
+        );
+
+        let first_revision = first_rejection.registry_capacity_revision;
+        let mut selected = None;
+        retain_earliest_quota_rejection(&mut selected, first_rejection);
+        retain_earliest_quota_rejection(&mut selected, second_rejection);
+
+        let selected = selected.unwrap();
+        assert_eq!(selected.stable_server_id, StableServerId(3_001));
+        assert_eq!(selected.retry_at, Some(earlier));
+        assert_eq!(selected.registry_capacity_revision, first_revision);
+    }
+
+    #[tokio::test]
+    async fn body_selection_reports_earliest_quota_when_all_fills_are_blocked() {
+        let later = Instant::now() + Duration::from_secs(120);
+        let earlier = Instant::now() + Duration::from_secs(60);
+        let client =
+            quota_selection_client(&[false, false], &[(0, Some(later)), (1, Some(earlier))]);
+
+        let selection = client.body_server_selection(&[]).await;
+        assert!(selection.eligible.is_empty());
+        let rejection = selection
+            .quota_blocked
+            .expect("quota block must survive filtering");
+        assert_eq!(rejection.stable_server_id, StableServerId(1_001));
+        assert_eq!(rejection.retry_at, Some(earlier));
+        assert!(client.body_server_order(&[]).await.is_empty());
+
+        let blocking = client
+            .try_acquire_blocking_body_lane(&[], &[])
+            .err()
+            .expect("blocking selection must surface the same quota block");
+        assert!(matches!(
+            blocking,
+            NntpError::QuotaBlocked(rejection)
+                if rejection.stable_server_id == StableServerId(1_001)
+                    && rejection.retry_at == Some(earlier)
+        ));
+    }
+
+    #[tokio::test]
+    async fn body_selection_keeps_quota_reason_when_other_fill_is_health_unavailable() {
+        let retry_at = Instant::now() + Duration::from_secs(60);
+        let client = quota_selection_client(&[false, false], &[(0, Some(retry_at))]);
+        client
+            .pool
+            .health()
+            .lock()
+            .await
+            .record_cooldown(1, CooldownReason::Transport);
+
+        let selection = client.body_server_selection(&[]).await;
+        assert!(selection.eligible.is_empty());
+        assert_eq!(
+            selection.quota_blocked.unwrap().stable_server_id,
+            StableServerId(1_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn body_selection_never_reports_quota_from_excluded_servers() {
+        let first = Instant::now() + Duration::from_secs(30);
+        let second = Instant::now() + Duration::from_secs(60);
+        let client =
+            quota_selection_client(&[false, false], &[(0, Some(first)), (1, Some(second))]);
+
+        let selection = client.body_server_selection(&[0]).await;
+        assert!(selection.eligible.is_empty());
+        assert_eq!(
+            selection.quota_blocked.unwrap().stable_server_id,
+            StableServerId(1_001)
+        );
+
+        let selection = client.body_server_selection(&[0, 1]).await;
+        assert!(selection.eligible.is_empty());
+        assert!(selection.quota_blocked.is_none());
+    }
+
+    #[tokio::test]
+    async fn quota_blocked_fill_does_not_unlock_or_report_locked_backfill() {
+        let retry_at = Instant::now() + Duration::from_secs(60);
+        let client = quota_selection_client(&[false, true], &[(0, Some(retry_at))]);
+
+        let selection = client.body_server_selection(&[]).await;
+        assert!(selection.eligible.is_empty());
+        assert_eq!(
+            selection.quota_blocked.unwrap().stable_server_id,
+            StableServerId(1_000)
+        );
+
+        let selection = client.body_server_selection(&[0]).await;
+        assert_eq!(selection.eligible, vec![ServerId(1)]);
+        assert!(selection.quota_blocked.is_none());
+    }
+
     #[tokio::test]
     async fn backfill_server_absent_from_ordinary_order() {
         let client = tiered_client(&[false, false, true]);
@@ -3324,6 +4047,206 @@ mod tests {
             Some("127.0.0.1".parse().unwrap())
         );
         assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn decoded_quota_rejection_fails_over_to_another_fill_server() {
+        let capped_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+            },
+        ])
+        .await;
+        let healthy_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: b"222 1 <quota-failover@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
+            },
+        ])
+        .await;
+
+        let transfers = crate::transfer::ServerTransferRegistry::new();
+        let capped_control = transfers.configure(
+            crate::transfer::StableServerId(101),
+            crate::transfer::ServerTransferConfig {
+                rate_bytes_per_sec: 0,
+                quota: Some(crate::transfer::QuotaRuntimeConfig {
+                    limit_bytes: 0,
+                    generation: 1,
+                    retry_at: None,
+                }),
+            },
+        );
+        let mut capped = scripted_server(capped_port, 0);
+        capped.stable_id = crate::transfer::StableServerId(101);
+        capped.transfer_control = Some(capped_control);
+        let healthy = scripted_server(healthy_port, 1);
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![capped, healthy],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(1),
+        });
+
+        let trace = client
+            .fetch_body_decoded_with_groups_traced("<quota-failover@example.com>", &[])
+            .await;
+        let decoded = trace.result.expect("second fill server should succeed");
+        let decoded_bytes: Vec<u8> = decoded
+            .decoded
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect();
+        assert_eq!(decoded_bytes, b"A");
+        assert_eq!(trace.attempts.len(), 2);
+        assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::QuotaBlocked);
+        assert_eq!(trace.attempts[1].outcome, FetchAttemptOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn decoded_quota_rejection_does_not_unlock_backfill() {
+        let capped_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+            },
+        ])
+        .await;
+        let backfill_port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: b"222 1 <backfill-locked@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
+            },
+        ])
+        .await;
+
+        let transfers = crate::transfer::ServerTransferRegistry::new();
+        let capped_control = transfers.configure(
+            crate::transfer::StableServerId(102),
+            crate::transfer::ServerTransferConfig {
+                rate_bytes_per_sec: 0,
+                quota: Some(crate::transfer::QuotaRuntimeConfig {
+                    limit_bytes: 0,
+                    generation: 1,
+                    retry_at: None,
+                }),
+            },
+        );
+        let mut capped = scripted_server(capped_port, 0);
+        capped.stable_id = crate::transfer::StableServerId(102);
+        capped.transfer_control = Some(capped_control);
+        let mut backfill = scripted_server(backfill_port, 0);
+        backfill.backfill = true;
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![capped, backfill],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(1),
+        });
+
+        let trace = client
+            .fetch_body_decoded_with_groups_traced("<backfill-locked@example.com>", &[])
+            .await;
+        assert!(matches!(
+            trace.result,
+            Err(DecodedBodyError::Nntp(NntpError::QuotaBlocked(_)))
+        ));
+        assert_eq!(trace.attempts.len(), 1);
+        assert_eq!(trace.attempts[0].server_idx, 0);
+        assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::QuotaBlocked);
+    }
+
+    #[tokio::test]
+    async fn deliberate_rate_wait_does_not_trip_decoded_soft_timeout_or_health() {
+        const DECODED_SIZE: usize = 1_200;
+        let mut response =
+            b"222 1 <rate-wait@example.com>\r\n=ybegin line=128 size=1200 name=x\r\n".to_vec();
+        for offset in (0..DECODED_SIZE).step_by(128) {
+            let line_len = (DECODED_SIZE - offset).min(128);
+            response.extend(std::iter::repeat_n(b'k', line_len));
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"=yend size=1200\r\n.\r\n");
+        let response: &'static [u8] = Box::leak(response.into_boxed_slice());
+        let port = spawn_scripted_server(vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response,
+            },
+        ])
+        .await;
+
+        let transfers = crate::transfer::ServerTransferRegistry::new();
+        let control = transfers.configure(
+            crate::transfer::StableServerId(103),
+            crate::transfer::ServerTransferConfig {
+                rate_bytes_per_sec: 1_000,
+                quota: None,
+            },
+        );
+        let mut server = scripted_server(port, 0);
+        server.stable_id = crate::transfer::StableServerId(103);
+        server.transfer_control = Some(control.clone());
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![server],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_millis(50),
+        });
+
+        let started = Instant::now();
+        let trace = client
+            .fetch_body_decoded_with_groups_traced("<rate-wait@example.com>", &[])
+            .await;
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        let decoded = trace.result.expect("deliberate wait must not time out");
+        let expected = vec![b'A'; DECODED_SIZE];
+        let decoded_bytes: Vec<u8> = decoded
+            .decoded
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect();
+        assert_eq!(decoded_bytes, expected);
+        assert_eq!(trace.attempts.len(), 1);
+        assert_eq!(trace.attempts[0].outcome, FetchAttemptOutcome::Success);
+        assert_eq!(
+            *client.pool.health().lock().await.server(0).state(),
+            crate::health::ServerState::Healthy
+        );
+        assert!(control.snapshot().lifetime_body_bytes > 1_000);
     }
 
     #[tokio::test]

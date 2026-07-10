@@ -429,12 +429,12 @@ function isBlockedByGlobalPause(job: { status: string }, isPaused: boolean) {
   return isPaused && (job.status === "DOWNLOADING" || job.status === "QUEUED");
 }
 
-function isBlockedByIspCap(
+function isBlockedByDownloadPolicy(
   job: { status: string },
   downloadBlock: { kind: string },
 ) {
   return (
-    downloadBlock.kind === "ISP_CAP"
+    (downloadBlock.kind === "ISP_CAP" || downloadBlock.kind === "SERVER_QUOTA")
     && (job.status === "DOWNLOADING" || job.status === "QUEUED")
   );
 }
@@ -538,7 +538,7 @@ export function JobList() {
   const isPaused = useLivePaused();
   const downloadBlock = useLiveDownloadBlock();
   const jobs = allJobs.filter((job) => job.status !== "COMPLETE" && job.status !== "FAILED");
-  const capBlockedJobs = jobs.filter((job) => isBlockedByIspCap(job, downloadBlock)).length;
+  const policyBlockedJobs = jobs.filter((job) => isBlockedByDownloadPolicy(job, downloadBlock)).length;
   const capResetAt = formatResetAt(downloadBlock.windowEndsAtEpochMs);
 
   const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
@@ -757,7 +757,7 @@ export function JobList() {
         const pending = pendingJobUpdates[job.id];
         const priorityValue = resolveJobPriority(job, pending);
         const categoryValue = resolveJobCategory(job, pending);
-        const blockedByIspCap = isBlockedByIspCap(job, downloadBlock);
+        const blockedByIspCap = isBlockedByDownloadPolicy(job, downloadBlock);
         const blockedByGlobalPause = isBlockedByGlobalPause(job, isPaused);
         return {
           ...job,
@@ -771,7 +771,9 @@ export function JobList() {
           blockedByGlobalPause,
           blockedByIspCap,
           etaDisplay: blockedByIspCap
-            ? t("jobs.bandwidthCapEta", { resetAt: capResetAt })
+            ? downloadBlock.kind === "SERVER_QUOTA"
+              ? t("jobs.serverQuotaEta")
+              : t("jobs.bandwidthCapEta", { resetAt: capResetAt })
             : blockedByGlobalPause
               ? t("status.paused")
               : (queueEtaById.get(job.id) ?? "\u2014"),
@@ -1347,20 +1349,29 @@ export function JobList() {
         }
       />
 
-      {downloadBlock.kind === "ISP_CAP" && capBlockedJobs > 0 ? (
+      {(downloadBlock.kind === "ISP_CAP" || downloadBlock.kind === "SERVER_QUOTA")
+      && policyBlockedJobs > 0 ? (
         <Card className="border-orange-500/40 bg-orange-500/8">
           <CardContent className="flex flex-col gap-4 py-5 sm:flex-row sm:items-center sm:justify-between">
             <div className="space-y-2">
               <div className="flex flex-wrap items-center gap-2">
-                <Badge variant="warning">{t("jobs.bandwidthCapBadge")}</Badge>
+                <Badge variant="warning">
+                  {downloadBlock.kind === "SERVER_QUOTA"
+                    ? t("jobs.serverQuotaBadge")
+                    : t("jobs.bandwidthCapBadge")}
+                </Badge>
                 <span className="text-sm font-medium text-foreground">
-                  {t("jobs.bandwidthCapTitle")}
+                  {downloadBlock.kind === "SERVER_QUOTA"
+                    ? t("jobs.serverQuotaTitle")
+                    : t("jobs.bandwidthCapTitle")}
                 </span>
               </div>
               <div className="text-sm text-muted-foreground">
-                {t("jobs.bandwidthCapBody", { resetAt: capResetAt })}
+                {downloadBlock.kind === "SERVER_QUOTA"
+                  ? t("jobs.serverQuotaBody")
+                  : t("jobs.bandwidthCapBody", { resetAt: capResetAt })}
               </div>
-              {isPaused ? (
+              {isPaused && downloadBlock.kind === "ISP_CAP" ? (
                 <div className="text-xs uppercase tracking-[0.14em] text-orange-700 dark:text-orange-300">
                   {t("jobs.bandwidthCapManualPauseNote")}
                 </div>
@@ -1368,7 +1379,11 @@ export function JobList() {
             </div>
             <div className="flex shrink-0 items-center gap-2">
               <Button asChild variant="outline">
-                <Link to="/settings/general">{t("jobs.bandwidthCapOpenSettings")}</Link>
+                <Link to={downloadBlock.kind === "SERVER_QUOTA" ? "/settings/servers" : "/settings/general"}>
+                  {downloadBlock.kind === "SERVER_QUOTA"
+                    ? t("jobs.serverQuotaOpenSettings")
+                    : t("jobs.bandwidthCapOpenSettings")}
+                </Link>
               </Button>
             </div>
           </CardContent>

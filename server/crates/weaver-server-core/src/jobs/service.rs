@@ -316,6 +316,9 @@ impl Pipeline {
         working_dir: &std::path::Path,
         staging_dir: Option<&std::path::Path>,
     ) {
+        // Redownload reuses these exact paths right away; a stale cached
+        // write handle would swallow the new download's writes.
+        crate::pipeline::close_cached_write_handles_under(working_dir).await;
         let paths = [
             Some(working_dir.to_path_buf()),
             staging_dir.map(|path| path.to_path_buf()),

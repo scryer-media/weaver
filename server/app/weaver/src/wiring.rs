@@ -97,7 +97,12 @@ pub(crate) async fn detect_server_capabilities(config: &mut Config, db: &Databas
     }
 }
 
-pub(crate) fn build_nntp_client(config: &Config, profile: &SystemProfile) -> NntpClient {
+pub(crate) fn build_nntp_client(
+    config: &Config,
+    profile: &SystemProfile,
+    policy_registry: &weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
+) -> NntpClient {
+    let transfer_registry = policy_registry.transfer_registry();
     let mut active: Vec<&ServerConfig> = config
         .servers
         .iter()
@@ -131,6 +136,10 @@ pub(crate) fn build_nntp_client(config: &Config, profile: &SystemProfile) -> Nnt
             group: server.priority,
             backfill: server.backfill,
             retention_days: server.retention_days,
+            stable_id: weaver_nntp::transfer::StableServerId(server.id),
+            transfer_control: Some(
+                transfer_registry.control(weaver_nntp::transfer::StableServerId(server.id)),
+            ),
         })
         .collect();
 
@@ -140,6 +149,21 @@ pub(crate) fn build_nntp_client(config: &Config, profile: &SystemProfile) -> Nnt
         max_retries_per_server: 1,
         soft_timeout: std::time::Duration::from_secs(15),
     })
+}
+
+pub(crate) async fn flush_server_transfer_usage(
+    policy: Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
+    context: &'static str,
+) {
+    match tokio::task::spawn_blocking(move || policy.flush_usage()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            error!(error = %error, context, "failed to flush server download usage");
+        }
+        Err(error) => {
+            error!(error = %error, context, "server download usage flush task failed");
+        }
+    }
 }
 
 /// Spawn the event-persistence subscriber and return its `JoinHandle` so the

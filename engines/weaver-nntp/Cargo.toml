@@ -38,3 +38,7 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "
 [[bench]]
 name = "multiline_decode"
 harness = false
+
+[[bench]]
+name = "transfer_policy"
+harness = false

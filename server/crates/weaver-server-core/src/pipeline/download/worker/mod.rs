@@ -14,6 +14,13 @@ mod pressure;
 mod refill;
 mod spawn;
 
+#[cfg(test)]
+pub(in crate::pipeline) use ip_replacement::{
+    is_ip_replacement_policy_stop, should_neutrally_park_ip_replacement,
+};
+#[cfg(test)]
+pub(in crate::pipeline) use spawn::lane_acquire_failure_for_work;
+
 enum DispatchAttempt {
     Dispatched,
     NoWork,

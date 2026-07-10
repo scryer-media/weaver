@@ -145,6 +145,22 @@ const SERVER_FIELDS = `
     priority
     backfill
     retentionDays
+    maxDownloadSpeed
+    downloadQuota {
+      enabled
+      period
+      limitBytes
+      resetTimeMinutesLocal
+      weeklyResetWeekday
+      monthlyResetDay
+      usedBytes
+      reservedBytes
+      remainingBytes
+      blocked
+      windowStartsAtEpochMs
+      windowEndsAtEpochMs
+      timezoneName
+    }
   }
 `;
 
@@ -161,6 +177,22 @@ const SERVER_DETAILS_FIELDS = `
     priority
     backfill
     retentionDays
+    maxDownloadSpeed
+    downloadQuota {
+      enabled
+      period
+      limitBytes
+      resetTimeMinutesLocal
+      weeklyResetWeekday
+      monthlyResetDay
+      usedBytes
+      reservedBytes
+      remainingBytes
+      blocked
+      windowStartsAtEpochMs
+      windowEndsAtEpochMs
+      timezoneName
+    }
   }
 `;
 
@@ -889,6 +921,15 @@ export const ADD_SERVER_MUTATION = gql`
 export const UPDATE_SERVER_MUTATION = gql`
   mutation UpdateServer($id: Int!, $input: ServerInput!) {
     updateServer(id: $id, input: $input) {
+      ...ServerFields
+    }
+  }
+  ${SERVER_FIELDS}
+`;
+
+export const RESET_SERVER_DOWNLOAD_QUOTA_USAGE_MUTATION = gql`
+  mutation ResetServerDownloadQuotaUsage($id: Int!) {
+    resetServerDownloadQuotaUsage(id: $id) {
       ...ServerFields
     }
   }

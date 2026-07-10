@@ -122,6 +122,10 @@ impl Pipeline {
                     let working_dir = state.working_dir.clone();
                     let staging_dir = state.staging_dir.clone();
                     tokio::spawn(async move {
+                        // Close cached write handles first: the working-dir
+                        // path may be reused verbatim by a re-added job, and a
+                        // stale handle would swallow its writes.
+                        crate::pipeline::close_cached_write_handles_under(&working_dir).await;
                         if let Err(e) = tokio::fs::remove_dir_all(&working_dir).await
                             && e.kind() != std::io::ErrorKind::NotFound
                         {

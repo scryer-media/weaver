@@ -2070,6 +2070,21 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         ));
     assert!(rendered.contains("weaver_job_progress_ratio{job_id=\"42\""));
     assert!(rendered.contains("weaver_pipeline_jobs{status=\"downloading\"} 1"));
+
+    let quota_rendered = metrics::render_prometheus_metrics(
+        &snapshot,
+        &jobs,
+        false,
+        &DownloadBlockState {
+            kind: DownloadBlockKind::ServerQuota,
+            ..DownloadBlockState::default()
+        },
+        &[],
+    );
+    assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"server_quota\"} 1"));
+    assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"none\"} 0"));
+    assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"manual_pause\"} 0"));
+    assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"isp_cap\"} 0"));
 }
 
 #[test]

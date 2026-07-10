@@ -1,5 +1,25 @@
 use super::*;
 
+pub(in crate::pipeline) fn is_ip_replacement_policy_stop(
+    data: &std::result::Result<DownloadPayload, DownloadError>,
+) -> bool {
+    matches!(
+        data,
+        Err(DownloadError::Fetch(failure))
+            if matches!(
+                failure.kind,
+                DownloadFailureKind::ServerQuota | DownloadFailureKind::Unrequested
+            )
+    )
+}
+
+pub(in crate::pipeline) fn should_neutrally_park_ip_replacement(
+    policy_stopped: bool,
+    prior_park_reason: LaneParkReason,
+) -> bool {
+    policy_stopped && prior_park_reason != LaneParkReason::Error
+}
+
 impl Pipeline {
     pub(in crate::pipeline::download::worker) fn observe_ip_rtt_attempts(
         &mut self,
@@ -291,22 +311,23 @@ impl Pipeline {
             let mode = DownloadLaneMode::Sequential;
             let exclude_servers = lease.compatibility.exclude_servers.clone();
             let job_id = lease.job_id;
-            let work_count = lease.works.len();
             let mut trial_attempts = Vec::new();
             let mut park_reason = LaneParkReason::NoWork;
+            let mut policy_stopped = false;
 
-            let mut remaining = work_count;
-            for work in lease.works {
+            let mut works = lease.works.into_iter();
+            while let Some(work) = works.next() {
+                let estimate = Self::bandwidth_reservation_estimate(work.byte_estimate);
                 let trace = lane
-                    .fetch_decoded_sequential(&work.message_id.to_string())
+                    .fetch_decoded_sequential_with_estimate(&work.message_id.to_string(), estimate)
                     .await;
                 trial_attempts.extend(trace.attempts.iter().cloned());
                 let segment_id = work.segment_id;
                 let retry_count = work.retry_count;
                 let (data, attempts, source_server_idx) =
                     Self::download_data_from_decoded_trace(segment_id, trace);
-                remaining = remaining.saturating_sub(1);
-                if data.is_err() {
+                let policy_stop = is_ip_replacement_policy_stop(&data);
+                if data.is_err() && !policy_stop {
                     park_reason = LaneParkReason::Error;
                 }
                 let _ = tx
@@ -322,19 +343,48 @@ impl Pipeline {
                         release_connection_slot: false,
                     })
                     .await;
+                if policy_stop {
+                    policy_stopped = true;
+                    for unrequested in works.by_ref() {
+                        let _ = tx
+                            .send(DownloadResult {
+                                segment_id: unrequested.segment_id,
+                                data: Err(DownloadError::Fetch(DownloadFailure::new(
+                                    DownloadFailureKind::Unrequested,
+                                    "BODY not requested because the IP replacement trial hit server quota",
+                                ))),
+                                attempts: Vec::new(),
+                                lane_observation: None,
+                                source_server_idx: None,
+                                origin: DownloadResultOrigin::IpReplacementTrial,
+                                retry_count: unrequested.retry_count,
+                                exclude_servers: exclude_servers.clone(),
+                                release_connection_slot: false,
+                            })
+                            .await;
+                    }
+                    break;
+                }
             }
 
-            let candidate_rtts = trial_attempts
-                .iter()
-                .filter(|attempt| {
-                    attempt.outcome == FetchAttemptOutcome::Success
-                        && attempt.server_idx == candidate.old_key.server_idx
-                        && attempt.remote_ip == Some(candidate_ip)
-                })
-                .map(|attempt| attempt.elapsed.as_secs_f64() * 1000.0)
-                .collect::<Vec<_>>();
+            let policy_parked = should_neutrally_park_ip_replacement(policy_stopped, park_reason);
+            let candidate_rtts = if policy_parked {
+                Vec::new()
+            } else {
+                trial_attempts
+                    .iter()
+                    .filter(|attempt| {
+                        attempt.outcome == FetchAttemptOutcome::Success
+                            && attempt.server_idx == candidate.old_key.server_idx
+                            && attempt.remote_ip == Some(candidate_ip)
+                    })
+                    .map(|attempt| attempt.elapsed.as_secs_f64() * 1000.0)
+                    .collect::<Vec<_>>()
+            };
 
-            let accepted = if candidate_rtts.len() >= IP_REPLACEMENT_TRIAL_SAMPLES {
+            let accepted = if policy_parked {
+                false
+            } else if candidate_rtts.len() >= IP_REPLACEMENT_TRIAL_SAMPLES {
                 let candidate_ewma_ms =
                     candidate_rtts.iter().sum::<f64>() / candidate_rtts.len() as f64;
                 let better_by_ratio = candidate_ewma_ms
@@ -380,7 +430,9 @@ impl Pipeline {
                 false
             };
 
-            if accepted {
+            if policy_parked {
+                lane.park();
+            } else if accepted {
                 let accepted_samples = trial_attempts
                     .iter()
                     .filter(|attempt| {
@@ -405,7 +457,9 @@ impl Pipeline {
                     job_id,
                     mode,
                     spillover_loan_kind: None,
-                    reason: if accepted {
+                    reason: if policy_parked {
+                        LaneParkReason::ServerQuota
+                    } else if accepted {
                         park_reason
                     } else {
                         LaneParkReason::ProofFailure

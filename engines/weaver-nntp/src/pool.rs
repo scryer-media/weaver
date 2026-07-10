@@ -13,6 +13,7 @@ use tracing::{debug, trace, warn};
 use crate::connection::{NntpConnection, ServerConfig};
 use crate::error::{NntpError, Result};
 use crate::health::{HealthConfig, HealthTracker};
+use crate::transfer::{ServerTransferControl, StableServerId};
 
 /// Identifies a specific server in the configuration.
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
@@ -31,6 +32,8 @@ struct ServerPool {
 pub struct NntpPool {
     pools: Vec<Arc<Mutex<ServerPool>>>,
     configs: Vec<ServerConfig>,
+    stable_ids: Vec<StableServerId>,
+    transfer_controls: Vec<Option<Arc<ServerTransferControl>>>,
     semaphores: Vec<Arc<Semaphore>>,
     shutdown: CancellationToken,
     max_idle_age: Duration,
@@ -79,6 +82,11 @@ impl Default for PoolConfig {
 /// Per-server pool configuration.
 pub struct ServerPoolConfig {
     pub server: ServerConfig,
+    /// Durable database identity. Unlike [`ServerId`], this survives reorder
+    /// and client rebuilds.
+    pub stable_id: StableServerId,
+    /// Shared BODY policy obtained from a long-lived registry.
+    pub transfer_control: Option<Arc<ServerTransferControl>>,
     pub max_connections: usize,
     /// Priority group. Lower values tried first within a tier.
     pub group: u32,
@@ -95,6 +103,8 @@ impl Default for ServerPoolConfig {
     fn default() -> Self {
         Self {
             server: ServerConfig::default(),
+            stable_id: StableServerId::default(),
+            transfer_control: None,
             max_connections: 1,
             group: 0,
             backfill: false,
@@ -109,6 +119,8 @@ impl NntpPool {
         let server_count = config.servers.len();
         let mut pools = Vec::with_capacity(server_count);
         let mut configs = Vec::with_capacity(server_count);
+        let mut stable_ids = Vec::with_capacity(server_count);
+        let mut transfer_controls = Vec::with_capacity(server_count);
         let mut semaphores = Vec::with_capacity(server_count);
         let mut last_connect_failure = Vec::with_capacity(server_count);
         let mut groups = Vec::with_capacity(server_count);
@@ -125,6 +137,15 @@ impl NntpPool {
         }
 
         for spc in &config.servers {
+            if let Some(control) = &spc.transfer_control {
+                assert_eq!(
+                    spc.stable_id,
+                    control.stable_server_id(),
+                    "ServerPoolConfig stable_id must match its transfer control"
+                );
+            }
+            stable_ids.push(spc.stable_id);
+            transfer_controls.push(spc.transfer_control.clone());
             groups.push(spc.group);
             backfill.push(spc.backfill && !all_backfill);
             retention_days.push(spc.retention_days);
@@ -149,6 +170,8 @@ impl NntpPool {
         NntpPool {
             pools,
             configs,
+            stable_ids,
+            transfer_controls,
             semaphores,
             shutdown: CancellationToken::new(),
             max_idle_age: config.max_idle_age,
@@ -188,7 +211,10 @@ impl NntpPool {
         exclusions.sort_unstable();
         exclusions.dedup();
         let offset = self.next_connect_offset(idx);
-        NntpConnection::connect_with_ip_policy(&self.configs[idx], &exclusions, offset).await
+        let mut connection =
+            NntpConnection::connect_with_ip_policy(&self.configs[idx], &exclusions, offset).await?;
+        connection.set_transfer_control(self.transfer_controls[idx].clone());
+        Ok(connection)
     }
 
     /// Acquire a connection from a specific server.
@@ -559,6 +585,14 @@ impl NntpPool {
         &self.configs
     }
 
+    pub fn stable_server_id(&self, server: ServerId) -> Option<StableServerId> {
+        self.stable_ids.get(server.0).copied()
+    }
+
+    pub fn server_transfer_control(&self, server: ServerId) -> Option<Arc<ServerTransferControl>> {
+        self.transfer_controls.get(server.0).cloned().flatten()
+    }
+
     pub fn try_acquire_blocking_permit(
         &self,
         server: ServerId,
@@ -759,6 +793,20 @@ mod tests {
     fn pool_creation() {
         let pool = NntpPool::new(test_pool_config(10));
         assert_eq!(pool.server_count(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "ServerPoolConfig stable_id must match its transfer control")]
+    fn pool_rejects_mismatched_transfer_control_identity() {
+        let registry = crate::transfer::ServerTransferRegistry::new();
+        let control = registry.configure(
+            crate::transfer::StableServerId(2),
+            crate::transfer::ServerTransferConfig::default(),
+        );
+        let mut config = test_pool_config(1);
+        config.servers[0].stable_id = crate::transfer::StableServerId(1);
+        config.servers[0].transfer_control = Some(control);
+        let _ = NntpPool::new(config);
     }
 
     #[test]

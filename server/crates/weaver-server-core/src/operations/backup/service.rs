@@ -82,6 +82,13 @@ impl BackupService {
     ) -> Result<BackupArtifact, BackupServiceError> {
         let _guard = self.inner.op_lock.lock().await;
 
+        if let Some(policy) = self.inner.handle.server_transfer_policy() {
+            tokio::task::spawn_blocking(move || policy.flush_usage())
+                .await
+                .map_err(|e| BackupServiceError::Io(e.to_string()))?
+                .map_err(|e| BackupServiceError::Io(e.to_string()))?;
+        }
+
         let temp_dir = tempfile::tempdir().map_err(io_err)?;
         let backup_db_path = temp_dir.path().join("backup.db");
         let export = {
@@ -188,10 +195,21 @@ impl BackupService {
         {
             let db = self.inner.db.clone();
             let backup_db_path = loaded.backup_db_path.clone();
-            tokio::task::spawn_blocking(move || db.import_stable_state(&backup_db_path))
-                .await
-                .map_err(|e| BackupServiceError::Io(e.to_string()))?
-                .map_err(|e| BackupServiceError::Io(e.to_string()))?;
+            let policy = self.inner.handle.server_transfer_policy();
+            tokio::task::spawn_blocking(move || {
+                if let Some(policy) = policy {
+                    policy.with_maintenance_quiesced(|| {
+                        db.import_stable_state(&backup_db_path)?;
+                        policy.clear_runtime_state();
+                        Ok(())
+                    })
+                } else {
+                    db.import_stable_state(&backup_db_path).map(|_| ())
+                }
+            })
+            .await
+            .map_err(|e| BackupServiceError::Io(e.to_string()))?
+            .map_err(|e| BackupServiceError::Io(e.to_string()))?;
         }
 
         let loaded_config =
