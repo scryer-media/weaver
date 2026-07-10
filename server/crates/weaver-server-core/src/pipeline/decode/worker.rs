@@ -845,16 +845,10 @@ impl Pipeline {
         expected_crc: u32,
         actual_crc: u32,
     ) -> Result<bool, String> {
-        let mut candidates = self
-            .unverified_segments
-            .iter()
-            .filter(|(segment_id, _)| segment_id.file_id == file_id)
-            .map(|(segment_id, provenance)| (*segment_id, provenance.clone()))
-            .collect::<Vec<_>>();
-        candidates.sort_by_key(|(segment_id, _)| segment_id.segment_number);
-        if candidates.is_empty() {
+        let Some(file_candidates) = self.unverified_segments.get(&file_id) else {
             return Ok(false);
-        }
+        };
+        let candidate_count = file_candidates.len();
 
         let Some(state) = self.jobs.get(&file_id.job_id) else {
             return Ok(false);
@@ -862,10 +856,16 @@ impl Pipeline {
         let Some(file_spec) = state.spec.files.get(file_id.file_index as usize) else {
             return Ok(false);
         };
-
-        let mut queued = Vec::with_capacity(candidates.len());
-        for (segment_id, provenance) in &candidates {
-            let retry_count = self.decode_retries.get(segment_id).copied().unwrap_or(0);
+        let mut queued = Vec::with_capacity(candidate_count);
+        for seg_spec in &file_spec.segments {
+            let Some(provenance) = file_candidates.get(&seg_spec.ordinal) else {
+                continue;
+            };
+            let segment_id = SegmentId {
+                file_id,
+                segment_number: seg_spec.ordinal,
+            };
+            let retry_count = self.decode_retries.get(&segment_id).copied().unwrap_or(0);
             if retry_count >= MAX_SEGMENT_RETRIES {
                 warn!(
                     file_id = %file_id,
@@ -877,22 +877,15 @@ impl Pipeline {
                 );
                 return Ok(false);
             }
-            let Some(seg_spec) = file_spec
-                .segments
-                .iter()
-                .find(|spec| spec.ordinal == segment_id.segment_number)
-            else {
-                return Ok(false);
-            };
             let exclude_servers = Self::decode_retry_exclude_servers(
                 &provenance.exclude_servers,
                 provenance.source_server_idx,
             );
             queued.push((
-                *segment_id,
+                segment_id,
                 retry_count + 1,
                 DownloadWork {
-                    segment_id: *segment_id,
+                    segment_id,
                     message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
                     groups: file_spec.groups.clone(),
                     priority: file_spec.role.download_priority(),
@@ -905,9 +898,14 @@ impl Pipeline {
                 },
             ));
         }
+        if queued.len() != candidate_count {
+            return Ok(false);
+        }
 
-        self.db
-            .mark_file_incomplete(file_id.job_id, file_id.file_index)
+        let recovery_job_id = file_id.job_id;
+        let recovery_file_index = file_id.file_index;
+        self.db_blocking(move |db| db.mark_file_incomplete(recovery_job_id, recovery_file_index))
+            .await
             .map_err(|error| {
                 format!("failed to persist file invalidation before CRC recovery: {error}")
             })?;
@@ -927,7 +925,6 @@ impl Pipeline {
             },
         );
 
-        let candidate_count = queued.len();
         for (segment_id, retry_count, work) in queued {
             self.decode_retries.insert(segment_id, retry_count);
             self.metrics
@@ -1269,8 +1266,7 @@ impl Pipeline {
         let DecodeResult {
             segment_id,
             raw_size: _,
-            source_server_idx,
-            exclude_servers,
+            unverified_provenance,
             file_offset,
             decoded_size,
             crc_valid,
@@ -1283,10 +1279,11 @@ impl Pipeline {
 
         let job_id = segment_id.file_id.job_id;
         let file_id = segment_id.file_id;
-        let is_file_crc_recovery = self
-            .file_crc_recoveries
-            .get(&file_id)
-            .is_some_and(|recovery| recovery.pending_segments.contains(&segment_id));
+        let is_file_crc_recovery = !self.file_crc_recoveries.is_empty()
+            && self
+                .file_crc_recoveries
+                .get(&file_id)
+                .is_some_and(|recovery| recovery.pending_segments.contains(&segment_id));
 
         let ready = {
             let _cpu_scope =
@@ -1360,15 +1357,29 @@ impl Pipeline {
             });
 
             if part_crc_verified {
-                self.unverified_segments.remove(&segment_id);
+                if is_file_crc_recovery {
+                    let remove_file_bucket = self
+                        .unverified_segments
+                        .get_mut(&file_id)
+                        .is_some_and(|segments| {
+                            segments.remove(&segment_id.segment_number);
+                            segments.is_empty()
+                        });
+                    if remove_file_bucket {
+                        self.unverified_segments.remove(&file_id);
+                    }
+                }
             } else {
-                self.unverified_segments.insert(
-                    segment_id,
-                    UnverifiedSegmentProvenance {
-                        source_server_idx,
-                        exclude_servers,
-                    },
-                );
+                let provenance = unverified_provenance
+                    .map(|provenance| *provenance)
+                    .unwrap_or(UnverifiedSegmentProvenance {
+                        source_server_idx: None,
+                        exclude_servers: Vec::new(),
+                    });
+                self.unverified_segments
+                    .entry(file_id)
+                    .or_default()
+                    .insert(segment_id.segment_number, provenance);
             }
 
             let buffered_segment = BufferedDecodedSegment {
@@ -1953,8 +1964,7 @@ impl Pipeline {
                     self.file_hash_states.remove(&file_id);
                     self.expected_file_crcs.remove(&file_id);
                     self.file_hash_reread_required.remove(&file_id);
-                    self.unverified_segments
-                        .retain(|segment_id, _| segment_id.file_id != file_id);
+                    self.unverified_segments.remove(&file_id);
                     self.file_crc_recoveries.remove(&file_id);
 
                     let mut stage_start = Instant::now();

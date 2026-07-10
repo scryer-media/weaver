@@ -1490,8 +1490,12 @@ async fn submit_decoded_segment_with_part_crc_verified(
                 segment_number,
             },
             raw_size: data.len() as u64,
-            source_server_idx: None,
-            exclude_servers: Vec::new(),
+            unverified_provenance: (!part_crc_verified).then(|| {
+                Box::new(UnverifiedSegmentProvenance {
+                    source_server_idx: None,
+                    exclude_servers: Vec::new(),
+                })
+            }),
             file_offset,
             decoded_size: data.len() as u32,
             crc_valid: true,
@@ -1524,8 +1528,12 @@ async fn submit_decoded_segment_from_server(
                 segment_number,
             },
             raw_size: data.len() as u64,
-            source_server_idx,
-            exclude_servers,
+            unverified_provenance: (!part_crc_verified).then(|| {
+                Box::new(UnverifiedSegmentProvenance {
+                    source_server_idx,
+                    exclude_servers,
+                })
+            }),
             file_offset,
             decoded_size: data.len() as u32,
             crc_valid: true,

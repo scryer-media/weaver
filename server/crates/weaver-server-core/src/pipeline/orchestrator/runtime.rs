@@ -420,7 +420,7 @@ impl Pipeline {
         self.file_hash_reread_required
             .retain(|file_id| file_id.job_id != job_id);
         self.unverified_segments
-            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+            .retain(|file_id, _| file_id.job_id != job_id);
         self.file_crc_recoveries
             .retain(|file_id, _| file_id.job_id != job_id);
         self.download_restart_durable_lead_retry_after

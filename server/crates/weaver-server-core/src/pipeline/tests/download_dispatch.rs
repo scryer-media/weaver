@@ -4986,8 +4986,7 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
             data: Ok(DownloadPayload::Decoded(DecodeResult {
                 segment_id,
                 raw_size,
-                source_server_idx: Some(0),
-                exclude_servers: Vec::new(),
+                unverified_provenance: None,
                 file_offset: 0,
                 decoded_size: payload.len() as u32,
                 crc_valid: true,
@@ -5035,7 +5034,8 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
     );
     let provenance = pipeline
         .unverified_segments
-        .get(&segment_id)
+        .get(&segment_id.file_id)
+        .and_then(|segments| segments.get(&segment_id.segment_number))
         .expect("streamed success must retain unverified segment provenance");
     assert_eq!(provenance.source_server_idx, Some(0));
     assert_eq!(provenance.exclude_servers, vec![2]);

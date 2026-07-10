@@ -14,6 +14,30 @@ pub(in crate::pipeline) fn lane_acquire_failure_for_work(
     }
 }
 
+fn send_blocking_decode_failure(
+    tx: &mpsc::Sender<DecodeDone>,
+    segment_id: SegmentId,
+    raw_size: u64,
+    source_server_idx: Option<usize>,
+    exclude_servers: Vec<usize>,
+    error: String,
+) {
+    let _profile_scope = crate::runtime::perf_probe::scope("download.decode.send_failure");
+    let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.send_failure");
+    let send_started = Instant::now();
+    let _ = tx.blocking_send(DecodeDone::Failed {
+        segment_id,
+        raw_size,
+        error,
+        source_server_idx,
+        exclude_servers,
+    });
+    crate::runtime::perf_probe::record(
+        "download.decode.done_channel.blocking_send",
+        send_started.elapsed(),
+    );
+}
+
 impl Pipeline {
     pub(in crate::pipeline::download::worker) fn spawn_decode_task(
         &self,
@@ -51,31 +75,19 @@ impl Pipeline {
             let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.task");
             crate::runtime::affinity::pin_current_thread_for_hot_download_path();
 
-            let send_decode_failure = |error: String| {
-                let _profile_scope =
-                    crate::runtime::perf_probe::scope("download.decode.send_failure");
-                let _cpu_scope =
-                    crate::runtime::perf_probe::cpu_scope("download.decode.send_failure");
-                let send_started = Instant::now();
-                let _ = tx.blocking_send(DecodeDone::Failed {
-                    segment_id,
-                    raw_size,
-                    error,
-                    source_server_idx,
-                    exclude_servers: exclude_servers.clone(),
-                });
-                crate::runtime::perf_probe::record(
-                    "download.decode.done_channel.blocking_send",
-                    send_started.elapsed(),
-                );
-            };
-
             if let Some(mut output) = output {
                 let Some(output_buf) = output.as_mut_slice() else {
                     let error = "failed to get unique pooled decode buffer".to_string();
                     metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                     warn!(segment = %segment_id, error, "yEnc decode failed");
-                    send_decode_failure(error);
+                    send_blocking_decode_failure(
+                        &tx,
+                        segment_id,
+                        raw_size,
+                        source_server_idx,
+                        exclude_servers,
+                        error,
+                    );
                     return;
                 };
 
@@ -109,16 +121,22 @@ impl Pipeline {
                         let _cpu_scope =
                             crate::runtime::perf_probe::cpu_scope("download.decode.send_success");
                         let send_started = Instant::now();
+                        let part_crc_verified =
+                            decode_result.expected_part_crc.is_some() && decode_result.crc_valid;
+                        let unverified_provenance = (!part_crc_verified).then(|| {
+                            Box::new(UnverifiedSegmentProvenance {
+                                source_server_idx,
+                                exclude_servers,
+                            })
+                        });
                         let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
                             segment_id,
                             raw_size,
-                            source_server_idx,
-                            exclude_servers: exclude_servers.clone(),
+                            unverified_provenance,
                             file_offset,
                             decoded_size: decode_result.bytes_written as u32,
                             crc_valid: decode_result.crc_valid,
-                            part_crc_verified: decode_result.expected_part_crc.is_some()
-                                && decode_result.crc_valid,
+                            part_crc_verified,
                             part_crc: decode_result.part_crc,
                             expected_file_crc: decode_result.expected_file_crc,
                             data: decoded,
@@ -136,7 +154,14 @@ impl Pipeline {
                         let error = e.to_string();
                         metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                         warn!(segment = %segment_id, error = %error, "yEnc decode failed");
-                        send_decode_failure(error);
+                        send_blocking_decode_failure(
+                            &tx,
+                            segment_id,
+                            raw_size,
+                            source_server_idx,
+                            exclude_servers,
+                            error,
+                        );
                     }
                 }
             } else {
@@ -167,16 +192,22 @@ impl Pipeline {
                         let _cpu_scope =
                             crate::runtime::perf_probe::cpu_scope("download.decode.send_success");
                         let send_started = Instant::now();
+                        let part_crc_verified =
+                            decode_result.expected_part_crc.is_some() && decode_result.crc_valid;
+                        let unverified_provenance = (!part_crc_verified).then(|| {
+                            Box::new(UnverifiedSegmentProvenance {
+                                source_server_idx,
+                                exclude_servers,
+                            })
+                        });
                         let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
                             segment_id,
                             raw_size,
-                            source_server_idx,
-                            exclude_servers: exclude_servers.clone(),
+                            unverified_provenance,
                             file_offset,
                             decoded_size: decode_result.bytes_written as u32,
                             crc_valid: decode_result.crc_valid,
-                            part_crc_verified: decode_result.expected_part_crc.is_some()
-                                && decode_result.crc_valid,
+                            part_crc_verified,
                             part_crc: decode_result.part_crc,
                             expected_file_crc: decode_result.expected_file_crc,
                             data: DecodedChunk::from(output),
@@ -194,7 +225,14 @@ impl Pipeline {
                         let error = e.to_string();
                         metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                         warn!(segment = %segment_id, error = %error, "yEnc decode failed");
-                        send_decode_failure(error);
+                        send_blocking_decode_failure(
+                            &tx,
+                            segment_id,
+                            raw_size,
+                            source_server_idx,
+                            exclude_servers,
+                            error,
+                        );
                     }
                 }
             }

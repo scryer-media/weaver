@@ -1135,8 +1135,9 @@ pub(super) struct MoveToCompleteDone {
 pub(super) struct DecodeResult {
     pub(super) segment_id: SegmentId,
     pub(super) raw_size: u64,
-    pub(super) source_server_idx: Option<usize>,
-    pub(super) exclude_servers: Vec<usize>,
+    /// Present only when this successful decode lacked an independently
+    /// verified yEnc part CRC. Keeps provenance off the verified hot path.
+    pub(super) unverified_provenance: Option<Box<UnverifiedSegmentProvenance>>,
     pub(super) file_offset: u64,
     pub(super) decoded_size: u32,
     pub(super) crc_valid: bool,
@@ -1148,7 +1149,7 @@ pub(super) struct DecodeResult {
     pub(super) yenc_name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct UnverifiedSegmentProvenance {
     pub(super) source_server_idx: Option<usize>,
     pub(super) exclude_servers: Vec<usize>,
@@ -1715,7 +1716,7 @@ pub struct Pipeline {
     pub(super) decode_retries: HashMap<SegmentId, u32>,
     /// Successfully decoded segments whose yEnc part CRC was absent. These are
     /// targeted for replacement only if the completed file CRC proves corruption.
-    pub(super) unverified_segments: HashMap<SegmentId, UnverifiedSegmentProvenance>,
+    pub(super) unverified_segments: HashMap<NzbFileId, HashMap<u32, UnverifiedSegmentProvenance>>,
     /// Completed files currently replacing unverified segments after a whole-file
     /// CRC mismatch. Final verification waits for the entire batch.
     pub(super) file_crc_recoveries: HashMap<NzbFileId, FileCrcRecoveryState>,
