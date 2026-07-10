@@ -452,7 +452,8 @@ impl Pipeline {
                 });
                 self.pump_decode_queue();
             }
-            Ok(DownloadPayload::Decoded(decoded)) => {
+            Ok(DownloadPayload::Decoded(mut decoded)) => {
+                decoded.exclude_servers = excluded_servers;
                 let raw_size_bytes = decoded.raw_size;
                 let raw_size = raw_size_bytes.min(u64::from(u32::MAX)) as u32;
                 let decoded_size = decoded.decoded_size;

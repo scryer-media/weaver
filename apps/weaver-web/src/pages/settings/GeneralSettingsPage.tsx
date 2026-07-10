@@ -93,7 +93,7 @@ export function GeneralSettingsPage() {
   const [completeDir, setCompleteDir] = useState("");
   const [cleanup, setCleanup] = useState(true);
   const [maxRetries, setMaxRetries] = useState(3);
-  const [ipReplacementBurst, setIpReplacementBurst] = useState(0);
+  const [ipReplacementBurst, setIpReplacementBurst] = useState(false);
   const [speedSaved, setSpeedSaved] = useState(false);
   const [ipReplacementBurstSaved, setIpReplacementBurstSaved] = useState(false);
   const [duplicatePolicySaveStatus, setDuplicatePolicySaveStatus] = useState<
@@ -121,7 +121,7 @@ export function GeneralSettingsPage() {
     setCompleteDir(settings.completeDir ?? "");
     setCleanup(settings.cleanupAfterExtract ?? true);
     setMaxRetries(settings.maxRetries ?? 3);
-    setIpReplacementBurst(settings.ipReplacementTrialExtraConnections ?? 0);
+    setIpReplacementBurst((settings.ipReplacementTrialExtraConnections ?? 0) > 0);
   }, [settings]);
 
   useEffect(() => {
@@ -270,11 +270,11 @@ export function GeneralSettingsPage() {
     }
   };
 
-  const applyIpReplacementBurst = async () => {
-    const value = Math.max(0, Math.min(1, Math.trunc(ipReplacementBurst)));
+  const updateIpReplacementBurst = async (enabled: boolean) => {
+    setIpReplacementBurst(enabled);
     const result = await updateSettings({
       input: {
-        ipReplacementTrialExtraConnections: value,
+        ipReplacementTrialExtraConnections: enabled ? 1 : 0,
       },
     });
 
@@ -467,26 +467,12 @@ export function GeneralSettingsPage() {
                 description={t("settings.ipReplacementTrialExtraConnectionsDesc")}
               >
                 <div className="flex flex-wrap items-center gap-3">
-                  <Input
-                    type="number"
-                    min={0}
-                    max={1}
-                    step={1}
-                    value={ipReplacementBurst}
-                    onChange={(event) => {
-                      const value = Number(event.target.value);
-                      setIpReplacementBurst(Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0);
-                    }}
-                    className="max-w-24"
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => void applyIpReplacementBurst()}
+                  <Switch
+                    checked={ipReplacementBurst}
+                    onCheckedChange={(enabled) => void updateIpReplacementBurst(enabled)}
+                    aria-label={t("settings.ipReplacementTrialExtraConnections")}
                     disabled={updateState.fetching}
-                  >
-                    {t("settings.save")}
-                  </Button>
+                  />
                   {ipReplacementBurstSaved ? (
                     <span className="text-sm text-status-completed">
                       {t("settings.saved")}

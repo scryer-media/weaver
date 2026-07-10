@@ -198,6 +198,8 @@ impl Pipeline {
             extracted_members: HashMap::new(),
             extracted_archives: HashMap::new(),
             decode_retries: HashMap::new(),
+            unverified_segments: HashMap::new(),
+            file_crc_recoveries: HashMap::new(),
             inflight_extractions: HashMap::new(),
             phase_progress: HashMap::new(),
             phase_progress_snapshots: HashMap::new(),
@@ -417,6 +419,10 @@ impl Pipeline {
             .retain(|file_id, _| file_id.job_id != job_id);
         self.file_hash_reread_required
             .retain(|file_id| file_id.job_id != job_id);
+        self.unverified_segments
+            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+        self.file_crc_recoveries
+            .retain(|file_id, _| file_id.job_id != job_id);
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
     }

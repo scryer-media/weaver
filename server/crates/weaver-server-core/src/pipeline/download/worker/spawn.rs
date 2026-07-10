@@ -112,6 +112,8 @@ impl Pipeline {
                         let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
                             segment_id,
                             raw_size,
+                            source_server_idx,
+                            exclude_servers: exclude_servers.clone(),
                             file_offset,
                             decoded_size: decode_result.bytes_written as u32,
                             crc_valid: decode_result.crc_valid,
@@ -168,6 +170,8 @@ impl Pipeline {
                         let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
                             segment_id,
                             raw_size,
+                            source_server_idx,
+                            exclude_servers: exclude_servers.clone(),
                             file_offset,
                             decoded_size: decode_result.bytes_written as u32,
                             crc_valid: decode_result.crc_valid,

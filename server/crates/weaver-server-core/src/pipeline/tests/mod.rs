@@ -1490,6 +1490,42 @@ async fn submit_decoded_segment_with_part_crc_verified(
                 segment_number,
             },
             raw_size: data.len() as u64,
+            source_server_idx: None,
+            exclude_servers: Vec::new(),
+            file_offset,
+            decoded_size: data.len() as u32,
+            crc_valid: true,
+            part_crc_verified,
+            part_crc: weaver_par2::checksum::crc32(data),
+            expected_file_crc,
+            data: DecodedChunk::from(data.to_vec()),
+            yenc_name: filename.to_string(),
+        })
+        .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_decoded_segment_from_server(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    segment_number: u32,
+    file_offset: u64,
+    data: &[u8],
+    filename: &str,
+    expected_file_crc: Option<u32>,
+    part_crc_verified: bool,
+    source_server_idx: Option<usize>,
+    exclude_servers: Vec<usize>,
+) {
+    pipeline
+        .handle_decode_success(DecodeResult {
+            segment_id: SegmentId {
+                file_id,
+                segment_number,
+            },
+            raw_size: data.len() as u64,
+            source_server_idx,
+            exclude_servers,
             file_offset,
             decoded_size: data.len() as u32,
             crc_valid: true,

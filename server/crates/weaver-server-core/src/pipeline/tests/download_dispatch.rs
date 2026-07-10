@@ -4964,9 +4964,10 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
     let job_id = JobId(20017);
     let filename = "streamed.bin";
     let payload = b"already decoded bytes".to_vec();
-    let spec = standalone_job_spec(
+    let spec = segmented_job_spec(
         "Streamed Decode Success",
-        &[(filename.to_string(), payload.len() as u32)],
+        filename,
+        &[payload.len() as u32, 1],
     );
     insert_active_job(&mut pipeline, job_id, spec).await;
 
@@ -4985,10 +4986,12 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
             data: Ok(DownloadPayload::Decoded(DecodeResult {
                 segment_id,
                 raw_size,
+                source_server_idx: Some(0),
+                exclude_servers: Vec::new(),
                 file_offset: 0,
                 decoded_size: payload.len() as u32,
                 crc_valid: true,
-                part_crc_verified: true,
+                part_crc_verified: false,
                 part_crc: weaver_par2::checksum::crc32(&payload),
                 expected_file_crc: None,
                 data: DecodedChunk::from(payload.clone()),
@@ -4999,7 +5002,7 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: vec![2],
             release_connection_slot: true,
         })
         .await;
@@ -5030,6 +5033,12 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
             .map(|state| state.downloaded_bytes),
         Some(payload.len() as u64)
     );
+    let provenance = pipeline
+        .unverified_segments
+        .get(&segment_id)
+        .expect("streamed success must retain unverified segment provenance");
+    assert_eq!(provenance.source_server_idx, Some(0));
+    assert_eq!(provenance.exclude_servers, vec![2]);
 }
 
 #[tokio::test]

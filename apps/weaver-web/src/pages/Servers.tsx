@@ -499,7 +499,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                                   server.backfill
                                     ? "bg-status-queued/15 text-status-queued"
                                     : priority === 0
-                                      ? "bg-priority-high/15 text-priority-high"
+                                      ? "bg-status-completed/15 text-status-completed"
                                       : "bg-secondary text-muted-foreground",
                                 )}
                               >

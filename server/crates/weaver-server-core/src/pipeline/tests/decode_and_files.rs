@@ -658,6 +658,8 @@ async fn disk_write_failure_fails_job_before_commit() {
                 segment_number: 0,
             },
             raw_size: 4,
+            source_server_idx: None,
+            exclude_servers: Vec::new(),
             file_offset: 0,
             decoded_size: 4,
             crc_valid: true,
@@ -930,6 +932,8 @@ async fn completed_file_uses_decoded_size_when_raw_article_bytes_are_larger() {
                 segment_number: 0,
             },
             raw_size: raw_article_bytes as u64,
+            source_server_idx: None,
+            exclude_servers: Vec::new(),
             file_offset: 0,
             decoded_size: payload.len() as u32,
             crc_valid: true,
@@ -994,6 +998,277 @@ async fn completed_file_crc32_mismatch_fails_before_persisting_completion() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn whole_file_crc_mismatch_recovers_unverified_nonzero_segment_from_alternate_server() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20900);
+    let filename = "payload.bin";
+    let expected_payload = b"abcdefgh";
+    let expected_crc = weaver_par2::checksum::crc32(expected_payload);
+    let spec = two_segment_standalone_job_spec("CRC Recovery", filename, 4, 4);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_decoded_segment_from_server(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        b"abcd",
+        filename,
+        Some(expected_crc),
+        true,
+        Some(0),
+        Vec::new(),
+    )
+    .await;
+    submit_decoded_segment_from_server(
+        &mut pipeline,
+        file_id,
+        1,
+        4,
+        b"WXYZ",
+        filename,
+        Some(expected_crc),
+        false,
+        Some(0),
+        Vec::new(),
+    )
+    .await;
+
+    assert!(matches!(
+        pipeline.jobs.get(&job_id).map(|state| &state.status),
+        Some(JobStatus::Downloading)
+    ));
+    assert_eq!(
+        pipeline
+            .file_crc_recoveries
+            .get(&file_id)
+            .map(|recovery| recovery.pending_segments.len()),
+        Some(1)
+    );
+    assert!(pipeline.job_has_pending_download_pipeline_work(job_id));
+    let queued = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .drain_all();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].segment_id.segment_number, 1);
+    assert_eq!(queued[0].exclude_servers, vec![0]);
+    assert!(
+        !pipeline.db.load_active_jobs().unwrap()[&job_id]
+            .file_progress
+            .contains_key(&file_id.file_index),
+        "CRC recovery must durably clear completed progress before re-download"
+    );
+
+    submit_decoded_segment_from_server(
+        &mut pipeline,
+        file_id,
+        1,
+        4,
+        b"efgh",
+        filename,
+        Some(expected_crc),
+        true,
+        Some(1),
+        vec![0],
+    )
+    .await;
+
+    assert_eq!(
+        tokio::fs::read(working_dir.join(filename)).await.unwrap(),
+        expected_payload
+    );
+    assert!(!pipeline.file_crc_recoveries.contains_key(&file_id));
+    assert!(
+        !pipeline
+            .unverified_segments
+            .keys()
+            .any(|segment_id| segment_id.file_id == file_id)
+    );
+    assert_eq!(
+        pipeline.jobs[&job_id].downloaded_bytes,
+        expected_payload.len() as u64,
+        "replacement bytes must not double-count logical progress"
+    );
+}
+
+#[tokio::test]
+async fn whole_file_crc_recovery_waits_for_entire_unverified_batch() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(20901);
+    let filename = "payload.bin";
+    let expected_payload = b"abcdefgh";
+    let expected_crc = weaver_par2::checksum::crc32(expected_payload);
+    let spec = two_segment_standalone_job_spec("CRC Recovery Batch", filename, 4, 4);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    for (segment_number, offset, data) in [(0, 0, b"ABCD".as_slice()), (1, 4, b"WXYZ")] {
+        submit_decoded_segment_from_server(
+            &mut pipeline,
+            file_id,
+            segment_number,
+            offset,
+            data,
+            filename,
+            Some(expected_crc),
+            false,
+            Some(0),
+            Vec::new(),
+        )
+        .await;
+    }
+    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+
+    submit_decoded_segment_from_server(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        b"abcd",
+        filename,
+        Some(expected_crc),
+        true,
+        Some(1),
+        vec![0],
+    )
+    .await;
+    assert_eq!(
+        pipeline
+            .file_crc_recoveries
+            .get(&file_id)
+            .map(|recovery| recovery.pending_segments.len()),
+        Some(1)
+    );
+    assert!(
+        !drain_job_events(&mut events, job_id)
+            .iter()
+            .any(|event| matches!(event, PipelineEvent::FileComplete { .. }))
+    );
+
+    submit_decoded_segment_from_server(
+        &mut pipeline,
+        file_id,
+        1,
+        4,
+        b"efgh",
+        filename,
+        Some(expected_crc),
+        true,
+        Some(1),
+        vec![0],
+    )
+    .await;
+    assert!(
+        drain_job_events(&mut events, job_id)
+            .iter()
+            .any(|event| matches!(event, PipelineEvent::FileComplete { .. }))
+    );
+}
+
+#[tokio::test]
+async fn matching_whole_file_crc_accepts_unverified_part_without_retry() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20902);
+    let filename = "payload.bin";
+    let payload = b"clean";
+    let expected_crc = weaver_par2::checksum::crc32(payload);
+    let spec = standalone_job_spec(
+        "Unverified But Whole CRC Clean",
+        &[(filename.to_string(), payload.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_decoded_segment_from_server(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        payload,
+        filename,
+        Some(expected_crc),
+        false,
+        Some(0),
+        Vec::new(),
+    )
+    .await;
+
+    assert!(!pipeline.file_crc_recoveries.contains_key(&file_id));
+    assert!(pipeline.jobs[&job_id].download_queue.is_empty());
+    assert!(!pipeline.unverified_segments.contains_key(&SegmentId {
+        file_id,
+        segment_number: 0,
+    }));
+}
+
+#[tokio::test]
+async fn whole_file_crc_recovery_fails_when_unverified_segment_budget_is_exhausted() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20903);
+    let filename = "payload.bin";
+    let payload = b"wrong";
+    let spec = standalone_job_spec(
+        "CRC Recovery Exhausted",
+        &[(filename.to_string(), payload.len() as u32)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let segment_id = SegmentId {
+        file_id,
+        segment_number: 0,
+    };
+    pipeline
+        .decode_retries
+        .insert(segment_id, MAX_SEGMENT_RETRIES);
+
+    submit_decoded_segment_from_server(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        payload,
+        filename,
+        Some(0xDEAD_BEEF),
+        false,
+        Some(0),
+        Vec::new(),
+    )
+    .await;
+
+    let status = job_status_for_assert(&pipeline, job_id).unwrap();
+    assert!(matches!(
+        status,
+        JobStatus::Failed { error } if error.contains("whole-file CRC32 mismatch")
+    ));
+    assert!(!pipeline.file_crc_recoveries.contains_key(&file_id));
+    assert!(!pipeline.unverified_segments.contains_key(&segment_id));
 }
 
 #[tokio::test]

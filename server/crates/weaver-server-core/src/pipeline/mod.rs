@@ -1135,6 +1135,8 @@ pub(super) struct MoveToCompleteDone {
 pub(super) struct DecodeResult {
     pub(super) segment_id: SegmentId,
     pub(super) raw_size: u64,
+    pub(super) source_server_idx: Option<usize>,
+    pub(super) exclude_servers: Vec<usize>,
     pub(super) file_offset: u64,
     pub(super) decoded_size: u32,
     pub(super) crc_valid: bool,
@@ -1144,6 +1146,19 @@ pub(super) struct DecodeResult {
     pub(super) data: DecodedChunk,
     /// Original filename from the yEnc header (for swap detection observability).
     pub(super) yenc_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct UnverifiedSegmentProvenance {
+    pub(super) source_server_idx: Option<usize>,
+    pub(super) exclude_servers: Vec<usize>,
+}
+
+#[derive(Debug)]
+pub(super) struct FileCrcRecoveryState {
+    pub(super) pending_segments: HashSet<SegmentId>,
+    pub(super) expected_crc: u32,
+    pub(super) last_actual_crc: u32,
 }
 
 /// Completion of a decode task, including explicit failures so backlog
@@ -1698,6 +1713,12 @@ pub struct Pipeline {
     /// mismatch), the segment is re-downloaded. After `MAX_SEGMENT_RETRIES` decode
     /// failures, the segment is marked permanently failed.
     pub(super) decode_retries: HashMap<SegmentId, u32>,
+    /// Successfully decoded segments whose yEnc part CRC was absent. These are
+    /// targeted for replacement only if the completed file CRC proves corruption.
+    pub(super) unverified_segments: HashMap<SegmentId, UnverifiedSegmentProvenance>,
+    /// Completed files currently replacing unverified segments after a whole-file
+    /// CRC mismatch. Final verification waits for the entire batch.
+    pub(super) file_crc_recoveries: HashMap<NzbFileId, FileCrcRecoveryState>,
     /// Archives with in-flight extraction tasks (spawned but not yet completed).
     /// Prevents duplicate spawns and ensures cleanup waits for extraction to finish.
     pub(super) inflight_extractions: HashMap<JobId, HashSet<String>>,

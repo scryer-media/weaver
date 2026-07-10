@@ -1221,6 +1221,36 @@ mod tests {
     }
 
     #[test]
+    fn decode_multipart_with_unrecognized_part_crc_field_remains_unverified() {
+        let damaged = b"Damaged data";
+        let encoded_data = encode_raw(damaged);
+        let mut article = Vec::new();
+        article.extend_from_slice(
+            format!(
+                "=ybegin part=1 total=2 line=128 size={} name=test.bin\r\n",
+                damaged.len() * 2
+            )
+            .as_bytes(),
+        );
+        article.extend_from_slice(format!("=ypart begin=1 end={}\r\n", damaged.len()).as_bytes());
+        article.extend_from_slice(&encoded_data);
+        article.extend_from_slice(
+            format!(
+                "\r\n=yend size={} part=1 xcrc32=DEADBEEF crc32=A3BDCA2D\r\n",
+                damaged.len()
+            )
+            .as_bytes(),
+        );
+
+        let mut output = vec![0u8; 1024];
+        let result = decode(&article, &mut output).unwrap();
+
+        assert_eq!(result.expected_part_crc, None);
+        assert_eq!(result.expected_file_crc, Some(0xA3BDCA2D));
+        assert!(result.crc_valid);
+    }
+
+    #[test]
     fn decode_multipart_ypart_range_size_mismatch_errors() {
         let original = b"Test data";
         let encoded_data = encode_raw(original);

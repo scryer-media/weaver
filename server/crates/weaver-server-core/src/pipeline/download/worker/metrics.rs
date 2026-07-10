@@ -302,6 +302,8 @@ impl Pipeline {
                 Ok(DownloadPayload::Decoded(DecodeResult {
                     segment_id,
                     raw_size: raw_size as u64,
+                    source_server_idx,
+                    exclude_servers: Vec::new(),
                     file_offset,
                     decoded_size: result.bytes_written as u32,
                     crc_valid: result.crc_valid,
