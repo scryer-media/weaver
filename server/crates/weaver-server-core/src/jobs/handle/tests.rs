@@ -333,7 +333,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     };
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::CancelJob { job_id, reply } => {
+                SchedulerCommand::CancelJob { job_id, reply, .. } => {
                     let result = if jobs.remove(&job_id).is_some() {
                         Ok(())
                     } else {
@@ -561,6 +561,8 @@ async fn add_job_with_options_can_start_paused_and_resume_to_queued() {
             sample_nzb_zstd(),
             AddJobOptions {
                 initially_paused: true,
+                semantic_materialization_generation: None,
+                semantic_promotion_generation: None,
             },
         )
         .await

@@ -1,4 +1,6 @@
 pub mod assembly;
+pub mod duplicate;
+pub mod duplicate_persistence;
 pub mod error;
 pub mod handle;
 pub mod ids;
@@ -11,6 +13,20 @@ pub mod repository;
 pub mod service;
 pub mod working_dir;
 
+pub use duplicate::{
+    CallerScopedIdempotency, DuplicateAction, DuplicateDecision, DuplicateJobLifecycle,
+    DuplicateMatch, DuplicateMode, DuplicatePolicy, FingerprintEvidence, FingerprintKind,
+    JobFingerprint, SemanticDuplicate, SemanticDuplicateLifecycleEvent, SemanticTerminalCause,
+    SubmissionOrigin, classify_semantic_terminal_cause, duplicate_admission_metrics_snapshot,
+    normalize_semantic_duplicate_key, record_duplicate_admission_metric,
+    record_semantic_duplicate_lifecycle_metric, semantic_duplicate_lifecycle_metrics_snapshot,
+};
+pub use duplicate_persistence::{
+    DuplicateAdmission, DuplicateAdmissionRequest, DuplicateBackfillEntry, DuplicateBackfillSource,
+    DuplicateBackfillState, DuplicateJobSummary, SemanticAdmission, SemanticCandidateSnapshot,
+    SemanticCandidateSource, SemanticCandidateState, SemanticPromotionClaim,
+    SemanticPromotionState,
+};
 pub use error::SchedulerError;
 pub use handle::{
     AddJobOptions, DownloadBlockKind, DownloadBlockState, FINISHED_JOBS_RUNTIME_CAP, JobInfo,

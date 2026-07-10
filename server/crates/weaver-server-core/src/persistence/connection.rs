@@ -426,6 +426,7 @@ enum DbWriteCommand {
     ArchiveJob {
         job_id: crate::jobs::ids::JobId,
         history: Box<crate::history::JobHistoryRow>,
+        typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
     },
     InsertJobEvents {
         events: Vec<crate::history::JobEvent>,
@@ -693,7 +694,11 @@ impl Database {
         let worker = async move {
             while let Some(command) = rx.recv().await {
                 match command {
-                    DbWriteCommand::ArchiveJob { job_id, history } => {
+                    DbWriteCommand::ArchiveJob {
+                        job_id,
+                        history,
+                        typed_terminal_cause,
+                    } => {
                         let writer = writer.clone();
                         tokio::task::spawn_blocking(move || {
                             // Capture the cache generation *before* the archive
@@ -701,7 +706,11 @@ impl Database {
                             // generation makes the conditional insert a no-op,
                             // rather than resurrecting the just-deleted row.
                             let observed_generation = writer.job_history_cache_generation();
-                            match writer.archive_job(job_id, history.as_ref()) {
+                            match writer.archive_job_with_terminal_cause(
+                                job_id,
+                                history.as_ref(),
+                                typed_terminal_cause,
+                            ) {
                                 Ok(Some(row)) => {
                                     writer.cache_job_history_at(row, observed_generation)
                                 }
@@ -774,8 +783,25 @@ impl Database {
         let command = DbWriteCommand::ArchiveJob {
             job_id,
             history: Box::new(history),
+            typed_terminal_cause: None,
         };
         self.try_send_with_retry(command, "archive")
+    }
+
+    pub fn try_queue_archive_job_with_terminal_cause(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        history: crate::history::JobHistoryRow,
+        typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
+    ) -> Result<(), StateError> {
+        self.try_send_with_retry(
+            DbWriteCommand::ArchiveJob {
+                job_id,
+                history: Box::new(history),
+                typed_terminal_cause,
+            },
+            "archive",
+        )
     }
 
     /// Queue a generic ordered write. Runs on the single serialized writer
@@ -849,6 +875,7 @@ impl Database {
             .send(DbWriteCommand::ArchiveJob {
                 job_id,
                 history: Box::new(history),
+                typed_terminal_cause: None,
             })
             .await
             .map_err(|_| StateError::Database("database writer queue closed".to_string()))

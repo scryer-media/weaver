@@ -43,16 +43,37 @@ impl Pipeline {
                 }
                 let _ = reply.send(result);
             }
-            SchedulerCommand::CancelJob { job_id, reply } => {
-                let result = if self.inflight_moves.contains(&job_id) {
+            SchedulerCommand::CancelJob {
+                job_id,
+                origin,
+                reply,
+            } => {
+                let semantic_cancel_is_safe = self.jobs.get(&job_id).is_some_and(|state| {
+                    matches!(
+                        (state.download_state, state.post_state),
+                        (
+                            crate::jobs::model::DownloadState::Queued
+                                | crate::jobs::model::DownloadState::Downloading,
+                            crate::jobs::model::PostState::Idle
+                        )
+                    )
+                });
+                let result = if !matches!(origin, crate::jobs::handle::CancellationOrigin::User)
+                    && !semantic_cancel_is_safe
+                {
+                    Err(crate::SchedulerError::Conflict(
+                        "semantic cancellation is only allowed while queued or downloading"
+                            .to_string(),
+                    ))
+                } else if self.inflight_moves.contains(&job_id) {
                     Err(crate::SchedulerError::Conflict(
                         "cancel is not supported while the final move is running".to_string(),
                     ))
-                } else if let Some(state) = self.jobs.remove(&job_id) {
-                    self.job_order.retain(|id| *id != job_id);
-                    self.remove_pending_completion_check(job_id);
-                    self.update_queue_metrics();
-
+                } else if self.jobs.contains_key(&job_id) {
+                    let state = self
+                        .jobs
+                        .get(&job_id)
+                        .expect("contains_key checked immediately above");
                     let now = timestamp_secs() as i64;
                     let elapsed_secs = state.created_at.elapsed().as_secs() as i64;
                     let created_at = now - elapsed_secs;
@@ -94,60 +115,75 @@ impl Pipeline {
                         .await;
                     if let Err(error) = archive_result {
                         tracing::error!(job_id = job_id.0, error = %error, "failed to durably archive cancelled job");
+                        Err(crate::SchedulerError::State(crate::StateError::Database(
+                            format!("failed to archive cancelled job: {error}"),
+                        )))
+                    } else {
+                        // Preserve the live job until its cancellation archive and
+                        // semantic terminal state are durable. A failed semantic
+                        // supersession must remain recoverable rather than report a
+                        // successful cancellation.
+                        let state = self
+                            .jobs
+                            .remove(&job_id)
+                            .expect("job was retained until archive completed");
+                        self.job_order.retain(|id| *id != job_id);
+                        self.remove_pending_completion_check(job_id);
+                        self.update_queue_metrics();
+
+                        self.clear_par2_runtime_state(job_id);
+                        self.clear_job_extraction_runtime(job_id);
+                        self.active_download_passes.remove(&job_id);
+                        self.jobs_finalizing_download.remove(&job_id);
+                        self.active_downloads_by_job.remove(&job_id);
+                        self.active_download_connections_by_job.remove(&job_id);
+                        self.active_downloads_by_file
+                            .retain(|file_id, _| file_id.job_id != job_id);
+                        self.active_decodes_by_job.remove(&job_id);
+                        self.active_decodes_by_file
+                            .retain(|file_id, _| file_id.job_id != job_id);
+                        self.pending_retries_by_job.remove(&job_id);
+                        self.pending_retries_by_segment
+                            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+                        self.rate_limit_reservations
+                            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+                        self.job_last_download_activity.remove(&job_id);
+                        self.clear_job_rar_runtime(job_id);
+                        self.clear_job_write_backlog(job_id);
+                        self.clear_job_progress_floor_runtime(job_id);
+                        self.clear_job_phase_progress_runtime(job_id);
+                        self.clear_job_retention_excludes(job_id);
+
+                        let working_dir = state.working_dir.clone();
+                        let staging_dir = state.staging_dir.clone();
+                        tokio::spawn(async move {
+                            // Close cached write handles first: the working-dir
+                            // path may be reused verbatim by a re-added job, and a
+                            // stale handle would swallow its writes.
+                            crate::pipeline::close_cached_write_handles_under(&working_dir).await;
+                            if let Err(e) = tokio::fs::remove_dir_all(&working_dir).await
+                                && e.kind() != std::io::ErrorKind::NotFound
+                            {
+                                tracing::warn!(
+                                    dir = %working_dir.display(),
+                                    error = %e,
+                                    "failed to clean up cancelled job directory"
+                                );
+                            }
+                            if let Some(staging) = staging_dir
+                                && let Err(e) = tokio::fs::remove_dir_all(&staging).await
+                                && e.kind() != std::io::ErrorKind::NotFound
+                            {
+                                tracing::warn!(
+                                    dir = %staging.display(),
+                                    error = %e,
+                                    "failed to clean up cancelled job staging directory"
+                                );
+                            }
+                        });
+
+                        Ok(())
                     }
-
-                    self.clear_par2_runtime_state(job_id);
-                    self.clear_job_extraction_runtime(job_id);
-                    self.active_download_passes.remove(&job_id);
-                    self.jobs_finalizing_download.remove(&job_id);
-                    self.active_downloads_by_job.remove(&job_id);
-                    self.active_download_connections_by_job.remove(&job_id);
-                    self.active_downloads_by_file
-                        .retain(|file_id, _| file_id.job_id != job_id);
-                    self.active_decodes_by_job.remove(&job_id);
-                    self.active_decodes_by_file
-                        .retain(|file_id, _| file_id.job_id != job_id);
-                    self.pending_retries_by_job.remove(&job_id);
-                    self.pending_retries_by_segment
-                        .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
-                    self.rate_limit_reservations
-                        .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
-                    self.job_last_download_activity.remove(&job_id);
-                    self.clear_job_rar_runtime(job_id);
-                    self.clear_job_write_backlog(job_id);
-                    self.clear_job_progress_floor_runtime(job_id);
-                    self.clear_job_phase_progress_runtime(job_id);
-                    self.clear_job_retention_excludes(job_id);
-
-                    let working_dir = state.working_dir.clone();
-                    let staging_dir = state.staging_dir.clone();
-                    tokio::spawn(async move {
-                        // Close cached write handles first: the working-dir
-                        // path may be reused verbatim by a re-added job, and a
-                        // stale handle would swallow its writes.
-                        crate::pipeline::close_cached_write_handles_under(&working_dir).await;
-                        if let Err(e) = tokio::fs::remove_dir_all(&working_dir).await
-                            && e.kind() != std::io::ErrorKind::NotFound
-                        {
-                            tracing::warn!(
-                                dir = %working_dir.display(),
-                                error = %e,
-                                "failed to clean up cancelled job directory"
-                            );
-                        }
-                        if let Some(staging) = staging_dir
-                            && let Err(e) = tokio::fs::remove_dir_all(&staging).await
-                            && e.kind() != std::io::ErrorKind::NotFound
-                        {
-                            tracing::warn!(
-                                dir = %staging.display(),
-                                error = %e,
-                                "failed to clean up cancelled job staging directory"
-                            );
-                        }
-                    });
-
-                    Ok(())
                 } else {
                     Err(crate::SchedulerError::JobNotFound(job_id))
                 };

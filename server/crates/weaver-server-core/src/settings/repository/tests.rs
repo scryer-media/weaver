@@ -125,6 +125,7 @@ fn config_roundtrip() {
             category_from_subfolders: true,
             scanning_paused: false,
         },
+        duplicate_policy: Default::default(),
         config_path: None,
     };
 

@@ -1,4 +1,5 @@
 import type { LocaleDictionary } from "../types";
+import { duplicateLocaleEntries } from "../duplicate-locales";
 
 const de: LocaleDictionary = {
   // Brand
@@ -650,6 +651,42 @@ const de: LocaleDictionary = {
   "schedule.empty": "Keine Zeitpläne",
   "schedule.emptyDesc": "Fügen Sie eine Zeitplanregel hinzu, um Downloads zu bestimmten Zeiten automatisch zu pausieren oder zu drosseln.",
   "schedule.everyDay": "Jeden Tag",
+
+  // Doppelte NZBs
+  "settings.duplicateHandling": "Behandlung doppelter NZBs",
+  "settings.duplicateHandlingDesc": "Legen Sie fest, was bei dauerhaft gespeicherten Duplikat-Hinweisen geschieht. Blockieren lehnt ab, Warnen akzeptiert, Pausieren akzeptiert angehalten.",
+  "settings.duplicateStrictActiveOrSuccess": "Striktes Artikellayout — aktiv oder erfolgreich",
+  "settings.duplicateStrictActiveOrSuccessDesc": "Wenn alle Artikel und Byte-Angaben einem aktiven oder erfolgreichen Auftrag entsprechen.",
+  "settings.duplicateStrictFailedOrCancelled": "Striktes Artikellayout — fehlgeschlagen oder abgebrochen",
+  "settings.duplicateStrictFailedOrCancelledDesc": "Wenn alle Artikel und Byte-Angaben einem fehlgeschlagenen oder abgebrochenen Auftrag entsprechen.",
+  "settings.duplicateArticleLayoutActiveOrSuccess": "Artikellayout — aktiv oder erfolgreich",
+  "settings.duplicateArticleLayoutActiveOrSuccessDesc": "Wenn die Artikelreihenfolge, nicht aber die Byte-Angaben, einem aktiven oder erfolgreichen Auftrag entspricht.",
+  "settings.duplicateArticleLayoutFailedOrCancelled": "Artikellayout — fehlgeschlagen oder abgebrochen",
+  "settings.duplicateArticleLayoutFailedOrCancelledDesc": "Wenn die Artikelreihenfolge, nicht aber die Byte-Angaben, einem fehlgeschlagenen oder abgebrochenen Auftrag entspricht.",
+  "settings.duplicateArticleSet": "Artikelmenge",
+  "settings.duplicateArticleSetDesc": "Wenn dieselben eindeutigen Artikel-IDs in einem anderen Layout vorhanden sind.",
+  "settings.duplicateNormalizedName": "Normalisierter Name",
+  "settings.duplicateNormalizedNameDesc": "Wenn normalisierte Release-Namen ohne stärkeren Artikelhinweis übereinstimmen.",
+  "settings.duplicateActionAccept": "Akzeptieren",
+  "settings.duplicateActionWarn": "Warnen und akzeptieren",
+  "settings.duplicateActionPause": "Pausiert akzeptieren",
+  "settings.duplicateActionBlock": "Blockieren",
+  "settings.duplicatePolicySaved": "Duplikatrichtlinie gespeichert.",
+  "settings.duplicatePolicySaveFailed": "Duplikatrichtlinie konnte nicht gespeichert werden.",
+  "upload.duplicateHandling": "Behandlung doppelter NZBs",
+  "upload.force": "Übermittlung erzwingen",
+  "upload.forceDesc": "Akzeptiert diese Übermittlung trotz semantischer und Artikel-Duplikatrichtlinie. Idempotenzkonflikte bleiben bestehen.",
+  "upload.duplicateMode": "Duplikatmodus",
+  "upload.duplicateModeEnforce": "Artikelrichtlinie anwenden",
+  "upload.duplicateModeScore": "Kandidaten bewerten",
+  "upload.duplicateModeAll": "Alle Kandidaten behalten",
+  "upload.duplicateModeForce": "Übermittlung erzwingen",
+  "upload.duplicateKey": "Duplikatschlüssel",
+  "upload.duplicateKeyPlaceholder": "Optionale Kandidatengruppe",
+  "upload.duplicateScore": "Duplikatbewertung",
+  "upload.duplicateScorePlaceholder": "0",
+  "upload.duplicateScoreHint": "Höhere Bewertungen gewinnen innerhalb desselben Duplikatschlüssels; bei Gleichstand bleibt der vorhandene Kandidat.",
+  ...duplicateLocaleEntries.deu,
 };
 
 export default de;

@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use weaver_server_core::bandwidth::{
     IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday,
 };
+use weaver_server_core::jobs::DuplicatePolicy;
+
+use crate::jobs::types::DuplicateActionGql;
 
 #[derive(Debug, Clone, SimpleObject)]
 pub struct GeneralSettings {
@@ -15,6 +18,7 @@ pub struct GeneralSettings {
     pub ip_replacement_trial_extra_connections: u8,
     pub isp_bandwidth_cap: Option<IspBandwidthCapSettings>,
     pub watch_folder: WatchFolderSettings,
+    pub duplicate_policy: DuplicatePolicySettings,
 }
 
 #[derive(Debug, InputObject)]
@@ -27,6 +31,40 @@ pub struct GeneralSettingsInput {
     pub ip_replacement_trial_extra_connections: Option<u8>,
     pub isp_bandwidth_cap: Option<IspBandwidthCapSettingsInput>,
     pub watch_folder: Option<WatchFolderSettingsInput>,
+    pub duplicate_policy: Option<DuplicatePolicySettingsInput>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SimpleObject)]
+pub struct DuplicatePolicySettings {
+    pub strict_active_or_success: DuplicateActionGql,
+    pub strict_failed_or_cancelled: DuplicateActionGql,
+    pub article_layout_active_or_success: DuplicateActionGql,
+    pub article_layout_failed_or_cancelled: DuplicateActionGql,
+    pub article_set: DuplicateActionGql,
+    pub normalized_name: DuplicateActionGql,
+}
+
+impl From<DuplicatePolicy> for DuplicatePolicySettings {
+    fn from(value: DuplicatePolicy) -> Self {
+        Self {
+            strict_active_or_success: value.strict_active_or_success.into(),
+            strict_failed_or_cancelled: value.strict_failed_or_cancelled.into(),
+            article_layout_active_or_success: value.article_layout_active_or_success.into(),
+            article_layout_failed_or_cancelled: value.article_layout_failed_or_cancelled.into(),
+            article_set: value.article_set.into(),
+            normalized_name: value.normalized_name.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, InputObject)]
+pub struct DuplicatePolicySettingsInput {
+    pub strict_active_or_success: Option<DuplicateActionGql>,
+    pub strict_failed_or_cancelled: Option<DuplicateActionGql>,
+    pub article_layout_active_or_success: Option<DuplicateActionGql>,
+    pub article_layout_failed_or_cancelled: Option<DuplicateActionGql>,
+    pub article_set: Option<DuplicateActionGql>,
+    pub normalized_name: Option<DuplicateActionGql>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]

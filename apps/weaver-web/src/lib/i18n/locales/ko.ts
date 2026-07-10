@@ -1,4 +1,5 @@
 import type { LocaleDictionary } from "../types";
+import { duplicateLocaleEntries } from "../duplicate-locales";
 
 const ko: LocaleDictionary = {
   // Brand
@@ -650,6 +651,41 @@ const ko: LocaleDictionary = {
   "schedule.empty": "스케줄 없음",
   "schedule.emptyDesc": "특정 시간에 자동으로 다운로드를 일시정지하거나 제한하려면 스케줄 규칙을 추가하세요.",
   "schedule.everyDay": "매일",
+
+  "settings.duplicateHandling": "중복 처리",
+  "settings.duplicateHandlingDesc": "새 NZB가 저장된 중복 근거와 일치할 때의 동작을 선택합니다. 차단은 거부하고, 경고는 수락하며, 일시정지는 일시정지 상태로 수락합니다.",
+  "settings.duplicateStrictActiveOrSuccess": "엄격한 아티클 레이아웃 — 활성 또는 성공",
+  "settings.duplicateStrictActiveOrSuccessDesc": "모든 아티클과 선언된 바이트가 활성 또는 성공한 작업과 일치할 때 사용합니다.",
+  "settings.duplicateStrictFailedOrCancelled": "엄격한 아티클 레이아웃 — 실패 또는 취소",
+  "settings.duplicateStrictFailedOrCancelledDesc": "모든 아티클과 선언된 바이트가 실패 또는 취소된 작업과 일치할 때 사용합니다.",
+  "settings.duplicateArticleLayoutActiveOrSuccess": "아티클 레이아웃 — 활성 또는 성공",
+  "settings.duplicateArticleLayoutActiveOrSuccessDesc": "아티클 순서는 같지만 선언된 바이트가 활성 또는 성공한 작업과 다를 때 사용합니다.",
+  "settings.duplicateArticleLayoutFailedOrCancelled": "아티클 레이아웃 — 실패 또는 취소",
+  "settings.duplicateArticleLayoutFailedOrCancelledDesc": "아티클 순서는 같지만 선언된 바이트가 실패 또는 취소된 작업과 다를 때 사용합니다.",
+  "settings.duplicateArticleSet": "아티클 집합",
+  "settings.duplicateArticleSetDesc": "같은 고유 아티클 ID가 다른 레이아웃에 있을 때 사용합니다.",
+  "settings.duplicateNormalizedName": "정규화된 이름",
+  "settings.duplicateNormalizedNameDesc": "더 강한 아티클 근거 없이 정규화된 릴리스 이름이 일치할 때 사용합니다.",
+  "settings.duplicateActionAccept": "수락",
+  "settings.duplicateActionWarn": "경고 후 수락",
+  "settings.duplicateActionPause": "일시정지로 수락",
+  "settings.duplicateActionBlock": "차단",
+  "settings.duplicatePolicySaved": "중복 정책을 저장했습니다.",
+  "settings.duplicatePolicySaveFailed": "중복 정책을 저장할 수 없습니다.",
+  "upload.duplicateHandling": "중복 처리",
+  "upload.force": "제출 강제",
+  "upload.forceDesc": "의미 및 아티클 지문 중복 정책에도 이 제출을 수락합니다. 멱등성 충돌은 계속 적용됩니다.",
+  "upload.duplicateMode": "중복 모드",
+  "upload.duplicateModeEnforce": "아티클 정책 적용",
+  "upload.duplicateModeScore": "후보 점수 매기기",
+  "upload.duplicateModeAll": "모든 후보 유지",
+  "upload.duplicateModeForce": "제출 강제",
+  "upload.duplicateKey": "중복 키",
+  "upload.duplicateKeyPlaceholder": "선택적 후보 그룹",
+  "upload.duplicateScore": "중복 점수",
+  "upload.duplicateScorePlaceholder": "0",
+  "upload.duplicateScoreHint": "같은 중복 키에서는 점수가 높은 후보가 이기며, 동점이면 기존 후보를 유지합니다.",
+  ...duplicateLocaleEntries.kor,
 };
 
 export default ko;

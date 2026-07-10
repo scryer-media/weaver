@@ -1494,6 +1494,9 @@ pub struct Pipeline {
     pub(super) metrics: Arc<PipelineMetrics>,
     /// Per-job state.
     pub(super) jobs: HashMap<JobId, JobState>,
+    /// Typed terminal provenance retained until the ordered history archive has
+    /// durably updated duplicate-promotion eligibility.
+    pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,
     /// Winning archive password candidate per job/RAR set, kept process-local and redacted.
     pub(super) archive_password_winners: HashMap<(JobId, String), ArchivePasswordCandidate>,
     /// Job dispatch order (FIFO by submission). First Downloading job is active.

@@ -217,6 +217,41 @@ pub(crate) async fn run(
             Err(e) => error!(job_id = candidate.job_id.0, error = %e, "failed to restore job"),
         }
     }
+    match weaver_server_core::ingest::reconcile_semantic_promotions(&db, &handle).await {
+        Ok(count) if count > 0 => info!(count, "recovered semantic promotion claims"),
+        Ok(_) => {}
+        Err(error) => error!(error = %error, "failed to reconcile semantic promotion claims"),
+    }
+    match weaver_server_core::ingest::reconcile_duplicate_fingerprint_backfill(&db, 4).await {
+        Ok(report) if report.scanned > 0 || report.skipped > 0 => info!(
+            scanned = report.scanned,
+            backfilled = report.backfilled,
+            skipped = report.skipped,
+            completed = report.completed,
+            "ran bounded duplicate fingerprint backfill"
+        ),
+        Ok(_) => {}
+        Err(error) => error!(error = %error, "failed to run duplicate fingerprint backfill"),
+    }
+    let semantic_promotion_task = {
+        let db = db.clone();
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            let mut delay = std::time::Duration::from_secs(2);
+            loop {
+                tokio::time::sleep(delay).await;
+                match weaver_server_core::ingest::reconcile_semantic_promotions(&db, &handle).await
+                {
+                    Ok(count) if count > 0 => delay = std::time::Duration::from_millis(100),
+                    Ok(_) => delay = std::time::Duration::from_secs(2),
+                    Err(error) => {
+                        error!(error = %error, "semantic promotion worker retrying after failure");
+                        delay = std::time::Duration::from_secs(5);
+                    }
+                }
+            }
+        })
+    };
 
     tokio::select! {
         _ = shutdown::wait_for_shutdown() => {
@@ -231,6 +266,7 @@ pub(crate) async fn run(
             watch_folder.stop().await;
             metrics_history_task.abort();
             maintenance_task.abort();
+            semantic_promotion_task.abort();
             server_transfer_maintenance.abort();
             wiring::flush_server_transfer_usage(
                 Arc::clone(&server_transfer_policy),
@@ -247,6 +283,7 @@ pub(crate) async fn run(
             watch_folder.stop().await;
             metrics_history_task.abort();
             maintenance_task.abort();
+            semantic_promotion_task.abort();
             server_transfer_maintenance.abort();
             wiring::flush_server_transfer_usage(
                 Arc::clone(&server_transfer_policy),
@@ -265,6 +302,7 @@ pub(crate) async fn run(
             watch_folder.stop().await;
             metrics_history_task.abort();
             maintenance_task.abort();
+            semantic_promotion_task.abort();
             server_transfer_maintenance.abort();
             wiring::flush_server_transfer_usage(
                 Arc::clone(&server_transfer_policy),

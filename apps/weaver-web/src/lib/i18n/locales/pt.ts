@@ -1,4 +1,5 @@
 import type { LocaleDictionary } from "../types";
+import { duplicateLocaleEntries } from "../duplicate-locales";
 
 const pt: LocaleDictionary = {
   // Brand
@@ -648,6 +649,41 @@ const pt: LocaleDictionary = {
   "schedule.empty": "Sem agendamentos",
   "schedule.emptyDesc": "Adicione uma regra de agendamento para pausar ou limitar downloads automaticamente em horários específicos.",
   "schedule.everyDay": "Todos os dias",
+
+  "settings.duplicateHandling": "Tratamento de duplicados",
+  "settings.duplicateHandlingDesc": "Escolha o que acontece quando um novo NZB corresponde a evidência durável de duplicado. Bloquear rejeita; avisar aceita; pausar aceita pausado.",
+  "settings.duplicateStrictActiveOrSuccess": "Layout estrito de artigos — ativo ou concluído",
+  "settings.duplicateStrictActiveOrSuccessDesc": "Use quando cada artigo e byte declarado corresponde a um job ativo ou concluído.",
+  "settings.duplicateStrictFailedOrCancelled": "Layout estrito de artigos — falho ou cancelado",
+  "settings.duplicateStrictFailedOrCancelledDesc": "Use quando cada artigo e byte declarado corresponde a um job falho ou cancelado.",
+  "settings.duplicateArticleLayoutActiveOrSuccess": "Layout de artigos — ativo ou concluído",
+  "settings.duplicateArticleLayoutActiveOrSuccessDesc": "Use quando a ordem dos artigos corresponde, mas os bytes declarados diferem para um job ativo ou concluído.",
+  "settings.duplicateArticleLayoutFailedOrCancelled": "Layout de artigos — falho ou cancelado",
+  "settings.duplicateArticleLayoutFailedOrCancelledDesc": "Use quando a ordem dos artigos corresponde, mas os bytes declarados diferem para um job falho ou cancelado.",
+  "settings.duplicateArticleSet": "Conjunto de artigos",
+  "settings.duplicateArticleSetDesc": "Use quando os mesmos IDs de artigo únicos estão presentes em outro layout.",
+  "settings.duplicateNormalizedName": "Nome normalizado",
+  "settings.duplicateNormalizedNameDesc": "Use quando nomes de lançamento normalizados correspondem sem evidência de artigo mais forte.",
+  "settings.duplicateActionAccept": "Aceitar",
+  "settings.duplicateActionWarn": "Avisar e aceitar",
+  "settings.duplicateActionPause": "Aceitar pausado",
+  "settings.duplicateActionBlock": "Bloquear",
+  "settings.duplicatePolicySaved": "Política de duplicados salva.",
+  "settings.duplicatePolicySaveFailed": "Não foi possível salvar a política de duplicados.",
+  "upload.duplicateHandling": "Tratamento de duplicados",
+  "upload.force": "Forçar envio",
+  "upload.forceDesc": "Aceita este envio apesar da política de duplicados semântica e de artigos. Conflitos de idempotência continuam aplicáveis.",
+  "upload.duplicateMode": "Modo de duplicado",
+  "upload.duplicateModeEnforce": "Aplicar política de artigos",
+  "upload.duplicateModeScore": "Pontuar candidatos",
+  "upload.duplicateModeAll": "Manter todos os candidatos",
+  "upload.duplicateModeForce": "Forçar envio",
+  "upload.duplicateKey": "Chave de duplicado",
+  "upload.duplicateKeyPlaceholder": "Grupo de candidatos opcional",
+  "upload.duplicateScore": "Pontuação de duplicado",
+  "upload.duplicateScorePlaceholder": "0",
+  "upload.duplicateScoreHint": "Pontuações maiores vencem na mesma chave de duplicado; em empate, o candidato existente é mantido.",
+  ...duplicateLocaleEntries.por,
 };
 
 export default pt;

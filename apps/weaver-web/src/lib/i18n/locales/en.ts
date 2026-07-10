@@ -1,4 +1,5 @@
 import type { LocaleDictionary } from "../types";
+import { duplicateLocaleEntries } from "../duplicate-locales";
 
 const en: LocaleDictionary = {
   // Brand
@@ -744,6 +745,42 @@ const en: LocaleDictionary = {
   "schedule.empty": "No schedules",
   "schedule.emptyDesc": "Add a schedule rule to automatically pause or limit downloads at specific times.",
   "schedule.everyDay": "Every day",
+
+  // Duplicate handling
+  "settings.duplicateHandling": "Duplicate Handling",
+  "settings.duplicateHandlingDesc": "Choose what happens when a new NZB matches durable duplicate evidence. Block rejects it; warn accepts it; pause accepts it paused.",
+  "settings.duplicateStrictActiveOrSuccess": "Strict article layout — active or successful",
+  "settings.duplicateStrictActiveOrSuccessDesc": "Use when every article and declared byte count matches an active or successful job.",
+  "settings.duplicateStrictFailedOrCancelled": "Strict article layout — failed or cancelled",
+  "settings.duplicateStrictFailedOrCancelledDesc": "Use when every article and declared byte count matches a failed or cancelled job.",
+  "settings.duplicateArticleLayoutActiveOrSuccess": "Article layout — active or successful",
+  "settings.duplicateArticleLayoutActiveOrSuccessDesc": "Use when article order matches but declared byte counts differ for an active or successful job.",
+  "settings.duplicateArticleLayoutFailedOrCancelled": "Article layout — failed or cancelled",
+  "settings.duplicateArticleLayoutFailedOrCancelledDesc": "Use when article order matches but declared byte counts differ for a failed or cancelled job.",
+  "settings.duplicateArticleSet": "Article set",
+  "settings.duplicateArticleSetDesc": "Use when the same unique article IDs are present in a different layout.",
+  "settings.duplicateNormalizedName": "Normalized name",
+  "settings.duplicateNormalizedNameDesc": "Use when normalized release names match without stronger article evidence.",
+  "settings.duplicateActionAccept": "Accept",
+  "settings.duplicateActionWarn": "Warn and accept",
+  "settings.duplicateActionPause": "Accept paused",
+  "settings.duplicateActionBlock": "Block",
+  "settings.duplicatePolicySaved": "Duplicate policy saved.",
+  "settings.duplicatePolicySaveFailed": "Could not save duplicate policy.",
+  "upload.duplicateHandling": "Duplicate Handling",
+  "upload.force": "Force submission",
+  "upload.forceDesc": "Accept this submission despite semantic and article-fingerprint duplicate policy. Idempotency conflicts still apply.",
+  "upload.duplicateMode": "Duplicate mode",
+  "upload.duplicateModeEnforce": "Enforce article policy",
+  "upload.duplicateModeScore": "Score candidates",
+  "upload.duplicateModeAll": "Keep all candidates",
+  "upload.duplicateModeForce": "Force submission",
+  "upload.duplicateKey": "Duplicate key",
+  "upload.duplicateKeyPlaceholder": "Optional candidate group",
+  "upload.duplicateScore": "Duplicate score",
+  "upload.duplicateScorePlaceholder": "0",
+  "upload.duplicateScoreHint": "Higher scores win within the same duplicate key; ties keep the existing candidate.",
+  ...duplicateLocaleEntries.eng,
 };
 
 export default en;

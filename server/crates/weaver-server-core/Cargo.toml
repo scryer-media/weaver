@@ -22,6 +22,8 @@ weaver-unrar = { workspace = true, features = [
 ] }
 serde = { workspace = true }
 blake3 = { workspace = true }
+unicode-normalization = { workspace = true }
+unicase = { version = "2.9.0", default-features = false }
 crc32fast = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }

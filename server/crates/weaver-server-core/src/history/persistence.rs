@@ -139,6 +139,17 @@ impl Database {
                     )
                     .await?;
                     replace_job_history_attributes_tx(tx, &attribute_entry).await?;
+                    crate::jobs::duplicate_persistence::transition_duplicate_snapshot_for_history_tx(
+                        tx,
+                        crate::JobId(attribute_entry.job_id),
+                        &attribute_entry.status,
+                        attribute_entry.error_message.as_deref(),
+                        None,
+                        attribute_entry.health,
+                        attribute_entry.failed_bytes,
+                        attribute_entry.completed_at,
+                    )
+                    .await?;
                     Ok(())
                 })
             })

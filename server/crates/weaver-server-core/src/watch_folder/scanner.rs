@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::categories::CategoryConfig;
-use crate::ingest::{SubmitNzbError, submit_nzb_bytes};
+use crate::ingest::{SubmissionOptions, SubmitNzbError, submit_nzb_bytes_with_options};
+use crate::jobs::SubmissionOrigin;
 use crate::runtime::fs as runtime_fs;
 use crate::settings::SharedConfig;
 use crate::{Database, SchedulerHandle};
@@ -248,7 +249,7 @@ impl WatchFolderScanner {
                 ("source".to_string(), "watch_folder".to_string()),
                 ("watch_path".to_string(), display_path(&source_path)),
             ];
-            match submit_nzb_bytes(
+            match submit_nzb_bytes_with_options(
                 &self.db,
                 &self.handle,
                 &self.config,
@@ -257,6 +258,10 @@ impl WatchFolderScanner {
                 None,
                 candidate.category.clone(),
                 metadata,
+                SubmissionOptions {
+                    origin: SubmissionOrigin::WatchFolder,
+                    ..SubmissionOptions::default()
+                },
             )
             .await
             {

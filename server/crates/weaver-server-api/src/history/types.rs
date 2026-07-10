@@ -11,8 +11,8 @@ use weaver_server_core::{
 
 use crate::jobs::release_display::{ReleaseDisplayInput, release_display_info};
 use crate::jobs::types::{
-    Attribute, JobStatusGql, ParsedRelease, PreparedQueueFilter, QueueAttention, QueueFilterInput,
-    QueueItemState, matches_attribute_filter_prepared,
+    Attribute, DuplicateSummaryInfo, JobStatusGql, ParsedRelease, PreparedQueueFilter,
+    QueueAttention, QueueFilterInput, QueueItemState, matches_attribute_filter_prepared,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
@@ -41,6 +41,8 @@ pub struct HistoryItem {
     pub completed_at: DateTime<Utc>,
     pub attention: Option<QueueAttention>,
     pub delete_operation: Option<HistoryDeleteRowState>,
+    #[serde(default)]
+    pub duplicate_summary: Option<DuplicateSummaryInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
@@ -421,6 +423,7 @@ pub fn history_item_from_row(
         completed_at: secs_to_datetime(row.completed_at),
         attention: attention_for_history_row(row, state),
         delete_operation,
+        duplicate_summary: None,
     }
 }
 

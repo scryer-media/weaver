@@ -241,6 +241,22 @@ pub struct RestoreJobRequest {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AddJobOptions {
     pub initially_paused: bool,
+    /// SCORE admission generation that must still be authoritative when the
+    /// scheduler durably materializes this job.
+    pub semantic_materialization_generation: Option<i64>,
+    /// Promotion-lease generation that owns this candidate materialization.
+    /// Unlike admission generations, this must also still hold an unexpired
+    /// durable promotion lease when the active job row is inserted.
+    pub semantic_promotion_generation: Option<i64>,
+}
+
+/// Internal provenance for cancellation. Semantic cancellation is intentionally
+/// narrower than a user cancel: it may interrupt only download-lane work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancellationOrigin {
+    User,
+    SemanticBad,
+    SemanticSuperseded,
 }
 
 pub enum SchedulerCommand {
@@ -271,6 +287,7 @@ pub enum SchedulerCommand {
     /// Cancel and remove a job.
     CancelJob {
         job_id: JobId,
+        origin: CancellationOrigin,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
     /// Update a job's category and/or metadata.
@@ -474,9 +491,32 @@ impl SchedulerHandle {
 
     /// Cancel a job.
     pub async fn cancel_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.cancel_job_with_origin(job_id, CancellationOrigin::User)
+            .await
+    }
+
+    pub async fn cancel_semantic_bad(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.cancel_job_with_origin(job_id, CancellationOrigin::SemanticBad)
+            .await
+    }
+
+    pub async fn cancel_semantic_superseded(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.cancel_job_with_origin(job_id, CancellationOrigin::SemanticSuperseded)
+            .await
+    }
+
+    async fn cancel_job_with_origin(
+        &self,
+        job_id: JobId,
+        origin: CancellationOrigin,
+    ) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::CancelJob { job_id, reply: tx })
+            .send(SchedulerCommand::CancelJob {
+                job_id,
+                origin,
+                reply: tx,
+            })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?

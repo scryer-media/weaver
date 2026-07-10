@@ -1,4 +1,5 @@
 import type { LocaleDictionary } from "../types";
+import { duplicateLocaleEntries } from "../duplicate-locales";
 
 const it: LocaleDictionary = {
   // Brand
@@ -650,6 +651,41 @@ const it: LocaleDictionary = {
   "schedule.empty": "Nessuna pianificazione",
   "schedule.emptyDesc": "Aggiungi una regola di pianificazione per mettere in pausa o limitare automaticamente i download in orari specifici.",
   "schedule.everyDay": "Ogni giorno",
+
+  "settings.duplicateHandling": "Gestione duplicati",
+  "settings.duplicateHandlingDesc": "Scegli cosa accade quando un nuovo NZB corrisponde a evidenza di duplicato durevole. Blocca lo rifiuta; avvisa lo accetta; pausa lo accetta in pausa.",
+  "settings.duplicateStrictActiveOrSuccess": "Layout articoli rigoroso — attivo o riuscito",
+  "settings.duplicateStrictActiveOrSuccessDesc": "Usa quando ogni articolo e byte dichiarato corrisponde a un job attivo o riuscito.",
+  "settings.duplicateStrictFailedOrCancelled": "Layout articoli rigoroso — non riuscito o annullato",
+  "settings.duplicateStrictFailedOrCancelledDesc": "Usa quando ogni articolo e byte dichiarato corrisponde a un job non riuscito o annullato.",
+  "settings.duplicateArticleLayoutActiveOrSuccess": "Layout articoli — attivo o riuscito",
+  "settings.duplicateArticleLayoutActiveOrSuccessDesc": "Usa quando l'ordine degli articoli corrisponde ma i byte dichiarati differiscono per un job attivo o riuscito.",
+  "settings.duplicateArticleLayoutFailedOrCancelled": "Layout articoli — non riuscito o annullato",
+  "settings.duplicateArticleLayoutFailedOrCancelledDesc": "Usa quando l'ordine degli articoli corrisponde ma i byte dichiarati differiscono per un job non riuscito o annullato.",
+  "settings.duplicateArticleSet": "Insieme di articoli",
+  "settings.duplicateArticleSetDesc": "Usa quando sono presenti gli stessi ID articolo univoci in un layout diverso.",
+  "settings.duplicateNormalizedName": "Nome normalizzato",
+  "settings.duplicateNormalizedNameDesc": "Usa quando i nomi di release normalizzati corrispondono senza evidenza articolo più forte.",
+  "settings.duplicateActionAccept": "Accetta",
+  "settings.duplicateActionWarn": "Avvisa e accetta",
+  "settings.duplicateActionPause": "Accetta in pausa",
+  "settings.duplicateActionBlock": "Blocca",
+  "settings.duplicatePolicySaved": "Criterio duplicati salvato.",
+  "settings.duplicatePolicySaveFailed": "Impossibile salvare il criterio duplicati.",
+  "upload.duplicateHandling": "Gestione duplicati",
+  "upload.force": "Forza invio",
+  "upload.forceDesc": "Accetta questo invio nonostante la politica di duplicati semantica e degli articoli. I conflitti di idempotenza restano applicabili.",
+  "upload.duplicateMode": "Modalità duplicato",
+  "upload.duplicateModeEnforce": "Applica politica articoli",
+  "upload.duplicateModeScore": "Valuta candidati",
+  "upload.duplicateModeAll": "Mantieni tutti i candidati",
+  "upload.duplicateModeForce": "Forza invio",
+  "upload.duplicateKey": "Chiave duplicato",
+  "upload.duplicateKeyPlaceholder": "Gruppo candidati facoltativo",
+  "upload.duplicateScore": "Punteggio duplicato",
+  "upload.duplicateScorePlaceholder": "0",
+  "upload.duplicateScoreHint": "I punteggi più alti vincono nella stessa chiave; a parità resta il candidato esistente.",
+  ...duplicateLocaleEntries.ita,
 };
 
 export default it;

@@ -169,6 +169,7 @@ impl TestHarness {
             isp_bandwidth_cap: None,
             ip_replacement_trial_extra_connections: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
             config_path: None,
         };
         let shared_config: SharedConfig = Arc::new(RwLock::new(config));
@@ -562,7 +563,7 @@ fn spawn_test_scheduler(
                     };
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::CancelJob { job_id, reply } => {
+                SchedulerCommand::CancelJob { job_id, reply, .. } => {
                     let result = if jobs.remove(&job_id).is_some() {
                         Ok(())
                     } else {

@@ -1,4 +1,5 @@
 import type { LocaleDictionary } from "../types";
+import { duplicateLocaleEntries } from "../duplicate-locales";
 
 const zh: LocaleDictionary = {
   // Brand
@@ -650,6 +651,41 @@ const zh: LocaleDictionary = {
   "schedule.empty": "无计划",
   "schedule.emptyDesc": "添加计划规则以在特定时间自动暂停或限制下载。",
   "schedule.everyDay": "每天",
+
+  "settings.duplicateHandling": "重复处理",
+  "settings.duplicateHandlingDesc": "选择新 NZB 与持久重复证据匹配时的处理方式。阻止会拒绝；警告会接受；暂停会以暂停状态接受。",
+  "settings.duplicateStrictActiveOrSuccess": "严格文章布局 — 活跃或成功",
+  "settings.duplicateStrictActiveOrSuccessDesc": "当每篇文章及声明字节数与活跃或成功任务完全匹配时使用。",
+  "settings.duplicateStrictFailedOrCancelled": "严格文章布局 — 失败或已取消",
+  "settings.duplicateStrictFailedOrCancelledDesc": "当每篇文章及声明字节数与失败或已取消任务完全匹配时使用。",
+  "settings.duplicateArticleLayoutActiveOrSuccess": "文章布局 — 活跃或成功",
+  "settings.duplicateArticleLayoutActiveOrSuccessDesc": "当文章顺序匹配但声明字节数与活跃或成功任务不同时使用。",
+  "settings.duplicateArticleLayoutFailedOrCancelled": "文章布局 — 失败或已取消",
+  "settings.duplicateArticleLayoutFailedOrCancelledDesc": "当文章顺序匹配但声明字节数与失败或已取消任务不同时使用。",
+  "settings.duplicateArticleSet": "文章集合",
+  "settings.duplicateArticleSetDesc": "当相同的唯一文章 ID 存在于不同布局中时使用。",
+  "settings.duplicateNormalizedName": "规范化名称",
+  "settings.duplicateNormalizedNameDesc": "当规范化发布名称匹配但没有更强文章证据时使用。",
+  "settings.duplicateActionAccept": "接受",
+  "settings.duplicateActionWarn": "警告并接受",
+  "settings.duplicateActionPause": "暂停接受",
+  "settings.duplicateActionBlock": "阻止",
+  "settings.duplicatePolicySaved": "重复策略已保存。",
+  "settings.duplicatePolicySaveFailed": "无法保存重复策略。",
+  "upload.duplicateHandling": "重复处理",
+  "upload.force": "强制提交",
+  "upload.forceDesc": "即使语义和文章指纹重复策略匹配，也接受此提交。幂等性冲突仍然有效。",
+  "upload.duplicateMode": "重复模式",
+  "upload.duplicateModeEnforce": "执行文章策略",
+  "upload.duplicateModeScore": "候选评分",
+  "upload.duplicateModeAll": "保留所有候选",
+  "upload.duplicateModeForce": "强制提交",
+  "upload.duplicateKey": "重复键",
+  "upload.duplicateKeyPlaceholder": "可选候选组",
+  "upload.duplicateScore": "重复评分",
+  "upload.duplicateScorePlaceholder": "0",
+  "upload.duplicateScoreHint": "同一重复键内分数较高者胜出；分数相同则保留现有候选。",
+  ...duplicateLocaleEntries.zho,
 };
 
 export default zh;

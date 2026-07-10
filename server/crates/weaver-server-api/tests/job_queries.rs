@@ -62,6 +62,135 @@ async fn jobs_returns_submitted() {
 }
 
 #[tokio::test]
+async fn queue_items_project_bulk_duplicate_summary() {
+    let h = TestHarness::new().await;
+    let job_id = h.submit_test_nzb("duplicate-summary-queue").await;
+
+    let resp = h
+        .execute(
+            r#"{
+              queueItems {
+                id
+                duplicateSummary {
+                  lifecycle
+                  action
+                  primaryReason
+                  semantic { score state }
+                }
+              }
+              queueSnapshot {
+                items {
+                  id
+                  duplicateSummary {
+                    lifecycle
+                    action
+                    primaryReason
+                  }
+                }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let items = data["queueItems"].as_array().unwrap();
+    let item = items
+        .iter()
+        .find(|item| item["id"].as_u64() == Some(job_id))
+        .expect("submitted job should be in queue");
+    let summary = &item["duplicateSummary"];
+    assert!(matches!(
+        summary["lifecycle"].as_str(),
+        Some("RESERVED" | "ACTIVE")
+    ));
+    assert_eq!(summary["action"].as_str(), Some("ACCEPT"));
+    assert!(summary["primaryReason"].is_null());
+    assert!(summary["semantic"].is_null());
+
+    let snapshot_item = data["queueSnapshot"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"].as_u64() == Some(job_id))
+        .expect("queue snapshot should include the submitted job");
+    assert_eq!(
+        snapshot_item["duplicateSummary"]["action"].as_str(),
+        Some("ACCEPT")
+    );
+}
+
+#[tokio::test]
+async fn duplicate_summary_projections_chunk_more_than_256_jobs() {
+    const JOB_COUNT: usize = 257;
+
+    let h = TestHarness::new().await;
+    let mut job_ids = Vec::with_capacity(JOB_COUNT);
+    for index in 0..JOB_COUNT {
+        job_ids.push(
+            h.submit_test_nzb(&format!("duplicate-summary-batch-{index:03}"))
+                .await,
+        );
+    }
+
+    let queue = h
+        .execute(
+            r#"{
+              queueItems(first: 512) {
+                id
+                duplicateSummary { action primaryReason }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&queue);
+    assert_duplicate_summaries_for_ids(
+        response_data(&queue)["queueItems"].as_array().unwrap(),
+        &job_ids,
+    );
+
+    for (index, job_id) in job_ids.iter().copied().enumerate() {
+        h.insert_history_row(&sample_history_row(
+            job_id,
+            &format!("duplicate-summary-batch-{index:03}"),
+            "complete",
+            1_800_000_000 + index as i64,
+        ));
+    }
+    let history = h
+        .execute(
+            r#"{
+              historyItems(first: 512) {
+                id
+                duplicateSummary { action primaryReason }
+              }
+              historyPage(input: { pageIndex: 0, pageSize: 512 }) {
+                items {
+                  id
+                  duplicateSummary { action primaryReason }
+                }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&history);
+    let data = response_data(&history);
+    assert_duplicate_summaries_for_ids(data["historyItems"].as_array().unwrap(), &job_ids);
+    assert_duplicate_summaries_for_ids(data["historyPage"]["items"].as_array().unwrap(), &job_ids);
+}
+
+fn assert_duplicate_summaries_for_ids(items: &[serde_json::Value], expected_ids: &[u64]) {
+    assert_eq!(items.len(), expected_ids.len());
+    for job_id in expected_ids {
+        let item = items
+            .iter()
+            .find(|item| item["id"].as_u64() == Some(*job_id))
+            .expect("every requested job should be returned");
+        assert_eq!(item["duplicateSummary"]["action"].as_str(), Some("ACCEPT"));
+        assert!(item["duplicateSummary"]["primaryReason"].is_null());
+    }
+}
+
+#[tokio::test]
 async fn jobs_filter_by_queued_status() {
     let h = TestHarness::new().await;
     h.submit_test_nzb("queued-one").await;
@@ -417,6 +546,65 @@ async fn history_items_respects_bounded_pagination_before_returning_rows() {
     assert_eq!(items.len(), 2);
     assert_eq!(items[0]["id"].as_u64().unwrap(), 5);
     assert_eq!(items[1]["id"].as_u64().unwrap(), 4);
+}
+
+#[tokio::test]
+async fn history_items_project_bulk_duplicate_summary() {
+    let h = TestHarness::new().await;
+    let job_id = h.submit_test_nzb("duplicate-summary-history").await;
+    h.insert_history_row(&sample_history_row(
+        job_id,
+        "duplicate-summary-history",
+        "complete",
+        1_700_000_123,
+    ));
+
+    let resp = h
+        .execute(
+            r#"{
+              historyItems(first: 10) {
+                id
+                duplicateSummary {
+                  lifecycle
+                  action
+                  primaryReason
+                }
+              }
+              historyPage(input: { pageIndex: 0, pageSize: 25 }) {
+                items {
+                  id
+                  duplicateSummary {
+                    lifecycle
+                    action
+                    primaryReason
+                  }
+                }
+              }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let items = data["historyItems"].as_array().unwrap();
+    let item = items
+        .iter()
+        .find(|item| item["id"].as_u64() == Some(job_id))
+        .expect("history row should be returned");
+    let summary = &item["duplicateSummary"];
+    assert_eq!(summary["lifecycle"].as_str(), Some("SUCCEEDED"));
+    assert_eq!(summary["action"].as_str(), Some("ACCEPT"));
+    assert!(summary["primaryReason"].is_null());
+
+    let page_item = data["historyPage"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"].as_u64() == Some(job_id))
+        .expect("history page should include the history row");
+    assert_eq!(
+        page_item["duplicateSummary"]["action"].as_str(),
+        Some("ACCEPT")
+    );
 }
 
 #[tokio::test]
