@@ -277,11 +277,11 @@ export function JobDetail() {
     : null;
 
   async function runDuplicateAction() {
-    if (!duplicateAction) {
+    if (!duplicateAction || !job) {
       return;
     }
     setDuplicateActionError(null);
-    let accepted = false;
+    let accepted: boolean;
     let message: string | null | undefined;
 
     if (duplicateAction === "good") {

@@ -41,6 +41,8 @@ use crate::transfer::{
 use crate::types::{ArticleId, Capabilities, Response};
 
 const MIN_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(not(windows))]
+const S2N_BLOCKING_IO_SLICE: Duration = Duration::from_millis(100);
 
 fn active_transfer_timeout(budget: &ActiveTransferBudget) -> NntpError {
     NntpError::SoftTimeout(budget.limit().as_secs())
@@ -1422,8 +1424,13 @@ impl BlockingS2nStream {
         ca_cert_path: Option<&std::path::Path>,
         timeout: Duration,
     ) -> Result<Self> {
-        tcp.set_read_timeout(Some(timeout)).map_err(NntpError::Io)?;
-        tcp.set_write_timeout(Some(timeout))
+        // Keep the direct S2N fd blocking for the throughput path, but wake a
+        // stalled syscall often enough for the elapsed operation deadline to
+        // be checked without reconfiguring socket options on every I/O call.
+        let io_slice = timeout.min(S2N_BLOCKING_IO_SLICE);
+        tcp.set_read_timeout(Some(io_slice))
+            .map_err(NntpError::Io)?;
+        tcp.set_write_timeout(Some(io_slice))
             .map_err(NntpError::Io)?;
         tcp.set_nonblocking(false).map_err(NntpError::Io)?;
 
@@ -1500,7 +1507,6 @@ impl BlockingS2nStream {
         target_read_size: usize,
         timeout: Duration,
     ) -> io::Result<(usize, TransportReadStats)> {
-        self.tcp.set_read_timeout(Some(timeout))?;
         let target = target_read_size.max(1);
         dst.reserve(target);
 
@@ -1580,9 +1586,6 @@ impl BlockingS2nStream {
     }
 
     fn write_all(&mut self, mut bytes: &[u8], timeout: Duration) -> Result<()> {
-        self.tcp
-            .set_write_timeout(Some(timeout))
-            .map_err(NntpError::Io)?;
         let started = Instant::now();
         while !bytes.is_empty() {
             let mut blocked = s2n::s2n_blocked_status::NOT_BLOCKED;
@@ -1614,9 +1617,6 @@ impl BlockingS2nStream {
     }
 
     fn flush(&mut self, timeout: Duration) -> Result<()> {
-        self.tcp
-            .set_write_timeout(Some(timeout))
-            .map_err(NntpError::Io)?;
         let started = Instant::now();
         loop {
             let mut blocked = s2n::s2n_blocked_status::NOT_BLOCKED;
@@ -1981,6 +1981,21 @@ mod tests {
     fn s2n_test_guard() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[cfg(not(windows))]
+    fn assert_s2n_socket_timeout_slice(conn: &BlockingNntpConnection) {
+        let BlockingTransport::S2n(stream) = &conn.transport else {
+            panic!("expected blocking S2N transport");
+        };
+        assert_eq!(
+            stream.tcp.read_timeout().unwrap(),
+            Some(S2N_BLOCKING_IO_SLICE)
+        );
+        assert_eq!(
+            stream.tcp.write_timeout().unwrap(),
+            Some(S2N_BLOCKING_IO_SLICE)
+        );
     }
 
     fn yenc_body(data: &[u8]) -> Vec<u8> {
@@ -2581,6 +2596,34 @@ mod tests {
         ));
         assert!(conn.poisoned);
         drop(conn);
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn blocking_s2n_retries_socket_slices_within_active_budget() {
+        let _guard = s2n_test_guard();
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
+            "<within-budget@test>",
+            TestArticle::DelayedInitial {
+                data: vec![b'A'; 128],
+                delay: Duration::from_millis(250),
+            },
+        )]);
+        let mut conn = connect_with_backend(&config, NntpTlsBackend::S2n);
+        conn.select_group("alt.test").unwrap();
+        assert_s2n_socket_timeout_slice(&conn);
+        let mut budget = ActiveTransferBudget::new(Duration::from_millis(500));
+
+        let article = conn
+            .stream_yenc_article_with_active_budget("<within-budget@test>", 0, &mut budget)
+            .expect("socket timeout slices must retry while active budget remains");
+
+        assert_eq!(article.into_data(), vec![b'A'; 128]);
+        assert_s2n_socket_timeout_slice(&conn);
+        conn.quit().unwrap();
+        assert_s2n_socket_timeout_slice(&conn);
         handle.join().unwrap();
         let _ = std::fs::remove_file(ca_path);
     }
