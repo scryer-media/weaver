@@ -1898,9 +1898,6 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
     ok(format!("Pushed {branch} and tag {tag_name}"));
 
     println!("\n{GREEN}{BOLD}Released {tag_name}{RESET}");
-    println!(
-        "\n{YELLOW}{BOLD}Reminder:{RESET} Update the weaver tag reference in Scryer's Cargo.toml to {BOLD}{tag_name}{RESET}"
-    );
     Ok(())
 }
 
