@@ -150,6 +150,8 @@ pub struct FusedYencArticleStats {
     pub nntp_terminator_cpu: Duration,
     pub article_finish_cpu: Duration,
     pub output_callback_cpu: Duration,
+    /// Deliberate shared server-rate wait, excluded from RTT/timeout metrics.
+    pub throttle_wait: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +268,15 @@ impl FusedYencArticleDecoder {
 
     pub fn set_profile_cpu(&mut self, enabled: bool) {
         self.profile_cpu = enabled;
+    }
+
+    /// Raw NNTP BODY payload consumed so far, excluding the multiline
+    /// terminator. Available even when the next decode call returns an error,
+    /// which lets transfer accounting retain partial failed bodies.
+    pub(crate) fn body_payload_bytes_consumed(&self) -> u64 {
+        self.stats
+            .encoded_bytes_consumed
+            .saturating_sub(self.stats.nntp_terminator_bytes)
     }
 
     pub(crate) fn drain_output_chunks(&mut self) -> Vec<Box<[u8]>> {

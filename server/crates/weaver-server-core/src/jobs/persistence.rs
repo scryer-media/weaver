@@ -556,6 +556,7 @@ impl Database {
         })
     }
 
+    #[allow(dead_code)] // retained for restoration paths that bypass admission.
     pub(crate) fn create_active_job_with_file_identities(
         &self,
         job: &ActiveJob,
@@ -598,6 +599,220 @@ impl Database {
                         .await?;
                         bulk_upsert_file_identities_tx(tx, job_id, &identities).await?;
                         Ok(())
+                    })
+                },
+            )
+            .await
+        })
+    }
+
+    /// Performs the inexpensive first half of SCORE materialization before a
+    /// pipeline creates a work directory. The transactional check below remains
+    /// authoritative; this keeps a known-stale submit from allocating anything.
+    pub(crate) fn semantic_materialization_is_current(
+        &self,
+        job_id: JobId,
+        generation: i64,
+    ) -> Result<bool, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            Ok(SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT 1 FROM semantic_duplicate_candidates
+                 WHERE job_id = {} AND candidate_state = {} AND materialization_generation = {}",
+                &[
+                    SqlArg::I64(job_id.0 as i64),
+                    SqlArg::Text("active".to_string()),
+                    SqlArg::I64(generation),
+                ],
+            )
+            .await?
+            .is_some())
+        })
+    }
+
+    /// Checks an owned promotion lease before the scheduler allocates a
+    /// working directory. The materialization transaction repeats this CAS.
+    pub(crate) fn semantic_promotion_materialization_is_current(
+        &self,
+        job_id: JobId,
+        generation: i64,
+    ) -> Result<bool, StateError> {
+        let datastore = self.datastore();
+        let now = (crate::jobs::epoch_ms_now() / 1_000.0) as i64;
+        self.run_sql_blocking(async move {
+            Ok(SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT 1 FROM semantic_duplicate_candidates
+                 WHERE job_id = {} AND candidate_state = {}
+                   AND promotion_state = {} AND promotion_generation = {}
+                   AND promotion_lease_expires_at > {}",
+                &[
+                    SqlArg::I64(job_id.0 as i64),
+                    SqlArg::Text("active".to_string()),
+                    SqlArg::Text("claimed".to_string()),
+                    SqlArg::I64(generation),
+                    SqlArg::I64(now),
+                ],
+            )
+            .await?
+            .is_some())
+        })
+    }
+
+    /// Atomically turns a reserved duplicate admission into an active job. A
+    /// SCORE caller supplies the generation it received at admission; parking
+    /// or superseding that candidate invalidates the generation before any
+    /// stale request can create scheduler work.
+    pub(crate) fn materialize_active_job_with_file_identities(
+        &self,
+        job: &ActiveJob,
+        identities: &[ActiveFileIdentity],
+        semantic_materialization_generation: Option<i64>,
+        semantic_promotion_generation: Option<i64>,
+    ) -> Result<bool, StateError> {
+        let datastore = self.datastore();
+        let job_id = job.job_id;
+        let identities = identities.to_vec();
+        let now = (crate::jobs::epoch_ms_now() / 1_000.0) as i64;
+        let args = vec![
+            SqlArg::I64(job.job_id.0 as i64),
+            SqlArg::Bytes(job.nzb_hash.to_vec()),
+            SqlArg::Text(job.nzb_path.to_str().unwrap_or("").to_string()),
+            SqlArg::Bytes(job.nzb_zstd.clone()),
+            SqlArg::Text(job.output_dir.to_str().unwrap_or("").to_string()),
+            SqlArg::Text(job.status.to_string()),
+            SqlArg::Text(job.download_state.to_string()),
+            SqlArg::Text(job.post_state.to_string()),
+            SqlArg::Text(job.run_state.to_string()),
+            SqlArg::I64(job.created_at as i64),
+            SqlArg::OptText(job.category.clone()),
+            SqlArg::OptText(metadata_json(&job.metadata)?),
+            SqlArg::OptText(job.paused_resume_status.map(str::to_string)),
+            SqlArg::OptText(job.paused_resume_download_state.map(str::to_string)),
+            SqlArg::OptText(job.paused_resume_post_state.map(str::to_string)),
+        ];
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(
+                &datastore,
+                "materialize_active_job_with_file_identities",
+                |tx| {
+                    let args = args.clone();
+                    let identities = identities.clone();
+                    Box::pin(async move {
+                        if let Some(generation) = semantic_materialization_generation {
+                            let lock = match tx {
+                                SqlTx::Postgres(_) => " FOR UPDATE",
+                                SqlTx::Sqlite(_) => "",
+                            };
+                            let Some(group) = tx
+                                .fetch_optional(
+                                    "SELECT group_id FROM semantic_duplicate_candidates WHERE job_id = {}",
+                                    &[SqlArg::I64(job_id.0 as i64)],
+                                )
+                                .await?
+                            else {
+                                return Ok(false);
+                            };
+                            tx.fetch_optional(
+                                &format!(
+                                    "SELECT group_id FROM semantic_duplicate_groups WHERE group_id = {{}}{lock}"
+                                ),
+                                &[SqlArg::I64(group.i64("group_id")?)],
+                            )
+                            .await?
+                            .ok_or_else(|| {
+                                StateError::Database(
+                                    "semantic duplicate group disappeared during materialization"
+                                        .to_string(),
+                                )
+                            })?;
+                            let claimed = tx
+                                .execute(
+                                    "UPDATE semantic_duplicate_candidates
+                                     SET updated_at = {}
+                                     WHERE job_id = {} AND candidate_state = {}
+                                       AND materialization_generation = {}",
+                                    &[
+                                        SqlArg::I64(now),
+                                        SqlArg::I64(job_id.0 as i64),
+                                        SqlArg::Text("active".to_string()),
+                                        SqlArg::I64(generation),
+                                    ],
+                                )
+                                .await?;
+                            if claimed != 1 {
+                                return Ok(false);
+                            }
+                        }
+                        if let Some(generation) = semantic_promotion_generation {
+                            let lock = match tx {
+                                SqlTx::Postgres(_) => " FOR UPDATE",
+                                SqlTx::Sqlite(_) => "",
+                            };
+                            let Some(group) = tx
+                                .fetch_optional(
+                                    "SELECT group_id FROM semantic_duplicate_candidates WHERE job_id = {}",
+                                    &[SqlArg::I64(job_id.0 as i64)],
+                                )
+                                .await?
+                            else {
+                                return Ok(false);
+                            };
+                            tx.fetch_optional(
+                                &format!(
+                                    "SELECT group_id FROM semantic_duplicate_groups WHERE group_id = {{}}{lock}"
+                                ),
+                                &[SqlArg::I64(group.i64("group_id")?)],
+                            )
+                            .await?
+                            .ok_or_else(|| {
+                                StateError::Database(
+                                    "semantic duplicate group disappeared during promotion"
+                                        .to_string(),
+                                )
+                            })?;
+                            let claimed = tx
+                                .execute(
+                                    "UPDATE semantic_duplicate_candidates
+                                     SET updated_at = {}
+                                     WHERE job_id = {} AND candidate_state = {}
+                                       AND promotion_state = {} AND promotion_generation = {}
+                                       AND promotion_lease_expires_at > {}",
+                                    &[
+                                        SqlArg::I64(now),
+                                        SqlArg::I64(job_id.0 as i64),
+                                        SqlArg::Text("active".to_string()),
+                                        SqlArg::Text("claimed".to_string()),
+                                        SqlArg::I64(generation),
+                                        SqlArg::I64(now),
+                                    ],
+                                )
+                                .await?;
+                            if claimed != 1 {
+                                return Ok(false);
+                            }
+                        }
+                        tx.execute(
+                            "UPDATE duplicate_job_snapshots
+                             SET lifecycle = {}, reservation_expires_at = NULL, updated_at = {}
+                             WHERE job_id = {}",
+                            &[
+                                SqlArg::Text("active".to_string()),
+                                SqlArg::I64(now),
+                                SqlArg::I64(job_id.0 as i64),
+                            ],
+                        )
+                        .await?;
+                        tx.execute(
+                            "INSERT INTO active_jobs
+                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state)
+                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                            &args,
+                        )
+                        .await?;
+                        bulk_upsert_file_identities_tx(tx, job_id, &identities).await?;
+                        Ok(true)
                     })
                 },
             )

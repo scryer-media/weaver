@@ -22,8 +22,15 @@ import {
 } from "@/graphql/queries";
 import { useTranslate, useLanguageSettings } from "@/lib/context/translate-context";
 import { AVAILABLE_LANGUAGES } from "@/lib/i18n";
+import {
+  DEFAULT_DUPLICATE_POLICY,
+  DUPLICATE_ACTIONS,
+  normalizeDuplicatePolicy,
+  type DuplicateAction,
+  type DuplicatePolicy,
+} from "@/features/duplicates/duplicate-policy";
 
-const MAX_SPEED = 100 * 1024 * 1024;
+const MAX_SPEED = 10 * 1024 * 1024 * 1024;
 
 type GeneralSettings = {
   dataDir: string;
@@ -33,6 +40,7 @@ type GeneralSettings = {
   maxDownloadSpeed: number;
   maxRetries: number;
   ipReplacementTrialExtraConnections: number;
+  duplicatePolicy: DuplicatePolicy;
 };
 
 type StorageBehaviorDraft = {
@@ -41,6 +49,13 @@ type StorageBehaviorDraft = {
   cleanupAfterExtract: boolean;
   maxRetries: number;
 };
+
+function normalizeGeneralSettings(settings: GeneralSettings): GeneralSettings {
+  return {
+    ...settings,
+    duplicatePolicy: normalizeDuplicatePolicy(settings.duplicatePolicy),
+  };
+}
 
 function normalizeStorageBehaviorDraft(draft: StorageBehaviorDraft): StorageBehaviorDraft {
   return {
@@ -78,9 +93,12 @@ export function GeneralSettingsPage() {
   const [completeDir, setCompleteDir] = useState("");
   const [cleanup, setCleanup] = useState(true);
   const [maxRetries, setMaxRetries] = useState(3);
-  const [ipReplacementBurst, setIpReplacementBurst] = useState(0);
+  const [ipReplacementBurst, setIpReplacementBurst] = useState(false);
   const [speedSaved, setSpeedSaved] = useState(false);
   const [ipReplacementBurstSaved, setIpReplacementBurstSaved] = useState(false);
+  const [duplicatePolicySaveStatus, setDuplicatePolicySaveStatus] = useState<
+    "idle" | "saved" | "error"
+  >("idle");
   const [storageSaveStatus, setStorageSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [storageSaveError, setStorageSaveError] = useState<string | null>(null);
   const speedSavedTimerRef = useRef<number | null>(null);
@@ -92,7 +110,7 @@ export function GeneralSettingsPage() {
 
   useEffect(() => {
     if (data?.settings) {
-      setSettings(data.settings);
+      setSettings(normalizeGeneralSettings(data.settings));
     }
   }, [data?.settings]);
 
@@ -103,7 +121,7 @@ export function GeneralSettingsPage() {
     setCompleteDir(settings.completeDir ?? "");
     setCleanup(settings.cleanupAfterExtract ?? true);
     setMaxRetries(settings.maxRetries ?? 3);
-    setIpReplacementBurst(settings.ipReplacementTrialExtraConnections ?? 0);
+    setIpReplacementBurst((settings.ipReplacementTrialExtraConnections ?? 0) > 0);
   }, [settings]);
 
   useEffect(() => {
@@ -127,7 +145,7 @@ export function GeneralSettingsPage() {
     if (!nextSettings) {
       return;
     }
-    setSettings(nextSettings);
+    setSettings(normalizeGeneralSettings(nextSettings));
     reexecuteQuery({ requestPolicy: "network-only" });
   }, [reexecuteQuery]);
 
@@ -252,11 +270,11 @@ export function GeneralSettingsPage() {
     }
   };
 
-  const applyIpReplacementBurst = async () => {
-    const value = Math.max(0, Math.min(1, Math.trunc(ipReplacementBurst)));
+  const updateIpReplacementBurst = async (enabled: boolean) => {
+    setIpReplacementBurst(enabled);
     const result = await updateSettings({
       input: {
-        ipReplacementTrialExtraConnections: value,
+        ipReplacementTrialExtraConnections: enabled ? 1 : 0,
       },
     });
 
@@ -264,6 +282,29 @@ export function GeneralSettingsPage() {
       applyUpdatedSettings(result.data.updateSettings);
       pulseIpReplacementBurstSaved();
     }
+  };
+
+  const updateDuplicatePolicy = (field: keyof DuplicatePolicy, action: DuplicateAction) => {
+    setSettings((current) =>
+      current
+        ? {
+            ...current,
+            duplicatePolicy: { ...current.duplicatePolicy, [field]: action },
+          }
+        : current,
+    );
+    setDuplicatePolicySaveStatus("idle");
+  };
+
+  const saveDuplicatePolicy = async () => {
+    const duplicatePolicy = settings?.duplicatePolicy ?? DEFAULT_DUPLICATE_POLICY;
+    const result = await updateSettings({ input: { duplicatePolicy } });
+    if (result.error || !result.data?.updateSettings) {
+      setDuplicatePolicySaveStatus("error");
+      return;
+    }
+    applyUpdatedSettings(result.data.updateSettings);
+    setDuplicatePolicySaveStatus("saved");
   };
 
   return (
@@ -311,7 +352,7 @@ export function GeneralSettingsPage() {
             />
             <div className="mt-2 flex justify-between text-xs text-muted-foreground">
               <span>{t("settings.unlimited")}</span>
-              <span>100 MB/s</span>
+              <span>10 GiB/s</span>
             </div>
           </div>
 
@@ -326,6 +367,60 @@ export function GeneralSettingsPage() {
               <span className="text-sm text-status-completed">
                 {t("settings.saved")}
               </span>
+            ) : null}
+          </div>
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title={t("settings.duplicateHandling")}
+        description={t("settings.duplicateHandlingDesc")}
+      >
+        <div className="space-y-5">
+          <div className="grid gap-4 xl:grid-cols-2">
+            {settings
+              ? [
+                  ["strictActiveOrSuccess", "settings.duplicateStrictActiveOrSuccess", "settings.duplicateStrictActiveOrSuccessDesc"],
+                  ["strictFailedOrCancelled", "settings.duplicateStrictFailedOrCancelled", "settings.duplicateStrictFailedOrCancelledDesc"],
+                  ["articleLayoutActiveOrSuccess", "settings.duplicateArticleLayoutActiveOrSuccess", "settings.duplicateArticleLayoutActiveOrSuccessDesc"],
+                  ["articleLayoutFailedOrCancelled", "settings.duplicateArticleLayoutFailedOrCancelled", "settings.duplicateArticleLayoutFailedOrCancelledDesc"],
+                  ["articleSet", "settings.duplicateArticleSet", "settings.duplicateArticleSetDesc"],
+                  ["normalizedName", "settings.duplicateNormalizedName", "settings.duplicateNormalizedNameDesc"],
+                ].map(([field, label, description]) => {
+                  const policyField = field as keyof DuplicatePolicy;
+                  return (
+                    <SettingField key={field} label={t(label)} description={t(description)}>
+                      <Select
+                        value={settings.duplicatePolicy[policyField]}
+                        onValueChange={(value) =>
+                          updateDuplicatePolicy(policyField, value as DuplicateAction)
+                        }
+                      >
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {DUPLICATE_ACTIONS.map((action) => (
+                            <SelectItem key={action} value={action}>
+                              {t(`settings.duplicateAction${action[0]}${action.slice(1).toLowerCase()}`)}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </SettingField>
+                  );
+                })
+              : null}
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <Button onClick={() => void saveDuplicatePolicy()} disabled={!settings || updateState.fetching}>
+              {t("settings.save")}
+            </Button>
+            {duplicatePolicySaveStatus === "saved" ? (
+              <span className="text-sm text-status-completed">{t("settings.duplicatePolicySaved")}</span>
+            ) : null}
+            {duplicatePolicySaveStatus === "error" ? (
+              <span className="text-sm text-destructive">{t("settings.duplicatePolicySaveFailed")}</span>
             ) : null}
           </div>
         </div>
@@ -372,26 +467,12 @@ export function GeneralSettingsPage() {
                 description={t("settings.ipReplacementTrialExtraConnectionsDesc")}
               >
                 <div className="flex flex-wrap items-center gap-3">
-                  <Input
-                    type="number"
-                    min={0}
-                    max={1}
-                    step={1}
-                    value={ipReplacementBurst}
-                    onChange={(event) => {
-                      const value = Number(event.target.value);
-                      setIpReplacementBurst(Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0);
-                    }}
-                    className="max-w-24"
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => void applyIpReplacementBurst()}
+                  <Switch
+                    checked={ipReplacementBurst}
+                    onCheckedChange={(enabled) => void updateIpReplacementBurst(enabled)}
+                    aria-label={t("settings.ipReplacementTrialExtraConnections")}
                     disabled={updateState.fetching}
-                  >
-                    {t("settings.save")}
-                  </Button>
+                  />
                   {ipReplacementBurstSaved ? (
                     <span className="text-sm text-status-completed">
                       {t("settings.saved")}

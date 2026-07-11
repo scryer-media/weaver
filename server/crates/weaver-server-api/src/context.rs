@@ -31,6 +31,8 @@ pub struct SchemaContext {
     pub handle: weaver_server_core::SchedulerHandle,
     pub config: SharedConfig,
     pub db: Database,
+    pub server_transfer_policy:
+        Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
     pub auth_cache: LoginAuthCache,
     pub api_key_cache: ApiKeyCache,
     pub rss: RssService,
@@ -80,6 +82,7 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
     .data(context.handle)
     .data(context.config)
     .data(context.db)
+    .data(context.server_transfer_policy)
     .data(context.auth_cache)
     .data(context.api_key_cache)
     .data(context.rss)

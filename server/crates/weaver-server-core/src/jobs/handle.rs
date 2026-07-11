@@ -25,21 +25,31 @@ pub const FINISHED_JOBS_RUNTIME_CAP: usize = 1_000;
 #[derive(Clone)]
 pub struct SharedPipelineState {
     jobs: Arc<RwLock<Vec<JobInfo>>>,
+    job_revision: tokio::sync::watch::Sender<u64>,
     paused: Arc<AtomicBool>,
     metrics: Arc<PipelineMetrics>,
     metrics_snapshot: Arc<RwLock<MetricsSnapshot>>,
     download_block: Arc<RwLock<DownloadBlockState>>,
+    server_quota_blocked: Arc<AtomicBool>,
+    server_transfer_policy:
+        Arc<RwLock<Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>>>,
+    nntp_pool: Arc<RwLock<Option<Arc<weaver_nntp::pool::NntpPool>>>>,
 }
 
 impl SharedPipelineState {
     pub fn new(metrics: Arc<PipelineMetrics>, initial_jobs: Vec<JobInfo>) -> Self {
         let metrics_snapshot = metrics.snapshot();
+        let (job_revision, _) = tokio::sync::watch::channel(0);
         Self {
             jobs: Arc::new(RwLock::new(initial_jobs)),
+            job_revision,
             paused: Arc::new(AtomicBool::new(false)),
             metrics,
             metrics_snapshot: Arc::new(RwLock::new(metrics_snapshot)),
             download_block: Arc::new(RwLock::new(DownloadBlockState::default())),
+            server_quota_blocked: Arc::new(AtomicBool::new(false)),
+            server_transfer_policy: Arc::new(RwLock::new(None)),
+            nntp_pool: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -82,6 +92,12 @@ impl SharedPipelineState {
 
     pub fn publish_jobs(&self, jobs: Vec<JobInfo>) {
         *self.jobs.write().unwrap() = jobs;
+        self.job_revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    pub fn subscribe_job_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.job_revision.subscribe()
     }
 
     pub fn refresh_metrics_snapshot(&self) {
@@ -92,8 +108,67 @@ impl SharedPipelineState {
         self.paused.store(paused, Ordering::Relaxed);
     }
 
-    pub fn set_download_block(&self, state: DownloadBlockState) {
-        *self.download_block.write().unwrap() = state;
+    pub fn set_download_block(&self, mut state: DownloadBlockState) {
+        let mut current = self.download_block.write().unwrap();
+        if self.server_quota_blocked.load(Ordering::Relaxed)
+            && matches!(
+                state.kind,
+                DownloadBlockKind::None
+                    | DownloadBlockKind::Scheduled
+                    | DownloadBlockKind::ServerQuota
+            )
+        {
+            state.kind = DownloadBlockKind::ServerQuota;
+        }
+        *current = state;
+    }
+
+    pub fn server_quota_blocked(&self) -> bool {
+        self.server_quota_blocked.load(Ordering::Relaxed)
+    }
+
+    pub fn set_server_quota_blocked(&self, blocked: bool) {
+        self.server_quota_blocked.store(blocked, Ordering::Relaxed);
+        let mut state = self.download_block.write().unwrap();
+        if blocked {
+            if matches!(
+                state.kind,
+                DownloadBlockKind::None
+                    | DownloadBlockKind::Scheduled
+                    | DownloadBlockKind::ServerQuota
+            ) {
+                state.kind = DownloadBlockKind::ServerQuota;
+            }
+        } else if state.kind == DownloadBlockKind::ServerQuota {
+            state.kind = if state.cap_enabled && state.remaining_bytes == 0 {
+                DownloadBlockKind::IspCap
+            } else if state.scheduled_speed_limit > 0 {
+                DownloadBlockKind::Scheduled
+            } else {
+                DownloadBlockKind::None
+            };
+        }
+    }
+
+    pub fn set_server_transfer_policy(
+        &self,
+        registry: Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>,
+    ) {
+        *self.server_transfer_policy.write().unwrap() = Some(registry);
+    }
+
+    pub fn server_transfer_policy(
+        &self,
+    ) -> Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>> {
+        self.server_transfer_policy.read().unwrap().clone()
+    }
+
+    pub fn set_nntp_pool(&self, pool: Arc<weaver_nntp::pool::NntpPool>) {
+        *self.nntp_pool.write().unwrap() = Some(pool);
+    }
+
+    pub fn nntp_pool(&self) -> Option<Arc<weaver_nntp::pool::NntpPool>> {
+        self.nntp_pool.read().unwrap().clone()
     }
 }
 
@@ -103,6 +178,7 @@ pub enum DownloadBlockKind {
     ManualPause,
     Scheduled,
     IspCap,
+    ServerQuota,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -165,6 +241,22 @@ pub struct RestoreJobRequest {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AddJobOptions {
     pub initially_paused: bool,
+    /// SCORE admission generation that must still be authoritative when the
+    /// scheduler durably materializes this job.
+    pub semantic_materialization_generation: Option<i64>,
+    /// Promotion-lease generation that owns this candidate materialization.
+    /// Unlike admission generations, this must also still hold an unexpired
+    /// durable promotion lease when the active job row is inserted.
+    pub semantic_promotion_generation: Option<i64>,
+}
+
+/// Internal provenance for cancellation. Semantic cancellation is intentionally
+/// narrower than a user cancel: it may interrupt only download-lane work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancellationOrigin {
+    User,
+    SemanticBad,
+    SemanticSuperseded,
 }
 
 pub enum SchedulerCommand {
@@ -195,6 +287,7 @@ pub enum SchedulerCommand {
     /// Cancel and remove a job.
     CancelJob {
         job_id: JobId,
+        origin: CancellationOrigin,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
     /// Update a job's category and/or metadata.
@@ -398,9 +491,32 @@ impl SchedulerHandle {
 
     /// Cancel a job.
     pub async fn cancel_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.cancel_job_with_origin(job_id, CancellationOrigin::User)
+            .await
+    }
+
+    pub async fn cancel_semantic_bad(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.cancel_job_with_origin(job_id, CancellationOrigin::SemanticBad)
+            .await
+    }
+
+    pub async fn cancel_semantic_superseded(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.cancel_job_with_origin(job_id, CancellationOrigin::SemanticSuperseded)
+            .await
+    }
+
+    async fn cancel_job_with_origin(
+        &self,
+        job_id: JobId,
+        origin: CancellationOrigin,
+    ) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::CancelJob { job_id, reply: tx })
+            .send(SchedulerCommand::CancelJob {
+                job_id,
+                origin,
+                reply: tx,
+            })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
@@ -590,6 +706,27 @@ impl SchedulerHandle {
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
         Ok(())
+    }
+
+    pub fn set_server_transfer_policy(
+        &self,
+        registry: Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>,
+    ) {
+        self.state.set_server_transfer_policy(registry);
+    }
+
+    pub fn server_transfer_policy(
+        &self,
+    ) -> Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>> {
+        self.state.server_transfer_policy()
+    }
+
+    pub fn set_nntp_pool(&self, pool: Arc<weaver_nntp::pool::NntpPool>) {
+        self.state.set_nntp_pool(pool);
+    }
+
+    pub fn nntp_pool(&self) -> Option<Arc<weaver_nntp::pool::NntpPool>> {
+        self.state.nntp_pool()
     }
 
     /// Replace the NNTP client at runtime (e.g. after server config changes).

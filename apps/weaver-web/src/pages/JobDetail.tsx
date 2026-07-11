@@ -3,6 +3,10 @@ import { Link, useNavigate, useParams } from "react-router";
 import { ChevronRight, Download } from "lucide-react";
 import { useMutation, useQuery, useSubscription } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import {
+  DuplicateSnapshotPanel,
+  type DuplicateSnapshot,
+} from "@/features/duplicates/DuplicateSnapshotPanel";
 import { JobProgress } from "@/components/JobProgress";
 import { JobStatusBadgeGroup } from "@/components/JobStatusBadge";
 import { getJobStages } from "@/lib/job-stages";
@@ -25,10 +29,15 @@ import {
 import {
   ACCEPT_HISTORY_DELETE_MUTATION,
   CANCEL_JOB_MUTATION,
+  DUPLICATE_SNAPSHOT_QUERY,
+  FORGET_DUPLICATE_IDENTITY_MUTATION,
   JOB_OUTPUT_FILES_QUERY,
   JOB_DETAIL_UPDATES_SUBSCRIPTION,
   JOB_QUERY,
+  MARK_DUPLICATE_BAD_MUTATION,
+  MARK_DUPLICATE_GOOD_MUTATION,
   PAUSE_JOB_MUTATION,
+  PROMOTE_DUPLICATE_CANDIDATE_MUTATION,
   REDOWNLOAD_JOB_MUTATION,
   REPROCESS_JOB_MUTATION,
   RESUME_JOB_MUTATION,
@@ -68,6 +77,12 @@ interface JobDetailQueryData {
   jobDetailSnapshot?: JobDetailSnapshotData | null;
 }
 
+interface DuplicateSnapshotQueryData {
+  duplicateSnapshot?: DuplicateSnapshot | null;
+}
+
+type DuplicateAction = "good" | "bad" | "promote" | "forget";
+
 export function JobDetail() {
   const t = useTranslate();
   const { id } = useParams();
@@ -82,6 +97,11 @@ export function JobDetail() {
     query: JOB_QUERY,
     variables: queryVariables,
   });
+  const [{ data: duplicateData }, reexecuteDuplicateSnapshot] = useQuery<DuplicateSnapshotQueryData>({
+    query: DUPLICATE_SNAPSHOT_QUERY,
+    variables: queryVariables,
+    pause: !Number.isFinite(jobId),
+  });
   const [{ data: subscriptionData }] = useSubscription<{
     jobDetailUpdates: JobDetailSnapshotData;
   }>({
@@ -95,6 +115,10 @@ export function JobDetail() {
   const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
   const [, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
   const [acceptDeleteState, acceptHistoryDelete] = useMutation(ACCEPT_HISTORY_DELETE_MUTATION);
+  const [markDuplicateGoodState, markDuplicateGood] = useMutation(MARK_DUPLICATE_GOOD_MUTATION);
+  const [markDuplicateBadState, markDuplicateBad] = useMutation(MARK_DUPLICATE_BAD_MUTATION);
+  const [promoteDuplicateState, promoteDuplicate] = useMutation(PROMOTE_DUPLICATE_CANDIDATE_MUTATION);
+  const [forgetDuplicateState, forgetDuplicateIdentity] = useMutation(FORGET_DUPLICATE_IDENTITY_MUTATION);
 
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [showRedownloadConfirm, setShowRedownloadConfirm] = useState(false);
@@ -105,6 +129,8 @@ export function JobDetail() {
   const [polledData, setPolledData] = useState<JobDetailQueryData | undefined>();
   const [isDownloadingNzb, setIsDownloadingNzb] = useState(false);
   const [nzbDownloadError, setNzbDownloadError] = useState<string | null>(null);
+  const [duplicateAction, setDuplicateAction] = useState<DuplicateAction | null>(null);
+  const [duplicateActionError, setDuplicateActionError] = useState<string | null>(null);
   const jobQueryData =
     polledData?.jobDetailSnapshot
     ?? subscriptionData?.jobDetailUpdates
@@ -219,6 +245,71 @@ export function JobDetail() {
   const originalNzbTitle = job.originalTitle.trim() || job.name;
   const defaultNzbFilename = `${originalNzbTitle || job.displayTitle}.nzb`;
   const jobNzbDownloadHref = new URL(`api/jobs/${job.id}/nzb`, document.baseURI).href;
+  const duplicateSnapshot = duplicateData?.duplicateSnapshot ?? null;
+  const duplicateActionBusy =
+    markDuplicateGoodState.fetching
+    || markDuplicateBadState.fetching
+    || promoteDuplicateState.fetching
+    || forgetDuplicateState.fetching;
+  const duplicateConfirm = duplicateAction
+    ? {
+        good: {
+          title: "confirm.duplicateGood",
+          message: "confirm.duplicateGoodMessage",
+          confirm: "confirm.duplicateGoodConfirm",
+        },
+        bad: {
+          title: "confirm.duplicateBad",
+          message: "confirm.duplicateBadMessage",
+          confirm: "confirm.duplicateBadConfirm",
+        },
+        promote: {
+          title: "confirm.duplicatePromote",
+          message: "confirm.duplicatePromoteMessage",
+          confirm: "confirm.duplicatePromoteConfirm",
+        },
+        forget: {
+          title: "confirm.duplicateForget",
+          message: "confirm.duplicateForgetMessage",
+          confirm: "confirm.duplicateForgetConfirm",
+        },
+      }[duplicateAction]
+    : null;
+
+  async function runDuplicateAction() {
+    if (!duplicateAction || !job) {
+      return;
+    }
+    setDuplicateActionError(null);
+    let accepted: boolean;
+    let message: string | null | undefined;
+
+    if (duplicateAction === "good") {
+      const result = await markDuplicateGood({ id: job.id });
+      accepted = result.data?.markDuplicateGood === true;
+      message = result.error?.message;
+    } else if (duplicateAction === "bad") {
+      const result = await markDuplicateBad({ id: job.id });
+      accepted = result.data?.markDuplicateBad?.accepted === true;
+      message = result.error?.message ?? result.data?.markDuplicateBad?.message;
+    } else if (duplicateAction === "promote") {
+      const result = await promoteDuplicate({ id: job.id });
+      accepted = result.data?.promoteDuplicateCandidate?.accepted === true;
+      message = result.error?.message ?? result.data?.promoteDuplicateCandidate?.message;
+    } else {
+      const result = await forgetDuplicateIdentity({ id: job.id });
+      accepted = result.data?.forgetDuplicateIdentity === true;
+      message = result.error?.message;
+    }
+
+    if (!accepted) {
+      setDuplicateActionError(message ?? t("duplicate.actionFailed"));
+      return;
+    }
+    setDuplicateAction(null);
+    void reexecuteDuplicateSnapshot({ requestPolicy: "network-only" });
+    void reexecuteJobQuery({ requestPolicy: "network-only" });
+  }
 
   async function downloadNzb() {
     setIsDownloadingNzb(true);
@@ -383,6 +474,18 @@ export function JobDetail() {
         </CardContent>
       </Card>
 
+      {duplicateSnapshot ? (
+        <DuplicateSnapshotPanel
+          snapshot={duplicateSnapshot}
+          busy={duplicateActionBusy}
+          error={duplicateActionError}
+          onMarkGood={() => setDuplicateAction("good")}
+          onMarkBad={() => setDuplicateAction("bad")}
+          onPromote={() => setDuplicateAction("promote")}
+          onForget={() => setDuplicateAction("forget")}
+        />
+      ) : null}
+
       {/* Output files */}
       <JobOutputFilesCard jobId={job.id} status={job.status} />
 
@@ -469,6 +572,23 @@ export function JobDetail() {
         }}
         onCancel={() => setShowCancelConfirm(false)}
       />
+
+      <ConfirmDialog
+        open={duplicateAction !== null}
+        title={t(duplicateConfirm?.title ?? "duplicate.panelTitle")}
+        message={t(duplicateConfirm?.message ?? "duplicate.actionFailed")}
+        confirmLabel={t(duplicateConfirm?.confirm ?? "action.cancel")}
+        cancelLabel={t("action.cancel")}
+        confirmDisabled={duplicateActionBusy}
+        cancelDisabled={duplicateActionBusy}
+        onConfirm={() => void runDuplicateAction()}
+        onCancel={() => {
+          setDuplicateActionError(null);
+          setDuplicateAction(null);
+        }}
+      >
+        {duplicateActionError ? <p className="text-sm text-destructive">{duplicateActionError}</p> : null}
+      </ConfirmDialog>
 
       <ConfirmDialog
         open={showRedownloadConfirm}

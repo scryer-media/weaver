@@ -29,6 +29,15 @@ const FACADE_QUEUE_ITEM_FIELDS = `
     health
     hasPassword
     category
+    duplicateSummary {
+      lifecycle
+      action
+      primaryReason
+      semantic {
+        score
+        state
+      }
+    }
     metadata: attributes {
       key
       value
@@ -58,6 +67,15 @@ export const FACADE_HISTORY_ITEM_FIELDS = `
     outputDir
     createdAt
     completedAt
+    duplicateSummary {
+      lifecycle
+      action
+      primaryReason
+      semantic {
+        score
+        state
+      }
+    }
     deleteOperation {
       operationId
       state
@@ -83,6 +101,15 @@ export const HISTORY_TABLE_ITEM_FIELDS = `
     health
     category
     completedAt
+    duplicateSummary {
+      lifecycle
+      action
+      primaryReason
+      semantic {
+        score
+        state
+      }
+    }
     deleteOperation {
       operationId
       state
@@ -145,6 +172,22 @@ const SERVER_FIELDS = `
     priority
     backfill
     retentionDays
+    maxDownloadSpeed
+    downloadQuota {
+      enabled
+      period
+      limitBytes
+      resetTimeMinutesLocal
+      weeklyResetWeekday
+      monthlyResetDay
+      usedBytes
+      reservedBytes
+      remainingBytes
+      blocked
+      windowStartsAtEpochMs
+      windowEndsAtEpochMs
+      timezoneName
+    }
   }
 `;
 
@@ -161,6 +204,22 @@ const SERVER_DETAILS_FIELDS = `
     priority
     backfill
     retentionDays
+    maxDownloadSpeed
+    downloadQuota {
+      enabled
+      period
+      limitBytes
+      resetTimeMinutesLocal
+      weeklyResetWeekday
+      monthlyResetDay
+      usedBytes
+      reservedBytes
+      remainingBytes
+      blocked
+      windowStartsAtEpochMs
+      windowEndsAtEpochMs
+      timezoneName
+    }
   }
 `;
 
@@ -228,6 +287,14 @@ const GENERAL_SETTINGS_FIELDS = `
     maxDownloadSpeed
     maxRetries
     ipReplacementTrialExtraConnections
+    duplicatePolicy {
+      strictActiveOrSuccess
+      strictFailedOrCancelled
+      articleLayoutActiveOrSuccess
+      articleLayoutFailedOrCancelled
+      articleSet
+      normalizedName
+    }
     ispBandwidthCap {
       ...IspBandwidthCapFields
     }
@@ -468,6 +535,56 @@ export const JOB_QUERY = gql`
   ${PARSED_RELEASE_FIELDS}
   ${FACADE_QUEUE_ITEM_FIELDS}
   ${FACADE_HISTORY_ITEM_FIELDS}
+`;
+
+export const DUPLICATE_SNAPSHOT_QUERY = gql`
+  query DuplicateSnapshot($id: Int!) {
+    duplicateSnapshot(id: $id) {
+      jobId
+      lifecycle
+      normalizedName
+      semantic {
+        groupId
+        normalizedKey
+        score
+        state
+        terminalCause
+        promotionState
+      }
+    }
+  }
+`;
+
+export const MARK_DUPLICATE_GOOD_MUTATION = gql`
+  mutation MarkDuplicateGood($id: Int!) {
+    markDuplicateGood(id: $id)
+  }
+`;
+
+export const MARK_DUPLICATE_BAD_MUTATION = gql`
+  mutation MarkDuplicateBad($id: Int!) {
+    markDuplicateBad(id: $id) {
+      accepted
+      jobId
+      message
+    }
+  }
+`;
+
+export const PROMOTE_DUPLICATE_CANDIDATE_MUTATION = gql`
+  mutation PromoteDuplicateCandidate($id: Int!) {
+    promoteDuplicateCandidate(id: $id) {
+      accepted
+      jobId
+      message
+    }
+  }
+`;
+
+export const FORGET_DUPLICATE_IDENTITY_MUTATION = gql`
+  mutation ForgetDuplicateIdentity($id: Int!) {
+    forgetDuplicateIdentity(id: $id)
+  }
 `;
 
 export const JOB_DETAIL_UPDATES_SUBSCRIPTION = gql`
@@ -889,6 +1006,15 @@ export const ADD_SERVER_MUTATION = gql`
 export const UPDATE_SERVER_MUTATION = gql`
   mutation UpdateServer($id: Int!, $input: ServerInput!) {
     updateServer(id: $id, input: $input) {
+      ...ServerFields
+    }
+  }
+  ${SERVER_FIELDS}
+`;
+
+export const RESET_SERVER_DOWNLOAD_QUOTA_USAGE_MUTATION = gql`
+  mutation ResetServerDownloadQuotaUsage($id: Int!) {
+    resetServerDownloadQuotaUsage(id: $id) {
       ...ServerFields
     }
   }

@@ -148,6 +148,7 @@ async fn archive_job_sql(
     datastore: StoreDatastore,
     job_id: JobId,
     args: Vec<SqlArg>,
+    typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
 ) -> Result<Option<history::JobHistoryRow>, StateError> {
     let archived = SqlRuntime::run_in_transaction(&datastore, "archive_job", |tx| {
         let args = args.clone();
@@ -194,6 +195,17 @@ async fn archive_job_sql(
             .transpose()?;
             if let Some(row) = &archived {
                 replace_job_history_attributes_tx(tx, row).await?;
+                crate::jobs::duplicate_persistence::transition_duplicate_snapshot_for_history_tx(
+                    tx,
+                    job_id,
+                    &row.status,
+                    row.error_message.as_deref(),
+                    typed_terminal_cause,
+                    row.health,
+                    row.failed_bytes,
+                    row.completed_at,
+                )
+                .await?;
             }
             delete_active_job_rows(tx, job_id.0 as i64).await?;
             Ok(archived)
@@ -216,7 +228,7 @@ impl Database {
         // history-delete that bumps the generation makes the re-cache a no-op
         // instead of resurrecting the just-deleted row.
         let observed_generation = self.job_history_cache_generation();
-        let result = self.run_sql_blocking(archive_job_sql(datastore, job_id, args));
+        let result = self.run_sql_blocking(archive_job_sql(datastore, job_id, args, None));
         if let Ok(Some(row)) = &result {
             self.cache_job_history_at(row.clone(), observed_generation);
         }
@@ -303,6 +315,7 @@ impl Database {
 }
 
 impl DatabaseWriterExecutor {
+    #[allow(dead_code)] // retained for callers without typed pipeline provenance.
     pub(crate) fn archive_job(
         &self,
         job_id: JobId,
@@ -310,7 +323,23 @@ impl DatabaseWriterExecutor {
     ) -> Result<Option<history::JobHistoryRow>, StateError> {
         let datastore = self.datastore();
         let args = history_args(history, job_id);
-        self.run_sql_blocking(archive_job_sql(datastore, job_id, args))
+        self.run_sql_blocking(archive_job_sql(datastore, job_id, args, None))
+    }
+
+    pub(crate) fn archive_job_with_terminal_cause(
+        &self,
+        job_id: JobId,
+        history: &history::JobHistoryRow,
+        typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
+    ) -> Result<Option<history::JobHistoryRow>, StateError> {
+        let datastore = self.datastore();
+        let args = history_args(history, job_id);
+        self.run_sql_blocking(archive_job_sql(
+            datastore,
+            job_id,
+            args,
+            typed_terminal_cause,
+        ))
     }
 }
 

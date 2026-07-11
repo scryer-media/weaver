@@ -1,10 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use async_graphql::{Enum, InputObject, SimpleObject, Upload};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use weaver_server_core::jobs::duplicate::DuplicateJobSnapshot;
 use weaver_server_core::jobs::handle::DownloadBlockState;
+use weaver_server_core::jobs::{
+    DuplicateAction, DuplicateDecision, DuplicateJobLifecycle, DuplicateJobSummary, DuplicateMatch,
+    DuplicateMode, FingerprintKind, JobId, SemanticAdmission, SemanticCandidateSnapshot,
+    SemanticCandidateState, SemanticPromotionState, SemanticTerminalCause,
+};
 use weaver_server_core::operations::metrics::MetricsSnapshot;
 use weaver_server_core::split_history_metadata;
 
@@ -12,6 +18,27 @@ use super::release_display::{ReleaseDisplayInput, release_display_info};
 use crate::system::types::{DownloadBlock, Metrics};
 
 pub use weaver_server_core::CLIENT_REQUEST_ID_ATTRIBUTE_KEY;
+
+/// The core loader deliberately caps a single database request at 256
+/// identities. API result sets are not universally capped, so callers must
+/// merge bounded batches before projecting duplicate data onto items.
+pub(crate) const DUPLICATE_SUMMARY_BATCH_SIZE: usize = 256;
+
+pub(crate) fn load_duplicate_summaries_chunked(
+    db: &weaver_server_core::Database,
+    job_ids: impl IntoIterator<Item = JobId>,
+) -> Result<BTreeMap<JobId, DuplicateJobSummary>, weaver_server_core::StateError> {
+    let job_ids = job_ids
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut summaries = BTreeMap::new();
+    for batch in job_ids.chunks(DUPLICATE_SUMMARY_BATCH_SIZE) {
+        summaries.extend(db.duplicate_summaries(batch)?);
+    }
+    Ok(summaries)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
 pub struct Attribute {
@@ -204,6 +231,10 @@ pub struct QueueItem {
     pub output_dir: Option<String>,
     pub created_at: DateTime<Utc>,
     pub attention: Option<QueueAttention>,
+    /// Compact durable duplicate state loaded with queue lists. It omits source
+    /// NZB material and credentials, which remain unavailable to GraphQL.
+    #[serde(default)]
+    pub duplicate_summary: Option<DuplicateSummaryInfo>,
 }
 
 fn default_queue_download_state() -> QueueDownloadState {
@@ -270,11 +301,338 @@ pub struct QueueEvent {
     pub global_state: Option<GlobalQueueState>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+pub enum DuplicateActionGql {
+    Accept,
+    Warn,
+    Pause,
+    Block,
+}
+
+impl From<DuplicateAction> for DuplicateActionGql {
+    fn from(value: DuplicateAction) -> Self {
+        match value {
+            DuplicateAction::Accept => Self::Accept,
+            DuplicateAction::Warn => Self::Warn,
+            DuplicateAction::Pause => Self::Pause,
+            DuplicateAction::Block => Self::Block,
+        }
+    }
+}
+
+impl From<DuplicateActionGql> for DuplicateAction {
+    fn from(value: DuplicateActionGql) -> Self {
+        match value {
+            DuplicateActionGql::Accept => Self::Accept,
+            DuplicateActionGql::Warn => Self::Warn,
+            DuplicateActionGql::Pause => Self::Pause,
+            DuplicateActionGql::Block => Self::Block,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+pub enum DuplicateFingerprintKindGql {
+    StrictArticleLayout,
+    ArticleLayout,
+    ArticleSet,
+    NormalizedName,
+}
+
+impl From<FingerprintKind> for DuplicateFingerprintKindGql {
+    fn from(value: FingerprintKind) -> Self {
+        match value {
+            FingerprintKind::StrictArticleLayout => Self::StrictArticleLayout,
+            FingerprintKind::ArticleLayout => Self::ArticleLayout,
+            FingerprintKind::ArticleSet => Self::ArticleSet,
+            FingerprintKind::NormalizedName => Self::NormalizedName,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+pub enum DuplicateLifecycleGql {
+    Reserved,
+    Active,
+    Parked,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl From<DuplicateJobLifecycle> for DuplicateLifecycleGql {
+    fn from(value: DuplicateJobLifecycle) -> Self {
+        match value {
+            DuplicateJobLifecycle::Reserved => Self::Reserved,
+            DuplicateJobLifecycle::Active => Self::Active,
+            DuplicateJobLifecycle::Parked => Self::Parked,
+            DuplicateJobLifecycle::Succeeded => Self::Succeeded,
+            DuplicateJobLifecycle::Failed => Self::Failed,
+            DuplicateJobLifecycle::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+pub enum SubmissionStatus {
+    Accepted,
+    Warned,
+    Paused,
+    Parked,
+    Blocked,
+    IdempotentReplay,
+    IdempotencyConflict,
+    ForceAccepted,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+#[graphql(name = "DuplicateMode")]
+pub enum DuplicateModeGql {
+    Enforce,
+    Score,
+    All,
+    Force,
+}
+
+impl From<DuplicateModeGql> for DuplicateMode {
+    fn from(value: DuplicateModeGql) -> Self {
+        match value {
+            DuplicateModeGql::Enforce => Self::Enforce,
+            DuplicateModeGql::Score => Self::Score,
+            DuplicateModeGql::All => Self::All,
+            DuplicateModeGql::Force => Self::Force,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+#[graphql(name = "SemanticCandidateState")]
+pub enum SemanticCandidateStateGql {
+    Active,
+    Parked,
+    Nonblocking,
+    Suppressed,
+}
+
+impl From<SemanticCandidateState> for SemanticCandidateStateGql {
+    fn from(value: SemanticCandidateState) -> Self {
+        match value {
+            SemanticCandidateState::Active => Self::Active,
+            SemanticCandidateState::Parked => Self::Parked,
+            SemanticCandidateState::Nonblocking => Self::Nonblocking,
+            SemanticCandidateState::Suppressed => Self::Suppressed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+#[graphql(name = "SemanticPromotionState")]
+pub enum SemanticPromotionStateGql {
+    None,
+    Pending,
+    Claimed,
+}
+
+impl From<SemanticPromotionState> for SemanticPromotionStateGql {
+    fn from(value: SemanticPromotionState) -> Self {
+        match value {
+            SemanticPromotionState::None => Self::None,
+            SemanticPromotionState::Pending => Self::Pending,
+            SemanticPromotionState::Claimed => Self::Claimed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+#[graphql(name = "SemanticTerminalCause")]
+pub enum SemanticTerminalCauseGql {
+    Success,
+    MissingArticlesOrLowHealth,
+    DecodeOrCorruptData,
+    RepairFailure,
+    ArchiveOrUnpackFailure,
+    PasswordFailure,
+    DiskOrPermissionFailure,
+    ServerAuthQuotaOrOutage,
+    Shutdown,
+    UserCancelled,
+    UnknownFailure,
+}
+
+impl From<SemanticTerminalCause> for SemanticTerminalCauseGql {
+    fn from(value: SemanticTerminalCause) -> Self {
+        match value {
+            SemanticTerminalCause::Success => Self::Success,
+            SemanticTerminalCause::MissingArticlesOrLowHealth => Self::MissingArticlesOrLowHealth,
+            SemanticTerminalCause::DecodeOrCorruptData => Self::DecodeOrCorruptData,
+            SemanticTerminalCause::RepairFailure => Self::RepairFailure,
+            SemanticTerminalCause::ArchiveOrUnpackFailure => Self::ArchiveOrUnpackFailure,
+            SemanticTerminalCause::PasswordFailure => Self::PasswordFailure,
+            SemanticTerminalCause::DiskOrPermissionFailure => Self::DiskOrPermissionFailure,
+            SemanticTerminalCause::ServerAuthQuotaOrOutage => Self::ServerAuthQuotaOrOutage,
+            SemanticTerminalCause::Shutdown => Self::Shutdown,
+            SemanticTerminalCause::UserCancelled => Self::UserCancelled,
+            SemanticTerminalCause::UnknownFailure => Self::UnknownFailure,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct SemanticDuplicateAdmissionInfo {
+    pub group_id: i64,
+    pub normalized_key: String,
+    pub score: i64,
+    pub state: SemanticCandidateStateGql,
+    pub superseded_job_id: Option<u64>,
+}
+
+impl From<&SemanticAdmission> for SemanticDuplicateAdmissionInfo {
+    fn from(value: &SemanticAdmission) -> Self {
+        Self {
+            group_id: value.group_id,
+            normalized_key: value.normalized_key.clone(),
+            score: value.score,
+            state: value.state.into(),
+            superseded_job_id: value.superseded_job_id.map(|job_id| job_id.0),
+        }
+    }
+}
+
+/// Durable duplicate identity state for queue, history, and job-detail
+/// consumers. Source NZB bytes and credentials are deliberately omitted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct DuplicateIdentitySnapshotInfo {
+    pub job_id: u64,
+    pub lifecycle: DuplicateLifecycleGql,
+    pub normalized_name: String,
+    pub semantic: Option<SemanticCandidateSnapshotInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct SemanticCandidateSnapshotInfo {
+    pub group_id: i64,
+    pub normalized_key: String,
+    pub score: i64,
+    pub state: SemanticCandidateStateGql,
+    pub terminal_cause: Option<SemanticTerminalCauseGql>,
+    pub promotion_state: SemanticPromotionStateGql,
+}
+
+impl DuplicateIdentitySnapshotInfo {
+    pub fn from_parts(
+        snapshot: &DuplicateJobSnapshot,
+        semantic: Option<&SemanticCandidateSnapshot>,
+    ) -> Self {
+        Self {
+            job_id: snapshot.job_id.0,
+            lifecycle: snapshot.lifecycle.into(),
+            normalized_name: snapshot.normalized_name.clone(),
+            semantic: semantic.map(|candidate| SemanticCandidateSnapshotInfo {
+                group_id: candidate.group_id,
+                normalized_key: candidate.normalized_key.clone(),
+                score: candidate.score,
+                state: candidate.state.into(),
+                terminal_cause: candidate.terminal_cause.map(Into::into),
+                promotion_state: candidate.promotion_state.into(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct DuplicateMatchInfo {
+    pub job_id: u64,
+    pub fingerprint_kind: DuplicateFingerprintKindGql,
+    pub lifecycle: DuplicateLifecycleGql,
+}
+
+impl From<&DuplicateMatch> for DuplicateMatchInfo {
+    fn from(value: &DuplicateMatch) -> Self {
+        Self {
+            job_id: value.job_id.0,
+            fingerprint_kind: value.fingerprint.kind.into(),
+            lifecycle: value.lifecycle.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct DuplicateDecisionInfo {
+    pub action: DuplicateActionGql,
+    pub force_bypassed: bool,
+    pub matches: Vec<DuplicateMatchInfo>,
+}
+
+/// A compact duplicate projection for queue and history lists. Full durable
+/// identity and semantic details remain available from `duplicateSnapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct DuplicateSummaryInfo {
+    pub lifecycle: DuplicateLifecycleGql,
+    pub action: DuplicateActionGql,
+    pub primary_reason: Option<DuplicateFingerprintKindGql>,
+    pub semantic: Option<SemanticCandidateSnapshotInfo>,
+}
+
+impl DuplicateSummaryInfo {
+    pub fn from_summary(summary: &DuplicateJobSummary) -> Self {
+        Self::from_parts(
+            &summary.snapshot,
+            summary.admission_action,
+            summary.admission_reason,
+            summary.semantic.as_ref(),
+        )
+    }
+
+    pub fn from_parts(
+        snapshot: &DuplicateJobSnapshot,
+        action: DuplicateAction,
+        primary_reason: Option<FingerprintKind>,
+        semantic: Option<&SemanticCandidateSnapshot>,
+    ) -> Self {
+        Self {
+            lifecycle: snapshot.lifecycle.into(),
+            action: action.into(),
+            primary_reason: primary_reason.map(Into::into),
+            semantic: semantic.map(|candidate| SemanticCandidateSnapshotInfo {
+                group_id: candidate.group_id,
+                normalized_key: candidate.normalized_key.clone(),
+                score: candidate.score,
+                state: candidate.state.into(),
+                terminal_cause: candidate.terminal_cause.map(Into::into),
+                promotion_state: candidate.promotion_state.into(),
+            }),
+        }
+    }
+}
+
+impl From<&DuplicateDecision> for DuplicateDecisionInfo {
+    fn from(value: &DuplicateDecision) -> Self {
+        Self {
+            action: value.action.into(),
+            force_bypassed: value.force_bypassed,
+            matches: value.matches.iter().map(DuplicateMatchInfo::from).collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct SubmissionResult {
     pub accepted: bool,
+    pub status: SubmissionStatus,
+    pub job_id: Option<u64>,
     pub client_request_id: Option<String>,
-    pub item: QueueItem,
+    pub item: Option<QueueItem>,
+    pub duplicate_decision: Option<DuplicateDecisionInfo>,
+    pub semantic_duplicate: Option<SemanticDuplicateAdmissionInfo>,
+    pub error_code: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+pub struct SemanticPromotionResult {
+    pub accepted: bool,
+    pub job_id: Option<u64>,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
@@ -337,6 +695,11 @@ pub struct SubmitNzbInput {
     pub category: Option<String>,
     pub attributes: Option<Vec<AttributeInput>>,
     pub client_request_id: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub force: Option<bool>,
+    pub dupe_key: Option<String>,
+    pub dupe_score: Option<i64>,
+    pub dupe_mode: Option<DuplicateModeGql>,
 }
 
 #[derive(Debug, InputObject)]
@@ -363,6 +726,11 @@ pub struct SubmitStagedNzbsInput {
     pub category: Option<String>,
     pub attributes: Option<Vec<AttributeInput>>,
     pub client_request_id: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub force: Option<bool>,
+    pub dupe_key: Option<String>,
+    pub dupe_score: Option<i64>,
+    pub dupe_mode: Option<DuplicateModeGql>,
 }
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -370,7 +738,9 @@ pub struct StagedNzbSubmissionResult {
     pub staged_upload_id: String,
     pub accepted: bool,
     pub retained: bool,
+    pub status: Option<SubmissionStatus>,
     pub item: Option<QueueItem>,
+    pub semantic_duplicate: Option<SemanticDuplicateAdmissionInfo>,
     pub error: Option<String>,
 }
 
@@ -687,6 +1057,7 @@ pub fn queue_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
         output_dir: info.output_dir.clone(),
         created_at: ms_to_datetime(info.created_at_epoch_ms as i64),
         attention: attention_for_live_job(info, state),
+        duplicate_summary: None,
     }
 }
 
@@ -726,6 +1097,7 @@ pub fn queue_item_from_submission(
         output_dir: None,
         created_at: ms_to_datetime(submitted.created_at_epoch_ms as i64),
         attention: None,
+        duplicate_summary: None,
     }
 }
 

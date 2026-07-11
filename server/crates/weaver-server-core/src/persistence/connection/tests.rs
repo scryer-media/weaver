@@ -624,6 +624,7 @@ fn is_boolean_column(table: &str, column: &str) -> bool {
             | ("servers", "active")
             | ("servers", "supports_pipelining")
             | ("servers", "backfill")
+            | ("servers", "download_quota_enabled")
             | ("active_jobs", "normalization_retried")
             | ("active_par2_files", "promoted")
             | ("active_extraction_chunks", "verified")
@@ -2039,6 +2040,15 @@ async fn postgres_runtime_smoke_when_configured() {
             priority: 2,
             backfill: false,
             retention_days: 0,
+            max_download_speed: 3_000_000,
+            download_quota: crate::servers::ServerDownloadQuotaConfig {
+                enabled: true,
+                limit_bytes: 20_000_000,
+                period: crate::servers::ServerDownloadQuotaPeriod::Weekly,
+                reset_time_minutes_local: 120,
+                weekly_reset_weekday: IspBandwidthCapWeekday::Thu,
+                monthly_reset_day: 10,
+            },
             tls_ca_cert: Some(PathBuf::from("/tmp/ca.pem")),
         }],
         categories: vec![CategoryConfig {
@@ -2064,6 +2074,7 @@ async fn postgres_runtime_smoke_when_configured() {
         }),
         ip_replacement_trial_extra_connections: Some(1),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+        duplicate_policy: Default::default(),
         config_path: None,
     };
     db.save_config(&config).unwrap();
@@ -2082,6 +2093,16 @@ async fn postgres_runtime_smoke_when_configured() {
     );
     assert_eq!(loaded_config.servers.len(), 1);
     assert_eq!(loaded_config.servers[0].host, "news.example.com");
+    assert_eq!(loaded_config.servers[0].max_download_speed, 3_000_000);
+    assert!(loaded_config.servers[0].download_quota.enabled);
+    assert_eq!(
+        loaded_config.servers[0].download_quota.limit_bytes,
+        20_000_000
+    );
+    assert_eq!(
+        loaded_config.servers[0].download_quota.period,
+        crate::servers::ServerDownloadQuotaPeriod::Weekly
+    );
     assert_eq!(loaded_config.servers[0].password.as_deref(), Some("pass"));
     assert_eq!(
         loaded_config.servers[0].tls_ca_cert.as_deref(),
@@ -2091,6 +2112,38 @@ async fn postgres_runtime_smoke_when_configured() {
     assert_eq!(loaded_config.categories[0].name, "TV");
     assert_eq!(db.next_server_id().unwrap(), 8);
     assert_eq!(db.next_category_id().unwrap(), 4);
+
+    execute(
+        &db,
+        "INSERT INTO servers
+            (id, host, port, tls, connections, active, supports_pipelining,
+             priority, backfill, retention_days)
+         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        vec![
+            SqlArg::I64(8),
+            SqlArg::Text("legacy-defaults.example.com".to_string()),
+            SqlArg::I64(119),
+            SqlArg::Bool(false),
+            SqlArg::I64(2),
+            SqlArg::Bool(false),
+            SqlArg::Bool(false),
+            SqlArg::I64(0),
+            SqlArg::Bool(false),
+            SqlArg::I64(0),
+        ],
+    );
+    let defaulted_server = db
+        .list_servers()
+        .unwrap()
+        .into_iter()
+        .find(|server| server.id == 8)
+        .unwrap();
+    assert_eq!(defaulted_server.max_download_speed, 0);
+    assert_eq!(
+        defaulted_server.download_quota,
+        crate::servers::ServerDownloadQuotaConfig::default()
+    );
+    assert!(db.delete_server(8).unwrap());
 
     let rss_feed = RssFeedRow {
         id: 1,
@@ -2214,6 +2267,24 @@ async fn postgres_runtime_smoke_when_configured() {
     .unwrap();
     assert!(db.load_active_jobs().unwrap().is_empty());
     assert!(db.get_job_history(job_id.0).unwrap().is_some());
+
+    let usage_updated_at = chrono::DateTime::from_timestamp(1_700_000_123, 0).unwrap();
+    let usage = crate::servers::ServerDownloadUsage {
+        server_id: 7,
+        lifetime_bytes: 8_000,
+        quota_baseline_bytes: 3_000,
+        window_start: Some(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()),
+        window_end: Some(chrono::DateTime::from_timestamp(1_700_086_400, 0).unwrap()),
+        updated_at: usage_updated_at,
+    };
+    db.upsert_server_download_usage(&usage).unwrap();
+    assert_eq!(db.server_download_usage(7).unwrap(), Some(usage));
+    let reset_usage = db.reset_server_download_usage(7).unwrap();
+    assert_eq!(reset_usage.lifetime_bytes, 8_000);
+    assert_eq!(reset_usage.quota_baseline_bytes, 8_000);
+    assert_eq!(reset_usage.used_bytes(), 0);
+    assert!(db.delete_server(7).unwrap());
+    assert_eq!(db.server_download_usage(7).unwrap(), None);
 
     let backup_path = tempfile::NamedTempFile::new().unwrap();
     let backup_error = db.export_stable_state(backup_path.path()).unwrap_err();

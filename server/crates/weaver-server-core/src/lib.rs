@@ -29,13 +29,21 @@ pub use history::{
     public_history_attributes, split_history_metadata,
 };
 pub use jobs::{
-    ActiveFileProgress, ActiveJob, ActivePar2File, DownloadBlockKind, DownloadBlockState,
-    DownloadState, ExtractionChunk, FieldUpdate, FileSpec, JobId, JobInfo, JobPhase,
-    JobPhaseProgress, JobSpec, JobState, JobStatus, JobUpdate, MessageId, NzbFileId, PhaseCounters,
-    PostState, RecoveredJob, RestoreJobRequest, RunState, SchedulerCommand, SchedulerError,
-    SchedulerHandle, SegmentId, SegmentSpec, ServerId, SharedPipelineState,
-    derive_legacy_job_status, epoch_ms_now, job_status_from_persisted_str,
-    runtime_lanes_from_status_snapshot,
+    ActiveFileProgress, ActiveJob, ActivePar2File, CallerScopedIdempotency, DownloadBlockKind,
+    DownloadBlockState, DownloadState, DuplicateAction, DuplicateAdmission,
+    DuplicateAdmissionRequest, DuplicateBackfillEntry, DuplicateBackfillSource,
+    DuplicateBackfillState, DuplicateDecision, DuplicateJobLifecycle, DuplicateJobSummary,
+    DuplicateMode, DuplicatePolicy, ExtractionChunk, FieldUpdate, FileSpec, FingerprintEvidence,
+    FingerprintKind, JobFingerprint, JobId, JobInfo, JobPhase, JobPhaseProgress, JobSpec, JobState,
+    JobStatus, JobUpdate, MessageId, NzbFileId, PhaseCounters, PostState, RecoveredJob,
+    RestoreJobRequest, RunState, SchedulerCommand, SchedulerError, SchedulerHandle, SegmentId,
+    SegmentSpec, SemanticCandidateSnapshot, SemanticCandidateSource, SemanticCandidateState,
+    SemanticDuplicate, SemanticDuplicateLifecycleEvent, SemanticPromotionClaim,
+    SemanticPromotionState, SemanticTerminalCause, ServerId, SharedPipelineState, SubmissionOrigin,
+    classify_semantic_terminal_cause, derive_legacy_job_status, epoch_ms_now,
+    job_status_from_persisted_str, normalize_semantic_duplicate_key,
+    record_semantic_duplicate_lifecycle_metric, runtime_lanes_from_status_snapshot,
+    semantic_duplicate_lifecycle_metrics_snapshot,
 };
 pub use operations::metrics::{
     DispatchShareMode, DownloadPressureReason, DownloadPressureState, MetricsSnapshot,

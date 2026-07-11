@@ -56,6 +56,7 @@ pub enum DownloadBlockKindGql {
     ManualPause,
     Scheduled,
     IspCap,
+    ServerQuota,
 }
 
 impl From<DownloadBlockKind> for DownloadBlockKindGql {
@@ -65,6 +66,7 @@ impl From<DownloadBlockKind> for DownloadBlockKindGql {
             DownloadBlockKind::ManualPause => Self::ManualPause,
             DownloadBlockKind::Scheduled => Self::Scheduled,
             DownloadBlockKind::IspCap => Self::IspCap,
+            DownloadBlockKind::ServerQuota => Self::ServerQuota,
         }
     }
 }

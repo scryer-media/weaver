@@ -599,14 +599,9 @@ impl Pipeline {
         } else {
             crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly
         };
+        // Totals are reserved per member at extraction open (see
+        // extract_rar_member_to_output); topology may not be rebuilt yet here.
         let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
-        self.phase_reserve_topology_extraction_totals(
-            job_id,
-            set_name,
-            std::iter::empty::<&str>(),
-            &already_extracted,
-            &phase_counters,
-        );
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || pp_pool.install(move || {
                 if volume_paths.is_empty() {

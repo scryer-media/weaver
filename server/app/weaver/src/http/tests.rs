@@ -138,6 +138,7 @@ fn test_config() -> SharedConfig {
         isp_bandwidth_cap: None,
         ip_replacement_trial_extra_connections: None,
         watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
+        duplicate_policy: Default::default(),
         config_path: None,
     }))
 }
@@ -218,7 +219,7 @@ fn scheduler_handle_with_mock_commands_with_db(
                     });
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::CancelJob { job_id, reply } => {
+                SchedulerCommand::CancelJob { job_id, reply, .. } => {
                     let mut jobs = state.list_jobs();
                     let original_len = jobs.len();
                     let cancelled = jobs.iter().find(|job| job.job_id == job_id).cloned();
@@ -2070,6 +2071,21 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         ));
     assert!(rendered.contains("weaver_job_progress_ratio{job_id=\"42\""));
     assert!(rendered.contains("weaver_pipeline_jobs{status=\"downloading\"} 1"));
+
+    let quota_rendered = metrics::render_prometheus_metrics(
+        &snapshot,
+        &jobs,
+        false,
+        &DownloadBlockState {
+            kind: DownloadBlockKind::ServerQuota,
+            ..DownloadBlockState::default()
+        },
+        &[],
+    );
+    assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"server_quota\"} 1"));
+    assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"none\"} 0"));
+    assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"manual_pause\"} 0"));
+    assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"isp_cap\"} 0"));
 }
 
 #[test]

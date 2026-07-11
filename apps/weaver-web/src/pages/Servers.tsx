@@ -5,10 +5,19 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { PageHeader } from "@/components/PageHeader";
 import { SectionCard } from "@/components/SectionCard";
+import { formatBytes, formatSpeed } from "@/components/SpeedDisplay";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Table,
   TableBody,
@@ -20,6 +29,7 @@ import {
 import {
   ADD_SERVER_MUTATION,
   REMOVE_SERVER_MUTATION,
+  RESET_SERVER_DOWNLOAD_QUOTA_USAGE_MUTATION,
   SERVER_QUERY,
   SERVERS_QUERY,
   TEST_CONNECTION_MUTATION,
@@ -27,6 +37,25 @@ import {
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
+
+type ServerDownloadQuotaPeriod = "ONE_TIME" | "DAILY" | "WEEKLY" | "MONTHLY";
+type ServerDownloadQuotaWeekday = "MON" | "TUE" | "WED" | "THU" | "FRI" | "SAT" | "SUN";
+
+type ServerDownloadQuota = {
+  enabled: boolean;
+  period: ServerDownloadQuotaPeriod;
+  limitBytes: number;
+  resetTimeMinutesLocal: number;
+  weeklyResetWeekday: ServerDownloadQuotaWeekday;
+  monthlyResetDay: number;
+  usedBytes: number;
+  reservedBytes: number;
+  remainingBytes: number;
+  blocked: boolean;
+  windowStartsAtEpochMs: number | null;
+  windowEndsAtEpochMs: number | null;
+  timezoneName: string;
+};
 
 type Server = {
   id: number;
@@ -39,6 +68,8 @@ type Server = {
   priority: number;
   backfill: boolean;
   retentionDays: number;
+  maxDownloadSpeed: number;
+  downloadQuota: ServerDownloadQuota;
 };
 
 type ServerDetails = Server & {
@@ -56,6 +87,19 @@ type ServerFormValues = {
   priority: number;
   backfill: boolean;
   retentionDays: number;
+  maxDownloadSpeedUnlimited: boolean;
+  maxDownloadSpeedMib: string;
+  maxDownloadSpeedBytes: number;
+  maxDownloadSpeedEdited: boolean;
+  quotaEnabled: boolean;
+  quotaLimit: string;
+  quotaUnit: "GB" | "TB";
+  quotaLimitBytes: number;
+  quotaLimitEdited: boolean;
+  quotaPeriod: ServerDownloadQuotaPeriod;
+  quotaResetTime: string;
+  quotaWeeklyResetWeekday: ServerDownloadQuotaWeekday;
+  quotaMonthlyResetDay: number;
 };
 
 const defaultForm: ServerFormValues = {
@@ -69,7 +113,101 @@ const defaultForm: ServerFormValues = {
   priority: 0,
   backfill: false,
   retentionDays: 0,
+  maxDownloadSpeedUnlimited: true,
+  maxDownloadSpeedMib: "10",
+  maxDownloadSpeedBytes: 0,
+  maxDownloadSpeedEdited: false,
+  quotaEnabled: false,
+  quotaLimit: "100",
+  quotaUnit: "GB",
+  quotaLimitBytes: 107_374_182_400,
+  quotaLimitEdited: false,
+  quotaPeriod: "MONTHLY",
+  quotaResetTime: "00:00",
+  quotaWeeklyResetWeekday: "MON",
+  quotaMonthlyResetDay: 1,
 };
+
+const MIB = 1024 * 1024;
+const GIB = 1024 * 1024 * 1024;
+const TIB = 1024 * 1024 * 1024 * 1024;
+
+function normalizeMonthlyResetDay(value: number) {
+  return Math.min(31, Math.max(1, Math.trunc(Number.isFinite(value) ? value : 1)));
+}
+
+function minutesToTimeInput(minutes: number) {
+  const clamped = Math.max(0, Math.min(23 * 60 + 59, minutes));
+  return `${String(Math.floor(clamped / 60)).padStart(2, "0")}:${String(clamped % 60).padStart(2, "0")}`;
+}
+
+function timeInputToMinutes(raw: string) {
+  const [hours, minutes] = raw.split(":").map(Number);
+  if (!Number.isInteger(hours) || !Number.isInteger(minutes)) return 0;
+  return Math.max(0, Math.min(23 * 60 + 59, hours * 60 + minutes));
+}
+
+function decimalInput(value: number) {
+  return String(Number(value.toFixed(4)));
+}
+
+function serverToFormValues(server: ServerDetails | Server): ServerFormValues {
+  const quotaUnit = server.downloadQuota.limitBytes >= TIB ? "TB" : "GB";
+  const quotaUnitBytes = quotaUnit === "TB" ? TIB : GIB;
+  return {
+    host: server.host,
+    port: server.port,
+    tls: server.tls,
+    username: "username" in server ? (server.username ?? "") : "",
+    password: "",
+    connections: server.connections,
+    active: server.active,
+    priority: server.priority,
+    backfill: server.backfill,
+    retentionDays: server.retentionDays,
+    maxDownloadSpeedUnlimited: server.maxDownloadSpeed === 0,
+    maxDownloadSpeedMib: server.maxDownloadSpeed === 0
+      ? defaultForm.maxDownloadSpeedMib
+      : decimalInput(server.maxDownloadSpeed / MIB),
+    maxDownloadSpeedBytes: server.maxDownloadSpeed,
+    maxDownloadSpeedEdited: false,
+    quotaEnabled: server.downloadQuota.enabled,
+    quotaLimit: server.downloadQuota.limitBytes === 0
+      ? defaultForm.quotaLimit
+      : decimalInput(server.downloadQuota.limitBytes / quotaUnitBytes),
+    quotaUnit,
+    quotaLimitBytes: server.downloadQuota.limitBytes,
+    quotaLimitEdited: false,
+    quotaPeriod: server.downloadQuota.period,
+    quotaResetTime: minutesToTimeInput(server.downloadQuota.resetTimeMinutesLocal),
+    quotaWeeklyResetWeekday: server.downloadQuota.weeklyResetWeekday,
+    quotaMonthlyResetDay: server.downloadQuota.monthlyResetDay,
+  };
+}
+
+function downloadLimitsInput(values: ServerFormValues) {
+  const quotaUnitBytes = values.quotaUnit === "TB" ? TIB : GIB;
+  const editedSpeedBytes = Math.round(Number(values.maxDownloadSpeedMib) * MIB);
+  const editedQuotaBytes = Math.round(Number(values.quotaLimit) * quotaUnitBytes);
+  return {
+    maxDownloadSpeed: values.maxDownloadSpeedUnlimited
+      ? 0
+      : !values.maxDownloadSpeedEdited && values.maxDownloadSpeedBytes > 0
+        ? values.maxDownloadSpeedBytes
+        : editedSpeedBytes,
+    downloadQuota: {
+      enabled: values.quotaEnabled,
+      limitBytes: !values.quotaLimitEdited
+        && (values.quotaLimitBytes > 0 || !values.quotaEnabled)
+        ? values.quotaLimitBytes
+        : editedQuotaBytes,
+      period: values.quotaPeriod,
+      resetTimeMinutesLocal: timeInputToMinutes(values.quotaResetTime),
+      weeklyResetWeekday: values.quotaWeeklyResetWeekday,
+      monthlyResetDay: normalizeMonthlyResetDay(values.quotaMonthlyResetDay),
+    },
+  };
+}
 
 export function Servers({ embedded = false }: { embedded?: boolean }) {
   const t = useTranslate();
@@ -85,11 +223,15 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   const [addServerState, addServer] = useMutation(ADD_SERVER_MUTATION);
   const [updateServerState, updateServer] = useMutation(UPDATE_SERVER_MUTATION);
   const [, removeServer] = useMutation(REMOVE_SERVER_MUTATION);
+  const [resetQuotaState, resetServerDownloadQuotaUsage] = useMutation(
+    RESET_SERVER_DOWNLOAD_QUOTA_USAGE_MUTATION,
+  );
   const [, testConnection] = useMutation(TEST_CONNECTION_MUTATION);
 
   const [servers, setServers] = useState<Server[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
+  const [resetConfirmId, setResetConfirmId] = useState<number | null>(null);
   const [testing, setTesting] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{
@@ -104,6 +246,13 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
       setServers(data.servers);
     }
   }, [data?.servers]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      void reexecuteServers({ requestPolicy: "network-only" });
+    }, 5_000);
+    return () => window.clearInterval(interval);
+  }, [reexecuteServers]);
 
   const isSavingServer = addServerState.fetching || updateServerState.fetching;
 
@@ -151,6 +300,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
       priority: values.priority,
       backfill: values.backfill,
       retentionDays: values.retentionDays,
+      ...downloadLimitsInput(values),
     };
 
     if (editingServerId != null) {
@@ -199,6 +349,27 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
       void reexecuteServers({ requestPolicy: "network-only" });
     }
     setDeleteConfirmId(null);
+  };
+
+  const handleResetQuotaUsage = async (id: number) => {
+    if (resetQuotaState.fetching) return;
+    setSaveError(null);
+    const result = await resetServerDownloadQuotaUsage({ id });
+    if (result.data?.resetServerDownloadQuotaUsage) {
+      setServers((current) =>
+        current.map((server) =>
+          server.id === id ? result.data.resetServerDownloadQuotaUsage : server,
+        ),
+      );
+      void reexecuteServers({ requestPolicy: "network-only" });
+    } else {
+      setSaveError(
+        result.error?.graphQLErrors[0]?.message
+          ?? result.error?.message
+          ?? t("servers.resetQuotaError"),
+      );
+    }
+    setResetConfirmId(null);
   };
 
   const handleTest = async (values: ServerFormValues) => {
@@ -256,43 +427,27 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
           </SectionCard>
         ) : (
           <ServerFormCard
+            key={editingServerId ?? "new"}
             initialValues={
               editingServerDetail
-                ? {
-                    host: editingServerDetail.host,
-                    port: editingServerDetail.port,
-                    tls: editingServerDetail.tls,
-                    username: editingServerDetail.username ?? "",
-                    password: "",
-                    connections: editingServerDetail.connections,
-                    active: editingServerDetail.active,
-                    priority: editingServerDetail.priority,
-                    backfill: editingServerDetail.backfill,
-                    retentionDays: editingServerDetail.retentionDays,
-                  }
+                ? serverToFormValues(editingServerDetail)
                 : editingServer
-                  ? {
-                      host: editingServer.host,
-                      port: editingServer.port,
-                      tls: editingServer.tls,
-                      username: "",
-                      password: "",
-                      connections: editingServer.connections,
-                      active: editingServer.active,
-                      priority: editingServer.priority,
-                      backfill: editingServer.backfill,
-                      retentionDays: editingServer.retentionDays,
-                    }
+                  ? serverToFormValues(editingServer)
                   : defaultForm
             }
+            runtimeServer={editingServer ?? editingServerDetail}
             editing={editingServerId != null}
             saving={isSavingServer}
             testing={testing}
+            resettingQuota={resetQuotaState.fetching}
             saveError={saveError}
             testResult={testResult}
             onCancel={closeForm}
             onSave={handleSave}
             onTest={handleTest}
+            onRequestQuotaReset={() => {
+              if (editingServerId != null) setResetConfirmId(editingServerId);
+            }}
           />
         )
       ) : null}
@@ -319,6 +474,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                     <TableHead>{t("servers.host")}</TableHead>
                     <TableHead>{t("servers.connections")}</TableHead>
                     <TableHead>{t("servers.tls")}</TableHead>
+                    <TableHead>{t("servers.limits")}</TableHead>
                     <TableHead>{t("servers.active")}</TableHead>
                     <TableHead>{t("table.actions")}</TableHead>
                   </TableRow>
@@ -343,7 +499,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                                   server.backfill
                                     ? "bg-status-queued/15 text-status-queued"
                                     : priority === 0
-                                      ? "bg-priority-high/15 text-priority-high"
+                                      ? "bg-status-completed/15 text-status-completed"
                                       : "bg-secondary text-muted-foreground",
                                 )}
                               >
@@ -370,6 +526,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                       </TableCell>
                       <TableCell className="tabular-nums">{server.connections}</TableCell>
                       <TableCell>{server.tls ? t("label.enabled") : t("label.disabled")}</TableCell>
+                      <TableCell><ServerLimitsSummary server={server} /></TableCell>
                       <TableCell>{server.active ? t("label.enabled") : t("label.disabled")}</TableCell>
                       <TableCell>
                         <div className="flex flex-wrap gap-2">
@@ -401,25 +558,91 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
         onConfirm={() => deleteConfirmId != null && void handleDelete(deleteConfirmId)}
         onCancel={() => setDeleteConfirmId(null)}
       />
+      <ConfirmDialog
+        open={resetConfirmId != null}
+        title={t("servers.resetQuotaTitle")}
+        message={t("servers.resetQuotaMessage")}
+        confirmLabel={t("servers.resetQuotaConfirm")}
+        cancelLabel={t("action.cancel")}
+        confirmDisabled={resetQuotaState.fetching}
+        cancelDisabled={resetQuotaState.fetching}
+        onConfirm={() => {
+          if (!resetQuotaState.fetching && resetConfirmId != null) {
+            void handleResetQuotaUsage(resetConfirmId);
+          }
+        }}
+        onCancel={() => {
+          if (!resetQuotaState.fetching) setResetConfirmId(null);
+        }}
+      />
     </div>
   );
 }
 
+function ServerLimitsSummary({ server }: { server: Server }) {
+  const t = useTranslate();
+  const quota = server.downloadQuota;
+  const quotaActivelyBlocked = quota.blocked && server.active;
+  const unlimited = server.maxDownloadSpeed === 0 && !quota.enabled;
+  if (unlimited) {
+    return <span className="text-xs text-muted-foreground">{t("servers.unlimited")}</span>;
+  }
+  return (
+    <div className="min-w-32 space-y-1 text-xs" aria-label={t("servers.limits")}>
+      <div className="whitespace-nowrap text-foreground">
+        {server.maxDownloadSpeed === 0 ? t("servers.unlimitedSpeed") : formatSpeed(server.maxDownloadSpeed)}
+      </div>
+      {quota.enabled ? (
+        <div className={cn(
+          "whitespace-nowrap",
+          quotaActivelyBlocked ? "font-medium text-destructive" : "text-muted-foreground",
+        )}>
+          {quota.blocked
+            ? t("servers.quotaReached")
+            : t("servers.quotaCompact", {
+                used: formatBytes(quota.usedBytes),
+                limit: formatBytes(quota.limitBytes),
+              })}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function formatQuotaResetAt(epochMs: number | null, timezoneName: string) {
+  if (epochMs == null) return null;
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      dateStyle: "medium",
+      timeStyle: "short",
+      timeZone: timezoneName,
+    }).format(new Date(epochMs));
+  } catch {
+    return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
+      .format(new Date(epochMs));
+  }
+}
+
 function ServerFormCard({
   initialValues,
+  runtimeServer,
   editing,
   saving,
   testing,
+  resettingQuota,
   saveError,
   testResult,
   onSave,
   onTest,
+  onRequestQuotaReset,
   onCancel,
 }: {
   initialValues: ServerFormValues;
+  runtimeServer: Server | ServerDetails | null;
   editing: boolean;
   saving: boolean;
   testing: boolean;
+  resettingQuota: boolean;
   saveError: string | null;
   testResult: {
     success: boolean;
@@ -429,15 +652,53 @@ function ServerFormCard({
   } | null;
   onSave: (values: ServerFormValues) => Promise<void>;
   onTest: (values: ServerFormValues) => Promise<void>;
+  onRequestQuotaReset: () => void;
   onCancel: () => void;
 }) {
   const t = useTranslate();
   const [values, setValues] = useState(initialValues);
   const [showTlsWarning, setShowTlsWarning] = useState(false);
-
-  useEffect(() => {
-    setValues(initialValues);
-  }, [initialValues]);
+  const speedLimitValue = Number(values.maxDownloadSpeedMib);
+  const quotaLimitValue = Number(values.quotaLimit);
+  const enteredSpeedBytes = Math.round(speedLimitValue * MIB);
+  const enteredQuotaBytes = Math.round(
+    quotaLimitValue * (values.quotaUnit === "TB" ? TIB : GIB),
+  );
+  const effectiveSpeedBytes = !values.maxDownloadSpeedEdited && values.maxDownloadSpeedBytes > 0
+    ? values.maxDownloadSpeedBytes
+    : enteredSpeedBytes;
+  const effectiveQuotaBytes = !values.quotaLimitEdited
+    && (values.quotaLimitBytes > 0 || !values.quotaEnabled)
+    ? values.quotaLimitBytes
+    : enteredQuotaBytes;
+  const resetTimeValid = /^([01]\d|2[0-3]):[0-5]\d$/.test(values.quotaResetTime);
+  const monthDayValid = Number.isInteger(values.quotaMonthlyResetDay)
+    && values.quotaMonthlyResetDay >= 1
+    && values.quotaMonthlyResetDay <= 31;
+  const limitsError = !values.maxDownloadSpeedUnlimited
+    && (!Number.isFinite(speedLimitValue) || speedLimitValue <= 0)
+    ? t("servers.speedValidation")
+    : !values.maxDownloadSpeedUnlimited && !Number.isSafeInteger(effectiveSpeedBytes)
+      ? t("servers.byteRangeValidation")
+    : values.quotaEnabled && (!Number.isFinite(quotaLimitValue) || quotaLimitValue <= 0)
+      ? t("servers.quotaValidation")
+      : !Number.isSafeInteger(effectiveQuotaBytes) || effectiveQuotaBytes < 0
+        ? t("servers.byteRangeValidation")
+      : values.quotaEnabled && values.quotaPeriod !== "ONE_TIME" && !resetTimeValid
+        ? t("servers.resetTimeValidation")
+        : values.quotaEnabled
+          && values.quotaPeriod === "MONTHLY"
+          && !monthDayValid
+          ? t("servers.monthDayValidation")
+          : null;
+  const runtimeQuota = runtimeServer?.downloadQuota ?? null;
+  const runtimeQuotaActivelyBlocked = runtimeQuota?.blocked === true && runtimeServer?.active !== false;
+  const quotaProgress = runtimeQuota?.limitBytes
+    ? Math.min(100, ((runtimeQuota.usedBytes + runtimeQuota.reservedBytes) / runtimeQuota.limitBytes) * 100)
+    : 0;
+  const quotaResetAt = runtimeQuota
+    ? formatQuotaResetAt(runtimeQuota.windowEndsAtEpochMs, runtimeQuota.timezoneName)
+    : null;
 
   const handleTlsChange = (checked: boolean) => {
     if (!checked && values.tls) {
@@ -546,6 +807,269 @@ function ServerFormCard({
           />
         </div>
 
+        <div
+          className="space-y-5 rounded-inner border border-border bg-background/40 p-4"
+          role="group"
+          aria-labelledby="server-download-limits-heading"
+          aria-describedby="server-download-limits-description"
+        >
+          <div>
+            <h3 id="server-download-limits-heading" className="text-sm font-semibold text-foreground">
+              {t("servers.downloadLimits")}
+            </h3>
+            <p id="server-download-limits-description" className="mt-1 text-xs text-muted-foreground">
+              {t("servers.downloadLimitsDescription")}
+            </p>
+          </div>
+
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-3">
+              <Label htmlFor="server-speed-limit-mib">{t("servers.speedLimit")}</Label>
+              <label htmlFor="server-speed-unlimited" className="flex cursor-pointer items-center gap-2 text-sm">
+                <Checkbox
+                  id="server-speed-unlimited"
+                  checked={values.maxDownloadSpeedUnlimited}
+                  onCheckedChange={(checked) =>
+                    setValues((current) => ({
+                      ...current,
+                      maxDownloadSpeedUnlimited: checked === true,
+                    }))
+                  }
+                />
+                {t("servers.unlimitedSpeed")}
+              </label>
+              <div className="flex items-center gap-2">
+                <Input
+                  id="server-speed-limit-mib"
+                  type="number"
+                  inputMode="decimal"
+                  min="0.01"
+                  step="0.01"
+                  disabled={values.maxDownloadSpeedUnlimited}
+                  value={values.maxDownloadSpeedMib}
+                  aria-describedby="server-speed-limit-description"
+                  aria-invalid={!values.maxDownloadSpeedUnlimited
+                    && (!Number.isFinite(speedLimitValue)
+                      || speedLimitValue <= 0
+                      || !Number.isSafeInteger(effectiveSpeedBytes))}
+                  onChange={(event) =>
+                    setValues((current) => ({
+                      ...current,
+                      maxDownloadSpeedMib: event.target.value,
+                      maxDownloadSpeedEdited: true,
+                    }))
+                  }
+                />
+                <span className="shrink-0 text-sm text-muted-foreground">MB/s</span>
+              </div>
+              <p id="server-speed-limit-description" className="text-xs text-muted-foreground">
+                {t("servers.speedLimitDescription")}
+              </p>
+            </div>
+
+            <div className="space-y-3">
+              <Label htmlFor="server-quota-limit">{t("servers.downloadQuota")}</Label>
+              <label htmlFor="server-quota-enabled" className="flex cursor-pointer items-center gap-2 text-sm">
+                <Checkbox
+                  id="server-quota-enabled"
+                  checked={values.quotaEnabled}
+                  onCheckedChange={(checked) =>
+                    setValues((current) => ({ ...current, quotaEnabled: checked === true }))
+                  }
+                />
+                {t("servers.enableQuota")}
+              </label>
+              <div className="flex gap-2">
+                <Input
+                  id="server-quota-limit"
+                  type="number"
+                  inputMode="decimal"
+                  min="0.01"
+                  step="0.01"
+                  disabled={!values.quotaEnabled}
+                  value={values.quotaLimit}
+                  aria-invalid={values.quotaEnabled
+                    && (!Number.isFinite(quotaLimitValue)
+                      || quotaLimitValue <= 0
+                      || !Number.isSafeInteger(effectiveQuotaBytes))}
+                  onChange={(event) =>
+                    setValues((current) => ({
+                      ...current,
+                      quotaLimit: event.target.value,
+                      quotaLimitEdited: true,
+                    }))
+                  }
+                />
+                <Select
+                  value={values.quotaUnit}
+                  disabled={!values.quotaEnabled}
+                  onValueChange={(quotaUnit) =>
+                    setValues((current) => ({
+                      ...current,
+                      quotaUnit: quotaUnit as "GB" | "TB",
+                      quotaLimitEdited: true,
+                    }))
+                  }
+                >
+                  <SelectTrigger className="w-24" aria-label={t("servers.downloadQuota")}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="GB">GB</SelectItem>
+                    <SelectItem value="TB">TB</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          </div>
+
+          {values.quotaEnabled ? (
+            <div className="grid gap-4 border-t border-border pt-4 md:grid-cols-2 xl:grid-cols-4">
+              <Field label={t("servers.quotaPeriod")} htmlFor="server-quota-period">
+                <Select
+                  value={values.quotaPeriod}
+                  onValueChange={(quotaPeriod) =>
+                    setValues((current) => ({
+                      ...current,
+                      quotaPeriod: quotaPeriod as ServerDownloadQuotaPeriod,
+                    }))
+                  }
+                >
+                  <SelectTrigger id="server-quota-period"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="ONE_TIME">{t("servers.periodOneTime")}</SelectItem>
+                    <SelectItem value="DAILY">{t("servers.periodDaily")}</SelectItem>
+                    <SelectItem value="WEEKLY">{t("servers.periodWeekly")}</SelectItem>
+                    <SelectItem value="MONTHLY">{t("servers.periodMonthly")}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
+              {values.quotaPeriod !== "ONE_TIME" ? (
+                <Field
+                  label={t("servers.resetTime")}
+                  description={t("servers.resetTimeLocalDescription")}
+                  htmlFor="server-quota-reset-time"
+                  descriptionId="server-quota-reset-time-description"
+                >
+                  <Input
+                    id="server-quota-reset-time"
+                    type="time"
+                    value={values.quotaResetTime}
+                    aria-describedby="server-quota-reset-time-description"
+                    aria-invalid={!resetTimeValid}
+                    onChange={(event) =>
+                      setValues((current) => ({ ...current, quotaResetTime: event.target.value }))
+                    }
+                  />
+                </Field>
+              ) : null}
+              {values.quotaPeriod === "WEEKLY" ? (
+                <Field label={t("servers.resetWeekday")} htmlFor="server-quota-reset-weekday">
+                  <Select
+                    value={values.quotaWeeklyResetWeekday}
+                    onValueChange={(quotaWeeklyResetWeekday) =>
+                      setValues((current) => ({
+                        ...current,
+                        quotaWeeklyResetWeekday: quotaWeeklyResetWeekday as ServerDownloadQuotaWeekday,
+                      }))
+                    }
+                  >
+                    <SelectTrigger id="server-quota-reset-weekday"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {(["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] as const).map((day) => (
+                        <SelectItem key={day} value={day}>{t(`servers.weekday${day}`)}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </Field>
+              ) : null}
+              {values.quotaPeriod === "MONTHLY" ? (
+                <Field
+                  label={t("servers.resetMonthDay")}
+                  description={t("servers.resetMonthDayDescription")}
+                  htmlFor="server-quota-reset-month-day"
+                  descriptionId="server-quota-reset-month-day-description"
+                >
+                  <Input
+                    id="server-quota-reset-month-day"
+                    type="number"
+                    min={1}
+                    max={31}
+                    step={1}
+                    value={values.quotaMonthlyResetDay}
+                    aria-describedby="server-quota-reset-month-day-description"
+                    aria-invalid={!monthDayValid}
+                    onChange={(event) =>
+                      setValues((current) => ({
+                        ...current,
+                        quotaMonthlyResetDay: Number(event.target.value),
+                      }))
+                    }
+                  />
+                </Field>
+              ) : null}
+            </div>
+          ) : null}
+
+          {limitsError ? (
+            <p id="server-download-limits-error" role="alert" className="text-sm text-destructive">
+              {limitsError}
+            </p>
+          ) : null}
+
+          {editing && runtimeQuota?.enabled ? (
+            <div className={cn(
+              "space-y-3 rounded-inner border p-4",
+              runtimeQuotaActivelyBlocked
+                ? "border-destructive/40 bg-destructive/5"
+                : "border-border bg-card/50",
+            )} role="status" aria-live="polite">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div className={cn("text-sm font-semibold", runtimeQuotaActivelyBlocked && "text-destructive")}>
+                    {runtimeQuota.blocked ? t("servers.quotaReached") : t("servers.quotaUsage")}
+                  </div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    {t("servers.quotaUsageSummary", {
+                      used: formatBytes(runtimeQuota.usedBytes),
+                      limit: formatBytes(runtimeQuota.limitBytes),
+                      remaining: formatBytes(runtimeQuota.remainingBytes),
+                    })}
+                  </div>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={resettingQuota}
+                  onClick={onRequestQuotaReset}
+                >
+                  {resettingQuota ? t("servers.resettingQuota") : t("servers.resetQuota")}
+                </Button>
+              </div>
+              <Progress
+                value={quotaProgress}
+                aria-label={t("servers.quotaUsage")}
+                aria-valuetext={t("servers.quotaUsageSummary", {
+                  used: formatBytes(runtimeQuota.usedBytes),
+                  limit: formatBytes(runtimeQuota.limitBytes),
+                  remaining: formatBytes(runtimeQuota.remainingBytes),
+                })}
+              />
+              <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
+                {runtimeQuota.reservedBytes > 0 ? (
+                  <span>{t("servers.quotaReserved", { bytes: formatBytes(runtimeQuota.reservedBytes) })}</span>
+                ) : null}
+                <span>
+                  {quotaResetAt
+                    ? t("servers.quotaResetsAt", { resetAt: quotaResetAt, timezone: runtimeQuota.timezoneName })
+                    : t("servers.quotaManualReset")}
+                </span>
+              </div>
+            </div>
+          ) : null}
+        </div>
+
         <ConfirmDialog
           open={showTlsWarning}
           title={t("confirm.disableTls")}
@@ -578,7 +1102,7 @@ function ServerFormCard({
         ) : null}
 
         <div className="flex flex-wrap gap-3">
-          <Button onClick={() => void onSave(values)} disabled={!values.host.trim() || saving}>
+          <Button onClick={() => void onSave(values)} disabled={!values.host.trim() || saving || limitsError != null}>
             {editing ? t("settings.save") : t("servers.addServer")}
           </Button>
           <Button variant="outline" onClick={() => void onTest(values)} disabled={!values.host.trim() || testing}>
@@ -596,17 +1120,23 @@ function ServerFormCard({
 function Field({
   label,
   description,
+  htmlFor,
+  descriptionId,
   children,
 }: {
   label: string;
   description?: string;
+  htmlFor?: string;
+  descriptionId?: string;
   children: ReactNode;
 }) {
   return (
     <div className="space-y-2">
-      <Label>{label}</Label>
+      <Label htmlFor={htmlFor}>{label}</Label>
       {children}
-      {description ? <p className="text-xs text-muted-foreground">{description}</p> : null}
+      {description ? (
+        <p id={descriptionId} className="text-xs text-muted-foreground">{description}</p>
+      ) : null}
     </div>
   );
 }

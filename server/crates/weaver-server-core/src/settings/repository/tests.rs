@@ -33,6 +33,15 @@ fn server_crud() {
         priority: 0,
         backfill: false,
         retention_days: 0,
+        max_download_speed: 2_500_000,
+        download_quota: crate::servers::ServerDownloadQuotaConfig {
+            enabled: true,
+            limit_bytes: 50_000_000,
+            period: crate::servers::ServerDownloadQuotaPeriod::Weekly,
+            reset_time_minutes_local: 7 * 60,
+            weekly_reset_weekday: crate::bandwidth::IspBandwidthCapWeekday::Wed,
+            monthly_reset_day: 15,
+        },
         tls_ca_cert: None,
     };
 
@@ -41,12 +50,16 @@ fn server_crud() {
     assert_eq!(servers.len(), 1);
     assert_eq!(servers[0].host, "news.example.com");
     assert_eq!(servers[0].port, 443);
+    assert_eq!(servers[0].max_download_speed, 2_500_000);
+    assert_eq!(servers[0].download_quota, server.download_quota);
 
     let mut updated = server.clone();
     updated.connections = 20;
+    updated.max_download_speed = 5_000_000;
     db.update_server(&updated).unwrap();
     let servers = db.list_servers().unwrap();
     assert_eq!(servers[0].connections, 20);
+    assert_eq!(servers[0].max_download_speed, 5_000_000);
 
     assert!(db.delete_server(1).unwrap());
     assert!(!db.delete_server(1).unwrap());
@@ -82,6 +95,15 @@ fn config_roundtrip() {
             priority: 0,
             backfill: false,
             retention_days: 0,
+            max_download_speed: 4_000_000,
+            download_quota: crate::servers::ServerDownloadQuotaConfig {
+                enabled: true,
+                limit_bytes: 80_000_000,
+                period: crate::servers::ServerDownloadQuotaPeriod::Monthly,
+                reset_time_minutes_local: 90,
+                weekly_reset_weekday: crate::bandwidth::IspBandwidthCapWeekday::Fri,
+                monthly_reset_day: 31,
+            },
             tls_ca_cert: None,
         }],
         categories: vec![CategoryConfig {
@@ -103,6 +125,7 @@ fn config_roundtrip() {
             category_from_subfolders: true,
             scanning_paused: false,
         },
+        duplicate_policy: Default::default(),
         config_path: None,
     };
 
@@ -116,6 +139,11 @@ fn config_roundtrip() {
     );
     assert_eq!(loaded.complete_dir, Some("/tmp/complete".to_string()));
     assert_eq!(loaded.max_download_speed, Some(1_000_000));
+    assert_eq!(loaded.servers[0].max_download_speed, 4_000_000);
+    assert_eq!(
+        loaded.servers[0].download_quota,
+        config.servers[0].download_quota
+    );
     assert_eq!(loaded.cleanup_after_extract, Some(false));
     assert_eq!(loaded.watch_folder.path.as_deref(), Some("/incoming/nzbs"));
     assert_eq!(

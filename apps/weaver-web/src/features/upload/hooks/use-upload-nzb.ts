@@ -3,6 +3,11 @@ import { useQuery } from "urql";
 import { authHeaders, fetchWithSessionRetry } from "@/graphql/client";
 import { CATEGORIES_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import {
+  duplicateSubmissionInput,
+  type DuplicateSubmissionMode,
+} from "@/features/upload/duplicate-submission";
+import { submissionStatusIsDurable } from "@/features/duplicates/duplicate-presentation";
 
 const NO_CATEGORY_VALUE = "__none__";
 
@@ -29,6 +34,13 @@ const SUBMIT_STAGED_NZBS_OPERATION = `
         stagedUploadId
         accepted
         retained
+        status
+        semanticDuplicate {
+          groupId
+          score
+          state
+          supersededJobId
+        }
         error
         item {
           id
@@ -61,6 +73,13 @@ export type UploadNzbEntry = {
   displayName?: string;
   totalFiles?: number;
   totalBytes?: number;
+  submissionStatus?: string;
+  semanticDuplicate?: {
+    groupId: number;
+    score: number;
+    state: string;
+    supersededJobId?: number | null;
+  };
 };
 
 type StageNzbUploadResponse = {
@@ -87,6 +106,13 @@ type SubmitStagedNzbsResponse = {
         stagedUploadId: string;
         accepted: boolean;
         retained: boolean;
+        status?: string | null;
+        semanticDuplicate?: {
+          groupId: number;
+          score: number;
+          state: string;
+          supersededJobId?: number | null;
+        } | null;
         error?: string | null;
         item?: {
           id: number;
@@ -159,6 +185,7 @@ async function submitStagedNzbs(input: {
   password: string;
   category: string;
   priority: string;
+  duplicate: ReturnType<typeof duplicateSubmissionInput>;
 }): Promise<SubmitStagedNzbsResponse> {
   const response = await fetchWithSessionRetry(graphqlUrl(), {
     method: "POST",
@@ -178,6 +205,7 @@ async function submitStagedNzbs(input: {
               ? input.category
               : null,
           attributes: [{ key: "priority", value: input.priority }],
+          ...input.duplicate,
         },
       },
     }),
@@ -239,6 +267,10 @@ export function useUploadNzb(options?: {
   const [password, setPassword] = useState("");
   const [category, setCategory] = useState(NO_CATEGORY_VALUE);
   const [priority, setPriority] = useState("NORMAL");
+  const [force, setForce] = useState(false);
+  const [duplicateMode, setDuplicateMode] = useState<DuplicateSubmissionMode>("ENFORCE");
+  const [duplicateKey, setDuplicateKey] = useState("");
+  const [duplicateScore, setDuplicateScore] = useState("");
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [{ data: categoryData }] = useQuery({ query: CATEGORIES_QUERY });
@@ -407,6 +439,10 @@ export function useUploadNzb(options?: {
       setPassword("");
       setCategory(NO_CATEGORY_VALUE);
       setPriority("NORMAL");
+      setForce(false);
+      setDuplicateMode("ENFORCE");
+      setDuplicateKey("");
+      setDuplicateScore("");
       setDragging(false);
       setError(null);
     }
@@ -487,8 +523,14 @@ export function useUploadNzb(options?: {
     [handleFiles],
   );
 
-  const submit = useCallback(async () => {
-    const readyEntries = entriesRef.current.filter((entry) => entry.status === "staged" && entry.stagedUploadId);
+  const submit = useCallback(async (submitOptions?: { force?: boolean; localIds?: string[] }) => {
+    const selectedIds = submitOptions?.localIds ? new Set(submitOptions.localIds) : null;
+    const readyEntries = entriesRef.current.filter(
+      (entry) =>
+        entry.status === "staged" &&
+        entry.stagedUploadId &&
+        (!selectedIds || selectedIds.has(entry.localId)),
+    );
     const hasPendingStages = entriesRef.current.some(
       (entry) => entry.status === "queued" || entry.status === "staging",
     );
@@ -514,6 +556,12 @@ export function useUploadNzb(options?: {
         password,
         category,
         priority,
+        duplicate: duplicateSubmissionInput({
+          force: submitOptions?.force || force,
+          mode: duplicateMode,
+          key: duplicateKey,
+          score: duplicateScore,
+        }),
       });
 
       const submitError = graphqlErrorMessage(payload);
@@ -558,7 +606,14 @@ export function useUploadNzb(options?: {
             continue;
           }
 
-          if (result.accepted) {
+          const submissionStatus = result.status ?? (result.accepted ? "ACCEPTED" : undefined);
+          const outcome = {
+            submissionStatus,
+            semanticDuplicate: result.semanticDuplicate ?? undefined,
+          };
+
+          if (submissionStatusIsDurable(submissionStatus) || result.accepted) {
+            nextEntries.push({ ...entry, status: "submitted", error: undefined, ...outcome });
             continue;
           }
 
@@ -566,7 +621,8 @@ export function useUploadNzb(options?: {
             nextEntries.push({
               ...entry,
               status: "staged",
-              error: result.error ?? t("upload.rejected"),
+              error: result.error ?? undefined,
+              ...outcome,
             });
             continue;
           }
@@ -575,7 +631,8 @@ export function useUploadNzb(options?: {
             ...entry,
             status: "failed",
             stagedUploadId: undefined,
-            error: result.error ?? t("upload.stageExpired"),
+            error: result.error ?? undefined,
+            ...outcome,
           });
         }
 
@@ -608,7 +665,18 @@ export function useUploadNzb(options?: {
       );
       return false;
     }
-  }, [category, options, password, priority, setEntriesState, t]);
+  }, [
+    category,
+    duplicateKey,
+    duplicateMode,
+    duplicateScore,
+    force,
+    options,
+    password,
+    priority,
+    setEntriesState,
+    t,
+  ]);
 
   const staging = entries.some((entry) => entry.status === "queued" || entry.status === "staging");
   const fetching = entries.some((entry) => entry.status === "submitting");
@@ -629,15 +697,24 @@ export function useUploadNzb(options?: {
     totalBytes,
     password,
     priority,
+    force,
+    duplicateMode,
+    duplicateKey,
+    duplicateScore,
     category,
     setCategory,
     setDragging,
     setPassword,
     setPriority,
+    setForce,
+    setDuplicateMode,
+    setDuplicateKey,
+    setDuplicateScore,
     handleDrop,
     handleFiles,
     removeFile,
     retryFile,
+    forceSubmitFile: (localId: string) => submit({ force: true, localIds: [localId] }),
     openPicker: () => fileInputRef.current?.click(),
     submit,
     onFileInputChange: (event: ChangeEvent<HTMLInputElement>) => {

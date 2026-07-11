@@ -84,6 +84,10 @@ impl Pipeline {
         dirs: &BTreeSet<PathBuf>,
     ) -> Result<(), crate::SchedulerError> {
         for dir in dirs {
+            // Failed jobs never pass through the finalize close, so drop any
+            // cached write handles before their dirs (and paths) are freed
+            // for reuse.
+            crate::pipeline::close_cached_write_handles_under(dir).await;
             match tokio::fs::remove_dir_all(dir).await {
                 Ok(()) => {
                     info!(dir = %dir.display(), "removed historical intermediate directory");
@@ -212,6 +216,7 @@ impl Pipeline {
             JobStatus::Failed { error } => ("failed".to_string(), Some(error.clone())),
             _ => return,
         };
+        let completed = matches!(state.status, JobStatus::Complete);
 
         let now = timestamp_secs() as i64;
         let elapsed_secs = state.created_at.elapsed().as_secs() as i64;
@@ -282,8 +287,17 @@ impl Pipeline {
         );
         self.enforce_finished_jobs_runtime_cap();
 
+        let typed_terminal_cause = if completed {
+            Some(crate::jobs::SemanticTerminalCause::Success)
+        } else {
+            self.semantic_terminal_causes.remove(&job_id)
+        };
+
         let archive_started = Instant::now();
-        if let Err(e) = self.db.try_queue_archive_job(job_id, row) {
+        if let Err(e) =
+            self.db
+                .try_queue_archive_job_with_terminal_cause(job_id, row, typed_terminal_cause)
+        {
             tracing::error!(job_id = job_id.0, error = %e, "failed to queue job history archival");
             return;
         }

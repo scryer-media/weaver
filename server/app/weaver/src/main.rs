@@ -161,12 +161,13 @@ async fn async_main() {
     }
 
     match command {
-        Command::Download { nzb, output } => {
+        Command::Download { nzb, output, force } => {
             if let Err(error) = commands::download::run(
                 &mut config,
                 &db,
                 &nzb,
                 output.as_deref(),
+                force,
                 &data_dir,
                 &intermediate_dir,
                 &complete_dir,

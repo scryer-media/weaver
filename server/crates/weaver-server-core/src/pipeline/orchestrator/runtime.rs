@@ -86,6 +86,7 @@ impl Pipeline {
             tuner,
             metrics,
             jobs: HashMap::new(),
+            semantic_terminal_causes: HashMap::new(),
             archive_password_winners: HashMap::new(),
             job_order: Vec::new(),
             active_downloads: 0,
@@ -123,6 +124,7 @@ impl Pipeline {
             job_last_download_activity: HashMap::new(),
             pending_retries_by_job: HashMap::new(),
             pending_retries_by_segment: HashMap::new(),
+            server_quota_parked: HashSet::new(),
             intermediate_dir,
             complete_dir,
             nzb_dir: data_dir.join(".weaver-nzbs"),
@@ -196,11 +198,12 @@ impl Pipeline {
             extracted_members: HashMap::new(),
             extracted_archives: HashMap::new(),
             decode_retries: HashMap::new(),
+            unverified_segments: HashMap::new(),
+            file_crc_recoveries: HashMap::new(),
             inflight_extractions: HashMap::new(),
             phase_progress: HashMap::new(),
             phase_progress_snapshots: HashMap::new(),
             phase_publish_state: HashMap::new(),
-            phase_extraction_member_totals: HashSet::new(),
             job_retention_exclude_cache: HashMap::new(),
             last_no_eligible_server_warn: None,
             inflight_moves: HashSet::new(),
@@ -416,6 +419,10 @@ impl Pipeline {
             .retain(|file_id, _| file_id.job_id != job_id);
         self.file_hash_reread_required
             .retain(|file_id| file_id.job_id != job_id);
+        self.unverified_segments
+            .retain(|file_id, _| file_id.job_id != job_id);
+        self.file_crc_recoveries
+            .retain(|file_id, _| file_id.job_id != job_id);
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
     }
@@ -836,6 +843,9 @@ impl Pipeline {
     /// from the new pool at order time, so nothing durable is lost.
     pub(in crate::pipeline) fn receive_retry_work(&mut self, retry: crate::pipeline::RetryWork) {
         let mut work = retry.work;
+        if self.server_quota_parked.remove(&work.segment_id) {
+            self.refresh_server_quota_block_presentation();
+        }
         if retry.scheduled_pool_generation != self.pool_generation
             && !work.exclude_servers.is_empty()
         {
@@ -854,6 +864,13 @@ impl Pipeline {
         let job_id = work.segment_id.file_id.job_id;
         let segment_id = work.segment_id;
         self.note_retry_requeued(segment_id);
+        if self
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| is_terminal_status(&state.status))
+        {
+            return;
+        }
         let promoted_recovery = work.is_recovery
             && self.is_promoted_recovery_file(job_id, segment_id.file_id.file_index);
         let mark_rar_unlock_dirty =
@@ -1023,10 +1040,18 @@ pub(crate) struct SegmentWriteBatchError {
 }
 
 const DISK_WRITE_OWNER_THREADS: usize = 8;
+// Cached write handles per owner thread. Batches are routed by path hash, so a
+// file's handle lives on exactly one thread and the cap bounds total fds at
+// DISK_WRITE_OWNER_THREADS * DISK_WRITE_HANDLE_CACHE_CAP.
+const DISK_WRITE_HANDLE_CACHE_CAP: usize = 16;
+// Backstop for eviction seams that have no explicit close hook (failed jobs,
+// maintenance sweepers): an idle handle never outlives the TTL, so a deleted
+// file's inode is released and its path becomes safe to reuse shortly after.
+const DISK_WRITE_HANDLE_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const DISK_WRITE_OWNER_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct DiskWriteOwnerPool {
     senders: Vec<std::sync::mpsc::Sender<DiskWriteCommand>>,
-    next: std::sync::atomic::AtomicUsize,
 }
 
 enum DiskWriteCommand {
@@ -1038,6 +1063,25 @@ enum DiskWriteCommand {
             Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError>,
         >,
     },
+    CloseHandles {
+        scope: CloseHandleScope,
+        ack: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+}
+
+#[derive(Clone)]
+enum CloseHandleScope {
+    Path(std::path::PathBuf),
+    Prefix(std::path::PathBuf),
+}
+
+impl CloseHandleScope {
+    fn matches(&self, path: &std::path::Path) -> bool {
+        match self {
+            Self::Path(target) => path == target,
+            Self::Prefix(prefix) => path.starts_with(prefix),
+        }
+    }
 }
 
 impl DiskWriteOwnerPool {
@@ -1052,10 +1096,17 @@ impl DiskWriteOwnerPool {
             senders.push(tx);
         }
 
-        Self {
-            senders,
-            next: std::sync::atomic::AtomicUsize::new(0),
-        }
+        Self { senders }
+    }
+
+    // Batches for a path must all land on the owner thread caching its handle;
+    // per-thread FIFO then guarantees a queued CloseHandles runs after every
+    // batch submitted before it.
+    fn owner_index_for_path(&self, path: &std::path::Path) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        (hasher.finish() as usize) % self.senders.len()
     }
 
     async fn write_batch(
@@ -1066,8 +1117,7 @@ impl DiskWriteOwnerPool {
         let queued_at = Instant::now();
         crate::runtime::perf_probe::record_value("download.disk_write.owner.submitted", 1);
         let (response, response_rx) = tokio::sync::oneshot::channel();
-        let sender_index =
-            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.senders.len();
+        let sender_index = self.owner_index_for_path(&path);
         let command = DiskWriteCommand::Batch {
             path,
             segments,
@@ -1076,7 +1126,9 @@ impl DiskWriteOwnerPool {
         };
 
         if let Err(error) = self.senders[sender_index].send(command) {
-            let DiskWriteCommand::Batch { segments, .. } = error.0;
+            let DiskWriteCommand::Batch { segments, .. } = error.0 else {
+                unreachable!("disk write batch send returned a different command");
+            };
             return Err(SegmentWriteBatchError {
                 source: std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
@@ -1095,31 +1147,165 @@ impl DiskWriteOwnerPool {
             })
         })
     }
-}
 
-fn disk_write_owner_pool() -> &'static DiskWriteOwnerPool {
-    static POOL: std::sync::OnceLock<DiskWriteOwnerPool> = std::sync::OnceLock::new();
-    POOL.get_or_init(DiskWriteOwnerPool::new)
-}
+    fn release_handle(&self, path: &std::path::Path) {
+        let index = self.owner_index_for_path(path);
+        let _ = self.senders[index].send(DiskWriteCommand::CloseHandles {
+            scope: CloseHandleScope::Path(path.to_path_buf()),
+            ack: None,
+        });
+    }
 
-fn run_disk_write_owner(rx: std::sync::mpsc::Receiver<DiskWriteCommand>) {
-    crate::runtime::affinity::pin_current_thread_for_hot_download_path();
-    while let Ok(command) = rx.recv() {
-        match command {
-            DiskWriteCommand::Batch {
-                path,
-                segments,
-                queued_at,
-                response,
-            } => {
-                let result = write_segments_to_disk_blocking(path, segments, queued_at);
-                let _ = response.send(result);
+    async fn close_handles_matching(&self, scope: CloseHandleScope) {
+        let mut acks = Vec::with_capacity(self.senders.len());
+        for sender in &self.senders {
+            let (ack, ack_rx) = tokio::sync::oneshot::channel();
+            let command = DiskWriteCommand::CloseHandles {
+                scope: scope.clone(),
+                ack: Some(ack),
+            };
+            // A send error means the owner thread is gone and its cache (and
+            // handles) dropped with it, which is exactly the state we want.
+            if sender.send(command).is_ok() {
+                acks.push(ack_rx);
             }
+        }
+        for ack in acks {
+            let _ = ack.await;
         }
     }
 }
 
+static DISK_WRITE_OWNER_POOL: std::sync::OnceLock<DiskWriteOwnerPool> = std::sync::OnceLock::new();
+
+fn disk_write_owner_pool() -> &'static DiskWriteOwnerPool {
+    DISK_WRITE_OWNER_POOL.get_or_init(DiskWriteOwnerPool::new)
+}
+
+/// Drop the cached write handle for `path` on its owner thread, if any.
+/// Fire-and-forget: queued behind any in-flight batches for the path, so the
+/// handle closes only after those writes land.
+pub(crate) fn release_cached_write_handle(path: &std::path::Path) {
+    let Some(pool) = DISK_WRITE_OWNER_POOL.get() else {
+        return;
+    };
+    pool.release_handle(path);
+}
+
+/// Close every cached write handle for paths under `dir` and wait until the
+/// owner threads acknowledge. Must be awaited before renaming, moving, or
+/// deleting a job's working files: working-dir paths are reused verbatim after
+/// deletion, and a stale cached handle would silently swallow a later job's
+/// writes into the old unlinked inode.
+pub(crate) async fn close_cached_write_handles_under(dir: &std::path::Path) {
+    let Some(pool) = DISK_WRITE_OWNER_POOL.get() else {
+        return;
+    };
+    pool.close_handles_matching(CloseHandleScope::Prefix(dir.to_path_buf()))
+        .await;
+}
+
+struct CachedDiskWriteHandle {
+    file: std::fs::File,
+    last_used: Instant,
+}
+
+#[derive(Default)]
+struct DiskWriteHandleCache {
+    entries: std::collections::HashMap<std::path::PathBuf, CachedDiskWriteHandle>,
+}
+
+impl DiskWriteHandleCache {
+    fn open_or_reuse(&mut self, path: &std::path::Path) -> std::io::Result<&mut std::fs::File> {
+        if !self.entries.contains_key(path) {
+            crate::runtime::perf_probe::record_value("download.disk_write.handle_cache.miss", 1);
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(path)?;
+            self.evict_to_cap();
+            self.entries.insert(
+                path.to_path_buf(),
+                CachedDiskWriteHandle {
+                    file,
+                    last_used: Instant::now(),
+                },
+            );
+        } else {
+            crate::runtime::perf_probe::record_value("download.disk_write.handle_cache.hit", 1);
+        }
+        let entry = self
+            .entries
+            .get_mut(path)
+            .expect("cached disk write handle present after insert");
+        entry.last_used = Instant::now();
+        Ok(&mut entry.file)
+    }
+
+    fn discard(&mut self, path: &std::path::Path) {
+        self.entries.remove(path);
+    }
+
+    fn close_matching(&mut self, scope: &CloseHandleScope) {
+        self.entries.retain(|path, _| !scope.matches(path));
+    }
+
+    fn close_idle(&mut self, ttl: std::time::Duration) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.last_used) < ttl);
+    }
+
+    fn evict_to_cap(&mut self) {
+        while self.entries.len() >= DISK_WRITE_HANDLE_CACHE_CAP {
+            let Some(least_recent) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            crate::runtime::perf_probe::record_value("download.disk_write.handle_cache.evicted", 1);
+            self.entries.remove(&least_recent);
+        }
+    }
+}
+
+fn run_disk_write_owner(rx: std::sync::mpsc::Receiver<DiskWriteCommand>) {
+    crate::runtime::affinity::pin_current_thread_for_hot_download_path();
+    let mut handles = DiskWriteHandleCache::default();
+    loop {
+        match rx.recv_timeout(DISK_WRITE_OWNER_SWEEP_INTERVAL) {
+            Ok(DiskWriteCommand::Batch {
+                path,
+                segments,
+                queued_at,
+                response,
+            }) => {
+                let result =
+                    write_segments_to_disk_blocking(&mut handles, path, segments, queued_at);
+                let _ = response.send(result);
+            }
+            Ok(DiskWriteCommand::CloseHandles { scope, ack }) => {
+                handles.close_matching(&scope);
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        handles.close_idle(DISK_WRITE_HANDLE_IDLE_TTL);
+    }
+}
+
 fn write_segments_to_disk_blocking(
+    handles: &mut DiskWriteHandleCache,
     path: std::path::PathBuf,
     segments: Vec<(u64, BufferedDecodedSegment)>,
     queued_at: Instant,
@@ -1131,13 +1317,7 @@ fn write_segments_to_disk_blocking(
     );
     let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.disk_write.task");
 
-    use std::io::Seek;
-    let mut file = match std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-    {
+    let file = match handles.open_or_reuse(&path) {
         Ok(file) => file,
         Err(source) => {
             return Err(SegmentWriteBatchError {
@@ -1147,6 +1327,25 @@ fn write_segments_to_disk_blocking(
             });
         }
     };
+
+    let result = write_segments_into_file(file, segments);
+    if result.is_err() {
+        // A failed seek/write leaves the handle in an unknown state (the path
+        // may even have vanished); drop it so the next batch reopens fresh,
+        // matching the old open-per-batch recovery behavior.
+        handles.discard(&path);
+        return result;
+    }
+
+    crate::runtime::perf_probe::record("download.disk_write.task", task_started.elapsed());
+    result
+}
+
+fn write_segments_into_file(
+    file: &mut std::fs::File,
+    segments: Vec<(u64, BufferedDecodedSegment)>,
+) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
+    use std::io::Seek;
 
     let mut written = Vec::with_capacity(segments.len());
     let mut next_file_offset = None;
@@ -1165,7 +1364,7 @@ fn write_segments_to_disk_blocking(
                 unwritten,
             });
         }
-        if let Err(source) = segment.data.write_to(&mut file) {
+        if let Err(source) = segment.data.write_to(file) {
             let mut unwritten = Vec::with_capacity(1 + remaining.size_hint().0);
             unwritten.push((offset, segment));
             unwritten.extend(remaining);
@@ -1179,7 +1378,6 @@ fn write_segments_to_disk_blocking(
         written.push((offset, segment));
     }
 
-    crate::runtime::perf_probe::record("download.disk_write.task", task_started.elapsed());
     Ok(written)
 }
 
@@ -1289,4 +1487,166 @@ pub(crate) fn timestamp_secs() -> u64 {
 
 pub(crate) fn is_terminal_status(status: &JobStatus) -> bool {
     matches!(status, JobStatus::Complete | JobStatus::Failed { .. })
+}
+
+#[cfg(test)]
+mod disk_write_handle_cache_tests {
+    use super::*;
+    use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+
+    fn segment(bytes: &[u8]) -> BufferedDecodedSegment {
+        BufferedDecodedSegment {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id: JobId(1),
+                    file_index: 0,
+                },
+                segment_number: 1,
+            },
+            decoded_size: bytes.len() as u32,
+            data: DecodedChunk::from(bytes.to_vec()),
+            part_crc: 0,
+            part_crc_verified: false,
+            yenc_name: String::new(),
+        }
+    }
+
+    #[test]
+    fn batches_reuse_cached_handle_and_preserve_prior_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("part.bin");
+        let mut cache = DiskWriteHandleCache::default();
+
+        let first = write_segments_to_disk_blocking(
+            &mut cache,
+            path.clone(),
+            vec![(0, segment(b"hello"))],
+            Instant::now(),
+        )
+        .map_err(|error| error.source)
+        .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(cache.entries.len(), 1);
+
+        let second = write_segments_to_disk_blocking(
+            &mut cache,
+            path.clone(),
+            vec![(5, segment(b" world"))],
+            Instant::now(),
+        )
+        .map_err(|error| error.source)
+        .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(cache.entries.len(), 1);
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn open_failure_returns_all_segments_unwritten_and_caches_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("missing-dir").join("part.bin");
+        let mut cache = DiskWriteHandleCache::default();
+
+        let error = write_segments_to_disk_blocking(
+            &mut cache,
+            path,
+            vec![(0, segment(b"a")), (1, segment(b"b"))],
+            Instant::now(),
+        )
+        .map(|written| written.len())
+        .unwrap_err();
+
+        assert!(error.written.is_empty());
+        assert_eq!(error.unwritten.len(), 2);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn write_failure_splits_batch_and_discards_cached_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("part.bin");
+        std::fs::write(&path, b"seed").unwrap();
+
+        // A read-only handle makes every write fail while seeks still succeed,
+        // standing in for a handle that went bad mid-batch.
+        let mut cache = DiskWriteHandleCache::default();
+        cache.entries.insert(
+            path.clone(),
+            CachedDiskWriteHandle {
+                file: std::fs::File::open(&path).unwrap(),
+                last_used: Instant::now(),
+            },
+        );
+
+        let error = write_segments_to_disk_blocking(
+            &mut cache,
+            path.clone(),
+            vec![(0, segment(b"a")), (1, segment(b"b"))],
+            Instant::now(),
+        )
+        .map(|written| written.len())
+        .unwrap_err();
+
+        assert!(error.written.is_empty());
+        assert_eq!(error.unwritten.len(), 2);
+        assert!(
+            cache.entries.is_empty(),
+            "failed handle must be dropped so the next batch reopens the path"
+        );
+    }
+
+    #[test]
+    fn cache_evicts_least_recent_handle_at_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = DiskWriteHandleCache::default();
+
+        for index in 0..DISK_WRITE_HANDLE_CACHE_CAP + 2 {
+            let path = temp.path().join(format!("part-{index}.bin"));
+            cache.open_or_reuse(&path).unwrap();
+        }
+
+        assert_eq!(cache.entries.len(), DISK_WRITE_HANDLE_CACHE_CAP);
+        let newest = temp
+            .path()
+            .join(format!("part-{}.bin", DISK_WRITE_HANDLE_CACHE_CAP + 1));
+        assert!(cache.entries.contains_key(&newest));
+    }
+
+    #[test]
+    fn close_matching_honors_path_and_prefix_scopes() {
+        let temp = tempfile::tempdir().unwrap();
+        let job_a = temp.path().join("job-a");
+        let job_b = temp.path().join("job-b");
+        std::fs::create_dir_all(&job_a).unwrap();
+        std::fs::create_dir_all(&job_b).unwrap();
+
+        let mut cache = DiskWriteHandleCache::default();
+        let a1 = job_a.join("part-1.bin");
+        let a2 = job_a.join("part-2.bin");
+        let b1 = job_b.join("part-1.bin");
+        for path in [&a1, &a2, &b1] {
+            cache.open_or_reuse(path).unwrap();
+        }
+
+        cache.close_matching(&CloseHandleScope::Prefix(job_a.clone()));
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.entries.contains_key(&b1));
+
+        cache.close_matching(&CloseHandleScope::Path(b1.clone()));
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn close_idle_drops_handles_past_ttl() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = DiskWriteHandleCache::default();
+        cache.open_or_reuse(&temp.path().join("part.bin")).unwrap();
+
+        cache.close_idle(std::time::Duration::from_secs(3600));
+        assert_eq!(cache.entries.len(), 1);
+
+        cache.close_idle(std::time::Duration::ZERO);
+        assert!(cache.entries.is_empty());
+    }
 }

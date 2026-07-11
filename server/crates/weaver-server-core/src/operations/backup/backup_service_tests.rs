@@ -18,12 +18,31 @@ fn open_temp_db() -> Database {
     Database::open_in_memory().unwrap()
 }
 
-fn build_service(db: Database, config: Config) -> (BackupService, RuntimeCapture) {
+fn build_service(
+    db: Database,
+    config: Config,
+) -> (
+    BackupService,
+    RuntimeCapture,
+    StdArc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>,
+) {
     let capture = RuntimeCapture::default();
+    let transfer_policy = StdArc::new(
+        crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+            db.clone(),
+            &config.servers,
+        )
+        .unwrap(),
+    );
     let shared_config = StdArc::new(RwLock::new(config));
     let handle = test_scheduler_handle(capture.clone());
+    handle.set_server_transfer_policy(StdArc::clone(&transfer_policy));
     let rss = RssService::new(handle.clone(), shared_config.clone(), db.clone());
-    (BackupService::new(handle, shared_config, db, rss), capture)
+    (
+        BackupService::new(handle, shared_config, db, rss),
+        capture,
+        transfer_policy,
+    )
 }
 
 fn test_scheduler_handle(capture: RuntimeCapture) -> SchedulerHandle {
@@ -72,6 +91,26 @@ fn test_scheduler_handle(capture: RuntimeCapture) -> SchedulerHandle {
     SchedulerHandle::new(cmd_tx, event_tx, state)
 }
 
+fn sample_server(id: u32) -> crate::servers::ServerConfig {
+    crate::servers::ServerConfig {
+        id,
+        host: format!("news-{id}.example.com"),
+        port: 563,
+        tls: true,
+        username: None,
+        password: None,
+        connections: 2,
+        active: true,
+        supports_pipelining: true,
+        priority: 0,
+        backfill: false,
+        retention_days: 0,
+        max_download_speed: 0,
+        download_quota: crate::servers::ServerDownloadQuotaConfig::default(),
+        tls_ca_cert: None,
+    }
+}
+
 fn sample_config() -> Config {
     Config {
         data_dir: "/old/data".into(),
@@ -100,6 +139,7 @@ fn sample_config() -> Config {
         ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+        duplicate_policy: Default::default(),
         config_path: None,
     }
 }
@@ -140,7 +180,7 @@ fn external_category_paths_require_manual_mapping() {
 async fn password_protected_backup_roundtrip_inspects() {
     let source_db = open_temp_db();
     populate_source_db(&source_db);
-    let (service, _) = build_service(source_db, sample_config());
+    let (service, _, _) = build_service(source_db, sample_config());
 
     let artifact = service
         .create_backup(Some("secret-pass".into()))
@@ -164,7 +204,7 @@ async fn password_protected_backup_roundtrip_inspects() {
 async fn plain_backup_contains_manifest_and_database() {
     let source_db = open_temp_db();
     populate_source_db(&source_db);
-    let (service, _) = build_service(source_db, sample_config());
+    let (service, _, _) = build_service(source_db, sample_config());
 
     let artifact = service.create_backup(None).await.unwrap();
     assert!(artifact.filename.ends_with(".tar.zst"));
@@ -186,6 +226,38 @@ async fn plain_backup_contains_manifest_and_database() {
         entries,
         vec!["backup.db".to_string(), "manifest.json".to_string()]
     );
+}
+
+#[tokio::test]
+async fn backup_flushes_live_server_download_usage_before_export() {
+    let source_db = open_temp_db();
+    let mut config = sample_config();
+    config.servers = vec![sample_server(7)];
+    source_db.save_config(&config).unwrap();
+    let (service, _, transfer_policy) = build_service(source_db.clone(), config);
+
+    let control = transfer_policy
+        .transfer_registry()
+        .control(weaver_nntp::transfer::StableServerId(7));
+    let mut permit = control.try_reserve(0).unwrap();
+    permit.record_blocking(4_321);
+    drop(permit);
+    assert!(
+        source_db
+            .server_download_usage(7)
+            .unwrap()
+            .is_none_or(|usage| usage.lifetime_bytes == 0)
+    );
+
+    let artifact = service.create_backup(None).await.unwrap();
+    let archive = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(archive.path(), artifact.bytes).unwrap();
+    let unpacked = tempfile::tempdir().unwrap();
+    archive::unpack_plain_archive(archive.path(), unpacked.path()).unwrap();
+
+    let exported = Database::open(&unpacked.path().join("backup.db")).unwrap();
+    let usage = exported.server_download_usage(7).unwrap().unwrap();
+    assert_eq!(usage.lifetime_bytes, 4_321);
 }
 
 fn write_plain_test_archive(path: &Path, entries: &[(&str, &[u8])]) {
@@ -254,7 +326,7 @@ fn unpack_plain_archive_requires_backup_db() {
 async fn restore_requires_category_remap_for_external_paths() {
     let source_db = open_temp_db();
     populate_source_db(&source_db);
-    let (source_service, _) = build_service(source_db, sample_config());
+    let (source_service, _, _) = build_service(source_db, sample_config());
 
     let artifact = source_service.create_backup(None).await.unwrap();
     let archive = tempfile::NamedTempFile::new().unwrap();
@@ -276,11 +348,12 @@ async fn restore_requires_category_remap_for_external_paths() {
             ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: Default::default(),
             config_path: None,
         })
         .unwrap();
 
-    let (target_service, _) = build_service(
+    let (target_service, _, _) = build_service(
         target_db.clone(),
         Config {
             data_dir: "/bootstrap".into(),
@@ -296,6 +369,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: Default::default(),
             config_path: None,
         },
     );
@@ -331,7 +405,22 @@ async fn restore_requires_category_remap_for_external_paths() {
 async fn restore_rewrites_paths_and_refreshes_runtime() {
     let source_db = open_temp_db();
     populate_source_db(&source_db);
-    let (source_service, _) = build_service(source_db, sample_config());
+    let mut source_config = sample_config();
+    source_config.servers = vec![sample_server(7), sample_server(8)];
+    source_db.save_config(&source_config).unwrap();
+    let (source_service, _, source_policy) = build_service(source_db, source_config);
+    let source_control = source_policy
+        .transfer_registry()
+        .control(weaver_nntp::transfer::StableServerId(7));
+    let mut source_permit = source_control.try_reserve(0).unwrap();
+    source_permit.record_blocking(9_000);
+    drop(source_permit);
+    let stray_source_control = source_policy
+        .transfer_registry()
+        .control(weaver_nntp::transfer::StableServerId(8));
+    let mut stray_source_permit = stray_source_control.try_reserve(0).unwrap();
+    stray_source_permit.record_blocking(1_000);
+    drop(stray_source_permit);
 
     let artifact = source_service.create_backup(None).await.unwrap();
     let archive = tempfile::NamedTempFile::new().unwrap();
@@ -345,7 +434,7 @@ async fn restore_rewrites_paths_and_refreshes_runtime() {
             complete_dir: None,
             buffer_pool: None,
             tuner: None,
-            servers: vec![],
+            servers: vec![sample_server(7)],
             categories: vec![],
             retry: None,
             max_download_speed: None,
@@ -353,11 +442,12 @@ async fn restore_rewrites_paths_and_refreshes_runtime() {
             ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: Default::default(),
             config_path: None,
         })
         .unwrap();
 
-    let (target_service, capture) = build_service(
+    let (target_service, capture, target_policy) = build_service(
         target_db.clone(),
         Config {
             data_dir: "/bootstrap".into(),
@@ -365,7 +455,7 @@ async fn restore_rewrites_paths_and_refreshes_runtime() {
             complete_dir: None,
             buffer_pool: None,
             tuner: None,
-            servers: vec![],
+            servers: vec![sample_server(7)],
             categories: vec![],
             retry: None,
             max_download_speed: None,
@@ -373,9 +463,22 @@ async fn restore_rewrites_paths_and_refreshes_runtime() {
             ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: Default::default(),
             config_path: None,
         },
     );
+    let stale_control = target_policy
+        .transfer_registry()
+        .control(weaver_nntp::transfer::StableServerId(7));
+    let mut stale_permit = stale_control.try_reserve(0).unwrap();
+    stale_permit.record_blocking(50_000);
+    drop(stale_permit);
+    let stray_control = target_policy
+        .transfer_registry()
+        .control(weaver_nntp::transfer::StableServerId(8));
+    let mut stray_permit = stray_control.try_reserve(0).unwrap();
+    stray_permit.record_blocking(75_000);
+    drop(stray_permit);
 
     let report = target_service
         .restore_backup(
@@ -416,6 +519,32 @@ async fn restore_rewrites_paths_and_refreshes_runtime() {
             .unwrap()
             .len(),
         1
+    );
+    assert_eq!(
+        target_policy.snapshot(7).unwrap().lifetime_bytes,
+        9_000,
+        "imported usage must replace stale live counters for the same server ID"
+    );
+    assert_eq!(
+        target_db
+            .server_download_usage(7)
+            .unwrap()
+            .unwrap()
+            .lifetime_bytes,
+        9_000
+    );
+    assert_eq!(
+        target_policy.snapshot(8).unwrap().lifetime_bytes,
+        1_000,
+        "restore must clear stray controls that were absent from the old policy map"
+    );
+    assert_eq!(
+        target_db
+            .server_download_usage(8)
+            .unwrap()
+            .unwrap()
+            .lifetime_bytes,
+        1_000
     );
 
     let updated = capture.updated_paths.lock().unwrap().clone().unwrap();

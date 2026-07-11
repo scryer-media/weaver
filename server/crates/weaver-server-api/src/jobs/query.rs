@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::jobs::types::{PreparedQueueFilter, matches_queue_filter_prepared};
+use crate::jobs::types::{
+    DuplicateIdentitySnapshotInfo, DuplicateSummaryInfo, PreparedQueueFilter,
+    load_duplicate_summaries_chunked, matches_queue_filter_prepared,
+};
 use crate::observability::with_timed_config_read;
 
 #[derive(Default)]
@@ -24,7 +27,7 @@ impl JobsQuery {
         let limit = first.unwrap_or(u32::MAX) as usize;
         let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
 
-        let items = handle
+        let mut items: Vec<QueueItem> = handle
             .list_jobs()
             .into_iter()
             .filter(|info| {
@@ -39,6 +42,7 @@ impl JobsQuery {
             .skip(offset)
             .take(limit)
             .collect();
+        attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
         Ok(items)
     }
     /// Public queue facade for one active item.
@@ -55,7 +59,13 @@ impl JobsQuery {
         }) else {
             return Ok(None);
         };
-        Ok(Some(queue_item_from_job(&info)))
+        let mut item = queue_item_from_job(&info);
+        attach_duplicate_summaries(
+            ctx.data::<Database>()?.clone(),
+            std::slice::from_mut(&mut item),
+        )
+        .await?;
+        Ok(Some(item))
     }
     /// Summary of the active queue and live throughput.
     #[graphql(guard = "ReadGuard")]
@@ -87,7 +97,7 @@ impl JobsQuery {
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
         let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
 
-        let items: Vec<QueueItem> = handle
+        let mut items: Vec<QueueItem> = handle
             .list_jobs()
             .into_iter()
             .filter(|info| {
@@ -100,6 +110,7 @@ impl JobsQuery {
             .map(|info| queue_item_from_job(&info))
             .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
             .collect();
+        attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
         let metrics = handle.get_metrics();
         let latest_cursor = replay.latest_cursor().await;
         let max_download_speed = with_timed_config_read(
@@ -231,6 +242,35 @@ impl JobsQuery {
             Err(e) => Err(e.into()),
         }
     }
+    /// Durable duplicate identity and semantic candidate state for a queue,
+    /// history, or job-detail item. Parked source material is never exposed.
+    #[graphql(guard = "ReadGuard")]
+    async fn duplicate_snapshot(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+    ) -> Result<Option<DuplicateIdentitySnapshotInfo>> {
+        let db = ctx.data::<Database>()?.clone();
+        let snapshot = tokio::task::spawn_blocking(move || {
+            db.duplicate_snapshot(weaver_server_core::jobs::ids::JobId(id))
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))??;
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+
+        let db = ctx.data::<Database>()?.clone();
+        let semantic = tokio::task::spawn_blocking(move || {
+            db.semantic_candidate_snapshot(weaver_server_core::jobs::ids::JobId(id))
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))??;
+        Ok(Some(DuplicateIdentitySnapshotInfo::from_parts(
+            &snapshot,
+            semantic.as_ref(),
+        )))
+    }
     /// List files in a completed job's output directory.
     async fn job_output_files(
         &self,
@@ -292,6 +332,24 @@ fn list_output_files(dir: &std::path::Path) -> Result<JobOutputResult> {
         files,
         total_bytes,
     })
+}
+
+async fn attach_duplicate_summaries(db: Database, items: &mut [QueueItem]) -> Result<()> {
+    let job_ids = items
+        .iter()
+        .map(|item| weaver_server_core::jobs::ids::JobId(item.id))
+        .collect::<Vec<_>>();
+    let summaries =
+        tokio::task::spawn_blocking(move || load_duplicate_summaries_chunked(&db, job_ids))
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+    for item in items {
+        if let Some(summary) = summaries.get(&weaver_server_core::jobs::ids::JobId(item.id)) {
+            item.duplicate_summary = Some(DuplicateSummaryInfo::from_summary(summary));
+        }
+    }
+    Ok(())
 }
 
 fn collect_files_recursive(dir: &std::path::Path, out: &mut Vec<JobOutputFile>) -> Result<()> {

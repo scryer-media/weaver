@@ -22,7 +22,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 31;
+const CURRENT_SCHEMA_VERSION: i64 = 33;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1061,6 +1061,75 @@ mod tests {
         .unwrap();
         assert_eq!(nzb_cols, 1);
         assert!(!sqlite_table_exists(&pool, "active_segments").await);
+
+        let server_limit_cols: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('servers')
+             WHERE name IN (
+                'max_download_speed',
+                'download_quota_enabled',
+                'download_quota_limit_bytes',
+                'download_quota_period',
+                'download_quota_reset_time_minutes_local',
+                'download_quota_weekly_reset_weekday',
+                'download_quota_monthly_reset_day'
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(server_limit_cols, 7);
+        assert!(sqlite_table_exists(&pool, "server_download_usage").await);
+        let usage_cascade: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('server_download_usage')
+             WHERE \"table\" = 'servers' AND \"from\" = 'server_id' AND on_delete = 'CASCADE'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(usage_cascade, 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_v31_upgrade_adds_server_download_limit_defaults() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(31), true)
+            .await
+            .unwrap();
+        execute_batch(
+            &pool,
+            "INSERT INTO servers
+                (id, host, port, tls, connections, active, supports_pipelining,
+                 priority, backfill, retention_days)
+             VALUES (1, 'news.example.com', 563, 1, 4, 1, 0, 0, 0, 0)",
+        )
+        .await;
+
+        run_embedded_migrations(&pool, MigrationMode::Apply)
+            .await
+            .unwrap();
+
+        let defaults: (i64, i64, i64, String, i64, String, i64) = sqlx::query_as(
+            "SELECT max_download_speed, download_quota_enabled,
+                    download_quota_limit_bytes, download_quota_period,
+                    download_quota_reset_time_minutes_local,
+                    download_quota_weekly_reset_weekday,
+                    download_quota_monthly_reset_day
+               FROM servers WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            defaults,
+            (0, 0, 0, "one_time".to_string(), 0, "mon".to_string(), 1)
+        );
+        assert!(sqlite_table_exists(&pool, "server_download_usage").await);
     }
 
     #[tokio::test]

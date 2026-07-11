@@ -15,24 +15,42 @@ use weaver_server_core::{
 pub(crate) struct PrometheusMetricsExporter {
     handle: SchedulerHandle,
     nntp_pool: Arc<NntpPool>,
+    transfer_policy:
+        Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
 }
 
 impl PrometheusMetricsExporter {
-    pub(crate) fn new(handle: SchedulerHandle, nntp_pool: Arc<NntpPool>) -> Self {
-        Self { handle, nntp_pool }
+    pub(crate) fn new(
+        handle: SchedulerHandle,
+        nntp_pool: Arc<NntpPool>,
+        transfer_policy: Arc<
+            weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
+        >,
+    ) -> Self {
+        Self {
+            handle,
+            nntp_pool,
+            transfer_policy,
+        }
     }
 
     pub(crate) async fn render(&self) -> String {
         let snapshot = self.handle.get_metrics();
         let jobs = self.handle.list_jobs();
         let download_block = self.handle.get_download_block();
-        let server_health = collect_server_health(&self.nntp_pool).await;
-        render_prometheus_metrics(
+        let nntp_pool = self
+            .handle
+            .nntp_pool()
+            .unwrap_or_else(|| Arc::clone(&self.nntp_pool));
+        let server_health = collect_server_health(&nntp_pool).await;
+        let server_transfers = self.transfer_policy.transfer_registry().snapshots();
+        render_prometheus_metrics_with_transfers(
             &snapshot,
             &jobs,
             self.handle.is_globally_paused(),
             &download_block,
             &server_health,
+            &server_transfers,
         )
     }
 }
@@ -118,12 +136,31 @@ async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn render_prometheus_metrics(
     snapshot: &MetricsSnapshot,
     jobs: &[JobInfo],
     pipeline_paused: bool,
     download_block: &DownloadBlockState,
     server_health: &[ServerHealthInfo],
+) -> String {
+    render_prometheus_metrics_with_transfers(
+        snapshot,
+        jobs,
+        pipeline_paused,
+        download_block,
+        server_health,
+        &[],
+    )
+}
+
+fn render_prometheus_metrics_with_transfers(
+    snapshot: &MetricsSnapshot,
+    jobs: &[JobInfo],
+    pipeline_paused: bool,
+    download_block: &DownloadBlockState,
+    server_health: &[ServerHealthInfo],
+    server_transfers: &[weaver_nntp::transfer::ServerTransferSnapshot],
 ) -> String {
     let mut out = String::with_capacity(16 * 1024);
     out.push_str("# HELP weaver_build_info Static build information.\n");
@@ -145,11 +182,12 @@ pub(super) fn render_prometheus_metrics(
 
     out.push_str("# HELP weaver_pipeline_download_gate Current global download gate by reason.\n");
     out.push_str("# TYPE weaver_pipeline_download_gate gauge\n");
-    for reason in ["none", "manual_pause", "isp_cap"] {
+    for reason in ["none", "manual_pause", "isp_cap", "server_quota"] {
         let active = match (reason, download_block.kind) {
             ("none", DownloadBlockKind::None) => 1,
             ("manual_pause", DownloadBlockKind::ManualPause) => 1,
             ("isp_cap", DownloadBlockKind::IspCap) => 1,
+            ("server_quota", DownloadBlockKind::ServerQuota) => 1,
             _ => 0,
         };
         append_labeled_metric(
@@ -229,6 +267,28 @@ pub(super) fn render_prometheus_metrics(
             "weaver_pipeline_jobs",
             &[("status", status)],
             count,
+        );
+    }
+
+    out.push_str("# HELP weaver_duplicate_admission_decisions_total Duplicate admission decisions by intake origin and public status.\n");
+    out.push_str("# TYPE weaver_duplicate_admission_decisions_total counter\n");
+    for metric in weaver_server_core::jobs::duplicate_admission_metrics_snapshot() {
+        append_labeled_metric(
+            &mut out,
+            "weaver_duplicate_admission_decisions_total",
+            &[("origin", metric.origin), ("status", metric.status)],
+            metric.count,
+        );
+    }
+
+    out.push_str("# HELP weaver_semantic_duplicate_lifecycle_total Semantic duplicate arbitration lifecycle events.\n");
+    out.push_str("# TYPE weaver_semantic_duplicate_lifecycle_total counter\n");
+    for metric in weaver_server_core::jobs::semantic_duplicate_lifecycle_metrics_snapshot() {
+        append_labeled_metric(
+            &mut out,
+            "weaver_semantic_duplicate_lifecycle_total",
+            &[("event", metric.event)],
+            metric.count,
         );
     }
 
@@ -1156,6 +1216,82 @@ pub(super) fn render_prometheus_metrics(
                 "weaver_server_premature_deaths",
                 labels,
                 srv.premature_deaths,
+            );
+        }
+    }
+
+    if !server_transfers.is_empty() {
+        out.push_str("# HELP weaver_server_download_lifetime_bytes Raw NNTP BODY bytes received per durable server.\n");
+        out.push_str("# TYPE weaver_server_download_lifetime_bytes counter\n");
+        out.push_str("# HELP weaver_server_download_rate_limit_bytes_per_second Configured aggregate per-server BODY rate limit; zero is unlimited.\n");
+        out.push_str("# TYPE weaver_server_download_rate_limit_bytes_per_second gauge\n");
+        out.push_str("# HELP weaver_server_download_throttle_seconds_total Time spent waiting on a per-server download rate limit.\n");
+        out.push_str("# TYPE weaver_server_download_throttle_seconds_total counter\n");
+        out.push_str("# HELP weaver_server_download_quota_enabled Whether a per-server BODY quota is enabled.\n");
+        out.push_str("# TYPE weaver_server_download_quota_enabled gauge\n");
+        out.push_str("# HELP weaver_server_download_quota_used_bytes BODY bytes charged in the current server quota window.\n");
+        out.push_str("# TYPE weaver_server_download_quota_used_bytes gauge\n");
+        out.push_str("# HELP weaver_server_download_quota_reserved_bytes Estimated BODY bytes reserved by in-flight work.\n");
+        out.push_str("# TYPE weaver_server_download_quota_reserved_bytes gauge\n");
+        out.push_str("# HELP weaver_server_download_quota_remaining_bytes Remaining admissible BODY bytes in the current server quota window.\n");
+        out.push_str("# TYPE weaver_server_download_quota_remaining_bytes gauge\n");
+        out.push_str("# HELP weaver_server_download_quota_blocked Whether the server currently rejects new BODY requests due to quota.\n");
+        out.push_str("# TYPE weaver_server_download_quota_blocked gauge\n");
+
+        for transfer in server_transfers {
+            let server_id = transfer.stable_server_id.0.to_string();
+            let labels: &[(&str, &str)] = &[("server_id", &server_id)];
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_download_lifetime_bytes",
+                labels,
+                transfer.lifetime_body_bytes,
+            );
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_download_rate_limit_bytes_per_second",
+                labels,
+                transfer.rate_bytes_per_sec,
+            );
+            append_labeled_metric_f64(
+                &mut out,
+                "weaver_server_download_throttle_seconds_total",
+                labels,
+                transfer.throttle_wait.as_secs_f64(),
+            );
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_download_quota_enabled",
+                labels,
+                u64::from(transfer.quota_enabled),
+            );
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_download_quota_used_bytes",
+                labels,
+                transfer.quota_used_bytes,
+            );
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_download_quota_reserved_bytes",
+                labels,
+                transfer.quota_reserved_bytes,
+            );
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_download_quota_remaining_bytes",
+                labels,
+                if transfer.quota_enabled {
+                    transfer.quota_remaining_bytes
+                } else {
+                    0
+                },
+            );
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_download_quota_blocked",
+                labels,
+                u64::from(transfer.quota_blocked),
             );
         }
     }

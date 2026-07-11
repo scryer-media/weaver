@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::history::types::history_delete_row_state_from_core;
+use crate::jobs::types::load_duplicate_summaries_chunked;
 
 enum HistoryQueryPlan {
     Empty,
@@ -43,6 +44,11 @@ impl HistoryQuery {
         let items = tokio::task::spawn_blocking(move || {
             let rows = db.list_job_history(&history_filter)?;
             let delete_states = load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?;
+            let duplicate_summaries = load_duplicate_summaries_chunked(
+                &db,
+                rows.iter()
+                    .map(|row| weaver_server_core::jobs::ids::JobId(row.job_id)),
+            )?;
             Ok::<_, weaver_server_core::StateError>(
                 rows.into_iter()
                     .map(|row| {
@@ -50,7 +56,11 @@ impl HistoryQuery {
                             .get(&row.job_id)
                             .cloned()
                             .map(history_delete_row_state_from_core);
-                        history_item_from_row(&row, delete_state)
+                        let mut item = history_item_from_row(&row, delete_state);
+                        item.duplicate_summary = duplicate_summaries
+                            .get(&weaver_server_core::jobs::ids::JobId(row.job_id))
+                            .map(crate::jobs::types::DuplicateSummaryInfo::from_summary);
+                        item
                     })
                     .collect::<Vec<_>>(),
             )
@@ -89,19 +99,29 @@ impl HistoryQuery {
             let row = db.get_job_history_profiled(id, "db.get_job_history.api_history_item")?;
             let delete_states =
                 load_history_delete_states(&db, row.iter().map(|entry| entry.job_id))?;
-            Ok::<_, weaver_server_core::StateError>((row, delete_states))
+            let duplicate_summaries = load_duplicate_summaries_chunked(
+                &db,
+                row.iter()
+                    .map(|entry| weaver_server_core::jobs::ids::JobId(entry.job_id)),
+            )?;
+            Ok::<_, weaver_server_core::StateError>((row, delete_states, duplicate_summaries))
         })
         .await
         .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
         .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
         Ok(row.0.as_ref().map(|history_row| {
-            history_item_from_row(
+            let mut item = history_item_from_row(
                 history_row,
                 row.1
                     .get(&history_row.job_id)
                     .cloned()
                     .map(history_delete_row_state_from_core),
-            )
+            );
+            item.duplicate_summary = row
+                .2
+                .get(&weaver_server_core::jobs::ids::JobId(history_row.job_id))
+                .map(crate::jobs::types::DuplicateSummaryInfo::from_summary);
+            item
         }))
     }
     /// Count history items exposed by the public history facade.
@@ -339,11 +359,20 @@ async fn load_history_page(db: Database, input: HistoryPageInput) -> Result<Hist
         // so the response (page shape, counts, per-page delete states) is
         // identical for identical data.
         let delete_states = load_history_delete_states(&db, page.items.iter().map(|item| item.id))?;
+        let duplicate_summaries = load_duplicate_summaries_chunked(
+            &db,
+            page.items
+                .iter()
+                .map(|item| weaver_server_core::jobs::ids::JobId(item.id)),
+        )?;
         for item in &mut page.items {
             item.delete_operation = delete_states
                 .get(&item.id)
                 .cloned()
                 .map(history_delete_row_state_from_core);
+            item.duplicate_summary = duplicate_summaries
+                .get(&weaver_server_core::jobs::ids::JobId(item.id))
+                .map(crate::jobs::types::DuplicateSummaryInfo::from_summary);
         }
         Ok::<_, weaver_server_core::StateError>(page)
     })

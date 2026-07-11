@@ -1,8 +1,9 @@
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use async_graphql::{Context, Object, Result};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::auth::AdminGuard;
 use crate::observability::{
@@ -27,6 +28,9 @@ impl ServersMutation {
         let config = ctx.data::<SharedConfig>()?;
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?;
+        let policy = ctx.data::<std::sync::Arc<
+            weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
+        >>()?;
         let _mutation_guard = SERVER_MUTATION_GUARD.lock().await;
         let normalized =
             NormalizedServerInput::from_input(input, None).map_err(async_graphql::Error::new)?;
@@ -64,10 +68,10 @@ impl ServersMutation {
                         .find(|candidate| candidate.id == server.id)
                     {
                         *existing = server.clone();
-                        Server::from(&*existing)
+                        existing.clone()
                     } else {
                         cfg.servers.push(server.clone());
-                        Server::from(&server)
+                        server.clone()
                     }
                 },
             )
@@ -76,9 +80,28 @@ impl ServersMutation {
 
         info!(id, "server added");
 
-        // Rebuild pool — this also detects capabilities for all servers.
-        rebuild_nntp_from_config(config, handle).await;
-        Ok(added)
+        let configured_servers =
+            with_timed_config_read(config, "servers.mutation.add_server.reconfigure", |cfg| {
+                cfg.servers.clone()
+            })
+            .await;
+        let policy_result = {
+            let policy = std::sync::Arc::clone(policy);
+            spawn_blocking_db(
+                "servers.mutation.add_server.reconfigure_policy",
+                move || policy.reconfigure(&configured_servers),
+            )
+            .await
+        };
+        complete_post_commit_runtime_update(
+            "add_server",
+            id,
+            policy_result,
+            rebuild_nntp_from_config(config, handle),
+        )
+        .await;
+        let snapshot = policy.snapshot(added.id);
+        Ok(Server::from_config(&added, snapshot.as_ref()))
     }
     /// Update an existing NNTP server by ID.
     #[graphql(guard = "AdminGuard")]
@@ -91,21 +114,21 @@ impl ServersMutation {
         let config = ctx.data::<SharedConfig>()?;
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?;
+        let policy = ctx.data::<std::sync::Arc<
+            weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
+        >>()?;
         let _mutation_guard = SERVER_MUTATION_GUARD.lock().await;
 
-        let existing_password = with_timed_config_read(
-            config,
-            "servers.mutation.update_server.existing_password",
-            |cfg| {
+        let existing =
+            with_timed_config_read(config, "servers.mutation.update_server.existing", |cfg| {
                 cfg.servers
                     .iter()
                     .find(|s| s.id == id)
-                    .map(|s| s.password.clone())
+                    .cloned()
                     .ok_or_else(|| async_graphql::Error::new(format!("server {id} not found")))
-            },
-        )
-        .await?;
-        let normalized = NormalizedServerInput::from_input(input, existing_password)
+            })
+            .await?;
+        let normalized = NormalizedServerInput::from_input(input, Some(&existing))
             .map_err(async_graphql::Error::new)?;
 
         let validated_capabilities = validate_server_before_save(&normalized).await?;
@@ -125,19 +148,39 @@ impl ServersMutation {
             with_timed_config_write(config, "servers.mutation.update_server.apply", move |cfg| {
                 if let Some(current) = cfg.servers.iter_mut().find(|candidate| candidate.id == id) {
                     *current = server.clone();
-                    Server::from(&*current)
+                    current.clone()
                 } else {
                     cfg.servers.push(server.clone());
-                    Server::from(&server)
+                    server.clone()
                 }
             })
             .await;
 
         info!(id, "server updated");
 
-        // Rebuild pool — this also detects capabilities for all servers.
-        rebuild_nntp_from_config(config, handle).await;
-        Ok(updated)
+        let configured_servers = with_timed_config_read(
+            config,
+            "servers.mutation.update_server.reconfigure",
+            |cfg| cfg.servers.clone(),
+        )
+        .await;
+        let policy_result = {
+            let policy = std::sync::Arc::clone(policy);
+            spawn_blocking_db(
+                "servers.mutation.update_server.reconfigure_policy",
+                move || policy.reconfigure(&configured_servers),
+            )
+            .await
+        };
+        complete_post_commit_runtime_update(
+            "update_server",
+            id,
+            policy_result,
+            rebuild_nntp_from_config(config, handle),
+        )
+        .await;
+        let snapshot = policy.snapshot(updated.id);
+        Ok(Server::from_config(&updated, snapshot.as_ref()))
     }
     /// Remove an NNTP server by ID.
     #[graphql(guard = "AdminGuard")]
@@ -145,6 +188,9 @@ impl ServersMutation {
         let config = ctx.data::<SharedConfig>()?;
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?;
+        let policy = ctx.data::<std::sync::Arc<
+            weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
+        >>()?;
         let _mutation_guard = SERVER_MUTATION_GUARD.lock().await;
 
         with_timed_config_read(config, "servers.mutation.remove_server.validate", |cfg| {
@@ -155,6 +201,14 @@ impl ServersMutation {
             }
         })
         .await?;
+
+        {
+            let policy = std::sync::Arc::clone(policy);
+            spawn_blocking_db("servers.mutation.remove_server.flush_usage", move || {
+                policy.flush_usage()
+            })
+            .await?;
+        }
 
         {
             let db = db.clone();
@@ -170,14 +224,70 @@ impl ServersMutation {
         let remaining =
             with_timed_config_write(config, "servers.mutation.remove_server.apply", move |cfg| {
                 cfg.servers.retain(|server| server.id != id);
-                cfg.servers.iter().map(Server::from).collect()
+                cfg.servers.clone()
             })
             .await;
 
         info!(id, "server removed");
 
-        rebuild_nntp_from_config(config, handle).await;
-        Ok(remaining)
+        let policy_result = {
+            let policy = std::sync::Arc::clone(policy);
+            let configured_servers = remaining.clone();
+            spawn_blocking_db(
+                "servers.mutation.remove_server.reconfigure_policy",
+                move || policy.reconfigure(&configured_servers),
+            )
+            .await
+        };
+        complete_post_commit_runtime_update(
+            "remove_server",
+            id,
+            policy_result,
+            rebuild_nntp_from_config(config, handle),
+        )
+        .await;
+        let snapshots = policy
+            .snapshots()
+            .into_iter()
+            .map(|snapshot| (snapshot.server_id, snapshot))
+            .collect::<std::collections::HashMap<_, _>>();
+        Ok(remaining
+            .iter()
+            .map(|server| Server::from_config(server, snapshots.get(&server.id)))
+            .collect())
+    }
+    /// Reset this server's quota baseline without clearing lifetime usage.
+    #[graphql(guard = "AdminGuard")]
+    async fn reset_server_download_quota_usage(
+        &self,
+        ctx: &Context<'_>,
+        id: u32,
+    ) -> Result<Server> {
+        let config = ctx.data::<SharedConfig>()?;
+        let policy = ctx
+            .data::<std::sync::Arc<
+                weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
+            >>()?
+            .clone();
+        let _mutation_guard = SERVER_MUTATION_GUARD.lock().await;
+        let server = with_timed_config_read(
+            config,
+            "servers.mutation.reset_server_download_quota_usage.server",
+            |cfg| {
+                cfg.servers
+                    .iter()
+                    .find(|server| server.id == id)
+                    .cloned()
+                    .ok_or_else(|| async_graphql::Error::new(format!("server {id} not found")))
+            },
+        )
+        .await?;
+        let snapshot = spawn_blocking_db(
+            "servers.mutation.reset_server_download_quota_usage.persist",
+            move || policy.reset_usage(id),
+        )
+        .await?;
+        Ok(Server::from_config(&server, Some(&snapshot)))
     }
     /// Test connectivity to an NNTP server without saving it.
     #[graphql(guard = "AdminGuard")]
@@ -208,6 +318,27 @@ impl ServersMutation {
     // ── Categories ────────────────────────────────────────────────────
 }
 
+async fn complete_post_commit_runtime_update<E, F>(
+    operation: &'static str,
+    server_id: u32,
+    policy_result: std::result::Result<(), E>,
+    rebuild: F,
+) where
+    E: std::fmt::Debug,
+    F: Future<Output = ()>,
+{
+    if let Err(error) = policy_result {
+        error!(
+            operation,
+            server_id,
+            error = ?error,
+            degraded = true,
+            "server change committed but transfer policy reconfiguration failed; rebuilding a fail-closed NNTP generation"
+        );
+    }
+    rebuild.await;
+}
+
 #[derive(Clone)]
 struct NormalizedServerInput {
     host: String,
@@ -220,20 +351,36 @@ struct NormalizedServerInput {
     priority: u16,
     backfill: bool,
     retention_days: u32,
+    max_download_speed: u64,
+    download_quota: weaver_server_core::servers::ServerDownloadQuotaConfig,
     tls_ca_cert: Option<PathBuf>,
 }
 
 impl NormalizedServerInput {
     fn from_input(
         input: ServerInput,
-        fallback_password: Option<String>,
+        fallback: Option<&weaver_server_core::servers::ServerConfig>,
     ) -> std::result::Result<Self, String> {
         let host = input.host.trim().to_string();
         if host.is_empty() {
             return Err("server host must not be empty".to_string());
         }
 
-        let password = normalize_optional_string(input.password).or(fallback_password);
+        let password = normalize_optional_string(input.password)
+            .or_else(|| fallback.and_then(|server| server.password.clone()));
+        let max_download_speed = input
+            .max_download_speed
+            .or_else(|| fallback.map(|server| server.max_download_speed))
+            .unwrap_or(0);
+        if max_download_speed > weaver_server_core::servers::MAX_PERSISTED_SERVER_DOWNLOAD_BYTES {
+            return Err("server max download speed exceeds database range".to_string());
+        }
+        let download_quota = input
+            .download_quota
+            .map(weaver_server_core::servers::ServerDownloadQuotaConfig::try_from)
+            .transpose()?
+            .or_else(|| fallback.map(|server| server.download_quota.clone()))
+            .unwrap_or_default();
 
         Ok(Self {
             host,
@@ -246,6 +393,8 @@ impl NormalizedServerInput {
             priority: input.priority,
             backfill: input.backfill,
             retention_days: input.retention_days,
+            max_download_speed,
+            download_quota,
             tls_ca_cert: normalize_optional_string(input.tls_ca_cert).map(PathBuf::from),
         })
     }
@@ -264,6 +413,8 @@ impl NormalizedServerInput {
             priority: self.priority as u32,
             backfill: self.backfill,
             retention_days: self.retention_days,
+            max_download_speed: self.max_download_speed,
+            download_quota: self.download_quota.clone(),
             tls_ca_cert: self.tls_ca_cert.clone(),
         }
     }
@@ -301,6 +452,7 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use tokio::sync::{RwLock, oneshot};
@@ -325,8 +477,70 @@ mod tests {
             isp_bandwidth_cap: None,
             ip_replacement_trial_extra_connections: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
             config_path: None,
         }))
+    }
+
+    fn inactive_server_input() -> ServerInput {
+        ServerInput {
+            host: "news.example.com".to_string(),
+            port: 119,
+            tls: false,
+            username: None,
+            password: None,
+            connections: 4,
+            active: false,
+            priority: 0,
+            backfill: false,
+            retention_days: 0,
+            max_download_speed: None,
+            download_quota: None,
+            tls_ca_cert: None,
+        }
+    }
+
+    #[test]
+    fn normalization_rejects_download_limits_outside_database_range() {
+        let mut input = inactive_server_input();
+        input.max_download_speed =
+            Some(weaver_server_core::servers::MAX_PERSISTED_SERVER_DOWNLOAD_BYTES + 1);
+        let error = NormalizedServerInput::from_input(input, None)
+            .err()
+            .expect("out-of-range speed should be rejected");
+        assert!(error.contains("max download speed exceeds database range"));
+
+        let mut input = inactive_server_input();
+        input.download_quota = Some(crate::servers::types::ServerDownloadQuotaInput {
+            enabled: false,
+            limit_bytes: weaver_server_core::servers::MAX_PERSISTED_SERVER_DOWNLOAD_BYTES + 1,
+            period: crate::servers::types::ServerDownloadQuotaPeriodGql::OneTime,
+            reset_time_minutes_local: 0,
+            weekly_reset_weekday: crate::servers::types::ServerDownloadQuotaWeekdayGql::Mon,
+            monthly_reset_day: 1,
+        });
+        let error = NormalizedServerInput::from_input(input, None)
+            .err()
+            .expect("out-of-range quota should be rejected");
+        assert!(error.contains("download quota limit exceeds database range"));
+    }
+
+    #[tokio::test]
+    async fn post_commit_policy_failure_still_rebuilds_runtime() {
+        let rebuilt = Arc::new(AtomicBool::new(false));
+        let rebuilt_in_future = Arc::clone(&rebuilt);
+
+        complete_post_commit_runtime_update(
+            "test_server_change",
+            7,
+            Err::<(), _>("usage persistence unavailable"),
+            async move {
+                rebuilt_in_future.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert!(rebuilt.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -358,6 +572,9 @@ mod tests {
                             priority: 0,
                             backfill: false,
                             retention_days: 0,
+                            max_download_speed: 0,
+                            download_quota:
+                                weaver_server_core::servers::ServerDownloadQuotaConfig::default(),
                             tls_ca_cert: None,
                         });
                     },

@@ -12,6 +12,7 @@ mod progress;
 mod repair;
 
 pub(crate) use orchestrator::check_disk_space;
+pub(crate) use orchestrator::{close_cached_write_handles_under, release_cached_write_handle};
 #[cfg(test)]
 use orchestrator::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};
 use orchestrator::{is_terminal_status, write_segment_to_disk, write_segments_to_disk};
@@ -781,6 +782,7 @@ pub(super) enum DownloadPayload {
 pub(super) enum DownloadFailureKind {
     ArticleNotFound,
     CapacityUnavailable,
+    ServerQuota,
     LaneUnavailable,
     Unrequested,
     Transient,
@@ -792,6 +794,8 @@ pub(super) enum DownloadFailureKind {
 pub(super) struct DownloadFailure {
     pub(super) kind: DownloadFailureKind,
     pub(super) message: String,
+    pub(super) retry_after: Option<Duration>,
+    pub(super) quota_rejection: Option<weaver_nntp::transfer::QuotaRejection>,
 }
 
 impl DownloadFailure {
@@ -799,6 +803,23 @@ impl DownloadFailure {
         Self {
             kind,
             message: message.into(),
+            retry_after: None,
+            quota_rejection: None,
+        }
+    }
+
+    pub(super) fn server_quota(
+        message: impl Into<String>,
+        rejection: weaver_nntp::transfer::QuotaRejection,
+    ) -> Self {
+        let retry_after = rejection
+            .retry_at
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        Self {
+            kind: DownloadFailureKind::ServerQuota,
+            message: message.into(),
+            retry_after,
+            quota_rejection: Some(rejection),
         }
     }
 
@@ -811,6 +832,9 @@ impl DownloadFailure {
                 "failed to acquire BODY lane",
             );
         };
+        if let NntpError::QuotaBlocked(rejection) = error {
+            return Self::server_quota(error.to_string(), rejection.as_ref().clone());
+        }
 
         let kind = match error {
             NntpError::AuthenticationFailed
@@ -831,6 +855,13 @@ impl DownloadFailure {
 
     pub(super) fn from_nntp(error: weaver_nntp::NntpError) -> Self {
         use weaver_nntp::NntpError;
+
+        if let NntpError::QuotaBlocked(rejection) = &error {
+            return Self::server_quota(error.to_string(), rejection.as_ref().clone());
+        }
+        if matches!(&error, NntpError::BodyNotRequestedDueToQuota { .. }) {
+            return Self::new(DownloadFailureKind::Unrequested, error.to_string());
+        }
 
         let kind = match &error {
             NntpError::ArticleNotFound
@@ -1104,6 +1135,9 @@ pub(super) struct MoveToCompleteDone {
 pub(super) struct DecodeResult {
     pub(super) segment_id: SegmentId,
     pub(super) raw_size: u64,
+    /// Present only when this successful decode lacked an independently
+    /// verified yEnc part CRC. Keeps provenance off the verified hot path.
+    pub(super) unverified_provenance: Option<Box<UnverifiedSegmentProvenance>>,
     pub(super) file_offset: u64,
     pub(super) decoded_size: u32,
     pub(super) crc_valid: bool,
@@ -1113,6 +1147,19 @@ pub(super) struct DecodeResult {
     pub(super) data: DecodedChunk,
     /// Original filename from the yEnc header (for swap detection observability).
     pub(super) yenc_name: String,
+}
+
+#[derive(Debug)]
+pub(super) struct UnverifiedSegmentProvenance {
+    pub(super) source_server_idx: Option<usize>,
+    pub(super) exclude_servers: Vec<usize>,
+}
+
+#[derive(Debug)]
+pub(super) struct FileCrcRecoveryState {
+    pub(super) pending_segments: HashSet<SegmentId>,
+    pub(super) expected_crc: u32,
+    pub(super) last_actual_crc: u32,
 }
 
 /// Completion of a decode task, including explicit failures so backlog
@@ -1463,6 +1510,9 @@ pub struct Pipeline {
     pub(super) metrics: Arc<PipelineMetrics>,
     /// Per-job state.
     pub(super) jobs: HashMap<JobId, JobState>,
+    /// Typed terminal provenance retained until the ordered history archive has
+    /// durably updated duplicate-promotion eligibility.
+    pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,
     /// Winning archive password candidate per job/RAR set, kept process-local and redacted.
     pub(super) archive_password_winners: HashMap<(JobId, String), ArchivePasswordCandidate>,
     /// Job dispatch order (FIFO by submission). First Downloading job is active.
@@ -1538,6 +1588,8 @@ pub struct Pipeline {
     pub(super) pending_retries_by_job: HashMap<JobId, usize>,
     /// Delayed retry tasks by exact segment.
     pub(super) pending_retries_by_segment: HashMap<SegmentId, usize>,
+    /// Work parked specifically on per-server quota capacity or policy changes.
+    pub(super) server_quota_parked: HashSet<SegmentId>,
     /// Directory for active downloads (per-job subdirectories).
     pub(super) intermediate_dir: PathBuf,
     /// Directory for completed downloads (category subdirectories).
@@ -1662,6 +1714,12 @@ pub struct Pipeline {
     /// mismatch), the segment is re-downloaded. After `MAX_SEGMENT_RETRIES` decode
     /// failures, the segment is marked permanently failed.
     pub(super) decode_retries: HashMap<SegmentId, u32>,
+    /// Successfully decoded segments whose yEnc part CRC was absent. These are
+    /// targeted for replacement only if the completed file CRC proves corruption.
+    pub(super) unverified_segments: HashMap<NzbFileId, HashMap<u32, UnverifiedSegmentProvenance>>,
+    /// Completed files currently replacing unverified segments after a whole-file
+    /// CRC mismatch. Final verification waits for the entire batch.
+    pub(super) file_crc_recoveries: HashMap<NzbFileId, FileCrcRecoveryState>,
     /// Archives with in-flight extraction tasks (spawned but not yet completed).
     /// Prevents duplicate spawns and ensures cleanup waits for extraction to finish.
     pub(super) inflight_extractions: HashMap<JobId, HashSet<String>>,
@@ -1671,8 +1729,6 @@ pub struct Pipeline {
     pub(super) phase_progress_snapshots: HashMap<JobId, Vec<JobPhaseProgress>>,
     /// Per-job queue-event coalescing state for sampled phase progress.
     pub(super) phase_publish_state: HashMap<JobId, progress::PhasePublishState>,
-    /// Extraction member totals already reserved into the live Extracting phase.
-    pub(super) phase_extraction_member_totals: HashSet<(JobId, String, String)>,
     /// Cached per-job retention exclusions (pool server indices whose
     /// retention window is older than the job). TTL'd; cleared on NNTP
     /// client rebuilds and job removal.

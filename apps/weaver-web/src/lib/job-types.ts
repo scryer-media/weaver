@@ -59,6 +59,16 @@ export interface JobPhaseProgressData {
   updatedAtEpochMs: number;
 }
 
+export interface DuplicateSummaryData {
+  lifecycle: string;
+  action: string;
+  primaryReason?: string | null;
+  semantic?: {
+    score: number;
+    state: string;
+  } | null;
+}
+
 export interface JobData {
   id: number;
   name: string;
@@ -83,6 +93,7 @@ export interface JobData {
   outputDir?: string | null;
   metadata: { key: string; value: string }[];
   deleteOperation?: DeleteOperationData | null;
+  duplicateSummary?: DuplicateSummaryData | null;
 }
 
 export interface GraphqlJobData extends Omit<JobData, "progress" | "phaseProgress" | "createdAt" | "completedAt" | "metadata"> {

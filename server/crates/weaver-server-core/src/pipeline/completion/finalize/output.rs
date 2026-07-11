@@ -121,6 +121,10 @@ async fn run_move_to_complete(
     dest: PathBuf,
     phase_counters: Arc<PhaseCounters>,
 ) -> Result<MoveToCompleteResult, String> {
+    // Every cached disk write handle under the working dir must be closed
+    // before its files are renamed or moved.
+    crate::pipeline::close_cached_write_handles_under(&working_dir).await;
+
     // Verify at least one source directory exists before creating
     // the destination, so a missing source doesn't leave behind an
     // empty complete dir.

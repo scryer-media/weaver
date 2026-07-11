@@ -1,6 +1,7 @@
 [package]
 name = "weaver-nntp"
 description = "Async NNTP protocol client with TLS and connection pooling"
+publish = false
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
@@ -37,4 +38,8 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "
 
 [[bench]]
 name = "multiline_decode"
+harness = false
+
+[[bench]]
+name = "transfer_policy"
 harness = false

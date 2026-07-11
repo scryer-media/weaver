@@ -40,7 +40,7 @@ type GeneralSettings = {
 };
 
 type DownloadBlock = {
-  kind: "NONE" | "MANUAL_PAUSE" | "ISP_CAP";
+  kind: "NONE" | "MANUAL_PAUSE" | "SCHEDULED" | "ISP_CAP" | "SERVER_QUOTA";
   capEnabled: boolean;
   usedBytes: number;
   limitBytes: number;
@@ -107,6 +107,13 @@ export function BandwidthCapSettingsPage() {
   >("MON");
   const [capMonthlyResetDay, setCapMonthlyResetDay] = useState(1);
   const [settingsSaved, setSettingsSaved] = useState(false);
+  const capMonthlyResetDayValid = Number.isInteger(capMonthlyResetDay)
+    && capMonthlyResetDay >= 1
+    && capMonthlyResetDay <= 31;
+  const normalizedCapMonthlyResetDay = Math.min(
+    31,
+    Math.max(1, Math.trunc(Number.isFinite(capMonthlyResetDay) ? capMonthlyResetDay : 1)),
+  );
 
   useEffect(() => {
     if (data?.settings) {
@@ -140,6 +147,7 @@ export function BandwidthCapSettingsPage() {
   }, [updateState.data, reexecuteQuery]);
 
   const persistSettings = async () => {
+    if (capPeriod === "MONTHLY" && !capMonthlyResetDayValid) return;
     await updateSettings({
       input: {
         ispBandwidthCap: {
@@ -148,15 +156,18 @@ export function BandwidthCapSettingsPage() {
           limitBytes: displayToBytes(capLimitValue, capLimitUnit),
           resetTimeMinutesLocal: timeInputToMinutes(capResetTime),
           weeklyResetWeekday: capWeeklyResetWeekday,
-          monthlyResetDay: capMonthlyResetDay,
+          monthlyResetDay: normalizedCapMonthlyResetDay,
         },
       },
     });
   };
 
   const downloadBlock = data?.globalState?.downloadBlock;
-  const capResetAt = downloadBlock?.windowEndsAtEpochMs
-    ? new Date(downloadBlock.windowEndsAtEpochMs).toLocaleString([], {
+  // SERVER_QUOTA carries placeholder ISP-cap counters. Do not present them as
+  // authoritative usage for the global ISP window.
+  const ispDownloadBlock = downloadBlock?.kind === "SERVER_QUOTA" ? null : downloadBlock;
+  const capResetAt = ispDownloadBlock?.windowEndsAtEpochMs
+    ? new Date(ispDownloadBlock.windowEndsAtEpochMs).toLocaleString([], {
         month: "short",
         day: "numeric",
         hour: "numeric",
@@ -164,12 +175,12 @@ export function BandwidthCapSettingsPage() {
       })
     : "\u2014";
 
-  const usageFillPct = downloadBlock?.capEnabled
+  const usageFillPct = ispDownloadBlock?.capEnabled
     ? Math.min(
         100,
         Math.max(
           0,
-          ((downloadBlock?.usedBytes ?? 0) / Math.max(downloadBlock?.limitBytes ?? 1, 1)) * 100,
+          ((ispDownloadBlock.usedBytes ?? 0) / Math.max(ispDownloadBlock.limitBytes ?? 1, 1)) * 100,
         ),
       )
     : 0;
@@ -190,7 +201,7 @@ export function BandwidthCapSettingsPage() {
       <SectionCard title={t("settings.bandwidthCapCurrentWindow")}>
         <div className="text-xs text-muted-foreground">
           {t("settings.bandwidthCapTimezone", {
-            timezone: downloadBlock?.timezoneName ?? "\u2014",
+            timezone: ispDownloadBlock?.timezoneName ?? "\u2014",
           })}
         </div>
         <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
@@ -199,7 +210,7 @@ export function BandwidthCapSettingsPage() {
               {t("settings.bandwidthCapUsed")}
             </div>
             <div className="mt-1 text-base font-semibold text-foreground">
-              {formatBytes(downloadBlock?.usedBytes ?? 0)}
+              {ispDownloadBlock ? formatBytes(ispDownloadBlock.usedBytes) : "\u2014"}
             </div>
           </div>
           <div>
@@ -207,8 +218,8 @@ export function BandwidthCapSettingsPage() {
               {t("settings.bandwidthCapRemaining")}
             </div>
             <div className="mt-1 text-base font-semibold text-foreground">
-              {downloadBlock?.capEnabled
-                ? formatBytes(downloadBlock?.remainingBytes ?? 0)
+              {ispDownloadBlock?.capEnabled
+                ? formatBytes(ispDownloadBlock.remainingBytes)
                 : "\u2014"}
             </div>
           </div>
@@ -217,8 +228,8 @@ export function BandwidthCapSettingsPage() {
               {t("settings.bandwidthCapLimit")}
             </div>
             <div className="mt-1 text-base font-semibold text-foreground">
-              {downloadBlock?.capEnabled
-                ? formatBytes(downloadBlock?.limitBytes ?? 0)
+              {ispDownloadBlock?.capEnabled
+                ? formatBytes(ispDownloadBlock.limitBytes)
                 : "\u2014"}
             </div>
           </div>
@@ -231,11 +242,18 @@ export function BandwidthCapSettingsPage() {
             </div>
           </div>
         </div>
-        <div className="mt-4 h-2 overflow-hidden rounded-pill bg-muted">
+        <div
+          className="mt-4 h-2 overflow-hidden rounded-pill bg-muted"
+          role="progressbar"
+          aria-label={t("settings.bandwidthCapUsed")}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={ispDownloadBlock?.capEnabled ? Math.round(usageFillPct) : undefined}
+        >
           <div
             className={cn("h-full transition-all", usageBarClass)}
             style={{
-              width: downloadBlock?.capEnabled ? `${usageFillPct}%` : "0%",
+              width: ispDownloadBlock?.capEnabled ? `${usageFillPct}%` : "0%",
             }}
           />
         </div>
@@ -348,19 +366,29 @@ export function BandwidthCapSettingsPage() {
                 description={t("settings.bandwidthCapMonthlyDayDesc")}
               >
                 <Input
+                  id="bandwidth-cap-monthly-reset-day"
                   type="number"
                   min={1}
                   max={31}
+                  step={1}
                   value={capMonthlyResetDay}
                   onChange={(event) => setCapMonthlyResetDay(Number(event.target.value))}
+                  aria-label={t("settings.bandwidthCapMonthlyDay")}
+                  aria-invalid={!capMonthlyResetDayValid}
                   className="max-w-32"
                 />
+                {!capMonthlyResetDayValid ? (
+                  <p className="text-xs text-destructive">{t("servers.monthDayValidation")}</p>
+                ) : null}
               </SettingField>
             ) : null}
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            <Button onClick={() => void persistSettings()} disabled={updateState.fetching}>
+            <Button
+              onClick={() => void persistSettings()}
+              disabled={updateState.fetching || (capPeriod === "MONTHLY" && !capMonthlyResetDayValid)}
+            >
               {t("settings.save")}
             </Button>
             {settingsSaved ? (

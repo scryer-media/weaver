@@ -7,6 +7,7 @@ use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 #[cfg(not(windows))]
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
@@ -34,9 +35,52 @@ use crate::tls::{
     NntpTlsBackend, RustlsSession, TLS_READ_BUFFER, TransportReadStats, build_tls_config,
     make_server_name, selected_blocking_tls_backend,
 };
+use crate::transfer::{
+    ActiveTransferBudget, BodyTransferAccounting, ServerTransferControl, StableServerId,
+};
 use crate::types::{ArticleId, Capabilities, Response};
 
 const MIN_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(not(windows))]
+const S2N_BLOCKING_IO_SLICE: Duration = Duration::from_millis(100);
+
+fn active_transfer_timeout(budget: &ActiveTransferBudget) -> NntpError {
+    NntpError::SoftTimeout(budget.limit().as_secs())
+}
+
+fn active_transfer_read_timeout(
+    command_timeout: Duration,
+    budget: Option<&ActiveTransferBudget>,
+) -> Result<(Duration, bool)> {
+    let Some(budget) = budget else {
+        return Ok((command_timeout, false));
+    };
+    let remaining = budget.remaining();
+    if remaining.is_zero() {
+        return Err(active_transfer_timeout(budget));
+    }
+    Ok((command_timeout.min(remaining), remaining <= command_timeout))
+}
+
+fn classify_active_io_error(
+    error: NntpError,
+    active_timeout: bool,
+    budget: Option<&ActiveTransferBudget>,
+) -> NntpError {
+    let timed_out = match &error {
+        NntpError::Timeout => true,
+        NntpError::Io(io_error) => matches!(
+            io_error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ),
+        _ => false,
+    };
+    if active_timeout && budget.is_some_and(|budget| budget.remaining().is_zero() || timed_out) {
+        active_transfer_timeout(budget.expect("active BODY budget is present"))
+    } else {
+        error
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BlockingLaneStats {
@@ -87,10 +131,12 @@ struct RawS2nConnection {
 pub struct BlockingBodyLane {
     conn: BlockingNntpConnection,
     server_id: ServerId,
+    stable_server_id: StableServerId,
     remote_ip: IpAddr,
     mode: BodyLaneMode,
     rtt_ewma: Option<Duration>,
     rtt_samples: VecDeque<Duration>,
+    soft_timeout: Duration,
     _permit: BlockingConnectionPermit,
 }
 
@@ -106,19 +152,36 @@ pub struct BlockingNntpConnection {
     current_group: Option<String>,
     credentials: Option<(String, String)>,
     poisoned: bool,
+    transfer_control: Option<Arc<ServerTransferControl>>,
+    body_accounting: VecDeque<BodyTransferAccounting>,
 }
 
 impl BlockingBodyLane {
+    // These are independent lane identity, transfer policy, address-selection,
+    // group, and ownership inputs at the engine boundary.
+    #[allow(clippy::too_many_arguments)]
     pub fn connect(
         server_id: ServerId,
+        stable_server_id: StableServerId,
+        transfer_control: Option<Arc<ServerTransferControl>>,
         config: &ServerConfig,
         excluded_ips: &[IpAddr],
         address_offset: usize,
         groups: &[String],
+        soft_timeout: Duration,
         permit: BlockingConnectionPermit,
     ) -> Result<Self> {
+        if transfer_control
+            .as_ref()
+            .is_some_and(|control| control.stable_server_id() != stable_server_id)
+        {
+            return Err(NntpError::MalformedResponse(
+                "stable server id does not match transfer control".to_string(),
+            ));
+        }
         let mut conn =
             BlockingNntpConnection::connect_with_ip_policy(config, excluded_ips, address_offset)?;
+        conn.set_transfer_control(transfer_control);
         for group in groups {
             match conn.select_group(group) {
                 Ok(()) => {
@@ -126,10 +189,12 @@ impl BlockingBodyLane {
                     return Ok(Self {
                         conn,
                         server_id,
+                        stable_server_id,
                         remote_ip,
                         mode: BodyLaneMode::Sequential,
                         rtt_ewma: None,
                         rtt_samples: VecDeque::with_capacity(16),
+                        soft_timeout,
                         _permit: permit,
                     });
                 }
@@ -143,10 +208,12 @@ impl BlockingBodyLane {
             Ok(Self {
                 conn,
                 server_id,
+                stable_server_id,
                 remote_ip,
                 mode: BodyLaneMode::Sequential,
                 rtt_ewma: None,
                 rtt_samples: VecDeque::with_capacity(16),
+                soft_timeout,
                 _permit: permit,
             })
         } else {
@@ -156,6 +223,10 @@ impl BlockingBodyLane {
 
     pub fn server_id(&self) -> ServerId {
         self.server_id
+    }
+
+    pub fn stable_server_id(&self) -> StableServerId {
+        self.stable_server_id
     }
 
     pub fn remote_ip(&self) -> IpAddr {
@@ -179,17 +250,39 @@ impl BlockingBodyLane {
     }
 
     pub fn fetch_decoded_sequential(&mut self, message_id: &str) -> DecodedBodyTrace {
+        self.fetch_decoded_sequential_with_estimate(message_id, 0)
+    }
+
+    pub fn fetch_decoded_sequential_with_estimate(
+        &mut self,
+        message_id: &str,
+        estimated_body_bytes: u64,
+    ) -> DecodedBodyTrace {
         self.mode = BodyLaneMode::Sequential;
         let started = Instant::now();
-        let result = self.read_decoded_body(message_id);
+        let result = self.read_decoded_body(message_id, estimated_body_bytes);
         let elapsed = started.elapsed();
-        self.observe_rtt(elapsed);
-        self.trace_item(message_id, elapsed, result)
+        let policy_elapsed = result.as_ref().map_or(elapsed, |decoded| {
+            elapsed.saturating_sub(decoded.io.throttle_wait)
+        });
+        if result.is_ok() {
+            self.observe_rtt(policy_elapsed);
+        }
+        self.trace_item(message_id, policy_elapsed, result)
     }
 
     pub fn fetch_decoded_pipeline(
         &mut self,
         message_ids: &[String],
+        max_depth: usize,
+    ) -> Vec<(usize, DecodedBodyTrace, BodyLaneTraceMeta)> {
+        self.fetch_decoded_pipeline_with_estimates(message_ids, &[], max_depth)
+    }
+
+    pub fn fetch_decoded_pipeline_with_estimates(
+        &mut self,
+        message_ids: &[String],
+        estimated_body_bytes: &[u64],
         max_depth: usize,
     ) -> Vec<(usize, DecodedBodyTrace, BodyLaneTraceMeta)> {
         self.mode = match max_depth {
@@ -198,21 +291,39 @@ impl BlockingBodyLane {
             _ => BodyLaneMode::PipelineDepth4,
         };
 
-        let requested = message_ids.len().min(max_depth);
-        if requested == 0 {
+        let offered = message_ids.len().min(max_depth);
+        if offered == 0 {
             return Vec::new();
         }
 
-        let mut out = Vec::with_capacity(requested);
+        let mut out = Vec::with_capacity(offered);
         let mut batch_clean = true;
+        let mut requested = 0usize;
+        let mut quota_rejection = None;
         let request_error = (|| {
-            for message_id in &message_ids[..requested] {
-                self.conn.write_body_request(message_id)?;
+            for (idx, message_id) in message_ids[..offered].iter().enumerate() {
+                let estimate = estimated_body_bytes.get(idx).copied().unwrap_or(0);
+                match self
+                    .conn
+                    .write_body_request_with_estimate(message_id, estimate)
+                {
+                    Ok(()) => requested += 1,
+                    Err(NntpError::QuotaBlocked(rejection)) => {
+                        quota_rejection = Some((idx, rejection));
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-            self.conn.flush_commands()
+            if requested > 0 {
+                self.conn.flush_commands()
+            } else {
+                Ok(())
+            }
         })();
 
         if let Err(error) = request_error {
+            self.conn.fail_body_pipeline();
             let elapsed = Duration::ZERO;
             for (idx, message_id) in message_ids.iter().take(requested).enumerate() {
                 let is_last = idx + 1 == requested;
@@ -245,13 +356,20 @@ impl BlockingBodyLane {
                 self.read_next_decoded_body()
             };
             let elapsed = started.elapsed();
-            self.observe_rtt(elapsed);
-            if matches!(result, Err(DecodedBodyError::Nntp(ref e)) if is_connection_error(e)) {
+            let policy_elapsed = result.as_ref().map_or(elapsed, |decoded| {
+                elapsed.saturating_sub(decoded.io.throttle_wait)
+            });
+            if result.is_ok() {
+                self.observe_rtt(policy_elapsed);
+            }
+            if self.conn.poisoned
+                || matches!(result, Err(DecodedBodyError::Nntp(ref e)) if is_connection_error(e))
+            {
                 closed_early = true;
             }
-            let trace = self.trace_item(message_id, elapsed, result);
+            let trace = self.trace_item(message_id, policy_elapsed, result);
             batch_clean &= trace.result.is_ok();
-            let is_complete = closed_early || idx + 1 == requested;
+            let is_complete = closed_early || (idx + 1 == requested && quota_rejection.is_none());
             out.push((
                 idx,
                 trace,
@@ -269,18 +387,68 @@ impl BlockingBodyLane {
             ));
         }
 
+        if let Some((quota_idx, source)) = quota_rejection {
+            for (tail_idx, message_id) in
+                message_ids.iter().enumerate().take(offered).skip(quota_idx)
+            {
+                let estimate = estimated_body_bytes.get(tail_idx).copied().unwrap_or(0);
+                let error = if tail_idx == quota_idx {
+                    NntpError::QuotaBlocked(source.clone())
+                } else if let Some(rejection) = self
+                    .conn
+                    .transfer_control
+                    .as_ref()
+                    .and_then(|control| control.quota_rejection_for(estimate))
+                {
+                    NntpError::quota_blocked(rejection)
+                } else {
+                    NntpError::BodyNotRequestedDueToQuota {
+                        preceding_rejection: source.clone(),
+                        requested_body_bytes: estimate,
+                    }
+                };
+                let trace = self.trace_item(
+                    message_id,
+                    Duration::ZERO,
+                    Err(DecodedBodyError::Nntp(error)),
+                );
+                let batch_complete = !closed_early && tail_idx + 1 == offered;
+                out.push((
+                    tail_idx,
+                    trace,
+                    BodyLaneTraceMeta {
+                        batch_complete,
+                        batch_clean: batch_clean && !closed_early,
+                        batch_response_count: if batch_complete { requested as u64 } else { 0 },
+                        unresolved_count: 0,
+                        connection_discarded: closed_early,
+                    },
+                ));
+            }
+        }
+
         out
     }
 
     pub fn park(mut self) {
-        let _ = self.conn.quit();
+        if self.conn.body_accounting.is_empty() {
+            let _ = self.conn.quit();
+        } else {
+            self.conn.fail_body_pipeline();
+        }
     }
 
     fn read_decoded_body(
         &mut self,
         message_id: &str,
+        estimated_body_bytes: u64,
     ) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        match self.conn.stream_yenc_article(message_id) {
+        let mut budget = ActiveTransferBudget::new(self.soft_timeout);
+        match self.conn.stream_yenc_article_with_active_budget(
+            message_id,
+            estimated_body_bytes,
+            &mut budget,
+        ) {
             Ok(article) => Ok(decoded_body_from_article(article)),
             Err(FusedYencError::Yenc(error)) => {
                 Err(DecodedBodyError::Decode { raw_size: 0, error })
@@ -290,7 +458,11 @@ impl BlockingBodyLane {
     }
 
     fn read_next_decoded_body(&mut self) -> std::result::Result<DecodedBody, DecodedBodyError> {
-        match self.conn.stream_next_yenc_article() {
+        let mut budget = ActiveTransferBudget::new(self.soft_timeout);
+        match self
+            .conn
+            .stream_next_yenc_article_with_active_budget(&mut budget)
+        {
             Ok(article) => Ok(decoded_body_from_article(article)),
             Err(FusedYencError::Yenc(error)) => {
                 Err(DecodedBodyError::Decode { raw_size: 0, error })
@@ -314,6 +486,14 @@ impl BlockingBodyLane {
             )) => (
                 FetchAttemptOutcome::NotFound,
                 Some("article not found".to_string()),
+            ),
+            Err(DecodedBodyError::Nntp(NntpError::QuotaBlocked(_))) => (
+                FetchAttemptOutcome::QuotaBlocked,
+                Some("server download quota blocked".to_string()),
+            ),
+            Err(DecodedBodyError::Nntp(NntpError::BodyNotRequestedDueToQuota { .. })) => (
+                FetchAttemptOutcome::QuotaUnrequested,
+                Some("BODY was not issued after quota rejection".to_string()),
             ),
             Err(DecodedBodyError::Nntp(
                 NntpError::AuthenticationFailed
@@ -461,6 +641,8 @@ impl BlockingNntpConnection {
             current_group: None,
             credentials: None,
             poisoned: false,
+            transfer_control: None,
+            body_accounting: VecDeque::new(),
         };
 
         let greeting = conn.read_response()?;
@@ -534,14 +716,69 @@ impl BlockingNntpConnection {
         }
     }
 
+    fn authenticate_with_active_budget(
+        &mut self,
+        username: &str,
+        password: &str,
+        budget: Option<&ActiveTransferBudget>,
+    ) -> Result<()> {
+        let user_resp = self.send_command_with_active_budget(
+            &Command::AuthInfoUser(username.to_string()),
+            budget,
+        )?;
+        match user_resp.code.raw() {
+            281 => return Ok(()),
+            381 => {}
+            _ => return Err(NntpError::from_status(user_resp.code, &user_resp.message)),
+        }
+
+        let pass_resp = self.send_command_with_active_budget(
+            &Command::AuthInfoPass(password.to_string()),
+            budget,
+        )?;
+        match pass_resp.code.raw() {
+            281 => Ok(()),
+            481 => Err(NntpError::AuthenticationFailed),
+            482 => Err(NntpError::AuthenticationRejected),
+            _ => Err(NntpError::from_status(pass_resp.code, &pass_resp.message)),
+        }
+    }
+
     fn write_command_frame(&mut self, cmd: &Command) -> Result<()> {
+        self.write_command_frame_with_timeout(cmd, self.command_timeout)
+    }
+
+    fn write_command_frame_with_timeout(&mut self, cmd: &Command, timeout: Duration) -> Result<()> {
         let encoded = cmd.encode();
-        self.transport.write_all(&encoded, self.command_timeout)?;
+        self.transport.write_all(&encoded, timeout)?;
         Ok(())
     }
 
+    fn write_command_frame_with_active_budget(
+        &mut self,
+        cmd: &Command,
+        budget: Option<&ActiveTransferBudget>,
+    ) -> Result<()> {
+        let (timeout, active_timeout) = active_transfer_read_timeout(self.command_timeout, budget)?;
+        self.write_command_frame_with_timeout(cmd, timeout)
+            .map_err(|error| classify_active_io_error(error, active_timeout, budget))
+    }
+
     pub fn flush_commands(&mut self) -> Result<()> {
-        self.transport.flush(self.command_timeout)
+        self.flush_commands_with_timeout(self.command_timeout)
+    }
+
+    fn flush_commands_with_timeout(&mut self, timeout: Duration) -> Result<()> {
+        self.transport.flush(timeout)
+    }
+
+    fn flush_commands_with_active_budget(
+        &mut self,
+        budget: Option<&ActiveTransferBudget>,
+    ) -> Result<()> {
+        let (timeout, active_timeout) = active_transfer_read_timeout(self.command_timeout, budget)?;
+        self.flush_commands_with_timeout(timeout)
+            .map_err(|error| classify_active_io_error(error, active_timeout, budget))
     }
 
     pub fn send_command(&mut self, cmd: &Command) -> Result<Response> {
@@ -550,13 +787,118 @@ impl BlockingNntpConnection {
         self.read_response()
     }
 
+    fn send_command_with_active_budget(
+        &mut self,
+        cmd: &Command,
+        budget: Option<&ActiveTransferBudget>,
+    ) -> Result<Response> {
+        self.write_command_frame_with_active_budget(cmd, budget)?;
+        self.flush_commands_with_active_budget(budget)?;
+        self.read_response_with_active_budget(budget)
+    }
+
     pub fn write_body_request(&mut self, message_id: &str) -> Result<()> {
+        self.write_body_request_with_estimate(message_id, 0)
+    }
+
+    pub fn write_body_request_with_estimate(
+        &mut self,
+        message_id: &str,
+        estimated_body_bytes: u64,
+    ) -> Result<()> {
+        self.reserve_body(estimated_body_bytes)?;
         let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
-        self.write_command_frame(&cmd)
+        if let Err(error) = self.write_command_frame(&cmd) {
+            self.body_accounting.pop_back();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn set_transfer_control(&mut self, control: Option<Arc<ServerTransferControl>>) {
+        debug_assert!(self.body_accounting.is_empty());
+        self.transfer_control = control;
+    }
+
+    fn reserve_body(&mut self, estimated_body_bytes: u64) -> Result<()> {
+        if let Some(control) = &self.transfer_control {
+            self.body_accounting.push_back(
+                control
+                    .start_body(estimated_body_bytes)
+                    .map_err(NntpError::quota_blocked)?,
+            );
+        }
+        Ok(())
+    }
+
+    fn charge_active_body(&mut self, bytes: usize) -> Duration {
+        match self.body_accounting.front_mut() {
+            Some(BodyTransferAccounting::Unlimited) => {
+                if let Some(control) = &self.transfer_control {
+                    control.record_unlimited_body_bytes(bytes);
+                }
+                Duration::ZERO
+            }
+            Some(BodyTransferAccounting::Tracked(permit)) => permit.record_blocking(bytes),
+            None => Duration::ZERO,
+        }
+    }
+
+    fn charge_active_body_without_wait(&mut self, bytes: usize) {
+        match self.body_accounting.front_mut() {
+            Some(BodyTransferAccounting::Unlimited) => {
+                if let Some(control) = &self.transfer_control {
+                    control.record_unlimited_body_bytes(bytes);
+                }
+            }
+            Some(BodyTransferAccounting::Tracked(permit)) => {
+                permit.record_without_wait(bytes);
+            }
+            None => {}
+        }
+    }
+
+    fn finish_active_body(&mut self) {
+        if let Some(BodyTransferAccounting::Tracked(permit)) = self.body_accounting.pop_front() {
+            permit.finish();
+        }
+    }
+
+    fn abort_active_body(&mut self) {
+        self.body_accounting.pop_front();
+    }
+
+    fn abort_all_bodies(&mut self) {
+        self.body_accounting.clear();
+    }
+
+    fn fail_body_pipeline(&mut self) {
+        self.poisoned = true;
+        self.current_group = None;
+        self.abort_all_bodies();
+    }
+
+    fn poison_on_soft_timeout(&mut self, error: &NntpError) {
+        if matches!(error, NntpError::SoftTimeout(_)) {
+            self.poisoned = true;
+            self.current_group = None;
+        }
     }
 
     fn read_response(&mut self) -> Result<Response> {
         match self.read_frame()? {
+            NntpFrame::Line(line) => parse_response(&line),
+            NntpFrame::MultiLineData(_) => Err(NntpError::MalformedResponse(
+                "expected single-line response, got multi-line data".into(),
+            )),
+        }
+    }
+
+    fn read_response_with_active_budget(
+        &mut self,
+        budget: Option<&ActiveTransferBudget>,
+    ) -> Result<Response> {
+        match self.read_frame_with_active_budget(budget)? {
             NntpFrame::Line(line) => parse_response(&line),
             NntpFrame::MultiLineData(_) => Err(NntpError::MalformedResponse(
                 "expected single-line response, got multi-line data".into(),
@@ -570,6 +912,27 @@ impl BlockingNntpConnection {
                 return Ok(frame);
             }
             self.read_into_buffer()?;
+        }
+    }
+
+    fn read_frame_with_active_budget(
+        &mut self,
+        budget: Option<&ActiveTransferBudget>,
+    ) -> Result<NntpFrame> {
+        loop {
+            if let Some(budget) = budget
+                && budget.remaining().is_zero()
+            {
+                return Err(active_transfer_timeout(budget));
+            }
+            if let Some(frame) = self.codec.decode(&mut self.read_buf)? {
+                return Ok(frame);
+            }
+            let (timeout, active_timeout) =
+                active_transfer_read_timeout(self.command_timeout, budget)?;
+            if let Err(error) = self.read_into_buffer_with_stats_timeout(timeout) {
+                return Err(classify_active_io_error(error, active_timeout, budget));
+            }
         }
     }
 
@@ -617,53 +980,169 @@ impl BlockingNntpConnection {
         &mut self,
         message_id: &str,
     ) -> std::result::Result<FusedYencArticle, FusedYencError> {
+        self.stream_yenc_article_with_estimate(message_id, 0)
+    }
+
+    pub fn stream_yenc_article_with_estimate(
+        &mut self,
+        message_id: &str,
+        estimated_body_bytes: u64,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError> {
+        self.stream_yenc_article_with_estimate_inner(message_id, estimated_body_bytes, None)
+    }
+
+    fn stream_yenc_article_with_active_budget(
+        &mut self,
+        message_id: &str,
+        estimated_body_bytes: u64,
+        budget: &mut ActiveTransferBudget,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError> {
+        self.stream_yenc_article_with_estimate_inner(message_id, estimated_body_bytes, Some(budget))
+    }
+
+    fn stream_yenc_article_with_estimate_inner(
+        &mut self,
+        message_id: &str,
+        estimated_body_bytes: u64,
+        budget: Option<&mut ActiveTransferBudget>,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError> {
+        self.reserve_body(estimated_body_bytes)?;
         let cmd = Command::Body(ArticleId::MessageId(message_id.to_string()));
-        let initial = self.send_command(&cmd)?;
+        let initial = match self.send_command_with_active_budget(&cmd, budget.as_deref()) {
+            Ok(initial) => initial,
+            Err(error) => {
+                self.poison_on_soft_timeout(&error);
+                self.abort_active_body();
+                return Err(error.into());
+            }
+        };
         let initial = if initial.code.raw() == 480 {
             if let Some((user, pass)) = self.credentials.clone() {
-                self.authenticate(&user, &pass)?;
+                if let Err(error) =
+                    self.authenticate_with_active_budget(&user, &pass, budget.as_deref())
+                {
+                    self.poison_on_soft_timeout(&error);
+                    self.abort_active_body();
+                    return Err(error.into());
+                }
                 self.current_group = None;
-                self.send_command(&cmd)?
+                match self.send_command_with_active_budget(&cmd, budget.as_deref()) {
+                    Ok(initial) => initial,
+                    Err(error) => {
+                        self.poison_on_soft_timeout(&error);
+                        self.abort_active_body();
+                        return Err(error.into());
+                    }
+                }
             } else {
+                self.abort_active_body();
                 return Err(NntpError::AuthenticationRequired.into());
             }
         } else {
             initial
         };
-        self.stream_yenc_article_response(initial)
+        self.stream_yenc_article_response(initial, budget)
     }
 
     pub fn stream_next_yenc_article(
         &mut self,
     ) -> std::result::Result<FusedYencArticle, FusedYencError> {
-        let initial = self.read_response()?;
+        self.stream_next_yenc_article_inner(None)
+    }
+
+    fn stream_next_yenc_article_with_active_budget(
+        &mut self,
+        budget: &mut ActiveTransferBudget,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError> {
+        self.stream_next_yenc_article_inner(Some(budget))
+    }
+
+    fn stream_next_yenc_article_inner(
+        &mut self,
+        budget: Option<&mut ActiveTransferBudget>,
+    ) -> std::result::Result<FusedYencArticle, FusedYencError> {
+        let initial = match self.read_response_with_active_budget(budget.as_deref()) {
+            Ok(initial) => initial,
+            Err(error) => {
+                self.fail_body_pipeline();
+                return Err(error.into());
+            }
+        };
         if initial.code.raw() == 480 {
-            self.poisoned = true;
-            self.current_group = None;
+            self.fail_body_pipeline();
             return Err(NntpError::AuthenticationRequired.into());
         }
-        self.stream_yenc_article_response(initial)
+        self.stream_yenc_article_response(initial, budget)
     }
 
     fn stream_yenc_article_response(
         &mut self,
         initial: Response,
+        mut budget: Option<&mut ActiveTransferBudget>,
     ) -> std::result::Result<FusedYencArticle, FusedYencError> {
-        let mut decoder = FusedYencArticleDecoder::from_body_response(initial)?;
+        let mut decoder = match FusedYencArticleDecoder::from_body_response(initial) {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                if matches!(
+                    &error,
+                    FusedYencError::Nntp(
+                        NntpError::ArticleNotFound
+                            | NntpError::NoSuchArticle { .. }
+                            | NntpError::NoArticleWithNumber
+                    )
+                ) {
+                    self.abort_active_body();
+                } else {
+                    self.fail_body_pipeline();
+                }
+                return Err(error);
+            }
+        };
         decoder.set_profile_cpu(profile_cpu_timings_enabled());
         let mut read_calls = 0u64;
         let mut read_bytes = 0u64;
         let mut transport_read = TransportReadStats::default();
         let mut article_chunks = Vec::new();
+        let mut throttle_wait = Duration::ZERO;
 
         loop {
-            match decoder.decode_available(&mut self.read_buf)? {
-                Some(mut article) => {
+            let payload_before = decoder.body_payload_bytes_consumed();
+            let decoded = decoder.decode_available(&mut self.read_buf);
+            let payload_delta = decoder
+                .body_payload_bytes_consumed()
+                .saturating_sub(payload_before);
+            if let Some(budget) = budget.as_deref()
+                && budget.remaining().is_zero()
+            {
+                self.charge_active_body_without_wait(payload_delta as usize);
+                let error = active_transfer_timeout(budget);
+                self.fail_body_pipeline();
+                return Err(error.into());
+            }
+            let waited = self.charge_active_body(payload_delta as usize);
+            throttle_wait = throttle_wait.saturating_add(waited);
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.exclude_wait(waited);
+            }
+            if let Some(budget) = budget.as_deref()
+                && budget.remaining().is_zero()
+            {
+                let error = active_transfer_timeout(budget);
+                self.fail_body_pipeline();
+                return Err(error.into());
+            }
+            match decoded {
+                Err(error) => {
+                    self.fail_body_pipeline();
+                    return Err(error);
+                }
+                Ok(Some(mut article)) => {
                     let chunks = std::mem::take(&mut article.chunks);
                     article_chunks.extend(chunks);
                     article.stats.read_calls = read_calls;
                     article.stats.read_bytes = read_bytes;
                     article.stats.transport_read = transport_read;
+                    article.stats.throttle_wait = throttle_wait;
                     article.stats.leftover_bytes_after_terminator = self.read_buf.len() as u64;
                     article.stats.output_batches = article_chunks.len() as u64;
                     article.chunks = article_chunks;
@@ -671,14 +1150,30 @@ impl BlockingNntpConnection {
                         lane_stats.body_responses += 1;
                         lane_stats.decoded_articles += 1;
                     }
+                    self.finish_active_body();
                     return Ok(article);
                 }
-                None => {
+                Ok(None) => {
                     article_chunks.extend(decoder.drain_output_chunks());
                 }
             }
 
-            let (n, stats) = self.read_into_buffer_with_stats()?;
+            let (read_timeout, active_timeout) =
+                match active_transfer_read_timeout(self.command_timeout, budget.as_deref()) {
+                    Ok(timeout) => timeout,
+                    Err(error) => {
+                        self.fail_body_pipeline();
+                        return Err(error.into());
+                    }
+                };
+            let (n, stats) = match self.read_into_buffer_with_stats_timeout(read_timeout) {
+                Ok(read) => read,
+                Err(error) => {
+                    let error = classify_active_io_error(error, active_timeout, budget.as_deref());
+                    self.fail_body_pipeline();
+                    return Err(error.into());
+                }
+            };
             read_calls += 1;
             read_bytes += n as u64;
             transport_read.add(stats);
@@ -696,6 +1191,13 @@ impl BlockingNntpConnection {
     }
 
     fn read_into_buffer_with_stats(&mut self) -> Result<(usize, TransportReadStats)> {
+        self.read_into_buffer_with_stats_timeout(self.command_timeout)
+    }
+
+    fn read_into_buffer_with_stats_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(usize, TransportReadStats)> {
         let socket_read_size = self.buffer_profile.socket_read_size.max(64 * 1024);
         if self.read_scratch.len() < socket_read_size {
             self.read_scratch.resize(socket_read_size, 0);
@@ -706,7 +1208,7 @@ impl BlockingNntpConnection {
                 &mut self.read_buf,
                 &mut self.read_scratch,
                 socket_read_size,
-                self.command_timeout,
+                timeout,
             )
             .map_err(|error| {
                 self.poisoned = true;
@@ -922,8 +1424,13 @@ impl BlockingS2nStream {
         ca_cert_path: Option<&std::path::Path>,
         timeout: Duration,
     ) -> Result<Self> {
-        tcp.set_read_timeout(Some(timeout)).map_err(NntpError::Io)?;
-        tcp.set_write_timeout(Some(timeout))
+        // Keep the direct S2N fd blocking for the throughput path, but wake a
+        // stalled syscall often enough for the elapsed operation deadline to
+        // be checked without reconfiguring socket options on every I/O call.
+        let io_slice = timeout.min(S2N_BLOCKING_IO_SLICE);
+        tcp.set_read_timeout(Some(io_slice))
+            .map_err(NntpError::Io)?;
+        tcp.set_write_timeout(Some(io_slice))
             .map_err(NntpError::Io)?;
         tcp.set_nonblocking(false).map_err(NntpError::Io)?;
 
@@ -1351,6 +1858,7 @@ fn decoded_io_from_fused_stats(stats: &FusedYencArticleStats) -> DecodedBodyIo {
         encoded_bytes_consumed: stats.encoded_bytes_consumed,
         decoded_bytes_written: stats.decoded_bytes_written,
         transport_read: stats.transport_read,
+        throttle_wait: stats.throttle_wait,
     }
 }
 
@@ -1399,6 +1907,14 @@ fn clone_nntp_error(error: &NntpError) -> NntpError {
         NntpError::PoolExhausted => NntpError::PoolExhausted,
         NntpError::PoolShutdown => NntpError::PoolShutdown,
         NntpError::SoftTimeout(seconds) => NntpError::SoftTimeout(*seconds),
+        NntpError::QuotaBlocked(rejection) => NntpError::QuotaBlocked(rejection.clone()),
+        NntpError::BodyNotRequestedDueToQuota {
+            preceding_rejection,
+            requested_body_bytes,
+        } => NntpError::BodyNotRequestedDueToQuota {
+            preceding_rejection: preceding_rejection.clone(),
+            requested_body_bytes: *requested_body_bytes,
+        },
         NntpError::UnexpectedResponse { code, message } => NntpError::UnexpectedResponse {
             code: *code,
             message: message.clone(),
@@ -1456,6 +1972,8 @@ mod tests {
 
     enum TestArticle {
         Body(Vec<u8>),
+        DelayedInitial { data: Vec<u8>, delay: Duration },
+        Trickle { data: Vec<u8>, line_delay: Duration },
         Truncated(Vec<u8>),
     }
 
@@ -1463,6 +1981,21 @@ mod tests {
     fn s2n_test_guard() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[cfg(not(windows))]
+    fn assert_s2n_socket_timeout_slice(conn: &BlockingNntpConnection) {
+        let BlockingTransport::S2n(stream) = &conn.transport else {
+            panic!("expected blocking S2N transport");
+        };
+        assert_eq!(
+            stream.tcp.read_timeout().unwrap(),
+            Some(S2N_BLOCKING_IO_SLICE)
+        );
+        assert_eq!(
+            stream.tcp.write_timeout().unwrap(),
+            Some(S2N_BLOCKING_IO_SLICE)
+        );
     }
 
     fn yenc_body(data: &[u8]) -> Vec<u8> {
@@ -1537,7 +2070,10 @@ mod tests {
                 let mut line = String::new();
                 loop {
                     line.clear();
-                    if stream.read_line(&mut line).await.unwrap() == 0 {
+                    let Ok(read) = stream.read_line(&mut line).await else {
+                        break;
+                    };
+                    if read == 0 {
                         break;
                     }
                     let command = line.trim_end_matches(['\r', '\n']);
@@ -1563,6 +2099,40 @@ mod tests {
                                     .unwrap();
                                 stream.get_mut().write_all(&yenc_body(data)).await.unwrap();
                                 stream.get_mut().write_all(b".\r\n").await.unwrap();
+                            }
+                            Some(TestArticle::DelayedInitial { data, delay }) => {
+                                tokio::time::sleep(*delay).await;
+                                if stream
+                                    .get_mut()
+                                    .write_all(
+                                        format!("222 0 {} body follows\r\n", id.trim()).as_bytes(),
+                                    )
+                                    .await
+                                    .is_err()
+                                    || stream.get_mut().write_all(&yenc_body(data)).await.is_err()
+                                    || stream.get_mut().write_all(b".\r\n").await.is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Some(TestArticle::Trickle { data, line_delay }) => {
+                                stream
+                                    .get_mut()
+                                    .write_all(format!("222 0 {} body follows\r\n", id.trim()).as_bytes())
+                                    .await
+                                    .unwrap();
+                                let encoded = yenc_body(data);
+                                for line in encoded.split_inclusive(|byte| *byte == b'\n') {
+                                    tokio::time::sleep(*line_delay).await;
+                                    if stream.get_mut().write_all(line).await.is_err()
+                                        || stream.get_mut().flush().await.is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                if stream.get_mut().write_all(b".\r\n").await.is_err() {
+                                    return;
+                                }
                             }
                             Some(TestArticle::Truncated(data)) => {
                                 stream
@@ -1611,6 +2181,23 @@ mod tests {
             tls_ca_cert: Some(ca_path.clone()),
         };
         (config, handle, ca_path)
+    }
+
+    fn test_transfer_control(
+        stable_id: u32,
+        limit_bytes: u64,
+    ) -> Arc<crate::transfer::ServerTransferControl> {
+        crate::transfer::ServerTransferRegistry::new().configure(
+            StableServerId(stable_id),
+            crate::transfer::ServerTransferConfig {
+                rate_bytes_per_sec: 0,
+                quota: Some(crate::transfer::QuotaRuntimeConfig {
+                    limit_bytes,
+                    generation: 1,
+                    retry_at: None,
+                }),
+            },
+        )
     }
 
     fn connect_with_backend(
@@ -1698,6 +2285,48 @@ mod tests {
         let _ = std::fs::remove_file(ca_path);
     }
 
+    fn tls_pipeline_failure_drains_permits_before_any_reuse(backend: NntpTlsBackend) {
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
+            "<first@test>",
+            TestArticle::Truncated(b"partial".to_vec()),
+        )]);
+        let mut conn = connect_with_backend(&config, backend);
+        let control = test_transfer_control(90, 1_000);
+        conn.set_transfer_control(Some(control.clone()));
+        conn.write_body_request_with_estimate("<first@test>", 400)
+            .unwrap();
+        conn.write_body_request_with_estimate("<second@test>", 400)
+            .unwrap();
+        assert_eq!(conn.body_accounting.len(), 2);
+        assert_eq!(control.snapshot().quota_reserved_bytes, 800);
+        conn.flush_commands().unwrap();
+
+        let error = conn.stream_next_yenc_article().unwrap_err();
+        assert!(matches!(
+            error,
+            FusedYencError::Nntp(NntpError::ServerDisconnectedMidBody)
+                | FusedYencError::Nntp(NntpError::Io(_))
+                | FusedYencError::Nntp(NntpError::ConnectionClosed)
+                | FusedYencError::Nntp(NntpError::TruncatedMultilineBody)
+                | FusedYencError::Yenc(_)
+        ));
+        assert!(conn.poisoned);
+        assert!(conn.body_accounting.is_empty());
+        assert_eq!(control.snapshot().quota_reserved_bytes, 0);
+
+        // Exercise the same queue as a hypothetical reuse guard: after the
+        // failure drain, a fresh reservation must be the only queued permit.
+        conn.reserve_body(200).unwrap();
+        assert_eq!(conn.body_accounting.len(), 1);
+        assert_eq!(control.snapshot().quota_reserved_bytes, 200);
+        conn.abort_all_bodies();
+        assert_eq!(control.snapshot().quota_reserved_bytes, 0);
+
+        drop(conn);
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
+    }
+
     fn tls_lane_reports_truncated_response(backend: NntpTlsBackend) {
         let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
             "<truncated@test>",
@@ -1744,6 +2373,140 @@ mod tests {
         tls_lane_reports_truncated_response(NntpTlsBackend::ManualRustls);
     }
 
+    #[test]
+    fn blocking_rustls_remote_trickle_consumes_active_budget() {
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
+            "<trickle@test>",
+            TestArticle::Trickle {
+                data: vec![b'A'; 2_560],
+                line_delay: Duration::from_millis(20),
+            },
+        )]);
+        let mut conn = connect_with_backend(&config, NntpTlsBackend::ManualRustls);
+        conn.select_group("alt.test").unwrap();
+        let mut budget = ActiveTransferBudget::new(Duration::from_millis(75));
+
+        let error = conn
+            .stream_yenc_article_with_active_budget("<trickle@test>", 0, &mut budget)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FusedYencError::Nntp(NntpError::SoftTimeout(_))
+        ));
+        assert!(conn.poisoned);
+        drop(conn);
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
+    }
+
+    #[test]
+    fn blocking_rustls_delayed_initial_consumes_active_budget() {
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
+            "<delayed@test>",
+            TestArticle::DelayedInitial {
+                data: vec![b'A'; 128],
+                delay: Duration::from_millis(300),
+            },
+        )]);
+        let mut conn = connect_with_backend(&config, NntpTlsBackend::ManualRustls);
+        conn.select_group("alt.test").unwrap();
+        let mut budget = ActiveTransferBudget::new(Duration::from_millis(75));
+
+        let error = conn
+            .stream_yenc_article_with_active_budget("<delayed@test>", 0, &mut budget)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FusedYencError::Nntp(NntpError::SoftTimeout(_))
+        ));
+        assert!(conn.poisoned);
+        drop(conn);
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
+    }
+
+    #[test]
+    fn blocking_rustls_rate_wait_is_excluded_from_active_budget() {
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
+            "<rate-wait@test>",
+            TestArticle::Body(vec![b'A'; 1_200]),
+        )]);
+        let mut conn = connect_with_backend(&config, NntpTlsBackend::ManualRustls);
+        let control = crate::transfer::ServerTransferRegistry::new().configure(
+            StableServerId(104),
+            crate::transfer::ServerTransferConfig {
+                rate_bytes_per_sec: 1_000,
+                quota: None,
+            },
+        );
+        conn.set_transfer_control(Some(control));
+        conn.select_group("alt.test").unwrap();
+        let mut budget = ActiveTransferBudget::new(Duration::from_millis(50));
+
+        let started = Instant::now();
+        let article = conn
+            .stream_yenc_article_with_active_budget("<rate-wait@test>", 0, &mut budget)
+            .expect("deliberate rate wait must not exhaust the active budget");
+
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(article.into_data(), vec![b'A'; 1_200]);
+        conn.quit().unwrap();
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
+    }
+
+    #[test]
+    fn expired_active_budget_does_not_enter_blocking_rate_wait() {
+        let decoded = vec![b'A'; 1_200];
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
+            "<expired-budget@test>",
+            TestArticle::Body(decoded.clone()),
+        )]);
+        let mut conn = connect_with_backend(&config, NntpTlsBackend::ManualRustls);
+        let control = crate::transfer::ServerTransferRegistry::new().configure(
+            StableServerId(105),
+            crate::transfer::ServerTransferConfig {
+                rate_bytes_per_sec: 1_000,
+                quota: None,
+            },
+        );
+        conn.set_transfer_control(Some(control.clone()));
+        conn.select_group("alt.test").unwrap();
+        conn.reserve_body(0).unwrap();
+        let initial = conn
+            .send_command(&Command::Body(ArticleId::MessageId(
+                "<expired-budget@test>".to_string(),
+            )))
+            .unwrap();
+        let mut buffered_body = yenc_body(&decoded);
+        buffered_body.extend_from_slice(b".\r\n");
+        conn.read_buf = BytesMut::from(buffered_body.as_slice());
+        let mut budget = ActiveTransferBudget::new(Duration::ZERO);
+
+        let error = conn
+            .stream_yenc_article_response(initial, Some(&mut budget))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FusedYencError::Nntp(NntpError::SoftTimeout(_))
+        ));
+        assert!(conn.poisoned);
+        let snapshot = control.snapshot();
+        assert!(snapshot.lifetime_body_bytes >= decoded.len() as u64);
+        assert_eq!(snapshot.throttle_wait, Duration::ZERO);
+        drop(conn);
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
+    }
+
+    #[test]
+    fn blocking_rustls_pipeline_failure_drains_transfer_permits() {
+        tls_pipeline_failure_drains_permits_before_any_reuse(NntpTlsBackend::ManualRustls);
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn blocking_s2n_fd_reads_single_body_response() {
@@ -1777,6 +2540,92 @@ mod tests {
     fn blocking_s2n_fd_reports_truncated_response() {
         let _guard = s2n_test_guard();
         tls_lane_reports_truncated_response(NntpTlsBackend::S2n);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn blocking_s2n_remote_trickle_consumes_active_budget() {
+        let _guard = s2n_test_guard();
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
+            "<trickle@test>",
+            TestArticle::Trickle {
+                data: vec![b'A'; 2_560],
+                line_delay: Duration::from_millis(20),
+            },
+        )]);
+        let mut conn = connect_with_backend(&config, NntpTlsBackend::S2n);
+        conn.select_group("alt.test").unwrap();
+        let mut budget = ActiveTransferBudget::new(Duration::from_millis(75));
+
+        let error = conn
+            .stream_yenc_article_with_active_budget("<trickle@test>", 0, &mut budget)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FusedYencError::Nntp(NntpError::SoftTimeout(_))
+        ));
+        assert!(conn.poisoned);
+        drop(conn);
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn blocking_s2n_delayed_initial_consumes_active_budget() {
+        let _guard = s2n_test_guard();
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
+            "<delayed@test>",
+            TestArticle::DelayedInitial {
+                data: vec![b'A'; 128],
+                delay: Duration::from_millis(300),
+            },
+        )]);
+        let mut conn = connect_with_backend(&config, NntpTlsBackend::S2n);
+        conn.select_group("alt.test").unwrap();
+        let mut budget = ActiveTransferBudget::new(Duration::from_millis(75));
+
+        let error = conn
+            .stream_yenc_article_with_active_budget("<delayed@test>", 0, &mut budget)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FusedYencError::Nntp(NntpError::SoftTimeout(_))
+        ));
+        assert!(conn.poisoned);
+        drop(conn);
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn blocking_s2n_retries_socket_slices_within_active_budget() {
+        let _guard = s2n_test_guard();
+        let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
+            "<within-budget@test>",
+            TestArticle::DelayedInitial {
+                data: vec![b'A'; 128],
+                delay: Duration::from_millis(250),
+            },
+        )]);
+        let mut conn = connect_with_backend(&config, NntpTlsBackend::S2n);
+        conn.select_group("alt.test").unwrap();
+        assert_s2n_socket_timeout_slice(&conn);
+        let mut budget = ActiveTransferBudget::new(Duration::from_millis(500));
+
+        let article = conn
+            .stream_yenc_article_with_active_budget("<within-budget@test>", 0, &mut budget)
+            .expect("socket timeout slices must retry while active budget remains");
+
+        assert_eq!(article.into_data(), vec![b'A'; 128]);
+        assert_s2n_socket_timeout_slice(&conn);
+        conn.quit().unwrap();
+        assert_s2n_socket_timeout_slice(&conn);
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(ca_path);
     }
 
     const TLS_DRAIN_RECORD_BYTES: usize = 16 * 1024;

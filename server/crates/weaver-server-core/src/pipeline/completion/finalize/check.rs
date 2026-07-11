@@ -305,6 +305,10 @@ impl Pipeline {
             .write_buffers
             .iter()
             .any(|(file_id, write_buf)| file_id.job_id == job_id && write_buf.buffered_len() > 0);
+        let has_file_crc_recovery = self
+            .file_crc_recoveries
+            .keys()
+            .any(|file_id| file_id.job_id == job_id);
 
         has_queued_work
             || has_inflight_downloads
@@ -313,6 +317,7 @@ impl Pipeline {
             || has_released_download_results
             || has_pending_decode
             || has_buffered_segments
+            || has_file_crc_recovery
     }
 
     fn promoted_recovery_pipeline_state(&self, job_id: JobId) -> PromotedRecoveryPipelineState {

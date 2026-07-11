@@ -316,6 +316,9 @@ impl Pipeline {
         working_dir: &std::path::Path,
         staging_dir: Option<&std::path::Path>,
     ) {
+        // Redownload reuses these exact paths right away; a stale cached
+        // write handle would swallow the new download's writes.
+        crate::pipeline::close_cached_write_handles_under(working_dir).await;
         let paths = [
             Some(working_dir.to_path_buf()),
             staging_dir.map(|path| path.to_path_buf()),
@@ -586,6 +589,37 @@ impl Pipeline {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
 
+        if let Some(generation) = options.semantic_materialization_generation {
+            let db = self.db.clone();
+            let current = tokio::task::spawn_blocking(move || {
+                db.semantic_materialization_is_current(job_id, generation)
+            })
+            .await
+            .map_err(|error| {
+                crate::SchedulerError::Internal(format!(
+                    "semantic materialization check worker panicked: {error}"
+                ))
+            })??;
+            if !current {
+                return Err(crate::SchedulerError::SemanticSuperseded);
+            }
+        }
+        if let Some(generation) = options.semantic_promotion_generation {
+            let db = self.db.clone();
+            let current = tokio::task::spawn_blocking(move || {
+                db.semantic_promotion_materialization_is_current(job_id, generation)
+            })
+            .await
+            .map_err(|error| {
+                crate::SchedulerError::Internal(format!(
+                    "semantic promotion check worker panicked: {error}"
+                ))
+            })??;
+            if !current {
+                return Err(crate::SchedulerError::SemanticSuperseded);
+            }
+        }
+
         let working_dir = compute_working_dir(&self.intermediate_dir, job_id, &spec.name);
         tokio::fs::create_dir_all(&working_dir)
             .await
@@ -660,23 +694,46 @@ impl Pipeline {
                 .initially_paused
                 .then_some(crate::jobs::model::PostState::Idle.as_str()),
         };
-        // Biggest single write on the add-job path: move it off the orchestrator
-        // loop so the round-trip doesn't park the worker thread. Preserve the
-        // prior logged-and-continued semantics (a failed persist does not abort
-        // the in-memory job creation below).
+        // Biggest single write on the add-job path: keep it off the
+        // orchestrator loop, but never create an in-memory job without durable
+        // active-job state. SCORE candidates additionally consume their
+        // admission generation in this same transaction, closing the window
+        // between a higher-score supersession and scheduler materialization.
         let db = self.db.clone();
-        match tokio::task::spawn_blocking(move || {
-            db.create_active_job_with_file_identities(&active_job, &initial_file_identities)
+        let semantic_materialization_generation = options.semantic_materialization_generation;
+        let semantic_promotion_generation = options.semantic_promotion_generation;
+        let persisted = tokio::task::spawn_blocking(move || {
+            db.materialize_active_job_with_file_identities(
+                &active_job,
+                &initial_file_identities,
+                semantic_materialization_generation,
+                semantic_promotion_generation,
+            )
         })
         .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                error!(error = %error, "db write failed for create_active_job_with_file_identities");
-            }
+        .map_err(|error| {
+            crate::SchedulerError::Internal(format!(
+                "create active job persistence worker panicked: {error}"
+            ))
+        })?;
+        match persisted {
             Err(error) => {
-                error!(error = %error, "join failed for create_active_job_with_file_identities task");
+                if let Err(cleanup_error) = tokio::fs::remove_dir_all(&working_dir).await
+                    && cleanup_error.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(job_id = job_id.0, error = %cleanup_error, "failed to clean working directory after active job persistence failure");
+                }
+                return Err(error.into());
             }
+            Ok(false) => {
+                if let Err(cleanup_error) = tokio::fs::remove_dir_all(&working_dir).await
+                    && cleanup_error.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(job_id = job_id.0, error = %cleanup_error, "failed to clean superseded job working directory");
+                }
+                return Err(crate::SchedulerError::SemanticSuperseded);
+            }
+            Ok(true) => {}
         }
         crate::runtime::perf_probe::record(
             "pipeline.add_job.persist_active_job",

@@ -67,12 +67,20 @@ impl Pipeline {
         true
     }
 
+    pub(in crate::pipeline) fn refresh_server_quota_block_presentation(&self) {
+        let blocked = !self.server_quota_parked.is_empty()
+            && self.nntp.all_normal_fill_servers_quota_blocked();
+        self.shared_state.set_server_quota_blocked(blocked);
+    }
+
     pub(in crate::pipeline::download::worker) fn schedule_download_work_without_retry_budget(
         &mut self,
         segment_id: SegmentId,
         retry_count: u32,
         exclude_servers: Vec<usize>,
-        delay: Duration,
+        delay: Option<Duration>,
+        wake_on_server_policy_change: bool,
+        quota_rejection: Option<weaver_nntp::transfer::QuotaRejection>,
     ) -> bool {
         let job_id = segment_id.file_id.job_id;
         let file_idx = segment_id.file_id.file_index as usize;
@@ -100,10 +108,79 @@ impl Pipeline {
             exclude_servers,
         };
         self.note_retry_scheduled(segment_id);
+        if wake_on_server_policy_change {
+            self.server_quota_parked.insert(segment_id);
+            self.refresh_server_quota_block_presentation();
+        }
         let retry_tx = self.retry_tx.clone();
         let scheduled_pool_generation = self.pool_generation;
+        let server_transfer_policy = wake_on_server_policy_change
+            .then(|| self.shared_state.server_transfer_policy())
+            .flatten();
+        let server_policy_changes = server_transfer_policy
+            .as_ref()
+            .map(|policy| policy.subscribe_changes());
+        let server_capacity_changes = server_transfer_policy
+            .as_ref()
+            .map(|policy| policy.subscribe_capacity_changes());
+        let rejection_is_current = server_transfer_policy
+            .as_ref()
+            .zip(quota_rejection.as_ref())
+            .is_none_or(|(policy, rejection)| policy.quota_rejection_is_current(rejection));
+        let mut delay = if rejection_is_current {
+            delay
+        } else {
+            Some(Duration::ZERO)
+        };
+        if delay.is_none() && server_policy_changes.is_none() && server_capacity_changes.is_none() {
+            delay = Some(Duration::from_secs(1));
+        }
+        let shared_state = self.shared_state.clone();
+        let mut job_changes = shared_state.subscribe_job_changes();
         tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
+            let wait_for_delay = async move {
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let wait_for_policy = async move {
+                if let Some(mut changes) = server_policy_changes {
+                    let _ = changes.changed().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let wait_for_capacity = async move {
+                if let Some(mut changes) = server_capacity_changes {
+                    let _ = changes.changed().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let wait_until_retry = async move {
+                tokio::select! {
+                    _ = wait_for_delay => {}
+                    _ = wait_for_policy => {}
+                    _ = wait_for_capacity => {}
+                }
+            };
+            tokio::pin!(wait_until_retry);
+            loop {
+                tokio::select! {
+                    _ = &mut wait_until_retry => break,
+                    _ = retry_tx.closed() => return,
+                    changed = job_changes.changed() => {
+                        let job_inactive = shared_state
+                            .get_job(job_id)
+                            .is_none_or(|job| is_terminal_status(&job.status));
+                        if changed.is_err() || job_inactive {
+                            break;
+                        }
+                    }
+                }
+            }
             let _ = retry_tx
                 .send(crate::pipeline::RetryWork {
                     scheduled_pool_generation,
@@ -116,7 +193,17 @@ impl Pipeline {
 
     pub(crate) fn release_download_result(&mut self, result: &DownloadResult) {
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.release_result");
-        self.record_download_lane_observation(result);
+        let policy_outcome = matches!(
+            &result.data,
+            Err(DownloadError::Fetch(failure))
+                if matches!(
+                    failure.kind,
+                    DownloadFailureKind::ServerQuota | DownloadFailureKind::Unrequested
+                )
+        );
+        if !policy_outcome {
+            self.record_download_lane_observation(result);
+        }
         self.active_downloads = self.active_downloads.saturating_sub(1);
         if result.release_connection_slot {
             if let Some(observation) = result.lane_observation.as_ref() {
@@ -300,6 +387,9 @@ impl Pipeline {
 
             for (attempt_index, attempt) in result.attempts.iter().enumerate() {
                 let outcome = match attempt.outcome {
+                    FetchAttemptOutcome::QuotaBlocked | FetchAttemptOutcome::QuotaUnrequested => {
+                        continue;
+                    }
                     FetchAttemptOutcome::Success => {
                         crate::events::model::ServerAttemptOutcome::Success
                     }
@@ -331,6 +421,10 @@ impl Pipeline {
             (excluded_servers, source_server_idx)
         };
 
+        if result.data.is_ok() {
+            self.refresh_server_quota_block_presentation();
+        }
+
         match result.data {
             Ok(DownloadPayload::Raw(raw)) => {
                 let raw_size_bytes = raw.len() as u64;
@@ -358,7 +452,13 @@ impl Pipeline {
                 });
                 self.pump_decode_queue();
             }
-            Ok(DownloadPayload::Decoded(decoded)) => {
+            Ok(DownloadPayload::Decoded(mut decoded)) => {
+                if !decoded.part_crc_verified {
+                    decoded.unverified_provenance = Some(Box::new(UnverifiedSegmentProvenance {
+                        source_server_idx,
+                        exclude_servers: excluded_servers,
+                    }));
+                }
                 let raw_size_bytes = decoded.raw_size;
                 let raw_size = raw_size_bytes.min(u64::from(u32::MAX)) as u32;
                 let decoded_size = decoded.decoded_size;
@@ -439,6 +539,67 @@ impl Pipeline {
                     self.maybe_finish_download_pass(job_id);
                     return;
                 }
+                if failure.kind == DownloadFailureKind::ServerQuota {
+                    let mut retry_after = failure.retry_after;
+                    let mut quota_rejection = failure.quota_rejection;
+                    let mut park_for_quota = source_server_idx.is_none();
+                    if source_server_idx.is_some()
+                        && let Some(rejection) = quota_rejection.as_ref()
+                    {
+                        let effective_excludes =
+                            self.effective_exclude_servers(job_id, &excluded_servers);
+                        let selection = self
+                            .nntp
+                            .body_server_selection_with_estimate(
+                                &effective_excludes,
+                                rejection.requested_body_bytes,
+                            )
+                            .await;
+                        if selection.eligible.is_empty()
+                            && let Some(current) = selection.quota_blocked
+                        {
+                            retry_after = current
+                                .retry_at
+                                .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+                            quota_rejection = Some(current);
+                            park_for_quota = true;
+                        }
+                    }
+
+                    if park_for_quota {
+                        if self.schedule_download_work_without_retry_budget(
+                            result.segment_id,
+                            result.retry_count,
+                            excluded_servers,
+                            retry_after,
+                            true,
+                            quota_rejection,
+                        ) {
+                            debug!(
+                                segment = %result.segment_id,
+                                retry_after_ms = ?retry_after.map(|value| value.as_millis()),
+                                "server quota blocked this work's eligible servers; parked without consuming retry budget"
+                            );
+                        }
+                    } else if let Some(source_server_idx) = source_server_idx
+                        && self.schedule_download_work_without_retry_budget(
+                            result.segment_id,
+                            result.retry_count,
+                            excluded_servers,
+                            Some(Duration::ZERO),
+                            false,
+                            None,
+                        )
+                    {
+                        debug!(
+                            segment = %result.segment_id,
+                            source_server_idx,
+                            "server quota rejected BODY admission; retrying eligible fill servers without unlocking backfill"
+                        );
+                    }
+                    self.maybe_finish_download_pass(job_id);
+                    return;
+                }
                 if failure.kind == DownloadFailureKind::Unrequested {
                     if self.restore_download_result_work_without_retry(
                         result.segment_id,
@@ -500,7 +661,9 @@ impl Pipeline {
                         result.segment_id,
                         result.retry_count,
                         excluded_servers,
-                        BODY_LANE_UNAVAILABLE_RETRY_DELAY,
+                        Some(BODY_LANE_UNAVAILABLE_RETRY_DELAY),
+                        false,
+                        None,
                     ) {
                         debug!(
                             job_id = job_id.0,
@@ -521,6 +684,23 @@ impl Pipeline {
                     self.maybe_finish_download_pass(job_id);
                     return;
                 }
+                let terminal_cause = match &failure.kind {
+                    DownloadFailureKind::ArticleNotFound => {
+                        crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth
+                    }
+                    DownloadFailureKind::Auth
+                    | DownloadFailureKind::ServerQuota
+                    | DownloadFailureKind::CapacityUnavailable
+                    | DownloadFailureKind::LaneUnavailable
+                    | DownloadFailureKind::Transient
+                    | DownloadFailureKind::Unrequested => {
+                        crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage
+                    }
+                    DownloadFailureKind::Permanent => {
+                        crate::jobs::SemanticTerminalCause::DecodeOrCorruptData
+                    }
+                };
+                self.semantic_terminal_causes.insert(job_id, terminal_cause);
                 match &failure.kind {
                     DownloadFailureKind::ArticleNotFound => self
                         .metrics
@@ -531,7 +711,7 @@ impl Pipeline {
                         .metrics
                         .download_failures_capacity_unavailable
                         .fetch_add(1, Ordering::Relaxed),
-                    DownloadFailureKind::Unrequested => 0,
+                    DownloadFailureKind::Unrequested | DownloadFailureKind::ServerQuota => 0,
                     DownloadFailureKind::Transient => self
                         .metrics
                         .download_failures_transient

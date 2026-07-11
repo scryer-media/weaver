@@ -354,6 +354,768 @@ async fn body_lane_unavailable_at_retry_limit_requeues_without_article_failure()
 }
 
 #[tokio::test]
+async fn server_quota_lane_failure_parks_until_retry_at_without_lane_spin() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20997);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Server Quota Guard", "retry.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    let transfers = weaver_nntp::transfer::ServerTransferRegistry::new();
+    let control = transfers.configure(
+        weaver_nntp::transfer::StableServerId(7),
+        weaver_nntp::transfer::ServerTransferConfig {
+            rate_bytes_per_sec: 0,
+            quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
+                limit_bytes: 128,
+                generation: 9,
+                retry_at: Some(Instant::now() + Duration::from_secs(30)),
+            }),
+        },
+    );
+    let _reservation = control.try_reserve(128).unwrap();
+    let rejection = control
+        .try_reserve(1)
+        .err()
+        .expect("quota must reject the next reservation");
+    let failure = DownloadFailure::from_lane_acquire_failure(Some(
+        &weaver_nntp::NntpError::quota_blocked(rejection),
+    ));
+    assert_eq!(failure.kind, DownloadFailureKind::ServerQuota);
+    assert!(
+        failure
+            .retry_after
+            .is_some_and(|delay| delay > Duration::from_secs(20))
+    );
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id,
+            data: Err(DownloadError::Fetch(failure)),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: MAX_SEGMENT_RETRIES + 1,
+            exclude_servers: Vec::new(),
+            release_connection_slot: false,
+        })
+        .await;
+
+    assert_eq!(
+        pipeline.pending_retries_by_job.get(&job_id).copied(),
+        Some(1)
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        pipeline.retry_rx.try_recv().is_err(),
+        "server quota retry must wait for retry_at or an explicit policy change"
+    );
+
+    pipeline.jobs.remove(&job_id);
+    pipeline.shared_state.publish_jobs(Vec::new());
+    let cancelled = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+        .await
+        .expect("job removal must wake an indefinite quota waiter")
+        .expect("retry channel must stay open");
+    pipeline.receive_retry_work(cancelled);
+    assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
+}
+
+#[tokio::test]
+async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(21002);
+    let large_segment = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let tail_segment = SegmentId {
+        segment_number: 1,
+        ..large_segment
+    };
+    let large_bytes = 5_000;
+    let tail_bytes = 1_000;
+    let spec = segmented_job_spec(
+        "Heterogeneous Quota Lease",
+        "heterogeneous.bin",
+        &[large_bytes, tail_bytes],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline.active_downloads = 2;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 2);
+
+    let policy = std::sync::Arc::new(
+        crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+            Database::open_in_memory().unwrap(),
+            &[],
+        )
+        .unwrap(),
+    );
+    let stable_id = weaver_nntp::transfer::StableServerId(17);
+    let control = policy.transfer_registry().configure(
+        stable_id,
+        weaver_nntp::transfer::ServerTransferConfig {
+            rate_bytes_per_sec: 0,
+            quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
+                limit_bytes: 10_000,
+                generation: 17,
+                retry_at: None,
+            }),
+        },
+    );
+    let reservation = control.try_reserve(5_000).unwrap();
+    pipeline.nntp = std::sync::Arc::new(NntpClient::new(NntpClientConfig {
+        servers: vec![
+            weaver_nntp::pool::ServerPoolConfig {
+                server: weaver_nntp::ServerConfig {
+                    host: "heterogeneous-fill.example.com".into(),
+                    ..Default::default()
+                },
+                stable_id,
+                transfer_control: Some(std::sync::Arc::clone(&control)),
+                max_connections: 1,
+                group: 0,
+                backfill: false,
+                retention_days: 0,
+            },
+            weaver_nntp::pool::ServerPoolConfig {
+                server: weaver_nntp::ServerConfig {
+                    host: "heterogeneous-backfill.example.com".into(),
+                    ..Default::default()
+                },
+                stable_id: weaver_nntp::transfer::StableServerId(18),
+                transfer_control: None,
+                max_connections: 1,
+                group: 0,
+                backfill: true,
+                retention_days: 0,
+            },
+        ],
+        max_idle_age: Duration::from_secs(1),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(1),
+    }));
+    pipeline.shared_state.set_server_transfer_policy(policy);
+
+    let large_estimate = Pipeline::bandwidth_reservation_estimate(large_bytes);
+    let blocked = pipeline
+        .nntp
+        .body_server_selection_with_estimate(&[], large_estimate)
+        .await;
+    assert!(blocked.eligible.is_empty());
+    let failure =
+        DownloadFailure::from_lane_acquire_failure(Some(&weaver_nntp::NntpError::quota_blocked(
+            blocked
+                .quota_blocked
+                .expect("large first work must be blocked"),
+        )));
+    let first_failure = crate::pipeline::download::lane_acquire_failure_for_work(&failure, 0);
+    let tail_failure = crate::pipeline::download::lane_acquire_failure_for_work(&failure, 1);
+    assert_eq!(first_failure.kind, DownloadFailureKind::ServerQuota);
+    assert_eq!(tail_failure.kind, DownloadFailureKind::Unrequested);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id: large_segment,
+            data: Err(DownloadError::Fetch(first_failure)),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 4,
+            exclude_servers: Vec::new(),
+            release_connection_slot: false,
+        })
+        .await;
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id: tail_segment,
+            data: Err(DownloadError::Fetch(tail_failure)),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 7,
+            exclude_servers: Vec::new(),
+            release_connection_slot: false,
+        })
+        .await;
+
+    assert!(pipeline.server_quota_parked.contains(&large_segment));
+    assert!(!pipeline.server_quota_parked.contains(&tail_segment));
+    assert_eq!(
+        pipeline.pending_retries_by_job.get(&job_id).copied(),
+        Some(1),
+        "only the tested large work should be quota-parked"
+    );
+    let tail_work = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("untested tail must re-enter the download queue");
+    assert_eq!(tail_work.segment_id, tail_segment);
+    assert_eq!(tail_work.retry_count, 7);
+    let tail_selection = pipeline
+        .nntp
+        .body_server_selection_with_estimate(
+            &tail_work.exclude_servers,
+            Pipeline::bandwidth_reservation_estimate(tail_work.byte_estimate),
+        )
+        .await;
+    assert_eq!(tail_selection.eligible, vec![weaver_nntp::ServerId(0)]);
+    assert!(
+        !tail_selection.eligible.contains(&weaver_nntp::ServerId(1)),
+        "reselecting the tail must not unlock backfill"
+    );
+
+    pipeline.jobs.remove(&job_id);
+    pipeline.shared_state.publish_jobs(Vec::new());
+    let cancelled = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+        .await
+        .expect("job removal must wake the parked large work")
+        .expect("retry channel must stay open");
+    pipeline.receive_retry_work(cancelled);
+    drop(reservation);
+}
+
+#[tokio::test]
+async fn server_quota_reservation_refund_wakes_parked_work() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20998);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Server Quota Refund", "refund.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    let policy = std::sync::Arc::new(
+        crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+            Database::open_in_memory().unwrap(),
+            &[],
+        )
+        .unwrap(),
+    );
+    let control = policy.transfer_registry().configure(
+        weaver_nntp::transfer::StableServerId(8),
+        weaver_nntp::transfer::ServerTransferConfig {
+            rate_bytes_per_sec: 0,
+            quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
+                limit_bytes: 128,
+                generation: 10,
+                retry_at: Some(Instant::now() + Duration::from_secs(30)),
+            }),
+        },
+    );
+    pipeline.shared_state.set_server_transfer_policy(policy);
+    let reservation = control.try_reserve(128).unwrap();
+    let rejection = control
+        .try_reserve(1)
+        .err()
+        .expect("quota must reject while the estimate is reserved");
+    let failure = DownloadFailure::from_lane_acquire_failure(Some(
+        &weaver_nntp::NntpError::quota_blocked(rejection),
+    ));
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id,
+            data: Err(DownloadError::Fetch(failure)),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: Vec::new(),
+            release_connection_slot: false,
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(pipeline.retry_rx.try_recv().is_err());
+
+    drop(reservation);
+
+    let retry = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+        .await
+        .expect("reservation refund must wake quota-parked work")
+        .expect("retry channel must stay open");
+    assert_eq!(retry.work.segment_id, segment_id);
+    pipeline.receive_retry_work(retry);
+    assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
+}
+
+#[tokio::test]
+async fn server_quota_source_failure_keeps_backfill_locked_and_fails_over_to_fill() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20999);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Server Quota Failover", "failover.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    let transfers = weaver_nntp::transfer::ServerTransferRegistry::new();
+    let control = transfers.configure(
+        weaver_nntp::transfer::StableServerId(9),
+        weaver_nntp::transfer::ServerTransferConfig {
+            rate_bytes_per_sec: 0,
+            quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
+                limit_bytes: 128,
+                generation: 11,
+                retry_at: Some(Instant::now() + Duration::from_secs(30)),
+            }),
+        },
+    );
+    let _reservation = control.try_reserve(128).unwrap();
+    let rejection = control
+        .try_reserve(1)
+        .err()
+        .expect("quota must reject the next reservation");
+    let failure = DownloadFailure::from_lane_acquire_failure(Some(
+        &weaver_nntp::NntpError::quota_blocked(rejection),
+    ));
+
+    let selection_server = |stable_id: u32,
+                            backfill: bool,
+                            transfer_control: Option<
+        std::sync::Arc<weaver_nntp::transfer::ServerTransferControl>,
+    >| weaver_nntp::pool::ServerPoolConfig {
+        server: weaver_nntp::ServerConfig {
+            host: format!("quota-selection-{stable_id}.example.com"),
+            ..Default::default()
+        },
+        stable_id: weaver_nntp::transfer::StableServerId(stable_id),
+        transfer_control,
+        max_connections: 1,
+        group: 0,
+        backfill,
+        retention_days: 0,
+    };
+    let two_fills = NntpClient::new(NntpClientConfig {
+        servers: vec![
+            selection_server(9, false, Some(std::sync::Arc::clone(&control))),
+            selection_server(11, false, None),
+        ],
+        max_idle_age: Duration::from_secs(1),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(1),
+    });
+    pipeline.nntp = std::sync::Arc::new(two_fills);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id,
+            data: Err(DownloadError::Fetch(failure)),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: MAX_SEGMENT_RETRIES + 1,
+            exclude_servers: Vec::new(),
+            release_connection_slot: false,
+        })
+        .await;
+
+    let retry = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+        .await
+        .expect("a quota-blocked source must immediately fail over")
+        .expect("retry channel must stay open");
+    assert_eq!(retry.work.segment_id, segment_id);
+    assert_eq!(
+        retry.work.exclude_servers,
+        Vec::<usize>::new(),
+        "quota-blocked sources must not count as exhausted fills and unlock backfill"
+    );
+    assert!(!pipeline.server_quota_parked.contains(&segment_id));
+    assert_ne!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::ServerQuota
+    );
+
+    let fill_and_backfill = NntpClient::new(NntpClientConfig {
+        servers: vec![
+            selection_server(9, false, Some(std::sync::Arc::clone(&control))),
+            selection_server(10, true, None),
+        ],
+        max_idle_age: Duration::from_secs(1),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(1),
+    });
+    let quota_retry = fill_and_backfill
+        .body_server_selection_with_estimate(&retry.work.exclude_servers, 1)
+        .await;
+    assert!(quota_retry.eligible.is_empty());
+    assert!(quota_retry.quota_blocked.is_some());
+    let missing_or_retention_retry = fill_and_backfill
+        .body_server_selection_with_estimate(&[0], 1)
+        .await;
+    assert_eq!(
+        missing_or_retention_retry.eligible,
+        vec![weaver_nntp::ServerId(1)],
+        "generic missing/retention exhaustion must still unlock backfill"
+    );
+
+    let two_fills = NntpClient::new(NntpClientConfig {
+        servers: vec![
+            selection_server(9, false, Some(std::sync::Arc::clone(&control))),
+            selection_server(11, false, None),
+        ],
+        max_idle_age: Duration::from_secs(1),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(1),
+    });
+    let fill_failover = two_fills
+        .body_server_selection_with_estimate(&retry.work.exclude_servers, 1)
+        .await;
+    assert_eq!(fill_failover.eligible, vec![weaver_nntp::ServerId(1)]);
+
+    pipeline.receive_retry_work(retry);
+    assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
+}
+
+#[tokio::test]
+async fn server_quota_source_failure_parks_while_only_backfill_remains() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(21000);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Server Quota Backfill Lock", "backfill-lock.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    let transfers = weaver_nntp::transfer::ServerTransferRegistry::new();
+    let control = transfers.configure(
+        weaver_nntp::transfer::StableServerId(12),
+        weaver_nntp::transfer::ServerTransferConfig {
+            rate_bytes_per_sec: 0,
+            quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
+                limit_bytes: 128,
+                generation: 12,
+                retry_at: Some(Instant::now() + Duration::from_secs(30)),
+            }),
+        },
+    );
+    let reservation = control.try_reserve(128).unwrap();
+    let rejection = control
+        .try_reserve(1)
+        .err()
+        .expect("quota must reject the next reservation");
+    let selection_server = |stable_id: u32,
+                            backfill: bool,
+                            transfer_control: Option<
+        std::sync::Arc<weaver_nntp::transfer::ServerTransferControl>,
+    >| weaver_nntp::pool::ServerPoolConfig {
+        server: weaver_nntp::ServerConfig {
+            host: format!("quota-park-{stable_id}.example.com"),
+            ..Default::default()
+        },
+        stable_id: weaver_nntp::transfer::StableServerId(stable_id),
+        transfer_control,
+        max_connections: 1,
+        group: 0,
+        backfill,
+        retention_days: 0,
+    };
+    pipeline.nntp = std::sync::Arc::new(NntpClient::new(NntpClientConfig {
+        servers: vec![
+            selection_server(12, false, Some(std::sync::Arc::clone(&control))),
+            selection_server(13, true, None),
+        ],
+        max_idle_age: Duration::from_secs(1),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(1),
+    }));
+    let failure = DownloadFailure::from_lane_acquire_failure(Some(
+        &weaver_nntp::NntpError::quota_blocked(rejection),
+    ));
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id,
+            data: Err(DownloadError::Fetch(failure)),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: MAX_SEGMENT_RETRIES + 1,
+            exclude_servers: Vec::new(),
+            release_connection_slot: false,
+        })
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        pipeline.retry_rx.try_recv().is_err(),
+        "quota must not unlock the backfill tier or spin an immediate retry"
+    );
+    assert!(pipeline.server_quota_parked.contains(&segment_id));
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::ServerQuota
+    );
+
+    pipeline.jobs.remove(&job_id);
+    pipeline.shared_state.publish_jobs(Vec::new());
+    let cancelled = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+        .await
+        .expect("job removal must wake the quota waiter")
+        .expect("retry channel must stay open");
+    pipeline.receive_retry_work(cancelled);
+    assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
+    drop(reservation);
+}
+
+#[tokio::test]
+async fn other_fill_refund_wakes_manual_quota_park_without_unlocking_backfill() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(21001);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Manual Quota Refund", "manual-refund.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    let policy = std::sync::Arc::new(
+        crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+            Database::open_in_memory().unwrap(),
+            &[],
+        )
+        .unwrap(),
+    );
+    let first_stable_id = weaver_nntp::transfer::StableServerId(14);
+    let second_stable_id = weaver_nntp::transfer::StableServerId(15);
+    let manual_quota = |generation| weaver_nntp::transfer::ServerTransferConfig {
+        rate_bytes_per_sec: 0,
+        quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
+            limit_bytes: 128,
+            generation,
+            retry_at: None,
+        }),
+    };
+    let first = policy
+        .transfer_registry()
+        .configure(first_stable_id, manual_quota(14));
+    let second = policy
+        .transfer_registry()
+        .configure(second_stable_id, manual_quota(15));
+    let first_reservation = first.try_reserve(128).unwrap();
+    let second_reservation = second.try_reserve(128).unwrap();
+    let selection_server = |stable_id: weaver_nntp::transfer::StableServerId,
+                            backfill: bool,
+                            transfer_control: Option<
+        std::sync::Arc<weaver_nntp::transfer::ServerTransferControl>,
+    >| weaver_nntp::pool::ServerPoolConfig {
+        server: weaver_nntp::ServerConfig {
+            host: format!("manual-quota-{}.example.com", stable_id.0),
+            ..Default::default()
+        },
+        stable_id,
+        transfer_control,
+        max_connections: 1,
+        group: 0,
+        backfill,
+        retention_days: 0,
+    };
+    pipeline.nntp = std::sync::Arc::new(NntpClient::new(NntpClientConfig {
+        servers: vec![
+            selection_server(first_stable_id, false, Some(std::sync::Arc::clone(&first))),
+            selection_server(
+                second_stable_id,
+                false,
+                Some(std::sync::Arc::clone(&second)),
+            ),
+            selection_server(weaver_nntp::transfer::StableServerId(16), true, None),
+        ],
+        max_idle_age: Duration::from_secs(1),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(1),
+    }));
+    pipeline.shared_state.set_server_transfer_policy(policy);
+
+    let blocked = pipeline
+        .nntp
+        .body_server_selection_with_estimate(&[], 1)
+        .await;
+    assert!(blocked.eligible.is_empty());
+    let rejection = blocked
+        .quota_blocked
+        .expect("both normal fills must be quota-blocked");
+    assert!(rejection.retry_at.is_none());
+    let selected_stable_id = rejection.stable_server_id;
+    let selected_local_revision = rejection.capacity_revision;
+    let (selected_reservation, other_reservation, other_server) =
+        if selected_stable_id == first_stable_id {
+            (
+                first_reservation,
+                second_reservation,
+                weaver_nntp::ServerId(1),
+            )
+        } else {
+            (
+                second_reservation,
+                first_reservation,
+                weaver_nntp::ServerId(0),
+            )
+        };
+    let failure = DownloadFailure::from_lane_acquire_failure(Some(
+        &weaver_nntp::NntpError::quota_blocked(rejection),
+    ));
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id,
+            data: Err(DownloadError::Fetch(failure)),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: MAX_SEGMENT_RETRIES + 1,
+            exclude_servers: Vec::new(),
+            release_connection_slot: false,
+        })
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        pipeline.retry_rx.try_recv().is_err(),
+        "manual quota has no timer and must remain parked before capacity changes"
+    );
+    assert!(pipeline.server_quota_parked.contains(&segment_id));
+
+    drop(other_reservation);
+
+    let retry = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+        .await
+        .expect("a non-selected fill refund must wake parked work")
+        .expect("retry channel must stay open");
+    assert_eq!(retry.work.segment_id, segment_id);
+    assert!(retry.work.exclude_servers.is_empty());
+    let selected = if selected_stable_id == first_stable_id {
+        &first
+    } else {
+        &second
+    };
+    assert_eq!(
+        selected.quota_rejection_for(1).unwrap().capacity_revision,
+        selected_local_revision,
+        "the selected rejection remains locally current; only the other fill changed"
+    );
+    let resumed = pipeline
+        .nntp
+        .body_server_selection_with_estimate(&retry.work.exclude_servers, 1)
+        .await;
+    assert_eq!(resumed.eligible, vec![other_server]);
+    assert!(
+        !resumed.eligible.contains(&weaver_nntp::ServerId(2)),
+        "quota capacity must not unlock the backfill tier"
+    );
+
+    pipeline.receive_retry_work(retry);
+    assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
+    drop(selected_reservation);
+}
+
+#[tokio::test]
+async fn server_quota_lane_park_does_not_increment_error_counter() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let before = pipeline
+        .metrics
+        .download_lane_parks_error_total
+        .load(Ordering::Relaxed);
+
+    pipeline.note_download_lane_started(DownloadLaneMode::Sequential);
+    pipeline.note_download_lane_released(DownloadLaneMode::Sequential, LaneParkReason::ServerQuota);
+
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_lane_parks_error_total
+            .load(Ordering::Relaxed),
+        before
+    );
+}
+
+#[tokio::test]
 async fn retention_excludes_derive_from_job_age_and_server_windows() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -3255,6 +4017,152 @@ fn spillover_loan_book_releases_mixed_kinds_independently() {
 }
 
 #[tokio::test]
+async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(21050);
+    let first_segment = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let tail_segment = SegmentId {
+        segment_number: 1,
+        ..first_segment
+    };
+    let spec = segmented_job_spec("IP Policy Stop", "ip-policy.bin", &[128, 64]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline.active_downloads = 2;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 2);
+
+    let quota_data: std::result::Result<DownloadPayload, DownloadError> =
+        Err(DownloadError::Fetch(DownloadFailure::new(
+            DownloadFailureKind::ServerQuota,
+            "server quota stopped the IP replacement trial",
+        )));
+    let unrequested_data: std::result::Result<DownloadPayload, DownloadError> =
+        Err(DownloadError::Fetch(DownloadFailure::new(
+            DownloadFailureKind::Unrequested,
+            "tail was not requested after the policy stop",
+        )));
+    assert!(crate::pipeline::download::is_ip_replacement_policy_stop(
+        &quota_data
+    ));
+    assert!(crate::pipeline::download::is_ip_replacement_policy_stop(
+        &unrequested_data
+    ));
+    assert!(
+        crate::pipeline::download::should_neutrally_park_ip_replacement(
+            true,
+            LaneParkReason::NoWork,
+        )
+    );
+    assert!(
+        !crate::pipeline::download::should_neutrally_park_ip_replacement(
+            true,
+            LaneParkReason::Error,
+        ),
+        "an earlier network failure must not be hidden by a later policy stop"
+    );
+
+    let rejected_before = pipeline
+        .metrics
+        .ip_replacement_trials_rejected_total
+        .load(Ordering::Relaxed);
+    let proof_before = pipeline
+        .metrics
+        .download_lane_parks_proof_failure_total
+        .load(Ordering::Relaxed);
+    let errors_before = pipeline
+        .metrics
+        .download_lane_parks_error_total
+        .load(Ordering::Relaxed);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id: first_segment,
+            data: quota_data,
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: DownloadResultOrigin::IpReplacementTrial,
+            retry_count: 4,
+            exclude_servers: vec![2],
+            release_connection_slot: false,
+        })
+        .await;
+    pipeline
+        .handle_download_done(DownloadResult {
+            segment_id: tail_segment,
+            data: unrequested_data,
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::IpReplacementTrial,
+            retry_count: 7,
+            exclude_servers: vec![2],
+            release_connection_slot: false,
+        })
+        .await;
+
+    let mut restored = Vec::new();
+    let queue = &mut pipeline.jobs.get_mut(&job_id).unwrap().download_queue;
+    while let Some(work) = queue.pop() {
+        restored.push(work);
+    }
+    restored.sort_unstable_by_key(|work| work.segment_id.segment_number);
+    assert_eq!(restored.len(), 2);
+    assert_eq!(restored[0].segment_id, first_segment);
+    assert_eq!(restored[0].retry_count, 4);
+    assert_eq!(restored[1].segment_id, tail_segment);
+    assert_eq!(restored[1].retry_count, 7);
+    assert!(restored.iter().all(|work| work.exclude_servers == vec![2]));
+    assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
+    assert!(!pipeline.server_quota_parked.contains(&first_segment));
+
+    pipeline.ip_replacement_burst_active = true;
+    pipeline.metrics.set_ip_replacement_burst_active(true);
+    pipeline.handle_download_lane_parked(DownloadLaneParked {
+        job_id,
+        mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: None,
+        reason: LaneParkReason::ServerQuota,
+        release_connection_slot: false,
+        release_ip_replacement_burst: true,
+    });
+    assert!(!pipeline.ip_replacement_burst_active);
+    assert_eq!(
+        pipeline
+            .metrics
+            .ip_replacement_trials_rejected_total
+            .load(Ordering::Relaxed),
+        rejected_before
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_lane_parks_proof_failure_total
+            .load(Ordering::Relaxed),
+        proof_before
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_lane_parks_error_total
+            .load(Ordering::Relaxed),
+        errors_before
+    );
+}
+
+#[tokio::test]
 async fn release_download_result_excludes_ip_replacement_trial_from_hot_success_and_speed() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -3966,6 +4874,52 @@ async fn dispatch_downloads_blocks_when_isp_bandwidth_cap_is_hit() {
 }
 
 #[tokio::test]
+async fn server_quota_ui_state_does_not_globally_stop_unrelated_dispatch() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 1,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    let job_id = JobId(20996);
+    let spec = standalone_job_spec("Server Quota Gate", &[("queued.bin".to_string(), 512u32)]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.connection_ramp = 1;
+    pipeline.shared_state.set_server_quota_blocked(true);
+    pipeline
+        .shared_state
+        .set_download_block(crate::jobs::handle::DownloadBlockState {
+            kind: crate::jobs::handle::DownloadBlockKind::Scheduled,
+            scheduled_speed_limit: 1_024,
+            ..Default::default()
+        });
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::ServerQuota
+    );
+    pipeline.shared_state.set_server_quota_blocked(false);
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::Scheduled
+    );
+    pipeline.shared_state.set_server_quota_blocked(true);
+
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 0);
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::ServerQuota
+    );
+}
+
+#[tokio::test]
 async fn set_bandwidth_cap_policy_recomputes_current_window_usage_from_ledger() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
@@ -4010,9 +4964,10 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
     let job_id = JobId(20017);
     let filename = "streamed.bin";
     let payload = b"already decoded bytes".to_vec();
-    let spec = standalone_job_spec(
+    let spec = segmented_job_spec(
         "Streamed Decode Success",
-        &[(filename.to_string(), payload.len() as u32)],
+        filename,
+        &[payload.len() as u32, 1],
     );
     insert_active_job(&mut pipeline, job_id, spec).await;
 
@@ -4031,10 +4986,11 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
             data: Ok(DownloadPayload::Decoded(DecodeResult {
                 segment_id,
                 raw_size,
+                unverified_provenance: None,
                 file_offset: 0,
                 decoded_size: payload.len() as u32,
                 crc_valid: true,
-                part_crc_verified: true,
+                part_crc_verified: false,
                 part_crc: weaver_par2::checksum::crc32(&payload),
                 expected_file_crc: None,
                 data: DecodedChunk::from(payload.clone()),
@@ -4045,7 +5001,7 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
             source_server_idx: Some(0),
             origin: DownloadResultOrigin::NormalPrimary,
             retry_count: 0,
-            exclude_servers: Vec::new(),
+            exclude_servers: vec![2],
             release_connection_slot: true,
         })
         .await;
@@ -4076,6 +5032,13 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
             .map(|state| state.downloaded_bytes),
         Some(payload.len() as u64)
     );
+    let provenance = pipeline
+        .unverified_segments
+        .get(&segment_id.file_id)
+        .and_then(|segments| segments.get(&segment_id.segment_number))
+        .expect("streamed success must retain unverified segment provenance");
+    assert_eq!(provenance.source_server_idx, Some(0));
+    assert_eq!(provenance.exclude_servers, vec![2]);
 }
 
 #[tokio::test]
@@ -4092,6 +5055,8 @@ async fn add_job_with_options_initially_paused_publishes_queued_lane_from_real_p
             sample_nzb_zstd(),
             crate::jobs::AddJobOptions {
                 initially_paused: true,
+                semantic_materialization_generation: None,
+                semantic_promotion_generation: None,
             },
         )
         .await

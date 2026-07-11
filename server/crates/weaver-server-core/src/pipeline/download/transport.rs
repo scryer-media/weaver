@@ -55,6 +55,7 @@ pub(crate) enum LaneParkReason {
     IpReplacementRetired,
     ServerTierChanged,
     ProofFailure,
+    ServerQuota,
     Error,
 }
 

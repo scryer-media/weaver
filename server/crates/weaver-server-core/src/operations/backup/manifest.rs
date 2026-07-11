@@ -141,7 +141,7 @@ pub(crate) fn validate_manifest(
     let runtime_schema = db
         .schema_version()
         .map_err(|e| BackupServiceError::Io(e.to_string()))?;
-    if manifest.weaver_schema_version != runtime_schema {
+    if manifest.weaver_schema_version > runtime_schema {
         return Err(BackupServiceError::SchemaMismatch {
             backup: manifest.weaver_schema_version,
             runtime: runtime_schema,

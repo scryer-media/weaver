@@ -114,12 +114,40 @@ pub enum NntpError {
     /// An article fetch exceeded the soft timeout, triggering failover to the next server.
     #[error("article fetch soft timeout ({0}s)")]
     SoftTimeout(u64),
+
+    /// A per-server BODY quota rejected admission before the command was sent.
+    /// This is scheduler policy, never a server health failure.
+    #[error("server download quota blocked: {0:?}")]
+    QuotaBlocked(Box<crate::transfer::QuotaRejection>),
+
+    /// A preceding pipeline item was quota-rejected, so this BODY was never sent.
+    #[error(
+        "BODY ({requested_body_bytes} estimated bytes) was not requested after quota rejection: {preceding_rejection:?}"
+    )]
+    BodyNotRequestedDueToQuota {
+        preceding_rejection: Box<crate::transfer::QuotaRejection>,
+        requested_body_bytes: u64,
+    },
 }
 
 /// Convenience type alias.
 pub type Result<T> = std::result::Result<T, NntpError>;
 
 impl NntpError {
+    pub fn quota_blocked(rejection: crate::transfer::QuotaRejection) -> Self {
+        Self::QuotaBlocked(Box::new(rejection))
+    }
+
+    pub fn body_not_requested_due_to_quota(
+        preceding_rejection: crate::transfer::QuotaRejection,
+        requested_body_bytes: u64,
+    ) -> Self {
+        Self::BodyNotRequestedDueToQuota {
+            preceding_rejection: Box::new(preceding_rejection),
+            requested_body_bytes,
+        }
+    }
+
     /// Create an `UnexpectedResponse` from a status code and message.
     pub fn unexpected(code: StatusCode, message: impl Into<String>) -> Self {
         NntpError::UnexpectedResponse {

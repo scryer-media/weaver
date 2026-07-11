@@ -1597,7 +1597,11 @@ async fn cancel_job_clears_promoted_recovery_runtime_state() {
 
     let (reply, result) = oneshot::channel();
     pipeline
-        .handle_command(SchedulerCommand::CancelJob { job_id, reply })
+        .handle_command(SchedulerCommand::CancelJob {
+            job_id,
+            origin: crate::jobs::handle::CancellationOrigin::User,
+            reply,
+        })
         .await;
     result.await.unwrap().unwrap();
 

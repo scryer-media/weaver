@@ -31,6 +31,7 @@ const STABLE_TABLES: &[&str] = &[
     "schema_version",
     "settings",
     "servers",
+    "server_download_usage",
     "categories",
     "api_keys",
     "job_history",
@@ -75,6 +76,7 @@ const CLEAR_IMPORT_TABLES: &[&str] = &[
     "api_keys",
     "bandwidth_usage_minute_buckets",
     "categories",
+    "server_download_usage",
     "servers",
     "settings",
 ];
@@ -402,6 +404,117 @@ impl Database {
                             } else {
                                 "0"
                             };
+                            let src_server_max_download_speed = if table_has_column(
+                                &mut conn,
+                                "src",
+                                "servers",
+                                "max_download_speed",
+                            )
+                            .await?
+                            {
+                                "max_download_speed"
+                            } else {
+                                "0"
+                            };
+                            let src_server_quota_enabled = if table_has_column(
+                                &mut conn,
+                                "src",
+                                "servers",
+                                "download_quota_enabled",
+                            )
+                            .await?
+                            {
+                                "download_quota_enabled"
+                            } else {
+                                "0"
+                            };
+                            let src_server_quota_limit = if table_has_column(
+                                &mut conn,
+                                "src",
+                                "servers",
+                                "download_quota_limit_bytes",
+                            )
+                            .await?
+                            {
+                                "download_quota_limit_bytes"
+                            } else {
+                                "0"
+                            };
+                            let src_server_quota_period = if table_has_column(
+                                &mut conn,
+                                "src",
+                                "servers",
+                                "download_quota_period",
+                            )
+                            .await?
+                            {
+                                "download_quota_period"
+                            } else {
+                                "'one_time'"
+                            };
+                            let src_server_quota_reset_time = if table_has_column(
+                                &mut conn,
+                                "src",
+                                "servers",
+                                "download_quota_reset_time_minutes_local",
+                            )
+                            .await?
+                            {
+                                "download_quota_reset_time_minutes_local"
+                            } else {
+                                "0"
+                            };
+                            let src_server_quota_weekday = if table_has_column(
+                                &mut conn,
+                                "src",
+                                "servers",
+                                "download_quota_weekly_reset_weekday",
+                            )
+                            .await?
+                            {
+                                "download_quota_weekly_reset_weekday"
+                            } else {
+                                "'mon'"
+                            };
+                            let src_server_quota_month_day = if table_has_column(
+                                &mut conn,
+                                "src",
+                                "servers",
+                                "download_quota_monthly_reset_day",
+                            )
+                            .await?
+                            {
+                                "download_quota_monthly_reset_day"
+                            } else {
+                                "1"
+                            };
+                            let src_server_tls_ca_cert =
+                                if table_has_column(&mut conn, "src", "servers", "tls_ca_cert")
+                                    .await?
+                                {
+                                    "tls_ca_cert"
+                                } else {
+                                    "NULL"
+                                };
+                            let src_has_server_download_usage = table_has_column(
+                                &mut conn,
+                                "src",
+                                "server_download_usage",
+                                "server_id",
+                            )
+                            .await?;
+                            let import_server_download_usage = if src_has_server_download_usage {
+                                "INSERT INTO server_download_usage
+                                     (server_id, lifetime_bytes, quota_baseline_bytes,
+                                      window_start_epoch_seconds, window_end_epoch_seconds,
+                                      updated_at_epoch_seconds)
+                                     SELECT server_id, lifetime_bytes, quota_baseline_bytes,
+                                            window_start_epoch_seconds, window_end_epoch_seconds,
+                                            updated_at_epoch_seconds
+                                       FROM src.server_download_usage;"
+                            } else {
+                                ""
+                            };
 
                             let mut tx = conn.begin().await.map_err(db_err)?;
                             for table in CLEAR_IMPORT_TABLES {
@@ -415,8 +528,23 @@ impl Database {
                             let import_sql = format!(
                                 "INSERT INTO settings (key, value)
                                      SELECT key, value FROM src.settings;
-                                 INSERT INTO servers (id, host, port, tls, username, password, connections, active, supports_pipelining, priority, backfill, retention_days)
-                                     SELECT id, host, port, tls, username, password, connections, active, supports_pipelining, priority, {src_server_backfill}, {src_server_retention_days} FROM src.servers;
+                                 INSERT INTO servers
+                                     (id, host, port, tls, username, password, connections, active,
+                                      supports_pipelining, priority, backfill, retention_days,
+                                      max_download_speed, download_quota_enabled,
+                                      download_quota_limit_bytes, download_quota_period,
+                                      download_quota_reset_time_minutes_local,
+                                      download_quota_weekly_reset_weekday,
+                                      download_quota_monthly_reset_day, tls_ca_cert)
+                                     SELECT id, host, port, tls, username, password, connections, active,
+                                            supports_pipelining, priority, {src_server_backfill},
+                                            {src_server_retention_days}, {src_server_max_download_speed},
+                                            {src_server_quota_enabled}, {src_server_quota_limit},
+                                            {src_server_quota_period}, {src_server_quota_reset_time},
+                                            {src_server_quota_weekday}, {src_server_quota_month_day},
+                                            {src_server_tls_ca_cert}
+                                       FROM src.servers;
+                                 {import_server_download_usage}
                                  INSERT INTO categories (id, name, dest_dir, aliases)
                                      SELECT id, name, dest_dir, aliases FROM src.categories;
                                  INSERT INTO api_keys (id, name, key_hash, scope, created_at, last_used_at)

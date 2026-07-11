@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info};
@@ -6,31 +6,26 @@ use tracing::{error, info};
 use crate::{shutdown, wiring};
 use weaver_server_core::Database;
 use weaver_server_core::events::model::PipelineEvent;
-use weaver_server_core::ingest;
+use weaver_server_core::ingest::{self, SubmissionOptions, SubmitNzbError};
+use weaver_server_core::jobs::{DuplicateMode, SubmissionOrigin};
 use weaver_server_core::settings::Config;
 use weaver_server_core::{Pipeline, SchedulerCommand, SchedulerHandle};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     config: &mut Config,
     db: &Database,
     nzb_path: &Path,
     output: Option<&Path>,
+    force: bool,
     data_dir: &Path,
     intermediate_dir: &Path,
     complete_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let effective_intermediate_dir = output.unwrap_or(intermediate_dir);
 
-    // Read and parse NZB.
     let nzb_bytes = std::fs::read(nzb_path)?;
-    let (job_id, job_spec) = ingest::import_nzb(&nzb_bytes, nzb_path)?;
-
-    info!(
-        job = %job_spec.name,
-        files = job_spec.files.len(),
-        bytes = job_spec.total_bytes,
-        "starting download"
-    );
+    info!(path = %nzb_path.display(), force, "starting standalone NZB submission");
 
     let wiring::RuntimeContext {
         profile,
@@ -40,7 +35,19 @@ pub(crate) async fn run(
 
     // Detect server capabilities (pipelining, etc.) and build NNTP client.
     wiring::detect_server_capabilities(config, db).await;
-    let nntp = wiring::build_nntp_client(config, &profile);
+    let policy_db = db.clone();
+    let policy_servers = config.servers.clone();
+    let server_transfer_policy = std::sync::Arc::new(
+        tokio::task::spawn_blocking(move || {
+            weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+                policy_db,
+                &policy_servers,
+            )
+        })
+        .await??,
+    );
+    let server_transfer_maintenance = server_transfer_policy.spawn_maintenance();
+    let nntp = wiring::build_nntp_client(config, &profile, &server_transfer_policy);
     let initial_global_paused = weaver_server_core::runtime::load_global_pause_from_db(db).await?;
 
     // Set up scheduler channels and shared control-plane state.
@@ -49,6 +56,8 @@ pub(crate) async fn run(
     let metrics = weaver_server_core::PipelineMetrics::new();
     let shared_state = weaver_server_core::SharedPipelineState::new(metrics, vec![]);
     let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
+    handle.set_server_transfer_policy(std::sync::Arc::clone(&server_transfer_policy));
+    handle.set_nntp_pool(std::sync::Arc::clone(nntp.pool()));
 
     // Subscribe to events for progress logging.
     let mut event_rx = event_tx.subscribe();
@@ -94,6 +103,7 @@ pub(crate) async fn run(
         .sum();
     let standalone_config: weaver_server_core::settings::SharedConfig =
         std::sync::Arc::new(tokio::sync::RwLock::new(config.clone()));
+    let submission_config = standalone_config.clone();
     let mut pipeline = Pipeline::new(
         cmd_rx,
         event_tx,
@@ -119,11 +129,45 @@ pub(crate) async fn run(
         pipeline.run().await;
     });
 
-    // Submit the job via the handle.
-    let nzb_zstd = ingest::compress_nzb_bytes(&nzb_bytes)?;
-    handle
-        .add_job(job_id, job_spec, PathBuf::from(nzb_path), nzb_zstd)
-        .await?;
+    match ingest::submit_nzb_bytes_with_options(
+        db,
+        &handle,
+        &submission_config,
+        &nzb_bytes,
+        nzb_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(str::to_string),
+        None,
+        None,
+        vec![("source".to_string(), "cli".to_string())],
+        SubmissionOptions {
+            duplicate_mode: if force {
+                DuplicateMode::Force
+            } else {
+                DuplicateMode::Enforce
+            },
+            origin: SubmissionOrigin::Cli,
+            ..SubmissionOptions::default()
+        },
+    )
+    .await
+    {
+        Ok(submitted) => {
+            info!(
+                job_id = submitted.job_id.0,
+                job = %submitted.spec.name,
+                files = submitted.spec.files.len(),
+                bytes = submitted.spec.total_bytes,
+                "submitted standalone NZB job"
+            );
+        }
+        Err(error @ SubmitNzbError::DuplicateBlocked { .. })
+        | Err(error @ SubmitNzbError::IdempotencyConflict { .. }) => {
+            return Err(format!("submission rejected: {error}").into());
+        }
+        Err(error) => return Err(error.into()),
+    }
 
     tokio::select! {
         _ = shutdown::wait_for_shutdown() => {
@@ -133,12 +177,24 @@ pub(crate) async fn run(
                 error!(error = %join_error, "pipeline task failed during shutdown");
             }
             flush_writer_queue_on_exit(db).await;
+            server_transfer_maintenance.abort();
+            wiring::flush_server_transfer_usage(
+                std::sync::Arc::clone(&server_transfer_policy),
+                "download command shutdown",
+            )
+            .await;
             log_task.abort();
             Ok(())
         }
         result = &mut pipeline_task => {
             let error = shutdown::pipeline_exit_error(result);
             flush_writer_queue_on_exit(db).await;
+            server_transfer_maintenance.abort();
+            wiring::flush_server_transfer_usage(
+                std::sync::Arc::clone(&server_transfer_policy),
+                "download command pipeline exit",
+            )
+            .await;
             log_task.abort();
             Err(error.into())
         }

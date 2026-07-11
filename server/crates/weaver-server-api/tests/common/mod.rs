@@ -124,6 +124,8 @@ pub struct TestHarness {
     pub db: Database,
     pub metrics: Arc<PipelineMetrics>,
     pub shared_state: SharedPipelineState,
+    pub server_transfer_policy:
+        Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
     pub auth_cache: LoginAuthCache,
     _scheduler_task: JoinHandle<()>,
     _tempdir: tempfile::TempDir,
@@ -167,6 +169,7 @@ impl TestHarness {
             isp_bandwidth_cap: None,
             ip_replacement_trial_extra_connections: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
             config_path: None,
         };
         let shared_config: SharedConfig = Arc::new(RwLock::new(config));
@@ -183,11 +186,19 @@ impl TestHarness {
         let api_key_cache = ApiKeyCache::from_rows(vec![]);
         let shared_schedules: weaver_server_core::bandwidth::schedule::SharedSchedules =
             Arc::new(RwLock::new(vec![]));
+        let server_transfer_policy = Arc::new(
+            weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+                db.clone(),
+                &[],
+            )
+            .expect("failed to create server transfer policy registry"),
+        );
 
         let schema = build_schema(SchemaContext {
             handle: handle.clone(),
             config: shared_config.clone(),
             db: db.clone(),
+            server_transfer_policy: Arc::clone(&server_transfer_policy),
             auth_cache: auth_cache.clone(),
             api_key_cache,
             rss,
@@ -206,6 +217,7 @@ impl TestHarness {
             db,
             metrics,
             shared_state,
+            server_transfer_policy,
             auth_cache,
             _scheduler_task: scheduler_task,
             _tempdir: tempdir,
@@ -551,7 +563,7 @@ fn spawn_test_scheduler(
                     };
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::CancelJob { job_id, reply } => {
+                SchedulerCommand::CancelJob { job_id, reply, .. } => {
                     let result = if jobs.remove(&job_id).is_some() {
                         Ok(())
                     } else {

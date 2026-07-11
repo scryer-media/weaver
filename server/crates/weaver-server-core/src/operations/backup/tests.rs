@@ -42,6 +42,15 @@ fn sample_config() -> Config {
             priority: 0,
             backfill: false,
             retention_days: 0,
+            max_download_speed: 2_000_000,
+            download_quota: crate::servers::ServerDownloadQuotaConfig {
+                enabled: true,
+                limit_bytes: 10_000_000,
+                period: crate::servers::ServerDownloadQuotaPeriod::Daily,
+                reset_time_minutes_local: 60,
+                weekly_reset_weekday: crate::bandwidth::IspBandwidthCapWeekday::Mon,
+                monthly_reset_day: 1,
+            },
             tls_ca_cert: None,
         }],
         categories: vec![CategoryConfig {
@@ -60,6 +69,7 @@ fn sample_config() -> Config {
         ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+        duplicate_policy: Default::default(),
         config_path: None,
     }
 }
@@ -68,6 +78,16 @@ fn sample_config() -> Config {
 async fn export_and_import_stable_state_roundtrip() {
     let src = Database::open_in_memory().unwrap();
     src.save_config(&sample_config()).unwrap();
+    let usage_updated_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    src.upsert_server_download_usage(&crate::servers::ServerDownloadUsage {
+        server_id: 1,
+        lifetime_bytes: 8_000,
+        quota_baseline_bytes: 3_000,
+        window_start: Some(usage_updated_at),
+        window_end: Some(usage_updated_at + chrono::Duration::days(1)),
+        updated_at: usage_updated_at,
+    })
+    .unwrap();
     let hash = [7u8; 32];
     src.insert_api_key("integration", &hash, "integration")
         .unwrap();
@@ -153,6 +173,11 @@ async fn export_and_import_stable_state_roundtrip() {
     assert_eq!(info.schema_version, src.schema_version().unwrap());
     assert!(info.included_tables.iter().any(|t| t == "settings"));
     assert!(
+        info.included_tables
+            .iter()
+            .any(|t| t == "server_download_usage")
+    );
+    assert!(
         !info
             .included_tables
             .iter()
@@ -176,6 +201,13 @@ async fn export_and_import_stable_state_roundtrip() {
     let restored = dest.load_config().unwrap();
     assert_eq!(restored.data_dir, "/old/data");
     assert_eq!(restored.servers.len(), 1);
+    assert_eq!(restored.servers[0].max_download_speed, 2_000_000);
+    assert!(restored.servers[0].download_quota.enabled);
+    assert_eq!(restored.servers[0].download_quota.limit_bytes, 10_000_000);
+    let restored_usage = dest.server_download_usage(1).unwrap().unwrap();
+    assert_eq!(restored_usage.lifetime_bytes, 8_000);
+    assert_eq!(restored_usage.quota_baseline_bytes, 3_000);
+    assert_eq!(restored_usage.updated_at, usage_updated_at);
     assert_eq!(restored.categories.len(), 1);
     assert_eq!(dest.list_api_keys().unwrap().len(), 1);
     let history = dest.list_job_history(&HistoryFilter::default()).unwrap();
@@ -265,4 +297,48 @@ async fn import_stable_state_ignores_legacy_integration_events_table() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn import_stable_state_defaults_limits_missing_from_old_archive_schema() {
+    let src = Database::open_in_memory().unwrap();
+    src.save_config(&sample_config()).unwrap();
+
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    src.export_stable_state(temp.path()).unwrap();
+
+    let legacy_pool = open_artifact_pool(temp.path()).await;
+    sqlx::query("DROP TABLE server_download_usage")
+        .execute(&legacy_pool)
+        .await
+        .unwrap();
+    for column in [
+        "max_download_speed",
+        "download_quota_enabled",
+        "download_quota_limit_bytes",
+        "download_quota_period",
+        "download_quota_reset_time_minutes_local",
+        "download_quota_weekly_reset_weekday",
+        "download_quota_monthly_reset_day",
+    ] {
+        let statement = format!("ALTER TABLE servers DROP COLUMN {column}");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(statement.as_str()))
+            .execute(&legacy_pool)
+            .await
+            .unwrap();
+    }
+    legacy_pool.close().await;
+
+    let dest = Database::open_in_memory().unwrap();
+    dest.import_stable_state(temp.path()).unwrap();
+
+    let restored = dest.load_config().unwrap();
+    assert_eq!(restored.servers.len(), 1);
+    assert_eq!(restored.servers[0].host, "news.example.com");
+    assert_eq!(restored.servers[0].max_download_speed, 0);
+    assert_eq!(
+        restored.servers[0].download_quota,
+        crate::servers::ServerDownloadQuotaConfig::default()
+    );
+    assert_eq!(dest.server_download_usage(1).unwrap(), None);
 }

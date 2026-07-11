@@ -1,9 +1,7 @@
 use super::*;
 
 impl Pipeline {
-    pub(in crate::pipeline::download::worker) fn bandwidth_reservation_estimate(
-        decoded_bytes: u32,
-    ) -> u64 {
+    pub(in crate::pipeline) fn bandwidth_reservation_estimate(decoded_bytes: u32) -> u64 {
         let decoded = decoded_bytes as u64;
         decoded.saturating_add(decoded / 16).saturating_add(1024)
     }
@@ -32,10 +30,7 @@ impl Pipeline {
         self.job_transport_profiles.get(&job_id)
     }
 
-    pub(in crate::pipeline::download::worker) fn note_download_lane_started(
-        &mut self,
-        mode: DownloadLaneMode,
-    ) {
+    pub(in crate::pipeline) fn note_download_lane_started(&mut self, mode: DownloadLaneMode) {
         debug_assert_eq!(
             DownloadLaneMode::PipelineDepth2.max_depth(),
             SAB_BODY_PIPELINE_DEPTH
@@ -76,7 +71,7 @@ impl Pipeline {
             .or_default() += 1;
     }
 
-    pub(in crate::pipeline::download::worker) fn note_download_lane_released(
+    pub(in crate::pipeline) fn note_download_lane_released(
         &mut self,
         mode: DownloadLaneMode,
         reason: LaneParkReason,
@@ -142,6 +137,7 @@ impl Pipeline {
                 .metrics
                 .download_lane_parks_proof_failure_total
                 .fetch_add(1, Ordering::Relaxed),
+            LaneParkReason::ServerQuota => 0,
             LaneParkReason::Error => self
                 .metrics
                 .download_lane_parks_error_total

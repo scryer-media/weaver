@@ -839,6 +839,184 @@ impl Pipeline {
         exclude_servers
     }
 
+    async fn schedule_file_crc_recovery(
+        &mut self,
+        file_id: NzbFileId,
+        expected_crc: u32,
+        actual_crc: u32,
+    ) -> Result<bool, String> {
+        let Some(file_candidates) = self.unverified_segments.get(&file_id) else {
+            return Ok(false);
+        };
+        let candidate_count = file_candidates.len();
+
+        let Some(state) = self.jobs.get(&file_id.job_id) else {
+            return Ok(false);
+        };
+        let Some(file_spec) = state.spec.files.get(file_id.file_index as usize) else {
+            return Ok(false);
+        };
+        let mut queued = Vec::with_capacity(candidate_count);
+        for seg_spec in &file_spec.segments {
+            let Some(provenance) = file_candidates.get(&seg_spec.ordinal) else {
+                continue;
+            };
+            let segment_id = SegmentId {
+                file_id,
+                segment_number: seg_spec.ordinal,
+            };
+            let retry_count = self.decode_retries.get(&segment_id).copied().unwrap_or(0);
+            if retry_count >= MAX_SEGMENT_RETRIES {
+                warn!(
+                    file_id = %file_id,
+                    segment = %segment_id,
+                    retries = retry_count,
+                    expected_crc = format_args!("{expected_crc:08x}"),
+                    actual_crc = format_args!("{actual_crc:08x}"),
+                    "whole-file CRC recovery exhausted segment retry budget"
+                );
+                return Ok(false);
+            }
+            let exclude_servers = Self::decode_retry_exclude_servers(
+                &provenance.exclude_servers,
+                provenance.source_server_idx,
+            );
+            queued.push((
+                segment_id,
+                retry_count + 1,
+                DownloadWork {
+                    segment_id,
+                    message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
+                    groups: file_spec.groups.clone(),
+                    priority: file_spec.role.download_priority(),
+                    byte_estimate: seg_spec.bytes,
+                    retry_count: 0,
+                    // A CRC recovery candidate is mandatory even when the source
+                    // file is normally optional recovery material.
+                    is_recovery: false,
+                    exclude_servers,
+                },
+            ));
+        }
+        if queued.len() != candidate_count {
+            return Ok(false);
+        }
+
+        let recovery_job_id = file_id.job_id;
+        let recovery_file_index = file_id.file_index;
+        self.db_blocking(move |db| db.mark_file_incomplete(recovery_job_id, recovery_file_index))
+            .await
+            .map_err(|error| {
+                format!("failed to persist file invalidation before CRC recovery: {error}")
+            })?;
+        self.pending_file_progress.remove(&file_id);
+        self.persisted_file_progress.remove(&file_id);
+        self.mark_file_hash_reread_required_for(file_id, "whole_file_crc_recovery");
+
+        self.file_crc_recoveries.insert(
+            file_id,
+            FileCrcRecoveryState {
+                pending_segments: queued
+                    .iter()
+                    .map(|(segment_id, _, _)| *segment_id)
+                    .collect(),
+                expected_crc,
+                last_actual_crc: actual_crc,
+            },
+        );
+
+        for (segment_id, retry_count, work) in queued {
+            self.decode_retries.insert(segment_id, retry_count);
+            self.metrics
+                .segments_retried
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                file_id = %file_id,
+                segment = %segment_id,
+                retry_count,
+                exclude_servers = ?work.exclude_servers,
+                "queued unverified segment for whole-file CRC recovery"
+            );
+            self.requeue_retry_work(work);
+        }
+        self.update_queue_metrics();
+        warn!(
+            file_id = %file_id,
+            candidate_count,
+            expected_crc = format_args!("{expected_crc:08x}"),
+            actual_crc = format_args!("{actual_crc:08x}"),
+            "whole-file CRC mismatch; recovering unverified segments"
+        );
+        Ok(true)
+    }
+
+    async fn persist_file_crc_recovery_segment(
+        &mut self,
+        file_offset: u64,
+        segment: BufferedDecodedSegment,
+    ) {
+        let segment_id = segment.segment_id;
+        let file_id = segment_id.file_id;
+        let Some((_job_id, filename, _working_dir, file_path)) =
+            self.write_target_for_file(file_id)
+        else {
+            self.fail_job(
+                file_id.job_id,
+                format!("missing write target during whole-file CRC recovery for {file_id}"),
+            );
+            return;
+        };
+
+        let segment = match write_segment_to_disk(&file_path, file_offset, segment).await {
+            Ok(segment) => segment,
+            Err(error) => {
+                self.fail_job_for_disk_write(
+                    SegmentWriteError::new(file_id, error),
+                    "disk write failed during whole-file CRC recovery",
+                );
+                return;
+            }
+        };
+        self.mark_file_hash_reread_required_for(file_id, "whole_file_crc_recovery_write");
+
+        let remaining = self.file_crc_recoveries.get_mut(&file_id).map(|recovery| {
+            recovery.pending_segments.remove(&segment_id);
+            recovery.pending_segments.len()
+        });
+        let Some(remaining) = remaining else {
+            debug!(segment = %segment_id, "discarding stale whole-file CRC recovery result");
+            return;
+        };
+        if remaining > 0 {
+            debug!(
+                file_id = %file_id,
+                segment = %segment_id,
+                remaining,
+                "whole-file CRC recovery replacement persisted"
+            );
+            return;
+        }
+
+        let recovery = self
+            .file_crc_recoveries
+            .remove(&file_id)
+            .expect("CRC recovery state must exist after final replacement");
+        info!(
+            file_id = %file_id,
+            expected_crc = format_args!("{:08x}", recovery.expected_crc),
+            previous_actual_crc = format_args!("{:08x}", recovery.last_actual_crc),
+            "whole-file CRC recovery batch persisted; verifying file"
+        );
+        self.commit_persisted_segment(
+            file_offset,
+            segment,
+            &filename,
+            &file_path,
+            SegmentHashMode::UpdateNow,
+        )
+        .await;
+    }
+
     pub(crate) async fn flush_quiescent_write_backlog(&mut self) {
         if self.active_downloads > 0
             || !self.pending_decode.is_empty()
@@ -1002,6 +1180,20 @@ impl Pipeline {
             self.metrics
                 .segments_failed_permanent
                 .fetch_add(1, Ordering::Relaxed);
+            if let Some((expected_crc, actual_crc)) = self
+                .file_crc_recoveries
+                .get(&segment_id.file_id)
+                .filter(|recovery| recovery.pending_segments.contains(&segment_id))
+                .map(|recovery| (recovery.expected_crc, recovery.last_actual_crc))
+            {
+                self.fail_job(
+                    job_id,
+                    format!(
+                        "whole-file CRC32 recovery exhausted for {segment_id}: expected {expected_crc:08x}, last actual {actual_crc:08x}; final decode error: {error}"
+                    ),
+                );
+                return;
+            }
             if let Some(state) = self.jobs.get_mut(&job_id) {
                 let file_idx = segment_id.file_id.file_index as usize;
                 if let Some(file_spec) = state.spec.files.get(file_idx)
@@ -1074,6 +1266,7 @@ impl Pipeline {
         let DecodeResult {
             segment_id,
             raw_size: _,
+            unverified_provenance,
             file_offset,
             decoded_size,
             crc_valid,
@@ -1086,6 +1279,11 @@ impl Pipeline {
 
         let job_id = segment_id.file_id.job_id;
         let file_id = segment_id.file_id;
+        let is_file_crc_recovery = !self.file_crc_recoveries.is_empty()
+            && self
+                .file_crc_recoveries
+                .get(&file_id)
+                .is_some_and(|recovery| recovery.pending_segments.contains(&segment_id));
 
         let ready = {
             let _cpu_scope =
@@ -1158,9 +1356,30 @@ impl Pipeline {
                 crc_valid,
             });
 
-            // Track decoded (not raw/yEnc-encoded) bytes so progress never exceeds 100%.
-            if let Some(state) = self.jobs.get_mut(&job_id) {
-                state.downloaded_bytes += decoded_size as u64;
+            if part_crc_verified {
+                if is_file_crc_recovery {
+                    let remove_file_bucket = self
+                        .unverified_segments
+                        .get_mut(&file_id)
+                        .is_some_and(|segments| {
+                            segments.remove(&segment_id.segment_number);
+                            segments.is_empty()
+                        });
+                    if remove_file_bucket {
+                        self.unverified_segments.remove(&file_id);
+                    }
+                }
+            } else {
+                let provenance = unverified_provenance
+                    .map(|provenance| *provenance)
+                    .unwrap_or(UnverifiedSegmentProvenance {
+                        source_server_idx: None,
+                        exclude_servers: Vec::new(),
+                    });
+                self.unverified_segments
+                    .entry(file_id)
+                    .or_default()
+                    .insert(segment_id.segment_number, provenance);
             }
 
             let buffered_segment = BufferedDecodedSegment {
@@ -1171,6 +1390,18 @@ impl Pipeline {
                 part_crc_verified,
                 yenc_name,
             };
+
+            if is_file_crc_recovery {
+                drop(_cpu_scope);
+                self.persist_file_crc_recovery_segment(file_offset, buffered_segment)
+                    .await;
+                return;
+            }
+
+            // Track decoded (not raw/yEnc-encoded) bytes so progress never exceeds 100%.
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                state.downloaded_bytes += decoded_size as u64;
+            }
             let buffered_len = buffered_segment.len_bytes();
 
             let ready = {
@@ -1501,23 +1732,29 @@ impl Pipeline {
             };
 
             match file_asm.commit_segment(segment_id.segment_number, decoded_size) {
-                Ok(commit) => Ok((commit.file_complete, file_asm.received_bytes())),
+                Ok(commit) => Ok((
+                    commit.file_complete,
+                    file_asm.received_bytes(),
+                    commit.was_duplicate,
+                )),
                 Err(e) => Err(e),
             }
         };
 
         match commit_result {
-            Ok((file_complete, total_bytes)) => {
-                self.metrics
-                    .bytes_committed
-                    .fetch_add(decoded_size as u64, Ordering::Relaxed);
-                self.metrics
-                    .segments_committed
-                    .fetch_add(1, Ordering::Relaxed);
+            Ok((file_complete, total_bytes, was_duplicate)) => {
+                if !was_duplicate {
+                    self.metrics
+                        .bytes_committed
+                        .fetch_add(decoded_size as u64, Ordering::Relaxed);
+                    self.metrics
+                        .segments_committed
+                        .fetch_add(1, Ordering::Relaxed);
 
-                let _ = self
-                    .event_tx
-                    .send(PipelineEvent::SegmentCommitted { segment_id });
+                    let _ = self
+                        .event_tx
+                        .send(PipelineEvent::SegmentCommitted { segment_id });
+                }
 
                 let use_crc_metadata = self.should_use_completed_file_crc_metadata(file_id);
                 match hash_mode {
@@ -1609,6 +1846,11 @@ impl Pipeline {
                         }
                     }
 
+                    // Queued behind the file's final write on its owner
+                    // thread, so the fd is released before verification,
+                    // repair, or the final move touch this path.
+                    crate::pipeline::release_cached_write_handle(file_path);
+
                     let expected_file_crc = self.expected_file_crcs.get(&file_id).copied();
                     let file_checksum = match self
                         .finalize_completed_file_hash(
@@ -1642,6 +1884,17 @@ impl Pipeline {
                         && file_checksum.crc32 != expected_crc
                     {
                         self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
+                        match self
+                            .schedule_file_crc_recovery(file_id, expected_crc, file_checksum.crc32)
+                            .await
+                        {
+                            Ok(true) => return,
+                            Ok(false) => {}
+                            Err(error) => {
+                                self.fail_job(job_id, error);
+                                return;
+                            }
+                        }
                         self.fail_job(
                             job_id,
                             format!(
@@ -1711,6 +1964,8 @@ impl Pipeline {
                     self.file_hash_states.remove(&file_id);
                     self.expected_file_crcs.remove(&file_id);
                     self.file_hash_reread_required.remove(&file_id);
+                    self.unverified_segments.remove(&file_id);
+                    self.file_crc_recoveries.remove(&file_id);
 
                     let mut stage_start = Instant::now();
                     self.try_load_par2_metadata(job_id, file_id).await;

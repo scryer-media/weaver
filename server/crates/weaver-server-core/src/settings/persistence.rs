@@ -125,7 +125,7 @@ async fn max_seen_job_id_floor_tx(tx: &mut SqlTx<'_>) -> Result<u64, StateError>
     Ok((max_seen as u64 + 1).max(10_000))
 }
 
-async fn reserve_next_job_id_tx(tx: &mut SqlTx<'_>) -> Result<u64, StateError> {
+pub(crate) async fn reserve_next_job_id_tx(tx: &mut SqlTx<'_>) -> Result<u64, StateError> {
     let floor = max_seen_job_id_floor_tx(tx).await?;
     tx.execute(
         "INSERT INTO settings (key, value) VALUES ({}, {})
