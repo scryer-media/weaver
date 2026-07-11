@@ -30,7 +30,7 @@ import {
   type DuplicatePolicy,
 } from "@/features/duplicates/duplicate-policy";
 
-const MAX_SPEED = 100 * 1024 * 1024;
+const MAX_SPEED = 10 * 1024 * 1024 * 1024;
 
 type GeneralSettings = {
   dataDir: string;
@@ -352,7 +352,7 @@ export function GeneralSettingsPage() {
             />
             <div className="mt-2 flex justify-between text-xs text-muted-foreground">
               <span>{t("settings.unlimited")}</span>
-              <span>100 MB/s</span>
+              <span>10 GiB/s</span>
             </div>
           </div>
 
