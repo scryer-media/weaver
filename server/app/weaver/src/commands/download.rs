@@ -11,6 +11,7 @@ use weaver_server_core::jobs::{DuplicateMode, SubmissionOrigin};
 use weaver_server_core::settings::Config;
 use weaver_server_core::{Pipeline, SchedulerCommand, SchedulerHandle};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     config: &mut Config,
     db: &Database,

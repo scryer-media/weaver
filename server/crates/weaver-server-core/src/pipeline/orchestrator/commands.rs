@@ -88,7 +88,7 @@ impl Pipeline {
                         status: "cancelled".to_string(),
                         error_message: None,
                         total_bytes: total,
-                        downloaded_bytes: Self::effective_downloaded_bytes(&state),
+                        downloaded_bytes: Self::effective_downloaded_bytes(state),
                         optional_recovery_bytes,
                         optional_recovery_downloaded_bytes,
                         failed_bytes: state.failed_bytes,

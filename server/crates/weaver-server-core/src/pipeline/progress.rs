@@ -51,12 +51,12 @@ impl Pipeline {
     }
 
     pub(crate) fn phase_end(&mut self, job_id: JobId, phase: JobPhase) {
-        if self.phase_progress.remove(&(job_id, phase)).is_some() {
-            if let Some(phases) = self.phase_progress_snapshots.get_mut(&job_id) {
-                phases.retain(|progress| progress.phase != phase);
-                if phases.is_empty() {
-                    self.phase_progress_snapshots.remove(&job_id);
-                }
+        if self.phase_progress.remove(&(job_id, phase)).is_some()
+            && let Some(phases) = self.phase_progress_snapshots.get_mut(&job_id)
+        {
+            phases.retain(|progress| progress.phase != phase);
+            if phases.is_empty() {
+                self.phase_progress_snapshots.remove(&job_id);
             }
         }
     }

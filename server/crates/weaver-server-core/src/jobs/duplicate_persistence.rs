@@ -735,7 +735,7 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<SemanticPromotionClaim>, StateError> {
         let datastore = self.datastore();
-        let limit = limit.max(1).min(256) as i64;
+        let limit = limit.clamp(1, 256) as i64;
         let now = epoch_seconds();
         let (active_claims, stale_claims, pending_triggers) =
             self.run_sql_blocking(async move {
@@ -1309,6 +1309,7 @@ impl Database {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn transition_duplicate_snapshot_for_history_tx(
     tx: &mut SqlTx<'_>,
     job_id: JobId,
@@ -1389,10 +1390,10 @@ async fn admit_duplicate_submission_tx(
 ) -> Result<DuplicateAdmission, StateError> {
     cleanup_stale_admissions_tx(tx, now).await?;
 
-    if let Some(key) = &request.idempotency {
-        if let Some(existing) = load_idempotency_tx(tx, key).await? {
-            return Ok(existing_idempotency_outcome(existing, request));
-        }
+    if let Some(key) = &request.idempotency
+        && let Some(existing) = load_idempotency_tx(tx, key).await?
+    {
+        return Ok(existing_idempotency_outcome(existing, request));
     }
 
     let job_id = JobId(reserve_next_job_id_tx(tx).await?);
