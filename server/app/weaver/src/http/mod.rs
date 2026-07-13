@@ -44,6 +44,7 @@ struct RequestAuthContext {
 pub struct ServerRuntime {
     pub schema: WeaverSchema,
     pub handle: SchedulerHandle,
+    pub scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
     pub db: Database,
     pub auth_cache: LoginAuthCache,
     pub api_key_cache: ApiKeyCache,

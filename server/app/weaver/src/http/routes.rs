@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Extension, Request};
-use axum::http::{StatusCode, header};
+use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -10,10 +10,13 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use weaver_server_core::auth::generate_api_key;
 
+pub(super) const NZBGET_RPC_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
 pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
     let super::ServerRuntime {
         schema,
         handle,
+        scheduled_resume,
         db,
         auth_cache,
         api_key_cache,
@@ -45,66 +48,14 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         session_token.clone(),
         rss,
         watch_folder,
+        scheduled_resume,
     );
     let backup_upload_routes = Router::new()
         .route("/inspect", post(super::backup::backup_inspect_handler))
         .route("/restore", post(super::backup::backup_restore_handler))
         .route_layer(RequestBodyLimitLayer::new(backup_upload_limit));
 
-    // NZBGet-compat RPC bodies carry whole NZBs as base64 (+33%) plus envelope
-    // overhead; axum's 2 MiB default would reject ordinary season packs.
-    let rpc_body_limit = usize::try_from(
-        security
-            .nzb_upload_limit_bytes
-            .saturating_mul(3)
-            .saturating_div(2),
-    )
-    .unwrap_or(usize::MAX);
-    // `jsonrpc_handler`/`xmlrpc_handler` take `body: Bytes`, which axum fully
-    // buffers (up to `rpc_body_limit`, as large as 384 MiB) as soon as that
-    // extractor runs -- before the handler body itself gets a chance to
-    // check auth. Without a gate here, an unauthenticated flood of requests
-    // could each buffer up to the limit concurrently and exhaust memory.
-    // `from_fn` runs as a Tower middleware wrapping the whole inner service,
-    // so it executes before axum dispatches to the route's handler and its
-    // extractors -- i.e. before any buffering happens:
-    //   (a) no credential header at all -> reject with 401 immediately
-    //       without calling `next`. A trivial unauth flood (no header) never
-    //       buffers a body, and needs no DB lookup.
-    //   (b) header present -> acquire a permit from a shared semaphore
-    //       (capacity 6) held across the whole request, so at most 6
-    //       requests buffer bodies concurrently.
-    // The presence check must accept EVERY credential form the facade's real
-    // authenticator (`resolve_caller`) honors, or it would 401 valid callers
-    // before the handler runs: `authorization`/`x-authorization` (Basic, used
-    // by Sonarr/Radarr/nzb360), `x-api-key`, and the `weaver_jwt`/
-    // `weaver_session` cookies.
-    // Residual: a client that sends a *present but bogus* credential still
-    // takes a buffering slot before its credentials are actually checked,
-    // but it is bounded to 6x `rpc_body_limit` total instead of unbounded --
-    // an acceptable tradeoff to avoid a DB lookup on every single request.
-    let rpc_buffer_gate = Arc::new(tokio::sync::Semaphore::new(6));
-    let nzbget_rpc_routes = Router::new()
-        .route("/jsonrpc", post(super::nzbget::jsonrpc_handler))
-        .route("/xmlrpc", post(super::nzbget::xmlrpc_handler))
-        .route_layer(axum::extract::DefaultBodyLimit::max(rpc_body_limit))
-        .layer(middleware::from_fn(move |req: Request, next: Next| {
-            let rpc_buffer_gate = Arc::clone(&rpc_buffer_gate);
-            async move {
-                let headers = req.headers();
-                let has_credential = headers.contains_key(header::AUTHORIZATION)
-                    || headers.contains_key("x-authorization")
-                    || headers.contains_key("x-api-key")
-                    || headers.contains_key(header::COOKIE);
-                if !has_credential {
-                    return StatusCode::UNAUTHORIZED.into_response();
-                }
-                let Ok(_permit) = rpc_buffer_gate.acquire().await else {
-                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
-                };
-                next.run(req).await
-            }
-        }));
+    let nzbget_rpc_routes = build_nzbget_rpc_routes(nzbget_context);
 
     let inner = Router::new()
         .route("/metrics", get(super::metrics::metrics_handler))
@@ -140,7 +91,6 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .layer(Extension(auth_cache))
         .layer(Extension(login_limiter))
         .layer(Extension(api_key_cache))
-        .layer(Extension(nzbget_context))
         .layer(Extension(request_auth))
         .layer(Extension(metrics_exporter))
         .layer(Extension(base_url_ext))
@@ -161,4 +111,47 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
             )
             .nest(&base_url, inner)
     }
+}
+
+pub(super) fn build_nzbget_rpc_routes(
+    nzbget_context: super::nzbget::NzbgetFacadeContext,
+) -> Router {
+    // 32 MiB of JSON/XML envelope carries roughly 24 MiB of decoded base64 NZB
+    // data, comfortably above observed real-world payloads while keeping the
+    // fully-buffered RPC surface bounded independently of the core upload cap.
+    let rpc_buffer_gate = Arc::new(tokio::sync::Semaphore::new(6));
+    let nzbget_auth_context = nzbget_context.clone();
+    Router::new()
+        .route("/jsonrpc", post(super::nzbget::jsonrpc_handler))
+        .route("/xmlrpc", post(super::nzbget::xmlrpc_handler))
+        .route_layer(axum::extract::DefaultBodyLimit::max(
+            NZBGET_RPC_BODY_LIMIT_BYTES,
+        ))
+        .layer(middleware::from_fn(move |mut req: Request, next: Next| {
+            let rpc_buffer_gate = Arc::clone(&rpc_buffer_gate);
+            let nzbget_auth_context = nzbget_auth_context.clone();
+            async move {
+                let scope = match super::nzbget::resolve_scope_for_facade(
+                    &nzbget_auth_context,
+                    req.headers(),
+                )
+                .await
+                {
+                    Ok(scope) => scope,
+                    Err(status) => {
+                        return super::nzbget::authentication_error_response(
+                            req.uri().path(),
+                            status,
+                        );
+                    }
+                };
+                req.extensions_mut()
+                    .insert(super::nzbget::NzbgetCallerScope(scope));
+                let Ok(_permit) = rpc_buffer_gate.acquire().await else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                next.run(req).await
+            }
+        }))
+        .layer(Extension(nzbget_context))
 }

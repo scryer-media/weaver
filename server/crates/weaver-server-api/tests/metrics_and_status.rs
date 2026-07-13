@@ -206,6 +206,40 @@ async fn is_paused_true_after_pause_all() {
     assert!(data["isPaused"].as_bool().unwrap());
 }
 
+#[tokio::test(start_paused = true)]
+async fn graphql_global_pause_surfaces_cancel_scheduled_resume() {
+    let h = TestHarness::new().await;
+    let mutations = [
+        ("mutation { pauseAll }", true),
+        ("mutation { resumeAll }", false),
+        ("mutation { pauseQueue { success } }", true),
+        ("mutation { resumeQueue { success } }", false),
+    ];
+
+    for (mutation, expected_paused) in mutations {
+        h.scheduled_resume.pause_all().await.unwrap();
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        h.scheduled_resume.schedule_resume(deadline).await.unwrap();
+        tokio::task::yield_now().await;
+
+        let resp = h.execute(mutation).await;
+        assert_no_errors(&resp);
+        assert_eq!(h.scheduled_resume.resume_at().await, 0);
+        assert_eq!(
+            h.db.get_setting("nzbget.scheduled_resume_at").unwrap(),
+            None
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(h.handle.is_globally_paused(), expected_paused);
+    }
+}
+
 #[tokio::test]
 async fn is_paused_false_after_resume_all() {
     let h = TestHarness::new().await;

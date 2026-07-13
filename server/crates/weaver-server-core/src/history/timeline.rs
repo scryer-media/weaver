@@ -16,6 +16,21 @@ pub struct JobEvent {
     pub file_id: Option<String>,
 }
 
+/// A job event read from durable storage together with its stable row id.
+#[derive(Debug, Clone)]
+pub struct JobEventRecord {
+    pub id: u64,
+    pub event: JobEvent,
+}
+
+impl std::ops::Deref for JobEventRecord {
+    type Target = JobEvent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.event
+    }
+}
+
 pub const JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER: &str = "__timeline:finalizing-download";
 
 /// Per-job (kind, first_ts, last_ts) event bounds keyed by job id.
@@ -209,6 +224,43 @@ impl Database {
         })
     }
 
+    /// Load the most recent events for a job with their stable database ids.
+    /// Results are returned oldest-first after the capped newest-row query.
+    pub fn get_job_event_records_latest(
+        &self,
+        job_id: u64,
+        cap: u32,
+    ) -> Result<Vec<JobEventRecord>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let mut rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT id, job_id, timestamp, kind, message, file_id
+                   FROM job_events
+                  WHERE job_id = {}
+                  ORDER BY id DESC
+                  LIMIT {}",
+                &[SqlArg::I64(job_id as i64), SqlArg::I64(i64::from(cap))],
+            )
+            .await?;
+            rows.reverse();
+            rows.into_iter()
+                .map(|row| {
+                    Ok(JobEventRecord {
+                        id: row.i64("id")? as u64,
+                        event: JobEvent {
+                            job_id: row.i64("job_id")? as u64,
+                            timestamp: row.i64("timestamp")?,
+                            kind: row.text("kind")?,
+                            message: row.text("message")?,
+                            file_id: row.opt_text("file_id")?,
+                        },
+                    })
+                })
+                .collect()
+        })
+    }
+
     /// Batched min/max event timestamps per (job, kind) for stage-duration
     /// reporting. One query regardless of how many jobs are listed; only the
     /// stage-boundary kinds in `kinds` are scanned.
@@ -255,19 +307,17 @@ impl Database {
     }
 
     /// Batched newest-first event read across multiple jobs in a single
-    /// query. Floored at `min_timestamp_ms` and capped at `limit` rows total
-    /// (not per job). Intended for callers that currently poll per-job (e.g.
-    /// [`Database::get_job_events_latest`] in a loop) and can instead issue
-    /// one query for the whole batch.
+    /// query. Floored at the stable database row `min_id` and capped at
+    /// `limit` rows total (not per job).
     ///
     /// Unlike [`Database::get_job_events_latest`], the result is returned in
     /// the raw `ORDER BY id DESC` order (newest first) and is not reversed.
     pub fn get_recent_job_events_multi(
         &self,
         job_ids: &[u64],
-        min_timestamp_ms: i64,
+        min_id: u64,
         limit: usize,
-    ) -> Result<Vec<JobEvent>, StateError> {
+    ) -> Result<Vec<JobEventRecord>, StateError> {
         if job_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -278,10 +328,11 @@ impl Database {
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
+        let min_id = min_id.min(i64::MAX as u64);
         let sql = format!(
-            "SELECT job_id, timestamp, kind, message, file_id
+            "SELECT id, job_id, timestamp, kind, message, file_id
                FROM job_events
-              WHERE job_id IN ({ids}) AND timestamp >= {min_timestamp_ms}
+              WHERE job_id IN ({ids}) AND id >= {min_id}
               ORDER BY id DESC
               LIMIT {limit}"
         );
@@ -290,12 +341,15 @@ impl Database {
             let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[]).await?;
             rows.into_iter()
                 .map(|row| {
-                    Ok(JobEvent {
-                        job_id: row.i64("job_id")? as u64,
-                        timestamp: row.i64("timestamp")?,
-                        kind: row.text("kind")?,
-                        message: row.text("message")?,
-                        file_id: row.opt_text("file_id")?,
+                    Ok(JobEventRecord {
+                        id: row.i64("id")? as u64,
+                        event: JobEvent {
+                            job_id: row.i64("job_id")? as u64,
+                            timestamp: row.i64("timestamp")?,
+                            kind: row.text("kind")?,
+                            message: row.text("message")?,
+                            file_id: row.opt_text("file_id")?,
+                        },
                     })
                 })
                 .collect()
@@ -348,28 +402,38 @@ mod get_recent_job_events_multi_tests {
     use super::*;
 
     #[test]
-    fn returns_newest_first_across_jobs_respecting_min_timestamp_and_limit() {
+    fn returns_newest_first_across_jobs_respecting_min_id_and_limit() {
         let db = Database::open_in_memory().unwrap();
+        // Row id 1 is below the requested IDFrom floor.
+        db.insert_job_event(1, 500, "OLD", "too old", None).unwrap();
         db.insert_job_event(1, 1000, "A", "job1-a", None).unwrap();
         db.insert_job_event(2, 1001, "B", "job2-a", None).unwrap();
         db.insert_job_event(1, 1002, "C", "job1-b", None).unwrap();
         db.insert_job_event(2, 1003, "D", "job2-b", None).unwrap();
-        // Below the floor: must be excluded regardless of limit.
-        db.insert_job_event(1, 500, "OLD", "too old", None).unwrap();
         // Unrelated job must not leak into the batch.
         db.insert_job_event(3, 2000, "OTHER", "other job", None)
             .unwrap();
 
-        let events = db.get_recent_job_events_multi(&[1, 2], 1000, 10).unwrap();
+        let events = db.get_recent_job_events_multi(&[1, 2], 2, 10).unwrap();
         // Newest first (ORDER BY id DESC): D, C, B, A.
         let messages: Vec<&str> = events.iter().map(|e| e.message.as_str()).collect();
         assert_eq!(messages, vec!["job2-b", "job1-b", "job2-a", "job1-a"]);
+        assert_eq!(
+            events.iter().map(|event| event.id).collect::<Vec<_>>(),
+            vec![5, 4, 3, 2]
+        );
 
         // `limit` caps the total row count across jobs while staying
         // newest-first.
-        let limited = db.get_recent_job_events_multi(&[1, 2], 1000, 2).unwrap();
+        let limited = db.get_recent_job_events_multi(&[1, 2], 2, 2).unwrap();
         let limited_messages: Vec<&str> = limited.iter().map(|e| e.message.as_str()).collect();
         assert_eq!(limited_messages, vec!["job2-b", "job1-b"]);
+
+        let latest = db.get_job_event_records_latest(1, 2).unwrap();
+        assert_eq!(
+            latest.iter().map(|event| event.id).collect::<Vec<_>>(),
+            vec![2, 4]
+        );
     }
 
     #[test]

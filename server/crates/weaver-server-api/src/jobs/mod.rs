@@ -1,5 +1,6 @@
 pub(crate) mod release_display;
 pub(crate) mod replay;
+pub mod scheduled_resume;
 pub(crate) mod staging;
 pub mod types;
 

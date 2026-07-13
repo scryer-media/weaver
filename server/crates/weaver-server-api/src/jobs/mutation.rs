@@ -17,6 +17,7 @@ use crate::jobs::types::{
     SubmitStagedNzbsResult, global_queue_state, normalize_priority_value, queue_item_from_job,
     queue_item_from_submission, submit_metadata,
 };
+use crate::{ScheduledResumeCoordinator, ScheduledResumeError};
 use weaver_server_core::ingest::{
     SubmissionDuplicateOutcome, SubmissionOptions, SubmitNzbError, SubmittedJob,
     fetch_nzb_from_url, materialize_semantic_promotion, submit_nzb_bytes_with_options,
@@ -529,17 +530,15 @@ impl JobsMutation {
     /// Pause all download dispatch globally.
     #[graphql(guard = "ControlGuard")]
     async fn pause_all(&self, ctx: &Context<'_>) -> Result<bool> {
-        let handle = ctx.data::<SchedulerHandle>()?;
-        handle.pause_all().await?;
-        clear_nzbget_scheduled_resume(ctx.data::<Database>()?).await;
+        let scheduled_resume = ctx.data::<ScheduledResumeCoordinator>()?;
+        map_scheduled_resume_result(scheduled_resume.pause_all().await)?;
         Ok(true)
     }
     /// Resume all download dispatch globally.
     #[graphql(guard = "ControlGuard")]
     async fn resume_all(&self, ctx: &Context<'_>) -> Result<bool> {
-        let handle = ctx.data::<SchedulerHandle>()?;
-        handle.resume_all().await?;
-        clear_nzbget_scheduled_resume(ctx.data::<Database>()?).await;
+        let scheduled_resume = ctx.data::<ScheduledResumeCoordinator>()?;
+        map_scheduled_resume_result(scheduled_resume.resume_all().await)?;
         Ok(true)
     }
     /// Set the global download speed limit in bytes/sec. 0 means unlimited.
@@ -685,8 +684,8 @@ impl JobsMutation {
     async fn pause_queue(&self, ctx: &Context<'_>) -> Result<QueueCommandResult> {
         let handle = ctx.data::<SchedulerHandle>()?;
         let config = ctx.data::<SharedConfig>()?;
-        map_scheduler_result(handle.pause_all().await)?;
-        clear_nzbget_scheduled_resume(ctx.data::<Database>()?).await;
+        let scheduled_resume = ctx.data::<ScheduledResumeCoordinator>()?;
+        map_scheduled_resume_result(scheduled_resume.pause_all().await)?;
         let cfg = config.read().await;
         Ok(QueueCommandResult {
             success: true,
@@ -704,8 +703,8 @@ impl JobsMutation {
     async fn resume_queue(&self, ctx: &Context<'_>) -> Result<QueueCommandResult> {
         let handle = ctx.data::<SchedulerHandle>()?;
         let config = ctx.data::<SharedConfig>()?;
-        map_scheduler_result(handle.resume_all().await)?;
-        clear_nzbget_scheduled_resume(ctx.data::<Database>()?).await;
+        let scheduled_resume = ctx.data::<ScheduledResumeCoordinator>()?;
+        map_scheduled_resume_result(scheduled_resume.resume_all().await)?;
         let cfg = config.read().await;
         Ok(QueueCommandResult {
             success: true,
@@ -771,18 +770,10 @@ fn map_scheduler_result<T>(result: std::result::Result<T, SchedulerError>) -> Re
     result.map_err(scheduler_graphql_error)
 }
 
-/// Clear the NZBGet facade's persisted auto-resume deadline (the
-/// `nzbget.scheduled_resume_at` setting, mirror of
-/// `http::nzbget::SCHEDULED_RESUME_SETTING`). A pause or resume from any surface
-/// supersedes that timer; without dropping the row here a stale deadline
-/// resurrects after a restart and silently un-pauses a UI-initiated pause. (The
-/// facade's in-memory timer is separate — unifying scheduled resume into the
-/// scheduler itself would also close the in-process race and the schedule-
-/// evaluator path.)
-async fn clear_nzbget_scheduled_resume(db: &Database) {
-    let db = db.clone();
-    let _ =
-        tokio::task::spawn_blocking(move || db.delete_setting("nzbget.scheduled_resume_at")).await;
+fn map_scheduled_resume_result<T>(
+    result: std::result::Result<T, ScheduledResumeError>,
+) -> Result<T> {
+    result.map_err(|error| graphql_error("SCHEDULER_ERROR", error.to_string()))
 }
 
 fn caller_identity(ctx: &Context<'_>) -> Result<CallerIdentity> {

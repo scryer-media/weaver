@@ -21,6 +21,7 @@ pub use backup::{
 pub use categories::types::*;
 pub use context::{SchemaContext, WeaverSchema, build_schema};
 pub use history::types::*;
+pub use jobs::scheduled_resume::{ScheduledResumeCoordinator, ScheduledResumeError};
 pub use jobs::types::*;
 pub use observability::{TestDbTaskHookGuard, install_test_db_task_hook};
 pub use rss::RssService;

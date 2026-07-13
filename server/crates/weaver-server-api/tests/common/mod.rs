@@ -120,6 +120,7 @@ fn runtime_lanes_for_status(
 pub struct TestHarness {
     pub schema: WeaverSchema,
     pub handle: SchedulerHandle,
+    pub scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
     pub config: SharedConfig,
     pub db: Database,
     pub metrics: Arc<PipelineMetrics>,
@@ -194,8 +195,11 @@ impl TestHarness {
             .expect("failed to create server transfer policy registry"),
         );
 
+        let scheduled_resume =
+            weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
         let schema = build_schema(SchemaContext {
             handle: handle.clone(),
+            scheduled_resume: scheduled_resume.clone(),
             config: shared_config.clone(),
             db: db.clone(),
             server_transfer_policy: Arc::clone(&server_transfer_policy),
@@ -213,6 +217,7 @@ impl TestHarness {
         Self {
             schema,
             handle,
+            scheduled_resume,
             config: shared_config,
             db,
             metrics,

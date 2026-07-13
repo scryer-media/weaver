@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
@@ -26,45 +25,6 @@ use weaver_server_core::{
     Database, FieldUpdate, HistoryFilter, JobId, JobUpdate, SchedulerError, SchedulerHandle,
 };
 
-/// Tracks a `scheduleresume` timer. NZBGet cancels a scheduled resume when any
-/// later pause/resume command arrives; the generation counter mirrors that.
-#[derive(Default)]
-struct ResumeSchedule {
-    generation: AtomicU64,
-    /// Unix epoch seconds when downloads auto-resume. 0 = no timer armed.
-    resume_at_epoch_secs: AtomicU64,
-}
-
-impl ResumeSchedule {
-    /// Invalidate any armed timer (a manual pause/resume supersedes it).
-    fn cancel(&self) -> u64 {
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        self.resume_at_epoch_secs.store(0, Ordering::Release);
-        generation
-    }
-
-    fn arm(&self, resume_at_epoch_secs: u64) -> u64 {
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        self.resume_at_epoch_secs
-            .store(resume_at_epoch_secs, Ordering::Release);
-        generation
-    }
-
-    fn is_current(&self, generation: u64) -> bool {
-        self.generation.load(Ordering::Acquire) == generation
-    }
-
-    fn clear_if_current(&self, generation: u64) {
-        if self.is_current(generation) {
-            self.resume_at_epoch_secs.store(0, Ordering::Release);
-        }
-    }
-
-    fn resume_at(&self) -> u64 {
-        self.resume_at_epoch_secs.load(Ordering::Acquire)
-    }
-}
-
 #[derive(Clone)]
 pub(super) struct NzbgetFacadeContext {
     db: Database,
@@ -75,7 +35,7 @@ pub(super) struct NzbgetFacadeContext {
     session_token: super::SessionToken,
     http_client: reqwest::Client,
     started_at: Instant,
-    resume_schedule: Arc<ResumeSchedule>,
+    scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
     rss: weaver_server_api::RssService,
     watch_folder: weaver_server_core::watch_folder::WatchFolderService,
     /// TTL-cached free-disk-space reading: `(epoch_secs, available_bytes)`.
@@ -107,6 +67,7 @@ impl NzbgetFacadeContext {
         session_token: super::SessionToken,
         rss: weaver_server_api::RssService,
         watch_folder: weaver_server_core::watch_folder::WatchFolderService,
+        scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
     ) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
@@ -114,7 +75,7 @@ impl NzbgetFacadeContext {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
-        let context = Self {
+        Self {
             db,
             handle,
             config,
@@ -123,17 +84,12 @@ impl NzbgetFacadeContext {
             session_token,
             http_client,
             started_at: Instant::now(),
-            resume_schedule: Arc::new(ResumeSchedule::default()),
+            scheduled_resume,
             rss,
             watch_folder,
             disk_cache: Arc::new(tokio::sync::Mutex::new(None)),
             history_cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        };
-        // Re-arm a persisted `scheduleresume` timer across restarts. Requires
-        // a Tokio runtime, which every construction site (server startup,
-        // tests) provides.
-        context.spawn_scheduled_resume_recovery();
-        context
+        }
     }
 
     /// Cached free-disk-space lookup used by `status()`. The actual syscall
@@ -168,87 +124,6 @@ impl NzbgetFacadeContext {
             None => 0,
         }
     }
-
-    /// Arm the auto-resume timer for an armed [`ResumeSchedule`] generation.
-    fn spawn_scheduled_resume(&self, resume_at_epoch_secs: u64, generation: u64) {
-        let ctx = self.clone();
-        tokio::spawn(async move {
-            let delay = resume_at_epoch_secs.saturating_sub(unix_now_secs());
-            tokio::time::sleep(Duration::from_secs(delay)).await;
-            // A pause/resume/scheduleresume issued in the meantime owns the
-            // schedule now; this timer silently stands down.
-            if ctx.resume_schedule.is_current(generation) {
-                let _ = ctx.handle.resume_all().await;
-                ctx.resume_schedule.clear_if_current(generation);
-                // Only clear the row if it still holds this timer's deadline; a
-                // newer scheduleresume may have persisted its own during the
-                // resume_all().await above.
-                clear_scheduled_resume_setting(&ctx.db, Some(resume_at_epoch_secs)).await;
-            }
-        });
-    }
-
-    /// Restore a persisted scheduled resume after a restart: re-arm timers
-    /// still in the future, and honor ones that elapsed while the server was
-    /// down by resuming immediately (the global pause itself is restored
-    /// separately from the `global_paused` setting).
-    fn spawn_scheduled_resume_recovery(&self) {
-        let ctx = self.clone();
-        tokio::spawn(async move {
-            let db = ctx.db.clone();
-            let stored =
-                tokio::task::spawn_blocking(move || db.get_setting(SCHEDULED_RESUME_SETTING)).await;
-            let Ok(Ok(Some(value))) = stored else {
-                return;
-            };
-            let Ok(resume_at) = value.trim().parse::<u64>() else {
-                // Corrupt row: drop it unconditionally.
-                clear_scheduled_resume_setting(&ctx.db, None).await;
-                return;
-            };
-            if resume_at <= unix_now_secs() {
-                let _ = ctx.handle.resume_all().await;
-                clear_scheduled_resume_setting(&ctx.db, Some(resume_at)).await;
-            } else {
-                let generation = ctx.resume_schedule.arm(resume_at);
-                ctx.spawn_scheduled_resume(resume_at, generation);
-            }
-        });
-    }
-}
-
-const SCHEDULED_RESUME_SETTING: &str = "nzbget.scheduled_resume_at";
-
-/// Clear the persisted scheduled-resume deadline.
-///
-/// `expected` guards against a TOCTOU: a stale timer firing after a newer
-/// `scheduleresume` has already persisted a *different* deadline must not delete
-/// the newer row. Pass `Some(deadline)` to delete only if the stored value still
-/// equals `deadline`; pass `None` for an unconditional clear (a manual
-/// pause/resume, which supersedes any timer regardless of value).
-async fn clear_scheduled_resume_setting(db: &Database, expected: Option<u64>) {
-    let db = db.clone();
-    let _ = tokio::task::spawn_blocking(move || match expected {
-        // Atomic compare-and-delete: drop the row only if it still holds this
-        // timer's exact deadline, so a newer scheduleresume's persisted deadline
-        // (written concurrently) is never clobbered. persist writes the value as a
-        // bare decimal, so a string compare against `to_string()` is exact.
-        Some(expected) => {
-            let _ = db.delete_setting_if_value(SCHEDULED_RESUME_SETTING, &expected.to_string());
-        }
-        None => {
-            let _ = db.delete_setting(SCHEDULED_RESUME_SETTING);
-        }
-    })
-    .await;
-}
-
-async fn persist_scheduled_resume_setting(db: &Database, resume_at_epoch_secs: u64) {
-    let db = db.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        db.set_setting(SCHEDULED_RESUME_SETTING, &resume_at_epoch_secs.to_string())
-    })
-    .await;
 }
 
 fn unix_now_secs() -> u64 {
@@ -303,18 +178,14 @@ impl RpcError {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct NzbgetCallerScope(pub(super) CallerScope);
+
 pub(super) async fn jsonrpc_handler(
     Extension(ctx): Extension<NzbgetFacadeContext>,
-    headers: HeaderMap,
+    Extension(NzbgetCallerScope(scope)): Extension<NzbgetCallerScope>,
     body: Bytes,
 ) -> Response {
-    let scope = match resolve_scope_for_facade(&ctx, &headers).await {
-        Ok(scope) => scope,
-        Err(status) => {
-            return rpc_error_response(status, Value::Null, RpcError::access_denied());
-        }
-    };
-
     let request = match serde_json::from_slice::<RpcRequest>(&body) {
         Ok(request) => request,
         Err(error) => {
@@ -407,7 +278,7 @@ async fn dispatch_method(
     }
 }
 
-async fn resolve_scope_for_facade(
+pub(super) async fn resolve_scope_for_facade(
     ctx: &NzbgetFacadeContext,
     headers: &HeaderMap,
 ) -> Result<CallerScope, StatusCode> {
@@ -510,14 +381,9 @@ struct XmlRpcCall {
 
 pub(super) async fn xmlrpc_handler(
     Extension(ctx): Extension<NzbgetFacadeContext>,
-    headers: HeaderMap,
+    Extension(NzbgetCallerScope(scope)): Extension<NzbgetCallerScope>,
     body: Bytes,
 ) -> Response {
-    let scope = match resolve_scope_for_facade(&ctx, &headers).await {
-        Ok(scope) => scope,
-        Err(status) => return xmlrpc_fault_response(status, RpcError::access_denied()),
-    };
-
     let call = match parse_xmlrpc_call(&body) {
         Ok(call) => call,
         Err(error) => {
@@ -544,6 +410,14 @@ pub(super) async fn xmlrpc_handler(
     match dispatch_method(&ctx, &method, params).await {
         Ok(result) => xmlrpc_success_response(&result),
         Err(error) => xmlrpc_fault_response(StatusCode::OK, error),
+    }
+}
+
+pub(super) fn authentication_error_response(path: &str, status: StatusCode) -> Response {
+    if path.ends_with("/xmlrpc") {
+        xmlrpc_fault_response(status, RpcError::access_denied())
+    } else {
+        rpc_error_response(status, Value::Null, RpcError::access_denied())
     }
 }
 
@@ -1285,7 +1159,16 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     let arr_download_limit = download_limit.min(i32::MAX as u64);
     let scan_paused = config.watch_folder.scanning_paused;
     let complete_dir = config.complete_dir();
-    let news_servers = config.servers.len();
+    let news_servers = config
+        .servers
+        .iter()
+        .map(|server| {
+            json!({
+                "ID": server.id,
+                "Active": server.active,
+            })
+        })
+        .collect::<Vec<_>>();
     drop(config);
     // Query free disk space only after the config guard is released and off
     // the async runtime thread: `disk_space` calls `statvfs` (or
@@ -1311,7 +1194,7 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     let (average_lo, average_hi) = size_parts(average_rate);
     let (free_disk_lo, free_disk_hi) = size_parts(free_disk);
     let (article_cache_lo, article_cache_hi) = size_parts(article_cache);
-    let resume_time = ctx.resume_schedule.resume_at();
+    let resume_time = ctx.scheduled_resume.resume_at().await;
 
     Ok(json!({
         "RemainingSizeLo": remaining_lo,
@@ -1598,10 +1481,11 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
     .unwrap_or_default();
 
-    let mut seen_ids = HashSet::with_capacity(rows.len() + terminal_items.len());
+    let persisted_ids = rows.iter().map(|row| row.job_id).collect::<HashSet<_>>();
+    let mut seen_terminal_ids = HashSet::with_capacity(terminal_items.len());
     let mut items = terminal_items
         .iter()
-        .filter(|item| seen_ids.insert(item.id))
+        .filter(|item| !persisted_ids.contains(&item.id) && seen_terminal_ids.insert(item.id))
         .map(|item| nzbget_history_queue_item(item, history_timings(stage_bounds.get(&item.id))))
         .collect::<Vec<_>>();
 
@@ -1612,8 +1496,8 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     // rows every poll. The final entry still merges FRESH per-poll stage
     // timings (from `job_events`, which a reprocess can append to without
     // touching `completed_at`), so it is never served stale. The in-memory
-    // terminal QueueItem entries above are rebuilt every call: they are not
-    // immutable (a job can still transition, e.g. Completed -> deleted).
+    // terminal QueueItem fallbacks above are emitted only until their durable
+    // row is visible and are rebuilt every call because they are not immutable.
     {
         let mut cache = ctx.history_cache.lock().await;
         // Simple bound: a long-running server accumulates one entry per
@@ -1622,7 +1506,7 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         if cache.len() > 4000 {
             cache.clear();
         }
-        for row in rows.iter().filter(|row| seen_ids.insert(row.job_id)) {
+        for row in &rows {
             let cached = cache
                 .get(&row.job_id)
                 .filter(|(completed_at, _)| *completed_at == row.completed_at)
@@ -2672,7 +2556,7 @@ fn log_entry_kind(kind: &str) -> &'static str {
 }
 
 fn job_events_to_log_entries(
-    events: Vec<weaver_server_core::history::timeline::JobEvent>,
+    events: Vec<weaver_server_core::history::timeline::JobEventRecord>,
     id_from: u64,
     limit: usize,
     label: impl Fn(&weaver_server_core::history::timeline::JobEvent) -> String,
@@ -2684,13 +2568,10 @@ fn job_events_to_log_entries(
             // epoch seconds.
             let timestamp = event.timestamp.max(0) as u64 / 1000;
             json!({
-                // Timestamps stand in for NZBGet's sequential log ids: they
-                // are monotonic enough for IDFrom polling and stable across
-                // calls, which synthetic per-response counters are not.
-                "ID": timestamp,
+                "ID": event.id,
                 "Kind": log_entry_kind(&event.kind),
                 "Time": timestamp,
-                "Text": label(&event),
+                "Text": label(&event.event),
             })
         })
         .filter(|entry| id_from == 0 || entry["ID"].as_u64().unwrap_or(0) >= id_from)
@@ -2720,11 +2601,8 @@ async fn log_entries(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result
     // unbounded fetch across every queued job in one query is not a
     // reasonable default, so fall back to a sane cap.
     let query_limit = if limit == 0 { 100 } else { limit };
-    // id_from is epoch seconds; the query filters on epoch-millisecond
-    // timestamps.
-    let min_timestamp_ms = id_from.saturating_mul(1000) as i64;
     let events = tokio::task::spawn_blocking(move || {
-        db.get_recent_job_events_multi(&ids, min_timestamp_ms, query_limit)
+        db.get_recent_job_events_multi(&ids, id_from, query_limit)
     })
     .await
     .map_err(|error| RpcError::invalid_parameter(format!("log unavailable: {error}")))?
@@ -2753,10 +2631,13 @@ async fn loadlog(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
     let limit = optional_i64_param(&params, 2)?.unwrap_or(0).max(0) as usize;
 
     let db = ctx.db.clone();
-    let events = tokio::task::spawn_blocking(move || db.get_job_events_latest(job_id.0, 1000))
-        .await
-        .map_err(|error| RpcError::invalid_parameter(format!("loadlog unavailable: {error}")))?
-        .map_err(|error| RpcError::invalid_parameter(format!("loadlog unavailable: {error}")))?;
+    let events =
+        tokio::task::spawn_blocking(move || db.get_job_event_records_latest(job_id.0, 1000))
+            .await
+            .map_err(|error| RpcError::invalid_parameter(format!("loadlog unavailable: {error}")))?
+            .map_err(|error| {
+                RpcError::invalid_parameter(format!("loadlog unavailable: {error}"))
+            })?;
 
     Ok(Value::Array(job_events_to_log_entries(
         events,
@@ -2791,24 +2672,18 @@ fn scheduler_rpc_error(command: &str, error: SchedulerError) -> RpcError {
 }
 
 async fn pause_download(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    ctx.resume_schedule.cancel();
-    // A manual pause supersedes any timer: clear unconditionally.
-    clear_scheduled_resume_setting(&ctx.db, None).await;
-    ctx.handle
+    ctx.scheduled_resume
         .pause_all()
         .await
-        .map_err(|error| scheduler_rpc_error("pausedownload", error))?;
+        .map_err(|error| RpcError::invalid_parameter(format!("pausedownload failed: {error}")))?;
     Ok(json!(true))
 }
 
 async fn resume_download(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    ctx.resume_schedule.cancel();
-    // A manual resume supersedes any timer: clear unconditionally.
-    clear_scheduled_resume_setting(&ctx.db, None).await;
-    ctx.handle
+    ctx.scheduled_resume
         .resume_all()
         .await
-        .map_err(|error| scheduler_rpc_error("resumedownload", error))?;
+        .map_err(|error| RpcError::invalid_parameter(format!("resumedownload failed: {error}")))?;
     Ok(json!(true))
 }
 
@@ -2845,9 +2720,10 @@ async fn scheduleresume(
     }
 
     let resume_at = unix_now_secs() + seconds as u64;
-    let generation = ctx.resume_schedule.arm(resume_at);
-    persist_scheduled_resume_setting(&ctx.db, resume_at).await;
-    ctx.spawn_scheduled_resume(resume_at, generation);
+    ctx.scheduled_resume
+        .schedule_resume(resume_at)
+        .await
+        .map_err(|error| RpcError::invalid_parameter(format!("scheduleresume failed: {error}")))?;
     Ok(json!(true))
 }
 

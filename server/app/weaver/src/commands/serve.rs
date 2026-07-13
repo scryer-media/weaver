@@ -158,10 +158,13 @@ pub(crate) async fn run(
     .await?;
 
     let nntp_pool = pipeline.nntp_pool();
+    let scheduled_resume =
+        weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
 
     // Build the GraphQL schema now that the live NNTP pool exists (for server-health metrics).
     let schema = weaver_server_api::build_schema(weaver_server_api::SchemaContext {
         handle: handle.clone(),
+        scheduled_resume: scheduled_resume.clone(),
         config: shared_config.clone(),
         db: db.clone(),
         server_transfer_policy: Arc::clone(&server_transfer_policy),
@@ -184,6 +187,7 @@ pub(crate) async fn run(
     let mut pipeline_task = tokio::spawn(async move {
         pipeline.run().await;
     });
+    scheduled_resume.recover().await?;
 
     let rss_task = rss.start_background_loop();
     watch_folder.reconcile_from_config().await?;
@@ -198,6 +202,7 @@ pub(crate) async fn run(
     let server_runtime = http::ServerRuntime {
         schema,
         handle: handle.clone(),
+        scheduled_resume,
         db: db.clone(),
         auth_cache: login_auth_cache,
         api_key_cache,

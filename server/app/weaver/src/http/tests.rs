@@ -157,6 +157,12 @@ fn nzbget_test_router(
         handle.clone(),
         config.clone(),
     );
+    let scheduled_resume =
+        weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
+    let recovery = scheduled_resume.clone();
+    tokio::spawn(async move {
+        let _ = recovery.recover().await;
+    });
     let context = nzbget::NzbgetFacadeContext::new(
         db,
         handle,
@@ -166,20 +172,10 @@ fn nzbget_test_router(
         session_token,
         rss,
         watch_folder,
+        scheduled_resume,
     );
 
-    let rpc_body_limit = usize::try_from(
-        weaver_server_core::security::RuntimeSecurityConfig::default()
-            .nzb_upload_limit_bytes
-            .saturating_mul(3)
-            .saturating_div(2),
-    )
-    .unwrap_or(usize::MAX);
-    Router::new()
-        .route("/jsonrpc", post(nzbget::jsonrpc_handler))
-        .route("/xmlrpc", post(nzbget::xmlrpc_handler))
-        .route_layer(axum::extract::DefaultBodyLimit::max(rpc_body_limit))
-        .layer(Extension(context))
+    routes::build_nzbget_rpc_routes(context)
 }
 
 async fn post_nzbget_xmlrpc(app: Router, body: &str, auth_value: &str) -> (StatusCode, String) {
@@ -685,6 +681,79 @@ async fn nzbget_auth_rejects_missing_and_invalid_basic_auth() {
 }
 
 #[tokio::test]
+async fn nzbget_invalid_auth_returns_without_polling_the_body() {
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+    let (_writer, reader) = tokio::io::duplex(1);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jsonrpc")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Basic not-base64")
+                .body(Body::from_stream(tokio_util::io::ReaderStream::new(reader)))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("authentication must complete without polling the pending body")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn nzbget_rpc_body_limit_is_exactly_32_mib() {
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+    let rpc = serde_json::json!({"method": "version", "params": [], "id": "limit"})
+        .to_string()
+        .into_bytes();
+
+    let mut accepted = rpc.clone();
+    accepted.resize(routes::NZBGET_RPC_BODY_LIMIT_BYTES, b' ');
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jsonrpc")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer session-token")
+                .body(Body::from(accepted))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut oversized = rpc;
+    oversized.resize(routes::NZBGET_RPC_BODY_LIMIT_BYTES + 1, b' ');
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jsonrpc")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer session-token")
+                .body(Body::from(oversized))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn nzbget_append_accepts_arr_v16_base64_payload_and_preserves_drone() {
     use base64::Engine as _;
 
@@ -1030,10 +1099,32 @@ async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
         .store(1_048_576, std::sync::atomic::Ordering::Relaxed);
     shared_state.refresh_metrics_snapshot();
     let handle = SchedulerHandle::new(cmd_tx, event_tx, shared_state);
+    let config = test_config();
+    config
+        .write()
+        .await
+        .servers
+        .push(weaver_server_core::servers::ServerConfig {
+            id: 7,
+            host: "news.example.com".into(),
+            port: 563,
+            tls: true,
+            username: None,
+            password: None,
+            connections: 8,
+            active: true,
+            supports_pipelining: false,
+            priority: 0,
+            backfill: false,
+            retention_days: 0,
+            max_download_speed: 0,
+            download_quota: Default::default(),
+            tls_ca_cert: None,
+        });
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle,
-        test_config(),
+        config,
         ApiKeyCache::default(),
     );
 
@@ -1058,6 +1149,22 @@ async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
     // off the config-lock critical section and behind the TTL cache — a
     // missing/unreadable complete_dir degrades to 0, never a null or error.
     assert!(status_payload["result"]["FreeDiskSpaceMB"].is_u64());
+    assert_eq!(
+        status_payload["result"]["NewsServers"],
+        serde_json::json!([{"ID": 7, "Active": true}])
+    );
+
+    let auth = basic_auth("session-token");
+    let (xml_status, xml_body) = post_nzbget_xmlrpc(
+        app.clone(),
+        "<methodCall><methodName>status</methodName></methodCall>",
+        &auth,
+    )
+    .await;
+    assert_eq!(xml_status, StatusCode::OK);
+    assert!(xml_body.contains("<name>NewsServers</name><value><array><data>"));
+    assert!(xml_body.contains("<name>Active</name><value><boolean>1</boolean></value>"));
+    assert!(xml_body.contains("<name>ID</name><value><i4>7</i4></value>"));
 
     let (status, groups_payload) = post_nzbget(
         app,
@@ -1269,7 +1376,7 @@ async fn nzbget_history_includes_terminal_memory_items_missing_from_db() {
 }
 
 #[tokio::test]
-async fn nzbget_history_orders_terminal_memory_items_before_db_rows_and_dedupes() {
+async fn nzbget_history_prefers_persisted_rows_over_terminal_duplicates() {
     let db = Database::open_in_memory().unwrap();
     db.insert_job_history(&nzbget_history_row(
         202,
@@ -1316,13 +1423,14 @@ async fn nzbget_history_orders_terminal_memory_items_before_db_rows_and_dedupes(
 
     assert_eq!(status, StatusCode::OK);
     let items = history_payload["result"].as_array().unwrap();
-    assert_eq!(items[0]["ID"], 202);
+    let item = items.iter().find(|item| item["ID"] == 202).unwrap();
     assert_eq!(
         items.iter().filter(|item| item["ID"] == 202).count(),
         1,
-        "terminal memory item should replace duplicate DB history row"
+        "persisted and terminal entries must be deduplicated"
     );
-    assert_eq!(items[0]["Parameters"][0]["Value"], "drone-terminal-memory");
+    assert_eq!(item["Parameters"][0]["Value"], "drone-db-duplicate");
+    assert_eq!(item["HistoryTime"], 1_700_000_300);
     assert!(items.iter().any(|item| item["ID"] == 203));
 }
 
@@ -1336,9 +1444,22 @@ async fn nzbget_history_maps_cancelled_db_rows_to_manual_delete() {
         Some(drone_metadata("drone-cancelled")),
     ))
     .unwrap();
+    let terminal = nzbget_test_job(
+        301,
+        JobStatus::Failed {
+            error: "runtime failure".to_string(),
+        },
+        weaver_server_core::DownloadState::Failed,
+        123,
+        123,
+        vec![(
+            weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+            "drone-terminal-failed".to_string(),
+        )],
+    );
     let app = nzbget_test_router(
         db,
-        test_scheduler_handle(),
+        scheduler_handle_with_mock_commands(vec![terminal]),
         test_config(),
         ApiKeyCache::default(),
     );
@@ -1364,6 +1485,7 @@ async fn nzbget_history_maps_cancelled_db_rows_to_manual_delete() {
     assert_eq!(item["ScriptStatus"], "NONE");
     assert_eq!(item["MarkStatus"], "NONE");
     assert_eq!(item["Parameters"][0]["Value"], "drone-cancelled");
+    assert_eq!(item["HistoryTime"], 1_700_000_500);
 }
 
 #[tokio::test]
@@ -2273,6 +2395,23 @@ async fn nzbget_log_and_loadlog_expose_job_events() {
     assert_eq!(entries[0]["Kind"], "INFO");
     assert_eq!(entries[1]["Kind"], "ERROR");
     assert_eq!(entries[1]["Text"], "repair failed hard");
+    assert_ne!(entries[0]["ID"], entries[1]["ID"]);
+    assert_eq!(entries[0]["Time"], entries[1]["Time"]);
+    let second_id = entries[1]["ID"].as_u64().unwrap();
+
+    let (_, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "loadlog",
+            "params": [42, second_id, 100],
+            "id": "loadlog-page"
+        }),
+        "Bearer session-token",
+    )
+    .await;
+    let page = payload["result"].as_array().unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0]["ID"], second_id);
 
     let (status, payload) = post_nzbget(
         app,
