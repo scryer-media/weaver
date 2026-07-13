@@ -78,6 +78,22 @@ pub(super) struct NzbgetFacadeContext {
     resume_schedule: Arc<ResumeSchedule>,
     rss: weaver_server_api::RssService,
     watch_folder: weaver_server_core::watch_folder::WatchFolderService,
+    /// TTL-cached free-disk-space reading: `(epoch_secs, available_bytes)`.
+    /// `statvfs`/`GetDiskFreeSpaceExW` is a blocking syscall that can stall
+    /// for seconds against an unhealthy NAS/NFS mount; `status()` reuses this
+    /// for a few seconds instead of calling it on every poll.
+    disk_cache: Arc<tokio::sync::Mutex<Option<(u64, u64)>>>,
+    /// Memoized PARSE of DB-row (immutable) history, keyed by job id ->
+    /// `(completed_at, HistoryItem)`. A history row's `completed_at` never
+    /// changes once written, so a cache hit reuses the parsed item instead of
+    /// re-running `history_item_from_row` (metadata parse + release-name parse)
+    /// for up to 1000 rows every poll. Only the PARSE is cached — the final
+    /// NZBGet entry (which folds in per-poll stage-timing fields derived from
+    /// `job_events`, a separate mutable source) is rebuilt fresh each call, so
+    /// a reprocess that appends new stage events is reflected immediately.
+    history_cache: Arc<
+        tokio::sync::Mutex<std::collections::HashMap<u64, (i64, weaver_server_api::HistoryItem)>>,
+    >,
 }
 
 impl NzbgetFacadeContext {
@@ -110,12 +126,47 @@ impl NzbgetFacadeContext {
             resume_schedule: Arc::new(ResumeSchedule::default()),
             rss,
             watch_folder,
+            disk_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            history_cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         };
         // Re-arm a persisted `scheduleresume` timer across restarts. Requires
         // a Tokio runtime, which every construction site (server startup,
         // tests) provides.
         context.spawn_scheduled_resume_recovery();
         context
+    }
+
+    /// Cached free-disk-space lookup used by `status()`. The actual syscall
+    /// runs off the tokio runtime thread (`spawn_blocking`) and the result is
+    /// reused for up to `DISK_CACHE_TTL_SECS` seconds, so a stalled NAS/NFS
+    /// mount can neither pin a worker thread nor (since callers read this
+    /// only after releasing the config guard) convoy config readers behind
+    /// it on every `status` poll.
+    async fn free_disk_space_bytes(&self, complete_dir: String) -> u64 {
+        const DISK_CACHE_TTL_SECS: u64 = 5;
+        let now = unix_now_secs();
+        if let Some((epoch_secs, bytes)) = *self.disk_cache.lock().await
+            && now.saturating_sub(epoch_secs) < DISK_CACHE_TTL_SECS
+        {
+            return bytes;
+        }
+        let available = tokio::task::spawn_blocking(move || {
+            weaver_server_core::operations::disk_space(Path::new(&complete_dir))
+                .map(|space| space.available_bytes)
+        })
+        .await
+        .ok()
+        .flatten();
+        match available {
+            // Only cache a real reading, so a transient statvfs failure (a
+            // briefly-unavailable mount, a join error) reports 0 for THIS poll
+            // without poisoning the cache with 0 for the next 5s.
+            Some(bytes) => {
+                *self.disk_cache.lock().await = Some((now, bytes));
+                bytes
+            }
+            None => 0,
+        }
     }
 
     /// Arm the auto-resume timer for an armed [`ResumeSchedule`] generation.
@@ -935,12 +986,18 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
         // Strip ASCII whitespace before decoding: with trim_text off, typed
         // <base64>/<string> content now reaches us verbatim, and base64 is
         // canonically line-wrapped — the STANDARD engine rejects embedded
-        // whitespace as an invalid byte.
-        let cleaned: String = request
-            .content_or_url
-            .chars()
-            .filter(|character| !character.is_ascii_whitespace())
-            .collect();
+        // whitespace as an invalid byte. Base64 is pure ASCII, so filter at
+        // the byte level into a pre-sized buffer instead of `.chars()`,
+        // which would pay a UTF-8 decode per byte for content that can run
+        // to hundreds of megabytes.
+        let source = request.content_or_url.as_bytes();
+        let mut cleaned = Vec::with_capacity(source.len());
+        cleaned.extend(
+            source
+                .iter()
+                .copied()
+                .filter(|byte| !byte.is_ascii_whitespace()),
+        );
         let bytes = BASE64_STANDARD
             .decode(&cleaned)
             .map_err(|error| RpcError::invalid_parameter(format!("invalid base64: {error}")))?;
@@ -1172,30 +1229,40 @@ async fn append_url(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<
 }
 
 async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    let jobs: Vec<QueueItem> = ctx
-        .handle
-        .list_jobs()
+    // Iterate `JobInfo` directly instead of mapping every job through
+    // `queue_item_from_job` (which deep-clones name/metadata/phase_progress)
+    // just to sum bytes and count states. Classify via
+    // `queue_item_state_from_job_info` — the SAME projection `queue_item_from_job`
+    // uses — not `QueueItemState::from(&status)`: the pipeline force-projects
+    // `download_state = Downloading` for a post-processing job with pending
+    // download work, so classifying off `status` alone would flip `ServerStandBy`
+    // and the post/par counts for those jobs.
+    let jobs = ctx.handle.list_jobs();
+    let states: Vec<(QueueItemState, u64, u64)> = jobs
         .iter()
-        .map(queue_item_from_job)
-        .collect();
-    let remaining = jobs
-        .iter()
-        .filter(|job| {
-            !matches!(
-                job.state,
-                QueueItemState::Completed | QueueItemState::Failed
+        .map(|job| {
+            (
+                weaver_server_api::queue_item_state_from_job_info(job),
+                job.total_bytes,
+                job.downloaded_bytes,
             )
         })
-        .map(|job| job.total_bytes.saturating_sub(job.downloaded_bytes))
+        .collect();
+    let remaining = states
+        .iter()
+        .filter(|(state, _, _)| {
+            !matches!(state, QueueItemState::Completed | QueueItemState::Failed)
+        })
+        .map(|(_, total, downloaded)| total.saturating_sub(*downloaded))
         .sum::<u64>();
     let forced = 0u64;
-    let post_job_count = jobs
+    let post_job_count = states
         .iter()
-        .filter(|job| job_in_post_processing(job))
+        .filter(|(state, _, _)| queue_item_state_in_post_processing(*state))
         .count();
-    let any_active = jobs
+    let any_active = states
         .iter()
-        .any(|job| job.state == QueueItemState::Downloading);
+        .any(|(state, _, _)| *state == QueueItemState::Downloading);
     let metrics = ctx.handle.get_metrics();
     let download_rate = metrics.current_download_speed;
     let arr_download_rate = download_rate.min(i32::MAX as u64);
@@ -1217,11 +1284,19 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     let download_limit = config.max_download_speed.unwrap_or(0);
     let arr_download_limit = download_limit.min(i32::MAX as u64);
     let scan_paused = config.watch_folder.scanning_paused;
-    let free_disk = weaver_server_core::operations::disk_space(Path::new(&config.complete_dir()))
-        .map(|space| space.available_bytes)
-        .unwrap_or(0);
+    let complete_dir = config.complete_dir();
     let news_servers = config.servers.len();
     drop(config);
+    // Query free disk space only after the config guard is released and off
+    // the async runtime thread: `disk_space` calls `statvfs` (or
+    // `GetDiskFreeSpaceExW`), a blocking syscall that can stall for seconds
+    // against an unhealthy NAS/NFS mount. Doing that while holding
+    // `config.read()` would pin a tokio worker AND -- this being a
+    // write-preferring `RwLock` -- convoy every other config reader behind
+    // the stall. `free_disk_space_bytes` additionally caches the result for a
+    // few seconds so a client polling `status` frequently doesn't hit the
+    // syscall on every request.
+    let free_disk = ctx.free_disk_space_bytes(complete_dir).await;
     // "Article cache" maps to weaver's in-flight decoded/buffered article
     // bytes: queued for decode, being decoded, and buffered for write.
     let article_cache = metrics
@@ -1285,6 +1360,21 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
 fn job_in_post_processing(item: &QueueItem) -> bool {
     matches!(
         item.state,
+        QueueItemState::Checking
+            | QueueItemState::Verifying
+            | QueueItemState::Repairing
+            | QueueItemState::Extracting
+            | QueueItemState::Finalizing
+    )
+}
+
+/// Same set as [`job_in_post_processing`], over an already-resolved state.
+/// `status()` iterates `SchedulerHandle::list_jobs()` directly (avoiding a
+/// per-job `QueueItem` deep-clone) and classifies each job with
+/// `queue_item_state_from_job_info`, so it needs the check on a bare state.
+fn queue_item_state_in_post_processing(state: QueueItemState) -> bool {
+    matches!(
+        state,
         QueueItemState::Checking
             | QueueItemState::Verifying
             | QueueItemState::Repairing
@@ -1514,14 +1604,40 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         .filter(|item| seen_ids.insert(item.id))
         .map(|item| nzbget_history_queue_item(item, history_timings(stage_bounds.get(&item.id))))
         .collect::<Vec<_>>();
-    items.extend(
-        rows.iter()
-            .filter(|row| seen_ids.insert(row.job_id))
-            .map(|row| {
+
+    // DB-row-derived entries are the immutable-parse path: a history row's
+    // `completed_at` never changes once written, so memoize the PARSED
+    // `HistoryItem` by job id and reuse it on a hit instead of re-running
+    // `history_item_from_row` (metadata + release-name parse) for up to 1000
+    // rows every poll. The final entry still merges FRESH per-poll stage
+    // timings (from `job_events`, which a reprocess can append to without
+    // touching `completed_at`), so it is never served stale. The in-memory
+    // terminal QueueItem entries above are rebuilt every call: they are not
+    // immutable (a job can still transition, e.g. Completed -> deleted).
+    {
+        let mut cache = ctx.history_cache.lock().await;
+        // Simple bound: a long-running server accumulates one entry per
+        // historical job id ever polled, so drop everything once it grows
+        // past a generous ceiling rather than tracking per-entry recency.
+        if cache.len() > 4000 {
+            cache.clear();
+        }
+        for row in rows.iter().filter(|row| seen_ids.insert(row.job_id)) {
+            let cached = cache
+                .get(&row.job_id)
+                .filter(|(completed_at, _)| *completed_at == row.completed_at)
+                .map(|(_, item)| item.clone());
+            let item = cached.unwrap_or_else(|| {
                 let item = history_item_from_row(row, None);
-                nzbget_history_item(&item, history_timings(stage_bounds.get(&row.job_id)))
-            }),
-    );
+                cache.insert(row.job_id, (row.completed_at, item.clone()));
+                item
+            });
+            items.push(nzbget_history_item(
+                &item,
+                history_timings(stage_bounds.get(&row.job_id)),
+            ));
+        }
+    }
     Ok(Value::Array(items))
 }
 
@@ -1943,6 +2059,21 @@ fn parse_editqueue_params(params: Option<Value>) -> Result<EditQueueRequest, Rpc
         }
     }
 
+    // A single call with an enormous id list (e.g. 100k ids) would otherwise
+    // monopolize the orchestrator command loop -- for the per-id commands
+    // (pause/resume/delete) every id is a scheduler round-trip. The cap has to
+    // clear a legitimate "select all" on a large hoarder queue, so it sits well
+    // above any real queue size while still bounding abuse two orders of
+    // magnitude below the 100k pathological case. (Reorder is exempt from the
+    // round-trip cost regardless: it batches into one `ReorderJobs` command.)
+    const MAX_EDITQUEUE_IDS: usize = 10_000;
+    if ids.len() > MAX_EDITQUEUE_IDS {
+        return Err(RpcError::invalid_parameter(format!(
+            "too many ids ({}), max {MAX_EDITQUEUE_IDS}",
+            ids.len()
+        )));
+    }
+
     Ok(EditQueueRequest {
         command,
         param,
@@ -2088,18 +2219,17 @@ async fn reorder_groups(
     } else {
         request.ids.clone()
     };
-    for job_id in ids {
-        match ctx.handle.reorder_job(job_id, target).await {
-            Ok(()) => {}
-            Err(SchedulerError::JobNotFound(_)) => return Ok(json!(false)),
-            Err(error) => {
-                return Err(RpcError::invalid_parameter(format!(
-                    "{command} failed: {error}"
-                )));
-            }
-        }
+    // One batched round-trip: `reorder_jobs` applies every move and then
+    // persists+publishes once, instead of one scheduler round-trip (and one
+    // persist+publish) per id.
+    let moves = ids.into_iter().map(|job_id| (job_id, target)).collect();
+    match ctx.handle.reorder_jobs(moves).await {
+        Ok(()) => Ok(json!(true)),
+        Err(SchedulerError::JobNotFound(_)) => Ok(json!(false)),
+        Err(error) => Err(RpcError::invalid_parameter(format!(
+            "{command} failed: {error}"
+        ))),
     }
-    Ok(json!(true))
 }
 
 async fn set_job_category(
@@ -2441,14 +2571,11 @@ async fn viewfeed(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Va
 }
 
 /// Kick a refresh of every enabled RSS feed. NZBGet's fetchfeeds returns
-/// immediately; the sync itself runs in the background.
+/// immediately; the sync itself runs in the background. Coalesced: a poll
+/// storm of fetchfeeds calls collapses into a single in-flight sync instead
+/// of spawning a new one (and a new local `tokio::spawn`) per call.
 fn fetch_feeds(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    let rss = ctx.rss.clone();
-    tokio::spawn(async move {
-        if let Err(error) = rss.run_all_sync().await {
-            tracing::warn!(target: "weaver::nzbget_facade", error = %error, "fetchfeeds sync failed");
-        }
-    });
+    ctx.rss.request_background_sync();
     Ok(json!(true))
 }
 
@@ -2505,9 +2632,6 @@ fn server_volume_entry(
 ) -> Value {
     let (total_lo, total_hi) = size_parts(total_bytes);
     let (custom_lo, custom_hi) = size_parts(custom_bytes);
-    let per_seconds = vec![0u32; 60];
-    let per_minutes = vec![0u32; 60];
-    let per_hours = vec![0u32; 24];
     json!({
         "ServerID": server_id,
         "DataTime": data_time,
@@ -2519,9 +2643,15 @@ fn server_volume_entry(
         "CustomSizeHi": custom_hi,
         "CustomSizeMB": bytes_to_mib(custom_bytes),
         "CustomTime": custom_time,
-        "BytesPerSeconds": per_seconds,
-        "BytesPerMinutes": per_minutes,
-        "BytesPerHours": per_hours,
+        // Weaver tracks no rolling download-rate series, so these are always
+        // zero — but NZBGet's wire contract is FIXED-length windows (60 secs,
+        // 60 mins, 24 hours), and a strict client may index a fixed offset
+        // (e.g. BytesPerSeconds[59]) or chart a fixed-length series. Emit the
+        // zero-filled fixed lengths; servervolumes is a cold endpoint, so the
+        // 144-element alloc per server is immaterial.
+        "BytesPerSeconds": vec![0u32; 60],
+        "BytesPerMinutes": vec![0u32; 60],
+        "BytesPerHours": vec![0u32; 24],
         "BytesPerDays": [],
         "SecSlot": 0,
         "MinSlot": 0,
@@ -2586,16 +2716,18 @@ async fn log_entries(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result
         .collect();
     let ids: Vec<u64> = jobs.iter().map(|job| job.job_id.0).collect();
     let db = ctx.db.clone();
+    // `limit == 0` means "no cap" everywhere else in this RPC surface, but an
+    // unbounded fetch across every queued job in one query is not a
+    // reasonable default, so fall back to a sane cap.
+    let query_limit = if limit == 0 { 100 } else { limit };
+    // id_from is epoch seconds; the query filters on epoch-millisecond
+    // timestamps.
+    let min_timestamp_ms = id_from.saturating_mul(1000) as i64;
     let events = tokio::task::spawn_blocking(move || {
-        let mut all = Vec::new();
-        for id in ids {
-            if let Ok(events) = db.get_job_events_latest(id, 100) {
-                all.extend(events);
-            }
-        }
-        all
+        db.get_recent_job_events_multi(&ids, min_timestamp_ms, query_limit)
     })
     .await
+    .map_err(|error| RpcError::invalid_parameter(format!("log unavailable: {error}")))?
     .map_err(|error| RpcError::invalid_parameter(format!("log unavailable: {error}")))?;
 
     Ok(Value::Array(job_events_to_log_entries(

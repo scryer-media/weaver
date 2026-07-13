@@ -490,6 +490,17 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     };
                     let _ = reply.send(result);
                 }
+                SchedulerCommand::ReorderJobs { moves, reply } => {
+                    // This mock does not track a manual queue order, so there
+                    // is nothing to splice; just validate that every job id in
+                    // the batch is known, mirroring the all-or-nothing
+                    // contract of the real handler.
+                    let result = match moves.iter().find(|(job_id, _)| !jobs.contains_key(job_id)) {
+                        Some((job_id, _)) => Err(SchedulerError::JobNotFound(*job_id)),
+                        None => Ok(()),
+                    };
+                    let _ = reply.send(result);
+                }
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.
@@ -827,6 +838,61 @@ async fn password_passthrough() {
 
     let info = handle.get_job(JobId(1)).unwrap();
     assert_eq!(info.password, Some("secret123".to_string()));
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn reorder_jobs_batch_succeeds_when_all_ids_known() {
+    let (handle, task) = test_scheduler();
+
+    for id in [1_u64, 2, 3] {
+        handle
+            .add_job(
+                JobId(id),
+                make_spec(&format!("Job {id}")),
+                PathBuf::from(format!("test{id}.nzb")),
+                sample_nzb_zstd(),
+            )
+            .await
+            .unwrap();
+    }
+
+    handle
+        .reorder_jobs(vec![
+            (JobId(1), QueueMoveTarget::Bottom),
+            (JobId(2), QueueMoveTarget::Top),
+        ])
+        .await
+        .unwrap();
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn reorder_jobs_batch_rejects_unknown_id_without_partial_application() {
+    let (handle, task) = test_scheduler();
+
+    handle
+        .add_job(
+            JobId(1),
+            make_spec("Known"),
+            PathBuf::from("test.nzb"),
+            sample_nzb_zstd(),
+        )
+        .await
+        .unwrap();
+
+    let err = handle
+        .reorder_jobs(vec![
+            (JobId(1), QueueMoveTarget::Top),
+            (JobId(999), QueueMoveTarget::Bottom),
+        ])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SchedulerError::JobNotFound(JobId(999))));
 
     handle.shutdown().await.unwrap();
     task.await.unwrap();

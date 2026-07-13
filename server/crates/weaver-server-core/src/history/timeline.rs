@@ -254,6 +254,54 @@ impl Database {
         })
     }
 
+    /// Batched newest-first event read across multiple jobs in a single
+    /// query. Floored at `min_timestamp_ms` and capped at `limit` rows total
+    /// (not per job). Intended for callers that currently poll per-job (e.g.
+    /// [`Database::get_job_events_latest`] in a loop) and can instead issue
+    /// one query for the whole batch.
+    ///
+    /// Unlike [`Database::get_job_events_latest`], the result is returned in
+    /// the raw `ORDER BY id DESC` order (newest first) and is not reversed.
+    pub fn get_recent_job_events_multi(
+        &self,
+        job_ids: &[u64],
+        min_timestamp_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<JobEvent>, StateError> {
+        if job_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Trusted internal u64 job ids, inlined as decimal integers exactly
+        // like `get_job_event_stage_bounds` — never user-supplied strings.
+        let ids = job_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT job_id, timestamp, kind, message, file_id
+               FROM job_events
+              WHERE job_id IN ({ids}) AND timestamp >= {min_timestamp_ms}
+              ORDER BY id DESC
+              LIMIT {limit}"
+        );
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[]).await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(JobEvent {
+                        job_id: row.i64("job_id")? as u64,
+                        timestamp: row.i64("timestamp")?,
+                        kind: row.text("kind")?,
+                        message: row.text("message")?,
+                        file_id: row.opt_text("file_id")?,
+                    })
+                })
+                .collect()
+        })
+    }
+
     /// Delete all events for a job.
     pub fn delete_job_events(&self, job_id: u64) -> Result<(), StateError> {
         let datastore = self.datastore();
@@ -292,3 +340,46 @@ impl DatabaseWriterExecutor {
 
 #[cfg(test)]
 mod tests;
+
+// Inline (rather than added to `tests.rs`, which is owned by another change in
+// flight against this crate): covers the new batched multi-job event read.
+#[cfg(test)]
+mod get_recent_job_events_multi_tests {
+    use super::*;
+
+    #[test]
+    fn returns_newest_first_across_jobs_respecting_min_timestamp_and_limit() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_job_event(1, 1000, "A", "job1-a", None).unwrap();
+        db.insert_job_event(2, 1001, "B", "job2-a", None).unwrap();
+        db.insert_job_event(1, 1002, "C", "job1-b", None).unwrap();
+        db.insert_job_event(2, 1003, "D", "job2-b", None).unwrap();
+        // Below the floor: must be excluded regardless of limit.
+        db.insert_job_event(1, 500, "OLD", "too old", None).unwrap();
+        // Unrelated job must not leak into the batch.
+        db.insert_job_event(3, 2000, "OTHER", "other job", None)
+            .unwrap();
+
+        let events = db.get_recent_job_events_multi(&[1, 2], 1000, 10).unwrap();
+        // Newest first (ORDER BY id DESC): D, C, B, A.
+        let messages: Vec<&str> = events.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(messages, vec!["job2-b", "job1-b", "job2-a", "job1-a"]);
+
+        // `limit` caps the total row count across jobs while staying
+        // newest-first.
+        let limited = db.get_recent_job_events_multi(&[1, 2], 1000, 2).unwrap();
+        let limited_messages: Vec<&str> = limited.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(limited_messages, vec!["job2-b", "job1-b"]);
+    }
+
+    #[test]
+    fn empty_job_ids_returns_empty_without_querying() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_job_event(1, 1000, "A", "job1-a", None).unwrap();
+        assert!(
+            db.get_recent_job_events_multi(&[], 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}

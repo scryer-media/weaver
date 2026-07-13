@@ -727,6 +727,15 @@ fn spawn_test_scheduler(
                     };
                     let _ = reply.send(result);
                 }
+                SchedulerCommand::ReorderJobs { moves, reply } => {
+                    let result = match moves.iter().find(|(job_id, _)| !jobs.contains_key(job_id)) {
+                        Some((job_id, _)) => {
+                            Err(weaver_server_core::SchedulerError::JobNotFound(*job_id))
+                        }
+                        None => Ok(()),
+                    };
+                    let _ = reply.send(result);
+                }
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.

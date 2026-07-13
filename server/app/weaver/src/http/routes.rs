@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::Extension;
+use axum::extract::{Extension, Request};
+use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -57,10 +60,51 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
             .saturating_div(2),
     )
     .unwrap_or(usize::MAX);
+    // `jsonrpc_handler`/`xmlrpc_handler` take `body: Bytes`, which axum fully
+    // buffers (up to `rpc_body_limit`, as large as 384 MiB) as soon as that
+    // extractor runs -- before the handler body itself gets a chance to
+    // check auth. Without a gate here, an unauthenticated flood of requests
+    // could each buffer up to the limit concurrently and exhaust memory.
+    // `from_fn` runs as a Tower middleware wrapping the whole inner service,
+    // so it executes before axum dispatches to the route's handler and its
+    // extractors -- i.e. before any buffering happens:
+    //   (a) no credential header at all -> reject with 401 immediately
+    //       without calling `next`. A trivial unauth flood (no header) never
+    //       buffers a body, and needs no DB lookup.
+    //   (b) header present -> acquire a permit from a shared semaphore
+    //       (capacity 6) held across the whole request, so at most 6
+    //       requests buffer bodies concurrently.
+    // The presence check must accept EVERY credential form the facade's real
+    // authenticator (`resolve_caller`) honors, or it would 401 valid callers
+    // before the handler runs: `authorization`/`x-authorization` (Basic, used
+    // by Sonarr/Radarr/nzb360), `x-api-key`, and the `weaver_jwt`/
+    // `weaver_session` cookies.
+    // Residual: a client that sends a *present but bogus* credential still
+    // takes a buffering slot before its credentials are actually checked,
+    // but it is bounded to 6x `rpc_body_limit` total instead of unbounded --
+    // an acceptable tradeoff to avoid a DB lookup on every single request.
+    let rpc_buffer_gate = Arc::new(tokio::sync::Semaphore::new(6));
     let nzbget_rpc_routes = Router::new()
         .route("/jsonrpc", post(super::nzbget::jsonrpc_handler))
         .route("/xmlrpc", post(super::nzbget::xmlrpc_handler))
-        .route_layer(axum::extract::DefaultBodyLimit::max(rpc_body_limit));
+        .route_layer(axum::extract::DefaultBodyLimit::max(rpc_body_limit))
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            let rpc_buffer_gate = Arc::clone(&rpc_buffer_gate);
+            async move {
+                let headers = req.headers();
+                let has_credential = headers.contains_key(header::AUTHORIZATION)
+                    || headers.contains_key("x-authorization")
+                    || headers.contains_key("x-api-key")
+                    || headers.contains_key(header::COOKIE);
+                if !has_credential {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                let Ok(_permit) = rpc_buffer_gate.acquire().await else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                next.run(req).await
+            }
+        }));
 
     let inner = Router::new()
         .route("/metrics", get(super::metrics::metrics_handler))

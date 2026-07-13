@@ -903,23 +903,31 @@ impl Database {
         if positions.is_empty() {
             return Ok(());
         }
+        // One statement instead of one UPDATE per job: a CASE expression maps
+        // each job id to its new position. Ids/positions are internal
+        // integers, inlined as decimals directly in the SQL text (no user
+        // strings), the same way `get_job_event_stage_bounds` inlines trusted
+        // integer ids. Plain CASE/WHEN/END and WHERE IN are portable across
+        // both sqlite and postgres.
+        let case_arms = positions
+            .iter()
+            .map(|(job_id, position)| format!("WHEN {} THEN {}", job_id.0, position))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let ids = positions
+            .iter()
+            .map(|(job_id, _)| job_id.0.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE active_jobs
+                SET queue_position = CASE job_id {case_arms} END
+              WHERE job_id IN ({ids})"
+        );
         let datastore = self.datastore();
-        let positions = positions.to_vec();
         self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "update_active_job_queue_positions", |tx| {
-                let positions = positions.clone();
-                Box::pin(async move {
-                    for (job_id, position) in positions {
-                        tx.execute(
-                            "UPDATE active_jobs SET queue_position = {} WHERE job_id = {}",
-                            &[SqlArg::I64(position), SqlArg::I64(job_id.0 as i64)],
-                        )
-                        .await?;
-                    }
-                    Ok(())
-                })
-            })
-            .await
+            SqlRuntime::execute(datastore.read_exec(), &sql, &[]).await?;
+            Ok(())
         })
     }
 
@@ -3083,5 +3091,77 @@ impl Database {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn sample_active_job(id: u64) -> ActiveJob {
+        ActiveJob {
+            job_id: JobId(id),
+            nzb_hash: [0xAA; 32],
+            nzb_path: PathBuf::from(format!("/tmp/queue_order_test_{id}.nzb")),
+            nzb_zstd: Vec::new(),
+            output_dir: PathBuf::from(format!("/tmp/queue_order_test_out_{id}")),
+            created_at: 1_700_000_000 + id,
+            category: None,
+            metadata: vec![],
+            status: "queued",
+            download_state: "queued",
+            post_state: "idle",
+            run_state: "active",
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+        }
+    }
+
+    #[test]
+    fn update_active_job_queue_positions_applies_case_update_to_all_rows() {
+        let db = Database::open_in_memory().unwrap();
+        for id in [1_u64, 2, 3] {
+            db.create_active_job(&sample_active_job(id)).unwrap();
+        }
+
+        db.update_active_job_queue_positions(&[(JobId(1), 2), (JobId(2), 0), (JobId(3), 1)])
+            .unwrap();
+
+        let jobs = db.load_active_jobs().unwrap();
+        assert_eq!(jobs[&JobId(1)].queue_position, Some(2));
+        assert_eq!(jobs[&JobId(2)].queue_position, Some(0));
+        assert_eq!(jobs[&JobId(3)].queue_position, Some(1));
+    }
+
+    #[test]
+    fn update_active_job_queue_positions_overwrites_previous_positions_in_one_statement() {
+        let db = Database::open_in_memory().unwrap();
+        for id in [1_u64, 2] {
+            db.create_active_job(&sample_active_job(id)).unwrap();
+        }
+        db.update_active_job_queue_positions(&[(JobId(1), 0), (JobId(2), 1)])
+            .unwrap();
+
+        // A second batch (the full re-derived order) must fully overwrite the
+        // positions from the first, in one statement.
+        db.update_active_job_queue_positions(&[(JobId(1), 1), (JobId(2), 0)])
+            .unwrap();
+
+        let jobs = db.load_active_jobs().unwrap();
+        assert_eq!(jobs[&JobId(1)].queue_position, Some(1));
+        assert_eq!(jobs[&JobId(2)].queue_position, Some(0));
+    }
+
+    #[test]
+    fn update_active_job_queue_positions_empty_slice_is_noop() {
+        let db = Database::open_in_memory().unwrap();
+        db.create_active_job(&sample_active_job(1)).unwrap();
+
+        db.update_active_job_queue_positions(&[]).unwrap();
+
+        let jobs = db.load_active_jobs().unwrap();
+        assert_eq!(jobs[&JobId(1)].queue_position, None);
     }
 }

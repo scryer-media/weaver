@@ -317,6 +317,40 @@ fn scheduler_handle_with_mock_commands_with_db(
                     };
                     let _ = reply.send(result);
                 }
+                SchedulerCommand::ReorderJobs { moves, reply } => {
+                    let mut jobs = state.list_jobs();
+                    // Mirrors `reorder_jobs`' all-or-nothing contract: if any
+                    // id is unknown, apply none of the moves.
+                    let missing = moves
+                        .iter()
+                        .find(|(job_id, _)| !jobs.iter().any(|job| job.job_id == *job_id))
+                        .map(|(job_id, _)| *job_id);
+                    let result = match missing {
+                        Some(job_id) => Err(SchedulerError::JobNotFound(job_id)),
+                        None => {
+                            for &(job_id, target) in &moves {
+                                let Some(current) =
+                                    jobs.iter().position(|job| job.job_id == job_id)
+                                else {
+                                    continue;
+                                };
+                                let last = jobs.len() - 1;
+                                let new_index = match target {
+                                    weaver_server_core::QueueMoveTarget::Top => 0,
+                                    weaver_server_core::QueueMoveTarget::Bottom => last,
+                                    weaver_server_core::QueueMoveTarget::Offset(delta) => {
+                                        (current as i64 + delta).clamp(0, last as i64) as usize
+                                    }
+                                };
+                                let job = jobs.remove(current);
+                                jobs.insert(new_index, job);
+                            }
+                            state.publish_jobs(jobs);
+                            Ok(())
+                        }
+                    };
+                    let _ = reply.send(result);
+                }
                 SchedulerCommand::PauseAll { reply } => {
                     state.set_paused(true);
                     let _ = reply.send(());
@@ -704,6 +738,57 @@ async fn nzbget_append_accepts_arr_v16_base64_payload_and_preserves_drone() {
 }
 
 #[tokio::test]
+async fn nzbget_append_accepts_base64_payload_with_embedded_whitespace() {
+    use base64::Engine as _;
+
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let encoded =
+        base64::engine::general_purpose::STANDARD.encode(minimal_nzb("Whitespace.Wrapped.Release"));
+    // Base64 is canonically line-wrapped, and some clients pad with stray
+    // spaces; with XML-RPC's `trim_text` disabled, that whitespace now
+    // reaches the facade verbatim. It must be stripped at the byte level
+    // before decoding rather than rejected as invalid base64.
+    let wrapped = encoded
+        .as_bytes()
+        .chunks(16)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n ");
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "append",
+            "params": [
+                "Whitespace.Wrapped.Release.nzb",
+                wrapped,
+                "tv",
+                0,
+                false,
+                false,
+                "",
+                0,
+                "all",
+                []
+            ],
+            "id": "append-whitespace"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["result"].as_u64().unwrap() >= 10_000);
+    assert_eq!(handle.list_jobs().len(), 1);
+}
+
+#[tokio::test]
 async fn nzbget_append_preserves_submitted_category_case_for_facade() {
     use base64::Engine as _;
 
@@ -969,6 +1054,10 @@ async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
         status_payload["result"]["DownloadRate"].as_u64().unwrap() > 0,
         "status should use the speed-bearing metrics snapshot"
     );
+    // FreeDiskSpaceMB must stay numeric after moving the disk_space() lookup
+    // off the config-lock critical section and behind the TTL cache — a
+    // missing/unreadable complete_dir degrades to 0, never a null or error.
+    assert!(status_payload["result"]["FreeDiskSpaceMB"].is_u64());
 
     let (status, groups_payload) = post_nzbget(
         app,
@@ -1275,6 +1364,47 @@ async fn nzbget_history_maps_cancelled_db_rows_to_manual_delete() {
     assert_eq!(item["ScriptStatus"], "NONE");
     assert_eq!(item["MarkStatus"], "NONE");
     assert_eq!(item["Parameters"][0]["Value"], "drone-cancelled");
+}
+
+#[tokio::test]
+async fn nzbget_history_repeat_poll_is_memo_transparent() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(
+        401,
+        "complete",
+        1_700_000_600,
+        Some(drone_metadata("drone-memo")),
+    ))
+    .unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status_1, payload_1) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "history", "params": [], "id": "history-memo-1"}),
+        "Bearer session-token",
+    )
+    .await;
+    let (status_2, payload_2) = post_nzbget(
+        app,
+        serde_json::json!({"method": "history", "params": [], "id": "history-memo-2"}),
+        "Bearer session-token",
+    )
+    .await;
+
+    assert_eq!(status_1, StatusCode::OK);
+    assert_eq!(status_2, StatusCode::OK);
+    // The second poll hits the per-job-id memo (completed_at unchanged), and
+    // must reproduce the exact same entry as the freshly-built first poll.
+    assert_eq!(payload_1["result"], payload_2["result"]);
+    let items = payload_2["result"].as_array().unwrap();
+    let item = items.iter().find(|item| item["ID"] == 401).unwrap();
+    assert_eq!(item["ParStatus"], "SUCCESS");
+    assert_eq!(item["Parameters"][0]["Value"], "drone-memo");
 }
 
 #[tokio::test]
@@ -1698,6 +1828,68 @@ async fn nzbget_editqueue_unsupported_commands_return_false_without_fault() {
         assert_eq!(payload["result"], false, "{command}");
         assert!(payload["error"].is_null(), "{command}");
     }
+}
+
+#[tokio::test]
+async fn nzbget_editqueue_rejects_more_than_max_ids() {
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    // One id over the 10_000-id cap; defuses a would-be orchestrator-loop
+    // monopolization from a single oversized call (e.g. 100k ids).
+    let ids: Vec<u64> = (1..=10_001).collect();
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupPause", 0, "", ids],
+            "id": "too-many-ids"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["error"]["code"], 2);
+}
+
+#[tokio::test]
+async fn nzbget_status_classifies_downloading_while_extracting_as_active() {
+    // A job the pipeline projects as still downloading during post-processing
+    // (status = Extracting but download_state = Downloading — the incremental
+    // extraction case) must be reported as actively downloading, NOT as a
+    // standby post-processing job. `status()` must classify via the projected
+    // runtime lanes (queue_item_state_from_job_info), not the coarse status.
+    let job = nzbget_test_job(
+        7,
+        JobStatus::Extracting,
+        weaver_server_core::DownloadState::Downloading,
+        1_000,
+        400,
+        vec![],
+    );
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        scheduler_handle_with_mock_commands(vec![job]),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "status", "params": [], "id": "standby"}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Actively downloading -> not standby, and not counted as a post-proc job.
+    assert_eq!(payload["result"]["ServerStandBy"], false);
+    assert_eq!(payload["result"]["PostJobCount"], 0);
+    assert_eq!(payload["result"]["ParJobCount"], 0);
 }
 
 #[tokio::test]
@@ -2473,7 +2665,12 @@ async fn nzbget_servervolumes_report_quota_window_usage() {
     assert_eq!(entries[1]["TotalSizeMB"], 5);
     assert_eq!(entries[1]["CustomSizeMB"], 3);
     assert_eq!(entries[1]["CustomTime"], 1_700_000_000);
+    // Weaver tracks no rolling series, but NZBGet's wire contract is
+    // fixed-length windows (60 sec / 60 min / 24 hr), zero-filled — a strict
+    // client may index a fixed offset, so we keep the lengths.
     assert_eq!(entries[1]["BytesPerSeconds"].as_array().unwrap().len(), 60);
+    assert_eq!(entries[1]["BytesPerMinutes"].as_array().unwrap().len(), 60);
+    assert_eq!(entries[1]["BytesPerHours"].as_array().unwrap().len(), 24);
 }
 
 #[tokio::test]

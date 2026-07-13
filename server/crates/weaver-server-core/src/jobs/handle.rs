@@ -373,6 +373,14 @@ pub enum SchedulerCommand {
         target: QueueMoveTarget,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
+    /// Batch-move multiple jobs within the manual queue order in a single
+    /// round trip. Applied all-or-nothing: if any job id is unknown, no move
+    /// is applied. Persists the resulting order and publishes a snapshot
+    /// once for the whole batch rather than once per move.
+    ReorderJobs {
+        moves: Vec<(JobId, QueueMoveTarget)>,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
     /// Pause all jobs globally (pipeline-wide).
     PauseAll { reply: oneshot::Sender<()> },
     /// Resume all jobs globally.
@@ -637,6 +645,23 @@ impl SchedulerHandle {
                 target,
                 reply: tx,
             })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+    }
+
+    /// Move multiple jobs within the manual queue order in a single round
+    /// trip. All moves are applied atomically: if any job id is unknown, no
+    /// move is applied and `Err(SchedulerError::JobNotFound)` is returned.
+    /// The resulting order is persisted and the job snapshot is published
+    /// once for the whole batch, rather than once per move.
+    pub async fn reorder_jobs(
+        &self,
+        moves: Vec<(JobId, QueueMoveTarget)>,
+    ) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::ReorderJobs { moves, reply: tx })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?

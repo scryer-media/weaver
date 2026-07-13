@@ -73,6 +73,28 @@ impl RssService {
         }
     }
 
+    /// Fire-and-forget trigger used by the NZBGet `fetchfeeds` facade.
+    ///
+    /// Spawns a background sync and returns immediately. Concurrent callers
+    /// are coalesced: if a sync is already running, this drops the request
+    /// instead of queueing another full indexer sweep behind `sync_lock`.
+    pub fn request_background_sync(&self) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let Ok(_guard) = service.inner.sync_lock.try_lock() else {
+                // A sync is already in flight; drop this request rather than
+                // queueing another one behind the lock.
+                return;
+            };
+            if let Err(error) = service
+                .run_sync_inner(RssSyncTarget::AllEnabledFeeds, false)
+                .await
+            {
+                warn!(error = %error, "RSS background sync failed");
+            }
+        });
+    }
+
     async fn run_sync_inner(
         &self,
         target: RssSyncTarget,
