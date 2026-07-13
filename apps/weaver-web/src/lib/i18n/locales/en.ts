@@ -11,6 +11,7 @@ const en: LocaleDictionary = {
   "nav.monitoring": "Monitoring",
   "nav.upload": "Upload",
   "nav.settings": "Settings",
+  "nav.sponsor": "Sponsor",
   "nav.logs": "Logs",
 
   // Status labels

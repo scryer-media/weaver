@@ -21,7 +21,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
 use tracing::info;
 
-use weaver_server_api::{BackupService, WeaverSchema};
+use weaver_server_api::{BackupService, RssService, WeaverSchema};
 use weaver_server_core::Database;
 use weaver_server_core::SchedulerHandle;
 use weaver_server_core::auth::{ApiKeyCache, LoginAuthCache};
@@ -48,6 +48,8 @@ pub struct ServerRuntime {
     pub auth_cache: LoginAuthCache,
     pub api_key_cache: ApiKeyCache,
     pub backup: BackupService,
+    pub rss: RssService,
+    pub watch_folder: weaver_server_core::watch_folder::WatchFolderService,
     pub metrics_exporter: PrometheusMetricsExporter,
     pub config: SharedConfig,
     pub base_url: String,

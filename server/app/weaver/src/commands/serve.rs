@@ -202,6 +202,8 @@ pub(crate) async fn run(
         auth_cache: login_auth_cache,
         api_key_cache,
         backup,
+        rss: rss.clone(),
+        watch_folder: watch_folder.clone(),
         metrics_exporter,
         config: shared_config.clone(),
         base_url,

@@ -119,6 +119,9 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             phase_progress: Vec::new(),
             failed_bytes: 0,
             health: 1000,
+            total_files: 0,
+            completed_files: 0,
+            remaining_par_files: 0,
             password: state.spec.password.clone(),
             category: state.spec.category.clone(),
             metadata: state.spec.metadata.clone(),
@@ -479,6 +482,14 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     };
                     let _ = reply.send(result);
                 }
+                SchedulerCommand::ReorderJob { job_id, reply, .. } => {
+                    let result = if jobs.contains_key(&job_id) {
+                        Ok(())
+                    } else {
+                        Err(SchedulerError::JobNotFound(job_id))
+                    };
+                    let _ = reply.send(result);
+                }
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.
@@ -695,6 +706,7 @@ async fn update_job_applies_explicit_patch() {
             JobUpdate {
                 category: FieldUpdate::Set("movies".to_string()),
                 metadata: FieldUpdate::Set(vec![("priority".to_string(), "high".to_string())]),
+                password: FieldUpdate::Unchanged,
             },
         )
         .await
@@ -713,6 +725,7 @@ async fn update_job_applies_explicit_patch() {
             JobUpdate {
                 category: FieldUpdate::Clear,
                 metadata: FieldUpdate::Clear,
+                password: FieldUpdate::Unchanged,
             },
         )
         .await

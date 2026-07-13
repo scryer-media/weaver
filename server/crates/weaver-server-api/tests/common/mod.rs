@@ -719,6 +719,14 @@ fn spawn_test_scheduler(
                     };
                     let _ = reply.send(result);
                 }
+                SchedulerCommand::ReorderJob { job_id, reply, .. } => {
+                    let result = if jobs.contains_key(&job_id) {
+                        Ok(())
+                    } else {
+                        Err(weaver_server_core::SchedulerError::JobNotFound(job_id))
+                    };
+                    let _ = reply.send(result);
+                }
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.
@@ -752,6 +760,9 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             phase_progress: Vec::new(),
             failed_bytes: 0,
             health: 1000,
+            total_files: 0,
+            completed_files: 0,
+            remaining_par_files: 0,
             password: state.spec.password.clone(),
             category: state.spec.category.clone(),
             metadata: state.spec.metadata.clone(),

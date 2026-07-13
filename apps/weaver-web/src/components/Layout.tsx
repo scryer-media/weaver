@@ -5,6 +5,7 @@ import {
   Activity,
   Clock3,
   FolderUp,
+  Heart,
   ListOrdered,
   Menu,
   Monitor,
@@ -338,6 +339,20 @@ function ThemeToggle({ className }: { className?: string }) {
   );
 }
 
+function SponsorLink({ label }: { label: string }) {
+  return (
+    <a
+      href="https://www.scryer.media/weaver/donate/"
+      target="_blank"
+      rel="noreferrer"
+      className="flex items-center justify-center gap-1.5 rounded-[9px] px-2 py-1 text-[11.5px] font-medium text-muted-foreground/80 transition-colors hover:bg-accent/40 hover:text-foreground"
+    >
+      <Heart className="size-3.5 text-status-failed/70" aria-hidden="true" />
+      <span>{label}</span>
+    </a>
+  );
+}
+
 function DisconnectBanner({
   title,
   message,
@@ -621,11 +636,14 @@ export function Layout() {
               <FolderUp className="size-4" />
               {t("nav.upload")}
             </Button>
-            {versionData?.version ? (
-              <div className="text-center text-[11px] tracking-wide text-muted-foreground/70">
-                v{versionData.version}
-              </div>
-            ) : null}
+            <div className="flex flex-col gap-1">
+              <SponsorLink label={t("nav.sponsor")} />
+              {versionData?.version ? (
+                <div className="text-center text-[11px] tracking-wide text-muted-foreground/70">
+                  v{versionData.version}
+                </div>
+              ) : null}
+            </div>
           </div>
         </aside>
 
@@ -748,6 +766,7 @@ export function Layout() {
                 <FolderUp className="size-4" />
                 {t("nav.upload")}
               </Button>
+              <SponsorLink label={t("nav.sponsor")} />
             </div>
           </div>
         </SheetContent>

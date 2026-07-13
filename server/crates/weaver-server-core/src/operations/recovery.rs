@@ -22,6 +22,9 @@ pub struct RecoveredServerState {
 
 pub struct RestoreCandidate {
     pub job_id: crate::jobs::ids::JobId,
+    /// Manual queue-order position persisted at reorder time; `None` sorts by
+    /// job id (creation order).
+    pub queue_position: Option<i64>,
     pub request: RestoreJobRequest,
 }
 
@@ -121,6 +124,9 @@ pub async fn recover_server_state(
                 phase_progress: Vec::new(),
                 failed_bytes: 0,
                 health: 1000,
+                total_files: 0,
+                completed_files: 0,
+                remaining_par_files: 0,
                 password: None,
                 category: recovered.category,
                 metadata: recovered.metadata,
@@ -143,12 +149,19 @@ pub async fn recover_server_state(
 
             match parse_result {
                 Ok(nzb) => {
-                    let spec = ingest::nzb_to_spec(
+                    let mut spec = ingest::nzb_to_spec(
                         &nzb,
                         &recovered.nzb_path,
                         recovered.category,
                         recovered.metadata,
                     );
+                    // Apply a persisted password override on top of the
+                    // NZB-derived password ('' = explicitly none).
+                    match recovered.password_override.as_deref() {
+                        None => {}
+                        Some("") => spec.password = None,
+                        Some(password) => spec.password = Some(password.to_string()),
+                    }
                     let status = job_status_from_persisted_str(
                         &recovered.status,
                         recovered.error.as_deref(),
@@ -173,6 +186,7 @@ pub async fn recover_server_state(
                         .and_then(PostState::parse);
                     to_restore.push(RestoreCandidate {
                         job_id,
+                        queue_position: recovered.queue_position,
                         request: RestoreJobRequest {
                             job_id,
                             job_hash: recovered.nzb_hash,
@@ -263,6 +277,9 @@ pub async fn recover_server_state(
                     phase_progress: Vec::new(),
                     failed_bytes: row.failed_bytes,
                     health: row.health,
+                    total_files: 0,
+                    completed_files: 0,
+                    remaining_par_files: 0,
                     password: None,
                     category: row.category,
                     metadata: row
@@ -307,6 +324,18 @@ pub async fn recover_server_state(
     if !to_restore.is_empty() {
         info!(count = to_restore.len(), "recovering in-progress jobs");
     }
+    // Restore in the user's manual queue order (falling back to creation
+    // order) so the rebuilt job_order matches what they arranged. This also
+    // makes restore order deterministic; it previously followed HashMap
+    // iteration.
+    to_restore.sort_by_key(|candidate| {
+        (
+            candidate
+                .queue_position
+                .unwrap_or(candidate.job_id.0 as i64),
+            candidate.job_id.0,
+        )
+    });
 
     let initial_global_paused = load_global_pause_from_db(db).await?;
 

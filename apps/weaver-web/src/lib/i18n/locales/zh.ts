@@ -10,6 +10,7 @@ const zh: LocaleDictionary = {
   "nav.metrics": "指标",
   "nav.upload": "上传",
   "nav.settings": "设置",
+  "nav.sponsor": "赞助",
 
   // Status labels
   "status.queued": "排队中",

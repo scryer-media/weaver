@@ -11,11 +11,11 @@ use crate::history::types::{
 use crate::jobs::staging::{StagedUploadManager, normalize_uploaded_nzb_reader};
 use crate::jobs::types::{
     DuplicateDecisionInfo, DuplicateModeGql, PRIORITY_ATTRIBUTE_KEY, PersistedQueueEvent,
-    QueueCommandResult, QueueEventKind, SemanticDuplicateAdmissionInfo, SemanticPromotionResult,
-    StageNzbUploadInput, StagedNzbSubmissionResult, StagedNzbUploadResult, SubmissionResult,
-    SubmissionStatus, SubmitNzbInput, SubmitStagedNzbsInput, SubmitStagedNzbsResult,
-    global_queue_state, normalize_priority_value, queue_item_from_job, queue_item_from_submission,
-    submit_metadata,
+    QueueCommandResult, QueueEventKind, QueueMoveKind, SemanticDuplicateAdmissionInfo,
+    SemanticPromotionResult, StageNzbUploadInput, StagedNzbSubmissionResult, StagedNzbUploadResult,
+    SubmissionResult, SubmissionStatus, SubmitNzbInput, SubmitStagedNzbsInput,
+    SubmitStagedNzbsResult, global_queue_state, normalize_priority_value, queue_item_from_job,
+    queue_item_from_submission, submit_metadata,
 };
 use weaver_server_core::ingest::{
     SubmissionDuplicateOutcome, SubmissionOptions, SubmitNzbError, SubmittedJob,
@@ -27,7 +27,9 @@ use weaver_server_core::jobs::{
     CallerScopedIdempotency, DuplicateAction, DuplicateMode, SemanticDuplicate, SubmissionOrigin,
 };
 use weaver_server_core::settings::SharedConfig;
-use weaver_server_core::{Database, FieldUpdate, JobUpdate, SchedulerError, SchedulerHandle};
+use weaver_server_core::{
+    Database, FieldUpdate, JobUpdate, QueueMoveTarget, SchedulerError, SchedulerHandle,
+};
 
 #[derive(Default)]
 pub(crate) struct JobsMutation;
@@ -478,11 +480,58 @@ impl JobsMutation {
         }
         Ok(true)
     }
+    /// Set or clear a queued job's archive/unpack password. Passing null or
+    /// an empty string removes the password (even one that came from the NZB
+    /// itself); the override is durable across restarts. The password never
+    /// appears in job attributes — only `hasPassword` reflects it.
+    #[graphql(guard = "ControlGuard")]
+    async fn set_job_password(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        password: Option<String>,
+    ) -> Result<bool> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        let password = password.filter(|value| !value.is_empty());
+        let update = JobUpdate {
+            password: match password {
+                Some(password) => FieldUpdate::Set(password),
+                None => FieldUpdate::Clear,
+            },
+            ..JobUpdate::default()
+        };
+        map_scheduler_result(handle.update_job(JobId(id), update).await)?;
+        Ok(true)
+    }
+    /// Move a queue item within the manual queue order. The move breaks ties
+    /// within a dispatch priority band; HIGH/NORMAL/LOW still dominates.
+    /// `offset` is required when `kind` is OFFSET (negative moves toward the
+    /// front).
+    #[graphql(guard = "ControlGuard")]
+    async fn reorder_queue_item(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        kind: QueueMoveKind,
+        offset: Option<i64>,
+    ) -> Result<bool> {
+        let handle = ctx.data::<SchedulerHandle>()?;
+        let target = match kind {
+            QueueMoveKind::Top => QueueMoveTarget::Top,
+            QueueMoveKind::Bottom => QueueMoveTarget::Bottom,
+            QueueMoveKind::Offset => QueueMoveTarget::Offset(offset.ok_or_else(|| {
+                graphql_error("INVALID_INPUT", "offset is required when kind is OFFSET")
+            })?),
+        };
+        map_scheduler_result(handle.reorder_job(JobId(id), target).await)?;
+        Ok(true)
+    }
     /// Pause all download dispatch globally.
     #[graphql(guard = "ControlGuard")]
     async fn pause_all(&self, ctx: &Context<'_>) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
         handle.pause_all().await?;
+        clear_nzbget_scheduled_resume(ctx.data::<Database>()?).await;
         Ok(true)
     }
     /// Resume all download dispatch globally.
@@ -490,6 +539,7 @@ impl JobsMutation {
     async fn resume_all(&self, ctx: &Context<'_>) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
         handle.resume_all().await?;
+        clear_nzbget_scheduled_resume(ctx.data::<Database>()?).await;
         Ok(true)
     }
     /// Set the global download speed limit in bytes/sec. 0 means unlimited.
@@ -636,6 +686,7 @@ impl JobsMutation {
         let handle = ctx.data::<SchedulerHandle>()?;
         let config = ctx.data::<SharedConfig>()?;
         map_scheduler_result(handle.pause_all().await)?;
+        clear_nzbget_scheduled_resume(ctx.data::<Database>()?).await;
         let cfg = config.read().await;
         Ok(QueueCommandResult {
             success: true,
@@ -654,6 +705,7 @@ impl JobsMutation {
         let handle = ctx.data::<SchedulerHandle>()?;
         let config = ctx.data::<SharedConfig>()?;
         map_scheduler_result(handle.resume_all().await)?;
+        clear_nzbget_scheduled_resume(ctx.data::<Database>()?).await;
         let cfg = config.read().await;
         Ok(QueueCommandResult {
             success: true,
@@ -717,6 +769,20 @@ fn scheduler_graphql_error(error: SchedulerError) -> async_graphql::Error {
 
 fn map_scheduler_result<T>(result: std::result::Result<T, SchedulerError>) -> Result<T> {
     result.map_err(scheduler_graphql_error)
+}
+
+/// Clear the NZBGet facade's persisted auto-resume deadline (the
+/// `nzbget.scheduled_resume_at` setting, mirror of
+/// `http::nzbget::SCHEDULED_RESUME_SETTING`). A pause or resume from any surface
+/// supersedes that timer; without dropping the row here a stale deadline
+/// resurrects after a restart and silently un-pauses a UI-initiated pause. (The
+/// facade's in-memory timer is separate — unifying scheduled resume into the
+/// scheduler itself would also close the in-process race and the schedule-
+/// evaluator path.)
+async fn clear_nzbget_scheduled_resume(db: &Database) {
+    let db = db.clone();
+    let _ =
+        tokio::task::spawn_blocking(move || db.delete_setting("nzbget.scheduled_resume_at")).await;
 }
 
 fn caller_identity(ctx: &Context<'_>) -> Result<CallerIdentity> {

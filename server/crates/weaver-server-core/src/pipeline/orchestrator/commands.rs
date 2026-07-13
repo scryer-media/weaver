@@ -215,6 +215,39 @@ impl Pipeline {
                 };
                 let _ = reply.send(result);
             }
+            SchedulerCommand::ReorderJob {
+                job_id,
+                target,
+                reply,
+            } => {
+                let result =
+                    if self.jobs.contains_key(&job_id) {
+                        crate::jobs::handle::splice_job_order(&mut self.job_order, job_id, target)
+                            .map(|moved| {
+                                if !moved {
+                                    return;
+                                }
+                                // Persist the whole (small) order so restore can
+                                // sort by queue_position and reproduce it exactly.
+                                let positions: Vec<(JobId, i64)> = self
+                                    .job_order
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, id)| (*id, index as i64))
+                                    .collect();
+                                if let Err(e) = self.db.try_queue_write(
+                                    "update_active_job_queue_positions",
+                                    move |db| db.update_active_job_queue_positions(&positions),
+                                ) {
+                                    error!(error = %e, "failed to queue ReorderJob write");
+                                }
+                                self.publish_snapshot();
+                            })
+                    } else {
+                        Err(crate::SchedulerError::JobNotFound(job_id))
+                    };
+                let _ = reply.send(result);
+            }
             SchedulerCommand::PauseAll { reply } => {
                 self.global_paused = true;
                 self.shared_state.set_paused(true);

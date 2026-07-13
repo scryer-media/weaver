@@ -18,6 +18,9 @@ pub struct JobEvent {
 
 pub const JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER: &str = "__timeline:finalizing-download";
 
+/// Per-job (kind, first_ts, last_ts) event bounds keyed by job id.
+pub type JobEventStageBounds = std::collections::HashMap<u64, Vec<(String, i64, i64)>>;
+
 fn max_rows_for_tx(tx: &SqlTx<'_>, binds_per_row: usize) -> usize {
     let bind_limit = match tx {
         SqlTx::Sqlite(_) => SQLITE_BATCH_BIND_LIMIT,
@@ -203,6 +206,51 @@ impl Database {
                     })
                 })
                 .collect()
+        })
+    }
+
+    /// Batched min/max event timestamps per (job, kind) for stage-duration
+    /// reporting. One query regardless of how many jobs are listed; only the
+    /// stage-boundary kinds in `kinds` are scanned.
+    pub fn get_job_event_stage_bounds(
+        &self,
+        job_ids: &[u64],
+        kinds: &[&str],
+    ) -> Result<JobEventStageBounds, StateError> {
+        if job_ids.is_empty() || kinds.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let ids = job_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        // Kinds are compile-time constants from callers; quote defensively
+        // anyway so a stray quote cannot break the statement.
+        let kinds = kinds
+            .iter()
+            .map(|kind| format!("'{}'", kind.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT job_id, kind, MIN(timestamp) AS first_ts, MAX(timestamp) AS last_ts
+               FROM job_events
+              WHERE job_id IN ({ids}) AND kind IN ({kinds})
+              GROUP BY job_id, kind"
+        );
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[]).await?;
+            let mut bounds: std::collections::HashMap<u64, Vec<(String, i64, i64)>> =
+                std::collections::HashMap::new();
+            for row in rows {
+                bounds.entry(row.i64("job_id")? as u64).or_default().push((
+                    row.text("kind")?,
+                    row.i64("first_ts")?,
+                    row.i64("last_ts")?,
+                ));
+            }
+            Ok(bounds)
         })
     }
 

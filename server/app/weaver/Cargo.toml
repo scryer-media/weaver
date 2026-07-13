@@ -39,6 +39,7 @@ tower-http = { workspace = true, default-features = false }
 async-graphql = { workspace = true }
 async-graphql-axum = { workspace = true, default-features = false }
 reqwest = { workspace = true }
+quick-xml = { workspace = true, default-features = false }
 libc = { workspace = true }
 rayon = { workspace = true, default-features = false }
 rust-embed = { workspace = true, default-features = false }

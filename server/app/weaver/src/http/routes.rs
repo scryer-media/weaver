@@ -15,6 +15,8 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         auth_cache,
         api_key_cache,
         backup,
+        rss,
+        watch_folder,
         metrics_exporter,
         config,
         base_url,
@@ -38,15 +40,31 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         auth_cache.clone(),
         api_key_cache.clone(),
         session_token.clone(),
+        rss,
+        watch_folder,
     );
     let backup_upload_routes = Router::new()
         .route("/inspect", post(super::backup::backup_inspect_handler))
         .route("/restore", post(super::backup::backup_restore_handler))
         .route_layer(RequestBodyLimitLayer::new(backup_upload_limit));
 
+    // NZBGet-compat RPC bodies carry whole NZBs as base64 (+33%) plus envelope
+    // overhead; axum's 2 MiB default would reject ordinary season packs.
+    let rpc_body_limit = usize::try_from(
+        security
+            .nzb_upload_limit_bytes
+            .saturating_mul(3)
+            .saturating_div(2),
+    )
+    .unwrap_or(usize::MAX);
+    let nzbget_rpc_routes = Router::new()
+        .route("/jsonrpc", post(super::nzbget::jsonrpc_handler))
+        .route("/xmlrpc", post(super::nzbget::xmlrpc_handler))
+        .route_layer(axum::extract::DefaultBodyLimit::max(rpc_body_limit));
+
     let inner = Router::new()
         .route("/metrics", get(super::metrics::metrics_handler))
-        .route("/jsonrpc", post(super::nzbget::jsonrpc_handler))
+        .merge(nzbget_rpc_routes)
         .route("/graphql", post(super::graphql::graphql_handler))
         .route("/graphql/ws", get(super::graphql::ws_handler))
         .route(

@@ -151,6 +151,12 @@ fn nzbget_test_router(
 ) -> Router {
     let auth_cache = LoginAuthCache::default();
     let session_token = SessionToken(Arc::new("session-token".to_string()));
+    let rss = weaver_server_api::RssService::new(handle.clone(), config.clone(), db.clone());
+    let watch_folder = weaver_server_core::watch_folder::WatchFolderService::new(
+        db.clone(),
+        handle.clone(),
+        config.clone(),
+    );
     let context = nzbget::NzbgetFacadeContext::new(
         db,
         handle,
@@ -158,11 +164,40 @@ fn nzbget_test_router(
         auth_cache,
         api_key_cache,
         session_token,
+        rss,
+        watch_folder,
     );
 
+    let rpc_body_limit = usize::try_from(
+        weaver_server_core::security::RuntimeSecurityConfig::default()
+            .nzb_upload_limit_bytes
+            .saturating_mul(3)
+            .saturating_div(2),
+    )
+    .unwrap_or(usize::MAX);
     Router::new()
         .route("/jsonrpc", post(nzbget::jsonrpc_handler))
+        .route("/xmlrpc", post(nzbget::xmlrpc_handler))
+        .route_layer(axum::extract::DefaultBodyLimit::max(rpc_body_limit))
         .layer(Extension(context))
+}
+
+async fn post_nzbget_xmlrpc(app: Router, body: &str, auth_value: &str) -> (StatusCode, String) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xmlrpc")
+                .header(header::AUTHORIZATION, auth_value)
+                .header(header::CONTENT_TYPE, "text/xml")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
 }
 
 fn api_key_cache(raw_key: &str, scope: &str) -> ApiKeyCache {
@@ -218,6 +253,83 @@ fn scheduler_handle_with_mock_commands_with_db(
                         job.download_state = weaver_server_core::DownloadState::Queued;
                     });
                     let _ = reply.send(result);
+                }
+                SchedulerCommand::ResumeJob { job_id, reply } => {
+                    let result = update_mock_job(&state, job_id, |job| {
+                        job.status = JobStatus::Queued;
+                        job.download_state = weaver_server_core::DownloadState::Queued;
+                        job.run_state = weaver_server_core::RunState::Active;
+                    });
+                    let _ = reply.send(result);
+                }
+                SchedulerCommand::UpdateJob {
+                    job_id,
+                    update,
+                    reply,
+                } => {
+                    let result = update_mock_job(&state, job_id, |job| {
+                        match &update.category {
+                            weaver_server_core::FieldUpdate::Unchanged => {}
+                            weaver_server_core::FieldUpdate::Clear => job.category = None,
+                            weaver_server_core::FieldUpdate::Set(category) => {
+                                job.category = Some(category.clone());
+                            }
+                        }
+                        match &update.metadata {
+                            weaver_server_core::FieldUpdate::Unchanged => {}
+                            weaver_server_core::FieldUpdate::Clear => job.metadata.clear(),
+                            weaver_server_core::FieldUpdate::Set(metadata) => {
+                                job.metadata = metadata.clone();
+                            }
+                        }
+                        match &update.password {
+                            weaver_server_core::FieldUpdate::Unchanged => {}
+                            weaver_server_core::FieldUpdate::Clear => job.password = None,
+                            weaver_server_core::FieldUpdate::Set(password) => {
+                                job.password = Some(password.clone());
+                            }
+                        }
+                    });
+                    let _ = reply.send(result);
+                }
+                SchedulerCommand::ReorderJob {
+                    job_id,
+                    target,
+                    reply,
+                } => {
+                    let mut jobs = state.list_jobs();
+                    let result = match jobs.iter().position(|job| job.job_id == job_id) {
+                        Some(current) => {
+                            let last = jobs.len() - 1;
+                            let new_index = match target {
+                                weaver_server_core::QueueMoveTarget::Top => 0,
+                                weaver_server_core::QueueMoveTarget::Bottom => last,
+                                weaver_server_core::QueueMoveTarget::Offset(delta) => {
+                                    (current as i64 + delta).clamp(0, last as i64) as usize
+                                }
+                            };
+                            let job = jobs.remove(current);
+                            jobs.insert(new_index, job);
+                            state.publish_jobs(jobs);
+                            Ok(())
+                        }
+                        None => Err(SchedulerError::JobNotFound(job_id)),
+                    };
+                    let _ = reply.send(result);
+                }
+                SchedulerCommand::PauseAll { reply } => {
+                    state.set_paused(true);
+                    let _ = reply.send(());
+                }
+                SchedulerCommand::ResumeAll { reply } => {
+                    state.set_paused(false);
+                    let _ = reply.send(());
+                }
+                SchedulerCommand::SetSpeedLimit { reply, .. } => {
+                    let _ = reply.send(());
+                }
+                SchedulerCommand::ReprocessJob { reply, .. } => {
+                    let _ = reply.send(Ok(()));
                 }
                 SchedulerCommand::CancelJob { job_id, reply, .. } => {
                     let mut jobs = state.list_jobs();
@@ -290,6 +402,8 @@ fn update_mock_job(
 }
 
 fn job_info_from_spec(job_id: JobId, spec: JobSpec) -> JobInfo {
+    let total_files = spec.files.len() as u32;
+    let remaining_par_files = spec.par2_volume_count() as u32;
     JobInfo {
         job_id,
         job_hash: None,
@@ -306,6 +420,9 @@ fn job_info_from_spec(job_id: JobId, spec: JobSpec) -> JobInfo {
         phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
+        total_files,
+        completed_files: 0,
+        remaining_par_files,
         password: spec.password,
         category: spec.category,
         metadata: spec.metadata,
@@ -375,6 +492,9 @@ fn nzbget_test_job(
         phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
+        total_files: 2,
+        completed_files: 1,
+        remaining_par_files: 1,
         password: None,
         category: Some("tv".into()),
         metadata,
@@ -422,7 +542,7 @@ async fn nzbget_unknown_method_returns_nzbget_error_envelope() {
     let (status, payload) = post_nzbget(
         app,
         serde_json::json!({
-            "method": "loadlog",
+            "method": "sysinfo",
             "params": [],
             "id": 12
         }),
@@ -869,6 +989,9 @@ async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
     assert_eq!(group["PausedSizeLo"], 0);
     assert_eq!(group["ActiveDownloads"], 1);
     assert_eq!(group["Status"], "DOWNLOADING");
+    assert_eq!(group["FileCount"], 2);
+    assert_eq!(group["RemainingFileCount"], 1);
+    assert_eq!(group["RemainingParCount"], 1);
     let parameters = group["Parameters"].as_array().unwrap();
     let drone_parameters = parameters
         .iter()
@@ -994,8 +1117,13 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
     assert_eq!(complete["UnpackStatus"], "SUCCESS");
     assert_eq!(complete["Parameters"][0]["Name"], "drone");
     assert_eq!(complete["Parameters"][0]["Value"], "drone-history");
-    assert_eq!(failed["ParStatus"], "FAILURE");
-    assert_eq!(failed["DeleteStatus"], "NONE");
+    // A failed job no longer claims a PAR failure it can't attribute. Sonarr/Radarr
+    // read failure only from the granular fields, so the failure is signaled via
+    // DeleteStatus="HEALTH" (their delete-failed set), not the compound Status;
+    // par/unpack stay NONE (no false stage claim).
+    assert_eq!(failed["ParStatus"], "NONE");
+    assert_eq!(failed["Status"], "FAILURE/HEALTH");
+    assert_eq!(failed["DeleteStatus"], "HEALTH");
     assert_eq!(failed["Message"], "article failures");
 }
 
@@ -1370,6 +1498,1190 @@ async fn nzbget_editqueue_maps_arr_actions() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["error"]["code"], 3);
+}
+
+#[tokio::test]
+async fn nzbget_editqueue_supports_v13_three_param_shape_with_id_array() {
+    let job = nzbget_test_job(
+        88,
+        JobStatus::Queued,
+        weaver_server_core::DownloadState::Queued,
+        100,
+        0,
+        vec![],
+    );
+    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupPause", "", [88]],
+            "id": "pause-v13"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+    assert_eq!(handle.list_jobs()[0].status, JobStatus::Paused);
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupResume", "", [88]],
+            "id": "resume-v13"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+    assert_eq!(handle.list_jobs()[0].status, JobStatus::Queued);
+}
+
+#[tokio::test]
+async fn nzbget_editqueue_category_priority_and_parameter_updates() {
+    let job = nzbget_test_job(
+        90,
+        JobStatus::Queued,
+        weaver_server_core::DownloadState::Queued,
+        100,
+        0,
+        vec![],
+    );
+    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    // nzb360 sends GroupApplyCategory (not GroupSetCategory) in legacy shape.
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupApplyCategory", 0, "movies", [90]],
+            "id": "category"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+    assert_eq!(handle.list_jobs()[0].category.as_deref(), Some("movies"));
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupSetPriority", 0, "900", [90]],
+            "id": "priority"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+
+    let (status, groups) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "listgroups",
+            "params": [],
+            "id": "groups"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let group = &groups["result"][0];
+    assert_eq!(group["Category"], "movies");
+    assert_eq!(group["MaxPriority"], 50);
+
+    // Generic parameters round-trip into the Parameters list.
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupSetParameter", 0, "MyTag=abc", [90]],
+            "id": "parameter"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+    let metadata = &handle.list_jobs()[0].metadata;
+    assert!(
+        metadata
+            .iter()
+            .any(|(key, value)| key == "MyTag" && value == "abc")
+    );
+
+    // Unpack passwords apply as weaver's durable password override and never
+    // leak into the visible metadata/Parameters listings.
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupSetParameter", 0, "*Unpack:Password=hunter2", [90]],
+            "id": "password"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+    assert_eq!(handle.list_jobs()[0].password.as_deref(), Some("hunter2"));
+    assert!(
+        handle.list_jobs()[0]
+            .metadata
+            .iter()
+            .all(|(_, value)| value != "hunter2")
+    );
+
+    // An empty value clears the password again.
+    let (_, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupSetParameter", 0, "*Unpack:Password=", [90]],
+            "id": "password-clear"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], true);
+    assert_eq!(handle.list_jobs()[0].password, None);
+}
+
+#[tokio::test]
+async fn nzbget_editqueue_unsupported_commands_return_false_without_fault() {
+    let job = nzbget_test_job(
+        91,
+        JobStatus::Queued,
+        weaver_server_core::DownloadState::Queued,
+        100,
+        0,
+        vec![],
+    );
+    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    for command in ["GroupMoveBefore", "GroupSetName", "FilePause", "GroupSort"] {
+        let (status, payload) = post_nzbget(
+            app.clone(),
+            serde_json::json!({
+                "method": "editqueue",
+                "params": [command, 0, "", [91]],
+                "id": command
+            }),
+            "Bearer control-key",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{command}");
+        assert_eq!(payload["result"], false, "{command}");
+        assert!(payload["error"].is_null(), "{command}");
+    }
+}
+
+#[tokio::test]
+async fn nzbget_global_pause_resume_and_scheduleresume_auto_resume() {
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "pausedownload", "params": [], "id": 1}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+    assert!(handle.is_globally_paused());
+
+    let (_, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "scheduleresume", "params": [1], "id": 2}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], true);
+
+    let (_, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "status", "params": [], "id": 3}),
+        "Bearer control-key",
+    )
+    .await;
+    assert!(payload["result"]["ResumeTime"].as_u64().unwrap() > 0);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+    assert!(
+        !handle.is_globally_paused(),
+        "scheduleresume timer should resume downloads"
+    );
+    let (_, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "status", "params": [], "id": 4}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"]["ResumeTime"], 0);
+
+    // A manual pause after arming a timer cancels the pending resume.
+    let (_, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "scheduleresume", "params": [1], "id": 5}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], true);
+    let (_, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "pausedownload", "params": [], "id": 6}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], true);
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+    assert!(
+        handle.is_globally_paused(),
+        "manual pause must cancel a pending scheduled resume"
+    );
+
+    let (_, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "resumedownload", "params": [], "id": 7}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], true);
+    assert!(!handle.is_globally_paused());
+}
+
+#[tokio::test]
+async fn nzbget_rate_persists_limit_and_pausescan_toggles_watch_folder() {
+    let db = Database::open_in_memory().unwrap();
+    let config = test_config();
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        db.clone(),
+        handle,
+        config.clone(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "rate", "params": [2500], "id": "rate"}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+    assert_eq!(
+        config.read().await.max_download_speed,
+        Some(2500 * 1024),
+        "rate should update the shared config in KB/s -> bytes/s"
+    );
+    assert_eq!(
+        db.get_setting("max_download_speed").unwrap().as_deref(),
+        Some("2560000")
+    );
+
+    let (_, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "pausescan", "params": [], "id": "pausescan"}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], true);
+    assert!(config.read().await.watch_folder.scanning_paused);
+    assert_eq!(
+        db.get_setting("watch_folder.scanning_paused")
+            .unwrap()
+            .as_deref(),
+        Some("true")
+    );
+
+    let (_, status_payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "status", "params": [], "id": "status"}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status_payload["result"]["ScanPaused"], true);
+
+    let (_, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "resumescan", "params": [], "id": "resumescan"}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], true);
+    assert!(!config.read().await.watch_folder.scanning_paused);
+}
+
+#[tokio::test]
+async fn nzbget_history_reports_compound_status_history_time_and_stage_timings() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(400, "complete", 1_700_000_400, None))
+        .unwrap();
+    db.insert_job_history(&nzbget_history_row(401, "failed", 1_700_000_500, None))
+        .unwrap();
+    db.insert_job_history(&nzbget_history_row(402, "cancelled", 1_700_000_600, None))
+        .unwrap();
+    // Stage boundaries in epoch milliseconds: 300s download, 40s repair.
+    let stage_event =
+        |kind: &str, timestamp: i64| weaver_server_core::history::timeline::JobEvent {
+            job_id: 400,
+            timestamp,
+            kind: kind.into(),
+            message: String::new(),
+            file_id: None,
+        };
+    db.insert_job_events(&[
+        stage_event("DownloadStarted", 1_700_000_000_000),
+        stage_event("DownloadFinished", 1_700_000_300_000),
+        stage_event("RepairStarted", 1_700_000_310_000),
+        stage_event("RepairComplete", 1_700_000_350_000),
+    ])
+    .unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "history", "params": [false], "id": "history"}),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = payload["result"].as_array().unwrap();
+    let by_id = |id: u64| items.iter().find(|item| item["ID"] == id).unwrap();
+    assert_eq!(by_id(400)["Status"], "SUCCESS/ALL");
+    assert_eq!(by_id(400)["HistoryTime"], 1_700_000_400);
+    assert_eq!(by_id(400)["DownloadTimeSec"], 300);
+    assert_eq!(by_id(400)["RepairTimeSec"], 40);
+    assert_eq!(by_id(400)["PostTotalTimeSec"], 40);
+    assert_eq!(by_id(401)["Status"], "FAILURE/HEALTH");
+    assert_eq!(by_id(401)["DownloadTimeSec"], 0);
+    assert_eq!(by_id(402)["Status"], "DELETED/MANUAL");
+    assert_eq!(by_id(402)["Deleted"], true);
+}
+
+fn two_file_nzb() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="test@test.com" date="1700000000" subject="Test - &quot;alpha.rar&quot; yEnc (1/2)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment bytes="400000" number="1">alpha-seg1@test.com</segment>
+      <segment bytes="200000" number="2">alpha-seg2@test.com</segment>
+    </segments>
+  </file>
+  <file poster="test@test.com" date="1700000100" subject="Test - &quot;beta.par2&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="100000" number="1">beta-seg1@test.com</segment></segments>
+  </file>
+</nzb>"#
+        .to_string()
+}
+
+#[tokio::test]
+async fn nzbget_listfiles_reports_nzb_files_with_progress() {
+    let db = Database::open_in_memory().unwrap();
+    let job = nzbget_test_job(
+        55,
+        JobStatus::Downloading,
+        weaver_server_core::DownloadState::Downloading,
+        700_000,
+        150_000,
+        vec![],
+    );
+    db.create_active_job(&weaver_server_core::ActiveJob {
+        job_id: JobId(55),
+        nzb_hash: [7u8; 32],
+        nzb_path: "/tmp/weaver/nzb/55.nzb".into(),
+        nzb_zstd: two_file_nzb().into_bytes(),
+        output_dir: "/tmp/weaver/intermediate/55".into(),
+        created_at: 1_700_000_000,
+        category: Some("tv".into()),
+        metadata: vec![],
+        status: "downloading",
+        download_state: "downloading",
+        post_state: "idle",
+        run_state: "active",
+        paused_resume_status: None,
+        paused_resume_download_state: None,
+        paused_resume_post_state: None,
+    })
+    .unwrap();
+    db.upsert_file_progress_batch(&[weaver_server_core::ActiveFileProgress {
+        job_id: JobId(55),
+        file_index: 0,
+        contiguous_bytes_written: 150_000,
+    }])
+    .unwrap();
+    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let app = nzbget_test_router(db, handle, test_config(), ApiKeyCache::default());
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "listfiles", "params": [0, 0, 55], "id": "files"}),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let files = payload["result"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    let alpha = files
+        .iter()
+        .find(|file| file["Filename"] == "alpha.rar")
+        .unwrap();
+    assert_eq!(alpha["NZBID"], 55);
+    assert_eq!(alpha["FileSizeLo"], 600_000);
+    assert_eq!(alpha["RemainingSizeLo"], 450_000);
+    let beta = files
+        .iter()
+        .find(|file| file["Filename"] == "beta.par2")
+        .unwrap();
+    assert_eq!(beta["FileSizeLo"], 100_000);
+    assert_eq!(beta["RemainingSizeLo"], 100_000);
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "listfiles", "params": [0, 0, 9999], "id": "missing"}),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["error"]["code"], 2);
+}
+
+#[tokio::test]
+async fn nzbget_postqueue_and_group_post_fields_report_stage_progress() {
+    let mut job = nzbget_test_job(
+        60,
+        JobStatus::Repairing,
+        weaver_server_core::DownloadState::Complete,
+        1_000_000,
+        1_000_000,
+        vec![],
+    );
+    job.post_state = weaver_server_core::PostState::Repairing;
+    job.phase_progress = vec![weaver_server_core::JobPhaseProgress {
+        phase: weaver_server_core::JobPhase::Repairing,
+        completed_bytes: 500_000,
+        total_bytes: 1_000_000,
+        progress_percent: 50.0,
+        rate_bps: Some(1_000_000),
+        estimated_remaining_ms: Some(500),
+        started_at_epoch_ms: 1_700_000_000_000.0,
+        updated_at_epoch_ms: 1_700_000_004_000.0,
+    }];
+    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle,
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "postqueue", "params": [0], "id": "postqueue"}),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = &payload["result"][0];
+    assert_eq!(entry["NZBID"], 60);
+    assert_eq!(entry["Stage"], "REPAIRING");
+    assert_eq!(entry["StageProgress"], 500);
+    assert_eq!(entry["StageTimeSec"], 4);
+
+    let (_, groups) = post_nzbget(
+        app,
+        serde_json::json!({"method": "listgroups", "params": [], "id": "groups"}),
+        "Bearer session-token",
+    )
+    .await;
+    let group = &groups["result"][0];
+    assert_eq!(group["Status"], "REPAIRING");
+    assert_eq!(group["PostStageProgress"], 500);
+    assert_eq!(group["PostInfoText"], "Repairing (50%)");
+}
+
+#[tokio::test]
+async fn nzbget_log_and_loadlog_expose_job_events() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_events(&[
+        weaver_server_core::history::timeline::JobEvent {
+            job_id: 42,
+            timestamp: 1_700_000_100,
+            kind: "download-started".into(),
+            message: "download started".into(),
+            file_id: None,
+        },
+        weaver_server_core::history::timeline::JobEvent {
+            job_id: 42,
+            timestamp: 1_700_000_200,
+            kind: "repair-failed".into(),
+            message: "repair failed hard".into(),
+            file_id: None,
+        },
+    ])
+    .unwrap();
+    let job = nzbget_test_job(
+        42,
+        JobStatus::Downloading,
+        weaver_server_core::DownloadState::Downloading,
+        100,
+        10,
+        vec![],
+    );
+    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let app = nzbget_test_router(db, handle, test_config(), ApiKeyCache::default());
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "loadlog", "params": [42, 0, 100], "id": "loadlog"}),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = payload["result"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["Kind"], "INFO");
+    assert_eq!(entries[1]["Kind"], "ERROR");
+    assert_eq!(entries[1]["Text"], "repair failed hard");
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "log", "params": [0, 20], "id": "log"}),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = payload["result"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries[0]["Text"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Friends.S05")
+    );
+}
+
+#[tokio::test]
+async fn nzbget_appendurl_validates_url_and_shape() {
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        scheduler_handle_with_mock_commands(vec![]),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    // Legacy nzb360 shape with a non-URL in the URL slot is rejected.
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "appendurl",
+            "params": ["release.nzb", "tv", 0, false, "not-a-url"],
+            "id": "bad-url"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["error"]["code"], 2);
+
+    // Private addresses are refused by the fetch guard rather than fetched.
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "appendurl",
+            "params": ["release.nzb", "tv", 0, false, "http://127.0.0.1:9/x.nzb"],
+            "id": "private-url"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["error"]["code"], 2);
+}
+
+const XMLRPC_VERSION_CALL: &str = r#"<?xml version="1.0"?>
+<methodCall><methodName>version</methodName><params/></methodCall>"#;
+
+#[tokio::test]
+async fn nzbget_xmlrpc_version_and_unknown_method_roundtrip() {
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, body) =
+        post_nzbget_xmlrpc(app.clone(), XMLRPC_VERSION_CALL, "Bearer session-token").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("<methodResponse><params><param><value><string>16.0-weaver</string></value></param></params></methodResponse>"),
+        "unexpected body: {body}"
+    );
+
+    let call = r#"<methodCall><methodName>bogusmethod</methodName></methodCall>"#;
+    let (status, body) = post_nzbget_xmlrpc(app, call, "Bearer session-token").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<fault>"), "unexpected body: {body}");
+    assert!(body.contains("faultCode"), "unexpected body: {body}");
+}
+
+#[tokio::test]
+async fn nzbget_xmlrpc_rejects_invalid_credentials() {
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, body) =
+        post_nzbget_xmlrpc(app, XMLRPC_VERSION_CALL, &basic_auth("wrong-token")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body.contains("<fault>"), "unexpected body: {body}");
+}
+
+#[tokio::test]
+async fn nzbget_xmlrpc_editqueue_nzb360_shape_pauses_group() {
+    let job = nzbget_test_job(
+        77,
+        JobStatus::Queued,
+        weaver_server_core::DownloadState::Queued,
+        100,
+        0,
+        vec![],
+    );
+    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    // Exact nzb360 wire shape: 4-arg legacy editqueue with int offset and an
+    // <array> of ids.
+    let call = r#"<?xml version="1.0"?>
+<methodCall>
+  <methodName>editqueue</methodName>
+  <params>
+    <param><value><string>GroupPause</string></value></param>
+    <param><value><i4>0</i4></value></param>
+    <param><value><string></string></value></param>
+    <param><value><array><data><value><i4>77</i4></value></data></array></value></param>
+  </params>
+</methodCall>"#;
+    let (status, body) = post_nzbget_xmlrpc(app.clone(), call, "Bearer control-key").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("<value><boolean>1</boolean></value>"),
+        "unexpected body: {body}"
+    );
+    assert_eq!(handle.list_jobs()[0].status, JobStatus::Paused);
+
+    // Read scope may not drive control methods over XML-RPC either.
+    let read_app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        scheduler_handle_with_mock_commands(vec![]),
+        test_config(),
+        api_key_cache("read-key", "read"),
+    );
+    let call = call.replace("GroupPause", "GroupResume");
+    let (status, body) = post_nzbget_xmlrpc(read_app, &call, "Bearer read-key").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("<fault>"), "unexpected body: {body}");
+}
+
+#[tokio::test]
+async fn nzbget_xmlrpc_append_returns_job_id() {
+    use base64::Engine as _;
+
+    let db = Database::open_in_memory().unwrap();
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        db,
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let content = base64::engine::general_purpose::STANDARD.encode(minimal_nzb("XmlAdd"));
+    let call = format!(
+        r#"<?xml version="1.0"?>
+<methodCall>
+  <methodName>append</methodName>
+  <params>
+    <param><value><string>XmlAdd.nzb</string></value></param>
+    <param><value><string>{content}</string></value></param>
+    <param><value><string>tv</string></value></param>
+    <param><value><i4>0</i4></value></param>
+    <param><value><boolean>0</boolean></value></param>
+    <param><value><boolean>0</boolean></value></param>
+    <param><value><string></string></value></param>
+    <param><value><i4>0</i4></value></param>
+    <param><value><string>Score</string></value></param>
+  </params>
+</methodCall>"#
+    );
+    let (status, body) = post_nzbget_xmlrpc(app.clone(), &call, "Bearer control-key").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<i4>"), "unexpected body: {body}");
+    let jobs = handle.list_jobs();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].category.as_deref(), Some("tv"));
+
+    // listgroups over XML-RPC returns a struct array for the added job.
+    let call = r#"<methodCall><methodName>listgroups</methodName></methodCall>"#;
+    let (status, body) = post_nzbget_xmlrpc(app, call, "Bearer control-key").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("<member><name>NZBID</name>"),
+        "unexpected body: {body}"
+    );
+    assert!(
+        body.contains("<name>Status</name><value><string>QUEUED</string></value>"),
+        "unexpected body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn nzbget_loadconfig_alias_exposes_categories() {
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "loadconfig", "params": [], "id": "loadconfig"}),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = payload["result"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["Name"] == "Category1.Name")
+    );
+}
+
+fn reorder_test_job(job_id: u64) -> JobInfo {
+    let mut job = nzbget_test_job(
+        job_id,
+        JobStatus::Queued,
+        weaver_server_core::DownloadState::Queued,
+        100,
+        0,
+        vec![],
+    );
+    job.name = format!("Job.{job_id}");
+    job
+}
+
+async fn listgroups_ids(app: Router) -> Vec<u64> {
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "listgroups", "params": [], "id": "order"}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    payload["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["NZBID"].as_u64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn nzbget_editqueue_move_commands_reorder_queue() {
+    let handle = scheduler_handle_with_mock_commands(vec![
+        reorder_test_job(1),
+        reorder_test_job(2),
+        reorder_test_job(3),
+    ]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    // nzb360 legacy shape: MoveTop with the id array in position 3.
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupMoveTop", 0, "", [3]],
+            "id": "top"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+    assert_eq!(listgroups_ids(app.clone()).await, vec![3, 1, 2]);
+
+    // nzb360 MoveOffset: delta rides in the legacy Offset argument.
+    let (_, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupMoveOffset", 2, "", [3]],
+            "id": "offset"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], true);
+    assert_eq!(listgroups_ids(app.clone()).await, vec![1, 2, 3]);
+
+    // v13+ shape: delta as the Param string, ids as an array.
+    let (_, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupMoveOffset", "-1", [2]],
+            "id": "offset-v13"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], true);
+    assert_eq!(listgroups_ids(app.clone()).await, vec![2, 1, 3]);
+
+    let (_, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupMoveBottom", 0, "", [2]],
+            "id": "bottom"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], true);
+    assert_eq!(listgroups_ids(app.clone()).await, vec![1, 3, 2]);
+
+    // Unknown ids answer false, matching the other editqueue commands.
+    let (_, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupMoveTop", 0, "", [99]],
+            "id": "missing"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], false);
+}
+
+#[tokio::test]
+async fn nzbget_servervolumes_report_quota_window_usage() {
+    use chrono::TimeZone as _;
+
+    let db = Database::open_in_memory().unwrap();
+    db.insert_server(&weaver_server_core::servers::ServerConfig {
+        id: 1,
+        host: "news.example.com".into(),
+        port: 563,
+        tls: true,
+        username: None,
+        password: None,
+        connections: 8,
+        active: true,
+        supports_pipelining: false,
+        priority: 0,
+        backfill: false,
+        retention_days: 0,
+        max_download_speed: 0,
+        download_quota: Default::default(),
+        tls_ca_cert: None,
+    })
+    .unwrap();
+    db.upsert_server_download_usage(&weaver_server_core::servers::ServerDownloadUsage {
+        server_id: 1,
+        lifetime_bytes: 5 * 1024 * 1024,
+        quota_baseline_bytes: 2 * 1024 * 1024,
+        window_start: Some(chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap()),
+        window_end: None,
+        updated_at: chrono::Utc.timestamp_opt(1_700_000_500, 0).unwrap(),
+    })
+    .unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "servervolumes", "params": [], "id": "volumes"}),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = payload["result"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "aggregate entry plus one server");
+    assert_eq!(entries[0]["ServerID"], 0);
+    assert_eq!(entries[0]["TotalSizeMB"], 5);
+    assert_eq!(entries[1]["ServerID"], 1);
+    assert_eq!(entries[1]["TotalSizeMB"], 5);
+    assert_eq!(entries[1]["CustomSizeMB"], 3);
+    assert_eq!(entries[1]["CustomTime"], 1_700_000_000);
+    assert_eq!(entries[1]["BytesPerSeconds"].as_array().unwrap().len(), 60);
+}
+
+#[tokio::test]
+async fn nzbget_scheduleresume_persists_and_recovers_across_restart() {
+    let db = Database::open_in_memory().unwrap();
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        db.clone(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let (_, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "pausedownload", "params": [], "id": 1}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], true);
+    let (_, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "scheduleresume", "params": [3600], "id": 2}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], true);
+    let stored = db
+        .get_setting("nzbget.scheduled_resume_at")
+        .unwrap()
+        .expect("scheduleresume must persist its deadline");
+    assert!(stored.parse::<u64>().unwrap() > 0);
+
+    // A manual resume clears the persisted deadline.
+    let (_, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "resumedownload", "params": [], "id": 3}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], true);
+    assert_eq!(db.get_setting("nzbget.scheduled_resume_at").unwrap(), None);
+
+    // Simulate a restart with an elapsed deadline: the recovery task resumes
+    // downloads and clears the setting.
+    db.set_setting("nzbget.scheduled_resume_at", "1000")
+        .unwrap();
+    handle.pause_all().await.unwrap();
+    assert!(handle.is_globally_paused());
+    let _restarted = nzbget_test_router(
+        db.clone(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    for _ in 0..50 {
+        if !handle.is_globally_paused() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        !handle.is_globally_paused(),
+        "elapsed scheduled resume must resume downloads at startup"
+    );
+    for _ in 0..50 {
+        if db
+            .get_setting("nzbget.scheduled_resume_at")
+            .unwrap()
+            .is_none()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(db.get_setting("nzbget.scheduled_resume_at").unwrap(), None);
+}
+
+#[tokio::test]
+async fn nzbget_feed_bridge_exposes_weaver_rss() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_rss_feed(&weaver_server_core::RssFeedRow {
+        id: 1,
+        name: "indexer".into(),
+        url: "https://indexer.example/rss".into(),
+        enabled: true,
+        poll_interval_secs: 900,
+        username: None,
+        password: None,
+        default_category: Some("tv".into()),
+        default_metadata: vec![],
+        etag: None,
+        last_modified: None,
+        last_polled_at: None,
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+    })
+    .unwrap();
+    db.insert_rss_seen_item(&weaver_server_core::RssSeenItemRow {
+        feed_id: 1,
+        item_id: "item-1".into(),
+        item_title: "Show.S01E01.720p".into(),
+        published_at: Some(1_700_000_000),
+        size_bytes: Some(750 * 1024 * 1024),
+        decision: "submitted".into(),
+        seen_at: 1_700_000_100,
+        job_id: Some(10),
+        item_url: Some("https://indexer.example/get/1".into()),
+        error: None,
+    })
+    .unwrap();
+    db.insert_rss_seen_item(&weaver_server_core::RssSeenItemRow {
+        feed_id: 1,
+        item_id: "item-2".into(),
+        item_title: "Show.S01E02.720p".into(),
+        published_at: Some(1_700_000_200),
+        size_bytes: None,
+        decision: "ignored".into(),
+        seen_at: 1_700_000_300,
+        job_id: None,
+        item_url: None,
+        error: None,
+    })
+    .unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    // Feeds surface as FeedN config entries.
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "loadconfig", "params": [], "id": "feeds-config"}),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = payload["result"].as_array().unwrap();
+    let by_name = |name: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["Name"] == name)
+            .unwrap_or_else(|| panic!("missing config entry {name}"))["Value"]
+            .clone()
+    };
+    assert_eq!(by_name("Feed1.Name"), "indexer");
+    // The feed URL is intentionally NOT exposed: it embeds the indexer API key and
+    // config/loadconfig are reachable with a read-scoped key. Only Name + Interval.
+    assert!(
+        entries.iter().all(|entry| entry["Name"] != "Feed1.URL"),
+        "feed URL must not be exposed via config"
+    );
+    assert_eq!(by_name("Feed1.Interval"), "15");
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "viewfeed", "params": [1], "id": "viewfeed"}),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = payload["result"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let grabbed = items
+        .iter()
+        .find(|item| item["Title"] == "Show.S01E01.720p")
+        .unwrap();
+    assert_eq!(grabbed["Status"], "FETCHED");
+    assert_eq!(grabbed["MatchStatus"], "ACCEPTED");
+    assert_eq!(grabbed["SizeMB"], 750);
+    let skipped = items
+        .iter()
+        .find(|item| item["Title"] == "Show.S01E02.720p")
+        .unwrap();
+    assert_eq!(skipped["Status"], "BACKLOG");
+    assert_eq!(skipped["MatchStatus"], "IGNORED");
+}
+
+#[tokio::test]
+async fn nzbget_rpc_routes_accept_bodies_beyond_default_axum_limit() {
+    use base64::Engine as _;
+
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        scheduler_handle_with_mock_commands(vec![]),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    // 3 MiB of base64 payload: over axum's 2 MiB default, far under the NZB
+    // upload limit. Not a valid NZB, so append answers 0 — reaching the RPC
+    // layer at all is what this guards (a missing limit override yields 413).
+    let content = base64::engine::general_purpose::STANDARD.encode(vec![b'x'; 3 * 1024 * 1024]);
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "append",
+            "params": ["big.nzb", content],
+            "id": "big-body"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], 0);
 }
 
 #[tokio::test]
@@ -1966,6 +3278,9 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         phase_progress: Vec::new(),
         failed_bytes: 2,
         health: 999,
+        total_files: 0,
+        completed_files: 0,
+        remaining_par_files: 0,
         password: Some("secret".into()),
         category: Some("tv".into()),
         metadata: Vec::new(),

@@ -225,7 +225,7 @@ impl Database {
                         created_at, queued_repair_at_epoch_ms,
                         queued_extract_at_epoch_ms, paused_resume_status,
                         paused_resume_download_state, paused_resume_post_state,
-                        category, metadata
+                        category, metadata, queue_position, password
                  FROM active_jobs",
                 &[],
             )
@@ -256,6 +256,8 @@ impl Database {
                     paused_resume_post_state: row.opt_text("paused_resume_post_state")?,
                     category: row.opt_text("category")?,
                     metadata: metadata_from_json(row.opt_text("metadata")?),
+                    queue_position: row.opt_i64("queue_position")?,
+                    password_override: row.opt_text("password")?,
                 };
                 jobs.insert(job_id, job);
             }
@@ -425,6 +427,47 @@ impl Database {
                 ))
             })
             .transpose()
+        })
+    }
+
+    /// Load the per-file runtime view for one active job: contiguous bytes
+    /// written per incomplete file plus the set of fully completed file
+    /// indices. Used by integration facades that expose per-file listings
+    /// without loading the full recovery snapshot.
+    pub fn load_active_file_runtime(
+        &self,
+        job_id: JobId,
+    ) -> Result<(HashMap<u32, u64>, HashSet<u32>), StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT file_index, contiguous_bytes_written
+                 FROM active_file_progress
+                 WHERE job_id = {}",
+                &[SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?;
+            let mut progress = HashMap::with_capacity(rows.len());
+            for row in rows {
+                progress.insert(
+                    row.i64("file_index")? as u32,
+                    row.i64("contiguous_bytes_written")? as u64,
+                );
+            }
+
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT file_index FROM active_files WHERE job_id = {}",
+                &[SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?;
+            let mut complete = HashSet::with_capacity(rows.len());
+            for row in rows {
+                complete.insert(row.i64("file_index")? as u32);
+            }
+
+            Ok((progress, complete))
         })
     }
 

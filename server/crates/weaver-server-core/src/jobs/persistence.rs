@@ -865,6 +865,57 @@ impl Database {
                             .await?;
                         }
                     }
+
+                    // Password override column: NULL = no override (restore
+                    // keeps the NZB-derived password), '' = explicitly no
+                    // password, anything else = the override itself.
+                    match update.password {
+                        FieldUpdate::Unchanged => {}
+                        FieldUpdate::Clear => {
+                            tx.execute(
+                                "UPDATE active_jobs SET password = {} WHERE job_id = {}",
+                                &[SqlArg::Text(String::new()), SqlArg::I64(job_id.0 as i64)],
+                            )
+                            .await?;
+                        }
+                        FieldUpdate::Set(password) => {
+                            tx.execute(
+                                "UPDATE active_jobs SET password = {} WHERE job_id = {}",
+                                &[SqlArg::Text(password), SqlArg::I64(job_id.0 as i64)],
+                            )
+                            .await?;
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    /// Persist the manual queue order as one transaction. Positions are the
+    /// full current order (small: one row per queued job) so restores sort by
+    /// `queue_position` and land in the exact user-arranged sequence.
+    pub fn update_active_job_queue_positions(
+        &self,
+        positions: &[(JobId, i64)],
+    ) -> Result<(), StateError> {
+        if positions.is_empty() {
+            return Ok(());
+        }
+        let datastore = self.datastore();
+        let positions = positions.to_vec();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "update_active_job_queue_positions", |tx| {
+                let positions = positions.clone();
+                Box::pin(async move {
+                    for (job_id, position) in positions {
+                        tx.execute(
+                            "UPDATE active_jobs SET queue_position = {} WHERE job_id = {}",
+                            &[SqlArg::I64(position), SqlArg::I64(job_id.0 as i64)],
+                        )
+                        .await?;
+                    }
                     Ok(())
                 })
             })

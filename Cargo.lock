@@ -4852,6 +4852,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "mime_guess",
+ "quick-xml",
  "rayon",
  "reqwest",
  "rmp-serde",

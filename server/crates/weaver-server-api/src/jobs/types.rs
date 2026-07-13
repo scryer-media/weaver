@@ -154,6 +154,15 @@ pub struct QueueAttention {
     pub message: String,
 }
 
+/// Kind of manual queue move. Offset carries its distance in the mutation's
+/// `offset` argument.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+pub enum QueueMoveKind {
+    Top,
+    Bottom,
+    Offset,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Enum)]
 pub enum QueuePhase {
     Downloading,
@@ -224,6 +233,15 @@ pub struct QueueItem {
     pub phase_progress: Vec<QueuePhaseProgress>,
     pub failed_bytes: u64,
     pub health: u32,
+    /// Total files in the NZB (all roles); 0 when unknown (legacy snapshots).
+    #[serde(default)]
+    pub file_count: u32,
+    /// Files not yet fully downloaded.
+    #[serde(default)]
+    pub remaining_file_count: u32,
+    /// PAR2 recovery volumes not yet fetched.
+    #[serde(default)]
+    pub remaining_par_count: u32,
     pub has_password: bool,
     pub category: Option<String>,
     pub attributes: Vec<Attribute>,
@@ -1050,6 +1068,9 @@ pub fn queue_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
             .collect(),
         failed_bytes: info.failed_bytes,
         health: info.health,
+        file_count: info.total_files,
+        remaining_file_count: info.total_files.saturating_sub(info.completed_files),
+        remaining_par_count: info.remaining_par_files,
         has_password: info.password.is_some(),
         category: info.category.clone(),
         attributes,
@@ -1090,6 +1111,9 @@ pub fn queue_item_from_submission(
         phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
+        file_count: submitted.spec.files.len() as u32,
+        remaining_file_count: submitted.spec.files.len() as u32,
+        remaining_par_count: submitted.spec.par2_volume_count() as u32,
         has_password: submitted.spec.password.is_some(),
         category: submitted.spec.category.clone(),
         attributes,

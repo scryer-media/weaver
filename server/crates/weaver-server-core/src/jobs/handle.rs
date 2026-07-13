@@ -181,6 +181,77 @@ pub enum DownloadBlockKind {
     ServerQuota,
 }
 
+/// Where a manual queue reorder should land a job. The order only breaks ties
+/// within a dispatch priority band: a LOW job moved to the top still yields to
+/// HIGH/NORMAL work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueueMoveTarget {
+    Top,
+    Bottom,
+    Offset(i64),
+}
+
+/// Splice `job_id` to its new position in the manual queue order. Pure so the
+/// clamp/splice arithmetic is unit-testable apart from pipeline state.
+pub fn splice_job_order(
+    order: &mut Vec<JobId>,
+    job_id: JobId,
+    target: QueueMoveTarget,
+) -> Result<bool, SchedulerError> {
+    let Some(current) = order.iter().position(|id| *id == job_id) else {
+        return Err(SchedulerError::JobNotFound(job_id));
+    };
+    let last = order.len() - 1;
+    let new_index = match target {
+        QueueMoveTarget::Top => 0,
+        QueueMoveTarget::Bottom => last,
+        QueueMoveTarget::Offset(delta) => {
+            (current as i64).saturating_add(delta).clamp(0, last as i64) as usize
+        }
+    };
+    if new_index == current {
+        return Ok(false);
+    }
+    let id = order.remove(current);
+    order.insert(new_index, id);
+    Ok(true)
+}
+
+#[cfg(test)]
+mod splice_job_order_tests {
+    use super::*;
+
+    fn order(ids: &[u64]) -> Vec<JobId> {
+        ids.iter().copied().map(JobId).collect()
+    }
+
+    #[test]
+    fn splices_top_bottom_and_clamped_offsets() {
+        let mut jobs = order(&[1, 2, 3, 4]);
+        assert!(splice_job_order(&mut jobs, JobId(3), QueueMoveTarget::Top).unwrap());
+        assert_eq!(jobs, order(&[3, 1, 2, 4]));
+
+        assert!(splice_job_order(&mut jobs, JobId(1), QueueMoveTarget::Bottom).unwrap());
+        assert_eq!(jobs, order(&[3, 2, 4, 1]));
+
+        assert!(splice_job_order(&mut jobs, JobId(4), QueueMoveTarget::Offset(-1)).unwrap());
+        assert_eq!(jobs, order(&[3, 4, 2, 1]));
+
+        // Offsets clamp at the edges instead of erroring.
+        assert!(splice_job_order(&mut jobs, JobId(3), QueueMoveTarget::Offset(-5)).is_ok());
+        assert_eq!(jobs, order(&[3, 4, 2, 1]));
+        assert!(splice_job_order(&mut jobs, JobId(3), QueueMoveTarget::Offset(99)).unwrap());
+        assert_eq!(jobs, order(&[4, 2, 1, 3]));
+
+        // No-op moves report false; unknown ids error.
+        assert!(!splice_job_order(&mut jobs, JobId(4), QueueMoveTarget::Top).unwrap());
+        assert!(matches!(
+            splice_job_order(&mut jobs, JobId(9), QueueMoveTarget::Top),
+            Err(SchedulerError::JobNotFound(JobId(9)))
+        ));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DownloadBlockState {
     pub kind: DownloadBlockKind,
@@ -296,6 +367,12 @@ pub enum SchedulerCommand {
         update: JobUpdate,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
+    /// Move a job within the manual queue order.
+    ReorderJob {
+        job_id: JobId,
+        target: QueueMoveTarget,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
     /// Pause all jobs globally (pipeline-wide).
     PauseAll { reply: oneshot::Sender<()> },
     /// Resume all jobs globally.
@@ -383,6 +460,15 @@ pub struct JobInfo {
     pub failed_bytes: u64,
     /// Job health 0-1000 (1000 = perfect). Drops as articles fail.
     pub health: u32,
+    /// Total files in the NZB (all roles).
+    #[serde(default)]
+    pub total_files: u32,
+    /// Files fully downloaded and committed.
+    #[serde(default)]
+    pub completed_files: u32,
+    /// PAR2 recovery volumes not yet fetched (fetched on demand).
+    #[serde(default)]
+    pub remaining_par_files: u32,
     pub password: Option<String>,
     /// Optional category (e.g. "tv", "movies").
     pub category: Option<String>,
@@ -529,6 +615,26 @@ impl SchedulerHandle {
             .send(SchedulerCommand::UpdateJob {
                 job_id,
                 update,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+    }
+
+    /// Move a job within the manual queue order. Durable and reflected in
+    /// queue listings; breaks ties within a dispatch priority band rather than
+    /// overriding HIGH/NORMAL/LOW.
+    pub async fn reorder_job(
+        &self,
+        job_id: JobId,
+        target: QueueMoveTarget,
+    ) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::ReorderJob {
+                job_id,
+                target,
                 reply: tx,
             })
             .await
