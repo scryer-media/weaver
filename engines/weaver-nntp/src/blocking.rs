@@ -1972,9 +1972,18 @@ mod tests {
 
     enum TestArticle {
         Body(Vec<u8>),
-        DelayedInitial { data: Vec<u8>, delay: Duration },
-        Trickle { data: Vec<u8>, line_delay: Duration },
-        Truncated(Vec<u8>),
+        DelayedInitial {
+            data: Vec<u8>,
+            delay: Duration,
+        },
+        Trickle {
+            data: Vec<u8>,
+            line_delay: Duration,
+        },
+        Truncated {
+            data: Vec<u8>,
+            wait_for_next_request: bool,
+        },
     }
 
     #[cfg(not(windows))]
@@ -2068,12 +2077,16 @@ mod tests {
                 stream.get_mut().flush().await.unwrap();
 
                 let mut line = String::new();
+                let mut close_after_next_request = false;
                 loop {
                     line.clear();
                     let Ok(read) = stream.read_line(&mut line).await else {
                         break;
                     };
                     if read == 0 {
+                        break;
+                    }
+                    if close_after_next_request {
                         break;
                     }
                     let command = line.trim_end_matches(['\r', '\n']);
@@ -2134,7 +2147,10 @@ mod tests {
                                     return;
                                 }
                             }
-                            Some(TestArticle::Truncated(data)) => {
+                            Some(TestArticle::Truncated {
+                                data,
+                                wait_for_next_request,
+                            }) => {
                                 stream
                                     .get_mut()
                                     .write_all(format!("222 0 {} body follows\r\n", id.trim()).as_bytes())
@@ -2142,7 +2158,11 @@ mod tests {
                                     .unwrap();
                                 stream.get_mut().write_all(&yenc_body(data)).await.unwrap();
                                 stream.get_mut().flush().await.unwrap();
-                                break;
+                                if *wait_for_next_request {
+                                    close_after_next_request = true;
+                                } else {
+                                    break;
+                                }
                             }
                             None => {
                                 stream
@@ -2288,7 +2308,10 @@ mod tests {
     fn tls_pipeline_failure_drains_permits_before_any_reuse(backend: NntpTlsBackend) {
         let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
             "<first@test>",
-            TestArticle::Truncated(b"partial".to_vec()),
+            TestArticle::Truncated {
+                data: b"partial".to_vec(),
+                wait_for_next_request: true,
+            },
         )]);
         let mut conn = connect_with_backend(&config, backend);
         let control = test_transfer_control(90, 1_000);
@@ -2330,7 +2353,10 @@ mod tests {
     fn tls_lane_reports_truncated_response(backend: NntpTlsBackend) {
         let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
             "<truncated@test>",
-            TestArticle::Truncated(b"incomplete article".to_vec()),
+            TestArticle::Truncated {
+                data: b"incomplete article".to_vec(),
+                wait_for_next_request: false,
+            },
         )]);
         let mut conn = connect_with_backend(&config, backend);
         conn.select_group("alt.test").unwrap();
