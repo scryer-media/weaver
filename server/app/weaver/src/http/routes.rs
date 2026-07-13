@@ -1,20 +1,28 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::Extension;
+use axum::extract::{Extension, Request};
+use axum::http::StatusCode;
+use axum::middleware::{self, Next};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use weaver_server_core::auth::generate_api_key;
 
+pub(super) const NZBGET_RPC_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
 pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
     let super::ServerRuntime {
         schema,
         handle,
+        scheduled_resume,
         db,
         auth_cache,
         api_key_cache,
         backup,
+        rss,
+        watch_folder,
         metrics_exporter,
         config,
         base_url,
@@ -38,15 +46,20 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         auth_cache.clone(),
         api_key_cache.clone(),
         session_token.clone(),
+        rss,
+        watch_folder,
+        scheduled_resume,
     );
     let backup_upload_routes = Router::new()
         .route("/inspect", post(super::backup::backup_inspect_handler))
         .route("/restore", post(super::backup::backup_restore_handler))
         .route_layer(RequestBodyLimitLayer::new(backup_upload_limit));
 
+    let nzbget_rpc_routes = build_nzbget_rpc_routes(nzbget_context);
+
     let inner = Router::new()
         .route("/metrics", get(super::metrics::metrics_handler))
-        .route("/jsonrpc", post(super::nzbget::jsonrpc_handler))
+        .merge(nzbget_rpc_routes)
         .route("/graphql", post(super::graphql::graphql_handler))
         .route("/graphql/ws", get(super::graphql::ws_handler))
         .route(
@@ -78,7 +91,6 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .layer(Extension(auth_cache))
         .layer(Extension(login_limiter))
         .layer(Extension(api_key_cache))
-        .layer(Extension(nzbget_context))
         .layer(Extension(request_auth))
         .layer(Extension(metrics_exporter))
         .layer(Extension(base_url_ext))
@@ -99,4 +111,47 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
             )
             .nest(&base_url, inner)
     }
+}
+
+pub(super) fn build_nzbget_rpc_routes(
+    nzbget_context: super::nzbget::NzbgetFacadeContext,
+) -> Router {
+    // 32 MiB of JSON/XML envelope carries roughly 24 MiB of decoded base64 NZB
+    // data, comfortably above observed real-world payloads while keeping the
+    // fully-buffered RPC surface bounded independently of the core upload cap.
+    let rpc_buffer_gate = Arc::new(tokio::sync::Semaphore::new(6));
+    let nzbget_auth_context = nzbget_context.clone();
+    Router::new()
+        .route("/jsonrpc", post(super::nzbget::jsonrpc_handler))
+        .route("/xmlrpc", post(super::nzbget::xmlrpc_handler))
+        .route_layer(axum::extract::DefaultBodyLimit::max(
+            NZBGET_RPC_BODY_LIMIT_BYTES,
+        ))
+        .layer(middleware::from_fn(move |mut req: Request, next: Next| {
+            let rpc_buffer_gate = Arc::clone(&rpc_buffer_gate);
+            let nzbget_auth_context = nzbget_auth_context.clone();
+            async move {
+                let scope = match super::nzbget::resolve_scope_for_facade(
+                    &nzbget_auth_context,
+                    req.headers(),
+                )
+                .await
+                {
+                    Ok(scope) => scope,
+                    Err(status) => {
+                        return super::nzbget::authentication_error_response(
+                            req.uri().path(),
+                            status,
+                        );
+                    }
+                };
+                req.extensions_mut()
+                    .insert(super::nzbget::NzbgetCallerScope(scope));
+                let Ok(_permit) = rpc_buffer_gate.acquire().await else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                next.run(req).await
+            }
+        }))
+        .layer(Extension(nzbget_context))
 }

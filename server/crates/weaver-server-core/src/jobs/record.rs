@@ -87,6 +87,11 @@ pub struct RecoveredJob {
     pub paused_resume_post_state: Option<String>,
     pub category: Option<String>,
     pub metadata: Vec<(String, String)>,
+    /// Manual queue-order position; `None` falls back to job-id order.
+    pub queue_position: Option<i64>,
+    /// Unpack password override: `None` = keep the NZB-derived password,
+    /// `Some("")` = explicitly no password, otherwise the override itself.
+    pub password_override: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

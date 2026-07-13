@@ -120,6 +120,7 @@ fn runtime_lanes_for_status(
 pub struct TestHarness {
     pub schema: WeaverSchema,
     pub handle: SchedulerHandle,
+    pub scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
     pub config: SharedConfig,
     pub db: Database,
     pub metrics: Arc<PipelineMetrics>,
@@ -194,8 +195,11 @@ impl TestHarness {
             .expect("failed to create server transfer policy registry"),
         );
 
+        let scheduled_resume =
+            weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
         let schema = build_schema(SchemaContext {
             handle: handle.clone(),
+            scheduled_resume: scheduled_resume.clone(),
             config: shared_config.clone(),
             db: db.clone(),
             server_transfer_policy: Arc::clone(&server_transfer_policy),
@@ -213,6 +217,7 @@ impl TestHarness {
         Self {
             schema,
             handle,
+            scheduled_resume,
             config: shared_config,
             db,
             metrics,
@@ -719,6 +724,23 @@ fn spawn_test_scheduler(
                     };
                     let _ = reply.send(result);
                 }
+                SchedulerCommand::ReorderJob { job_id, reply, .. } => {
+                    let result = if jobs.contains_key(&job_id) {
+                        Ok(())
+                    } else {
+                        Err(weaver_server_core::SchedulerError::JobNotFound(job_id))
+                    };
+                    let _ = reply.send(result);
+                }
+                SchedulerCommand::ReorderJobs { moves, reply } => {
+                    let result = match moves.iter().find(|(job_id, _)| !jobs.contains_key(job_id)) {
+                        Some((job_id, _)) => {
+                            Err(weaver_server_core::SchedulerError::JobNotFound(*job_id))
+                        }
+                        None => Ok(()),
+                    };
+                    let _ = reply.send(result);
+                }
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.
@@ -752,6 +774,9 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             phase_progress: Vec::new(),
             failed_bytes: 0,
             health: 1000,
+            total_files: 0,
+            completed_files: 0,
+            remaining_par_files: 0,
             password: state.spec.password.clone(),
             category: state.spec.category.clone(),
             metadata: state.spec.metadata.clone(),

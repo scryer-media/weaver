@@ -83,6 +83,23 @@ impl JobSpec {
             .map(|segment| segment.bytes as u64)
             .sum()
     }
+
+    /// Number of PAR2 recovery volumes (excludes the tiny always-fetched
+    /// index files).
+    pub fn par2_volume_count(&self) -> usize {
+        self.files
+            .iter()
+            .filter(|file| {
+                matches!(
+                    file.role,
+                    FileRole::Par2 {
+                        is_index: false,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -103,11 +120,14 @@ impl<T> FieldUpdate<T> {
 pub struct JobUpdate {
     pub category: FieldUpdate<String>,
     pub metadata: FieldUpdate<Vec<(String, String)>>,
+    /// Archive/unpack password override. `Clear` removes a password even when
+    /// the NZB itself carries one; the override persists across restarts.
+    pub password: FieldUpdate<String>,
 }
 
 impl JobUpdate {
     pub fn is_empty(&self) -> bool {
-        self.category.is_unchanged() && self.metadata.is_unchanged()
+        self.category.is_unchanged() && self.metadata.is_unchanged() && self.password.is_unchanged()
     }
 
     pub fn apply_to_spec(&self, spec: &mut JobSpec) {
@@ -121,6 +141,12 @@ impl JobUpdate {
             FieldUpdate::Unchanged => {}
             FieldUpdate::Clear => spec.metadata.clear(),
             FieldUpdate::Set(metadata) => spec.metadata = metadata.clone(),
+        }
+
+        match &self.password {
+            FieldUpdate::Unchanged => {}
+            FieldUpdate::Clear => spec.password = None,
+            FieldUpdate::Set(password) => spec.password = Some(password.clone()),
         }
     }
 }

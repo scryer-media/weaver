@@ -10,6 +10,7 @@ const ko: LocaleDictionary = {
   "nav.metrics": "메트릭",
   "nav.upload": "업로드",
   "nav.settings": "설정",
+  "nav.sponsor": "후원하기",
 
   // Status labels
   "status.queued": "대기 중",

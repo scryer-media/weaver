@@ -151,6 +151,9 @@ fn history_job(job_id: u64, status: JobStatus) -> JobInfo {
         phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,
+        total_files: 0,
+        completed_files: 0,
+        remaining_par_files: 0,
         password: None,
         category: None,
         metadata: Vec::new(),
@@ -201,6 +204,40 @@ async fn is_paused_true_after_pause_all() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert!(data["isPaused"].as_bool().unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn graphql_global_pause_surfaces_cancel_scheduled_resume() {
+    let h = TestHarness::new().await;
+    let mutations = [
+        ("mutation { pauseAll }", true),
+        ("mutation { resumeAll }", false),
+        ("mutation { pauseQueue { success } }", true),
+        ("mutation { resumeQueue { success } }", false),
+    ];
+
+    for (mutation, expected_paused) in mutations {
+        h.scheduled_resume.pause_all().await.unwrap();
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        h.scheduled_resume.schedule_resume(deadline).await.unwrap();
+        tokio::task::yield_now().await;
+
+        let resp = h.execute(mutation).await;
+        assert_no_errors(&resp);
+        assert_eq!(h.scheduled_resume.resume_at().await, 0);
+        assert_eq!(
+            h.db.get_setting("nzbget.scheduled_resume_at").unwrap(),
+            None
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(h.handle.is_globally_paused(), expected_paused);
+    }
 }
 
 #[tokio::test]

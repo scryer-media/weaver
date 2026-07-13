@@ -10,6 +10,7 @@ const ja: LocaleDictionary = {
   "nav.metrics": "メトリクス",
   "nav.upload": "アップロード",
   "nav.settings": "設定",
+  "nav.sponsor": "スポンサー",
 
   // Status labels
   "status.queued": "待機中",

@@ -190,6 +190,57 @@ file = "migrations/0033_duplicate_admission/postgres.sql"
 engine = "postgres"
 scope = "all"
 
+[[migration]]
+version = 34
+description = "manual queue ordering position"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0034_queue_order/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0034_queue_order/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 35
+description = "active job unpack password override"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0035_active_job_password/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0035_active_job_password/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 36
+description = "job_events stage-bounds composite index"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0036_job_events_stage_index/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0036_job_events_stage_index/postgres.sql"
+engine = "postgres"
+scope = "all"
+
 [[baseline]]
 through_version = 21
 file = "migrations/0021_legacy_schema_parity/fresh.sql"

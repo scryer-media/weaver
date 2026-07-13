@@ -37,6 +37,25 @@ impl Database {
         })
     }
 
+    /// Delete `key` only if its stored value still equals `expected`, atomically
+    /// in one statement. Closes the read-then-delete TOCTOU a two-round-trip
+    /// value-compare would leave open (a concurrent writer replacing the value
+    /// between the read and the delete).
+    pub fn delete_setting_if_value(&self, key: &str, expected: &str) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let key = key.to_string();
+        let expected = expected.to_string();
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "DELETE FROM settings WHERE key = {} AND value = {}",
+                &[SqlArg::Text(key), SqlArg::Text(expected)],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
     pub fn save_schedules(&self, entries: &[ScheduleEntry]) -> Result<(), StateError> {
         let json =
             serde_json::to_string(entries).map_err(|e| StateError::Database(e.to_string()))?;

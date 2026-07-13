@@ -1299,6 +1299,19 @@ impl Pipeline {
             {
                 download_state = crate::jobs::model::DownloadState::Downloading;
             }
+            let remaining_par_files = state
+                .assembly
+                .files()
+                .filter(|file| {
+                    matches!(
+                        file.role(),
+                        weaver_model::files::FileRole::Par2 {
+                            is_index: false,
+                            ..
+                        }
+                    ) && !file.is_complete()
+                })
+                .count() as u32;
             list.push(JobInfo {
                 job_id: state.job_id,
                 job_hash: Some(state.job_hash),
@@ -1324,6 +1337,9 @@ impl Pipeline {
                     .unwrap_or_default(),
                 failed_bytes: state.failed_bytes,
                 health,
+                total_files: state.assembly.total_file_count() as u32,
+                completed_files: state.assembly.complete_file_count() as u32,
+                remaining_par_files,
                 password: state.spec.password.clone(),
                 category: state.spec.category.clone(),
                 metadata: state.spec.metadata.clone(),

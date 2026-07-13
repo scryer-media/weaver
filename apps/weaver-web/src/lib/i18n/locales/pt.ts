@@ -10,6 +10,7 @@ const pt: LocaleDictionary = {
   "nav.metrics": "Métricas",
   "nav.upload": "Enviar",
   "nav.settings": "Configurações",
+  "nav.sponsor": "Patrocinar",
 
   // Status labels
   "status.queued": "Na fila",

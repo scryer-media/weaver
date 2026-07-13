@@ -29,6 +29,7 @@ pub fn apply_graphql_query_guards<Query, Mutation, Subscription>(
 
 pub struct SchemaContext {
     pub handle: weaver_server_core::SchedulerHandle,
+    pub scheduled_resume: crate::ScheduledResumeCoordinator,
     pub config: SharedConfig,
     pub db: Database,
     pub server_transfer_policy:
@@ -80,6 +81,7 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
         SubscriptionRoot::default(),
     ))
     .data(context.handle)
+    .data(context.scheduled_resume)
     .data(context.config)
     .data(context.db)
     .data(context.server_transfer_policy)
