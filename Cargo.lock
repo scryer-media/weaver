@@ -184,7 +184,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -195,7 +195,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -539,21 +539,9 @@ version = "1.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4342d8937fc7e5dd9b1c60292261c0670c882a2cd1719cfc11b1af41731e32ad"
 dependencies = [
- "aws-lc-sys 0.42.0",
+ "aws-lc-sys",
  "untrusted 0.7.1",
  "zeroize",
-]
-
-[[package]]
-name = "aws-lc-sys"
-version = "0.41.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2f9779ce85b93ab6170dd940ad0169b5766ff848247aff13bb788b832fe3f4"
-dependencies = [
- "cc",
- "cmake",
- "dunce",
- "fs_extra",
 ]
 
 [[package]]
@@ -1445,7 +1433,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2296,7 +2284,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2631,7 +2619,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3108,7 +3096,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3431,7 +3419,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3854,7 +3842,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4153,10 +4141,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4600,7 +4588,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4926,11 +4914,11 @@ dependencies = [
 
 [[package]]
 name = "weaver-par2"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41cc76194be9b3ecace0b0c7197230d3478cd515db69ff2652cea5c8567807fc"
+checksum = "b74ee837445f35b25156657c52f8f5574bd5a98b2c87f6b87db2194737211288"
 dependencies = [
- "aws-lc-sys 0.42.0",
+ "aws-lc-sys",
  "bytes",
  "crc32fast",
  "libc",
@@ -4939,7 +4927,7 @@ dependencies = [
  "rayon",
  "thiserror 2.0.18",
  "tracing",
- "weaver-reed-solomon",
+ "weaver-reed-solomon 0.2.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -4952,6 +4940,15 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-metal",
+ "rayon",
+]
+
+[[package]]
+name = "weaver-reed-solomon"
+version = "0.2.3"
+source = "git+https://github.com/scryer-media/rarpar?rev=a5de0d3bbce13999d50cec4bced17096ce1d1ae6#a5de0d3bbce13999d50cec4bced17096ce1d1ae6"
+dependencies = [
+ "memmap2",
  "rayon",
 ]
 
@@ -5049,12 +5046,11 @@ dependencies = [
 
 [[package]]
 name = "weaver-unrar"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98638ec1bbd43d40c8705a3871977575f63ac357bdb5ebc04bc41465b9f77612"
+version = "0.3.1"
+source = "git+https://github.com/scryer-media/rarpar?rev=a5de0d3bbce13999d50cec4bced17096ce1d1ae6#a5de0d3bbce13999d50cec4bced17096ce1d1ae6"
 dependencies = [
  "aws-lc-rs",
- "aws-lc-sys 0.41.0",
+ "aws-lc-sys",
  "blake2s_simd",
  "crc32fast",
  "filetime",
@@ -5068,7 +5064,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "unicode-normalization",
- "weaver-reed-solomon",
+ "weaver-reed-solomon 0.2.3 (git+https://github.com/scryer-media/rarpar?rev=a5de0d3bbce13999d50cec4bced17096ce1d1ae6)",
  "windows-sys 0.61.2",
  "zeroize",
 ]
@@ -5126,7 +5122,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

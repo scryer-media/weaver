@@ -146,6 +146,12 @@ pub async fn rebuild_nntp_from_config(config: &SharedConfig, handle: &SchedulerH
             .collect();
 
         let total: usize = servers.iter().map(|server| server.max_connections).sum();
+        tracing::info!(
+            active_server_count = servers.len(),
+            total_connections = total,
+            policies_ready,
+            "building NNTP runtime generation"
+        );
         let client = NntpClient::new(NntpClientConfig {
             servers,
             max_idle_age: std::time::Duration::from_mins(5),

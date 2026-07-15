@@ -56,6 +56,7 @@ const HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
 const HOT_LEASE_TARGET_RUNWAY_SECS: u64 = 2;
 const HOT_LEASE_WARMUP_WORK_LIMIT: usize = 16;
 const NO_ELIGIBLE_SERVER_WARN_INTERVAL: Duration = Duration::from_secs(60);
+const BODY_FETCH_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const HOT_DISPATCH_WARMUP_MIN_DURATION: Duration = Duration::from_secs(2);
 const HOT_DISPATCH_FORCE_UNDERFILL_AFTER: Duration = Duration::from_secs(5);
 const HOT_DISPATCH_MIN_SUCCESSFUL_PRIMARY_BODIES: u64 = 24;
@@ -148,6 +149,17 @@ impl Pipeline {
                 .get(&job_id)
                 .map(|state| state.spec.total_bytes)
                 .unwrap_or(0);
+            let tuner_max = self.tuner.params().max_concurrent_downloads;
+            info!(
+                job_id = job_id.0,
+                total_bytes = total,
+                configured_server_count = self.nntp.pool().server_count(),
+                tuner_max_connections = tuner_max,
+                connection_ramp = self.connection_ramp,
+                effective_connection_capacity =
+                    self.effective_download_connection_capacity(tuner_max),
+                "NNTP download pass started"
+            );
             self.phase_begin(job_id, JobPhase::Downloading, Some(total));
             let _ = self
                 .event_tx

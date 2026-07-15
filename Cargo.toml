@@ -22,7 +22,7 @@ tokio = { version = "1.52", default-features = false, features = ["fs", "io-util
 serde = { version = "1.0", default-features = false, features = ["derive", "rc", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 thiserror = { version = "2.0", default-features = false, features = ["std"] }
-tracing = { version = "0.1", default-features = false, features = ["std", "release_max_level_info"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "ansi", "env-filter"] }
 bytes = { version = "1", default-features = false, features = ["std"] }
 async-graphql = { version = "7.2", default-features = false, features = ["chrono"] }
@@ -90,8 +90,8 @@ security-framework-sys = { version = "2", default-features = false }
 keyring = { version = "4", default-features = false, features = ["v1"] }
 keyring-core = { version = "1", default-features = false }
 windows-sys = { version = "0.61", default-features = false }
-weaver-par2 = { version = "0.2.1", default-features = false, features = ["metal", "native-crypto"] }
-weaver-unrar = { version = "0.2.0", default-features = false, features = ["crypto-aws-lc"] }
+weaver-par2 = { version = "0.2.4", default-features = false, features = ["metal", "native-crypto"] }
+weaver-unrar = { git = "https://github.com/scryer-media/rarpar", rev = "a5de0d3bbce13999d50cec4bced17096ce1d1ae6", version = "0.3.1", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.12.0", default-features = false }
 
 [profile.release]

@@ -837,10 +837,21 @@ impl DownloadFailure {
         }
 
         let kind = match error {
+            NntpError::PoolExhausted | NntpError::PoolShutdown | NntpError::TooManyConnections => {
+                DownloadFailureKind::CapacityUnavailable
+            }
             NntpError::AuthenticationFailed
             | NntpError::AuthenticationRejected
             | NntpError::AuthenticationRequired
             | NntpError::AccessDenied => DownloadFailureKind::Auth,
+            NntpError::ServiceUnavailable
+            | NntpError::Timeout
+            | NntpError::SoftTimeout(_)
+            | NntpError::ConnectionClosed
+            | NntpError::ServerDisconnectedMidBody
+            | NntpError::TruncatedMultilineBody
+            | NntpError::MalformedMultilineTerminator
+            | NntpError::Io(_) => DownloadFailureKind::Transient,
             NntpError::NoSuchGroup
             | NntpError::NoGroupSelected
             | NntpError::CommandNotRecognized
@@ -1735,6 +1746,8 @@ pub struct Pipeline {
     pub(super) job_retention_exclude_cache: HashMap<JobId, (Instant, Arc<Vec<usize>>)>,
     /// Rate limiter for the "no eligible news server" warning.
     pub(super) last_no_eligible_server_warn: Option<Instant>,
+    /// Rate limiter for representative NNTP BODY fetch failures at info level.
+    pub(super) last_body_fetch_failure_log_at: Option<Instant>,
     /// Jobs currently performing their final move into the complete directory.
     pub(super) inflight_moves: HashSet<JobId>,
     /// Complete destinations reserved for in-flight moves so concurrent jobs do not collide.

@@ -185,13 +185,22 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
 }
 
 #[test]
-fn lane_acquire_failure_without_body_request_is_lane_unavailable() {
+fn lane_acquire_failure_preserves_retry_semantics() {
     let unavailable = DownloadFailure::from_lane_acquire_failure(None);
     assert_eq!(unavailable.kind, DownloadFailureKind::LaneUnavailable);
 
     let pool_miss =
         DownloadFailure::from_lane_acquire_failure(Some(&weaver_nntp::NntpError::PoolExhausted));
-    assert_eq!(pool_miss.kind, DownloadFailureKind::LaneUnavailable);
+    assert_eq!(pool_miss.kind, DownloadFailureKind::CapacityUnavailable);
+
+    let timeout =
+        DownloadFailure::from_lane_acquire_failure(Some(&weaver_nntp::NntpError::SoftTimeout(15)));
+    assert_eq!(timeout.kind, DownloadFailureKind::Transient);
+
+    let io_failure = DownloadFailure::from_lane_acquire_failure(Some(&weaver_nntp::NntpError::Io(
+        std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused"),
+    )));
+    assert_eq!(io_failure.kind, DownloadFailureKind::Transient);
 
     let auth_failure = DownloadFailure::from_lane_acquire_failure(Some(
         &weaver_nntp::NntpError::AuthenticationFailed,

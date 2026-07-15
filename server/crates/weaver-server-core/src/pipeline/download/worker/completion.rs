@@ -517,6 +517,28 @@ impl Pipeline {
                 );
             }
             Err(DownloadError::Fetch(failure)) => {
+                if matches!(
+                    failure.kind,
+                    DownloadFailureKind::CapacityUnavailable
+                        | DownloadFailureKind::Transient
+                        | DownloadFailureKind::Auth
+                        | DownloadFailureKind::Permanent
+                ) && self
+                    .last_body_fetch_failure_log_at
+                    .is_none_or(|at| at.elapsed() >= BODY_FETCH_FAILURE_LOG_INTERVAL)
+                {
+                    self.last_body_fetch_failure_log_at = Some(Instant::now());
+                    info!(
+                        job_id = job_id.0,
+                        segment = %result.segment_id,
+                        failure_kind = ?failure.kind,
+                        retry_count = result.retry_count,
+                        attempt_count = result.attempts.len(),
+                        source_server_idx = ?source_server_idx,
+                        error = %failure.message,
+                        "NNTP BODY fetch failed"
+                    );
+                }
                 if result.origin == DownloadResultOrigin::IpReplacementTrial
                     && !matches!(
                         failure.kind,
@@ -646,11 +668,27 @@ impl Pipeline {
                         .is_none_or(|at| at.elapsed() >= NO_ELIGIBLE_SERVER_WARN_INTERVAL)
                     {
                         let effective = self.effective_exclude_servers(job_id, &excluded_servers);
-                        if self.nntp.body_server_order(&effective).await.is_empty() {
-                            self.last_no_eligible_server_warn = Some(Instant::now());
+                        let eligible_servers = self.nntp.body_server_order(&effective).await;
+                        self.last_no_eligible_server_warn = Some(Instant::now());
+                        if eligible_servers.is_empty() {
                             warn!(
                                 job_id = job_id.0,
+                                segment = %result.segment_id,
+                                configured_server_count = server_count,
+                                excluded_server_count = effective.len(),
+                                error = %failure.message,
                                 "downloads waiting: no eligible news server (cooling down, disabled, or outside retention); check server health and credentials"
+                            );
+                        } else {
+                            info!(
+                                job_id = job_id.0,
+                                segment = %result.segment_id,
+                                configured_server_count = server_count,
+                                eligible_server_count = eligible_servers.len(),
+                                excluded_server_count = effective.len(),
+                                retry_delay_ms = BODY_LANE_UNAVAILABLE_RETRY_DELAY.as_millis() as u64,
+                                error = %failure.message,
+                                "BODY lane acquisition failed; download work will retry"
                             );
                         }
                     }

@@ -3,6 +3,7 @@ import { useQuery } from "urql";
 import { authHeaders, fetchWithSessionRetry } from "@/graphql/client";
 import { CATEGORIES_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { shouldCloseAfterSubmit } from "@/features/upload/close-decision";
 import {
   duplicateSubmissionInput,
   type DuplicateSubmissionMode,
@@ -636,7 +637,12 @@ export function useUploadNzb(options?: {
           });
         }
 
-        shouldClose = nextEntries.length === 0;
+        // Close once every entry reached a successful terminal state (see
+        // shouldCloseAfterSubmit). Submitted entries are RETAINED in the list
+        // now (so the queue-duplicate "accepted with warning" outcome can
+        // render), so the old `length === 0` check never fired and the dialog
+        // stopped dismissing on submit.
+        shouldClose = shouldCloseAfterSubmit(nextEntries.map((entry) => entry.status));
         return nextEntries;
       });
 
