@@ -18,7 +18,7 @@
 ---
 
 <p align="center">
-  <img src="docs/img/weaver-overview.webp" alt="weaver overview" width="800"/>
+  <a target="_blank" href="https://www.scryer.media/weaver/"><img src="docs/img/weaver-overview.webp" alt="weaver overview" width="800"/></a>
 </p>
 
 ## What is Weaver?
