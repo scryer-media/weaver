@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/scryer-media/weaver/releases"><img src="https://img.shields.io/github/v/release/scryer-media/weaver" alt="Release" /></a>
   <a href="https://ghcr.io/scryer-media/weaver"><img src="https://img.shields.io/badge/container-ghcr.io-blue" alt="Container" /></a>
-  <a href="https://github.com/sponsors/NZBMan"><img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4%EF%B8%8F-db61a2?logo=githubsponsors&logoColor=white" alt="Sponsor NZBMan" /></a>
+  <a href="https://www.scryer.media/weaver/donate/"><img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4%EF%B8%8F-db61a2?logo=githubsponsors&logoColor=white" alt="Sponsor NZBMan" /></a>
 </p>
 
 ---
@@ -100,11 +100,6 @@ Maintainer note: this is a first-party `weaver` image. Any future LSIO adoption 
 
 Weaver exposes a **GraphQL API** at `/graphql` with full query, mutation, and subscription support. The same API powers the web UI, so anything you can do in the interface is available programmatically.
 
-WebSocket subscriptions provide real-time push updates for job progress, server status, and system events.
-
-Weaver also exposes an NZBGet-compatible facade on two transports: JSON-RPC at `/jsonrpc` (Sonarr, Radarr, Prowlarr) and XML-RPC at `/xmlrpc` (nzb360 and other mobile clients). Use a Weaver API key with `control` scope as the NZBGet password; the username is ignored. A read-scoped key is enough for Test/version/config calls but cannot grab, control, or remove downloads. Fresh Radarr setups use NZBGet's default password (`tegbzn6789`), so replace it with the Weaver API key.
-
-The facade covers the surfaces those clients actually call: `version`, `status`, `listgroups`, `listfiles`, `history` (compound `SUCCESS/ALL`-style statuses plus per-stage `DownloadTimeSec`/`RepairTimeSec`/`UnpackTimeSec` durations), `config`/`loadconfig` (categories and `FeedN` entries from weaver's RSS feeds), `viewfeed`/`previewfeed`/`fetchfeeds` (bridged to weaver RSS), `postqueue`, `servervolumes` (per-server quota-window usage), `log`/`loadlog`/`writelog`, `append` (v13 9-arg), `appendurl` (legacy 5-arg), `rate`, `pausedownload`/`resumedownload`, `pausescan`/`resumescan` (watch-folder scanning), `pausepost`/`resumepost` (accepted; weaver has no separate post-processing pause), and `scheduleresume` (nzb360's "pause for X minutes" — the timer survives restarts). `editqueue` accepts both the legacy 4-arg `(Command, Offset, Param, IDs)` and v13 3-arg shapes and maps `GroupPause`/`GroupResume`, `GroupDelete` (and park/dupe variants), `GroupFinalDelete`, `GroupMoveTop`/`GroupMoveBottom`/`GroupMoveOffset` (durable manual queue order; reorders within a priority band — HIGH/NORMAL/LOW still dominates dispatch), `GroupApplyCategory`/`GroupSetCategory`, `GroupSetPriority` (numbers or FORCE/HIGH/NORMAL/LOW names; FORCE collapses to HIGH), `GroupSetParameter` (including `*Unpack:Password=…`, which maps to weaver's durable password override and never appears in visible attributes), dupe-key/score/mode setters, `HistoryDelete`/`HistoryFinalDelete`, `HistoryReturn`/`HistoryRedownload`, `HistoryProcess`, and `HistoryMarkGood`. Commands with no weaver equivalent (anchor-relative moves, sorting, per-file operations, renames) return `false` rather than pretending to succeed. `status` reports real free disk space, paused flags, quota state, scheduled-resume time, article-cache bytes, and active connection count; `listgroups` carries real `FileCount`/`RemainingFileCount`/`RemainingParCount`. RPC bodies up to 1.5× the NZB upload limit are accepted on both endpoints, so large base64 NZBs are not rejected by the transport.
 
 ## License
 
