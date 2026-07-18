@@ -262,6 +262,19 @@ function Invoke-NoArgStartupSmoke {
   }
 }
 
+function Assert-WindowsKeyPersistence {
+  $defaultLog = Join-Path $validationRoot "noarg-startup\local-app-data\weaver\logs\weaver.log"
+  if (-not (Test-Path $defaultLog)) {
+    throw "Cannot verify Credential Manager persistence because $defaultLog does not exist."
+  }
+
+  $contents = Get-Content $defaultLog -Raw
+  if ($contents -notmatch "using encryption master key from Windows Credential Manager") {
+    throw "A repeated Windows startup did not reuse its Credential Manager encryption key."
+  }
+  Write-Log $startupLog "Repeated startup reused the Windows Credential Manager encryption key."
+}
+
 function Invoke-WinGetLocalInstallSmoke {
   param(
     [Parameter(Mandatory = $true)]
@@ -317,14 +330,41 @@ ManifestVersion: 1.12.0
 "@ | Set-Content -Path (Join-Path $manifestRoot "ScryerMedia.Weaver.installer.yaml") -Encoding utf8
 
   Write-Log $wingetLog "Running winget local manifest install smoke from $manifestRoot"
+  $installSucceeded = $false
   try {
     & $winget settings --enable LocalManifestFiles *>> $wingetLog
     & $winget install --manifest $manifestRoot --accept-package-agreements --accept-source-agreements --disable-interactivity *>> $wingetLog
     if ($LASTEXITCODE -ne 0) {
       throw "winget install exited with code $LASTEXITCODE"
     }
+    $installSucceeded = $true
     Write-Log $wingetLog "winget local manifest install smoke succeeded."
+
+    $aliasName = "weaver-ci-$Architecture"
+    $installedExe = (Get-Command $aliasName -ErrorAction SilentlyContinue).Source
+    if (-not $installedExe) {
+      $link = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links") -Filter "$aliasName*" -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty FullName
+      $installedExe = $link
+    }
+    if (-not $installedExe -or -not (Test-Path $installedExe)) {
+      throw "winget installed the package but did not create the $aliasName command alias"
+    }
+
+    & $installedExe --version *>> $wingetLog
+    if ($LASTEXITCODE -ne 0) {
+      throw "winget-installed Weaver --version exited with code $LASTEXITCODE"
+    }
+    Write-Log $wingetLog "winget-installed command alias executed successfully from $installedExe."
+
+    Invoke-NoArgStartupSmoke -ExePath $installedExe
+    Assert-WindowsKeyPersistence
+    Write-Log $wingetLog "winget-installed Weaver reused the Windows Credential Manager key."
   } catch {
+    if ($installSucceeded) {
+      Write-Log $wingetLog "winget-installed Weaver validation failed: $($_.Exception.Message)"
+      throw
+    }
     Write-Log $wingetLog "winget local manifest install smoke was inconclusive: $($_.Exception.Message)"
     Write-Warning "winget local manifest install smoke was inconclusive; see $wingetLog."
   } finally {
@@ -370,4 +410,6 @@ $sourceUrl = "https://github.com/scryer-media/weaver/releases/download/weaver-lo
 Invoke-AttachmentServicesSave -Path $zipCopy -Source $sourceUrl
 
 Invoke-NoArgStartupSmoke -ExePath $packagedExe
+Invoke-NoArgStartupSmoke -ExePath $packagedExe
+Assert-WindowsKeyPersistence
 Invoke-WinGetLocalInstallSmoke -PackageZip $zipCopy

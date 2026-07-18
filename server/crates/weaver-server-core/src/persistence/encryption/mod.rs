@@ -6,6 +6,7 @@
 
 pub(crate) mod keystore;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod key_file;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -176,7 +177,8 @@ pub(crate) fn maybe_decrypt(key: Option<&EncryptionKey>, value: Option<String>) 
 /// Priority:
 /// 1. `WEAVER_ENCRYPTION_KEY` env var explicit override
 /// 2. Platform keystores (Docker secret, OS keychain, key file)
-/// 3. Auto-generate an in-memory ephemeral key, warn
+/// 3. Generate and create a key in a writable platform store, without overwriting
+/// 4. Auto-generate an in-memory ephemeral key when no store supports creation
 pub fn ensure_encryption_key(data_dir: Option<PathBuf>) -> Result<EncryptionKey, String> {
     // 1. Env var explicit override. Non-interactive tooling and profiling
     // should be able to avoid platform keychain prompts entirely.
@@ -203,14 +205,38 @@ pub fn ensure_encryption_key(data_dir: Option<PathBuf>) -> Result<EncryptionKey,
             }
             Ok(None) => continue,
             Err(e) => {
-                tracing::warn!("could not read from {}: {e}", store.name());
-                continue;
+                return Err(format!(
+                    "failed to read encryption key from {}: {e}",
+                    store.name()
+                ));
             }
         }
     }
 
-    // 3. Ephemeral in-memory key. Do not persist this automatically.
+    // 3. Persist a generated key only in stores with safe create-only semantics.
+    // Environment variables and Docker secrets returned above and are never
+    // copied into the data directory.
     let key = EncryptionKey::generate();
+    let encoded = key.to_base64();
+    for store in &stores {
+        match store.create_key_if_absent(&encoded) {
+            Ok(Some(persisted)) => {
+                let key = EncryptionKey::from_base64(&persisted)
+                    .map_err(|e| format!("invalid generated key in {}: {e}", store.name()))?;
+                tracing::info!("persisted encryption master key in {}", store.name());
+                return Ok(key);
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                return Err(format!(
+                    "failed to persist generated encryption key in {}: {e}",
+                    store.name()
+                ));
+            }
+        }
+    }
+
+    // 4. Platforms without a writable store retain the existing ephemeral fallback.
     tracing::warn!(
         "generated ephemeral encryption master key (in memory only); configure the platform \
          keystore or set WEAVER_ENCRYPTION_KEY as an escape hatch to decrypt secrets across \

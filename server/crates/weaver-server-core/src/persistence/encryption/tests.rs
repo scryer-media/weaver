@@ -1,6 +1,9 @@
 use super::*;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
@@ -138,10 +141,12 @@ fn encrypt_secret_for_write_requires_key_for_plaintext() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn env_key_wins_over_persistent_store() {
+    let _env_lock = ENV_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let stored_key = EncryptionKey::generate();
     let env_key = EncryptionKey::generate();
-    std::fs::write(dir.path().join("encryption.key"), stored_key.to_base64()).unwrap();
+    let key_path = dir.path().join("encryption.key");
+    std::fs::write(&key_path, stored_key.to_base64()).unwrap();
 
     let _env_guard = EnvVarGuard::set("WEAVER_ENCRYPTION_KEY", env_key.to_base64());
 
@@ -149,4 +154,64 @@ fn env_key_wins_over_persistent_store() {
 
     assert_eq!(loaded_key.to_base64(), env_key.to_base64());
     assert_ne!(loaded_key.to_base64(), stored_key.to_base64());
+    assert_eq!(
+        std::fs::read_to_string(key_path).unwrap(),
+        stored_key.to_base64()
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn generated_key_is_persisted_and_reused() {
+    let _env_lock = ENV_LOCK.lock().unwrap();
+    let _env_guard = EnvVarGuard::set("WEAVER_ENCRYPTION_KEY", String::new());
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("encryption.key");
+
+    let generated = ensure_encryption_key(Some(dir.path().to_path_buf())).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&key_path).unwrap(),
+        generated.to_base64()
+    );
+
+    let reloaded = ensure_encryption_key(Some(dir.path().to_path_buf())).unwrap();
+    assert_eq!(reloaded.to_base64(), generated.to_base64());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn env_key_is_not_copied_to_key_file() {
+    let _env_lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let env_key = EncryptionKey::generate();
+    let _env_guard = EnvVarGuard::set("WEAVER_ENCRYPTION_KEY", env_key.to_base64());
+
+    let loaded = ensure_encryption_key(Some(dir.path().to_path_buf())).unwrap();
+
+    assert_eq!(loaded.to_base64(), env_key.to_base64());
+    assert!(!dir.path().join("encryption.key").exists());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn empty_existing_key_file_is_not_overwritten() {
+    let _env_lock = ENV_LOCK.lock().unwrap();
+    let _env_guard = EnvVarGuard::set("WEAVER_ENCRYPTION_KEY", String::new());
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("encryption.key");
+    std::fs::write(&key_path, "").unwrap();
+
+    let error = ensure_encryption_key(Some(dir.path().to_path_buf())).unwrap_err();
+
+    assert!(error.contains("is empty"));
+    assert_eq!(std::fs::read_to_string(key_path).unwrap(), "");
 }

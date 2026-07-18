@@ -195,6 +195,9 @@ active = true
         assert_eq!(config.data_dir, data_dir.display().to_string());
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].password, Some("pass".to_string()));
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(data_dir.join("encryption.key").exists());
+        #[cfg(target_os = "windows")]
         assert!(!data_dir.join("encryption.key").exists());
         assert!(migrated_path.exists());
         assert!(!dir.path().join("weaver.toml.toml.migrated").exists());
@@ -208,10 +211,18 @@ active = true
         write_test_config(&toml_path, &data_dir);
 
         let (mut db, mut config) = open_db_and_config(&toml_path).unwrap();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let imported_key = std::fs::read_to_string(data_dir.join("encryption.key")).unwrap();
 
         bootstrap_encryption(&data_dir, &mut db, &mut config).unwrap();
 
         assert_eq!(config.servers[0].password, Some("pass".to_string()));
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("encryption.key")).unwrap(),
+            imported_key
+        );
+        #[cfg(target_os = "windows")]
         assert!(!data_dir.join("encryption.key").exists());
     }
 

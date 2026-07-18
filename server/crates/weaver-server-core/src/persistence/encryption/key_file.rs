@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 
 use super::keystore::KeyStore;
@@ -33,6 +34,54 @@ impl KeyStore for KeyFile {
                 self.path.display()
             )),
         }
+    }
+
+    fn create_key_if_absent(&self, key: &str) -> Result<Option<String>, String> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "failed to create key directory at {}: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let mut file = match options.open(&self.path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return self
+                    .get_key()?
+                    .map(Some)
+                    .ok_or_else(|| format!("key file at {} is empty", self.path.display()));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "failed to create key file at {}: {e}",
+                    self.path.display()
+                ));
+            }
+        };
+
+        let write_result = file
+            .write_all(key.as_bytes())
+            .and_then(|()| file.sync_all());
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&self.path);
+            return Err(format!(
+                "failed to persist key file at {}: {e}",
+                self.path.display()
+            ));
+        }
+
+        Ok(Some(key.to_string()))
     }
 
     fn delete_key(&self) -> Result<(), String> {

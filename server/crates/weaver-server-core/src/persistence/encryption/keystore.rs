@@ -2,6 +2,12 @@ use std::path::PathBuf;
 
 pub trait KeyStore: Send + Sync {
     fn get_key(&self) -> Result<Option<String>, String>;
+    /// Persist a newly generated key without replacing an existing key.
+    ///
+    /// Stores that are externally managed or read-only return `Ok(None)`.
+    fn create_key_if_absent(&self, _key: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     #[allow(dead_code)]
     fn delete_key(&self) -> Result<(), String>;
     fn name(&self) -> &'static str;
@@ -29,11 +35,11 @@ pub fn platform_keystores(_data_dir: Option<PathBuf>) -> Vec<Box<dyn KeyStore>> 
             stores.push(Box::new(super::key_file::KeyFile::new(dir)));
         }
     } else {
-        stores.push(Box::new(super::macos::MacOSKeychain));
+        stores.push(Box::new(super::macos::MacOSKeychain::new()));
     }
 
     #[cfg(target_os = "windows")]
-    stores.push(Box::new(super::windows::WindowsCredentialManager));
+    stores.push(Box::new(super::windows::WindowsCredentialManager::new()));
 
     #[cfg(target_os = "linux")]
     {

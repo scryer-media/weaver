@@ -40,6 +40,8 @@ Instead of the traditional sequential approach (download everything, then repair
 
 Installation instructions can be found on the [Weaver docs website](https://www.scryer.media/weaver/docs/installation/)
 
+Encryption-at-rest setup is automatic: Weaver creates and reuses an encryption key in macOS Keychain, Windows Credential Manager (including WinGet portable installs), or a mode-`0600` key file in the Linux data directory. Existing `WEAVER_ENCRYPTION_KEY` overrides take precedence.
+
 ## Docker
 
 Weaver publishes a first-party container image:
@@ -55,6 +57,8 @@ The Docker contract is intentionally small:
 - `TZ` defaults to `Etc/UTC`
 - `UMASK` is optional and accepts standard octal values such as `022`
 - `--user=1000:1000` and `--read-only=true` are both supported
+
+When neither `WEAVER_ENCRYPTION_KEY` nor the Docker secret at `/run/secrets/weaver_encryption_key` is provided, Weaver creates `/config/encryption.key` with mode `0600`. Preserve that file with the rest of `/config`; existing external keys take precedence and are not copied into the volume.
 
 ### docker-compose
 

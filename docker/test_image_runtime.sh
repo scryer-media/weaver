@@ -26,6 +26,14 @@ owner_of() {
     fi
 }
 
+mode_of() {
+    if stat -c '%a' "$1" >/dev/null 2>&1; then
+        stat -c '%a' "$1"
+    else
+        stat -f '%Lp' "$1"
+    fi
+}
+
 run_help() {
     docker run --rm --platform "$PLATFORM" "$IMAGE_TAG" --help
 }
@@ -49,7 +57,12 @@ current_uid=$(id -u)
 current_gid=$(id -g)
 tmpdir=$(mktemp -d)
 payload_dir=$(mktemp -d)
-trap 'sudo rm -rf "$tmpdir" "$payload_dir"' EXIT INT TERM
+key_container="weaver-key-persistence-$$"
+cleanup() {
+    docker rm -f "$key_container" >/dev/null 2>&1 || true
+    sudo rm -rf "$tmpdir" "$payload_dir"
+}
+trap cleanup EXIT INT TERM
 chmod 0755 "$payload_dir"
 
 sudo chown 65534:65534 "$tmpdir"
@@ -66,6 +79,65 @@ owner=$(owner_of "$tmpdir")
         "$current_uid:$current_gid" "$owner" >&2
     exit 1
 }
+
+start_key_test_container() {
+    docker run -d --name "$key_container" --platform "$PLATFORM" \
+        -e PUID="$current_uid" \
+        -e PGID="$current_gid" \
+        -v "$tmpdir:/config" \
+        "$IMAGE_TAG" >/dev/null
+}
+
+wait_for_key_file() {
+    attempts=0
+    while [ ! -s "$tmpdir/encryption.key" ]; do
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 100 ]; then
+            docker logs "$key_container" >&2 || true
+            printf 'assertion failed: container did not create /config/encryption.key\n' >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+}
+
+wait_for_container_log() {
+    expected_log=$1
+    attempts=0
+    while :; do
+        container_logs=$(docker logs "$key_container" 2>&1 || true)
+        case "$container_logs" in
+            *"$expected_log"*) return ;;
+        esac
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 100 ]; then
+            printf 'assertion failed: container log did not contain: %s\n%s\n' \
+                "$expected_log" "$container_logs" >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+}
+
+start_key_test_container
+wait_for_key_file
+wait_for_container_log "persisted encryption master key in key file"
+first_key=$(tr -d '\r\n' <"$tmpdir/encryption.key")
+[ "$(mode_of "$tmpdir/encryption.key")" = "600" ] || {
+    printf 'assertion failed: /config/encryption.key should have mode 600\n' >&2
+    exit 1
+}
+docker rm -f "$key_container" >/dev/null
+
+start_key_test_container
+wait_for_key_file
+wait_for_container_log "using encryption master key from key file"
+second_key=$(tr -d '\r\n' <"$tmpdir/encryption.key")
+[ "$second_key" = "$first_key" ] || {
+    printf 'assertion failed: container restart should reuse /config/encryption.key\n' >&2
+    exit 1
+}
+docker rm -f "$key_container" >/dev/null
 
 cat >"$payload_dir/weaver-portable" <<'EOF'
 #!/bin/sh
