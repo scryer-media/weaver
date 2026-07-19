@@ -27,6 +27,7 @@ pub struct SharedPipelineState {
     jobs: Arc<RwLock<Vec<JobInfo>>>,
     job_revision: tokio::sync::watch::Sender<u64>,
     paused: Arc<AtomicBool>,
+    post_processing_paused: Arc<AtomicBool>,
     metrics: Arc<PipelineMetrics>,
     metrics_snapshot: Arc<RwLock<MetricsSnapshot>>,
     download_block: Arc<RwLock<DownloadBlockState>>,
@@ -44,6 +45,7 @@ impl SharedPipelineState {
             jobs: Arc::new(RwLock::new(initial_jobs)),
             job_revision,
             paused: Arc::new(AtomicBool::new(false)),
+            post_processing_paused: Arc::new(AtomicBool::new(false)),
             metrics,
             metrics_snapshot: Arc::new(RwLock::new(metrics_snapshot)),
             download_block: Arc::new(RwLock::new(DownloadBlockState::default())),
@@ -70,6 +72,14 @@ impl SharedPipelineState {
 
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
+    }
+
+    pub fn is_post_processing_paused(&self) -> bool {
+        self.post_processing_paused.load(Ordering::Relaxed)
+    }
+
+    pub fn set_post_processing_paused(&self, paused: bool) {
+        self.post_processing_paused.store(paused, Ordering::Relaxed);
     }
 
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
@@ -385,6 +395,15 @@ pub enum SchedulerCommand {
     PauseAll { reply: oneshot::Sender<()> },
     /// Resume all jobs globally.
     ResumeAll { reply: oneshot::Sender<()> },
+    /// Pause admission of queued extension post-processing attempts.
+    PausePostProcessing { reply: oneshot::Sender<()> },
+    /// Resume admission of queued extension post-processing attempts.
+    ResumePostProcessing { reply: oneshot::Sender<()> },
+    /// Cancel the queued or active extension attempt for a job.
+    CancelPostProcessing {
+        job_id: JobId,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
     /// Set global speed limit (bytes/sec). 0 means unlimited.
     SetSpeedLimit {
         bytes_per_sec: u64,
@@ -767,9 +786,42 @@ impl SchedulerHandle {
         Ok(())
     }
 
+    pub async fn pause_post_processing(&self) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::PausePostProcessing { reply: tx })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        Ok(())
+    }
+
+    pub async fn resume_post_processing(&self) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::ResumePostProcessing { reply: tx })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        Ok(())
+    }
+
+    pub async fn cancel_post_processing(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::CancelPostProcessing { job_id, reply: tx })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+    }
+
     /// Check whether the pipeline is globally paused (reads from shared state).
     pub fn is_globally_paused(&self) -> bool {
         self.state.is_paused()
+    }
+
+    pub fn is_post_processing_paused(&self) -> bool {
+        self.state.is_post_processing_paused()
     }
 
     pub async fn set_bandwidth_cap_policy(

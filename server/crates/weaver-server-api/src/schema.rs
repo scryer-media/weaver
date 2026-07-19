@@ -12,7 +12,7 @@ use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::{Database, JobHistoryRow, JobInfo, SchedulerHandle};
 
 use crate::auth::types::{ApiKey, ApiKeyScope};
-use crate::auth::{AdminGuard, ReadGuard, graphql_error};
+use crate::auth::{AdminGuard, ControlGuard, ReadGuard, graphql_error};
 use crate::categories::types::Category;
 use crate::history::timeline::build_job_timeline;
 use crate::history::types::history_item_from_row;
@@ -28,6 +28,7 @@ use crate::jobs::types::{
     decode_event_cursor, decode_offset_cursor, global_queue_state, metrics_from_snapshot,
     queue_item_from_job, queue_summary,
 };
+use crate::post_processing::types::*;
 use crate::rss::types::{RssFeed, RssSeenItem};
 use crate::servers::types::Server;
 use crate::settings::types::GeneralSettings;
@@ -51,6 +52,7 @@ pub struct QueryRoot(
     categories_query::CategoriesQuery,
     history_query::HistoryQuery,
     jobs_query::JobsQuery,
+    post_processing_query::PostProcessingQuery,
     rss_query::RssQuery,
     servers_query::ServersQuery,
     settings_query::SettingsQuery,
@@ -62,6 +64,7 @@ pub struct MutationRoot(
     auth_mutation::AuthMutation,
     categories_mutation::CategoriesMutation,
     jobs_mutation::JobsMutation,
+    post_processing_mutation::PostProcessingMutation,
     rss_mutation::RssMutation,
     servers_mutation::ServersMutation,
     settings_mutation::SettingsMutation,
@@ -87,6 +90,9 @@ pub mod history_query;
 #[path = "jobs/query.rs"]
 pub mod jobs_query;
 
+#[path = "post_processing/query.rs"]
+pub mod post_processing_query;
+
 #[path = "rss/query.rs"]
 pub mod rss_query;
 
@@ -107,6 +113,9 @@ pub mod categories_mutation;
 
 #[path = "jobs/mutation.rs"]
 pub mod jobs_mutation;
+
+#[path = "post_processing/mutation.rs"]
+pub mod post_processing_mutation;
 
 #[path = "rss/mutation.rs"]
 pub mod rss_mutation;

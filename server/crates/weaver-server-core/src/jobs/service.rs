@@ -1496,6 +1496,10 @@ impl Pipeline {
                 JobStatus::QueuedExtract => crate::jobs::model::PostState::QueuedExtract,
                 JobStatus::Extracting => crate::jobs::model::PostState::Extracting,
                 JobStatus::Moving => crate::jobs::model::PostState::Finalizing,
+                JobStatus::QueuedPostProcessing => {
+                    crate::jobs::model::PostState::QueuedPostProcessing
+                }
+                JobStatus::PostProcessing => crate::jobs::model::PostState::PostProcessing,
                 JobStatus::Complete => crate::jobs::model::PostState::Completed,
                 JobStatus::Failed { .. } => crate::jobs::model::PostState::Failed,
                 JobStatus::Paused => crate::jobs::model::PostState::Idle,
@@ -1606,6 +1610,8 @@ impl Pipeline {
             .await;
         }
         self.reconcile_job_progress(job_id).await;
+        let restored_terminal_post_processing =
+            self.recover_restored_terminal_post_processing(job_id);
 
         if self
             .jobs
@@ -1650,15 +1656,17 @@ impl Pipeline {
             missing_checkpoint_files = restore_skip_plan.stats.missing_checkpoint_files,
             "job restored from journal"
         );
-        if self.jobs.get(&job_id).is_some_and(|state| {
-            !matches!(
-                state.status,
-                JobStatus::Paused
-                    | JobStatus::Moving
-                    | JobStatus::Complete
-                    | JobStatus::Failed { .. }
-            )
-        }) {
+        if !restored_terminal_post_processing
+            && self.jobs.get(&job_id).is_some_and(|state| {
+                !matches!(
+                    state.status,
+                    JobStatus::Paused
+                        | JobStatus::Moving
+                        | JobStatus::Complete
+                        | JobStatus::Failed { .. }
+                )
+            })
+        {
             self.schedule_job_completion_check(job_id);
         }
         Ok(())

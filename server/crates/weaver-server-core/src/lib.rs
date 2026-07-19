@@ -12,6 +12,7 @@ mod migration_hook_ids;
 pub mod operations;
 pub mod persistence;
 pub mod pipeline;
+pub mod post_processing;
 pub mod rss;
 pub mod runtime;
 pub mod schema_migrations;

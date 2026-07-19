@@ -158,6 +158,7 @@ pub(crate) async fn run(
     .await?;
 
     let nntp_pool = pipeline.nntp_pool();
+    let post_processing_service = pipeline.post_processing_service();
     let scheduled_resume =
         weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
 
@@ -176,10 +177,12 @@ pub(crate) async fn run(
         log_buffer: log_ring_buffer,
         nntp_pool: Some(nntp_pool.clone()),
         spawn_history_delete_worker: true,
+        post_processing_service: Some(post_processing_service),
     });
 
     let metrics_exporter = http::PrometheusMetricsExporter::new(
         handle.clone(),
+        db.clone(),
         nntp_pool,
         Arc::clone(&server_transfer_policy),
     );

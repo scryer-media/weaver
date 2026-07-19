@@ -132,6 +132,23 @@ impl JobsMutation {
         let dupe_key = input.dupe_key.clone();
         let dupe_score = input.dupe_score;
         let dupe_mode = input.dupe_mode;
+        let post_processing_selection = input
+            .post_processing
+            .clone()
+            .map(crate::post_processing::types::PostProcessingSelectionInput::into_domain)
+            .transpose()
+            .map_err(|message| graphql_error("INVALID_INPUT", message))?;
+        let plan_category = category.clone();
+        let db_for_plan = db.clone();
+        let frozen_post_processing_plan = tokio::task::spawn_blocking(move || {
+            db_for_plan.resolve_post_processing_plan(
+                post_processing_selection.as_ref(),
+                plan_category.as_deref(),
+            )
+        })
+        .await
+        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+        .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
 
         let (entries, missing) =
             manager.take_for_submit(&caller_identity, &input.staged_upload_ids);
@@ -166,7 +183,7 @@ impl JobsMutation {
                 .as_deref()
                 .or(client_request_id.as_deref())
                 .map(|key| format!("{key}:staged:{staged_upload_id}"));
-            let options = graphql_submission_options(
+            let mut options = graphql_submission_options(
                 &caller_identity,
                 None,
                 staged_idempotency_key.as_deref(),
@@ -175,6 +192,7 @@ impl JobsMutation {
                 dupe_score,
                 dupe_mode,
             );
+            options.frozen_post_processing_plan = Some(frozen_post_processing_plan.clone());
 
             match submit_staged_nzb_zstd_with_options(
                 db,
@@ -977,12 +995,29 @@ async fn submission_result_item(
 
 async fn submit_from_facade_input(
     ctx: &Context<'_>,
-    input: SubmitNzbInput,
+    mut input: SubmitNzbInput,
 ) -> Result<SubmissionResult> {
     let handle = ctx.data::<SchedulerHandle>()?;
     let db = ctx.data::<Database>()?;
     let config = ctx.data::<SharedConfig>()?;
     let caller = caller_identity(ctx)?;
+    let post_processing_selection = input
+        .post_processing
+        .take()
+        .map(crate::post_processing::types::PostProcessingSelectionInput::into_domain)
+        .transpose()
+        .map_err(|message| graphql_error("INVALID_INPUT", message))?;
+    let plan_category = input.category.clone();
+    let db_for_plan = db.clone();
+    let frozen_post_processing_plan = tokio::task::spawn_blocking(move || {
+        db_for_plan.resolve_post_processing_plan(
+            post_processing_selection.as_ref(),
+            plan_category.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+    .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
 
     let (nzb_bytes, upload, filename) = match (input.nzb_base64, input.url, input.nzb_upload) {
         (Some(b64), None, None) => {
@@ -1016,7 +1051,7 @@ async fn submit_from_facade_input(
 
     let client_request_id = input.client_request_id.clone();
     let category = input.category.clone();
-    let options = graphql_submission_options(
+    let mut options = graphql_submission_options(
         &caller,
         client_request_id.as_deref(),
         input.idempotency_key.as_deref(),
@@ -1025,6 +1060,7 @@ async fn submit_from_facade_input(
         input.dupe_score,
         input.dupe_mode,
     );
+    options.frozen_post_processing_plan = Some(frozen_post_processing_plan);
     let metadata = submit_metadata(input.attributes, input.client_request_id.clone())
         .map_err(|message| graphql_error("INVALID_INPUT", message))?;
 

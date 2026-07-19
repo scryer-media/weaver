@@ -141,6 +141,9 @@ fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> 
         SqlArg::I64(history.created_at),
         SqlArg::I64(history.completed_at),
         SqlArg::OptText(history.metadata.clone()),
+        SqlArg::I64(job_id.0 as i64),
+        SqlArg::I64(job_id.0 as i64),
+        SqlArg::I64(job_id.0 as i64),
     ]
 }
 
@@ -160,12 +163,16 @@ async fn archive_job_sql(
                  (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                   optional_recovery_bytes, optional_recovery_downloaded_bytes,
                   failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
-                  created_at, completed_at, metadata)
+                  created_at, completed_at, metadata, pipeline_outcome_json,
+                  post_processing_summary, post_processing_run_id)
                  VALUES ({}, COALESCE({}, (SELECT nzb_hash FROM active_jobs WHERE job_id = {})),
                          {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                          COALESCE({}, (SELECT nzb_path FROM active_jobs WHERE job_id = {})),
                          (SELECT nzb_zstd FROM active_jobs WHERE job_id = {}),
-                         {}, {}, {})
+                         {}, {}, {},
+                         (SELECT pipeline_outcome_json FROM active_jobs WHERE job_id = {}),
+                         COALESCE((SELECT post_processing_summary FROM active_jobs WHERE job_id = {}), 'not_run'),
+                         (SELECT post_processing_run_id FROM active_jobs WHERE job_id = {}))
                  ON CONFLICT(job_id) DO UPDATE SET
                     job_hash = excluded.job_hash,
                     name = excluded.name,
@@ -183,7 +190,10 @@ async fn archive_job_sql(
                     nzb_zstd = COALESCE(excluded.nzb_zstd, job_history.nzb_zstd),
                     created_at = excluded.created_at,
                     completed_at = excluded.completed_at,
-                    metadata = excluded.metadata
+                    metadata = excluded.metadata,
+                    pipeline_outcome_json = excluded.pipeline_outcome_json,
+                    post_processing_summary = excluded.post_processing_summary,
+                    post_processing_run_id = excluded.post_processing_run_id
                  RETURNING job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                     optional_recovery_bytes, optional_recovery_downloaded_bytes,
                     failed_bytes, health, category, output_dir, nzb_path,

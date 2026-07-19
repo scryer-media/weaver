@@ -237,6 +237,8 @@ const zh: LocaleDictionary = {
   "settings.security": "安全",
   "settings.backupNav": "备份",
   "settings.rss": "RSS + Watch Folder",
+  "settings.postProcessing": "Post-processing",
+  "settings.postProcessingDesc": "Approve and configure terminal extension scripts.",
   "settings.generalPageDesc": "在此集中调整下载速度、存储路径、清理行为和重试策略。",
   "settings.language": "语言",
   "settings.languageDesc": "选择 Weaver 界面的显示语言。",

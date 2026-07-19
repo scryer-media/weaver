@@ -58,6 +58,18 @@ fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
             weaver_server_core::RunState::Active,
             None,
         ),
+        JobStatus::QueuedPostProcessing => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::QueuedPostProcessing,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::PostProcessing => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::PostProcessing,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
         JobStatus::Complete => (
             weaver_server_core::DownloadState::Complete,
             weaver_server_core::PostState::Completed,

@@ -117,6 +117,13 @@ export const router = createBrowserRouter([
             ),
           },
           {
+            path: "post-processing",
+            lazy: lazyNamedRoute(
+              () => import("@/pages/settings/PostProcessingSettingsPage"),
+              "PostProcessingSettingsPage",
+            ),
+          },
+          {
             path: "schedules",
             lazy: lazyNamedRoute(
               () => import("@/pages/settings/ScheduleSettingsPage"),

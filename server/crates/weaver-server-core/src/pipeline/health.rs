@@ -292,6 +292,92 @@ impl Pipeline {
 
     /// Mark a job as failed and purge its queued segments.
     pub(super) fn fail_job(&mut self, job_id: JobId, error: String) {
+        let failure_stage = self
+            .jobs
+            .get(&job_id)
+            .map(|state| match state.status {
+                JobStatus::Verifying => crate::post_processing::model::PipelineFailureStage::Verify,
+                JobStatus::QueuedRepair | JobStatus::Repairing => {
+                    crate::post_processing::model::PipelineFailureStage::Repair
+                }
+                JobStatus::QueuedExtract | JobStatus::Extracting => {
+                    crate::post_processing::model::PipelineFailureStage::Extract
+                }
+                JobStatus::Moving => crate::post_processing::model::PipelineFailureStage::Move,
+                _ => crate::post_processing::model::PipelineFailureStage::Download,
+            })
+            .unwrap_or(crate::post_processing::model::PipelineFailureStage::Download);
+        let plan = match self.db.post_processing_settings() {
+            Ok(settings) if settings.execution_enabled => {
+                match self.db.frozen_post_processing_plan(job_id.0) {
+                    Ok(Some(plan)) if !plan.steps().is_empty() => Some(plan),
+                    Ok(_) => None,
+                    Err(plan_error) => {
+                        tracing::warn!(
+                            job_id = job_id.0,
+                            error = %plan_error,
+                            "could not load failure post-processing plan; preserving legacy failure finalization"
+                        );
+                        None
+                    }
+                }
+            }
+            Ok(_) => None,
+            Err(settings_error) => {
+                tracing::warn!(
+                    job_id = job_id.0,
+                    error = %settings_error,
+                    "could not load post-processing settings; preserving legacy failure finalization"
+                );
+                None
+            }
+        };
+        let should_defer = plan.is_some()
+            && self.jobs.contains_key(&job_id)
+            && !self.inflight_terminal_post_processing.contains(&job_id);
+        let (released_repair, released_extract) =
+            self.prepare_failed_job_runtime(job_id, &error, should_defer);
+
+        if let Some(plan) = plan.filter(|_| should_defer) {
+            if released_repair {
+                self.promote_queued_repairs();
+            }
+            if released_extract {
+                self.promote_queued_extractions();
+            }
+            self.start_terminal_post_processing_with_outcome(
+                job_id,
+                plan,
+                crate::post_processing::model::PipelineOutcome::Failed {
+                    stage: failure_stage,
+                    code: "PIPELINE_FAILURE".to_string(),
+                    message: error.clone(),
+                },
+                crate::post_processing::persistence::TerminalIntent::Fail,
+                Some(error),
+            );
+            return;
+        }
+
+        self.finish_failed_job(job_id, error, released_repair, released_extract);
+    }
+
+    pub(crate) fn finalize_failed_job_after_terminal_post_processing(
+        &mut self,
+        job_id: JobId,
+        error: String,
+    ) {
+        let (released_repair, released_extract) =
+            self.prepare_failed_job_runtime(job_id, &error, false);
+        self.finish_failed_job(job_id, error, released_repair, released_extract);
+    }
+
+    fn prepare_failed_job_runtime(
+        &mut self,
+        job_id: JobId,
+        error: &str,
+        preserve_staging: bool,
+    ) -> (bool, bool) {
         let (staging_dir, released_repair, released_extract) =
             if let Some(state) = self.jobs.get_mut(&job_id) {
                 let released_repair = matches!(state.status, JobStatus::Repairing);
@@ -301,12 +387,17 @@ impl Pipeline {
                 state.paused_resume_status = None;
                 state.paused_resume_download_state = None;
                 state.paused_resume_post_state = None;
-                state.set_failure(error.clone());
+                state.set_failure(error.to_string());
                 state.held_segments.clear();
                 // Clear per-job queues to free memory.
                 state.download_queue = DownloadQueue::new();
                 state.recovery_queue = DownloadQueue::new();
-                (state.staging_dir.take(), released_repair, released_extract)
+                let staging_dir = if preserve_staging {
+                    None
+                } else {
+                    state.staging_dir.take()
+                };
+                (staging_dir, released_repair, released_extract)
             } else {
                 (None, false, false)
             };
@@ -366,6 +457,16 @@ impl Pipeline {
         self.clear_job_retention_excludes(job_id);
         self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
+        (released_repair, released_extract)
+    }
+
+    fn finish_failed_job(
+        &mut self,
+        job_id: JobId,
+        error: String,
+        released_repair: bool,
+        released_extract: bool,
+    ) {
         self.record_job_history(job_id);
         self.job_order.retain(|id| *id != job_id);
         let _ = self

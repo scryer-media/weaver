@@ -237,6 +237,8 @@ const ja: LocaleDictionary = {
   "settings.security": "セキュリティ",
   "settings.backupNav": "バックアップ",
   "settings.rss": "RSS",
+  "settings.postProcessing": "Post-processing",
+  "settings.postProcessingDesc": "Approve and configure terminal extension scripts.",
   "settings.generalPageDesc": "ダウンロード速度、ストレージパス、クリーンアップ動作、リトライポリシーをまとめて調整します。",
   "settings.language": "言語",
   "settings.languageDesc": "Weaver インターフェースの表示言語を選択します。",

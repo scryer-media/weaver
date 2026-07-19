@@ -1244,7 +1244,7 @@ async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId, m
                     )
                 })
                 .expect("move channel should stay open");
-            pipeline.handle_move_to_complete_done(done);
+            pipeline.handle_move_to_complete_done(done).await;
             pump_pipeline_runtime_queues(pipeline).await;
             continue;
         }
@@ -1271,7 +1271,7 @@ async fn settle_inflight_moves(pipeline: &mut Pipeline) {
             .await
             .expect("final move result should arrive")
             .expect("move channel should stay open");
-        pipeline.handle_move_to_complete_done(done);
+        pipeline.handle_move_to_complete_done(done).await;
         pipeline.pump_decode_queue();
         while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
             pipeline.check_job_completion(queued_job).await;
@@ -1280,7 +1280,7 @@ async fn settle_inflight_moves(pipeline: &mut Pipeline) {
     }
 
     while let Ok(done) = pipeline.move_done_rx.try_recv() {
-        pipeline.handle_move_to_complete_done(done);
+        pipeline.handle_move_to_complete_done(done).await;
         pipeline.pump_decode_queue();
         while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
             pipeline.check_job_completion(queued_job).await;

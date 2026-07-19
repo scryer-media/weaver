@@ -81,6 +81,7 @@ pub struct SubmissionOptions {
     pub semantic_duplicate: Option<SemanticDuplicate>,
     pub origin: SubmissionOrigin,
     pub idempotency: Option<CallerScopedIdempotency>,
+    pub frozen_post_processing_plan: Option<crate::post_processing::model::FrozenPlan>,
 }
 
 impl Default for SubmissionOptions {
@@ -92,6 +93,7 @@ impl Default for SubmissionOptions {
             semantic_duplicate: None,
             origin: SubmissionOrigin::Api,
             idempotency: None,
+            frozen_post_processing_plan: None,
         }
     }
 }
@@ -245,13 +247,60 @@ pub async fn resolve_submission_category_with_mode(
     }
 }
 
+async fn persist_submission_plan(
+    db: &Database,
+    job_id: JobId,
+    category: Option<String>,
+    explicit_plan: Option<crate::post_processing::model::FrozenPlan>,
+) -> Result<(), SubmitNzbError> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || {
+        let plan = explicit_plan
+            .map(Ok)
+            .unwrap_or_else(|| db.resolve_post_processing_plan(None, category.as_deref()))?;
+        db.save_frozen_post_processing_plan(job_id.0, &plan, chrono::Utc::now().timestamp_millis())
+    })
+    .await
+    .map_err(|error| {
+        SubmitNzbError::State(crate::StateError::Database(format!(
+            "post-processing plan worker panicked: {error}"
+        )))
+    })??;
+    Ok(())
+}
+
+async fn rollback_accepted_submission(
+    db: &Database,
+    job_id: JobId,
+    superseded_job_id: Option<JobId>,
+    delete_plan: bool,
+) {
+    if let Some(superseded_job_id) = superseded_job_id {
+        let rollback_db = db.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            rollback_db.rollback_semantic_supersession(job_id, superseded_job_id)
+        })
+        .await;
+    }
+    if delete_plan {
+        let plan_db = db.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            plan_db.delete_frozen_post_processing_plan(job_id.0)
+        })
+        .await;
+    }
+    let release_db = db.clone();
+    let _ =
+        tokio::task::spawn_blocking(move || release_db.release_duplicate_admission(job_id)).await;
+}
+
 async fn submit_prepared_nzb(
     db: &Database,
     handle: &SchedulerHandle,
     config: &SharedConfig,
     nzb: Nzb,
     prepared: PreparedSubmission,
-    options: SubmissionOptions,
+    mut options: SubmissionOptions,
 ) -> Result<SubmittedJob, SubmitNzbError> {
     if nzb.files.is_empty() {
         return Err(SubmitNzbError::Empty);
@@ -383,6 +432,17 @@ async fn submit_prepared_nzb(
             semantic,
         } => {
             record_duplicate_admission_metric(&options.origin, "parked");
+            if let Err(error) = persist_submission_plan(
+                db,
+                job_id,
+                spec.category.clone(),
+                options.frozen_post_processing_plan.take(),
+            )
+            .await
+            {
+                rollback_accepted_submission(db, job_id, None, true).await;
+                return Err(error);
+            }
             return Ok(SubmittedJob {
                 job_id,
                 job_hash,
@@ -410,35 +470,28 @@ async fn submit_prepared_nzb(
             return Err(SubmitNzbError::DuplicateBlocked { decision });
         }
     };
+    if let Err(error) = persist_submission_plan(
+        db,
+        job_id,
+        spec.category.clone(),
+        options.frozen_post_processing_plan.take(),
+    )
+    .await
+    {
+        rollback_accepted_submission(db, job_id, superseded_job_id, true).await;
+        return Err(error);
+    }
     if let Some(superseded_job_id) = superseded_job_id {
         match handle.cancel_semantic_superseded(superseded_job_id).await {
             Ok(()) | Err(crate::SchedulerError::JobNotFound(_)) => {}
             Err(crate::SchedulerError::Conflict(error)) => {
-                let rollback_db = db.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    rollback_db.rollback_semantic_supersession(job_id, superseded_job_id)
-                })
-                .await;
-                let release_db = db.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    release_db.release_duplicate_admission(job_id)
-                })
-                .await;
+                rollback_accepted_submission(db, job_id, Some(superseded_job_id), true).await;
                 return Err(SubmitNzbError::Scheduler(crate::SchedulerError::Conflict(
                     error,
                 )));
             }
             Err(error) => {
-                let rollback_db = db.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    rollback_db.rollback_semantic_supersession(job_id, superseded_job_id)
-                })
-                .await;
-                let release_db = db.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    release_db.release_duplicate_admission(job_id)
-                })
-                .await;
+                rollback_accepted_submission(db, job_id, Some(superseded_job_id), true).await;
                 return Err(error.into());
             }
         }
@@ -482,8 +535,7 @@ async fn submit_prepared_nzb(
                 },
             });
         }
-        let db = db.clone();
-        let _ = tokio::task::spawn_blocking(move || db.release_duplicate_admission(job_id)).await;
+        rollback_accepted_submission(db, job_id, superseded_job_id, true).await;
         return Err(error.into());
     }
 

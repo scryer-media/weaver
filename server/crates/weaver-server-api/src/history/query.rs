@@ -537,7 +537,8 @@ fn history_query_plan(
                 | QueueItemState::Verifying
                 | QueueItemState::Repairing
                 | QueueItemState::Extracting
-                | QueueItemState::Finalizing => {}
+                | QueueItemState::Finalizing
+                | QueueItemState::PostProcessing => {}
             }
         }
         if statuses.is_empty() {
@@ -706,6 +707,7 @@ fn history_state_key(state: QueueItemState) -> &'static str {
         QueueItemState::Repairing => "repairing",
         QueueItemState::Extracting => "extracting",
         QueueItemState::Finalizing => "finalizing",
+        QueueItemState::PostProcessing => "post_processing",
     }
 }
 
