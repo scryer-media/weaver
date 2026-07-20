@@ -107,6 +107,8 @@ fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
         ],
         output_dir: Some("/tmp/out".to_string()),
         error,
+        download_wait_reason: None,
+        download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
     }
 }

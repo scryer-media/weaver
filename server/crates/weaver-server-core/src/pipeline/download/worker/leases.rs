@@ -199,6 +199,7 @@ impl Pipeline {
         if compatibility.is_recovery {
             let lease = DownloadBatchLease {
                 job_id,
+                runtime_generation: self.pool_generation,
                 lane_mode: DownloadLaneMode::Sequential,
                 spillover_loan_kind: None,
                 server_modes: Vec::new(),
@@ -230,6 +231,7 @@ impl Pipeline {
 
         let lease = DownloadBatchLease {
             job_id,
+            runtime_generation: self.pool_generation,
             lane_mode: DownloadLaneMode::Sequential,
             spillover_loan_kind: None,
             server_modes: Vec::new(),
@@ -309,6 +311,7 @@ impl Pipeline {
             self.effective_exclude_servers(job_id, &compatibility.exclude_servers);
         DownloadBatchLease {
             job_id,
+            runtime_generation: self.pool_generation,
             lane_mode,
             spillover_loan_kind: None,
             server_modes,

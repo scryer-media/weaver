@@ -42,6 +42,11 @@ impl PrometheusMetricsExporter {
             .handle
             .nntp_pool()
             .unwrap_or_else(|| Arc::clone(&self.nntp_pool));
+        let runtime_generation = self
+            .handle
+            .nntp_runtime_activation()
+            .map(|activation| activation.generation)
+            .unwrap_or(0);
         let server_health = collect_server_health(&nntp_pool).await;
         let server_transfers = self.transfer_policy.transfer_registry().snapshots();
         render_prometheus_metrics_with_transfers(
@@ -50,6 +55,7 @@ impl PrometheusMetricsExporter {
             self.handle.is_globally_paused(),
             &download_block,
             &server_health,
+            runtime_generation,
             &server_transfers,
         )
     }
@@ -95,18 +101,32 @@ pub(super) struct ServerHealthInfo {
     pub(super) latency_ms: f64,
     pub(super) connections_available: usize,
     pub(super) connections_max: usize,
+    pub(super) connections_configured: usize,
+    pub(super) capacity_penalty_until_epoch_ms: u64,
+    pub(super) capacity_reductions: u64,
     pub(super) premature_deaths: usize,
 }
 
 async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
     let configs = pool.server_configs();
     // Build labels and read load outside the health lock.
-    let pre: Vec<(String, usize, usize)> = configs
+    let pre: Vec<(String, usize, usize, usize, u64, u64)> = configs
         .iter()
         .enumerate()
         .map(|(idx, cfg)| {
-            let (avail, max) = pool.server_load(idx);
-            (format!("{}:{}", cfg.host, cfg.port), avail, max)
+            let server = weaver_nntp::ServerId(idx);
+            let (avail, effective) = pool.server_load(idx);
+            let configured = pool.configured_connections(server).unwrap_or(effective);
+            let penalty_until = pool.capacity_penalty_until_epoch_ms(server).unwrap_or(0);
+            let reductions = pool.capacity_reductions(server).unwrap_or(0);
+            (
+                format!("{}:{}", cfg.host, cfg.port),
+                avail,
+                effective,
+                configured,
+                penalty_until,
+                reductions,
+            )
         })
         .collect();
 
@@ -114,25 +134,30 @@ async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
     let health = pool.health().lock().await;
     pre.into_iter()
         .enumerate()
-        .map(|(idx, (label, avail, max))| {
-            let srv = health.server(idx);
-            ServerHealthInfo {
-                label,
-                state: match srv.state() {
-                    weaver_nntp::ServerState::Healthy => "healthy",
-                    weaver_nntp::ServerState::Degraded { .. } => "degraded",
-                    weaver_nntp::ServerState::CoolingDown { .. } => "cooling_down",
-                    weaver_nntp::ServerState::Disabled { .. } => "disabled",
-                },
-                success_count: srv.success_count,
-                failure_count: srv.failure_count,
-                consecutive_failures: srv.consecutive_failures,
-                latency_ms: health.latency_ms(idx),
-                connections_available: avail,
-                connections_max: max,
-                premature_deaths: health.recent_premature_deaths(idx),
-            }
-        })
+        .map(
+            |(idx, (label, avail, effective, configured, penalty_until, reductions))| {
+                let srv = health.server(idx);
+                ServerHealthInfo {
+                    label,
+                    state: match srv.state() {
+                        weaver_nntp::ServerState::Healthy => "healthy",
+                        weaver_nntp::ServerState::Degraded { .. } => "degraded",
+                        weaver_nntp::ServerState::CoolingDown { .. } => "cooling_down",
+                        weaver_nntp::ServerState::Disabled { .. } => "disabled",
+                    },
+                    success_count: srv.success_count,
+                    failure_count: srv.failure_count,
+                    consecutive_failures: srv.consecutive_failures,
+                    latency_ms: health.latency_ms(idx),
+                    connections_available: avail,
+                    connections_max: effective,
+                    connections_configured: configured,
+                    capacity_penalty_until_epoch_ms: penalty_until,
+                    capacity_reductions: reductions,
+                    premature_deaths: health.recent_premature_deaths(idx),
+                }
+            },
+        )
         .collect()
 }
 
@@ -143,6 +168,7 @@ pub(super) fn render_prometheus_metrics(
     pipeline_paused: bool,
     download_block: &DownloadBlockState,
     server_health: &[ServerHealthInfo],
+    runtime_generation: u64,
 ) -> String {
     render_prometheus_metrics_with_transfers(
         snapshot,
@@ -150,6 +176,7 @@ pub(super) fn render_prometheus_metrics(
         pipeline_paused,
         download_block,
         server_health,
+        runtime_generation,
         &[],
     )
 }
@@ -160,6 +187,7 @@ fn render_prometheus_metrics_with_transfers(
     pipeline_paused: bool,
     download_block: &DownloadBlockState,
     server_health: &[ServerHealthInfo],
+    runtime_generation: u64,
     server_transfers: &[weaver_nntp::transfer::ServerTransferSnapshot],
 ) -> String {
     let mut out = String::with_capacity(16 * 1024);
@@ -350,6 +378,58 @@ fn render_prometheus_metrics_with_transfers(
         &mut out,
         "weaver_pipeline_segments_retried_total",
         snapshot.segments_retried,
+    );
+
+    out.push_str("# HELP weaver_pipeline_parked_infrastructure_work Segments parked while NNTP infrastructure is unavailable.\n");
+    out.push_str("# TYPE weaver_pipeline_parked_infrastructure_work gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_pipeline_parked_infrastructure_work",
+        snapshot.parked_infrastructure_work,
+    );
+
+    out.push_str("# HELP weaver_nntp_generation_recovery_requeues_total Segments requeued after stale NNTP generation failures.\n");
+    out.push_str("# TYPE weaver_nntp_generation_recovery_requeues_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_nntp_generation_recovery_requeues_total",
+        snapshot.nntp_generation_recovery_requeues,
+    );
+
+    out.push_str("# HELP weaver_nntp_capacity_probe_attempts_total Adaptive-capacity provider connection probes attempted.\n");
+    out.push_str("# TYPE weaver_nntp_capacity_probe_attempts_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_nntp_capacity_probe_attempts_total",
+        snapshot.nntp_capacity_probe_attempts_total,
+    );
+    out.push_str("# HELP weaver_nntp_capacity_probe_successes_total Adaptive-capacity probes that restored one connection.\n");
+    out.push_str("# TYPE weaver_nntp_capacity_probe_successes_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_nntp_capacity_probe_successes_total",
+        snapshot.nntp_capacity_probe_successes_total,
+    );
+    out.push_str("# HELP weaver_nntp_capacity_probe_rejections_total Adaptive-capacity probes rejected by provider limits.\n");
+    out.push_str("# TYPE weaver_nntp_capacity_probe_rejections_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_nntp_capacity_probe_rejections_total",
+        snapshot.nntp_capacity_probe_rejections_total,
+    );
+    out.push_str("# HELP weaver_nntp_capacity_probe_transport_failures_total Adaptive-capacity probes that failed during transport setup.\n");
+    out.push_str("# TYPE weaver_nntp_capacity_probe_transport_failures_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_nntp_capacity_probe_transport_failures_total",
+        snapshot.nntp_capacity_probe_transport_failures_total,
+    );
+    out.push_str("# HELP weaver_nntp_capacity_probe_stale_generation_total Probe results ignored after an NNTP generation replacement.\n");
+    out.push_str("# TYPE weaver_nntp_capacity_probe_stale_generation_total counter\n");
+    append_metric(
+        &mut out,
+        "weaver_nntp_capacity_probe_stale_generation_total",
+        snapshot.nntp_capacity_probe_stale_generation_total,
     );
 
     out.push_str("# HELP weaver_pipeline_segments_failed_permanent_total Total segments permanently failed.\n");
@@ -1167,6 +1247,14 @@ fn render_prometheus_metrics_with_transfers(
         out.push_str("# TYPE weaver_server_connections_available gauge\n");
         out.push_str("# HELP weaver_server_connections_max Maximum connections per server.\n");
         out.push_str("# TYPE weaver_server_connections_max gauge\n");
+        out.push_str("# HELP weaver_server_connections_configured Operator-configured maximum connections per server.\n");
+        out.push_str("# TYPE weaver_server_connections_configured gauge\n");
+        out.push_str("# HELP weaver_server_connections_effective Runtime maximum connections after provider capacity adaptation.\n");
+        out.push_str("# TYPE weaver_server_connections_effective gauge\n");
+        out.push_str("# HELP weaver_server_capacity_penalty_until_epoch_ms Provider capacity penalty deadline in Unix epoch milliseconds.\n");
+        out.push_str("# TYPE weaver_server_capacity_penalty_until_epoch_ms gauge\n");
+        out.push_str("# HELP weaver_server_capacity_reductions_total Runtime connection-cap reductions caused by provider rejections.\n");
+        out.push_str("# TYPE weaver_server_capacity_reductions_total counter\n");
         out.push_str(
             "# HELP weaver_server_premature_deaths Recent connections that died before 60s age.\n",
         );
@@ -1213,12 +1301,44 @@ fn render_prometheus_metrics_with_transfers(
             );
             append_labeled_metric(
                 &mut out,
+                "weaver_server_connections_configured",
+                labels,
+                srv.connections_configured,
+            );
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_connections_effective",
+                labels,
+                srv.connections_max,
+            );
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_capacity_penalty_until_epoch_ms",
+                labels,
+                srv.capacity_penalty_until_epoch_ms,
+            );
+            append_labeled_metric(
+                &mut out,
+                "weaver_server_capacity_reductions_total",
+                labels,
+                srv.capacity_reductions,
+            );
+            append_labeled_metric(
+                &mut out,
                 "weaver_server_premature_deaths",
                 labels,
                 srv.premature_deaths,
             );
         }
     }
+
+    out.push_str("# HELP weaver_nntp_runtime_generation Active NNTP runtime generation.\n");
+    out.push_str("# TYPE weaver_nntp_runtime_generation gauge\n");
+    append_metric(
+        &mut out,
+        "weaver_nntp_runtime_generation",
+        runtime_generation,
+    );
 
     if !server_transfers.is_empty() {
         out.push_str("# HELP weaver_server_download_lifetime_bytes Raw NNTP BODY bytes received per durable server.\n");

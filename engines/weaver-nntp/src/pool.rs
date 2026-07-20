@@ -2,22 +2,35 @@ use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::{Mutex, Semaphore};
+use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
 use crate::connection::{NntpConnection, ServerConfig};
 use crate::error::{NntpError, Result};
-use crate::health::{HealthConfig, HealthTracker};
+use crate::health::{HealthConfig, HealthTracker, ServerState};
 use crate::transfer::{ServerTransferControl, StableServerId};
 
 /// Identifies a specific server in the configuration.
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub struct ServerId(pub usize);
+
+/// Whether BODY work can use any server without constructing a ranked order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyServerAvailability {
+    /// At least one server is usable, even if all of its permits are busy.
+    Eligible,
+    /// No server is usable now, but one has a timed health recovery.
+    WaitingUntil(Duration),
+    /// No admissible server has a timed recovery.
+    Blocked,
+}
 
 /// Connection pool for a single NNTP server.
 #[allow(dead_code)]
@@ -50,12 +63,211 @@ pub struct NntpPool {
     retention_days: Vec<u32>,
     /// Maximum connections per server (parallel to pools/configs).
     max_connections: Vec<usize>,
+    /// Runtime connection limits learned from provider capacity responses.
+    adaptive_connections: Vec<AdaptiveConnectionLimit>,
     retired_ips: Arc<Mutex<HashSet<(usize, IpAddr)>>>,
     connect_cursors: Vec<AtomicUsize>,
 }
 
 pub struct BlockingConnectionPermit {
     _permit: OwnedSemaphorePermit,
+}
+
+const CAPACITY_PENALTY: Duration = Duration::from_secs(10 * 60);
+const CAPACITY_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityProbeOutcome {
+    Succeeded,
+    Rejected,
+    TransportFailure,
+    AuthenticationFailure,
+    NoConfiguredPermit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityChange {
+    pub server: ServerId,
+    pub configured_connections: usize,
+    pub effective_connections: usize,
+    pub effective_delta: isize,
+    pub coalesced_rejections: u64,
+    pub probe_outcome: Option<CapacityProbeOutcome>,
+    pub next_probe_at_epoch_ms: Option<u64>,
+}
+
+#[derive(Debug)]
+struct CapacityRecoveryState {
+    next_probe_at: Option<TokioInstant>,
+    next_probe_at_epoch_ms: Option<u64>,
+    probe_in_flight: bool,
+    changed: bool,
+    pending_rejections: u64,
+    last_reported_effective: usize,
+    latest_probe_outcome: Option<CapacityProbeOutcome>,
+}
+
+#[derive(Debug)]
+struct AdaptiveConnectionLimit {
+    configured: usize,
+    effective: AtomicUsize,
+    reductions: AtomicU64,
+    recovery: StdMutex<CapacityRecoveryState>,
+}
+
+impl AdaptiveConnectionLimit {
+    fn new(configured: usize) -> Self {
+        Self {
+            configured,
+            effective: AtomicUsize::new(configured),
+            reductions: AtomicU64::new(0),
+            recovery: StdMutex::new(CapacityRecoveryState {
+                next_probe_at: None,
+                next_probe_at_epoch_ms: None,
+                probe_in_flight: false,
+                changed: false,
+                pending_rejections: 0,
+                last_reported_effective: configured,
+                latest_probe_outcome: None,
+            }),
+        }
+    }
+
+    fn effective(&self) -> usize {
+        self.effective.load(Ordering::Acquire)
+    }
+
+    fn admits_normal(&self, active_after_acquire: usize) -> bool {
+        active_after_acquire <= self.effective()
+    }
+
+    fn set_next_probe(recovery: &mut CapacityRecoveryState, delay: Option<Duration>) {
+        recovery.next_probe_at = delay.map(|delay| TokioInstant::now() + delay);
+        recovery.next_probe_at_epoch_ms = delay.map(|delay| {
+            unix_epoch_ms().saturating_add(delay.as_millis().try_into().unwrap_or(u64::MAX))
+        });
+    }
+
+    fn claim_due_probe(&self, now: TokioInstant) -> bool {
+        let mut recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.effective() >= self.configured
+            || recovery.probe_in_flight
+            || recovery.next_probe_at.is_none_or(|deadline| now < deadline)
+        {
+            return false;
+        }
+        recovery.probe_in_flight = true;
+        true
+    }
+
+    fn record_rejection(&self) -> bool {
+        let previous = self
+            .effective
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(1).max(1))
+            })
+            .unwrap_or_else(|current| current);
+        let effective = previous.saturating_sub(1).max(1);
+        if effective < previous {
+            self.reductions.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        recovery.probe_in_flight = false;
+        Self::set_next_probe(&mut recovery, Some(CAPACITY_PENALTY));
+        recovery.changed = true;
+        recovery.pending_rejections = recovery.pending_rejections.saturating_add(1);
+        recovery.latest_probe_outcome = None;
+        previous == 1
+    }
+
+    fn finish_probe(&self, outcome: CapacityProbeOutcome) {
+        let mut recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !recovery.probe_in_flight {
+            return;
+        }
+        recovery.probe_in_flight = false;
+        recovery.changed = true;
+        recovery.latest_probe_outcome = Some(outcome);
+        match outcome {
+            CapacityProbeOutcome::Succeeded => {
+                let previous = self
+                    .effective
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                        (current < self.configured).then_some(current + 1)
+                    })
+                    .unwrap_or_else(|current| current);
+                let effective = previous.saturating_add(1).min(self.configured);
+                Self::set_next_probe(
+                    &mut recovery,
+                    (effective < self.configured).then_some(CAPACITY_RECOVERY_INTERVAL),
+                );
+            }
+            CapacityProbeOutcome::Rejected => {
+                recovery.pending_rejections = recovery.pending_rejections.saturating_add(1);
+                Self::set_next_probe(&mut recovery, Some(CAPACITY_PENALTY));
+            }
+            CapacityProbeOutcome::AuthenticationFailure => {
+                Self::set_next_probe(&mut recovery, None);
+            }
+            CapacityProbeOutcome::TransportFailure | CapacityProbeOutcome::NoConfiguredPermit => {
+                Self::set_next_probe(&mut recovery, Some(CAPACITY_RECOVERY_INTERVAL));
+            }
+        }
+    }
+
+    fn take_change(&self, server: ServerId) -> Option<CapacityChange> {
+        let mut recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !recovery.changed {
+            return None;
+        }
+        recovery.changed = false;
+        let effective = self.effective();
+        let effective_delta = effective as isize - recovery.last_reported_effective as isize;
+        recovery.last_reported_effective = effective;
+        let coalesced_rejections = std::mem::take(&mut recovery.pending_rejections);
+        Some(CapacityChange {
+            server,
+            configured_connections: self.configured,
+            effective_connections: effective,
+            effective_delta,
+            coalesced_rejections,
+            probe_outcome: recovery.latest_probe_outcome,
+            next_probe_at_epoch_ms: recovery.next_probe_at_epoch_ms,
+        })
+    }
+
+    fn penalty_until_epoch_ms(&self) -> Option<u64> {
+        self.recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .next_probe_at_epoch_ms
+            .filter(|deadline| *deadline > unix_epoch_ms())
+    }
+
+    fn reductions(&self) -> u64 {
+        self.reductions.load(Ordering::Relaxed)
+    }
+}
+
+fn unix_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 /// Configuration for creating an NNTP pool.
@@ -127,6 +339,7 @@ impl NntpPool {
         let mut backfill = Vec::with_capacity(server_count);
         let mut retention_days = Vec::with_capacity(server_count);
         let mut max_connections = Vec::with_capacity(server_count);
+        let mut adaptive_connections = Vec::with_capacity(server_count);
         let mut connect_cursors = Vec::with_capacity(server_count);
 
         // A config where every server is backfill has no fill tier to
@@ -150,6 +363,7 @@ impl NntpPool {
             backfill.push(spc.backfill && !all_backfill);
             retention_days.push(spc.retention_days);
             max_connections.push(spc.max_connections);
+            adaptive_connections.push(AdaptiveConnectionLimit::new(spc.max_connections));
             connect_cursors.push(AtomicUsize::new(0));
             semaphores.push(Arc::new(Semaphore::new(spc.max_connections)));
             configs.push(spc.server.clone());
@@ -183,6 +397,7 @@ impl NntpPool {
             backfill,
             retention_days,
             max_connections,
+            adaptive_connections,
             retired_ips: Arc::new(Mutex::new(HashSet::new())),
             connect_cursors,
         }
@@ -202,6 +417,31 @@ impl NntpPool {
     }
 
     async fn connect_server_excluding(
+        &self,
+        idx: usize,
+        excluded_ips: &[IpAddr],
+    ) -> Result<NntpConnection> {
+        match self
+            .connect_server_excluding_untracked(idx, excluded_ips)
+            .await
+        {
+            Ok(connection) => Ok(connection),
+            Err(error) => {
+                if matches!(error, NntpError::TooManyConnections) {
+                    let should_block = self.record_provider_capacity_rejection(ServerId(idx));
+                    if should_block {
+                        self.health
+                            .lock()
+                            .await
+                            .record_cooldown(idx, crate::health::CooldownReason::Capacity);
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn connect_server_excluding_untracked(
         &self,
         idx: usize,
         excluded_ips: &[IpAddr],
@@ -235,6 +475,12 @@ impl NntpPool {
             .await
             .map_err(|_| NntpError::PoolShutdown)?;
 
+        let active_after_acquire =
+            self.max_connections[idx].saturating_sub(self.semaphores[idx].available_permits());
+        if !self.adaptive_connections[idx].admits_normal(active_after_acquire) {
+            return Err(NntpError::PoolExhausted);
+        }
+
         self.acquire_with_permit(idx, Some(permit)).await
     }
 
@@ -255,6 +501,9 @@ impl NntpPool {
 
         let idx = server.0;
         if idx >= self.pools.len() {
+            return Err(NntpError::PoolExhausted);
+        }
+        if self.adaptive_connections[idx].effective() < self.max_connections[idx] {
             return Err(NntpError::PoolExhausted);
         }
 
@@ -344,6 +593,7 @@ impl NntpPool {
             retired_ips: self.retired_ips.clone(),
             server_idx: idx,
             return_to_pool: permit.is_some(),
+            shutdown: self.shutdown.clone(),
             _permit: permit,
         })
     }
@@ -391,6 +641,7 @@ impl NntpPool {
             retired_ips: self.retired_ips.clone(),
             server_idx: idx,
             return_to_pool: permit.is_some(),
+            shutdown: self.shutdown.clone(),
             _permit: permit,
         })
     }
@@ -411,13 +662,24 @@ impl NntpPool {
         // Try non-blocking acquire on each server in group+health order.
         for idx in &ordered {
             match self.semaphores[*idx].clone().try_acquire_owned() {
-                Ok(permit) => match self.acquire_with_permit(*idx, Some(permit)).await {
-                    Ok(conn) => return Ok(conn),
-                    Err(e) => {
-                        warn!(server = idx, error = %e, "failed to acquire from server, trying next");
+                Ok(permit) => {
+                    let active_after_acquire = self.max_connections[*idx]
+                        .saturating_sub(self.semaphores[*idx].available_permits());
+                    if !self.adaptive_connections[*idx].admits_normal(active_after_acquire) {
                         continue;
                     }
-                },
+                    match self.acquire_with_permit(*idx, Some(permit)).await {
+                        Ok(conn) => return Ok(conn),
+                        Err(e) => {
+                            if matches!(e, NntpError::TooManyConnections) {
+                                trace!(server = idx, "provider capacity rejected connection");
+                            } else {
+                                warn!(server = idx, error = %e, "failed to acquire from server, trying next");
+                            }
+                            continue;
+                        }
+                    }
+                }
                 Err(_) => continue, // No permits available, try next server.
             }
         }
@@ -514,15 +776,43 @@ impl NntpPool {
         }
     }
 
-    /// Gracefully shut down the pool, closing all idle connections.
+    /// Shut down the pool and wait for active leases to drain.
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
 
         for pool in &self.pools {
-            let mut pool = pool.lock().await;
-            for mut conn in pool.idle.drain(..) {
-                let _ = conn.quit().await;
+            pool.lock().await.idle.clear();
+        }
+
+        // Generation replacement must not let the new client race the old
+        // client's still-live BODY sockets for the same provider allowance.
+        // Async leases are tracked by `active_count`; owned/blocking lanes are
+        // also fenced by their configured semaphore permits.
+        let deadline = TokioInstant::now() + Duration::from_secs(15);
+        loop {
+            let mut async_leases = 0usize;
+            for pool in &self.pools {
+                async_leases = async_leases.saturating_add(pool.lock().await.active_count);
             }
+            let configured_leases: usize = self
+                .semaphores
+                .iter()
+                .zip(&self.max_connections)
+                .map(|(semaphore, configured)| {
+                    configured.saturating_sub(semaphore.available_permits())
+                })
+                .sum();
+            if async_leases == 0 && configured_leases == 0 {
+                break;
+            }
+            if TokioInstant::now() >= deadline {
+                warn!(
+                    async_leases,
+                    configured_leases, "timed out draining active NNTP leases during shutdown"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         debug!("NNTP pool shut down");
@@ -555,14 +845,91 @@ impl NntpPool {
         self.backfill.iter().any(|backfill| *backfill)
     }
 
-    /// Total configured connections across fill (non-backfill) servers.
+    /// Total effective connections across fill (non-backfill) servers.
     pub fn fill_connection_capacity(&self) -> usize {
         self.backfill
             .iter()
-            .zip(&self.max_connections)
+            .zip(&self.adaptive_connections)
             .filter(|(backfill, _)| !**backfill)
-            .map(|(_, max)| *max)
+            .map(|(_, limit)| limit.effective())
             .sum()
+    }
+
+    pub fn effective_connection_capacity(&self) -> usize {
+        self.adaptive_connections
+            .iter()
+            .map(AdaptiveConnectionLimit::effective)
+            .sum()
+    }
+
+    pub fn effective_connections(&self, server: ServerId) -> Option<usize> {
+        self.adaptive_connections
+            .get(server.0)
+            .map(AdaptiveConnectionLimit::effective)
+    }
+
+    pub fn configured_connections(&self, server: ServerId) -> Option<usize> {
+        self.max_connections.get(server.0).copied()
+    }
+
+    pub fn capacity_reductions(&self, server: ServerId) -> Option<u64> {
+        self.adaptive_connections
+            .get(server.0)
+            .map(AdaptiveConnectionLimit::reductions)
+    }
+
+    pub fn capacity_penalty_until_epoch_ms(&self, server: ServerId) -> Option<u64> {
+        self.adaptive_connections
+            .get(server.0)
+            .and_then(AdaptiveConnectionLimit::penalty_until_epoch_ms)
+    }
+
+    /// Inspect BODY eligibility without allocating or ranking server candidates.
+    pub async fn body_server_availability(
+        &self,
+        failure_excludes: &[usize],
+        retention_excludes: &[usize],
+        requested_body_bytes: u64,
+    ) -> BodyServerAvailability {
+        let is_excluded = |server_idx: usize| {
+            failure_excludes.contains(&server_idx) || retention_excludes.contains(&server_idx)
+        };
+        let backfill_unlocked = self
+            .backfill
+            .iter()
+            .enumerate()
+            .filter(|(_, backfill)| !**backfill)
+            .all(|(server_idx, _)| is_excluded(server_idx));
+        let now = Instant::now();
+        let mut health = self.health.lock().await;
+        health.check_reenable_all();
+        let mut retry_after = None;
+        for server_idx in 0..self.configs.len() {
+            if is_excluded(server_idx)
+                || (self.backfill[server_idx] && !backfill_unlocked)
+                || self.transfer_controls[server_idx]
+                    .as_ref()
+                    .is_some_and(|control| {
+                        control.quota_rejection_for(requested_body_bytes).is_some()
+                    })
+            {
+                continue;
+            }
+            match health.server(server_idx).state() {
+                ServerState::Healthy | ServerState::Degraded { .. } => {
+                    return BodyServerAvailability::Eligible;
+                }
+                ServerState::CoolingDown { until, .. } | ServerState::Disabled { until, .. } => {
+                    let delay = until.saturating_duration_since(now);
+                    retry_after =
+                        Some(retry_after.map_or(delay, |current: Duration| current.min(delay)));
+                }
+            }
+        }
+        retry_after.map_or(
+            BodyServerAvailability::Blocked,
+            BodyServerAvailability::WaitingUntil,
+        )
     }
 
     /// Whether every fill (non-backfill) server is in `exclude` — the gate
@@ -604,8 +971,92 @@ impl NntpPool {
         let permit = self.semaphores[idx]
             .clone()
             .try_acquire_owned()
-            .map_err(|_| NntpError::TooManyConnections)?;
+            .map_err(|_| NntpError::PoolExhausted)?;
+        let active_after_acquire =
+            self.max_connections[idx].saturating_sub(self.semaphores[idx].available_permits());
+        if !self.adaptive_connections[idx].admits_normal(active_after_acquire) {
+            return Err(NntpError::PoolExhausted);
+        }
         Ok(BlockingConnectionPermit { _permit: permit })
+    }
+
+    pub fn record_provider_capacity_rejection(&self, server: ServerId) -> bool {
+        let Some(limit) = self.adaptive_connections.get(server.0) else {
+            return true;
+        };
+        limit.record_rejection()
+    }
+
+    /// Claim every capacity probe that is due now. Each server can have at
+    /// most one claimed probe until [`run_capacity_probe`](Self::run_capacity_probe)
+    /// records its result.
+    pub fn claim_due_capacity_probes(&self, now: TokioInstant) -> Vec<ServerId> {
+        self.adaptive_connections
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, limit)| limit.claim_due_probe(now).then_some(ServerId(idx)))
+            .collect()
+    }
+
+    /// Open one fresh authenticated provider connection outside the effective
+    /// admission gate. A successful probe is parked in the idle pool for the
+    /// next normal BODY lease; failed probes never reduce known-good capacity.
+    pub async fn run_capacity_probe(&self, server: ServerId) -> CapacityProbeOutcome {
+        let idx = server.0;
+        let Some(limit) = self.adaptive_connections.get(idx) else {
+            return CapacityProbeOutcome::TransportFailure;
+        };
+        if self.shutdown.is_cancelled() {
+            limit.finish_probe(CapacityProbeOutcome::TransportFailure);
+            return CapacityProbeOutcome::TransportFailure;
+        }
+        let Some(semaphore) = self.semaphores.get(idx) else {
+            limit.finish_probe(CapacityProbeOutcome::TransportFailure);
+            return CapacityProbeOutcome::TransportFailure;
+        };
+
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                limit.finish_probe(CapacityProbeOutcome::NoConfiguredPermit);
+                return CapacityProbeOutcome::NoConfiguredPermit;
+            }
+        };
+
+        let connect_result = tokio::select! {
+            _ = self.shutdown.cancelled() => Err(NntpError::PoolShutdown),
+            result = self.connect_server_excluding_untracked(idx, &[]) => result,
+        };
+        let outcome = match connect_result {
+            Ok(connection) if !self.shutdown.is_cancelled() => {
+                self.pools[idx].lock().await.idle.push_back(connection);
+                CapacityProbeOutcome::Succeeded
+            }
+            Ok(_) => CapacityProbeOutcome::TransportFailure,
+            Err(NntpError::TooManyConnections) => CapacityProbeOutcome::Rejected,
+            Err(
+                NntpError::AuthenticationFailed
+                | NntpError::AuthenticationRejected
+                | NntpError::AuthenticationRequired
+                | NntpError::AccessDenied,
+            ) => {
+                self.health.lock().await.record_failure(idx, true);
+                CapacityProbeOutcome::AuthenticationFailure
+            }
+            Err(_) => CapacityProbeOutcome::TransportFailure,
+        };
+        drop(permit);
+        limit.finish_probe(outcome);
+        outcome
+    }
+
+    /// Drain coalesced adaptive-capacity state changes for structured logging.
+    pub fn take_capacity_changes(&self) -> Vec<CapacityChange> {
+        self.adaptive_connections
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, limit)| limit.take_change(ServerId(idx)))
+            .collect()
     }
 
     pub fn blocking_connect_plan(
@@ -632,14 +1083,20 @@ impl NntpPool {
         Ok((self.configs[idx].clone(), exclusions, offset))
     }
 
-    /// Returns `(available_permits, max_connections)` for the given server.
+    /// Returns `(available_permits, effective_connections)` for the given server.
     ///
     /// This is lock-free — it reads semaphore permits and the pre-stored
     /// max_connections value, so it can be called from synchronous contexts.
     pub fn server_load(&self, idx: usize) -> (usize, usize) {
-        let available = self.semaphores[idx].available_permits();
-        let max = self.max_connections[idx];
-        (available, max)
+        let effective = self.adaptive_connections[idx].effective();
+        let active = self.active_connections(idx);
+        (effective.saturating_sub(active.min(effective)), effective)
+    }
+
+    /// Actual leased connections, which may temporarily exceed the learned
+    /// effective cap while excess lanes from an earlier limit drain.
+    pub fn active_connections(&self, idx: usize) -> usize {
+        self.max_connections[idx].saturating_sub(self.semaphores[idx].available_permits())
     }
 
     pub async fn retire_ip(&self, server: ServerId, ip: IpAddr) {
@@ -679,6 +1136,7 @@ pub struct PooledConnection {
     retired_ips: Arc<Mutex<HashSet<(usize, IpAddr)>>>,
     server_idx: usize,
     return_to_pool: bool,
+    shutdown: CancellationToken,
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -729,37 +1187,39 @@ impl Drop for PooledConnection {
             let pool = self.pool.clone();
             let retired_ips = self.retired_ips.clone();
             let server_idx = self.server_idx;
+            let healthy = conn.is_healthy();
             let poisoned = conn.is_poisoned();
             let return_to_pool = self.return_to_pool;
+            let shutdown = self.shutdown.clone();
 
-            if conn.is_healthy() && return_to_pool {
-                // tokio::spawn can fail during runtime shutdown; if so, the
-                // connection is simply dropped (permit released by _permit).
-                drop(tokio::spawn(async move {
-                    let mut pool = pool.lock().await;
-                    pool.active_count = pool.active_count.saturating_sub(1);
-                    let retired = retired_ips.lock().await;
-                    if retired.contains(&(server_idx, conn.remote_ip())) {
+            // tokio::spawn can fail during runtime shutdown; if so, the
+            // connection is simply dropped (permit released by _permit).
+            drop(tokio::spawn(async move {
+                let retired = healthy
+                    && return_to_pool
+                    && retired_ips
+                        .lock()
+                        .await
+                        .contains(&(server_idx, conn.remote_ip()));
+                let mut pool = pool.lock().await;
+                pool.active_count = pool.active_count.saturating_sub(1);
+                if healthy && return_to_pool {
+                    if shutdown.is_cancelled() {
+                        trace!(server = server_idx, "dropped connection from shutdown pool");
+                    } else if retired {
                         trace!(server = server_idx, "dropped retired-ip connection");
                     } else {
-                        drop(retired);
                         pool.idle.push_back(conn);
                         trace!(server = server_idx, "returned connection to pool");
                     }
-                }));
-            } else {
-                drop(tokio::spawn(async move {
-                    let mut pool = pool.lock().await;
-                    pool.active_count = pool.active_count.saturating_sub(1);
-                    if conn.is_healthy() {
-                        trace!(server = server_idx, "dropped non-poolable connection");
-                    } else if poisoned {
-                        trace!(server = server_idx, "dropped poisoned connection");
-                    } else {
-                        trace!(server = server_idx, "dropped unhealthy connection");
-                    }
-                }));
-            }
+                } else if healthy {
+                    trace!(server = server_idx, "dropped non-poolable connection");
+                } else if poisoned {
+                    trace!(server = server_idx, "dropped poisoned connection");
+                } else {
+                    trace!(server = server_idx, "dropped unhealthy connection");
+                }
+            }));
         }
     }
 }
@@ -1147,5 +1607,297 @@ mod tests {
         let (avail1, max1) = pool.server_load(1);
         assert_eq!(avail1, 5);
         assert_eq!(max1, 5);
+    }
+
+    #[tokio::test]
+    async fn provider_connection_cap_converges_without_stopping_accepted_lanes() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_by_server = Arc::clone(&accepted);
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let slot = accepted_by_server.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let (reader, mut writer) = socket.into_split();
+                    if slot >= 2 {
+                        let _ = writer.write_all(b"502 Too Many Connections\r\n").await;
+                        return;
+                    }
+                    writer
+                        .write_all(b"200 test server ready\r\n")
+                        .await
+                        .unwrap();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Some(line) = lines.next_line().await.unwrap() {
+                        if line == "CAPABILITIES" {
+                            writer
+                                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                                .await
+                                .unwrap();
+                        } else if line.starts_with("BODY ") {
+                            writer
+                                .write_all(b"222 0 <test> body follows\r\npayload\r\n.\r\n")
+                                .await
+                                .unwrap();
+                        } else if line == "QUIT" {
+                            let _ = writer.write_all(b"205 closing\r\n").await;
+                            return;
+                        } else {
+                            writer.write_all(b"500 unsupported\r\n").await.unwrap();
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut config = test_pool_config(8);
+        config.servers[0].server.host = "127.0.0.1".into();
+        config.servers[0].server.port = port;
+        config.servers[0].server.tls = false;
+        let pool = NntpPool::new(config);
+        let attempts = tokio::join!(
+            pool.acquire(ServerId(0)),
+            pool.acquire(ServerId(0)),
+            pool.acquire(ServerId(0)),
+            pool.acquire(ServerId(0)),
+            pool.acquire(ServerId(0)),
+            pool.acquire(ServerId(0)),
+            pool.acquire(ServerId(0)),
+            pool.acquire(ServerId(0)),
+        );
+        let mut accepted_lanes: Vec<_> = [
+            attempts.0, attempts.1, attempts.2, attempts.3, attempts.4, attempts.5, attempts.6,
+            attempts.7,
+        ]
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect();
+        assert_eq!(accepted_lanes.len(), 2);
+        assert_eq!(pool.configured_connections(ServerId(0)), Some(8));
+        assert_eq!(pool.effective_connections(ServerId(0)), Some(2));
+        assert_eq!(pool.capacity_reductions(ServerId(0)), Some(6));
+
+        for lane in &mut accepted_lanes {
+            let body = lane.body_by_id_raw("<test>").await.unwrap();
+            assert_eq!(body.data.as_ref(), b"payload\r\n");
+        }
+
+        assert_eq!(
+            pool.claim_due_capacity_probes(TokioInstant::now() + CAPACITY_PENALTY),
+            vec![ServerId(0)]
+        );
+        assert_eq!(
+            pool.run_capacity_probe(ServerId(0)).await,
+            CapacityProbeOutcome::Rejected
+        );
+        assert_eq!(pool.effective_connections(ServerId(0)), Some(2));
+
+        for lane in &mut accepted_lanes {
+            let body = lane.body_by_id_raw("<test>").await.unwrap();
+            assert_eq!(body.data.as_ref(), b"payload\r\n");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn adaptive_capacity_is_scoped_to_the_rejecting_server() {
+        let mut config = test_pool_config(8);
+        config.servers.push(ServerPoolConfig {
+            server: ServerConfig {
+                host: "backup.example.com".into(),
+                ..Default::default()
+            },
+            max_connections: 4,
+            group: 0,
+            ..ServerPoolConfig::default()
+        });
+        let pool = NntpPool::new(config);
+
+        for _ in 0..6 {
+            pool.adaptive_connections[0].record_rejection();
+        }
+
+        assert_eq!(pool.effective_connections(ServerId(0)), Some(2));
+        assert_eq!(pool.effective_connections(ServerId(1)), Some(4));
+        assert_eq!(pool.server_load(0), (2, 2));
+        assert_eq!(pool.server_load(1), (4, 4));
+        assert!(matches!(
+            pool.health().lock().await.server(1).state(),
+            crate::health::ServerState::Healthy
+        ));
+    }
+
+    #[tokio::test]
+    async fn body_availability_treats_saturated_server_as_eligible() {
+        let pool = NntpPool::new(test_pool_config(1));
+        let _permit = pool
+            .try_acquire_blocking_permit(ServerId(0))
+            .expect("configured lane should be acquirable");
+
+        assert_eq!(
+            pool.body_server_availability(&[], &[], 0).await,
+            BodyServerAvailability::Eligible
+        );
+    }
+
+    #[tokio::test]
+    async fn body_availability_respects_fill_backfill_and_health_deadlines() {
+        let mut config = test_pool_config(1);
+        config.servers.push(ServerPoolConfig {
+            server: ServerConfig {
+                host: "backup.example.com".into(),
+                ..Default::default()
+            },
+            stable_id: StableServerId(2),
+            max_connections: 1,
+            backfill: true,
+            ..ServerPoolConfig::default()
+        });
+        let pool = NntpPool::new(config);
+        pool.health()
+            .lock()
+            .await
+            .record_cooldown(0, crate::health::CooldownReason::Transport);
+
+        assert!(matches!(
+            pool.body_server_availability(&[], &[], 0).await,
+            BodyServerAvailability::WaitingUntil(delay) if !delay.is_zero()
+        ));
+        assert_eq!(
+            pool.body_server_availability(&[0], &[], 0).await,
+            BodyServerAvailability::Eligible
+        );
+        assert_eq!(
+            pool.body_server_availability(&[], &[0], 0).await,
+            BodyServerAvailability::Eligible
+        );
+    }
+
+    #[tokio::test]
+    async fn body_availability_keeps_degraded_servers_and_waits_for_disabled_servers() {
+        let pool = NntpPool::new(test_pool_config(1));
+        {
+            let mut health = pool.health().lock().await;
+            for _ in 0..3 {
+                health.record_failure(0, false);
+            }
+        }
+        assert_eq!(
+            pool.body_server_availability(&[], &[], 0).await,
+            BodyServerAvailability::Eligible
+        );
+
+        pool.health().lock().await.record_failure(0, true);
+        assert!(matches!(
+            pool.body_server_availability(&[], &[], 0).await,
+            BodyServerAvailability::WaitingUntil(delay) if !delay.is_zero()
+        ));
+    }
+
+    #[tokio::test]
+    async fn body_availability_reports_quota_block_without_health_deadline() {
+        let stable_id = StableServerId(1);
+        let registry = crate::transfer::ServerTransferRegistry::new();
+        let control = registry.configure(
+            stable_id,
+            crate::transfer::ServerTransferConfig {
+                quota: Some(crate::transfer::QuotaRuntimeConfig {
+                    limit_bytes: 0,
+                    generation: 1,
+                    retry_at: None,
+                }),
+                ..Default::default()
+            },
+        );
+        let mut config = test_pool_config(1);
+        config.servers[0].stable_id = stable_id;
+        config.servers[0].transfer_control = Some(control);
+        let pool = NntpPool::new(config);
+
+        assert_eq!(
+            pool.body_server_availability(&[], &[], 0).await,
+            BodyServerAvailability::Blocked
+        );
+    }
+
+    #[test]
+    fn capacity_floor_keeps_last_lane_until_provider_rejects_it() {
+        let pool = NntpPool::new(test_pool_config(2));
+
+        assert!(!pool.record_provider_capacity_rejection(ServerId(0)));
+        assert_eq!(pool.effective_connections(ServerId(0)), Some(1));
+        assert!(pool.record_provider_capacity_rejection(ServerId(0)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adaptive_capacity_reduces_immediately_and_recovers_additively() {
+        let limit = AdaptiveConnectionLimit::new(8);
+
+        for expected in (2..=7).rev() {
+            assert!(!limit.record_rejection());
+            assert_eq!(limit.effective(), expected);
+        }
+        assert_eq!(limit.effective(), 2);
+        assert!(limit.admits_normal(2));
+        assert!(!limit.admits_normal(3));
+        let reduction = limit.take_change(ServerId(0)).unwrap();
+        assert_eq!(reduction.effective_delta, -6);
+        assert_eq!(reduction.coalesced_rejections, 6);
+        assert_eq!(reduction.probe_outcome, None);
+        assert!(limit.take_change(ServerId(0)).is_none());
+
+        tokio::time::advance(CAPACITY_PENALTY - Duration::from_secs(1)).await;
+        assert!(!limit.claim_due_probe(TokioInstant::now()));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(limit.claim_due_probe(TokioInstant::now()));
+        assert!(!limit.claim_due_probe(TokioInstant::now()));
+        limit.finish_probe(CapacityProbeOutcome::Rejected);
+        assert_eq!(limit.effective(), 2);
+        let rejection = limit.take_change(ServerId(0)).unwrap();
+        assert_eq!(rejection.effective_delta, 0);
+        assert_eq!(rejection.coalesced_rejections, 1);
+        assert_eq!(
+            rejection.probe_outcome,
+            Some(CapacityProbeOutcome::Rejected)
+        );
+
+        tokio::time::advance(CAPACITY_PENALTY).await;
+        assert!(limit.claim_due_probe(TokioInstant::now()));
+        limit.finish_probe(CapacityProbeOutcome::TransportFailure);
+        assert_eq!(limit.effective(), 2);
+        let transport = limit.take_change(ServerId(0)).unwrap();
+        assert_eq!(
+            transport.probe_outcome,
+            Some(CapacityProbeOutcome::TransportFailure)
+        );
+        assert_eq!(transport.effective_delta, 0);
+
+        tokio::time::advance(CAPACITY_RECOVERY_INTERVAL).await;
+        for expected in 3..=8 {
+            assert!(limit.claim_due_probe(TokioInstant::now()));
+            limit.finish_probe(CapacityProbeOutcome::Succeeded);
+            assert_eq!(limit.effective(), expected);
+            let recovery = limit.take_change(ServerId(0)).unwrap();
+            assert_eq!(recovery.effective_delta, 1);
+            assert_eq!(recovery.coalesced_rejections, 0);
+            assert_eq!(
+                recovery.probe_outcome,
+                Some(CapacityProbeOutcome::Succeeded)
+            );
+            assert!(limit.admits_normal(expected));
+            assert!(!limit.admits_normal(expected.saturating_add(1)));
+            if expected < 8 {
+                assert!(!limit.claim_due_probe(TokioInstant::now()));
+                tokio::time::advance(CAPACITY_RECOVERY_INTERVAL).await;
+            }
+        }
+
+        assert_eq!(limit.effective(), 8);
+        assert!(!limit.claim_due_probe(TokioInstant::now()));
     }
 }

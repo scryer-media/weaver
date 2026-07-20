@@ -34,6 +34,7 @@ pub struct SharedPipelineState {
     server_transfer_policy:
         Arc<RwLock<Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>>>,
     nntp_pool: Arc<RwLock<Option<Arc<weaver_nntp::pool::NntpPool>>>>,
+    nntp_runtime_activation: Arc<RwLock<Option<NntpRuntimeActivation>>>,
 }
 
 impl SharedPipelineState {
@@ -50,6 +51,7 @@ impl SharedPipelineState {
             server_quota_blocked: Arc::new(AtomicBool::new(false)),
             server_transfer_policy: Arc::new(RwLock::new(None)),
             nntp_pool: Arc::new(RwLock::new(None)),
+            nntp_runtime_activation: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -169,6 +171,14 @@ impl SharedPipelineState {
 
     pub fn nntp_pool(&self) -> Option<Arc<weaver_nntp::pool::NntpPool>> {
         self.nntp_pool.read().unwrap().clone()
+    }
+
+    pub fn set_nntp_runtime_activation(&self, activation: NntpRuntimeActivation) {
+        *self.nntp_runtime_activation.write().unwrap() = Some(activation);
+    }
+
+    pub fn nntp_runtime_activation(&self) -> Option<NntpRuntimeActivation> {
+        *self.nntp_runtime_activation.read().unwrap()
     }
 }
 
@@ -330,6 +340,13 @@ pub enum CancellationOrigin {
     SemanticSuperseded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NntpRuntimeActivation {
+    pub generation: u64,
+    pub configured_connections: usize,
+    pub effective_connections: usize,
+}
+
 pub enum SchedulerCommand {
     /// Submit a new job.
     AddJob {
@@ -413,7 +430,7 @@ pub enum SchedulerCommand {
     RebuildNntp {
         client: Box<dyn Any + Send>,
         total_connections: usize,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<NntpRuntimeActivation, SchedulerError>>,
     },
     /// Update runtime storage directories after a restore.
     UpdateRuntimePaths {
@@ -486,6 +503,10 @@ pub struct JobInfo {
     pub output_dir: Option<String>,
     /// Error message (only set when status is Failed).
     pub error: Option<String>,
+    #[serde(default)]
+    pub download_wait_reason: Option<String>,
+    #[serde(default)]
+    pub download_retry_at_epoch_ms: Option<f64>,
     /// Wall-clock creation time (Unix epoch milliseconds).
     pub created_at_epoch_ms: f64,
 }
@@ -860,12 +881,16 @@ impl SchedulerHandle {
         self.state.nntp_pool()
     }
 
+    pub fn nntp_runtime_activation(&self) -> Option<NntpRuntimeActivation> {
+        self.state.nntp_runtime_activation()
+    }
+
     /// Replace the NNTP client at runtime (e.g. after server config changes).
     pub async fn rebuild_nntp<T: Send + 'static>(
         &self,
         client: T,
         total_connections: usize,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<NntpRuntimeActivation, SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::RebuildNntp {
@@ -875,8 +900,7 @@ impl SchedulerHandle {
             })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
-        Ok(())
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
     /// Update the pipeline's runtime directories for future jobs.

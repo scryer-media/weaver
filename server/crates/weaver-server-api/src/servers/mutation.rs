@@ -1,9 +1,8 @@
-use std::future::Future;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use async_graphql::{Context, Object, Result};
-use tracing::{error, info};
+use tracing::info;
 
 use crate::auth::AdminGuard;
 use crate::observability::{
@@ -80,26 +79,7 @@ impl ServersMutation {
 
         info!(id, "server added");
 
-        let configured_servers =
-            with_timed_config_read(config, "servers.mutation.add_server.reconfigure", |cfg| {
-                cfg.servers.clone()
-            })
-            .await;
-        let policy_result = {
-            let policy = std::sync::Arc::clone(policy);
-            spawn_blocking_db(
-                "servers.mutation.add_server.reconfigure_policy",
-                move || policy.reconfigure(&configured_servers),
-            )
-            .await
-        };
-        complete_post_commit_runtime_update(
-            "add_server",
-            id,
-            policy_result,
-            rebuild_nntp_from_config(config, handle),
-        )
-        .await;
+        activate_nntp_runtime("add_server", id, config, handle).await?;
         let snapshot = policy.snapshot(added.id);
         Ok(Server::from_config(&added, snapshot.as_ref()))
     }
@@ -158,27 +138,7 @@ impl ServersMutation {
 
         info!(id, "server updated");
 
-        let configured_servers = with_timed_config_read(
-            config,
-            "servers.mutation.update_server.reconfigure",
-            |cfg| cfg.servers.clone(),
-        )
-        .await;
-        let policy_result = {
-            let policy = std::sync::Arc::clone(policy);
-            spawn_blocking_db(
-                "servers.mutation.update_server.reconfigure_policy",
-                move || policy.reconfigure(&configured_servers),
-            )
-            .await
-        };
-        complete_post_commit_runtime_update(
-            "update_server",
-            id,
-            policy_result,
-            rebuild_nntp_from_config(config, handle),
-        )
-        .await;
+        activate_nntp_runtime("update_server", id, config, handle).await?;
         let snapshot = policy.snapshot(updated.id);
         Ok(Server::from_config(&updated, snapshot.as_ref()))
     }
@@ -230,22 +190,7 @@ impl ServersMutation {
 
         info!(id, "server removed");
 
-        let policy_result = {
-            let policy = std::sync::Arc::clone(policy);
-            let configured_servers = remaining.clone();
-            spawn_blocking_db(
-                "servers.mutation.remove_server.reconfigure_policy",
-                move || policy.reconfigure(&configured_servers),
-            )
-            .await
-        };
-        complete_post_commit_runtime_update(
-            "remove_server",
-            id,
-            policy_result,
-            rebuild_nntp_from_config(config, handle),
-        )
-        .await;
+        activate_nntp_runtime("remove_server", id, config, handle).await?;
         let snapshots = policy
             .snapshots()
             .into_iter()
@@ -318,25 +263,26 @@ impl ServersMutation {
     // ── Categories ────────────────────────────────────────────────────
 }
 
-async fn complete_post_commit_runtime_update<E, F>(
+async fn activate_nntp_runtime(
     operation: &'static str,
     server_id: u32,
-    policy_result: std::result::Result<(), E>,
-    rebuild: F,
-) where
-    E: std::fmt::Debug,
-    F: Future<Output = ()>,
-{
-    if let Err(error) = policy_result {
-        error!(
-            operation,
-            server_id,
-            error = ?error,
-            degraded = true,
-            "server change committed but transfer policy reconfiguration failed; rebuilding a fail-closed NNTP generation"
-        );
-    }
-    rebuild.await;
+    config: &SharedConfig,
+    handle: &SchedulerHandle,
+) -> Result<()> {
+    let activation = rebuild_nntp_from_config(config, handle).await.map_err(|error| {
+        async_graphql::Error::new(format!(
+            "server setting was saved, but the runtime remains on the prior NNTP generation; retry the change or restart Weaver ({error})"
+        ))
+    })?;
+    info!(
+        operation,
+        server_id,
+        runtime_generation = activation.generation,
+        configured_connections = activation.configured_connections,
+        effective_connections = activation.effective_connections,
+        "server change activated in NNTP runtime"
+    );
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -452,7 +398,6 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use tokio::sync::{RwLock, oneshot};
@@ -523,24 +468,6 @@ mod tests {
             .err()
             .expect("out-of-range quota should be rejected");
         assert!(error.contains("download quota limit exceeds database range"));
-    }
-
-    #[tokio::test]
-    async fn post_commit_policy_failure_still_rebuilds_runtime() {
-        let rebuilt = Arc::new(AtomicBool::new(false));
-        let rebuilt_in_future = Arc::clone(&rebuilt);
-
-        complete_post_commit_runtime_update(
-            "test_server_change",
-            7,
-            Err::<(), _>("usage persistence unavailable"),
-            async move {
-                rebuilt_in_future.store(true, Ordering::SeqCst);
-            },
-        )
-        .await;
-
-        assert!(rebuilt.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

@@ -145,6 +145,10 @@ impl Pipeline {
                         self.pending_retries_by_job.remove(&job_id);
                         self.pending_retries_by_segment
                             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+                        self.cancel_infrastructure_retries_for_job(job_id);
+                        self.download_wait_by_job.remove(&job_id);
+                        self.terminal_segment_failures
+                            .retain(|segment_id| segment_id.file_id.job_id != job_id);
                         self.rate_limit_reservations
                             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
                         self.job_last_download_activity.remove(&job_id);
@@ -412,31 +416,54 @@ impl Pipeline {
                 total_connections,
                 reply,
             } => {
-                if let Ok(new_client) = client.downcast::<NntpClient>() {
-                    self.nntp = Arc::new(*new_client);
+                let result = if let Ok(new_client) = client.downcast::<NntpClient>() {
+                    let new_client = Arc::new(*new_client);
+                    let effective_connections = new_client.pool().effective_connection_capacity();
+                    let old_client = std::mem::replace(&mut self.nntp, new_client);
                     // Server indices and retention windows may have changed:
                     // recompute retention and drop queued failure exclusions,
                     // whose indices refer to the old pool layout. Bumping the
                     // generation also invalidates the failure indices carried by
                     // in-flight delayed retries when they re-enter the queue.
                     self.pool_generation = self.pool_generation.wrapping_add(1);
+                    let recovery_requeues = self.wake_all_infrastructure_retries();
                     self.clear_retention_exclude_cache();
                     for state in self.jobs.values_mut() {
                         state.download_queue.clear_exclude_servers();
                         state.recovery_queue.clear_exclude_servers();
                     }
+                    self.metrics
+                        .nntp_generation_recovery_requeues
+                        .fetch_add(recovery_requeues as u64, Ordering::Relaxed);
                     self.owned_download_lane_pool.reset();
                     self.owned_download_lane_pool
                         .resize(total_connections.max(1));
                     self.connection_ramp = total_connections.min(5);
                     self.tuner.set_connection_limit(total_connections);
+                    tokio::spawn(async move { old_client.shutdown().await });
+                    self.dispatch_downloads();
+                    let activation = NntpRuntimeActivation {
+                        generation: self.pool_generation,
+                        configured_connections: total_connections,
+                        effective_connections,
+                    };
+                    self.shared_state.set_nntp_runtime_activation(activation);
+                    self.publish_snapshot();
                     info!(
-                        total_connections,
+                        runtime_generation = activation.generation,
+                        configured_connections = activation.configured_connections,
+                        effective_connections = activation.effective_connections,
+                        recovery_requeues,
                         max_downloads = self.tuner.params().max_concurrent_downloads,
-                        "NNTP client rebuilt with new server config"
+                        "NNTP runtime generation activated"
                     );
-                }
-                let _ = reply.send(());
+                    Ok(activation)
+                } else {
+                    Err(SchedulerError::Internal(
+                        "invalid NNTP runtime client supplied for activation".to_string(),
+                    ))
+                };
+                let _ = reply.send(result);
             }
             SchedulerCommand::UpdateRuntimePaths {
                 data_dir,

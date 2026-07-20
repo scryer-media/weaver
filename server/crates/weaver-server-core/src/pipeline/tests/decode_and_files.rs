@@ -203,6 +203,7 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
     let raw_size = raw.len() as u64;
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(raw)),
             attempts: Vec::new(),
@@ -307,6 +308,7 @@ async fn decode_failure_retries_excluding_actual_source_server() {
     pipeline.active_downloads += 1;
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from_static(
                 b"not a yenc article",
@@ -373,6 +375,7 @@ async fn streamed_decode_failure_retries_excluding_actual_source_server() {
     pipeline.active_downloads += 1;
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Decode {
                 raw_size: 19,

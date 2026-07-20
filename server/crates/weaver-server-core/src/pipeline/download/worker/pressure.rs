@@ -262,9 +262,18 @@ impl Pipeline {
             .values()
             .filter(|s| matches!(s.status, JobStatus::Checking))
             .count();
-        configured_max
-            .min(self.connection_ramp)
-            .saturating_sub(active_probes)
+        let configured_limit = configured_max.min(self.connection_ramp);
+        let adaptive_limit = self.nntp.pool().effective_connection_capacity();
+        let connection_limit = if adaptive_limit == 0 {
+            // A zero-server generation is already governed by the scheduler's
+            // configured limit. Treat zero here as "no adaptive cap" so direct
+            // pipeline fixtures and generation transitions do not collapse a
+            // separately managed limit.
+            configured_limit
+        } else {
+            configured_limit.min(adaptive_limit)
+        };
+        connection_limit.saturating_sub(active_probes)
     }
 
     pub(in crate::pipeline::download::worker) fn soft_pressure_dispatch_delay(

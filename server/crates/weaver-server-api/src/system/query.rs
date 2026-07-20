@@ -151,14 +151,17 @@ impl SystemQuery {
     /// Live per-server NNTP health (connections, latency, state) for the monitoring dashboard.
     #[graphql(guard = "ReadGuard")]
     async fn server_health(&self, ctx: &Context<'_>) -> Result<Vec<ServerHealth>> {
-        let live_pool = ctx
-            .data::<weaver_server_core::SchedulerHandle>()?
-            .nntp_pool();
+        let handle = ctx.data::<weaver_server_core::SchedulerHandle>()?;
+        let live_pool = handle.nntp_pool();
+        let runtime_generation = handle
+            .nntp_runtime_activation()
+            .map(|activation| activation.generation)
+            .unwrap_or(0);
         let fallback_pool = ctx
             .data_opt::<Option<Arc<NntpPool>>>()
             .and_then(Clone::clone);
         match live_pool.or(fallback_pool) {
-            Some(pool) => Ok(collect_server_health(&pool).await),
+            Some(pool) => Ok(collect_server_health(&pool, runtime_generation).await),
             None => Ok(Vec::new()),
         }
     }
@@ -202,23 +205,46 @@ impl SystemQuery {
 /// emitted by the Prometheus exporter (`collect_server_health` in the app binary), shaped
 /// for the GraphQL monitoring API. The connection pool orders servers by priority, so the
 /// first entry is the primary and the rest are backups.
-async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealth> {
+async fn collect_server_health(pool: &NntpPool, runtime_generation: u64) -> Vec<ServerHealth> {
+    struct ServerLoadSnapshot {
+        host: String,
+        port: u16,
+        tier: String,
+        active: usize,
+        effective: usize,
+        configured: usize,
+        penalty_until: Option<u64>,
+    }
+
     let configs = pool.server_configs();
     // Read connection load outside the health lock.
-    let pre: Vec<(String, u16, String, usize, usize)> = configs
+    let pre: Vec<ServerLoadSnapshot> = configs
         .iter()
         .enumerate()
         .map(|(idx, cfg)| {
-            let (available, max) = pool.server_load(idx);
+            let (_, effective) = pool.server_load(idx);
+            let active = pool.active_connections(idx);
+            let configured = pool
+                .configured_connections(weaver_nntp::ServerId(idx))
+                .unwrap_or(effective);
+            let penalty_until = pool.capacity_penalty_until_epoch_ms(weaver_nntp::ServerId(idx));
             let tier = if idx == 0 { "PRIMARY" } else { "BACKUP" };
-            (cfg.host.clone(), cfg.port, tier.to_string(), available, max)
+            ServerLoadSnapshot {
+                host: cfg.host.clone(),
+                port: cfg.port,
+                tier: tier.to_string(),
+                active,
+                effective,
+                configured,
+                penalty_until,
+            }
         })
         .collect();
 
     let health = pool.health().lock().await;
     pre.into_iter()
         .enumerate()
-        .map(|(idx, (host, port, tier, available, max))| {
+        .map(|(idx, snapshot)| {
             let srv = health.server(idx);
             let state = match srv.state() {
                 weaver_nntp::ServerState::Healthy => "healthy",
@@ -227,13 +253,17 @@ async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealth> {
                 weaver_nntp::ServerState::Disabled { .. } => "disabled",
             };
             ServerHealth {
-                label: format!("{host}:{port}"),
-                host,
-                port,
-                tier,
+                label: format!("{}:{}", snapshot.host, snapshot.port),
+                host: snapshot.host,
+                port: snapshot.port,
+                tier: snapshot.tier,
                 state: state.to_string(),
-                connections_active: max.saturating_sub(available) as u32,
-                connections_max: max as u32,
+                connections_active: snapshot.active as u32,
+                connections_max: snapshot.effective as u32,
+                connections_configured: snapshot.configured as u32,
+                connections_effective: snapshot.effective as u32,
+                capacity_penalty_until_epoch_ms: snapshot.penalty_until,
+                runtime_generation,
                 latency_ms: health.latency_ms(idx),
                 success_count: srv.success_count,
                 failure_count: srv.failure_count,

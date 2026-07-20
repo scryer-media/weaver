@@ -94,11 +94,19 @@ impl Pipeline {
     ) -> usize {
         let server_count = self.nntp.pool().server_count();
         let retention = self.job_retention_excludes(job_id);
+        Self::unavailable_server_count_from_excludes(server_count, failure_excludes, &retention)
+    }
+
+    pub(in crate::pipeline) fn unavailable_server_count_from_excludes(
+        server_count: usize,
+        failure_excludes: &[usize],
+        retention_excludes: &[usize],
+    ) -> usize {
         failure_excludes
             .iter()
             .filter(|idx| **idx < server_count)
             .count()
-            + retention
+            + retention_excludes
                 .iter()
                 .filter(|idx| **idx < server_count && !failure_excludes.contains(idx))
                 .count()

@@ -99,9 +99,10 @@ async fn shutdown_drain_consumes_inflight_download_results() {
     pipeline
         .download_done_tx
         .send(DownloadResult {
+            runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::fetch(
-                DownloadFailureKind::Transient,
+                DownloadFailureKind::EstablishedTransport,
                 "shutdown test",
             )),
             attempts: Vec::new(),
@@ -152,6 +153,7 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -160,7 +162,7 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
                 segment_number: 0,
             },
             data: Err(DownloadError::fetch(
-                DownloadFailureKind::Transient,
+                DownloadFailureKind::EstablishedTransport,
                 "connection reset by peer",
             )),
             attempts: Vec::new(),
@@ -195,12 +197,15 @@ fn lane_acquire_failure_preserves_retry_semantics() {
 
     let timeout =
         DownloadFailure::from_lane_acquire_failure(Some(&weaver_nntp::NntpError::SoftTimeout(15)));
-    assert_eq!(timeout.kind, DownloadFailureKind::Transient);
+    assert_eq!(timeout.kind, DownloadFailureKind::ConnectionEstablishment);
 
     let io_failure = DownloadFailure::from_lane_acquire_failure(Some(&weaver_nntp::NntpError::Io(
         std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused"),
     )));
-    assert_eq!(io_failure.kind, DownloadFailureKind::Transient);
+    assert_eq!(
+        io_failure.kind,
+        DownloadFailureKind::ConnectionEstablishment
+    );
 
     let auth_failure = DownloadFailure::from_lane_acquire_failure(Some(
         &weaver_nntp::NntpError::AuthenticationFailed,
@@ -209,7 +214,28 @@ fn lane_acquire_failure_preserves_retry_semantics() {
 
     let setup_failure =
         DownloadFailure::from_lane_acquire_failure(Some(&weaver_nntp::NntpError::NoSuchGroup));
-    assert_eq!(setup_failure.kind, DownloadFailureKind::Permanent);
+    assert_eq!(setup_failure.kind, DownloadFailureKind::ContentOrProtocol);
+}
+
+#[test]
+fn only_article_or_content_failures_consume_article_retry_budget() {
+    for kind in [
+        DownloadFailureKind::CapacityUnavailable,
+        DownloadFailureKind::ConnectionEstablishment,
+        DownloadFailureKind::EstablishedTransport,
+        DownloadFailureKind::Auth,
+        DownloadFailureKind::ServerQuota,
+        DownloadFailureKind::LaneUnavailable,
+        DownloadFailureKind::Unrequested,
+    ] {
+        assert!(kind.preserves_article_retry_budget(), "kind={kind:?}");
+    }
+    for kind in [
+        DownloadFailureKind::ArticleNotFound,
+        DownloadFailureKind::ContentOrProtocol,
+    ] {
+        assert!(!kind.preserves_article_retry_budget(), "kind={kind:?}");
+    }
 }
 
 #[tokio::test]
@@ -239,6 +265,7 @@ async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::fetch(
                 DownloadFailureKind::CapacityUnavailable,
@@ -276,15 +303,40 @@ async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
         0
     );
 
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    let work = pipeline
-        .retry_rx
-        .try_recv()
-        .expect("pool capacity miss should requeue without poisoning health")
-        .work;
-    assert_eq!(work.segment_id, segment_id);
-    assert_eq!(work.retry_count, MAX_SEGMENT_RETRIES);
-    assert_eq!(work.exclude_servers, vec![0]);
+    assert_eq!(
+        pipeline
+            .download_wait_by_job
+            .get(&job_id)
+            .map(|wait| wait.reason),
+        Some("provider connection capacity unavailable")
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        pipeline
+            .metrics
+            .parked_infrastructure_work
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("generation wake should requeue parked infrastructure work");
+    assert_eq!(retry.segment_id, segment_id);
+    assert_eq!(retry.retry_count, MAX_SEGMENT_RETRIES);
+    assert_eq!(retry.exclude_servers, vec![0]);
+    assert!(!pipeline.download_wait_by_job.contains_key(&job_id));
+    assert_eq!(
+        pipeline
+            .metrics
+            .parked_infrastructure_work
+            .load(Ordering::Relaxed),
+        0
+    );
 }
 
 #[tokio::test]
@@ -314,6 +366,7 @@ async fn body_lane_unavailable_at_retry_limit_requeues_without_article_failure()
 
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::fetch(
                 DownloadFailureKind::LaneUnavailable,
@@ -350,16 +403,265 @@ async fn body_lane_unavailable_at_retry_limit_requeues_without_article_failure()
             .load(Ordering::Relaxed),
         0
     );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        pipeline
+            .metrics
+            .parked_infrastructure_work
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        pipeline
+            .download_wait_by_job
+            .get(&job_id)
+            .map(|wait| wait.reason),
+        Some("no eligible NNTP server")
+    );
 
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let work = pipeline
-        .retry_rx
-        .try_recv()
-        .expect("pre-BODY lane miss should requeue without consuming article retry budget")
-        .work;
-    assert_eq!(work.segment_id, segment_id);
-    assert_eq!(work.retry_count, MAX_SEGMENT_RETRIES + 1);
-    assert_eq!(work.exclude_servers, vec![0, 1]);
+    assert!(pipeline.retry_rx.try_recv().is_err());
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("generation wake should requeue parked pre-BODY work without retry charge");
+    assert_eq!(retry.segment_id, segment_id);
+    assert_eq!(retry.retry_count, MAX_SEGMENT_RETRIES + 1);
+    assert_eq!(retry.exclude_servers, vec![0, 1]);
+    assert_eq!(
+        pipeline
+            .metrics
+            .parked_infrastructure_work
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert!(!pipeline.download_wait_by_job.contains_key(&job_id));
+}
+
+#[tokio::test]
+async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
+    const RETRY_COUNT: usize = 10_000;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20020);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Generation Batch", "retry.bin", &[128]),
+    )
+    .await;
+    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+    pipeline.pending_retries_by_job.insert(job_id, RETRY_COUNT);
+    pipeline.download_wait_by_job.insert(
+        job_id,
+        DownloadWaitStatus {
+            reason: "no eligible NNTP server",
+            retry_at_epoch_ms: None,
+            pending_count: RETRY_COUNT,
+        },
+    );
+
+    for segment_number in 0..RETRY_COUNT as u32 {
+        let segment_id = SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number,
+        };
+        pipeline.pending_retries_by_segment.insert(segment_id, 1);
+        pipeline.schedule_infrastructure_retry(
+            None,
+            RetryWork {
+                scheduled_pool_generation: pipeline.pool_generation,
+                infrastructure_retry: true,
+                work: DownloadWork {
+                    segment_id,
+                    message_id: crate::jobs::ids::MessageId::new(&format!(
+                        "<batch-{segment_number}>"
+                    )),
+                    groups: Vec::new(),
+                    priority: 0,
+                    byte_estimate: 128,
+                    retry_count: MAX_SEGMENT_RETRIES,
+                    is_recovery: false,
+                    exclude_servers: vec![0],
+                },
+            },
+        );
+    }
+
+    let mut job_changes = pipeline.shared_state.subscribe_job_changes();
+    let previous_revision = *job_changes.borrow();
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), RETRY_COUNT);
+    pipeline.publish_snapshot();
+    job_changes.changed().await.unwrap();
+
+    assert_eq!(*job_changes.borrow(), previous_revision.wrapping_add(1));
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        RETRY_COUNT
+    );
+    assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
+    assert!(pipeline.pending_retries_by_segment.is_empty());
+    assert!(!pipeline.download_wait_by_job.contains_key(&job_id));
+    assert_eq!(
+        pipeline
+            .metrics
+            .parked_infrastructure_work
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn stale_generation_transport_failure_is_requeued_without_poisoning_health() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20015);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Generation Fence", "retry.bin", &[128]),
+    )
+    .await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline.pool_generation = 2;
+    pipeline.active_downloads = 1;
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            runtime_generation: 1,
+            segment_id,
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::EstablishedTransport,
+                "old generation connection reset",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: MAX_SEGMENT_RETRIES + 10,
+            exclude_servers: vec![0],
+            release_connection_slot: true,
+        })
+        .await;
+
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    assert_eq!(state.failed_bytes, 0);
+    let queued = state.download_queue.drain_all();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].segment_id, segment_id);
+    assert_eq!(queued[0].retry_count, MAX_SEGMENT_RETRIES + 10);
+    assert!(queued[0].exclude_servers.is_empty());
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .nntp_generation_recovery_requeues
+            .load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test]
+async fn stale_generation_success_does_not_update_new_lane_health() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.pool_generation = 2;
+    pipeline.active_downloads = 1;
+    pipeline.active_download_connections = 1;
+
+    pipeline.release_download_result(&DownloadResult {
+        runtime_generation: 1,
+        segment_id: SegmentId {
+            file_id: NzbFileId {
+                job_id: JobId(20017),
+                file_index: 0,
+            },
+            segment_number: 0,
+        },
+        data: Ok(DownloadPayload::Raw(Bytes::from_static(b"article"))),
+        attempts: Vec::new(),
+        lane_observation: Some(DownloadLaneObservation {
+            server_idx: Some(0),
+            mode: DownloadLaneMode::PipelineDepth2,
+            supports_pipelining: true,
+            rtt: Some(Duration::from_millis(5)),
+            batch_complete: true,
+            batch_clean: true,
+            batch_response_count: 1,
+            unresolved_count: 0,
+            connection_discarded: false,
+        }),
+        source_server_idx: Some(0),
+        origin: DownloadResultOrigin::NormalPrimary,
+        retry_count: 0,
+        exclude_servers: Vec::new(),
+        release_connection_slot: true,
+    });
+
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pipeline_trial_success_total
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn terminal_accounting_is_idempotent() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20016);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Terminal Accounting", "retry.bin", &[128, 10_000]),
+    )
+    .await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.failed_bytes = 17;
+    }
+
+    pipeline.book_failed_segment(segment_id);
+    pipeline.book_failed_segment(segment_id);
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 145);
+    assert_eq!(pipeline.terminal_segment_failures.len(), 1);
 }
 
 #[tokio::test]
@@ -414,6 +716,7 @@ async fn server_quota_lane_failure_parks_until_retry_at_without_lane_spin() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
             attempts: Vec::new(),
@@ -551,6 +854,7 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
 
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id: large_segment,
             data: Err(DownloadError::Fetch(first_failure)),
             attempts: Vec::new(),
@@ -564,6 +868,7 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
         .await;
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id: tail_segment,
             data: Err(DownloadError::Fetch(tail_failure)),
             attempts: Vec::new(),
@@ -668,6 +973,7 @@ async fn server_quota_reservation_refund_wakes_parked_work() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
             attempts: Vec::new(),
@@ -766,6 +1072,7 @@ async fn server_quota_source_failure_keeps_backfill_locked_and_fails_over_to_fil
 
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
             attempts: Vec::new(),
@@ -906,6 +1213,7 @@ async fn server_quota_source_failure_parks_while_only_backfill_remains() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
             attempts: Vec::new(),
@@ -1051,6 +1359,7 @@ async fn other_fill_refund_wakes_manual_quota_park_without_unlocking_backfill() 
 
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
             attempts: Vec::new(),
@@ -1174,6 +1483,7 @@ async fn article_not_found_exhaustion_counts_retention_excluded_servers() {
     // failed bytes instead of retrying forever.
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -1240,6 +1550,7 @@ async fn fully_retention_excluded_job_books_missing_instead_of_requeueing() {
     // missing article, not requeued without budget forever.
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -1299,6 +1610,7 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -1366,6 +1678,7 @@ async fn recovery_article_not_found_does_not_mark_health_failure() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -1424,6 +1737,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
     pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -1465,6 +1779,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
     pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -1473,8 +1788,8 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
                 segment_number: 1,
             },
             data: Err(DownloadError::fetch(
-                DownloadFailureKind::Transient,
-                "connection reset by peer",
+                DownloadFailureKind::ContentOrProtocol,
+                "malformed BODY response",
             )),
             attempts: Vec::new(),
             lane_observation: None,
@@ -3013,6 +3328,7 @@ async fn hot_share_yield_signal_clears_when_refill_gates_disable_bounded_share()
     pipeline.global_paused = true;
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        runtime_generation: 0,
         job_id,
         server_idx: 0,
         remote_ip: "127.0.0.1".parse().unwrap(),
@@ -3310,6 +3626,7 @@ async fn hot_lane_refill_yields_when_bounded_share_unmet() {
     };
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        runtime_generation: 0,
         job_id: hot_job_id,
         server_idx: 0,
         remote_ip: "127.0.0.1".parse().unwrap(),
@@ -3398,6 +3715,7 @@ async fn bounded_same_band_refill_survives_hot_queued_primary() {
     };
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        runtime_generation: 0,
         job_id: peer_job_id,
         server_idx: 0,
         remote_ip: "127.0.0.1".parse().unwrap(),
@@ -3496,6 +3814,7 @@ async fn lane_refill_preserves_same_band_spillover_after_underfill() {
     };
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        runtime_generation: 0,
         job_id: spillover_job_id,
         server_idx: 0,
         remote_ip: "127.0.0.1".parse().unwrap(),
@@ -3675,6 +3994,7 @@ async fn lane_refill_reclaims_spillover_after_measured_speed_harm() {
 
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        runtime_generation: 0,
         job_id: spillover_job_id,
         server_idx: 0,
         remote_ip: "127.0.0.1".parse().unwrap(),
@@ -3755,6 +4075,7 @@ async fn release_download_result_updates_hot_job_successes_before_heavy_processi
         .insert(segment_id.file_id, 1);
 
     pipeline.release_download_result(&DownloadResult {
+        runtime_generation: 0,
         segment_id,
         data: Ok(DownloadPayload::Raw(Bytes::from_static(b"article"))),
         attempts: vec![],
@@ -3799,6 +4120,7 @@ async fn released_download_result_fences_completion_until_processed() {
 
     pipeline
         .process_released_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from_static(b"discarded"))),
             attempts: vec![],
@@ -3838,6 +4160,7 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
     pipeline.handle_owned_download_lane_event(
         OwnedDownloadLaneEvent::BatchComplete {
             results: vec![DownloadResult {
+                runtime_generation: 0,
                 segment_id,
                 data: Ok(DownloadPayload::Raw(Bytes::from_static(b"owned"))),
                 attempts: vec![],
@@ -4097,6 +4420,7 @@ async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id: first_segment,
             data: quota_data,
             attempts: Vec::new(),
@@ -4110,6 +4434,7 @@ async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
         .await;
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id: tail_segment,
             data: unrequested_data,
             attempts: Vec::new(),
@@ -4194,6 +4519,7 @@ async fn release_download_result_excludes_ip_replacement_trial_from_hot_success_
         .insert(segment_id.file_id, 1);
 
     pipeline.release_download_result(&DownloadResult {
+        runtime_generation: 0,
         segment_id,
         data: Ok(DownloadPayload::Raw(Bytes::from_static(b"trial-article"))),
         attempts: vec![],
@@ -4318,6 +4644,7 @@ async fn retired_ip_replacement_lane_parks_at_refill_boundary() {
 
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        runtime_generation: 0,
         job_id: JobId(21004),
         server_idx: old_key.server_idx,
         remote_ip: old_key.ip,
@@ -4991,6 +5318,7 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
     pipeline.active_downloads += 1;
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Decoded(DecodeResult {
                 segment_id,
@@ -5990,6 +6318,7 @@ async fn download_done_refunds_rate_limit_estimate_to_actual_raw_bytes() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from(vec![0; 500]))),
             attempts: vec![],
@@ -6026,6 +6355,7 @@ async fn download_done_charges_rate_limit_for_raw_bytes_above_estimate() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from(vec![0; 1_600]))),
             attempts: vec![],

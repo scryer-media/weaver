@@ -7,6 +7,7 @@ mod decode;
 pub mod download;
 mod extraction;
 mod health;
+mod infrastructure_retry;
 mod orchestrator;
 mod progress;
 mod repair;
@@ -44,8 +45,8 @@ use crate::runtime::buffers::{BufferHandle, BufferPool};
 use crate::runtime::system_profile::SystemProfile;
 use crate::{
     DispatchShareMode, DownloadPressureReason, DownloadPressureState, DownloadQueue, DownloadWork,
-    JobInfo, JobSpec, JobState, JobStatus, PipelineMetrics, RuntimeTuner, SchedulerCommand,
-    SchedulerError, SharedPipelineState, SpilloverDecision, TokenBucket,
+    JobInfo, JobSpec, JobState, JobStatus, NntpRuntimeActivation, PipelineMetrics, RuntimeTuner,
+    SchedulerCommand, SchedulerError, SharedPipelineState, SpilloverDecision, TokenBucket,
 };
 use weaver_nntp::NntpClient;
 #[cfg(test)]
@@ -221,6 +222,7 @@ impl DownloadBatchCompatibility {
 
 pub(super) struct DownloadBatchLease {
     pub(super) job_id: JobId,
+    pub(super) runtime_generation: u64,
     pub(super) lane_mode: DownloadLaneMode,
     pub(super) spillover_loan_kind: Option<SpilloverLoanKind>,
     pub(super) server_modes: Vec<(usize, DownloadLaneMode)>,
@@ -234,6 +236,7 @@ pub(super) struct DownloadBatchLease {
 
 pub(super) struct DownloadLaneRefillRequest {
     pub(super) job_id: JobId,
+    pub(super) runtime_generation: u64,
     pub(super) server_idx: usize,
     pub(super) remote_ip: IpAddr,
     pub(super) supports_pipelining: bool,
@@ -736,6 +739,7 @@ impl DownloadResultOrigin {
 /// Result of a download task.
 pub(super) struct DownloadResult {
     pub(super) segment_id: SegmentId,
+    pub(super) runtime_generation: u64,
     pub(super) data: std::result::Result<DownloadPayload, DownloadError>,
     pub(super) attempts: Vec<weaver_nntp::client::FetchAttemptTrace>,
     pub(super) lane_observation: Option<DownloadLaneObservation>,
@@ -756,7 +760,15 @@ pub(super) struct DownloadResult {
 /// `exclude_servers` indices after a `RebuildNntp` reshaped the pool.
 pub(in crate::pipeline) struct RetryWork {
     pub(in crate::pipeline) scheduled_pool_generation: u64,
+    pub(in crate::pipeline) infrastructure_retry: bool,
     pub(in crate::pipeline) work: DownloadWork,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DownloadWaitStatus {
+    pub(super) reason: &'static str,
+    pub(super) retry_at_epoch_ms: Option<f64>,
+    pub(super) pending_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -785,9 +797,38 @@ pub(super) enum DownloadFailureKind {
     ServerQuota,
     LaneUnavailable,
     Unrequested,
-    Transient,
+    ConnectionEstablishment,
+    EstablishedTransport,
     Auth,
-    Permanent,
+    ContentOrProtocol,
+}
+
+impl DownloadFailureKind {
+    fn preserves_article_retry_budget(&self) -> bool {
+        matches!(
+            self,
+            Self::CapacityUnavailable
+                | Self::ServerQuota
+                | Self::LaneUnavailable
+                | Self::Unrequested
+                | Self::ConnectionEstablishment
+                | Self::EstablishedTransport
+                | Self::Auth
+        )
+    }
+
+    fn infrastructure_wait_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::CapacityUnavailable => Some("provider connection capacity unavailable"),
+            Self::ServerQuota => Some("NNTP server quota blocked"),
+            Self::LaneUnavailable => Some("no eligible NNTP server"),
+            Self::Unrequested => Some("NNTP lane replaced"),
+            Self::ConnectionEstablishment => Some("NNTP connection unavailable"),
+            Self::EstablishedTransport => Some("NNTP BODY transport unavailable"),
+            Self::Auth => Some("NNTP authentication blocked"),
+            Self::ArticleNotFound | Self::ContentOrProtocol => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -823,6 +864,32 @@ impl DownloadFailure {
         }
     }
 
+    fn infrastructure_kind(
+        error: &weaver_nntp::NntpError,
+        transport_kind: DownloadFailureKind,
+    ) -> Option<DownloadFailureKind> {
+        use weaver_nntp::NntpError;
+
+        match error {
+            NntpError::PoolExhausted | NntpError::PoolShutdown | NntpError::TooManyConnections => {
+                Some(DownloadFailureKind::CapacityUnavailable)
+            }
+            NntpError::AuthenticationFailed
+            | NntpError::AuthenticationRejected
+            | NntpError::AuthenticationRequired
+            | NntpError::AccessDenied => Some(DownloadFailureKind::Auth),
+            NntpError::ServiceUnavailable
+            | NntpError::Timeout
+            | NntpError::SoftTimeout(_)
+            | NntpError::ConnectionClosed
+            | NntpError::ServerDisconnectedMidBody
+            | NntpError::TruncatedMultilineBody
+            | NntpError::MalformedMultilineTerminator
+            | NntpError::Io(_) => Some(transport_kind),
+            _ => None,
+        }
+    }
+
     pub(super) fn from_lane_acquire_failure(error: Option<&weaver_nntp::NntpError>) -> Self {
         use weaver_nntp::NntpError;
 
@@ -836,30 +903,16 @@ impl DownloadFailure {
             return Self::server_quota(error.to_string(), rejection.as_ref().clone());
         }
 
-        let kind = match error {
-            NntpError::PoolExhausted | NntpError::PoolShutdown | NntpError::TooManyConnections => {
-                DownloadFailureKind::CapacityUnavailable
-            }
-            NntpError::AuthenticationFailed
-            | NntpError::AuthenticationRejected
-            | NntpError::AuthenticationRequired
-            | NntpError::AccessDenied => DownloadFailureKind::Auth,
-            NntpError::ServiceUnavailable
-            | NntpError::Timeout
-            | NntpError::SoftTimeout(_)
-            | NntpError::ConnectionClosed
-            | NntpError::ServerDisconnectedMidBody
-            | NntpError::TruncatedMultilineBody
-            | NntpError::MalformedMultilineTerminator
-            | NntpError::Io(_) => DownloadFailureKind::Transient,
-            NntpError::NoSuchGroup
-            | NntpError::NoGroupSelected
-            | NntpError::CommandNotRecognized
-            | NntpError::TlsRequired
-            | NntpError::UnexpectedResponse { .. }
-            | NntpError::MalformedResponse(_) => DownloadFailureKind::Permanent,
-            _ => DownloadFailureKind::LaneUnavailable,
-        };
+        let kind = Self::infrastructure_kind(error, DownloadFailureKind::ConnectionEstablishment)
+            .unwrap_or(match error {
+                NntpError::NoSuchGroup
+                | NntpError::NoGroupSelected
+                | NntpError::CommandNotRecognized
+                | NntpError::TlsRequired
+                | NntpError::UnexpectedResponse { .. }
+                | NntpError::MalformedResponse(_) => DownloadFailureKind::ContentOrProtocol,
+                _ => DownloadFailureKind::LaneUnavailable,
+            });
 
         Self::new(kind, error.to_string())
     }
@@ -878,22 +931,8 @@ impl DownloadFailure {
             NntpError::ArticleNotFound
             | NntpError::NoSuchArticle { .. }
             | NntpError::NoArticleWithNumber => DownloadFailureKind::ArticleNotFound,
-            NntpError::PoolExhausted | NntpError::PoolShutdown | NntpError::TooManyConnections => {
-                DownloadFailureKind::CapacityUnavailable
-            }
-            NntpError::AuthenticationFailed
-            | NntpError::AuthenticationRejected
-            | NntpError::AuthenticationRequired
-            | NntpError::AccessDenied => DownloadFailureKind::Auth,
-            NntpError::ServiceUnavailable
-            | NntpError::Timeout
-            | NntpError::SoftTimeout(_)
-            | NntpError::ConnectionClosed
-            | NntpError::ServerDisconnectedMidBody
-            | NntpError::TruncatedMultilineBody
-            | NntpError::MalformedMultilineTerminator
-            | NntpError::Io(_) => DownloadFailureKind::Transient,
-            _ => DownloadFailureKind::Permanent,
+            error => Self::infrastructure_kind(error, DownloadFailureKind::EstablishedTransport)
+                .unwrap_or(DownloadFailureKind::ContentOrProtocol),
         };
 
         Self::new(kind, error.to_string())
@@ -941,6 +980,12 @@ pub(super) struct ProbeUpdate {
     /// True when probe confirmation hit a non-authoritative transport/protocol
     /// failure and the round should be discarded.
     pub(super) inconclusive: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CapacityProbeCompletion {
+    pub(super) generation: u64,
+    pub(super) outcome: weaver_nntp::CapacityProbeOutcome,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1599,6 +1644,9 @@ pub struct Pipeline {
     pub(super) pending_retries_by_job: HashMap<JobId, usize>,
     /// Delayed retry tasks by exact segment.
     pub(super) pending_retries_by_segment: HashMap<SegmentId, usize>,
+    pub(super) download_wait_by_job: HashMap<JobId, DownloadWaitStatus>,
+    /// Idempotent terminal segment accounting.
+    pub(in crate::pipeline) terminal_segment_failures: HashSet<SegmentId>,
     /// Work parked specifically on per-server quota capacity or policy changes.
     pub(super) server_quota_parked: HashSet<SegmentId>,
     /// Directory for active downloads (per-job subdirectories).
@@ -1650,15 +1698,21 @@ pub struct Pipeline {
     pub(super) ip_replacement_trial_rx: mpsc::Receiver<IpReplacementTrialEvent>,
     pub(super) decode_done_tx: mpsc::Sender<DecodeDone>,
     pub(super) decode_done_rx: mpsc::Receiver<DecodeDone>,
-    /// Channel for delayed retries — segments sleep then come back here.
+    /// Channel through which due retries re-enter the pipeline loop.
     pub(in crate::pipeline) retry_tx: mpsc::Sender<RetryWork>,
     pub(in crate::pipeline) retry_rx: mpsc::Receiver<RetryWork>,
+    /// Pipeline-owned infrastructure retries, drained in deadline batches.
+    pub(in crate::pipeline) infrastructure_retries:
+        infrastructure_retry::InfrastructureRetryQueue<RetryWork>,
     /// Monotonic NNTP pool generation, bumped on every `RebuildNntp`. Server
     /// indices in `DownloadWork::exclude_servers` are only meaningful within
     /// the generation they were computed under; delayed retries carry the
     /// generation they were scheduled under so stale indices can be dropped
     /// when they re-enter after a rebuild.
     pub(super) pool_generation: u64,
+    /// Bounded completion path for dedicated adaptive-capacity probes.
+    pub(super) capacity_probe_result_tx: mpsc::Sender<CapacityProbeCompletion>,
+    pub(super) capacity_probe_result_rx: mpsc::Receiver<CapacityProbeCompletion>,
     /// Channel for health probe results: (job_id, total_probes, missed_count).
     pub(super) probe_result_tx: mpsc::Sender<ProbeUpdate>,
     pub(super) probe_result_rx: mpsc::Receiver<ProbeUpdate>,

@@ -385,6 +385,7 @@ impl Pipeline {
                 let mode = lease.lane_mode;
                 let spillover_loan_kind = lease.spillover_loan_kind;
                 let job_id = lease.job_id;
+                let runtime_generation = lease.runtime_generation;
                 for (work_index, work) in lease.works.into_iter().enumerate() {
                     let work_failure = lane_acquire_failure_for_work(&failure, work_index);
                     let policy_outcome = matches!(
@@ -394,6 +395,7 @@ impl Pipeline {
                     let _ = tx
                         .send(DownloadResult {
                             segment_id: work.segment_id,
+                            runtime_generation,
                             data: Err(DownloadError::Fetch(work_failure)),
                             attempts: Vec::new(),
                             lane_observation: Some(DownloadLaneObservation {
@@ -436,6 +438,7 @@ impl Pipeline {
             loop {
                 let DownloadBatchLease {
                     job_id,
+                    runtime_generation,
                     lane_mode,
                     spillover_loan_kind,
                     server_modes,
@@ -526,6 +529,7 @@ impl Pipeline {
                                 let _ = tx
                                     .send(DownloadResult {
                                         segment_id,
+                                        runtime_generation,
                                         data,
                                         attempts,
                                         lane_observation: Some(observation),
@@ -593,6 +597,7 @@ impl Pipeline {
                                             let _ = tx
                                                 .send(DownloadResult {
                                                     segment_id,
+                                                    runtime_generation,
                                                     data,
                                                     attempts,
                                                     lane_observation: Some(observation),
@@ -650,6 +655,7 @@ impl Pipeline {
                                             let _ = tx
                                                 .send(DownloadResult {
                                                     segment_id,
+                                                    runtime_generation,
                                                     data,
                                                     attempts,
                                                     lane_observation: Some(observation),
@@ -683,8 +689,9 @@ impl Pipeline {
                         let _ = tx
                             .send(DownloadResult {
                                 segment_id: work.segment_id,
+                                runtime_generation,
                                 data: Err(DownloadError::Fetch(DownloadFailure::new(
-                                    DownloadFailureKind::Transient,
+                                    DownloadFailureKind::EstablishedTransport,
                                     "batch ended without result",
                                 ))),
                                 attempts: Vec::new(),
@@ -720,6 +727,7 @@ impl Pipeline {
                         let _ = tx
                             .send(DownloadResult {
                                 segment_id: work.segment_id,
+                                runtime_generation,
                                 data: Err(DownloadError::Fetch(DownloadFailure::new(
                                     DownloadFailureKind::Unrequested,
                                     "lane parked before leased article was requested",
@@ -756,6 +764,7 @@ impl Pipeline {
                 if refill_tx
                     .send(DownloadLaneRefillRequest {
                         job_id,
+                        runtime_generation,
                         server_idx,
                         remote_ip: lane.remote_ip(),
                         supports_pipelining,

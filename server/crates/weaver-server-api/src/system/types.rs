@@ -840,8 +840,16 @@ pub struct ServerHealth {
     pub state: String,
     /// Currently in-use connections (max - available permits).
     pub connections_active: u32,
-    /// Configured maximum connections.
+    /// Runtime effective maximum connections (legacy field).
     pub connections_max: u32,
+    /// Saved operator-configured maximum connections.
+    pub connections_configured: u32,
+    /// Runtime maximum after provider capacity adaptation.
+    pub connections_effective: u32,
+    /// End of the current provider-capacity penalty, if one is active.
+    pub capacity_penalty_until_epoch_ms: Option<u64>,
+    /// Active NNTP runtime generation.
+    pub runtime_generation: u64,
     /// EWMA request latency in milliseconds.
     pub latency_ms: f64,
     pub success_count: u64,

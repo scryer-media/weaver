@@ -529,6 +529,90 @@ async fn update_server_connections_are_visible_in_follow_up_query() {
 }
 
 #[tokio::test]
+async fn active_connection_reduction_waits_for_new_runtime_generation() {
+    let h = TestHarness::new().await;
+    let initial_port = spawn_scripted_server(vec![
+        ScriptStep {
+            expect_prefix: None,
+            response: b"200 ready\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("CAPABILITIES"),
+            response: b"500 unknown\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("QUIT"),
+            response: b"205 bye\r\n",
+        },
+    ])
+    .await;
+    let corrected_port = spawn_scripted_server(vec![
+        ScriptStep {
+            expect_prefix: None,
+            response: b"200 ready\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("CAPABILITIES"),
+            response: b"500 unknown\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("QUIT"),
+            response: b"205 bye\r\n",
+        },
+    ])
+    .await;
+
+    let response = h
+        .execute(&format!(
+            r#"mutation {{
+                addServer(input: {{
+                    host: "127.0.0.1",
+                    port: {initial_port},
+                    tls: false,
+                    connections: 80,
+                    active: true
+                }}) {{ id }}
+            }}"#
+        ))
+        .await;
+    assert_no_errors(&response);
+    let id = response_data(&response)["addServer"]["id"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        h.shared_state.nntp_runtime_activation(),
+        Some(weaver_server_core::NntpRuntimeActivation {
+            generation: 1,
+            configured_connections: 80,
+            effective_connections: 80,
+        })
+    );
+
+    let response = h
+        .execute(&format!(
+            r#"mutation {{
+                updateServer(id: {id}, input: {{
+                    host: "127.0.0.1",
+                    port: {corrected_port},
+                    tls: false,
+                    connections: 20,
+                    active: true
+                }}) {{ id connections }}
+            }}"#
+        ))
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        h.shared_state.nntp_runtime_activation(),
+        Some(weaver_server_core::NntpRuntimeActivation {
+            generation: 2,
+            configured_connections: 20,
+            effective_connections: 20,
+        })
+    );
+}
+
+#[tokio::test]
 async fn servers_query_stays_responsive_during_update_server_persist() {
     let h = TestHarness::new().await;
     let resp = h

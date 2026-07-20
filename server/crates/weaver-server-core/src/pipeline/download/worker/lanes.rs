@@ -168,22 +168,36 @@ impl Pipeline {
             .or_default() += 1;
     }
 
-    pub(in crate::pipeline::download::worker) fn book_failed_segment(&mut self, seg_id: SegmentId) {
+    pub(in crate::pipeline) fn book_failed_segment(&mut self, seg_id: SegmentId) {
         let job_id = seg_id.file_id.job_id;
+        let failed_bytes = self.health_counted_segment_bytes(seg_id);
+        if !self.terminal_segment_failures.insert(seg_id) {
+            return;
+        }
         if let Some(state) = self.jobs.get_mut(&job_id) {
-            let file_idx = seg_id.file_id.file_index as usize;
-            if let Some(file_spec) = state.spec.files.get(file_idx)
-                && file_spec.role.counts_toward_health()
-                && let Some(seg_spec) = file_spec
-                    .segments
-                    .iter()
-                    .find(|s| s.ordinal == seg_id.segment_number)
-            {
-                state.failed_bytes += seg_spec.bytes as u64;
-            }
+            state.failed_bytes = state.failed_bytes.saturating_add(failed_bytes);
         }
         self.mark_promoted_recovery_segment_unavailable(seg_id);
         self.check_health(job_id);
+    }
+
+    fn health_counted_segment_bytes(&self, segment_id: SegmentId) -> u64 {
+        self.jobs
+            .get(&segment_id.file_id.job_id)
+            .and_then(|state| {
+                let file_spec = state
+                    .spec
+                    .files
+                    .get(segment_id.file_id.file_index as usize)?;
+                file_spec.role.counts_toward_health().then(|| {
+                    file_spec
+                        .segments
+                        .iter()
+                        .find(|segment| segment.ordinal == segment_id.segment_number)
+                        .map_or(0, |segment| segment.bytes as u64)
+                })
+            })
+            .unwrap_or(0)
     }
 
     pub(in crate::pipeline::download::worker) fn refill_mode_pressure(

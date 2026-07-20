@@ -169,6 +169,13 @@ fn sample_snapshot(
         disk_write_latency_us: 200,
         segments_retried: 0,
         segments_failed_permanent: 0,
+        parked_infrastructure_work: 0,
+        nntp_generation_recovery_requeues: 0,
+        nntp_capacity_probe_attempts_total: 0,
+        nntp_capacity_probe_successes_total: 0,
+        nntp_capacity_probe_rejections_total: 0,
+        nntp_capacity_probe_transport_failures_total: 0,
+        nntp_capacity_probe_stale_generation_total: 0,
         download_failures_article_not_found: 0,
         download_failures_capacity_unavailable: 0,
         download_failures_transient: 0,
@@ -274,6 +281,8 @@ fn job_info(job_id: u64, status: JobStatus) -> JobInfo {
         metadata: Vec::new(),
         output_dir: None,
         error: None,
+        download_wait_reason: None,
+        download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 0.0,
     }
 }

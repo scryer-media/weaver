@@ -1,4 +1,136 @@
 use super::*;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+fn capacity_test_client(port: u16, connections: usize) -> NntpClient {
+    NntpClient::new(NntpClientConfig::single(
+        weaver_nntp::ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            tls: false,
+            connect_timeout: Duration::from_secs(2),
+            command_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+        connections,
+    ))
+}
+
+async fn spawn_capacity_limited_body_server(
+    connection_limit: usize,
+    payload: Vec<u8>,
+    total_segments: usize,
+) -> (
+    u16,
+    Arc<AtomicBool>,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let fast_bodies = Arc::new(AtomicBool::new(false));
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    let mut encoded = Vec::new();
+    weaver_yenc::encode(&payload, &mut encoded, 128, "capacity-recovery.bin").unwrap();
+    let header_end = encoded
+        .windows(2)
+        .position(|bytes| bytes == b"\r\n")
+        .unwrap()
+        + 2;
+    let trailer_start = encoded
+        .windows(b"\r\n=yend".len())
+        .rposition(|bytes| bytes == b"\r\n=yend")
+        .unwrap();
+    let crc_start = encoded
+        .windows(b"crc32=".len())
+        .position(|bytes| bytes == b"crc32=")
+        .unwrap()
+        + b"crc32=".len();
+    let encoded_body = Arc::new(encoded[header_end..trailer_start].to_vec());
+    let part_crc = Arc::new(String::from_utf8(encoded[crc_start..crc_start + 8].to_vec()).unwrap());
+    let part_size = payload.len();
+    let total_size = part_size * total_segments;
+
+    let fast_bodies_for_server = Arc::clone(&fast_bodies);
+    let active_for_server = Arc::clone(&active_connections);
+    let server = tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let active = active_for_server.fetch_add(1, Ordering::SeqCst) + 1;
+            let active_for_connection = Arc::clone(&active_for_server);
+            let fast_bodies = Arc::clone(&fast_bodies_for_server);
+            let encoded_body = Arc::clone(&encoded_body);
+            let part_crc = Arc::clone(&part_crc);
+            tokio::spawn(async move {
+                let (reader, mut writer) = socket.into_split();
+                if active > connection_limit {
+                    let _ = writer.write_all(b"502 Too Many Connections\r\n").await;
+                    active_for_connection.fetch_sub(1, Ordering::SeqCst);
+                    return;
+                }
+
+                if writer.write_all(b"200 test server ready\r\n").await.is_ok() {
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if line == "CAPABILITIES" {
+                            if writer
+                                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else if line.starts_with("GROUP ") {
+                            if writer
+                                .write_all(b"211 1000 1 1000 alt.binaries.test\r\n")
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else if line.starts_with("BODY ") {
+                            if !fast_bodies.load(Ordering::Acquire) {
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                            }
+                            let part_index = line
+                                .split("segment-")
+                                .nth(1)
+                                .and_then(|suffix| suffix.split('@').next())
+                                .and_then(|index| index.parse::<usize>().ok())
+                                .unwrap();
+                            let part_number = part_index + 1;
+                            let part_begin = part_index * part_size + 1;
+                            let part_end = part_begin + part_size - 1;
+                            let header = format!(
+                                "222 0 <test> body follows\r\n=ybegin part={part_number} total={total_segments} line=128 size={total_size} name=capacity-recovery.bin\r\n=ypart begin={part_begin} end={part_end}\r\n"
+                            );
+                            let trailer = format!(
+                                "\r\n=yend size={part_size} part={part_number} pcrc32={}\r\n.\r\n",
+                                part_crc
+                            );
+                            if writer.write_all(header.as_bytes()).await.is_err()
+                                || writer.write_all(&encoded_body).await.is_err()
+                                || writer.write_all(trailer.as_bytes()).await.is_err()
+                            {
+                                break;
+                            }
+                        } else if line == "QUIT" {
+                            let _ = writer.write_all(b"205 closing\r\n").await;
+                            break;
+                        } else if writer.write_all(b"500 unsupported\r\n").await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                active_for_connection.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+
+    (port, fast_bodies, active_connections, server)
+}
 
 #[tokio::test]
 async fn phase_end_removes_only_the_ended_phase_snapshot() {
@@ -243,6 +375,147 @@ async fn submit_nzb_persists_zstd_and_creates_active_job() {
 }
 
 #[tokio::test]
+async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_change() {
+    const TOTAL_SEGMENTS: usize = 1_000;
+    let payload = vec![b'A'; 1024];
+    let (port, fast_bodies, active_connections, server) =
+        spawn_capacity_limited_body_server(20, payload.clone(), TOTAL_SEGMENTS).await;
+    let initial_client = capacity_test_client(port, 80);
+    let old_pool = Arc::clone(initial_client.pool());
+    let harness = TestHarness::new_with_nntp(initial_client, 80).await;
+    let job_id = JobId(80_020);
+    let segment_sizes = vec![payload.len() as u32; TOTAL_SEGMENTS];
+    let spec = segmented_job_spec(
+        "active 80 to 20 capacity recovery",
+        "capacity-recovery.bin",
+        &segment_sizes,
+    );
+
+    harness
+        .handle
+        .add_job(
+            job_id,
+            spec,
+            PathBuf::from("capacity-recovery.nzb"),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    wait_until(Duration::from_secs(15), || {
+        harness.handle.get_job(job_id).is_ok_and(|job| {
+            job.downloaded_bytes > 0
+                && !matches!(job.status, JobStatus::Complete | JobStatus::Failed { .. })
+        })
+    })
+    .await
+    .expect("job should begin downloading before the generation correction");
+
+    wait_until(Duration::from_secs(20), || {
+        old_pool.effective_connection_capacity() == 20
+    })
+    .await
+    .expect("configured 80/provider 20 should converge to effective 20");
+    assert_eq!(
+        old_pool.capacity_reductions(weaver_nntp::ServerId(0)),
+        Some(60)
+    );
+    assert!(active_connections.load(Ordering::Acquire) <= 20);
+    let progress_before_rebuild = harness.handle.get_job(job_id).unwrap().downloaded_bytes;
+
+    let activation = harness
+        .handle
+        .rebuild_nntp(capacity_test_client(port, 20), 20)
+        .await
+        .unwrap();
+    assert_eq!(activation.generation, 1);
+    assert_eq!(activation.configured_connections, 20);
+    assert_eq!(activation.effective_connections, 20);
+    fast_bodies.store(true, Ordering::Release);
+
+    wait_until(Duration::from_secs(15), || {
+        harness
+            .handle
+            .get_job(job_id)
+            .is_ok_and(|job| job.downloaded_bytes > progress_before_rebuild)
+    })
+    .await
+    .expect("the same active job should resume within the generation handoff bound");
+
+    let completed = wait_until(Duration::from_secs(30), || {
+        harness
+            .handle
+            .get_job(job_id)
+            .is_ok_and(|job| matches!(job.status, JobStatus::Complete))
+    })
+    .await;
+    assert!(
+        completed.is_ok(),
+        "same no-PAR2 job did not complete: job={:?} metrics={:?}",
+        harness.handle.get_job(job_id),
+        harness.handle.get_live_metrics()
+    );
+
+    let job = harness.handle.get_job(job_id).unwrap();
+    assert_eq!(job.failed_bytes, 0);
+    assert_eq!(job.health, 1000);
+    assert_eq!(job.remaining_par_files, 0);
+    let metrics = harness.handle.get_live_metrics();
+    assert_eq!(metrics.segments_failed_permanent, 0);
+    assert_eq!(metrics.download_failures_article_not_found, 0);
+
+    harness.shutdown().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn stalled_capacity_probe_does_not_block_rar_scheduler_events() {
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (accepted_tx, accepted_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (_socket, _) = listener.accept().await.unwrap();
+        let _ = accepted_tx.send(());
+        std::future::pending::<()>().await;
+    });
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let client = capacity_test_client(port, 2);
+    assert!(
+        !client
+            .pool()
+            .record_provider_capacity_rejection(weaver_nntp::ServerId(0))
+    );
+    pipeline.nntp = Arc::new(client);
+    pipeline.drive_capacity_probes_at(tokio::time::Instant::now() + Duration::from_secs(10 * 60));
+    accepted_rx.await.unwrap();
+
+    for kind in [
+        RarCapacityRetryKind::Refresh,
+        RarCapacityRetryKind::Extraction,
+        RarCapacityRetryKind::FullSetExtraction,
+    ] {
+        pipeline
+            .rar_capacity_retry_tx
+            .send(RarCapacityRetry {
+                job_id: JobId(1),
+                set_name: "stalled-probe.rar".to_string(),
+                kind,
+            })
+            .await
+            .unwrap();
+        let received = pipeline.rar_capacity_retry_rx.recv().await.unwrap();
+        assert_eq!(received.kind, kind);
+    }
+
+    pipeline.nntp.shutdown().await;
+    server.abort();
+}
+
+#[tokio::test]
 async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
@@ -391,6 +664,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
         tokio::time::timeout(
             Duration::from_secs(1),
             pipeline.handle_download_done(DownloadResult {
+                runtime_generation: 0,
                 segment_id,
                 data: Ok(DownloadPayload::Raw(raw)),
                 attempts: Vec::new(),
@@ -444,6 +718,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
     pipeline.active_downloads += 1;
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -542,6 +817,7 @@ async fn in_order_segments_keep_write_cursor_until_file_completes() {
         pipeline.active_downloads += 1;
         pipeline
             .handle_download_done(DownloadResult {
+                runtime_generation: 0,
                 segment_id,
                 data: Ok(DownloadPayload::Raw(raw)),
                 attempts: Vec::new(),
@@ -630,6 +906,7 @@ async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
         pipeline.active_downloads += 1;
         pipeline
             .handle_download_done(DownloadResult {
+                runtime_generation: 0,
                 segment_id: SegmentId {
                     file_id: NzbFileId {
                         job_id,
@@ -783,6 +1060,7 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
     pipeline.note_retry_scheduled(segment_id);
     pipeline.receive_retry_work(super::RetryWork {
         scheduled_pool_generation: 0,
+        infrastructure_retry: false,
         work: make_work(),
     });
     let queued = pipeline
@@ -802,6 +1080,7 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
     pipeline.note_retry_scheduled(segment_id);
     pipeline.receive_retry_work(super::RetryWork {
         scheduled_pool_generation: 1,
+        infrastructure_retry: false,
         work: make_work(),
     });
     let queued = pipeline

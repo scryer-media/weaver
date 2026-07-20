@@ -66,6 +66,7 @@ async fn excluded_source_not_found_retries_without_marking_health_failure() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,

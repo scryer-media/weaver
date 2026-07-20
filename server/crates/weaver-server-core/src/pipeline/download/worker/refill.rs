@@ -26,6 +26,7 @@ impl Pipeline {
     ) {
         let DownloadLaneRefillRequest {
             job_id,
+            runtime_generation,
             server_idx,
             remote_ip,
             supports_pipelining,
@@ -34,6 +35,13 @@ impl Pipeline {
             compatibility,
             response_tx,
         } = request;
+        if runtime_generation != self.pool_generation {
+            let _ = response_tx.send(DownloadLaneRefillResponse {
+                lease: None,
+                park_reason: LaneParkReason::Error,
+            });
+            return;
+        }
         let now = Instant::now();
         let mut park_reason = LaneParkReason::NoWork;
         let mut allow_refill = !self.global_paused && !self.rate_limiter.should_wait();
@@ -75,6 +83,7 @@ impl Pipeline {
             self.deferred_lane_refills
                 .push_back(DownloadLaneRefillRequest {
                     job_id,
+                    runtime_generation,
                     server_idx,
                     remote_ip,
                     supports_pipelining,

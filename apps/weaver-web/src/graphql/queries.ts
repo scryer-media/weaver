@@ -680,6 +680,10 @@ export const SERVER_HEALTH_QUERY = gql`
       state
       connectionsActive
       connectionsMax
+      connectionsConfigured
+      connectionsEffective
+      capacityPenaltyUntilEpochMs
+      runtimeGeneration
       latencyMs
       successCount
       failureCount

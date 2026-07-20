@@ -1312,6 +1312,7 @@ impl Pipeline {
                     ) && !file.is_complete()
                 })
                 .count() as u32;
+            let download_wait = self.download_wait_by_job.get(&state.job_id);
             list.push(JobInfo {
                 job_id: state.job_id,
                 job_hash: Some(state.job_hash),
@@ -1321,6 +1322,8 @@ impl Pipeline {
                 } else {
                     None
                 },
+                download_wait_reason: download_wait.map(|wait| wait.reason.to_owned()),
+                download_retry_at_epoch_ms: download_wait.and_then(|wait| wait.retry_at_epoch_ms),
                 status: state.status.clone(),
                 download_state,
                 post_state,

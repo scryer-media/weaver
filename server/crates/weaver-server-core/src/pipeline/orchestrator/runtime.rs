@@ -61,6 +61,7 @@ impl Pipeline {
         let (ip_replacement_trial_tx, ip_replacement_trial_rx) = mpsc::channel(16);
         let (decode_done_tx, decode_done_rx) = mpsc::channel(256);
         let (retry_tx, retry_rx) = mpsc::channel(256);
+        let (capacity_probe_result_tx, capacity_probe_result_rx) = mpsc::channel(64);
         let (probe_result_tx, probe_result_rx) = mpsc::channel(16);
         let (extract_done_tx, extract_done_rx) = mpsc::channel(32);
         let (rar_refresh_done_tx, rar_refresh_done_rx) = mpsc::channel(32);
@@ -69,6 +70,11 @@ impl Pipeline {
             mpsc::channel(32);
         let (move_done_tx, move_done_rx) = mpsc::channel(32);
         let nntp = Arc::new(nntp);
+        shared_state.set_nntp_runtime_activation(NntpRuntimeActivation {
+            generation: 0,
+            configured_connections: total_connections,
+            effective_connections: nntp.pool().effective_connection_capacity(),
+        });
         let owned_download_lane_pool =
             download::owned_lane::OwnedDownloadLanePool::new(total_connections.max(1));
         shared_state.set_paused(initial_global_paused);
@@ -124,6 +130,8 @@ impl Pipeline {
             job_last_download_activity: HashMap::new(),
             pending_retries_by_job: HashMap::new(),
             pending_retries_by_segment: HashMap::new(),
+            download_wait_by_job: HashMap::new(),
+            terminal_segment_failures: HashSet::new(),
             server_quota_parked: HashSet::new(),
             intermediate_dir,
             complete_dir,
@@ -163,7 +171,10 @@ impl Pipeline {
             decode_done_rx,
             retry_tx,
             retry_rx,
+            infrastructure_retries: infrastructure_retry::InfrastructureRetryQueue::default(),
             pool_generation: 0,
+            capacity_probe_result_tx,
+            capacity_probe_result_rx,
             probe_result_tx,
             probe_result_rx,
             extract_done_tx,
@@ -311,6 +322,93 @@ impl Pipeline {
 
     pub fn nntp_pool(&self) -> Arc<weaver_nntp::pool::NntpPool> {
         self.nntp.pool().clone()
+    }
+
+    pub(in crate::pipeline) fn drive_capacity_probes_at(&self, now: tokio::time::Instant) {
+        let pool = self.nntp_pool();
+        for change in pool.take_capacity_changes() {
+            match change.probe_outcome {
+                Some(
+                    weaver_nntp::CapacityProbeOutcome::Succeeded
+                    | weaver_nntp::CapacityProbeOutcome::NoConfiguredPermit,
+                ) => info!(
+                    server = change.server.0,
+                    configured_connections = change.configured_connections,
+                    effective_connections = change.effective_connections,
+                    effective_delta = change.effective_delta,
+                    coalesced_rejections = change.coalesced_rejections,
+                    probe_outcome = ?change.probe_outcome,
+                    next_probe_at_epoch_ms = change.next_probe_at_epoch_ms,
+                    runtime_generation = self.pool_generation,
+                    "NNTP adaptive capacity changed"
+                ),
+                _ => warn!(
+                    server = change.server.0,
+                    configured_connections = change.configured_connections,
+                    effective_connections = change.effective_connections,
+                    effective_delta = change.effective_delta,
+                    coalesced_rejections = change.coalesced_rejections,
+                    probe_outcome = ?change.probe_outcome,
+                    next_probe_at_epoch_ms = change.next_probe_at_epoch_ms,
+                    runtime_generation = self.pool_generation,
+                    "NNTP adaptive capacity changed"
+                ),
+            }
+        }
+
+        let generation = self.pool_generation;
+        for server in pool.claim_due_capacity_probes(now) {
+            let pool = Arc::clone(&pool);
+            let result_tx = self.capacity_probe_result_tx.clone();
+            tokio::spawn(async move {
+                let outcome = pool.run_capacity_probe(server).await;
+                let _ = result_tx
+                    .send(CapacityProbeCompletion {
+                        generation,
+                        outcome,
+                    })
+                    .await;
+            });
+        }
+    }
+
+    fn handle_capacity_probe_completion(&mut self, completion: CapacityProbeCompletion) {
+        if completion.generation != self.pool_generation {
+            self.metrics
+                .nntp_capacity_probe_stale_generation_total
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        if !matches!(
+            completion.outcome,
+            weaver_nntp::CapacityProbeOutcome::NoConfiguredPermit
+        ) {
+            self.metrics
+                .nntp_capacity_probe_attempts_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        match completion.outcome {
+            weaver_nntp::CapacityProbeOutcome::Succeeded => {
+                self.metrics
+                    .nntp_capacity_probe_successes_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.dispatch_downloads();
+            }
+            weaver_nntp::CapacityProbeOutcome::Rejected => {
+                self.metrics
+                    .nntp_capacity_probe_rejections_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            weaver_nntp::CapacityProbeOutcome::TransportFailure => {
+                self.metrics
+                    .nntp_capacity_probe_transport_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            weaver_nntp::CapacityProbeOutcome::AuthenticationFailure
+            | weaver_nntp::CapacityProbeOutcome::NoConfiguredPermit => {}
+        }
     }
 
     pub(crate) fn effective_downloaded_bytes(state: &JobState) -> u64 {
@@ -553,6 +651,8 @@ impl Pipeline {
     pub async fn run(&mut self) {
         let mut metrics_snapshot_interval = tokio::time::interval(Self::METRICS_SNAPSHOT_INTERVAL);
         metrics_snapshot_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut capacity_probe_interval = tokio::time::interval(Duration::from_secs(1));
+        capacity_probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut tune_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         tune_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut stalled_download_interval = tokio::time::interval(STALLED_DOWNLOAD_CHECK_INTERVAL);
@@ -590,6 +690,11 @@ impl Pipeline {
             let durable_lead_retry_sleep = tokio::time::sleep(
                 durable_lead_retry_delay.unwrap_or_else(|| std::time::Duration::from_secs(3600)),
             );
+            let infrastructure_retry_deadline = self.infrastructure_retries.next_deadline();
+            let infrastructure_retry_sleep =
+                tokio::time::sleep_until(infrastructure_retry_deadline.unwrap_or_else(|| {
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
+                }));
 
             loop {
                 match self.cmd_rx.try_recv() {
@@ -651,6 +756,9 @@ impl Pipeline {
                     Some(update) = self.probe_result_rx.recv() => {
                         self.handle_probe_update(update);
                     }
+                    Some(completion) = self.capacity_probe_result_rx.recv() => {
+                        self.handle_capacity_probe_completion(completion);
+                    }
                     Some(done) = self.extract_done_rx.recv() => {
                         self.handle_extraction_done(done).await;
                     }
@@ -669,6 +777,9 @@ impl Pipeline {
                     Some(retry) = self.retry_rx.recv() => {
                         self.receive_retry_work(retry);
                     }
+                    _ = capacity_probe_interval.tick() => {
+                        self.drive_capacity_probes_at(tokio::time::Instant::now());
+                    }
                     _ = metrics_snapshot_interval.tick() => {
                         self.sample_phase_progress();
                         self.shared_state.refresh_metrics_snapshot();
@@ -678,6 +789,9 @@ impl Pipeline {
                     }
                     _ = rate_sleep, if !rate_delay.is_zero() => {}
                     _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {}
+                    _ = infrastructure_retry_sleep, if infrastructure_retry_deadline.is_some() => {
+                        self.requeue_due_infrastructure_retries();
+                    }
                     _ = tune_interval.tick() => {
                         self.flush_quiescent_write_backlog().await;
                         self.refresh_download_pressure();
@@ -785,6 +899,49 @@ impl Pipeline {
         self.shared_state.publish_jobs(self.list_jobs());
     }
 
+    fn update_parked_infrastructure_metric(&self) {
+        self.metrics
+            .parked_infrastructure_work
+            .store(self.infrastructure_retries.len(), Ordering::Relaxed);
+    }
+
+    pub(in crate::pipeline) fn schedule_infrastructure_retry(
+        &mut self,
+        delay: Option<std::time::Duration>,
+        retry: RetryWork,
+    ) {
+        self.infrastructure_retries.schedule(delay, retry);
+        self.update_parked_infrastructure_metric();
+    }
+
+    pub(in crate::pipeline) fn cancel_infrastructure_retries_for_job(&mut self, job_id: JobId) {
+        self.infrastructure_retries
+            .cancel_where(|retry| retry.work.segment_id.file_id.job_id == job_id);
+        self.update_parked_infrastructure_metric();
+    }
+
+    pub(in crate::pipeline) fn wake_all_infrastructure_retries(&mut self) -> usize {
+        let ready = self.infrastructure_retries.wake_all();
+        self.update_parked_infrastructure_metric();
+        self.requeue_infrastructure_retry_batch(ready)
+    }
+
+    fn requeue_due_infrastructure_retries(&mut self) -> usize {
+        let ready = self
+            .infrastructure_retries
+            .take_due(tokio::time::Instant::now());
+        self.update_parked_infrastructure_metric();
+        self.requeue_infrastructure_retry_batch(ready)
+    }
+
+    fn requeue_infrastructure_retry_batch(&mut self, ready: Vec<RetryWork>) -> usize {
+        let count = ready.len();
+        for retry in ready {
+            self.receive_retry_work(retry);
+        }
+        count
+    }
+
     fn drain_ready_download_results(&mut self, pending: &mut VecDeque<DownloadResult>) {
         while pending.len() < Self::DOWNLOAD_COMPLETION_DRAIN_LIMIT {
             if let Ok(event) = self.owned_download_lane_event_rx.try_recv() {
@@ -843,20 +1000,25 @@ impl Pipeline {
     /// fall back to a clean attempt; retention excludes are recomputed fresh
     /// from the new pool at order time, so nothing durable is lost.
     pub(in crate::pipeline) fn receive_retry_work(&mut self, retry: crate::pipeline::RetryWork) {
-        let mut work = retry.work;
+        let crate::pipeline::RetryWork {
+            scheduled_pool_generation,
+            infrastructure_retry,
+            mut work,
+        } = retry;
         if self.server_quota_parked.remove(&work.segment_id) {
             self.refresh_server_quota_block_presentation();
         }
-        if retry.scheduled_pool_generation != self.pool_generation
-            && !work.exclude_servers.is_empty()
-        {
+        if scheduled_pool_generation != self.pool_generation && !work.exclude_servers.is_empty() {
             debug!(
                 segment = %work.segment_id,
-                scheduled_generation = retry.scheduled_pool_generation,
+                scheduled_generation = scheduled_pool_generation,
                 current_generation = self.pool_generation,
                 "dropping stale server exclusions on retry after NNTP pool rebuild"
             );
             work.exclude_servers.clear();
+        }
+        if infrastructure_retry {
+            self.note_infrastructure_retry_requeued(work.segment_id.file_id.job_id);
         }
         self.requeue_retry_work(work);
     }

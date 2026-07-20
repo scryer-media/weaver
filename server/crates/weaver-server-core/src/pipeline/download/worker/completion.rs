@@ -10,20 +10,66 @@ impl Pipeline {
             .or_default() += 1;
     }
 
-    pub(crate) fn note_retry_requeued(&mut self, segment_id: SegmentId) {
-        let job_id = segment_id.file_id.job_id;
-        let Some(pending) = self.pending_retries_by_job.get_mut(&job_id) else {
+    fn note_infrastructure_retry_scheduled(
+        &mut self,
+        job_id: JobId,
+        kind: DownloadFailureKind,
+        delay: Option<std::time::Duration>,
+    ) {
+        let Some(reason) = kind.infrastructure_wait_reason() else {
             return;
         };
-        *pending = pending.saturating_sub(1);
-        if *pending == 0 {
-            self.pending_retries_by_job.remove(&job_id);
+        let retry_at_epoch_ms = delay.map(|delay| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64()
+                * 1000.0
+                + delay.as_secs_f64() * 1000.0
+        });
+        let wait = self
+            .download_wait_by_job
+            .entry(job_id)
+            .or_insert(DownloadWaitStatus {
+                reason,
+                retry_at_epoch_ms,
+                pending_count: 0,
+            });
+        wait.reason = reason;
+        wait.retry_at_epoch_ms = match (wait.retry_at_epoch_ms, retry_at_epoch_ms) {
+            (Some(current), Some(next)) => Some(current.min(next)),
+            (Some(current), None) => Some(current),
+            (None, next) => next,
+        };
+        wait.pending_count += 1;
+    }
+
+    pub(crate) fn note_retry_requeued(&mut self, segment_id: SegmentId) {
+        let job_id = segment_id.file_id.job_id;
+        if let Some(pending) = self.pending_retries_by_job.get_mut(&job_id) {
+            *pending = pending.saturating_sub(1);
+            if *pending == 0 {
+                self.pending_retries_by_job.remove(&job_id);
+            }
         }
         if let Some(pending) = self.pending_retries_by_segment.get_mut(&segment_id) {
             *pending = pending.saturating_sub(1);
             if *pending == 0 {
                 self.pending_retries_by_segment.remove(&segment_id);
             }
+        }
+    }
+
+    pub(crate) fn note_infrastructure_retry_requeued(&mut self, job_id: JobId) {
+        let clear_wait = self
+            .download_wait_by_job
+            .get_mut(&job_id)
+            .is_some_and(|wait| {
+                wait.pending_count = wait.pending_count.saturating_sub(1);
+                wait.pending_count == 0
+            });
+        if clear_wait {
+            self.download_wait_by_job.remove(&job_id);
         }
     }
 
@@ -73,6 +119,57 @@ impl Pipeline {
         self.shared_state.set_server_quota_blocked(blocked);
     }
 
+    fn download_retry_work(
+        &self,
+        segment_id: SegmentId,
+        retry_count: u32,
+        exclude_servers: Vec<usize>,
+    ) -> Option<DownloadWork> {
+        let job_id = segment_id.file_id.job_id;
+        let file_idx = segment_id.file_id.file_index as usize;
+        let state = self.jobs.get(&job_id)?;
+        let file_spec = state.spec.files.get(file_idx)?;
+        let seg_spec = file_spec
+            .segments
+            .iter()
+            .find(|seg| seg.ordinal == segment_id.segment_number)?;
+        Some(DownloadWork {
+            segment_id,
+            message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
+            groups: file_spec.groups.clone(),
+            priority: file_spec.role.download_priority(),
+            byte_estimate: seg_spec.bytes,
+            retry_count,
+            is_recovery: file_spec.role.is_recovery(),
+            exclude_servers,
+        })
+    }
+
+    fn schedule_centralized_download_work_without_retry_budget(
+        &mut self,
+        segment_id: SegmentId,
+        retry_count: u32,
+        exclude_servers: Vec<usize>,
+        delay: Option<Duration>,
+        failure_kind: DownloadFailureKind,
+    ) -> bool {
+        let Some(work) = self.download_retry_work(segment_id, retry_count, exclude_servers) else {
+            return false;
+        };
+        self.note_retry_scheduled(segment_id);
+        let scheduled_pool_generation = self.pool_generation;
+        self.note_infrastructure_retry_scheduled(segment_id.file_id.job_id, failure_kind, delay);
+        self.schedule_infrastructure_retry(
+            delay,
+            RetryWork {
+                scheduled_pool_generation,
+                infrastructure_retry: true,
+                work,
+            },
+        );
+        true
+    }
+
     pub(in crate::pipeline::download::worker) fn schedule_download_work_without_retry_budget(
         &mut self,
         segment_id: SegmentId,
@@ -83,37 +180,16 @@ impl Pipeline {
         quota_rejection: Option<weaver_nntp::transfer::QuotaRejection>,
     ) -> bool {
         let job_id = segment_id.file_id.job_id;
-        let file_idx = segment_id.file_id.file_index as usize;
-        let Some(state) = self.jobs.get(&job_id) else {
+        let Some(work) = self.download_retry_work(segment_id, retry_count, exclude_servers) else {
             return false;
-        };
-        let Some(file_spec) = state.spec.files.get(file_idx) else {
-            return false;
-        };
-        let Some(seg_spec) = file_spec
-            .segments
-            .iter()
-            .find(|seg| seg.ordinal == segment_id.segment_number)
-        else {
-            return false;
-        };
-        let work = DownloadWork {
-            segment_id,
-            message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
-            groups: file_spec.groups.clone(),
-            priority: file_spec.role.download_priority(),
-            byte_estimate: seg_spec.bytes,
-            retry_count,
-            is_recovery: file_spec.role.is_recovery(),
-            exclude_servers,
         };
         self.note_retry_scheduled(segment_id);
+        let scheduled_pool_generation = self.pool_generation;
         if wake_on_server_policy_change {
             self.server_quota_parked.insert(segment_id);
             self.refresh_server_quota_block_presentation();
         }
         let retry_tx = self.retry_tx.clone();
-        let scheduled_pool_generation = self.pool_generation;
         let server_transfer_policy = wake_on_server_policy_change
             .then(|| self.shared_state.server_transfer_policy())
             .flatten();
@@ -184,6 +260,7 @@ impl Pipeline {
             let _ = retry_tx
                 .send(crate::pipeline::RetryWork {
                     scheduled_pool_generation,
+                    infrastructure_retry: false,
                     work,
                 })
                 .await;
@@ -193,6 +270,7 @@ impl Pipeline {
 
     pub(crate) fn release_download_result(&mut self, result: &DownloadResult) {
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.release_result");
+        let stale_generation = result.runtime_generation != self.pool_generation;
         let policy_outcome = matches!(
             &result.data,
             Err(DownloadError::Fetch(failure))
@@ -201,7 +279,7 @@ impl Pipeline {
                     DownloadFailureKind::ServerQuota | DownloadFailureKind::Unrequested
                 )
         );
-        if !policy_outcome {
+        if !policy_outcome && !stale_generation {
             self.record_download_lane_observation(result);
         }
         self.active_downloads = self.active_downloads.saturating_sub(1);
@@ -376,6 +454,27 @@ impl Pipeline {
             return;
         }
 
+        if result.runtime_generation != self.pool_generation && result.data.is_err() {
+            let restored = self.restore_download_result_work_without_retry(
+                result.segment_id,
+                result.retry_count,
+                Vec::new(),
+            );
+            self.metrics
+                .nntp_generation_recovery_requeues
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                job_id = job_id.0,
+                segment = %result.segment_id,
+                dispatched_generation = result.runtime_generation,
+                active_generation = self.pool_generation,
+                restored,
+                "returned stale NNTP generation failure without charging retry budget"
+            );
+            self.maybe_finish_download_pass(job_id);
+            return;
+        }
+
         let (excluded_servers, source_server_idx) = {
             let _cpu_scope =
                 crate::runtime::perf_probe::cpu_scope("download.process_done.pre_match");
@@ -520,9 +619,10 @@ impl Pipeline {
                 if matches!(
                     failure.kind,
                     DownloadFailureKind::CapacityUnavailable
-                        | DownloadFailureKind::Transient
+                        | DownloadFailureKind::ConnectionEstablishment
+                        | DownloadFailureKind::EstablishedTransport
                         | DownloadFailureKind::Auth
-                        | DownloadFailureKind::Permanent
+                        | DownloadFailureKind::ContentOrProtocol
                 ) && self
                     .last_body_fetch_failure_log_at
                     .is_none_or(|at| at.elapsed() >= BODY_FETCH_FAILURE_LOG_INTERVAL)
@@ -544,7 +644,7 @@ impl Pipeline {
                         failure.kind,
                         DownloadFailureKind::ArticleNotFound
                             | DownloadFailureKind::Auth
-                            | DownloadFailureKind::Permanent
+                            | DownloadFailureKind::ContentOrProtocol
                     )
                 {
                     if self.restore_download_result_work_without_retry(
@@ -645,9 +745,13 @@ impl Pipeline {
                     // than every server's retention window hits exactly this.
                     // Book it as missing instead.
                     let server_count = self.nntp.pool().server_count();
-                    if server_count > 0
-                        && self.unavailable_server_count(job_id, &excluded_servers) >= server_count
-                    {
+                    let retention_excludes = self.job_retention_excludes(job_id);
+                    let unavailable_server_count = Self::unavailable_server_count_from_excludes(
+                        server_count,
+                        &excluded_servers,
+                        &retention_excludes,
+                    );
+                    if server_count > 0 && unavailable_server_count >= server_count {
                         self.metrics
                             .articles_not_found
                             .fetch_add(1, Ordering::Relaxed);
@@ -663,19 +767,33 @@ impl Pipeline {
                     // rather than saturation (empty order, not just busy
                     // permits), surface it — a fill server stuck in
                     // auth-disable cycles otherwise stalls the queue silently.
+                    let availability = self
+                        .nntp
+                        .body_server_availability(&excluded_servers, &retention_excludes, 0)
+                        .await;
+                    let retry_delay = match availability {
+                        weaver_nntp::pool::BodyServerAvailability::Eligible => {
+                            Some(BODY_LANE_UNAVAILABLE_RETRY_DELAY)
+                        }
+                        weaver_nntp::pool::BodyServerAvailability::WaitingUntil(delay) => {
+                            Some(delay)
+                        }
+                        weaver_nntp::pool::BodyServerAvailability::Blocked => None,
+                    };
                     if self
                         .last_no_eligible_server_warn
                         .is_none_or(|at| at.elapsed() >= NO_ELIGIBLE_SERVER_WARN_INTERVAL)
                     {
-                        let effective = self.effective_exclude_servers(job_id, &excluded_servers);
-                        let eligible_servers = self.nntp.body_server_order(&effective).await;
                         self.last_no_eligible_server_warn = Some(Instant::now());
-                        if eligible_servers.is_empty() {
+                        if !matches!(
+                            availability,
+                            weaver_nntp::pool::BodyServerAvailability::Eligible
+                        ) {
                             warn!(
                                 job_id = job_id.0,
                                 segment = %result.segment_id,
                                 configured_server_count = server_count,
-                                excluded_server_count = effective.len(),
+                                excluded_server_count = unavailable_server_count,
                                 error = %failure.message,
                                 "downloads waiting: no eligible news server (cooling down, disabled, or outside retention); check server health and credentials"
                             );
@@ -684,8 +802,7 @@ impl Pipeline {
                                 job_id = job_id.0,
                                 segment = %result.segment_id,
                                 configured_server_count = server_count,
-                                eligible_server_count = eligible_servers.len(),
-                                excluded_server_count = effective.len(),
+                                excluded_server_count = unavailable_server_count,
                                 retry_delay_ms = BODY_LANE_UNAVAILABLE_RETRY_DELAY.as_millis() as u64,
                                 error = %failure.message,
                                 "BODY lane acquisition failed; download work will retry"
@@ -695,19 +812,18 @@ impl Pipeline {
                     self.metrics
                         .download_failures_capacity_unavailable
                         .fetch_add(1, Ordering::Relaxed);
-                    if self.schedule_download_work_without_retry_budget(
+                    if self.schedule_centralized_download_work_without_retry_budget(
                         result.segment_id,
                         result.retry_count,
                         excluded_servers,
-                        Some(BODY_LANE_UNAVAILABLE_RETRY_DELAY),
-                        false,
-                        None,
+                        retry_delay,
+                        DownloadFailureKind::LaneUnavailable,
                     ) {
                         debug!(
                             job_id = job_id.0,
                             segment = %result.segment_id,
                             retry_count = result.retry_count,
-                            retry_delay_ms = BODY_LANE_UNAVAILABLE_RETRY_DELAY.as_millis() as u64,
+                            retry_delay_ms = ?retry_delay.map(|delay| delay.as_millis() as u64),
                             error = %failure.message,
                             "body lane unavailable; requeued without consuming article retry budget"
                         );
@@ -730,11 +846,12 @@ impl Pipeline {
                     | DownloadFailureKind::ServerQuota
                     | DownloadFailureKind::CapacityUnavailable
                     | DownloadFailureKind::LaneUnavailable
-                    | DownloadFailureKind::Transient
+                    | DownloadFailureKind::ConnectionEstablishment
+                    | DownloadFailureKind::EstablishedTransport
                     | DownloadFailureKind::Unrequested => {
                         crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage
                     }
-                    DownloadFailureKind::Permanent => {
+                    DownloadFailureKind::ContentOrProtocol => {
                         crate::jobs::SemanticTerminalCause::DecodeOrCorruptData
                     }
                 };
@@ -750,7 +867,8 @@ impl Pipeline {
                         .download_failures_capacity_unavailable
                         .fetch_add(1, Ordering::Relaxed),
                     DownloadFailureKind::Unrequested | DownloadFailureKind::ServerQuota => 0,
-                    DownloadFailureKind::Transient => self
+                    DownloadFailureKind::ConnectionEstablishment
+                    | DownloadFailureKind::EstablishedTransport => self
                         .metrics
                         .download_failures_transient
                         .fetch_add(1, Ordering::Relaxed),
@@ -758,7 +876,7 @@ impl Pipeline {
                         .metrics
                         .download_failures_auth
                         .fetch_add(1, Ordering::Relaxed),
-                    DownloadFailureKind::Permanent => self
+                    DownloadFailureKind::ContentOrProtocol => self
                         .metrics
                         .download_failures_permanent
                         .fetch_add(1, Ordering::Relaxed),
@@ -811,9 +929,8 @@ impl Pipeline {
                     self.book_failed_segment(result.segment_id);
                 } else {
                     let seg_id = result.segment_id;
-                    let capacity_unavailable =
-                        failure.kind == DownloadFailureKind::CapacityUnavailable;
-                    let next_retry = if capacity_unavailable || source_not_found {
+                    let preserves_retry_budget = failure.kind.preserves_article_retry_budget();
+                    let next_retry = if preserves_retry_budget || source_not_found {
                         result.retry_count
                     } else {
                         result.retry_count + 1
@@ -855,7 +972,7 @@ impl Pipeline {
                             self.metrics
                                 .segments_retried
                                 .fetch_add(1, Ordering::Relaxed);
-                            let delay = if capacity_unavailable {
+                            let delay = if preserves_retry_budget {
                                 std::time::Duration::from_secs(1)
                             } else if source_not_found {
                                 std::time::Duration::ZERO
@@ -863,6 +980,13 @@ impl Pipeline {
                                 std::time::Duration::from_secs(1 << (next_retry - 1))
                             };
                             self.note_retry_scheduled(seg_id);
+                            if preserves_retry_budget {
+                                self.note_infrastructure_retry_scheduled(
+                                    seg_id.file_id.job_id,
+                                    failure.kind,
+                                    Some(delay),
+                                );
+                            }
                             debug!(
                                 segment = %seg_id,
                                 error = %failure.message,
@@ -870,17 +994,21 @@ impl Pipeline {
                                 delay_secs = delay.as_secs(),
                                 "download failed, scheduling retry"
                             );
-                            let retry_tx = self.retry_tx.clone();
                             let scheduled_pool_generation = self.pool_generation;
-                            tokio::spawn(async move {
-                                tokio::time::sleep(delay).await;
-                                let _ = retry_tx
-                                    .send(crate::pipeline::RetryWork {
-                                        scheduled_pool_generation,
-                                        work,
-                                    })
-                                    .await;
-                            });
+                            let retry = crate::pipeline::RetryWork {
+                                scheduled_pool_generation,
+                                infrastructure_retry: preserves_retry_budget,
+                                work,
+                            };
+                            if preserves_retry_budget {
+                                self.schedule_infrastructure_retry(Some(delay), retry);
+                            } else {
+                                let retry_tx = self.retry_tx.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(delay).await;
+                                    let _ = retry_tx.send(retry).await;
+                                });
+                            }
                         }
                     } else {
                         warn!(

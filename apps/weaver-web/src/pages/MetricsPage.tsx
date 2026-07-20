@@ -49,6 +49,10 @@ interface ServerHealthEntry {
   state: string;
   connectionsActive: number;
   connectionsMax: number;
+  connectionsConfigured: number;
+  connectionsEffective: number;
+  capacityPenaltyUntilEpochMs: number | null;
+  runtimeGeneration: number;
   latencyMs: number;
   successCount: number;
   failureCount: number;
@@ -333,9 +337,11 @@ export function MetricsPage() {
                   const dotClass = SERVER_STATE_DOT_CLASS[server.state] ?? "bg-muted-foreground";
                   const active = server.connectionsActive > 0 && server.state !== "disabled";
                   const connPct =
-                    server.connectionsMax > 0
-                      ? (server.connectionsActive / server.connectionsMax) * 100
+                    server.connectionsEffective > 0
+                      ? (server.connectionsActive / server.connectionsEffective) * 100
                       : 0;
+                  const capacityReduced =
+                    server.connectionsEffective < server.connectionsConfigured;
                   const latencyClass =
                     server.latencyMs < 80
                       ? "text-status-completed"
@@ -374,13 +380,18 @@ export function MetricsPage() {
                           {server.label}
                         </div>
                       </div>
-                      <div className="hidden w-32 shrink-0 sm:block">
+                      <div className="hidden w-40 shrink-0 sm:block">
                         <div className="flex items-center justify-between text-[10.5px] text-muted-foreground">
                           <span>{t("metrics.serverConns")}</span>
                           <span className="font-semibold tabular-nums text-foreground">
-                            {server.connectionsActive} / {server.connectionsMax}
+                            {server.connectionsActive} / {server.connectionsEffective}
                           </span>
                         </div>
+                        {capacityReduced ? (
+                          <div className="mt-0.5 text-right text-[9px] tabular-nums text-status-paused">
+                            configured {server.connectionsConfigured}
+                          </div>
+                        ) : null}
                         <div className="mt-1.5 h-1.5 overflow-hidden rounded-pill bg-secondary">
                           <div
                             className="h-full rounded-pill bg-status-downloading transition-[width] duration-500 motion-reduce:transition-none"

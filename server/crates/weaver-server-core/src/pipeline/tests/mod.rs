@@ -63,6 +63,19 @@ struct TestHarness {
 
 impl TestHarness {
     async fn new() -> Self {
+        Self::new_with_nntp(
+            NntpClient::new(NntpClientConfig {
+                servers: vec![],
+                max_idle_age: Duration::from_secs(1),
+                max_retries_per_server: 1,
+                soft_timeout: Duration::from_secs(15),
+            }),
+            0,
+        )
+        .await
+    }
+
+    async fn new_with_nntp(nntp: NntpClient, total_connections: usize) -> Self {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join("data");
         let intermediate_dir = temp_dir.path().join("intermediate");
@@ -91,12 +104,6 @@ impl TestHarness {
         let shared_state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
         let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
 
-        let nntp = NntpClient::new(NntpClientConfig {
-            servers: vec![],
-            max_idle_age: Duration::from_secs(1),
-            max_retries_per_server: 1,
-            soft_timeout: Duration::from_secs(15),
-        });
         let profile = SystemProfile {
             cpu: CpuProfile {
                 physical_cores: 4,
@@ -132,7 +139,7 @@ impl TestHarness {
             data_dir.clone(),
             intermediate_dir,
             complete_dir,
-            0,
+            total_connections,
             4,
             vec![],
             false,
@@ -241,6 +248,8 @@ fn finished_job_info(job_id: JobId) -> JobInfo {
         job_hash: Some([0; 32]),
         name: format!("finished-{}", job_id.0),
         error: None,
+        download_wait_reason: None,
+        download_retry_at_epoch_ms: None,
         status: JobStatus::Complete,
         download_state: crate::jobs::model::DownloadState::Complete,
         post_state: crate::jobs::model::PostState::Idle,

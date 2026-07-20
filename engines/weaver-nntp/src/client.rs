@@ -8,14 +8,16 @@ use bytes::Bytes;
 use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use tokio::time::Instant as TokioInstant;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 use weaver_yenc::{DecodeResult as YencDecodeResult, YencError};
 
 use crate::connection::ServerConfig;
 use crate::error::{NntpError, Result};
 use crate::fused_yenc::{FusedYencArticleStats, FusedYencError};
 use crate::health::{CooldownReason, ServerState};
-use crate::pool::{NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig};
+use crate::pool::{
+    BodyServerAvailability, NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig,
+};
 use crate::tls::TransportReadStats;
 use crate::transfer::{
     ActiveTransferBudget, QuotaRejection, ServerTransferSnapshot, StableServerId,
@@ -792,6 +794,17 @@ impl NntpClient {
         self.body_server_selection(exclude).await.eligible
     }
 
+    pub async fn body_server_availability(
+        &self,
+        failure_excludes: &[usize],
+        retention_excludes: &[usize],
+        requested_body_bytes: u64,
+    ) -> BodyServerAvailability {
+        self.pool
+            .body_server_availability(failure_excludes, retention_excludes, requested_body_bytes)
+            .await
+    }
+
     pub async fn body_server_selection(&self, exclude: &[usize]) -> BodyServerSelection {
         self.body_server_selection_with_estimate(exclude, 0).await
     }
@@ -1186,20 +1199,6 @@ impl NntpClient {
                     last_error = Some(e);
                     continue;
                 }
-                Err(e @ NntpError::SoftTimeout(_)) => {
-                    attempts.push(FetchAttemptTrace {
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::TransientFailure,
-                        error: Some(e.to_string()),
-                    });
-                    if let Some(reason) = cooldown_reason(&e) {
-                        self.record_server_cooldown(idx, reason).await;
-                    }
-                    last_retryable_error = Some(e);
-                    continue;
-                }
                 Err(NntpError::AuthenticationFailed)
                 | Err(NntpError::AuthenticationRejected)
                 | Err(NntpError::AccessDenied) => {
@@ -1222,9 +1221,7 @@ impl NntpClient {
                         outcome: FetchAttemptOutcome::TransientFailure,
                         error: Some(e.to_string()),
                     });
-                    if let Some(reason) = cooldown_reason(&e) {
-                        self.record_server_cooldown(idx, reason).await;
-                    }
+                    self.record_transient_server_failure(idx, &e).await;
                     last_retryable_error = Some(e);
                     continue;
                 }
@@ -1836,20 +1833,6 @@ impl NntpClient {
                 *last_error = Some(DecodedBodyError::Nntp(error));
                 DecodedBatchDisposition::Retry
             }
-            Err(DecodedBodyError::Nntp(e @ NntpError::SoftTimeout(_))) => {
-                attempts.push(FetchAttemptTrace {
-                    server_idx,
-                    remote_ip,
-                    elapsed,
-                    outcome: FetchAttemptOutcome::TransientFailure,
-                    error: Some(e.to_string()),
-                });
-                if let Some(reason) = cooldown_reason(&e) {
-                    self.record_server_cooldown(server_idx, reason).await;
-                }
-                *last_error = Some(DecodedBodyError::Nntp(e));
-                DecodedBatchDisposition::Retry
-            }
             Err(DecodedBodyError::Nntp(
                 NntpError::AuthenticationFailed
                 | NntpError::AuthenticationRejected
@@ -1874,9 +1857,7 @@ impl NntpClient {
                     outcome: FetchAttemptOutcome::TransientFailure,
                     error: Some(e.to_string()),
                 });
-                if let Some(reason) = cooldown_reason(&e) {
-                    self.record_server_cooldown(server_idx, reason).await;
-                }
+                self.record_transient_server_failure(server_idx, &e).await;
                 *last_error = Some(DecodedBodyError::Nntp(e));
                 DecodedBatchDisposition::Retry
             }
@@ -1976,20 +1957,6 @@ impl NntpClient {
                     last_error = Some(DecodedBodyError::Nntp(e));
                     continue;
                 }
-                Err(DecodedBodyError::Nntp(e @ NntpError::SoftTimeout(_))) => {
-                    attempts.push(FetchAttemptTrace {
-                        server_idx: idx,
-                        remote_ip: None,
-                        elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::TransientFailure,
-                        error: Some(e.to_string()),
-                    });
-                    if let Some(reason) = cooldown_reason(&e) {
-                        self.record_server_cooldown(idx, reason).await;
-                    }
-                    last_retryable_error = Some(DecodedBodyError::Nntp(e));
-                    continue;
-                }
                 Err(DecodedBodyError::Nntp(
                     NntpError::AuthenticationFailed
                     | NntpError::AuthenticationRejected
@@ -2014,9 +1981,7 @@ impl NntpClient {
                         outcome: FetchAttemptOutcome::TransientFailure,
                         error: Some(e.to_string()),
                     });
-                    if let Some(reason) = cooldown_reason(&e) {
-                        self.record_server_cooldown(idx, reason).await;
-                    }
+                    self.record_transient_server_failure(idx, &e).await;
                     last_retryable_error = Some(DecodedBodyError::Nntp(e));
                     continue;
                 }
@@ -2170,7 +2135,7 @@ impl NntpClient {
                     self.pool
                         .health()
                         .blocking_lock()
-                        .record_cooldown(attempt.server_idx, CooldownReason::Transport);
+                        .record_failure(attempt.server_idx, false);
                 }
                 FetchAttemptOutcome::NotFound
                 | FetchAttemptOutcome::QuotaBlocked
@@ -2252,7 +2217,17 @@ impl NntpClient {
     }
 
     fn record_blocking_connect_failure(&self, server_idx: usize, error: &NntpError) {
-        if matches!(
+        if matches!(error, NntpError::TooManyConnections) {
+            if self
+                .pool
+                .record_provider_capacity_rejection(ServerId(server_idx))
+            {
+                self.pool
+                    .health()
+                    .blocking_lock()
+                    .record_cooldown(server_idx, CooldownReason::Capacity);
+            }
+        } else if matches!(
             error,
             NntpError::AuthenticationFailed
                 | NntpError::AuthenticationRejected
@@ -2279,6 +2254,15 @@ impl NntpClient {
     async fn record_server_failure(&self, server_idx: usize, is_auth: bool) {
         let mut health = self.pool.health().lock().await;
         health.record_failure(server_idx, is_auth);
+    }
+
+    async fn record_transient_server_failure(&self, server_idx: usize, error: &NntpError) {
+        if !matches!(
+            error,
+            NntpError::TooManyConnections | NntpError::PoolExhausted | NntpError::PoolShutdown
+        ) {
+            self.record_server_failure(server_idx, false).await;
+        }
     }
 
     async fn record_server_cooldown(&self, server_idx: usize, reason: CooldownReason) {
@@ -2518,19 +2502,6 @@ impl NntpClient {
                     last_error = Some(e);
                     continue;
                 }
-                Err(e @ NntpError::SoftTimeout(_)) => {
-                    warn!(
-                        server = idx,
-                        error = %e,
-                        message_id,
-                        "soft timeout, trying next server"
-                    );
-                    if let Some(reason) = cooldown_reason(&e) {
-                        self.record_server_cooldown(idx, reason).await;
-                    }
-                    last_retryable_error = Some(e);
-                    continue;
-                }
                 Err(NntpError::AuthenticationFailed)
                 | Err(NntpError::AuthenticationRejected)
                 | Err(NntpError::AccessDenied) => {
@@ -2543,15 +2514,20 @@ impl NntpClient {
                     continue;
                 }
                 Err(e) if is_transient(&e) => {
-                    warn!(
-                        server = idx,
-                        error = %e,
-                        message_id,
-                        "transient error, trying next server"
-                    );
-                    if let Some(reason) = cooldown_reason(&e) {
-                        self.record_server_cooldown(idx, reason).await;
+                    if matches!(e, NntpError::TooManyConnections) {
+                        trace!(
+                            server = idx,
+                            message_id, "provider capacity rejected connection"
+                        );
+                    } else {
+                        warn!(
+                            server = idx,
+                            error = %e,
+                            message_id,
+                            "transient error, trying next server"
+                        );
                     }
+                    self.record_transient_server_failure(idx, &e).await;
                     last_retryable_error = Some(e);
                     continue;
                 }
@@ -3024,7 +3000,7 @@ fn cooldown_reason(err: &NntpError) -> Option<CooldownReason> {
         | NntpError::MalformedMultilineTerminator
         | NntpError::ServiceUnavailable
         | NntpError::SoftTimeout(_) => Some(CooldownReason::Transport),
-        NntpError::TooManyConnections => Some(CooldownReason::Capacity),
+        NntpError::TooManyConnections => None,
         NntpError::PoolExhausted => None,
         _ => None,
     }
@@ -3552,6 +3528,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn infrastructure_admission_failures_do_not_poison_server_health() {
+        let client = NntpClient::new(NntpClientConfig::single(
+            ServerConfig {
+                host: "news.example.com".into(),
+                ..Default::default()
+            },
+            5,
+        ));
+
+        for error in [
+            NntpError::TooManyConnections,
+            NntpError::PoolExhausted,
+            NntpError::PoolShutdown,
+        ] {
+            client.record_transient_server_failure(0, &error).await;
+        }
+        assert_eq!(
+            client.pool().health().lock().await.server(0).failure_count,
+            0
+        );
+
+        client
+            .record_transient_server_failure(0, &NntpError::SoftTimeout(15))
+            .await;
+        assert_eq!(
+            client.pool().health().lock().await.server(0).failure_count,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn all_async_fetch_families_keep_capacity_rejections_out_of_health() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let _ = socket.write_all(b"502 Too Many Connections\r\n").await;
+                });
+            }
+        });
+        let client = NntpClient::new(NntpClientConfig::single(
+            ServerConfig {
+                host: "127.0.0.1".into(),
+                port,
+                tls: false,
+                ..Default::default()
+            },
+            64,
+        ));
+
+        assert!(client.fetch_body("<test>").await.is_err());
+        assert_eq!(
+            client.pool().health().lock().await.server(0).failure_count,
+            0,
+            "BODY"
+        );
+        assert!(
+            client
+                .fetch_body_decoded_with_groups("<test>", &[])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            client.pool().health().lock().await.server(0).failure_count,
+            0,
+            "decoded BODY"
+        );
+        assert!(client.stat_many(&["<test>"]).await.is_err());
+        assert_eq!(
+            client.pool().health().lock().await.server(0).failure_count,
+            0,
+            "STAT"
+        );
+        assert!(client.fetch_head("<test>").await.is_err());
+        assert_eq!(
+            client.pool().health().lock().await.server(0).failure_count,
+            0,
+            "HEAD"
+        );
+        assert!(client.fetch_article("<test>").await.is_err());
+
+        let health = client.pool().health().lock().await;
+        assert_eq!(health.server(0).failure_count, 0);
+        assert_eq!(health.server(0).consecutive_failures, 0);
+        drop(health);
+        let reductions = client.pool().capacity_reductions(ServerId(0)).unwrap();
+        assert!(reductions >= 5);
+        assert_eq!(
+            client.pool().effective_connections(ServerId(0)),
+            Some(64 - reductions as usize)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn blocking_tls_capacity_rejection_reduces_once_without_health_poisoning() {
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_blocking_s2n_server(563, 8)],
+            max_idle_age: Duration::from_secs(30),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(15),
+        });
+
+        client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
+
+        assert_eq!(client.pool().effective_connections(ServerId(0)), Some(7));
+        assert_eq!(client.pool().capacity_reductions(ServerId(0)), Some(1));
+        let health = client.pool().health().lock().await;
+        assert_eq!(health.server(0).failure_count, 0);
+        assert_eq!(health.server(0).consecutive_failures, 0);
+    }
+
+    #[tokio::test]
     async fn client_shutdown() {
         let config = NntpClientConfig::single(
             ServerConfig {
@@ -3584,10 +3675,7 @@ mod tests {
             cooldown_reason(&NntpError::SoftTimeout(15)),
             Some(CooldownReason::Transport)
         );
-        assert_eq!(
-            cooldown_reason(&NntpError::TooManyConnections),
-            Some(CooldownReason::Capacity)
-        );
+        assert_eq!(cooldown_reason(&NntpError::TooManyConnections), None);
         assert_eq!(cooldown_reason(&NntpError::PoolExhausted), None);
         assert_eq!(
             cooldown_reason(&NntpError::Timeout),
@@ -4470,13 +4558,14 @@ mod tests {
                 .is_some_and(|error| error.contains("soft timeout"))
         );
         assert_eq!(trace.attempts[1].outcome, FetchAttemptOutcome::Success);
+        let health = client.pool.health().lock().await;
+        let primary = health.server(0);
         assert!(matches!(
-            client.pool.health().lock().await.server(0).state(),
-            crate::health::ServerState::CoolingDown {
-                reason: CooldownReason::Transport,
-                ..
-            }
+            primary.state(),
+            crate::health::ServerState::Healthy
         ));
+        assert_eq!(primary.failure_count, 1);
+        assert_eq!(primary.consecutive_failures, 1);
     }
 
     #[tokio::test]

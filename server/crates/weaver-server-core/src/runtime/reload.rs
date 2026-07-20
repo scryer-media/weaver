@@ -1,7 +1,7 @@
 use crate::Database;
-use crate::SchedulerHandle;
 use crate::servers::probe_server_connection;
 use crate::settings::{Config, SharedConfig};
+use crate::{NntpRuntimeActivation, SchedulerError, SchedulerHandle};
 
 pub async fn load_global_pause_from_db(db: &Database) -> Result<bool, String> {
     let db = db.clone();
@@ -72,57 +72,40 @@ pub async fn refresh_server_capabilities_from_config(config: &SharedConfig, db: 
     }
 }
 
-pub async fn rebuild_nntp_from_config(config: &SharedConfig, handle: &SchedulerHandle) {
+pub async fn rebuild_nntp_from_config(
+    config: &SharedConfig,
+    handle: &SchedulerHandle,
+) -> Result<NntpRuntimeActivation, SchedulerError> {
     use weaver_nntp::client::{NntpClient, NntpClientConfig};
     use weaver_nntp::pool::ServerPoolConfig;
-    use weaver_nntp::transfer::{ServerTransferRegistry, StableServerId};
+    use weaver_nntp::transfer::StableServerId;
 
-    let policy_registry = handle.server_transfer_policy();
-    let transfer_registry = policy_registry
-        .as_ref()
-        .map(|registry| registry.transfer_registry())
-        .unwrap_or_else(|| std::sync::Arc::new(ServerTransferRegistry::new()));
+    let policy_registry = handle.server_transfer_policy().ok_or_else(|| {
+        SchedulerError::Internal("server transfer policy registry unavailable".to_string())
+    })?;
+    let transfer_registry = policy_registry.transfer_registry();
 
     let configured_servers = config.read().await.servers.clone();
-    let policies_ready = match policy_registry.as_ref() {
-        Some(registry) => {
-            let registry = std::sync::Arc::clone(registry);
-            let servers = configured_servers.clone();
-            match tokio::task::spawn_blocking(move || registry.reconfigure(&servers)).await {
-                Ok(Ok(())) => true,
-                Ok(Err(error)) => {
-                    tracing::error!(
-                        error = %error,
-                        "failed to reconfigure server transfer policies; disabling NNTP servers for this runtime generation"
-                    );
-                    false
-                }
-                Err(error) => {
-                    tracing::error!(
-                        error = %error,
-                        "server transfer policy reconfiguration task failed; disabling NNTP servers for this runtime generation"
-                    );
-                    false
-                }
-            }
-        }
-        None => {
-            tracing::error!(
-                "server transfer policy registry unavailable; disabling NNTP servers for this runtime generation"
-            );
-            false
-        }
-    };
+    let registry = std::sync::Arc::clone(&policy_registry);
+    let servers = configured_servers.clone();
+    tokio::task::spawn_blocking(move || registry.reconfigure(&servers))
+        .await
+        .map_err(|error| {
+            SchedulerError::Internal(format!(
+                "server transfer policy reconfiguration task failed: {error}"
+            ))
+        })?
+        .map_err(|error| {
+            SchedulerError::Internal(format!(
+                "failed to reconfigure server transfer policies: {error}"
+            ))
+        })?;
 
     let (client, total) = {
-        let mut active: Vec<&crate::servers::ServerConfig> = if policies_ready {
-            configured_servers
-                .iter()
-                .filter(|server| server.active)
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let mut active: Vec<&crate::servers::ServerConfig> = configured_servers
+            .iter()
+            .filter(|server| server.active)
+            .collect();
         active.sort_by_key(|server| (server.priority, server.id));
         let servers: Vec<ServerPoolConfig> = active
             .iter()
@@ -149,7 +132,6 @@ pub async fn rebuild_nntp_from_config(config: &SharedConfig, handle: &SchedulerH
         tracing::info!(
             active_server_count = servers.len(),
             total_connections = total,
-            policies_ready,
             "building NNTP runtime generation"
         );
         let client = NntpClient::new(NntpClientConfig {
@@ -162,10 +144,9 @@ pub async fn rebuild_nntp_from_config(config: &SharedConfig, handle: &SchedulerH
     };
 
     let pool = std::sync::Arc::clone(client.pool());
-    match handle.rebuild_nntp(client, total).await {
-        Ok(()) => handle.set_nntp_pool(pool),
-        Err(error) => tracing::error!("failed to rebuild NNTP client: {error}"),
-    }
+    let activation = handle.rebuild_nntp(client, total).await?;
+    handle.set_nntp_pool(pool);
+    Ok(activation)
 }
 
 pub async fn reload_runtime_from_db(
@@ -191,7 +172,9 @@ pub async fn reload_runtime_from_db(
     }
 
     refresh_server_capabilities_from_config(config, db).await;
-    rebuild_nntp_from_config(config, handle).await;
+    rebuild_nntp_from_config(config, handle)
+        .await
+        .map_err(|error| error.to_string())?;
     handle
         .set_speed_limit(loaded.max_download_speed.unwrap_or(0))
         .await
@@ -223,7 +206,6 @@ mod tests {
 
     use super::*;
     use crate::events::model::PipelineEvent;
-    use crate::jobs::SchedulerCommand;
     use crate::persistence::sql_runtime::SqlRuntime;
     use crate::servers::{ServerConfig, ServerDownloadQuotaConfig};
     use crate::{PipelineMetrics, SharedPipelineState};
@@ -249,7 +231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_reconfigure_failure_rebuilds_with_servers_disabled() {
+    async fn policy_reconfigure_failure_preserves_prior_generation() {
         let db = Database::open_in_memory().unwrap();
         let server = server(41);
         db.insert_server(&server).unwrap();
@@ -294,31 +276,16 @@ mod tests {
         let state = SharedPipelineState::new(PipelineMetrics::new(), Vec::new());
         let handle = SchedulerHandle::new(cmd_tx, event_tx, state);
         handle.set_server_transfer_policy(policy);
-        let command_task = tokio::spawn(async move {
-            let Some(SchedulerCommand::RebuildNntp {
-                client,
-                total_connections,
-                reply,
-            }) = cmd_rx.recv().await
-            else {
-                panic!("expected NNTP rebuild command");
-            };
-            let client = client
-                .downcast::<weaver_nntp::client::NntpClient>()
-                .expect("rebuild must carry an NNTP client");
-            assert_eq!(total_connections, 0);
-            assert_eq!(client.pool().server_count(), 0);
-            let _ = reply.send(());
-        });
-
-        rebuild_nntp_from_config(&config, &handle).await;
-        command_task.await.unwrap();
-
-        assert_eq!(handle.nntp_pool().unwrap().server_count(), 0);
+        let error = rebuild_nntp_from_config(&config, &handle)
+            .await
+            .expect_err("policy failure must not replace the active generation");
+        assert!(error.to_string().contains("transfer policies"));
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(handle.nntp_pool().is_none());
     }
 
     #[tokio::test]
-    async fn missing_policy_registry_rebuilds_with_servers_disabled() {
+    async fn missing_policy_registry_preserves_prior_generation() {
         let config: SharedConfig = Arc::new(RwLock::new(Config {
             data_dir: "/tmp/weaver-runtime-reload-missing-policy-test".to_string(),
             intermediate_dir: None,
@@ -340,26 +307,11 @@ mod tests {
         let (event_tx, _) = broadcast::channel::<PipelineEvent>(1);
         let state = SharedPipelineState::new(PipelineMetrics::new(), Vec::new());
         let handle = SchedulerHandle::new(cmd_tx, event_tx, state);
-        let command_task = tokio::spawn(async move {
-            let Some(SchedulerCommand::RebuildNntp {
-                client,
-                total_connections,
-                reply,
-            }) = cmd_rx.recv().await
-            else {
-                panic!("expected NNTP rebuild command");
-            };
-            let client = client
-                .downcast::<weaver_nntp::client::NntpClient>()
-                .expect("rebuild must carry an NNTP client");
-            assert_eq!(total_connections, 0);
-            assert_eq!(client.pool().server_count(), 0);
-            let _ = reply.send(());
-        });
-
-        rebuild_nntp_from_config(&config, &handle).await;
-        command_task.await.unwrap();
-
-        assert_eq!(handle.nntp_pool().unwrap().server_count(), 0);
+        let error = rebuild_nntp_from_config(&config, &handle)
+            .await
+            .expect_err("missing policy registry must not replace the active generation");
+        assert!(error.to_string().contains("registry unavailable"));
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(handle.nntp_pool().is_none());
     }
 }

@@ -758,6 +758,8 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         metadata,
         output_dir: row.output_dir.clone(),
         error,
+        download_wait_reason: None,
+        download_retry_at_epoch_ms: None,
         created_at_epoch_ms: row.created_at as f64 * 1000.0,
     }
 }

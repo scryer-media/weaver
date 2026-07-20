@@ -112,6 +112,8 @@ pub async fn recover_server_state(
                 } else {
                     None
                 },
+                download_wait_reason: None,
+                download_retry_at_epoch_ms: None,
                 status,
                 download_state,
                 post_state,
@@ -265,6 +267,8 @@ pub async fn recover_server_state(
                     }),
                     name: row.name,
                     error: history_error,
+                    download_wait_reason: None,
+                    download_retry_at_epoch_ms: None,
                     status,
                     download_state,
                     post_state,

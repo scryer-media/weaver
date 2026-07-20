@@ -30,7 +30,8 @@ pub use duplicate_persistence::{
 pub use error::SchedulerError;
 pub use handle::{
     AddJobOptions, DownloadBlockKind, DownloadBlockState, FINISHED_JOBS_RUNTIME_CAP, JobInfo,
-    QueueMoveTarget, RestoreJobRequest, SchedulerCommand, SchedulerHandle, SharedPipelineState,
+    NntpRuntimeActivation, QueueMoveTarget, RestoreJobRequest, SchedulerCommand, SchedulerHandle,
+    SharedPipelineState,
 };
 pub use ids::{ConnectionId, JobId, MessageId, NzbFileId, SegmentId, ServerId};
 pub use model::{

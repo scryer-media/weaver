@@ -194,6 +194,7 @@ impl TestHarness {
             )
             .expect("failed to create server transfer policy registry"),
         );
+        handle.set_server_transfer_policy(Arc::clone(&server_transfer_policy));
 
         let scheduled_resume =
             weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
@@ -472,6 +473,7 @@ fn spawn_test_scheduler(
 
     let task = tokio::spawn(async move {
         let mut jobs: HashMap<JobId, JobState> = HashMap::new();
+        let mut nntp_generation = 0u64;
 
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
@@ -593,8 +595,32 @@ fn spawn_test_scheduler(
                 SchedulerCommand::SetBandwidthCapPolicy { reply, .. } => {
                     let _ = reply.send(Ok(()));
                 }
-                SchedulerCommand::RebuildNntp { reply, .. } => {
-                    let _ = reply.send(());
+                SchedulerCommand::RebuildNntp {
+                    client,
+                    total_connections,
+                    reply,
+                } => {
+                    let activation = client
+                        .downcast::<weaver_nntp::NntpClient>()
+                        .map_err(|_| {
+                            weaver_server_core::SchedulerError::Internal(
+                                "invalid NNTP client type".to_owned(),
+                            )
+                        })
+                        .map(|client| {
+                            nntp_generation = nntp_generation.wrapping_add(1);
+                            weaver_server_core::NntpRuntimeActivation {
+                                generation: nntp_generation,
+                                configured_connections: total_connections,
+                                effective_connections: client
+                                    .pool()
+                                    .effective_connection_capacity(),
+                            }
+                        });
+                    if let Ok(activation) = activation {
+                        scheduler_state.set_nntp_runtime_activation(activation);
+                    }
+                    let _ = reply.send(activation);
                 }
                 SchedulerCommand::UpdateRuntimePaths { reply, .. } => {
                     let _ = reply.send(Ok(()));
@@ -762,6 +788,8 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             } else {
                 None
             },
+            download_wait_reason: None,
+            download_retry_at_epoch_ms: None,
             status: state.status.clone(),
             download_state: state.download_state,
             post_state: state.post_state,

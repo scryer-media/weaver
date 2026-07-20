@@ -458,6 +458,8 @@ fn job_info_from_spec(job_id: JobId, spec: JobSpec) -> JobInfo {
         metadata: spec.metadata,
         output_dir: None,
         error: None,
+        download_wait_reason: None,
+        download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
     }
 }
@@ -530,6 +532,8 @@ fn nzbget_test_job(
         metadata,
         output_dir: Some("/downloads/tv/Friends".into()),
         error: None,
+        download_wait_reason: None,
+        download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
     }
 }
@@ -3587,6 +3591,13 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         disk_write_latency_us: 16,
         segments_retried: 17,
         segments_failed_permanent: 18,
+        parked_infrastructure_work: 29,
+        nntp_generation_recovery_requeues: 30,
+        nntp_capacity_probe_attempts_total: 31,
+        nntp_capacity_probe_successes_total: 32,
+        nntp_capacity_probe_rejections_total: 33,
+        nntp_capacity_probe_transport_failures_total: 34,
+        nntp_capacity_probe_stale_generation_total: 35,
         download_failures_article_not_found: 24,
         download_failures_capacity_unavailable: 25,
         download_failures_transient: 26,
@@ -3622,6 +3633,8 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         metadata: Vec::new(),
         output_dir: None,
         error: None,
+        download_wait_reason: None,
+        download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
     }];
 
@@ -3643,6 +3656,7 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
             scheduled_speed_limit: 0,
         },
         &[],
+        0,
     );
 
     assert!(rendered.contains("weaver_pipeline_paused 1"));
@@ -3717,6 +3731,13 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     assert!(rendered.contains("weaver_pipeline_download_failures_total{kind=\"transient\"} 26"));
     assert!(rendered.contains("weaver_pipeline_download_failures_total{kind=\"auth\"} 27"));
     assert!(rendered.contains("weaver_pipeline_download_failures_total{kind=\"permanent\"} 28"));
+    assert!(rendered.contains("weaver_pipeline_parked_infrastructure_work 29"));
+    assert!(rendered.contains("weaver_nntp_generation_recovery_requeues_total 30"));
+    assert!(rendered.contains("weaver_nntp_capacity_probe_attempts_total 31"));
+    assert!(rendered.contains("weaver_nntp_capacity_probe_successes_total 32"));
+    assert!(rendered.contains("weaver_nntp_capacity_probe_rejections_total 33"));
+    assert!(rendered.contains("weaver_nntp_capacity_probe_transport_failures_total 34"));
+    assert!(rendered.contains("weaver_nntp_capacity_probe_stale_generation_total 35"));
     assert!(rendered.contains(
             "weaver_job_info{job_id=\"42\",job_name=\"Silver Horizon\",status=\"downloading\",category=\"tv\",has_password=\"true\"} 1"
         ));
@@ -3732,6 +3753,7 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
             ..DownloadBlockState::default()
         },
         &[],
+        0,
     );
     assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"server_quota\"} 1"));
     assert!(quota_rendered.contains("weaver_pipeline_download_gate{reason=\"none\"} 0"));
@@ -3849,6 +3871,13 @@ fn renders_prometheus_download_observed_limiter_states() {
         disk_write_latency_us: 0,
         segments_retried: 0,
         segments_failed_permanent: 0,
+        parked_infrastructure_work: 0,
+        nntp_generation_recovery_requeues: 0,
+        nntp_capacity_probe_attempts_total: 0,
+        nntp_capacity_probe_successes_total: 0,
+        nntp_capacity_probe_rejections_total: 0,
+        nntp_capacity_probe_transport_failures_total: 0,
+        nntp_capacity_probe_stale_generation_total: 0,
         download_failures_article_not_found: 0,
         download_failures_capacity_unavailable: 0,
         download_failures_transient: 0,
@@ -3882,21 +3911,35 @@ fn renders_prometheus_download_observed_limiter_states() {
         latency_ms: 0.0,
         connections_available: 0,
         connections_max: 20,
+        connections_configured: 80,
+        capacity_penalty_until_epoch_ms: 0,
+        capacity_reductions: 60,
         premature_deaths: 0,
     }];
 
     let rendered =
-        metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &server_health);
+        metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &server_health, 2);
     assert!(
         rendered
             .contains("weaver_pipeline_download_observed_limiter{limiter=\"network_limited\"} 1")
     );
+    assert!(
+        rendered.contains("weaver_server_connections_configured{server=\"news.example:563\"} 80")
+    );
+    assert!(
+        rendered.contains("weaver_server_connections_effective{server=\"news.example:563\"} 20")
+    );
+    assert!(
+        rendered
+            .contains("weaver_server_capacity_reductions_total{server=\"news.example:563\"} 60")
+    );
+    assert!(rendered.contains("weaver_nntp_runtime_generation 2"));
 
     snapshot.decode_pending_bytes = 128 * 1024 * 1024;
     snapshot.current_download_speed = 30 * 1024 * 1024;
     snapshot.decode_rate_mbps = 5.0;
     let rendered =
-        metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &server_health);
+        metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &server_health, 2);
     assert!(
         rendered
             .contains("weaver_pipeline_download_observed_limiter{limiter=\"decode_lagging\"} 1")
@@ -3911,7 +3954,7 @@ fn renders_prometheus_download_observed_limiter_states() {
     snapshot.current_download_speed = 4 * 1024 * 1024;
     snapshot.decode_rate_mbps = 5.0;
     let rendered =
-        metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &server_health);
+        metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &server_health, 2);
     assert!(
         rendered
             .contains("weaver_pipeline_download_observed_limiter{limiter=\"decode_lagging\"} 1")
@@ -3923,7 +3966,7 @@ fn renders_prometheus_download_observed_limiter_states() {
     snapshot.decode_rate_mbps = 0.0;
     snapshot.download_pressure_state = weaver_server_core::DownloadPressureState::Soft;
     snapshot.download_pressure_reason = weaver_server_core::DownloadPressureReason::Write;
-    let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[]);
+    let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[], 0);
     assert!(
         rendered
             .contains("weaver_pipeline_download_observed_limiter{limiter=\"pressure_limited\"} 1")
@@ -3933,12 +3976,12 @@ fn renders_prometheus_download_observed_limiter_states() {
     snapshot.download_pressure_reason = weaver_server_core::DownloadPressureReason::None;
     snapshot.download_queue_depth = 0;
     snapshot.active_downloads = 0;
-    let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[]);
+    let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[], 0);
     assert!(rendered.contains("weaver_pipeline_download_observed_limiter{limiter=\"idle\"} 1"));
 
     snapshot.download_queue_depth = 242;
     snapshot.recovery_queue_depth = 242;
-    let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[]);
+    let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[], 0);
     assert!(rendered.contains("weaver_pipeline_download_observed_limiter{limiter=\"idle\"} 1"));
     assert!(
         rendered
@@ -3949,7 +3992,7 @@ fn renders_prometheus_download_observed_limiter_states() {
     snapshot.recovery_queue_depth = 0;
     snapshot.download_pressure_state = weaver_server_core::DownloadPressureState::Soft;
     snapshot.download_pressure_reason = weaver_server_core::DownloadPressureReason::Write;
-    let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[]);
+    let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[], 0);
     assert!(rendered.contains("weaver_pipeline_download_observed_limiter{limiter=\"idle\"} 1"));
 }
 

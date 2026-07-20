@@ -247,6 +247,8 @@ fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
         } else {
             None
         },
+        download_wait_reason: None,
+        download_retry_at_epoch_ms: None,
         created_at_epoch_ms: row.created_at as f64 * 1000.0,
     }
 }

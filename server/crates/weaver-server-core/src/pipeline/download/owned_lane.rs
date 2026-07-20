@@ -237,6 +237,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         let stats_before = lane.stats();
         let DownloadBatchLease {
             job_id,
+            runtime_generation,
             lane_mode,
             spillover_loan_kind,
             server_modes,
@@ -265,6 +266,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             if refill_tx
                 .blocking_send(DownloadLaneRefillRequest {
                     job_id,
+                    runtime_generation,
                     server_idx,
                     remote_ip: lane.remote_ip(),
                     supports_pipelining,
@@ -324,6 +326,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                             .expect("owned lane result emitted once per work item");
                         let result = result_from_trace(
                             work,
+                            runtime_generation,
                             trace,
                             DownloadLaneObservation {
                                 server_idx: Some(server_idx),
@@ -387,6 +390,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                         };
                         let result = result_from_trace(
                             work,
+                            runtime_generation,
                             trace,
                             observation,
                             is_recovery,
@@ -416,6 +420,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             for work in works_by_index.into_iter().flatten() {
                 results.push(unresolved_result(
                     work,
+                    runtime_generation,
                     server_idx,
                     actual_mode,
                     supports_pipelining,
@@ -519,6 +524,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 let retry_sent = refill_tx
                     .blocking_send(DownloadLaneRefillRequest {
                         job_id,
+                        runtime_generation,
                         server_idx,
                         remote_ip: lane.remote_ip(),
                         supports_pipelining,
@@ -666,6 +672,7 @@ fn send_owned_batch(
 
 fn result_from_trace(
     work: DownloadWork,
+    runtime_generation: u64,
     trace: weaver_nntp::client::DecodedBodyTrace,
     mut observation: DownloadLaneObservation,
     is_recovery: bool,
@@ -689,6 +696,7 @@ fn result_from_trace(
     }
     DownloadResult {
         segment_id,
+        runtime_generation,
         data,
         attempts,
         lane_observation: Some(observation),
@@ -703,6 +711,7 @@ fn result_from_trace(
 #[allow(clippy::too_many_arguments)]
 fn unresolved_result(
     work: DownloadWork,
+    runtime_generation: u64,
     server_idx: usize,
     mode: DownloadLaneMode,
     supports_pipelining: bool,
@@ -715,8 +724,9 @@ fn unresolved_result(
 ) -> DownloadResult {
     DownloadResult {
         segment_id: work.segment_id,
+        runtime_generation,
         data: Err(DownloadError::Fetch(DownloadFailure::new(
-            DownloadFailureKind::Transient,
+            DownloadFailureKind::EstablishedTransport,
             message,
         ))),
         attempts: Vec::new(),
@@ -808,6 +818,7 @@ mod tests {
         let rejection = control.try_reserve(1).err().unwrap();
         let result = result_from_trace(
             tail_work(6, 0),
+            0,
             weaver_nntp::client::DecodedBodyTrace {
                 attempts: Vec::new(),
                 result: Err(weaver_nntp::client::DecodedBodyError::Nntp(

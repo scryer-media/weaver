@@ -124,6 +124,8 @@ fn job(status: JobStatus) -> JobInfo {
         metadata: Vec::new(),
         output_dir: None,
         error,
+        download_wait_reason: None,
+        download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_000.0,
     }
 }

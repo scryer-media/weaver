@@ -64,7 +64,11 @@ fn test_scheduler_handle(capture: RuntimeCapture) -> SchedulerHandle {
                     let _ = reply.send(Ok(()));
                 }
                 SchedulerCommand::RebuildNntp { reply, .. } => {
-                    let _ = reply.send(());
+                    let _ = reply.send(Ok(crate::NntpRuntimeActivation {
+                        generation: 1,
+                        configured_connections: 0,
+                        effective_connections: 0,
+                    }));
                 }
                 SchedulerCommand::UpdateRuntimePaths {
                     data_dir,

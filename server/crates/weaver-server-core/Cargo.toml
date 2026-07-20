@@ -75,6 +75,11 @@ tokio = { workspace = true }
 tempfile = { workspace = true }
 sevenz-rust2 = { workspace = true }
 axum = { workspace = true }
+criterion = "0.5"
+
+[[bench]]
+name = "infrastructure_retry"
+harness = false
 
 [build-dependencies]
 blake3 = { workspace = true }

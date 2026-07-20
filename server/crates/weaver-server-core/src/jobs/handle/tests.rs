@@ -107,6 +107,8 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             } else {
                 None
             },
+            download_wait_reason: None,
+            download_retry_at_epoch_ms: None,
             status: state.status.clone(),
             download_state: state.download_state,
             post_state: state.post_state,
@@ -362,7 +364,11 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     let _ = reply.send(Ok(()));
                 }
                 SchedulerCommand::RebuildNntp { reply, .. } => {
-                    let _ = reply.send(());
+                    let _ = reply.send(Ok(NntpRuntimeActivation {
+                        generation: 1,
+                        configured_connections: 0,
+                        effective_connections: 0,
+                    }));
                 }
                 SchedulerCommand::UpdateRuntimePaths { reply, .. } => {
                     let _ = reply.send(Ok(()));

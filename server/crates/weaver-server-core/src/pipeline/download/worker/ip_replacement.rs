@@ -311,6 +311,7 @@ impl Pipeline {
             let mode = DownloadLaneMode::Sequential;
             let exclude_servers = lease.compatibility.exclude_servers.clone();
             let job_id = lease.job_id;
+            let runtime_generation = lease.runtime_generation;
             let mut trial_attempts = Vec::new();
             let mut park_reason = LaneParkReason::NoWork;
             let mut policy_stopped = false;
@@ -333,6 +334,7 @@ impl Pipeline {
                 let _ = tx
                     .send(DownloadResult {
                         segment_id,
+                        runtime_generation,
                         data,
                         attempts,
                         lane_observation: None,
@@ -349,6 +351,7 @@ impl Pipeline {
                         let _ = tx
                             .send(DownloadResult {
                                 segment_id: unrequested.segment_id,
+                                runtime_generation,
                                 data: Err(DownloadError::Fetch(DownloadFailure::new(
                                     DownloadFailureKind::Unrequested,
                                     "BODY not requested because the IP replacement trial hit server quota",
