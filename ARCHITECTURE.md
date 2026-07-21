@@ -21,7 +21,7 @@ The backend is authoritative. The web app is a projection client, not a second s
 Weaver is intentionally:
 
 - a single deployable binary
-- SQLite-backed
+- SQL-backed, with SQLite as the default and PostgreSQL supported
 - GraphQL-first
 - optimized for one homelab node rather than distributed deployment
 - built around a byte pipeline, not a fleet of cooperating services
@@ -62,7 +62,7 @@ The only intentional shell holdouts should be true runtime/container entrypoints
 
 ### 1. The Backend Is Authoritative
 
-All durable truth lives in the backend.
+Authoritative product state and policy live in the backend.
 
 That includes:
 
@@ -73,47 +73,39 @@ That includes:
 - authentication and API keys
 - backup and restore state
 
-The web app may project, filter, and present that state, but it does not invent durable truth.
+Downloaded payloads and completed outputs remain filesystem artifacts, and
+protected key material may live in an operating-system secret store or a
+restricted data file. Those are explicit backend-owned resources, not state the
+web app may invent.
+
+The web app may project, filter, and present authoritative state, but it does
+not own product policy or durable state.
 
 If a feature cannot clearly answer "who is authoritative for this state?", the design is not ready.
 
 ### 2. Dependency Direction Is Strict
 
-Weaver should converge on this dependency direction:
+Dependencies point from product and transport layers toward lower layers:
 
-```text
-weaver-model + engine crates
-          ^
-weaver-server-core
-          ^
-weaver-server-api
-          ^
-weaver app crate
-```
+- low-level shared models have no product-layer dependencies
+- engine crates may depend on shared models or lower engine utilities, never on
+  server product crates
+- server core owns product behavior and persistence orchestration and may depend
+  on shared models and engines
+- server API maps GraphQL transport to server-core behavior; it may consume
+  narrow engine runtime types needed to project live telemetry, but it does not
+  own engine or product policy
+- the app crate owns composition, process startup, CLI commands, compatibility
+  adapters, and HTTP wiring; reusable product behavior stays in server core
+- the web app uses GraphQL plus narrowly scoped HTTP endpoints exposed by the
+  app and does not depend on backend implementation types
 
-And outside the Rust dependency graph:
-
-```text
-weaver-web
-   |
-GraphQL
-   |
-weaver-server-api
-```
-
-Rules:
-
-- low-level shared model code stays in the small shared crate
-- engine crates stay below the server product layer
-- server core owns product behavior and persistence orchestration
-- the API crate maps transport to server-core behavior
-- the app crate owns composition, process startup, and HTTP wiring
-
-Never add an upward dependency. Never make an engine crate depend on server-core. Never let the API crate or app crate become a second domain layer.
+Never add a dependency from a lower layer to a product or transport layer.
+Never let the API or app crate become a second domain layer.
 
 ### 3. Weaver Does Not Require a Durable Domain Event Spine
 
-Weaver is the important exception to the event-spine rule used elsewhere.
+Weaver does not use a durable domain-event spine as its source of truth.
 
 Weaver may emit runtime pipeline events for:
 
@@ -125,7 +117,10 @@ Weaver may emit runtime pipeline events for:
 
 Those events are useful, but they are not the product's canonical durable truth.
 
-We do not force Weaver into event sourcing. We do not require every durable state change to become a first-class domain event. Durable truth may live directly in explicit domain state and SQLite-backed records as long as the system can recover, explain current state, and rebuild operator-facing views correctly.
+We do not force Weaver into event sourcing. We do not require every durable state
+change to become a first-class domain event. Durable truth may live directly in
+explicit domain state and SQL-backed records as long as the system can recover,
+explain current state, and rebuild operator-facing views correctly.
 
 ### 4. Durable Before Live
 
@@ -139,13 +134,19 @@ The rule is:
 
 This means subscriptions and UI refreshes should always be able to recover from durable state, not depend on transient in-memory delivery.
 
-### 5. The API Describes Intent, Not Storage
+### 5. Public Interfaces Describe Intent, Not Storage
 
-Weaver uses a semantic GraphQL API.
+GraphQL is Weaver's primary application query, mutation, and subscription
+surface.
 
 Queries should describe the views the UI and integrations need. Mutations should describe business actions. Subscriptions should describe meaningful live updates.
 
-We do not expose raw SQLite tables, ad hoc status strings, or storage-only details merely because doing so is easy.
+Narrow HTTP surfaces also exist for authentication and sessions, backup and
+binary file transfer, Prometheus metrics, and compatibility RPC. They are
+transport adapters, not alternate product layers; authorization and product
+rules still belong to the backend domains that own them.
+
+We do not expose raw database tables, ad hoc status strings, or storage-only details merely because doing so is easy.
 
 The API should reflect how operators think about:
 
@@ -160,18 +161,25 @@ The API should reflect how operators think about:
 
 It should not reflect how the tables happen to be laid out.
 
-### 6. Single-Node SQLite Runtime Is Deliberate
+### 6. The Single-Node SQL Runtime Is Deliberate
 
-Weaver is SQLite-first by design.
+SQLite is the default local backend. PostgreSQL is also a supported persistence
+backend. Both implement the same single-node Weaver product model; selecting
+PostgreSQL does not turn Weaver into a distributed application.
 
-This is not a temporary placeholder for a future distributed system. It is the deliberate operating model for the product.
+The single-node operating model is deliberate, not a placeholder for future
+distributed coordination.
 
 That means:
 
-- all durable product state lives in SQLite
-- we do not add Redis, message brokers, or extra persistence systems
-- backup, restore, migration, and portability matter
-- serialized writes and simple operations matter more than multi-node ambition
+- durable product metadata and policy use the selected SQL backend
+- backend-specific SQL, retries, and migrations stay behind the persistence
+  boundary
+- SQLite and PostgreSQL must preserve the same domain semantics
+- Redis, message brokers, and secondary control-plane datastores are not part of
+  the architecture
+- backup, restore, migration, and portability behavior must be explicit for
+  each supported backend
 
 ### 7. Memory Must Be Bounded
 
@@ -189,9 +197,12 @@ If memory growth is unbounded, the feature is not done.
 
 ### 8. Shared Mutable Runtime State Must Be Explicit
 
-Shared mutable runtime coordination must stay explicit and centralized.
+Shared mutable runtime coordination must stay explicit and centrally owned.
 
-We do not spread product behavior across module-level singletons, hidden stateful helpers, or incidental cross-thread mutation.
+Product authority must not be spread across module-level singletons, hidden
+stateful helpers, or incidental cross-thread mutation. Narrow process-wide
+guards, bounded caches, and observability counters are acceptable when their
+lifetime is explicit and they do not become authoritative domain state.
 
 Runtime state such as:
 
@@ -208,13 +219,18 @@ must have obvious ownership and obvious construction.
 
 Weaver should not rely on free-floating string identifiers at internal boundaries.
 
-Statuses, enum-like values, schedule actions, bandwidth-cap modes, queue states, auth scopes, and GraphQL-exposed state should be represented by:
+Stable statuses, schedule actions, bandwidth-cap modes, queue states, and auth
+scopes should be represented internally by:
 
 - Rust enums with serde where appropriate
 - typed constants defined once where enum modeling is not appropriate
 - explicit boundary mappings at persistence and API edges
 
-There should be no stringly typed enums floating around inside application code. Internal modules should pass typed values and only serialize at real boundaries.
+Closed, stable GraphQL state should use GraphQL enums or an explicit mapping from
+the domain enum. String tokens are acceptable for compatibility protocols,
+open-ended diagnostics, and observability surfaces when the mapping is
+centralized at the boundary. Internal modules pass typed values and serialize
+only at real boundaries.
 
 ### 10. Frontend Boundaries Are Real
 
@@ -224,7 +240,8 @@ The rules are:
 
 - the backend owns durable truth and policy
 - the web app owns presentation, user interaction, and local projection behavior
-- GraphQL is the boundary
+- GraphQL is the primary application boundary; bounded HTTP endpoints handle
+  sessions, backup and file transfer, metrics, and compatibility needs
 - backend internal types do not leak into frontend architecture
 
 Weaver-web should feel rich, but it should still be a projection client over backend truth.
@@ -239,7 +256,7 @@ Those crates should own protocol and algorithm concerns. They should not own pro
 - job lifecycle
 - category behavior
 - API-facing models
-- SQLite orchestration
+- persistence orchestration
 
 If shared low-level contracts are needed between engines and the server, they belong in the small shared model crate, not in a generic junk-drawer core crate.
 
@@ -331,20 +348,21 @@ If product logic starts migrating into those crates, the architecture is driftin
 
 ## Patterns
 
-### 1. Serde Defines Enum Boundaries
+### 1. Typed Enums Define Stable State
 
 Rust enums are the canonical way to represent discrete state in Weaver.
 
-Their serde form is the default boundary contract for:
+Boundary representations are explicit:
 
-- SQLite persistence where enum state must be stored
-- GraphQL where enum state is genuinely part of the public contract
+- SQL persistence uses serde or a dedicated storage mapping
+- GraphQL uses the domain enum or a dedicated GraphQL enum with an explicit
+  conversion
+- compatibility and observability strings are mapped at their transport edge
 
 Rules:
 
 - internal state stays strongly typed
-- persistence uses the serde form
-- API exposure uses the serde form when that state is part of the product contract
+- storage and API representations do not leak back into domain logic
 - if an enum is too implementation-shaped to expose cleanly, keep it internal rather than leaking a backend detail
 
 ### 2. Real Boundaries Belong at Persistence and API Layers
@@ -414,16 +432,17 @@ These files have distinct purposes:
 
 Not every tiny domain needs every file on day one. The point is to keep responsibilities obvious and to split by meaning rather than growing giant cross-domain files.
 
-### 5. Tests Should Live Beside Domains, Not Inside Production Files
+### 5. Tests Live At The Boundary They Validate
 
-Weaver follows the parallel test directory convention.
+Weaver uses all three normal Rust test placements:
 
-The default is:
+- inline unit tests for private, local behavior
+- sibling test modules for larger domain or implementation suites
+- crate-level `tests/` for public API, integration, and cross-domain behavior
 
-- crate-level `tests/` for integration and domain behavior
-- domain-oriented test files beside the crate, not inline in production modules
-
-Inline `#[cfg(test)]` modules should be rare exceptions, not the default.
+Choose the narrowest placement that can test the real contract. Split large test
+modules when they obscure production code, but do not move a unit test away from
+the private behavior it needs to validate merely to satisfy a directory rule.
 
 ## Canonical Feature Flow
 
@@ -449,7 +468,6 @@ These are signs that a change is likely heading in the wrong direction:
 - making an engine crate depend on server product crates
 - introducing stringly typed statuses where enums should exist
 - leaking storage-shaped records into domain logic
-- adding inline tests by default instead of using parallel test files
 - creating new giant sink files like `facade.rs`, `types.rs`, or `service.rs` at crate root
 - forcing event-sourcing style machinery onto features that do not need it just to imitate another product
 
@@ -464,7 +482,8 @@ Before merging a feature, confirm:
 - internal calls use typed values instead of stringly glue
 - memory growth is bounded
 - engine crates remain below the product layer
-- tests live in the parallel test structure
+- tests cover the behavior at the appropriate unit, domain, or integration
+  boundary
 - the change uses the least necessary code that cleanly solves the problem
 
 ## Final Rule
@@ -478,4 +497,5 @@ If a future change forces a choice between:
 
 the default answer should be domain ownership.
 
-The only explicit exception from the Volt and Scryer model is that Weaver does not require a durable domain event spine. Everything else should still follow the same architectural discipline.
+Weaver does not require an event-sourced domain spine. Explicit durable state
+plus recoverable runtime projections is the deliberate model.
