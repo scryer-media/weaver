@@ -161,6 +161,27 @@ impl Pipeline {
 
     pub(crate) async fn cleanup_output_dir(&self, dir: Option<&std::path::Path>) {
         let Some(dir) = dir else { return };
+        match tokio::fs::symlink_metadata(dir).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                warn!(dir = %dir.display(), error = %error, "could not inspect complete output directory before cleanup");
+                return;
+            }
+            Ok(_) => {}
+        }
+        let ownership_path = dir.to_path_buf();
+        let owned = tokio::task::spawn_blocking(move || {
+            crate::jobs::working_dir::is_weaver_owned_output_dir(&ownership_path)
+        })
+        .await
+        .unwrap_or(false);
+        if !owned {
+            warn!(
+                dir = %dir.display(),
+                "refusing recursive cleanup of an output directory without a valid Weaver ownership marker"
+            );
+            return;
+        }
         match tokio::fs::remove_dir_all(dir).await {
             Ok(()) => {
                 info!(dir = %dir.display(), "removed complete output directory");
@@ -182,6 +203,9 @@ impl Pipeline {
         self.clear_terminal_segment_failures(job_id);
         self.clear_par2_runtime_state(job_id);
         self.clear_job_extraction_runtime(job_id);
+        self.post_processing_repair_reentered.remove(&job_id);
+        self.post_processing_repair_return_to_terminal
+            .remove(&job_id);
         self.inflight_moves.remove(&job_id);
         self.reserved_complete_destinations.remove(&job_id);
         self.active_download_passes.remove(&job_id);

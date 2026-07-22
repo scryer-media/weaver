@@ -1186,6 +1186,20 @@ pub(super) struct MoveToCompleteDone {
     pub(super) result: Result<MoveToCompleteResult, String>,
 }
 
+pub(super) enum TerminalPostProcessingEvent {
+    Started(JobId),
+    Done(TerminalPostProcessingDone),
+}
+
+pub(super) struct TerminalPostProcessingDone {
+    pub(super) job_id: JobId,
+    pub(super) primary_failure: Option<String>,
+    pub(super) result: Result<
+        crate::post_processing::service::RunExecutionReport,
+        crate::post_processing::service::PostProcessingServiceError,
+    >,
+}
+
 /// Result of a decode task.
 pub(super) struct DecodeResult {
     pub(super) segment_id: SegmentId,
@@ -1730,6 +1744,13 @@ pub struct Pipeline {
     /// Channel for background final-move results.
     pub(super) move_done_tx: mpsc::Sender<MoveToCompleteDone>,
     pub(super) move_done_rx: mpsc::Receiver<MoveToCompleteDone>,
+    pub(super) terminal_post_processing_done_tx: mpsc::Sender<TerminalPostProcessingEvent>,
+    pub(super) terminal_post_processing_done_rx: mpsc::Receiver<TerminalPostProcessingEvent>,
+    pub(super) terminal_post_processing_service:
+        crate::post_processing::service::PostProcessingService,
+    pub(super) inflight_terminal_post_processing: HashSet<JobId>,
+    pub(super) terminal_post_processing_cancellations:
+        HashMap<JobId, tokio::sync::watch::Sender<bool>>,
     /// Whether all downloads are globally paused.
     pub(super) global_paused: bool,
     /// ISP bandwidth cap runtime state.
@@ -1840,6 +1861,10 @@ pub struct Pipeline {
     pub(super) par2_bypassed: HashSet<JobId>,
     /// Jobs whose PAR2 set has already validated the current payload bytes.
     pub(super) par2_verified: HashSet<JobId>,
+    /// Jobs that have consumed NZBGet's one permitted post-processing PAR re-entry.
+    pub(super) post_processing_repair_reentered: HashSet<JobId>,
+    /// Jobs returning from that PAR pass to terminal extension processing in place.
+    pub(super) post_processing_repair_return_to_terminal: HashSet<JobId>,
     /// Promoted PAR2 recovery segments that can no longer be fetched or decoded.
     pub(super) unavailable_promoted_recovery_segments: HashSet<SegmentId>,
     /// Finished jobs (Complete/Failed) from recovery — surfaced in list/get queries.

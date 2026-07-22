@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::jobs::ids::JobId;
 
 pub const WORKING_DIR_MARKER: &str = ".weaver-job-dir";
+pub const OUTPUT_DIR_MARKER: &str = ".weaver-output-dir";
 
 pub fn sanitize_dirname(name: &str) -> String {
     weaver_model::files::sanitize_path_component(name)
@@ -27,6 +28,36 @@ pub fn working_dir_marker_path(dir: &Path) -> PathBuf {
 
 pub fn is_weaver_owned_working_dir(dir: &Path) -> bool {
     working_dir_marker_path(dir).is_file()
+}
+
+pub fn mark_weaver_owned_output_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::write(dir.join(OUTPUT_DIR_MARKER), output_marker_value(dir)?)
+}
+
+pub fn is_weaver_owned_output_dir(dir: &Path) -> bool {
+    let Ok(directory_metadata) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return false;
+    }
+    let marker = dir.join(OUTPUT_DIR_MARKER);
+    let Ok(marker_metadata) = std::fs::symlink_metadata(&marker) else {
+        return false;
+    };
+    if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
+        return false;
+    }
+    let Ok(expected) = output_marker_value(dir) else {
+        return false;
+    };
+    std::fs::read(&marker).is_ok_and(|stored| stored == expected)
+}
+
+fn output_marker_value(dir: &Path) -> std::io::Result<Vec<u8>> {
+    let canonical = std::fs::canonicalize(dir)?;
+    let digest = blake3::hash(canonical.as_os_str().as_encoded_bytes());
+    Ok(format!("weaver-output-v1:{}\n", digest.to_hex()).into_bytes())
 }
 
 #[cfg(test)]
@@ -57,5 +88,23 @@ mod tests {
 
         assert!(file_name.ends_with(".#42"));
         assert!(file_name.len() <= weaver_model::files::DOWNLOAD_FILENAME_MAX_BYTES);
+    }
+
+    #[test]
+    fn output_ownership_marker_is_bound_to_its_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let owned = temp.path().join("owned");
+        let copied = temp.path().join("copied");
+        std::fs::create_dir(&owned).unwrap();
+        std::fs::create_dir(&copied).unwrap();
+        mark_weaver_owned_output_dir(&owned).unwrap();
+
+        assert!(is_weaver_owned_output_dir(&owned));
+        std::fs::copy(
+            owned.join(OUTPUT_DIR_MARKER),
+            copied.join(OUTPUT_DIR_MARKER),
+        )
+        .unwrap();
+        assert!(!is_weaver_owned_output_dir(&copied));
     }
 }

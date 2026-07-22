@@ -69,6 +69,21 @@ impl Pipeline {
         let (verified_suspect_persist_done_tx, verified_suspect_persist_done_rx) =
             mpsc::channel(32);
         let (move_done_tx, move_done_rx) = mpsc::channel(32);
+        let (terminal_post_processing_done_tx, terminal_post_processing_done_rx) =
+            mpsc::channel(32);
+        let post_processing_settings = db.post_processing_settings().unwrap_or_else(|error| {
+            warn!(error = %error, "failed to load post-processing settings; using disabled defaults");
+            crate::post_processing::model::PostProcessingSettings::default()
+        });
+        let terminal_post_processing_service =
+            crate::post_processing::service::PostProcessingService::new_with_termination_grace(
+                db.clone(),
+                usize::from(post_processing_settings.concurrency),
+                Duration::from_secs(post_processing_settings.termination_grace_seconds),
+            );
+        if let Err(error) = terminal_post_processing_service.recover_interrupted() {
+            warn!(error = %error, "failed to recover interrupted post-processing attempts");
+        }
         let nntp = Arc::new(nntp);
         shared_state.set_nntp_runtime_activation(NntpRuntimeActivation {
             generation: 0,
@@ -187,6 +202,11 @@ impl Pipeline {
             verified_suspect_persist_done_rx,
             move_done_tx,
             move_done_rx,
+            terminal_post_processing_done_tx,
+            terminal_post_processing_done_rx,
+            terminal_post_processing_service,
+            inflight_terminal_post_processing: HashSet::new(),
+            terminal_post_processing_cancellations: HashMap::new(),
             global_paused: initial_global_paused,
             bandwidth_cap,
             bandwidth_reservations: HashMap::new(),
@@ -233,6 +253,8 @@ impl Pipeline {
             pending_concat: HashMap::new(),
             par2_bypassed: HashSet::new(),
             par2_verified: HashSet::new(),
+            post_processing_repair_reentered: HashSet::new(),
+            post_processing_repair_return_to_terminal: HashSet::new(),
             unavailable_promoted_recovery_segments: HashSet::new(),
             finished_jobs: initial_history,
             shared_state,
@@ -409,6 +431,12 @@ impl Pipeline {
             weaver_nntp::CapacityProbeOutcome::AuthenticationFailure
             | weaver_nntp::CapacityProbeOutcome::NoConfiguredPermit => {}
         }
+    }
+
+    pub fn post_processing_service(
+        &self,
+    ) -> crate::post_processing::service::PostProcessingService {
+        self.terminal_post_processing_service.clone()
     }
 
     pub(crate) fn effective_downloaded_bytes(state: &JobState) -> u64 {
@@ -772,7 +800,17 @@ impl Pipeline {
                         self.handle_verified_suspect_persist_done(done);
                     }
                     Some(done) = self.move_done_rx.recv() => {
-                        self.handle_move_to_complete_done(done);
+                        self.handle_move_to_complete_done(done).await;
+                    }
+                    Some(event) = self.terminal_post_processing_done_rx.recv() => {
+                        match event {
+                            TerminalPostProcessingEvent::Started(job_id) => {
+                                self.handle_terminal_post_processing_started(job_id);
+                            }
+                            TerminalPostProcessingEvent::Done(done) => {
+                                self.handle_terminal_post_processing_done(done);
+                            }
+                        }
                     }
                     Some(retry) = self.retry_rx.recv() => {
                         self.receive_retry_work(retry);

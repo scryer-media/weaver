@@ -1,0 +1,85 @@
+{
+  "main": "email.py",
+  "name": "email",
+  "kind": "POST-PROCESSING",
+  "displayName": "Email",
+  "version": "1.0.0",
+  "nzbgetMinVersion": "23.1",
+  "author": "Author's name",
+  "homepage": "https://github.example",
+  "license": "GNU",
+  "about": "About",
+  "description": ["Description"],
+  "requirements": ["This script requires Python to be installed."],
+  "options": [
+    {
+      "name": "sendMail",
+      "displayName": "SendMail",
+      "value": "Always",
+      "description": ["When to send the message."],
+      "select": ["Always", "OnFailure"]
+    },
+    {
+      "name": "port",
+      "displayName": "Port",
+      "value": 25,
+      "description": ["SMTP server port (1-65535)"],
+      "select": [1, 65535]
+    },
+    {
+      "section": "Categories",
+      "name": "Category",
+      "displayName": "Category",
+      "value": 25,
+      "description": ["Categories section"],
+      "select": []
+    },
+    {
+      "section": "Server",
+      "name": "Server.Timeout",
+      "displayName": "Server timeout",
+      "value": 2.5,
+      "description": ["Fractional timeout in seconds"],
+      "select": [0.5, 1.0, 2.5, 5.0]
+    }
+  ],
+  "commands": [
+    {
+      "name": "connectionTest",
+      "action": "Send",
+      "displayName": "ConnectionTest",
+      "description": ["To check connection parameters click the button."]
+    },
+    {
+      "section": "Feeds",
+      "name": "connectionTestTask",
+      "action": "SendToTask",
+      "displayName": "ConnectionTestTask",
+      "description": ["Feeds command"]
+    }
+  ],
+  "sections": [
+    {
+      "name": "Categories",
+      "prefix": "Category",
+      "multi": true
+    },
+    {
+      "name": "Feeds",
+      "prefix": "Feed",
+      "multi": false
+    },
+    {
+      "name": "Server",
+      "prefix": "Server",
+      "multi": false
+    },
+    {
+      "name": "options",
+      "prefix": "option",
+      "multi": true
+    }
+  ],
+  "queueEvents": "NZB_ADDED, NZB_DOWNLOADED, FILE_DOWNLOADED",
+  "taskTime": "1:00:00"
+}

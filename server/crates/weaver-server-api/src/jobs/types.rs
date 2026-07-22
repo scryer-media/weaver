@@ -64,6 +64,7 @@ pub enum QueueItemState {
     Repairing,
     Extracting,
     Finalizing,
+    PostProcessing,
     Completed,
     Failed,
     Paused,
@@ -74,13 +75,15 @@ impl From<&weaver_server_core::JobStatus> for QueueItemState {
         match value {
             weaver_server_core::JobStatus::Queued
             | weaver_server_core::JobStatus::QueuedRepair
-            | weaver_server_core::JobStatus::QueuedExtract => Self::Queued,
+            | weaver_server_core::JobStatus::QueuedExtract
+            | weaver_server_core::JobStatus::QueuedPostProcessing => Self::Queued,
             weaver_server_core::JobStatus::Downloading => Self::Downloading,
             weaver_server_core::JobStatus::Checking => Self::Verifying,
             weaver_server_core::JobStatus::Verifying => Self::Verifying,
             weaver_server_core::JobStatus::Repairing => Self::Repairing,
             weaver_server_core::JobStatus::Extracting => Self::Extracting,
             weaver_server_core::JobStatus::Moving => Self::Finalizing,
+            weaver_server_core::JobStatus::PostProcessing => Self::PostProcessing,
             weaver_server_core::JobStatus::Complete => Self::Completed,
             weaver_server_core::JobStatus::Failed { .. } => Self::Failed,
             weaver_server_core::JobStatus::Paused => Self::Paused,
@@ -120,6 +123,8 @@ pub enum QueuePostState {
     AwaitingRepair,
     Verifying,
     Finalizing,
+    QueuedPostProcessing,
+    PostProcessing,
     Completed,
     Failed,
 }
@@ -136,6 +141,8 @@ impl From<weaver_server_core::PostState> for QueuePostState {
             weaver_server_core::PostState::AwaitingRepair => Self::AwaitingRepair,
             weaver_server_core::PostState::Verifying => Self::Verifying,
             weaver_server_core::PostState::Finalizing => Self::Finalizing,
+            weaver_server_core::PostState::QueuedPostProcessing => Self::QueuedPostProcessing,
+            weaver_server_core::PostState::PostProcessing => Self::PostProcessing,
             weaver_server_core::PostState::Completed => Self::Completed,
             weaver_server_core::PostState::Failed => Self::Failed,
         }
@@ -146,6 +153,7 @@ impl From<weaver_server_core::PostState> for QueuePostState {
 pub enum QueueWaitReason {
     RepairCapacity,
     ExtractionCapacity,
+    PostProcessingCapacity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
@@ -720,6 +728,7 @@ pub struct SubmitNzbInput {
     pub dupe_key: Option<String>,
     pub dupe_score: Option<i64>,
     pub dupe_mode: Option<DuplicateModeGql>,
+    pub post_processing: Option<crate::post_processing::types::PostProcessingSelectionInput>,
 }
 
 #[derive(Debug, InputObject)]
@@ -751,6 +760,7 @@ pub struct SubmitStagedNzbsInput {
     pub dupe_key: Option<String>,
     pub dupe_score: Option<i64>,
     pub dupe_mode: Option<DuplicateModeGql>,
+    pub post_processing: Option<crate::post_processing::types::PostProcessingSelectionInput>,
 }
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -927,6 +937,8 @@ pub enum JobStatusGql {
     QueuedExtract,
     Extracting,
     Moving,
+    QueuedPostProcessing,
+    PostProcessing,
     Complete,
     Failed,
     Paused,
@@ -944,6 +956,8 @@ impl From<&weaver_server_core::JobStatus> for JobStatusGql {
             weaver_server_core::JobStatus::QueuedExtract => Self::QueuedExtract,
             weaver_server_core::JobStatus::Extracting => Self::Extracting,
             weaver_server_core::JobStatus::Moving => Self::Moving,
+            weaver_server_core::JobStatus::QueuedPostProcessing => Self::QueuedPostProcessing,
+            weaver_server_core::JobStatus::PostProcessing => Self::PostProcessing,
             weaver_server_core::JobStatus::Complete => Self::Complete,
             weaver_server_core::JobStatus::Failed { .. } => Self::Failed,
             weaver_server_core::JobStatus::Paused => Self::Paused,
@@ -1236,7 +1250,9 @@ pub fn queue_summary(items: &[QueueItem], metrics: &MetricsSnapshot) -> QueueSum
                 summary.active_items += 1;
                 summary.extracting_items += 1;
             }
-            QueueItemState::Downloading | QueueItemState::Finalizing => {
+            QueueItemState::Downloading
+            | QueueItemState::Finalizing
+            | QueueItemState::PostProcessing => {
                 summary.active_items += 1;
             }
             QueueItemState::Checking => {
@@ -1357,6 +1373,9 @@ fn wait_reason_for_post_state(
     match post_state {
         weaver_server_core::PostState::QueuedRepair => Some(QueueWaitReason::RepairCapacity),
         weaver_server_core::PostState::QueuedExtract => Some(QueueWaitReason::ExtractionCapacity),
+        weaver_server_core::PostState::QueuedPostProcessing => {
+            Some(QueueWaitReason::PostProcessingCapacity)
+        }
         _ => None,
     }
 }
@@ -1372,6 +1391,7 @@ pub fn queue_item_state_from_job_info(info: &weaver_server_core::JobInfo) -> Que
         weaver_server_core::JobStatus::Failed { .. } => return QueueItemState::Failed,
         weaver_server_core::JobStatus::Complete => return QueueItemState::Completed,
         weaver_server_core::JobStatus::Moving => return QueueItemState::Finalizing,
+        weaver_server_core::JobStatus::PostProcessing => return QueueItemState::PostProcessing,
         _ => {}
     }
 
@@ -1389,10 +1409,12 @@ pub fn queue_item_state_from_job_info(info: &weaver_server_core::JobInfo) -> Que
         weaver_server_core::PostState::Repairing => QueueItemState::Repairing,
         weaver_server_core::PostState::Extracting => QueueItemState::Extracting,
         weaver_server_core::PostState::Finalizing => QueueItemState::Finalizing,
+        weaver_server_core::PostState::PostProcessing => QueueItemState::PostProcessing,
         weaver_server_core::PostState::Completed => QueueItemState::Completed,
         weaver_server_core::PostState::Failed => QueueItemState::Failed,
         weaver_server_core::PostState::QueuedRepair
-        | weaver_server_core::PostState::QueuedExtract => QueueItemState::Queued,
+        | weaver_server_core::PostState::QueuedExtract
+        | weaver_server_core::PostState::QueuedPostProcessing => QueueItemState::Queued,
         weaver_server_core::PostState::Idle | weaver_server_core::PostState::WaitingForVolumes => {
             QueueItemState::from(&info.status)
         }

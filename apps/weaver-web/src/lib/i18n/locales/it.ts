@@ -237,6 +237,8 @@ const it: LocaleDictionary = {
   "settings.security": "Sicurezza",
   "settings.backupNav": "Backup",
   "settings.rss": "RSS",
+  "settings.postProcessing": "Post-processing",
+  "settings.postProcessingDesc": "Approve and configure terminal extension scripts.",
   "settings.generalPageDesc": "Regola velocità di download, percorsi di archiviazione, comportamento di pulizia e politica di riprova da un unico posto.",
   "settings.language": "Lingua",
   "settings.languageDesc": "Scegli la lingua di visualizzazione dell'interfaccia di Weaver.",

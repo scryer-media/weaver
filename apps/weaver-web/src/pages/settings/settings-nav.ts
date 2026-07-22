@@ -30,6 +30,11 @@ export const settingsNav = [
     descriptionKey: "watchFolder.desc",
   },
   {
+    to: "/settings/post-processing",
+    labelKey: "settings.postProcessing",
+    descriptionKey: "settings.postProcessingDesc",
+  },
+  {
     to: "/settings/schedules",
     labelKey: "schedule.title",
     descriptionKey: "schedule.desc",

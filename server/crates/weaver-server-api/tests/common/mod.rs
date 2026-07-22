@@ -91,6 +91,18 @@ fn runtime_lanes_for_status(
             weaver_server_core::RunState::Active,
             None,
         ),
+        JobStatus::QueuedPostProcessing => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::QueuedPostProcessing,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::PostProcessing => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::PostProcessing,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
         JobStatus::Complete => (
             weaver_server_core::DownloadState::Complete,
             weaver_server_core::PostState::Completed,
@@ -213,6 +225,7 @@ impl TestHarness {
                 weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),
             nntp_pool: None,
             spawn_history_delete_worker,
+            post_processing_service: None,
         });
 
         Self {
@@ -766,6 +779,13 @@ fn spawn_test_scheduler(
                         None => Ok(()),
                     };
                     let _ = reply.send(result);
+                }
+                SchedulerCommand::PausePostProcessing { reply }
+                | SchedulerCommand::ResumePostProcessing { reply } => {
+                    let _ = reply.send(());
+                }
+                SchedulerCommand::CancelPostProcessing { reply, .. } => {
+                    let _ = reply.send(Ok(()));
                 }
                 SchedulerCommand::Shutdown => break,
             }

@@ -75,6 +75,18 @@ fn runtime_lanes_for_status(
             crate::jobs::model::RunState::Active,
             None,
         ),
+        JobStatus::QueuedPostProcessing => (
+            crate::jobs::model::DownloadState::Complete,
+            crate::jobs::model::PostState::QueuedPostProcessing,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
+        JobStatus::PostProcessing => (
+            crate::jobs::model::DownloadState::Complete,
+            crate::jobs::model::PostState::PostProcessing,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
         JobStatus::Complete => (
             crate::jobs::model::DownloadState::Complete,
             crate::jobs::model::PostState::Completed,
@@ -506,6 +518,13 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         None => Ok(()),
                     };
                     let _ = reply.send(result);
+                }
+                SchedulerCommand::PausePostProcessing { reply }
+                | SchedulerCommand::ResumePostProcessing { reply } => {
+                    let _ = reply.send(());
+                }
+                SchedulerCommand::CancelPostProcessing { reply, .. } => {
+                    let _ = reply.send(Ok(()));
                 }
                 SchedulerCommand::Shutdown => break,
             }

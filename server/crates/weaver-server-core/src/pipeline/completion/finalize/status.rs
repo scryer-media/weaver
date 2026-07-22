@@ -222,6 +222,8 @@ impl Pipeline {
             JobStatus::QueuedExtract => "queued_extract",
             JobStatus::Extracting => "extracting",
             JobStatus::Moving => "moving",
+            JobStatus::QueuedPostProcessing => "queued_post_processing",
+            JobStatus::PostProcessing => "post_processing",
             JobStatus::Complete => "complete",
             JobStatus::Failed { .. } => "failed",
             JobStatus::Paused => "paused",

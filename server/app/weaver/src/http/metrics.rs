@@ -8,12 +8,13 @@ use weaver_nntp::pool::NntpPool;
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::{
-    DownloadPressureState, JobInfo, JobStatus, MetricsSnapshot, SchedulerHandle,
+    Database, DownloadPressureState, JobInfo, JobStatus, MetricsSnapshot, SchedulerHandle,
 };
 
 #[derive(Clone)]
 pub(crate) struct PrometheusMetricsExporter {
     handle: SchedulerHandle,
+    db: Database,
     nntp_pool: Arc<NntpPool>,
     transfer_policy:
         Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
@@ -22,6 +23,7 @@ pub(crate) struct PrometheusMetricsExporter {
 impl PrometheusMetricsExporter {
     pub(crate) fn new(
         handle: SchedulerHandle,
+        db: Database,
         nntp_pool: Arc<NntpPool>,
         transfer_policy: Arc<
             weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
@@ -29,6 +31,7 @@ impl PrometheusMetricsExporter {
     ) -> Self {
         Self {
             handle,
+            db,
             nntp_pool,
             transfer_policy,
         }
@@ -49,7 +52,7 @@ impl PrometheusMetricsExporter {
             .unwrap_or(0);
         let server_health = collect_server_health(&nntp_pool).await;
         let server_transfers = self.transfer_policy.transfer_registry().snapshots();
-        render_prometheus_metrics_with_transfers(
+        let mut output = render_prometheus_metrics_with_transfers(
             &snapshot,
             &jobs,
             self.handle.is_globally_paused(),
@@ -57,8 +60,65 @@ impl PrometheusMetricsExporter {
             &server_health,
             runtime_generation,
             &server_transfers,
-        )
+        );
+        let db = self.db.clone();
+        match tokio::task::spawn_blocking(move || db.post_processing_metrics_snapshot()).await {
+            Ok(Ok(metrics)) => append_post_processing_metrics(&mut output, &metrics),
+            Ok(Err(error)) => {
+                tracing::debug!(error = %error, "failed to collect post-processing metrics")
+            }
+            Err(error) => {
+                tracing::debug!(error = %error, "post-processing metrics task failed")
+            }
+        }
+        output
     }
+}
+
+fn append_post_processing_metrics(
+    output: &mut String,
+    metrics: &weaver_server_core::post_processing::persistence::PostProcessingMetricsSnapshot,
+) {
+    append_metric(
+        output,
+        "weaver_post_processing_queue_depth",
+        metrics.queue_depth,
+    );
+    append_metric(
+        output,
+        "weaver_post_processing_active_attempts",
+        metrics.active_attempts,
+    );
+    append_metric(
+        output,
+        "weaver_post_processing_attempt_duration_seconds_count",
+        metrics.duration_count,
+    );
+    append_metric_f64(
+        output,
+        "weaver_post_processing_attempt_duration_seconds_sum",
+        metrics.duration_sum_millis as f64 / 1_000.0,
+    );
+    for (result, count) in [
+        ("succeeded", metrics.succeeded),
+        ("failed", metrics.failed),
+        ("skipped", metrics.skipped),
+        ("timed_out", metrics.timed_out),
+        ("cancelled", metrics.cancelled),
+        ("interrupted", metrics.interrupted),
+    ] {
+        append_labeled_metric(
+            output,
+            "weaver_post_processing_attempt_results",
+            &[("result", result)],
+            count,
+        );
+    }
+    append_metric(
+        output,
+        "weaver_post_processing_output_truncations",
+        metrics.truncated,
+    );
 }
 
 pub(super) async fn metrics_handler(
@@ -1614,6 +1674,8 @@ fn job_status_label(status: &JobStatus) -> &'static str {
         JobStatus::QueuedExtract => "queued_extract",
         JobStatus::Extracting => "extracting",
         JobStatus::Moving => "moving",
+        JobStatus::QueuedPostProcessing => "queued_post_processing",
+        JobStatus::PostProcessing => "post_processing",
         JobStatus::Complete => "complete",
         JobStatus::Failed { .. } => "failed",
         JobStatus::Paused => "paused",

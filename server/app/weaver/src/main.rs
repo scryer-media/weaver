@@ -28,6 +28,11 @@ const DOTENV_FILE: &str = ".env";
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
+    if let Some(code) =
+        weaver_server_core::post_processing::runner::maybe_run_supervisor_from_process_args()
+    {
+        std::process::exit(code);
+    }
     if let Err(error) = load_cwd_dotenv() {
         eprintln!("failed to load {DOTENV_FILE}: {error}");
         std::process::exit(1);

@@ -2332,6 +2332,136 @@ async fn postgres_reserve_next_job_id_is_unique_under_concurrency_when_configure
     admin_pool.close().await;
 }
 
+#[tokio::test]
+async fn postgres_post_processing_roundtrip_when_configured() {
+    let Some((admin_pool, schema, target_url)) =
+        create_postgres_test_schema("postgres_post_processing").await
+    else {
+        return;
+    };
+
+    let mut db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let digest =
+        crate::post_processing::model::ExtensionDigest::new(format!("blake3:{}", "c".repeat(64)))
+            .unwrap();
+    let manifest = crate::post_processing::manifest::parse_native_manifest(
+        r#"{
+            "schema_version": 1,
+            "kind": "native",
+            "id": "postgres.roundtrip",
+            "name": "Postgres Roundtrip",
+            "version": "1.0.0",
+            "entrypoint": "process.sh",
+            "commands": [],
+            "options": []
+        }"#,
+        crate::post_processing::model::VerifiedExtensionDigest::from_verified_package_digest(
+            digest,
+        ),
+    )
+    .unwrap();
+    db.upsert_discovered_extension(&manifest, Some("/scripts/postgres"), 10)
+        .unwrap();
+    let revision = manifest.revision();
+    db.approve_extension_revision(
+        revision.extension_id(),
+        revision.revision_id(),
+        "/managed/postgres",
+        20,
+    )
+    .unwrap();
+    let selection = crate::post_processing::model::SubmissionPlanSelection::extensions(vec![
+        crate::post_processing::model::ExtensionSelection::pinned(
+            revision.extension_id().clone(),
+            revision.revision_id().clone(),
+        ),
+    ])
+    .unwrap();
+    let plan = db
+        .resolve_post_processing_plan(Some(&selection), None)
+        .unwrap();
+    let run_id = db
+        .create_post_processing_run(
+            77,
+            &plan,
+            &crate::post_processing::model::PipelineOutcome::Succeeded,
+            crate::post_processing::persistence::TerminalIntent::Complete,
+            None,
+            30,
+        )
+        .unwrap();
+    assert!(db.mark_post_processing_run_running(&run_id, 40).unwrap());
+    let attempt_id = db
+        .enqueue_post_processing_attempt(
+            &run_id,
+            &plan.steps()[0],
+            manifest.adapter(),
+            Some(vec![7; 32]),
+            50,
+        )
+        .unwrap();
+    assert!(
+        db.mark_post_processing_attempt_starting(
+            &attempt_id,
+            &serde_json::json!({"adapter": "native"}),
+            "/work/postgres",
+            60,
+        )
+        .unwrap()
+    );
+    assert!(
+        db.mark_post_processing_attempt_running(&attempt_id)
+            .unwrap()
+    );
+    db.append_post_processing_log(
+        &attempt_id,
+        crate::post_processing::persistence::LogStream::Stdout,
+        b"postgres-log",
+        70,
+    )
+    .unwrap();
+    assert!(
+        db.finish_post_processing_attempt(
+            &attempt_id,
+            crate::post_processing::model::AttemptStatus::Succeeded,
+            Some(0),
+            None,
+            None,
+            80,
+        )
+        .unwrap()
+    );
+    assert!(
+        db.finish_post_processing_run(
+            &run_id,
+            crate::post_processing::model::RunStatus::Succeeded,
+            crate::post_processing::model::PostProcessingSummary::Succeeded,
+            90,
+        )
+        .unwrap()
+    );
+
+    let stored_run = db.post_processing_run(&run_id).unwrap().unwrap();
+    assert_eq!(
+        stored_run.status,
+        crate::post_processing::model::RunStatus::Succeeded
+    );
+    let attempts = db.post_processing_attempts(&run_id).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].status,
+        crate::post_processing::model::AttemptStatus::Succeeded
+    );
+    let logs = db.post_processing_logs(&attempt_id, None, 10).unwrap();
+    assert_eq!(logs.chunks.len(), 1);
+    assert_eq!(logs.chunks[0].payload, b"postgres-log");
+
+    drop(db);
+    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
+    admin_pool.close().await;
+}
+
 async fn create_postgres_test_schema(test_name: &str) -> Option<(sqlx::PgPool, String, String)> {
     let Ok(base_url) = std::env::var("WEAVER_TEST_POSTGRES_URL") else {
         eprintln!("skipping {test_name}; WEAVER_TEST_POSTGRES_URL is not set");

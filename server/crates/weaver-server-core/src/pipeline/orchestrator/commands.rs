@@ -339,6 +339,32 @@ impl Pipeline {
                 let _ = self.event_tx.send(PipelineEvent::GlobalResumed);
                 let _ = reply.send(());
             }
+            SchedulerCommand::PausePostProcessing { reply } => {
+                self.terminal_post_processing_service.pause();
+                self.shared_state.set_post_processing_paused(true);
+                let _ = reply.send(());
+            }
+            SchedulerCommand::ResumePostProcessing { reply } => {
+                self.terminal_post_processing_service.resume();
+                self.shared_state.set_post_processing_paused(false);
+                let _ = reply.send(());
+            }
+            SchedulerCommand::CancelPostProcessing { job_id, reply } => {
+                let pipeline_cancelled = self
+                    .terminal_post_processing_cancellations
+                    .get(&job_id)
+                    .is_some_and(|sender| sender.send(true).is_ok());
+                let service_cancelled = self.terminal_post_processing_service.cancel_job(job_id.0);
+                let result = (pipeline_cancelled || service_cancelled)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        crate::SchedulerError::Conflict(format!(
+                            "job {} has no queued or active post-processing attempt",
+                            job_id.0
+                        ))
+                    });
+                let _ = reply.send(result);
+            }
             SchedulerCommand::SetSpeedLimit {
                 bytes_per_sec,
                 reply,

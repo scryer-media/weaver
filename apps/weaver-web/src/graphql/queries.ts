@@ -1390,3 +1390,261 @@ export const TOGGLE_SCHEDULE_MUTATION = gql`
     }
   }
 `;
+
+export const POST_PROCESSING_SETTINGS_QUERY = gql`
+  query PostProcessingSettings {
+    postProcessingSettings {
+      discoveryEnabled
+      executionEnabled
+      concurrency
+      terminationGraceSeconds
+      pythonInterpreter
+      powershellInterpreter
+      batchInterpreter
+      webhooksEnabled
+      allowedRoots
+    }
+    postProcessingRevisions {
+      extensionId
+      revisionId
+      declaredVersion
+      digest
+      adapter
+      displayName
+      trustState
+      managed
+      sourcePath
+      discoveredAtEpochMs
+      approvedAtEpochMs
+      manifest
+    }
+    postProcessingProfiles {
+      profileId
+      name
+      enabled
+      createdAtEpochMs
+      updatedAtEpochMs
+      definition
+    }
+  }
+`;
+
+export const UPDATE_POST_PROCESSING_SETTINGS_MUTATION = gql`
+  mutation UpdatePostProcessingSettings($input: PostProcessingSettingsInput!) {
+    updatePostProcessingSettings(input: $input) {
+      discoveryEnabled
+      executionEnabled
+      concurrency
+      terminationGraceSeconds
+      pythonInterpreter
+      powershellInterpreter
+      batchInterpreter
+      allowedRoots
+    }
+  }
+`;
+
+export const DISCOVER_POST_PROCESSING_EXTENSIONS_MUTATION = gql`
+  mutation DiscoverPostProcessingExtensions {
+    discoverPostProcessingExtensions {
+      extensionId
+      revisionId
+      declaredVersion
+      digest
+      adapter
+      displayName
+      trustState
+      managed
+      sourcePath
+      discoveredAtEpochMs
+      approvedAtEpochMs
+      manifest
+    }
+  }
+`;
+
+export const APPROVE_POST_PROCESSING_REVISION_MUTATION = gql`
+  mutation ApprovePostProcessingRevision($extensionId: String!, $revisionId: String!) {
+    approvePostProcessingRevision(extensionId: $extensionId, revisionId: $revisionId) {
+      extensionId
+      revisionId
+      trustState
+      managed
+    }
+  }
+`;
+
+export const DISABLE_POST_PROCESSING_REVISION_MUTATION = gql`
+  mutation DisablePostProcessingRevision($extensionId: String!, $revisionId: String!) {
+    disablePostProcessingRevision(extensionId: $extensionId, revisionId: $revisionId)
+  }
+`;
+
+export const REVOKE_POST_PROCESSING_REVISION_MUTATION = gql`
+  mutation RevokePostProcessingRevision($extensionId: String!, $revisionId: String!) {
+    revokePostProcessingRevision(extensionId: $extensionId, revisionId: $revisionId)
+  }
+`;
+
+export const SAVE_POST_PROCESSING_PROFILE_MUTATION = gql`
+  mutation SavePostProcessingProfile($input: PostProcessingProfileInput!) {
+    savePostProcessingProfile(input: $input) {
+      profileId
+      name
+      enabled
+      updatedAtEpochMs
+      definition
+    }
+  }
+`;
+
+export const DELETE_POST_PROCESSING_PROFILE_MUTATION = gql`
+  mutation DeletePostProcessingProfile($profileId: String!) {
+    deletePostProcessingProfile(profileId: $profileId)
+  }
+`;
+
+export const ASSIGN_GLOBAL_POST_PROCESSING_PROFILE_MUTATION = gql`
+  mutation AssignGlobalPostProcessingProfile($profileId: String) {
+    assignGlobalPostProcessingProfile(profileId: $profileId)
+  }
+`;
+
+export const ASSIGN_CATEGORY_POST_PROCESSING_PROFILE_MUTATION = gql`
+  mutation AssignCategoryPostProcessingProfile($category: String!, $profileId: String) {
+    assignCategoryPostProcessingProfile(category: $category, profileId: $profileId)
+  }
+`;
+
+const POST_PROCESSING_RUN_FIELDS = gql`
+  fragment PostProcessingRunFields on PostProcessingRun {
+    runId
+    jobId
+    status
+    pipelineOutcome
+    summary
+    terminalIntent
+    plan
+    rerunOfRunId
+    queuedAtEpochMs
+    queuePosition
+    startedAtEpochMs
+    finishedAtEpochMs
+  }
+`;
+
+export const POST_PROCESSING_QUEUE_QUERY = gql`
+  query PostProcessingQueue {
+    postProcessingQueue {
+      ...PostProcessingRunFields
+    }
+  }
+  ${POST_PROCESSING_RUN_FIELDS}
+`;
+
+export const POST_PROCESSING_JOB_QUERY = gql`
+  query PostProcessingJob($jobId: Int!) {
+    postProcessingJobPlan(jobId: $jobId) {
+      jobId
+      definition
+    }
+    postProcessingRuns(jobId: $jobId, limit: 100) {
+      ...PostProcessingRunFields
+    }
+  }
+  ${POST_PROCESSING_RUN_FIELDS}
+`;
+
+export const POST_PROCESSING_ATTEMPTS_QUERY = gql`
+  query PostProcessingAttempts($runId: String!) {
+    postProcessingAttempts(runId: $runId) {
+      attemptId
+      runId
+      stepIndex
+      status
+      extensionId
+      revisionId
+      adapter
+      workingDirectory
+      exitCode
+      errorMessage
+      progress
+      outputTruncated
+      queuedAtEpochMs
+      startedAtEpochMs
+      finishedAtEpochMs
+    }
+  }
+`;
+
+export const POST_PROCESSING_ARTIFACTS_QUERY = gql`
+  query PostProcessingArtifacts($runId: String!) {
+    postProcessingArtifacts(runId: $runId) {
+      attemptId
+      stepIndex
+      path
+      exists
+      isFile
+      isDirectory
+      isSymlink
+      sizeBytes
+    }
+  }
+`;
+
+export const POST_PROCESSING_LOGS_QUERY = gql`
+  query PostProcessingLogs($attemptId: String!, $cursor: Int, $limit: Int!) {
+    postProcessingLogs(attemptId: $attemptId, cursor: $cursor, limit: $limit) {
+      chunks {
+        sequence
+        stream
+        text
+        createdAtEpochMs
+      }
+      nextCursor
+      truncated
+    }
+  }
+`;
+
+export const PAUSE_POST_PROCESSING_QUEUE_MUTATION = gql`
+  mutation PausePostProcessingQueue {
+    pausePostProcessingQueue
+  }
+`;
+
+export const RESUME_POST_PROCESSING_QUEUE_MUTATION = gql`
+  mutation ResumePostProcessingQueue {
+    resumePostProcessingQueue
+  }
+`;
+
+export const REORDER_POST_PROCESSING_QUEUE_MUTATION = gql`
+  mutation ReorderPostProcessingQueue($runIds: [String!]!) {
+    reorderPostProcessingQueue(runIds: $runIds)
+  }
+`;
+
+export const CANCEL_JOB_POST_PROCESSING_MUTATION = gql`
+  mutation CancelJobPostProcessing($jobId: Int!) {
+    cancelJobPostProcessing(jobId: $jobId)
+  }
+`;
+
+export const RERUN_POST_PROCESSING_MUTATION = gql`
+  mutation RerunPostProcessing($input: PostProcessingRerunInput!) {
+    rerunPostProcessing(input: $input) {
+      ...PostProcessingRunFields
+    }
+  }
+  ${POST_PROCESSING_RUN_FIELDS}
+`;
+
+export const SET_JOB_POST_PROCESSING_SELECTION_MUTATION = gql`
+  mutation SetJobPostProcessingSelection($jobId: Int!, $selection: PostProcessingSelectionInput!) {
+    setJobPostProcessingSelection(jobId: $jobId, selection: $selection) {
+      jobId
+      definition
+    }
+  }
+`;

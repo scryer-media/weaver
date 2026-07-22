@@ -194,6 +194,8 @@ pub enum JobStatus {
     Extracting,
     /// Moving extracted files to the final destination directory.
     Moving,
+    QueuedPostProcessing,
+    PostProcessing,
     Complete,
     Failed {
         error: String,
@@ -213,6 +215,8 @@ impl JobStatus {
             Self::QueuedExtract => "queued_extract",
             Self::Extracting => "extracting",
             Self::Moving => "moving",
+            Self::QueuedPostProcessing => "queued_post_processing",
+            Self::PostProcessing => "post_processing",
             Self::Complete => "complete",
             Self::Failed { .. } => "failed",
             Self::Paused => "paused",
@@ -264,6 +268,8 @@ pub enum PostState {
     AwaitingRepair,
     Verifying,
     Finalizing,
+    QueuedPostProcessing,
+    PostProcessing,
     Completed,
     Failed,
 }
@@ -280,6 +286,8 @@ impl PostState {
             Self::AwaitingRepair => "awaiting_repair",
             Self::Verifying => "verifying",
             Self::Finalizing => "finalizing",
+            Self::QueuedPostProcessing => "queued_post_processing",
+            Self::PostProcessing => "post_processing",
             Self::Completed => "completed",
             Self::Failed => "failed",
         }
@@ -296,6 +304,8 @@ impl PostState {
             "awaiting_repair" => Some(Self::AwaitingRepair),
             "verifying" => Some(Self::Verifying),
             "finalizing" => Some(Self::Finalizing),
+            "queued_post_processing" => Some(Self::QueuedPostProcessing),
+            "post_processing" => Some(Self::PostProcessing),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
             _ => None,
@@ -350,6 +360,8 @@ pub fn derive_legacy_job_status(
 
     match post_state {
         PostState::Finalizing => JobStatus::Moving,
+        PostState::QueuedPostProcessing => JobStatus::QueuedPostProcessing,
+        PostState::PostProcessing => JobStatus::PostProcessing,
         PostState::Repairing => JobStatus::Repairing,
         PostState::QueuedRepair => JobStatus::QueuedRepair,
         PostState::Verifying | PostState::AwaitingRepair => JobStatus::Verifying,
@@ -379,6 +391,8 @@ pub fn job_status_from_persisted_str(status: &str, error: Option<&str>) -> JobSt
         "queued_extract" => JobStatus::QueuedExtract,
         "extracting" => JobStatus::Extracting,
         "moving" => JobStatus::Moving,
+        "queued_post_processing" => JobStatus::QueuedPostProcessing,
+        "post_processing" => JobStatus::PostProcessing,
         "complete" => JobStatus::Complete,
         "failed" => JobStatus::Failed {
             error: error.unwrap_or("unknown error").to_string(),
@@ -432,6 +446,16 @@ pub fn runtime_lanes_from_status_snapshot(
         JobStatus::Moving => (
             DownloadState::Complete,
             PostState::Finalizing,
+            RunState::Active,
+        ),
+        JobStatus::QueuedPostProcessing => (
+            DownloadState::Complete,
+            PostState::QueuedPostProcessing,
+            RunState::Active,
+        ),
+        JobStatus::PostProcessing => (
+            DownloadState::Complete,
+            PostState::PostProcessing,
             RunState::Active,
         ),
         JobStatus::Complete => (

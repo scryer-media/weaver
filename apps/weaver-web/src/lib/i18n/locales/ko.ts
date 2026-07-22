@@ -237,6 +237,8 @@ const ko: LocaleDictionary = {
   "settings.security": "보안",
   "settings.backupNav": "백업",
   "settings.rss": "RSS",
+  "settings.postProcessing": "Post-processing",
+  "settings.postProcessingDesc": "Approve and configure terminal extension scripts.",
   "settings.generalPageDesc": "다운로드 속도, 저장 경로, 정리 동작, 재시도 정책을 한 곳에서 조정하세요.",
   "settings.language": "언어",
   "settings.languageDesc": "Weaver 인터페이스의 표시 언어를 선택하세요.",

@@ -78,13 +78,15 @@ pub const JOB_STATUS_KEYS: [&str; NUM_JOB_STATUS_METRICS] = [
     "queued_extract",
     "extracting",
     "moving",
+    "queued_post_processing",
+    "post_processing",
     "failed",
     "complete",
 ];
 
 const NUM_COUNTER_METRICS: usize = 19;
 const NUM_GAUGE_METRICS: usize = 24;
-const NUM_JOB_STATUS_METRICS: usize = 12;
+const NUM_JOB_STATUS_METRICS: usize = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricsHistoryTier {
@@ -1020,6 +1022,8 @@ fn job_status_index(status: &JobStatus) -> Option<usize> {
         JobStatus::QueuedExtract => "queued_extract",
         JobStatus::Extracting => "extracting",
         JobStatus::Moving => "moving",
+        JobStatus::QueuedPostProcessing => "queued_post_processing",
+        JobStatus::PostProcessing => "post_processing",
         JobStatus::Failed { .. } => "failed",
         JobStatus::Complete => "complete",
     };
