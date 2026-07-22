@@ -371,6 +371,7 @@ impl Pipeline {
 
     async fn reset_failed_job_runtime(&mut self, job_id: JobId) {
         self.remove_pending_completion_check(job_id);
+        self.clear_terminal_segment_failures(job_id);
         self.clear_par2_runtime_state(job_id);
         self.clear_job_extraction_runtime(job_id);
         self.clear_job_rar_runtime(job_id);

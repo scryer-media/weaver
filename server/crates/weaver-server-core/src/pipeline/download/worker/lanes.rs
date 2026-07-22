@@ -181,6 +181,11 @@ impl Pipeline {
         self.check_health(job_id);
     }
 
+    pub(crate) fn clear_terminal_segment_failures(&mut self, job_id: JobId) {
+        self.terminal_segment_failures
+            .retain(|segment_id| segment_id.file_id.job_id != job_id);
+    }
+
     fn health_counted_segment_bytes(&self, segment_id: SegmentId) -> u64 {
         self.jobs
             .get(&segment_id.file_id.job_id)

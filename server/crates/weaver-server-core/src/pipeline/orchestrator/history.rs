@@ -179,6 +179,7 @@ impl Pipeline {
     pub(crate) fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
         self.jobs.remove(&job_id);
         self.job_order.retain(|id| *id != job_id);
+        self.clear_terminal_segment_failures(job_id);
         self.clear_par2_runtime_state(job_id);
         self.clear_job_extraction_runtime(job_id);
         self.inflight_moves.remove(&job_id);

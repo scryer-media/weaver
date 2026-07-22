@@ -930,6 +930,7 @@ impl Pipeline {
                 } else {
                     let seg_id = result.segment_id;
                     let preserves_retry_budget = failure.kind.preserves_article_retry_budget();
+                    let infrastructure_retry = failure.kind.infrastructure_wait_reason().is_some();
                     let next_retry = if preserves_retry_budget || source_not_found {
                         result.retry_count
                     } else {
@@ -972,7 +973,7 @@ impl Pipeline {
                             self.metrics
                                 .segments_retried
                                 .fetch_add(1, Ordering::Relaxed);
-                            let delay = if preserves_retry_budget {
+                            let delay = if infrastructure_retry {
                                 std::time::Duration::from_secs(1)
                             } else if source_not_found {
                                 std::time::Duration::ZERO
@@ -980,7 +981,7 @@ impl Pipeline {
                                 std::time::Duration::from_secs(1 << (next_retry - 1))
                             };
                             self.note_retry_scheduled(seg_id);
-                            if preserves_retry_budget {
+                            if infrastructure_retry {
                                 self.note_infrastructure_retry_scheduled(
                                     seg_id.file_id.job_id,
                                     failure.kind,
@@ -997,10 +998,10 @@ impl Pipeline {
                             let scheduled_pool_generation = self.pool_generation;
                             let retry = crate::pipeline::RetryWork {
                                 scheduled_pool_generation,
-                                infrastructure_retry: preserves_retry_budget,
+                                infrastructure_retry,
                                 work,
                             };
-                            if preserves_retry_budget {
+                            if infrastructure_retry {
                                 self.schedule_infrastructure_retry(Some(delay), retry);
                             } else {
                                 let retry_tx = self.retry_tx.clone();

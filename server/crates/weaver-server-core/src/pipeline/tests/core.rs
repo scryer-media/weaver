@@ -423,9 +423,11 @@ async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_chan
     assert!(active_connections.load(Ordering::Acquire) <= 20);
     let progress_before_rebuild = harness.handle.get_job(job_id).unwrap().downloaded_bytes;
 
+    let replacement_client = capacity_test_client(port, 20);
+    let replacement_pool = Arc::clone(replacement_client.pool());
     let activation = harness
         .handle
-        .rebuild_nntp(capacity_test_client(port, 20), 20)
+        .rebuild_nntp(replacement_client, 20)
         .await
         .unwrap();
     assert_eq!(activation.generation, 1);
@@ -441,6 +443,15 @@ async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_chan
     })
     .await
     .expect("the same active job should resume within the generation handoff bound");
+    assert_eq!(replacement_pool.effective_connection_capacity(), 20);
+    assert_eq!(
+        replacement_pool.capacity_reductions(weaver_nntp::ServerId(0)),
+        Some(0)
+    );
+    assert_eq!(
+        replacement_pool.capacity_penalty_until_epoch_ms(weaver_nntp::ServerId(0)),
+        None
+    );
 
     let completed = wait_until(Duration::from_secs(30), || {
         harness

@@ -100,6 +100,7 @@ pub struct CapacityChange {
 struct CapacityRecoveryState {
     next_probe_at: Option<TokioInstant>,
     next_probe_at_epoch_ms: Option<u64>,
+    activation_grace_until: Option<TokioInstant>,
     probe_in_flight: bool,
     changed: bool,
     pending_rejections: u64,
@@ -110,20 +111,23 @@ struct CapacityRecoveryState {
 #[derive(Debug)]
 struct AdaptiveConnectionLimit {
     configured: usize,
+    auth_retry_after: Duration,
     effective: AtomicUsize,
     reductions: AtomicU64,
     recovery: StdMutex<CapacityRecoveryState>,
 }
 
 impl AdaptiveConnectionLimit {
-    fn new(configured: usize) -> Self {
+    fn new(configured: usize, auth_retry_after: Duration) -> Self {
         Self {
             configured,
+            auth_retry_after,
             effective: AtomicUsize::new(configured),
             reductions: AtomicU64::new(0),
             recovery: StdMutex::new(CapacityRecoveryState {
                 next_probe_at: None,
                 next_probe_at_epoch_ms: None,
+                activation_grace_until: None,
                 probe_in_flight: false,
                 changed: false,
                 pending_rejections: 0,
@@ -163,7 +167,30 @@ impl AdaptiveConnectionLimit {
         true
     }
 
+    fn begin_activation_grace(&self, duration: Duration) {
+        let mut recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        recovery.activation_grace_until = Some(TokioInstant::now() + duration);
+    }
+
     fn record_rejection(&self) -> bool {
+        let mut recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if recovery
+            .activation_grace_until
+            .is_some_and(|until| TokioInstant::now() < until)
+        {
+            recovery.changed = true;
+            recovery.pending_rejections = recovery.pending_rejections.saturating_add(1);
+            recovery.latest_probe_outcome = None;
+            return true;
+        }
+        recovery.activation_grace_until = None;
+
         let previous = self
             .effective
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -174,10 +201,6 @@ impl AdaptiveConnectionLimit {
         if effective < previous {
             self.reductions.fetch_add(1, Ordering::Relaxed);
         }
-        let mut recovery = self
-            .recovery
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
         recovery.probe_in_flight = false;
         Self::set_next_probe(&mut recovery, Some(CAPACITY_PENALTY));
         recovery.changed = true;
@@ -216,7 +239,7 @@ impl AdaptiveConnectionLimit {
                 Self::set_next_probe(&mut recovery, Some(CAPACITY_PENALTY));
             }
             CapacityProbeOutcome::AuthenticationFailure => {
-                Self::set_next_probe(&mut recovery, None);
+                Self::set_next_probe(&mut recovery, Some(self.auth_retry_after));
             }
             CapacityProbeOutcome::TransportFailure | CapacityProbeOutcome::NoConfiguredPermit => {
                 Self::set_next_probe(&mut recovery, Some(CAPACITY_RECOVERY_INTERVAL));
@@ -363,7 +386,10 @@ impl NntpPool {
             backfill.push(spc.backfill && !all_backfill);
             retention_days.push(spc.retention_days);
             max_connections.push(spc.max_connections);
-            adaptive_connections.push(AdaptiveConnectionLimit::new(spc.max_connections));
+            adaptive_connections.push(AdaptiveConnectionLimit::new(
+                spc.max_connections,
+                config.health_config.auth_disable_duration,
+            ));
             connect_cursors.push(AtomicUsize::new(0));
             semaphores.push(Arc::new(Semaphore::new(spc.max_connections)));
             configs.push(spc.server.clone());
@@ -978,6 +1004,13 @@ impl NntpPool {
             return Err(NntpError::PoolExhausted);
         }
         Ok(BlockingConnectionPermit { _permit: permit })
+    }
+
+    /// Ignore lasting capacity learning while old-generation provider slots drain.
+    pub fn begin_activation_overlap_grace(&self, duration: Duration) {
+        for limit in &self.adaptive_connections {
+            limit.begin_activation_grace(duration);
+        }
     }
 
     pub fn record_provider_capacity_rejection(&self, server: ServerId) -> bool {
@@ -1836,7 +1869,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn adaptive_capacity_reduces_immediately_and_recovers_additively() {
-        let limit = AdaptiveConnectionLimit::new(8);
+        let limit = AdaptiveConnectionLimit::new(8, Duration::from_mins(5));
 
         for expected in (2..=7).rev() {
             assert!(!limit.record_rejection());
@@ -1899,5 +1932,56 @@ mod tests {
 
         assert_eq!(limit.effective(), 8);
         assert!(!limit.claim_due_probe(TokioInstant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authentication_probe_rearms_at_auth_disable_duration() {
+        let auth_retry_after = Duration::from_secs(90);
+        let limit = AdaptiveConnectionLimit::new(3, auth_retry_after);
+        assert!(!limit.record_rejection());
+        assert!(!limit.record_rejection());
+        assert_eq!(limit.effective(), 1);
+
+        tokio::time::advance(CAPACITY_PENALTY).await;
+        assert!(limit.claim_due_probe(TokioInstant::now()));
+        limit.finish_probe(CapacityProbeOutcome::AuthenticationFailure);
+        assert_eq!(limit.effective(), 1);
+        assert!(!limit.claim_due_probe(TokioInstant::now()));
+
+        tokio::time::advance(auth_retry_after - Duration::from_secs(1)).await;
+        assert!(!limit.claim_due_probe(TokioInstant::now()));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(limit.claim_due_probe(TokioInstant::now()));
+        limit.finish_probe(CapacityProbeOutcome::AuthenticationFailure);
+
+        tokio::time::advance(auth_retry_after).await;
+        assert!(limit.claim_due_probe(TokioInstant::now()));
+        limit.finish_probe(CapacityProbeOutcome::Succeeded);
+        assert_eq!(limit.effective(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activation_grace_coalesces_rejections_without_learning_a_lower_cap() {
+        let limit = AdaptiveConnectionLimit::new(8, Duration::from_mins(5));
+        limit.begin_activation_grace(Duration::from_secs(30));
+
+        assert!(limit.record_rejection());
+        assert_eq!(limit.effective(), 8);
+        assert_eq!(limit.reductions(), 0);
+        assert!(limit.penalty_until_epoch_ms().is_none());
+        let first = limit.take_change(ServerId(0)).unwrap();
+        assert_eq!(first.effective_delta, 0);
+        assert_eq!(first.coalesced_rejections, 1);
+
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(limit.record_rejection());
+        assert_eq!(limit.effective(), 8);
+        assert_eq!(limit.reductions(), 0);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!limit.record_rejection());
+        assert_eq!(limit.effective(), 7);
+        assert_eq!(limit.reductions(), 1);
+        assert!(limit.penalty_until_epoch_ms().is_some());
     }
 }

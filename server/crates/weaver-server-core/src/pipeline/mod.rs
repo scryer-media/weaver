@@ -812,7 +812,6 @@ impl DownloadFailureKind {
                 | Self::LaneUnavailable
                 | Self::Unrequested
                 | Self::ConnectionEstablishment
-                | Self::EstablishedTransport
                 | Self::Auth
         )
     }

@@ -184,6 +184,65 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
         pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
         Some(JobStatus::Downloading)
     );
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 0);
+    assert_eq!(
+        pipeline
+            .metrics
+            .parked_infrastructure_work
+            .load(Ordering::Relaxed),
+        1
+    );
+
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("transport retry should remain in the batched infrastructure queue");
+    assert_eq!(retry.retry_count, 1);
+
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline
+        .handle_download_done(DownloadResult {
+            runtime_generation: 0,
+            segment_id: retry.segment_id,
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::EstablishedTransport,
+                "connection reset by peer",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: MAX_SEGMENT_RETRIES,
+            exclude_servers: retry.exclude_servers,
+            release_connection_slot: true,
+        })
+        .await;
+
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ));
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
+    assert_eq!(
+        pipeline
+            .metrics
+            .parked_infrastructure_work
+            .load(Ordering::Relaxed),
+        0
+    );
 }
 
 #[test]
@@ -218,11 +277,10 @@ fn lane_acquire_failure_preserves_retry_semantics() {
 }
 
 #[test]
-fn only_article_or_content_failures_consume_article_retry_budget() {
+fn only_pre_body_infrastructure_failures_preserve_article_retry_budget() {
     for kind in [
         DownloadFailureKind::CapacityUnavailable,
         DownloadFailureKind::ConnectionEstablishment,
-        DownloadFailureKind::EstablishedTransport,
         DownloadFailureKind::Auth,
         DownloadFailureKind::ServerQuota,
         DownloadFailureKind::LaneUnavailable,
@@ -231,11 +289,17 @@ fn only_article_or_content_failures_consume_article_retry_budget() {
         assert!(kind.preserves_article_retry_budget(), "kind={kind:?}");
     }
     for kind in [
+        DownloadFailureKind::EstablishedTransport,
         DownloadFailureKind::ArticleNotFound,
         DownloadFailureKind::ContentOrProtocol,
     ] {
         assert!(!kind.preserves_article_retry_budget(), "kind={kind:?}");
     }
+    assert!(
+        DownloadFailureKind::EstablishedTransport
+            .infrastructure_wait_reason()
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -662,6 +726,21 @@ async fn terminal_accounting_is_idempotent() {
     pipeline.book_failed_segment(segment_id);
     assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 145);
     assert_eq!(pipeline.terminal_segment_failures.len(), 1);
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.status = JobStatus::Failed {
+            error: "retry requested".to_string(),
+        };
+    }
+    pipeline.reprocess_job(job_id).await.unwrap();
+    assert!(!pipeline.terminal_segment_failures.contains(&segment_id));
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 0);
+
+    pipeline.book_failed_segment(segment_id);
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 128);
+    pipeline.purge_terminal_job_runtime(job_id);
+    assert!(!pipeline.terminal_segment_failures.contains(&segment_id));
 }
 
 #[tokio::test]
