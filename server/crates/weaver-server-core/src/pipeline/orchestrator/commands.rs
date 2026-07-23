@@ -544,80 +544,49 @@ impl Pipeline {
                 } else {
                     None
                 };
-                let result = match self.jobs.get(&job_id).map(|state| state.status.clone()) {
-                    Some(status) if !is_terminal_status(&status) => {
-                        Err(crate::SchedulerError::Conflict(
-                            "cannot delete active job — cancel it first".into(),
-                        ))
+                if self
+                    .jobs
+                    .get(&job_id)
+                    .is_some_and(|state| !is_terminal_status(&state.status))
+                {
+                    let _ = reply.send(Err(crate::SchedulerError::Conflict(
+                        "cannot delete active job — cancel it first".into(),
+                    )));
+                    return;
+                }
+                let db = self.db.clone();
+                let delete_result =
+                    tokio::task::spawn_blocking(move || db.delete_job_history(job_id.0)).await;
+                match delete_result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(crate::StateError::Conflict(message))) => {
+                        let _ = reply.send(Err(SchedulerError::Conflict(message)));
+                        return;
                     }
-                    Some(_) => {
-                        if let Err(error) = self
-                            .cleanup_history_intermediate_dirs(&history_cleanup_dirs)
-                            .await
-                        {
-                            let _ = reply.send(Err(error));
-                            return;
-                        }
-                        self.cleanup_output_dir(output_dir.as_deref()).await;
-                        self.purge_terminal_job_runtime(job_id);
-                        self.finished_jobs.retain(|j| j.job_id != job_id);
-                        let db = self.db.clone();
-                        tokio::task::spawn_blocking(move || {
-                            if let Err(error) = db.delete_job_history(job_id.0) {
-                                tracing::warn!(
-                                    job_id = job_id.0,
-                                    error = %error,
-                                    "failed to delete job history row on user delete"
-                                );
-                            }
-                            if let Err(error) = db.delete_job_events(job_id.0) {
-                                tracing::warn!(
-                                    job_id = job_id.0,
-                                    error = %error,
-                                    "failed to delete job events on user delete"
-                                );
-                            }
-                        });
-                        self.publish_snapshot();
-                        Ok(())
+                    Ok(Err(error)) => {
+                        let _ = reply.send(Err(SchedulerError::Internal(format!(
+                            "failed to delete history bundle: {error}"
+                        ))));
+                        return;
                     }
-                    None => {
-                        if let Err(error) = self
-                            .cleanup_history_intermediate_dirs(&history_cleanup_dirs)
-                            .await
-                        {
-                            let _ = reply.send(Err(error));
-                            return;
-                        }
-                        self.cleanup_output_dir(output_dir.as_deref()).await;
-                        self.finished_jobs.retain(|j| j.job_id != job_id);
-                        let db = self.db.clone();
-                        let delete_result =
-                            tokio::task::spawn_blocking(move || -> Result<(), String> {
-                                db.delete_job_history(job_id.0)
-                                    .map_err(|e| format!("failed to delete history row: {e}"))?;
-                                db.delete_job_events(job_id.0)
-                                    .map_err(|e| format!("failed to delete job events: {e}"))?;
-                                Ok(())
-                            })
-                            .await;
-                        match delete_result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
-                                let _ = reply.send(Err(SchedulerError::Internal(error)));
-                                return;
-                            }
-                            Err(error) => {
-                                let _ = reply.send(Err(SchedulerError::Internal(format!(
-                                    "failed to join history delete task: {error}"
-                                ))));
-                                return;
-                            }
-                        }
-                        self.publish_snapshot();
-                        Ok(())
+                    Err(error) => {
+                        let _ = reply.send(Err(SchedulerError::Internal(format!(
+                            "failed to join history delete task: {error}"
+                        ))));
+                        return;
                     }
-                };
+                }
+                let cleanup_error = self
+                    .cleanup_history_intermediate_dirs(&history_cleanup_dirs)
+                    .await
+                    .err();
+                self.cleanup_output_dir(output_dir.as_deref()).await;
+                if self.jobs.contains_key(&job_id) {
+                    self.purge_terminal_job_runtime(job_id);
+                }
+                self.finished_jobs.retain(|job| job.job_id != job_id);
+                self.publish_snapshot();
+                let result = cleanup_error.map_or(Ok(()), Err);
                 let _ = reply.send(result);
             }
             SchedulerCommand::DeleteAllHistory {
@@ -631,18 +600,39 @@ impl Pipeline {
                         return;
                     }
                 };
-                if let Err(error) = self
+                let output_dirs = if delete_files {
+                    self.all_output_dirs().await
+                } else {
+                    Vec::new()
+                };
+                let db = self.db.clone();
+                let delete_result =
+                    tokio::task::spawn_blocking(move || db.delete_all_job_history()).await;
+                match delete_result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(crate::StateError::Conflict(message))) => {
+                        let _ = reply.send(Err(SchedulerError::Conflict(message)));
+                        return;
+                    }
+                    Ok(Err(error)) => {
+                        let _ = reply.send(Err(SchedulerError::Internal(format!(
+                            "failed to delete all history bundles: {error}"
+                        ))));
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(SchedulerError::Internal(format!(
+                            "failed to join delete-all-history task: {error}"
+                        ))));
+                        return;
+                    }
+                }
+                let cleanup_error = self
                     .cleanup_history_intermediate_dirs(&history_cleanup_dirs)
                     .await
-                {
-                    let _ = reply.send(Err(error));
-                    return;
-                }
-                if delete_files {
-                    let output_dirs = self.all_output_dirs().await;
-                    for dir in &output_dirs {
-                        self.cleanup_output_dir(Some(dir)).await;
-                    }
+                    .err();
+                for dir in &output_dirs {
+                    self.cleanup_output_dir(Some(dir)).await;
                 }
                 let terminal_job_ids: Vec<JobId> = self
                     .jobs
@@ -655,30 +645,8 @@ impl Pipeline {
                     self.purge_terminal_job_runtime(job_id);
                 }
                 self.finished_jobs.clear();
-                let db = self.db.clone();
-                let delete_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                    db.delete_all_job_history()
-                        .map_err(|e| format!("failed to delete all job history: {e}"))?;
-                    db.delete_all_job_events()
-                        .map_err(|e| format!("failed to delete all job events: {e}"))?;
-                    Ok(())
-                })
-                .await;
-                match delete_result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        let _ = reply.send(Err(SchedulerError::Internal(error)));
-                        return;
-                    }
-                    Err(error) => {
-                        let _ = reply.send(Err(SchedulerError::Internal(format!(
-                            "failed to join delete-all-history task: {error}"
-                        ))));
-                        return;
-                    }
-                }
                 self.publish_snapshot();
-                let _ = reply.send(Ok(()));
+                let _ = reply.send(cleanup_error.map_or(Ok(()), Err));
             }
             SchedulerCommand::Shutdown => unreachable!("handled in select"),
         }

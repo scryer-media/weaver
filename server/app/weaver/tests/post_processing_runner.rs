@@ -83,6 +83,7 @@ fn request(
             pipeline_outcome: PipelineOutcome::Succeeded,
             par_status: 2,
             unpack_status: 2,
+            compatibility: Default::default(),
         },
         timeout_policy,
         termination_grace: Duration::from_millis(100),

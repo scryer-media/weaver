@@ -21,10 +21,15 @@ pub const GRAPHQL_MAX_DEPTH: usize = 16;
 pub fn apply_graphql_query_guards<Query, Mutation, Subscription>(
     builder: SchemaBuilder<Query, Mutation, Subscription>,
 ) -> SchemaBuilder<Query, Mutation, Subscription> {
-    builder
-        .disable_introspection()
+    let builder = builder
         .limit_complexity(GRAPHQL_MAX_COMPLEXITY)
-        .limit_depth(GRAPHQL_MAX_DEPTH)
+        .limit_depth(GRAPHQL_MAX_DEPTH);
+
+    if std::env::var("WEAVER_E2E_MODE").as_deref() == Ok("1") {
+        builder
+    } else {
+        builder.disable_introspection()
+    }
 }
 
 pub struct SchemaContext {

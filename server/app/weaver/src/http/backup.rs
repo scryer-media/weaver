@@ -1,6 +1,9 @@
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::{path::PathBuf, sync::Arc};
 
 use axum::Json;
+use axum::body::Body;
 use axum::extract::{
     Extension, FromRequestParts, Multipart,
     multipart::{Field, MultipartError},
@@ -8,6 +11,8 @@ use axum::extract::{
 use axum::http::{HeaderMap, StatusCode, header, request::Parts};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
+use tokio::io::{AsyncRead, ReadBuf};
+use tokio_util::io::ReaderStream;
 
 use weaver_server_api::{
     BackupService, BackupStatus, CategoryRemapInput, RestoreOptions, backup_error_status_code,
@@ -28,6 +33,21 @@ pub(super) struct BackupHandlerState {
     backup: BackupService,
     session_token: Arc<String>,
     security: RuntimeSecurityConfig,
+}
+
+struct BackupArtifactReader {
+    file: tokio::fs::File,
+    _temp_dir: tempfile::TempDir,
+}
+
+impl AsyncRead for BackupArtifactReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.file).poll_read(context, buffer)
+    }
 }
 
 impl<S> FromRequestParts<S> for BackupHandlerState
@@ -115,17 +135,29 @@ pub(super) async fn backup_export_handler(
         return status.into_response();
     }
     match backup.create_backup(body.password).await {
-        Ok(artifact) => (
-            [
-                (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-                (
-                    header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}\"", artifact.filename),
+        Ok(artifact) => {
+            let (filename, path, temp_dir) = artifact.into_parts();
+            match tokio::fs::File::open(path).await {
+                Ok(file) => (
+                    [
+                        (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                        (
+                            header::CONTENT_DISPOSITION,
+                            format!("attachment; filename=\"{filename}\""),
+                        ),
+                    ],
+                    Body::from_stream(ReaderStream::new(BackupArtifactReader {
+                        file,
+                        _temp_dir: temp_dir,
+                    })),
+                )
+                    .into_response(),
+                Err(error) => super::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to open backup artifact: {error}"),
                 ),
-            ],
-            artifact.bytes,
-        )
-            .into_response(),
+            }
+        }
         Err(error) => super::error_response(backup_error_status_code(&error), &error.to_string()),
     }
 }
@@ -193,14 +225,7 @@ pub(super) async fn backup_restore_handler(
                 .restore_backup(&upload.file_path, upload.password, options)
                 .await
             {
-                Ok(report) => {
-                    if let Err(status) =
-                        super::auth::refresh_auth_caches(&db, &auth_cache, &api_key_cache).await
-                    {
-                        return status.into_response();
-                    }
-                    Json(report).into_response()
-                }
+                Ok(report) => Json(report).into_response(),
                 Err(error) => {
                     super::error_response(backup_error_status_code(&error), &error.to_string())
                 }
@@ -248,6 +273,8 @@ struct MultipartByteLimiter {
     limit: u64,
 }
 
+const MAX_BACKUP_TEXT_FIELD_BYTES: usize = 1024 * 1024;
+
 impl MultipartByteLimiter {
     fn new(limit: u64) -> Self {
         Self { consumed: 0, limit }
@@ -272,6 +299,12 @@ async fn read_field_bytes_limited(
     let mut bytes = Vec::new();
     while let Some(chunk) = field.chunk().await.map_err(multipart_error_response)? {
         limiter.consume(chunk.len())?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_BACKUP_TEXT_FIELD_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("backup text field exceeds {MAX_BACKUP_TEXT_FIELD_BYTES} bytes"),
+            ));
+        }
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
@@ -444,6 +477,17 @@ mod tests {
 
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert!(message.contains("backup upload exceeds 5 bytes"));
+    }
+
+    #[tokio::test]
+    async fn backup_upload_bounds_individual_text_fields() {
+        let oversized = vec![b'x'; MAX_BACKUP_TEXT_FIELD_BYTES + 1];
+        let multipart = multipart_from_parts(&[("password", oversized.as_slice())]).await;
+
+        let (status, message) = parse_upload_err(multipart, u64::MAX).await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(message.contains("backup text field exceeds"));
     }
 
     #[tokio::test]

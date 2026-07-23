@@ -234,6 +234,33 @@ impl ServersMutation {
         .await?;
         Ok(Server::from_config(&server, Some(&snapshot)))
     }
+    /// Test a saved NNTP server using its decrypted persisted credentials.
+    #[graphql(guard = "AdminGuard")]
+    async fn test_configured_server_connection(
+        &self,
+        ctx: &Context<'_>,
+        id: u32,
+    ) -> Result<TestConnectionResult> {
+        let config = ctx.data::<SharedConfig>()?;
+        let server = with_timed_config_read(
+            config,
+            "servers.mutation.test_configured_server_connection.server",
+            |cfg| {
+                cfg.servers
+                    .iter()
+                    .find(|server| server.id == id)
+                    .cloned()
+                    .ok_or_else(|| async_graphql::Error::new(format!("server {id} not found")))
+            },
+        )
+        .await?;
+        Ok(
+            weaver_server_core::servers::probe_server_connection(&server)
+                .await
+                .into(),
+        )
+    }
+
     /// Test connectivity to an NNTP server without saving it.
     #[graphql(guard = "AdminGuard")]
     async fn test_connection(

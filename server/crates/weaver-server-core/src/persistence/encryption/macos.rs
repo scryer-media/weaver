@@ -65,6 +65,29 @@ impl KeyStore for MacOSKeychain {
         }
     }
 
+    fn replace_key(&self, key: &str) -> Result<bool, String> {
+        let keychain = Self::keychain()?;
+        match keychain.find_generic_password(&self.service, &self.account) {
+            Ok((_password, mut item)) => item
+                .set_password(key.as_bytes())
+                .map(|()| true)
+                .map_err(|error| format!("failed to replace key in macOS Keychain: {error}")),
+            Err(error) if error.code() == security_framework_sys::base::errSecItemNotFound => {
+                keychain
+                    .add_generic_password(&self.service, &self.account, key.as_bytes())
+                    .map(|()| true)
+                    .map_err(|error| {
+                        format!("failed to store restored key in macOS Keychain: {error}")
+                    })
+            }
+            Err(error) => Err(format!("macOS Keychain error: {error}")),
+        }
+    }
+
+    fn can_replace(&self) -> bool {
+        true
+    }
+
     fn delete_key(&self) -> Result<(), String> {
         match Self::keychain()?.find_generic_password(&self.service, &self.account) {
             Ok((_password, item)) => {
@@ -101,6 +124,7 @@ mod tests {
         let _cleanup = KeychainCleanup(&store);
         let first = EncryptionKey::generate().to_base64();
         let second = EncryptionKey::generate().to_base64();
+        let restored = EncryptionKey::generate().to_base64();
 
         assert_eq!(
             store.create_key_if_absent(&first).unwrap().as_deref(),
@@ -111,5 +135,7 @@ mod tests {
             Some(first.as_str())
         );
         assert_eq!(store.get_key().unwrap().as_deref(), Some(first.as_str()));
+        assert!(store.replace_key(&restored).unwrap());
+        assert_eq!(store.get_key().unwrap().as_deref(), Some(restored.as_str()));
     }
 }

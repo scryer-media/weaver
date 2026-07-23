@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use tracing::{error, info};
+use tracing::info;
 
 use crate::Database;
 use crate::persistence::database_target::DatabaseTarget;
@@ -32,7 +32,10 @@ pub fn resolve_database_paths(config_path: &Path) -> (PathBuf, Option<PathBuf>) 
 pub fn open_db_and_config(
     config_path: &Path,
 ) -> Result<(Database, Config), Box<dyn std::error::Error>> {
-    let (_db_path, toml_path) = resolve_database_paths(config_path);
+    finish_open_db_and_config(config_path, open_database(config_path)?)
+}
+
+pub fn open_database(config_path: &Path) -> Result<Database, Box<dyn std::error::Error>> {
     let target = DatabaseTarget::resolve(config_path)?;
 
     if let DatabaseTarget::SqlitePath(path) = &target
@@ -40,7 +43,14 @@ pub fn open_db_and_config(
     {
         std::fs::create_dir_all(parent)?;
     }
-    let mut db = Database::open_target(target)?;
+    Ok(Database::open_target(target)?)
+}
+
+pub fn finish_open_db_and_config(
+    config_path: &Path,
+    mut db: Database,
+) -> Result<(Database, Config), Box<dyn std::error::Error>> {
+    let (_db_path, toml_path) = resolve_database_paths(config_path);
 
     if let Some(ref toml) = toml_path {
         bootstrap_encryption_for_toml_import(config_path, toml, &mut db)?;
@@ -94,24 +104,28 @@ pub fn bootstrap_encryption(
     config: &mut Config,
 ) -> Result<(), String> {
     if db.encryption_key().is_none() {
-        let key =
-            crate::persistence::encryption::ensure_encryption_key(Some(data_dir.to_path_buf()))?;
+        let encrypted_credentials_exist = db
+            .has_encrypted_credentials()
+            .map_err(|error| format!("inspect encrypted credential state: {error}"))?;
+        let key = crate::persistence::encryption::ensure_encryption_key_for_state(
+            Some(data_dir.to_path_buf()),
+            encrypted_credentials_exist,
+        )?;
+        db.validate_encrypted_credentials(&key)
+            .map_err(|error| format!("validate encryption key against persisted state: {error}"))?;
         db.set_encryption_key(key);
     }
-    if let Err(e) = db.migrate_plaintext_credentials() {
-        error!("failed to encrypt existing passwords: {e}");
-    }
+    db.migrate_plaintext_credentials()
+        .map_err(|error| format!("encrypt existing credentials: {error}"))?;
 
     let saved_data_dir = config.data_dir.clone();
-    match db.load_config() {
-        Ok(mut reloaded) => {
-            if reloaded.data_dir.is_empty() {
-                reloaded.data_dir = saved_data_dir;
-            }
-            *config = reloaded;
-        }
-        Err(e) => error!("failed to reload config after setting encryption key: {e}"),
+    let mut reloaded = db
+        .load_config()
+        .map_err(|error| format!("reload config after setting encryption key: {error}"))?;
+    if reloaded.data_dir.is_empty() {
+        reloaded.data_dir = saved_data_dir;
     }
+    *config = reloaded;
     Ok(())
 }
 

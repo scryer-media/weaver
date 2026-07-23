@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use chrono::{Datelike, Local, NaiveTime};
+use chrono::{Datelike, NaiveTime};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -34,7 +34,7 @@ pub fn spawn_evaluator_with_watch_folder(
 ) {
     tokio::spawn(async move {
         let mut last_action: Option<ScheduleAction> = None;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut interval = tokio::time::interval(crate::e2e_clock::schedule_poll_interval());
 
         loop {
             interval.tick().await;
@@ -46,7 +46,7 @@ pub fn spawn_evaluator_with_watch_folder(
 
             let result = tokio::spawn(async move {
                 let entries = schedules.read().await;
-                let now = Local::now();
+                let now = crate::e2e_clock::local_now();
                 let current_day = Weekday::from_chrono(now.weekday());
                 let current_time = now.time();
 

@@ -13,4 +13,7 @@ pub(crate) mod sqlite_writer;
 pub use connection::Database;
 pub(crate) use connection::DatabaseWriterExecutor;
 pub use error::StateError;
-pub use setup::{bootstrap_encryption, open_db_and_config, resolve_database_paths};
+pub use setup::{
+    bootstrap_encryption, finish_open_db_and_config, open_database, open_db_and_config,
+    resolve_database_paths,
+};

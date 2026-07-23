@@ -342,3 +342,41 @@ async fn import_stable_state_defaults_limits_missing_from_old_archive_schema() {
     );
     assert_eq!(dest.server_download_usage(1).unwrap(), None);
 }
+
+#[tokio::test]
+async fn postgres_export_and_import_use_the_portable_sqlite_backup() {
+    let Some((source, source_admin, source_schema)) =
+        open_postgres_backup_test_db("portable_source").await
+    else {
+        return;
+    };
+    source.save_config(&sample_config()).unwrap();
+    let backup = tempfile::NamedTempFile::new().unwrap();
+    let export = source.export_stable_state(backup.path()).unwrap();
+    assert_eq!(export.included_tables, STABLE_TABLES);
+
+    let portable = Database::open(backup.path()).unwrap();
+    let portable_config = portable.load_config().unwrap();
+    assert_eq!(portable_config.data_dir, "/old/data");
+    assert_eq!(portable_config.servers[0].host, "news.example.com");
+    assert_eq!(portable_config.categories[0].name, "tv");
+    drop(portable);
+
+    let Some((target, target_admin, target_schema)) =
+        open_postgres_backup_test_db("portable_target").await
+    else {
+        drop(source);
+        drop_postgres_backup_test_schema(source_admin, source_schema).await;
+        return;
+    };
+    target.import_stable_state(backup.path()).unwrap();
+    let target_config = target.load_config().unwrap();
+    assert_eq!(target_config.data_dir, "/old/data");
+    assert_eq!(target_config.servers[0].host, "news.example.com");
+    assert_eq!(target_config.categories[0].name, "tv");
+
+    drop(source);
+    drop(target);
+    drop_postgres_backup_test_schema(source_admin, source_schema).await;
+    drop_postgres_backup_test_schema(target_admin, target_schema).await;
+}

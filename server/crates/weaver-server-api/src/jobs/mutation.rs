@@ -138,13 +138,9 @@ impl JobsMutation {
             .map(crate::post_processing::types::PostProcessingSelectionInput::into_domain)
             .transpose()
             .map_err(|message| graphql_error("INVALID_INPUT", message))?;
-        let plan_category = category.clone();
         let db_for_plan = db.clone();
         let frozen_post_processing_plan = tokio::task::spawn_blocking(move || {
-            db_for_plan.resolve_post_processing_plan(
-                post_processing_selection.as_ref(),
-                plan_category.as_deref(),
-            )
+            db_for_plan.freeze_submission_post_processing_plan(post_processing_selection.as_ref())
         })
         .await
         .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
@@ -192,7 +188,7 @@ impl JobsMutation {
                 dupe_score,
                 dupe_mode,
             );
-            options.frozen_post_processing_plan = Some(frozen_post_processing_plan.clone());
+            options.frozen_post_processing_plan = frozen_post_processing_plan.clone();
 
             match submit_staged_nzb_zstd_with_options(
                 db,
@@ -1007,13 +1003,9 @@ async fn submit_from_facade_input(
         .map(crate::post_processing::types::PostProcessingSelectionInput::into_domain)
         .transpose()
         .map_err(|message| graphql_error("INVALID_INPUT", message))?;
-    let plan_category = input.category.clone();
     let db_for_plan = db.clone();
     let frozen_post_processing_plan = tokio::task::spawn_blocking(move || {
-        db_for_plan.resolve_post_processing_plan(
-            post_processing_selection.as_ref(),
-            plan_category.as_deref(),
-        )
+        db_for_plan.freeze_submission_post_processing_plan(post_processing_selection.as_ref())
     })
     .await
     .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
@@ -1060,7 +1052,7 @@ async fn submit_from_facade_input(
         input.dupe_score,
         input.dupe_mode,
     );
-    options.frozen_post_processing_plan = Some(frozen_post_processing_plan);
+    options.frozen_post_processing_plan = frozen_post_processing_plan;
     let metadata = submit_metadata(input.attributes, input.client_request_id.clone())
         .map_err(|message| graphql_error("INVALID_INPUT", message))?;
 

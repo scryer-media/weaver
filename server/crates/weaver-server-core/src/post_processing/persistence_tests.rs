@@ -1,15 +1,59 @@
 use super::manifest::parse_native_manifest;
 use super::model::{
     ApprovedFilesystemRoot, ApprovedFilesystemRoots, ArtifactCondition, AttemptStatus,
-    ExtensionDigest, ExtensionSelection, FrozenPlanProvenance, OnFailure, OptionName, OrderedStep,
-    OutcomeImpact, PipelineOutcome, PostProcessingSettings, PostProcessingSummary, Profile,
-    ProfileId, ResolvedOption, ResolvedOptionValue, RunStatus, RunWhen, SecretOptionValue,
+    ExtensionDigest, ExtensionSelection, FrozenPlan, FrozenPlanProvenance, OnFailure, OptionName,
+    OrderedStep, OutcomeImpact, PipelineOutcome, PostProcessingSettings, PostProcessingSummary,
+    Profile, ProfileId, ResolvedOption, ResolvedOptionValue, RunStatus, RunWhen, SecretOptionValue,
     SubmissionPlanSelection, TimeoutPolicy, TrustState, VerifiedExtensionDigest,
 };
 use super::persistence::{LogStream, TerminalIntent, encode_control_effects};
 use super::runner::ControlEffects;
+use crate::history::JobHistoryRow;
+use crate::jobs::{ActiveJob, JobId};
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlRuntime, StoreDatastore};
+
+fn history_row(job_id: u64) -> JobHistoryRow {
+    JobHistoryRow {
+        job_id,
+        job_hash: None,
+        name: format!("history-{job_id}"),
+        status: "complete".into(),
+        error_message: None,
+        total_bytes: 1,
+        downloaded_bytes: 1,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1,
+        completed_at: 2,
+        metadata: None,
+    }
+}
+
+fn active_job(job_id: u64) -> ActiveJob {
+    ActiveJob {
+        job_id: JobId(job_id),
+        nzb_hash: [0; 32],
+        nzb_path: format!("/tmp/{job_id}.nzb").into(),
+        nzb_zstd: vec![],
+        output_dir: format!("/tmp/{job_id}").into(),
+        created_at: 1,
+        category: None,
+        metadata: vec![],
+        status: "queued",
+        download_state: "queued",
+        post_state: "idle",
+        run_state: "active",
+        paused_resume_status: None,
+        paused_resume_download_state: None,
+        paused_resume_post_state: None,
+    }
+}
 
 fn manifest() -> super::model::ExtensionManifest {
     let digest = ExtensionDigest::new(format!("blake3:{}", "a".repeat(64))).unwrap();
@@ -130,6 +174,15 @@ fn revisions_profiles_and_frozen_plans_are_durable_and_secret_safe() {
         .unwrap();
     let reloaded = db.frozen_post_processing_plan(42).unwrap().unwrap();
     assert_eq!(reloaded, frozen);
+    let persisted_key = db.encryption_key().unwrap().clone();
+    assert!(db.has_encrypted_credentials().unwrap());
+    db.validate_encrypted_credentials(&persisted_key).unwrap();
+    assert!(
+        db.validate_encrypted_credentials(
+            &crate::persistence::encryption::EncryptionKey::generate()
+        )
+        .is_err()
+    );
 
     let datastore = db.datastore();
     let secret_json = db
@@ -353,6 +406,23 @@ async fn stored_secret_json(datastore: StoreDatastore) -> Result<String, crate::
 #[test]
 fn omitted_selection_keeps_the_empty_plan_compatibility_contract() {
     let db = Database::open_in_memory().unwrap();
+    assert_eq!(
+        db.freeze_submission_post_processing_plan(None).unwrap(),
+        None
+    );
+    assert_eq!(
+        db.freeze_submission_post_processing_plan(Some(&SubmissionPlanSelection::inherit()))
+            .unwrap(),
+        None
+    );
+    let disabled = db
+        .freeze_submission_post_processing_plan(Some(&SubmissionPlanSelection::disabled()))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        disabled.provenance(),
+        FrozenPlanProvenance::Disabled
+    ));
     let plan = db.resolve_post_processing_plan(None, None).unwrap();
     assert!(matches!(plan.provenance(), FrozenPlanProvenance::Empty));
     assert!(plan.steps().is_empty());
@@ -551,5 +621,116 @@ fn attempts_are_durable_bounded_and_interrupted_without_implicit_rerun() {
     assert!(
         !db.mark_post_processing_attempt_running(&attempt_id)
             .unwrap()
+    );
+}
+
+#[test]
+fn startup_interrupts_only_orphaned_queued_post_processing_runs() {
+    let db = Database::open_in_memory().unwrap();
+    let plan = FrozenPlan::new(FrozenPlanProvenance::Disabled, vec![]).unwrap();
+    db.create_active_job(&active_job(50)).unwrap();
+    let active_run = db
+        .create_post_processing_run(
+            50,
+            &plan,
+            &PipelineOutcome::Succeeded,
+            TerminalIntent::Complete,
+            None,
+            10,
+        )
+        .unwrap();
+    db.insert_job_history(&history_row(51)).unwrap();
+    let orphaned_run = db
+        .create_post_processing_run(
+            51,
+            &plan,
+            &PipelineOutcome::Succeeded,
+            TerminalIntent::Complete,
+            None,
+            11,
+        )
+        .unwrap();
+
+    assert_eq!(db.recover_interrupted_post_processing(20).unwrap(), 0);
+    assert_eq!(
+        db.post_processing_run(&active_run).unwrap().unwrap().status,
+        RunStatus::Queued
+    );
+    assert_eq!(
+        db.post_processing_run(&orphaned_run)
+            .unwrap()
+            .unwrap()
+            .status,
+        RunStatus::Interrupted
+    );
+}
+
+#[test]
+fn history_bundle_deletion_conflicts_with_queued_reruns_then_cleans_dependents() {
+    let db = Database::open_in_memory().unwrap();
+    let plan = FrozenPlan::new(FrozenPlanProvenance::Disabled, vec![]).unwrap();
+    db.insert_job_history(&history_row(61)).unwrap();
+    let source_run = db
+        .create_post_processing_run(
+            61,
+            &plan,
+            &PipelineOutcome::Succeeded,
+            TerminalIntent::Complete,
+            None,
+            10,
+        )
+        .unwrap();
+    db.finish_post_processing_run(
+        &source_run,
+        RunStatus::Succeeded,
+        PostProcessingSummary::Succeeded,
+        11,
+    )
+    .unwrap();
+    db.save_frozen_post_processing_plan(61, &plan, 12).unwrap();
+    let rerun = db
+        .create_history_post_processing_rerun(
+            61,
+            &plan,
+            &PipelineOutcome::Succeeded,
+            TerminalIntent::Complete,
+            &source_run,
+            13,
+        )
+        .unwrap();
+    let external_rerun = db
+        .create_post_processing_run(
+            62,
+            &plan,
+            &PipelineOutcome::Succeeded,
+            TerminalIntent::Complete,
+            Some(&source_run),
+            14,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        db.delete_job_history(61),
+        Err(crate::StateError::Conflict(_))
+    ));
+    db.finish_post_processing_run(
+        &rerun,
+        RunStatus::Cancelled,
+        PostProcessingSummary::Cancelled,
+        15,
+    )
+    .unwrap();
+
+    assert!(db.delete_job_history(61).unwrap());
+    assert!(db.get_job_history(61).unwrap().is_none());
+    assert!(db.frozen_post_processing_plan(61).unwrap().is_none());
+    assert!(db.post_processing_run(&source_run).unwrap().is_none());
+    assert!(db.post_processing_run(&rerun).unwrap().is_none());
+    assert!(
+        db.post_processing_run(&external_rerun)
+            .unwrap()
+            .unwrap()
+            .rerun_of_run_id
+            .is_none()
     );
 }

@@ -113,6 +113,20 @@ impl KeyStore for WindowsCredentialManager {
         }
     }
 
+    fn replace_key(&self, key: &str) -> Result<bool, String> {
+        let _guard = CredentialCreateGuard::acquire()?;
+        self.entry()?
+            .set_password(key)
+            .map(|()| true)
+            .map_err(|error| {
+                format!("failed to replace key in Windows Credential Manager: {error}")
+            })
+    }
+
+    fn can_replace(&self) -> bool {
+        true
+    }
+
     fn delete_key(&self) -> Result<(), String> {
         let entry = self.entry()?;
         match entry.delete_credential() {
@@ -156,6 +170,7 @@ mod tests {
         let _cleanup = CredentialCleanup(&store);
         let first = EncryptionKey::generate().to_base64();
         let second = EncryptionKey::generate().to_base64();
+        let restored = EncryptionKey::generate().to_base64();
 
         assert_eq!(
             store.create_key_if_absent(&first).unwrap().as_deref(),
@@ -166,6 +181,8 @@ mod tests {
             Some(first.as_str())
         );
         assert_eq!(store.get_key().unwrap().as_deref(), Some(first.as_str()));
+        assert!(store.replace_key(&restored).unwrap());
+        assert_eq!(store.get_key().unwrap().as_deref(), Some(restored.as_str()));
     }
 
     #[test]

@@ -67,7 +67,7 @@ security-framework-sys = { workspace = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { workspace = true }
 keyring-core = { workspace = true }
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }

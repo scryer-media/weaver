@@ -471,7 +471,7 @@ impl NntpConnection {
 
     /// Authenticate using AUTHINFO USER/PASS (RFC 4643).
     pub async fn authenticate(&mut self, username: &str, password: &str) -> Result<()> {
-        debug!(user = %username, "authenticating");
+        debug!("authenticating");
 
         let user_resp = self
             .send_command(&Command::AuthInfoUser(username.to_string()))
@@ -510,7 +510,11 @@ impl NntpConnection {
         self.last_used = Instant::now();
 
         let encoded = cmd.encode();
-        trace!(cmd = %String::from_utf8_lossy(&encoded).trim(), "sending command");
+        let verb = encoded
+            .split(|byte| byte.is_ascii_whitespace())
+            .next()
+            .unwrap_or_default();
+        trace!(cmd = %String::from_utf8_lossy(verb), "sending command");
 
         let transport = self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
         transport.write_all(&encoded).await.map_err(|e| {

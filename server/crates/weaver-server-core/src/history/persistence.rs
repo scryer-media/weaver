@@ -164,13 +164,75 @@ impl Database {
     pub fn delete_job_history(&self, job_id: u64) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let result = self.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(
-                datastore.read_exec(),
-                "DELETE FROM job_history WHERE job_id = {}",
-                &[SqlArg::I64(job_id as i64)],
-            )
-            .await?;
-            Ok(changed > 0)
+            SqlRuntime::run_in_transaction(&datastore, "delete_job_history_bundle", |tx| {
+                Box::pin(async move {
+                    let job_id = i64::try_from(job_id)
+                        .map_err(|_| StateError::Database("job id is too large".into()))?;
+                    let lock_sql = match tx {
+                        SqlTx::Postgres(_) => {
+                            "SELECT job_id FROM job_history WHERE job_id = {} FOR UPDATE"
+                        }
+                        SqlTx::Sqlite(_) => "SELECT job_id FROM job_history WHERE job_id = {}",
+                    };
+                    if tx
+                        .fetch_optional(lock_sql, &[SqlArg::I64(job_id)])
+                        .await?
+                        .is_none()
+                    {
+                        return Ok(false);
+                    }
+                    if tx
+                        .fetch_optional(
+                            "SELECT run_id FROM post_processing_runs
+                              WHERE job_id = {} AND status IN ('queued', 'starting', 'running')
+                              LIMIT 1",
+                            &[SqlArg::I64(job_id)],
+                        )
+                        .await?
+                        .is_some()
+                    {
+                        return Err(StateError::Conflict(
+                            "cannot delete history while post-processing is active".into(),
+                        ));
+                    }
+                    tx.execute(
+                        "UPDATE post_processing_runs SET rerun_of_run_id = NULL
+                          WHERE job_id <> {} AND rerun_of_run_id IN (
+                              SELECT run_id FROM post_processing_runs WHERE job_id = {}
+                          )",
+                        &[SqlArg::I64(job_id), SqlArg::I64(job_id)],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM post_processing_runs WHERE job_id = {}",
+                        &[SqlArg::I64(job_id)],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM post_processing_job_plans WHERE job_id = {}",
+                        &[SqlArg::I64(job_id)],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM job_events WHERE job_id = {}",
+                        &[SqlArg::I64(job_id)],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM job_history_attributes WHERE job_id = {}",
+                        &[SqlArg::I64(job_id)],
+                    )
+                    .await?;
+                    Ok(tx
+                        .execute(
+                            "DELETE FROM job_history WHERE job_id = {}",
+                            &[SqlArg::I64(job_id)],
+                        )
+                        .await?
+                        > 0)
+                })
+            })
+            .await
         });
         if result.as_ref().is_ok_and(|changed| *changed) {
             self.invalidate_job_history_cache(job_id);
@@ -181,9 +243,87 @@ impl Database {
     pub fn delete_all_job_history(&self) -> Result<usize, StateError> {
         let datastore = self.datastore();
         let result = self.run_sql_blocking(async move {
-            let changed =
-                SqlRuntime::execute(datastore.read_exec(), "DELETE FROM job_history", &[]).await?;
-            Ok(changed as usize)
+            SqlRuntime::run_in_transaction(&datastore, "delete_all_job_history_bundles", |tx| {
+                Box::pin(async move {
+                    let lock_sql = match tx {
+                        SqlTx::Postgres(_) => "SELECT job_id FROM job_history FOR UPDATE",
+                        SqlTx::Sqlite(_) => "SELECT job_id FROM job_history",
+                    };
+                    let history = tx.fetch_all(lock_sql, &[]).await?;
+                    if history.is_empty() {
+                        return Ok(0);
+                    }
+                    if tx
+                        .fetch_optional(
+                            "SELECT r.run_id FROM post_processing_runs r
+                              WHERE r.status IN ('queued', 'starting', 'running')
+                                AND EXISTS (
+                                    SELECT 1 FROM job_history h WHERE h.job_id = r.job_id
+                                )
+                              LIMIT 1",
+                            &[],
+                        )
+                        .await?
+                        .is_some()
+                    {
+                        return Err(StateError::Conflict(
+                            "cannot delete history while post-processing is active".into(),
+                        ));
+                    }
+                    tx.execute(
+                        "UPDATE post_processing_runs SET rerun_of_run_id = NULL
+                          WHERE NOT EXISTS (
+                              SELECT 1 FROM job_history h WHERE h.job_id = post_processing_runs.job_id
+                          ) AND rerun_of_run_id IN (
+                              SELECT source.run_id FROM post_processing_runs source
+                              WHERE EXISTS (
+                                  SELECT 1 FROM job_history h WHERE h.job_id = source.job_id
+                              )
+                          )",
+                        &[],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM post_processing_runs
+                          WHERE EXISTS (
+                              SELECT 1 FROM job_history h
+                               WHERE h.job_id = post_processing_runs.job_id
+                          )",
+                        &[],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM post_processing_job_plans
+                          WHERE EXISTS (
+                              SELECT 1 FROM job_history h
+                               WHERE h.job_id = post_processing_job_plans.job_id
+                          )",
+                        &[],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM job_events
+                          WHERE EXISTS (
+                              SELECT 1 FROM job_history h WHERE h.job_id = job_events.job_id
+                          )",
+                        &[],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM job_history_attributes
+                          WHERE EXISTS (
+                              SELECT 1 FROM job_history h
+                               WHERE h.job_id = job_history_attributes.job_id
+                          )",
+                        &[],
+                    )
+                    .await?;
+                    let changed = tx.execute("DELETE FROM job_history", &[]).await?;
+                    usize::try_from(changed)
+                        .map_err(|_| StateError::Database("history count is too large".into()))
+                })
+            })
+            .await
         });
         if result.as_ref().is_ok_and(|changed| *changed > 0) {
             self.clear_job_history_cache();

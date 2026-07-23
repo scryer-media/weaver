@@ -14,6 +14,7 @@ use weaver_server_core::{Database, Pipeline, SchedulerCommand, SchedulerHandle};
 pub(crate) async fn run(
     mut config: Config,
     db: Database,
+    restore_locator_dir: PathBuf,
     port: u16,
     base_url: &str,
     log_ring_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
@@ -93,6 +94,7 @@ pub(crate) async fn run(
         shared_config.clone(),
         db.clone(),
         rss.clone(),
+        restore_locator_dir,
     );
     let jwt_secret = db.get_or_create_jwt_signing_secret()?;
     let auth_credentials = db.get_auth_credentials()?;

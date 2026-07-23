@@ -663,6 +663,64 @@ impl Pipeline {
                 .map(std::path::PathBuf::from),
             batch: settings.batch_interpreter.map(std::path::PathBuf::from),
         };
+        let pipeline_failure_stage = match &pipeline_outcome {
+            crate::post_processing::model::PipelineOutcome::Failed { stage, .. } => Some(*stage),
+            crate::post_processing::model::PipelineOutcome::Succeeded => None,
+        };
+        let par_status = if matches!(
+            pipeline_failure_stage,
+            Some(
+                crate::post_processing::model::PipelineFailureStage::Verify
+                    | crate::post_processing::model::PipelineFailureStage::Repair
+            )
+        ) {
+            1
+        } else if self.par2_verified.contains(&job_id) {
+            2
+        } else {
+            0
+        };
+        let unpack_status = if matches!(
+            pipeline_failure_stage,
+            Some(crate::post_processing::model::PipelineFailureStage::Extract)
+        ) {
+            1
+        } else if self
+            .extracted_archives
+            .get(&job_id)
+            .is_some_and(|archives| !archives.is_empty())
+        {
+            2
+        } else {
+            0
+        };
+        let (data_dir, intermediate_dir, complete_dir) = self
+            .config
+            .try_read()
+            .ok()
+            .map(|config| {
+                (
+                    std::path::PathBuf::from(&config.data_dir),
+                    std::path::PathBuf::from(config.intermediate_dir()),
+                    std::path::PathBuf::from(config.complete_dir()),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    self.intermediate_dir
+                        .parent()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_default(),
+                    self.intermediate_dir.clone(),
+                    self.complete_dir.clone(),
+                )
+            });
+        let failure_message = match &pipeline_outcome {
+            crate::post_processing::model::PipelineOutcome::Failed { message, .. } => {
+                Some(message.clone())
+            }
+            crate::post_processing::model::PipelineOutcome::Succeeded => None,
+        };
         let context = crate::post_processing::runner::JobExecutionContext {
             job_id: job_id.0,
             name: state.spec.name.clone(),
@@ -673,12 +731,27 @@ impl Pipeline {
             working_directory: state.working_dir.clone(),
             final_directory: state.working_dir.clone(),
             pipeline_outcome: pipeline_outcome.clone(),
-            par_status: if self.par2_verified.contains(&job_id) {
-                2
-            } else {
-                0
+            par_status,
+            unpack_status,
+            compatibility: crate::post_processing::runner::CompatibilityFacts {
+                total_bytes: state.spec.total_bytes,
+                downloaded_bytes: state.downloaded_bytes,
+                health_milli: health_milli(state.spec.total_bytes, state.failed_bytes),
+                critical_health_milli: Self::critical_health_milli(
+                    state.spec.total_bytes,
+                    state.par2_bytes,
+                ),
+                password: state.spec.password.clone(),
+                failure_message,
+                data_dir: Some(data_dir),
+                intermediate_dir: Some(intermediate_dir),
+                complete_dir: Some(complete_dir),
+                temp_dir: Some(std::env::temp_dir()),
+                app_dir: std::env::current_exe()
+                    .ok()
+                    .and_then(|path| path.parent().map(std::path::PathBuf::from)),
+                previous_script_status: Default::default(),
             },
-            unpack_status: 2,
         };
         self.transition_postprocessing_status(
             job_id,
@@ -806,6 +879,20 @@ impl Pipeline {
             .map(|attempt| attempt.control_effects())
             .collect::<Vec<_>>();
         let repair_requested = effects.iter().any(|effect| effect.repair_requested);
+        let mut restored_working_directory = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.working_dir.clone());
+        let mut restored_final_directory = None;
+        for effect in &effects {
+            if let Some(directory) = effect.directory.as_ref() {
+                restored_working_directory = Some(directory.clone());
+            }
+            if let Some(final_directory) = effect.final_directory.as_ref() {
+                restored_final_directory = Some(final_directory.clone());
+            }
+        }
+        let output_directory = restored_final_directory.or(restored_working_directory);
         let summary = if matches!(
             run.status,
             crate::post_processing::model::RunStatus::Starting
@@ -829,6 +916,7 @@ impl Pipeline {
                 summary,
                 effects,
                 repair_requested,
+                output_directory,
             }),
         });
         true
@@ -869,12 +957,7 @@ impl Pipeline {
                 ),
             }
             if let Ok(report) = &done.result
-                && let Some(path) = report.effects.iter().rev().find_map(|effects| {
-                    effects
-                        .final_directory
-                        .as_ref()
-                        .or(effects.directory.as_ref())
-                })
+                && let Some(path) = report.output_directory.as_ref()
                 && let Some(state) = self.jobs.get_mut(&done.job_id)
             {
                 state.working_dir = path.clone();
@@ -891,12 +974,8 @@ impl Pipeline {
                         | crate::post_processing::model::PostProcessingSummary::NotRun
                 ) =>
             {
-                if let Some(path) = report.effects.iter().rev().find_map(|effects| {
-                    effects
-                        .final_directory
-                        .as_ref()
-                        .or(effects.directory.as_ref())
-                }) && let Some(state) = self.jobs.get_mut(&done.job_id)
+                if let Some(path) = report.output_directory.as_ref()
+                    && let Some(state) = self.jobs.get_mut(&done.job_id)
                 {
                     state.working_dir = path.clone();
                 }

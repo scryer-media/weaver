@@ -215,3 +215,75 @@ fn empty_existing_key_file_is_not_overwritten() {
     assert!(error.contains("is empty"));
     assert_eq!(std::fs::read_to_string(key_path).unwrap(), "");
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn missing_key_is_not_replaced_over_encrypted_state() {
+    let _env_lock = ENV_LOCK.lock().unwrap();
+    let _env_guard = EnvVarGuard::set("WEAVER_ENCRYPTION_KEY", String::new());
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("encryption.key");
+
+    let error = ensure_encryption_key_for_state(Some(dir.path().to_path_buf()), true).unwrap_err();
+
+    assert!(error.contains("encrypted credentials exist"));
+    assert!(error.contains("refusing to generate a replacement key"));
+    assert!(!key_path.exists());
+}
+
+#[test]
+fn persisted_credentials_validate_the_selected_key_before_startup() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut db = crate::Database::open(&directory.path().join("weaver.db")).unwrap();
+    let persisted_key = EncryptionKey::generate();
+    db.set_encryption_key(persisted_key.clone());
+    db.insert_server(&crate::servers::ServerConfig {
+        id: 1,
+        host: "news.example.invalid".to_string(),
+        port: 119,
+        tls: false,
+        username: Some("weaver".to_string()),
+        password: Some("persisted-secret".to_string()),
+        connections: 1,
+        active: true,
+        supports_pipelining: false,
+        priority: 0,
+        backfill: false,
+        retention_days: 0,
+        max_download_speed: 0,
+        download_quota: Default::default(),
+        tls_ca_cert: None,
+    })
+    .unwrap();
+
+    assert!(db.has_encrypted_credentials().unwrap());
+    db.validate_encrypted_credentials(&persisted_key).unwrap();
+
+    let wrong_key = EncryptionKey::generate();
+    let error = db.validate_encrypted_credentials(&wrong_key).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot decrypt persisted server credential 1")
+    );
+}
+
+#[test]
+fn persisted_jwt_secret_is_encrypted_state_and_rejects_the_wrong_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut db = crate::Database::open(&directory.path().join("weaver.db")).unwrap();
+    let persisted_key = EncryptionKey::generate();
+    db.set_encryption_key(persisted_key.clone());
+    let persisted_secret = db.get_or_create_jwt_signing_secret().unwrap();
+
+    assert!(db.has_encrypted_credentials().unwrap());
+    db.validate_encrypted_credentials(&persisted_key).unwrap();
+
+    let wrong_key = EncryptionKey::generate();
+    assert!(db.validate_encrypted_credentials(&wrong_key).is_err());
+    assert_eq!(
+        db.get_or_create_jwt_signing_secret().unwrap(),
+        persisted_secret,
+        "validation must not rotate persisted JWT state"
+    );
+}

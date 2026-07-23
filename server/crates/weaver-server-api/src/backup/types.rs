@@ -14,6 +14,7 @@ pub fn backup_error_status_code(error: &BackupServiceError) -> axum::http::Statu
         | BackupServiceError::UnsupportedScope(_)
         | BackupServiceError::SchemaMismatch { .. }
         | BackupServiceError::MissingCategoryRemaps(_)
+        | BackupServiceError::KeyIncompatible(_)
         | BackupServiceError::Validation(_) => axum::http::StatusCode::BAD_REQUEST,
         BackupServiceError::Io(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
     }

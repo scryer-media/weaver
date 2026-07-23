@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod bandwidth;
 pub mod categories;
+pub mod e2e_clock;
 pub mod e2e_failpoint;
 pub mod error;
 pub mod events;

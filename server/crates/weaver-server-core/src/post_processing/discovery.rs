@@ -13,8 +13,8 @@ use super::model::{
 use crate::persistence::Database;
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
-const MAX_PACKAGE_ENTRIES: usize = 10_000;
-const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_PACKAGE_ENTRIES: usize = 10_000;
+pub(crate) const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DiscoveryOptions {
@@ -303,7 +303,7 @@ pub(crate) fn verify_managed_extension(
     Ok(())
 }
 
-fn hash_package(path: &Path) -> Result<ExtensionDigest, DiscoveryError> {
+pub(crate) fn hash_package(path: &Path) -> Result<ExtensionDigest, DiscoveryError> {
     let mut entries = package_files(path)?;
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     let mut hasher = blake3::Hasher::new();
@@ -333,7 +333,7 @@ fn hash_package(path: &Path) -> Result<ExtensionDigest, DiscoveryError> {
     ExtensionDigest::new(format!("blake3:{}", hasher.finalize().to_hex())).map_err(Into::into)
 }
 
-fn package_files(path: &Path) -> Result<Vec<(PathBuf, PathBuf)>, DiscoveryError> {
+pub(crate) fn package_files(path: &Path) -> Result<Vec<(PathBuf, PathBuf)>, DiscoveryError> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Err(DiscoveryError::UnsafePackageEntry);
@@ -385,7 +385,7 @@ fn reject_symlinks(path: &Path) -> Result<(), DiscoveryError> {
     package_files(path).map(|_| ())
 }
 
-fn copy_package(source: &Path, destination: &Path) -> Result<(), DiscoveryError> {
+pub(crate) fn copy_package(source: &Path, destination: &Path) -> Result<(), DiscoveryError> {
     let metadata = fs::symlink_metadata(source)?;
     if metadata.is_file() {
         let name = source.file_name().ok_or(DiscoveryError::InvalidPath)?;

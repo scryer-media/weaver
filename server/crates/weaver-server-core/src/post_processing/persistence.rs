@@ -13,7 +13,7 @@ use super::model::{
 };
 use super::runner::ControlEffects;
 use crate::persistence::encryption::{decrypt_value, encrypt_value};
-use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime};
+use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRow, SqlRuntime};
 use crate::persistence::{Database, StateError};
 
 const GLOBAL_ASSIGNMENT_KEY: &str = "*";
@@ -664,6 +664,16 @@ impl Database {
         })
     }
 
+    pub fn freeze_submission_post_processing_plan(
+        &self,
+        selection: Option<&SubmissionPlanSelection>,
+    ) -> Result<Option<FrozenPlan>, StateError> {
+        match selection.map(SubmissionPlanSelection::mode) {
+            Some(SubmissionPlanSelectionMode::Inherit) | None => Ok(None),
+            Some(_) => self.resolve_post_processing_plan(selection, None).map(Some),
+        }
+    }
+
     pub fn resolve_post_processing_plan(
         &self,
         selection: Option<&SubmissionPlanSelection>,
@@ -981,12 +991,59 @@ impl Database {
         rerun_of_run_id: Option<&RunId>,
         queued_at_epoch_ms: i64,
     ) -> Result<RunId, StateError> {
+        self.create_post_processing_run_inner(
+            job_id,
+            plan,
+            pipeline_outcome,
+            terminal_intent,
+            rerun_of_run_id,
+            queued_at_epoch_ms,
+            false,
+        )
+    }
+
+    pub fn create_history_post_processing_rerun(
+        &self,
+        job_id: u64,
+        plan: &FrozenPlan,
+        pipeline_outcome: &PipelineOutcome,
+        terminal_intent: TerminalIntent,
+        rerun_of_run_id: &RunId,
+        queued_at_epoch_ms: i64,
+    ) -> Result<RunId, StateError> {
+        self.create_post_processing_run_inner(
+            job_id,
+            plan,
+            pipeline_outcome,
+            terminal_intent,
+            Some(rerun_of_run_id),
+            queued_at_epoch_ms,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_post_processing_run_inner(
+        &self,
+        job_id: u64,
+        plan: &FrozenPlan,
+        pipeline_outcome: &PipelineOutcome,
+        terminal_intent: TerminalIntent,
+        rerun_of_run_id: Option<&RunId>,
+        queued_at_epoch_ms: i64,
+        require_history: bool,
+    ) -> Result<RunId, StateError> {
         let run_id = generate_run_id()?;
         let (plan_json, secret_options_json) = encode_plan(plan, self.encryption_key())?;
         let pipeline_outcome_json = to_json(pipeline_outcome)?;
         let terminal_intent = terminal_intent_name(terminal_intent).to_string();
         let rerun = rerun_of_run_id.map(|id| id.as_str().to_string());
         let datastore = self.datastore();
+        let history_lock_sql = if datastore.engine() == SqlEngine::Postgres {
+            "SELECT job_id FROM job_history WHERE job_id = {} FOR UPDATE"
+        } else {
+            "SELECT job_id FROM job_history WHERE job_id = {}"
+        };
         let run_id_text = run_id.as_str().to_string();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "create_post_processing_run", |tx| {
@@ -997,6 +1054,16 @@ impl Database {
                 let terminal_intent = terminal_intent.clone();
                 let rerun = rerun.clone();
                 Box::pin(async move {
+                    if require_history
+                        && tx
+                            .fetch_optional(history_lock_sql, &[SqlArg::I64(job_id_i64(job_id)?)])
+                            .await?
+                            .is_none()
+                    {
+                        return Err(StateError::Conflict(
+                            "history row disappeared before rerun creation".into(),
+                        ));
+                    }
                     let queue_position = tx
                         .fetch_optional(
                             "SELECT COALESCE(MAX(queue_position), 0) + 1 AS next_position
@@ -1345,6 +1412,19 @@ impl Database {
                                 SET status = 'interrupted', summary = 'interrupted',
                                     finished_at_epoch_ms = {}
                               WHERE status IN ('starting', 'running')",
+                            &[SqlArg::I64(finished_at_epoch_ms)],
+                        )
+                        .await?;
+                        tx.execute(
+                            "UPDATE post_processing_runs
+                                SET status = 'interrupted', summary = 'interrupted',
+                                    finished_at_epoch_ms = {}
+                              WHERE status = 'queued'
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM active_jobs
+                                     WHERE active_jobs.post_processing_run_id =
+                                           post_processing_runs.run_id
+                                )",
                             &[SqlArg::I64(finished_at_epoch_ms)],
                         )
                         .await?;
@@ -1723,41 +1803,49 @@ impl Database {
     ) -> Result<PostProcessingMetricsSnapshot, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let row = SqlRuntime::fetch_optional(
+            let queue_row = SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT
-                    (SELECT COUNT(*) FROM post_processing_runs WHERE status = 'queued') AS queue_depth,
-                    (SELECT COUNT(*) FROM post_processing_attempts
-                      WHERE status IN ('starting', 'running')) AS active_attempts,
-                    (SELECT COUNT(*) FROM post_processing_attempts
-                      WHERE started_at_epoch_ms IS NOT NULL AND finished_at_epoch_ms IS NOT NULL)
-                      AS duration_count,
-                    COALESCE((SELECT SUM(finished_at_epoch_ms - started_at_epoch_ms)
-                      FROM post_processing_attempts
-                      WHERE started_at_epoch_ms IS NOT NULL AND finished_at_epoch_ms IS NOT NULL), 0)
-                      AS duration_sum_millis,
-                    (SELECT COUNT(*) FROM post_processing_attempts WHERE status = 'succeeded')
-                      AS succeeded,
-                    (SELECT COUNT(*) FROM post_processing_attempts WHERE status = 'failed') AS failed,
-                    (SELECT COUNT(*) FROM post_processing_attempts WHERE status = 'skipped') AS skipped,
-                    (SELECT COUNT(*) FROM post_processing_attempts WHERE status = 'timed_out')
-                      AS timed_out,
-                    (SELECT COUNT(*) FROM post_processing_attempts WHERE status = 'cancelled')
-                      AS cancelled,
-                    (SELECT COUNT(*) FROM post_processing_attempts WHERE status = 'interrupted')
-                      AS interrupted,
-                    (SELECT COUNT(*) FROM post_processing_attempts WHERE output_truncated = TRUE)
-                      AS truncated",
+                "SELECT COUNT(*) AS queue_depth FROM post_processing_runs WHERE status = 'queued'",
                 &[],
             )
             .await?
-            .ok_or_else(|| StateError::Database("post-processing metrics query returned no row".into()))?;
+            .ok_or_else(|| {
+                StateError::Database("post-processing queue metrics returned no row".into())
+            })?;
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT
+                    COALESCE(SUM(CASE WHEN status IN ('starting', 'running') THEN 1 ELSE 0 END), 0)
+                      AS active_attempts,
+                    COALESCE(SUM(CASE WHEN started_at_epoch_ms IS NOT NULL
+                      AND finished_at_epoch_ms IS NOT NULL THEN 1 ELSE 0 END), 0) AS duration_count,
+                    COALESCE(SUM(CASE WHEN started_at_epoch_ms IS NOT NULL
+                      AND finished_at_epoch_ms IS NOT NULL
+                      THEN finished_at_epoch_ms - started_at_epoch_ms ELSE 0 END), 0)
+                      AS duration_sum_millis,
+                    COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS succeeded,
+                    COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+                    COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0) AS skipped,
+                    COALESCE(SUM(CASE WHEN status = 'timed_out' THEN 1 ELSE 0 END), 0) AS timed_out,
+                    COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) AS cancelled,
+                    COALESCE(SUM(CASE WHEN status = 'interrupted' THEN 1 ELSE 0 END), 0)
+                      AS interrupted,
+                    COALESCE(SUM(CASE WHEN output_truncated = TRUE THEN 1 ELSE 0 END), 0)
+                      AS truncated
+                   FROM post_processing_attempts",
+                &[],
+            )
+            .await?
+            .ok_or_else(|| {
+                StateError::Database("post-processing attempt metrics returned no row".into())
+            })?;
             let metric = |name| {
                 u64::try_from(row.i64(name)?)
                     .map_err(|_| StateError::Database(format!("invalid {name} metric")))
             };
             Ok(PostProcessingMetricsSnapshot {
-                queue_depth: metric("queue_depth")?,
+                queue_depth: u64::try_from(queue_row.i64("queue_depth")?)
+                    .map_err(|_| StateError::Database("invalid queue_depth metric".into()))?,
                 active_attempts: metric("active_attempts")?,
                 duration_count: metric("duration_count")?,
                 duration_sum_millis: metric("duration_sum_millis")?,

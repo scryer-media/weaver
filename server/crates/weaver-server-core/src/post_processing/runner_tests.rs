@@ -22,9 +22,10 @@ use super::model::{
 use super::persistence::LogStream;
 use super::runner::{
     CapturedOutputLine, ControlEffects, ExecutionDisposition, ExtensionExecutionRequest,
-    ExtensionExecutionResult, InterpreterConfig, JobExecutionContext, RunnerError,
-    adapter_contract_for_test, control_effects_for_test, execute_extension, redact_bytes_for_test,
-    redact_execution_result_for_test, webhook_url_for_test,
+    ExtensionExecutionResult, InterpreterConfig, JobExecutionContext, NzbgetScriptStatus,
+    RunnerError, adapter_contract_for_test, bounded_output_for_test, control_effects_for_test,
+    execute_extension, redact_bytes_for_test, redact_execution_result_for_test,
+    webhook_url_for_test,
 };
 
 type CapturedWebhookRequests = Arc<Mutex<Vec<(HeaderMap, Vec<u8>)>>>;
@@ -94,6 +95,7 @@ fn request(manifest: super::model::ExtensionManifest) -> ExtensionExecutionReque
             },
             par_status: 2,
             unpack_status: 2,
+            compatibility: super::runner::CompatibilityFacts::default(),
         },
         timeout_policy: TimeoutPolicy::Default24Hours,
         termination_grace: Duration::from_secs(10),
@@ -118,13 +120,40 @@ fn sab_adapter_supplies_the_documented_eight_arguments() {
         vec![],
     )
     .unwrap();
-    let (args, env) = adapter_contract_for_test(&request(sab)).unwrap();
+    let mut request = request(sab);
+    request.context.compatibility.total_bytes = 1_000;
+    request.context.compatibility.downloaded_bytes = 900;
+    request.context.compatibility.password = Some("job-password".into());
+    request.context.compatibility.failure_message = Some("unpack failed".into());
+    let (args, env) = adapter_contract_for_test(&request).unwrap();
     assert_eq!(args.len(), 8);
     assert_eq!(args[0], "/work/job");
-    assert_eq!(args[6], "1");
-    assert_eq!(args[7], "https://example.invalid/failure");
+    assert_eq!(args[6], "2");
+    assert_eq!(args[7], "");
     assert_eq!(env["SAB_NZO_ID"], "42");
+    assert_eq!(env["SAB_COMPLETE_DIR"], args[0]);
+    assert_eq!(env["SAB_PP_STATUS"], args[6]);
+    assert_eq!(env["SAB_FAIL_MSG"], "unpack failed");
+    assert_eq!(env["SAB_URL"], "https://example.invalid/failure");
+    assert_eq!(env["SAB_FAILURE_URL"], "");
+    assert_eq!(env["SAB_BYTES"], "1000");
+    assert_eq!(env["SAB_BYTES_DOWNLOADED"], "900");
+    assert_eq!(env["SAB_PASSWORD"], "job-password");
     assert!(!env.contains_key("SAB_API_KEY"));
+
+    for (stage, expected) in [
+        (PipelineFailureStage::Download, "-1"),
+        (PipelineFailureStage::Verify, "1"),
+        (PipelineFailureStage::Repair, "1"),
+        (PipelineFailureStage::Move, "2"),
+    ] {
+        request.context.pipeline_outcome = PipelineOutcome::Failed {
+            stage,
+            code: "failed".into(),
+            message: "failed".into(),
+        };
+        assert_eq!(adapter_contract_for_test(&request).unwrap().0[6], expected);
+    }
 }
 
 #[test]
@@ -146,11 +175,39 @@ fn nzbget_adapter_supplies_status_options_and_control_commands() {
         super::model::OptionName::new("Api.Token").unwrap(),
         ResolvedOptionValue::Secret(SecretOptionValue::for_execution("secret-value")),
     ));
+    request.context.compatibility.health_milli = 952;
+    request.context.compatibility.critical_health_milli = 900;
+    request.context.compatibility.previous_script_status = NzbgetScriptStatus::Failure;
+    request.context.compatibility.data_dir = Some(PathBuf::from("/data"));
+    request.context.compatibility.intermediate_dir = Some(PathBuf::from("/intermediate"));
+    request.context.compatibility.complete_dir = Some(PathBuf::from("/complete"));
+    request.context.compatibility.temp_dir = Some(PathBuf::from("/tmp"));
+    request.context.compatibility.app_dir = Some(PathBuf::from("/app"));
     let (args, env) = adapter_contract_for_test(&request).unwrap();
     assert!(args.is_empty());
+    assert_eq!(env["NZBPP_STATUS"], "FAILURE/UNPACK");
     assert_eq!(env["NZBPP_TOTALSTATUS"], "FAILURE");
     assert_eq!(env["NZBPP_PARSTATUS"], "2");
+    assert_eq!(env["NZBPP_SCRIPTSTATUS"], "FAILURE");
+    assert_eq!(env["NZBPP_HEALTH"], "952");
+    assert_eq!(env["NZBPO_Api.Token"], "secret-value");
     assert_eq!(env["NZBPO_API_TOKEN"], "secret-value");
+    assert_eq!(env["NZBOP_MAINDIR"], "/data");
+    assert_eq!(env["NZBOP_INTERDIR"], "/intermediate");
+    assert_eq!(env["NZBOP_DESTDIR"], "/complete");
+
+    request.context.pipeline_outcome = PipelineOutcome::Succeeded;
+    request.context.par_status = 0;
+    request.context.unpack_status = 0;
+    assert_eq!(
+        adapter_contract_for_test(&request).unwrap().1["NZBPP_STATUS"],
+        "SUCCESS/HEALTH"
+    );
+    request.context.par_status = 2;
+    assert_eq!(
+        adapter_contract_for_test(&request).unwrap().1["NZBPP_STATUS"],
+        "SUCCESS/ALL"
+    );
 
     let lines = vec![
         CapturedOutputLine {
@@ -173,6 +230,35 @@ fn nzbget_adapter_supplies_status_options_and_control_commands() {
     assert_eq!(effects.directory, Some(PathBuf::from("/work/job/new")));
     assert_eq!(effects.parameters["RESULT"], "ok");
     assert!(effects.mark_bad);
+}
+
+#[test]
+fn control_output_survives_display_truncation_and_enforces_its_own_limit() {
+    let mut lines = vec![b"display header\n".to_vec()];
+    lines.push(b"[WEAVER] {\"type\":\"directory\",\"path\":\"/work/next\"}\n".to_vec());
+    lines.extend((0..80).map(|_| vec![b'x'; 64 * 1024]));
+    let (display, effects, truncated) =
+        bounded_output_for_test(ExtensionAdapter::Native, lines).unwrap();
+    assert!(truncated);
+    assert_eq!(effects.directory, Some(PathBuf::from("/work/next")));
+    assert!(
+        display
+            .iter()
+            .all(|line| !line.bytes.starts_with(b"[WEAVER] "))
+    );
+
+    let oversized_control = (0..65)
+        .map(|_| {
+            let mut line = b"[NZB] NZBPR_VALUE=".to_vec();
+            line.extend(std::iter::repeat_n(b'x', 65_500));
+            line.push(b'\n');
+            line
+        })
+        .collect();
+    assert!(matches!(
+        bounded_output_for_test(ExtensionAdapter::Nzbget, oversized_control),
+        Err(RunnerError::SupervisorProtocol(_))
+    ));
 }
 
 #[test]

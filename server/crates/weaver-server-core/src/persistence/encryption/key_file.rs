@@ -84,6 +84,49 @@ impl KeyStore for KeyFile {
         Ok(Some(key.to_string()))
     }
 
+    fn replace_key(&self, key: &str) -> Result<bool, String> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "failed to create key directory at {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        let parent = self
+            .path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let mut staged = tempfile::Builder::new()
+            .prefix(".encryption-key-")
+            .tempfile_in(parent)
+            .map_err(|error| format!("failed to stage encryption key: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            staged
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("failed to protect staged encryption key: {error}"))?;
+        }
+        staged
+            .write_all(key.as_bytes())
+            .and_then(|()| staged.as_file().sync_all())
+            .map_err(|error| format!("failed to write staged encryption key: {error}"))?;
+        staged
+            .persist(&self.path)
+            .map_err(|error| format!("failed to replace encryption key: {}", error.error))?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("failed to sync encryption key directory: {error}"))?;
+        Ok(true)
+    }
+
+    fn can_replace(&self) -> bool {
+        true
+    }
+
     fn delete_key(&self) -> Result<(), String> {
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
@@ -97,5 +140,30 @@ impl KeyStore for KeyFile {
 
     fn name(&self) -> &'static str {
         "key file"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacement_is_atomic_and_owner_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = KeyFile::new(directory.path().to_path_buf());
+        store.create_key_if_absent("old-key").unwrap();
+        assert!(store.replace_key("new-key").unwrap());
+        assert_eq!(store.get_key().unwrap().as_deref(), Some("new-key"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(directory.path().join("encryption.key"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }

@@ -11,7 +11,7 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::StateError;
 use crate::persistence::database_target::DatabaseTarget;
-use crate::persistence::sql_runtime::StoreDatastore;
+use crate::persistence::sql_runtime::{StoreDatastore, db_err};
 use crate::persistence::sql_services::DatabaseServices;
 
 pub use crate::auth::{ApiKeyRow, AuthCredentials};
@@ -506,6 +506,7 @@ impl JobHistoryCache {
 /// SQL-backed persistent store for config, servers, and job history.
 #[derive(Clone)]
 pub struct Database {
+    target: DatabaseTarget,
     sql_services: DatabaseServices,
     sql_worker: DatabaseRuntimeWorker,
     writer_tx: mpsc::Sender<DbWriteCommand>,
@@ -529,10 +530,11 @@ impl Database {
 
     pub(crate) fn open_target(target: DatabaseTarget) -> Result<Self, StateError> {
         let sql_worker = DatabaseRuntimeWorker::start(&target)?;
-        let sql_services = open_sql_services_blocking(&sql_worker, target)?;
+        let sql_services = open_sql_services_blocking(&sql_worker, target.clone())?;
 
         let (writer_tx, writer_rx) = mpsc::channel(SQLITE_WRITE_QUEUE_CAPACITY);
         let db = Self {
+            target,
             sql_services,
             sql_worker,
             writer_tx,
@@ -553,10 +555,11 @@ impl Database {
         let path = tempdir.path().join("weaver.db");
         let target = DatabaseTarget::SqlitePath(path.clone());
         let sql_worker = DatabaseRuntimeWorker::start(&target)?;
-        let sql_services = open_sql_services_blocking(&sql_worker, target)?;
+        let sql_services = open_sql_services_blocking(&sql_worker, target.clone())?;
 
         let (writer_tx, writer_rx) = mpsc::channel(SQLITE_WRITE_QUEUE_CAPACITY);
         let db = Self {
+            target,
             sql_services,
             sql_worker,
             writer_tx,
@@ -572,6 +575,37 @@ impl Database {
 
     pub(crate) fn datastore(&self) -> StoreDatastore {
         self.sql_services.datastore()
+    }
+
+    pub(crate) fn database_target(&self) -> &DatabaseTarget {
+        &self.target
+    }
+
+    pub(crate) fn checkpoint_sqlite(&self) -> Result<(), StateError> {
+        let StoreDatastore::Sqlite { pool, .. } = self.datastore() else {
+            return Ok(());
+        };
+        self.run_sql_blocking_local(move || async move {
+            let mut connection = pool.acquire().await.map_err(db_err)?;
+            sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .execute(&mut *connection)
+                .await
+                .map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn close(self) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let worker = self.sql_worker.clone();
+        drop(self);
+        worker.block_on(async move {
+            match datastore {
+                StoreDatastore::Sqlite { pool, .. } => pool.close().await,
+                StoreDatastore::Postgres { pool } => pool.close().await,
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn get_cached_job_history(&self, job_id: u64) -> Option<JobHistoryRow> {
@@ -675,6 +709,7 @@ impl Database {
     fn writer_task_handle(&self) -> Database {
         let (detached_tx, _detached_rx) = mpsc::channel(1);
         Database {
+            target: self.target.clone(),
             sql_services: self.sql_services.clone(),
             sql_worker: self.sql_worker.clone(),
             writer_tx: detached_tx,
@@ -918,6 +953,121 @@ impl Database {
         }
     }
 
+    /// Return whether any persisted credential requires the encryption key.
+    /// This check intentionally reads raw storage before a key is installed so
+    /// startup can refuse to replace a missing key over encrypted state.
+    pub fn has_encrypted_credentials(&self) -> Result<bool, StateError> {
+        use crate::persistence::encryption::is_encrypted;
+        use crate::persistence::sql_runtime::SqlRuntime;
+
+        let datastore = self.datastore();
+        let encrypted_credentials_exist = self.run_sql_blocking(async move {
+            for query in [
+                "SELECT password FROM servers WHERE password IS NOT NULL",
+                "SELECT password FROM rss_feeds WHERE password IS NOT NULL",
+            ] {
+                let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
+                for row in rows {
+                    if is_encrypted(&row.text("password")?) {
+                        return Ok(true);
+                    }
+                }
+            }
+            for query in [
+                "SELECT secret_options_json FROM post_processing_profile_steps",
+                "SELECT secret_options_json FROM post_processing_job_plans",
+                "SELECT secret_options_json FROM post_processing_runs",
+            ] {
+                let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
+                for row in rows {
+                    if !post_processing_secret_ciphertexts(&row.text("secret_options_json")?)?
+                        .is_empty()
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        })?;
+        if encrypted_credentials_exist {
+            return Ok(true);
+        }
+        self.has_encrypted_persisted_jwt_signing_secret()
+    }
+
+    /// Prove that every encrypted persisted credential can be authenticated by
+    /// the selected key before startup exposes any decrypted configuration.
+    pub fn validate_encrypted_credentials(
+        &self,
+        key: &crate::persistence::encryption::EncryptionKey,
+    ) -> Result<(), StateError> {
+        use crate::persistence::encryption::{decrypt_value, is_encrypted};
+        use crate::persistence::sql_runtime::SqlRuntime;
+
+        let datastore = self.datastore();
+        let credential_key = key.clone();
+        self.run_sql_blocking(async move {
+            for (kind, query) in [
+                (
+                    "server",
+                    "SELECT id, password FROM servers WHERE password IS NOT NULL",
+                ),
+                (
+                    "RSS feed",
+                    "SELECT id, password FROM rss_feeds WHERE password IS NOT NULL",
+                ),
+            ] {
+                let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
+                for row in rows {
+                    let id = row.i64("id")?;
+                    let password = row.text("password")?;
+                    if !is_encrypted(&password) {
+                        continue;
+                    }
+                    decrypt_value(&credential_key, &password).map_err(|error| {
+                        StateError::Conflict(format!(
+                            "cannot decrypt persisted {kind} credential {id}: {error}"
+                        ))
+                    })?;
+                }
+            }
+            for (kind, query) in [
+                (
+                    "profile",
+                    "SELECT secret_options_json FROM post_processing_profile_steps",
+                ),
+                (
+                    "frozen plan",
+                    "SELECT secret_options_json FROM post_processing_job_plans",
+                ),
+                (
+                    "run",
+                    "SELECT secret_options_json FROM post_processing_runs",
+                ),
+            ] {
+                let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
+                for row in rows {
+                    for ciphertext in post_processing_secret_ciphertexts(
+                        &row.text("secret_options_json")?,
+                    )? {
+                        if !is_encrypted(&ciphertext) {
+                            return Err(StateError::Conflict(format!(
+                                "persisted post-processing {kind} secret option is not encrypted"
+                            )));
+                        }
+                        decrypt_value(&credential_key, &ciphertext).map_err(|error| {
+                            StateError::Conflict(format!(
+                                "cannot decrypt persisted post-processing {kind} secret option: {error}"
+                            ))
+                        })?;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        self.validate_persisted_jwt_signing_secret(key)
+    }
+
     /// Re-encrypt any plaintext passwords in the database.
     ///
     /// On upgrade from a version without encryption, passwords are stored as
@@ -1003,6 +1153,32 @@ impl Database {
             Ok(())
         })
     }
+}
+
+fn post_processing_secret_ciphertexts(raw: &str) -> Result<Vec<String>, StateError> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).map_err(|error| {
+        StateError::Database(format!(
+            "invalid persisted post-processing secret options: {error}"
+        ))
+    })?;
+    let entries = value.as_array().ok_or_else(|| {
+        StateError::Database("persisted post-processing secret options are not an array".into())
+    })?;
+    entries
+        .iter()
+        .map(|entry| {
+            entry
+                .as_object()
+                .and_then(|entry| entry.get("ciphertext"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    StateError::Database(
+                        "persisted post-processing secret option has no ciphertext".into(),
+                    )
+                })
+        })
+        .collect()
 }
 
 #[cfg(test)]

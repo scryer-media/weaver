@@ -62,20 +62,26 @@ type BackupStatusResponse = {
   can_restore: boolean;
   busy: boolean;
   reason?: string | null;
+  pending_restore?: string | null;
+  pending_restore_error?: string | null;
 };
 
 type BackupManifest = {
-  format_version: number;
+  format_version: number | string;
   scope: string;
   created_at_epoch_ms: number;
+  source_weaver_version?: string;
+  source_engine?: string;
   weaver_schema_version: number;
   included_tables: string[];
+  tables?: Record<string, { rows: number; columns: string[]; checksum: string }>;
   source_paths: {
     data_dir: string;
     intermediate_dir: string;
     complete_dir: string;
   };
   encrypted: boolean;
+  managed_packages?: Array<{ digest: string }>;
   notes: string[];
 };
 
@@ -87,6 +93,16 @@ type CategoryRemapRequirement = {
 type BackupInspectResult = {
   manifest: BackupManifest;
   required_category_remaps: CategoryRemapRequirement[];
+  key_compatible: boolean;
+  warnings: string[];
+};
+
+type RestoreReport = {
+  staged: boolean;
+  restart_required: boolean;
+  pending_restore_id?: string | null;
+  history_jobs: number;
+  warnings: string[];
 };
 
 type ApiKeyScope = "CONTROL" | "READ" | "ADMIN";
@@ -193,13 +209,13 @@ export function BackupRestoreSection({
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({
-          password: backupPassword.trim() ? backupPassword.trim() : null,
+          password: backupPassword.trim() ? backupPassword : null,
         }),
       });
       if (!response.ok) {
         await throwJsonError(response);
       }
-      await saveResponseAsDownload(response, `weaver_backup_${Date.now()}.tar.zst`);
+      await saveResponseAsDownload(response, `weaver_backup_${Date.now()}.enc`);
       setBackupMessage(t("settings.backupDownloadReady"));
     } catch (error) {
       setBackupError(error instanceof Error ? error.message : String(error));
@@ -217,7 +233,7 @@ export function BackupRestoreSection({
       const form = new FormData();
       form.append("file", restoreFile);
       if (restorePassword.trim()) {
-        form.append("password", restorePassword.trim());
+        form.append("password", restorePassword);
       }
       const response = await fetch(new URL("api/backup/inspect", document.baseURI).href, {
         method: "POST",
@@ -248,7 +264,7 @@ export function BackupRestoreSection({
       const form = new FormData();
       form.append("file", restoreFile);
       if (restorePassword.trim()) {
-        form.append("password", restorePassword.trim());
+        form.append("password", restorePassword);
       }
       form.append("data_dir", dataDir.trim());
       if (restoreIntermediateDir.trim()) {
@@ -276,14 +292,14 @@ export function BackupRestoreSection({
         headers: authHeaders(),
         body: form,
       });
-      const payload = (await readJsonOrThrow(response)) as { history_jobs: number };
+      const payload = (await readJsonOrThrow(response)) as RestoreReport;
       setRestoreMessage(
         t("settings.restoreSuccess").replace(
           "{{count}}",
           String(payload.history_jobs ?? 0),
         ),
       );
-      setTimeout(() => window.location.reload(), 1200);
+      await loadStatus();
     } catch (error) {
       setRestoreError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -299,6 +315,7 @@ export function BackupRestoreSection({
   const restoreDisabled =
     !restoreFile ||
     !inspectResult ||
+    !inspectResult.key_compatible ||
     !dataDir.trim() ||
     !!statusLoading ||
     !status?.can_restore ||
@@ -328,7 +345,7 @@ export function BackupRestoreSection({
           <Button
             className="mt-3"
             onClick={handleDownloadBackup}
-            disabled={backupBusy || status?.busy}
+            disabled={backupBusy || status?.busy || !backupPassword.trim()}
           >
             {backupBusy ? t("settings.backupDownloading") : t("settings.backupDownload")}
           </Button>
@@ -346,7 +363,7 @@ export function BackupRestoreSection({
             <Label>{t("settings.restoreFile")}</Label>
             <input
               type="file"
-              accept=".tar.zst,.age,.db,.zst"
+              accept=".enc,.tar.zst,.age,.db,.zst"
               onChange={(e) => {
                 setRestoreFile(e.target.files?.[0] ?? null);
                 setInspectResult(null);
@@ -392,6 +409,19 @@ export function BackupRestoreSection({
               </span>
             )}
           </div>
+
+          {status?.pending_restore && (
+            <div className="mt-2 space-y-1 text-xs">
+              <p className="text-status-paused">
+                Restore {status.pending_restore} is staged. Restart Weaver to apply it.
+              </p>
+              {status.pending_restore_error && (
+                <p className="text-destructive">
+                  The last startup attempt failed: {status.pending_restore_error}
+                </p>
+              )}
+            </div>
+          )}
 
           <div className="mt-3 space-y-1.5">
             <Label>{t("settings.restoreDataDir")}</Label>
@@ -445,6 +475,19 @@ export function BackupRestoreSection({
                   {t("settings.restoreSchema")}:{" "}
                   {inspectResult.manifest.weaver_schema_version}
                 </div>
+                {inspectResult.manifest.source_engine && (
+                  <div>Source database: {inspectResult.manifest.source_engine}</div>
+                )}
+                <div>
+                  Exported rows:{" "}
+                  {Object.values(inspectResult.manifest.tables ?? {}).reduce(
+                    (total, table) => total + table.rows,
+                    0,
+                  )}
+                </div>
+                <div>
+                  Managed packages: {inspectResult.manifest.managed_packages?.length ?? 0}
+                </div>
                 <div>
                   {t("settings.restoreEncrypted")}:{" "}
                   {inspectResult.manifest.encrypted
@@ -462,6 +505,19 @@ export function BackupRestoreSection({
                     <div key={note}>{note}</div>
                   ))}
                 </div>
+              )}
+              {inspectResult.warnings.length > 0 && (
+                <div className="mt-3 space-y-1 text-xs text-status-paused">
+                  {inspectResult.warnings.map((warning) => (
+                    <div key={warning}>{warning}</div>
+                  ))}
+                </div>
+              )}
+              {!inspectResult.key_compatible && (
+                <p className="mt-3 text-xs text-destructive">
+                  This backup&apos;s encryption key cannot be promoted into the configured key
+                  store.
+                </p>
               )}
             </div>
           )}

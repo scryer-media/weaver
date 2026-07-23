@@ -123,6 +123,22 @@ impl Database {
             Ok(())
         })
     }
+
+    pub(crate) fn has_encrypted_persisted_jwt_signing_secret(&self) -> Result<bool, StateError> {
+        Ok(self
+            .get_setting(JWT_SIGNING_SECRET_SETTING_KEY)?
+            .is_some_and(|stored| is_encrypted(&stored)))
+    }
+
+    pub(crate) fn validate_persisted_jwt_signing_secret(
+        &self,
+        encryption_key: &crate::persistence::encryption::EncryptionKey,
+    ) -> Result<(), StateError> {
+        let Some(stored) = self.get_setting(JWT_SIGNING_SECRET_SETTING_KEY)? else {
+            return Ok(());
+        };
+        decode_stored_jwt_signing_secret(&stored, Some(encryption_key)).map(|_| ())
+    }
 }
 
 async fn get_or_create_jwt_signing_secret_tx(

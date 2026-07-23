@@ -12,7 +12,7 @@ use super::model::{
 use super::persistence::{PostProcessingRunRecord, TerminalIntent};
 use super::runner::{
     ControlEffects, ExecutionDisposition, ExtensionExecutionRequest, InterpreterConfig,
-    JobExecutionContext, RunnerError, execute_extension_with_spawn_callback,
+    JobExecutionContext, NzbgetScriptStatus, RunnerError, execute_extension_with_spawn_callback,
 };
 use crate::persistence::{Database, StateError};
 
@@ -128,6 +128,7 @@ pub struct RunExecutionReport {
     pub summary: PostProcessingSummary,
     pub effects: Vec<ControlEffects>,
     pub repair_requested: bool,
+    pub output_directory: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -286,6 +287,7 @@ impl PostProcessingService {
                 summary: PostProcessingSummary::NotRun,
                 effects: vec![],
                 repair_requested: false,
+                output_directory: Some(context.working_directory.clone()),
             });
         }
         let run_id = self.db.create_post_processing_run(
@@ -495,13 +497,14 @@ impl PostProcessingService {
             summary: PostProcessingSummary::Cancelled,
             effects: vec![],
             repair_requested: false,
+            output_directory: None,
         })
     }
 
     async fn execute_steps(
         &self,
         run: PostProcessingRunRecord,
-        context: JobExecutionContext,
+        mut context: JobExecutionContext,
         interpreters: InterpreterConfig,
         cancellation: Option<watch::Receiver<bool>>,
         selected_step_indexes: Option<&HashSet<u32>>,
@@ -510,6 +513,7 @@ impl PostProcessingService {
         let mut effects = Vec::new();
         let mut repair_requested = false;
         let mut executed_attempt = false;
+        let mut explicit_final_directory = false;
         let pipeline_succeeded = matches!(run.pipeline_outcome, PipelineOutcome::Succeeded);
         let mut cancellation = cancellation;
         let mut available_artifacts =
@@ -633,7 +637,35 @@ impl PostProcessingService {
                         Some(super::persistence::encode_control_effects(&result.effects)?),
                         timestamp,
                     )?;
+                    if let Some(directory) = result.effects.directory.as_ref() {
+                        context.working_directory = directory.clone();
+                        available_artifacts = collect_artifact_paths(
+                            &context.working_directory,
+                            MAX_DISCOVERED_ARTIFACTS,
+                        );
+                    }
+                    if let Some(final_directory) = result.effects.final_directory.as_ref() {
+                        context.final_directory = final_directory.clone();
+                        explicit_final_directory = true;
+                    }
                     available_artifacts.extend(result.effects.artifacts.iter().cloned());
+                    match result.disposition {
+                        ExecutionDisposition::Skipped => {}
+                        ExecutionDisposition::Succeeded | ExecutionDisposition::RepairRequested => {
+                            if context.compatibility.previous_script_status
+                                != NzbgetScriptStatus::Failure
+                            {
+                                context.compatibility.previous_script_status =
+                                    NzbgetScriptStatus::Success;
+                            }
+                        }
+                        ExecutionDisposition::Failed
+                        | ExecutionDisposition::Cancelled
+                        | ExecutionDisposition::TimedOut => {
+                            context.compatibility.previous_script_status =
+                                NzbgetScriptStatus::Failure;
+                        }
+                    }
                     effects.push(result.effects);
                     if failed {
                         let failure_summary = match result.disposition {
@@ -666,6 +698,7 @@ impl PostProcessingService {
                         PostProcessingSummary::Failed
                     };
                     summary = merge_post_processing_summary(summary, failure_summary);
+                    context.compatibility.previous_script_status = NzbgetScriptStatus::Failure;
                     if step.on_failure() == OnFailure::Stop {
                         break;
                     }
@@ -699,6 +732,11 @@ impl PostProcessingService {
             summary,
             effects,
             repair_requested,
+            output_directory: Some(if explicit_final_directory {
+                context.final_directory
+            } else {
+                context.working_directory
+            }),
         })
     }
 }

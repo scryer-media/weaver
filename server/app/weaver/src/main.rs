@@ -115,11 +115,49 @@ async fn async_main() {
         other => other,
     };
 
-    let (mut db, mut config) = match bootstrap::open_db_and_config(&config_path) {
-        Ok(result) => result,
+    if let Err(error) = weaver_server_core::e2e_clock::validate() {
+        error!("invalid Weaver e2e clock: {error}");
+        std::process::exit(1);
+    }
+
+    let restore_locator_dir =
+        weaver_server_core::persistence::setup::default_data_dir_for_config_path(&config_path);
+    let db = match bootstrap::open_database(&config_path) {
+        Ok(db) => db,
         Err(error) => {
-            error!("failed to load config: {error}");
+            error!("failed to open database: {error}");
             std::process::exit(1);
+        }
+    };
+    let (db, restore_outcome) =
+        match weaver_server_core::operations::apply_pending_restore(db, &restore_locator_dir) {
+            Ok(result) => result,
+            Err(error) => {
+                error!("failed to apply staged restore: {error}");
+                std::process::exit(1);
+            }
+        };
+    let (mut db, mut config) = if let Some(outcome) = restore_outcome {
+        tracing::info!(
+            restore_id = %outcome.restore_id,
+            managed_packages = outcome.managed_packages_restored,
+            "applied staged backup restore"
+        );
+        let config = match db.load_config() {
+            Ok(config) => config,
+            Err(error) => {
+                error!("failed to load restored config: {error}");
+                std::process::exit(1);
+            }
+        };
+        (db, config)
+    } else {
+        match bootstrap::finish_open_db_and_config(&config_path, db) {
+            Ok(result) => result,
+            Err(error) => {
+                error!("failed to load config: {error}");
+                std::process::exit(1);
+            }
         }
     };
     let env_seed = match bootstrap::parse_env_seed_from_process() {
@@ -130,16 +168,15 @@ async fn async_main() {
         }
     };
 
-    bootstrap::reset_login_if_requested(&mut db);
-    if let Err(error) = bootstrap::apply_core_env_seed(&db, &mut config, &env_seed) {
-        error!("failed to seed config settings from environment: {error}");
-        std::process::exit(1);
-    }
     bootstrap::default_data_dir_from_config_path(&config_path, &mut config);
-
     let data_dir = PathBuf::from(&config.data_dir);
     if let Err(error) = bootstrap::bootstrap_encryption(&data_dir, &mut db, &mut config) {
         error!("failed to bootstrap encryption key: {error}");
+        std::process::exit(1);
+    }
+    bootstrap::reset_login_if_requested(&mut db);
+    if let Err(error) = bootstrap::apply_core_env_seed(&db, &mut config, &env_seed) {
+        error!("failed to seed config settings from environment: {error}");
         std::process::exit(1);
     }
     if let Err(error) = bootstrap::apply_server_env_seed(&db, &mut config, &env_seed) {
@@ -184,8 +221,15 @@ async fn async_main() {
             }
         }
         Command::Serve { port, base_url } => {
-            if let Err(error) =
-                commands::serve::run(config, db, port, &base_url, log_ring_buffer.clone()).await
+            if let Err(error) = commands::serve::run(
+                config,
+                db,
+                restore_locator_dir,
+                port,
+                &base_url,
+                log_ring_buffer.clone(),
+            )
+            .await
             {
                 error!("server failed: {error}");
                 std::process::exit(1);

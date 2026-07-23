@@ -180,6 +180,16 @@ pub(crate) fn maybe_decrypt(key: Option<&EncryptionKey>, value: Option<String>) 
 /// 3. Generate and create a key in a writable platform store, without overwriting
 /// 4. Auto-generate an in-memory ephemeral key when no store supports creation
 pub fn ensure_encryption_key(data_dir: Option<PathBuf>) -> Result<EncryptionKey, String> {
+    ensure_encryption_key_for_state(data_dir, false)
+}
+
+/// Ensure a key is available without ever replacing a missing key when
+/// encrypted credentials already exist. A fresh instance may create a key;
+/// an existing encrypted instance must recover the original key or fail.
+pub fn ensure_encryption_key_for_state(
+    data_dir: Option<PathBuf>,
+    encrypted_credentials_exist: bool,
+) -> Result<EncryptionKey, String> {
     // 1. Env var explicit override. Non-interactive tooling and profiling
     // should be able to avoid platform keychain prompts entirely.
     if let Ok(env_key) = std::env::var("WEAVER_ENCRYPTION_KEY") {
@@ -213,6 +223,14 @@ pub fn ensure_encryption_key(data_dir: Option<PathBuf>) -> Result<EncryptionKey,
         }
     }
 
+    if encrypted_credentials_exist {
+        return Err(
+            "encrypted credentials exist but no encryption key is available; refusing to \
+             generate a replacement key"
+                .to_string(),
+        );
+    }
+
     // 3. Persist a generated key only in stores with safe create-only semantics.
     // Environment variables and Docker secrets returned above and are never
     // copied into the data directory.
@@ -243,6 +261,100 @@ pub fn ensure_encryption_key(data_dir: Option<PathBuf>) -> Result<EncryptionKey,
          restarts"
     );
     Ok(key)
+}
+
+pub fn backup_key_source_name(data_dir: Option<PathBuf>, current_key: &EncryptionKey) -> String {
+    let encoded = current_key.to_base64();
+    if std::env::var("WEAVER_ENCRYPTION_KEY")
+        .ok()
+        .is_some_and(|value| value.trim() == encoded)
+    {
+        return "WEAVER_ENCRYPTION_KEY".into();
+    }
+    for store in keystore::platform_keystores(data_dir) {
+        if store
+            .get_key()
+            .ok()
+            .flatten()
+            .is_some_and(|value| value.trim() == encoded)
+        {
+            return store.name().to_string();
+        }
+    }
+    "ephemeral".into()
+}
+
+pub fn validate_restore_encryption_key(
+    data_dir: Option<PathBuf>,
+    restored_key: &str,
+) -> Result<String, String> {
+    let restored = EncryptionKey::from_base64(restored_key)?.to_base64();
+    if let Ok(value) = std::env::var("WEAVER_ENCRYPTION_KEY")
+        && !value.trim().is_empty()
+    {
+        return if value.trim() == restored {
+            Ok("WEAVER_ENCRYPTION_KEY (matched)".into())
+        } else {
+            Err("WEAVER_ENCRYPTION_KEY does not match the backup key".into())
+        };
+    }
+
+    let stores = keystore::platform_keystores(data_dir);
+    for store in &stores {
+        if let Some(existing) = store.get_key()? {
+            if store.can_replace() {
+                return Ok(format!("{} (replace)", store.name()));
+            }
+            return if existing.trim() == restored {
+                Ok(format!("{} (matched)", store.name()))
+            } else {
+                Err(format!("{} does not match the backup key", store.name()))
+            };
+        }
+    }
+    stores
+        .iter()
+        .find(|store| store.can_replace())
+        .map(|store| format!("{} (create)", store.name()))
+        .ok_or_else(|| "no persistent Weaver-managed encryption keystore is available".to_string())
+}
+
+pub fn promote_restore_encryption_key(
+    data_dir: Option<PathBuf>,
+    restored_key: &str,
+) -> Result<EncryptionKey, String> {
+    let restored = EncryptionKey::from_base64(restored_key)?;
+    let encoded = restored.to_base64();
+    if let Ok(value) = std::env::var("WEAVER_ENCRYPTION_KEY")
+        && !value.trim().is_empty()
+    {
+        if value.trim() == encoded {
+            return Ok(restored);
+        }
+        return Err("WEAVER_ENCRYPTION_KEY does not match the backup key".into());
+    }
+
+    let stores = keystore::platform_keystores(data_dir);
+    for store in &stores {
+        if let Some(existing) = store.get_key()? {
+            if existing.trim() == encoded {
+                return Ok(restored);
+            }
+            if store.replace_key(&encoded)? {
+                return Ok(restored);
+            }
+            return Err(format!(
+                "{} is externally managed and does not match",
+                store.name()
+            ));
+        }
+    }
+    for store in &stores {
+        if store.replace_key(&encoded)? {
+            return Ok(restored);
+        }
+    }
+    Err("no persistent Weaver-managed encryption keystore is available".into())
 }
 
 #[cfg(test)]

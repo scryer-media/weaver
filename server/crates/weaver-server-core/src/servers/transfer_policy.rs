@@ -108,14 +108,6 @@ impl ServerTransferPolicyRegistry {
         Arc::clone(&self.transfers)
     }
 
-    pub(crate) fn with_maintenance_quiesced<T>(&self, operation: impl FnOnce() -> T) -> T {
-        let _guard = self
-            .maintenance_gate
-            .lock()
-            .expect("server policy maintenance gate poisoned");
-        operation()
-    }
-
     /// Drop live controls so the next reconfigure restores counters from the
     /// database. Used after a stable-state import where persisted usage must
     /// replace any pre-restore runtime state for overlapping server IDs.
@@ -159,7 +151,7 @@ impl ServerTransferPolicyRegistry {
             .maintenance_gate
             .lock()
             .expect("server policy maintenance gate poisoned");
-        let now = Local::now();
+        let now = crate::e2e_clock::local_now();
         let configured_ids = servers
             .iter()
             .map(|server| server.id)
@@ -260,7 +252,7 @@ impl ServerTransferPolicyRegistry {
                     quota_baseline_bytes: baseline,
                     window_start: window.map(|value| value.start),
                     window_end: window.map(|value| value.end),
-                    updated_at: Utc::now(),
+                    updated_at: crate::e2e_clock::utc_now(),
                 });
             }
         }
@@ -280,12 +272,12 @@ impl ServerTransferPolicyRegistry {
             server_id,
             &snapshot,
             policy,
-            Local::now(),
+            crate::e2e_clock::local_now(),
         ))
     }
 
     pub fn snapshots(&self) -> Vec<ServerDownloadQuotaSnapshot> {
-        let now = Local::now();
+        let now = crate::e2e_clock::local_now();
         let state = self.state.lock().expect("server policy registry poisoned");
         let mut snapshots = state
             .policies
@@ -304,7 +296,7 @@ impl ServerTransferPolicyRegistry {
             .maintenance_gate
             .lock()
             .expect("server policy maintenance gate poisoned");
-        let now = Local::now();
+        let now = crate::e2e_clock::local_now();
         let (usage, result) = {
             let mut state = self.state.lock().expect("server policy registry poisoned");
             let policy = state.policies.get_mut(&server_id).ok_or_else(|| {
@@ -325,7 +317,7 @@ impl ServerTransferPolicyRegistry {
                 quota_baseline_bytes: after.lifetime_body_bytes,
                 window_start: policy.window.map(|value| value.start),
                 window_end: policy.window.map(|value| value.end),
-                updated_at: Utc::now(),
+                updated_at: crate::e2e_clock::utc_now(),
             };
             let result = snapshot_for_policy(server_id, &after, policy, now);
             (usage, result)
@@ -345,7 +337,7 @@ impl ServerTransferPolicyRegistry {
     }
 
     fn refresh_windows_inner(&self) -> Result<(), StateError> {
-        let now = Local::now();
+        let now = crate::e2e_clock::local_now();
         let now_utc = now.with_timezone(&Utc);
         let mut changed = Vec::new();
         {
@@ -381,7 +373,7 @@ impl ServerTransferPolicyRegistry {
                 quota_baseline_bytes: lifetime_bytes,
                 window_start: policy.window.map(|value| value.start),
                 window_end: policy.window.map(|value| value.end),
-                updated_at: Utc::now(),
+                updated_at: crate::e2e_clock::utc_now(),
             })?;
             info!(server_id, "server download quota window reset");
         }
@@ -409,7 +401,7 @@ impl ServerTransferPolicyRegistry {
                             .saturating_sub(snapshot.quota_used_bytes),
                         window_start: policy.window.map(|value| value.start),
                         window_end: policy.window.map(|value| value.end),
-                        updated_at: Utc::now(),
+                        updated_at: crate::e2e_clock::utc_now(),
                     }
                 })
                 .collect::<Vec<_>>()
@@ -483,7 +475,7 @@ fn transfer_config_parts(
 }
 
 fn monotonic_deadline(window: ServerQuotaWindow) -> Option<Instant> {
-    let delay = (window.end - Utc::now()).to_std().ok()?;
+    let delay = (window.end - crate::e2e_clock::utc_now()).to_std().ok()?;
     Some(Instant::now() + delay)
 }
 

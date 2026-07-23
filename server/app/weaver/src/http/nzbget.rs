@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,7 +20,8 @@ use weaver_server_api::{
 use weaver_server_core::auth::{ApiKeyCache, CallerScope, LoginAuthCache};
 use weaver_server_core::settings::model::SharedConfig;
 use weaver_server_core::{
-    Database, FieldUpdate, HistoryFilter, JobId, JobUpdate, SchedulerError, SchedulerHandle,
+    Database, FieldUpdate, HistoryFilter, JobId, JobStatus, JobUpdate, SchedulerError,
+    SchedulerHandle,
 };
 
 #[derive(Clone)]
@@ -852,7 +853,7 @@ struct AppendRequest {
     dupe_key: Option<String>,
     dupe_score: Option<i64>,
     dupe_mode: Option<String>,
-    parameters: BTreeMap<String, String>,
+    parameters: Vec<(String, String)>,
 }
 
 async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
@@ -886,7 +887,11 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
         (bytes, None)
     };
 
-    let client_request_id = request.parameters.get("drone").cloned();
+    let client_request_id = request
+        .parameters
+        .iter()
+        .rev()
+        .find_map(|(name, value)| (name == "drone").then(|| value.clone()));
     let mut attributes = vec![AttributeInput {
         key: PRIORITY_ATTRIBUTE_KEY.to_string(),
         value: priority_label(request.priority).to_string(),
@@ -934,7 +939,7 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
         request.category.clone(),
         metadata,
         SubmissionOptions {
-            category_resolution: CategoryResolutionMode::PreserveSubmitted,
+            category_resolution: CategoryResolutionMode::ResolveConfigured,
             add_paused: request.add_paused,
             duplicate_mode: nzbget_duplicate_mode(
                 dupe_mode.as_deref(),
@@ -948,7 +953,7 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
                 )
             }),
             origin: weaver_server_core::SubmissionOrigin::NzbGet,
-            frozen_post_processing_plan: Some(frozen_post_processing_plan),
+            frozen_post_processing_plan,
             ..SubmissionOptions::default()
         },
     )
@@ -963,82 +968,74 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
 async fn resolve_nzbget_append_post_processing_plan(
     ctx: &NzbgetFacadeContext,
     request: &AppendRequest,
-) -> Result<weaver_server_core::post_processing::model::FrozenPlan, RpcError> {
-    let configured_scripts = request.parameters.iter().find_map(|(name, value)| {
-        let normalized = name.trim().to_ascii_lowercase();
-        (normalized.contains("postprocess")
-            && (normalized.ends_with("script") || normalized.ends_with("scripts")))
-        .then_some(value.clone())
-    });
+) -> Result<Option<weaver_server_core::post_processing::model::FrozenPlan>, RpcError> {
     let db = ctx.db.clone();
-    let category = request.category.clone();
-    tokio::task::spawn_blocking(move || {
-        resolve_nzbget_post_processing_plan(&db, configured_scripts.as_deref(), category.as_deref())
-    })
-    .await
-    .map_err(|error| RpcError::invalid_parameter(format!("append failed: {error}")))?
-    .map_err(|error| RpcError::invalid_parameter(format!("append failed: {error}")))
+    let parameters = request.parameters.clone();
+    tokio::task::spawn_blocking(move || resolve_nzbget_post_processing_plan(&db, &parameters))
+        .await
+        .map_err(|error| RpcError::invalid_parameter(format!("append failed: {error}")))?
+        .map_err(|error| RpcError::invalid_parameter(format!("append failed: {error}")))
 }
 
 fn resolve_nzbget_post_processing_plan(
     db: &Database,
-    configured_scripts: Option<&str>,
-    category: Option<&str>,
-) -> Result<weaver_server_core::post_processing::model::FrozenPlan, weaver_server_core::StateError>
-{
-    let selection = if let Some(configured_scripts) = configured_scripts {
-        let names = configured_scripts
-            .split([',', ';'])
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .collect::<Vec<_>>();
-        if names.is_empty() {
-            Some(weaver_server_core::post_processing::model::SubmissionPlanSelection::disabled())
-        } else {
-            let revisions = db.list_extension_revisions()?;
-            let mut selections = Vec::with_capacity(names.len());
-            for name in names {
-                let record =
-                    revisions
-                        .iter()
-                        .find(|record| {
-                            record.trust_state
-                                == weaver_server_core::post_processing::model::TrustState::Approved
-                                && (record.manifest.compatibility_name().is_some_and(
-                                    |compatibility| {
-                                        compatibility.as_str().eq_ignore_ascii_case(name)
-                                    },
-                                ) || record
-                                    .manifest
-                                    .revision()
-                                    .extension_id()
-                                    .as_str()
-                                    .eq_ignore_ascii_case(name)
-                                    || record.manifest.entrypoint().eq_ignore_ascii_case(name))
-                        })
-                        .ok_or_else(|| {
-                            weaver_server_core::StateError::Database(format!(
-                                "approved post-processing extension '{name}' was not found"
-                            ))
-                        })?;
-                selections.push(
-                    weaver_server_core::post_processing::model::ExtensionSelection::pinned(
-                        record.manifest.revision().extension_id().clone(),
-                        record.manifest.revision().revision_id().clone(),
-                    ),
-                );
+    parameters: &[(String, String)],
+) -> Result<
+    Option<weaver_server_core::post_processing::model::FrozenPlan>,
+    weaver_server_core::StateError,
+> {
+    let script_flags = parameters
+        .iter()
+        .filter_map(|(name, value)| name.strip_suffix(':').map(|name| (name, value)))
+        .collect::<Vec<_>>();
+    if script_flags.is_empty() {
+        return Ok(None);
+    }
+
+    let revisions = db.list_extension_revisions()?;
+    let mut recognized = false;
+    let mut selections = Vec::new();
+    for (name, value) in script_flags {
+        let enabled = matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "yes" | "on" | "1"
+        );
+        let record = revisions.iter().find(|record| {
+            record.trust_state == weaver_server_core::post_processing::model::TrustState::Approved
+                && record
+                    .manifest
+                    .compatibility_name()
+                    .is_some_and(|compatibility| compatibility.as_str() == name)
+        });
+        let Some(record) = record else {
+            if enabled {
+                return Err(weaver_server_core::StateError::Database(format!(
+                    "approved post-processing extension '{name}' was not found"
+                )));
             }
-            Some(
-                weaver_server_core::post_processing::model::SubmissionPlanSelection::extensions(
-                    selections,
-                )
-                .map_err(|error| weaver_server_core::StateError::Database(error.to_string()))?,
-            )
+            continue;
+        };
+        recognized = true;
+        if enabled {
+            selections.push(
+                weaver_server_core::post_processing::model::ExtensionSelection::pinned(
+                    record.manifest.revision().extension_id().clone(),
+                    record.manifest.revision().revision_id().clone(),
+                ),
+            );
         }
+    }
+
+    if !recognized {
+        return Ok(None);
+    }
+    let selection = if selections.is_empty() {
+        weaver_server_core::post_processing::model::SubmissionPlanSelection::disabled()
     } else {
-        None
+        weaver_server_core::post_processing::model::SubmissionPlanSelection::extensions(selections)
+            .map_err(|error| weaver_server_core::StateError::Database(error.to_string()))?
     };
-    db.resolve_post_processing_plan(selection.as_ref(), category)
+    db.freeze_submission_post_processing_plan(Some(&selection))
 }
 
 fn append_rejection_result(error: SubmitNzbError) -> Result<Value, RpcError> {
@@ -1137,6 +1134,49 @@ mod append_rejection_tests {
     }
 
     #[test]
+    fn append_parses_legacy_and_current_pp_parameter_layouts_in_last_value_order() {
+        let legacy = parse_append_params(Some(json!([
+            "legacy.nzb",
+            "payload",
+            "",
+            0,
+            false,
+            false,
+            "",
+            0,
+            "all",
+            ["First:", "yes", "Second:", "on", "First:", "off"]
+        ])))
+        .unwrap();
+        assert_eq!(
+            legacy.parameters,
+            vec![
+                ("Second:".to_string(), "on".to_string()),
+                ("First:".to_string(), "off".to_string())
+            ]
+        );
+
+        let current = parse_append_params(Some(json!([
+            "current.nzb",
+            "payload",
+            "",
+            0,
+            false,
+            false,
+            "",
+            0,
+            "all",
+            true,
+            ["First:", "1"]
+        ])))
+        .unwrap();
+        assert_eq!(
+            current.parameters,
+            vec![("First:".to_string(), "1".to_string())]
+        );
+    }
+
+    #[test]
     fn nzbget_append_scripts_resolve_to_approved_pinned_revisions() {
         use weaver_server_core::post_processing::discovery::{
             DiscoveryOptions, discover_and_record_extensions,
@@ -1175,19 +1215,37 @@ mod append_rejection_tests {
         .unwrap();
 
         let compatibility_name = manifest.compatibility_name().unwrap().as_str();
-        let plan =
-            resolve_nzbget_post_processing_plan(&db, Some(compatibility_name), None).unwrap();
+        let flag = format!("{compatibility_name}:");
+        let plan = resolve_nzbget_post_processing_plan(&db, &[(flag.clone(), "yes".to_string())])
+            .unwrap()
+            .unwrap();
         assert_eq!(plan.steps().len(), 1);
         assert_eq!(plan.steps()[0].revision(), manifest.revision());
         assert!(matches!(plan.provenance(), FrozenPlanProvenance::Explicit));
 
-        let disabled = resolve_nzbget_post_processing_plan(&db, Some("  "), None).unwrap();
+        let disabled = resolve_nzbget_post_processing_plan(&db, &[(flag, "no".to_string())])
+            .unwrap()
+            .unwrap();
         assert!(disabled.steps().is_empty());
         assert!(matches!(
             disabled.provenance(),
             FrozenPlanProvenance::Disabled
         ));
-        assert!(resolve_nzbget_post_processing_plan(&db, Some("missing-script"), None).is_err());
+        assert!(
+            resolve_nzbget_post_processing_plan(
+                &db,
+                &[("missing-script:".to_string(), "on".to_string())],
+            )
+            .is_err()
+        );
+        assert_eq!(
+            resolve_nzbget_post_processing_plan(
+                &db,
+                &[("missing-script:".to_string(), "off".to_string())],
+            )
+            .unwrap(),
+            None
+        );
     }
 }
 
@@ -1208,8 +1266,23 @@ fn parse_append_params(params: Option<Value>) -> Result<AppendRequest, RpcError>
         dupe_key: optional_string_param(&params, 6)?,
         dupe_score: optional_i64_param(&params, 7)?,
         dupe_mode: optional_string_param(&params, 8)?,
-        parameters: parse_parameter_pairs(params.get(9))?,
+        parameters: parse_parameter_pairs(params.get(append_parameter_index(&params)))?,
     })
+}
+
+fn append_parameter_index(params: &[Value]) -> usize {
+    match params.get(9) {
+        Some(Value::Bool(_) | Value::Number(_)) => 10,
+        Some(Value::String(value))
+            if matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "true" | "false" | "yes" | "no" | "on" | "off" | "1" | "0"
+            ) =>
+        {
+            10
+        }
+        _ => 9,
+    }
 }
 
 /// Legacy (pre-v13) `appendurl(NZBFilename, Category, Priority, AddToTop,
@@ -1274,9 +1347,13 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         .map(|(_, total, downloaded)| total.saturating_sub(*downloaded))
         .sum::<u64>();
     let forced = 0u64;
-    let post_job_count = states
+    let post_job_count = jobs
         .iter()
-        .filter(|(state, _, _)| queue_item_state_in_post_processing(*state))
+        .zip(&states)
+        .filter(|(job, (state, _, _))| {
+            matches!(job.status, JobStatus::QueuedPostProcessing)
+                || queue_item_state_in_post_processing(*state)
+        })
         .count();
     let any_active = states
         .iter()
@@ -1384,19 +1461,6 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     }))
 }
 
-fn job_in_post_processing(item: &QueueItem) -> bool {
-    matches!(
-        item.state,
-        QueueItemState::Checking
-            | QueueItemState::Verifying
-            | QueueItemState::Repairing
-            | QueueItemState::Extracting
-            | QueueItemState::Finalizing
-            | QueueItemState::PostProcessing
-    )
-}
-
-/// Same set as [`job_in_post_processing`], over an already-resolved state.
 /// `status()` iterates `SchedulerHandle::list_jobs()` directly (avoiding a
 /// per-job `QueueItem` deep-clone) and classifies each job with
 /// `queue_item_state_from_job_info`, so it needs the check on a bare state.
@@ -2609,8 +2673,13 @@ async fn postqueue(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         .handle
         .list_jobs()
         .iter()
+        .filter(|job| {
+            matches!(job.status, JobStatus::QueuedPostProcessing)
+                || queue_item_state_in_post_processing(
+                    weaver_server_api::queue_item_state_from_job_info(job),
+                )
+        })
         .map(queue_item_from_job)
-        .filter(job_in_post_processing)
         .map(|item| {
             let info = post_progress_info(&item);
             let stage = match item.state {
@@ -3155,8 +3224,8 @@ fn parse_job_id_value(value: &Value) -> Result<JobId, RpcError> {
     }
 }
 
-fn parse_parameter_pairs(value: Option<&Value>) -> Result<BTreeMap<String, String>, RpcError> {
-    let mut out = BTreeMap::new();
+fn parse_parameter_pairs(value: Option<&Value>) -> Result<Vec<(String, String)>, RpcError> {
+    let mut out = Vec::new();
     let Some(value) = value else {
         return Ok(out);
     };
@@ -3173,7 +3242,7 @@ fn parse_parameter_pairs(value: Option<&Value>) -> Result<BTreeMap<String, Strin
                         continue;
                     };
                     if let Some(value) = object.get("Value").and_then(value_to_string) {
-                        out.insert(name.to_string(), value);
+                        insert_parameter(&mut out, name.to_string(), value);
                     }
                 }
                 return Ok(out);
@@ -3190,7 +3259,7 @@ fn parse_parameter_pairs(value: Option<&Value>) -> Result<BTreeMap<String, Strin
                     ));
                 };
                 if let Some(value) = value_to_string(&pair[1]) {
-                    out.insert(name.to_string(), value);
+                    insert_parameter(&mut out, name.to_string(), value);
                 }
             }
             Ok(out)
@@ -3198,7 +3267,7 @@ fn parse_parameter_pairs(value: Option<&Value>) -> Result<BTreeMap<String, Strin
         Value::Object(object) => {
             for (key, value) in object {
                 if let Some(value) = value_to_string(value) {
-                    out.insert(key.clone(), value);
+                    insert_parameter(&mut out, key.clone(), value);
                 }
             }
             Ok(out)
@@ -3207,6 +3276,13 @@ fn parse_parameter_pairs(value: Option<&Value>) -> Result<BTreeMap<String, Strin
             "parameters must be an array or object",
         )),
     }
+}
+
+fn insert_parameter(out: &mut Vec<(String, String)>, name: String, value: String) {
+    if let Some(index) = out.iter().position(|(existing, _)| existing == &name) {
+        out.remove(index);
+    }
+    out.push((name, value));
 }
 
 fn value_to_string(value: &Value) -> Option<String> {

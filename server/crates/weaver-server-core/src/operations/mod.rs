@@ -15,8 +15,8 @@ pub use async_ops::{
 };
 pub use backup::{
     BackupArtifact, BackupInspectResult, BackupManifest, BackupService, BackupServiceError,
-    BackupStatus, CategoryRemapInput, CategoryRemapRequirement, RestoreOptions, RestoreReport,
-    StableStateExport,
+    BackupStatus, CategoryRemapInput, CategoryRemapRequirement, PendingRestoreOutcome,
+    RestoreOptions, RestoreReport, StableStateExport, apply_pending_restore,
 };
 pub use disk::{DiskSpace, disk_space};
 pub use health::{

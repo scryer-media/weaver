@@ -862,7 +862,7 @@ async fn nzbget_append_accepts_base64_payload_with_embedded_whitespace() {
 }
 
 #[tokio::test]
-async fn nzbget_append_preserves_submitted_category_case_for_facade() {
+async fn nzbget_append_canonicalizes_submitted_category_for_facade() {
     use base64::Engine as _;
 
     let db = Database::open_in_memory().unwrap();
@@ -912,7 +912,7 @@ async fn nzbget_append_preserves_submitted_category_case_for_facade() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(payload["result"].as_u64().unwrap() >= 10_000);
-    assert_eq!(handle.list_jobs()[0].category.as_deref(), Some("tv"));
+    assert_eq!(handle.list_jobs()[0].category.as_deref(), Some("TV"));
 
     let (status, groups_payload) = post_nzbget(
         app,
@@ -925,7 +925,7 @@ async fn nzbget_append_preserves_submitted_category_case_for_facade() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(groups_payload["result"][0]["Category"], "tv");
+    assert_eq!(groups_payload["result"][0]["Category"], "TV");
 }
 
 #[tokio::test]
@@ -2323,7 +2323,16 @@ async fn nzbget_postqueue_and_group_post_fields_report_stage_progress() {
         started_at_epoch_ms: 1_700_000_000_000.0,
         updated_at_epoch_ms: 1_700_000_004_000.0,
     }];
-    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let mut queued = nzbget_test_job(
+        61,
+        JobStatus::QueuedPostProcessing,
+        weaver_server_core::DownloadState::Complete,
+        1_000_000,
+        1_000_000,
+        vec![],
+    );
+    queued.post_state = weaver_server_core::PostState::QueuedPostProcessing;
+    let handle = scheduler_handle_with_mock_commands(vec![job, queued]);
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle,
@@ -2343,6 +2352,16 @@ async fn nzbget_postqueue_and_group_post_fields_report_stage_progress() {
     assert_eq!(entry["Stage"], "REPAIRING");
     assert_eq!(entry["StageProgress"], 500);
     assert_eq!(entry["StageTimeSec"], 4);
+    assert_eq!(payload["result"][1]["NZBID"], 61);
+    assert_eq!(payload["result"][1]["Stage"], "QUEUED");
+
+    let (_, status_payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "status", "params": [], "id": "status"}),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status_payload["result"]["PostJobCount"], 2);
 
     let (_, groups) = post_nzbget(
         app,

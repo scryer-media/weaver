@@ -15,6 +15,19 @@ pub(crate) enum DatabaseTarget {
 }
 
 impl DatabaseTarget {
+    pub(crate) fn sqlite_path(&self) -> Result<Option<PathBuf>, StateError> {
+        match self {
+            Self::SqlitePath(path) => Ok(Some(path.clone())),
+            Self::SqliteUrl(url) => {
+                let options: sqlx::sqlite::SqliteConnectOptions = url.parse().map_err(|error| {
+                    StateError::Database(format!("invalid SQLite URL: {error}"))
+                })?;
+                Ok(Some(options.get_filename().to_path_buf()))
+            }
+            Self::PostgresUrl(_) => Ok(None),
+        }
+    }
+
     pub(crate) fn from_config_path(config_path: &Path) -> Self {
         let (db_path, _) = super::setup::resolve_database_paths(config_path);
         Self::SqlitePath(db_path)

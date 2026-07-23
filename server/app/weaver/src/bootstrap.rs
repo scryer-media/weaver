@@ -7,10 +7,15 @@ use weaver_server_core::settings::Config;
 use weaver_server_core::settings::env_seed::{EnvSeedConfig, EnvSeedError};
 use weaver_server_core::{Database, StateError};
 
-pub(crate) fn open_db_and_config(
+pub(crate) fn open_database(config_path: &Path) -> Result<Database, Box<dyn std::error::Error>> {
+    weaver_server_core::persistence::open_database(config_path)
+}
+
+pub(crate) fn finish_open_db_and_config(
     config_path: &Path,
+    db: Database,
 ) -> Result<(Database, Config), Box<dyn std::error::Error>> {
-    weaver_server_core::persistence::open_db_and_config(config_path)
+    weaver_server_core::persistence::finish_open_db_and_config(config_path, db)
 }
 
 pub(crate) fn reset_login_if_requested(db: &mut Database) {

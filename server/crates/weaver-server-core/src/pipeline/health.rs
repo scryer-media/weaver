@@ -8,7 +8,7 @@ impl Pipeline {
         total_bytes.saturating_sub(par2_bytes)
     }
 
-    fn critical_health_milli(total: u64, par2_bytes: u64) -> u32 {
+    pub(crate) fn critical_health_milli(total: u64, par2_bytes: u64) -> u32 {
         if par2_bytes == 0 {
             850
         } else if par2_bytes * 2 > total {

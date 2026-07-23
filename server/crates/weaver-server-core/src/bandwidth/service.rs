@@ -95,7 +95,7 @@ impl BandwidthCapRuntime {
         let default_policy = Self::default_display_policy();
         let policy = self.policy.as_ref().unwrap_or(&default_policy);
 
-        let now = Local::now();
+        let now = crate::e2e_clock::local_now();
         let next_window = compute_window(now, policy);
         let should_reload = self.window.as_ref() != Some(&next_window);
         if should_reload {
@@ -140,7 +140,7 @@ impl BandwidthCapRuntime {
         db: &crate::Database,
         payload_bytes: u64,
     ) -> Result<(), crate::StateError> {
-        let now = Local::now();
+        let now = crate::e2e_clock::local_now();
         let bucket_epoch_minute = now.timestamp().div_euclid(60);
         self.record_pending_usage(bucket_epoch_minute, payload_bytes);
         if let Some(window) = &self.window
@@ -209,9 +209,10 @@ impl BandwidthCapRuntime {
 
     pub(crate) fn to_download_block_state(&self, global_paused: bool) -> DownloadBlockState {
         let timezone_name = {
-            let label = Local::now().format("%Z").to_string();
+            let now = crate::e2e_clock::local_now();
+            let label = now.format("%Z").to_string();
             if label.is_empty() {
-                Local::now().offset().to_string()
+                now.offset().to_string()
             } else {
                 label
             }

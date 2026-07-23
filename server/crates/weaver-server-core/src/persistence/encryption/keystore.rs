@@ -8,6 +8,14 @@ pub trait KeyStore: Send + Sync {
     fn create_key_if_absent(&self, _key: &str) -> Result<Option<String>, String> {
         Ok(None)
     }
+    /// Atomically replace a Weaver-managed key. Externally managed stores
+    /// return `Ok(false)` and must be validated instead of overwritten.
+    fn replace_key(&self, _key: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn can_replace(&self) -> bool {
+        false
+    }
     #[allow(dead_code)]
     fn delete_key(&self) -> Result<(), String>;
     fn name(&self) -> &'static str;

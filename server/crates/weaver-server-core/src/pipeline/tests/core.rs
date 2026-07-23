@@ -1238,6 +1238,7 @@ async fn nzbget_repair_request_reenters_par_once_when_inputs_remain() {
             summary: crate::post_processing::model::PostProcessingSummary::Succeeded,
             effects: vec![],
             repair_requested: true,
+            output_directory: None,
         }),
     });
 

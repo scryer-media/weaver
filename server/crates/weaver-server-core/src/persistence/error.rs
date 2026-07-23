@@ -5,4 +5,7 @@ pub enum StateError {
 
     #[error("database error: {0}")]
     Database(String),
+
+    #[error("state conflict: {0}")]
+    Conflict(String),
 }
