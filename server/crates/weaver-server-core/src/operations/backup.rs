@@ -40,7 +40,14 @@ pub use self::manifest::{
 pub use self::service::BackupService;
 pub use pending::{PendingRestoreOutcome, apply_pending_restore};
 
-const STABLE_TABLES: &[&str] = &[
+#[doc(hidden)]
+pub fn create_backup_temp_dir() -> Result<tempfile::TempDir, std::io::Error> {
+    let directory = tempfile::tempdir()?;
+    permissions::set_directory_owner_only(directory.path())?;
+    Ok(directory)
+}
+
+const LEGACY_V1_STABLE_TABLES: &[&str] = &[
     "schema_version",
     "settings",
     "servers",
@@ -64,36 +71,7 @@ const STABLE_TABLES: &[&str] = &[
     "rss_seen_items",
 ];
 
-const RESTORE_PRISTINE_TABLES: &[&str] = &[
-    "metrics_history_chunks",
-    "job_history",
-    "job_history_attributes",
-    "job_events",
-    "post_processing_extension_revisions",
-    "post_processing_profiles",
-    "post_processing_profile_steps",
-    "post_processing_profile_assignments",
-    "post_processing_job_plans",
-    "post_processing_runs",
-    "post_processing_attempts",
-    "post_processing_log_chunks",
-    "active_jobs",
-    "active_file_progress",
-    "active_files",
-    "active_file_identities",
-    "active_par2",
-    "active_par2_files",
-    "active_extracted",
-    "active_failed_extractions",
-    "active_extraction_chunks",
-    "active_archive_headers",
-    "active_rar_volume_facts",
-    "active_detected_archives",
-    "active_volume_status",
-    "active_rar_verified_suspect",
-];
-
-const CLEAR_IMPORT_TABLES: &[&str] = &[
+const LEGACY_V1_CLEAR_IMPORT_TABLES: &[&str] = &[
     "metrics_history_chunks",
     "post_processing_log_chunks",
     "post_processing_attempts",
@@ -246,7 +224,7 @@ async fn copy_stable_tables_to_backup(
 
     create_backup_table_schema(&mut export_conn).await?;
 
-    for table in STABLE_TABLES
+    for table in LEGACY_V1_STABLE_TABLES
         .iter()
         .copied()
         .chain(std::iter::once(MIGRATION_LEDGER_TABLE))
@@ -292,7 +270,7 @@ async fn copy_postgres_stable_tables_to_backup(
         .map_err(db_err)?;
     let mut tx = conn.begin().await.map_err(db_err)?;
 
-    for table in CLEAR_IMPORT_TABLES {
+    for table in LEGACY_V1_CLEAR_IMPORT_TABLES {
         let sql = format!("DELETE FROM {table}");
         sqlx::raw_sql(AssertSqlSafe(sql.as_str()))
             .execute(&mut *tx)
@@ -304,7 +282,7 @@ async fn copy_postgres_stable_tables_to_backup(
         .await
         .map_err(db_err)?;
 
-    for table in STABLE_TABLES {
+    for table in LEGACY_V1_STABLE_TABLES {
         let select = format!("SELECT * FROM {table}");
         let rows: Vec<PgRow> = sqlx::query(AssertSqlSafe(select.as_str()))
             .fetch_all(&pool)
@@ -442,7 +420,7 @@ async fn import_stable_state_to_postgres(
     .execute(&mut *tx)
     .await
     .map_err(db_err)?;
-    for table in CLEAR_IMPORT_TABLES {
+    for table in LEGACY_V1_CLEAR_IMPORT_TABLES {
         let sql = format!("DELETE FROM {table}");
         sqlx::raw_sql(AssertSqlSafe(sql.as_str()))
             .execute(&mut *tx)
@@ -452,7 +430,7 @@ async fn import_stable_state_to_postgres(
 
     let mut history_run_links = Vec::<(i64, String)>::new();
     let mut rerun_links = Vec::<(String, String)>::new();
-    for table in STABLE_TABLES {
+    for table in LEGACY_V1_STABLE_TABLES {
         if *table == "schema_version"
             || (!include_post_processing && is_post_processing_table(table))
         {
@@ -483,6 +461,13 @@ async fn import_stable_state_to_postgres(
             {
                 let mut values = builder.separated(", ");
                 for column in &columns {
+                    if *table == "job_history"
+                        && column.name == "post_processing_summary"
+                        && !include_post_processing
+                    {
+                        values.push_bind(Some("not_run".to_string()));
+                        continue;
+                    }
                     if *table == "job_history" && column.name == "post_processing_run_id" {
                         if include_post_processing {
                             let job_id: i64 = row.try_get("job_id").map_err(db_err)?;
@@ -633,7 +618,7 @@ async fn import_stable_state_to_postgres(
 }
 
 async fn create_backup_table_schema(conn: &mut SqliteConnection) -> Result<(), StateError> {
-    for table in STABLE_TABLES
+    for table in LEGACY_V1_STABLE_TABLES
         .iter()
         .copied()
         .chain(std::iter::once(MIGRATION_LEDGER_TABLE))
@@ -658,7 +643,7 @@ async fn create_backup_table_schema(conn: &mut SqliteConnection) -> Result<(), S
 }
 
 async fn create_backup_indexes(conn: &mut SqliteConnection) -> Result<(), StateError> {
-    for table in STABLE_TABLES
+    for table in LEGACY_V1_STABLE_TABLES
         .iter()
         .copied()
         .chain(std::iter::once(MIGRATION_LEDGER_TABLE))
@@ -730,8 +715,18 @@ impl Database {
     pub fn restore_target_is_pristine(&self) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            for table in RESTORE_PRISTINE_TABLES {
-                let query = format!("SELECT COUNT(*) AS count FROM {table}");
+            for entry in catalog::BACKUP_TABLE_CATALOG {
+                let query = match entry.restore_target_policy {
+                    catalog::RestoreTargetPolicy::Replace => continue,
+                    catalog::RestoreTargetPolicy::RequireEmpty => format!(
+                        "SELECT COUNT(*) AS count FROM {}",
+                        catalog::quote_identifier(entry.table)
+                    ),
+                    catalog::RestoreTargetPolicy::RequireZeroUsage => "SELECT COUNT(*) AS count
+                           FROM server_download_usage
+                          WHERE lifetime_bytes != 0 OR quota_baseline_bytes != 0"
+                        .to_string(),
+                };
                 let count = SqlRuntime::fetch_optional(datastore.read_exec(), &query, &[])
                     .await?
                     .map(|row| row.i64("count"))
@@ -791,7 +786,10 @@ impl Database {
 
         Ok(StableStateExport {
             schema_version,
-            included_tables: STABLE_TABLES.iter().map(|t| (*t).to_string()).collect(),
+            included_tables: LEGACY_V1_STABLE_TABLES
+                .iter()
+                .map(|t| (*t).to_string())
+                .collect(),
             max_job_id,
         })
     }
@@ -878,13 +876,14 @@ impl Database {
                             } else {
                                 "NULL"
                             };
-                            let src_post_processing_summary = if table_has_column(
-                                &mut conn,
-                                "src",
-                                "job_history",
-                                "post_processing_summary",
-                            )
-                            .await?
+                            let src_post_processing_summary = if include_post_processing
+                                && table_has_column(
+                                    &mut conn,
+                                    "src",
+                                    "job_history",
+                                    "post_processing_summary",
+                                )
+                                .await?
                             {
                                 "post_processing_summary"
                             } else {
@@ -1098,7 +1097,7 @@ impl Database {
                             };
 
                             let mut tx = conn.begin().await.map_err(db_err)?;
-                            for table in CLEAR_IMPORT_TABLES {
+                            for table in LEGACY_V1_CLEAR_IMPORT_TABLES {
                                 let sql = format!("DELETE FROM {table}");
                                 sqlx::raw_sql(AssertSqlSafe(sql.as_str()))
                                     .execute(&mut *tx)
@@ -1170,11 +1169,7 @@ impl Database {
                                      (feed_id, item_id, item_title, published_at, size_bytes, decision, seen_at, job_id, item_url, error)
                                      SELECT feed_id, item_id, item_title, published_at, size_bytes, decision, seen_at, job_id, item_url, error
                                      FROM src.rss_seen_items;
-                                 DELETE FROM sqlite_sequence WHERE name IN ('api_keys', 'job_events');
-                                 INSERT INTO sqlite_sequence (name, seq)
-                                     SELECT 'api_keys', COALESCE(MAX(id), 0) FROM api_keys;
-                                 INSERT INTO sqlite_sequence (name, seq)
-                                     SELECT 'job_events', COALESCE(MAX(id), 0) FROM job_events;
+                                 DELETE FROM sqlite_sequence;
                                  ",
                             );
                             sqlx::raw_sql(AssertSqlSafe(import_sql.as_str()))

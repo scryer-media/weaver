@@ -5335,6 +5335,91 @@ async fn server_quota_ui_state_does_not_globally_stop_unrelated_dispatch() {
 }
 
 #[tokio::test]
+async fn bandwidth_cap_state_refresh_preserves_scheduled_speed_limit() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 1,
+            medium_count: 1,
+            large_count: 1,
+        },
+        1,
+    )
+    .await;
+
+    pipeline.scheduled_rate_limit = Some(131_072);
+    pipeline.rate_limiter.set_rate(131_072);
+    pipeline.refresh_bandwidth_cap_window().unwrap();
+    assert_eq!(
+        pipeline.shared_state.download_block().scheduled_speed_limit,
+        131_072
+    );
+
+    pipeline.record_download_bandwidth_usage(1_024).unwrap();
+    assert_eq!(
+        pipeline.shared_state.download_block().scheduled_speed_limit,
+        131_072
+    );
+
+    pipeline.flush_download_bandwidth_usage().unwrap();
+    assert_eq!(
+        pipeline.shared_state.download_block().scheduled_speed_limit,
+        131_072
+    );
+}
+
+#[tokio::test]
+async fn clearing_scheduled_speed_limit_restores_latest_configured_limit() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+
+    let (reply, received) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::SetSpeedLimit {
+            bytes_per_sec: 512 * 1024,
+            reply,
+        })
+        .await;
+    received.await.unwrap();
+
+    let (reply, received) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::ApplyScheduleAction {
+            action: crate::bandwidth::ScheduleAction::SpeedLimit {
+                bytes_per_sec: 128 * 1024,
+            },
+            reply,
+        })
+        .await;
+    received.await.unwrap();
+    assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
+
+    let (reply, received) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::SetSpeedLimit {
+            bytes_per_sec: 768 * 1024,
+            reply,
+        })
+        .await;
+    received.await.unwrap();
+    assert_eq!(pipeline.configured_rate_limit, 768 * 1024);
+    assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
+
+    let (reply, received) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::ClearScheduleAction { reply })
+        .await;
+    received.await.unwrap();
+    assert_eq!(pipeline.scheduled_rate_limit, None);
+    assert_eq!(pipeline.rate_limiter.rate(), 768 * 1024);
+    assert_eq!(
+        pipeline.shared_state.download_block().scheduled_speed_limit,
+        0
+    );
+}
+
+#[tokio::test]
 async fn set_bandwidth_cap_policy_recomputes_current_window_usage_from_ledger() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
@@ -6375,6 +6460,33 @@ async fn restore_paused_postprocessing_target_normalizes_to_downloading() {
         pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
         Some(JobStatus::Downloading)
     );
+}
+
+#[tokio::test]
+async fn active_rate_limit_does_not_prelease_multiple_bodies() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 4,
+            medium_count: 2,
+            large_count: 1,
+        },
+        4,
+    )
+    .await;
+    let job_id = JobId(31232);
+    let files = (0..4)
+        .map(|index| (format!("rate-limit-{index}.bin"), 512 * 1024))
+        .collect::<Vec<_>>();
+    let spec = standalone_job_spec("Rate Limited Lease", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    pipeline.rate_limiter.set_rate(128 * 1024);
+    pipeline.dispatch_downloads();
+
+    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 3);
 }
 
 #[tokio::test]

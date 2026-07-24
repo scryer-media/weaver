@@ -180,15 +180,36 @@ pub(super) async fn backup_inspect_handler(
         return status.into_response();
     }
     match parse_backup_upload(multipart, security.backup_upload_limit_bytes).await {
-        Ok(upload) => match backup
-            .inspect_backup(&upload.file_path, upload.password)
-            .await
-        {
-            Ok(result) => Json(result).into_response(),
-            Err(error) => {
-                super::error_response(backup_error_status_code(&error), &error.to_string())
+        Ok(upload) => {
+            let target_data_dir = upload
+                .data_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from);
+            let result = match target_data_dir {
+                Some(target_data_dir) => {
+                    backup
+                        .inspect_backup_for_target(
+                            &upload.file_path,
+                            upload.password,
+                            &target_data_dir,
+                        )
+                        .await
+                }
+                None => {
+                    backup
+                        .inspect_backup(&upload.file_path, upload.password)
+                        .await
+                }
+            };
+            match result {
+                Ok(result) => Json(result).into_response(),
+                Err(error) => {
+                    super::error_response(backup_error_status_code(&error), &error.to_string())
+                }
             }
-        },
+        }
         Err((status, message)) => super::error_response(status, &message),
     }
 }
@@ -274,6 +295,9 @@ struct MultipartByteLimiter {
 }
 
 const MAX_BACKUP_TEXT_FIELD_BYTES: usize = 1024 * 1024;
+pub(super) const BACKUP_MULTIPART_METADATA_LIMIT_BYTES: usize = 5 * MAX_BACKUP_TEXT_FIELD_BYTES;
+pub(super) const BACKUP_MULTIPART_ENVELOPE_ALLOWANCE_BYTES: usize =
+    BACKUP_MULTIPART_METADATA_LIMIT_BYTES + 1024 * 1024;
 
 impl MultipartByteLimiter {
     fn new(limit: u64) -> Self {
@@ -334,7 +358,8 @@ async fn parse_backup_upload(
 ) -> Result<ParsedBackupUpload, (StatusCode, String)> {
     use tokio::io::AsyncWriteExt;
 
-    let temp_dir = tempfile::tempdir().map_err(super::internal_upload_err)?;
+    let temp_dir = weaver_server_core::operations::backup::create_backup_temp_dir()
+        .map_err(super::internal_upload_err)?;
     let file_path = temp_dir.path().join("upload.bin");
     let mut saw_file = false;
     let mut password = None;
@@ -342,7 +367,9 @@ async fn parse_backup_upload(
     let mut intermediate_dir = None;
     let mut complete_dir = None;
     let mut category_remaps = Vec::new();
-    let mut limiter = MultipartByteLimiter::new(upload_limit_bytes);
+    let mut file_limiter = MultipartByteLimiter::new(upload_limit_bytes);
+    let mut metadata_limiter =
+        MultipartByteLimiter::new(BACKUP_MULTIPART_METADATA_LIMIT_BYTES as u64);
 
     while let Some(field) = multipart
         .next_field()
@@ -364,7 +391,7 @@ async fn parse_backup_upload(
                     .map_err(super::internal_upload_err)?;
                 let mut field = field;
                 while let Some(chunk) = field.chunk().await.map_err(multipart_error_response)? {
-                    limiter.consume(chunk.len())?;
+                    file_limiter.consume(chunk.len())?;
                     dest.write_all(&chunk)
                         .await
                         .map_err(super::internal_upload_err)?;
@@ -372,23 +399,24 @@ async fn parse_backup_upload(
                 dest.flush().await.map_err(super::internal_upload_err)?;
             }
             "password" => {
-                password = Some(read_text_field_limited(field, &mut limiter).await?);
+                password = Some(read_text_field_limited(field, &mut metadata_limiter).await?);
             }
             "data_dir" => {
-                data_dir = Some(read_text_field_limited(field, &mut limiter).await?);
+                data_dir = Some(read_text_field_limited(field, &mut metadata_limiter).await?);
             }
             "intermediate_dir" => {
-                intermediate_dir = Some(read_text_field_limited(field, &mut limiter).await?);
+                intermediate_dir =
+                    Some(read_text_field_limited(field, &mut metadata_limiter).await?);
             }
             "complete_dir" => {
-                complete_dir = Some(read_text_field_limited(field, &mut limiter).await?);
+                complete_dir = Some(read_text_field_limited(field, &mut metadata_limiter).await?);
             }
             "category_remaps" => {
-                let raw = read_text_field_limited(field, &mut limiter).await?;
+                let raw = read_text_field_limited(field, &mut metadata_limiter).await?;
                 category_remaps = serde_json::from_str(&raw)
                     .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
             }
-            _ => drain_field_limited(field, &mut limiter).await?,
+            _ => drain_field_limited(field, &mut metadata_limiter).await?,
         }
     }
 
@@ -460,20 +488,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backup_upload_limit_applies_to_non_file_fields() {
-        let multipart = multipart_from_parts(&[("password", b"too-large")]).await;
+    async fn backup_file_limit_does_not_consume_restore_metadata() {
+        let multipart = multipart_from_parts(&[("file", b"abcde"), ("password", b"secret")]).await;
 
-        let (status, message) = parse_upload_err(multipart, 4).await;
-
-        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-        assert!(message.contains("backup upload exceeds 4 bytes"));
+        let upload = parse_backup_upload(multipart, 5).await.unwrap();
+        assert_eq!(std::fs::read(upload.file_path).unwrap(), b"abcde");
+        assert_eq!(upload.password.as_deref(), Some("secret"));
     }
 
     #[tokio::test]
-    async fn backup_upload_limit_counts_combined_fields() {
-        let multipart = multipart_from_parts(&[("file", b"abc"), ("password", b"def")]).await;
+    async fn backup_upload_limit_applies_to_the_backup_file() {
+        let multipart = multipart_from_parts(&[("file", b"abcdef"), ("password", b"x")]).await;
 
         let (status, message) = parse_upload_err(multipart, 5).await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(message.contains("backup upload exceeds 5 bytes"));
+    }
+
+    #[test]
+    fn backup_upload_bounds_aggregate_metadata() {
+        let mut limiter = MultipartByteLimiter::new(5);
+        limiter.consume(3).unwrap();
+        let (status, message) = limiter.consume(3).unwrap_err();
 
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert!(message.contains("backup upload exceeds 5 bytes"));
@@ -518,5 +555,30 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn backup_upload_route_accepts_a_file_at_the_configured_limit_with_metadata() {
+        async fn parses_multipart(multipart: Multipart) -> StatusCode {
+            match parse_backup_upload(multipart, 5).await {
+                Ok(_) => StatusCode::OK,
+                Err((status, _)) => status,
+            }
+        }
+
+        let request_limit = 5_usize.saturating_add(BACKUP_MULTIPART_ENVELOPE_ALLOWANCE_BYTES);
+        let app = axum::Router::new()
+            .route("/backup", post(parses_multipart))
+            .route_layer(RequestBodyLimitLayer::new(request_limit));
+        let response = app
+            .oneshot(multipart_request_from_parts(&[
+                ("file", b"abcde"),
+                ("password", b"secret"),
+                ("data_dir", b"/tmp/weaver"),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

@@ -1493,6 +1493,15 @@ async fn listgroups(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     Ok(Value::Array(groups))
 }
 
+fn nzbget_release_name<'a>(original_title: &'a str, fallback_name: &'a str) -> &'a str {
+    let original_title = original_title.trim();
+    if original_title.is_empty() {
+        fallback_name
+    } else {
+        original_title
+    }
+}
+
 fn nzbget_group(item: &QueueItem) -> Value {
     let total = item.total_bytes;
     let downloaded = item.downloaded_bytes;
@@ -1510,17 +1519,18 @@ fn nzbget_group(item: &QueueItem) -> Value {
     let output_dir = item.output_dir.clone().unwrap_or_default();
     let post_info = post_progress_info(item);
     let critical_health = critical_health(item);
+    let release_name = nzbget_release_name(&item.original_title, &item.name);
 
     let mut group = json!({
         "FirstID": item.id,
         "LastID": item.id,
         "NZBID": item.id,
-        "Name": item.name,
-        "NZBName": item.name,
+        "Name": release_name,
+        "NZBName": release_name,
         "NZBNicename": item.display_title,
         "Kind": "NZB",
         "URL": "",
-        "NZBFilename": item.name,
+        "NZBFilename": release_name,
         "DestDir": output_dir,
         "FinalDir": output_dir,
         "Category": item.category.clone().unwrap_or_default(),
@@ -1966,7 +1976,7 @@ fn nzbget_history_item(item: &weaver_server_api::HistoryItem, timings: HistoryTi
     let failed = item.state == QueueItemState::Failed && !cancelled;
     nzbget_history_entry(
         item.id,
-        &item.name,
+        nzbget_release_name(&item.original_title, &item.name),
         item.category.as_deref(),
         item.total_bytes,
         &item.output_dir.clone().unwrap_or_default(),
@@ -1984,7 +1994,7 @@ fn nzbget_history_queue_item(item: &QueueItem, timings: HistoryTimings) -> Value
     let failed = item.state == QueueItemState::Failed;
     nzbget_history_entry(
         item.id,
-        &item.name,
+        nzbget_release_name(&item.original_title, &item.name),
         item.category.as_deref(),
         item.total_bytes,
         &item.output_dir.clone().unwrap_or_default(),

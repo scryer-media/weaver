@@ -492,6 +492,8 @@ const fr: LocaleDictionary = {
   "settings.backupExportDesc": "Créez un bundle chiffré contenant la configuration, l’historique durable et l’état des doublons, l’état RSS, les identifiants et les extensions gérées.",
   "settings.backupPassword": "Protection par mot de passe",
   "settings.backupPasswordPlaceholder": "Obligatoire pour chaque nouvelle sauvegarde",
+  "settings.backupPasswordConfirm": "Confirmer le mot de passe",
+  "settings.backupPasswordMismatch": "Les mots de passe ne correspondent pas.",
   "settings.backupDownload": "Télécharger la sauvegarde",
   "settings.backupDownloading": "Préparation de la sauvegarde...",
   "settings.backupDownloadReady": "Le téléchargement de la sauvegarde a commencé.",

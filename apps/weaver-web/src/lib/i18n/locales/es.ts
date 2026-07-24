@@ -492,6 +492,8 @@ const es: LocaleDictionary = {
   "settings.backupExportDesc": "Crea un paquete cifrado con configuración, historial y estado de duplicados duraderos, estado RSS, credenciales y extensiones administradas.",
   "settings.backupPassword": "Protección con contraseña",
   "settings.backupPasswordPlaceholder": "Obligatoria para cada copia nueva",
+  "settings.backupPasswordConfirm": "Confirmar contraseña",
+  "settings.backupPasswordMismatch": "Las contraseñas no coinciden.",
   "settings.backupDownload": "Descargar copia de seguridad",
   "settings.backupDownloading": "Preparando copia de seguridad...",
   "settings.backupDownloadReady": "La descarga de la copia de seguridad ha comenzado.",

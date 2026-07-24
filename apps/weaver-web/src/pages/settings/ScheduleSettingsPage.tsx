@@ -169,17 +169,22 @@ export function ScheduleSettingsPage() {
             <div className="space-y-4 rounded-inner border border-border bg-background/40 p-5">
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label className="text-sm font-semibold">{t("schedule.time")}</Label>
+                  <Label htmlFor="schedule-time" className="text-sm font-semibold">
+                    {t("schedule.time")}
+                  </Label>
                   <Input
+                    id="schedule-time"
                     type="time"
                     value={formTime}
                     onChange={(e) => setFormTime(e.target.value)}
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label className="text-sm font-semibold">{t("schedule.action")}</Label>
+                  <Label htmlFor="schedule-action" className="text-sm font-semibold">
+                    {t("schedule.action")}
+                  </Label>
                   <Select value={formAction} onValueChange={setFormAction}>
-                    <SelectTrigger>
+                    <SelectTrigger id="schedule-action">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -245,8 +250,11 @@ export function ScheduleSettingsPage() {
               </div>
 
               <div className="space-y-2">
-                <Label className="text-sm font-semibold">{t("schedule.label")}</Label>
+                <Label htmlFor="schedule-label" className="text-sm font-semibold">
+                  {t("schedule.label")}
+                </Label>
                 <Input
+                  id="schedule-label"
                   value={formLabel}
                   onChange={(e) => setFormLabel(e.target.value)}
                   placeholder={t("schedule.labelPlaceholder")}
@@ -278,6 +286,8 @@ export function ScheduleSettingsPage() {
           {schedules.map((entry) => (
             <div
               key={entry.id}
+              role="group"
+              aria-label={entry.label || entry.time}
               className="flex items-center justify-between gap-4 rounded-inner border border-border p-4"
             >
               <div className="flex items-center gap-3">
@@ -316,12 +326,14 @@ export function ScheduleSettingsPage() {
               </div>
               <div className="flex items-center gap-1">
                 <Switch
+                  aria-label={entry.label || entry.time}
                   checked={entry.enabled}
                   onCheckedChange={(checked) =>
                     handleToggle(entry.id, checked)
                   }
                 />
                 <Button
+                  aria-label={t("action.edit")}
                   size="icon"
                   variant="ghost"
                   onClick={() => openEdit(entry)}
@@ -329,6 +341,7 @@ export function ScheduleSettingsPage() {
                   <Pencil className="h-4 w-4" />
                 </Button>
                 <Button
+                  aria-label={t("action.delete")}
                   size="icon"
                   variant="ghost"
                   onClick={() => handleDelete(entry.id)}

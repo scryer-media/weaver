@@ -2,19 +2,8 @@ use crate::StateError;
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
 use crate::history::{parse_history_metadata, public_history_attributes};
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, max_rows_for_tx};
 use sqlx::{Postgres, QueryBuilder, Sqlite};
-
-const SQLITE_BATCH_BIND_LIMIT: usize = 900;
-const POSTGRES_BATCH_BIND_LIMIT: usize = 16_000;
-
-fn max_rows_for_tx(tx: &SqlTx<'_>, binds_per_row: usize) -> usize {
-    let bind_limit = match tx {
-        SqlTx::Sqlite(_) => SQLITE_BATCH_BIND_LIMIT,
-        SqlTx::Postgres(_) => POSTGRES_BATCH_BIND_LIMIT,
-    };
-    (bind_limit / binds_per_row.max(1)).max(1)
-}
 
 async fn bulk_insert_integration_events_tx(
     tx: &mut SqlTx<'_>,

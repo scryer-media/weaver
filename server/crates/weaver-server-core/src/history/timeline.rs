@@ -1,10 +1,7 @@
 use crate::StateError;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, StoreDatastore};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, StoreDatastore, max_rows_for_tx};
 use crate::persistence::{Database, DatabaseWriterExecutor};
 use sqlx::{Postgres, QueryBuilder, Sqlite};
-
-const SQLITE_BATCH_BIND_LIMIT: usize = 900;
-const POSTGRES_BATCH_BIND_LIMIT: usize = 16_000;
 
 /// A persisted job event.
 #[derive(Debug, Clone)]
@@ -35,14 +32,6 @@ pub const JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER: &str = "__timeline:finalizing-
 
 /// Per-job (kind, first_ts, last_ts) event bounds keyed by job id.
 pub type JobEventStageBounds = std::collections::HashMap<u64, Vec<(String, i64, i64)>>;
-
-fn max_rows_for_tx(tx: &SqlTx<'_>, binds_per_row: usize) -> usize {
-    let bind_limit = match tx {
-        SqlTx::Sqlite(_) => SQLITE_BATCH_BIND_LIMIT,
-        SqlTx::Postgres(_) => POSTGRES_BATCH_BIND_LIMIT,
-    };
-    (bind_limit / binds_per_row.max(1)).max(1)
-}
 
 async fn bulk_insert_job_events_tx(
     tx: &mut SqlTx<'_>,

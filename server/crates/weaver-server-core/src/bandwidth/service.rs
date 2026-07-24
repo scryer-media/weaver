@@ -420,10 +420,11 @@ pub(crate) fn compute_window(
 impl Pipeline {
     pub(crate) fn refresh_bandwidth_cap_window(&mut self) -> Result<(), SchedulerError> {
         self.bandwidth_cap.update_for_now(&self.db)?;
-        self.shared_state.set_download_block(
-            self.bandwidth_cap
-                .to_download_block_state(self.global_paused),
-        );
+        let mut block = self
+            .bandwidth_cap
+            .to_download_block_state(self.global_paused);
+        block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
+        self.shared_state.set_download_block(block);
         Ok(())
     }
 
@@ -472,19 +473,21 @@ impl Pipeline {
     ) -> Result<(), SchedulerError> {
         self.bandwidth_cap
             .record_download_bytes(&self.db, payload_bytes)?;
-        self.shared_state.set_download_block(
-            self.bandwidth_cap
-                .to_download_block_state(self.global_paused),
-        );
+        let mut block = self
+            .bandwidth_cap
+            .to_download_block_state(self.global_paused);
+        block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
+        self.shared_state.set_download_block(block);
         Ok(())
     }
 
     pub(crate) fn flush_download_bandwidth_usage(&mut self) -> Result<(), SchedulerError> {
         self.bandwidth_cap.flush_pending_usage(&self.db)?;
-        self.shared_state.set_download_block(
-            self.bandwidth_cap
-                .to_download_block_state(self.global_paused),
-        );
+        let mut block = self
+            .bandwidth_cap
+            .to_download_block_state(self.global_paused);
+        block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
+        self.shared_state.set_download_block(block);
         Ok(())
     }
 }

@@ -507,7 +507,7 @@ fn nzbget_test_job(
     JobInfo {
         job_id: JobId(job_id),
         job_hash: None,
-        name: "Friends.S05.720p.BluRay.DD5.1.x264-NTb".into(),
+        name: "Silver.Horizon.S05.720p.BluRay.DD5.1.x264-WVR".into(),
         status,
         download_state,
         post_state: weaver_server_core::PostState::Idle,
@@ -530,7 +530,7 @@ fn nzbget_test_job(
         password: None,
         category: Some("tv".into()),
         metadata,
-        output_dir: Some("/downloads/tv/Friends".into()),
+        output_dir: Some("/downloads/tv/Silver.Horizon".into()),
         error: None,
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
@@ -770,14 +770,14 @@ async fn nzbget_append_accepts_arr_v16_base64_payload_and_preserves_drone() {
         api_key_cache("control-key", "control"),
     );
     let nzb_b64 = base64::engine::general_purpose::STANDARD
-        .encode(minimal_nzb("Friends.S05.720p.BluRay.DD5.1.x264-NTb"));
+        .encode(minimal_nzb("Silver.Horizon.S05.720p.BluRay.DD5.1.x264-WVR"));
 
     let (status, payload) = post_nzbget(
         app,
         serde_json::json!({
             "method": "append",
             "params": [
-                "Friends.S05.720p.BluRay.DD5.1.x264-NTb.nzb",
+                "Silver.Horizon.S05.720p.BluRay.DD5.1.x264-WVR.nzb",
                 nzb_b64,
                 "tv",
                 50,
@@ -1090,6 +1090,10 @@ async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
                 weaver_server_api::PRIORITY_ATTRIBUTE_KEY.to_string(),
                 "HIGH".to_string(),
             ),
+            (
+                weaver_server_core::ingest::ORIGINAL_TITLE_METADATA_KEY.to_string(),
+                "Silver.Horizon.S05E01.720p.BluRay.DD5.1.x264-WVR".to_string(),
+            ),
             ("drone".to_string(), "spoofed-drone".to_string()),
         ],
     );
@@ -1183,7 +1187,10 @@ async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
     assert_eq!(status, StatusCode::OK);
     let group = &groups_payload["result"][0];
     assert_eq!(group["NZBID"], 42);
-    assert_eq!(group["NZBName"], "Friends.S05.720p.BluRay.DD5.1.x264-NTb");
+    assert_eq!(
+        group["NZBName"],
+        "Silver.Horizon.S05E01.720p.BluRay.DD5.1.x264-WVR"
+    );
     assert_eq!(group["FileSizeHi"], 1);
     assert_eq!(group["RemainingSizeHi"], 1);
     assert_eq!(group["PausedSizeLo"], 0);
@@ -1246,10 +1253,16 @@ async fn nzbget_status_clamps_download_rate_to_arr_int() {
 #[tokio::test]
 async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
     let db = Database::open_in_memory().unwrap();
-    let metadata = serde_json::to_string(&vec![(
-        weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
-        "drone-history".to_string(),
-    )])
+    let metadata = serde_json::to_string(&vec![
+        (
+            weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+            "drone-history".to_string(),
+        ),
+        (
+            weaver_server_core::ingest::ORIGINAL_TITLE_METADATA_KEY.to_string(),
+            "Complete.Release.S01E01.1080p.WEB-DL".to_string(),
+        ),
+    ])
     .unwrap();
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
         job_id: 100,
@@ -1313,6 +1326,7 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
     let items = payload["result"].as_array().unwrap();
     let complete = items.iter().find(|item| item["ID"] == 100).unwrap();
     let failed = items.iter().find(|item| item["ID"] == 101).unwrap();
+    assert_eq!(complete["NZBName"], "Complete.Release.S01E01.1080p.WEB-DL");
     assert_eq!(complete["ParStatus"], "SUCCESS");
     assert_eq!(complete["UnpackStatus"], "SUCCESS");
     assert_eq!(complete["Parameters"][0]["Name"], "drone");
@@ -2449,7 +2463,7 @@ async fn nzbget_log_and_loadlog_expose_job_events() {
         entries[0]["Text"]
             .as_str()
             .unwrap()
-            .starts_with("[Friends.S05")
+            .starts_with("[Silver.Horizon.S05")
     );
 }
 
@@ -3340,12 +3354,12 @@ async fn auth_status_handler_uses_cached_auth_state() {
 async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
     let db = Database::open_in_memory().unwrap();
     let handle = test_scheduler_handle();
-    let xml = minimal_nzb("Friends.S05.720p.BluRay.DD5.1.x264-NTb");
+    let xml = minimal_nzb("Silver.Horizon.S05.720p.BluRay.DD5.1.x264-WVR");
     let nzb_zstd = weaver_server_core::ingest::compress_nzb_bytes(xml.as_bytes()).unwrap();
     db.create_active_job(&weaver_server_core::ActiveJob {
         job_id: JobId(10_000),
         nzb_hash: weaver_server_core::ingest::hash_persisted_nzb_bytes(&nzb_zstd),
-        nzb_path: std::path::PathBuf::from("Friends.S05.720p.BluRay.DD5.1.x264-NTb.nzb"),
+        nzb_path: std::path::PathBuf::from("Silver.Horizon.S05.720p.BluRay.DD5.1.x264-WVR.nzb"),
         nzb_zstd,
         output_dir: std::path::PathBuf::from("/tmp/weaver-http-test"),
         created_at: 1_700_000_000,
@@ -3365,7 +3379,7 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
         &weaver_server_core::JobHistoryRow {
             job_id: 10_000,
             job_hash: None,
-            name: "Friends".to_string(),
+            name: "Silver Horizon".to_string(),
             status: "complete".to_string(),
             error_message: None,
             total_bytes: 123,
@@ -3376,13 +3390,13 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
             health: 1000,
             category: Some("tv".to_string()),
             output_dir: None,
-            nzb_path: Some("Friends.S05.720p.BluRay.DD5.1.x264-NTb.nzb".to_string()),
+            nzb_path: Some("Silver.Horizon.S05.720p.BluRay.DD5.1.x264-WVR.nzb".to_string()),
             created_at: 1_700_000_000,
             completed_at: 1_700_000_100,
             metadata: Some(
                 serde_json::to_string(&vec![(
                     weaver_server_core::ingest::ORIGINAL_TITLE_METADATA_KEY.to_string(),
-                    "Friends.S05.720p.BluRay.DD5.1.x264-NTb".to_string(),
+                    "Silver.Horizon.S05.720p.BluRay.DD5.1.x264-WVR".to_string(),
                 )])
                 .unwrap(),
             ),
@@ -3417,7 +3431,7 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
             .headers()
             .get(header::CONTENT_DISPOSITION)
             .and_then(|value| value.to_str().ok()),
-        Some("attachment; filename=\"Friends.S05.720p.BluRay.DD5.1.x264-NTb.nzb\"")
+        Some("attachment; filename=\"Silver.Horizon.S05.720p.BluRay.DD5.1.x264-WVR.nzb\"")
     );
     assert_eq!(
         response
@@ -3444,7 +3458,7 @@ async fn job_output_file_download_handler_streams_history_file() {
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
         job_id: 10_001,
         job_hash: None,
-        name: "Friends".to_string(),
+        name: "Silver Horizon".to_string(),
         status: "complete".to_string(),
         error_message: None,
         total_bytes: 123,
@@ -3497,6 +3511,12 @@ async fn job_output_file_download_handler_streams_history_file() {
     assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(body, Bytes::from_static(b"video-bytes"));
+}
+
+fn prometheus_golden_hash(rendered: &str) -> u64 {
+    rendered.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 #[test]
@@ -3678,6 +3698,44 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         0,
     );
 
+    assert_eq!(
+        (rendered.len(), prometheus_golden_hash(&rendered)),
+        (25_264, 13_069_257_777_456_965_180),
+        "the complete deterministic Prometheus output changed"
+    );
+    let mut with_post_processing = rendered.clone();
+    metrics::append_post_processing_metrics(
+        &mut with_post_processing,
+        &weaver_server_core::post_processing::persistence::PostProcessingMetricsSnapshot {
+            queue_depth: 1,
+            active_attempts: 2,
+            duration_count: 3,
+            duration_sum_millis: 4_500,
+            succeeded: 5,
+            failed: 6,
+            skipped: 7,
+            timed_out: 8,
+            cancelled: 9,
+            interrupted: 10,
+            truncated: 11,
+        },
+    );
+    assert_eq!(
+        &with_post_processing[rendered.len()..],
+        concat!(
+            "weaver_post_processing_queue_depth 1\n",
+            "weaver_post_processing_active_attempts 2\n",
+            "weaver_post_processing_attempt_duration_seconds_count 3\n",
+            "weaver_post_processing_attempt_duration_seconds_sum 4.5\n",
+            "weaver_post_processing_attempt_results{result=\"succeeded\"} 5\n",
+            "weaver_post_processing_attempt_results{result=\"failed\"} 6\n",
+            "weaver_post_processing_attempt_results{result=\"skipped\"} 7\n",
+            "weaver_post_processing_attempt_results{result=\"timed_out\"} 8\n",
+            "weaver_post_processing_attempt_results{result=\"cancelled\"} 9\n",
+            "weaver_post_processing_attempt_results{result=\"interrupted\"} 10\n",
+            "weaver_post_processing_output_truncations 11\n",
+        )
+    );
     assert!(rendered.contains("weaver_pipeline_paused 1"));
     assert!(rendered.contains("weaver_pipeline_current_download_speed_bytes_per_second 19"));
     assert!(rendered.contains("weaver_pipeline_active_downloads 6"));

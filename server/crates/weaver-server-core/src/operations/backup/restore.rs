@@ -4,7 +4,9 @@ use std::path::{Component, Path, PathBuf};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
 use sqlx::{Connection, Row, Sqlite, Transaction};
 
-use super::logical::{append_table_objects, read_table_objects, rewrite_table_objects};
+use super::logical::{
+    append_table_objects, read_table_objects, rewrite_table_objects, visit_table_objects,
+};
 use super::manifest::{BackupManifest, BackupServiceError, RestoreOptions};
 use crate::Database;
 use crate::settings::Config;
@@ -605,8 +607,6 @@ pub(crate) fn rewrite_logical_bundle_for_restore(
     let old_data = manifest.source_paths.data_dir.clone();
     let old_intermediate = manifest.source_paths.intermediate_dir.clone();
     let old_complete = manifest.source_paths.complete_dir.clone();
-    let category_rows = read_table_objects(root, "categories")
-        .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
     let mut path_remaps = vec![
         PathRemap {
             source: old_intermediate,
@@ -624,12 +624,12 @@ pub(crate) fn rewrite_logical_bundle_for_restore(
     let mut category_destinations = BTreeMap::new();
     let mut missing = Vec::new();
     let mut used_remaps = BTreeSet::new();
-    for row in &category_rows {
+    visit_table_objects(root, "categories", |row| {
         let Some(name) = row.get("name").and_then(serde_json::Value::as_str) else {
-            continue;
+            return Ok(());
         };
         let Some(destination) = row.get("dest_dir").and_then(serde_json::Value::as_str) else {
-            continue;
+            return Ok(());
         };
         let target = if let Some(rewritten) =
             rewrite_stored_prefix(destination, &old_complete, &resolved.complete)
@@ -640,14 +640,16 @@ pub(crate) fn rewrite_logical_bundle_for_restore(
             mapped.clone()
         } else {
             missing.push(name.to_string());
-            continue;
+            return Ok(());
         };
         path_remaps.push(PathRemap {
             source: destination.to_string(),
             target: target.clone(),
         });
         category_destinations.insert(name.to_string(), target);
-    }
+        Ok(())
+    })
+    .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
     if !missing.is_empty() {
         missing.sort();
         missing.dedup();
@@ -800,6 +802,10 @@ pub(crate) fn rewrite_logical_bundle_for_restore(
         Ok(())
     })?;
     rewrite_manifest_table(root, manifest, "post_processing_job_plans", |row| {
+        rewrite_json_column(row, "plan_json", &path_remaps)?;
+        Ok(())
+    })?;
+    rewrite_manifest_table(root, manifest, "post_processing_runs", |row| {
         rewrite_json_column(row, "plan_json", &path_remaps)?;
         Ok(())
     })?;

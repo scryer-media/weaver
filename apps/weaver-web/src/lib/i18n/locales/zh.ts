@@ -492,6 +492,8 @@ const zh: LocaleDictionary = {
   "settings.backupExportDesc": "创建包含配置、持久历史和重复项状态、RSS 状态、凭据及托管扩展包的加密归档。",
   "settings.backupPassword": "密码保护",
   "settings.backupPasswordPlaceholder": "每个新备份都必须设置",
+  "settings.backupPasswordConfirm": "确认密码",
+  "settings.backupPasswordMismatch": "密码不匹配。",
   "settings.backupDownload": "下载备份",
   "settings.backupDownloading": "正在准备备份...",
   "settings.backupDownloadReady": "备份下载已开始。",

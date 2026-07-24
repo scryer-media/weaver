@@ -30,6 +30,8 @@ const POSTGRES_TRANSIENT_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_millis(150),
     Duration::from_millis(400),
 ];
+pub(crate) const SQLITE_BATCH_BIND_LIMIT: usize = 900;
+pub(crate) const POSTGRES_BATCH_BIND_LIMIT: usize = 16_000;
 
 pub(crate) type SqlResult<T> = Result<T, StateError>;
 
@@ -122,6 +124,22 @@ pub(crate) enum SqlRow {
 pub(crate) enum SqlTx<'db> {
     Sqlite(Transaction<'db, Sqlite>),
     Postgres(Transaction<'db, Postgres>),
+}
+
+pub(crate) fn max_rows_for_engine(engine: SqlEngine, binds_per_row: usize) -> usize {
+    let bind_limit = match engine {
+        SqlEngine::Sqlite => SQLITE_BATCH_BIND_LIMIT,
+        SqlEngine::Postgres => POSTGRES_BATCH_BIND_LIMIT,
+    };
+    (bind_limit / binds_per_row.max(1)).max(1)
+}
+
+pub(crate) fn max_rows_for_tx(tx: &SqlTx<'_>, binds_per_row: usize) -> usize {
+    let engine = match tx {
+        SqlTx::Sqlite(_) => SqlEngine::Sqlite,
+        SqlTx::Postgres(_) => SqlEngine::Postgres,
+    };
+    max_rows_for_engine(engine, binds_per_row)
 }
 
 pub(crate) struct SqlRuntime;
@@ -1204,6 +1222,17 @@ pub(crate) fn pg_db_err(error: sqlx::Error) -> StateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transaction_row_sizing_respects_engine_limits_and_boundaries() {
+        assert_eq!(max_rows_for_engine(SqlEngine::Sqlite, 0), 900);
+        assert_eq!(max_rows_for_engine(SqlEngine::Sqlite, 1), 900);
+        assert_eq!(max_rows_for_engine(SqlEngine::Sqlite, 4), 225);
+        assert_eq!(max_rows_for_engine(SqlEngine::Sqlite, 901), 1);
+        assert_eq!(max_rows_for_engine(SqlEngine::Postgres, 1), 16_000);
+        assert_eq!(max_rows_for_engine(SqlEngine::Postgres, 5), 3_200);
+        assert_eq!(max_rows_for_engine(SqlEngine::Postgres, 16_001), 1);
+    }
 
     #[test]
     fn render_sqlite_placeholders() {

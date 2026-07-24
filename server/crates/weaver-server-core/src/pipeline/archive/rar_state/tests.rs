@@ -1,141 +1,14 @@
 use super::*;
+use crate::pipeline::archive::test_support::{
+    RAR5_SIGNATURE as TEST_RAR5_SIG, end_header as build_test_rar_end_header,
+    file_header as build_test_rar_file_header,
+    file_header_with_extra as build_test_rar_file_header_with_extra,
+    file_version_extra as build_test_file_version_extra, main_header as build_test_rar_main_header,
+    redirection_extra as build_test_redirection_extra,
+};
 use std::io::Cursor;
 use weaver_par2::checksum;
 use weaver_unrar::RarArchive;
-
-const TEST_RAR5_SIG: [u8; 8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
-
-fn encode_test_rar_vint(mut value: u64) -> Vec<u8> {
-    let mut result = Vec::new();
-    loop {
-        let mut byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        result.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
-    result
-}
-
-fn build_test_rar_header(
-    header_type: u64,
-    common_flags: u64,
-    type_body: &[u8],
-    extra: &[u8],
-) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&encode_test_rar_vint(header_type));
-
-    let mut flags = common_flags;
-    if !extra.is_empty() {
-        flags |= 0x0001;
-    }
-    body.extend_from_slice(&encode_test_rar_vint(flags));
-    if !extra.is_empty() {
-        body.extend_from_slice(&encode_test_rar_vint(extra.len() as u64));
-    }
-    body.extend_from_slice(type_body);
-    body.extend_from_slice(extra);
-
-    let header_size = body.len() as u64;
-    let header_size_bytes = encode_test_rar_vint(header_size);
-    let crc = checksum::crc32(&[header_size_bytes.as_slice(), body.as_slice()].concat());
-
-    let mut result = Vec::new();
-    result.extend_from_slice(&crc.to_le_bytes());
-    result.extend_from_slice(&header_size_bytes);
-    result.extend_from_slice(&body);
-    result
-}
-
-fn build_test_rar_main_header(archive_flags: u64, volume_number: Option<u64>) -> Vec<u8> {
-    let mut type_body = Vec::new();
-    type_body.extend_from_slice(&encode_test_rar_vint(archive_flags));
-    if let Some(volume_number) = volume_number {
-        type_body.extend_from_slice(&encode_test_rar_vint(volume_number));
-    }
-    build_test_rar_header(1, 0, &type_body, &[])
-}
-
-fn build_test_rar_end_header(more_volumes: bool) -> Vec<u8> {
-    let end_flags: u64 = if more_volumes { 0x0001 } else { 0 };
-    build_test_rar_header(5, 0, &encode_test_rar_vint(end_flags), &[])
-}
-
-fn build_test_rar_file_header(
-    filename: &str,
-    common_flags_extra: u64,
-    data_size: u64,
-    unpacked_size: u64,
-    data_crc: Option<u32>,
-) -> Vec<u8> {
-    build_test_rar_file_header_with_extra(
-        filename,
-        common_flags_extra,
-        data_size,
-        unpacked_size,
-        data_crc,
-        &[],
-    )
-}
-
-fn build_test_rar_file_header_with_extra(
-    filename: &str,
-    common_flags_extra: u64,
-    data_size: u64,
-    unpacked_size: u64,
-    data_crc: Option<u32>,
-    extra: &[u8],
-) -> Vec<u8> {
-    let file_flags: u64 = if data_crc.is_some() { 0x0004 } else { 0 };
-    let mut type_body = Vec::new();
-    type_body.extend_from_slice(&encode_test_rar_vint(file_flags));
-    type_body.extend_from_slice(&encode_test_rar_vint(unpacked_size));
-    type_body.extend_from_slice(&encode_test_rar_vint(0o644));
-    if let Some(data_crc) = data_crc {
-        type_body.extend_from_slice(&data_crc.to_le_bytes());
-    }
-    type_body.extend_from_slice(&encode_test_rar_vint(0));
-    type_body.extend_from_slice(&encode_test_rar_vint(1));
-    type_body.extend_from_slice(&encode_test_rar_vint(filename.len() as u64));
-    type_body.extend_from_slice(filename.as_bytes());
-
-    let mut file_body = Vec::new();
-    file_body.extend_from_slice(&encode_test_rar_vint(data_size));
-    file_body.extend_from_slice(&type_body);
-
-    build_test_rar_header(2, 0x0002 | common_flags_extra, &file_body, extra)
-}
-
-fn build_test_extra_record(record_type: u64, body: &[u8]) -> Vec<u8> {
-    let type_bytes = encode_test_rar_vint(record_type);
-    let record_size = type_bytes.len() + body.len();
-    let mut data = Vec::new();
-    data.extend_from_slice(&encode_test_rar_vint(record_size as u64));
-    data.extend_from_slice(&type_bytes);
-    data.extend_from_slice(body);
-    data
-}
-
-fn build_test_file_version_extra(version: u64) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&encode_test_rar_vint(0));
-    body.extend_from_slice(&encode_test_rar_vint(version));
-    build_test_extra_record(0x04, &body)
-}
-
-fn build_test_redirection_extra(redir_type: u64, target: &str) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&encode_test_rar_vint(redir_type));
-    body.extend_from_slice(&encode_test_rar_vint(0));
-    body.extend_from_slice(&encode_test_rar_vint(target.len() as u64));
-    body.extend_from_slice(target.as_bytes());
-    build_test_extra_record(0x05, &body)
-}
 
 fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     let episode_a = b"episode-a-payload";

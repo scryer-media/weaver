@@ -369,7 +369,10 @@ impl Pipeline {
                 bytes_per_sec,
                 reply,
             } => {
-                self.rate_limiter.set_rate(bytes_per_sec);
+                self.configured_rate_limit = bytes_per_sec;
+                if self.scheduled_rate_limit.is_none() {
+                    self.rate_limiter.set_rate(bytes_per_sec);
+                }
                 let _ = reply.send(());
             }
             SchedulerCommand::SetIpReplacementTrialExtraConnections {
@@ -395,6 +398,10 @@ impl Pipeline {
             }
             SchedulerCommand::ApplyScheduleAction { action, reply } => {
                 use crate::bandwidth::ScheduleAction;
+                if !matches!(&action, ScheduleAction::SpeedLimit { .. }) {
+                    self.scheduled_rate_limit = None;
+                    self.rate_limiter.set_rate(self.configured_rate_limit);
+                }
                 match action {
                     ScheduleAction::Pause => {
                         self.global_paused = true;
@@ -411,6 +418,7 @@ impl Pipeline {
                         info!("schedule: resumed downloads");
                     }
                     ScheduleAction::SpeedLimit { bytes_per_sec } => {
+                        self.scheduled_rate_limit = Some(bytes_per_sec);
                         self.rate_limiter.set_rate(bytes_per_sec);
                         let mut block = self
                             .bandwidth_cap
@@ -421,6 +429,7 @@ impl Pipeline {
                     }
                     ScheduleAction::PauseWatchFolderScanning
                     | ScheduleAction::ResumeWatchFolderScanning => {
+                        let _ = self.refresh_bandwidth_cap_window();
                         warn!(
                             action = ?action,
                             "watch folder schedule action reached download pipeline"
@@ -434,7 +443,8 @@ impl Pipeline {
                     self.global_paused = false;
                     self.shared_state.set_paused(false);
                 }
-                self.rate_limiter.set_rate(0);
+                self.scheduled_rate_limit = None;
+                self.rate_limiter.set_rate(self.configured_rate_limit);
                 let _ = self.refresh_bandwidth_cap_window();
                 info!("schedule: cleared scheduled action");
                 let _ = reply.send(());

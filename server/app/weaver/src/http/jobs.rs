@@ -353,8 +353,8 @@ mod tests {
     #[test]
     fn download_filename_preserves_release_name_and_appends_suffix() {
         assert_eq!(
-            download_filename("Friends.S05.720p.BluRay"),
-            "Friends.S05.720p.BluRay.nzb"
+            download_filename("Silver.Horizon.S05.720p.BluRay"),
+            "Silver.Horizon.S05.720p.BluRay.nzb"
         );
         assert_eq!(download_filename("already.nzb"), "already.nzb");
         assert_eq!(download_filename("  "), "job.nzb");

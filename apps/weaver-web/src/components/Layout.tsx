@@ -427,13 +427,11 @@ export function Layout() {
     queueSnapshots: QueueSnapshotPayload;
   }>({
     query: JOB_UPDATES_SUBSCRIPTION,
-    pause: connectionState.status === "disconnected",
   });
   const [{ data: metricsSubscriptionData }] = useSubscription<{
     systemMetricsUpdates: LiveMetricsSnapshot;
   }>({
     query: LIVE_METRICS_SUBSCRIPTION,
-    pause: connectionState.status === "disconnected",
   });
 
   const reconnectPolling = useReconnectPolling<{ queueSnapshot: QueueSnapshotPayload }>({

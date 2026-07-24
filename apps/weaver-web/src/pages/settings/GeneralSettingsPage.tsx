@@ -343,6 +343,7 @@ export function GeneralSettingsPage() {
           <div>
             <input
               type="range"
+              aria-label={t("settings.speedLimit")}
               min={0}
               max={MAX_SPEED}
               step={1024 * 1024}

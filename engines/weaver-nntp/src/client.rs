@@ -3036,6 +3036,9 @@ fn should_discard_stat_connection(err: &NntpError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        ScriptedStep, read_command_line, spawn_scripted_server as spawn_shared_scripted_server,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -3044,42 +3047,18 @@ mod tests {
         response: &'static [u8],
     }
 
-    async fn read_command_line(socket: &mut TcpStream) -> String {
-        let mut buf = Vec::new();
-        loop {
-            let mut byte = [0u8; 1];
-            let n = socket.read(&mut byte).await.unwrap();
-            assert!(n > 0, "client closed connection before command completed");
-            buf.push(byte[0]);
-            if byte[0] == b'\n' {
-                break;
-            }
+    impl ScriptedStep for ScriptStep {
+        fn expected_prefix(&self) -> Option<&str> {
+            self.expect_prefix
         }
-        String::from_utf8(buf).unwrap()
+
+        fn response(&self) -> &[u8] {
+            self.response
+        }
     }
 
     async fn spawn_scripted_server(steps: Vec<ScriptStep>) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            for step in steps {
-                if let Some(prefix) = step.expect_prefix {
-                    let line = read_command_line(&mut socket).await;
-                    assert!(
-                        line.starts_with(prefix),
-                        "expected command starting with {prefix:?}, got {line:?}"
-                    );
-                }
-                if !step.response.is_empty() {
-                    socket.write_all(step.response).await.unwrap();
-                    socket.flush().await.unwrap();
-                }
-            }
-        });
-
-        port
+        spawn_shared_scripted_server(steps, Duration::ZERO).await
     }
 
     async fn spawn_trickling_body_server(line_delay: Duration) -> u16 {

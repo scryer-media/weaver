@@ -157,6 +157,7 @@ export function BackupRestoreSection({
   const [status, setStatus] = useState<BackupStatusResponse | null>(null);
   const [statusLoading, setStatusLoading] = useState(true);
   const [backupPassword, setBackupPassword] = useState("");
+  const [backupPasswordConfirm, setBackupPasswordConfirm] = useState("");
   const [backupBusy, setBackupBusy] = useState(false);
   const [backupMessage, setBackupMessage] = useState<string | null>(null);
   const [backupError, setBackupError] = useState<string | null>(null);
@@ -234,6 +235,9 @@ export function BackupRestoreSection({
       form.append("file", restoreFile);
       if (restorePassword.trim()) {
         form.append("password", restorePassword);
+      }
+      if (dataDir.trim()) {
+        form.append("data_dir", dataDir.trim());
       }
       const response = await fetch(new URL("api/backup/inspect", document.baseURI).href, {
         method: "POST",
@@ -334,18 +338,41 @@ export function BackupRestoreSection({
             {t("settings.backupExportDesc")}
           </p>
           <div className="mt-4 space-y-1.5">
-            <Label>{t("settings.backupPassword")}</Label>
+            <Label htmlFor="backup-export-password">{t("settings.backupPassword")}</Label>
             <Input
+              id="backup-export-password"
               type="password"
               value={backupPassword}
               onChange={(e) => setBackupPassword(e.target.value)}
               placeholder={t("settings.backupPasswordPlaceholder")}
             />
           </div>
+          <div className="mt-3 space-y-1.5">
+            <Label htmlFor="backup-export-password-confirm">
+              {t("settings.backupPasswordConfirm")}
+            </Label>
+            <Input
+              id="backup-export-password-confirm"
+              type="password"
+              value={backupPasswordConfirm}
+              onChange={(e) => setBackupPasswordConfirm(e.target.value)}
+              placeholder={t("settings.backupPasswordPlaceholder")}
+            />
+          </div>
+          {backupPasswordConfirm && backupPasswordConfirm !== backupPassword ? (
+            <p role="alert" className="mt-2 text-xs text-destructive">
+              {t("settings.backupPasswordMismatch")}
+            </p>
+          ) : null}
           <Button
             className="mt-3"
             onClick={handleDownloadBackup}
-            disabled={backupBusy || status?.busy || !backupPassword.trim()}
+            disabled={
+              backupBusy ||
+              status?.busy ||
+              !backupPassword.trim() ||
+              backupPasswordConfirm !== backupPassword
+            }
           >
             {backupBusy ? t("settings.backupDownloading") : t("settings.backupDownload")}
           </Button>
@@ -360,8 +387,9 @@ export function BackupRestoreSection({
           <p className="mt-1 text-[12.5px] text-muted-foreground">{t("settings.restoreDesc")}</p>
 
           <div className="mt-4 space-y-1.5">
-            <Label>{t("settings.restoreFile")}</Label>
+            <Label htmlFor="backup-restore-file">{t("settings.restoreFile")}</Label>
             <input
+              id="backup-restore-file"
               type="file"
               accept=".enc,.tar.zst,.age,.db,.zst"
               onChange={(e) => {
@@ -375,8 +403,9 @@ export function BackupRestoreSection({
           </div>
 
           <div className="mt-3 space-y-1.5">
-            <Label>{t("settings.backupPassword")}</Label>
+            <Label htmlFor="backup-restore-password">{t("settings.backupPassword")}</Label>
             <Input
+              id="backup-restore-password"
               type="password"
               value={restorePassword}
               onChange={(e) => setRestorePassword(e.target.value)}
@@ -398,6 +427,7 @@ export function BackupRestoreSection({
               </span>
             ) : (
               <span
+                data-testid="backup-restore-availability"
                 className={cn(
                   "text-xs",
                   status?.can_restore ? "text-muted-foreground" : "text-destructive",
@@ -450,7 +480,10 @@ export function BackupRestoreSection({
           </div>
 
           {inspectResult && (
-            <div className="mt-3 rounded-inner border border-border bg-card/60 p-3">
+            <div
+              data-testid="backup-preview"
+              className="mt-3 rounded-inner border border-border bg-card/60 p-3"
+            >
               <div className="text-sm font-medium text-foreground">
                 {t("settings.restorePreview")}
               </div>
@@ -523,7 +556,10 @@ export function BackupRestoreSection({
           )}
 
           {remapRequirements.length > 0 && (
-            <div className="mt-3 rounded-inner border border-status-paused/40 bg-status-paused/10 p-3">
+            <div
+              data-testid="backup-category-remaps"
+              className="mt-3 rounded-inner border border-status-paused/40 bg-status-paused/10 p-3"
+            >
               <div className="text-sm font-medium text-foreground">
                 {t("settings.restoreRemapsTitle")}
               </div>
@@ -562,8 +598,18 @@ export function BackupRestoreSection({
             {restoreBusy ? t("settings.restoreRunning") : t("settings.restoreButton")}
           </Button>
 
-          {restoreMessage && <p className="mt-3 text-xs text-status-completed">{restoreMessage}</p>}
-          {restoreError && <p className="mt-3 text-xs text-destructive">{restoreError}</p>}
+          {restoreMessage && (
+            <p role="status" className="mt-3 text-xs text-status-completed">{restoreMessage}</p>
+          )}
+          {restoreError && (
+            <p
+              role="alert"
+              data-testid="backup-restore-error"
+              className="mt-3 text-xs text-destructive"
+            >
+              {restoreError}
+            </p>
+          )}
         </SettingsInnerBox>
       </div>
 
@@ -739,6 +785,7 @@ export function ApiKeysSection() {
             }) => (
               <div
                 key={key.id}
+                data-testid="api-key-row"
                 className="flex items-center justify-between gap-4 rounded-inner border border-border px-4 py-3"
               >
                 <div className="min-w-0 flex-1">
@@ -844,6 +891,7 @@ export function ApiKeysSection() {
             <div className="flex items-center gap-2">
               <Input
                 ref={keyFieldRef}
+                data-testid="raw-api-key"
                 readOnly
                 value={createdKey?.rawKey ?? ""}
                 onFocus={handleKeyFieldFocus}

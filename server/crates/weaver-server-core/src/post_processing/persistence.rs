@@ -1271,6 +1271,7 @@ impl Database {
         exit_code: Option<i32>,
         error_message: Option<String>,
         progress: Option<serde_json::Value>,
+        output_truncated: bool,
         finished_at_epoch_ms: i64,
     ) -> Result<bool, StateError> {
         if matches!(
@@ -1288,6 +1289,7 @@ impl Database {
                 datastore.read_exec(),
                 "UPDATE post_processing_attempts
                     SET status = {}, exit_code = {}, error_message = {}, progress_json = {},
+                        output_truncated = output_truncated OR {},
                         finished_at_epoch_ms = {}, control_token_hash = NULL
                   WHERE attempt_id = {} AND status IN ('queued', 'starting', 'running')",
                 &[
@@ -1295,6 +1297,7 @@ impl Database {
                     SqlArg::OptI32(exit_code),
                     SqlArg::OptText(error_message),
                     SqlArg::OptJson(progress),
+                    SqlArg::Bool(output_truncated),
                     SqlArg::I64(finished_at_epoch_ms),
                     SqlArg::Text(id),
                 ],

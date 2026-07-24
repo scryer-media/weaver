@@ -1644,6 +1644,13 @@ async fn admit_semantic_candidate_tx(
         SqlTx::Postgres(_) => " FOR UPDATE",
         SqlTx::Sqlite(_) => "",
     };
+    let candidate_lock = match tx {
+        // PostgreSQL rejects an unqualified FOR UPDATE when a LEFT JOIN is
+        // present because the nullable side cannot be locked. The candidate
+        // row is the admission state this transaction may mutate.
+        SqlTx::Postgres(_) => " FOR UPDATE OF c",
+        SqlTx::Sqlite(_) => "",
+    };
     let group_id = tx
         .fetch_optional(
             &format!(
@@ -1665,7 +1672,7 @@ async fn admit_semantic_candidate_tx(
                  INNER JOIN duplicate_job_snapshots AS s ON s.job_id = c.job_id
                  LEFT JOIN active_jobs AS a ON a.job_id = c.job_id
                  WHERE c.group_id = {{}} AND c.candidate_state = {{}}
-                 ORDER BY c.created_at ASC, c.job_id ASC LIMIT 1{lock}"
+                 ORDER BY c.created_at ASC, c.job_id ASC LIMIT 1{candidate_lock}"
             ),
             &[
                 SqlArg::I64(group_id),

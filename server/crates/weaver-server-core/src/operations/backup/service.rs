@@ -10,7 +10,9 @@ use super::archive::{
     ManagedPackageSource, is_bundle_encrypted, maybe_decrypt_archive, unpack_bundle_archive,
     unpack_plain_archive, write_bundle_archive,
 };
-use super::logical::{read_table_objects, validate_legacy_encryption_key, verify_table_parts};
+use super::logical::{
+    read_table_objects, validate_legacy_encryption_key, verify_table_parts, visit_table_objects,
+};
 use super::manifest::{
     BackupArtifact, BackupInspectResult, BackupInstanceSecrets, BackupManifest, BackupServiceError,
     BackupSourcePaths, BackupStatus, CategoryRemapRequirement, ManagedPackageInventory,
@@ -121,6 +123,12 @@ impl BackupService {
             .ok_or(BackupServiceError::PasswordRequired)?;
         let _guard = self.inner.op_lock.lock().await;
 
+        self.inner
+            .db
+            .flush_write_queue()
+            .await
+            .map_err(|error| BackupServiceError::Io(error.to_string()))?;
+
         if let Some(policy) = self.inner.handle.server_transfer_policy() {
             tokio::task::spawn_blocking(move || policy.flush_usage())
                 .await
@@ -175,7 +183,7 @@ impl BackupService {
         );
         write_json(&export.staging.path().join("manifest.json"), &manifest)?;
 
-        let artifact_dir = tempfile::tempdir().map_err(io_err)?;
+        let artifact_dir = super::create_backup_temp_dir().map_err(io_err)?;
         let timestamp = manifest.created_at_epoch_ms / 1000;
         let filename = format!("weaver_backup_{timestamp}.enc");
         let path = artifact_dir.path().join(&filename);
@@ -200,18 +208,34 @@ impl BackupService {
         archive_path: &Path,
         password: Option<String>,
     ) -> Result<BackupInspectResult, BackupServiceError> {
+        let target_data_dir = PathBuf::from(&self.inner.config.read().await.data_dir);
+        self.inspect_backup_for_target(archive_path, password, &target_data_dir)
+            .await
+    }
+
+    pub async fn inspect_backup_for_target(
+        &self,
+        archive_path: &Path,
+        password: Option<String>,
+        target_data_dir: &Path,
+    ) -> Result<BackupInspectResult, BackupServiceError> {
         let _guard = self.inner.op_lock.lock().await;
         let loaded = self.load_backup(archive_path, password).await?;
-        let target_data_dir = self.inner.config.read().await.data_dir.clone();
         let key_compatible = match &loaded.kind {
             LoadedBackupKind::Logical { secrets } => {
                 crate::persistence::encryption::validate_restore_encryption_key(
-                    Some(PathBuf::from(target_data_dir)),
+                    Some(target_data_dir.to_path_buf()),
                     &secrets.encryption_master_key,
                 )
                 .is_ok()
             }
-            LoadedBackupKind::Legacy { .. } => true,
+            LoadedBackupKind::Legacy { .. } => self.inner.db.encryption_key().is_some_and(|key| {
+                crate::persistence::encryption::validate_restore_encryption_key(
+                    Some(target_data_dir.to_path_buf()),
+                    &key.to_base64(),
+                )
+                .is_ok()
+            }),
         };
         Ok(BackupInspectResult {
             required_category_remaps: loaded.required_category_remaps,
@@ -267,6 +291,16 @@ impl BackupService {
                 backup_db_path,
                 source_config,
             } => {
+                let active_key = self.inner.db.encryption_key().ok_or_else(|| {
+                    BackupServiceError::KeyIncompatible(
+                        "legacy restore requires the active instance encryption key".into(),
+                    )
+                })?;
+                crate::persistence::encryption::validate_restore_encryption_key(
+                    Some(PathBuf::from(&options.data_dir)),
+                    &active_key.to_base64(),
+                )
+                .map_err(BackupServiceError::KeyIncompatible)?;
                 let backup_db_path = backup_db_path.clone();
                 let source_config = source_config.as_ref().clone();
                 let rewrite_options = options.clone();
@@ -345,9 +379,10 @@ impl BackupService {
         archive_path: &Path,
         password: Option<String>,
     ) -> Result<LoadedBackup, BackupServiceError> {
-        let temp_dir = tempfile::tempdir().map_err(io_err)?;
+        let temp_dir = super::create_backup_temp_dir().map_err(io_err)?;
         let root = temp_dir.path().join("bundle");
         std::fs::create_dir(&root).map_err(io_err)?;
+        super::permissions::set_directory_owner_only(&root).map_err(io_err)?;
         let archive = archive_path.to_path_buf();
         let extraction_root = root.clone();
         let manifest = tokio::task::spawn_blocking(move || {
@@ -409,7 +444,7 @@ impl BackupService {
         archive_path: &Path,
         password: Option<String>,
     ) -> Result<LoadedBackup, BackupServiceError> {
-        let temp_dir = tempfile::tempdir().map_err(io_err)?;
+        let temp_dir = super::create_backup_temp_dir().map_err(io_err)?;
         let root = temp_dir.path().join("legacy");
         let archive = archive_path.to_path_buf();
         let work_dir = temp_dir.path().to_path_buf();
@@ -417,6 +452,7 @@ impl BackupService {
         let manifest = tokio::task::spawn_blocking(move || {
             let extracted = maybe_decrypt_archive(&archive, password, &work_dir)?;
             std::fs::create_dir(&extraction_root).map_err(io_err)?;
+            super::permissions::set_directory_owner_only(&extraction_root).map_err(io_err)?;
             unpack_plain_archive(&extracted, &extraction_root)
         })
         .await
@@ -470,28 +506,38 @@ async fn validate_logical_database(
     let validation_tables = root.join("tables");
     let validation_manifest = manifest.clone();
     tokio::task::spawn_blocking(move || {
-        let mut validation_db = Database::open_in_memory()
+        let validation_dir = super::create_backup_temp_dir().map_err(io_err)?;
+        let validation_path = validation_dir.path().join("validation.db");
+        let mut validation_db = Database::open(&validation_path)
             .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
+        super::permissions::set_file_owner_only(&validation_path).map_err(io_err)?;
         validation_db.set_encryption_key(restored_key.clone());
-        validation_db
-            .import_logical_backup(
-                &validation_tables,
-                &validation_manifest.tables,
-                validation_manifest.weaver_schema_version,
-            )
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        validation_db
-            .validate_encrypted_credentials(&restored_key)
-            .map_err(|error| {
-                BackupServiceError::Validation(format!(
-                    "backup data does not match its encryption master key: {error}"
-                ))
-            })?;
-        validation_db
-            .load_config()
-            .map_err(|error| BackupServiceError::Validation(error.to_string()))?
-            .validate()
-            .map_err(|errors| BackupServiceError::Validation(errors.join("; ")))
+        let validation_result = (|| {
+            validation_db
+                .import_logical_backup(
+                    &validation_tables,
+                    &validation_manifest.tables,
+                    validation_manifest.weaver_schema_version,
+                )
+                .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
+            validation_db
+                .validate_encrypted_credentials(&restored_key)
+                .map_err(|error| {
+                    BackupServiceError::Validation(format!(
+                        "backup data does not match its encryption master key: {error}"
+                    ))
+                })?;
+            validation_db
+                .load_config()
+                .map_err(|error| BackupServiceError::Validation(error.to_string()))?
+                .validate()
+                .map_err(|errors| BackupServiceError::Validation(errors.join("; ")))
+        })();
+        let close_result = validation_db
+            .close()
+            .map_err(|error| BackupServiceError::Io(error.to_string()));
+        validation_result?;
+        close_result
     })
     .await
     .map_err(|error| BackupServiceError::Io(error.to_string()))?
@@ -542,25 +588,25 @@ fn managed_package_sources_from_export(
     root: &Path,
 ) -> Result<Vec<ManagedPackageSource>, BackupServiceError> {
     let mut packages = BTreeMap::<String, PathBuf>::new();
-    for row in read_table_objects(root, "post_processing_extension_revisions")
-        .map_err(|error| BackupServiceError::Validation(error.to_string()))?
-    {
+    visit_table_objects(root, "post_processing_extension_revisions", |row| {
         let Some(path) = row.get("managed_path").and_then(JsonValue::as_str) else {
-            continue;
+            return Ok(());
         };
         let digest = row
             .get("digest")
             .and_then(JsonValue::as_str)
-            .ok_or_else(|| BackupServiceError::Validation("managed revision has no digest".into()))?
+            .ok_or_else(|| crate::StateError::Database("managed revision has no digest".into()))?
             .to_string();
         if let Some(existing) = packages.insert(digest.clone(), PathBuf::from(path))
             && existing != Path::new(path)
         {
-            return Err(BackupServiceError::Validation(format!(
+            return Err(crate::StateError::Database(format!(
                 "managed package {digest} has conflicting paths"
             )));
         }
-    }
+        Ok(())
+    })
+    .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
     packages
         .into_iter()
         .map(|(digest, path)| {
@@ -641,15 +687,22 @@ fn validate_managed_references(
     root: &Path,
     manifest: &BackupManifest,
 ) -> Result<(), BackupServiceError> {
-    let referenced = read_table_objects(root, "post_processing_extension_revisions")
-        .map_err(|error| BackupServiceError::Validation(error.to_string()))?
-        .into_iter()
-        .filter(|row| {
-            row.get("managed_path")
-                .is_some_and(|value| !value.is_null())
-        })
-        .filter_map(|row| row.get("digest")?.as_str().map(ToString::to_string))
-        .collect::<BTreeSet<_>>();
+    let mut referenced = BTreeSet::new();
+    visit_table_objects(root, "post_processing_extension_revisions", |row| {
+        if row
+            .get("managed_path")
+            .is_none_or(serde_json::Value::is_null)
+        {
+            return Ok(());
+        }
+        let digest = row
+            .get("digest")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| crate::StateError::Database("managed revision has no digest".into()))?;
+        referenced.insert(digest.to_string());
+        Ok(())
+    })
+    .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
     let declared = manifest
         .managed_packages
         .iter()

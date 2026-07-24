@@ -52,6 +52,9 @@ pub mod tls;
 pub mod transfer;
 pub mod types;
 
+#[cfg(test)]
+mod test_support;
+
 // Re-export primary types for convenience.
 pub use blocking::{BlockingBodyLane, BlockingLaneStats, BlockingNntpConnection};
 pub use client::{

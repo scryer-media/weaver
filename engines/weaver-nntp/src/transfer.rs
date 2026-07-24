@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
+use crate::error::NntpError;
+
 const RATE_BURST_MICROS: u64 = 1_000_000;
 const RATE_SCHEDULE_EPOCH_SHIFT: u32 = 48;
 const RATE_SCHEDULE_TARGET_MASK: u64 = (1_u64 << RATE_SCHEDULE_EPOCH_SHIFT) - 1;
@@ -92,6 +94,24 @@ impl ActiveTransferBudget {
     pub(crate) fn limit(&self) -> Duration {
         self.limit
     }
+}
+
+pub(crate) fn active_transfer_timeout(budget: &ActiveTransferBudget) -> NntpError {
+    NntpError::SoftTimeout(budget.limit().as_secs())
+}
+
+pub(crate) fn active_transfer_read_timeout(
+    command_timeout: Duration,
+    budget: Option<&ActiveTransferBudget>,
+) -> crate::error::Result<(Duration, bool)> {
+    let Some(budget) = budget else {
+        return Ok((command_timeout, false));
+    };
+    let remaining = budget.remaining();
+    if remaining.is_zero() {
+        return Err(active_transfer_timeout(budget));
+    }
+    Ok((command_timeout.min(remaining), remaining <= command_timeout))
 }
 
 /// Admission failure for a BODY request.
@@ -991,6 +1011,34 @@ mod tests {
     use std::sync::Barrier;
 
     use super::*;
+
+    #[test]
+    fn active_transfer_read_timeout_preserves_command_and_budget_bounds() {
+        let command_timeout = Duration::from_secs(10);
+        assert_eq!(
+            active_transfer_read_timeout(command_timeout, None).unwrap(),
+            (command_timeout, false)
+        );
+
+        let long_budget = ActiveTransferBudget::new(Duration::from_secs(60));
+        assert_eq!(
+            active_transfer_read_timeout(command_timeout, Some(&long_budget)).unwrap(),
+            (command_timeout, false)
+        );
+
+        let short_budget = ActiveTransferBudget::new(Duration::from_secs(1));
+        let (timeout, active) =
+            active_transfer_read_timeout(command_timeout, Some(&short_budget)).unwrap();
+        assert!(active);
+        assert!(!timeout.is_zero());
+        assert!(timeout <= Duration::from_secs(1));
+
+        let expired = ActiveTransferBudget::new(Duration::ZERO);
+        assert!(matches!(
+            active_transfer_read_timeout(command_timeout, Some(&expired)),
+            Err(NntpError::SoftTimeout(0))
+        ));
+    }
 
     fn quota(limit_bytes: u64, generation: u64) -> ServerTransferConfig {
         ServerTransferConfig {

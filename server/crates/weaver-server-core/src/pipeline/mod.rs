@@ -1760,7 +1760,11 @@ pub struct Pipeline {
     pub(crate) bandwidth_reservations: HashMap<SegmentId, u64>,
     /// Estimated bytes charged to the speed limiter for in-flight downloads.
     pub(crate) rate_limit_reservations: HashMap<SegmentId, u64>,
-    /// Bandwidth rate limiter.
+    /// Persisted/general speed limit restored when no schedule speed action is active.
+    pub(super) configured_rate_limit: u64,
+    /// Active schedule speed action, if any.
+    pub(super) scheduled_rate_limit: Option<u64>,
+    /// Effective bandwidth rate limiter.
     pub(super) rate_limiter: TokenBucket,
     /// Gradual connection ramp-up limit (increases each tick).
     pub(super) connection_ramp: usize,

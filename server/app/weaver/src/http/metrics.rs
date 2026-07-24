@@ -75,7 +75,7 @@ impl PrometheusMetricsExporter {
     }
 }
 
-fn append_post_processing_metrics(
+pub(super) fn append_post_processing_metrics(
     output: &mut String,
     metrics: &weaver_server_core::post_processing::persistence::PostProcessingMetricsSnapshot,
 ) {
@@ -230,15 +230,84 @@ pub(super) fn render_prometheus_metrics(
     server_health: &[ServerHealthInfo],
     runtime_generation: u64,
 ) -> String {
-    render_prometheus_metrics_with_transfers(
+    render_prometheus_metrics_input(&PrometheusRenderInput {
         snapshot,
-        jobs,
         pipeline_paused,
+        jobs,
         download_block,
         server_health,
         runtime_generation,
-        &[],
-    )
+        server_transfers: &[],
+        duplicate_admission: &[],
+        semantic_duplicate_lifecycle: &[],
+        build_version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
+#[derive(Clone, Copy)]
+struct PrometheusRenderInput<'a> {
+    snapshot: &'a MetricsSnapshot,
+    jobs: &'a [JobInfo],
+    pipeline_paused: bool,
+    download_block: &'a DownloadBlockState,
+    server_health: &'a [ServerHealthInfo],
+    runtime_generation: u64,
+    server_transfers: &'a [weaver_nntp::transfer::ServerTransferSnapshot],
+    duplicate_admission: &'a [(&'static str, &'static str, u64)],
+    semantic_duplicate_lifecycle: &'a [(&'static str, u64)],
+    build_version: &'a str,
+}
+
+#[derive(Clone, Copy)]
+enum ScalarMetricValue {
+    Integer(u64),
+    Float(f64),
+}
+
+#[derive(Clone, Copy)]
+struct ScalarMetricDescriptor<'a> {
+    name: &'a str,
+    help: &'a str,
+    metric_type: &'static str,
+    value: ScalarMetricValue,
+}
+
+impl<'a> ScalarMetricDescriptor<'a> {
+    const fn counter(name: &'a str, help: &'a str, value: u64) -> Self {
+        Self {
+            name,
+            help,
+            metric_type: "counter",
+            value: ScalarMetricValue::Integer(value),
+        }
+    }
+
+    const fn gauge(name: &'a str, help: &'a str, value: u64) -> Self {
+        Self {
+            name,
+            help,
+            metric_type: "gauge",
+            value: ScalarMetricValue::Integer(value),
+        }
+    }
+
+    const fn gauge_f64(name: &'a str, help: &'a str, value: f64) -> Self {
+        Self {
+            name,
+            help,
+            metric_type: "gauge",
+            value: ScalarMetricValue::Float(value),
+        }
+    }
+
+    const fn counter_f64(name: &'a str, help: &'a str, value: f64) -> Self {
+        Self {
+            name,
+            help,
+            metric_type: "counter",
+            value: ScalarMetricValue::Float(value),
+        }
+    }
 }
 
 fn render_prometheus_metrics_with_transfers(
@@ -250,13 +319,50 @@ fn render_prometheus_metrics_with_transfers(
     runtime_generation: u64,
     server_transfers: &[weaver_nntp::transfer::ServerTransferSnapshot],
 ) -> String {
+    let duplicate_admission: Vec<_> =
+        weaver_server_core::jobs::duplicate_admission_metrics_snapshot()
+            .into_iter()
+            .map(|metric| (metric.origin, metric.status, metric.count))
+            .collect();
+    let semantic_duplicate_lifecycle: Vec<_> =
+        weaver_server_core::jobs::semantic_duplicate_lifecycle_metrics_snapshot()
+            .into_iter()
+            .map(|metric| (metric.event, metric.count))
+            .collect();
+    render_prometheus_metrics_input(&PrometheusRenderInput {
+        snapshot,
+        jobs,
+        pipeline_paused,
+        download_block,
+        server_health,
+        runtime_generation,
+        server_transfers,
+        duplicate_admission: &duplicate_admission,
+        semantic_duplicate_lifecycle: &semantic_duplicate_lifecycle,
+        build_version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
+fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>) -> String {
+    let PrometheusRenderInput {
+        snapshot,
+        jobs,
+        pipeline_paused,
+        download_block,
+        server_health,
+        runtime_generation,
+        server_transfers,
+        duplicate_admission,
+        semantic_duplicate_lifecycle,
+        build_version,
+    } = *input;
     let mut out = String::with_capacity(16 * 1024);
     out.push_str("# HELP weaver_build_info Static build information.\n");
     out.push_str("# TYPE weaver_build_info gauge\n");
     append_labeled_metric(
         &mut out,
         "weaver_build_info",
-        &[("version", env!("CARGO_PKG_VERSION"))],
+        &[("version", build_version)],
         1,
     );
 
@@ -286,61 +392,43 @@ fn render_prometheus_metrics_with_transfers(
         );
     }
 
-    out.push_str(
-        "# HELP weaver_bandwidth_cap_enabled Whether the ISP bandwidth cap policy is enabled.\n",
-    );
-    out.push_str("# TYPE weaver_bandwidth_cap_enabled gauge\n");
-    append_metric(
+    append_scalar_metrics(
         &mut out,
-        "weaver_bandwidth_cap_enabled",
-        if download_block.cap_enabled { 1 } else { 0 },
-    );
-
-    out.push_str(
-        "# HELP weaver_bandwidth_cap_used_bytes Current ISP bandwidth cap usage in bytes.\n",
-    );
-    out.push_str("# TYPE weaver_bandwidth_cap_used_bytes gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_bandwidth_cap_used_bytes",
-        download_block.used_bytes,
-    );
-
-    out.push_str(
-        "# HELP weaver_bandwidth_cap_limit_bytes Configured ISP bandwidth cap limit in bytes.\n",
-    );
-    out.push_str("# TYPE weaver_bandwidth_cap_limit_bytes gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_bandwidth_cap_limit_bytes",
-        download_block.limit_bytes,
-    );
-
-    out.push_str("# HELP weaver_bandwidth_cap_remaining_bytes Remaining ISP bandwidth cap bytes in the active window.\n");
-    out.push_str("# TYPE weaver_bandwidth_cap_remaining_bytes gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_bandwidth_cap_remaining_bytes",
-        download_block.remaining_bytes,
-    );
-
-    out.push_str("# HELP weaver_bandwidth_cap_reserved_bytes Bytes conservatively reserved for in-flight downloads against the active cap window.\n");
-    out.push_str("# TYPE weaver_bandwidth_cap_reserved_bytes gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_bandwidth_cap_reserved_bytes",
-        download_block.reserved_bytes,
-    );
-
-    out.push_str("# HELP weaver_bandwidth_cap_window_end_seconds Active ISP bandwidth cap window end as a unix timestamp.\n");
-    out.push_str("# TYPE weaver_bandwidth_cap_window_end_seconds gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_bandwidth_cap_window_end_seconds",
-        download_block
-            .window_ends_at_epoch_ms
-            .map(|value| (value / 1000.0) as u64)
-            .unwrap_or(0),
+        &[
+            ScalarMetricDescriptor::gauge(
+                "weaver_bandwidth_cap_enabled",
+                "Whether the ISP bandwidth cap policy is enabled.",
+                u64::from(download_block.cap_enabled),
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_bandwidth_cap_used_bytes",
+                "Current ISP bandwidth cap usage in bytes.",
+                download_block.used_bytes,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_bandwidth_cap_limit_bytes",
+                "Configured ISP bandwidth cap limit in bytes.",
+                download_block.limit_bytes,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_bandwidth_cap_remaining_bytes",
+                "Remaining ISP bandwidth cap bytes in the active window.",
+                download_block.remaining_bytes,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_bandwidth_cap_reserved_bytes",
+                "Bytes conservatively reserved for in-flight downloads against the active cap window.",
+                download_block.reserved_bytes,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_bandwidth_cap_window_end_seconds",
+                "Active ISP bandwidth cap window end as a unix timestamp.",
+                download_block
+                    .window_ends_at_epoch_ms
+                    .map(|value| (value / 1000.0) as u64)
+                    .unwrap_or(0),
+            ),
+        ],
     );
 
     out.push_str("# HELP weaver_pipeline_jobs Number of active jobs by status.\n");
@@ -360,144 +448,117 @@ fn render_prometheus_metrics_with_transfers(
 
     out.push_str("# HELP weaver_duplicate_admission_decisions_total Duplicate admission decisions by intake origin and public status.\n");
     out.push_str("# TYPE weaver_duplicate_admission_decisions_total counter\n");
-    for metric in weaver_server_core::jobs::duplicate_admission_metrics_snapshot() {
+    for &(origin, status, count) in duplicate_admission {
         append_labeled_metric(
             &mut out,
             "weaver_duplicate_admission_decisions_total",
-            &[("origin", metric.origin), ("status", metric.status)],
-            metric.count,
+            &[("origin", origin), ("status", status)],
+            count,
         );
     }
 
     out.push_str("# HELP weaver_semantic_duplicate_lifecycle_total Semantic duplicate arbitration lifecycle events.\n");
     out.push_str("# TYPE weaver_semantic_duplicate_lifecycle_total counter\n");
-    for metric in weaver_server_core::jobs::semantic_duplicate_lifecycle_metrics_snapshot() {
+    for &(event, count) in semantic_duplicate_lifecycle {
         append_labeled_metric(
             &mut out,
             "weaver_semantic_duplicate_lifecycle_total",
-            &[("event", metric.event)],
-            metric.count,
+            &[("event", event)],
+            count,
         );
     }
 
-    out.push_str(
-        "# HELP weaver_pipeline_bytes_downloaded_total Total bytes downloaded by the pipeline.\n",
-    );
-    out.push_str("# TYPE weaver_pipeline_bytes_downloaded_total counter\n");
-    append_metric(
+    append_scalar_metrics(
         &mut out,
-        "weaver_pipeline_bytes_downloaded_total",
-        snapshot.bytes_downloaded,
+        &[
+            ScalarMetricDescriptor::counter(
+                "weaver_pipeline_bytes_downloaded_total",
+                "Total bytes downloaded by the pipeline.",
+                snapshot.bytes_downloaded,
+            ),
+            ScalarMetricDescriptor::counter(
+                "weaver_pipeline_bytes_decoded_total",
+                "Total bytes decoded by the pipeline.",
+                snapshot.bytes_decoded,
+            ),
+            ScalarMetricDescriptor::counter(
+                "weaver_pipeline_bytes_committed_total",
+                "Total bytes committed to disk by the pipeline.",
+                snapshot.bytes_committed,
+            ),
+        ],
     );
 
-    out.push_str(
-        "# HELP weaver_pipeline_bytes_decoded_total Total bytes decoded by the pipeline.\n",
-    );
-    out.push_str("# TYPE weaver_pipeline_bytes_decoded_total counter\n");
-    append_metric(
+    append_scalar_metrics(
         &mut out,
-        "weaver_pipeline_bytes_decoded_total",
-        snapshot.bytes_decoded,
-    );
-
-    out.push_str("# HELP weaver_pipeline_bytes_committed_total Total bytes committed to disk by the pipeline.\n");
-    out.push_str("# TYPE weaver_pipeline_bytes_committed_total counter\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_bytes_committed_total",
-        snapshot.bytes_committed,
-    );
-
-    out.push_str("# HELP weaver_pipeline_segments_downloaded_total Total segments downloaded.\n");
-    out.push_str("# TYPE weaver_pipeline_segments_downloaded_total counter\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_segments_downloaded_total",
-        snapshot.segments_downloaded,
-    );
-
-    out.push_str("# HELP weaver_pipeline_segments_decoded_total Total segments decoded.\n");
-    out.push_str("# TYPE weaver_pipeline_segments_decoded_total counter\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_segments_decoded_total",
-        snapshot.segments_decoded,
-    );
-
-    out.push_str("# HELP weaver_pipeline_segments_committed_total Total segments committed.\n");
-    out.push_str("# TYPE weaver_pipeline_segments_committed_total counter\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_segments_committed_total",
-        snapshot.segments_committed,
+        &[
+            ScalarMetricDescriptor::counter(
+                "weaver_pipeline_segments_downloaded_total",
+                "Total segments downloaded.",
+                snapshot.segments_downloaded,
+            ),
+            ScalarMetricDescriptor::counter(
+                "weaver_pipeline_segments_decoded_total",
+                "Total segments decoded.",
+                snapshot.segments_decoded,
+            ),
+            ScalarMetricDescriptor::counter(
+                "weaver_pipeline_segments_committed_total",
+                "Total segments committed.",
+                snapshot.segments_committed,
+            ),
+            ScalarMetricDescriptor::counter(
+                "weaver_pipeline_segments_retried_total",
+                "Total segments retried.",
+                snapshot.segments_retried,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_pipeline_parked_infrastructure_work",
+                "Segments parked while NNTP infrastructure is unavailable.",
+                snapshot.parked_infrastructure_work as u64,
+            ),
+            ScalarMetricDescriptor::counter(
+                "weaver_nntp_generation_recovery_requeues_total",
+                "Segments requeued after stale NNTP generation failures.",
+                snapshot.nntp_generation_recovery_requeues,
+            ),
+        ],
     );
 
-    out.push_str("# HELP weaver_pipeline_segments_retried_total Total segments retried.\n");
-    out.push_str("# TYPE weaver_pipeline_segments_retried_total counter\n");
-    append_metric(
+    append_scalar_metrics(
         &mut out,
-        "weaver_pipeline_segments_retried_total",
-        snapshot.segments_retried,
-    );
-
-    out.push_str("# HELP weaver_pipeline_parked_infrastructure_work Segments parked while NNTP infrastructure is unavailable.\n");
-    out.push_str("# TYPE weaver_pipeline_parked_infrastructure_work gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_parked_infrastructure_work",
-        snapshot.parked_infrastructure_work,
-    );
-
-    out.push_str("# HELP weaver_nntp_generation_recovery_requeues_total Segments requeued after stale NNTP generation failures.\n");
-    out.push_str("# TYPE weaver_nntp_generation_recovery_requeues_total counter\n");
-    append_metric(
-        &mut out,
-        "weaver_nntp_generation_recovery_requeues_total",
-        snapshot.nntp_generation_recovery_requeues,
-    );
-
-    out.push_str("# HELP weaver_nntp_capacity_probe_attempts_total Adaptive-capacity provider connection probes attempted.\n");
-    out.push_str("# TYPE weaver_nntp_capacity_probe_attempts_total counter\n");
-    append_metric(
-        &mut out,
-        "weaver_nntp_capacity_probe_attempts_total",
-        snapshot.nntp_capacity_probe_attempts_total,
-    );
-    out.push_str("# HELP weaver_nntp_capacity_probe_successes_total Adaptive-capacity probes that restored one connection.\n");
-    out.push_str("# TYPE weaver_nntp_capacity_probe_successes_total counter\n");
-    append_metric(
-        &mut out,
-        "weaver_nntp_capacity_probe_successes_total",
-        snapshot.nntp_capacity_probe_successes_total,
-    );
-    out.push_str("# HELP weaver_nntp_capacity_probe_rejections_total Adaptive-capacity probes rejected by provider limits.\n");
-    out.push_str("# TYPE weaver_nntp_capacity_probe_rejections_total counter\n");
-    append_metric(
-        &mut out,
-        "weaver_nntp_capacity_probe_rejections_total",
-        snapshot.nntp_capacity_probe_rejections_total,
-    );
-    out.push_str("# HELP weaver_nntp_capacity_probe_transport_failures_total Adaptive-capacity probes that failed during transport setup.\n");
-    out.push_str("# TYPE weaver_nntp_capacity_probe_transport_failures_total counter\n");
-    append_metric(
-        &mut out,
-        "weaver_nntp_capacity_probe_transport_failures_total",
-        snapshot.nntp_capacity_probe_transport_failures_total,
-    );
-    out.push_str("# HELP weaver_nntp_capacity_probe_stale_generation_total Probe results ignored after an NNTP generation replacement.\n");
-    out.push_str("# TYPE weaver_nntp_capacity_probe_stale_generation_total counter\n");
-    append_metric(
-        &mut out,
-        "weaver_nntp_capacity_probe_stale_generation_total",
-        snapshot.nntp_capacity_probe_stale_generation_total,
-    );
-
-    out.push_str("# HELP weaver_pipeline_segments_failed_permanent_total Total segments permanently failed.\n");
-    out.push_str("# TYPE weaver_pipeline_segments_failed_permanent_total counter\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_segments_failed_permanent_total",
-        snapshot.segments_failed_permanent,
+        &[
+            ScalarMetricDescriptor::counter(
+                "weaver_nntp_capacity_probe_attempts_total",
+                "Adaptive-capacity provider connection probes attempted.",
+                snapshot.nntp_capacity_probe_attempts_total,
+            ),
+            ScalarMetricDescriptor::counter(
+                "weaver_nntp_capacity_probe_successes_total",
+                "Adaptive-capacity probes that restored one connection.",
+                snapshot.nntp_capacity_probe_successes_total,
+            ),
+            ScalarMetricDescriptor::counter(
+                "weaver_nntp_capacity_probe_rejections_total",
+                "Adaptive-capacity probes rejected by provider limits.",
+                snapshot.nntp_capacity_probe_rejections_total,
+            ),
+            ScalarMetricDescriptor::counter(
+                "weaver_nntp_capacity_probe_transport_failures_total",
+                "Adaptive-capacity probes that failed during transport setup.",
+                snapshot.nntp_capacity_probe_transport_failures_total,
+            ),
+            ScalarMetricDescriptor::counter(
+                "weaver_nntp_capacity_probe_stale_generation_total",
+                "Probe results ignored after an NNTP generation replacement.",
+                snapshot.nntp_capacity_probe_stale_generation_total,
+            ),
+            ScalarMetricDescriptor::counter(
+                "weaver_pipeline_segments_failed_permanent_total",
+                "Total segments permanently failed.",
+                snapshot.segments_failed_permanent,
+            ),
+        ],
     );
 
     out.push_str(
@@ -525,144 +586,101 @@ fn render_prometheus_metrics_with_transfers(
         );
     }
 
-    out.push_str("# HELP weaver_pipeline_articles_not_found_total Total articles not found.\n");
-    out.push_str("# TYPE weaver_pipeline_articles_not_found_total counter\n");
-    append_metric(
+    append_scalar_metrics(
         &mut out,
-        "weaver_pipeline_articles_not_found_total",
-        snapshot.articles_not_found,
+        &[
+            ScalarMetricDescriptor::counter(
+                "weaver_pipeline_articles_not_found_total",
+                "Total articles not found.",
+                snapshot.articles_not_found,
+            ),
+            ScalarMetricDescriptor::counter(
+                "weaver_pipeline_decode_errors_total",
+                "Total decode errors.",
+                snapshot.decode_errors,
+            ),
+            ScalarMetricDescriptor::counter(
+                "weaver_pipeline_crc_errors_total",
+                "Total CRC errors.",
+                snapshot.crc_errors,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_pipeline_download_queue_depth",
+                "Download queue depth.",
+                snapshot.download_queue_depth as u64,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_pipeline_active_downloads",
+                "Active article downloads.",
+                snapshot.active_downloads as u64,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_pipeline_active_decodes",
+                "Active decode tasks.",
+                snapshot.active_decodes as u64,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_pipeline_decode_pending",
+                "Decode pending queue depth.",
+                snapshot.decode_pending as u64,
+            ),
+        ],
     );
 
-    out.push_str("# HELP weaver_pipeline_decode_errors_total Total decode errors.\n");
-    out.push_str("# TYPE weaver_pipeline_decode_errors_total counter\n");
-    append_metric(
+    append_scalar_metrics(
         &mut out,
-        "weaver_pipeline_decode_errors_total",
-        snapshot.decode_errors,
-    );
-
-    out.push_str("# HELP weaver_pipeline_crc_errors_total Total CRC errors.\n");
-    out.push_str("# TYPE weaver_pipeline_crc_errors_total counter\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_crc_errors_total",
-        snapshot.crc_errors,
-    );
-
-    out.push_str("# HELP weaver_pipeline_download_queue_depth Download queue depth.\n");
-    out.push_str("# TYPE weaver_pipeline_download_queue_depth gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_download_queue_depth",
-        snapshot.download_queue_depth,
-    );
-
-    out.push_str("# HELP weaver_pipeline_active_downloads Active article downloads.\n");
-    out.push_str("# TYPE weaver_pipeline_active_downloads gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_active_downloads",
-        snapshot.active_downloads,
-    );
-
-    out.push_str("# HELP weaver_pipeline_active_decodes Active decode tasks.\n");
-    out.push_str("# TYPE weaver_pipeline_active_decodes gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_active_decodes",
-        snapshot.active_decodes,
-    );
-
-    out.push_str("# HELP weaver_pipeline_decode_pending Decode pending queue depth.\n");
-    out.push_str("# TYPE weaver_pipeline_decode_pending gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_decode_pending",
-        snapshot.decode_pending,
-    );
-
-    out.push_str(
-        "# HELP weaver_pipeline_decode_pending_bytes Raw article bytes queued for decode.\n",
-    );
-    out.push_str("# TYPE weaver_pipeline_decode_pending_bytes gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_decode_pending_bytes",
-        snapshot.decode_pending_bytes,
-    );
-
-    out.push_str(
-        "# HELP weaver_pipeline_decode_active_bytes Raw article bytes currently being decoded.\n",
-    );
-    out.push_str("# TYPE weaver_pipeline_decode_active_bytes gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_decode_active_bytes",
-        snapshot.decode_active_bytes,
-    );
-
-    out.push_str("# HELP weaver_pipeline_commit_pending Commit pending queue depth.\n");
-    out.push_str("# TYPE weaver_pipeline_commit_pending gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_commit_pending",
-        snapshot.commit_pending,
-    );
-
-    out.push_str("# HELP weaver_pipeline_recovery_queue_depth Recovery queue depth.\n");
-    out.push_str("# TYPE weaver_pipeline_recovery_queue_depth gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_recovery_queue_depth",
-        snapshot.recovery_queue_depth,
-    );
-
-    out.push_str("# HELP weaver_pipeline_write_buffered_bytes Buffered write bytes.\n");
-    out.push_str("# TYPE weaver_pipeline_write_buffered_bytes gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_write_buffered_bytes",
-        snapshot.write_buffered_bytes,
-    );
-
-    out.push_str("# HELP weaver_pipeline_write_buffered_segments Buffered write segments.\n");
-    out.push_str("# TYPE weaver_pipeline_write_buffered_segments gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_write_buffered_segments",
-        snapshot.write_buffered_segments,
-    );
-
-    out.push_str("# HELP weaver_pipeline_decode_pressure_soft_limit_bytes Decode soft pressure limit in bytes.\n");
-    out.push_str("# TYPE weaver_pipeline_decode_pressure_soft_limit_bytes gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_decode_pressure_soft_limit_bytes",
-        snapshot.decode_pressure_soft_limit_bytes,
-    );
-
-    out.push_str("# HELP weaver_pipeline_decode_pressure_hard_limit_bytes Decode hard pressure limit in bytes.\n");
-    out.push_str("# TYPE weaver_pipeline_decode_pressure_hard_limit_bytes gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_decode_pressure_hard_limit_bytes",
-        snapshot.decode_pressure_hard_limit_bytes,
-    );
-
-    out.push_str("# HELP weaver_pipeline_write_pressure_soft_limit_bytes Write soft pressure limit in bytes.\n");
-    out.push_str("# TYPE weaver_pipeline_write_pressure_soft_limit_bytes gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_write_pressure_soft_limit_bytes",
-        snapshot.write_pressure_soft_limit_bytes,
-    );
-
-    out.push_str("# HELP weaver_pipeline_write_pressure_hard_limit_bytes Write hard pressure limit in bytes.\n");
-    out.push_str("# TYPE weaver_pipeline_write_pressure_hard_limit_bytes gauge\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_write_pressure_hard_limit_bytes",
-        snapshot.write_pressure_hard_limit_bytes,
+        &[
+            ScalarMetricDescriptor::gauge(
+                "weaver_pipeline_decode_pending_bytes",
+                "Raw article bytes queued for decode.",
+                snapshot.decode_pending_bytes,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_pipeline_decode_active_bytes",
+                "Raw article bytes currently being decoded.",
+                snapshot.decode_active_bytes,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_pipeline_commit_pending",
+                "Commit pending queue depth.",
+                snapshot.commit_pending as u64,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_pipeline_recovery_queue_depth",
+                "Recovery queue depth.",
+                snapshot.recovery_queue_depth as u64,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_pipeline_write_buffered_bytes",
+                "Buffered write bytes.",
+                snapshot.write_buffered_bytes,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_pipeline_write_buffered_segments",
+                "Buffered write segments.",
+                snapshot.write_buffered_segments as u64,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_pipeline_decode_pressure_soft_limit_bytes",
+                "Decode soft pressure limit in bytes.",
+                snapshot.decode_pressure_soft_limit_bytes,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_pipeline_decode_pressure_hard_limit_bytes",
+                "Decode hard pressure limit in bytes.",
+                snapshot.decode_pressure_hard_limit_bytes,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_pipeline_write_pressure_soft_limit_bytes",
+                "Write soft pressure limit in bytes.",
+                snapshot.write_pressure_soft_limit_bytes,
+            ),
+            ScalarMetricDescriptor::gauge(
+                "weaver_pipeline_write_pressure_hard_limit_bytes",
+                "Write hard pressure limit in bytes.",
+                snapshot.write_pressure_hard_limit_bytes,
+            ),
+        ],
     );
 
     out.push_str("# HELP weaver_pipeline_download_pressure_state Download backpressure state.\n");
@@ -1134,48 +1152,35 @@ fn render_prometheus_metrics_with_transfers(
         );
     }
 
-    out.push_str(
-        "# HELP weaver_pipeline_download_pressure_stalls_total Hard pressure stalls started.\n",
-    );
-    out.push_str("# TYPE weaver_pipeline_download_pressure_stalls_total counter\n");
-    append_metric(
+    append_scalar_metrics(
         &mut out,
-        "weaver_pipeline_download_pressure_stalls_total",
-        snapshot.download_pressure_stalls_total,
-    );
-
-    out.push_str(
-        "# HELP weaver_pipeline_download_restart_durable_lead_blocked_total Restart durable lead dispatch blocks.\n",
-    );
-    out.push_str("# TYPE weaver_pipeline_download_restart_durable_lead_blocked_total counter\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_download_restart_durable_lead_blocked_total",
-        snapshot.download_restart_durable_lead_blocked_total,
-    );
-
-    out.push_str("# HELP weaver_pipeline_download_pressure_stall_duration_seconds Completed hard pressure stall duration.\n");
-    out.push_str("# TYPE weaver_pipeline_download_pressure_stall_duration_seconds counter\n");
-    append_metric_f64(
-        &mut out,
-        "weaver_pipeline_download_pressure_stall_duration_seconds",
-        snapshot.download_pressure_stall_duration_ms as f64 / 1000.0,
-    );
-
-    out.push_str("# HELP weaver_pipeline_download_pressure_current_stall_seconds Current hard pressure stall duration.\n");
-    out.push_str("# TYPE weaver_pipeline_download_pressure_current_stall_seconds gauge\n");
-    append_metric_f64(
-        &mut out,
-        "weaver_pipeline_download_pressure_current_stall_seconds",
-        snapshot.download_pressure_current_stall_ms as f64 / 1000.0,
-    );
-
-    out.push_str("# HELP weaver_pipeline_direct_write_evictions_total Direct write evictions.\n");
-    out.push_str("# TYPE weaver_pipeline_direct_write_evictions_total counter\n");
-    append_metric(
-        &mut out,
-        "weaver_pipeline_direct_write_evictions_total",
-        snapshot.direct_write_evictions,
+        &[
+            ScalarMetricDescriptor::counter(
+                "weaver_pipeline_download_pressure_stalls_total",
+                "Hard pressure stalls started.",
+                snapshot.download_pressure_stalls_total,
+            ),
+            ScalarMetricDescriptor::counter(
+                "weaver_pipeline_download_restart_durable_lead_blocked_total",
+                "Restart durable lead dispatch blocks.",
+                snapshot.download_restart_durable_lead_blocked_total,
+            ),
+            ScalarMetricDescriptor::counter_f64(
+                "weaver_pipeline_download_pressure_stall_duration_seconds",
+                "Completed hard pressure stall duration.",
+                snapshot.download_pressure_stall_duration_ms as f64 / 1000.0,
+            ),
+            ScalarMetricDescriptor::gauge_f64(
+                "weaver_pipeline_download_pressure_current_stall_seconds",
+                "Current hard pressure stall duration.",
+                snapshot.download_pressure_current_stall_ms as f64 / 1000.0,
+            ),
+            ScalarMetricDescriptor::counter(
+                "weaver_pipeline_direct_write_evictions_total",
+                "Direct write evictions.",
+                snapshot.direct_write_evictions,
+            ),
+        ],
     );
 
     out.push_str("# HELP weaver_pipeline_verify_active Active verification workers.\n");
@@ -1531,6 +1536,25 @@ fn observed_download_limiter(
         return "active";
     }
     "dispatch_limited"
+}
+
+fn append_scalar_metrics(out: &mut String, metrics: &[ScalarMetricDescriptor<'_>]) {
+    for metric in metrics {
+        out.push_str("# HELP ");
+        out.push_str(metric.name);
+        out.push(' ');
+        out.push_str(metric.help);
+        out.push('\n');
+        out.push_str("# TYPE ");
+        out.push_str(metric.name);
+        out.push(' ');
+        out.push_str(metric.metric_type);
+        out.push('\n');
+        match metric.value {
+            ScalarMetricValue::Integer(value) => append_metric(out, metric.name, value),
+            ScalarMetricValue::Float(value) => append_metric_f64(out, metric.name, value),
+        }
+    }
 }
 
 fn append_metric<T: std::fmt::Display>(out: &mut String, name: &str, value: T) {

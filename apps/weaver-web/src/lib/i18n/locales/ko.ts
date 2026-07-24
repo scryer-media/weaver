@@ -492,6 +492,8 @@ const ko: LocaleDictionary = {
   "settings.backupExportDesc": "구성, 영구 기록과 중복 상태, RSS 상태, 자격 증명 및 관리형 확장 패키지를 포함하는 암호화 번들을 만듭니다.",
   "settings.backupPassword": "비밀번호 보호",
   "settings.backupPasswordPlaceholder": "새 백업마다 필수",
+  "settings.backupPasswordConfirm": "비밀번호 확인",
+  "settings.backupPasswordMismatch": "비밀번호가 일치하지 않습니다.",
   "settings.backupDownload": "백업 다운로드",
   "settings.backupDownloading": "백업 준비 중...",
   "settings.backupDownloadReady": "백업 다운로드가 시작되었습니다.",

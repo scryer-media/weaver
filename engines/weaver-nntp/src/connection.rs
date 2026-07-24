@@ -17,6 +17,7 @@ use crate::response::{is_multiline_status, parse_response};
 use crate::tls::{NntpTransport, TransportReadStats};
 use crate::transfer::{
     ActiveTransferBudget, BodyTransferAccounting, QuotaRejection, ServerTransferControl,
+    active_transfer_read_timeout, active_transfer_timeout,
 };
 use crate::types::{ArticleId, Capabilities, MultiLineResponse, Response};
 
@@ -28,10 +29,6 @@ pub struct BodyStreamStats {
     pub throttle_wait: Duration,
 }
 
-fn active_transfer_timeout(budget: &ActiveTransferBudget) -> NntpError {
-    NntpError::SoftTimeout(budget.limit().as_secs())
-}
-
 fn ensure_active_transfer_budget(budget: Option<&ActiveTransferBudget>) -> Result<()> {
     if let Some(budget) = budget
         && budget.remaining().is_zero()
@@ -39,20 +36,6 @@ fn ensure_active_transfer_budget(budget: Option<&ActiveTransferBudget>) -> Resul
         return Err(active_transfer_timeout(budget));
     }
     Ok(())
-}
-
-fn active_transfer_read_timeout(
-    command_timeout: Duration,
-    budget: Option<&ActiveTransferBudget>,
-) -> Result<(Duration, bool)> {
-    let Some(budget) = budget else {
-        return Ok((command_timeout, false));
-    };
-    let remaining = budget.remaining();
-    if remaining.is_zero() {
-        return Err(active_transfer_timeout(budget));
-    }
-    Ok((command_timeout.min(remaining), remaining <= command_timeout))
 }
 
 async fn await_active_transfer<F, T>(budget: Option<&ActiveTransferBudget>, future: F) -> Result<T>
@@ -1680,6 +1663,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::test_support::{
+        ScriptedStep, spawn_scripted_server as spawn_shared_scripted_server,
+    };
     use crate::tls::ManualTlsStream;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -1705,18 +1691,18 @@ mod tests {
         delay: Duration,
     }
 
-    async fn read_command_line(socket: &mut TcpStream) -> String {
-        let mut buf = Vec::new();
-        loop {
-            let mut byte = [0u8; 1];
-            let n = socket.read(&mut byte).await.unwrap();
-            assert!(n > 0, "client closed connection before command completed");
-            buf.push(byte[0]);
-            if byte[0] == b'\n' {
-                break;
-            }
+    impl ScriptedStep for ScriptStep {
+        fn expected_prefix(&self) -> Option<&str> {
+            self.expect_prefix
         }
-        String::from_utf8(buf).unwrap()
+
+        fn response(&self) -> &[u8] {
+            self.response
+        }
+
+        fn delay(&self) -> Duration {
+            self.delay
+        }
     }
 
     fn test_tls_configs() -> (Arc<ClientConfig>, Arc<RustlsServerConfig>) {
@@ -2351,33 +2337,7 @@ mod tests {
     }
 
     async fn spawn_scripted_server(steps: Vec<ScriptStep>, hold_open_after_last: Duration) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            for step in steps {
-                if let Some(prefix) = step.expect_prefix {
-                    let line = read_command_line(&mut socket).await;
-                    assert!(
-                        line.starts_with(prefix),
-                        "expected command starting with {prefix:?}, got {line:?}"
-                    );
-                }
-                if step.delay > Duration::ZERO {
-                    tokio::time::sleep(step.delay).await;
-                }
-                if !step.response.is_empty() {
-                    socket.write_all(step.response).await.unwrap();
-                    socket.flush().await.unwrap();
-                }
-            }
-            if hold_open_after_last > Duration::ZERO {
-                tokio::time::sleep(hold_open_after_last).await;
-            }
-        });
-
-        port
+        spawn_shared_scripted_server(steps, hold_open_after_last).await
     }
 
     fn scripted_plain_config(port: u16) -> ServerConfig {

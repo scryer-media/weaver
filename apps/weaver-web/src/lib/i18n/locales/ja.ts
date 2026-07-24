@@ -490,6 +490,8 @@ const ja: LocaleDictionary = {
   "settings.backupExportDesc": "設定、永続的な履歴と重複状態、RSS 状態、認証情報、管理対象拡張機能を含む暗号化バンドルを作成します。",
   "settings.backupPassword": "パスワード保護",
   "settings.backupPasswordPlaceholder": "新しいバックアップごとに必須",
+  "settings.backupPasswordConfirm": "パスワードの確認",
+  "settings.backupPasswordMismatch": "パスワードが一致しません。",
   "settings.backupDownload": "バックアップをダウンロード",
   "settings.backupDownloading": "バックアップを準備中...",
   "settings.backupDownloadReady": "バックアップのダウンロードが開始されました。",

@@ -492,6 +492,8 @@ const de: LocaleDictionary = {
   "settings.backupExportDesc": "Ein verschlüsseltes Paket mit Konfiguration, dauerhaftem Verlauf und Duplikatstatus, RSS-Status, Zugangsdaten und verwalteten Erweiterungen erstellen.",
   "settings.backupPassword": "Passwortschutz",
   "settings.backupPasswordPlaceholder": "Für jedes neue Backup erforderlich",
+  "settings.backupPasswordConfirm": "Passwort bestätigen",
+  "settings.backupPasswordMismatch": "Die Passwörter stimmen nicht überein.",
   "settings.backupDownload": "Backup herunterladen",
   "settings.backupDownloading": "Backup wird vorbereitet...",
   "settings.backupDownloadReady": "Backup-Download gestartet.",
