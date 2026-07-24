@@ -11,6 +11,18 @@ use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidt
 use crate::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use crate::pipeline::Pipeline;
 
+/// Origin of a global download pause, so the download-block presentation can
+/// distinguish a schedule-driven pause from a manual one across every refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GlobalPause {
+    /// Not globally paused; the cap/quota may still block.
+    Running,
+    /// Operator pressed pause.
+    Manual,
+    /// A bandwidth schedule paused downloads.
+    Scheduled,
+}
+
 const BANDWIDTH_LEDGER_RETENTION_DAYS: i64 = 90;
 const BANDWIDTH_CAP_USAGE_FLUSH_BYTES: u64 = 64 * 1024 * 1024;
 const BANDWIDTH_CAP_USAGE_FLUSH_INTERVAL: StdDuration = StdDuration::from_secs(10);
@@ -48,6 +60,12 @@ pub(crate) struct BandwidthCapRuntime {
     window: Option<BandwidthCapWindow>,
     used_bytes: u64,
     reserved_bytes: u64,
+    /// Dispatch was refused because the next reservation no longer fits the
+    /// allowance. Conservative pre-reservation parks work before `used`
+    /// reaches the limit, so the blocked presentation must not wait for
+    /// `remaining_bytes() == 0`. Sticky until a reservation succeeds, the
+    /// window rolls over, or the policy changes.
+    parked_on_cap: bool,
     last_pruned_bucket_epoch_minute: Option<i64>,
     pending_usage_by_minute: BTreeMap<i64, u64>,
     pending_usage_bytes: u64,
@@ -60,6 +78,7 @@ impl BandwidthCapRuntime {
         self.window = None;
         self.used_bytes = 0;
         self.reserved_bytes = 0;
+        self.parked_on_cap = false;
     }
 
     pub(crate) fn cap_enabled(&self) -> bool {
@@ -105,6 +124,7 @@ impl BandwidthCapRuntime {
             self.used_bytes = db.sum_bandwidth_usage_minutes(start_minute, end_minute)?;
             self.window = Some(next_window);
             self.reserved_bytes = 0;
+            self.parked_on_cap = false;
         }
 
         let prune_cutoff =
@@ -129,6 +149,11 @@ impl BandwidthCapRuntime {
 
     pub(crate) fn reserve(&mut self, bytes: u64) {
         self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
+        self.parked_on_cap = false;
+    }
+
+    pub(crate) fn record_reservation_rejected(&mut self) {
+        self.parked_on_cap = true;
     }
 
     pub(crate) fn release(&mut self, bytes: u64) {
@@ -207,7 +232,7 @@ impl BandwidthCapRuntime {
                 .is_some_and(|started| started.elapsed() >= interval)
     }
 
-    pub(crate) fn to_download_block_state(&self, global_paused: bool) -> DownloadBlockState {
+    pub(crate) fn to_download_block_state(&self, pause: GlobalPause) -> DownloadBlockState {
         let timezone_name = {
             let now = crate::e2e_clock::local_now();
             let label = now.format("%Z").to_string();
@@ -218,12 +243,20 @@ impl BandwidthCapRuntime {
             }
         };
 
-        let kind = if global_paused {
-            DownloadBlockKind::ManualPause
-        } else if self.cap_enabled() && self.remaining_bytes() == 0 {
-            DownloadBlockKind::IspCap
-        } else {
-            DownloadBlockKind::None
+        // A global pause outranks the cap. The origin of the pause is carried
+        // explicitly so every block-state refresh reports the same kind:
+        // deriving it from a single `global_paused` bool let a scheduled pause
+        // be silently reclassified as manual by any later refresh.
+        let kind = match pause {
+            GlobalPause::Manual => DownloadBlockKind::ManualPause,
+            GlobalPause::Scheduled => DownloadBlockKind::Scheduled,
+            GlobalPause::Running => {
+                if self.cap_enabled() && (self.remaining_bytes() == 0 || self.parked_on_cap) {
+                    DownloadBlockKind::IspCap
+                } else {
+                    DownloadBlockKind::None
+                }
+            }
         };
 
         DownloadBlockState {
@@ -418,11 +451,21 @@ pub(crate) fn compute_window(
 }
 
 impl Pipeline {
+    /// The current global-pause origin, so every download-block refresh reports
+    /// a consistent Scheduled vs ManualPause kind.
+    pub(crate) fn global_pause(&self) -> GlobalPause {
+        if !self.global_paused {
+            GlobalPause::Running
+        } else if self.scheduled_pause {
+            GlobalPause::Scheduled
+        } else {
+            GlobalPause::Manual
+        }
+    }
+
     pub(crate) fn refresh_bandwidth_cap_window(&mut self) -> Result<(), SchedulerError> {
         self.bandwidth_cap.update_for_now(&self.db)?;
-        let mut block = self
-            .bandwidth_cap
-            .to_download_block_state(self.global_paused);
+        let mut block = self.bandwidth_cap.to_download_block_state(self.global_pause());
         block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
         self.shared_state.set_download_block(block);
         Ok(())
@@ -444,6 +487,11 @@ impl Pipeline {
     ) -> Result<bool, SchedulerError> {
         self.refresh_bandwidth_cap_window()?;
         if !self.bandwidth_cap.can_reserve(estimate_bytes) {
+            self.bandwidth_cap.record_reservation_rejected();
+            self.shared_state.set_download_block(
+                self.bandwidth_cap
+                    .to_download_block_state(self.global_pause()),
+            );
             return Ok(false);
         }
         self.bandwidth_cap.reserve(estimate_bytes);
@@ -451,7 +499,7 @@ impl Pipeline {
             .insert(segment_id, estimate_bytes);
         self.shared_state.set_download_block(
             self.bandwidth_cap
-                .to_download_block_state(self.global_paused),
+                .to_download_block_state(self.global_pause()),
         );
         Ok(true)
     }
@@ -475,7 +523,7 @@ impl Pipeline {
             .record_download_bytes(&self.db, payload_bytes)?;
         let mut block = self
             .bandwidth_cap
-            .to_download_block_state(self.global_paused);
+            .to_download_block_state(self.global_pause());
         block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
         self.shared_state.set_download_block(block);
         Ok(())
@@ -485,7 +533,7 @@ impl Pipeline {
         self.bandwidth_cap.flush_pending_usage(&self.db)?;
         let mut block = self
             .bandwidth_cap
-            .to_download_block_state(self.global_paused);
+            .to_download_block_state(self.global_pause());
         block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
         self.shared_state.set_download_block(block);
         Ok(())

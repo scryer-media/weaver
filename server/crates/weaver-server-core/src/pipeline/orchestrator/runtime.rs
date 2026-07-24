@@ -208,6 +208,7 @@ impl Pipeline {
             inflight_terminal_post_processing: HashSet::new(),
             terminal_post_processing_cancellations: HashMap::new(),
             global_paused: initial_global_paused,
+            scheduled_pause: false,
             bandwidth_cap,
             bandwidth_reservations: HashMap::new(),
             rate_limit_reservations: HashMap::new(),

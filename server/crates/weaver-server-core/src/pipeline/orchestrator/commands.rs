@@ -314,9 +314,12 @@ impl Pipeline {
             }
             SchedulerCommand::PauseAll { reply } => {
                 self.global_paused = true;
+                self.scheduled_pause = false;
                 self.shared_state.set_paused(true);
-                self.shared_state
-                    .set_download_block(self.bandwidth_cap.to_download_block_state(true));
+                self.shared_state.set_download_block(
+                    self.bandwidth_cap
+                        .to_download_block_state(self.global_pause()),
+                );
                 if let Err(e) = self
                     .db_blocking(move |db| db.set_setting("global_paused", "true"))
                     .await
@@ -328,6 +331,7 @@ impl Pipeline {
             }
             SchedulerCommand::ResumeAll { reply } => {
                 self.global_paused = false;
+                self.scheduled_pause = false;
                 self.shared_state.set_paused(false);
                 let _ = self.refresh_bandwidth_cap_window();
                 if let Err(e) = self
@@ -405,14 +409,20 @@ impl Pipeline {
                 match action {
                     ScheduleAction::Pause => {
                         self.global_paused = true;
+                        self.scheduled_pause = true;
                         self.shared_state.set_paused(true);
-                        let mut block = self.bandwidth_cap.to_download_block_state(true);
-                        block.kind = crate::jobs::handle::DownloadBlockKind::Scheduled;
-                        self.shared_state.set_download_block(block);
+                        // The Scheduled kind now falls out of global_pause(), so
+                        // any later block-state refresh keeps reporting it
+                        // instead of reclassifying the pause as manual.
+                        self.shared_state.set_download_block(
+                            self.bandwidth_cap
+                                .to_download_block_state(self.global_pause()),
+                        );
                         info!("schedule: paused downloads");
                     }
                     ScheduleAction::Resume => {
                         self.global_paused = false;
+                        self.scheduled_pause = false;
                         self.shared_state.set_paused(false);
                         let _ = self.refresh_bandwidth_cap_window();
                         info!("schedule: resumed downloads");
@@ -422,7 +432,7 @@ impl Pipeline {
                         self.rate_limiter.set_rate(bytes_per_sec);
                         let mut block = self
                             .bandwidth_cap
-                            .to_download_block_state(self.global_paused);
+                            .to_download_block_state(self.global_pause());
                         block.scheduled_speed_limit = bytes_per_sec;
                         self.shared_state.set_download_block(block);
                         info!(bytes_per_sec, "schedule: set speed limit");
@@ -443,6 +453,7 @@ impl Pipeline {
                     self.global_paused = false;
                     self.shared_state.set_paused(false);
                 }
+                self.scheduled_pause = false;
                 self.scheduled_rate_limit = None;
                 self.rate_limiter.set_rate(self.configured_rate_limit);
                 let _ = self.refresh_bandwidth_cap_window();

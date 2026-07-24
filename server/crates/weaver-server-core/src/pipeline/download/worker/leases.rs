@@ -66,15 +66,10 @@ impl Pipeline {
                 if let Some(state) = self.jobs.get_mut(&job_id) {
                     state.download_queue.push(work);
                 }
-                if self.bandwidth_cap.cap_enabled() {
-                    use crate::jobs::handle::{DownloadBlockKind, DownloadBlockState};
-                    self.shared_state.set_download_block(DownloadBlockState {
-                        kind: DownloadBlockKind::IspCap,
-                        ..self
-                            .bandwidth_cap
-                            .to_download_block_state(self.global_paused)
-                    });
-                }
+                // reserve_bandwidth_for_dispatch marked the cap runtime parked
+                // and published the IspCap block state; the mark is sticky, so
+                // later usage flushes keep presenting the cap block instead of
+                // reverting to None while remaining allowance is nonzero.
                 self.update_queue_metrics();
                 if stop_on_cap_block {
                     Err(DispatchAttempt::StopAll)

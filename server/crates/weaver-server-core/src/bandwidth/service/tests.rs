@@ -123,3 +123,76 @@ fn enabled_cap_keeps_conservative_bandwidth_flush_threshold() {
         BANDWIDTH_CAP_USAGE_FLUSH_BYTES
     );
 }
+
+#[test]
+fn parked_dispatch_presents_a_sticky_isp_cap_block_below_the_limit() {
+    let db = crate::Database::open_in_memory().unwrap();
+    let mut runtime = BandwidthCapRuntime::default();
+    runtime.set_policy(Some(cap(IspBandwidthCapPeriod::Daily)));
+    runtime.update_for_now(&db).unwrap();
+
+    // Consume most of the allowance without reaching the limit.
+    runtime.reserve(700);
+    runtime.release(700);
+    runtime.record_download_bytes(&db, 700).unwrap();
+    assert!(runtime.remaining_bytes() > 0);
+    assert_eq!(
+        runtime.to_download_block_state(GlobalPause::Running).kind,
+        crate::DownloadBlockKind::None
+    );
+
+    // The next article no longer fits: conservative pre-reservation parks the
+    // work while `used` is still below the limit. The presentation must say
+    // IspCap and stay there across later block-state recomputation.
+    assert!(!runtime.can_reserve(400));
+    runtime.record_reservation_rejected();
+    assert_eq!(
+        runtime.to_download_block_state(GlobalPause::Running).kind,
+        crate::DownloadBlockKind::IspCap
+    );
+    assert_eq!(
+        runtime.to_download_block_state(GlobalPause::Running).kind,
+        crate::DownloadBlockKind::IspCap
+    );
+
+    // A successful reservation clears the parked presentation.
+    assert!(runtime.can_reserve(100));
+    runtime.reserve(100);
+    assert_eq!(
+        runtime.to_download_block_state(GlobalPause::Running).kind,
+        crate::DownloadBlockKind::None
+    );
+
+    // A parked runtime recovers when the window rolls over.
+    runtime.record_reservation_rejected();
+    runtime.set_policy(Some(cap(IspBandwidthCapPeriod::Daily)));
+    runtime.update_for_now(&db).unwrap();
+    assert_eq!(
+        runtime.to_download_block_state(GlobalPause::Running).kind,
+        crate::DownloadBlockKind::None
+    );
+}
+
+#[test]
+fn global_pause_origin_selects_the_block_kind() {
+    let db = crate::Database::open_in_memory().unwrap();
+    let mut runtime = BandwidthCapRuntime::default();
+    runtime.update_for_now(&db).unwrap();
+
+    // With no ISP cap engaged, the reported kind is driven purely by the
+    // origin of the global pause. A schedule-driven pause must present as
+    // Scheduled even though it shares the `global_paused` flag with a manual
+    // pause; a concurrent recomputation must not collapse it to ManualPause.
+    assert_eq!(
+        runtime.to_download_block_state(GlobalPause::Running).kind,
+        crate::DownloadBlockKind::None
+    );
+    assert_eq!(
+        runtime.to_download_block_state(GlobalPause::Manual).kind,
+        crate::DownloadBlockKind::ManualPause
+    );
+    assert_eq!(
+        runtime.to_download_block_state(GlobalPause::Scheduled).kind,
+        crate::DownloadBlockKind::Scheduled
+    );
+}

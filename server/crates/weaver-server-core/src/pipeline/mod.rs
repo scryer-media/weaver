@@ -1753,6 +1753,10 @@ pub struct Pipeline {
         HashMap<JobId, tokio::sync::watch::Sender<bool>>,
     /// Whether all downloads are globally paused.
     pub(super) global_paused: bool,
+    /// Whether the active global pause came from a bandwidth schedule rather
+    /// than an operator action. Only meaningful while `global_paused` is true;
+    /// it selects the Scheduled vs ManualPause download-block presentation.
+    pub(super) scheduled_pause: bool,
     /// ISP bandwidth cap runtime state.
     pub(crate) bandwidth_cap: BandwidthCapRuntime,
     /// Conservative byte reservations for in-flight downloads used to enforce the

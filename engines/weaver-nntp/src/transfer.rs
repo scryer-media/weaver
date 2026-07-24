@@ -329,6 +329,13 @@ struct TransferState {
     config: ServerTransferConfig,
     quota_used_bytes: u64,
     quota_reserved_bytes: u64,
+    /// Sticky signal that a BODY reservation was refused for quota. Conservative
+    /// reservation reserves the estimate and reconciles down to the smaller
+    /// actual, so `quota_used_bytes` stays strictly below the limit in steady
+    /// state and `used >= limit` almost never latches. This records the real
+    /// "refusing work" condition instead. Set when a reservation-sized request
+    /// is rejected, cleared when one is admitted or the window/config resets.
+    quota_saturated: bool,
     quota_epoch: u64,
     capacity_revision: u64,
 }
@@ -384,6 +391,7 @@ impl ServerTransferControl {
                 config: ServerTransferConfig::default(),
                 quota_used_bytes: 0,
                 quota_reserved_bytes: 0,
+                quota_saturated: false,
                 quota_epoch: 0,
                 capacity_revision: 1,
             }),
@@ -437,6 +445,12 @@ impl ServerTransferControl {
             }
             if quota_epoch_changed {
                 state.quota_epoch = state.quota_epoch.wrapping_add(1).max(1);
+            }
+            // A window rollover, manual reset, or quota edit all bump the
+            // generation (or drop the quota); either way the refusal condition
+            // no longer holds, so the server is free to take work again.
+            if quota_epoch_changed || !state.initialized || config.quota.is_none() {
+                state.quota_saturated = false;
             }
 
             state.config = config;
@@ -507,6 +521,11 @@ impl ServerTransferControl {
                 .fetch_add(1, Ordering::Relaxed);
             let mut state = self.state.lock().expect("server transfer state poisoned");
             if let Some(rejection) = self.quota_rejection_locked(&state, estimated_body_bytes) {
+                // A real dispatch reservation was refused: latch blocked so the
+                // per-server signal reflects that the server is turning work
+                // away, which the strict `used >= limit` check misses under
+                // conservative (estimate-then-reconcile) reservation.
+                state.quota_saturated = true;
                 return Err(rejection);
             }
             if state.config.quota.is_some() {
@@ -514,6 +533,8 @@ impl ServerTransferControl {
                     .quota_reserved_bytes
                     .saturating_add(estimated_body_bytes);
                 reserved_quota_bytes = estimated_body_bytes;
+                // Admitting a reservation means the server is taking work again.
+                state.quota_saturated = false;
             }
         }
 
@@ -637,7 +658,7 @@ impl ServerTransferControl {
             } else {
                 u64::MAX
             },
-            quota_blocked: quota.is_some_and(|_| projected >= limit),
+            quota_blocked: quota.is_some_and(|_| projected >= limit || state.quota_saturated),
             quota_generation: quota.map_or(0, |value| value.generation),
             capacity_revision: state.capacity_revision,
             retry_at: quota.and_then(|value| value.retry_at),
@@ -1078,6 +1099,52 @@ mod tests {
         let rejection = control.try_reserve(1).err().unwrap();
         assert!(rejection.snapshot.quota_blocked);
         assert_eq!(rejection.snapshot.quota_used_bytes, 1_100);
+    }
+
+    #[test]
+    fn refused_reservation_reports_blocked_below_the_limit_and_clears_on_reset() {
+        let registry = ServerTransferRegistry::new();
+        // A limit that admits one 800-estimate reservation but not two: after
+        // one article the used bytes reconcile below the limit, so the strict
+        // `used >= limit` check would never latch.
+        let control = registry.configure(StableServerId(11), quota(1_000, 1));
+
+        let mut permit = control.try_reserve(800).unwrap();
+        permit.record_blocking(650);
+        drop(permit);
+        let snapshot = control.snapshot();
+        assert!(snapshot.quota_used_bytes < snapshot.quota_limit_bytes);
+        assert!(
+            !snapshot.quota_blocked,
+            "one admitted article is not blocked"
+        );
+
+        // The next reservation cannot fit and is refused; the server must now
+        // report blocked even though used (650) is below the limit (1000).
+        assert!(control.try_reserve(800).is_err());
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.quota_used_bytes, 650);
+        assert!(snapshot.quota_used_bytes < snapshot.quota_limit_bytes);
+        assert!(
+            snapshot.quota_blocked,
+            "a refused reservation latches blocked"
+        );
+        assert_eq!(snapshot.quota_remaining_bytes, 350);
+
+        // A smaller reservation that still fits admits and clears the stale
+        // refusal without any reset.
+        let mut permit = control.try_reserve(200).unwrap();
+        assert!(!control.snapshot().quota_blocked);
+        permit.record_blocking(150);
+        drop(permit);
+        assert!(!control.snapshot().quota_blocked);
+
+        // Refuse again, then prove a window/quota reset (new generation) clears
+        // the refusal.
+        assert!(control.try_reserve(800).is_err());
+        assert!(control.snapshot().quota_blocked);
+        registry.configure(StableServerId(11), quota(1_000, 2));
+        assert!(!control.snapshot().quota_blocked);
     }
 
     #[test]
