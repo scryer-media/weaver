@@ -14,6 +14,7 @@ type FolderPathInputProps = {
   browseLabel?: string;
   className?: string;
   inputClassName?: string;
+  inputId?: string;
 };
 
 export function FolderPathInput({
@@ -24,6 +25,7 @@ export function FolderPathInput({
   browseLabel,
   className,
   inputClassName,
+  inputId,
 }: FolderPathInputProps) {
   const t = useTranslate();
   const [open, setOpen] = useState(false);
@@ -45,6 +47,7 @@ export function FolderPathInput({
     <>
       <div className={cn("flex gap-2", className)}>
         <Input
+          id={inputId}
           type="text"
           value={value}
           readOnly

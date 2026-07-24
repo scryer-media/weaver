@@ -2,7 +2,8 @@ use super::*;
 use std::path::Path;
 
 use crate::categories::CategoryConfig;
-use crate::servers::ServerConfig;
+use crate::operations::metrics::PipelineMetrics;
+use crate::servers::{ServerConfig, ServerDownloadUsage};
 use crate::settings::{Config, RetryOverrides};
 use crate::{
     HistoryFilter, JobEvent, JobHistoryRow, RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow,
@@ -71,6 +72,24 @@ fn sample_config() -> Config {
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         config_path: None,
+    }
+}
+
+#[test]
+fn backup_temp_directory_is_owner_only() {
+    let directory = create_backup_temp_dir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        assert_eq!(
+            std::fs::metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 }
 
@@ -253,6 +272,35 @@ fn restore_target_is_not_pristine_with_history() {
     assert!(!db.restore_target_is_pristine().unwrap());
 }
 
+#[test]
+fn idle_metrics_history_does_not_make_restore_target_non_pristine() {
+    let db = Database::open_in_memory().unwrap();
+    let metrics = PipelineMetrics::new();
+    db.record_metrics_history_sample(10, &metrics.snapshot(), &[])
+        .unwrap();
+
+    assert_eq!(
+        db.list_metrics_history_chunks(crate::MetricsHistoryTier::Raw10s)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(db.restore_target_is_pristine().unwrap());
+}
+
+#[test]
+fn zero_value_server_usage_does_not_make_restore_target_non_pristine() {
+    let db = Database::open_in_memory().unwrap();
+    db.save_config(&sample_config()).unwrap();
+    let mut usage = ServerDownloadUsage::empty(1);
+    db.upsert_server_download_usage(&usage).unwrap();
+    assert!(db.restore_target_is_pristine().unwrap());
+
+    usage.lifetime_bytes = 1;
+    db.upsert_server_download_usage(&usage).unwrap();
+    assert!(!db.restore_target_is_pristine().unwrap());
+}
+
 #[tokio::test]
 async fn import_stable_state_ignores_legacy_integration_events_table() {
     let src = Database::open_in_memory().unwrap();
@@ -353,7 +401,7 @@ async fn postgres_export_and_import_use_the_portable_sqlite_backup() {
     source.save_config(&sample_config()).unwrap();
     let backup = tempfile::NamedTempFile::new().unwrap();
     let export = source.export_stable_state(backup.path()).unwrap();
-    assert_eq!(export.included_tables, STABLE_TABLES);
+    assert_eq!(export.included_tables, LEGACY_V1_STABLE_TABLES);
 
     let portable = Database::open(backup.path()).unwrap();
     let portable_config = portable.load_config().unwrap();

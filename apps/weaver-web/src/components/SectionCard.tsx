@@ -34,6 +34,7 @@ export function SectionCard({
 }: SectionCardProps) {
   const [internalOpen, setInternalOpen] = useState(defaultOpen);
   const contentId = useId();
+  const titleId = useId();
   const isOpen = open ?? internalOpen;
 
   const toggle = () => {
@@ -47,7 +48,12 @@ export function SectionCard({
 
   const titleBlock = (
     <div className="min-w-0">
-      <div className="font-space-grotesk text-lg font-bold leading-tight text-foreground">{title}</div>
+      <div
+        id={titleId}
+        className="font-space-grotesk text-lg font-bold leading-tight text-foreground"
+      >
+        {title}
+      </div>
       {description ? (
         <div className="mt-1.5 text-[12.5px] leading-5 text-muted-foreground">{description}</div>
       ) : null}
@@ -55,7 +61,10 @@ export function SectionCard({
   );
 
   return (
-    <section className={cn("rounded-card border border-border bg-card p-5 sm:p-6", className)}>
+    <section
+      aria-labelledby={titleId}
+      className={cn("rounded-card border border-border bg-card p-5 sm:p-6", className)}
+    >
       <div className="flex items-start justify-between gap-4">
         {collapsible ? (
           <button

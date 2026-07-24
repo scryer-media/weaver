@@ -212,29 +212,6 @@ pub(super) fn queue_touch_api_key_last_used(db: &Database, id: i64) {
     });
 }
 
-pub(super) async fn refresh_auth_caches(
-    db: &Database,
-    auth_cache: &LoginAuthCache,
-    api_key_cache: &ApiKeyCache,
-) -> Result<(), StatusCode> {
-    let db_clone = db.clone();
-    let (credentials, jwt_secret, api_keys) = tokio::task::spawn_blocking(move || {
-        let credentials = db_clone.get_auth_credentials().map_err(|_| ())?;
-        let jwt_secret = db_clone
-            .get_or_create_jwt_signing_secret()
-            .map_err(|_| ())?;
-        let api_keys = db_clone.list_api_key_auth_rows().map_err(|_| ())?;
-        Ok::<_, ()>((credentials, jwt_secret, api_keys))
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    auth_cache.replace_credentials(credentials, jwt_secret);
-    api_key_cache.replace_rows(api_keys);
-    Ok(())
-}
-
 #[derive(Clone)]
 pub(super) struct ResolvedCaller {
     pub(super) scope: CallerScope,
@@ -383,15 +360,18 @@ pub(super) async fn logout_handler(
         format!("{JWT_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}");
     let session_cookie =
         format!("{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}");
-    (
-        StatusCode::OK,
-        [
-            (header::SET_COOKIE, jwt_cookie),
-            (header::SET_COOKIE, session_cookie),
-        ],
-        Json(serde_json::json!({ "ok": true })),
-    )
-        .into_response()
+    let mut response = (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response();
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        jwt_cookie.parse().expect("JWT expiry cookie is valid"),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        session_cookie
+            .parse()
+            .expect("session expiry cookie is valid"),
+    );
+    response
 }
 
 pub(super) fn session_cookie_value(
@@ -466,6 +446,30 @@ mod tests {
         let peer: SocketAddr = "203.0.113.9:51234".parse().unwrap();
         assert_eq!(login_client_id(&headers, Some(peer)), "203.0.113.9");
         assert_eq!(login_client_id(&headers, None), "198.51.100.10");
+    }
+
+    #[tokio::test]
+    async fn logout_expires_both_auth_cookies() {
+        let response = logout_handler(Extension(RuntimeSecurityConfig::default())).await;
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(cookies.len(), 2);
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("weaver_jwt=;"))
+        );
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("weaver_session=;"))
+        );
+        assert!(cookies.iter().all(|cookie| cookie.contains("Max-Age=0")));
     }
 }
 

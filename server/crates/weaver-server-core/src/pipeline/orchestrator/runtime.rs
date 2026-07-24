@@ -211,6 +211,8 @@ impl Pipeline {
             bandwidth_cap,
             bandwidth_reservations: HashMap::new(),
             rate_limit_reservations: HashMap::new(),
+            configured_rate_limit: 0,
+            scheduled_rate_limit: None,
             connection_ramp: total_connections.min(Self::INITIAL_CONNECTION_RAMP_LIMIT),
             rate_limiter: TokenBucket::new(0),
             write_buf_max_pending,

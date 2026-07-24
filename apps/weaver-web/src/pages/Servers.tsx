@@ -405,7 +405,11 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
       <PageHeader
         title={t("servers.title")}
         description={embedded ? t("settings.serversDesc") : t("servers.description")}
-        actions={<Button onClick={openAdd}>{t("servers.addServer")}</Button>}
+        actions={
+          <Button data-testid="add-server-button" onClick={openAdd}>
+            {t("servers.addServer")}
+          </Button>
+        }
       />
 
       {showForm ? (
@@ -524,7 +528,9 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                           </div>
                         </div>
                       </TableCell>
-                      <TableCell className="tabular-nums">{server.connections}</TableCell>
+                      <TableCell data-testid="server-connections" className="tabular-nums">
+                        {server.connections}
+                      </TableCell>
                       <TableCell>{server.tls ? t("label.enabled") : t("label.disabled")}</TableCell>
                       <TableCell><ServerLimitsSummary server={server} /></TableCell>
                       <TableCell>{server.active ? t("label.enabled") : t("label.disabled")}</TableCell>
@@ -728,36 +734,41 @@ function ServerFormCard({
     >
       <div className="space-y-5">
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          <Field label={t("servers.host")}>
+          <Field label={t("servers.host")} htmlFor="server-host">
             <Input
+              id="server-host"
               value={values.host}
               placeholder="news.example.com"
               onChange={(event) => setValues((current) => ({ ...current, host: event.target.value }))}
             />
           </Field>
-          <Field label={t("servers.port")}>
+          <Field label={t("servers.port")} htmlFor="server-port">
             <Input
+              id="server-port"
               type="number"
               value={values.port}
               onChange={(event) => setValues((current) => ({ ...current, port: Number(event.target.value) }))}
             />
           </Field>
-          <Field label={t("servers.username")}>
+          <Field label={t("servers.username")} htmlFor="server-username">
             <Input
+              id="server-username"
               value={values.username}
               onChange={(event) => setValues((current) => ({ ...current, username: event.target.value }))}
             />
           </Field>
-          <Field label={t("servers.password")}>
+          <Field label={t("servers.password")} htmlFor="server-password">
             <Input
+              id="server-password"
               type="password"
               value={values.password}
               placeholder={editing ? "Leave blank to keep" : ""}
               onChange={(event) => setValues((current) => ({ ...current, password: event.target.value }))}
             />
           </Field>
-          <Field label={t("servers.connections")}>
+          <Field label={t("servers.connections")} htmlFor="server-connections">
             <Input
+              id="server-connections"
               type="number"
               min={1}
               max={50}
@@ -765,16 +776,26 @@ function ServerFormCard({
               onChange={(event) => setValues((current) => ({ ...current, connections: Number(event.target.value) }))}
             />
           </Field>
-          <Field label={t("servers.group")} description={t("servers.groupDescription")}>
+          <Field
+            label={t("servers.group")}
+            description={t("servers.groupDescription")}
+            htmlFor="server-priority"
+          >
             <Input
+              id="server-priority"
               type="number"
               min={0}
               value={values.priority}
               onChange={(event) => setValues((current) => ({ ...current, priority: Number(event.target.value) }))}
             />
           </Field>
-          <Field label={t("servers.retention")} description={t("servers.retentionDescription")}>
+          <Field
+            label={t("servers.retention")}
+            description={t("servers.retentionDescription")}
+            htmlFor="server-retention"
+          >
             <Input
+              id="server-retention"
               type="number"
               min={0}
               value={values.retentionDays}

@@ -755,8 +755,10 @@ pub(super) unsafe fn sse41_decode_with_escape_mask(
     _mm_add_epi8(block, _mm_blendv_epi8(normal, escaped_offset, mask))
 }
 
-/// SSSE3 twin of [`decode_kernel_simd64_avx2_line_aware`] for the pre-AVX2
-/// tiers in the portable binary.
+/// Line-aware 64-byte-block driver for the pre-AVX2 tiers in the portable
+/// binary: consult the caller's line-length hint, try the fast whole-line
+/// path first, and fall back to the generic 64-byte block decode. Mirrors the
+/// AVX-512/VBMI2 line-aware kernel structure with SSSE3-width vectors.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
 pub(super) unsafe fn decode_kernel_simd64_ssse3_line_aware(
@@ -838,8 +840,11 @@ pub(super) unsafe fn decode_kernel_simd64_ssse3_line_aware(
     })
 }
 
-/// SSSE3 twin of [`try_decode_avx2_line`]: same guards and bail conditions,
-/// 4x16-byte vectors instead of 2x32.
+/// Whole-line fast path for the SSSE3 tier: decode one complete yEnc line
+/// (hint-length plus CRLF) in a single pass when the window holds it, bailing
+/// to the block path on escapes at boundaries, stuffed dots, or short input.
+/// Same guards and bail conditions as `try_decode_avx512_vbmi2_line`, with
+/// 4x16-byte vectors instead of one 512-bit vector.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
 #[allow(clippy::too_many_arguments)]

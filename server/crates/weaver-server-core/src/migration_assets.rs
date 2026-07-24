@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::range::Range;
@@ -156,6 +157,18 @@ impl CompiledMigrationCatalog {
             .last()
             .map(|migration| migration.version)
             .unwrap_or(self.starting_version - 1)
+    }
+
+    pub(crate) fn pending_keys(
+        &self,
+        applied_versions: impl IntoIterator<Item = i64>,
+    ) -> Vec<String> {
+        let applied_versions: HashSet<_> = applied_versions.into_iter().collect();
+        self.migrations
+            .iter()
+            .filter(|migration| !applied_versions.contains(&migration.version))
+            .map(|migration| migration.key.clone())
+            .collect()
     }
 
     pub fn find_migration(&self, version: i64) -> Option<&CompiledMigration> {

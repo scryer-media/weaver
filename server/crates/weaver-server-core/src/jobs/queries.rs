@@ -509,6 +509,10 @@ impl Database {
                      SELECT MAX(job_id) AS id FROM active_jobs
                      UNION ALL
                      SELECT MAX(job_id) AS id FROM job_history
+                     UNION ALL
+                     SELECT MAX(job_id) AS id FROM duplicate_job_snapshots
+                     UNION ALL
+                     SELECT MAX(job_id) AS id FROM forgotten_duplicate_identities
                  ) ids",
                 &[],
             )

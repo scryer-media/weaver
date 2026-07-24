@@ -144,7 +144,7 @@ function tokenRefreshUrl(): string {
     return new URL("__weaver/session", document.baseURI).href;
   }
 
-  return "/";
+  return new URL(".", document.baseURI).href;
 }
 
 function withSessionCredentials(init?: RequestInit): RequestInit {

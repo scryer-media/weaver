@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::logical::{read_table_objects, verify_table_parts};
+use super::logical::{verify_table_parts, visit_table_objects};
 use super::manifest::{
     BackupInstanceSecrets, BackupManifest, BackupServiceError, RestoreOptions, io_err,
     validate_manifest,
@@ -166,15 +166,34 @@ pub(crate) fn stage_pending_restore(
     metadata: &PendingRestoreMetadata,
 ) -> Result<(), BackupServiceError> {
     let destination = current_data_dir.join(PENDING_RESTORE_DIR);
-    if destination.exists() {
+    if std::fs::symlink_metadata(&destination).is_ok()
+        || std::fs::symlink_metadata(current_data_dir.join(LOCATION_POINTER)).is_ok()
+    {
         return Err(BackupServiceError::Validation(
             "a restore is already pending; restart Weaver before staging another".into(),
         ));
     }
-    std::fs::create_dir_all(current_data_dir).map_err(io_err)?;
+    create_dir_all_durable(current_data_dir)?;
     let pointer_destination = std::fs::canonicalize(current_data_dir)
         .map_err(io_err)?
         .join(PENDING_RESTORE_DIR);
+    let staging = current_data_dir.join(format!(".restore-pending-{}", metadata.restore_id));
+    if std::fs::symlink_metadata(&staging).is_ok() {
+        return Err(BackupServiceError::Validation(
+            "a restore staging reservation already exists; restart Weaver before retrying".into(),
+        ));
+    }
+    let reservation = (|| {
+        std::fs::create_dir(&staging).map_err(io_err)?;
+        set_directory_owner_only(&staging)?;
+        write_owner_only_json(&staging.join(PENDING_METADATA), metadata)?;
+        sync_directory(&staging)
+    })();
+    if let Err(error) = reservation {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+
     let mut pointer_dirs = Vec::new();
     for pointer_dir in [
         PathBuf::from(&metadata.restore_locator_dir),
@@ -190,21 +209,15 @@ pub(crate) fn stage_pending_restore(
             for written in written_pointers {
                 let _ = std::fs::remove_file(written);
             }
+            let _ = std::fs::remove_dir_all(&staging);
             return Err(error);
         }
         written_pointers.push(pointer_dir.join(LOCATION_POINTER));
     }
 
-    let staging = current_data_dir.join(format!(".restore-pending-{}", metadata.restore_id));
     let mut published = false;
     let result = (|| {
-        if staging.exists() {
-            std::fs::remove_dir_all(&staging).map_err(io_err)?;
-        }
-        std::fs::create_dir(&staging).map_err(io_err)?;
-        set_directory_owner_only(&staging)?;
         copy_tree(extracted_root, &staging)?;
-        write_owner_only_json(&staging.join(PENDING_METADATA), metadata)?;
         let ready = staging.join(READY_MARKER);
         write_owner_only(&ready, metadata.restore_id.as_bytes())?;
         sync_directory(&staging)?;
@@ -283,10 +296,41 @@ fn cleanup_completed_restores(data_dir: &Path) -> Result<(), BackupServiceError>
             if entry.file_name().to_str().is_some_and(|name| {
                 name.starts_with(".restore-completed-") || name.starts_with(".restore-pending-")
             }) {
+                cleanup_restore_location_pointers(&entry.path())?;
                 std::fs::remove_dir_all(entry.path()).map_err(io_err)?;
             }
         }
         sync_directory(&parent)?;
+    }
+    Ok(())
+}
+
+fn cleanup_restore_location_pointers(root: &Path) -> Result<(), BackupServiceError> {
+    let Ok(metadata) = read_pending_metadata(root) else {
+        return Ok(());
+    };
+    let Some(parent) = root.parent() else {
+        return Ok(());
+    };
+    let expected_pending = std::fs::canonicalize(parent)
+        .map_err(io_err)?
+        .join(PENDING_RESTORE_DIR);
+    for pointer_dir in BTreeSet::from([
+        PathBuf::from(metadata.current_data_dir),
+        PathBuf::from(metadata.restore_locator_dir),
+        PathBuf::from(metadata.options.data_dir),
+    ]) {
+        let pointer = pointer_dir.join(LOCATION_POINTER);
+        let matches = std::fs::read_to_string(&pointer)
+            .ok()
+            .map(|raw| PathBuf::from(raw.trim()))
+            .is_some_and(|path| path == expected_pending);
+        if matches {
+            remove_file_if_present(&pointer)?;
+            if pointer_dir.is_dir() {
+                sync_directory(&pointer_dir)?;
+            }
+        }
     }
     Ok(())
 }
@@ -300,6 +344,7 @@ fn apply_pending_restore_inner(
         return Ok((db, None));
     }
     if !root.join(READY_MARKER).is_file() {
+        cleanup_restore_location_pointers(root)?;
         std::fs::remove_dir_all(root).map_err(io_err)?;
         return Ok((db, None));
     }
@@ -413,18 +458,8 @@ fn apply_pending_restore_inner(
     let pending_parent = root.parent().unwrap_or(data_dir).to_path_buf();
     let completed = root.with_file_name(format!(".restore-completed-{}", metadata.restore_id));
     std::fs::rename(root, &completed).map_err(io_err)?;
+    cleanup_restore_location_pointers(&completed)?;
     let _ = std::fs::remove_dir_all(&completed);
-    let pointer_dirs = BTreeSet::from([
-        PathBuf::from(&metadata.current_data_dir),
-        PathBuf::from(&metadata.restore_locator_dir),
-        PathBuf::from(&metadata.options.data_dir),
-    ]);
-    for pointer_dir in pointer_dirs {
-        remove_file_if_present(&pointer_dir.join(LOCATION_POINTER))?;
-        if pointer_dir.is_dir() {
-            sync_directory(&pointer_dir)?;
-        }
-    }
     sync_directory(&pending_parent)?;
     Ok((
         db,
@@ -447,25 +482,28 @@ fn apply_sqlite_restore(
     installed_packages: &[PathBuf],
 ) -> Result<Database, BackupServiceError> {
     let database_parent = live_path.parent().unwrap_or_else(|| Path::new("."));
-    let preparing = database_parent.join(format!(
-        ".weaver-restore-{}.preparing.db",
-        metadata.restore_id
-    ));
+    let preparing_dir =
+        database_parent.join(format!(".weaver-restore-{}.preparing", metadata.restore_id));
+    let preparing = preparing_dir.join("weaver.db");
     let prepared = database_parent.join(format!(
         ".weaver-restore-{}.prepared.db",
         metadata.restore_id
     ));
     let prepare_now = journal_phase(journal) < PromotionPhase::DatabasePrepared;
     if prepare_now {
-        remove_file_if_present(&preparing)?;
+        if preparing_dir.exists() {
+            std::fs::remove_dir_all(&preparing_dir).map_err(io_err)?;
+        }
         remove_file_if_present(&prepared)?;
+        std::fs::create_dir(&preparing_dir).map_err(io_err)?;
+        set_directory_owner_only(&preparing_dir)?;
         let mut prepared_db = Database::open(&preparing)
             .map_err(|error| BackupServiceError::Io(error.to_string()))?;
         set_file_owner_only(&preparing)?;
         prepared_db.set_encryption_key(restored_key.clone());
         if let Err(error) = import_restore_payload(&prepared_db, root, metadata, manifest) {
             let _ = prepared_db.close();
-            let _ = std::fs::remove_file(&preparing);
+            let _ = std::fs::remove_dir_all(&preparing_dir);
             remove_installed_packages(installed_packages);
             return Err(error);
         }
@@ -480,6 +518,7 @@ fn apply_sqlite_restore(
         remove_sqlite_sidecars(&preparing)?;
         sync_file(&preparing)?;
         std::fs::rename(&preparing, &prepared).map_err(io_err)?;
+        std::fs::remove_dir(&preparing_dir).map_err(io_err)?;
         sync_directory(database_parent)?;
         *journal = Some(write_promotion_phase(
             root,
@@ -544,6 +583,7 @@ fn apply_sqlite_restore(
             .map_err(|error| BackupServiceError::Io(error.to_string()))?;
     }
 
+    cleanup_sqlite_replacement_backup(&prepared)?;
     activate_restore_key(metadata, restored_key)?;
     *journal = Some(write_promotion_phase(
         root,
@@ -849,6 +889,16 @@ fn remove_sqlite_sidecars(database: &Path) -> Result<(), BackupServiceError> {
 }
 
 #[cfg(not(windows))]
+fn cleanup_sqlite_replacement_backup(_prepared: &Path) -> Result<(), BackupServiceError> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cleanup_sqlite_replacement_backup(prepared: &Path) -> Result<(), BackupServiceError> {
+    remove_file_if_present(&prepared.with_extension("original.db"))
+}
+
+#[cfg(not(windows))]
 fn replace_sqlite_database(prepared: &Path, live: &Path) -> Result<(), BackupServiceError> {
     std::fs::rename(prepared, live).map_err(io_err)?;
     sync_directory(live.parent().unwrap_or_else(|| Path::new(".")))
@@ -935,23 +985,21 @@ fn revalidate_logical_pending(
     }
 
     let mut referenced = BTreeSet::new();
-    for row in read_table_objects(root, "post_processing_extension_revisions")
-        .map_err(|error| BackupServiceError::Validation(error.to_string()))?
-    {
+    visit_table_objects(root, "post_processing_extension_revisions", |row| {
         if row
             .get("managed_path")
             .is_none_or(serde_json::Value::is_null)
         {
-            continue;
+            return Ok(());
         }
         let digest = row
             .get("digest")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                BackupServiceError::Validation("managed revision has no digest".into())
-            })?;
+            .ok_or_else(|| crate::StateError::Database("managed revision has no digest".into()))?;
         referenced.insert(digest.to_string());
-    }
+        Ok(())
+    })
+    .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
     let declared = manifest
         .managed_packages
         .iter()
@@ -1032,7 +1080,7 @@ fn install_managed_packages(
             let parent = target.parent().ok_or_else(|| {
                 BackupServiceError::Validation("managed package target has no parent".into())
             })?;
-            std::fs::create_dir_all(parent).map_err(io_err)?;
+            create_dir_all_durable(parent)?;
             let temporary = parent.join(format!(
                 ".restore-{}-{}",
                 std::process::id(),
@@ -1165,7 +1213,7 @@ fn write_location_pointer(
     target_data_dir: &Path,
     pending_root: &Path,
 ) -> Result<(), BackupServiceError> {
-    std::fs::create_dir_all(target_data_dir).map_err(io_err)?;
+    create_dir_all_durable(target_data_dir)?;
     let mut bytes = pending_root.to_string_lossy().as_bytes().to_vec();
     bytes.push(b'\n');
     write_owner_only(&target_data_dir.join(LOCATION_POINTER), &bytes)?;
@@ -1249,6 +1297,35 @@ fn set_directory_owner_only(path: &Path) -> Result<(), BackupServiceError> {
     permissions::set_directory_owner_only(path).map_err(io_err)
 }
 
+fn create_dir_all_durable(path: &Path) -> Result<(), BackupServiceError> {
+    let mut existing = path;
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing.parent().ok_or_else(|| {
+                    BackupServiceError::Validation(
+                        "restore directory has no existing ancestor".into(),
+                    )
+                })?;
+            }
+            Err(error) => return Err(io_err(error)),
+        }
+    }
+    std::fs::create_dir_all(path).map_err(io_err)?;
+    let mut current = path;
+    loop {
+        sync_directory(current)?;
+        if current == existing {
+            break;
+        }
+        current = current.parent().ok_or_else(|| {
+            BackupServiceError::Validation("restore directory escaped its existing ancestor".into())
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), BackupServiceError> {
     std::fs::File::open(path)
@@ -1293,5 +1370,73 @@ mod tests {
             std::fs::read_to_string(pointer).unwrap(),
             "/existing/restore-pending\n"
         );
+    }
+
+    #[test]
+    fn startup_cleanup_removes_all_pointers_from_interrupted_staging_and_completion() {
+        for prefix in [".restore-pending-", ".restore-completed-"] {
+            let launch = tempfile::tempdir().unwrap();
+            let current = tempfile::tempdir().unwrap();
+            let target = tempfile::tempdir().unwrap();
+            let restore_id = format!("test-{}", prefix.trim_matches(['.', '-']));
+            let abandoned = current.path().join(format!("{prefix}{restore_id}"));
+            std::fs::create_dir(&abandoned).unwrap();
+            let metadata = PendingRestoreMetadata {
+                restore_id,
+                legacy: false,
+                current_data_dir: current.path().display().to_string(),
+                restore_locator_dir: launch.path().display().to_string(),
+                legacy_key_fingerprint: None,
+                legacy_backup_checksum: None,
+                options: RestoreOptions {
+                    data_dir: target.path().display().to_string(),
+                    intermediate_dir: None,
+                    complete_dir: None,
+                    category_remaps: Vec::new(),
+                },
+            };
+            write_owner_only_json(&abandoned.join(PENDING_METADATA), &metadata).unwrap();
+            let expected_pending = std::fs::canonicalize(current.path())
+                .unwrap()
+                .join(PENDING_RESTORE_DIR);
+            write_location_pointer(launch.path(), &expected_pending).unwrap();
+            write_location_pointer(target.path(), &expected_pending).unwrap();
+
+            cleanup_completed_restores(launch.path()).unwrap();
+
+            assert!(!abandoned.exists());
+            assert!(!launch.path().join(LOCATION_POINTER).exists());
+            assert!(!target.path().join(LOCATION_POINTER).exists());
+        }
+    }
+
+    #[test]
+    fn staging_refuses_an_existing_location_reservation() {
+        let extracted = tempfile::tempdir().unwrap();
+        let current = tempfile::tempdir().unwrap();
+        std::fs::write(
+            current.path().join(LOCATION_POINTER),
+            "/other/restore-pending\n",
+        )
+        .unwrap();
+        let metadata = PendingRestoreMetadata {
+            restore_id: "reserved".into(),
+            legacy: false,
+            current_data_dir: current.path().display().to_string(),
+            restore_locator_dir: current.path().display().to_string(),
+            legacy_key_fingerprint: None,
+            legacy_backup_checksum: None,
+            options: RestoreOptions {
+                data_dir: current.path().display().to_string(),
+                intermediate_dir: None,
+                complete_dir: None,
+                category_remaps: Vec::new(),
+            },
+        };
+
+        assert!(matches!(
+            stage_pending_restore(extracted.path(), current.path(), &metadata),
+            Err(BackupServiceError::Validation(_))
+        ));
     }
 }

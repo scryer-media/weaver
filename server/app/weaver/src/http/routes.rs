@@ -33,6 +33,8 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
     let login_limiter = super::auth::LoginRateLimiter::default();
     let backup_upload_limit =
         usize::try_from(security.backup_upload_limit_bytes).unwrap_or(usize::MAX);
+    let backup_request_limit = backup_upload_limit
+        .saturating_add(super::backup::BACKUP_MULTIPART_ENVELOPE_ALLOWANCE_BYTES);
     let request_auth = super::RequestAuthContext {
         db: db.clone(),
         auth_cache: auth_cache.clone(),
@@ -53,7 +55,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
     let backup_upload_routes = Router::new()
         .route("/inspect", post(super::backup::backup_inspect_handler))
         .route("/restore", post(super::backup::backup_restore_handler))
-        .route_layer(RequestBodyLimitLayer::new(backup_upload_limit));
+        .route_layer(RequestBodyLimitLayer::new(backup_request_limit));
 
     let nzbget_rpc_routes = build_nzbget_rpc_routes(nzbget_context);
 

@@ -9,11 +9,11 @@ use crate::jobs::record::{
     ActiveExtractionChunk, ActiveFileIdentity, ActiveFileProgress, ActiveJob, ExtractionChunk,
 };
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, SqlTx};
+use crate::persistence::sql_runtime::{
+    POSTGRES_BATCH_BIND_LIMIT, SQLITE_BATCH_BIND_LIMIT, SqlArg, SqlEngine, SqlRuntime, SqlTx,
+    max_rows_for_tx,
+};
 use sqlx::{Postgres, QueryBuilder, Sqlite};
-
-const SQLITE_BATCH_BIND_LIMIT: usize = 900;
-const POSTGRES_BATCH_BIND_LIMIT: usize = 16_000;
 
 async fn active_job_exists_tx(tx: &mut SqlTx<'_>, job_id: JobId) -> Result<bool, StateError> {
     let sql = match tx {
@@ -64,14 +64,6 @@ fn metadata_json(metadata: &[(String, String)]) -> Result<Option<String>, StateE
     } else {
         serde_json::to_string(metadata).map(Some).map_err(db_err)
     }
-}
-
-fn max_rows_for_tx(tx: &SqlTx<'_>, binds_per_row: usize) -> usize {
-    let bind_limit = match tx {
-        SqlTx::Sqlite(_) => SQLITE_BATCH_BIND_LIMIT,
-        SqlTx::Postgres(_) => POSTGRES_BATCH_BIND_LIMIT,
-    };
-    (bind_limit / binds_per_row.max(1)).max(1)
 }
 
 async fn active_job_ids_tx(

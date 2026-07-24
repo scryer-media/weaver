@@ -37,30 +37,13 @@ use crate::tls::{
 };
 use crate::transfer::{
     ActiveTransferBudget, BodyTransferAccounting, ServerTransferControl, StableServerId,
+    active_transfer_read_timeout, active_transfer_timeout,
 };
 use crate::types::{ArticleId, Capabilities, Response};
 
 const MIN_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(not(windows))]
 const S2N_BLOCKING_IO_SLICE: Duration = Duration::from_millis(100);
-
-fn active_transfer_timeout(budget: &ActiveTransferBudget) -> NntpError {
-    NntpError::SoftTimeout(budget.limit().as_secs())
-}
-
-fn active_transfer_read_timeout(
-    command_timeout: Duration,
-    budget: Option<&ActiveTransferBudget>,
-) -> Result<(Duration, bool)> {
-    let Some(budget) = budget else {
-        return Ok((command_timeout, false));
-    };
-    let remaining = budget.remaining();
-    if remaining.is_zero() {
-        return Err(active_transfer_timeout(budget));
-    }
-    Ok((command_timeout.min(remaining), remaining <= command_timeout))
-}
 
 fn classify_active_io_error(
     error: NntpError,

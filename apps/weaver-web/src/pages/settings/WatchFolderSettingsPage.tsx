@@ -219,14 +219,14 @@ function WatchFolderSettingsCard({
     >
       <div className="space-y-5">
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          <Field label={t("watchFolder.mode")}>
+          <Field label={t("watchFolder.mode")} htmlFor="watch-folder-mode">
             <Select
               value={values.mode}
               onValueChange={(mode) =>
                 onChange({ ...values, mode: mode as WatchFolderMode })
               }
             >
-              <SelectTrigger>
+              <SelectTrigger id="watch-folder-mode">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -237,8 +237,9 @@ function WatchFolderSettingsCard({
             </Select>
           </Field>
 
-          <Field label={t("watchFolder.folder")}>
+          <Field label={t("watchFolder.folder")} htmlFor="watch-folder-path">
             <FolderPathInput
+              inputId="watch-folder-path"
               value={values.path}
               onChange={(path) => onChange({ ...values, path })}
               browseLabel={t("watchFolder.browse")}
@@ -246,8 +247,9 @@ function WatchFolderSettingsCard({
           </Field>
 
           {values.mode === "polling" ? (
-            <Field label={t("watchFolder.pollInterval")}>
+            <Field label={t("watchFolder.pollInterval")} htmlFor="watch-folder-poll-interval">
               <Input
+                id="watch-folder-poll-interval"
                 type="number"
                 min={1}
                 value={values.pollIntervalSecs}
@@ -313,7 +315,12 @@ function WatchFolderScanReportCard({ report }: { report: WatchFolderScanReport }
     report.skippedInputs.length + report.permanentErrors.length + report.transientErrors.length;
 
   return (
-    <div className="space-y-4 rounded-inner border border-border p-5">
+    <div
+      role="region"
+      aria-label={t("watchFolder.scanReport")}
+      data-testid="watch-folder-scan-report"
+      className="space-y-4 rounded-inner border border-border p-5"
+    >
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
         <DetailCard label={t("watchFolder.discovered")}>{report.discoveredFiles.length}</DetailCard>
         <DetailCard label={t("watchFolder.queued")}>{report.queuedNzbs.length}</DetailCard>
@@ -372,14 +379,18 @@ function Field({
   label,
   description,
   children,
+  htmlFor,
 }: {
   label: string;
   description?: string;
   children: ReactNode;
+  htmlFor?: string;
 }) {
   return (
     <div className="space-y-2">
-      <Label className="text-sm font-semibold">{label}</Label>
+      <Label htmlFor={htmlFor} className="text-sm font-semibold">
+        {label}
+      </Label>
       {children}
       {description ? <p className="text-[12.5px] text-muted-foreground">{description}</p> : null}
     </div>

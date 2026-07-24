@@ -164,33 +164,15 @@ unsafe fn avx2_block_with_state(
     }
 
     let mut output = vec![0u8; input.len() + 64];
-    let mut dst = 0usize;
     let mut state = KernelState {
         state: initial_state,
         ..KernelState::body()
     };
-    let consumed = unsafe {
-        use std::arch::x86_64::*;
-        let a = _mm256_loadu_si256(input.as_ptr() as *const __m256i);
-        let b = _mm256_loadu_si256(input.as_ptr().add(32) as *const __m256i);
-        let specials = avx2_special_mask64(a, b);
-        try_decode_avx2_block(
-            a,
-            b,
-            specials,
-            input,
-            0,
-            &mut output,
-            &mut dst,
-            &mut state,
-            dot_unstuffing,
-            true,
-        )
-        .unwrap()
-    }
-    .expect("avx2 block should consume");
-    assert_eq!(consumed, 64);
-    output.truncate(dst);
+    let outcome =
+        unsafe { decode_kernel_avx2(input, &mut output, &mut state, dot_unstuffing, false, true) }
+            .expect("active avx2 kernel should decode");
+    assert_eq!(outcome.consumed, 64);
+    output.truncate(outcome.written);
     Some((output, state))
 }
 
@@ -1577,6 +1559,53 @@ fn dump_avx2_divergence() {
                 }
             }
         }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires an AVX2 CPU or Intel SDE"]
+fn avx2_active_kernel_required_matches_scalar() {
+    assert!(
+        is_x86_feature_detected!("avx2"),
+        "the AVX2-required lane must expose AVX2 instead of self-skipping"
+    );
+
+    let payload: Vec<u8> = (0..4096)
+        .map(|index| ((index * 31 + 17) & 0xff) as u8)
+        .collect();
+    let body = encoded_body_for(&payload, 128);
+    for hint in [None, Some(128u32), Some(64)] {
+        let mut reference = vec![0u8; body.len() + 64];
+        let mut reference_state = KernelState::body_with_line_length(hint);
+        let reference_outcome = decode_kernel_scalar(
+            &body,
+            &mut reference,
+            &mut reference_state,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+        reference.truncate(reference_outcome.written);
+
+        let mut output = vec![0u8; body.len() + 64];
+        let mut state = KernelState::body_with_line_length(hint);
+        let outcome =
+            unsafe { decode_kernel_avx2(&body, &mut output, &mut state, true, false, false) }
+                .unwrap();
+        output.truncate(outcome.written);
+
+        assert_eq!(
+            (output, outcome.consumed, outcome.end, state),
+            (
+                reference.clone(),
+                reference_outcome.consumed,
+                reference_outcome.end,
+                reference_state,
+            ),
+            "active AVX2 kernel hint={hint:?}"
+        );
     }
 }
 

@@ -43,7 +43,7 @@ export function DataTablePagination<TData>({
             table.setPageIndex(0);
           }}
         >
-          <SelectTrigger className="h-8 w-[92px]">
+          <SelectTrigger aria-label={rowsPerPageLabel} className="h-8 w-[92px]">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>

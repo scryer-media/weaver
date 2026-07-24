@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useId, type ReactNode } from "react";
 import { Sparkline } from "@/components/ui/sparkline";
 import { cn } from "@/lib/utils";
 
@@ -33,15 +33,21 @@ export function StatTile({
   size = "md",
   className,
 }: StatTileProps) {
+  const labelId = useId();
   return (
     <div
+      role="group"
+      aria-labelledby={labelId}
       className={cn(
         "rounded-card border border-border bg-card",
         size === "sm" ? "p-4" : "p-5",
         className,
       )}
     >
-      <div className="text-[10.5px] font-semibold uppercase tracking-[0.13em] text-muted-foreground">
+      <div
+        id={labelId}
+        className="text-[10.5px] font-semibold uppercase tracking-[0.13em] text-muted-foreground"
+      >
         {label}
       </div>
       <div className="mt-2.5 flex items-baseline gap-1.5">

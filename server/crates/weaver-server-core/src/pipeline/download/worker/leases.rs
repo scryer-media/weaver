@@ -256,13 +256,20 @@ impl Pipeline {
         pressure: DownloadPressure,
         refill: bool,
     ) -> DownloadBatchLease {
-        let work_limit = self.download_lane_lease_work_limit(
-            job_id,
-            lane_mode,
-            pressure,
-            refill,
-            first.byte_estimate,
-        );
+        // Rate reservations are activated after the lease is finalized. Keep
+        // limited leases single-work so every subsequent BODY refill observes
+        // the updated token balance instead of pre-leasing past the limit.
+        let work_limit = if self.rate_limiter.is_limited() {
+            1
+        } else {
+            self.download_lane_lease_work_limit(
+                job_id,
+                lane_mode,
+                pressure,
+                refill,
+                first.byte_estimate,
+            )
+        };
         let cap_for_restart_durable_lead = self.should_cap_lease_for_restart_durable_lead(job_id);
         let mut leased_undurable_bytes = if first.is_recovery {
             0

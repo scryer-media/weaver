@@ -113,6 +113,8 @@ async fn next_job_id_floor_target(datastore: &StoreDatastore) -> Result<u64, Sta
              SELECT MAX(job_id) AS id FROM job_history
              UNION ALL
              SELECT MAX(job_id) AS id FROM duplicate_job_snapshots
+             UNION ALL
+             SELECT MAX(job_id) AS id FROM forgotten_duplicate_identities
          ) ids",
         &[],
     )
@@ -135,6 +137,8 @@ async fn max_seen_job_id_floor_tx(tx: &mut SqlTx<'_>) -> Result<u64, StateError>
                  SELECT MAX(job_id) AS id FROM job_history
                  UNION ALL
                  SELECT MAX(job_id) AS id FROM duplicate_job_snapshots
+                 UNION ALL
+                 SELECT MAX(job_id) AS id FROM forgotten_duplicate_identities
              ) ids",
             &[],
         )

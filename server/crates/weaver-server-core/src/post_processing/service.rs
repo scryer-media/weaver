@@ -635,6 +635,7 @@ impl PostProcessingService {
                         result.exit_code,
                         result.error_message.clone(),
                         Some(super::persistence::encode_control_effects(&result.effects)?),
+                        result.output_truncated,
                         timestamp,
                     )?;
                     if let Some(directory) = result.effects.directory.as_ref() {
@@ -690,6 +691,7 @@ impl PostProcessingService {
                         None,
                         Some(error.to_string()),
                         None,
+                        false,
                         now_epoch_ms(),
                     )?;
                     let failure_summary = if step.outcome_impact() == OutcomeImpact::Warning {

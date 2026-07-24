@@ -429,6 +429,105 @@ fn omitted_selection_keeps_the_empty_plan_compatibility_contract() {
 }
 
 #[test]
+fn finishing_attempt_persists_and_preserves_output_truncation() {
+    let db = Database::open_in_memory().unwrap();
+    let manifest = manifest();
+    db.upsert_discovered_extension(&manifest, Some("/data/scripts/example"), 10)
+        .unwrap();
+    let revision = manifest.revision();
+    db.approve_extension_revision(
+        revision.extension_id(),
+        revision.revision_id(),
+        "/data/managed/blake3/aaaa",
+        20,
+    )
+    .unwrap();
+    let selection = SubmissionPlanSelection::extensions(vec![ExtensionSelection::pinned(
+        revision.extension_id().clone(),
+        revision.revision_id().clone(),
+    )])
+    .unwrap();
+    let plan = db
+        .resolve_post_processing_plan(Some(&selection), None)
+        .unwrap();
+    let create_running_attempt = |job_id, timestamp| {
+        let run_id = db
+            .create_post_processing_run(
+                job_id,
+                &plan,
+                &PipelineOutcome::Succeeded,
+                TerminalIntent::Complete,
+                None,
+                timestamp,
+            )
+            .unwrap();
+        let attempt_id = db
+            .enqueue_post_processing_attempt(
+                &run_id,
+                &plan.steps()[0],
+                manifest.adapter(),
+                None,
+                timestamp + 1,
+            )
+            .unwrap();
+        assert!(
+            db.mark_post_processing_attempt_starting(
+                &attempt_id,
+                &serde_json::json!({"program": "process.sh"}),
+                "/work/job",
+                timestamp + 2,
+            )
+            .unwrap()
+        );
+        assert!(
+            db.mark_post_processing_attempt_running(&attempt_id)
+                .unwrap()
+        );
+        (run_id, attempt_id)
+    };
+
+    let (runner_run_id, runner_attempt_id) = create_running_attempt(101, 30);
+    assert!(
+        db.finish_post_processing_attempt(
+            &runner_attempt_id,
+            AttemptStatus::Succeeded,
+            Some(0),
+            None,
+            None,
+            true,
+            40,
+        )
+        .unwrap()
+    );
+    assert!(db.post_processing_attempts(&runner_run_id).unwrap()[0].output_truncated);
+
+    let (streamed_run_id, streamed_attempt_id) = create_running_attempt(102, 50);
+    let line = vec![b'x'; super::persistence::MAX_LOGICAL_LINE_BYTES];
+    for offset in 0..66 {
+        db.append_post_processing_log(&streamed_attempt_id, LogStream::Stdout, &line, 60 + offset)
+            .unwrap();
+    }
+    assert!(
+        db.post_processing_logs(&streamed_attempt_id, None, 500)
+            .unwrap()
+            .truncated
+    );
+    assert!(
+        db.finish_post_processing_attempt(
+            &streamed_attempt_id,
+            AttemptStatus::Succeeded,
+            Some(0),
+            None,
+            None,
+            false,
+            130,
+        )
+        .unwrap()
+    );
+    assert!(db.post_processing_attempts(&streamed_run_id).unwrap()[0].output_truncated);
+}
+
+#[test]
 fn attempts_are_durable_bounded_and_interrupted_without_implicit_rerun() {
     let db = Database::open_in_memory().unwrap();
     let manifest = manifest();
@@ -557,6 +656,7 @@ fn attempts_are_durable_bounded_and_interrupted_without_implicit_rerun() {
             Some(0),
             None,
             Some(encode_control_effects(&expected_effects).unwrap()),
+            false,
             38,
         )
         .unwrap()

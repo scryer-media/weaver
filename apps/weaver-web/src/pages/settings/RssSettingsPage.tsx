@@ -421,7 +421,9 @@ export function RssSettingsPage() {
             >
               {syncTarget === "all" ? t("rss.syncing") : t("rss.runAllFeeds")}
             </Button>
-            <Button onClick={openAddFeed}>{t("rss.addFeed")}</Button>
+            <Button data-testid="rss-add-feed" onClick={openAddFeed}>
+              {t("rss.addFeed")}
+            </Button>
           </>
         }
       />
@@ -875,7 +877,12 @@ function RuleFormCard({
   }, [initialValues]);
 
   return (
-    <div className="rounded-inner border border-border bg-background/40 p-5">
+    <div
+      role="region"
+      aria-label={editing ? t("rss.editRule") : t("rss.addRule")}
+      data-testid="rss-rule-form"
+      className="rounded-inner border border-border bg-background/40 p-5"
+    >
       <div className="mb-4">
         <div className="font-space-grotesk text-base font-bold text-foreground">
           {editing ? t("rss.editRule") : t("rss.addRule")}
@@ -1109,9 +1116,13 @@ function SyncReportCard({ report }: { report: RssSyncReport }) {
         <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
           <DetailCard label={t("rss.feedsPolled")}>{report.feedsPolled}</DetailCard>
           <DetailCard label={t("rss.itemsFetched")}>{report.itemsFetched}</DetailCard>
-          <DetailCard label={t("rss.itemsNew")}>{report.itemsNew}</DetailCard>
+          <DetailCard label={t("rss.itemsNew")} testId="rss-sync-items-new">
+            {report.itemsNew}
+          </DetailCard>
           <DetailCard label={t("rss.itemsAccepted")}>{report.itemsAccepted}</DetailCard>
-          <DetailCard label={t("rss.itemsSubmitted")}>{report.itemsSubmitted}</DetailCard>
+          <DetailCard label={t("rss.itemsSubmitted")} testId="rss-sync-items-submitted">
+            {report.itemsSubmitted}
+          </DetailCard>
           <DetailCard label={t("rss.itemsIgnored")}>{report.itemsIgnored}</DetailCard>
         </div>
 
@@ -1120,6 +1131,8 @@ function SyncReportCard({ report }: { report: RssSyncReport }) {
             {report.feedResults.map((result) => (
               <div
                 key={result.feedId}
+                role="group"
+                aria-label={result.feedName}
                 className="rounded-inner border border-border bg-background/40 p-5"
               >
                 <div className="mb-3 text-sm font-semibold text-foreground">
@@ -1141,7 +1154,7 @@ function SyncReportCard({ report }: { report: RssSyncReport }) {
                   </DetailCard>
                 </div>
                 {result.errors.length > 0 ? (
-                  <div className="mt-3 space-y-1 text-sm text-destructive">
+                  <div role="alert" className="mt-3 space-y-1 text-sm text-destructive">
                     {result.errors.map((message) => (
                       <div key={message}>{message}</div>
                     ))}
@@ -1153,7 +1166,7 @@ function SyncReportCard({ report }: { report: RssSyncReport }) {
         ) : null}
 
         {report.errors.length > 0 ? (
-          <div className="space-y-1 text-sm text-destructive">
+          <div role="alert" className="space-y-1 text-sm text-destructive">
             {report.errors.map((message) => (
               <div key={message}>{message}</div>
             ))}
@@ -1193,6 +1206,8 @@ function SeenItemsCard({
           {items.slice(0, 8).map((item) => (
             <div
               key={`${item.feedId}:${item.itemId}`}
+              role="group"
+              aria-label={item.itemTitle}
               className="rounded-inner border border-border bg-card px-4 py-4"
             >
               <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
@@ -1360,12 +1375,14 @@ function Field({
 function DetailCard({
   label,
   children,
+  testId,
 }: {
   label: string;
   children: ReactNode;
+  testId?: string;
 }) {
   return (
-    <div className="rounded-inner border border-border bg-card px-3 py-3">
+    <div data-testid={testId} className="rounded-inner border border-border bg-card px-3 py-3">
       <div className="text-[10.5px] font-semibold uppercase tracking-[0.13em] text-muted-foreground">
         {label}
       </div>

@@ -472,7 +472,11 @@ export function LogViewerPage() {
             Clear
           </Button>
         </div>
-        <div className="flex items-center gap-1.5 text-[13px] text-muted-foreground sm:ml-auto">
+        <div
+          role="status"
+          aria-label="Log stream status"
+          className="flex items-center gap-1.5 text-[13px] text-muted-foreground sm:ml-auto"
+        >
           <span className={cn("size-2 rounded-pill", indicatorDotClass)} />
           {indicatorLabel}
         </div>

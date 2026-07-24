@@ -316,6 +316,7 @@ jobs:
                 run_sde "$bin" simd::tests::avx512_vbmi2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
                 run_sde "$bin" simd::tests::avx512_vbmi2_block_handles_dot_stuffed_line_start --exact --test-threads=1
                 run_sde "$bin" simd::tests::avx512_vbmi2_block_preserves_trailing_cr_state --exact --test-threads=1
+                run_sde "$bin" simd::tests::avx2_active_kernel_required_matches_scalar --ignored --exact --test-threads=1
                 run_sde "$bin" simd::tests::forced_tier_kernels_match_scalar_with_line_hints --exact --test-threads=1
                 run_sde "$bin" simd::tests::dispatch_kernel_matches_scalar_on_adversarial_streams --exact --test-threads=1
                 run_sde "$bin" simd::tests::dispatch_kernel_matches_scalar_across_chunk_splits --exact --test-threads=1

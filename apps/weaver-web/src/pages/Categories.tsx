@@ -121,7 +121,11 @@ export function Categories({ embedded = false }: { embedded?: boolean }) {
       <PageHeader
         title={t("categories.title")}
         description={embedded ? t("settings.categoriesDesc") : t("categories.emptyHint")}
-        actions={<Button onClick={openAdd}>{t("categories.addCategory")}</Button>}
+        actions={
+          <Button data-testid="add-category-button" onClick={openAdd}>
+            {t("categories.addCategory")}
+          </Button>
+        }
       />
 
       {showForm ? (
@@ -257,8 +261,9 @@ function CategoryFormCard({
     >
       <div className="space-y-5">
         <div className="grid gap-4 xl:grid-cols-3">
-          <Field label={t("categories.name")}>
+          <Field label={t("categories.name")} htmlFor="category-name">
             <Input
+              id="category-name"
               value={values.name}
               placeholder="Movies"
               onChange={(event) => setValues((current) => ({ ...current, name: event.target.value }))}
@@ -270,8 +275,13 @@ function CategoryFormCard({
               onChange={(destDir) => setValues((current) => ({ ...current, destDir }))}
             />
           </Field>
-          <Field label={t("categories.aliases")} description={t("categories.aliasesDesc")}>
+          <Field
+            label={t("categories.aliases")}
+            description={t("categories.aliasesDesc")}
+            htmlFor="category-aliases"
+          >
             <Input
+              id="category-aliases"
               value={values.aliases}
               placeholder="movie*, film*"
               onChange={(event) => setValues((current) => ({ ...current, aliases: event.target.value }))}
@@ -295,15 +305,17 @@ function CategoryFormCard({
 function Field({
   label,
   description,
+  htmlFor,
   children,
 }: {
   label: string;
   description?: string;
+  htmlFor?: string;
   children: ReactNode;
 }) {
   return (
     <div className="space-y-2">
-      <Label>{label}</Label>
+      <Label htmlFor={htmlFor}>{label}</Label>
       {children}
       {description ? <p className="text-xs text-muted-foreground">{description}</p> : null}
     </div>

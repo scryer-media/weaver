@@ -13,15 +13,15 @@ use sqlx::{Acquire, Column, Connection, Postgres, Row, Sqlite, TypeInfo, ValueRe
 
 use super::catalog::{
     BACKUP_TABLE_CATALOG, BackupTableClassification, catalog_tables, export_query,
-    is_engine_internal_table, quote_identifier,
+    is_engine_internal_table, is_optional_catalog_table, quote_identifier,
 };
 use crate::persistence::sql_runtime::StoreDatastore;
+use crate::security::RuntimeSecurityConfig;
 use crate::{Database, StateError};
 
 pub(crate) const EXPORT_BATCH_SIZE: i64 = 1_000;
 const BLOB_MARKER_TYPE: &str = "__weaver_type";
 const BLOB_MARKER_BASE64: &str = "base64";
-const MAX_NDJSON_LINE_BYTES: usize = 16 * 1024 * 1024;
 type NdjsonRow = Result<(usize, JsonMap<String, JsonValue>), StateError>;
 
 struct NdjsonRows {
@@ -29,6 +29,7 @@ struct NdjsonRows {
     display: String,
     line_number: usize,
     line: Vec<u8>,
+    line_limit: usize,
 }
 
 impl Iterator for NdjsonRows {
@@ -37,11 +38,10 @@ impl Iterator for NdjsonRows {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             self.line.clear();
-            let read =
-                match read_bounded_line(&mut self.reader, &mut self.line, MAX_NDJSON_LINE_BYTES) {
-                    Ok(read) => read,
-                    Err(error) => return Some(Err(error)),
-                };
+            let read = match read_bounded_line(&mut self.reader, &mut self.line, self.line_limit) {
+                Ok(read) => read,
+                Err(error) => return Some(Err(error)),
+            };
             if read == 0 {
                 return None;
             }
@@ -80,15 +80,9 @@ pub(crate) struct LogicalBackupExport {
     pub tables: BTreeMap<String, TablePartMetadata>,
 }
 
-#[derive(Default)]
-struct ExportScope {
-    history_jobs: BTreeSet<i64>,
-    terminal_runs: BTreeSet<String>,
-}
-
 impl Database {
     pub(crate) fn export_logical_backup(&self) -> Result<LogicalBackupExport, StateError> {
-        let staging = tempfile::tempdir().map_err(db_err)?;
+        let staging = super::create_backup_temp_dir().map_err(db_err)?;
         let tables_dir = staging.path().join("tables");
         std::fs::create_dir_all(&tables_dir).map_err(db_err)?;
         let schema_version = self.schema_version()?;
@@ -216,12 +210,11 @@ async fn export_sqlite(
         .await
         .map_err(db_err)?;
     let result = async {
-        let scope = load_sqlite_export_scope(&mut conn).await?;
         let tables =
             ordered_sqlite_tables(&mut conn, &actual, &[BackupTableClassification::Export]).await?;
         let mut parts = BTreeMap::new();
         for table in tables {
-            let part = export_sqlite_table(&mut conn, &table, tables_dir, &scope).await?;
+            let part = export_sqlite_table(&mut conn, &table, tables_dir).await?;
             parts.insert(table, part);
         }
         Ok::<_, StateError>(parts)
@@ -246,12 +239,11 @@ async fn export_postgres(
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-    let scope = load_postgres_export_scope(&mut tx).await?;
     let tables =
         ordered_postgres_tables(&mut tx, &actual, &[BackupTableClassification::Export]).await?;
     let mut parts = BTreeMap::new();
     for table in tables {
-        let part = export_postgres_table(&mut tx, &table, tables_dir, &scope).await?;
+        let part = export_postgres_table(&mut tx, &table, tables_dir).await?;
         parts.insert(table, part);
     }
     tx.rollback().await.map_err(db_err)?;
@@ -298,91 +290,38 @@ async fn validate_postgres_catalog(
 fn validate_actual_tables(actual: &BTreeSet<String>) -> Result<(), StateError> {
     let classified = BACKUP_TABLE_CATALOG
         .iter()
-        .map(|entry| entry.table)
+        .map(|entry| entry.table.to_string())
         .collect::<BTreeSet<_>>();
     if classified.len() != BACKUP_TABLE_CATALOG.len() {
         return Err(StateError::Database(
             "backup catalog classifies a table more than once".into(),
         ));
     }
-    let missing = actual
-        .iter()
-        .filter(|table| !classified.contains(table.as_str()))
+    let unclassified = actual.difference(&classified).cloned().collect::<Vec<_>>();
+    let nonexistent = classified
+        .difference(actual)
+        .filter(|table| !is_optional_catalog_table(table))
         .cloned()
         .collect::<Vec<_>>();
-    if missing.is_empty() {
+    if unclassified.is_empty() && nonexistent.is_empty() {
         Ok(())
     } else {
         Err(StateError::Database(format!(
-            "backup catalog is missing classifications for tables: {}",
-            missing.join(", ")
+            "backup catalog mismatch: unclassified [{}], nonexistent [{}]",
+            unclassified.join(", "),
+            nonexistent.join(", ")
         )))
     }
-}
-
-async fn load_sqlite_export_scope(
-    conn: &mut sqlx::SqliteConnection,
-) -> Result<ExportScope, StateError> {
-    let history_jobs = sqlx::query("SELECT job_id FROM job_history")
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(db_err)?
-        .into_iter()
-        .filter_map(|row| row.try_get::<i64, _>(0).ok())
-        .collect();
-    let terminal_runs = sqlx::query(
-        "SELECT run_id FROM post_processing_runs
-          WHERE job_id IN (SELECT job_id FROM job_history)
-            AND status IN ('succeeded', 'failed', 'skipped', 'cancelled', 'interrupted')",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(db_err)?
-    .into_iter()
-    .filter_map(|row| row.try_get::<String, _>(0).ok())
-    .collect();
-    Ok(ExportScope {
-        history_jobs,
-        terminal_runs,
-    })
-}
-
-async fn load_postgres_export_scope(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-) -> Result<ExportScope, StateError> {
-    let history_jobs = sqlx::query("SELECT job_id FROM job_history")
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(db_err)?
-        .into_iter()
-        .filter_map(|row| row.try_get::<i64, _>(0).ok())
-        .collect();
-    let terminal_runs = sqlx::query(
-        "SELECT run_id FROM post_processing_runs
-          WHERE job_id IN (SELECT job_id FROM job_history)
-            AND status IN ('succeeded', 'failed', 'skipped', 'cancelled', 'interrupted')",
-    )
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(db_err)?
-    .into_iter()
-    .filter_map(|row| row.try_get::<String, _>(0).ok())
-    .collect();
-    Ok(ExportScope {
-        history_jobs,
-        terminal_runs,
-    })
 }
 
 async fn export_sqlite_table(
     conn: &mut sqlx::SqliteConnection,
     table: &str,
     tables_dir: &Path,
-    scope: &ExportScope,
 ) -> Result<TablePartMetadata, StateError> {
     let columns = sqlite_table_columns(conn, table).await?;
     let order = sqlite_row_order(conn, table).await?;
-    let base = export_query(table);
+    let base = export_query(table, &columns);
     let query = format!("{base} ORDER BY {order} LIMIT ? OFFSET ?");
     let path = tables_dir.join(format!("{table}.ndjson"));
     let mut output = ExportTableWriter::new(&path)?;
@@ -399,7 +338,7 @@ async fn export_sqlite_table(
         }
         offset += i64::try_from(batch.len()).map_err(db_err)?;
         for row in batch {
-            output.write(table, encode_sqlite_row(&row)?, scope)?;
+            output.write(encode_sqlite_row(&row)?)?;
         }
     }
     output.finish(columns)
@@ -409,11 +348,10 @@ async fn export_postgres_table(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     table: &str,
     tables_dir: &Path,
-    scope: &ExportScope,
 ) -> Result<TablePartMetadata, StateError> {
     let columns = postgres_table_columns(tx, table).await?;
     let order = postgres_row_order(tx, table).await?;
-    let base = export_query(table);
+    let base = export_query(table, &columns);
     let query = format!("{base} ORDER BY {order} LIMIT $1 OFFSET $2");
     let path = tables_dir.join(format!("{table}.ndjson"));
     let mut output = ExportTableWriter::new(&path)?;
@@ -430,7 +368,7 @@ async fn export_postgres_table(
         }
         offset += i64::try_from(batch.len()).map_err(db_err)?;
         for row in batch {
-            output.write(table, encode_postgres_row(&row)?, scope)?;
+            output.write(encode_postgres_row(&row)?)?;
         }
     }
     output.finish(columns)
@@ -453,13 +391,7 @@ impl ExportTableWriter {
         })
     }
 
-    fn write(
-        &mut self,
-        table: &str,
-        mut value: JsonValue,
-        scope: &ExportScope,
-    ) -> Result<(), StateError> {
-        sanitize_export_row(table, &mut value, scope);
+    fn write(&mut self, value: JsonValue) -> Result<(), StateError> {
         self.line.clear();
         serde_json::to_writer(&mut self.line, &value).map_err(db_err)?;
         self.line.push(b'\n');
@@ -476,49 +408,6 @@ impl ExportTableWriter {
             columns,
             checksum: self.hasher.finalize().to_hex().to_string(),
         })
-    }
-}
-
-fn sanitize_export_row(table: &str, value: &mut JsonValue, scope: &ExportScope) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    match table {
-        "job_history" => {
-            let retained = object
-                .get("post_processing_run_id")
-                .and_then(JsonValue::as_str)
-                .is_some_and(|run| scope.terminal_runs.contains(run));
-            if !retained {
-                object.insert("post_processing_run_id".into(), JsonValue::Null);
-                object.insert(
-                    "post_processing_summary".into(),
-                    JsonValue::String("not_run".into()),
-                );
-            }
-        }
-        "post_processing_runs" => {
-            let retained = object
-                .get("rerun_of_run_id")
-                .and_then(JsonValue::as_str)
-                .is_some_and(|run| scope.terminal_runs.contains(run));
-            if !retained {
-                object.insert("rerun_of_run_id".into(), JsonValue::Null);
-            }
-        }
-        "rss_seen_items" => {
-            let retained = object
-                .get("job_id")
-                .and_then(JsonValue::as_i64)
-                .is_some_and(|job| scope.history_jobs.contains(&job));
-            if !retained {
-                object.insert("job_id".into(), JsonValue::Null);
-            }
-        }
-        "post_processing_extension_revisions" => {
-            object.insert("discovered_source_path".into(), JsonValue::Null);
-        }
-        _ => {}
     }
 }
 
@@ -589,6 +478,35 @@ async fn sqlite_table_columns(
         .map_err(db_err)?
         .into_iter()
         .map(|row| row.try_get("name").map_err(db_err))
+        .collect()
+}
+
+struct SqliteImportColumn {
+    name: String,
+    nullable: bool,
+    has_default: bool,
+}
+
+async fn sqlite_import_column_info(
+    conn: &mut sqlx::SqliteConnection,
+    table: &str,
+) -> Result<Vec<SqliteImportColumn>, StateError> {
+    let query = format!("PRAGMA table_info({})", quote_identifier(table));
+    sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db_err)?
+        .into_iter()
+        .map(|row| {
+            Ok(SqliteImportColumn {
+                name: row.try_get("name").map_err(db_err)?,
+                nullable: row.try_get::<i64, _>("notnull").map_err(db_err)? == 0,
+                has_default: row
+                    .try_get::<Option<String>, _>("dflt_value")
+                    .map_err(db_err)?
+                    .is_some(),
+            })
+        })
         .collect()
 }
 
@@ -792,7 +710,7 @@ async fn import_sqlite(
 ) -> Result<(), StateError> {
     let mut conn = pool.acquire().await.map_err(db_err)?;
     let actual = validate_sqlite_catalog(&mut conn).await?;
-    let mut clear = ordered_sqlite_tables(
+    let clear = ordered_sqlite_tables(
         &mut conn,
         &actual,
         &[
@@ -804,13 +722,8 @@ async fn import_sqlite(
     .await?;
     let export =
         ordered_sqlite_tables(&mut conn, &actual, &[BackupTableClassification::Export]).await?;
-    validate_manifest_tables(expected, &export, allow_older_catalog)?;
-    retain_restore_clear_tables(&mut clear, expected);
-    let import = export
-        .iter()
-        .filter(|table| expected.contains_key(*table))
-        .cloned()
-        .collect::<Vec<_>>();
+    validate_manifest_tables(expected, &export)?;
+    let import = export;
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut *conn)
         .await
@@ -837,6 +750,7 @@ async fn import_sqlite(
             )
             .await?;
         }
+        repair_sqlite_sequences(&mut conn).await?;
         let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
             .fetch_one(&mut *conn)
             .await
@@ -871,7 +785,7 @@ async fn import_postgres(
     let mut conn = pool.acquire().await.map_err(db_err)?;
     let actual = validate_postgres_catalog(&mut conn).await?;
     let mut tx = conn.begin().await.map_err(db_err)?;
-    let mut clear = ordered_postgres_tables(
+    let clear = ordered_postgres_tables(
         &mut tx,
         &actual,
         &[
@@ -883,13 +797,8 @@ async fn import_postgres(
     .await?;
     let export =
         ordered_postgres_tables(&mut tx, &actual, &[BackupTableClassification::Export]).await?;
-    validate_manifest_tables(expected, &export, allow_older_catalog)?;
-    retain_restore_clear_tables(&mut clear, expected);
-    let import = export
-        .iter()
-        .filter(|table| expected.contains_key(*table))
-        .cloned()
-        .collect::<Vec<_>>();
+    validate_manifest_tables(expected, &export)?;
+    let import = export;
     for table in clear.iter().rev() {
         let query = format!("DELETE FROM {}", quote_identifier(table));
         sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
@@ -897,31 +806,18 @@ async fn import_postgres(
             .await
             .map_err(db_err)?;
     }
-    let mut deferred_rerun_references = Vec::new();
     for table in &import {
-        deferred_rerun_references.extend(
-            import_postgres_table(
-                &mut tx,
-                table,
-                &tables_dir.join(format!("{table}.ndjson")),
-                expected.get(table).expect("validated import table"),
-                allow_older_catalog,
-            )
-            .await?,
-        );
-    }
-    for (run_id, rerun_of_run_id) in deferred_rerun_references {
-        sqlx::query(
-            "UPDATE post_processing_runs
-                SET rerun_of_run_id = $1
-              WHERE run_id = $2",
+        import_postgres_table(
+            &mut tx,
+            table,
+            &tables_dir.join(format!("{table}.ndjson")),
+            expected.get(table).expect("validated import table"),
+            allow_older_catalog,
         )
-        .bind(rerun_of_run_id)
-        .bind(run_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
+        .await?;
     }
+    restore_postgres_rerun_references(&mut tx, &tables_dir.join("post_processing_runs.ndjson"))
+        .await?;
     validate_postgres_counts(&mut tx, expected).await?;
     repair_postgres_sequences(&mut tx).await?;
     tx.commit().await.map_err(db_err)
@@ -930,13 +826,12 @@ async fn import_postgres(
 fn validate_manifest_tables(
     expected: &BTreeMap<String, TablePartMetadata>,
     export: &[String],
-    allow_older_catalog: bool,
 ) -> Result<(), StateError> {
     let expected = expected.keys().cloned().collect::<BTreeSet<_>>();
     let actual = export.iter().cloned().collect::<BTreeSet<_>>();
     let missing = actual.difference(&expected).cloned().collect::<Vec<_>>();
     let unexpected = expected.difference(&actual).cloned().collect::<Vec<_>>();
-    if unexpected.is_empty() && (missing.is_empty() || allow_older_catalog) {
+    if unexpected.is_empty() && missing.is_empty() {
         return Ok(());
     }
     Err(StateError::Database(format!(
@@ -946,14 +841,6 @@ fn validate_manifest_tables(
     )))
 }
 
-fn retain_restore_clear_tables(
-    tables: &mut Vec<String>,
-    expected: &BTreeMap<String, TablePartMetadata>,
-) {
-    let exported = catalog_tables(&[BackupTableClassification::Export]);
-    tables.retain(|table| !exported.contains(table) || expected.contains_key(table));
-}
-
 async fn import_sqlite_table(
     conn: &mut sqlx::SqliteConnection,
     table: &str,
@@ -961,9 +848,10 @@ async fn import_sqlite_table(
     source: &TablePartMetadata,
     allow_older_catalog: bool,
 ) -> Result<(), StateError> {
-    let target = sqlite_table_columns(conn, table)
-        .await?
-        .into_iter()
+    let target_columns = sqlite_import_column_info(conn, table).await?;
+    let target = target_columns
+        .iter()
+        .map(|column| column.name.clone())
         .collect::<BTreeSet<_>>();
     let unknown = source
         .columns
@@ -977,19 +865,18 @@ async fn import_sqlite_table(
             unknown.join(", ")
         )));
     }
-    if !allow_older_catalog {
-        let source_columns = source.columns.iter().collect::<BTreeSet<_>>();
-        let missing = target
-            .iter()
-            .filter(|column| !source_columns.contains(column))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return Err(StateError::Database(format!(
-                "backup table {table} is missing current source columns: {}",
-                missing.join(", ")
-            )));
-        }
+    let source_columns = source.columns.iter().collect::<BTreeSet<_>>();
+    let missing = target_columns
+        .iter()
+        .filter(|column| !source_columns.contains(&column.name))
+        .filter(|column| !allow_older_catalog || (!column.nullable && !column.has_default))
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(StateError::Database(format!(
+            "backup table {table} is missing required target columns: {}",
+            missing.join(", ")
+        )));
     }
     for row in read_ndjson_rows(path)? {
         let (line_number, object) = row?;
@@ -1034,7 +921,7 @@ async fn import_postgres_table(
     path: &Path,
     source: &TablePartMetadata,
     allow_older_catalog: bool,
-) -> Result<Vec<(String, String)>, StateError> {
+) -> Result<(), StateError> {
     let target = postgres_column_info(tx, table).await?;
     let target_names = target
         .iter()
@@ -1052,34 +939,30 @@ async fn import_postgres_table(
             unknown.join(", ")
         )));
     }
-    if !allow_older_catalog {
-        let source_columns = source
-            .columns
-            .iter()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
-        let missing = target
-            .iter()
-            .filter(|column| !source_columns.contains(column.name.as_str()))
-            .map(|column| column.name.clone())
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return Err(StateError::Database(format!(
-                "backup table {table} is missing current source columns: {}",
-                missing.join(", ")
-            )));
-        }
+    let source_columns = source
+        .columns
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let missing = target
+        .iter()
+        .filter(|column| !source_columns.contains(column.name.as_str()))
+        .filter(|column| !allow_older_catalog || (!column.nullable && !column.has_default))
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(StateError::Database(format!(
+            "backup table {table} is missing required target columns: {}",
+            missing.join(", ")
+        )));
     }
-    let mut deferred_rerun_references = Vec::new();
     for row in read_ndjson_rows(path)? {
         let (line_number, mut object) = row?;
         if table == "post_processing_runs"
-            && let (Some(run_id), Some(rerun_of_run_id)) = (
-                object.get("run_id").and_then(JsonValue::as_str),
-                object.get("rerun_of_run_id").and_then(JsonValue::as_str),
-            )
+            && object
+                .get("rerun_of_run_id")
+                .is_some_and(|value| !value.is_null())
         {
-            deferred_rerun_references.push((run_id.to_string(), rerun_of_run_id.to_string()));
             object.insert("rerun_of_run_id".into(), JsonValue::Null);
         }
         let columns = target
@@ -1120,7 +1003,40 @@ async fn import_postgres_table(
             ))
         })?;
     }
-    Ok(deferred_rerun_references)
+    Ok(())
+}
+
+async fn restore_postgres_rerun_references(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    path: &Path,
+) -> Result<(), StateError> {
+    for row in read_ndjson_rows(path)? {
+        let (line_number, object) = row?;
+        let Some(rerun_of_run_id) = object.get("rerun_of_run_id").and_then(JsonValue::as_str)
+        else {
+            continue;
+        };
+        let run_id = object
+            .get("run_id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                StateError::Database(format!(
+                    "backup post_processing_runs:{} has no run_id",
+                    line_number + 1
+                ))
+            })?;
+        sqlx::query(
+            "UPDATE post_processing_runs
+                SET rerun_of_run_id = $1
+              WHERE run_id = $2",
+        )
+        .bind(rerun_of_run_id)
+        .bind(run_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    }
+    Ok(())
 }
 
 fn read_ndjson_rows(path: &Path) -> Result<NdjsonRows, StateError> {
@@ -1130,7 +1046,15 @@ fn read_ndjson_rows(path: &Path) -> Result<NdjsonRows, StateError> {
         display: path.display().to_string(),
         line_number: 0,
         line: Vec::with_capacity(16 * 1024),
+        line_limit: backup_payload_limit(),
     })
+}
+
+fn backup_payload_limit() -> usize {
+    usize::try_from(
+        RuntimeSecurityConfig::from_env_or_default_for_tests().backup_upload_limit_bytes,
+    )
+    .unwrap_or(usize::MAX)
 }
 
 fn read_bounded_line<R: BufRead>(
@@ -1226,6 +1150,8 @@ fn blob_bytes(value: &JsonValue) -> Result<Vec<u8>, StateError> {
 struct PostgresColumn {
     name: String,
     kind: String,
+    nullable: bool,
+    has_default: bool,
 }
 
 async fn postgres_column_info(
@@ -1233,7 +1159,10 @@ async fn postgres_column_info(
     table: &str,
 ) -> Result<Vec<PostgresColumn>, StateError> {
     sqlx::query(
-        "SELECT column_name, udt_name FROM information_schema.columns
+        "SELECT column_name, udt_name,
+                is_nullable = 'YES' AS nullable,
+                column_default IS NOT NULL OR is_identity = 'YES' AS has_default
+           FROM information_schema.columns
           WHERE table_schema = current_schema() AND table_name = $1
           ORDER BY ordinal_position",
     )
@@ -1246,6 +1175,8 @@ async fn postgres_column_info(
         Ok(PostgresColumn {
             name: row.try_get("column_name").map_err(db_err)?,
             kind: row.try_get("udt_name").map_err(db_err)?,
+            nullable: row.try_get("nullable").map_err(db_err)?,
+            has_default: row.try_get("has_default").map_err(db_err)?,
         })
     })
     .collect()
@@ -1267,6 +1198,23 @@ fn postgres_cast(kind: &str) -> &'static str {
         "jsonb" => "::jsonb",
         _ => "",
     }
+}
+
+async fn repair_sqlite_sequences(conn: &mut sqlx::SqliteConnection) -> Result<(), StateError> {
+    let has_sequence_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+          WHERE type = 'table' AND name = 'sqlite_sequence'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    if has_sequence_table != 0 {
+        sqlx::query("DELETE FROM sqlite_sequence")
+            .execute(&mut *conn)
+            .await
+            .map_err(db_err)?;
+    }
+    Ok(())
 }
 
 async fn validate_sqlite_counts(
@@ -1377,9 +1325,10 @@ pub(crate) fn verify_table_parts(
         let mut hasher = blake3::Hasher::new();
         let mut rows = 0_u64;
         let mut buffer = Vec::new();
+        let line_limit = backup_payload_limit();
         loop {
             buffer.clear();
-            let read = read_bounded_line(&mut reader, &mut buffer, MAX_NDJSON_LINE_BYTES)?;
+            let read = read_bounded_line(&mut reader, &mut buffer, line_limit)?;
             if read == 0 {
                 break;
             }
@@ -1412,13 +1361,31 @@ pub(crate) fn read_table_objects(
     root: &Path,
     table: &str,
 ) -> Result<Vec<JsonMap<String, JsonValue>>, StateError> {
+    let mut rows = Vec::new();
+    visit_table_objects(root, table, |row| {
+        rows.push(row);
+        Ok(())
+    })?;
+    Ok(rows)
+}
+
+pub(crate) fn visit_table_objects<F>(
+    root: &Path,
+    table: &str,
+    mut visit: F,
+) -> Result<(), StateError>
+where
+    F: FnMut(JsonMap<String, JsonValue>) -> Result<(), StateError>,
+{
     let path = root.join("tables").join(format!("{table}.ndjson"));
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    read_ndjson_rows(&path)?
-        .map(|row| row.map(|(_, object)| object))
-        .collect()
+    for row in read_ndjson_rows(&path)? {
+        let (_, row) = row?;
+        visit(row)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn rewrite_table_objects<F>(
@@ -1564,6 +1531,16 @@ mod logical_reader_tests {
     use super::*;
 
     #[test]
+    fn restore_manifest_requires_the_complete_export_catalog() {
+        let expected = BTreeMap::from([("settings".to_string(), TablePartMetadata::default())]);
+        let export = vec!["settings".to_string(), "servers".to_string()];
+
+        let error = validate_manifest_tables(&expected, &export).unwrap_err();
+
+        assert!(error.to_string().contains("missing [servers]"));
+    }
+
+    #[test]
     fn bounded_line_reader_rejects_before_buffering_an_oversized_row() {
         let mut reader = BufReader::new(std::io::Cursor::new(vec![b'x'; 9]));
         let mut line = Vec::new();
@@ -1572,5 +1549,95 @@ mod logical_reader_tests {
 
         assert!(error.to_string().contains("exceeds 8 bytes"));
         assert!(line.is_empty());
+    }
+
+    #[tokio::test]
+    async fn older_schema_rows_only_omit_nullable_or_defaulted_columns() {
+        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE rejected (
+                id INTEGER PRIMARY KEY,
+                optional TEXT,
+                defaulted TEXT NOT NULL DEFAULT 'default',
+                required TEXT NOT NULL
+             );
+             CREATE TABLE accepted (
+                id INTEGER PRIMARY KEY,
+                optional TEXT,
+                defaulted TEXT NOT NULL DEFAULT 'default'
+             );",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let row_path = root.path().join("rows.ndjson");
+        std::fs::write(&row_path, b"{\"id\":1}\n").unwrap();
+        let metadata = TablePartMetadata {
+            rows: 1,
+            columns: vec!["id".into()],
+            checksum: String::new(),
+        };
+
+        let error = import_sqlite_table(&mut conn, "rejected", &row_path, &metadata, true)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("required target columns: required")
+        );
+
+        import_sqlite_table(&mut conn, "accepted", &row_path, &metadata, true)
+            .await
+            .unwrap();
+        let restored: (Option<String>, String) =
+            sqlx::query_as("SELECT optional, defaulted FROM accepted WHERE id = 1")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(restored, (None, "default".into()));
+    }
+
+    #[tokio::test]
+    async fn sqlite_sequence_repair_uses_the_restored_row_floor() {
+        let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE sequenced (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                value TEXT NOT NULL
+             )",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO sequenced (id, value) VALUES (100, 'old')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM sequenced")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO sequenced (id, value) VALUES (7, 'restored')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        repair_sqlite_sequences(&mut conn).await.unwrap();
+        sqlx::query("INSERT INTO sequenced (value) VALUES ('next')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let next: i64 = sqlx::query_scalar("SELECT id FROM sequenced WHERE value = 'next'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(next, 8);
     }
 }

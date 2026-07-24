@@ -314,17 +314,12 @@ fn list_pending_migrations_from_applied(
     applied: &[MigrationLedgerRow],
     catalog: &CompiledMigrationCatalog,
 ) -> Vec<String> {
-    let applied_versions: HashSet<i64> = applied
-        .iter()
-        .filter(|row| row.success)
-        .map(|row| row.version)
-        .collect();
-    catalog
-        .migrations
-        .iter()
-        .filter(|migration| !applied_versions.contains(&migration.version))
-        .map(|migration| migration.key.clone())
-        .collect()
+    catalog.pending_keys(
+        applied
+            .iter()
+            .filter(|row| row.success)
+            .map(|row| row.version),
+    )
 }
 
 fn validate_known_migrations(

@@ -588,10 +588,13 @@ export function PostProcessingSettingsPage() {
         <div className="space-y-5">
           <div className="flex items-center justify-between gap-4">
             <div>
-              <Label>Discover packages in the data-directory scripts folder</Label>
+              <Label htmlFor="pp-discovery-enabled">
+                Discover packages in the data-directory scripts folder
+              </Label>
               <p className="text-sm text-muted-foreground">Disabled by default after upgrades.</p>
             </div>
             <Switch
+              id="pp-discovery-enabled"
               checked={settings.discoveryEnabled}
               onCheckedChange={(checked) =>
                 setSettings((current) => ({ ...current, discoveryEnabled: checked }))
@@ -600,12 +603,15 @@ export function PostProcessingSettingsPage() {
           </div>
           <div className="flex items-center justify-between gap-4">
             <div>
-              <Label>Execute approved post-processing plans</Label>
+              <Label htmlFor="pp-execution-enabled">
+                Execute approved post-processing plans
+              </Label>
               <p className="text-sm text-muted-foreground">
                 Existing jobs retain their frozen revision and options.
               </p>
             </div>
             <Switch
+              id="pp-execution-enabled"
               checked={settings.executionEnabled}
               onCheckedChange={(checked) =>
                 setSettings((current) => ({ ...current, executionEnabled: checked }))
@@ -617,10 +623,11 @@ export function PostProcessingSettingsPage() {
           ] as const).map(([field, label, description]) => (
             <div className="flex items-center justify-between gap-4" key={field}>
               <div>
-                <Label>{label}</Label>
+                <Label htmlFor={`pp-${field}`}>{label}</Label>
                 <p className="text-sm text-muted-foreground">{description}</p>
               </div>
               <Switch
+                id={`pp-${field}`}
                 checked={settings[field]}
                 onCheckedChange={(checked) =>
                   setSettings((current) => ({ ...current, [field]: checked }))
@@ -711,6 +718,8 @@ export function PostProcessingSettingsPage() {
             revisions.map((revision) => (
               <div
                 key={`${revision.extensionId}:${revision.revisionId}`}
+                role="group"
+                aria-label={`Extension revision ${revision.displayName} ${revision.declaredVersion} ${revision.revisionId}`}
                 className="flex flex-col gap-3 rounded-md border border-border/70 p-4 md:flex-row md:items-center md:justify-between"
               >
                 <div className="min-w-0">
@@ -799,7 +808,11 @@ export function PostProcessingSettingsPage() {
 
             <div className="mt-5 space-y-4">
               {steps.map((step, index) => (
-                <div key={`${index}:${step.extensionId}:${step.revisionId}`} className="rounded-md border p-4">
+                <div
+                  key={`${index}:${step.extensionId}:${step.revisionId}`}
+                  data-testid={`pp-profile-step-${index}`}
+                  className="rounded-md border p-4"
+                >
                   <div className="mb-4 flex items-center justify-between">
                     <span className="font-medium">Step {index + 1}</span>
                     <div className="flex gap-2">
@@ -925,8 +938,9 @@ export function PostProcessingSettingsPage() {
                       />
                     </div>
                     <div className="space-y-2 md:col-span-2 lg:col-span-3">
-                      <Label>Options JSON</Label>
+                      <Label htmlFor={`pp-profile-step-${index}-options`}>Options JSON</Label>
                       <textarea
+                        id={`pp-profile-step-${index}-options`}
                         className="min-h-24 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm"
                         value={step.options}
                         onChange={(event) => updateStep(index, { options: event.target.value })}
@@ -955,9 +969,9 @@ export function PostProcessingSettingsPage() {
       >
         <div className="grid gap-5 md:grid-cols-2">
           <div className="space-y-3">
-            <Label>Global default</Label>
+            <Label htmlFor="pp-global-profile">Global default</Label>
             <Select value={globalProfileId} onValueChange={setGlobalProfileId}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectTrigger id="pp-global-profile"><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="__none__">No global default</SelectItem>
                 {profiles.map((profile) => (
@@ -970,8 +984,9 @@ export function PostProcessingSettingsPage() {
           <div className="space-y-3">
             <Label htmlFor="pp-category">Category assignment</Label>
             <Input id="pp-category" value={category} onChange={(event) => setCategory(event.target.value)} placeholder="movies" />
+            <Label htmlFor="pp-category-profile">Category profile</Label>
             <Select value={assignmentProfileId} onValueChange={setAssignmentProfileId}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectTrigger id="pp-category-profile"><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="__none__">Inherit global default</SelectItem>
                 {profiles.map((profile) => (
@@ -1003,11 +1018,14 @@ export function PostProcessingSettingsPage() {
           {queueRuns.length === 0 ? (
             <p className="text-sm text-muted-foreground">No queued or active extension runs.</p>
           ) : (
-            queueRuns.map((run) => (
-              <div
-                key={run.runId}
-                className="flex flex-col gap-3 rounded-md border p-4 md:flex-row md:items-center md:justify-between"
-              >
+            <div role="list" aria-label="Post-processing queue" className="space-y-3">
+              {queueRuns.map((run) => (
+                <div
+                  key={run.runId}
+                  role="listitem"
+                  aria-label={`Post-processing queue job ${run.jobId}`}
+                  className="flex flex-col gap-3 rounded-md border p-4 md:flex-row md:items-center md:justify-between"
+                >
                 <div>
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="font-medium">Job {run.jobId}</span>
@@ -1048,8 +1066,9 @@ export function PostProcessingSettingsPage() {
                     Cancel attempt
                   </Button>
                 </div>
-              </div>
-            ))
+                </div>
+              ))}
+            </div>
           )}
         </div>
       </SectionCard>
@@ -1061,24 +1080,33 @@ export function PostProcessingSettingsPage() {
         <div className="space-y-5">
           <div className="flex max-w-md gap-2">
             <Input
+              aria-label="Job ID"
               value={jobIdInput}
               onChange={(event) => setJobIdInput(event.target.value)}
               placeholder="Job ID"
               inputMode="numeric"
             />
-            <Button onClick={() => inspectJob()}>Inspect</Button>
+            <Button aria-label="Inspect job plan" onClick={() => inspectJob()}>Inspect</Button>
           </div>
 
           {inspectedJobId !== null ? (
             <>
-              <div className="rounded-md border p-4">
+              <div
+                role="region"
+                aria-label={`Frozen plan for job ${inspectedJobId}`}
+                className="rounded-md border p-4"
+              >
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <h3 className="font-medium">Frozen plan for job {inspectedJobId}</h3>
                   <Badge variant="outline">
                     {jobData?.postProcessingJobPlan ? "FROZEN" : "NO PLAN"}
                   </Badge>
                 </div>
-                <pre className="mt-3 max-h-72 overflow-auto rounded-md bg-muted/40 p-3 text-xs">
+                <pre
+                  role="region"
+                  aria-label="Frozen plan definition"
+                  className="mt-3 max-h-72 overflow-auto rounded-md bg-muted/40 p-3 text-xs"
+                >
                   {JSON.stringify(jobData?.postProcessingJobPlan?.definition ?? null, null, 2)}
                 </pre>
               </div>
@@ -1087,14 +1115,14 @@ export function PostProcessingSettingsPage() {
                 <h3 className="font-medium">Replace selection before execution starts</h3>
                 <div className="mt-4 grid gap-4 md:grid-cols-2">
                   <div className="space-y-2">
-                    <Label>Selection mode</Label>
+                    <Label htmlFor="pp-job-selection-mode">Selection mode</Label>
                     <Select
                       value={jobSelectionMode}
                       onValueChange={(value) =>
                         setJobSelectionMode(value as typeof jobSelectionMode)
                       }
                     >
-                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectTrigger id="pp-job-selection-mode"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="INHERIT">Inherit category/global default</SelectItem>
                         <SelectItem value="DISABLED">Disable for this job</SelectItem>
@@ -1105,9 +1133,11 @@ export function PostProcessingSettingsPage() {
                   </div>
                   {jobSelectionMode === "PROFILE" ? (
                     <div className="space-y-2">
-                      <Label>Profile</Label>
+                      <Label htmlFor="pp-job-selection-profile">Profile</Label>
                       <Select value={jobSelectionProfileId} onValueChange={setJobSelectionProfileId}>
-                        <SelectTrigger><SelectValue placeholder="Select profile" /></SelectTrigger>
+                        <SelectTrigger id="pp-job-selection-profile">
+                          <SelectValue placeholder="Select profile" />
+                        </SelectTrigger>
                         <SelectContent>
                           <SelectItem value="__none__">Select profile</SelectItem>
                           {profiles.map((profile) => (
@@ -1137,7 +1167,7 @@ export function PostProcessingSettingsPage() {
               </div>
 
               <div className="grid gap-5 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-                <div className="space-y-3">
+                <div role="region" aria-label="Post-processing runs" className="space-y-3">
                   <h3 className="font-medium">Runs</h3>
                   {(jobData?.postProcessingRuns ?? []).length === 0 ? (
                     <p className="text-sm text-muted-foreground">No post-processing runs recorded.</p>
@@ -1146,6 +1176,7 @@ export function PostProcessingSettingsPage() {
                       <button
                         type="button"
                         key={run.runId}
+                        aria-label={`Post-processing run ${run.runId} ${run.status}`}
                         onClick={() => {
                           setSelectedRunId(run.runId);
                           setSelectedAttemptId("");
@@ -1228,7 +1259,11 @@ export function PostProcessingSettingsPage() {
                       {selectedAttempt.attemptId}
                     </span>
                   </div>
-                  <pre className="mt-3 max-h-[32rem] overflow-auto whitespace-pre-wrap rounded-md bg-black/90 p-4 text-xs text-white">
+                  <pre
+                    role="log"
+                    aria-label="Redacted bounded log output"
+                    className="mt-3 max-h-[32rem] overflow-auto whitespace-pre-wrap rounded-md bg-black/90 p-4 text-xs text-white"
+                  >
                     {(logsData?.postProcessingLogs.chunks ?? [])
                       .map((chunk) => `[${chunk.stream}] ${chunk.text}`)
                       .join("") || "No log output."}

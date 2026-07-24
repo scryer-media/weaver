@@ -2287,12 +2287,11 @@ async fn postgres_runtime_smoke_when_configured() {
     assert_eq!(db.server_download_usage(7).unwrap(), None);
 
     let backup_path = tempfile::NamedTempFile::new().unwrap();
-    let backup_error = db.export_stable_state(backup_path.path()).unwrap_err();
-    assert!(
-        backup_error
-            .to_string()
-            .contains("requires sqlite datastore")
-    );
+    let backup = db.export_stable_state(backup_path.path()).unwrap();
+    assert_eq!(backup.max_job_id, job_id.0);
+    let portable = Database::open(backup_path.path()).unwrap();
+    assert!(portable.get_job_history(job_id.0).unwrap().is_some());
+    drop(portable);
 
     drop(db);
     execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
@@ -2421,6 +2420,13 @@ async fn postgres_post_processing_roundtrip_when_configured() {
         70,
     )
     .unwrap();
+    execute(
+        &db,
+        "UPDATE post_processing_attempts
+            SET output_truncated = TRUE
+          WHERE attempt_id = {}",
+        vec![SqlArg::Text(attempt_id.as_str().to_string())],
+    );
     assert!(
         db.finish_post_processing_attempt(
             &attempt_id,
@@ -2428,6 +2434,7 @@ async fn postgres_post_processing_roundtrip_when_configured() {
             Some(0),
             None,
             None,
+            false,
             80,
         )
         .unwrap()
@@ -2453,6 +2460,7 @@ async fn postgres_post_processing_roundtrip_when_configured() {
         attempts[0].status,
         crate::post_processing::model::AttemptStatus::Succeeded
     );
+    assert!(attempts[0].output_truncated);
     let logs = db.post_processing_logs(&attempt_id, None, 10).unwrap();
     assert_eq!(logs.chunks.len(), 1);
     assert_eq!(logs.chunks[0].payload, b"postgres-log");

@@ -198,6 +198,8 @@ export function DirectoryBrowserDialog({
 
           <div className="flex min-w-0 flex-col gap-2 sm:flex-row">
             <Input
+              id="directory-browser-path"
+              aria-label={t("categories.directoryBrowserPath")}
               value={currentPath}
               onChange={(event) => setCurrentPath(event.target.value)}
               disabled={isBusy}

@@ -1,11 +1,12 @@
 use super::*;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
 use crate::JobHistoryRow;
 use crate::categories::CategoryConfig;
 use crate::operations::backup::manifest::BackupInstanceSecrets;
-use crate::persistence::sql_runtime::StoreDatastore;
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, StoreDatastore};
 use crate::post_processing::discovery::{
     DiscoveryOptions, approve_discovered_extension, discover_and_record_extensions, hash_package,
 };
@@ -63,6 +64,27 @@ fn query_count(db: &Database, table: &'static str) -> i64 {
             .fetch_one(&mut *connection)
             .await
             .map_err(|error| crate::StateError::Database(error.to_string()))
+    })
+    .unwrap()
+}
+
+fn history_post_processing_state(db: &Database, job_id: u64) -> (String, Option<String>) {
+    let job_id = i64::try_from(job_id).expect("test job ID fits in i64");
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        let row = SqlRuntime::fetch_optional(
+            datastore.read_exec(),
+            "SELECT post_processing_summary, post_processing_run_id
+               FROM job_history
+              WHERE job_id = {}",
+            &[SqlArg::I64(job_id)],
+        )
+        .await?
+        .ok_or_else(|| crate::StateError::Database("history row is missing".into()))?;
+        Ok((
+            row.text("post_processing_summary")?,
+            row.opt_text("post_processing_run_id")?,
+        ))
     })
     .unwrap()
 }
@@ -312,6 +334,119 @@ async fn password_protected_backup_roundtrip_inspects() {
 }
 
 #[tokio::test]
+async fn logical_v2_postgres_source_restores_to_sqlite_and_postgres() {
+    let Some((source_db, admin, schema)) =
+        open_postgres_backup_test_db("logical_postgres_source").await
+    else {
+        return;
+    };
+    populate_source_db(&source_db);
+    let (source_service, _, _) = build_service(source_db.clone(), sample_config());
+    let artifact = source_service
+        .create_backup(Some("cross-engine-secret".into()))
+        .await
+        .unwrap();
+    let inspect = source_service
+        .inspect_backup(&artifact.path, Some("cross-engine-secret".into()))
+        .await
+        .unwrap();
+    assert_eq!(inspect.manifest.source_engine, "postgres");
+
+    let target_root = tempfile::tempdir().unwrap();
+    let target_db = open_temp_db();
+    let mut target_config = sample_config();
+    target_config.data_dir = target_root.path().to_string_lossy().into_owned();
+    let (target_service, _, _) = build_service(target_db.clone(), target_config);
+    target_service
+        .restore_backup(
+            &artifact.path,
+            Some("cross-engine-secret".into()),
+            RestoreOptions {
+                data_dir: target_root.path().to_string_lossy().into_owned(),
+                intermediate_dir: None,
+                complete_dir: None,
+                category_remaps: vec![CategoryRemapInput {
+                    category_name: "movies".into(),
+                    new_dest_dir: target_root
+                        .path()
+                        .join("complete/movies")
+                        .to_string_lossy()
+                        .into_owned(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    drop(target_service);
+    let (restored, outcome) = apply_pending_restore(target_db, target_root.path()).unwrap();
+    assert!(outcome.is_some());
+    assert_eq!(
+        restored.get_job_history(41).unwrap().unwrap().output_dir,
+        Some(
+            target_root
+                .path()
+                .join("complete/tv/fixture")
+                .to_string_lossy()
+                .into_owned()
+        )
+    );
+
+    let Some((postgres_target, target_admin, target_schema)) =
+        open_postgres_backup_test_db("logical_postgres_target").await
+    else {
+        panic!("PostgreSQL source was available but a target schema could not be created");
+    };
+    let postgres_root = tempfile::tempdir().unwrap();
+    let mut postgres_config = sample_config();
+    postgres_config.data_dir = postgres_root.path().to_string_lossy().into_owned();
+    let (postgres_service, _, _) = build_service(postgres_target.clone(), postgres_config);
+    postgres_service
+        .restore_backup(
+            &artifact.path,
+            Some("cross-engine-secret".into()),
+            RestoreOptions {
+                data_dir: postgres_root.path().to_string_lossy().into_owned(),
+                intermediate_dir: None,
+                complete_dir: None,
+                category_remaps: vec![CategoryRemapInput {
+                    category_name: "movies".into(),
+                    new_dest_dir: postgres_root
+                        .path()
+                        .join("complete/movies")
+                        .to_string_lossy()
+                        .into_owned(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    drop(postgres_service);
+    let (postgres_restored, outcome) =
+        apply_pending_restore(postgres_target, postgres_root.path()).unwrap();
+    assert!(outcome.is_some());
+    assert_eq!(
+        postgres_restored
+            .get_job_history(41)
+            .unwrap()
+            .unwrap()
+            .output_dir,
+        Some(
+            postgres_root
+                .path()
+                .join("complete/tv/fixture")
+                .to_string_lossy()
+                .into_owned()
+        )
+    );
+    drop(postgres_restored);
+    drop_postgres_backup_test_schema(target_admin, target_schema).await;
+
+    drop(source_service);
+    drop(source_db);
+    drop_postgres_backup_test_schema(admin, schema).await;
+}
+
+#[tokio::test]
 async fn logical_backup_rejects_a_master_key_that_cannot_decrypt_its_data() {
     let mut source_db = open_temp_db();
     source_db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
@@ -401,7 +536,7 @@ async fn logical_backup_preserves_only_terminal_duplicate_identity_graphs() {
              VALUES (1, 'group', 1, 1)",
             "INSERT INTO semantic_duplicate_candidates
                 (job_id, group_id, score, candidate_state, created_at, updated_at)
-             VALUES (20001, 1, 100, 'nonblocking', 1, 1)",
+             VALUES (20001, 1, 100, 'active', 1, 1)",
             "INSERT INTO semantic_duplicate_candidates
                 (job_id, group_id, score, candidate_state, created_at, updated_at)
              VALUES (20002, 1, 90, 'active', 1, 1)",
@@ -572,6 +707,7 @@ async fn encrypted_v2_backup_restores_managed_packages_under_the_target_data_dir
             Some(0),
             None,
             None,
+            false,
             35,
         )
         .unwrap();
@@ -692,7 +828,11 @@ async fn encrypted_v2_backup_restores_managed_packages_under_the_target_data_dir
         restored_plan.steps()[0].approved_roots().as_slice()[0].as_str(),
         expected_approved_root
     );
-    assert!(target_db.post_processing_run(&run_id).unwrap().is_some());
+    let restored_run = target_db.post_processing_run(&run_id).unwrap().unwrap();
+    assert_eq!(
+        restored_run.plan.steps()[0].approved_roots().as_slice()[0].as_str(),
+        expected_approved_root
+    );
     assert!(
         target_db
             .post_processing_run(&queued_run_id)
@@ -785,7 +925,11 @@ async fn encrypted_v2_backup_restores_managed_packages_under_the_target_data_dir
                 .unwrap()
                 .is_some()
         );
-        assert!(postgres_db.post_processing_run(&run_id).unwrap().is_some());
+        let restored_run = postgres_db.post_processing_run(&run_id).unwrap().unwrap();
+        assert_eq!(
+            restored_run.plan.steps()[0].approved_roots().as_slice()[0].as_str(),
+            postgres_root.path().join("approved").to_string_lossy()
+        );
         assert!(
             postgres_db
                 .post_processing_run(&queued_run_id)
@@ -945,6 +1089,14 @@ async fn legacy_v1_restore_skips_post_processing_state_and_reports_a_warning() {
     let source_root = tempfile::tempdir().unwrap();
     let source_db = open_temp_db();
     populate_source_db(&source_db);
+    execute_sql(
+        &source_db,
+        vec![
+            "UPDATE job_history
+                SET post_processing_summary = 'succeeded',
+                    post_processing_run_id = 'legacy-run'",
+        ],
+    );
     let source_config = sample_config();
     source_db.save_config(&source_config).unwrap();
     add_managed_extension(&source_db, source_root.path());
@@ -1004,6 +1156,10 @@ async fn legacy_v1_restore_skips_post_processing_state_and_reports_a_warning() {
     target_db = restored_target_db;
     outcome.unwrap();
     assert!(target_db.list_extension_revisions().unwrap().is_empty());
+    assert_eq!(
+        history_post_processing_state(&target_db, 41),
+        ("not_run".into(), None)
+    );
     let restored_history = target_db
         .list_job_history(&HistoryFilter::default())
         .unwrap();
@@ -1017,6 +1173,45 @@ async fn legacy_v1_restore_skips_post_processing_state_and_reports_a_warning() {
                 .as_ref()
         )
     );
+
+    if let Some((postgres_target, admin, schema)) =
+        open_postgres_backup_test_db("legacy_post_processing_reset").await
+    {
+        let postgres_root = tempfile::tempdir().unwrap();
+        let mut postgres_config = sample_config();
+        postgres_config.data_dir = postgres_root.path().to_string_lossy().into_owned();
+        let (postgres_service, _, _) = build_service(postgres_target.clone(), postgres_config);
+        postgres_service
+            .restore_backup(
+                &encrypted_archive_path,
+                Some("legacy-secret".into()),
+                RestoreOptions {
+                    data_dir: postgres_root.path().to_string_lossy().into_owned(),
+                    intermediate_dir: None,
+                    complete_dir: None,
+                    category_remaps: vec![CategoryRemapInput {
+                        category_name: "movies".into(),
+                        new_dest_dir: postgres_root
+                            .path()
+                            .join("complete/movies")
+                            .to_string_lossy()
+                            .into_owned(),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        drop(postgres_service);
+        let (postgres_restored, outcome) =
+            apply_pending_restore(postgres_target, postgres_root.path()).unwrap();
+        assert!(outcome.is_some());
+        assert_eq!(
+            history_post_processing_state(&postgres_restored, 41),
+            ("not_run".into(), None)
+        );
+        drop(postgres_restored);
+        drop_postgres_backup_test_schema(admin, schema).await;
+    }
 }
 
 #[tokio::test]
@@ -1046,6 +1241,41 @@ async fn plaintext_archive_cannot_claim_the_bundle_v2_format() {
 }
 
 #[tokio::test]
+async fn legacy_plaintext_archive_rejects_trailing_bytes() {
+    use std::io::Write as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let source_db = Database::open(&root.path().join("source.db")).unwrap();
+    source_db.save_config(&sample_config()).unwrap();
+    let exported_db = root.path().join("backup.db");
+    source_db.export_stable_state(&exported_db).unwrap();
+    let manifest: BackupManifest = serde_json::from_slice(&plain_test_manifest()).unwrap();
+    let archive_path = root.path().join("legacy-trailing.tar.zst");
+    archive::write_plain_archive(&archive_path, &manifest, &exported_db, &[]).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&archive_path)
+        .unwrap()
+        .write_all(b"undeclared trailing bytes")
+        .unwrap();
+
+    let target_db = open_temp_db();
+    let (service, _, _) = build_service(target_db, sample_config());
+    let error = service
+        .inspect_backup(&archive_path, None)
+        .await
+        .unwrap_err();
+
+    let message = error.to_string();
+    assert!(
+        message.contains("zstd")
+            || message.contains("frame")
+            || message.contains("Unknown frame descriptor"),
+        "unexpected trailing-data error: {message}"
+    );
+}
+
+#[tokio::test]
 async fn new_backup_requires_a_nonblank_password() {
     let source_db = open_temp_db();
     populate_source_db(&source_db);
@@ -1059,6 +1289,96 @@ async fn new_backup_requires_a_nonblank_password() {
         service.create_backup(Some("   ".into())).await,
         Err(BackupServiceError::PasswordRequired)
     ));
+}
+
+/// The SQLite export reads through one read-only snapshot transaction on the
+/// live WAL database instead of a `VACUUM INTO` copy. This pins the property
+/// that decision relies on: rows committed while the export is running must
+/// not appear partially, so every exported `job_events` row still references
+/// an exported `job_history` job.
+#[tokio::test]
+async fn sqlite_export_snapshot_stays_closed_while_history_grows_concurrently() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(&root.path().join("source.db")).unwrap();
+    populate_source_db(&db);
+    for sequence in 0..500_i64 {
+        db.insert_job_event(41, sequence, "DownloadStarted", "seed event", None)
+            .unwrap();
+    }
+
+    let stop = StdArc::new(AtomicBool::new(false));
+    let writer_stop = StdArc::clone(&stop);
+    let writer_db = db.clone();
+    let writer = std::thread::spawn(move || {
+        let mut inserted = 0_u64;
+        while !writer_stop.load(Ordering::Acquire) {
+            let job_id = 50_000 + inserted;
+            writer_db
+                .insert_job_history(&JobHistoryRow {
+                    job_id,
+                    job_hash: None,
+                    name: format!("Concurrent Fixture {job_id}"),
+                    status: "complete".into(),
+                    error_message: None,
+                    total_bytes: 1,
+                    downloaded_bytes: 1,
+                    optional_recovery_bytes: 0,
+                    optional_recovery_downloaded_bytes: 0,
+                    failed_bytes: 0,
+                    health: 1000,
+                    category: None,
+                    output_dir: None,
+                    nzb_path: None,
+                    created_at: 1,
+                    completed_at: 2,
+                    metadata: None,
+                })
+                .unwrap();
+            writer_db
+                .insert_job_event(job_id, 1, "DownloadStarted", "concurrent event", None)
+                .unwrap();
+            inserted += 1;
+        }
+        inserted
+    });
+
+    let export_db = db.clone();
+    let export = tokio::task::spawn_blocking(move || export_db.export_logical_backup())
+        .await
+        .unwrap()
+        .unwrap();
+    stop.store(true, Ordering::Release);
+    let concurrent_rows = writer.join().unwrap();
+    assert!(concurrent_rows > 0, "concurrent writer never inserted");
+
+    let staging = export.staging.path();
+    let history_ids = logical::read_table_objects(staging, "job_history")
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            row.get("job_id")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let event_job_ids = logical::read_table_objects(staging, "job_events")
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            row.get("job_id")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert!(history_ids.contains(&41));
+    assert!(
+        event_job_ids.is_subset(&history_ids),
+        "exported events reference jobs missing from the snapshot: {:?}",
+        event_job_ids.difference(&history_ids).collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
@@ -1108,6 +1428,151 @@ async fn backup_flushes_live_server_download_usage_before_export() {
     );
 }
 
+#[tokio::test]
+async fn backup_waits_for_queued_database_writes_before_opening_its_snapshot() {
+    let source_db = open_temp_db();
+    populate_source_db(&source_db);
+    let (service, _, _) = build_service(source_db.clone(), sample_config());
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    source_db
+        .try_queue_write("backup_flush_gate", move |_db| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(())
+        })
+        .unwrap();
+    source_db
+        .try_queue_write("backup_flush_event", move |db| {
+            db.insert_job_event(
+                41,
+                99,
+                "backup_flush",
+                "queued write reached the backup snapshot",
+                None,
+            )
+        })
+        .unwrap();
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(std::time::Duration::from_secs(2)))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let task = tokio::spawn(async move {
+        service
+            .create_backup(Some("queued-write-secret".into()))
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !task.is_finished(),
+        "backup must wait for the ordered writer queue"
+    );
+    release_tx.send(()).unwrap();
+    let artifact = task.await.unwrap().unwrap();
+
+    let unpacked = tempfile::tempdir().unwrap();
+    archive::unpack_bundle_archive(
+        &artifact.path,
+        unpacked.path(),
+        Some("queued-write-secret".into()),
+    )
+    .unwrap();
+    let rows = logical::read_table_objects(unpacked.path(), "job_events").unwrap();
+    assert!(rows.iter().any(|row| {
+        row.get("message").and_then(serde_json::Value::as_str)
+            == Some("queued write reached the backup snapshot")
+    }));
+}
+
+#[tokio::test]
+#[ignore = "100k-row streaming backup stress"]
+async fn logical_export_streams_one_hundred_thousand_rows() {
+    let source_db = open_temp_db();
+    populate_source_db(&source_db);
+    execute_sql(
+        &source_db,
+        vec![
+            "WITH digits(value) AS (
+                 VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)
+             )
+             INSERT INTO job_events (job_id, timestamp, kind, message, file_id)
+             SELECT 41,
+                    a.value + 10 * b.value + 100 * c.value
+                        + 1000 * d.value + 10000 * e.value,
+                    'info',
+                    'backup streaming stress event',
+                    NULL
+               FROM digits a
+               CROSS JOIN digits b
+               CROSS JOIN digits c
+               CROSS JOIN digits d
+               CROSS JOIN digits e",
+        ],
+    );
+    let (service, _, _) = build_service(source_db, sample_config());
+
+    let artifact = service
+        .create_backup(Some("streaming-stress-secret".into()))
+        .await
+        .unwrap();
+    let unpacked = tempfile::tempdir().unwrap();
+    let manifest = archive::unpack_bundle_archive(
+        &artifact.path,
+        unpacked.path(),
+        Some("streaming-stress-secret".into()),
+    )
+    .unwrap();
+
+    assert_eq!(manifest.tables["job_events"].rows, 100_000);
+}
+
+#[test]
+fn logical_table_rows_may_exceed_sixteen_mib_within_the_backup_limit() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("tables")).unwrap();
+    let payload = "x".repeat(16 * 1024 * 1024 + 1);
+    let row = serde_json::json!({ "payload": payload });
+    let mut bytes = serde_json::to_vec(&row).unwrap();
+    bytes.push(b'\n');
+    let checksum = blake3::hash(&bytes).to_hex().to_string();
+    std::fs::write(root.path().join("tables/large.ndjson"), bytes).unwrap();
+    let expected = BTreeMap::from([(
+        "large".into(),
+        logical::TablePartMetadata {
+            rows: 1,
+            columns: vec!["payload".into()],
+            checksum,
+        },
+    )]);
+
+    logical::verify_table_parts(root.path(), &expected).unwrap();
+    let rows = logical::read_table_objects(root.path(), "large").unwrap();
+    assert_eq!(
+        rows[0]
+            .get("payload")
+            .and_then(serde_json::Value::as_str)
+            .map(str::len),
+        Some(16 * 1024 * 1024 + 1)
+    );
+}
+
+#[test]
+fn durable_duplicate_identity_makes_a_restore_target_non_pristine() {
+    let db = open_temp_db();
+    assert!(db.restore_target_is_pristine().unwrap());
+    execute_sql(
+        &db,
+        vec![
+            "INSERT INTO forgotten_duplicate_identities (job_id, forgotten_at)
+             VALUES (29999, 1)",
+        ],
+    );
+    assert!(!db.restore_target_is_pristine().unwrap());
+    assert_eq!(db.max_job_id_all().unwrap(), 29_999);
+    assert_eq!(db.initialize_next_job_id_counter().unwrap(), 30_000);
+}
+
 fn write_plain_test_archive(path: &Path, entries: &[(&str, &[u8])]) {
     let file = File::create(path).unwrap();
     let encoder = zstd::stream::write::Encoder::new(file, 1).unwrap();
@@ -1124,6 +1589,14 @@ fn write_plain_test_archive(path: &Path, entries: &[(&str, &[u8])]) {
 }
 
 fn write_plain_test_archive_with_extra_header(path: &Path, header: &tar::Header) {
+    write_plain_test_archive_with_extra_entry(path, header, std::io::empty());
+}
+
+fn write_plain_test_archive_with_extra_entry(
+    path: &Path,
+    header: &tar::Header,
+    payload: impl std::io::Read,
+) {
     let file = File::create(path).unwrap();
     let encoder = zstd::stream::write::Encoder::new(file, 1).unwrap();
     let mut tar = tar::Builder::new(encoder);
@@ -1138,7 +1611,7 @@ fn write_plain_test_archive_with_extra_header(path: &Path, header: &tar::Header)
         tar.append_data(&mut regular, name, bytes.as_slice())
             .unwrap();
     }
-    tar.append(header, std::io::empty()).unwrap();
+    tar.append(header, payload).unwrap();
     let encoder = tar.into_inner().unwrap();
     encoder.finish().unwrap();
 }
@@ -1222,6 +1695,28 @@ fn unpack_plain_archive_rejects_links() {
     let error = archive::unpack_plain_archive(&archive_path, &output_dir).unwrap_err();
     assert!(error.to_string().contains("unsupported entry"));
     assert!(!output_dir.join("managed-link").exists());
+}
+
+#[test]
+fn unpack_plain_archive_rejects_gnu_long_name_metadata() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let archive_path = tempdir.path().join("long-name.tar.zst");
+    let output_dir = tempdir.path().join("out");
+    std::fs::create_dir(&output_dir).unwrap();
+    let payload = vec![b'a'; 4098];
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::GNULongName);
+    header.set_size(payload.len() as u64);
+    header.set_mode(0o600);
+    header.set_cksum();
+    write_plain_test_archive_with_extra_entry(
+        &archive_path,
+        &header,
+        std::io::Cursor::new(payload),
+    );
+
+    let error = archive::unpack_plain_archive(&archive_path, &output_dir).unwrap_err();
+    assert!(error.to_string().contains("unsupported entry"));
 }
 
 #[test]
@@ -1673,6 +2168,82 @@ async fn sqlite_restore_resumes_after_every_promotion_phase() {
                 .join("restore-pending-location")
                 .exists()
         );
+    }
+}
+
+#[tokio::test]
+async fn postgres_restore_resumes_after_every_promotion_phase() {
+    use super::pending::{PromotionPhase, set_restore_test_fail_after};
+
+    let source_db = open_temp_db();
+    populate_source_db(&source_db);
+    let (source_service, _, _) = build_service(source_db, sample_config());
+    let artifact = source_service
+        .create_backup(Some("postgres-crash-secret".into()))
+        .await
+        .unwrap();
+
+    for phase in [
+        PromotionPhase::Validated,
+        PromotionPhase::DatabaseInstalled,
+        PromotionPhase::KeyPromoted,
+    ] {
+        let Some((target_db, admin, schema)) =
+            open_postgres_backup_test_db("postgres_restore_resume").await
+        else {
+            return;
+        };
+        let target = target_db.database_target().clone();
+        let current_root = tempfile::tempdir().unwrap();
+        let restored_root = tempfile::tempdir().unwrap();
+        let mut target_config = sample_config();
+        target_config.data_dir = current_root.path().to_string_lossy().into_owned();
+        let (target_service, _, _) = build_service(target_db.clone(), target_config);
+        target_service
+            .restore_backup(
+                &artifact.path,
+                Some("postgres-crash-secret".into()),
+                RestoreOptions {
+                    data_dir: restored_root.path().to_string_lossy().into_owned(),
+                    intermediate_dir: None,
+                    complete_dir: None,
+                    category_remaps: vec![CategoryRemapInput {
+                        category_name: "movies".into(),
+                        new_dest_dir: restored_root
+                            .path()
+                            .join("complete/movies")
+                            .to_string_lossy()
+                            .into_owned(),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        drop(target_service);
+
+        set_restore_test_fail_after(Some(phase));
+        let error = apply_pending_restore(target_db, current_root.path())
+            .err()
+            .unwrap_or_else(|| panic!("restore failpoint should interrupt after {phase:?}"));
+        assert!(error.to_string().contains("injected restore interruption"));
+
+        let reopened = Database::open_target(target).unwrap();
+        let (restored, outcome) = apply_pending_restore(reopened, current_root.path()).unwrap();
+        assert!(outcome.is_some());
+        assert_eq!(
+            restored
+                .list_job_history(&HistoryFilter::default())
+                .unwrap()
+                .len(),
+            1,
+            "PostgreSQL restore did not recover after {phase:?}"
+        );
+        assert_eq!(
+            restored.load_config().unwrap().data_dir,
+            restored_root.path().to_string_lossy()
+        );
+        drop(restored);
+        drop_postgres_backup_test_schema(admin, schema).await;
     }
 }
 
