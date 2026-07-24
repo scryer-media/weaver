@@ -526,7 +526,12 @@ export function RssSettingsPage() {
               <Button variant="ghost" size="sm" onClick={() => openEditFeed(feed)}>
                 {t("action.edit")}
               </Button>
-              <Button variant="ghost" size="sm" onClick={() => setDeleteFeedId(feed.id)}>
+              <Button
+                variant="ghost"
+                size="sm"
+                data-testid="rss-delete-feed"
+                onClick={() => setDeleteFeedId(feed.id)}
+              >
                 {t("action.delete")}
               </Button>
             </div>
