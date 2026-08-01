@@ -523,13 +523,23 @@ export function RssSettingsPage() {
               >
                 {t("rss.clearSeen")}
               </Button>
-              <Button variant="ghost" size="sm" onClick={() => openEditFeed(feed)}>
+              {/* Feed-level actions repeat the same visible labels as the
+                  per-rule actions below, so name them explicitly: assistive
+                  tech would otherwise announce two identical "Edit"/"Delete"
+                  buttons for very different destructive scopes. */}
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-label={t("rss.editFeed")}
+                onClick={() => openEditFeed(feed)}
+              >
                 {t("action.edit")}
               </Button>
               <Button
                 variant="ghost"
                 size="sm"
                 data-testid="rss-delete-feed"
+                aria-label={t("rss.deleteFeed")}
                 onClick={() => setDeleteFeedId(feed.id)}
               >
                 {t("action.delete")}
@@ -1100,10 +1110,12 @@ function RuleCard({
         </div>
 
         <div className="flex flex-wrap gap-2">
-          <Button variant="ghost" size="sm" onClick={onEdit}>
+          {/* Named for the same reason as the feed-level actions: these sit
+              inside a feed card that carries its own Edit/Delete pair. */}
+          <Button variant="ghost" size="sm" aria-label={t("rss.editRule")} onClick={onEdit}>
             {t("action.edit")}
           </Button>
-          <Button variant="ghost" size="sm" onClick={onDelete}>
+          <Button variant="ghost" size="sm" aria-label={t("rss.deleteRule")} onClick={onDelete}>
             {t("action.delete")}
           </Button>
         </div>
