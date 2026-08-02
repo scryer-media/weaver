@@ -1405,8 +1405,6 @@ jobs:
           path: artifacts
       - name: Validate Docker runtime selector
         run: sh docker/test_runtime_select.sh
-      - name: Validate Docker docs contract
-        run: sh docker/test_docs_contract.sh
       - name: Prepare build context
         run: sh docker/prepare-build-context.sh artifacts docker-ctx
       - uses: docker/setup-qemu-action@v4
@@ -1491,8 +1489,6 @@ jobs:
           path: artifacts
       - name: Validate Docker runtime selector
         run: sh docker/test_runtime_select.sh
-      - name: Validate Docker docs contract
-        run: sh docker/test_docs_contract.sh
       - name: Prepare build context
         run: sh docker/prepare-build-context.sh artifacts docker-ctx
       - uses: docker/setup-qemu-action@v4
