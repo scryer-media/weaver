@@ -7293,6 +7293,7 @@ async fn incomplete_download_with_active_extraction_defers_instead_of_failing() 
             retry_count: 0,
             is_recovery: false,
             exclude_servers: Vec::new(),
+            avoid_server: None,
         });
         state.recovery_queue = DownloadQueue::new();
         state
@@ -7926,6 +7927,7 @@ async fn rar_unlock_dirty_priorities_apply_before_lane_refill() {
             is_recovery: false,
             groups: vec!["alt.binaries.test".to_string()],
             exclude_servers: Vec::new(),
+            avoid_server: None,
         },
         response_tx,
     });
@@ -7987,6 +7989,7 @@ async fn rar_unlock_retry_requeue_marks_rar_volume_dirty_only() {
         retry_count: 1,
         is_recovery: false,
         exclude_servers: Vec::new(),
+        avoid_server: None,
     });
     assert!(
         !pipeline

@@ -882,6 +882,7 @@ impl Pipeline {
                         retry_count: 0,
                         is_recovery,
                         exclude_servers: vec![],
+                        avoid_server: None,
                     });
                 }
             }

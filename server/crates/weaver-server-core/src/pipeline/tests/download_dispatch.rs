@@ -245,6 +245,128 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
     );
 }
 
+/// A transport-failure retry must point away from the server that just
+/// failed when an alternative exists (`avoid_server`), without entering the
+/// 430-exhaustion ledger — otherwise sustained stochastic stall on a
+/// healthy-looking primary can burn every retry on the same server while a
+/// clean backup idles, and one transient timeout could later help declare an
+/// article missing.
+#[tokio::test]
+async fn transport_failure_retry_rotates_off_the_failed_server() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0]));
+    let job_id = JobId(20009);
+    let spec = segmented_job_spec("Transport Rotation", "rotation.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            runtime_generation: 0,
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                segment_number: 0,
+            },
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::EstablishedTransport,
+                "article fetch soft timeout (15s)",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: Vec::new(),
+            release_connection_slot: true,
+        })
+        .await;
+
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("transport retry should requeue");
+    assert_eq!(retry.avoid_server, Some(0));
+    assert!(
+        retry.exclude_servers.is_empty(),
+        "rotation must not enter the article-not-found exhaustion ledger"
+    );
+    assert_eq!(retry.retry_count, 1);
+}
+
+/// With a single configured server there is nowhere to rotate to: the retry
+/// must stay eligible for that server instead of dead-ending.
+#[tokio::test]
+async fn transport_failure_retry_keeps_single_server_eligible() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0]));
+    let job_id = JobId(20010);
+    let spec = segmented_job_spec("Transport Rotation Solo", "rotation-solo.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            runtime_generation: 0,
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                segment_number: 0,
+            },
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::EstablishedTransport,
+                "article fetch soft timeout (15s)",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: Vec::new(),
+            release_connection_slot: true,
+        })
+        .await;
+
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("transport retry should requeue");
+    assert_eq!(retry.avoid_server, None);
+    assert!(retry.exclude_servers.is_empty());
+}
+
 #[test]
 fn lane_acquire_failure_preserves_retry_semantics() {
     let unavailable = DownloadFailure::from_lane_acquire_failure(None);
@@ -555,6 +677,7 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
                     retry_count: MAX_SEGMENT_RETRIES,
                     is_recovery: false,
                     exclude_servers: vec![0],
+                    avoid_server: None,
                 },
             },
         );
@@ -1927,6 +2050,7 @@ async fn download_pass_finishes_when_only_optional_recovery_queue_remains() {
             retry_count: 0,
             is_recovery: true,
             exclude_servers: Vec::new(),
+            avoid_server: None,
         });
     }
 
@@ -2218,6 +2342,7 @@ async fn dispatch_downloads_waits_for_downstream_work_when_restart_durable_lead_
         retry_count: 0,
         is_recovery: false,
         exclude_servers: vec![],
+        avoid_server: None,
     };
 
     pipeline.active_decodes_by_job.insert(job_id, 1);
@@ -2567,6 +2692,7 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
         retry_count: 0,
         is_recovery: false,
         exclude_servers: vec![],
+        avoid_server: None,
     };
     assert!(pipeline.primary_download_within_restart_durable_lead(job_id, &next_work));
     pipeline
@@ -3419,6 +3545,7 @@ async fn hot_share_yield_signal_clears_when_refill_gates_disable_bounded_share()
             is_recovery: false,
             groups: vec!["alt.binaries.test".to_string()],
             exclude_servers: Vec::new(),
+            avoid_server: None,
         },
         response_tx,
     });
@@ -4735,6 +4862,7 @@ async fn retired_ip_replacement_lane_parks_at_refill_boundary() {
             is_recovery: false,
             groups: vec!["alt.binaries.test".to_string()],
             exclude_servers: Vec::new(),
+            avoid_server: None,
         },
         response_tx,
     });

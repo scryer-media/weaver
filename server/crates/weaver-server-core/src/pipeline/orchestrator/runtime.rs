@@ -1049,7 +1049,9 @@ impl Pipeline {
         if self.server_quota_parked.remove(&work.segment_id) {
             self.refresh_server_quota_block_presentation();
         }
-        if scheduled_pool_generation != self.pool_generation && !work.exclude_servers.is_empty() {
+        if scheduled_pool_generation != self.pool_generation
+            && (!work.exclude_servers.is_empty() || work.avoid_server.is_some())
+        {
             debug!(
                 segment = %work.segment_id,
                 scheduled_generation = scheduled_pool_generation,
@@ -1057,6 +1059,7 @@ impl Pipeline {
                 "dropping stale server exclusions on retry after NNTP pool rebuild"
             );
             work.exclude_servers.clear();
+            work.avoid_server = None;
         }
         if infrastructure_retry {
             self.note_infrastructure_retry_requeued(work.segment_id.file_id.job_id);

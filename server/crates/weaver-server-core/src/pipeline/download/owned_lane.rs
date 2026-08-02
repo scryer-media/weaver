@@ -24,7 +24,7 @@ struct OwnedLaneRun {
 }
 
 enum OwnedLanePoolCommand {
-    Run(OwnedLaneRun),
+    Run(Box<OwnedLaneRun>),
     Reset,
 }
 
@@ -80,14 +80,14 @@ impl OwnedDownloadLanePool {
         if self.senders.is_empty() {
             return Err(initial_lease);
         }
-        let command = OwnedLanePoolCommand::Run(OwnedLaneRun {
+        let command = OwnedLanePoolCommand::Run(Box::new(OwnedLaneRun {
             nntp,
             event_tx,
             refill_tx,
             parked_tx,
             hot_share_yield_signal,
             initial_lease,
-        });
+        }));
         let sender_index = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
         self.senders[sender_index]
             .send(command)
@@ -117,7 +117,7 @@ fn run_owned_lane_worker(rx: std_mpsc::Receiver<OwnedLanePoolCommand>) {
     while let Ok(command) = rx.recv() {
         match command {
             OwnedLanePoolCommand::Run(run) => {
-                run_owned_blocking_download_lane(&mut cached_lane, run);
+                run_owned_blocking_download_lane(&mut cached_lane, *run);
             }
             OwnedLanePoolCommand::Reset => {
                 park_cached_lane(&mut cached_lane);
@@ -771,6 +771,7 @@ mod tests {
             retry_count,
             is_recovery: false,
             exclude_servers: Vec::new(),
+            avoid_server: None,
         }
     }
 

@@ -895,6 +895,7 @@ impl Pipeline {
                     // file is normally optional recovery material.
                     is_recovery: false,
                     exclude_servers,
+                    avoid_server: None,
                 },
             ));
         }
@@ -1218,6 +1219,7 @@ impl Pipeline {
                     retry_count: 0,
                     is_recovery: file_spec.role.is_recovery(),
                     exclude_servers: exclude.clone(),
+                    avoid_server: None,
                 };
                 self.metrics
                     .segments_retried

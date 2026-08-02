@@ -1930,6 +1930,7 @@ fn rar_unlock_work(job_id: JobId, file_index: u32, priority: u32) -> DownloadWor
         retry_count: 0,
         is_recovery: false,
         exclude_servers: Vec::new(),
+        avoid_server: None,
     }
 }
 

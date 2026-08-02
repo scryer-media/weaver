@@ -200,6 +200,10 @@ pub(super) struct DownloadBatchCompatibility {
     pub(super) is_recovery: bool,
     pub(super) groups: Vec<String>,
     pub(super) exclude_servers: Vec<usize>,
+    /// Transport-rotation hint carried from [`DownloadWork::avoid_server`].
+    /// Batched works share one effective exclude set, so works with different
+    /// avoid hints must not share a lease.
+    pub(super) avoid_server: Option<usize>,
 }
 
 impl DownloadBatchCompatibility {
@@ -209,6 +213,7 @@ impl DownloadBatchCompatibility {
             is_recovery: work.is_recovery,
             groups: work.groups.clone(),
             exclude_servers: work.exclude_servers.clone(),
+            avoid_server: work.avoid_server,
         }
     }
 
@@ -217,6 +222,7 @@ impl DownloadBatchCompatibility {
             && work.is_recovery == self.is_recovery
             && work.groups == self.groups
             && work.exclude_servers == self.exclude_servers
+            && work.avoid_server == self.avoid_server
     }
 }
 

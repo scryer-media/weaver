@@ -18,6 +18,7 @@ fn make_work(seg: u32) -> DownloadWork {
         retry_count: 0,
         is_recovery: false,
         exclude_servers: vec![],
+        avoid_server: None,
     }
 }
 

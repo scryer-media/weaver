@@ -1,6 +1,25 @@
 use super::*;
 
 impl Pipeline {
+    /// Effective excludes for one lease: the segment's failure ledger plus job
+    /// retention excludes, plus the transport-rotation `avoid_server` hint.
+    /// The hint only ever shapes selection here — exhaustion accounting reads
+    /// the ledger alone, so a transient timeout can never help declare an
+    /// article missing.
+    fn lease_effective_exclude_servers(
+        &mut self,
+        job_id: JobId,
+        compatibility: &DownloadBatchCompatibility,
+    ) -> Vec<usize> {
+        let mut effective = self.effective_exclude_servers(job_id, &compatibility.exclude_servers);
+        if let Some(avoid) = compatibility.avoid_server
+            && !effective.contains(&avoid)
+        {
+            effective.push(avoid);
+        }
+        effective
+    }
+
     pub(in crate::pipeline::download::worker) fn reserve_download_work_for_dispatch(
         &mut self,
         job_id: JobId,
@@ -190,7 +209,7 @@ impl Pipeline {
         };
         let compatibility = DownloadBatchCompatibility::from_work(&first);
         let effective_exclude_servers =
-            self.effective_exclude_servers(job_id, &compatibility.exclude_servers);
+            self.lease_effective_exclude_servers(job_id, &compatibility);
         if compatibility.is_recovery {
             let lease = DownloadBatchLease {
                 job_id,
@@ -310,7 +329,7 @@ impl Pipeline {
             server_modes_pressure,
         );
         let effective_exclude_servers =
-            self.effective_exclude_servers(job_id, &compatibility.exclude_servers);
+            self.lease_effective_exclude_servers(job_id, &compatibility);
         DownloadBatchLease {
             job_id,
             runtime_generation: self.pool_generation,

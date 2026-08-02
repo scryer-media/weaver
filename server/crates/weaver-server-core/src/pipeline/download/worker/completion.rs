@@ -103,6 +103,9 @@ impl Pipeline {
             retry_count,
             is_recovery: file_spec.role.is_recovery(),
             exclude_servers,
+            // Park/restore drops any rotation hint: it is advisory, and the
+            // next transport failure recomputes it.
+            avoid_server: None,
         };
         if work.is_recovery {
             state.recovery_queue.push(work);
@@ -142,6 +145,7 @@ impl Pipeline {
             retry_count,
             is_recovery: file_spec.role.is_recovery(),
             exclude_servers,
+            avoid_server: None,
         })
     }
 
@@ -919,6 +923,30 @@ impl Pipeline {
                         }
                     });
 
+                // Transport rotation: point the retry away from the server
+                // whose established connection just failed, when any
+                // alternative remains. Without this the retry re-enters
+                // selection that still prefers the same healthy-looking
+                // primary, so under sustained stochastic stall (e.g. 10% of
+                // bodies timing out) every retry can land on the flaky server
+                // while a clean backup idles. Replace semantics — only the
+                // most recent failure is avoided — so rotation can never
+                // exclude every server, and single-server setups are
+                // untouched.
+                let avoid_server = if failure.kind == DownloadFailureKind::EstablishedTransport {
+                    source_server_idx.filter(|&idx| {
+                        let server_count = self.nntp.pool().server_count();
+                        let mut probe = retry_exclude_servers.clone();
+                        if !probe.contains(&idx) {
+                            probe.push(idx);
+                        }
+                        idx < server_count
+                            && self.unavailable_server_count(job_id, &probe) < server_count
+                    })
+                } else {
+                    None
+                };
+
                 if article_not_found_exhausted {
                     self.metrics
                         .articles_not_found
@@ -969,6 +997,7 @@ impl Pipeline {
                                 retry_count: next_retry,
                                 is_recovery: file_spec.role.is_recovery(),
                                 exclude_servers: retry_exclude_servers.clone(),
+                                avoid_server,
                             };
                             self.metrics
                                 .segments_retried

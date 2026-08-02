@@ -46,6 +46,14 @@ pub enum DisableReason {
     AuthFailure,
     /// Too many consecutive failures exceeded the disable threshold.
     ConsecutiveFailures,
+    /// The windowed transport-failure ratio exceeded the configured threshold.
+    ///
+    /// The consecutive-failure machine cannot catch a server that fails a
+    /// steady fraction of attempts: any success resets the run, so a primary
+    /// stalling 10% of BODY fetches stays "Healthy" forever while a clean
+    /// backup idles. The ratio window is the cumulative complement (compare
+    /// SABnzbd's `bad_cons / threads` block).
+    FailureRatio,
 }
 
 /// Configuration thresholds for health state transitions.
@@ -65,6 +73,13 @@ pub struct HealthConfig {
     pub transient_cooldown: Duration,
     /// How long to cool down a server after a capacity-related failure.
     pub capacity_cooldown: Duration,
+    /// Length of the rolling window for failure-ratio accounting.
+    pub failure_ratio_window: Duration,
+    /// Minimum attempts inside one window before the ratio can trip; keeps
+    /// isolated blips on quiet servers from disabling anything.
+    pub failure_ratio_min_attempts: u32,
+    /// Percentage of failed attempts within a window that disables the server.
+    pub failure_ratio_threshold_pct: u32,
 }
 
 impl Default for HealthConfig {
@@ -77,6 +92,12 @@ impl Default for HealthConfig {
             auth_disable_duration: Duration::from_mins(5),
             transient_cooldown: Duration::from_secs(10),
             capacity_cooldown: Duration::from_secs(5),
+            // 10% sustained transport failure over 40+ attempts is pathological
+            // for any real provider (normal transient rates are well under 1%),
+            // while the sample floor keeps a single blip from ever tripping.
+            failure_ratio_window: Duration::from_secs(30),
+            failure_ratio_min_attempts: 40,
+            failure_ratio_threshold_pct: 10,
         }
     }
 }
@@ -101,6 +122,12 @@ pub struct ServerHealth {
     /// Recent premature connection deaths (connections that died before
     /// `MIN_CONNECTION_LIFETIME`). Stored as timestamps for time-windowed counting.
     premature_deaths: Vec<Instant>,
+    /// Start of the current failure-ratio window; `None` until the first attempt.
+    ratio_window_started: Option<Instant>,
+    /// Attempts recorded in the current failure-ratio window.
+    ratio_attempts: u32,
+    /// Failed attempts recorded in the current failure-ratio window.
+    ratio_failures: u32,
 }
 
 impl ServerHealth {
@@ -121,6 +148,9 @@ impl ServerHealth {
             latency_ewma_us: 0.0,
             latency_samples: 0,
             premature_deaths: Vec::new(),
+            ratio_window_started: None,
+            ratio_attempts: 0,
+            ratio_failures: 0,
         }
     }
 
@@ -128,7 +158,65 @@ impl ServerHealth {
     pub fn record_success(&mut self) {
         self.success_count += 1;
         self.consecutive_failures = 0;
+        self.note_ratio_attempt(false);
+        // In-flight fetches routinely land right after a failure-ratio trip —
+        // at the trip threshold most attempts still succeed. Those stragglers
+        // must not lift the quarantine whose whole purpose is shifting work
+        // away from a server that keeps succeeding most of the time.
+        if let ServerState::Disabled {
+            until,
+            reason: DisableReason::FailureRatio,
+        } = self.state
+            && Instant::now() < until
+        {
+            return;
+        }
         self.state = ServerState::Healthy;
+    }
+
+    /// Record one attempt into the failure-ratio window; returns `true` when
+    /// the window tripped and moved the server to [`ServerState::Disabled`].
+    ///
+    /// Unlike `consecutive_failures` (reset by any success), the window counts
+    /// cumulatively, so a server failing a steady fraction of a busy workload
+    /// trips even though successes vastly outnumber failures. Quiet servers
+    /// never reach `failure_ratio_min_attempts` within one window and fall
+    /// back to the consecutive machine.
+    fn note_ratio_attempt(&mut self, failed: bool) -> bool {
+        let now = Instant::now();
+        match self.ratio_window_started {
+            Some(started) if now.duration_since(started) <= self.config.failure_ratio_window => {}
+            _ => {
+                self.ratio_window_started = Some(now);
+                self.ratio_attempts = 0;
+                self.ratio_failures = 0;
+            }
+        }
+        self.ratio_attempts += 1;
+        if failed {
+            self.ratio_failures += 1;
+        }
+        if matches!(self.state, ServerState::Disabled { .. }) {
+            return false;
+        }
+        if self.ratio_attempts < self.config.failure_ratio_min_attempts
+            || self.ratio_failures.saturating_mul(100)
+                < self
+                    .ratio_attempts
+                    .saturating_mul(self.config.failure_ratio_threshold_pct)
+        {
+            return false;
+        }
+        let backoff = self.compute_backoff();
+        self.disable_count += 1;
+        self.state = ServerState::Disabled {
+            until: now + backoff,
+            reason: DisableReason::FailureRatio,
+        };
+        self.ratio_window_started = None;
+        self.ratio_attempts = 0;
+        self.ratio_failures = 0;
+        true
     }
 
     /// Record a failed operation.
@@ -146,6 +234,11 @@ impl ServerHealth {
                 until: Instant::now() + self.config.auth_disable_duration,
                 reason: DisableReason::AuthFailure,
             };
+            return;
+        }
+
+        // A ratio trip subsumes the consecutive-threshold transitions below.
+        if self.note_ratio_attempt(true) {
             return;
         }
 
@@ -170,6 +263,14 @@ impl ServerHealth {
     /// eventually yields to backup servers instead of re-entering immediately forever.
     pub fn record_cooldown(&mut self, reason: CooldownReason) {
         self.failure_count += 1;
+
+        // Ratio accounting runs first: when sustained transport flake trips
+        // the window, the resulting disable subsumes the short cooldown.
+        // Capacity rejections are provider connection policy, not flakiness,
+        // and stay out of the ratio window.
+        if matches!(reason, CooldownReason::Transport) && self.note_ratio_attempt(true) {
+            return;
+        }
 
         let (duration, resume_degraded) = match reason {
             // Transport problems should still participate in the longer-lived
@@ -420,7 +521,157 @@ mod tests {
             auth_disable_duration: Duration::from_millis(100),
             transient_cooldown: Duration::from_millis(50),
             capacity_cooldown: Duration::from_millis(25),
+            // High sample floor so consecutive-machine tests above never
+            // interact with the ratio window.
+            failure_ratio_window: Duration::from_secs(3600),
+            failure_ratio_min_attempts: 40,
+            failure_ratio_threshold_pct: 10,
         }
+    }
+
+    fn ratio_config(min_attempts: u32, threshold_pct: u32, window: Duration) -> HealthConfig {
+        HealthConfig {
+            failure_ratio_window: window,
+            failure_ratio_min_attempts: min_attempts,
+            failure_ratio_threshold_pct: threshold_pct,
+            ..test_config()
+        }
+    }
+
+    #[test]
+    fn failure_ratio_trips_despite_interleaved_successes() {
+        let mut health = ServerHealth::new(ratio_config(10, 20, Duration::from_secs(3600)));
+
+        // 8 successes and 2 transport failures, interleaved so the run of
+        // consecutive failures never exceeds one — the consecutive machine is
+        // structurally blind to this shape.
+        for attempt in 0..10 {
+            if attempt % 5 == 4 {
+                health.record_cooldown(CooldownReason::Transport);
+            } else {
+                health.record_success();
+            }
+            assert!(health.consecutive_failures <= 1);
+        }
+
+        assert!(matches!(
+            health.state(),
+            ServerState::Disabled {
+                reason: DisableReason::FailureRatio,
+                ..
+            }
+        ));
+        assert!(!health.is_available());
+    }
+
+    #[test]
+    fn failure_ratio_needs_min_samples() {
+        let mut health = ServerHealth::new(ratio_config(10, 20, Duration::from_secs(3600)));
+
+        // 25% failure ratio, but below the sample floor: a blip, not a trend.
+        health.record_cooldown(CooldownReason::Transport);
+        for _ in 0..3 {
+            health.record_success();
+        }
+
+        assert_eq!(*health.state(), ServerState::Healthy);
+        assert!(health.is_available());
+    }
+
+    #[test]
+    fn capacity_cooldowns_stay_out_of_the_ratio_window() {
+        let mut health = ServerHealth::new(ratio_config(4, 25, Duration::from_secs(3600)));
+
+        // Provider capacity rejections at any rate must not trip the ratio.
+        for _ in 0..12 {
+            health.record_cooldown(CooldownReason::Capacity);
+            health.record_success();
+        }
+
+        assert!(!matches!(
+            health.state(),
+            ServerState::Disabled {
+                reason: DisableReason::FailureRatio,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn success_stragglers_do_not_lift_ratio_disable() {
+        let mut health = ServerHealth::new(ratio_config(4, 50, Duration::from_secs(3600)));
+
+        for _ in 0..2 {
+            health.record_success();
+            health.record_cooldown(CooldownReason::Transport);
+        }
+        assert!(matches!(
+            health.state(),
+            ServerState::Disabled {
+                reason: DisableReason::FailureRatio,
+                ..
+            }
+        ));
+
+        // At a 10% failure rate, ~9 in-flight successes land right after the
+        // trip. They must not restore Healthy while the quarantine holds.
+        for _ in 0..9 {
+            health.record_success();
+        }
+        assert!(!health.is_available());
+        assert!(matches!(
+            health.state(),
+            ServerState::Disabled {
+                reason: DisableReason::FailureRatio,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ratio_window_expiry_resets_counts() {
+        let mut health = ServerHealth::new(ratio_config(4, 50, Duration::from_millis(30)));
+
+        health.record_cooldown(CooldownReason::Transport);
+        health.record_cooldown(CooldownReason::Transport);
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Fresh window: 1 failure over 4 attempts stays under 50% — without
+        // the reset the carried failures would have tripped at attempt four.
+        for _ in 0..3 {
+            health.record_success();
+        }
+        health.record_cooldown(CooldownReason::Transport);
+
+        // The final failure still earns its short transport cooldown, but the
+        // ratio must not have tripped: without the reset, six attempts with
+        // three failures would have crossed the 50% threshold.
+        assert!(matches!(
+            health.state(),
+            ServerState::CoolingDown {
+                reason: CooldownReason::Transport,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ratio_disable_reenables_as_degraded_probe() {
+        let mut health = ServerHealth::new(ratio_config(4, 50, Duration::from_secs(3600)));
+
+        for _ in 0..2 {
+            health.record_success();
+            health.record_cooldown(CooldownReason::Transport);
+        }
+        assert!(!health.is_available());
+
+        std::thread::sleep(Duration::from_millis(150));
+        health.check_reenable();
+
+        // Same re-entry semantics as a consecutive-failure disable: probe as
+        // Degraded one failure below the breaker.
+        assert!(matches!(health.state(), ServerState::Degraded { .. }));
+        assert!(health.is_available());
     }
 
     #[test]

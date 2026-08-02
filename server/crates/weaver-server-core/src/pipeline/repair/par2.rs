@@ -1057,6 +1057,7 @@ impl Pipeline {
                         retry_count: 0,
                         is_recovery: true,
                         exclude_servers: Vec::new(),
+                        avoid_server: None,
                     });
                     promoted_segments += 1;
                 }

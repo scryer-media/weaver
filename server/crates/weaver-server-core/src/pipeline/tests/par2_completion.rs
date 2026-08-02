@@ -1181,6 +1181,7 @@ async fn complete_payload_does_not_finalize_while_promoted_recovery_is_pending()
             retry_count: 0,
             is_recovery: true,
             exclude_servers: Vec::new(),
+            avoid_server: None,
         });
     }
     pipeline
@@ -1241,6 +1242,7 @@ async fn complete_payload_finalizes_while_optional_recovery_is_parked() {
             retry_count: 0,
             is_recovery: true,
             exclude_servers: Vec::new(),
+            avoid_server: None,
         });
     }
 
@@ -1360,6 +1362,7 @@ async fn complete_direct_payload_with_loaded_par2_does_not_finalize_with_parked_
             retry_count: 0,
             is_recovery: true,
             exclude_servers: Vec::new(),
+            avoid_server: None,
         });
     }
     write_and_complete_file(&mut pipeline, job_id, 1, index_filename, &par2_bytes).await;
@@ -1478,6 +1481,7 @@ async fn archive_payload_does_not_extract_while_promoted_recovery_is_pending() {
             retry_count: 0,
             is_recovery: true,
             exclude_servers: Vec::new(),
+            avoid_server: None,
         });
     }
     pipeline
@@ -1552,6 +1556,7 @@ async fn cancel_job_clears_promoted_recovery_runtime_state() {
             retry_count: 0,
             is_recovery: true,
             exclude_servers: Vec::new(),
+            avoid_server: None,
         });
         state.recovery_queue.push(DownloadWork {
             segment_id: SegmentId {
@@ -1565,6 +1570,7 @@ async fn cancel_job_clears_promoted_recovery_runtime_state() {
             retry_count: 0,
             is_recovery: true,
             exclude_servers: Vec::new(),
+            avoid_server: None,
         });
     }
     pipeline
@@ -1722,6 +1728,7 @@ async fn promoted_recovery_wait_does_not_reverify_until_recovery_finishes() {
             retry_count: 0,
             is_recovery: true,
             exclude_servers: Vec::new(),
+            avoid_server: None,
         });
     }
     install_test_par2_runtime(
@@ -1849,6 +1856,7 @@ async fn promoted_recovery_retry_reenters_dispatchable_queue() {
         retry_count: 1,
         is_recovery: true,
         exclude_servers: Vec::new(),
+        avoid_server: None,
     });
 
     assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
@@ -1983,6 +1991,7 @@ async fn unavailable_promoted_recovery_promotes_next_candidate_before_failing() 
             retry_count: 0,
             is_recovery: true,
             exclude_servers: Vec::new(),
+            avoid_server: None,
         });
         state.recovery_queue.push(DownloadWork {
             segment_id: second_segment,
@@ -1993,6 +2002,7 @@ async fn unavailable_promoted_recovery_promotes_next_candidate_before_failing() 
             retry_count: 0,
             is_recovery: true,
             exclude_servers: Vec::new(),
+            avoid_server: None,
         });
     }
     write_and_complete_file(&mut pipeline, job_id, 1, index_filename, &par2_bytes).await;

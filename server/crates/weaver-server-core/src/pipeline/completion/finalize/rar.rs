@@ -1222,6 +1222,7 @@ impl Pipeline {
                             retry_count: 0,
                             is_recovery: false,
                             exclude_servers: vec![],
+                            avoid_server: None,
                         })
                         .collect();
                     Some(SourceRetryFile {

@@ -15,6 +15,15 @@ pub struct DownloadWork {
     pub is_recovery: bool,
     /// Servers to skip for this download (e.g. after decode failure from that server).
     pub exclude_servers: Vec<usize>,
+    /// Transport-rotation hint: the server whose established connection just
+    /// failed for this segment. Selection avoids it on the next attempt so the
+    /// retry lands elsewhere when an alternative exists — mirroring
+    /// NZBGet's per-article `failedServers` — but unlike `exclude_servers` it
+    /// never counts toward article-not-found exhaustion, so one transient
+    /// timeout can never help declare an article missing. Replaced (not
+    /// accumulated) on each transport failure; advisory only, so an index left
+    /// stale by a pool rebuild merely skips one server for one attempt.
+    pub avoid_server: Option<usize>,
 }
 
 /// Wrapper that implements ordering for the priority queue.
@@ -114,6 +123,7 @@ impl DownloadQueue {
         let items: Vec<_> = self.heap.drain().collect();
         for Reverse(mut pw) in items {
             pw.work.exclude_servers.clear();
+            pw.work.avoid_server = None;
             self.heap.push(Reverse(pw));
         }
         self.excluded_work = 0;

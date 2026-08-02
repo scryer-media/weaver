@@ -1062,6 +1062,7 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
         retry_count: 1,
         is_recovery: false,
         exclude_servers: vec![0],
+        avoid_server: None,
     };
 
     // A rebuild bumped the generation after this retry was scheduled under gen 0:

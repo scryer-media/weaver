@@ -15,8 +15,16 @@ fn pinned_argon2() -> argon2::Argon2<'static> {
 }
 
 pub fn hash_password(password: &str) -> Result<String, String> {
-    use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
-    let salt = SaltString::generate(&mut OsRng);
+    use argon2::password_hash::{PasswordHasher, Salt, SaltString};
+    // Salt bytes come straight from `getrandom` (already a direct dependency)
+    // rather than `password_hash::rand_core::OsRng`: that re-export only
+    // compiles when some other crate in the build graph happens to enable
+    // `rand_core/getrandom`, which held for workspace builds but broke
+    // standalone `-p weaver-server-core` builds after the 2026-08 dep bumps.
+    let mut salt_bytes = [0u8; Salt::RECOMMENDED_LENGTH];
+    getrandom::fill(&mut salt_bytes).map_err(|error| format!("salt generation failed: {error}"))?;
+    let salt = SaltString::encode_b64(&salt_bytes)
+        .map_err(|error| format!("salt encoding failed: {error}"))?;
     pinned_argon2()
         .hash_password(password.as_bytes(), &salt)
         .map(|hash| hash.to_string())
