@@ -131,10 +131,17 @@ mod tests {
             .expect("matching cached headers should rebuild without volume 0");
 
         assert_eq!(computed.rebuild_source.as_str(), "cached-headers");
+        // The guard under test only ever fires for waited-on volumes; if the
+        // fixture stops producing this wait the whole test goes vacuous.
         assert!(
-            rar_refresh_open_tracking::opened().is_empty(),
-            "cached-header rebuild reopened volumes: {:?}",
-            rar_refresh_open_tracking::opened()
+            computed.plan.waiting_on_volumes.contains(&5),
+            "fixture must leave volume 5 waiting: {:?}",
+            computed.plan.waiting_on_volumes
+        );
+        let opened = rar_refresh_open_tracking::opened();
+        assert!(
+            opened.is_empty(),
+            "cached-header rebuild reopened volumes: {opened:?}"
         );
         assert_eq!(
             computed
@@ -456,11 +463,17 @@ fn present_waiting_rar_volumes(
     facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
     volume_paths: &BTreeMap<u32, PathBuf>,
 ) -> Vec<u32> {
-    // Waiting on a volume past the first on-disk gap is the correct plan, not a
-    // stale-snapshot symptom: nothing links that volume's continuation headers
-    // back to a member start until the gap fills, so a volume-0 rebuild reads
-    // the same files and reproduces the same wait.
-    let reachable_end = rar_state::contiguous_prefix_end(volume_paths);
+    // Waiting on a volume past the first gap in the header chain is the correct
+    // plan, not a stale-snapshot symptom: no rebuild of any kind can link a
+    // continuation header back to its member start across a gap neither view can
+    // see into. The chain stays reachable through cached facts even when the
+    // file itself was eagerly deleted after extraction, so the prefix must be
+    // measured over facts ∪ volume_paths — disk presence alone would suppress
+    // retries that a volume-0 rebuild (which attaches real readers, not the
+    // cached path's empty cursors) could genuinely change.
+    let reachable_end = (0u32..)
+        .take_while(|volume| facts.contains_key(volume) || volume_paths.contains_key(volume))
+        .last();
     let mut volumes: Vec<u32> = plan
         .waiting_on_volumes
         .iter()
