@@ -249,7 +249,7 @@ async fn record_job_history_purges_terminal_job_runtime_and_queue_metrics() {
     );
 
     pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Complete;
-    pipeline.record_job_history(job_id);
+    pipeline.record_job_history(job_id, None);
     pipeline.db.flush_write_queue().await.unwrap();
 
     assert!(pipeline.db.load_active_jobs().unwrap().is_empty());
@@ -297,7 +297,7 @@ async fn record_job_history_caps_finished_job_runtime_cache() {
     insert_active_job(&mut pipeline, job_id, spec).await;
     pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Complete;
 
-    pipeline.record_job_history(job_id);
+    pipeline.record_job_history(job_id, None);
     pipeline.db.flush_write_queue().await.unwrap();
 
     assert_eq!(
@@ -334,7 +334,7 @@ async fn record_job_history_retains_failed_job_nzb() {
     pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Failed {
         error: "boom".to_string(),
     };
-    pipeline.record_job_history(job_id);
+    pipeline.record_job_history(job_id, None);
     pipeline.db.flush_write_queue().await.unwrap();
 
     let history = pipeline.db.get_job_history(job_id.0).unwrap().unwrap();
@@ -369,7 +369,7 @@ async fn record_job_history_retains_complete_job_nzb() {
         .0;
 
     pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Complete;
-    pipeline.record_job_history(job_id);
+    pipeline.record_job_history(job_id, None);
     pipeline.db.flush_write_queue().await.unwrap();
 
     let history = pipeline.db.get_job_history(job_id.0).unwrap().unwrap();
@@ -384,6 +384,137 @@ async fn record_job_history_retains_complete_job_nzb() {
         .unwrap()
         .unwrap();
     assert_eq!(nzb_zstd.unwrap(), sample_nzb_zstd());
+}
+
+/// Park the serialized database writer until the returned sender is dropped, so
+/// a queued archive cannot commit while the test inspects the event stream.
+fn hold_database_writer(pipeline: &Pipeline) -> std::sync::mpsc::Sender<()> {
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    pipeline
+        .db
+        .try_queue_write("test_hold_database_writer", move |_db| {
+            let _ = release_rx.recv();
+            Ok(())
+        })
+        .unwrap();
+    release_tx
+}
+
+async fn wait_for_job_event(
+    events: &mut broadcast::Receiver<PipelineEvent>,
+    is_expected: impl Fn(&PipelineEvent) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events.recv().await.expect("pipeline event channel closed");
+            if is_expected(&event) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for pipeline event");
+}
+
+#[tokio::test]
+async fn job_completed_event_publishes_after_history_archive_commits() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30040);
+    let spec = standalone_job_spec(
+        "Durable Completion Event",
+        &[("durable-completion.mkv".to_string(), 123)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let release = hold_database_writer(&pipeline);
+    pipeline.complete_job_after_terminal_post_processing(job_id);
+
+    assert!(
+        !drain_job_events(&mut events, job_id)
+            .iter()
+            .any(|event| matches!(event, PipelineEvent::JobCompleted { .. })),
+        "completion must not be announced while the history archive is still queued"
+    );
+    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
+
+    drop(release);
+    wait_for_job_event(
+        &mut events,
+        |event| matches!(event, PipelineEvent::JobCompleted { job_id: id } if *id == job_id),
+    )
+    .await;
+
+    // The facade refuses history lookups for jobs the scheduler still lists as
+    // live, so the finished snapshot has to be published by the time the event
+    // is observable.
+    assert!(
+        pipeline
+            .shared_state
+            .list_jobs()
+            .iter()
+            .all(|info| info.job_id != job_id || is_terminal_status(&info.status)),
+        "completed job must be published as finished before its terminal event"
+    );
+
+    // Deliberately no flush_write_queue: a subscriber that reacts to the
+    // terminal event must find the row through the same reads the history
+    // facade uses.
+    let archived = pipeline.db.get_job_history(job_id.0).unwrap();
+    assert_eq!(
+        archived.map(|row| row.status),
+        Some("complete".to_string()),
+        "history row must be readable as soon as the completion event is observed"
+    );
+    let listed = pipeline
+        .db
+        .list_job_history(&crate::HistoryFilter::default())
+        .unwrap();
+    assert!(listed.iter().any(|row| row.job_id == job_id.0));
+}
+
+#[tokio::test]
+async fn job_failed_event_publishes_after_history_archive_commits() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30041);
+    let spec = standalone_job_spec(
+        "Durable Failure Event",
+        &[("durable-failure.mkv".to_string(), 123)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let release = hold_database_writer(&pipeline);
+    pipeline.fail_job(job_id, "durable failure".to_string());
+
+    assert!(
+        !drain_job_events(&mut events, job_id)
+            .iter()
+            .any(|event| matches!(event, PipelineEvent::JobFailed { .. })),
+        "failure must not be announced while the history archive is still queued"
+    );
+    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
+
+    drop(release);
+    wait_for_job_event(
+        &mut events,
+        |event| matches!(event, PipelineEvent::JobFailed { job_id: id, .. } if *id == job_id),
+    )
+    .await;
+
+    let archived = pipeline.db.get_job_history(job_id.0).unwrap();
+    assert_eq!(
+        archived.map(|row| row.status),
+        Some("failed".to_string()),
+        "history row must be readable as soon as the failure event is observed"
+    );
+    let listed = pipeline
+        .db
+        .list_job_history(&crate::HistoryFilter::default())
+        .unwrap();
+    assert!(listed.iter().any(|row| row.job_id == job_id.0));
 }
 
 #[tokio::test]

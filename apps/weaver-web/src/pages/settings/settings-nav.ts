@@ -1,4 +1,11 @@
-export const settingsNav = [
+type SettingsNavEntry = {
+  to: string;
+  labelKey: string;
+  descriptionKey: string;
+  beta?: boolean;
+};
+
+export const settingsNav: readonly SettingsNavEntry[] = [
   {
     to: "/settings/general",
     labelKey: "settings.general",
@@ -33,6 +40,7 @@ export const settingsNav = [
     to: "/settings/post-processing",
     labelKey: "settings.postProcessing",
     descriptionKey: "settings.postProcessingDesc",
+    beta: true,
   },
   {
     to: "/settings/schedules",

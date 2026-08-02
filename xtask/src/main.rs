@@ -153,6 +153,11 @@ struct WingetArgs {
 struct ServeArgs {
     #[arg(long, help = "Reset the dev SQLite database before starting Weaver")]
     clean: bool,
+    #[arg(
+        long,
+        help = "Build and run the backend with the optimized release profile"
+    )]
+    release: bool,
     target: Option<String>,
 }
 
@@ -2593,7 +2598,11 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     );
     let state_key_file = state_dir.join("encryption.key");
     let rust_log = build_rust_log(args.target.as_deref());
-    let backend_binary = ctx.path("target/debug/weaver");
+    let backend_binary = if args.release {
+        ctx.path("target/release/weaver")
+    } else {
+        ctx.path("target/debug/weaver")
+    };
     let backend_url = format!("http://127.0.0.1:{backend_port}");
     let frontend_url = format!("http://127.0.0.1:{frontend_port}");
     let vite_use_polling =
@@ -2642,12 +2651,19 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
 
     let encryption_key = ensure_state_encryption_key(&state_key_file, &db_path)?;
     step("Building Weaver backend");
-    println!("   Rust build: cargo build --locked -p weaver");
+    let profile_arg = args.release.then_some("--release");
+    println!(
+        "   Rust build: cargo build --locked -p weaver{}",
+        if args.release { " --release" } else { "" }
+    );
     let mut build = ctx.command_in("cargo", &ctx.repo_root);
     build
         .env("WEAVER_ENABLE_DIAGNOSTICS", &diagnostics_enabled)
         .env("RUSTFLAGS", &local_rustflags);
     build.args(["build", "--locked", "-p", "weaver"]);
+    if let Some(profile_arg) = profile_arg {
+        build.arg(profile_arg);
+    }
     run_checked(&mut build)?;
 
     bootstrap_state_dir(

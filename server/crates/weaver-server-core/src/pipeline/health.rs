@@ -467,11 +467,8 @@ impl Pipeline {
         released_repair: bool,
         released_extract: bool,
     ) {
-        self.record_job_history(job_id);
+        self.record_job_history(job_id, Some(PipelineEvent::JobFailed { job_id, error }));
         self.job_order.retain(|id| *id != job_id);
-        let _ = self
-            .event_tx
-            .send(PipelineEvent::JobFailed { job_id, error });
         if released_repair {
             self.promote_queued_repairs();
         }

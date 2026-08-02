@@ -29,15 +29,6 @@ const FACADE_QUEUE_ITEM_FIELDS = `
     health
     hasPassword
     category
-    duplicateSummary {
-      lifecycle
-      action
-      primaryReason
-      semantic {
-        score
-        state
-      }
-    }
     metadata: attributes {
       key
       value
@@ -67,15 +58,6 @@ export const FACADE_HISTORY_ITEM_FIELDS = `
     outputDir
     createdAt
     completedAt
-    duplicateSummary {
-      lifecycle
-      action
-      primaryReason
-      semantic {
-        score
-        state
-      }
-    }
     deleteOperation {
       operationId
       state
@@ -101,15 +83,6 @@ export const HISTORY_TABLE_ITEM_FIELDS = `
     health
     category
     completedAt
-    duplicateSummary {
-      lifecycle
-      action
-      primaryReason
-      semantic {
-        score
-        state
-      }
-    }
     deleteOperation {
       operationId
       state

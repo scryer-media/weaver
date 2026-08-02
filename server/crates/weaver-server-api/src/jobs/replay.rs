@@ -310,6 +310,18 @@ async fn queue_event_records_from_pipeline_event(
     }
 
     let Ok(info) = handle.get_job(weaver_server_core::jobs::ids::JobId(job_id)) else {
+        // The scheduler already purged this job, so the cached item is the only
+        // payload left for it. Only a terminal outcome may consume that entry:
+        // the pipeline emits non-terminal events (MoveToCompleteFinished,
+        // DownloadFinished, phase updates) right before the terminal one, and
+        // evicting on those would leave the JobCompleted/JobFailed behind them
+        // with nothing to publish.
+        if !matches!(
+            event,
+            PipelineEvent::JobCompleted { .. } | PipelineEvent::JobFailed { .. }
+        ) {
+            return queue_events;
+        }
         if let Some(mut previous_item) = caches.evict(job_id) {
             match event {
                 PipelineEvent::JobCompleted { .. } => {
@@ -472,4 +484,257 @@ fn queue_event_progress_signature(item: &QueueItem) -> ProgressSignature {
 
 fn progress_signature_has_progress(signature: &ProgressSignature) -> bool {
     signature.overall_bucket > 0 || !signature.phases.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tokio::sync::mpsc;
+    use weaver_server_core::jobs::handle::{JobInfo, SharedPipelineState};
+    use weaver_server_core::jobs::ids::JobId;
+    use weaver_server_core::operations::metrics::PipelineMetrics;
+    use weaver_server_core::settings::Config;
+    use weaver_server_core::{DownloadState, JobStatus, PostState, RunState, SchedulerCommand};
+
+    const PURGED_JOB_ID: u64 = 4242;
+
+    fn test_config() -> SharedConfig {
+        Arc::new(RwLock::new(Config {
+            data_dir: "/tmp/weaver".to_string(),
+            intermediate_dir: None,
+            complete_dir: None,
+            buffer_pool: None,
+            tuner: None,
+            servers: vec![],
+            categories: vec![],
+            retry: None,
+            max_download_speed: None,
+            cleanup_after_extract: None,
+            isp_bandwidth_cap: None,
+            ip_replacement_trial_extra_connections: None,
+            watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
+            config_path: None,
+        }))
+    }
+
+    fn finalizing_job_info() -> JobInfo {
+        JobInfo {
+            job_id: JobId(PURGED_JOB_ID),
+            job_hash: None,
+            name: "Purged Completion".to_string(),
+            error: None,
+            download_wait_reason: None,
+            download_retry_at_epoch_ms: None,
+            status: JobStatus::Moving,
+            download_state: DownloadState::Complete,
+            post_state: PostState::Finalizing,
+            run_state: RunState::Active,
+            progress: 100.0,
+            total_bytes: 1024,
+            downloaded_bytes: 1024,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            phase_progress: Vec::new(),
+            failed_bytes: 0,
+            health: 1000,
+            total_files: 1,
+            completed_files: 1,
+            remaining_par_files: 0,
+            password: None,
+            category: None,
+            metadata: Vec::new(),
+            output_dir: None,
+            created_at_epoch_ms: 0.0,
+        }
+    }
+
+    /// Seed the replay caches from a live finalizing job, then purge it from the
+    /// scheduler the way the pipeline does before its terminal event lands.
+    fn purged_job_fixture() -> (SchedulerHandle, SharedConfig, QueueEventCaches) {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SchedulerCommand>(4);
+        let (event_tx, _event_rx) = broadcast::channel(4);
+        let state = SharedPipelineState::new(PipelineMetrics::new(), vec![finalizing_job_info()]);
+        let handle = SchedulerHandle::new(cmd_tx, event_tx, state.clone());
+
+        let mut caches = QueueEventCaches::default();
+        caches.seed_from_handle(&handle);
+        state.publish_jobs(Vec::new());
+
+        (handle, test_config(), caches)
+    }
+
+    fn completed_job_info() -> JobInfo {
+        let status = JobStatus::Complete;
+        let (download_state, post_state, run_state) =
+            weaver_server_core::runtime_lanes_from_status_snapshot(&status);
+        JobInfo {
+            status,
+            download_state,
+            post_state,
+            run_state,
+            ..finalizing_job_info()
+        }
+    }
+
+    /// The ordering production actually takes: `record_job_history` moves the
+    /// job into `finished_jobs` and republishes the snapshot *before* the
+    /// terminal event is released, so the job is still resolvable — the
+    /// evicted-cache path is only the fallback.
+    #[tokio::test]
+    async fn completed_job_in_finished_snapshot_emits_item_completed() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SchedulerCommand>(4);
+        let (event_tx, _event_rx) = broadcast::channel(4);
+        let state = SharedPipelineState::new(PipelineMetrics::new(), vec![finalizing_job_info()]);
+        let handle = SchedulerHandle::new(cmd_tx, event_tx, state.clone());
+        let config = test_config();
+
+        let mut caches = QueueEventCaches::default();
+        caches.seed_from_handle(&handle);
+        state.publish_jobs(vec![completed_job_info()]);
+
+        let records = queue_event_records_from_pipeline_event(
+            &PipelineEvent::JobCompleted {
+                job_id: JobId(PURGED_JOB_ID),
+            },
+            &handle,
+            &config,
+            &mut caches,
+        )
+        .await;
+
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = &records[0];
+        assert_eq!(record.kind, QueueEventKind::ItemCompleted);
+        assert_eq!(record.item_id, Some(PURGED_JOB_ID));
+        assert_eq!(record.state, Some(QueueItemState::Completed));
+        let item = record
+            .item
+            .as_ref()
+            .expect("completed queue event must carry an item payload");
+        assert_eq!(item.id, PURGED_JOB_ID);
+        assert_eq!(item.state, QueueItemState::Completed);
+    }
+
+    async fn assert_item_completed_survives(intermediate: PipelineEvent) {
+        let (handle, config, mut caches) = purged_job_fixture();
+
+        let intermediate_records =
+            queue_event_records_from_pipeline_event(&intermediate, &handle, &config, &mut caches)
+                .await;
+        assert!(
+            intermediate_records.is_empty(),
+            "intermediate event for a purged job should not publish a queue event"
+        );
+
+        let records = queue_event_records_from_pipeline_event(
+            &PipelineEvent::JobCompleted {
+                job_id: JobId(PURGED_JOB_ID),
+            },
+            &handle,
+            &config,
+            &mut caches,
+        )
+        .await;
+
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = &records[0];
+        assert_eq!(record.kind, QueueEventKind::ItemCompleted);
+        assert_eq!(record.item_id, Some(PURGED_JOB_ID));
+        assert_eq!(record.state, Some(QueueItemState::Completed));
+        let item = record
+            .item
+            .as_ref()
+            .expect("completed queue event must carry an item payload");
+        assert_eq!(item.id, PURGED_JOB_ID);
+        assert_eq!(item.state, QueueItemState::Completed);
+    }
+
+    #[tokio::test]
+    async fn move_to_complete_finished_keeps_item_completed_for_purged_job() {
+        assert_item_completed_survives(PipelineEvent::MoveToCompleteFinished {
+            job_id: JobId(PURGED_JOB_ID),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn download_finished_keeps_item_completed_for_purged_job() {
+        assert_item_completed_survives(PipelineEvent::DownloadFinished {
+            job_id: JobId(PURGED_JOB_ID),
+            finalization_pending: false,
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn intermediate_event_keeps_failed_state_change_for_purged_job() {
+        let (handle, config, mut caches) = purged_job_fixture();
+
+        let intermediate_records = queue_event_records_from_pipeline_event(
+            &PipelineEvent::MoveToCompleteFinished {
+                job_id: JobId(PURGED_JOB_ID),
+            },
+            &handle,
+            &config,
+            &mut caches,
+        )
+        .await;
+        assert!(intermediate_records.is_empty());
+
+        let records = queue_event_records_from_pipeline_event(
+            &PipelineEvent::JobFailed {
+                job_id: JobId(PURGED_JOB_ID),
+                error: "boom".to_string(),
+            },
+            &handle,
+            &config,
+            &mut caches,
+        )
+        .await;
+
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = &records[0];
+        assert_eq!(record.kind, QueueEventKind::ItemStateChanged);
+        assert_eq!(record.item_id, Some(PURGED_JOB_ID));
+        assert_eq!(record.state, Some(QueueItemState::Failed));
+        let item = record
+            .item
+            .as_ref()
+            .expect("failed queue event must carry an item payload");
+        assert_eq!(item.id, PURGED_JOB_ID);
+        assert_eq!(item.state, QueueItemState::Failed);
+        assert_eq!(item.error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn terminal_event_still_evicts_the_cached_item() {
+        let (handle, config, mut caches) = purged_job_fixture();
+
+        let first = queue_event_records_from_pipeline_event(
+            &PipelineEvent::JobCompleted {
+                job_id: JobId(PURGED_JOB_ID),
+            },
+            &handle,
+            &config,
+            &mut caches,
+        )
+        .await;
+        assert_eq!(first.len(), 1);
+
+        let replayed = queue_event_records_from_pipeline_event(
+            &PipelineEvent::JobCompleted {
+                job_id: JobId(PURGED_JOB_ID),
+            },
+            &handle,
+            &config,
+            &mut caches,
+        )
+        .await;
+        assert!(
+            replayed.is_empty(),
+            "a terminal event must publish once, not per repeat"
+        );
+    }
 }

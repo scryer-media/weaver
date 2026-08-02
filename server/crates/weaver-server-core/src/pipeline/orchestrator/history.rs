@@ -230,16 +230,30 @@ impl Pipeline {
             .truncate(crate::jobs::FINISHED_JOBS_RUNTIME_CAP);
     }
 
-    pub(crate) fn record_job_history(&mut self, job_id: JobId) {
+    /// Archive the job's history row and publish `terminal_event` once that
+    /// archive has committed. Terminal events are routed through here so every
+    /// caller keeps the same guarantee: a subscriber that observes the event can
+    /// immediately read the row back from the history facade.
+    pub(crate) fn record_job_history(
+        &mut self,
+        job_id: JobId,
+        terminal_event: Option<PipelineEvent>,
+    ) {
         let state = match self.jobs.get(&job_id) {
             Some(s) => s,
-            None => return,
+            None => {
+                self.publish_terminal_event(terminal_event);
+                return;
+            }
         };
 
         let (status_str, error_message) = match &state.status {
             JobStatus::Complete => ("complete".to_string(), None),
             JobStatus::Failed { error } => ("failed".to_string(), Some(error.clone())),
-            _ => return,
+            _ => {
+                self.publish_terminal_event(terminal_event);
+                return;
+            }
         };
         let completed = matches!(state.status, JobStatus::Complete);
 
@@ -324,18 +338,53 @@ impl Pipeline {
         };
 
         let archive_started = Instant::now();
-        if let Err(e) =
-            self.db
-                .try_queue_archive_job_with_terminal_cause(job_id, row, typed_terminal_cause)
-        {
-            tracing::error!(job_id = job_id.0, error = %e, "failed to queue job history archival");
-            return;
-        }
+        let archived = match self.db.try_queue_archive_job_with_terminal_cause(
+            job_id,
+            row,
+            typed_terminal_cause,
+        ) {
+            Ok(archived) => archived,
+            Err(e) => {
+                tracing::error!(job_id = job_id.0, error = %e, "failed to queue job history archival");
+                self.publish_terminal_event(terminal_event);
+                return;
+            }
+        };
         debug!(
             job_id = job_id.0,
             elapsed_ms = archive_started.elapsed().as_millis(),
             "queued job history archival"
         );
+        // Purge and republish before arming the deferred event: the runtime
+        // snapshot must already list the job as finished when a subscriber
+        // reacts, or the history facade rejects the lookup as a still-live job.
         self.purge_terminal_job_runtime(job_id);
+        self.publish_snapshot();
+        self.publish_terminal_event_after_archive(archived, terminal_event);
+    }
+
+    fn publish_terminal_event(&self, terminal_event: Option<PipelineEvent>) {
+        if let Some(event) = terminal_event {
+            let _ = self.event_tx.send(event);
+        }
+    }
+
+    /// Hold the terminal event until the history archive has committed, so the
+    /// row is queryable the moment the event is observed. A dropped signal (the
+    /// writer queue closed at shutdown) still publishes: losing a terminal event
+    /// is worse than publishing one ahead of its row.
+    fn publish_terminal_event_after_archive(
+        &self,
+        archived: oneshot::Receiver<()>,
+        terminal_event: Option<PipelineEvent>,
+    ) {
+        let Some(event) = terminal_event else {
+            return;
+        };
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let _ = archived.await;
+            let _ = event_tx.send(event);
+        });
     }
 }

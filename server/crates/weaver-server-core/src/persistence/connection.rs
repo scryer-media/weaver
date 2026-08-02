@@ -427,6 +427,10 @@ enum DbWriteCommand {
         job_id: crate::jobs::ids::JobId,
         history: Box<crate::history::JobHistoryRow>,
         typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
+        /// Fired once the archive transaction has committed and the row has
+        /// been re-cached, so callers can hold a terminal event until the
+        /// history row is queryable through the read paths.
+        committed: Option<oneshot::Sender<()>>,
     },
     InsertJobEvents {
         events: Vec<crate::history::JobEvent>,
@@ -733,6 +737,7 @@ impl Database {
                         job_id,
                         history,
                         typed_terminal_cause,
+                        committed,
                     } => {
                         let writer = writer.clone();
                         tokio::task::spawn_blocking(move || {
@@ -761,6 +766,9 @@ impl Database {
                         })
                         .await
                         .ok();
+                        if let Some(committed) = committed {
+                            let _ = committed.send(());
+                        }
                     }
                     DbWriteCommand::InsertJobEvents { events } => {
                         let writer = writer.clone();
@@ -819,24 +827,32 @@ impl Database {
             job_id,
             history: Box::new(history),
             typed_terminal_cause: None,
+            committed: None,
         };
         self.try_send_with_retry(command, "archive")
     }
 
+    /// Queue the durable history archive and hand back a signal that fires once
+    /// that write has committed. Terminal job events are published off this
+    /// signal, so a subscriber that observes one can immediately read the row
+    /// back through the history facade instead of racing the write queue.
     pub fn try_queue_archive_job_with_terminal_cause(
         &self,
         job_id: crate::jobs::ids::JobId,
         history: crate::history::JobHistoryRow,
         typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
-    ) -> Result<(), StateError> {
+    ) -> Result<oneshot::Receiver<()>, StateError> {
+        let (committed_tx, committed_rx) = oneshot::channel();
         self.try_send_with_retry(
             DbWriteCommand::ArchiveJob {
                 job_id,
                 history: Box::new(history),
                 typed_terminal_cause,
+                committed: Some(committed_tx),
             },
             "archive",
-        )
+        )?;
+        Ok(committed_rx)
     }
 
     /// Queue a generic ordered write. Runs on the single serialized writer
@@ -911,6 +927,7 @@ impl Database {
                 job_id,
                 history: Box::new(history),
                 typed_terminal_cause: None,
+                committed: None,
             })
             .await
             .map_err(|_| StateError::Database("database writer queue closed".to_string()))

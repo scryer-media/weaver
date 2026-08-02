@@ -24,7 +24,6 @@ import { DataTablePagination } from "@/components/data-table/DataTablePagination
 import { EmptyState } from "@/components/EmptyState";
 import { FilterChip } from "@/components/FilterChip";
 import { JobStatusBadge } from "@/components/JobStatusBadge";
-import { DuplicateSummaryBadge } from "@/features/duplicates/DuplicateSummaryBadge";
 import { formatBytes } from "@/components/SpeedDisplay";
 import { cn } from "@/lib/utils";
 import { STATUS_BG_CLASS, STATUS_TEXT_CLASS } from "@/lib/status-tokens";
@@ -32,7 +31,6 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { useTablePreferences } from "@/lib/hooks/use-table-preferences";
 import {
   formatJobReleaseName,
-  type DuplicateSummaryData,
   type DeleteOperationData,
   normalizeFacadeJobStatus,
   normalizeGraphqlTimestamp,
@@ -61,7 +59,6 @@ type HistoryJob = {
   category: string | null;
   completedAt?: number | null;
   deleteOperation?: DeleteOperationData | null;
-  duplicateSummary?: DuplicateSummaryData | null;
 };
 type HistoryFilter = "all" | "success" | "failure";
 type FacadeHistoryJob = Omit<HistoryJob, "completedAt"> & {
@@ -793,7 +790,6 @@ export function History() {
               >
                 {displayName}
               </Link>
-              <DuplicateSummaryBadge summary={row.original.duplicateSummary} />
               {deleteOperation?.locked ? (
                 <span className="text-[10.5px] text-status-paused">Deleting…</span>
               ) : deleteOperation?.state === "FAILED" ? (

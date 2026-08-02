@@ -1026,7 +1026,10 @@ impl Pipeline {
         }
     }
 
-    fn complete_job_after_terminal_post_processing(&mut self, job_id: JobId) {
+    pub(in crate::pipeline) fn complete_job_after_terminal_post_processing(
+        &mut self,
+        job_id: JobId,
+    ) {
         self.transition_completed_runtime(job_id);
         if self.active_download_passes.remove(&job_id) {
             self.phase_end(job_id, JobPhase::Downloading);
@@ -1039,12 +1042,11 @@ impl Pipeline {
         self.clear_par2_runtime_state(job_id);
         self.clear_job_rar_runtime(job_id);
         self.job_order.retain(|id| *id != job_id);
-        let _ = self.event_tx.send(PipelineEvent::JobCompleted { job_id });
         info!(
             job_id = job_id.0,
             "job completed after terminal post-processing"
         );
-        self.record_job_history(job_id);
+        self.record_job_history(job_id, Some(PipelineEvent::JobCompleted { job_id }));
         self.publish_snapshot();
     }
 

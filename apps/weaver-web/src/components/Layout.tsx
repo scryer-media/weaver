@@ -29,6 +29,7 @@ import {
   VERSION_QUERY,
 } from "@/graphql/queries";
 import { formatSpeed } from "@/components/SpeedDisplay";
+import { Badge } from "@/components/ui/badge";
 import { Sparkline } from "@/components/ui/sparkline";
 import { UploadModal } from "@/components/UploadModal";
 import { useSpeedHistory } from "@/lib/hooks/use-speed-history";
@@ -597,13 +598,18 @@ export function Layout() {
                               key={entry.to}
                               to={entry.to}
                               className={cn(
-                                "block rounded-lg px-2.5 py-1.5 text-[13px] transition-colors",
+                                "flex items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-[13px] transition-colors",
                                 childActive
                                   ? "bg-accent font-semibold text-foreground"
                                   : "font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground",
                               )}
                             >
-                              {t(entry.labelKey)}
+                              <span>{t(entry.labelKey)}</span>
+                              {entry.beta ? (
+                                <Badge variant="secondary" className="px-1 py-0 text-[9px] uppercase tracking-[0.08em]">
+                                  Beta
+                                </Badge>
+                              ) : null}
                             </Link>
                           );
                         })}
@@ -718,17 +724,22 @@ export function Layout() {
                             return (
                               <Link
                                 key={entry.to}
-                                to={entry.to}
-                                onClick={() => setMobileNavOpen(false)}
-                                className={cn(
-                                  "block rounded-lg px-3 py-2 text-[13px] transition-colors",
-                                  childActive
-                                    ? "bg-accent font-semibold text-foreground"
-                                    : "font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground",
-                                )}
-                              >
-                                {t(entry.labelKey)}
-                              </Link>
+                              to={entry.to}
+                              onClick={() => setMobileNavOpen(false)}
+                              className={cn(
+                                "flex items-center justify-between gap-2 rounded-lg px-3 py-2 text-[13px] transition-colors",
+                                childActive
+                                  ? "bg-accent font-semibold text-foreground"
+                                  : "font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground",
+                              )}
+                            >
+                              <span>{t(entry.labelKey)}</span>
+                              {entry.beta ? (
+                                <Badge variant="secondary" className="px-1 py-0 text-[9px] uppercase tracking-[0.08em]">
+                                  Beta
+                                </Badge>
+                              ) : null}
+                            </Link>
                             );
                           })}
                         </div>

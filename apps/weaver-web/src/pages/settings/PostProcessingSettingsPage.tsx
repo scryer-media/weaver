@@ -567,6 +567,11 @@ export function PostProcessingSettingsPage() {
     <div className="max-w-[1180px] space-y-6">
       <PageHeader
         title="Post-processing"
+        titleAdornment={
+          <span className="inline-flex items-center rounded-chip bg-secondary px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.1em] text-secondary-foreground">
+            Beta
+          </span>
+        }
         description="Discover, approve, and run terminal extensions after Weaver’s built-in pipeline."
       />
 
@@ -838,7 +843,9 @@ export function PostProcessingSettingsPage() {
                   </div>
                   <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
                     <div className="space-y-2 md:col-span-2 lg:col-span-3">
-                      <Label>Approved immutable revision</Label>
+                      <Label htmlFor={`pp-profile-step-${index}-revision`}>
+                        Approved immutable revision
+                      </Label>
                       <Select
                         value={`${step.extensionId}|${step.revisionId}`}
                         onValueChange={(value) => {
@@ -846,7 +853,7 @@ export function PostProcessingSettingsPage() {
                           updateStep(index, { extensionId, revisionId });
                         }}
                       >
-                        <SelectTrigger><SelectValue placeholder="Select an approved revision" /></SelectTrigger>
+                        <SelectTrigger id={`pp-profile-step-${index}-revision`}><SelectValue placeholder="Select an approved revision" /></SelectTrigger>
                         <SelectContent>
                           {approvedRevisions.map((revision) => (
                             <SelectItem
@@ -860,9 +867,9 @@ export function PostProcessingSettingsPage() {
                       </Select>
                     </div>
                     <div className="space-y-2">
-                      <Label>Run when</Label>
+                      <Label htmlFor={`pp-profile-step-${index}-run-when`}>Run when</Label>
                       <Select value={step.runWhen} onValueChange={(value) => updateStep(index, { runWhen: value as ProfileStep["runWhen"] })}>
-                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectTrigger id={`pp-profile-step-${index}-run-when`}><SelectValue /></SelectTrigger>
                         <SelectContent>
                           <SelectItem value="ALWAYS">Always</SelectItem>
                           <SelectItem value="SUCCESS">Pipeline succeeded</SelectItem>
@@ -871,9 +878,9 @@ export function PostProcessingSettingsPage() {
                       </Select>
                     </div>
                     <div className="space-y-2">
-                      <Label>After failure</Label>
+                      <Label htmlFor={`pp-profile-step-${index}-on-failure`}>After failure</Label>
                       <Select value={step.onFailure} onValueChange={(value) => updateStep(index, { onFailure: value as ProfileStep["onFailure"] })}>
-                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectTrigger id={`pp-profile-step-${index}-on-failure`}><SelectValue /></SelectTrigger>
                         <SelectContent>
                           <SelectItem value="STOP">Stop later steps</SelectItem>
                           <SelectItem value="CONTINUE">Continue</SelectItem>
@@ -881,9 +888,9 @@ export function PostProcessingSettingsPage() {
                       </Select>
                     </div>
                     <div className="space-y-2">
-                      <Label>Outcome impact</Label>
+                      <Label htmlFor={`pp-profile-step-${index}-outcome-impact`}>Outcome impact</Label>
                       <Select value={step.outcomeImpact} onValueChange={(value) => updateStep(index, { outcomeImpact: value as ProfileStep["outcomeImpact"] })}>
-                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectTrigger id={`pp-profile-step-${index}-outcome-impact`}><SelectValue /></SelectTrigger>
                         <SelectContent>
                           <SelectItem value="WARN">Warning</SelectItem>
                           <SelectItem value="FAIL_JOB">Fail successful job</SelectItem>
@@ -891,8 +898,11 @@ export function PostProcessingSettingsPage() {
                       </Select>
                     </div>
                     <div className="space-y-2">
-                      <Label>Timeout seconds</Label>
+                      <Label htmlFor={`pp-profile-step-${index}-timeout-seconds`}>
+                        Timeout seconds
+                      </Label>
                       <Input
+                        id={`pp-profile-step-${index}-timeout-seconds`}
                         type="number"
                         min={1}
                         disabled={step.unlimitedTimeout}
@@ -902,22 +912,31 @@ export function PostProcessingSettingsPage() {
                     </div>
                     <div className="flex items-end gap-3 pb-2">
                       <Switch
+                        id={`pp-profile-step-${index}-unlimited-timeout`}
                         checked={step.unlimitedTimeout}
                         onCheckedChange={(checked) => updateStep(index, { unlimitedTimeout: checked })}
                       />
-                      <Label>Unlimited timeout</Label>
+                      <Label htmlFor={`pp-profile-step-${index}-unlimited-timeout`}>
+                        Unlimited timeout
+                      </Label>
                     </div>
                     <div className="space-y-2 md:col-span-2 lg:col-span-3">
-                      <Label>Step-approved roots (one per line)</Label>
+                      <Label htmlFor={`pp-profile-step-${index}-approved-roots`}>
+                        Step-approved roots (one per line)
+                      </Label>
                       <textarea
+                        id={`pp-profile-step-${index}-approved-roots`}
                         className="min-h-20 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm"
                         value={step.approvedRoots}
                         onChange={(event) => updateStep(index, { approvedRoots: event.target.value })}
                       />
                     </div>
                     <div className="space-y-2 md:col-span-2">
-                      <Label>Required artifact suffixes (one per line)</Label>
+                      <Label htmlFor={`pp-profile-step-${index}-artifact-suffixes`}>
+                        Required artifact suffixes (one per line)
+                      </Label>
                       <textarea
+                        id={`pp-profile-step-${index}-artifact-suffixes`}
                         className="min-h-20 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm"
                         value={step.requiredArtifactSuffixes}
                         onChange={(event) =>
@@ -927,8 +946,11 @@ export function PostProcessingSettingsPage() {
                       />
                     </div>
                     <div className="space-y-2">
-                      <Label>Minimum artifact count</Label>
+                      <Label htmlFor={`pp-profile-step-${index}-minimum-artifact-count`}>
+                        Minimum artifact count
+                      </Label>
                       <Input
+                        id={`pp-profile-step-${index}-minimum-artifact-count`}
                         type="number"
                         min={0}
                         value={step.minimumArtifactCount}

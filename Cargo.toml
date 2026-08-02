@@ -91,7 +91,7 @@ keyring = { version = "4", default-features = false, features = ["v1"] }
 keyring-core = { version = "1", default-features = false }
 windows-sys = { version = "0.61", default-features = false }
 weaver-par2 = { version = "0.2.4", default-features = false, features = ["metal", "native-crypto"] }
-weaver-unrar = { git = "https://github.com/scryer-media/rarpar", rev = "a5de0d3bbce13999d50cec4bced17096ce1d1ae6", version = "0.3.1", default-features = false, features = ["crypto-aws-lc"] }
+weaver-unrar = { version = "0.3.1", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.12.0", default-features = false }
 
 [profile.release]
