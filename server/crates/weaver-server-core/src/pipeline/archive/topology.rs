@@ -69,6 +69,99 @@ mod tests {
             .collect()
     }
 
+    /// Volumes 0-2 and 5 of a six-volume set, all covered by a matching cached
+    /// snapshot. The gap at 3-4 leaves volume 5 waiting no matter which source
+    /// the plan is rebuilt from, so it must not be read as snapshot staleness.
+    fn holey_cached_rebuild_input(temp_dir: &tempfile::TempDir) -> RarSetComputeInput {
+        let files = build_many_volume_rar_set(6);
+        let present = [0usize, 1, 2, 5];
+
+        let mut cached_archive =
+            weaver_unrar::RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+        for volume in present.iter().copied().skip(1) {
+            cached_archive
+                .add_volume(volume, Box::new(Cursor::new(files[volume].1.clone())))
+                .unwrap();
+        }
+
+        let mut volume_map = HashMap::new();
+        let mut volume_paths = BTreeMap::new();
+        let mut facts = BTreeMap::new();
+        for volume in present.iter().copied() {
+            let (filename, bytes) = &files[volume];
+            let path = temp_dir.path().join(filename);
+            std::fs::write(&path, bytes).unwrap();
+            volume_map.insert(filename.clone(), volume as u32);
+            volume_paths.insert(volume as u32, path);
+            facts.insert(
+                volume as u32,
+                weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None)
+                    .expect("synthetic RAR volume facts should parse"),
+            );
+        }
+
+        RarSetComputeInput {
+            job_id: JobId(98),
+            set_name: "show".to_string(),
+            existing: RarSetState::default(),
+            volume_map,
+            volume_paths,
+            password_candidates: Vec::new(),
+            extracted: HashSet::new(),
+            failed: HashSet::new(),
+            facts,
+            verified_suspect_volumes: HashSet::new(),
+            worker_active: false,
+            cached_headers: Some(cached_archive.serialize_headers()),
+            extraction_generation: 0,
+            reason: RefreshReason::CoverageExpansion,
+        }
+    }
+
+    #[test]
+    fn rar_plan_rebuild_reuses_matching_cached_headers_without_reopening_volume_zero() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let input = holey_cached_rebuild_input(&temp_dir);
+        // Volume 0 is only ever opened by the fallback, so removing it turns any
+        // unnecessary reopen into a hard failure instead of silent extra I/O.
+        std::fs::remove_file(&input.volume_paths[&0]).unwrap();
+
+        let _tracking = rar_refresh_open_tracking::start();
+        let computed = Pipeline::compute_rar_set_state_blocking(input)
+            .expect("matching cached headers should rebuild without volume 0");
+
+        assert_eq!(computed.rebuild_source.as_str(), "cached-headers");
+        assert!(
+            rar_refresh_open_tracking::opened().is_empty(),
+            "cached-header rebuild reopened volumes: {:?}",
+            rar_refresh_open_tracking::opened()
+        );
+        assert_eq!(
+            computed
+                .plan
+                .topology
+                .complete_volumes
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1, 2, 5])
+        );
+    }
+
+    #[test]
+    fn rar_plan_rebuild_falls_back_to_volume_zero_without_usable_cached_headers() {
+        for cached_headers in [None, Some(b"not-a-cached-header-snapshot".to_vec())] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut input = holey_cached_rebuild_input(&temp_dir);
+            input.cached_headers = cached_headers;
+
+            let computed = Pipeline::compute_rar_set_state_blocking(input)
+                .expect("live volumes should still rebuild the plan");
+
+            assert_eq!(computed.rebuild_source.as_str(), "volume-0");
+        }
+    }
+
     #[test]
     fn rar_refresh_compute_bounds_live_source_readers_for_many_volumes() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -139,7 +232,7 @@ mod tests {
 
 #[cfg(test)]
 mod rar_refresh_open_tracking {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::io::{Read, Seek};
     use std::path::Path;
 
@@ -147,6 +240,7 @@ mod rar_refresh_open_tracking {
         static ENABLED: Cell<bool> = const { Cell::new(false) };
         static ACTIVE: Cell<usize> = const { Cell::new(0) };
         static PEAK: Cell<usize> = const { Cell::new(0) };
+        static OPENED: RefCell<Vec<std::path::PathBuf>> = const { RefCell::new(Vec::new()) };
     }
 
     pub(super) struct Guard {
@@ -161,6 +255,7 @@ mod rar_refresh_open_tracking {
         });
         ACTIVE.with(|active| active.set(0));
         PEAK.with(|peak| peak.set(0));
+        OPENED.with(|opened| opened.borrow_mut().clear());
         Guard { previous }
     }
 
@@ -168,10 +263,15 @@ mod rar_refresh_open_tracking {
         PEAK.with(Cell::get)
     }
 
+    pub(super) fn opened() -> Vec<std::path::PathBuf> {
+        OPENED.with(|opened| opened.borrow().clone())
+    }
+
     pub(super) fn open(path: &Path) -> std::io::Result<Box<dyn weaver_unrar::ReadSeek>> {
         let file = std::fs::File::open(path)?;
         let counted = ENABLED.with(Cell::get);
         if counted {
+            OPENED.with(|opened| opened.borrow_mut().push(path.to_path_buf()));
             ACTIVE.with(|active| {
                 let next = active.get() + 1;
                 active.set(next);
@@ -356,11 +456,20 @@ fn present_waiting_rar_volumes(
     facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
     volume_paths: &BTreeMap<u32, PathBuf>,
 ) -> Vec<u32> {
+    // Waiting on a volume past the first on-disk gap is the correct plan, not a
+    // stale-snapshot symptom: nothing links that volume's continuation headers
+    // back to a member start until the gap fills, so a volume-0 rebuild reads
+    // the same files and reproduces the same wait.
+    let reachable_end = rar_state::contiguous_prefix_end(volume_paths);
     let mut volumes: Vec<u32> = plan
         .waiting_on_volumes
         .iter()
         .copied()
-        .filter(|volume| facts.contains_key(volume) && volume_paths.contains_key(volume))
+        .filter(|volume| {
+            facts.contains_key(volume)
+                && volume_paths.contains_key(volume)
+                && reachable_end.is_some_and(|end| *volume <= end)
+        })
         .collect();
     volumes.sort_unstable();
     volumes.dedup();

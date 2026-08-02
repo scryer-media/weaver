@@ -151,13 +151,13 @@ impl PlannerMemberReadiness {
     }
 }
 
-pub(crate) fn contiguous_prefix_end(facts: &BTreeMap<u32, RarVolumeFacts>) -> Option<u32> {
-    if !facts.contains_key(&0) {
+pub(crate) fn contiguous_prefix_end<T>(volumes: &BTreeMap<u32, T>) -> Option<u32> {
+    if !volumes.contains_key(&0) {
         return None;
     }
 
     let mut next = 0u32;
-    while facts.contains_key(&next) {
+    while volumes.contains_key(&next) {
         next = next.saturating_add(1);
     }
     Some(next.saturating_sub(1))
