@@ -50,6 +50,19 @@ Run affected tests while iterating. For frontend, platform, release, or
 performance changes, run the applicable checks shown by `xtask --help` and
 current CI. Disclose anything relevant that was not run.
 
+`api/graphql/schema.graphql` is a generated artifact: the release regenerates
+and commits it, and the release gate rejects breaking or dangerous API changes
+in a patch release. Regenerate it locally and check a change against the
+committed schema with:
+
+```bash
+cargo run --locked -p weaver-server-api --bin export-graphql-schema
+```
+
+```bash
+cd apps/weaver-web && npm run test:graphql-compat
+```
+
 ## Tests And Fixtures
 
 - Add regression coverage for bug fixes and test failure, cancellation,

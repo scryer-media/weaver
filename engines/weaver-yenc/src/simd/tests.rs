@@ -168,8 +168,12 @@ unsafe fn avx2_block_with_state(
         state: initial_state,
         ..KernelState::body()
     };
+    // `preserve_pending` must be set: this helper stands in for a mid-stream
+    // 64-byte block, so a window that ends on `=` carries the escape as
+    // pending state instead of failing as a truncated escape. The other tiers'
+    // `try_decode_*_block` primitives preserve pending state unconditionally.
     let outcome =
-        unsafe { decode_kernel_avx2(input, &mut output, &mut state, dot_unstuffing, false, true) }
+        unsafe { decode_kernel_avx2(input, &mut output, &mut state, dot_unstuffing, true, true) }
             .expect("active avx2 kernel should decode");
     assert_eq!(outcome.consumed, 64);
     output.truncate(outcome.written);

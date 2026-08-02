@@ -81,6 +81,63 @@ def safe_part(value: str) -> str:
     return "".join(c if c.isalnum() or c in "._-" else "_" for c in value)
 
 
+def collect_support_binaries(
+    cargo_messages: list[dict],
+    package_map: dict[str, dict[str, str]],
+    workspace: Path,
+    stage_dir: Path,
+) -> list[dict]:
+    """Stage workspace `[[bin]]` executables alongside the test binaries.
+
+    Integration tests reach their package's binaries through
+    `env!("CARGO_BIN_EXE_<name>")`, which bakes in an absolute path under the
+    build job's `target/` directory. The lane jobs only unpack this archive, so
+    without the binaries those tests fail to spawn (see
+    `server/app/weaver/tests/post_processing_runner.rs`, which executes the
+    real `weaver` binary as its post-processing supervisor). Record each one by
+    its workspace-relative path so `run_lane` can restore it in place.
+    """
+    support_dir = stage_dir / "support"
+    entries = []
+    seen = set()
+    for message in cargo_messages:
+        if message.get("reason") != "compiler-artifact":
+            continue
+        executable = message.get("executable")
+        profile = message.get("profile", {})
+        if not executable or profile.get("test"):
+            continue
+        if "bin" not in message.get("target", {}).get("kind", []):
+            continue
+        if message.get("package_id") not in package_map:
+            continue
+
+        source = Path(executable)
+        try:
+            relative_target = source.resolve().relative_to(workspace)
+        except ValueError:
+            # A target directory outside the workspace cannot be restored to
+            # the path the test binary was compiled against; skip it loudly
+            # rather than shipping a binary that would land somewhere else.
+            print(f"skipping out-of-workspace binary {source}", file=sys.stderr)
+            continue
+        if relative_target.as_posix() in seen:
+            continue
+        seen.add(relative_target.as_posix())
+
+        rel_bin = Path("support") / relative_target
+        dest = support_dir / relative_target
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, dest)
+        dest.chmod(dest.stat().st_mode | 0o111)
+        entries.append(
+            {"artifact": rel_bin.as_posix(), "workspace_path": relative_target.as_posix()}
+        )
+
+    entries.sort(key=lambda entry: entry["workspace_path"])
+    return entries
+
+
 def collect(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
     package_map = load_package_map(Path(args.metadata), workspace)
@@ -135,16 +192,26 @@ def collect(args: argparse.Namespace) -> None:
         raise SystemExit("no Rust test executables were collected")
 
     entries.sort(key=lambda entry: (entry["package"], entry["target"], entry["artifact"]))
+    support = collect_support_binaries(cargo_messages, package_map, workspace, stage_dir)
     manifest_path = stage_dir / "manifest.json"
-    manifest_path.write_text(json.dumps({"tests": entries}, indent=2) + "\n", encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps({"tests": entries, "support_binaries": support}, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     if archive_path.exists():
         archive_path.unlink()
     with tarfile.open(archive_path, "w:gz") as tar:
         tar.add(manifest_path, arcname="manifest.json")
         tar.add(bin_dir, arcname="bin")
+        support_dir = stage_dir / "support"
+        if support_dir.exists():
+            tar.add(support_dir, arcname="support")
 
-    print(f"collected {len(entries)} Rust test executables into {archive_path}")
+    print(
+        f"collected {len(entries)} Rust test executables and "
+        f"{len(support)} support binaries into {archive_path}"
+    )
 
 
 def slow_filters_for(entry: dict) -> list[str]:
@@ -193,11 +260,26 @@ def commands_for_lane(entry: dict, lane: str) -> list[list[str]]:
     raise SystemExit(f"unknown lane: {lane}")
 
 
+def restore_support_binaries(manifest: dict, artifact_root: Path, workspace: Path) -> None:
+    """Put staged `[[bin]]` executables back where `CARGO_BIN_EXE_*` expects them."""
+    for entry in manifest.get("support_binaries", []):
+        source = artifact_root / entry["artifact"]
+        if not source.is_file():
+            print(f"missing staged support binary {source}", file=sys.stderr)
+            continue
+        dest = workspace / entry["workspace_path"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, dest)
+        dest.chmod(dest.stat().st_mode | 0o111)
+        print(f"restored support binary {entry['workspace_path']}", flush=True)
+
+
 def run_lane(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
     manifest_path = Path(args.manifest).resolve()
     artifact_root = manifest_path.parent
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    restore_support_binaries(manifest, artifact_root, workspace)
 
     failures = 0
     ran = 0

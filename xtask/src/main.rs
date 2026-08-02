@@ -55,6 +55,14 @@ const RELEASE_LOCAL_PATH_TOKENS: &[&str] = &[
     concat!("C:/", "Users/"),
 ];
 const RELEASE_SIBLING_E2E_TOKENS: &[&str] = &[concat!("..", "/e2e/"), concat!("..\\", "e2e\\")];
+const GRAPHQL_API_COMPAT_STEP: &str = "graphql_api_compat";
+/// First weaver release that ships `api/graphql/schema.graphql`. Releases cut
+/// before this version have no committed schema to diff against, so the gate
+/// bootstraps its baseline instead of failing. Once a release at or after this
+/// version is tagged, a missing artifact is a hard release failure.
+const GRAPHQL_API_BASELINE_VERSION: &str = "0.7.7";
+const GRAPHQL_SCHEMA_ARTIFACT: &str = "api/graphql/schema.graphql";
+const GRAPHQL_SCHEMA_EXPORT_DIR: &str = "target/xtask-release/graphql";
 const WINGET_PACKAGE_IDENTIFIER: &str = "ScryerMedia.Weaver";
 const WINGET_PACKAGE_NAME: &str = "Weaver";
 const WINGET_MONIKER: &str = "weaver-usenet";
@@ -1777,10 +1785,21 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
                 ok("Rust validation passed");
             }
 
+            // Always runs, even when the dry-run cache lets the heavy Rust
+            // validation be skipped: the real release needs the regenerated
+            // artifact in its worktree to commit alongside the version bump.
+            run_weaver_graphql_api_compat_validation(
+                ctx,
+                "[graphql] ",
+                latest_tag.as_deref(),
+                &next_version,
+            )?;
+
             Ok::<(Vec<String>, String), anyhow::Error>((
                 vec![
                     "release_prep_validation".to_string(),
                     "rust_validation".to_string(),
+                    GRAPHQL_API_COMPAT_STEP.to_string(),
                 ],
                 prepared_tree,
             ))
@@ -1860,6 +1879,7 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
     if npm_lock.exists() && changed_file(ctx, &npm_lock)? {
         changed.push(npm_lock.clone());
     }
+    maybe_add_changed_graphql_schema_artifact(ctx, &mut changed)?;
     if !changed.is_empty() {
         let mut add = ctx.command_in("git", &ctx.repo_root);
         add.arg("add");
@@ -1928,6 +1948,165 @@ fn run_weaver_release_hygiene_validation(ctx: &TaskContext, prefix: &'static str
     Ok(())
 }
 
+/// Export the current GraphQL SDL, diff it against the schema shipped by the
+/// previous release, and refresh the committed `api/graphql/schema.graphql`
+/// artifact. Breaking and dangerous changes fail a patch release outright and
+/// are only warned about when the release raises the minor or major version.
+fn run_weaver_graphql_api_compat_validation(
+    ctx: &TaskContext,
+    prefix: &'static str,
+    latest_tag: Option<&str>,
+    next_version: &Version,
+) -> Result<()> {
+    prefixed_step(prefix, "Exporting current GraphQL schema");
+    let export_dir = ctx.path(GRAPHQL_SCHEMA_EXPORT_DIR);
+    fs::create_dir_all(&export_dir)
+        .with_context(|| format!("failed to create {}", export_dir.display()))?;
+    let current_schema_path = export_dir.join("schema.graphql");
+    let previous_schema_path = export_dir.join("previous-schema.graphql");
+    let mut export = ctx.command_in("cargo", &ctx.repo_root);
+    export.args([
+        "run",
+        "--locked",
+        "--quiet",
+        "-p",
+        "weaver-server-api",
+        "--bin",
+        "export-graphql-schema",
+    ]);
+    let current_sdl = run_capture(&mut export).context("failed to export GraphQL schema")?;
+    fs::write(&current_schema_path, current_sdl).with_context(|| {
+        format!(
+            "failed to write current GraphQL schema to {}",
+            current_schema_path.display()
+        )
+    })?;
+    prefixed_ok(prefix, "Current GraphQL schema exported");
+
+    match read_previous_release_graphql_schema(ctx, latest_tag) {
+        Ok(previous_sdl) => {
+            fs::write(&previous_schema_path, previous_sdl).with_context(|| {
+                format!(
+                    "failed to write previous GraphQL schema to {}",
+                    previous_schema_path.display()
+                )
+            })?;
+            prefixed_step(prefix, "Checking GraphQL API compatibility");
+            let web_dir = ctx.path("apps/weaver-web");
+            let mut check = ctx.command_in("node", &web_dir);
+            check.arg("scripts/check-graphql-schema-compat.mjs");
+            check.arg(&previous_schema_path);
+            check.arg(&current_schema_path);
+            match run_streaming(&mut check, prefix) {
+                Ok(()) => prefixed_ok(prefix, "GraphQL API compatibility passed"),
+                Err(error) if schema_breaks_allowed_for_bump(latest_tag, next_version) => {
+                    warn(format!(
+                        "GraphQL API breaking/dangerous changes detected and PERMITTED: this \
+                         release raises the minor or major version (next: {next_version}). The \
+                         full change list is streamed above — every break must be enumerated \
+                         in the release notes. Checker result: {error:#}"
+                    ));
+                }
+                Err(error) => {
+                    return Err(error).context(
+                        "GraphQL API compatibility failed for a patch release — breaking \
+                         schema changes are only permitted when the minor or major version \
+                         increases",
+                    );
+                }
+            }
+        }
+        Err(error) if allow_missing_previous_graphql_schema(latest_tag) => {
+            warn(format!(
+                "Bootstrapping GraphQL API baseline for {next_version}; previous schema was unavailable: {error:#}"
+            ));
+        }
+        Err(error) => {
+            bail!(
+                "previous release GraphQL schema is required from {GRAPHQL_API_BASELINE_VERSION} onward: {error:#}"
+            );
+        }
+    }
+
+    update_graphql_schema_artifact(ctx, &current_schema_path)?;
+    prefixed_ok(prefix, "GraphQL schema artifact updated");
+    Ok(())
+}
+
+fn read_previous_release_graphql_schema(
+    ctx: &TaskContext,
+    latest_tag: Option<&str>,
+) -> Result<String> {
+    let latest_tag =
+        latest_tag.ok_or_else(|| anyhow!("no previous weaver release tag was found"))?;
+    let spec = format!("{latest_tag}:{GRAPHQL_SCHEMA_ARTIFACT}");
+    let mut show = ctx.command_in("git", &ctx.repo_root);
+    show.args(["show", &spec]);
+    run_capture(&mut show)
+        .with_context(|| format!("failed to read {GRAPHQL_SCHEMA_ARTIFACT} from {latest_tag}"))
+}
+
+/// Bootstrapping is only allowed while every tagged release predates the
+/// baseline, i.e. no release has shipped the schema artifact yet. Once one
+/// has, a missing artifact means the previous release regressed and the gate
+/// fails instead of silently re-baselining.
+fn allow_missing_previous_graphql_schema(latest_tag: Option<&str>) -> bool {
+    let Some(tag) = latest_tag else {
+        return true;
+    };
+    let Ok(previous) = Version::parse(tag.trim_start_matches("weaver-v")) else {
+        return true;
+    };
+    previous < graphql_api_baseline_version()
+}
+
+fn graphql_api_baseline_version() -> Version {
+    Version::parse(GRAPHQL_API_BASELINE_VERSION)
+        .expect("GraphQL API baseline version should be valid semver")
+}
+
+/// Breaking/dangerous GraphQL schema changes are permitted only when the
+/// release raises the minor or major version (e.g. 0.7.x → 0.8.0 — a major
+/// weaver release under 0.x versioning); patch releases keep the hard
+/// compatibility failure.
+fn schema_breaks_allowed_for_bump(latest_tag: Option<&str>, next_version: &Version) -> bool {
+    let Some(tag) = latest_tag else {
+        return false;
+    };
+    let Ok(previous) = Version::parse(tag.trim_start_matches("weaver-v")) else {
+        return false;
+    };
+    next_version.major > previous.major
+        || (next_version.major == previous.major && next_version.minor > previous.minor)
+}
+
+fn update_graphql_schema_artifact(ctx: &TaskContext, current_schema_path: &Path) -> Result<()> {
+    let artifact = ctx.path(GRAPHQL_SCHEMA_ARTIFACT);
+    if let Some(parent) = artifact.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::copy(current_schema_path, &artifact).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            current_schema_path.display(),
+            artifact.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn maybe_add_changed_graphql_schema_artifact(
+    ctx: &TaskContext,
+    changed: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let artifact = ctx.path(GRAPHQL_SCHEMA_ARTIFACT);
+    if changed_file(ctx, &artifact)? && !changed.iter().any(|path| path == &artifact) {
+        changed.push(artifact);
+    }
+    Ok(())
+}
+
 fn run_weaver_web_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
     let web_dir = ctx.path("apps/weaver-web");
     prefixed_step(prefix, "Running npm audit fix");
@@ -1941,6 +2120,12 @@ fn run_weaver_web_validation(ctx: &TaskContext, prefix: &'static str) -> Result<
     lint.args(["run", "lint"]);
     run_streaming(&mut lint, prefix)?;
     prefixed_ok(prefix, "Web lint passed");
+
+    prefixed_step(prefix, "Running GraphQL compatibility checker tests");
+    let mut graphql_compat_tests = ctx.command_in("npm", &web_dir);
+    graphql_compat_tests.args(["run", "test:graphql-compat"]);
+    run_streaming(&mut graphql_compat_tests, prefix)?;
+    prefixed_ok(prefix, "GraphQL compatibility checker tests passed");
 
     prefixed_step(prefix, "Running web build");
     let mut build = ctx.command_in("npm", &web_dir);
@@ -2808,6 +2993,54 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphql_baseline_bootstrap_applies_only_before_the_baseline_release() {
+        let baseline = graphql_api_baseline_version();
+
+        // No release has shipped api/graphql/schema.graphql yet.
+        assert!(allow_missing_previous_graphql_schema(None));
+        let before_baseline = Version::new(baseline.major, baseline.minor, baseline.patch - 1);
+        assert!(allow_missing_previous_graphql_schema(Some(&format!(
+            "weaver-v{before_baseline}"
+        ))));
+
+        // The baseline release and everything after it must ship the artifact;
+        // a missing one is a regression, not a fresh baseline.
+        assert!(!allow_missing_previous_graphql_schema(Some(&format!(
+            "weaver-v{baseline}"
+        ))));
+        let after_baseline = Version::new(baseline.major, baseline.minor + 1, 0);
+        assert!(!allow_missing_previous_graphql_schema(Some(&format!(
+            "weaver-v{after_baseline}"
+        ))));
+    }
+
+    #[test]
+    fn graphql_schema_breaks_require_a_minor_or_major_bump() {
+        let patch = Version::parse("0.7.7").unwrap();
+        assert!(!schema_breaks_allowed_for_bump(
+            Some("weaver-v0.7.6"),
+            &patch
+        ));
+
+        let minor = Version::parse("0.8.0").unwrap();
+        assert!(schema_breaks_allowed_for_bump(
+            Some("weaver-v0.7.6"),
+            &minor
+        ));
+
+        let major = Version::parse("1.0.0").unwrap();
+        assert!(schema_breaks_allowed_for_bump(
+            Some("weaver-v0.7.6"),
+            &major
+        ));
+
+        // Without a previous tag there is nothing to compare, so breaks are
+        // never waved through on that path.
+        assert!(!schema_breaks_allowed_for_bump(None, &major));
+        assert!(!schema_breaks_allowed_for_bump(Some("not-a-tag"), &major));
+    }
 
     fn sample_winget_artifacts() -> Vec<WingetArtifact> {
         vec![

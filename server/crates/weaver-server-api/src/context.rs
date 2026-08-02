@@ -59,6 +59,22 @@ pub struct SchemaContext {
         Option<weaver_server_core::post_processing::service::PostProcessingService>,
 }
 
+/// Render the GraphQL SDL for the public API without constructing any runtime
+/// state. The release gate exports this into `api/graphql/schema.graphql` and
+/// diffs it against the previous release, so it must stay free of database,
+/// scheduler, or network dependencies. The query guards applied in
+/// [`build_schema`] only bound complexity/depth and introspection, none of
+/// which change the emitted SDL.
+pub fn export_schema_sdl() -> String {
+    Schema::build(
+        QueryRoot::default(),
+        MutationRoot::default(),
+        SubscriptionRoot::default(),
+    )
+    .finish()
+    .sdl()
+}
+
 pub fn build_schema(context: SchemaContext) -> WeaverSchema {
     let replay = QueueEventReplay::default();
     replay.spawn_producer(context.handle.clone(), context.config.clone());

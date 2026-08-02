@@ -20,7 +20,7 @@ pub use backup::{
     backup_error_status_code,
 };
 pub use categories::types::*;
-pub use context::{SchemaContext, WeaverSchema, build_schema};
+pub use context::{SchemaContext, WeaverSchema, build_schema, export_schema_sdl};
 pub use history::types::*;
 pub use jobs::scheduled_resume::{ScheduledResumeCoordinator, ScheduledResumeError};
 pub use jobs::types::*;

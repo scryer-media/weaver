@@ -146,6 +146,13 @@ binary file transfer, Prometheus metrics, and compatibility RPC. They are
 transport adapters, not alternate product layers; authorization and product
 rules still belong to the backend domains that own them.
 
+Because it is a public surface, the schema is a versioned artifact. Every
+release regenerates `api/graphql/schema.graphql` from the live roots and
+commits it with the version bump, and the release gate diffs it against the
+schema shipped by the previous release. Breaking and dangerous changes fail a
+patch release; they are only permitted when the release raises the minor or
+major version, and then must be enumerated in the release notes.
+
 We do not expose raw database tables, ad hoc status strings, or storage-only details merely because doing so is easy.
 
 The API should reflect how operators think about:

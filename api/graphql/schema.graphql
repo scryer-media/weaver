@@ -1,0 +1,2167 @@
+input AcceptHistoryDeleteInput {
+	mode: AcceptHistoryDeleteMode!
+	ids: [Int!]! = []
+	deleteFiles: Boolean!
+}
+
+enum AcceptHistoryDeleteMode {
+	IDS
+	ALL_HISTORY
+}
+
+type ApiKey {
+	id: Int!
+	name: String!
+	scope: ApiKeyScope!
+	createdAt: Float!
+	lastUsedAt: Float
+}
+
+enum ApiKeyScope {
+	READ
+	CONTROL
+	ADMIN
+}
+
+type Attribute {
+	key: String!
+	value: String!
+}
+
+input AttributeInput {
+	key: String!
+	value: String!
+}
+
+type Category {
+	id: Int!
+	name: String!
+	destDir: String
+	aliases: String!
+}
+
+input CategoryInput {
+	name: String!
+	destDir: String
+	aliases: String! = ""
+}
+
+type CreateApiKeyResult {
+	key: ApiKey!
+	rawKey: String!
+}
+
+"""
+Implement the DateTime<Utc> scalar
+
+The input/output is a string in RFC3339 format.
+"""
+scalar DateTime
+
+type DirectoryBrowseEntry {
+	name: String!
+	path: String!
+}
+
+type DirectoryBrowseResult {
+	currentPath: String!
+	parentPath: String
+	entries: [DirectoryBrowseEntry!]!
+}
+
+"""
+Filesystem capacity for a configured storage directory (data / intermediate / complete).
+"""
+type DiskUsage {
+	"""
+	Human label for the directory role (e.g. "Data", "Complete library").
+	"""
+	label: String!
+	"""
+	Configured directory path.
+	"""
+	path: String!
+	"""
+	Total capacity of the backing filesystem, in bytes.
+	"""
+	totalBytes: Int!
+	"""
+	Used capacity of the backing filesystem, in bytes.
+	"""
+	usedBytes: Int!
+	"""
+	Available (non-reserved) capacity, in bytes.
+	"""
+	freeBytes: Int!
+}
+
+type DownloadBlock {
+	kind: DownloadBlockKindGql!
+	capEnabled: Boolean!
+	period: IspBandwidthCapPeriodGql
+	usedBytes: Int!
+	limitBytes: Int!
+	remainingBytes: Int!
+	reservedBytes: Int!
+	windowStartsAtEpochMs: Float
+	windowEndsAtEpochMs: Float
+	timezoneName: String!
+	scheduledSpeedLimit: Int!
+}
+
+enum DownloadBlockKindGql {
+	NONE
+	MANUAL_PAUSE
+	SCHEDULED
+	ISP_CAP
+	SERVER_QUOTA
+}
+
+enum DownloadPressureReasonGql {
+	NONE
+	DECODE
+	WRITE
+	DECODE_AND_WRITE
+}
+
+enum DownloadPressureStateGql {
+	CLEAR
+	SOFT
+	HARD
+}
+
+enum DuplicateActionGql {
+	ACCEPT
+	WARN
+	PAUSE
+	BLOCK
+}
+
+type DuplicateDecisionInfo {
+	action: DuplicateActionGql!
+	forceBypassed: Boolean!
+	matches: [DuplicateMatchInfo!]!
+}
+
+enum DuplicateFingerprintKindGql {
+	STRICT_ARTICLE_LAYOUT
+	ARTICLE_LAYOUT
+	ARTICLE_SET
+	NORMALIZED_NAME
+}
+
+"""
+Durable duplicate identity state for queue, history, and job-detail
+consumers. Source NZB bytes and credentials are deliberately omitted.
+"""
+type DuplicateIdentitySnapshotInfo {
+	jobId: Int!
+	lifecycle: DuplicateLifecycleGql!
+	normalizedName: String!
+	semantic: SemanticCandidateSnapshotInfo
+}
+
+enum DuplicateLifecycleGql {
+	RESERVED
+	ACTIVE
+	PARKED
+	SUCCEEDED
+	FAILED
+	CANCELLED
+}
+
+type DuplicateMatchInfo {
+	jobId: Int!
+	fingerprintKind: DuplicateFingerprintKindGql!
+	lifecycle: DuplicateLifecycleGql!
+}
+
+enum DuplicateMode {
+	ENFORCE
+	SCORE
+	ALL
+	FORCE
+}
+
+type DuplicatePolicySettings {
+	strictActiveOrSuccess: DuplicateActionGql!
+	strictFailedOrCancelled: DuplicateActionGql!
+	articleLayoutActiveOrSuccess: DuplicateActionGql!
+	articleLayoutFailedOrCancelled: DuplicateActionGql!
+	articleSet: DuplicateActionGql!
+	normalizedName: DuplicateActionGql!
+}
+
+input DuplicatePolicySettingsInput {
+	strictActiveOrSuccess: DuplicateActionGql
+	strictFailedOrCancelled: DuplicateActionGql
+	articleLayoutActiveOrSuccess: DuplicateActionGql
+	articleLayoutFailedOrCancelled: DuplicateActionGql
+	articleSet: DuplicateActionGql
+	normalizedName: DuplicateActionGql
+}
+
+"""
+A compact duplicate projection for queue and history lists. Full durable
+identity and semantic details remain available from `duplicateSnapshot`.
+"""
+type DuplicateSummaryInfo {
+	lifecycle: DuplicateLifecycleGql!
+	action: DuplicateActionGql!
+	primaryReason: DuplicateFingerprintKindGql
+	semantic: SemanticCandidateSnapshotInfo
+}
+
+type E2EpostProcessingSeed {
+	jobIds: [Int!]!
+	runIds: [String!]!
+}
+
+enum EventKind {
+	JOB_CREATED
+	JOB_PAUSED
+	JOB_RESUMED
+	JOB_CANCELLED
+	JOB_COMPLETED
+	JOB_FAILED
+	DOWNLOAD_STARTED
+	DOWNLOAD_FINISHED
+	DOWNLOAD_PIPELINE_DRAINED
+	SERVER_ATTEMPT
+	ARTICLE_DOWNLOADED
+	ARTICLE_NOT_FOUND
+	SEGMENT_DECODED
+	SEGMENT_COMMITTED
+	FILE_COMPLETE
+	FILE_MISSING
+	VERIFICATION_STARTED
+	VERIFICATION_COMPLETE
+	JOB_VERIFICATION_STARTED
+	JOB_VERIFICATION_COMPLETE
+	REPAIR_STARTED
+	REPAIR_COMPLETE
+	REPAIR_FAILED
+	EXTRACTION_READY
+	EXTRACTION_MEMBER_STARTED
+	EXTRACTION_MEMBER_WAITING_STARTED
+	EXTRACTION_MEMBER_WAITING_FINISHED
+	EXTRACTION_MEMBER_APPEND_STARTED
+	EXTRACTION_MEMBER_APPEND_FINISHED
+	EXTRACTION_MEMBER_FINISHED
+	EXTRACTION_MEMBER_FAILED
+	EXTRACTION_PROGRESS
+	EXTRACTION_COMPLETE
+	EXTRACTION_FAILED
+	MOVE_TO_COMPLETE_STARTED
+	MOVE_TO_COMPLETE_FINISHED
+	SEGMENT_RETRY_SCHEDULED
+	SEGMENT_FAILED_PERMANENT
+	GLOBAL_PAUSED
+	GLOBAL_RESUMED
+	PHASE_PROGRESS_UPDATED
+}
+
+enum ExtractionMemberSpanKind {
+	EXTRACTING
+	WAITING_FOR_VOLUME
+	APPENDING
+}
+
+enum ExtractionMemberState {
+	RUNNING
+	INTERRUPTED
+	COMPLETE
+	AWAITING_REPAIR
+	FAILED
+}
+
+type ExtractionMemberTimeline {
+	member: String!
+	state: ExtractionMemberState!
+	error: String
+	spans: [ExtractionMemberTimelineSpan!]!
+}
+
+type ExtractionMemberTimelineSpan {
+	kind: ExtractionMemberSpanKind!
+	startedAt: Float!
+	endedAt: Float
+	state: TimelineSpanState!
+	label: String
+}
+
+type ExtractionTimelineGroup {
+	setName: String!
+	members: [ExtractionMemberTimeline!]!
+}
+
+type GeneralSettings {
+	dataDir: String!
+	intermediateDir: String!
+	completeDir: String!
+	cleanupAfterExtract: Boolean!
+	maxDownloadSpeed: Int!
+	maxRetries: Int!
+	ipReplacementTrialExtraConnections: Int!
+	ispBandwidthCap: IspBandwidthCapSettings
+	watchFolder: WatchFolderSettings!
+	duplicatePolicy: DuplicatePolicySettings!
+}
+
+input GeneralSettingsInput {
+	intermediateDir: String
+	completeDir: String
+	cleanupAfterExtract: Boolean
+	maxDownloadSpeed: Int
+	maxRetries: Int
+	ipReplacementTrialExtraConnections: Int
+	ispBandwidthCap: IspBandwidthCapSettingsInput
+	watchFolder: WatchFolderSettingsInput
+	duplicatePolicy: DuplicatePolicySettingsInput
+}
+
+type GlobalQueueState {
+	isPaused: Boolean!
+	speedLimitBytesPerSec: Int!
+	downloadBlock: DownloadBlock!
+}
+
+type HistoryCommandResult {
+	success: Boolean!
+	removedIds: [Int!]!
+}
+
+type HistoryDeleteAcceptance {
+	operationId: Int!
+	acceptedIds: [Int!]!
+	totalTargets: Int!
+}
+
+type HistoryDeleteOperation {
+	id: Int!
+	state: HistoryDeleteOperationState!
+	deleteFiles: Boolean!
+	totalTargets: Int!
+	queuedTargets: Int!
+	runningTargets: Int!
+	completedTargets: Int!
+	failedTargets: Int!
+	requestedAt: DateTime!
+}
+
+enum HistoryDeleteOperationState {
+	QUEUED
+	RUNNING
+	COMPLETED
+	COMPLETED_WITH_ERRORS
+}
+
+type HistoryDeleteRowState {
+	operationId: Int!
+	state: HistoryDeleteRowStateKind!
+	locked: Boolean!
+	deleteFiles: Boolean!
+	errorMessage: String
+}
+
+enum HistoryDeleteRowStateKind {
+	QUEUED
+	RUNNING
+	FAILED
+}
+
+type HistoryItem {
+	id: Int!
+	jobHash: String
+	name: String!
+	displayTitle: String!
+	originalTitle: String!
+	parsedRelease: ParsedRelease!
+	state: QueueItemState!
+	error: String
+	progressPercent: Float!
+	totalBytes: Int!
+	downloadedBytes: Int!
+	optionalRecoveryBytes: Int!
+	optionalRecoveryDownloadedBytes: Int!
+	failedBytes: Int!
+	health: Int!
+	hasPassword: Boolean!
+	category: String
+	attributes: [Attribute!]!
+	clientRequestId: String
+	outputDir: String
+	createdAt: DateTime!
+	completedAt: DateTime!
+	attention: QueueAttention
+	deleteOperation: HistoryDeleteRowState
+	duplicateSummary: DuplicateSummaryInfo
+}
+
+type HistoryPage {
+	items: [HistoryItem!]!
+	totalCount: Int!
+	counts: HistoryPageCounts!
+}
+
+type HistoryPageCounts {
+	all: Int!
+	success: Int!
+	failure: Int!
+}
+
+input HistoryPageInput {
+	pageIndex: Int!
+	pageSize: Int!
+	search: String
+	status: HistoryStatusFilter
+	sortField: HistorySortField
+	sortDirection: HistorySortDirection
+}
+
+enum HistorySortDirection {
+	ASC
+	DESC
+}
+
+enum HistorySortField {
+	COMPLETED_AT
+	NAME
+	STATE
+	HEALTH
+	SIZE
+	CATEGORY
+}
+
+enum HistoryStatusFilter {
+	ALL
+	SUCCESS
+	FAILURE
+}
+
+enum IspBandwidthCapPeriodGql {
+	DAILY
+	WEEKLY
+	MONTHLY
+}
+
+type IspBandwidthCapSettings {
+	enabled: Boolean!
+	period: IspBandwidthCapPeriodGql!
+	limitBytes: Int!
+	resetTimeMinutesLocal: Int!
+	weeklyResetWeekday: IspBandwidthCapWeekdayGql!
+	monthlyResetDay: Int!
+}
+
+input IspBandwidthCapSettingsInput {
+	enabled: Boolean!
+	period: IspBandwidthCapPeriodGql!
+	limitBytes: Int!
+	resetTimeMinutesLocal: Int!
+	weeklyResetWeekday: IspBandwidthCapWeekdayGql!
+	monthlyResetDay: Int!
+}
+
+enum IspBandwidthCapWeekdayGql {
+	MON
+	TUE
+	WED
+	THU
+	FRI
+	SAT
+	SUN
+}
+
+"""
+A scalar that can represent any JSON value.
+"""
+scalar JSON
+
+type Job {
+	id: Int!
+	name: String!
+	displayTitle: String!
+	originalTitle: String!
+	parsedRelease: ParsedRelease!
+	status: JobStatusGql!
+	error: String
+	progress: Float!
+	totalBytes: Int!
+	downloadedBytes: Int!
+	optionalRecoveryBytes: Int!
+	optionalRecoveryDownloadedBytes: Int!
+	failedBytes: Int!
+	health: Int!
+	hasPassword: Boolean!
+	category: String
+	metadata: [MetadataEntry!]!
+	outputDir: String
+	createdAt: Float
+}
+
+type JobDetailSnapshot {
+	queueItem: QueueItem
+	historyItem: HistoryItem
+	jobTimeline: JobTimeline
+	jobEvents: [JobEvent!]!
+}
+
+type JobEvent {
+	kind: EventKind!
+	jobId: Int!
+	fileId: String
+	message: String!
+	timestamp: Float!
+}
+
+type JobOutputFile {
+	name: String!
+	path: String!
+	sizeBytes: Int!
+}
+
+type JobOutputResult {
+	outputDir: String!
+	files: [JobOutputFile!]!
+	totalBytes: Int!
+}
+
+"""
+GraphQL job statuses collapse the internal `Checking` phase into
+`Verifying` so clients see one post-download verification step before
+extraction begins.
+"""
+enum JobStatusGql {
+	QUEUED
+	DOWNLOADING
+	CHECKING
+	VERIFYING
+	QUEUED_REPAIR
+	REPAIRING
+	QUEUED_EXTRACT
+	EXTRACTING
+	MOVING
+	QUEUED_POST_PROCESSING
+	POST_PROCESSING
+	COMPLETE
+	FAILED
+	PAUSED
+}
+
+type JobTimeline {
+	startedAt: Float!
+	endedAt: Float
+	outcome: JobStatusGql!
+	lanes: [JobTimelineLane!]!
+	extractionGroups: [ExtractionTimelineGroup!]!
+}
+
+type JobTimelineLane {
+	stage: TimelineStage!
+	spans: [JobTimelineSpan!]!
+}
+
+type JobTimelineSpan {
+	startedAt: Float!
+	endedAt: Float
+	state: TimelineSpanState!
+	label: String
+}
+
+type JobsSnapshot {
+	jobs: [Job!]!
+	metrics: Metrics!
+	isPaused: Boolean!
+	downloadBlock: DownloadBlock!
+}
+
+type LoginStatusResult {
+	enabled: Boolean!
+	username: String
+}
+
+type MetadataEntry {
+	key: String!
+	value: String!
+}
+
+input MetadataInput {
+	key: String!
+	value: String!
+}
+
+type MetricLabel {
+	key: String!
+	value: String!
+}
+
+type MetricSeries {
+	metric: String!
+	labels: [MetricLabel!]!
+	variant: MetricSeriesVariant!
+	values: [Float!]!
+}
+
+enum MetricSeriesVariant {
+	ACTUAL
+	AVG
+	PEAK
+}
+
+type Metrics {
+	bytesDownloaded: Int!
+	bytesDecoded: Int!
+	bytesCommitted: Int!
+	downloadQueueDepth: Int!
+	activeDownloads: Int!
+	activeDecodes: Int!
+	decodePending: Int!
+	decodePendingBytes: Int!
+	decodeActiveBytes: Int!
+	commitPending: Int!
+	writeBufferedBytes: Int!
+	writeBufferedSegments: Int!
+	directWriteEvictions: Int!
+	decodePressureSoftLimitBytes: Int!
+	decodePressureHardLimitBytes: Int!
+	writePressureSoftLimitBytes: Int!
+	writePressureHardLimitBytes: Int!
+	downloadPressureState: DownloadPressureStateGql!
+	downloadPressureReason: DownloadPressureReasonGql!
+	downloadPressureStallsTotal: Int!
+	downloadPressureStallDurationMs: Int!
+	downloadPressureCurrentStallMs: Int!
+	hotDispatchJobId: Int!
+	hotDispatchMode: String!
+	hotDispatchUnderfillMs: Int!
+	hotDispatchLentConnections: Int!
+	hotDispatchWarmupComplete: Boolean!
+	hotDispatchLastSpilloverDecision: String!
+	hotDispatchSpilloverBlockedWarmupTotal: Int!
+	hotDispatchSpilloverBlockedPressureTotal: Int!
+	hotDispatchSpilloverBlockedNearCapTotal: Int!
+	hotDispatchSpilloverBlockedHotCanUseCapacityTotal: Int!
+	hotDispatchSpilloverBlockedBestModePendingTotal: Int!
+	hotDispatchSpilloverBlockedRecentExpansionHelpedTotal: Int!
+	hotDispatchSpilloverBlockedCapSpeedTotal: Int!
+	hotDispatchSpilloverAllowedUnderfillTotal: Int!
+	hotDispatchSpilloverAllowedMeasuredUnderfillTotal: Int!
+	hotDispatchSpilloverReclaimedTotal: Int!
+	hotDispatchHotSpeedBps: Int!
+	hotDispatchExclusivePeakBps: Int!
+	hotDispatchSpilloverPreSpeedBps: Int!
+	hotDispatchSpilloverPostSpeedBps: Int!
+	hotDispatchSpilloverActiveLoans: Int!
+	hotDispatchSpilloverReclaimedSpeedHarmTotal: Int!
+	hotDispatchRecentExpansionImprovementPct: Int!
+	hotDispatchBestModeBlockReason: Int!
+	hotDispatchLastExpansionKind: Int!
+	hotDispatchLastExpansionBeforeBps: Int!
+	hotDispatchLastExpansionAfterBps: Int!
+	downloadLanesActive: Int!
+	downloadLanesSequentialActive: Int!
+	downloadLanesDepth2Active: Int!
+	downloadLanesDepth4Active: Int!
+	downloadLanesIdleActive: Int!
+	downloadLanesAwaitingWorkActive: Int!
+	downloadLanesBindingServerActive: Int!
+	downloadLanesAcquiredActive: Int!
+	downloadLanesIssuingActive: Int!
+	downloadLanesDrainingActive: Int!
+	downloadLanesYieldAfterBatchActive: Int!
+	downloadLanesParkingActive: Int!
+	downloadLanesRecoveringActive: Int!
+	downloadLaneParksNoWorkTotal: Int!
+	downloadLaneParksSpilloverSpeedHarmTotal: Int!
+	downloadLaneParksIpReplacementRetiredTotal: Int!
+	downloadLaneParksErrorTotal: Int!
+	downloadLaneLeaseItemsTotal: Int!
+	downloadLaneRefillGrantedTotal: Int!
+	downloadLaneRefillParkedTotal: Int!
+	downloadPipelineTrialSuccessTotal: Int!
+	downloadPipelineTrialFailureTotal: Int!
+	downloadPipelineProofPassTotal: Int!
+	downloadPipelineCooldownTotal: Int!
+	downloadPipelineReplayItemsTotal: Int!
+	ipReplacementTrialExtraConnections: Int!
+	ipReplacementBurstActive: Boolean!
+	ipReplacementOverMaxConnections: Int!
+	ipRttEwmaEntries: Int!
+	ipRttEwmaSlowestMs: Int!
+	ipReplacementTrialsStartedTotal: Int!
+	ipReplacementTrialsRejectedTotal: Int!
+	ipReplacementTrialsAcceptedTotal: Int!
+	ipReplacementTrialsBlockedTotal: Int!
+	ipReplacementTrialsAcquireFailedTotal: Int!
+	ipReplacementTrialsSameIpRejectedTotal: Int!
+	ipReplacementOldConnectionsRetiredTotal: Int!
+	segmentsDownloaded: Int!
+	segmentsDecoded: Int!
+	segmentsCommitted: Int!
+	articlesNotFound: Int!
+	decodeErrors: Int!
+	verifyActive: Int!
+	repairActive: Int!
+	extractActive: Int!
+	diskWriteLatencyUs: Int!
+	segmentsRetried: Int!
+	segmentsFailedPermanent: Int!
+	downloadFailuresArticleNotFound: Int!
+	downloadFailuresCapacityUnavailable: Int!
+	downloadFailuresTransient: Int!
+	downloadFailuresAuth: Int!
+	downloadFailuresPermanent: Int!
+	currentDownloadSpeed: Int!
+	crcErrors: Int!
+	recoveryQueueDepth: Int!
+	articlesPerSec: Float!
+	decodeRateMbps: Float!
+}
+
+enum MetricsHistoryRangeGql {
+	TEN_MINUTES
+	ONE_HOUR
+	SIX_HOURS
+	TWENTY_FOUR_HOURS
+	SEVEN_DAYS
+	THIRTY_DAYS
+}
+
+type MetricsHistoryResult {
+	timestamps: [Float!]!
+	resolutionSec: Int!
+	series: [MetricSeries!]!
+}
+
+type MutationRoot {
+	"""
+	Create a new API key. Returns the raw key (shown only once).
+	"""
+	createApiKey(name: String!, scope: ApiKeyScope!): CreateApiKeyResult!
+	"""
+	Delete an API key by ID.
+	"""
+	deleteApiKey(id: Int!): [ApiKey!]!
+	"""
+	Enable login protection with a username and password.
+	"""
+	enableLogin(username: String!, password: String!): Boolean!
+	"""
+	Disable login protection.
+	"""
+	disableLogin: Boolean!
+	"""
+	Change the login password. Requires the current password for verification.
+	"""
+	changePassword(currentPassword: String!, newPassword: String!): Boolean!
+	"""
+	Add a new category.
+	"""
+	addCategory(input: CategoryInput!): Category!
+	"""
+	Update a category by ID.
+	"""
+	updateCategory(id: Int!, input: CategoryInput!): Category!
+	"""
+	Remove a category by ID.
+	"""
+	removeCategory(id: Int!): [Category!]!
+	"""
+	Submit an NZB for download through the public integration facade.
+	"""
+	submitNzb(input: SubmitNzbInput!): SubmissionResult!
+	stageNzbUpload(input: StageNzbUploadInput!): StagedNzbUploadResult!
+	submitStagedNzbs(input: SubmitStagedNzbsInput!): SubmitStagedNzbsResult!
+	discardStagedNzbs(ids: [String!]!): Boolean!
+	"""
+	Pause a running job.
+	"""
+	pauseJob(id: Int!): Boolean!
+	"""
+	Resume a paused job.
+	"""
+	resumeJob(id: Int!): Boolean!
+	"""
+	Cancel and remove a job.
+	"""
+	cancelJob(id: Int!): Boolean!
+	"""
+	Reprocess a completed or failed job (re-run post-download stages without re-downloading).
+	"""
+	reprocessJob(id: Int!): Boolean!
+	"""
+	Re-download a completed or failed job from its persisted NZB under the same job ID.
+	"""
+	redownloadJob(id: Int!): Boolean!
+	"""
+	Delete a completed/failed/cancelled job from history.
+	Returns the remaining history jobs after deletion.
+	"""
+	acceptHistoryDelete(input: AcceptHistoryDeleteInput!): HistoryDeleteAcceptance!
+	"""
+	Delete a completed/failed/cancelled job from history.
+	Returns the remaining history jobs after deletion.
+	"""
+	deleteHistory(id: Int!, deleteFiles: Boolean! = false): [HistoryItem!]!
+	"""
+	Explicitly forget durable duplicate identity for a job without deleting history or files.
+	"""
+	forgetDuplicateIdentity(id: Int!): Boolean!
+	markDuplicateGood(id: Int!): Boolean!
+	markDuplicateBad(id: Int!): SemanticPromotionResult!
+	promoteDuplicateCandidate(id: Int!): SemanticPromotionResult!
+	"""
+	Delete multiple completed/failed/cancelled jobs from history by ID.
+	Returns the remaining history jobs after deletion.
+	"""
+	deleteHistoryBatch(ids: [Int!]!, deleteFiles: Boolean! = false): [HistoryItem!]!
+	"""
+	Delete all completed/failed/cancelled jobs from history.
+	"""
+	deleteAllHistory(deleteFiles: Boolean! = false): [HistoryItem!]!
+	"""
+	Update category and/or priority for one or more jobs.
+	"""
+	updateJobs(ids: [Int!]!, category: String, priority: String): Boolean!
+	"""
+	Set or clear a queued job's archive/unpack password. Passing null or
+	an empty string removes the password (even one that came from the NZB
+	itself); the override is durable across restarts. The password never
+	appears in job attributes — only `hasPassword` reflects it.
+	"""
+	setJobPassword(id: Int!, password: String): Boolean!
+	"""
+	Move a queue item within the manual queue order. The move breaks ties
+	within a dispatch priority band; HIGH/NORMAL/LOW still dominates.
+	`offset` is required when `kind` is OFFSET (negative moves toward the
+	front).
+	"""
+	reorderQueueItem(id: Int!, kind: QueueMoveKind!, offset: Int): Boolean!
+	"""
+	Pause all download dispatch globally.
+	"""
+	pauseAll: Boolean!
+	"""
+	Resume all download dispatch globally.
+	"""
+	resumeAll: Boolean!
+	"""
+	Set the global download speed limit in bytes/sec. 0 means unlimited.
+	"""
+	setSpeedLimit(bytesPerSec: Int!): Boolean!
+	"""
+	Pause one queue item and return its updated facade state.
+	"""
+	pauseQueueItem(id: Int!): QueueCommandResult!
+	"""
+	Resume one queue item and return its updated facade state.
+	"""
+	resumeQueueItem(id: Int!): QueueCommandResult!
+	"""
+	Cancel one queue item.
+	"""
+	cancelQueueItem(id: Int!): QueueCommandResult!
+	"""
+	Reprocess a failed queue item.
+	"""
+	reprocessQueueItem(id: Int!): QueueCommandResult!
+	"""
+	Re-download a failed queue item under the same job ID.
+	"""
+	redownloadQueueItem(id: Int!): QueueCommandResult!
+	"""
+	Remove history items by ID.
+	"""
+	removeHistoryItems(ids: [Int!]!, deleteFiles: Boolean! = false): HistoryCommandResult!
+	"""
+	Pause the queue globally.
+	"""
+	pauseQueue: QueueCommandResult!
+	"""
+	Resume the queue globally.
+	"""
+	resumeQueue: QueueCommandResult!
+	"""
+	Set the queue speed limit in bytes/sec. 0 means unlimited.
+	"""
+	setQueueSpeedLimit(bytesPerSec: Int!): QueueCommandResult!
+	updatePostProcessingSettings(input: PostProcessingSettingsInput!): PostProcessingSettingsGql!
+	discoverPostProcessingExtensions(bareScriptAdapter: PostProcessingAdapterInput): [PostProcessingExtensionRevision!]!
+	runPostProcessingDiagnostic(input: PostProcessingDiagnosticInput!): PostProcessingDiagnosticResult!
+	approvePostProcessingRevision(extensionId: String!, revisionId: String!): PostProcessingExtensionRevision!
+	disablePostProcessingRevision(extensionId: String!, revisionId: String!): Boolean!
+	revokePostProcessingRevision(extensionId: String!, revisionId: String!): Boolean!
+	savePostProcessingProfile(input: PostProcessingProfileInput!): PostProcessingProfile!
+	deletePostProcessingProfile(profileId: String!): Boolean!
+	assignGlobalPostProcessingProfile(profileId: String): Boolean!
+	assignCategoryPostProcessingProfile(category: String!, profileId: String): Boolean!
+	setJobPostProcessingSelection(jobId: Int!, selection: PostProcessingSelectionInput!): PostProcessingJobPlan!
+	"""
+	Creates deterministic, metadata-only jobs and real queued
+	post-processing runs for the isolated browser release gate. The first
+	call omits `job_ids` and prepares two paused jobs so the browser can
+	exercise selection controls. The second call supplies those exact IDs
+	after the browser pauses the post-processing queue.
+	"""
+	seedE2EPostProcessingRuns(profileId: String!, jobIds: [Int!]): E2EpostProcessingSeed!
+	pausePostProcessingQueue: Boolean!
+	resumePostProcessingQueue: Boolean!
+	reorderPostProcessingQueue(runIds: [String!]!): [String!]!
+	cancelJobPostProcessing(jobId: Int!): Boolean!
+	rerunPostProcessing(input: PostProcessingRerunInput!): PostProcessingRun!
+	"""
+	Add a new RSS feed.
+	"""
+	addRssFeed(input: RssFeedInput!): RssFeed!
+	"""
+	Update an RSS feed.
+	"""
+	updateRssFeed(id: Int!, input: RssFeedInput!): RssFeed!
+	"""
+	Delete an RSS feed.
+	"""
+	deleteRssFeed(id: Int!): Boolean!
+	"""
+	Add a new RSS rule.
+	"""
+	addRssRule(feedId: Int!, input: RssRuleInput!): RssRule!
+	"""
+	Update an RSS rule.
+	"""
+	updateRssRule(id: Int!, input: RssRuleInput!): RssRule!
+	"""
+	Delete an RSS rule.
+	"""
+	deleteRssRule(id: Int!): Boolean!
+	"""
+	Run RSS sync immediately for all enabled feeds or one specific feed.
+	"""
+	runRssSync(feedId: Int): RssSyncReport!
+	"""
+	Forget one seen RSS item so it can be reconsidered on a future sync.
+	"""
+	deleteRssSeenItem(feedId: Int!, itemId: String!): Boolean!
+	"""
+	Clear seen RSS items, either globally or for one feed.
+	"""
+	clearRssSeenItems(feedId: Int): Int!
+	"""
+	Add a new NNTP server.
+	"""
+	addServer(input: ServerInput!): Server!
+	"""
+	Update an existing NNTP server by ID.
+	"""
+	updateServer(id: Int!, input: ServerInput!): Server!
+	"""
+	Remove an NNTP server by ID.
+	"""
+	removeServer(id: Int!): [Server!]!
+	"""
+	Reset this server's quota baseline without clearing lifetime usage.
+	"""
+	resetServerDownloadQuotaUsage(id: Int!): Server!
+	"""
+	Test a saved NNTP server using its decrypted persisted credentials.
+	"""
+	testConfiguredServerConnection(id: Int!): TestConnectionResult!
+	"""
+	Test connectivity to an NNTP server without saving it.
+	"""
+	testConnection(input: ServerInput!): TestConnectionResult!
+	"""
+	Update general settings.
+	"""
+	updateSettings(input: GeneralSettingsInput!): GeneralSettings!
+	scanWatchFolder: WatchFolderScanReport!
+	createSchedule(input: ScheduleInput!): [Schedule!]!
+	updateSchedule(id: String!, input: ScheduleInput!): [Schedule!]!
+	deleteSchedule(id: String!): [Schedule!]!
+	toggleSchedule(id: String!, enabled: Boolean!): [Schedule!]!
+	createDirectory(path: String!, name: String!): DirectoryBrowseResult!
+}
+
+type ParsedEpisode {
+	season: Int
+	episodeNumbers: [Int!]!
+	absoluteEpisode: Int
+	raw: String
+}
+
+type ParsedRelease {
+	normalizedTitle: String!
+	releaseGroup: String
+	languagesAudio: [String!]!
+	languagesSubtitles: [String!]!
+	year: Int
+	quality: String
+	source: String
+	videoCodec: String
+	videoEncoding: String
+	audio: String
+	audioCodecs: [String!]!
+	audioChannels: String
+	isDualAudio: Boolean!
+	isAtmos: Boolean!
+	isDolbyVision: Boolean!
+	detectedHdr: Boolean!
+	isHdr10Plus: Boolean!
+	isHlg: Boolean!
+	fps: Float
+	isProperUpload: Boolean!
+	isRepack: Boolean!
+	isRemux: Boolean!
+	isBdDisk: Boolean!
+	isAiEnhanced: Boolean!
+	isHardcodedSubs: Boolean!
+	streamingService: String
+	edition: String
+	animeVersion: Int
+	episode: ParsedEpisode
+	parseConfidence: Float!
+}
+
+type PipelineEventGql {
+	kind: EventKind!
+	jobId: Int
+	fileId: String
+	message: String!
+}
+
+enum PostProcessingAdapterInput {
+	SABNZBD
+	NZBGET
+}
+
+type PostProcessingArtifact {
+	attemptId: String!
+	stepIndex: Int!
+	path: String!
+	exists: Boolean!
+	isFile: Boolean!
+	isDirectory: Boolean!
+	isSymlink: Boolean!
+	sizeBytes: Int
+}
+
+type PostProcessingAttempt {
+	attemptId: String!
+	runId: String!
+	stepIndex: Int!
+	status: String!
+	extensionId: String!
+	revisionId: String!
+	adapter: String!
+	workingDirectory: String
+	exitCode: Int
+	errorMessage: String
+	progress: JSON
+	outputTruncated: Boolean!
+	queuedAtEpochMs: Int!
+	startedAtEpochMs: Int
+	finishedAtEpochMs: Int
+}
+
+input PostProcessingDiagnosticInput {
+	extensionId: String!
+	revisionId: String!
+	command: String!
+	options: [PostProcessingOptionInput!]! = []
+}
+
+type PostProcessingDiagnosticOutputLine {
+	sequence: Int!
+	stream: String!
+	text: String!
+}
+
+type PostProcessingDiagnosticResult {
+	succeeded: Boolean!
+	exitCode: Int
+	errorMessage: String
+	outputTruncated: Boolean!
+	output: [PostProcessingDiagnosticOutputLine!]!
+}
+
+type PostProcessingExtensionRevision {
+	extensionId: String!
+	revisionId: String!
+	declaredVersion: String!
+	digest: String!
+	adapter: String!
+	displayName: String!
+	trustState: String!
+	managed: Boolean!
+	sourcePath: String
+	discoveredAtEpochMs: Int!
+	approvedAtEpochMs: Int
+	manifest: JSON!
+}
+
+type PostProcessingJobPlan {
+	jobId: Int!
+	definition: JSON!
+}
+
+type PostProcessingLogChunkGql {
+	sequence: Int!
+	stream: String!
+	text: String!
+	createdAtEpochMs: Int!
+}
+
+type PostProcessingLogPageGql {
+	chunks: [PostProcessingLogChunkGql!]!
+	nextCursor: Int
+	truncated: Boolean!
+}
+
+enum PostProcessingOnFailureInput {
+	STOP
+	CONTINUE
+}
+
+input PostProcessingOptionInput {
+	name: String!
+	kind: PostProcessingOptionValueKind!
+	value: String!
+}
+
+enum PostProcessingOptionValueKind {
+	STRING
+	INTEGER
+	NUMBER
+	BOOLEAN
+	SECRET
+}
+
+enum PostProcessingOutcomeImpactInput {
+	WARN
+	FAIL_JOB
+}
+
+type PostProcessingProfile {
+	profileId: String!
+	name: String!
+	enabled: Boolean!
+	createdAtEpochMs: Int!
+	updatedAtEpochMs: Int!
+	definition: JSON!
+}
+
+input PostProcessingProfileInput {
+	profileId: String!
+	name: String!
+	enabled: Boolean! = true
+	steps: [PostProcessingProfileStepInput!]!
+}
+
+input PostProcessingProfileStepInput {
+	extensionId: String!
+	revisionId: String
+	runWhen: PostProcessingRunWhenInput!
+	onFailure: PostProcessingOnFailureInput!
+	outcomeImpact: PostProcessingOutcomeImpactInput!
+	timeoutSeconds: Int
+	unlimitedTimeout: Boolean! = false
+	approvedRoots: [String!]! = []
+	requiredArtifactSuffixes: [String!]! = []
+	minimumArtifactCount: Int! = 0
+	options: [PostProcessingOptionInput!]! = []
+}
+
+input PostProcessingRerunInput {
+	runId: String!
+	mode: PostProcessingRerunModeInput!
+	stepIndexes: [Int!]! = []
+	rebindToLatestApproved: Boolean! = false
+}
+
+enum PostProcessingRerunModeInput {
+	ALL
+	SELECTED
+	FAILED_AND_LATER
+}
+
+type PostProcessingRun {
+	runId: String!
+	jobId: Int!
+	status: String!
+	pipelineOutcome: JSON!
+	summary: String!
+	terminalIntent: String!
+	plan: JSON!
+	rerunOfRunId: String
+	queuedAtEpochMs: Int!
+	queuePosition: Int!
+	startedAtEpochMs: Int
+	finishedAtEpochMs: Int
+}
+
+enum PostProcessingRunWhenInput {
+	ALWAYS
+	SUCCESS
+	FAILURE
+}
+
+input PostProcessingSelectionInput {
+	mode: PostProcessingSelectionModeInput!
+	profileId: String
+	extensionIds: [String!]! = []
+}
+
+enum PostProcessingSelectionModeInput {
+	INHERIT
+	DISABLED
+	PROFILE
+	EXTENSIONS
+}
+
+type PostProcessingSettingsGql {
+	discoveryEnabled: Boolean!
+	executionEnabled: Boolean!
+	concurrency: Int!
+	terminationGraceSeconds: Int!
+	pythonInterpreter: String
+	powershellInterpreter: String
+	batchInterpreter: String
+	webhooksEnabled: Boolean!
+	allowedRoots: [String!]!
+}
+
+input PostProcessingSettingsInput {
+	discoveryEnabled: Boolean!
+	executionEnabled: Boolean!
+	concurrency: Int!
+	terminationGraceSeconds: Int!
+	pythonInterpreter: String
+	powershellInterpreter: String
+	batchInterpreter: String
+	webhooksEnabled: Boolean! = false
+	allowedRoots: [String!]! = []
+}
+
+type QueryRoot {
+	"""
+	Admin-facing auth status moved to query semantics.
+	"""
+	adminLoginStatus: LoginStatusResult!
+	"""
+	List all API keys (without raw key values).
+	"""
+	apiKeys: [ApiKey!]!
+	"""
+	List all configured categories.
+	"""
+	categories: [Category!]!
+	"""
+	Public history facade.
+	"""
+	historyItems(filter: QueueFilterInput, first: Int, after: String): [HistoryItem!]!
+	"""
+	Server-backed history table page with search, counts, sorting, and pagination.
+	"""
+	historyPage(input: HistoryPageInput!): HistoryPage!
+	"""
+	Public history facade for one completed or failed item.
+	"""
+	historyItem(id: Int!): HistoryItem
+	"""
+	Count history items exposed by the public history facade.
+	"""
+	historyItemsCount(filter: QueueFilterInput): Int!
+	"""
+	Compatibility facade for recent queue lifecycle history.
+	
+	This is backed by the bounded in-memory replay window rather than
+	persisted queue events. Older entries fall out of the ring buffer, and
+	stale cursors degrade to `[]` for compatibility with the old table.
+	"""
+	historyEvents(itemId: Int!, first: Int, after: String): [QueueEvent!]!
+	"""
+	Atomic snapshot for the job detail page.
+	"""
+	jobDetailSnapshot(jobId: Int!): JobDetailSnapshot!
+	"""
+	Active or recent background history delete operations.
+	"""
+	historyDeleteOperations(activeOnly: Boolean! = true): [HistoryDeleteOperation!]!
+	"""
+	Get synthesized waterfall/timeline data for a job.
+	"""
+	jobTimeline(jobId: Int!): JobTimeline
+	"""
+	Get the event log for a specific job.
+	"""
+	jobEvents(jobId: Int!): [JobEvent!]!
+	"""
+	Public queue facade for active or in-flight items.
+	"""
+	queueItems(filter: QueueFilterInput, first: Int, after: String): [QueueItem!]!
+	"""
+	Public queue facade for one active item.
+	"""
+	queueItem(id: Int!): QueueItem
+	"""
+	Summary of the active queue and live throughput.
+	"""
+	queueSummary: QueueSummary!
+	"""
+	Atomic queue bootstrap snapshot for initial page load and reconnect polling.
+	"""
+	queueSnapshot(filter: QueueFilterInput): QueueSnapshot!
+	"""
+	Current global queue state facade.
+	"""
+	globalQueueState: GlobalQueueState!
+	"""
+	Compatibility cursor for the live-only `queueEvents` stream.
+	"""
+	latestQueueCursor: String!
+	"""
+	List jobs, optionally filtered by status, category, or metadata key.
+	Supports pagination via `limit` and `offset`.
+	"""
+	jobs(status: [JobStatusGql!], category: String, hasMetadataKey: String, limit: Int, offset: Int): [Job!]!
+	"""
+	Count jobs matching the given filters (same filters as `jobs`).
+	"""
+	jobCount(status: [JobStatusGql!], category: String, hasMetadataKey: String): Int!
+	"""
+	Get a specific job by ID.
+	"""
+	job(id: Int!): Job
+	"""
+	Durable duplicate identity and semantic candidate state for a queue,
+	history, or job-detail item. Parked source material is never exposed.
+	"""
+	duplicateSnapshot(id: Int!): DuplicateIdentitySnapshotInfo
+	"""
+	List files in a completed job's output directory.
+	"""
+	jobOutputFiles(jobId: Int!): JobOutputResult
+	postProcessingSettings: PostProcessingSettingsGql!
+	postProcessingRevisions: [PostProcessingExtensionRevision!]!
+	postProcessingProfiles: [PostProcessingProfile!]!
+	postProcessingJobPlan(jobId: Int!): PostProcessingJobPlan
+	postProcessingRuns(jobId: Int, limit: Int! = 100): [PostProcessingRun!]!
+	postProcessingQueue: [PostProcessingRun!]!
+	postProcessingRun(runId: String!): PostProcessingRun
+	postProcessingAttempts(runId: String!): [PostProcessingAttempt!]!
+	postProcessingArtifacts(runId: String!): [PostProcessingArtifact!]!
+	postProcessingLogs(attemptId: String!, cursor: Int, limit: Int! = 200): PostProcessingLogPageGql!
+	"""
+	List configured RSS feeds.
+	"""
+	rssFeeds: [RssFeed!]!
+	"""
+	Get a single RSS feed.
+	"""
+	rssFeed(id: Int!): RssFeed
+	"""
+	List recently seen RSS items, optionally scoped to one feed.
+	"""
+	rssSeenItems(feedId: Int, limit: Int): [RssSeenItem!]!
+	"""
+	Return whether any NNTP servers are configured.
+	"""
+	hasConfiguredServers: Boolean!
+	"""
+	List all configured NNTP servers.
+	"""
+	servers: [Server!]!
+	"""
+	Load one configured NNTP server for editing.
+	"""
+	server(id: Int!): ServerDetails
+	"""
+	Get general settings.
+	"""
+	settings: GeneralSettings!
+	schedules: [Schedule!]!
+	"""
+	The running weaver binary version.
+	"""
+	version: String!
+	"""
+	System status facade for integrations.
+	"""
+	systemStatus: SystemStatus!
+	"""
+	System metrics facade for integrations.
+	"""
+	systemMetrics: Metrics!
+	"""
+	Tiered local metrics history for the built-in monitoring UI.
+	"""
+	metricsHistory(range: MetricsHistoryRangeGql!): MetricsHistoryResult!
+	browseDirectories(path: String): DirectoryBrowseResult!
+	"""
+	Return recent log lines from the in-memory ring buffer.
+	"""
+	serviceLogs(limit: Int! = 250): ServiceLogsPayload!
+	"""
+	Get current pipeline metrics.
+	"""
+	metrics: Metrics!
+	"""
+	Check whether the pipeline is globally paused.
+	"""
+	isPaused: Boolean!
+	"""
+	Current global download block state (manual pause or ISP cap).
+	"""
+	downloadBlock: DownloadBlock!
+	"""
+	Live per-server NNTP health (connections, latency, state) for the monitoring dashboard.
+	"""
+	serverHealth: [ServerHealth!]!
+	"""
+	Filesystem capacity for the configured storage directories (data / intermediate / complete).
+	"""
+	diskUsage: [DiskUsage!]!
+}
+
+type QueueAttention {
+	code: String!
+	message: String!
+}
+
+type QueueCommandResult {
+	success: Boolean!
+	message: String
+	item: QueueItem
+	globalState: GlobalQueueState
+}
+
+enum QueueDownloadState {
+	QUEUED
+	DOWNLOADING
+	CHECKING
+	COMPLETE
+	FAILED
+}
+
+type QueueEvent {
+	cursor: String!
+	occurredAt: DateTime!
+	kind: QueueEventKind!
+	itemId: Int
+	item: QueueItem
+	state: QueueItemState
+	previousState: QueueItemState
+	attention: QueueAttention
+	globalState: GlobalQueueState
+}
+
+enum QueueEventKind {
+	ITEM_CREATED
+	ITEM_STATE_CHANGED
+	ITEM_PROGRESS
+	ITEM_ATTENTION
+	ITEM_COMPLETED
+	ITEM_REMOVED
+	GLOBAL_STATE_CHANGED
+}
+
+input QueueFilterInput {
+	itemIds: [Int!]
+	states: [QueueItemState!]
+	category: String
+	hasAttributeKey: String
+	attributeEquals: AttributeInput
+}
+
+type QueueItem {
+	id: Int!
+	jobHash: String
+	name: String!
+	displayTitle: String!
+	originalTitle: String!
+	parsedRelease: ParsedRelease!
+	state: QueueItemState!
+	downloadState: QueueDownloadState!
+	postState: QueuePostState!
+	waitReason: QueueWaitReason
+	downloadWaitReason: String
+	downloadRetryAtEpochMs: Float
+	error: String
+	progressPercent: Float!
+	totalBytes: Int!
+	downloadedBytes: Int!
+	optionalRecoveryBytes: Int!
+	optionalRecoveryDownloadedBytes: Int!
+	phaseProgress: [QueuePhaseProgress!]!
+	failedBytes: Int!
+	health: Int!
+	"""
+	Total files in the NZB (all roles); 0 when unknown (legacy snapshots).
+	"""
+	fileCount: Int!
+	"""
+	Files not yet fully downloaded.
+	"""
+	remainingFileCount: Int!
+	"""
+	PAR2 recovery volumes not yet fetched.
+	"""
+	remainingParCount: Int!
+	hasPassword: Boolean!
+	category: String
+	attributes: [Attribute!]!
+	clientRequestId: String
+	outputDir: String
+	createdAt: DateTime!
+	attention: QueueAttention
+	"""
+	Compact durable duplicate state loaded with queue lists. It omits source
+	NZB material and credentials, which remain unavailable to GraphQL.
+	"""
+	duplicateSummary: DuplicateSummaryInfo
+}
+
+"""
+Public queue states collapse the internal `Checking` phase into
+`Verifying` so clients see one post-download verification step before
+extraction begins.
+"""
+enum QueueItemState {
+	QUEUED
+	DOWNLOADING
+	CHECKING
+	VERIFYING
+	REPAIRING
+	EXTRACTING
+	FINALIZING
+	POST_PROCESSING
+	COMPLETED
+	FAILED
+	PAUSED
+}
+
+"""
+Kind of manual queue move. Offset carries its distance in the mutation's
+`offset` argument.
+"""
+enum QueueMoveKind {
+	TOP
+	BOTTOM
+	OFFSET
+}
+
+enum QueuePhase {
+	DOWNLOADING
+	REPAIRING
+	EXTRACTING
+	MOVING
+}
+
+type QueuePhaseProgress {
+	phase: QueuePhase!
+	completedBytes: Float!
+	totalBytes: Float!
+	progressPercent: Float!
+	rateBps: Float
+	estimatedRemainingMs: Float
+	startedAtEpochMs: Float!
+	updatedAtEpochMs: Float!
+}
+
+enum QueuePostState {
+	IDLE
+	QUEUED_REPAIR
+	REPAIRING
+	QUEUED_EXTRACT
+	EXTRACTING
+	WAITING_FOR_VOLUMES
+	AWAITING_REPAIR
+	VERIFYING
+	FINALIZING
+	QUEUED_POST_PROCESSING
+	POST_PROCESSING
+	COMPLETED
+	FAILED
+}
+
+type QueueSnapshot {
+	items: [QueueItem!]!
+	summary: QueueSummary!
+	metrics: Metrics!
+	globalState: GlobalQueueState!
+	latestCursor: String!
+	generatedAt: DateTime!
+}
+
+type QueueSummary {
+	totalItems: Int!
+	queuedItems: Int!
+	activeItems: Int!
+	pausedItems: Int!
+	failedItems: Int!
+	totalBytes: Int!
+	downloadedBytes: Int!
+	currentDownloadSpeed: Int!
+	verifyingItems: Int!
+	repairingItems: Int!
+	extractingItems: Int!
+}
+
+enum QueueWaitReason {
+	REPAIR_CAPACITY
+	EXTRACTION_CAPACITY
+	POST_PROCESSING_CAPACITY
+}
+
+type RssFeed {
+	id: Int!
+	name: String!
+	url: String!
+	enabled: Boolean!
+	pollIntervalSecs: Int!
+	username: String
+	hasPassword: Boolean!
+	defaultCategory: String
+	defaultMetadata: [MetadataEntry!]!
+	etag: String
+	lastModified: String
+	lastPolledAt: Float
+	lastSuccessAt: Float
+	lastError: String
+	consecutiveFailures: Int!
+	rules: [RssRule!]!
+}
+
+input RssFeedInput {
+	name: String!
+	url: String!
+	enabled: Boolean! = true
+	pollIntervalSecs: Int
+	username: String
+	password: String
+	defaultCategory: String
+	defaultMetadata: [MetadataInput!]
+}
+
+type RssFeedSyncResult {
+	feedId: Int!
+	feedName: String!
+	itemsFetched: Int!
+	itemsNew: Int!
+	itemsAccepted: Int!
+	itemsSubmitted: Int!
+	itemsIgnored: Int!
+	errors: [String!]!
+}
+
+type RssRule {
+	id: Int!
+	feedId: Int!
+	sortOrder: Int!
+	enabled: Boolean!
+	action: RssRuleActionGql!
+	titleRegex: String
+	itemCategories: [String!]!
+	minSizeBytes: Int
+	maxSizeBytes: Int
+	categoryOverride: String
+	metadata: [MetadataEntry!]!
+}
+
+enum RssRuleActionGql {
+	ACCEPT
+	REJECT
+}
+
+input RssRuleInput {
+	enabled: Boolean! = true
+	sortOrder: Int!
+	action: RssRuleActionGql!
+	titleRegex: String
+	itemCategories: [String!]
+	minSizeBytes: Int
+	maxSizeBytes: Int
+	categoryOverride: String
+	metadata: [MetadataInput!]
+}
+
+type RssSeenItem {
+	feedId: Int!
+	itemId: String!
+	itemTitle: String!
+	publishedAt: Float
+	sizeBytes: Int
+	decision: String!
+	seenAt: Float!
+	jobId: Int
+	itemUrl: String
+	error: String
+}
+
+type RssSyncReport {
+	feedsPolled: Int!
+	itemsFetched: Int!
+	itemsNew: Int!
+	itemsAccepted: Int!
+	itemsSubmitted: Int!
+	itemsIgnored: Int!
+	errors: [String!]!
+	feedResults: [RssFeedSyncResult!]!
+}
+
+type Schedule {
+	id: String!
+	enabled: Boolean!
+	label: String!
+	days: [String!]!
+	time: String!
+	actionType: String!
+	speedLimitBytes: Int
+}
+
+input ScheduleInput {
+	enabled: Boolean
+	label: String
+	days: [String!]
+	time: String!
+	actionType: String!
+	speedLimitBytes: Int
+}
+
+type SemanticCandidateSnapshotInfo {
+	groupId: Int!
+	normalizedKey: String!
+	score: Int!
+	state: SemanticCandidateState!
+	terminalCause: SemanticTerminalCause
+	promotionState: SemanticPromotionState!
+}
+
+enum SemanticCandidateState {
+	ACTIVE
+	PARKED
+	NONBLOCKING
+	SUPPRESSED
+}
+
+type SemanticDuplicateAdmissionInfo {
+	groupId: Int!
+	normalizedKey: String!
+	score: Int!
+	state: SemanticCandidateState!
+	supersededJobId: Int
+}
+
+type SemanticPromotionResult {
+	accepted: Boolean!
+	jobId: Int
+	message: String
+}
+
+enum SemanticPromotionState {
+	NONE
+	PENDING
+	CLAIMED
+}
+
+enum SemanticTerminalCause {
+	SUCCESS
+	MISSING_ARTICLES_OR_LOW_HEALTH
+	DECODE_OR_CORRUPT_DATA
+	REPAIR_FAILURE
+	ARCHIVE_OR_UNPACK_FAILURE
+	PASSWORD_FAILURE
+	DISK_OR_PERMISSION_FAILURE
+	SERVER_AUTH_QUOTA_OR_OUTAGE
+	SHUTDOWN
+	USER_CANCELLED
+	UNKNOWN_FAILURE
+}
+
+type Server {
+	id: Int!
+	host: String!
+	port: Int!
+	tls: Boolean!
+	connections: Int!
+	active: Boolean!
+	supportsPipelining: Boolean!
+	priority: Int!
+	backfill: Boolean!
+	retentionDays: Int!
+	maxDownloadSpeed: Int!
+	downloadQuota: ServerDownloadQuota!
+	tlsCaCert: String
+}
+
+type ServerDetails {
+	id: Int!
+	host: String!
+	port: Int!
+	tls: Boolean!
+	username: String
+	connections: Int!
+	active: Boolean!
+	supportsPipelining: Boolean!
+	priority: Int!
+	backfill: Boolean!
+	retentionDays: Int!
+	maxDownloadSpeed: Int!
+	downloadQuota: ServerDownloadQuota!
+	tlsCaCert: String
+}
+
+type ServerDownloadQuota {
+	enabled: Boolean!
+	limitBytes: Int!
+	period: ServerDownloadQuotaPeriodGql!
+	resetTimeMinutesLocal: Int!
+	weeklyResetWeekday: ServerDownloadQuotaWeekdayGql!
+	monthlyResetDay: Int!
+	lifetimeBytes: Int!
+	usedBytes: Int!
+	reservedBytes: Int!
+	remainingBytes: Int!
+	blocked: Boolean!
+	windowStartsAtEpochMs: Float
+	windowEndsAtEpochMs: Float
+	timezoneName: String!
+}
+
+input ServerDownloadQuotaInput {
+	enabled: Boolean! = false
+	limitBytes: Int! = 0
+	period: ServerDownloadQuotaPeriodGql! = ONE_TIME
+	resetTimeMinutesLocal: Int! = 0
+	weeklyResetWeekday: ServerDownloadQuotaWeekdayGql! = MON
+	monthlyResetDay: Int! = 1
+}
+
+enum ServerDownloadQuotaPeriodGql {
+	ONE_TIME
+	DAILY
+	WEEKLY
+	MONTHLY
+}
+
+enum ServerDownloadQuotaWeekdayGql {
+	MON
+	TUE
+	WED
+	THU
+	FRI
+	SAT
+	SUN
+}
+
+"""
+Live health for one configured news server, derived from the NNTP connection pool.
+"""
+type ServerHealth {
+	host: String!
+	port: Int!
+	"""
+	`host:port` label.
+	"""
+	label: String!
+	"""
+	"PRIMARY" for the highest-priority server, "BACKUP" otherwise.
+	"""
+	tier: String!
+	"""
+	One of "healthy", "degraded", "cooling_down", "disabled".
+	"""
+	state: String!
+	"""
+	Currently in-use connections (max - available permits).
+	"""
+	connectionsActive: Int!
+	"""
+	Runtime effective maximum connections (legacy field).
+	"""
+	connectionsMax: Int!
+	"""
+	Saved operator-configured maximum connections.
+	"""
+	connectionsConfigured: Int!
+	"""
+	Runtime maximum after provider capacity adaptation.
+	"""
+	connectionsEffective: Int!
+	"""
+	End of the current provider-capacity penalty, if one is active.
+	"""
+	capacityPenaltyUntilEpochMs: Int
+	"""
+	Active NNTP runtime generation.
+	"""
+	runtimeGeneration: Int!
+	"""
+	EWMA request latency in milliseconds.
+	"""
+	latencyMs: Float!
+	successCount: Int!
+	failureCount: Int!
+	consecutiveFailures: Int!
+	"""
+	Connections that died before reaching a healthy age, recently.
+	"""
+	prematureDeaths: Int!
+}
+
+input ServerInput {
+	host: String!
+	port: Int!
+	tls: Boolean!
+	username: String
+	password: String
+	connections: Int!
+	active: Boolean! = true
+	priority: Int! = 0
+	"""
+	Backfill servers only serve articles the fill tier is missing.
+	"""
+	backfill: Boolean! = false
+	"""
+	Days of retention this server holds (0 = unlimited).
+	"""
+	retentionDays: Int! = 0
+	"""
+	Aggregate bytes/second for this server. Omitted updates preserve the value.
+	"""
+	maxDownloadSpeed: Int
+	"""
+	Hard BODY-byte quota. Omitted updates preserve the current policy.
+	"""
+	downloadQuota: ServerDownloadQuotaInput
+	tlsCaCert: String
+}
+
+type ServiceLogsPayload {
+	lines: [String!]!
+	count: Int!
+}
+
+input StageNzbUploadInput {
+	nzbUpload: Upload!
+	filename: String
+}
+
+type StagedNzbSubmissionResult {
+	stagedUploadId: String!
+	accepted: Boolean!
+	retained: Boolean!
+	status: SubmissionStatus
+	item: QueueItem
+	semanticDuplicate: SemanticDuplicateAdmissionInfo
+	error: String
+}
+
+type StagedNzbUploadResult {
+	accepted: Boolean!
+	stagedUploadId: String
+	filename: String
+	displayName: String
+	totalFiles: Int
+	totalBytes: Int
+	error: String
+}
+
+type SubmissionResult {
+	accepted: Boolean!
+	status: SubmissionStatus!
+	jobId: Int
+	clientRequestId: String
+	item: QueueItem
+	duplicateDecision: DuplicateDecisionInfo
+	semanticDuplicate: SemanticDuplicateAdmissionInfo
+	errorCode: String
+	message: String
+}
+
+enum SubmissionStatus {
+	ACCEPTED
+	WARNED
+	PAUSED
+	PARKED
+	BLOCKED
+	IDEMPOTENT_REPLAY
+	IDEMPOTENCY_CONFLICT
+	FORCE_ACCEPTED
+}
+
+input SubmitNzbInput {
+	url: String
+	nzbBase64: String
+	nzbUpload: Upload
+	filename: String
+	password: String
+	category: String
+	attributes: [AttributeInput!]
+	clientRequestId: String
+	idempotencyKey: String
+	force: Boolean
+	dupeKey: String
+	dupeScore: Int
+	dupeMode: DuplicateMode
+	postProcessing: PostProcessingSelectionInput
+}
+
+input SubmitStagedNzbsInput {
+	stagedUploadIds: [String!]!
+	password: String
+	category: String
+	attributes: [AttributeInput!]
+	clientRequestId: String
+	idempotencyKey: String
+	force: Boolean
+	dupeKey: String
+	dupeScore: Int
+	dupeMode: DuplicateMode
+	postProcessing: PostProcessingSelectionInput
+}
+
+type SubmitStagedNzbsResult {
+	acceptedCount: Int!
+	clientRequestId: String
+	results: [StagedNzbSubmissionResult!]!
+}
+
+type SubscriptionRoot {
+	"""
+	Subscribe to all pipeline events.
+	"""
+	events: PipelineEventGql!
+	"""
+	Admin-facing raw event stream.
+	"""
+	adminEvents: PipelineEventGql!
+	"""
+	Read-facing live snapshot for the job detail page.
+	"""
+	jobDetailUpdates(jobId: Int!): JobDetailSnapshot!
+	"""
+	Subscribe to real-time job state snapshots.
+	
+	Pushes a full snapshot whenever a pipeline event fires, throttled to
+	at most once per 100ms so rapid-fire segment events don't flood the
+	client. Also ticks every 2s during idle so speed gauges stay fresh.
+	"""
+	jobUpdates: JobsSnapshot!
+	"""
+	Subscribe to the public queue snapshot facade.
+	"""
+	queueSnapshots(filter: QueueFilterInput): QueueSnapshot!
+	"""
+	Subscribe to live public queue events.
+	
+	Replays recent in-memory queue events after `after`, then continues
+	streaming live events from the same bounded replay buffer.
+	"""
+	queueEvents(after: String, filter: QueueFilterInput): QueueEvent!
+	"""
+	Subscribe to live log lines from the service.
+	"""
+	serviceLogLines: String!
+	"""
+	Subscribe to cadence-driven system metrics and global queue state.
+	"""
+	systemMetricsUpdates: SystemMetricsSnapshot!
+}
+
+type SystemMetricsSnapshot {
+	metrics: Metrics!
+	globalState: GlobalQueueState!
+}
+
+type SystemStatus {
+	version: String!
+	globalState: GlobalQueueState!
+	summary: QueueSummary!
+}
+
+type TestConnectionResult {
+	success: Boolean!
+	message: String!
+	latencyMs: Int
+	supportsPipelining: Boolean!
+}
+
+enum TimelineSpanState {
+	RUNNING
+	COMPLETE
+	FAILED
+}
+
+enum TimelineStage {
+	PENDING_DOWNLOAD
+	DOWNLOADING
+	FINALIZING_DOWNLOAD
+	PAUSED
+	VERIFYING
+	REPAIRING
+	EXTRACTING
+	INTERRUPTED
+	FINAL_MOVE
+}
+
+"""
+A multipart file upload
+"""
+scalar Upload
+
+type WatchFolderMarkerRename {
+	from: String!
+	to: String!
+	marker: String!
+}
+
+type WatchFolderScanIssue {
+	path: String!
+	reason: String!
+}
+
+type WatchFolderScanReport {
+	discoveredFiles: [String!]!
+	queuedNzbs: [String!]!
+	skippedInputs: [WatchFolderScanIssue!]!
+	permanentErrors: [WatchFolderScanIssue!]!
+	transientErrors: [WatchFolderScanIssue!]!
+	markerRenamedSources: [WatchFolderMarkerRename!]!
+}
+
+type WatchFolderSettings {
+	mode: String!
+	path: String
+	pollIntervalSecs: Int!
+	stabilitySecs: Int!
+	categoryFromSubfolders: Boolean!
+	scanningPaused: Boolean!
+}
+
+input WatchFolderSettingsInput {
+	mode: String
+	path: String
+	pollIntervalSecs: Int
+	stabilitySecs: Int
+	categoryFromSubfolders: Boolean
+	scanningPaused: Boolean
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Provides a scalar specification URL for specifying the behavior of custom scalar types.
+"""
+directive @specifiedBy(url: String!) on SCALAR
+schema {
+	query: QueryRoot
+	mutation: MutationRoot
+	subscription: SubscriptionRoot
+}
