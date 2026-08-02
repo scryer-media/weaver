@@ -465,7 +465,9 @@ impl Pipeline {
 
     pub(crate) fn refresh_bandwidth_cap_window(&mut self) -> Result<(), SchedulerError> {
         self.bandwidth_cap.update_for_now(&self.db)?;
-        let mut block = self.bandwidth_cap.to_download_block_state(self.global_pause());
+        let mut block = self
+            .bandwidth_cap
+            .to_download_block_state(self.global_pause());
         block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
         self.shared_state.set_download_block(block);
         Ok(())
