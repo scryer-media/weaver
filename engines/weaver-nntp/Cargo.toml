@@ -25,16 +25,16 @@ libc = { workspace = true }
 
 # s2n-tls is POSIX-only C; Windows builds use the rustls/aws-lc backend instead.
 [target.'cfg(not(windows))'.dependencies]
-s2n-tls = "0.3.39"
-s2n-tls-sys = "0.3.39"
-s2n-tls-tokio = "0.3.39"
+s2n-tls = "0.3.41"
+s2n-tls-sys = "0.3.41"
+s2n-tls-tokio = "0.3.41"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
-criterion = "0.5"
-rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
+criterion = "0.8"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]

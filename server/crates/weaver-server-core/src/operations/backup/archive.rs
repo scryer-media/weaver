@@ -160,10 +160,11 @@ impl<W: Write> BundleChunkWriter<W> {
     fn write_chunk(&mut self, plaintext: &[u8]) -> Result<(), std::io::Error> {
         let nonce_bytes = bundle_nonce(self.nonce_prefix, self.chunk_index);
         let aad = bundle_aad(&self.metadata, self.chunk_index);
+        let nonce = Nonce::try_from(nonce_bytes.as_slice()).map_err(std::io::Error::other)?;
         let ciphertext = self
             .cipher
             .encrypt(
-                Nonce::from_slice(&nonce_bytes),
+                &nonce,
                 Payload {
                     msg: plaintext,
                     aad: &aad,
@@ -316,10 +317,12 @@ impl<R: Read> BundleChunkReader<R> {
         })?;
         let nonce = bundle_nonce(self.nonce_prefix, self.chunk_index);
         let aad = bundle_aad(&self.metadata, self.chunk_index);
+        let nonce =
+            Nonce::try_from(nonce.as_slice()).map_err(|_| BackupServiceError::InvalidPassword)?;
         self.plaintext = self
             .cipher
             .decrypt(
-                Nonce::from_slice(&nonce),
+                &nonce,
                 Payload {
                     msg: &ciphertext,
                     aad: &aad,
@@ -1024,7 +1027,6 @@ pub(crate) fn encrypt_archive(
     output: &Path,
     password: &str,
 ) -> Result<(), std::io::Error> {
-    use aes_gcm::aead::generic_array::GenericArray;
     use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 
     let mut plaintext = Vec::new();
@@ -1034,14 +1036,14 @@ pub(crate) fn encrypt_archive(
     getrandom::fill(&mut salt).map_err(|e| std::io::Error::other(e.to_string()))?;
 
     let key = derive_key(password, &salt);
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(&key));
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(std::io::Error::other)?;
 
     let mut nonce_bytes = [0u8; 12];
     getrandom::fill(&mut nonce_bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let nonce = GenericArray::from_slice(&nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes.as_slice()).map_err(std::io::Error::other)?;
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_ref())
+        .encrypt(&nonce, plaintext.as_ref())
         .map_err(|e| std::io::Error::other(format!("encryption failed: {e}")))?;
 
     let mut out = File::create(output)?;
@@ -1071,7 +1073,6 @@ pub(crate) fn maybe_decrypt_archive(
 }
 
 fn decrypt_archive(input: &Path, output: &Path, password: &str) -> Result<(), BackupServiceError> {
-    use aes_gcm::aead::generic_array::GenericArray;
     use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 
     let limit = RuntimeSecurityConfig::from_env_or_default_for_tests().backup_upload_limit_bytes;
@@ -1098,11 +1099,11 @@ fn decrypt_archive(input: &Path, output: &Path, password: &str) -> Result<(), Ba
     let ciphertext = &data[header_len..];
 
     let key = derive_key(password, salt);
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(&key));
-    let nonce = GenericArray::from_slice(nonce_bytes);
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(io_err)?;
+    let nonce = Nonce::try_from(nonce_bytes).map_err(io_err)?;
 
     let plaintext = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|_| BackupServiceError::InvalidPassword)?;
 
     let mut options = std::fs::OpenOptions::new();

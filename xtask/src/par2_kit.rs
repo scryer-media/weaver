@@ -255,5 +255,5 @@ fn make_executable(path: &Path) -> Result<()> {
 fn sha256_file(path: &Path) -> Result<String> {
     let bytes = fs::read(path)?;
     let digest = Sha256::digest(bytes);
-    Ok(format!("{digest:x}"))
+    Ok(hex::encode(digest))
 }

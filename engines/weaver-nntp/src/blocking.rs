@@ -2023,7 +2023,7 @@ mod tests {
         let cert_der = certified_key.cert.der().clone();
         let cert_pem = certified_key.cert.pem();
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            certified_key.key_pair.serialize_der(),
+            certified_key.signing_key.serialize_der(),
         ));
 
         let server_provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
@@ -2646,7 +2646,7 @@ mod tests {
         let cert_der = certified_key.cert.der().clone();
         let cert_pem = certified_key.cert.pem();
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            certified_key.key_pair.serialize_der(),
+            certified_key.signing_key.serialize_der(),
         ));
 
         let server_provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();

@@ -15,8 +15,7 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
-use aes_gcm::aead::rand_core::RngCore;
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::{Engine, engine::general_purpose::STANDARD};
 
@@ -57,7 +56,7 @@ impl EncryptionKey {
 
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut bytes);
+        getrandom::fill(&mut bytes).expect("getrandom failed");
         Self { key_bytes: bytes }
     }
 
@@ -72,11 +71,12 @@ pub fn encrypt_value(key: &EncryptionKey, plaintext: &str) -> Result<String, Str
         .map_err(|e| format!("failed to create cipher: {e}"))?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    getrandom::fill(&mut nonce_bytes).map_err(|e| format!("failed to generate nonce: {e}"))?;
+    let nonce = Nonce::try_from(nonce_bytes.as_slice())
+        .map_err(|e| format!("failed to create nonce: {e}"))?;
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+        .encrypt(&nonce, plaintext.as_bytes())
         .map_err(|e| format!("encryption failed: {e}"))?;
 
     let mut combined = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -102,13 +102,13 @@ pub fn decrypt_value(key: &EncryptionKey, stored: &str) -> Result<String, String
     }
 
     let (nonce_bytes, ciphertext) = combined.split_at(NONCE_LEN);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes).map_err(|e| format!("invalid nonce: {e}"))?;
 
     let cipher = Aes256Gcm::new_from_slice(&key.key_bytes)
         .map_err(|e| format!("failed to create cipher: {e}"))?;
 
     let plaintext = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|_| "decryption failed (wrong key or corrupted data)".to_string())?;
 
     String::from_utf8(plaintext).map_err(|e| format!("decrypted value is not valid UTF-8: {e}"))

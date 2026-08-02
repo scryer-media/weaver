@@ -3700,7 +3700,7 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
 
     assert_eq!(
         (rendered.len(), prometheus_golden_hash(&rendered)),
-        (25_264, 13_069_257_777_456_965_180),
+        (25_264, 6_677_090_437_867_211_205),
         "the complete deterministic Prometheus output changed"
     );
     let mut with_post_processing = rendered.clone();

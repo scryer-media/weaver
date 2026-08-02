@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, Mac, digest::KeyInit};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};

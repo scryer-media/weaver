@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -348,14 +348,6 @@ impl TaskContext {
         command.current_dir(cwd);
         command
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct GhRelease {
-    #[serde(rename = "tagName")]
-    tag_name: String,
-    #[serde(rename = "publishedAt")]
-    published_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1885,8 +1877,6 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
         ok("Nothing to commit");
     }
 
-    prune_weaver_release_history(ctx)?;
-
     step(format!("Creating signed tag {tag_name}"));
     let mut tag = ctx.command_in("git", &ctx.repo_root);
     tag.args(["tag", "-s", &tag_name, "-m", &format!("Release {tag_name}")]);
@@ -2088,113 +2078,6 @@ fn run_weaver_ci_clippy_validation(ctx: &TaskContext, prefix: &'static str) -> R
     clippy.args(["xtask", "ci", "clippy", "--linux-only"]);
     run_streaming(&mut clippy, prefix)?;
     prefixed_ok(prefix, "Clippy passed");
-    Ok(())
-}
-
-fn prune_weaver_release_history(ctx: &TaskContext) -> Result<()> {
-    const KEEP_RELEASES: usize = 4;
-    step(format!(
-        "Culling old release artifacts (keeping {KEEP_RELEASES} most recent)"
-    ));
-
-    let mut list = ctx.command_in("gh", &ctx.repo_root);
-    list.args([
-        "release",
-        "list",
-        "--limit",
-        "100",
-        "--json",
-        "tagName,publishedAt",
-    ]);
-    let mut releases: Vec<GhRelease> = serde_json::from_str(&run_capture(&mut list)?)?;
-    releases.sort_by_key(|release| release.published_at.clone());
-    releases.reverse();
-
-    let old_releases = releases
-        .iter()
-        .skip(KEEP_RELEASES)
-        .map(|release| release.tag_name.clone())
-        .collect::<Vec<_>>();
-    if old_releases.is_empty() {
-        ok("No old releases to cull");
-    } else {
-        for tag in &old_releases {
-            println!("   deleting release: {tag}");
-            let mut delete = ctx.command_in("gh", &ctx.repo_root);
-            delete.args(["release", "delete", tag, "--yes"]);
-            let _ = run_checked(&mut delete);
-        }
-        ok("Old releases deleted");
-    }
-
-    let mut package_check = ctx.command_in("gh", &ctx.repo_root);
-    package_check.args(["api", "orgs/scryer-media/packages/container/weaver"]);
-    if !run_status(&mut package_check)?.success() {
-        ok("No GHCR package found — skipping Docker cleanup");
-        return Ok(());
-    }
-
-    let mut versions = ctx.command_in("gh", &ctx.repo_root);
-    versions.args([
-        "api",
-        "orgs/scryer-media/packages/container/weaver/versions",
-        "--paginate",
-        "--jq",
-        ".[] | [(.id | tostring), .created_at, ((.metadata.container.tags | length) | tostring)] | @tsv",
-    ]);
-    let versions = run_capture(&mut versions)?;
-    let mut rows = Vec::new();
-    for row in versions.lines() {
-        let mut fields = row.split('\t');
-        let Some(id) = fields.next() else {
-            continue;
-        };
-        let Some(created_at) = fields.next() else {
-            continue;
-        };
-        let Some(tag_count) = fields.next() else {
-            continue;
-        };
-        rows.push((
-            id.to_string(),
-            DateTime::parse_from_rfc3339(created_at)?.with_timezone(&Utc),
-            tag_count.parse::<usize>()?,
-        ));
-    }
-    let mut tagged = rows
-        .iter()
-        .filter(|(_, _, tag_count)| *tag_count > 0)
-        .map(|(_, created_at, _)| *created_at)
-        .collect::<Vec<_>>();
-    tagged.sort_by_key(|created_at| *created_at);
-    tagged.reverse();
-    if tagged.len() < KEEP_RELEASES {
-        ok(format!(
-            "Fewer than {KEEP_RELEASES} Docker releases — nothing to cull"
-        ));
-        return Ok(());
-    }
-    let cutoff = tagged[KEEP_RELEASES - 1] - Duration::seconds(60);
-    let mut deleted = 0;
-    for (id, created_at, _) in rows {
-        if created_at >= cutoff {
-            continue;
-        }
-        let mut delete = ctx.command_in("gh", &ctx.repo_root);
-        delete.args([
-            "api",
-            "--method",
-            "DELETE",
-            &format!("orgs/scryer-media/packages/container/weaver/versions/{id}"),
-        ]);
-        let _ = run_checked(&mut delete);
-        deleted += 1;
-    }
-    if deleted == 0 {
-        ok("No old Docker images to cull");
-    } else {
-        ok(format!("Deleted {deleted} old Docker image versions"));
-    }
     Ok(())
 }
 

@@ -1225,7 +1225,7 @@ fn summarize_real_download(job_id: i64, terminal_status: &str, samples: &[Value]
 
 fn sha256_file(path: &Path) -> Result<String> {
     let bytes = fs::read(path)?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 struct ChildGuard<'a> {
