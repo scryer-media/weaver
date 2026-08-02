@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef } from "react";
 import { Provider } from "urql";
-import { RouterProvider } from "react-router";
+import { RouterProvider } from "react-router/dom";
 import { ThemeProvider } from "next-themes";
 import { requestGraphqlClientRestart, useGraphqlClient } from "./graphql/client";
 import { router } from "./router";
