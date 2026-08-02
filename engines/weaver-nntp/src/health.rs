@@ -158,7 +158,7 @@ impl ServerHealth {
     pub fn record_success(&mut self) {
         self.success_count += 1;
         self.consecutive_failures = 0;
-        self.note_ratio_attempt(false);
+        self.note_ratio_attempt(false, false);
         // In-flight fetches routinely land right after a failure-ratio trip —
         // at the trip threshold most attempts still succeed. Those stragglers
         // must not lift the quarantine whose whole purpose is shifting work
@@ -182,7 +182,7 @@ impl ServerHealth {
     /// trips even though successes vastly outnumber failures. Quiet servers
     /// never reach `failure_ratio_min_attempts` within one window and fall
     /// back to the consecutive machine.
-    fn note_ratio_attempt(&mut self, failed: bool) -> bool {
+    fn note_ratio_attempt(&mut self, failed: bool, allow_trip: bool) -> bool {
         let now = Instant::now();
         match self.ratio_window_started {
             Some(started) if now.duration_since(started) <= self.config.failure_ratio_window => {}
@@ -196,7 +196,7 @@ impl ServerHealth {
         if failed {
             self.ratio_failures += 1;
         }
-        if matches!(self.state, ServerState::Disabled { .. }) {
+        if !allow_trip || matches!(self.state, ServerState::Disabled { .. }) {
             return false;
         }
         if self.ratio_attempts < self.config.failure_ratio_min_attempts
@@ -225,6 +225,16 @@ impl ServerHealth {
     /// consecutive failure count. Otherwise the state transitions through
     /// Degraded and eventually Disabled based on configured thresholds.
     pub fn record_failure(&mut self, is_auth: bool) {
+        self.record_failure_gated(is_auth, true);
+    }
+
+    /// [`Self::record_failure`] with an explicit failure-ratio trip gate.
+    ///
+    /// [`HealthTracker`] passes `allow_ratio_trip: false` when no other fill
+    /// server could absorb the shifted load — disabling the only usable
+    /// server would turn a 10%-flaky-but-90%-working connection into a full
+    /// outage. The window still counts attempts either way.
+    pub fn record_failure_gated(&mut self, is_auth: bool, allow_ratio_trip: bool) {
         self.failure_count += 1;
         self.consecutive_failures += 1;
 
@@ -238,7 +248,7 @@ impl ServerHealth {
         }
 
         // A ratio trip subsumes the consecutive-threshold transitions below.
-        if self.note_ratio_attempt(true) {
+        if self.note_ratio_attempt(true, allow_ratio_trip) {
             return;
         }
 
@@ -262,13 +272,21 @@ impl ServerHealth {
     /// advance the longer-lived degraded/disabled thresholds so a flaky primary
     /// eventually yields to backup servers instead of re-entering immediately forever.
     pub fn record_cooldown(&mut self, reason: CooldownReason) {
+        self.record_cooldown_gated(reason, true);
+    }
+
+    /// [`Self::record_cooldown`] with an explicit failure-ratio trip gate
+    /// (see [`Self::record_failure_gated`]).
+    pub fn record_cooldown_gated(&mut self, reason: CooldownReason, allow_ratio_trip: bool) {
         self.failure_count += 1;
 
         // Ratio accounting runs first: when sustained transport flake trips
         // the window, the resulting disable subsumes the short cooldown.
         // Capacity rejections are provider connection policy, not flakiness,
         // and stay out of the ratio window.
-        if matches!(reason, CooldownReason::Transport) && self.note_ratio_attempt(true) {
+        if matches!(reason, CooldownReason::Transport)
+            && self.note_ratio_attempt(true, allow_ratio_trip)
+        {
             return;
         }
 
@@ -423,15 +441,46 @@ impl ServerHealth {
 #[derive(Debug)]
 pub struct HealthTracker {
     servers: Vec<ServerHealth>,
+    /// Backfill flag per server, parallel to `servers`. Failure-ratio trips
+    /// only fire when another FILL server can absorb the shifted load;
+    /// backfill servers never count (health never unlocks backfill, so
+    /// disabling the last fill server in their favor would stall fill work).
+    backfill: Vec<bool>,
 }
 
 impl HealthTracker {
-    /// Create a tracker for `server_count` servers, all starting Healthy.
+    /// Create a tracker for `server_count` servers, all starting Healthy and
+    /// all treated as fill servers.
     pub fn new(server_count: usize, config: HealthConfig) -> Self {
+        Self::new_with_backfill(server_count, config, vec![false; server_count])
+    }
+
+    /// Create a tracker with explicit per-server backfill flags.
+    pub fn new_with_backfill(
+        server_count: usize,
+        config: HealthConfig,
+        backfill: Vec<bool>,
+    ) -> Self {
+        debug_assert_eq!(backfill.len(), server_count);
         let servers = (0..server_count)
             .map(|_| ServerHealth::new(config.clone()))
             .collect();
-        Self { servers }
+        Self { servers, backfill }
+    }
+
+    /// Whether a failure-ratio trip on `server_idx` has somewhere to shift
+    /// load: another fill server that is currently usable. A server sitting in
+    /// an unexpired disable/cooldown does not count — conservative, since the
+    /// next window re-evaluates after it re-enables.
+    fn ratio_trip_allowed(&self, server_idx: usize) -> bool {
+        self.servers.iter().enumerate().any(|(idx, server)| {
+            idx != server_idx
+                && !self.backfill.get(idx).copied().unwrap_or(false)
+                && matches!(
+                    server.state(),
+                    ServerState::Healthy | ServerState::Degraded { .. }
+                )
+        })
     }
 
     /// Record a successful operation for the given server.
@@ -441,12 +490,14 @@ impl HealthTracker {
 
     /// Record a failed operation for the given server.
     pub fn record_failure(&mut self, server_idx: usize, is_auth: bool) {
-        self.servers[server_idx].record_failure(is_auth);
+        let allow_ratio_trip = self.ratio_trip_allowed(server_idx);
+        self.servers[server_idx].record_failure_gated(is_auth, allow_ratio_trip);
     }
 
     /// Record a short-lived cooldown-worthy failure for the given server.
     pub fn record_cooldown(&mut self, server_idx: usize, reason: CooldownReason) {
-        self.servers[server_idx].record_cooldown(reason);
+        let allow_ratio_trip = self.ratio_trip_allowed(server_idx);
+        self.servers[server_idx].record_cooldown_gated(reason, allow_ratio_trip);
     }
 
     /// Whether the given server is available for work.
@@ -653,6 +704,71 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Drive one server in a tracker through a 50% failure pattern that
+    /// crosses the ratio threshold (min 4 samples).
+    fn drive_ratio_pattern(tracker: &mut HealthTracker, server_idx: usize) {
+        for _ in 0..4 {
+            tracker.record_success(server_idx);
+            tracker.record_cooldown(server_idx, CooldownReason::Transport);
+        }
+    }
+
+    #[test]
+    fn tracker_ratio_trip_requires_another_usable_fill_server() {
+        // Single server: never trip — disabling the only server would turn a
+        // flaky-but-working connection into a full outage.
+        let mut solo = HealthTracker::new(1, ratio_config(4, 50, Duration::from_secs(3600)));
+        drive_ratio_pattern(&mut solo, 0);
+        assert!(!matches!(
+            solo.server(0).state(),
+            ServerState::Disabled {
+                reason: DisableReason::FailureRatio,
+                ..
+            }
+        ));
+
+        // A backfill server is not an alternative: health never unlocks
+        // backfill, so the fill workload would stall.
+        let mut with_backfill = HealthTracker::new_with_backfill(
+            2,
+            ratio_config(4, 50, Duration::from_secs(3600)),
+            vec![false, true],
+        );
+        drive_ratio_pattern(&mut with_backfill, 0);
+        assert!(!matches!(
+            with_backfill.server(0).state(),
+            ServerState::Disabled {
+                reason: DisableReason::FailureRatio,
+                ..
+            }
+        ));
+
+        // A second fill server that is itself disabled does not count either.
+        let mut peer_down = HealthTracker::new(2, ratio_config(4, 50, Duration::from_secs(3600)));
+        peer_down.record_failure(1, true);
+        assert!(!peer_down.is_available(1));
+        drive_ratio_pattern(&mut peer_down, 0);
+        assert!(!matches!(
+            peer_down.server(0).state(),
+            ServerState::Disabled {
+                reason: DisableReason::FailureRatio,
+                ..
+            }
+        ));
+
+        // With a healthy second fill server the trip fires and shifts load.
+        let mut pair = HealthTracker::new(2, ratio_config(4, 50, Duration::from_secs(3600)));
+        drive_ratio_pattern(&mut pair, 0);
+        assert!(matches!(
+            pair.server(0).state(),
+            ServerState::Disabled {
+                reason: DisableReason::FailureRatio,
+                ..
+            }
+        ));
+        assert!(pair.is_available(1));
     }
 
     #[test]

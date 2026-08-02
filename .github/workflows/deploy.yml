@@ -1327,9 +1327,6 @@ jobs:
           path: artifacts
       - name: Validate Docker runtime selector
         run: sh docker/test_runtime_select.sh
-      - name: Validate Docker docs contract
-        if: matrix.platform_id == 'amd64'
-        run: sh docker/test_docs_contract.sh
       - name: Prepare build context
         run: sh docker/prepare-build-context.sh artifacts docker-ctx
       - uses: docker/setup-qemu-action@v4

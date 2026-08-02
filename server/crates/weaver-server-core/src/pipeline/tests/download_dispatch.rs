@@ -367,6 +367,93 @@ async fn transport_failure_retry_keeps_single_server_eligible() {
     assert!(retry.exclude_servers.is_empty());
 }
 
+/// A backfill server is not a rotation target: the avoid hint joins the
+/// lease's effective excludes, and excluding the whole fill tier would
+/// unlock backfill (`fill_servers_exhausted`) for work the fill server can
+/// serve on the next attempt — backfill is reserved for missing articles.
+#[tokio::test]
+async fn transport_failure_retry_does_not_rotate_toward_backfill() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let servers = vec![
+        weaver_nntp::pool::ServerPoolConfig {
+            server: weaver_nntp::ServerConfig {
+                host: "fill.example.com".into(),
+                ..Default::default()
+            },
+            max_connections: 2,
+            ..weaver_nntp::pool::ServerPoolConfig::default()
+        },
+        weaver_nntp::pool::ServerPoolConfig {
+            server: weaver_nntp::ServerConfig {
+                host: "backfill.example.com".into(),
+                ..Default::default()
+            },
+            max_connections: 2,
+            backfill: true,
+            ..weaver_nntp::pool::ServerPoolConfig::default()
+        },
+    ];
+    pipeline.nntp = std::sync::Arc::new(weaver_nntp::client::NntpClient::new(
+        weaver_nntp::client::NntpClientConfig {
+            servers,
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(1),
+        },
+    ));
+    let job_id = JobId(20011);
+    let spec = segmented_job_spec("Transport Rotation Backfill", "rotation-bf.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            runtime_generation: 0,
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                segment_number: 0,
+            },
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::EstablishedTransport,
+                "article fetch soft timeout (15s)",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: Vec::new(),
+            release_connection_slot: true,
+        })
+        .await;
+
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("transport retry should requeue");
+    assert_eq!(
+        retry.avoid_server, None,
+        "rotation must not manufacture fill-tier exhaustion"
+    );
+}
+
 #[test]
 fn lane_acquire_failure_preserves_retry_semantics() {
     let unavailable = DownloadFailure::from_lane_acquire_failure(None);

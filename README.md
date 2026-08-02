@@ -55,8 +55,15 @@ The Docker contract is intentionally small:
 - Persist app data in `/config`
 - Use `PUID` / `PGID` when you want the container to re-own `/config` and then drop privileges
 - `TZ` defaults to `Etc/UTC`
-- `UMASK` is optional and accepts standard octal values such as `022`
+- `UMASK` has no image default and is optional; it accepts standard octal values such as `022`
 - `--user=1000:1000` and `--read-only=true` are both supported
+
+Completed downloads default to `/config/complete` and in-progress work to `/config/intermediate`.
+If you only mount `/config`, finished media accumulates inside the config volume. Mount a
+separate downloads volume and point Weaver at it with `WEAVER_COMPLETE_DIR` and
+`WEAVER_INTERMEDIATE_DIR`. Both are first-run seeds: they apply only while the corresponding
+setting is still empty, and are ignored once Weaver has started or the value has been changed
+in the UI.
 
 When neither `WEAVER_ENCRYPTION_KEY` nor the Docker secret at `/run/secrets/weaver_encryption_key` is provided, Weaver creates `/config/encryption.key` with mode `0600`. Preserve that file with the rest of `/config`; existing external keys take precedence and are not copied into the volume.
 
@@ -79,26 +86,10 @@ services:
     restart: unless-stopped
 ```
 
-### docker run
-
-```bash
-docker run -d \
-  --name=weaver \
-  -e PUID=1000 \
-  -e PGID=1000 \
-  -e TZ=Etc/UTC \
-  -e UMASK=022 \
-  -p 9090:9090 \
-  -v /path/to/weaver/config:/config \
-  --restart unless-stopped \
-  ghcr.io/scryer-media/weaver:latest
-```
-
 If you run the container as root, the entrypoint will re-own `/config` to `PUID` / `PGID` and then drop privileges before starting `weaver`. If you run with `--user=1000:1000`, make sure the bind mount is already owned by that uid/gid because the ownership repair path is skipped in non-root mode.
 
 For hardened deployments, `weaver` supports `--read-only=true` as long as `/config` remains writable.
 
-Maintainer note: this is a first-party `weaver` image. Any future LSIO adoption is a separate track and should not change the current Docker contract without an explicit migration plan.
 
 ## API
 
@@ -107,5 +98,4 @@ Weaver exposes a **GraphQL API** at `/graphql` with full query, mutation, and su
 
 ## License
 
-GPL-3.0-or-later with the UnRAR source-code restriction for RAR extraction
-and recovery code. See [LICENSE](LICENSE) for details.
+GPL-3.0-or-later with the UnRAR source-code restriction for RAR extraction. See [LICENSE](LICENSE) for details.

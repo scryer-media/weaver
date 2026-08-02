@@ -197,7 +197,13 @@ impl Pipeline {
         let Some(first) = self.pop_download_work_for_batch(job_id, None) else {
             return Ok(None);
         };
-        if first.is_recovery || first.exclude_servers.contains(&server_idx) {
+        // A segment that just transport-failed on this server must not be its
+        // IP-replacement probe either — and its avoid hint would land in the
+        // lease's effective excludes, fighting the trial's own target.
+        if first.is_recovery
+            || first.exclude_servers.contains(&server_idx)
+            || first.avoid_server == Some(server_idx)
+        {
             if let Some(state) = self.jobs.get_mut(&job_id) {
                 state.download_queue.push(first);
             }

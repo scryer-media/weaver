@@ -924,25 +924,33 @@ impl Pipeline {
                     });
 
                 // Transport rotation: point the retry away from the server
-                // whose established connection just failed, when any
-                // alternative remains. Without this the retry re-enters
-                // selection that still prefers the same healthy-looking
-                // primary, so under sustained stochastic stall (e.g. 10% of
-                // bodies timing out) every retry can land on the flaky server
-                // while a clean backup idles. Replace semantics — only the
-                // most recent failure is avoided — so rotation can never
-                // exclude every server, and single-server setups are
-                // untouched.
-                let avoid_server = if failure.kind == DownloadFailureKind::EstablishedTransport {
-                    source_server_idx.filter(|&idx| {
-                        let server_count = self.nntp.pool().server_count();
-                        let mut probe = retry_exclude_servers.clone();
-                        if !probe.contains(&idx) {
-                            probe.push(idx);
-                        }
-                        idx < server_count
-                            && self.unavailable_server_count(job_id, &probe) < server_count
-                    })
+                // whose established connection just failed, when an
+                // alternative FILL server remains. Without this the retry
+                // re-enters selection that still prefers the same
+                // healthy-looking primary, so under sustained stochastic
+                // stall (e.g. 10% of bodies timing out) every retry can land
+                // on the flaky server while a clean backup idles. Replace
+                // semantics — only the most recent failure is avoided — so
+                // rotation can never exclude every server, and single-server
+                // setups are untouched. The alternative must be a fill
+                // server: the avoid hint joins the lease's effective
+                // excludes, and an exclude set covering the whole fill tier
+                // unlocks backfill (`fill_servers_exhausted`) — backfill is
+                // reserved for articles the fill tier is missing, never for
+                // transient blips the primary can serve on the next attempt.
+                let avoid_server = if failure.kind == DownloadFailureKind::EstablishedTransport
+                    && let Some(idx) = source_server_idx
+                {
+                    let retention_excludes = self.job_retention_excludes(job_id);
+                    let backfill = self.nntp.pool().server_backfill_flags();
+                    let other_fill_available =
+                        backfill.iter().enumerate().any(|(other, is_backfill)| {
+                            other != idx
+                                && !is_backfill
+                                && !retry_exclude_servers.contains(&other)
+                                && !retention_excludes.contains(&other)
+                        });
+                    (idx < backfill.len() && other_fill_available).then_some(idx)
                 } else {
                     None
                 };

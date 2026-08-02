@@ -402,9 +402,10 @@ impl NntpPool {
             last_connect_failure.push(Arc::new(Mutex::new(None)));
         }
 
-        let health = Arc::new(Mutex::new(HealthTracker::new(
+        let health = Arc::new(Mutex::new(HealthTracker::new_with_backfill(
             server_count,
             config.health_config,
+            backfill.clone(),
         )));
 
         NntpPool {
