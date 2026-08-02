@@ -1546,6 +1546,113 @@ impl Database {
         })
     }
 
+    /// Persist a whole attempt's captured output in one transaction.
+    ///
+    /// Appending line-by-line costs a transaction *and* a full re-read of the
+    /// attempt's existing chunks per line to recompute the retained total,
+    /// which is quadratic: a chatty extension emitting thousands of lines can
+    /// spend tens of seconds here. Inserting the batch and enforcing the
+    /// retention cap once collapses that to a single pass while leaving the
+    /// stored result identical — sequence 0 is still retained, older chunks
+    /// after it are dropped oldest-first, and `output_truncated` is set
+    /// whenever anything was dropped.
+    pub fn append_post_processing_logs(
+        &self,
+        attempt_id: &AttemptId,
+        lines: &[(LogStream, Vec<u8>)],
+        created_at_epoch_ms: i64,
+    ) -> Result<(), StateError> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        if let Some(oversized) = lines
+            .iter()
+            .find(|(_, payload)| payload.len() > MAX_LOGICAL_LINE_BYTES)
+        {
+            let _ = oversized;
+            return Err(StateError::Database(
+                "post-processing log chunk exceeds logical line limit".into(),
+            ));
+        }
+        let datastore = self.datastore();
+        let id = attempt_id.as_str().to_string();
+        let lines = lines.to_vec();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "append_post_processing_logs", |tx| {
+                let id = id.clone();
+                let lines = lines.clone();
+                Box::pin(async move {
+                    let mut next = tx
+                        .fetch_optional(
+                            "SELECT COALESCE(MAX(sequence), -1) + 1 AS next_sequence
+                               FROM post_processing_log_chunks WHERE attempt_id = {}",
+                            &[SqlArg::Text(id.clone())],
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            StateError::Database("failed to allocate log sequence".into())
+                        })?
+                        .i64("next_sequence")?;
+                    for (stream, payload) in &lines {
+                        tx.execute(
+                            "INSERT INTO post_processing_log_chunks (
+                                attempt_id, sequence, stream, payload, byte_count, created_at_epoch_ms
+                             ) VALUES ({}, {}, {}, {}, {}, {})",
+                            &[
+                                SqlArg::Text(id.clone()),
+                                SqlArg::I64(next),
+                                SqlArg::Text(log_stream_name(*stream).to_string()),
+                                SqlArg::Bytes(payload.clone()),
+                                SqlArg::I64(payload.len() as i64),
+                                SqlArg::I64(created_at_epoch_ms),
+                            ],
+                        )
+                        .await?;
+                        next += 1;
+                    }
+                    let rows = tx
+                        .fetch_all(
+                            "SELECT sequence, byte_count FROM post_processing_log_chunks
+                              WHERE attempt_id = {} ORDER BY sequence",
+                            &[SqlArg::Text(id.clone())],
+                        )
+                        .await?;
+                    let mut total = rows.iter().try_fold(0_u64, |total, row| {
+                        let bytes = u64::try_from(row.i64("byte_count")?)
+                            .map_err(|_| StateError::Database("invalid stored log size".into()))?;
+                        Ok::<_, StateError>(total.saturating_add(bytes))
+                    })?;
+                    let mut truncated = false;
+                    for row in rows.iter().skip(1) {
+                        if total <= MAX_PERSISTED_ATTEMPT_OUTPUT_BYTES {
+                            break;
+                        }
+                        let bytes = u64::try_from(row.i64("byte_count")?)
+                            .map_err(|_| StateError::Database("invalid stored log size".into()))?;
+                        tx.execute(
+                            "DELETE FROM post_processing_log_chunks
+                              WHERE attempt_id = {} AND sequence = {}",
+                            &[SqlArg::Text(id.clone()), SqlArg::I64(row.i64("sequence")?)],
+                        )
+                        .await?;
+                        total = total.saturating_sub(bytes);
+                        truncated = true;
+                    }
+                    if truncated {
+                        tx.execute(
+                            "UPDATE post_processing_attempts SET output_truncated = {}
+                              WHERE attempt_id = {}",
+                            &[SqlArg::Bool(true), SqlArg::Text(id)],
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
     pub fn post_processing_logs(
         &self,
         attempt_id: &AttemptId,

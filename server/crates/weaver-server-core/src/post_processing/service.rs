@@ -610,14 +610,13 @@ impl PostProcessingService {
             match result {
                 Ok(result) => {
                     let timestamp = now_epoch_ms();
-                    for line in &result.output {
-                        self.db.append_post_processing_log(
-                            &attempt_id,
-                            line.stream,
-                            &line.bytes,
-                            timestamp,
-                        )?;
-                    }
+                    let captured_lines = result
+                        .output
+                        .iter()
+                        .map(|line| (line.stream, line.bytes.clone()))
+                        .collect::<Vec<_>>();
+                    self.db
+                        .append_post_processing_logs(&attempt_id, &captured_lines, timestamp)?;
                     let (attempt_status, failed) = match result.disposition {
                         ExecutionDisposition::Succeeded => (AttemptStatus::Succeeded, false),
                         ExecutionDisposition::Skipped => (AttemptStatus::Skipped, false),

@@ -216,12 +216,13 @@ export function PostProcessingSettingsPage() {
     pause: inspectedJobId === null,
     requestPolicy: "network-only",
   });
-  const [{ data: attemptsData, error: attemptsError }] = useQuery<AttemptsData>({
-    query: POST_PROCESSING_ATTEMPTS_QUERY,
-    variables: { runId: selectedRunId },
-    pause: !selectedRunId,
-    requestPolicy: "network-only",
-  });
+  const [{ data: attemptsData, error: attemptsError }, refreshAttempts] =
+    useQuery<AttemptsData>({
+      query: POST_PROCESSING_ATTEMPTS_QUERY,
+      variables: { runId: selectedRunId },
+      pause: !selectedRunId,
+      requestPolicy: "network-only",
+    });
   const [{ data: logsData, error: logsError }] = useQuery<LogsData>({
     query: POST_PROCESSING_LOGS_QUERY,
     variables: { attemptId: selectedAttemptId, cursor: null, limit: 500 },
@@ -263,9 +264,14 @@ export function PostProcessingSettingsPage() {
     const timer = window.setInterval(() => {
       refreshQueue({ requestPolicy: "network-only" });
       if (inspectedJobId !== null) refreshJob({ requestPolicy: "network-only" });
+      // The attempts query is keyed on the selected run, so without this a run
+      // opened while it was still executing would keep rendering its steps as
+      // QUEUED/RUNNING for as long as it stayed selected — even after the run
+      // itself refreshed to a terminal status.
+      if (selectedRunId) refreshAttempts({ requestPolicy: "network-only" });
     }, 3000);
     return () => window.clearInterval(timer);
-  }, [inspectedJobId, refreshJob, refreshQueue]);
+  }, [inspectedJobId, refreshAttempts, refreshJob, refreshQueue, selectedRunId]);
 
   useEffect(() => {
     const runs = jobData?.postProcessingRuns ?? [];

@@ -525,6 +525,49 @@ fn finishing_attempt_persists_and_preserves_output_truncation() {
         .unwrap()
     );
     assert!(db.post_processing_attempts(&streamed_run_id).unwrap()[0].output_truncated);
+
+    // The batched write is what the service actually uses; it must leave the
+    // same stored state as appending the identical lines one at a time.
+    let (batched_run_id, batched_attempt_id) = create_running_attempt(103, 200);
+    let batched_lines = (0..66)
+        .map(|_| (LogStream::Stdout, line.clone()))
+        .collect::<Vec<_>>();
+    db.append_post_processing_logs(&batched_attempt_id, &batched_lines, 210)
+        .unwrap();
+    let streamed_logs = db
+        .post_processing_logs(&streamed_attempt_id, None, 500)
+        .unwrap();
+    let batched_logs = db
+        .post_processing_logs(&batched_attempt_id, None, 500)
+        .unwrap();
+    assert!(batched_logs.truncated);
+    assert_eq!(batched_logs.chunks.first().unwrap().sequence, 0);
+    assert_eq!(
+        batched_logs
+            .chunks
+            .iter()
+            .map(|chunk| chunk.sequence)
+            .collect::<Vec<_>>(),
+        streamed_logs
+            .chunks
+            .iter()
+            .map(|chunk| chunk.sequence)
+            .collect::<Vec<_>>(),
+        "batched append must retain the same chunks as per-line append"
+    );
+    assert!(
+        db.finish_post_processing_attempt(
+            &batched_attempt_id,
+            AttemptStatus::Succeeded,
+            Some(0),
+            None,
+            None,
+            false,
+            220,
+        )
+        .unwrap()
+    );
+    assert!(db.post_processing_attempts(&batched_run_id).unwrap()[0].output_truncated);
 }
 
 #[test]
