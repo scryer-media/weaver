@@ -236,7 +236,10 @@ impl Pipeline {
                     continue;
                 }
                 if !file_type.is_file() {
-                    continue;
+                    return Err(format!(
+                        "extraction tree contains non-file/non-directory entry {}",
+                        path.display()
+                    ));
                 }
 
                 let relative_path = path
@@ -499,6 +502,15 @@ impl Pipeline {
             .flat_map(|topology| topology.volume_map.keys().cloned())
             .collect();
         let scan_root = self.nested_scan_root(job_id)?;
+        if self
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.staging_dir.as_ref())
+            .is_some_and(|staging| staging == &scan_root)
+        {
+            let budget = self.extraction_budget(job_id, &scan_root)?;
+            ExtractionRoot::open(&scan_root)?.scan_no_links(&budget)?;
+        }
         let password_candidates = self.archive_password_candidates_for_job(job_id);
         let scanned_files = Self::scan_extraction_root(&scan_root, password_candidates).await?;
         let nested_archives: Vec<NestedArchiveFile> = scanned_files

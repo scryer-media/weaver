@@ -775,6 +775,10 @@ impl SchedulerHandle {
         self.state.metrics_snapshot()
     }
 
+    pub fn get_extraction_rejections(&self) -> [u64; 9] {
+        self.state.metrics().extraction_rejections()
+    }
+
     /// Get a fresh atomics-based metrics snapshot without advancing the shared
     /// speed tracker.
     pub fn get_live_metrics(&self) -> MetricsSnapshot {

@@ -21,7 +21,9 @@ impl DiskSpace {
 pub fn disk_space(path: &Path) -> Option<DiskSpace> {
     #[cfg(unix)]
     {
-        let path_cstr = std::ffi::CString::new(path.to_str()?.as_bytes()).ok()?;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path_cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
         // SAFETY: `statvfs` fills a zeroed `libc::statvfs` for a valid C string path;
         // we check the return code before reading any fields.
         unsafe {

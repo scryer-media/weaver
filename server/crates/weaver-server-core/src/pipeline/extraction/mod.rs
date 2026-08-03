@@ -1,8 +1,12 @@
 use super::*;
 
 mod rar;
+mod safety;
 
 pub(crate) use rar::{RarArchiveOpenMode, RarExtractionContext, RarExtractionOpenRequest};
+pub(crate) use safety::{
+    BudgetedReader, BudgetedWriter, ExtractionLimits, ExtractionRoot, JobExtractionBudget,
+};
 
 /// Re-exported so the direct-store coverage snapshot gates its destination
 /// paths with the same validator RAR extraction gates member paths with, rather

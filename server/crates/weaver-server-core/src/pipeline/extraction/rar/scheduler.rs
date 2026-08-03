@@ -19,6 +19,17 @@ enum RarExtractionSettle {
 }
 
 impl Pipeline {
+    fn fail_terminal_extraction_rejection(&mut self, job_id: JobId, error: &str) -> bool {
+        if !JobExtractionBudget::is_rejection(error) {
+            return false;
+        }
+        if let Some(budget) = self.extraction_budgets.get(&job_id) {
+            budget.cancel_with_error(error);
+        }
+        self.fail_job(job_id, error.to_string());
+        true
+    }
+
     fn is_recoverable_full_set_extraction_error(error: &str) -> bool {
         let lower = error.to_ascii_lowercase();
         lower.contains("checksum") || lower.contains("crc mismatch")
@@ -624,6 +635,27 @@ impl Pipeline {
                 scheduled_slots += 1;
 
                 let output_dir = self.extraction_staging_dir(job_id);
+                let budget = match self.extraction_budget(job_id, &output_dir) {
+                    Ok(budget) => budget,
+                    Err(error) => {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
+                };
+                let root = match ExtractionRoot::open(&output_dir) {
+                    Ok(root) => Arc::new(root),
+                    Err(error) => {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
+                };
+                let task_permit = match budget.task_permit_for_root(root) {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
+                };
                 let event_tx = self.event_tx.clone();
                 let attempted = members_to_extract.clone();
                 let extract_done_tx = self.extract_done_tx.clone();
@@ -643,6 +675,8 @@ impl Pipeline {
                 tokio::task::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         pp_pool.install(move || {
+                            let _task_permit = task_permit;
+                            let root = _task_permit.root();
                             let selection =
                                 Self::open_rar_archive_for_extraction_with_password_candidates(
                                     RarExtractionOpenRequest {
@@ -654,8 +688,11 @@ impl Pipeline {
                                         open_mode: RarArchiveOpenMode::AttachOnly,
                                         requested_members: &members_to_extract,
                                         already_extracted: None,
+                                        budget: Some(Arc::clone(&budget)),
                                     },
                                 )?;
+                            let _memory_permit =
+                                budget.reserve_memory_wait(selection.decoder_memory_bytes)?;
                             let mut archive = selection.archive;
                             let selected_password = selection.password;
                             let archive_password_required = archive.metadata().is_encrypted;
@@ -694,6 +731,8 @@ impl Pipeline {
                                         job_id,
                                         set_name: &set_name_for_task,
                                         output_dir: &output_dir,
+                                        root: Some(Arc::clone(&root)),
+                                        budget: Some(Arc::clone(&budget)),
                                         options: &options,
                                         phase_attempt: Some(Arc::new(PhaseAttemptCounters::new(
                                             Arc::clone(&phase_counters),
@@ -1059,6 +1098,16 @@ impl Pipeline {
                 let mut capacity_retry = false;
                 match result {
                     Ok(outcome) => {
+                        if let Some(error) = outcome
+                            .failed
+                            .iter()
+                            .map(|(_, error)| error)
+                            .find(|error| JobExtractionBudget::is_rejection(error))
+                            .cloned()
+                            && self.fail_terminal_extraction_rejection(job_id, &error)
+                        {
+                            return;
+                        }
                         if let Err(error) = self
                             .normalize_extraction_output_tree(job_id, &set_name)
                             .await
@@ -1212,6 +1261,9 @@ impl Pipeline {
                         }
                     }
                     Err(error) => {
+                        if self.fail_terminal_extraction_rejection(job_id, &error) {
+                            return;
+                        }
                         let current_failed_members = attempted
                             .iter()
                             .filter(|member| {
@@ -1335,6 +1387,16 @@ impl Pipeline {
                 result,
             } => match result {
                 Ok(outcome) => {
+                    if let Some(error) = outcome
+                        .failed
+                        .iter()
+                        .map(|(_, error)| error)
+                        .find(|error| JobExtractionBudget::is_rejection(error))
+                        .cloned()
+                        && self.fail_terminal_extraction_rejection(job_id, &error)
+                    {
+                        return;
+                    }
                     if let Err(error) = self
                         .normalize_extraction_output_tree(job_id, &set_name)
                         .await
@@ -1490,6 +1552,9 @@ impl Pipeline {
                     }
                 }
                 Err(e) => {
+                    if self.fail_terminal_extraction_rejection(job_id, &e) {
+                        return;
+                    }
                     warn!(
                         job_id = job_id.0,
                         set_name = %set_name,

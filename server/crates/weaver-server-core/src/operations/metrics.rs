@@ -382,6 +382,7 @@ pub struct PipelineMetrics {
     pub verify_active: AtomicUsize,
     pub repair_active: AtomicUsize,
     pub extract_active: AtomicUsize,
+    extraction_rejections: [AtomicU64; 9],
     pub disk_write_latency_us: AtomicU64,
 
     // Retry tracking
@@ -522,6 +523,7 @@ impl PipelineMetrics {
             verify_active: AtomicUsize::new(0),
             repair_active: AtomicUsize::new(0),
             extract_active: AtomicUsize::new(0),
+            extraction_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
             disk_write_latency_us: AtomicU64::new(0),
             segments_retried: AtomicU64::new(0),
             segments_failed_permanent: AtomicU64::new(0),
@@ -548,6 +550,27 @@ impl PipelineMetrics {
         let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_sub(amount))
         });
+    }
+
+    pub(crate) fn note_extraction_rejection(&self, reason: &str) {
+        const REASONS: [&str; 9] = [
+            "unsafe_path",
+            "unsupported_entry",
+            "member_bytes",
+            "job_bytes",
+            "ratio",
+            "entries",
+            "deadline",
+            "memory",
+            "disk_reserve",
+        ];
+        if let Some(index) = REASONS.iter().position(|candidate| *candidate == reason) {
+            self.extraction_rejections[index].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn extraction_rejections(&self) -> [u64; 9] {
+        std::array::from_fn(|index| self.extraction_rejections[index].load(Ordering::Relaxed))
     }
 
     pub fn set_ip_replacement_trial_extra_connections(&self, value: u8) {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::pipeline::extraction::RarExtractionOpenRequest;
+use crate::pipeline::extraction::{BudgetedReader, RarExtractionOpenRequest};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -102,9 +102,25 @@ fn is_windows_drive_component(value: &str) -> bool {
     bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
+fn simple_decoder_memory_bytes(kind: SimpleArchiveKind, max_memory_bytes: u64) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    match kind {
+        SimpleArchiveKind::Zstd => max_memory_bytes,
+        SimpleArchiveKind::Brotli => 32 * MIB,
+        SimpleArchiveKind::Zip | SimpleArchiveKind::TarBz2 | SimpleArchiveKind::Bzip2 => 8 * MIB,
+        SimpleArchiveKind::Tar
+        | SimpleArchiveKind::TarGz
+        | SimpleArchiveKind::Gz
+        | SimpleArchiveKind::Deflate
+        | SimpleArchiveKind::Split => MIB,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn extract_zip(
     archive_path: &Path,
-    output_dir: &Path,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
     password: Option<&str>,
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
@@ -112,19 +128,23 @@ fn extract_zip(
     phase_counters: Option<Arc<PhaseCounters>>,
 ) -> Result<Vec<String>, String> {
     let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open zip: {e}"))?;
+    let file = BudgetedReader::new(file, Arc::clone(budget));
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("failed to read zip archive: {e}"))?;
     let mut extracted = Vec::new();
-    if let Some(counters) = phase_counters.as_ref() {
-        let mut known_total = 0u64;
-        for i in 0..archive.len() {
-            let entry = archive
-                .by_index_raw(i)
-                .map_err(|e| format!("failed to read zip entry {i}: {e}"))?;
-            if !entry.is_dir() {
-                known_total = known_total.saturating_add(entry.size());
-            }
+    let mut known_total = 0u64;
+    for i in 0..archive.len() {
+        let entry = archive
+            .by_index_raw(i)
+            .map_err(|e| format!("failed to read zip entry {i}: {e}"))?;
+        budget.check_member_metadata(entry.name(), entry.size())?;
+        let raw_name = entry.name();
+        validate_zip_entry_path(raw_name).map_err(|error| budget.reject_unsafe_path(error))?;
+        if !entry.is_dir() {
+            known_total = known_total.saturating_add(entry.size());
         }
+    }
+    if let Some(counters) = phase_counters.as_ref() {
         counters
             .total_bytes
             .fetch_add(known_total, Ordering::Relaxed);
@@ -141,29 +161,22 @@ fn extract_zip(
                 .map_err(|e| format!("failed to read zip entry {i}: {e}"))?
         };
         let raw_name = entry.name().to_string();
-        let safe_path = validate_zip_entry_path(&raw_name)?;
+        let safe_path =
+            validate_zip_entry_path(&raw_name).map_err(|error| budget.reject_unsafe_path(error))?;
         let name = safe_path.to_string_lossy().replace('\\', "/");
 
         if entry.is_dir() {
-            let dir_path = output_dir.join(&safe_path);
-            std::fs::create_dir_all(&dir_path)
-                .map_err(|e| format!("failed to create dir {name}: {e}"))?;
+            root.create_dir(&safe_path, budget)?;
             continue;
         }
 
-        let out_path = output_dir.join(&safe_path);
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create parent dir: {e}"))?;
-        }
         let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
             job_id,
             set_name: set_name.to_string(),
             member: name.clone(),
         });
 
-        let outfile = std::fs::File::create(&out_path)
-            .map_err(|e| format!("failed to create {name}: {e}"))?;
+        let outfile = root.create_file(&safe_path, budget)?;
         let attempt = phase_counters
             .as_ref()
             .map(|counters| Arc::new(PhaseAttemptCounters::new(Arc::clone(counters))));
@@ -201,44 +214,51 @@ fn extract_zip(
 
 fn extract_tar(
     archive_path: &Path,
-    output_dir: &Path,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
     let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open tar: {e}"))?;
-    extract_tar_from_reader(file, output_dir, event_tx, job_id, set_name)
+    let file = BudgetedReader::new(file, Arc::clone(budget));
+    extract_tar_from_reader(file, root, budget, event_tx, job_id, set_name)
 }
 
 fn extract_tar_gz(
     archive_path: &Path,
-    output_dir: &Path,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
     let file =
         std::fs::File::open(archive_path).map_err(|e| format!("failed to open tar.gz: {e}"))?;
+    let file = BudgetedReader::new(file, Arc::clone(budget));
     let gz = flate2::read::GzDecoder::new(file);
-    extract_tar_from_reader(gz, output_dir, event_tx, job_id, set_name)
+    extract_tar_from_reader(gz, root, budget, event_tx, job_id, set_name)
 }
 
 fn extract_tar_bz2(
     archive_path: &Path,
-    output_dir: &Path,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
     let file =
         std::fs::File::open(archive_path).map_err(|e| format!("failed to open tar.bz2: {e}"))?;
+    let file = BudgetedReader::new(file, Arc::clone(budget));
     let bz2 = bzip2::read::BzDecoder::new(file);
-    extract_tar_from_reader(bz2, output_dir, event_tx, job_id, set_name)
+    extract_tar_from_reader(bz2, root, budget, event_tx, job_id, set_name)
 }
 
 fn extract_tar_from_reader<R: std::io::Read>(
     reader: R,
-    output_dir: &Path,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
@@ -259,8 +279,33 @@ fn extract_tar_from_reader<R: std::io::Read>(
         if entry.header().entry_type().is_dir() && is_tar_current_dir_entry(&raw_name) {
             continue;
         }
-        let safe_path = validate_tar_entry_path(&raw_name)?;
+        let safe_path =
+            validate_tar_entry_path(&raw_name).map_err(|error| budget.reject_unsafe_path(error))?;
         let name = safe_path.to_string_lossy().replace('\\', "/");
+
+        let entry_type = entry.header().entry_type();
+        let mut has_sparse_metadata = false;
+        if let Some(extensions) = entry
+            .pax_extensions()
+            .map_err(|error| format!("failed to inspect tar metadata for {name}: {error}"))?
+        {
+            for extension in extensions {
+                let extension = extension
+                    .map_err(|error| format!("failed to parse tar metadata for {name}: {error}"))?;
+                has_sparse_metadata |= extension.key_bytes().starts_with(b"GNU.sparse");
+            }
+        }
+        if has_sparse_metadata {
+            return Err(budget.reject_unsupported_entry(format!(
+                "tar entry '{name}' uses sparse-file metadata"
+            )));
+        }
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            return Err(budget.reject_unsupported_entry(format!(
+                "tar entry '{name}' has forbidden type {entry_type:?}"
+            )));
+        }
+        budget.check_member_metadata(&name, entry.size())?;
 
         let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
             job_id,
@@ -268,11 +313,16 @@ fn extract_tar_from_reader<R: std::io::Read>(
             member: name.clone(),
         });
 
-        let unpacked = entry
-            .unpack_in(output_dir)
-            .map_err(|e| format!("failed to extract tar entry {name}: {e}"))?;
-        if !unpacked {
-            return Err(format!("unsafe tar entry path: {raw_name}"));
+        let bytes_written = if entry_type.is_dir() {
+            root.create_dir(&safe_path, budget)?;
+            0
+        } else {
+            let mut output = root.create_file(&safe_path, budget)?;
+            std::io::copy(&mut entry, &mut output)
+                .map_err(|e| format!("failed to extract tar entry {name}: {e}"))?
+        };
+        if bytes_written > 0 {
+            tracing::debug!(job_id = job_id.0, member = %name, bytes_written, "tar member bytes written");
         }
 
         let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
@@ -289,12 +339,14 @@ fn extract_tar_from_reader<R: std::io::Read>(
 
 fn extract_gz(
     archive_path: &Path,
-    output_dir: &Path,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
     let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open gz: {e}"))?;
+    let file = BudgetedReader::new(file, Arc::clone(budget));
     let mut gz = flate2::read::GzDecoder::new(file);
 
     // Output filename: strip .gz extension
@@ -306,7 +358,9 @@ fn extract_gz(
         .strip_suffix(".gz")
         .or_else(|| archive_name.strip_suffix(".GZ"))
         .unwrap_or(&archive_name);
-    let out_path = output_dir.join(output_name);
+    let safe_path = root
+        .validate_relative_path(output_name)
+        .map_err(|error| budget.reject_unsafe_path(error))?;
 
     let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
         job_id,
@@ -314,8 +368,7 @@ fn extract_gz(
         member: output_name.to_string(),
     });
 
-    let mut outfile = std::fs::File::create(&out_path)
-        .map_err(|e| format!("failed to create {output_name}: {e}"))?;
+    let mut outfile = root.create_file(&safe_path, budget)?;
     let bytes_written = std::io::copy(&mut gz, &mut outfile)
         .map_err(|e| format!("failed to decompress gz: {e}"))?;
 
@@ -352,7 +405,8 @@ fn derive_single_file_output_name<'a>(archive_name: &'a str, suffixes: &[&str]) 
 fn extract_single_stream_to_file<R: std::io::Read>(
     mut reader: R,
     archive_path: &Path,
-    output_dir: &Path,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
     suffixes: &[&str],
     format_name: &str,
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
@@ -364,7 +418,9 @@ fn extract_single_stream_to_file<R: std::io::Read>(
         .unwrap_or_default()
         .to_string_lossy();
     let output_name = derive_single_file_output_name(&archive_name, suffixes);
-    let out_path = output_dir.join(output_name);
+    let safe_path = root
+        .validate_relative_path(output_name)
+        .map_err(|error| budget.reject_unsafe_path(error))?;
 
     let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
         job_id,
@@ -372,8 +428,7 @@ fn extract_single_stream_to_file<R: std::io::Read>(
         member: output_name.to_string(),
     });
 
-    let mut outfile = std::fs::File::create(&out_path)
-        .map_err(|e| format!("failed to create {output_name}: {e}"))?;
+    let mut outfile = root.create_file(&safe_path, budget)?;
     let bytes_written = std::io::copy(&mut reader, &mut outfile)
         .map_err(|e| format!("failed to decompress {format_name}: {e}"))?;
 
@@ -389,17 +444,20 @@ fn extract_single_stream_to_file<R: std::io::Read>(
 
 fn extract_brotli(
     archive_path: &Path,
-    output_dir: &Path,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
     let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open br: {e}"))?;
+    let file = BudgetedReader::new(file, Arc::clone(budget));
     let reader = brotli::Decompressor::new(file, 4096);
     extract_single_stream_to_file(
         reader,
         archive_path,
-        output_dir,
+        root,
+        budget,
         &[".br"],
         "br",
         event_tx,
@@ -410,18 +468,21 @@ fn extract_brotli(
 
 fn extract_deflate(
     archive_path: &Path,
-    output_dir: &Path,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
     let file =
         std::fs::File::open(archive_path).map_err(|e| format!("failed to open deflate: {e}"))?;
+    let file = BudgetedReader::new(file, Arc::clone(budget));
     let reader = flate2::read::DeflateDecoder::new(file);
     extract_single_stream_to_file(
         reader,
         archive_path,
-        output_dir,
+        root,
+        budget,
         &[".deflate"],
         "deflate",
         event_tx,
@@ -432,19 +493,27 @@ fn extract_deflate(
 
 fn extract_zstd(
     archive_path: &Path,
-    output_dir: &Path,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
     let file =
         std::fs::File::open(archive_path).map_err(|e| format!("failed to open zstd: {e}"))?;
-    let reader =
+    let file = BudgetedReader::new(file, Arc::clone(budget));
+    let mut reader =
         zstd::stream::read::Decoder::new(file).map_err(|e| format!("failed to open zstd: {e}"))?;
+    let max_memory_bytes = budget.max_memory_bytes().max(1024);
+    let window_log = (63 - max_memory_bytes.leading_zeros()).clamp(10, 31);
+    reader
+        .window_log_max(window_log)
+        .map_err(|e| format!("failed to apply zstd memory limit: {e}"))?;
     extract_single_stream_to_file(
         reader,
         archive_path,
-        output_dir,
+        root,
+        budget,
         &[".zstd", ".zst"],
         "zstd",
         event_tx,
@@ -455,17 +524,20 @@ fn extract_zstd(
 
 fn extract_bzip2(
     archive_path: &Path,
-    output_dir: &Path,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
     let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open bz2: {e}"))?;
+    let file = BudgetedReader::new(file, Arc::clone(budget));
     let reader = bzip2::read::BzDecoder::new(file);
     extract_single_stream_to_file(
         reader,
         archive_path,
-        output_dir,
+        root,
+        budget,
         &[".bz2"],
         "bz2",
         event_tx,
@@ -476,7 +548,8 @@ fn extract_bzip2(
 
 fn extract_split(
     file_paths: &[PathBuf],
-    output_dir: &Path,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
@@ -492,7 +565,9 @@ fn extract_split(
     } else {
         &first_name
     };
-    let out_path = output_dir.join(output_name);
+    let safe_path = root
+        .validate_relative_path(output_name)
+        .map_err(|error| budget.reject_unsafe_path(error))?;
 
     let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
         job_id,
@@ -500,10 +575,10 @@ fn extract_split(
         member: output_name.to_string(),
     });
 
-    let mut reader = crate::pipeline::archive::split_reader::SplitFileReader::open(file_paths)
+    let reader = crate::pipeline::archive::split_reader::SplitFileReader::open(file_paths)
         .map_err(|e| format!("failed to open split files: {e}"))?;
-    let outfile = std::fs::File::create(&out_path)
-        .map_err(|e| format!("failed to create {output_name}: {e}"))?;
+    let mut reader = BudgetedReader::new(reader, Arc::clone(budget));
+    let outfile = root.create_file(&safe_path, budget)?;
     let attempt = phase_counters.as_ref().map(|counters| {
         let total = file_paths
             .iter()
@@ -585,6 +660,9 @@ impl Pipeline {
         let set_name_for_task = set_name.to_string();
         let event_tx = self.event_tx.clone();
         let output_dir = self.extraction_staging_dir(job_id);
+        let budget = self.extraction_budget(job_id, &output_dir)?;
+        let root = Arc::new(ExtractionRoot::open(&output_dir)?);
+        let task_permit = budget.task_permit_for_root(root)?;
         let set_name_for_result = set_name_owned.clone();
         let shared_kdf_cache = self
             .rar_sets
@@ -604,6 +682,8 @@ impl Pipeline {
         let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || pp_pool.install(move || {
+                let _task_permit = task_permit;
+                let root = _task_permit.root();
                 if volume_paths.is_empty() {
                     return Err(format!("no on-disk RAR volumes for set '{set_name_owned}'"));
                 }
@@ -618,8 +698,11 @@ impl Pipeline {
                         open_mode,
                         requested_members: &[],
                         already_extracted: Some(&already_extracted),
+                        budget: Some(Arc::clone(&budget)),
                     },
                 )?;
+                let _memory_permit =
+                    budget.reserve_memory_wait(selection.decoder_memory_bytes)?;
                 let mut archive = selection.archive;
                 let selected_password = selection.password;
 
@@ -651,6 +734,7 @@ impl Pipeline {
                             &output_dir,
                             &options,
                         )
+                        .with_security(Arc::clone(&root), Arc::clone(&budget))
                         .with_phase_attempt(Some(Arc::new(PhaseAttemptCounters::new(Arc::clone(
                             &phase_counters,
                         ))))),
@@ -781,6 +865,13 @@ impl Pipeline {
                 Ok(_) => spawned += 1,
                 Err(e) => {
                     warn!(job_id = job_id.0, archive = %name, error = %e, "failed to start extraction");
+                    if JobExtractionBudget::is_rejection(&e) {
+                        if let Some(budget) = self.extraction_budgets.get(&job_id) {
+                            budget.cancel_with_error(&e);
+                        }
+                        self.fail_job(job_id, e);
+                        return spawned;
+                    }
                     if let Some(inflight) = self.inflight_extractions.get_mut(&job_id) {
                         inflight.remove(name);
                     }
@@ -826,6 +917,9 @@ impl Pipeline {
         let password = self.primary_archive_password_for_job(job_id);
 
         let output_dir = self.extraction_staging_dir(job_id);
+        let budget = self.extraction_budget(job_id, &output_dir)?;
+        let root = Arc::new(ExtractionRoot::open(&output_dir)?);
+        let task_permit = budget.task_permit_for_root(root)?;
         let event_tx = self.event_tx.clone();
         let set_name_owned = set_name.to_string();
 
@@ -836,6 +930,13 @@ impl Pipeline {
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 pp_pool.install(move || {
+                    let _task_permit = task_permit;
+                    let root = _task_permit.root();
+                    // 7z can encode its own header and payload with different codecs. Reserve
+                    // the configured ceiling while this decoder is live so large archives do
+                    // not inherit a hardcoded small allowance and concurrent decoders cannot
+                    // exceed the shared job budget.
+                    let _memory_permit = budget.reserve_memory_wait(budget.max_memory_bytes())?;
                     if file_paths.is_empty() {
                         return Err(format!("no 7z files found for set '{set_name_owned}'"));
                     }
@@ -848,8 +949,14 @@ impl Pipeline {
                     let known_total = if file_paths.len() == 1 {
                         let file = std::fs::File::open(&file_paths[0])
                             .map_err(|e| format!("failed to open 7z file: {e}"))?;
+                        let file = BudgetedReader::new(file, Arc::clone(&budget));
                         let archive_reader = sevenz_rust2::ArchiveReader::new(file, pw.clone())
                             .map_err(|e| format!("failed to read 7z archive: {e}"))?;
+                        for entry in &archive_reader.archive().files {
+                            budget.check_member_metadata(entry.name(), entry.size())?;
+                            root.validate_relative_path(entry.name())
+                                .map_err(|error| budget.reject_unsafe_path(error))?;
+                        }
                         archive_reader
                             .archive()
                             .files
@@ -862,9 +969,15 @@ impl Pipeline {
                             &file_paths,
                         )
                         .map_err(|e| format!("failed to open 7z split files: {e}"))?;
+                        let reader = BudgetedReader::new(reader, Arc::clone(&budget));
                         let archive_reader =
                             sevenz_rust2::ArchiveReader::new(reader, pw.clone())
                                 .map_err(|e| format!("failed to read 7z archive: {e}"))?;
+                        for entry in &archive_reader.archive().files {
+                            budget.check_member_metadata(entry.name(), entry.size())?;
+                            root.validate_relative_path(entry.name())
+                                .map_err(|error| budget.reject_unsafe_path(error))?;
+                        }
                         archive_reader
                             .archive()
                             .files
@@ -880,29 +993,38 @@ impl Pipeline {
                     let mut extracted_members = Vec::new();
                     let extracted_members_ref = &mut extracted_members;
                     let event_tx_ref = &event_tx;
-                    let output_dir_ref = &output_dir;
+                    let root_ref = &root;
+                    let budget_ref = &budget;
 
                     let extract_fn = |entry: &sevenz_rust2::ArchiveEntry,
                                       reader: &mut dyn std::io::Read,
                                       _dest: &PathBuf|
                      -> Result<bool, sevenz_rust2::Error> {
+                        let safe_path =
+                            root_ref
+                                .validate_relative_path(entry.name())
+                                .map_err(|error| {
+                                    std::io::Error::other(budget_ref.reject_unsafe_path(error))
+                                })?;
+                        budget_ref
+                            .check_member_metadata(entry.name(), entry.size())
+                            .map_err(std::io::Error::other)?;
                         if entry.is_directory() {
-                            let dir_path = output_dir_ref.join(entry.name());
-                            std::fs::create_dir_all(&dir_path)?;
+                            root_ref
+                                .create_dir(&safe_path, budget_ref)
+                                .map_err(std::io::Error::other)?;
                             return Ok(true);
                         }
 
-                        let out_path = output_dir_ref.join(entry.name());
-                        if let Some(parent) = out_path.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
                         let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberStarted {
                             job_id,
                             set_name: set_name_owned.clone(),
                             member: entry.name().to_string(),
                         });
 
-                        let file = std::fs::File::create(&out_path)?;
+                        let file = root_ref
+                            .create_file(&safe_path, budget_ref)
+                            .map_err(std::io::Error::other)?;
                         let attempt =
                             Arc::new(PhaseAttemptCounters::new(Arc::clone(&phase_counters)));
                         let mut file = CountingWriter::new(file, Arc::clone(&attempt));
@@ -943,6 +1065,7 @@ impl Pipeline {
                     if file_paths.len() == 1 {
                         let file = std::fs::File::open(&file_paths[0])
                             .map_err(|e| format!("failed to open 7z file: {e}"))?;
+                        let file = BudgetedReader::new(file, Arc::clone(&budget));
                         sevenz_rust2::decompress_with_extract_fn_and_password(
                             file,
                             &output_dir,
@@ -955,6 +1078,7 @@ impl Pipeline {
                             &file_paths,
                         )
                         .map_err(|e| format!("failed to open 7z split files: {e}"))?;
+                        let reader = BudgetedReader::new(reader, Arc::clone(&budget));
                         sevenz_rust2::decompress_with_extract_fn_and_password(
                             reader,
                             &output_dir,
@@ -1030,6 +1154,9 @@ impl Pipeline {
         let password = self.primary_archive_password_for_job(job_id);
 
         let output_dir = self.extraction_staging_dir(job_id);
+        let budget = self.extraction_budget(job_id, &output_dir)?;
+        let root = Arc::new(ExtractionRoot::open(&output_dir)?);
+        let task_permit = budget.task_permit_for_root(root)?;
         let event_tx = self.event_tx.clone();
         let set_name_owned = set_name.to_string();
         let extract_done_tx = self.extract_done_tx.clone();
@@ -1040,6 +1167,11 @@ impl Pipeline {
         tokio::task::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 pp_pool.install(move || {
+                    let _task_permit = task_permit;
+                    let root = _task_permit.root();
+                    let decoder_memory =
+                        simple_decoder_memory_bytes(kind, budget.max_memory_bytes());
+                    let _memory_permit = budget.reserve_memory_wait(decoder_memory)?;
                     if file_paths.is_empty() {
                         return Err(format!("no files found for set '{set_name_owned}'"));
                     }
@@ -1047,7 +1179,8 @@ impl Pipeline {
                     let extracted_members = match kind {
                         SimpleArchiveKind::Zip => extract_zip(
                             &file_paths[0],
-                            &output_dir,
+                            &root,
+                            &budget,
                             password.as_deref(),
                             &event_tx,
                             job_id,
@@ -1056,63 +1189,72 @@ impl Pipeline {
                         )?,
                         SimpleArchiveKind::Tar => extract_tar(
                             &file_paths[0],
-                            &output_dir,
+                            &root,
+                            &budget,
                             &event_tx,
                             job_id,
                             &set_name_owned,
                         )?,
                         SimpleArchiveKind::TarGz => extract_tar_gz(
                             &file_paths[0],
-                            &output_dir,
+                            &root,
+                            &budget,
                             &event_tx,
                             job_id,
                             &set_name_owned,
                         )?,
                         SimpleArchiveKind::TarBz2 => extract_tar_bz2(
                             &file_paths[0],
-                            &output_dir,
+                            &root,
+                            &budget,
                             &event_tx,
                             job_id,
                             &set_name_owned,
                         )?,
                         SimpleArchiveKind::Gz => extract_gz(
                             &file_paths[0],
-                            &output_dir,
+                            &root,
+                            &budget,
                             &event_tx,
                             job_id,
                             &set_name_owned,
                         )?,
                         SimpleArchiveKind::Deflate => extract_deflate(
                             &file_paths[0],
-                            &output_dir,
+                            &root,
+                            &budget,
                             &event_tx,
                             job_id,
                             &set_name_owned,
                         )?,
                         SimpleArchiveKind::Brotli => extract_brotli(
                             &file_paths[0],
-                            &output_dir,
+                            &root,
+                            &budget,
                             &event_tx,
                             job_id,
                             &set_name_owned,
                         )?,
                         SimpleArchiveKind::Zstd => extract_zstd(
                             &file_paths[0],
-                            &output_dir,
+                            &root,
+                            &budget,
                             &event_tx,
                             job_id,
                             &set_name_owned,
                         )?,
                         SimpleArchiveKind::Bzip2 => extract_bzip2(
                             &file_paths[0],
-                            &output_dir,
+                            &root,
+                            &budget,
                             &event_tx,
                             job_id,
                             &set_name_owned,
                         )?,
                         SimpleArchiveKind::Split => extract_split(
                             &file_paths,
-                            &output_dir,
+                            &root,
+                            &budget,
                             &event_tx,
                             job_id,
                             &set_name_owned,

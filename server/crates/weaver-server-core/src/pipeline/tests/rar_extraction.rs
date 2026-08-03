@@ -149,6 +149,7 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
             requested_members: None,
             already_extracted: None,
+            budget: None,
         },
     )
     .unwrap()
@@ -189,6 +190,7 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::RefreshProvidedVolumes,
             requested_members: None,
             already_extracted: None,
+            budget: None,
         },
     )
     .unwrap()
@@ -481,6 +483,7 @@ async fn rar_password_fallback_from_nzb_meta_is_validated_before_remembering_cac
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
             requested_members: &[],
             already_extracted: None,
+            budget: None,
         },
     )
     .expect("cached headers should validate extraction with the fallback winner");
@@ -551,6 +554,7 @@ async fn rar_password_member_encrypted_fallback_from_nzb_meta_is_validated_by_pr
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
             requested_members: &requested_members,
             already_extracted: None,
+            budget: None,
         },
     )
     .expect("member extraction probe should fall back to the NZB meta password");
@@ -650,6 +654,7 @@ async fn rar_password_member_encrypted_cached_headers_probe_after_restart() {
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
             requested_members: &requested_members,
             already_extracted: None,
+            budget: None,
         },
     )
     .expect("cached headers should still probe extraction before selecting a member password");

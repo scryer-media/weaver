@@ -99,15 +99,40 @@ fn extract_with_weaver_zip(
     extract_with_weaver_zip_result(archive_path, output_dir, password).unwrap()
 }
 
+fn test_extraction_security(output_dir: &Path) -> (ExtractionRoot, Arc<JobExtractionBudget>) {
+    let limits = Arc::new(ExtractionLimits {
+        max_job_bytes: 2 * 1024 * 1024 * 1024 * 1024,
+        max_member_bytes: 1024 * 1024 * 1024 * 1024,
+        max_entries: 100_000,
+        max_ratio: 100,
+        max_seconds: 43_200,
+        min_free_bytes: 1,
+        max_memory_bytes: 1024 * 1024 * 1024,
+    });
+    let root = ExtractionRoot::open(output_dir).unwrap();
+    let budget = JobExtractionBudget::new(
+        limits,
+        output_dir.to_path_buf(),
+        1024 * 1024 * 1024,
+        0,
+        0,
+        PipelineMetrics::new(),
+    )
+    .unwrap();
+    (root, budget)
+}
+
 fn extract_with_weaver_zip_result(
     archive_path: &Path,
     output_dir: &Path,
     password: Option<&str>,
 ) -> Result<Vec<String>, String> {
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
+    let (root, budget) = test_extraction_security(output_dir);
     extract_zip(
         archive_path,
-        output_dir,
+        &root,
+        &budget,
         password,
         &event_tx,
         JobId(1),
@@ -123,9 +148,11 @@ fn extract_with_weaver_zip_result_with_phase(
 ) -> (Result<Vec<String>, String>, Arc<PhaseCounters>) {
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
     let phase_counters = Arc::new(PhaseCounters::default());
+    let (root, budget) = test_extraction_security(output_dir);
     let result = extract_zip(
         archive_path,
-        output_dir,
+        &root,
+        &budget,
         password,
         &event_tx,
         JobId(1),
@@ -199,9 +226,11 @@ fn extract_with_weaver_tar_result(
     output_dir: &Path,
 ) -> Result<Vec<String>, String> {
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
+    let (root, budget) = test_extraction_security(output_dir);
     extract_tar(
         archive_path,
-        output_dir,
+        &root,
+        &budget,
         &event_tx,
         JobId(1),
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
@@ -250,6 +279,23 @@ fn assert_zip_method_matches_7z(extra_args: &[&str], password: Option<&str>) {
     let mut expected_names: Vec<_> = expected.keys().cloned().collect();
     expected_names.sort();
     assert_eq!(actual_names, expected_names);
+}
+
+#[test]
+fn simple_decoder_reservations_use_realistic_codec_bounds() {
+    let large_limit = 48_u64 * 1024 * 1024 * 1024;
+    assert_eq!(
+        simple_decoder_memory_bytes(SimpleArchiveKind::Zstd, large_limit),
+        large_limit
+    );
+    assert_eq!(
+        simple_decoder_memory_bytes(SimpleArchiveKind::Brotli, large_limit),
+        32 * 1024 * 1024
+    );
+    assert_eq!(
+        simple_decoder_memory_bytes(SimpleArchiveKind::Tar, large_limit),
+        1024 * 1024
+    );
 }
 
 #[test]
@@ -414,6 +460,47 @@ fn tar_rejects_unsafe_entry_paths() {
             !tmp.path().join("escape.txt").exists(),
             "unsafe tar entry {name} should not write beside output dir"
         );
+    }
+}
+
+#[test]
+fn tar_rejects_links_and_special_entries_without_touching_targets() {
+    for (label, entry_type, link_target) in [
+        ("symlink", tar::EntryType::Symlink, Some("../outside.txt")),
+        ("hardlink", tar::EntryType::Link, Some("../outside.txt")),
+        ("fifo", tar::EntryType::Fifo, None),
+        ("sparse", tar::EntryType::GNUSparse, None),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let archive_path = tmp.path().join(format!("{label}.tar"));
+        let out_dir = tmp.path().join("out");
+        let outside = tmp.path().join("outside.txt");
+        fs::create_dir_all(&out_dir).unwrap();
+        fs::write(&outside, b"unchanged").unwrap();
+
+        let file = fs::File::create(&archive_path).unwrap();
+        let mut builder = tar::Builder::new(file);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(entry_type);
+        header.set_size(0);
+        header.set_mode(0o644);
+        if let Some(target) = link_target {
+            header.set_link_name(target).unwrap();
+        }
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "payload", std::io::empty())
+            .unwrap();
+        builder.finish().unwrap();
+
+        let error = extract_with_weaver_tar_result(&archive_path, &out_dir).unwrap_err();
+        assert!(
+            error.contains("unsupported_entry")
+                || (label == "sparse" && error.contains("failed to read tar entry")),
+            "{label}: {error}"
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"unchanged");
+        assert!(read_dir_contents(&out_dir).is_empty());
     }
 }
 

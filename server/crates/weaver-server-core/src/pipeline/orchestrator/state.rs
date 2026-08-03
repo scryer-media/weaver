@@ -28,6 +28,62 @@ impl Pipeline {
         staging
     }
 
+    pub(crate) fn extraction_budget(
+        &mut self,
+        job_id: JobId,
+        staging: &std::path::Path,
+    ) -> Result<Arc<JobExtractionBudget>, String> {
+        if let Some(budget) = self.extraction_budgets.get(&job_id) {
+            return Ok(Arc::clone(budget));
+        }
+        let state = self
+            .jobs
+            .get(&job_id)
+            .ok_or_else(|| format!("job {job_id:?} not found"))?;
+        let archive_sources = state
+            .assembly
+            .archive_topologies()
+            .values()
+            .flat_map(|topology| topology.volume_map.keys().cloned())
+            .collect::<HashSet<_>>();
+        let declared_archive_bytes = state
+            .assembly
+            .files()
+            .filter(|file| archive_sources.contains(&self.current_filename_for_file(job_id, file)))
+            .map(|file| file.total_bytes())
+            .sum::<u64>()
+            .max(1);
+        let (initial_entries, initial_bytes) = match ExtractionRoot::snapshot_usage(staging) {
+            Ok(usage) => usage,
+            Err(error) => {
+                let budget = JobExtractionBudget::new(
+                    Arc::clone(&self.extraction_limits),
+                    staging.to_path_buf(),
+                    declared_archive_bytes,
+                    0,
+                    0,
+                    Arc::clone(&self.metrics),
+                )?;
+                let rejection = if error.contains("symlink") || error.contains("reparse") {
+                    budget.reject_unsafe_path(error)
+                } else {
+                    budget.reject_unsupported_entry(error)
+                };
+                return Err(rejection);
+            }
+        };
+        let budget = JobExtractionBudget::new(
+            Arc::clone(&self.extraction_limits),
+            staging.to_path_buf(),
+            declared_archive_bytes,
+            initial_entries,
+            initial_bytes,
+            Arc::clone(&self.metrics),
+        )?;
+        self.extraction_budgets.insert(job_id, Arc::clone(&budget));
+        Ok(budget)
+    }
+
     pub(crate) fn note_write_buffered(&mut self, bytes: usize, segments: usize) {
         self.write_buffered_bytes += bytes;
         self.write_buffered_segments += segments;

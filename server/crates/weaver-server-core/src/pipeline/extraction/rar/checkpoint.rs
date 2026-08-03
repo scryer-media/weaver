@@ -1,7 +1,8 @@
 use super::*;
 
 pub(crate) struct SharedOutputFile {
-    pub(crate) inner: std::io::BufWriter<std::fs::File>,
+    pub(crate) inner:
+        std::io::BufWriter<crate::pipeline::extraction::BudgetedWriter<cap_std::fs::File>>,
 }
 
 pub(crate) struct DirectOutputWriter {

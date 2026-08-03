@@ -332,7 +332,12 @@ impl Pipeline {
                 None
             }
         };
-        let should_defer = plan.is_some()
+        let extraction_rejected = JobExtractionBudget::is_rejection(&error);
+        if extraction_rejected && let Some(budget) = self.extraction_budgets.get(&job_id) {
+            budget.cancel_with_error(&error);
+        }
+        let should_defer = !extraction_rejected
+            && plan.is_some()
             && self.jobs.contains_key(&job_id)
             && !self.inflight_terminal_post_processing.contains(&job_id);
         let (released_repair, released_extract) =
@@ -401,6 +406,11 @@ impl Pipeline {
             } else {
                 (None, false, false)
             };
+        let extraction_budget = if preserve_staging {
+            None
+        } else {
+            self.extraction_budgets.remove(&job_id)
+        };
         if released_repair {
             self.metrics.repair_active.fetch_sub(1, Ordering::Relaxed);
         }
@@ -410,6 +420,9 @@ impl Pipeline {
         // Clean up staging directory if it was created.
         if let Some(staging) = staging_dir {
             tokio::spawn(async move {
+                if let Some(budget) = extraction_budget {
+                    let _ = tokio::task::spawn_blocking(move || budget.wait_for_idle()).await;
+                }
                 if let Err(e) = tokio::fs::remove_dir_all(&staging).await
                     && e.kind() != std::io::ErrorKind::NotFound
                 {

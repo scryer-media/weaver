@@ -66,6 +66,16 @@ fn metrics_snapshot() {
 }
 
 #[test]
+fn extraction_rejections_are_counted_by_stable_reason() {
+    let metrics = PipelineMetrics::new();
+    metrics.note_extraction_rejection("unsafe_path");
+    metrics.note_extraction_rejection("unsafe_path");
+    metrics.note_extraction_rejection("disk_reserve");
+
+    assert_eq!(metrics.extraction_rejections(), [2, 0, 0, 0, 0, 0, 0, 0, 1]);
+}
+
+#[test]
 fn decode_byte_accounting_releases_saturating() {
     let m = PipelineMetrics::new();
     m.note_decode_work_queued(100);

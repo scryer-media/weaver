@@ -1,6 +1,140 @@
 use super::*;
 
 #[test]
+fn safe_move_uses_rename_without_copy_on_the_same_filesystem() {
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("source.bin");
+    let dst = temp.path().join("dest.bin");
+    std::fs::write(&src, b"renamed payload").unwrap();
+    let counters = Arc::new(PhaseCounters::default());
+    let rename_calls = std::cell::Cell::new(0usize);
+    let copy_calls = std::cell::Cell::new(0usize);
+
+    move_path_with_safe_rename_or_copy_fallback_using(
+        &src,
+        &dst,
+        Arc::clone(&counters),
+        |src, dst| {
+            rename_calls.set(rename_calls.get() + 1);
+            crate::runtime::fs::rename_no_overwrite(src, dst)
+        },
+        |_, _, _| {
+            copy_calls.set(copy_calls.get() + 1);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(rename_calls.get(), 1);
+    assert_eq!(copy_calls.get(), 0);
+    assert!(!src.exists());
+    assert_eq!(std::fs::read(&dst).unwrap(), b"renamed payload");
+    assert_eq!(
+        counters.completed_bytes.load(Ordering::Relaxed),
+        b"renamed payload".len() as u64
+    );
+}
+
+#[test]
+fn same_filesystem_directory_publication_renames_without_copy() {
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("source");
+    let dst = temp.path().join("dest");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("payload.bin"), b"renamed payload").unwrap();
+    let copy_calls = std::cell::Cell::new(0usize);
+
+    move_path_with_safe_rename_or_copy_fallback_using(
+        &src,
+        &dst,
+        Arc::new(PhaseCounters::default()),
+        rename_path_for_publication,
+        |_, _, _| {
+            copy_calls.set(copy_calls.get() + 1);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(copy_calls.get(), 0);
+    assert!(!src.exists());
+    assert_eq!(
+        std::fs::read(dst.join("payload.bin")).unwrap(),
+        b"renamed payload"
+    );
+}
+
+#[test]
+fn safe_move_uses_exactly_one_copy_after_cross_device_rename_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("source.bin");
+    let dst = temp.path().join("dest.bin");
+    std::fs::write(&src, b"copied payload").unwrap();
+    let counters = Arc::new(PhaseCounters::default());
+    let rename_calls = std::cell::Cell::new(0usize);
+    let copy_calls = std::cell::Cell::new(0usize);
+
+    move_path_with_safe_rename_or_copy_fallback_using(
+        &src,
+        &dst,
+        Arc::clone(&counters),
+        |_, _| {
+            rename_calls.set(rename_calls.get() + 1);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::CrossesDevices,
+                "simulated EXDEV",
+            ))
+        },
+        |src, dst, counters| {
+            copy_calls.set(copy_calls.get() + 1);
+            move_path_with_copy_fallback(src, dst, counters)
+        },
+    )
+    .unwrap();
+
+    assert_eq!(rename_calls.get(), 1);
+    assert_eq!(copy_calls.get(), 1);
+    assert!(!src.exists());
+    assert_eq!(std::fs::read(&dst).unwrap(), b"copied payload");
+    assert_eq!(
+        counters.completed_bytes.load(Ordering::Relaxed),
+        b"copied payload".len() as u64
+    );
+}
+
+#[test]
+fn safe_move_does_not_copy_after_an_unrelated_rename_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("source.bin");
+    let dst = temp.path().join("dest.bin");
+    std::fs::write(&src, b"unmoved payload").unwrap();
+    let counters = Arc::new(PhaseCounters::default());
+    let copy_calls = std::cell::Cell::new(0usize);
+
+    let error = move_path_with_safe_rename_or_copy_fallback_using(
+        &src,
+        &dst,
+        counters,
+        |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated",
+            ))
+        },
+        |_, _, _| {
+            copy_calls.set(copy_calls.get() + 1);
+            Ok(())
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.0.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(copy_calls.get(), 0);
+    assert_eq!(std::fs::read(&src).unwrap(), b"unmoved payload");
+    assert!(!dst.exists());
+}
+
+#[test]
 fn copy_fallback_copies_file_then_removes_source() {
     let temp = tempfile::tempdir().unwrap();
     let src = temp.path().join("source.bin");

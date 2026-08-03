@@ -89,6 +89,8 @@ services:
 
 Weaver always validates the HTTP `Host` authority. Direct access through `localhost` or an IPv4/IPv6 literal works without configuration. Set `WEAVER_HTTP_ALLOWED_HOSTS` to a comma-separated list of exact DNS, container, or reverse-proxy names used to reach Weaver. An entry without a port allows that hostname on any port; `host:port` restricts it to that port. Schemes, paths, credentials, and wildcards are rejected, and forwarded-host headers are not trusted.
 
+Archive extraction is protected by always-on expansion limits. The defaults are 2 TiB per job, 1 TiB per member, 100,000 entries, a 100:1 expansion ratio, 12 hours, a free-space reserve of `max(512 MiB, min(5% of the filesystem, 20 GiB))`, and half of cgroup-aware memory clamped to 64 MiB–64 GiB. Override them with byte-count or integer environment values: `WEAVER_EXTRACTION_MAX_JOB_BYTES`, `WEAVER_EXTRACTION_MAX_MEMBER_BYTES`, `WEAVER_EXTRACTION_MAX_ENTRIES`, `WEAVER_EXTRACTION_MAX_RATIO`, `WEAVER_EXTRACTION_MAX_SECONDS`, `WEAVER_EXTRACTION_MIN_FREE_BYTES`, and `WEAVER_EXTRACTION_MAX_MEMORY_BYTES`. Invalid or zero values prevent startup.
+
 If you run the container as root, the entrypoint will re-own `/config` to `PUID` / `PGID` and then drop privileges before starting `weaver`. If you run with `--user=1000:1000`, make sure the bind mount is already owned by that uid/gid because the ownership repair path is skipped in non-root mode.
 
 For hardened deployments, `weaver` supports `--read-only=true` as long as `/config` remains writable.

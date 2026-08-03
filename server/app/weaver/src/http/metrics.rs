@@ -61,6 +61,27 @@ impl PrometheusMetricsExporter {
             runtime_generation,
             &server_transfers,
         );
+        for (reason, count) in [
+            "unsafe_path",
+            "unsupported_entry",
+            "member_bytes",
+            "job_bytes",
+            "ratio",
+            "entries",
+            "deadline",
+            "memory",
+            "disk_reserve",
+        ]
+        .into_iter()
+        .zip(self.handle.get_extraction_rejections())
+        {
+            append_labeled_metric(
+                &mut output,
+                "weaver_extraction_rejections_total",
+                &[("reason", reason)],
+                count,
+            );
+        }
         let db = self.db.clone();
         match tokio::task::spawn_blocking(move || db.post_processing_metrics_snapshot()).await {
             Ok(Ok(metrics)) => append_post_processing_metrics(&mut output, &metrics),

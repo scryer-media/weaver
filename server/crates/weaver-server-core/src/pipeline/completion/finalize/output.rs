@@ -75,13 +75,55 @@ fn cleanup_copy_destination_if_parent_matches(
     }
 }
 
+fn rename_path_for_publication(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(src)?;
+    if !metadata.is_dir() {
+        return runtime_fs::rename_no_overwrite(src, dst);
+    }
+
+    match std::fs::symlink_metadata(dst) {
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("destination already exists: {}", dst.display()),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::fs::rename(src, dst)
+}
+
 fn move_path_with_safe_rename_or_copy_fallback(
     src: &std::path::Path,
     dst: &std::path::Path,
     phase_counters: Arc<PhaseCounters>,
 ) -> Result<(), (std::io::Error, std::io::Error)> {
+    move_path_with_safe_rename_or_copy_fallback_using(
+        src,
+        dst,
+        phase_counters,
+        rename_path_for_publication,
+        move_path_with_copy_fallback,
+    )
+}
+
+fn move_path_with_safe_rename_or_copy_fallback_using<R, C>(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    phase_counters: Arc<PhaseCounters>,
+    rename: R,
+    copy: C,
+) -> Result<(), (std::io::Error, std::io::Error)>
+where
+    R: FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+    C: FnOnce(&std::path::Path, &std::path::Path, &PhaseCounters) -> std::io::Result<()>,
+{
     let path_bytes = path_regular_file_bytes(src).unwrap_or(0);
-    match runtime_fs::rename_no_overwrite(src, dst) {
+    match rename(src, dst) {
         Ok(()) => {
             if path_bytes > 0 {
                 phase_counters
@@ -90,8 +132,13 @@ fn move_path_with_safe_rename_or_copy_fallback(
             }
             Ok(())
         }
-        Err(rename_err) => move_path_with_copy_fallback(src, dst, &phase_counters)
-            .map_err(|copy_err| (rename_err, copy_err)),
+        Err(rename_err) if rename_err.kind() == std::io::ErrorKind::CrossesDevices => {
+            copy(src, dst, &phase_counters).map_err(|copy_err| (rename_err, copy_err))
+        }
+        Err(rename_err) => Err((
+            rename_err,
+            std::io::Error::other("copy fallback not attempted for a non-cross-device error"),
+        )),
     }
 }
 
@@ -532,6 +579,11 @@ impl Pipeline {
                 state.spec.category.clone(),
             )
         };
+
+        if let Some(staging) = staging_dir.as_deref() {
+            let budget = self.extraction_budget(job_id, staging)?;
+            ExtractionRoot::open(staging)?.scan_no_links(&budget)?;
+        }
 
         self.phase_end(job_id, JobPhase::Extracting);
         self.phase_end(job_id, JobPhase::Repairing);

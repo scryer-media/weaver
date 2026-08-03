@@ -46,6 +46,8 @@ notify = { workspace = true }
 zstd = { workspace = true }
 zip = { workspace = true }
 tar = { workspace = true }
+cap-std = { workspace = true }
+cap-fs-ext = { workspace = true }
 flate2 = { workspace = true }
 brotli = { workspace = true }
 bzip2 = { workspace = true }

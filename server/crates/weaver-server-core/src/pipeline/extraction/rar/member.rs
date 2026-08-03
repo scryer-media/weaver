@@ -13,6 +13,8 @@ pub(crate) struct RarExtractionContext<'a> {
     pub(crate) job_id: JobId,
     pub(crate) set_name: &'a str,
     pub(crate) output_dir: &'a std::path::Path,
+    pub(crate) root: Option<Arc<ExtractionRoot>>,
+    pub(crate) budget: Option<Arc<JobExtractionBudget>>,
     pub(crate) options: &'a weaver_unrar::ExtractOptions,
     pub(crate) phase_attempt: Option<Arc<PhaseAttemptCounters>>,
 }
@@ -33,13 +35,6 @@ impl PhaseAttemptRollbackGuard {
     fn reserve_total(&self, bytes: u64) {
         if let Some(attempt) = &self.attempt {
             attempt.reserve_total(bytes);
-        }
-    }
-
-    fn record_and_commit(mut self, bytes: u64) {
-        if let Some(attempt) = self.attempt.take() {
-            attempt.record_completed(bytes);
-            attempt.commit();
         }
     }
 
@@ -92,11 +87,28 @@ fn configured_rar_max_dict_bytes() -> u64 {
 
 /// Apply the server's decode limits to a freshly opened archive.
 pub(crate) fn apply_server_rar_limits(archive: &mut weaver_unrar::RarArchive) {
+    apply_server_rar_limits_with_memory_limit(archive, u64::MAX);
+}
+
+fn apply_server_rar_limits_with_memory_limit(
+    archive: &mut weaver_unrar::RarArchive,
+    extraction_memory_limit: u64,
+) {
     let limits = weaver_unrar::Limits {
-        max_dict_size: configured_rar_max_dict_bytes(),
+        max_dict_size: configured_rar_max_dict_bytes().min(extraction_memory_limit),
         ..Default::default()
     };
     archive.set_limits(limits);
+}
+
+fn rar_decoder_memory_bytes(archive: &weaver_unrar::RarArchive) -> u64 {
+    archive
+        .metadata()
+        .members
+        .iter()
+        .map(|member| member.compression.dict_size)
+        .max()
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +126,7 @@ pub(crate) struct RarExtractionOpenRequest<'a> {
     pub(crate) open_mode: RarArchiveOpenMode,
     pub(crate) requested_members: &'a [String],
     pub(crate) already_extracted: Option<&'a std::collections::HashSet<String>>,
+    pub(crate) budget: Option<Arc<JobExtractionBudget>>,
 }
 
 pub(crate) struct RarArchiveSnapshotOpenRequest<'a> {
@@ -125,6 +138,7 @@ pub(crate) struct RarArchiveSnapshotOpenRequest<'a> {
     pub(crate) open_mode: RarArchiveOpenMode,
     pub(crate) requested_members: Option<&'a [String]>,
     pub(crate) already_extracted: Option<&'a std::collections::HashSet<String>>,
+    pub(crate) budget: Option<Arc<JobExtractionBudget>>,
 }
 
 struct RarArchiveOpenInputs<'a> {
@@ -135,12 +149,40 @@ struct RarArchiveOpenInputs<'a> {
     open_mode: RarArchiveOpenMode,
     requested_members: Option<&'a [String]>,
     already_extracted: Option<&'a std::collections::HashSet<String>>,
+    budget: Option<Arc<JobExtractionBudget>>,
+}
+
+struct BudgetedRarVolumeProvider<'a, P> {
+    inner: &'a P,
+    budget: Arc<JobExtractionBudget>,
+}
+
+impl<'a, P> BudgetedRarVolumeProvider<'a, P> {
+    fn new(inner: &'a P, budget: Arc<JobExtractionBudget>) -> Self {
+        Self { inner, budget }
+    }
+}
+
+impl<P: weaver_unrar::VolumeProvider> weaver_unrar::VolumeProvider
+    for BudgetedRarVolumeProvider<'_, P>
+{
+    fn get_volume(
+        &self,
+        index: usize,
+    ) -> Result<Box<dyn weaver_unrar::ReadSeek>, weaver_unrar::VolumeProviderError> {
+        let reader = self.inner.get_volume(index)?;
+        Ok(Box::new(BudgetedReader::new(
+            reader,
+            Arc::clone(&self.budget),
+        )))
+    }
 }
 
 pub(crate) struct RarExtractionOpenSelection {
     pub(crate) archive: weaver_unrar::RarArchive,
     pub(crate) password: Option<String>,
     pub(crate) validated_password: Option<String>,
+    pub(crate) decoder_memory_bytes: u64,
 }
 
 /// Rejects any path that would escape the directory it is joined onto: absolute
@@ -325,6 +367,8 @@ impl<'a> RarExtractionContext<'a> {
             job_id,
             set_name,
             output_dir,
+            root: None,
+            budget: None,
             options,
             phase_attempt: None,
         }
@@ -332,6 +376,16 @@ impl<'a> RarExtractionContext<'a> {
 
     pub(crate) fn with_phase_attempt(mut self, attempt: Option<Arc<PhaseAttemptCounters>>) -> Self {
         self.phase_attempt = attempt;
+        self
+    }
+
+    pub(crate) fn with_security(
+        mut self,
+        root: Arc<ExtractionRoot>,
+        budget: Arc<JobExtractionBudget>,
+    ) -> Self {
+        self.root = Some(root);
+        self.budget = Some(budget);
         self
     }
 }
@@ -349,16 +403,44 @@ impl Pipeline {
             job_id,
             set_name,
             output_dir,
+            root,
+            budget,
             options,
             phase_attempt,
         } = ctx;
+        let root = match root {
+            Some(root) => root,
+            None => Arc::new(ExtractionRoot::open(output_dir)?),
+        };
+        let budget = match budget {
+            Some(budget) => budget,
+            None => {
+                let limits = Arc::new(ExtractionLimits::from_env(output_dir)?);
+                let (initial_entries, initial_bytes) = ExtractionRoot::snapshot_usage(output_dir)?;
+                JobExtractionBudget::new(
+                    limits,
+                    output_dir.to_path_buf(),
+                    archive
+                        .metadata()
+                        .members
+                        .iter()
+                        .map(|member| member.compressed_size)
+                        .sum(),
+                    initial_entries,
+                    initial_bytes,
+                    PipelineMetrics::new(),
+                )?
+            }
+        };
         let phase_guard = PhaseAttemptRollbackGuard::new(phase_attempt);
         let member = archive
             .member_info(idx)
             .ok_or_else(|| format!("member index {idx} missing from archive metadata"))?;
         let member_name = member.name.clone();
-        let safe_member_path = validate_sanitized_rar_member_path(&member_name)?;
+        let safe_member_path = validate_sanitized_rar_member_path(&member_name)
+            .map_err(|error| budget.reject_unsafe_path(error))?;
         let unpacked_size = member.unpacked_size.unwrap_or(0);
+        budget.check_member_metadata(&member_name, unpacked_size)?;
         let is_directory = member.is_directory;
         let first_volume = member.volumes.first_volume as u32;
         let last_volume = member.volumes.last_volume as u32;
@@ -366,10 +448,15 @@ impl Pipeline {
 
         if is_directory {
             let dir_path = output_dir.join(&safe_member_path);
-            std::fs::create_dir_all(&dir_path)
-                .map_err(|e| format!("failed to create dir {}: {e}", member_name))?;
+            root.create_dir(&safe_member_path, &budget)?;
             apply_rar_member_filesystem_metadata(&member, &dir_path)?;
             return Ok((member_name, 0, unpacked_size));
+        }
+
+        if member.is_symlink || member.is_hardlink || member.is_file_copy {
+            return Err(budget.reject_unsupported_entry(format!(
+                "RAR member '{member_name}' is a link or file-copy entry"
+            )));
         }
 
         // Reserve this member's share of the Extracting total here, at open
@@ -384,10 +471,6 @@ impl Pipeline {
 
         let safe_member_name = safe_member_path.to_string_lossy().replace('\\', "/");
         let (out_path, partial_path) = Self::member_output_paths(output_dir, &safe_member_name);
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create parent dir: {e}"))?;
-        }
 
         let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
             job_id,
@@ -397,26 +480,6 @@ impl Pipeline {
         crate::e2e_failpoint::maybe_delay("extract.member_start");
 
         let chunk_dir = Self::member_chunk_dir(output_dir, set_name, &member_name);
-
-        if member.is_symlink || member.is_hardlink || member.is_file_copy {
-            if partial_path.exists() || chunk_dir.exists() {
-                Self::clear_member_extraction_artifacts(&partial_path, &chunk_dir)?;
-            }
-            let bytes_written = archive
-                .extract_member_to_file(idx, options, None, &out_path)
-                .map_err(|error| format!("failed to extract {member_name}: {error}"))?;
-            phase_guard.record_and_commit(bytes_written);
-            info!(
-                job_id = job_id.0,
-                set_name,
-                member = %member_name,
-                bytes_written,
-                unpacked_size,
-                out_path = %out_path.display(),
-                "RAR link member extraction finalized"
-            );
-            return Ok((member_name, bytes_written, unpacked_size));
-        }
 
         let partial_size = std::fs::metadata(&partial_path).ok().map(|meta| meta.len());
         let out_size = std::fs::metadata(&out_path).ok().map(|meta| meta.len());
@@ -440,15 +503,10 @@ impl Pipeline {
             Self::clear_member_extraction_artifacts(&partial_path, &chunk_dir)?;
         }
 
-        let mut partial_file_options = std::fs::OpenOptions::new();
-        partial_file_options.create(true).write(true).truncate(true);
-        let partial_file = partial_file_options.open(&partial_path).map_err(|e| {
-            format!(
-                "failed to create partial output {}: {e}",
-                partial_path.display()
-            )
+        let partial_relative = partial_path.strip_prefix(output_dir).map_err(|error| {
+            budget.reject_unsafe_path(format!("RAR partial output escaped staging root: {error}"))
         })?;
-        weaver_unrar::RarArchive::preallocate_output_file(&partial_file, unpacked_size);
+        let partial_file = root.create_file(partial_relative, &budget)?;
         let shared = Rc::new(RefCell::new(SharedOutputFile {
             inner: std::io::BufWriter::with_capacity(8 * 1024 * 1024, partial_file),
         }));
@@ -508,6 +566,7 @@ impl Pipeline {
                 provider_paths.insert((absolute_volume - first_volume) as usize, path.clone());
             }
             let provider = ReadaheadVolumeProvider::new(provider_paths);
+            let provider = BudgetedRarVolumeProvider::new(&provider, Arc::clone(&budget));
             let shared_ref = Rc::clone(&shared);
             let checkpoint_ref = Arc::clone(&checkpoint);
             archive
@@ -627,6 +686,7 @@ impl Pipeline {
             open_mode,
             requested_members,
             already_extracted,
+            budget,
         } = request;
         let context = format!("failed to open RAR archive for set '{set_name}'");
         let inputs = RarArchiveOpenInputs {
@@ -637,6 +697,7 @@ impl Pipeline {
             open_mode,
             requested_members,
             already_extracted,
+            budget,
         };
         Self::try_rar_password_candidates(&context, &password_candidates, |password| {
             Self::open_rar_archive_from_snapshot_or_disk_with_password(&inputs, password)
@@ -659,6 +720,7 @@ impl Pipeline {
             open_mode,
             requested_members,
             already_extracted,
+            budget,
         } = request;
 
         if password_candidates.len() <= 1 {
@@ -672,11 +734,14 @@ impl Pipeline {
                     open_mode,
                     requested_members: Some(requested_members),
                     already_extracted,
+                    budget,
                 })?;
+            let decoder_memory_bytes = rar_decoder_memory_bytes(&selection.value);
             return Ok(RarExtractionOpenSelection {
                 archive: selection.value,
                 password: selection.selected_password,
                 validated_password: None,
+                decoder_memory_bytes,
             });
         }
 
@@ -689,11 +754,22 @@ impl Pipeline {
             open_mode,
             requested_members: Some(requested_members),
             already_extracted,
+            budget: budget.clone(),
         };
         let selection =
             Self::try_rar_password_candidates(&context, &password_candidates, |password| {
                 let mut probe_archive =
                     Self::open_rar_archive_from_snapshot_or_disk_with_password(&inputs, password)?;
+                let _memory_permit = if let Some(budget) = inputs.budget.as_ref() {
+                    let required = rar_decoder_memory_bytes(&probe_archive);
+                    Some(
+                        budget
+                            .reserve_memory_wait(required)
+                            .map_err(crate::pipeline::RarPasswordAttemptError::Fatal)?,
+                    )
+                } else {
+                    None
+                };
                 let probe = Self::select_rar_password_probe_member(
                     &probe_archive,
                     requested_members,
@@ -705,6 +781,7 @@ impl Pipeline {
                         &volume_paths,
                         idx,
                         password,
+                        inputs.budget.as_ref(),
                     )?;
                     requires_password
                 } else {
@@ -716,12 +793,14 @@ impl Pipeline {
             })?;
         let (archive, password_validated) = selection.value;
         ensure_unique_sanitized_rar_member_paths(&archive)?;
+        let decoder_memory_bytes = rar_decoder_memory_bytes(&archive);
         let password = selection.selected_password;
         let validated_password = password_validated.then(|| password.clone()).flatten();
         Ok(RarExtractionOpenSelection {
             archive,
             password,
             validated_password,
+            decoder_memory_bytes,
         })
     }
 
@@ -765,6 +844,11 @@ impl Pipeline {
         let open_mode = inputs.open_mode;
         let requested_members = inputs.requested_members;
         let already_extracted = inputs.already_extracted;
+        if let Some(budget) = inputs.budget.as_ref() {
+            budget.check_active_io().map_err(|error| {
+                crate::pipeline::RarPasswordAttemptError::Fatal(error.to_string())
+            })?;
+        }
         let has_cached_headers = cached_headers.is_some();
         let refresh_provided_volumes =
             matches!(open_mode, RarArchiveOpenMode::RefreshProvidedVolumes);
@@ -776,6 +860,7 @@ impl Pipeline {
                         first_path,
                         password,
                         inputs.shared_kdf_cache.clone(),
+                        inputs.budget.as_ref(),
                     )?;
                 }
                 weaver_unrar::RarArchive::deserialize_headers_with_password_and_shared_kdf_cache(
@@ -799,10 +884,18 @@ impl Pipeline {
                     first_path,
                     password,
                     inputs.shared_kdf_cache.clone(),
+                    inputs.budget.as_ref(),
                 )?
             }
         };
-        apply_server_rar_limits(&mut archive);
+        apply_server_rar_limits_with_memory_limit(
+            &mut archive,
+            inputs
+                .budget
+                .as_ref()
+                .map(|budget| budget.max_memory_bytes())
+                .unwrap_or(u64::MAX),
+        );
 
         let full_set_open = requested_members.is_some_and(|members| members.is_empty());
         let metadata_may_expand =
@@ -826,10 +919,20 @@ impl Pipeline {
             {
                 archive.attach_volume_reader(
                     *volume_number as usize,
-                    bounded_sources
-                        .as_ref()
-                        .expect("bounded source pool should exist")
-                        .reader(path.clone()),
+                    if let Some(budget) = inputs.budget.as_ref() {
+                        Box::new(BudgetedReader::new(
+                            bounded_sources
+                                .as_ref()
+                                .expect("bounded source pool should exist")
+                                .reader(path.clone()),
+                            Arc::clone(budget),
+                        ))
+                    } else {
+                        bounded_sources
+                            .as_ref()
+                            .expect("bounded source pool should exist")
+                            .reader(path.clone())
+                    },
                 );
                 continue;
             }
@@ -860,31 +963,47 @@ impl Pipeline {
                     ));
                 }
             };
+            let file: Box<dyn weaver_unrar::ReadSeek> = if let Some(budget) = inputs.budget.as_ref()
+            {
+                Box::new(BudgetedReader::new(file, Arc::clone(budget)))
+            } else {
+                Box::new(file)
+            };
             if has_cached_headers
                 && refresh_provided_volumes
                 && archive.has_volume(*volume_number as usize)
             {
                 archive
-                    .refresh_volume(*volume_number as usize, Box::new(file))
+                    .refresh_volume(*volume_number as usize, file)
                     .map_err(|error| {
                         crate::pipeline::RarPasswordAttemptError::Fatal(format!(
                             "failed to refresh RAR volume {volume_number} for set '{set_name}': {error}"
                         ))
                     })?;
             } else if archive.has_volume(*volume_number as usize) {
-                archive.attach_volume_reader(*volume_number as usize, Box::new(file));
+                archive.attach_volume_reader(*volume_number as usize, file);
             } else {
                 archive
-                    .add_volume(*volume_number as usize, Box::new(file))
+                    .add_volume(*volume_number as usize, file)
                     .map_err(crate::pipeline::RarPasswordAttemptError::from)?;
             }
             if retain_attached_readers {
                 archive.attach_volume_reader(
                     *volume_number as usize,
-                    bounded_sources
-                        .as_ref()
-                        .expect("bounded source pool should exist")
-                        .reader(path.clone()),
+                    if let Some(budget) = inputs.budget.as_ref() {
+                        Box::new(BudgetedReader::new(
+                            bounded_sources
+                                .as_ref()
+                                .expect("bounded source pool should exist")
+                                .reader(path.clone()),
+                            Arc::clone(budget),
+                        ))
+                    } else {
+                        bounded_sources
+                            .as_ref()
+                            .expect("bounded source pool should exist")
+                            .reader(path.clone())
+                    },
                 );
             } else {
                 archive.attach_volume_reader(
@@ -901,6 +1020,7 @@ impl Pipeline {
         first_path: &PathBuf,
         password: Option<&str>,
         shared_kdf_cache: std::sync::Arc<weaver_unrar::crypto::KdfCache>,
+        budget: Option<&Arc<JobExtractionBudget>>,
     ) -> Result<weaver_unrar::RarArchive, crate::pipeline::RarPasswordAttemptError> {
         let first_file = std::fs::File::open(first_path).map_err(|e| {
             crate::pipeline::RarPasswordAttemptError::Fatal(
@@ -910,6 +1030,11 @@ impl Pipeline {
                 ),
             )
         })?;
+        let first_file: Box<dyn weaver_unrar::ReadSeek> = if let Some(budget) = budget {
+            Box::new(BudgetedReader::new(first_file, Arc::clone(budget)))
+        } else {
+            Box::new(first_file)
+        };
         match password {
             Some(password) => weaver_unrar::RarArchive::open_with_password_and_shared_kdf_cache(
                 first_file,
@@ -965,6 +1090,7 @@ impl Pipeline {
         volume_paths: &std::collections::BTreeMap<u32, PathBuf>,
         idx: usize,
         password: Option<&str>,
+        budget: Option<&Arc<JobExtractionBudget>>,
     ) -> Result<(), crate::pipeline::RarPasswordAttemptError> {
         let member = archive.member_info(idx).ok_or_else(|| {
             crate::pipeline::RarPasswordAttemptError::Fatal(format!(
@@ -1003,9 +1129,19 @@ impl Pipeline {
             provider_paths.insert((absolute_volume - first_volume) as usize, path.clone());
         }
         let provider = ReadaheadVolumeProvider::new(provider_paths);
+        let budgeted_provider =
+            budget.map(|budget| BudgetedRarVolumeProvider::new(&provider, Arc::clone(budget)));
         let mut sink = std::io::sink();
         archive
-            .extract_member_streaming(idx, &options, &provider, &mut sink)
+            .extract_member_streaming(
+                idx,
+                &options,
+                budgeted_provider
+                    .as_ref()
+                    .map(|provider| provider as &dyn weaver_unrar::VolumeProvider)
+                    .unwrap_or(&provider),
+                &mut sink,
+            )
             .map(|_| ())
             .map_err(crate::pipeline::RarPasswordAttemptError::from)
     }
@@ -1084,7 +1220,12 @@ impl Pipeline {
     ) -> Result<crate::pipeline::ArchivePasswordSelection<weaver_unrar::RarArchive>, String> {
         let context = format!("failed to parse RAR volume 0 for set '{set_name}'");
         Self::try_rar_password_candidates(&context, candidates, |password| {
-            Self::open_rar_volume_zero_with_password(first_path, password, shared_kdf_cache.clone())
+            Self::open_rar_volume_zero_with_password(
+                first_path,
+                password,
+                shared_kdf_cache.clone(),
+                None,
+            )
         })
     }
 
@@ -1242,7 +1383,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn rar_server_extraction_delegates_symlink_entries_to_unrar_crate() {
+    fn rar_server_extraction_rejects_symlink_entries() {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar5/rar5_symlink.rar");
         let file = std::fs::File::open(&fixture).unwrap();
@@ -1255,17 +1396,12 @@ mod tests {
             .expect("fixture should contain a symlink member");
         let member = archive.member_info(symlink_idx).unwrap();
         let member_name = member.name.clone();
-        let expected_target = member
-            .link_target
-            .clone()
-            .expect("symlink member should expose target");
-
         let output_dir = tempfile::tempdir().unwrap();
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
         let volume_paths = std::collections::BTreeMap::new();
         let options = weaver_unrar::ExtractOptions::default();
 
-        let (name, written, total) = Pipeline::extract_rar_member_to_output(
+        let error = Pipeline::extract_rar_member_to_output(
             &mut archive,
             RarExtractionContext {
                 volume_paths: &volume_paths,
@@ -1273,27 +1409,17 @@ mod tests {
                 job_id: JobId(42),
                 set_name: "rar5-symlink",
                 output_dir: output_dir.path(),
+                root: None,
+                budget: None,
                 options: &options,
                 phase_attempt: None,
             },
             symlink_idx,
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(name, member_name);
-        assert_eq!(written, 0);
-        assert_eq!(total, 0);
-
-        let out_path = output_dir.path().join(member_name);
-        let metadata = std::fs::symlink_metadata(&out_path).unwrap();
-        assert!(
-            metadata.file_type().is_symlink(),
-            "server extraction should create a symlink instead of an empty regular file"
-        );
-        assert_eq!(
-            std::fs::read_link(out_path).unwrap(),
-            PathBuf::from(expected_target)
-        );
+        assert!(error.contains("unsupported_entry"));
+        assert!(!output_dir.path().join(member_name).exists());
     }
 
     #[test]
@@ -1499,6 +1625,7 @@ mod tests {
                 open_mode: RarArchiveOpenMode::AttachOnly,
                 requested_members: Some(&requested),
                 already_extracted: None,
+                budget: None,
             })
             .unwrap()
             .value;
