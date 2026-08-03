@@ -58,6 +58,7 @@ use self::archive::rar_state::{RarDerivedPlan, RarSetState};
 use self::download::{
     DownloadLaneMode, DownloadLaneRuntimeState, JobTransportProfile, LaneParkReason,
 };
+use self::extraction::{ExtractionLimits, ExtractionRoot, JobExtractionBudget};
 
 /// Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
@@ -1904,6 +1905,10 @@ pub struct Pipeline {
     /// (extraction, PAR2 verify/repair). Niced on Unix so the OS scheduler
     /// prefers download/decode threads when CPU is contended.
     pub(super) pp_pool: Arc<rayon::ThreadPool>,
+    /// Environment-derived, always-on extraction ceilings.
+    pub(super) extraction_limits: Arc<ExtractionLimits>,
+    /// One shared output budget per job, retained across nested extraction layers.
+    pub(super) extraction_budgets: HashMap<JobId, Arc<JobExtractionBudget>>,
 }
 
 #[cfg(test)]

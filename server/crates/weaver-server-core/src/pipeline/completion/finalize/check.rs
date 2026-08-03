@@ -509,18 +509,107 @@ impl Pipeline {
                 | crate::jobs::assembly::ArchiveType::Zstd
                 | crate::jobs::assembly::ArchiveType::Bzip2 => CleanPar2IntegrityGate::StrongDecode,
             };
-            gate = match (gate, topology_gate) {
-                (CleanPar2IntegrityGate::StrongDecode, _)
-                | (_, CleanPar2IntegrityGate::StrongDecode) => CleanPar2IntegrityGate::StrongDecode,
-                (CleanPar2IntegrityGate::WeakTransform, _)
-                | (_, CleanPar2IntegrityGate::WeakTransform) => {
-                    CleanPar2IntegrityGate::WeakTransform
-                }
-                _ => CleanPar2IntegrityGate::None,
-            };
+            gate = Self::fold_integrity_gate(gate, topology_gate);
         }
 
-        gate
+        Self::fold_integrity_gate(gate, self.direct_rar_integrity_gate(job_id))
+    }
+
+    /// Job-wide fold. The **strongest** contribution wins, which is why a
+    /// contribution has to be earned per archive rather than assumed per job: a
+    /// `StrongDecode` from one archive suppresses the authoritative pass for
+    /// every other archive in the job as well.
+    fn fold_integrity_gate(
+        gate: CleanPar2IntegrityGate,
+        contribution: CleanPar2IntegrityGate,
+    ) -> CleanPar2IntegrityGate {
+        match (gate, contribution) {
+            (CleanPar2IntegrityGate::StrongDecode, _)
+            | (_, CleanPar2IntegrityGate::StrongDecode) => CleanPar2IntegrityGate::StrongDecode,
+            (CleanPar2IntegrityGate::WeakTransform, _)
+            | (_, CleanPar2IntegrityGate::WeakTransform) => CleanPar2IntegrityGate::WeakTransform,
+            _ => CleanPar2IntegrityGate::None,
+        }
+    }
+
+    /// What a job's **direct** RAR sets contribute to the clean-PAR2 integrity
+    /// gate (plan 135, D7).
+    ///
+    /// A direct set never enters the archive topology by construction, so the
+    /// loop above cannot see it and a job made entirely of direct sets reads
+    /// `None` — which forces the authoritative pass, whose repair branch
+    /// materializes every still-routing set before handing the repairer files it
+    /// can write into. While the job is live that costs nothing, because live
+    /// PAR2 verifies from the decode buffer and short-circuits the pass. **After
+    /// a restart there is no decode buffer**: no article of a byte-complete set
+    /// arrives, live PAR2 has nothing to hash, and a set that is byte-perfect on
+    /// disk is materialized and redownloaded anyway.
+    ///
+    /// A **restored** RAR set has the same claim to `StrongDecode` a
+    /// conventionally extracted one does, and for a stronger reason than routing
+    /// alone: its checkpointed bytes were re-read off disk this run and
+    /// re-composed through the member CRC32s by D6's gate re-arm, and its
+    /// refetched bytes went through the router's gate on the way in. Three
+    /// predicates make that claim honest, and each one is load-bearing:
+    ///
+    /// - **The job is only RAR archives.** The fold above is job-wide and the
+    ///   strongest contribution wins, so a direct RAR set in a job that also
+    ///   holds a conventional Split or Tar would suppress the authoritative pass
+    ///   for the *split archive* — an archive whose integrity nothing in this job
+    ///   has checked. A mixed job contributes nothing here.
+    /// - **Every set was restored, and none is demoted.** A set this run
+    ///   downloaded live is deliberately left alone: live PAR2 hashes its
+    ///   articles out of the decode buffer, which catches damage in the *volume*
+    ///   space that no member checksum can see — a corrupted recovery record, say
+    ///   — and that detection must not be traded away. Live sets keep reaching the
+    ///   authoritative pass exactly as before; this is only about the sets live
+    ///   PAR2 could never have seen, because not one article of them arrived.
+    /// - **No set is carrying restart-seeded coverage.** Bytes restored from a
+    ///   checkpoint are covered and *unverified* until the re-arm re-reads them
+    ///   (D6); a set still holding them has decoded nothing and may not claim
+    ///   decode strength. The re-arm runs at the download/verify boundary, so by
+    ///   the time this matters a healthy set has cleared it — and one that could
+    ///   not has demoted.
+    ///
+    /// # What this does and does not vouch for
+    ///
+    /// The member CRC32s vouch for the **member payloads** — the bytes that
+    /// become output — and not for the volume-space bytes PAR2 describes. A
+    /// volume's envelope regions (headers, a recovery record) are covered by no
+    /// member checksum. That is the same trade the conventional RAR path makes
+    /// when it contributes `StrongDecode`: there too the guarantee is that the
+    /// extractor's own per-file CRC32 passed, not that every byte of every volume
+    /// file matched its PAR2 description.
+    fn direct_rar_integrity_gate(&self, job_id: JobId) -> CleanPar2IntegrityGate {
+        let sets = self.direct_store.sets_for(job_id);
+        if sets.is_empty() {
+            return CleanPar2IntegrityGate::None;
+        }
+        if !self.job_has_only_rar_archives(job_id) {
+            return CleanPar2IntegrityGate::None;
+        }
+        if !sets.iter().all(|set| {
+            set.was_restored() && !set.is_demoted() && !set.has_restart_seeded_coverage()
+        }) {
+            return CleanPar2IntegrityGate::None;
+        }
+        CleanPar2IntegrityGate::StrongDecode
+    }
+
+    /// [`Self::direct_rar_integrity_gate`] as a bool, so the predicate can be
+    /// pinned on its own.
+    ///
+    /// It is worth a direct test rather than only an end-to-end one: the
+    /// contribution is job-wide and the strongest wins, so the interesting case —
+    /// a mixed job that must contribute *nothing* — is a **negative**, and a
+    /// negative asserted through a whole job gate passes just as well when the
+    /// gate never got that far.
+    #[cfg(test)]
+    pub(crate) fn direct_rar_contributes_strong_decode(&self, job_id: JobId) -> bool {
+        matches!(
+            self.direct_rar_integrity_gate(job_id),
+            CleanPar2IntegrityGate::StrongDecode
+        )
     }
 
     async fn load_existing_complete_file_hashes(

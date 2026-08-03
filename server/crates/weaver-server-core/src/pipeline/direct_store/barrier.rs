@@ -62,10 +62,10 @@ fn failure_backoff(consecutive_failures: u32) -> Duration {
 
 /// Why the caller is demanding a barrier. The caller decides when these happen;
 /// the controller only records which one it served.
-// `Pause` and `Demotion` have no caller yet: pause routes through the same
-// shutdown path for now, and D8's demotion *deletes* the row rather than
-// checkpointing it. Both are the vocabulary the demand seam is specified in, so
-// they stay named rather than being re-invented when phases 5 and 6 use them.
+// `Demotion` still has no caller: D8's demotion *deletes* the row rather than
+// checkpointing it, so the demand exists in the vocabulary the seam is specified
+// in without a path that raises it. `Pause` and `PhaseChange` are wired in wave
+// 3 — the command seam and the set's last volume respectively.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BarrierDemand {
@@ -266,6 +266,15 @@ pub(crate) struct BarrierReport {
 #[derive(Debug, Clone, Default)]
 struct VolumeCoverage {
     file_index: u32,
+    /// The volume's decoded length, once every article of it has arrived. `None`
+    /// while it is still downloading.
+    ///
+    /// Deliberately the *length* rather than a `complete` flag: the snapshot's
+    /// bit means "all bytes durable", which is the conjunction of this and the
+    /// published floor, and a flag latched here would publish that claim for a
+    /// volume whose bytes are still held. See
+    /// [`super::snapshot::VolumeFloor::complete`].
+    decoded_len: Option<u64>,
     /// Last published contiguous floor. Bytes below it have been trimmed out of
     /// `ranges`, so the floor itself is what continuity is measured from.
     floor: u64,
@@ -339,6 +348,12 @@ impl CoverageBarrier {
             let volume = barrier.volumes.entry(entry.volume_index).or_default();
             volume.file_index = entry.file_index;
             volume.floor = entry.floor;
+            // A published `complete` always means the floor *is* the volume's
+            // decoded length, so the floor is the length coming back. Rebuilding
+            // it this way keeps the invariant self-checking: the next barrier
+            // re-derives the bit from `floor >= decoded_len` exactly as the run
+            // that wrote it did, rather than carrying a claim forward unexamined.
+            volume.decoded_len = entry.complete.then_some(entry.floor);
             barrier
                 .published_floors
                 .insert(entry.volume_index, entry.floor);
@@ -441,6 +456,17 @@ impl CoverageBarrier {
     /// destination path. Idempotent.
     pub(crate) fn register_volume(&mut self, volume_index: u32, file_index: u32) {
         self.volumes.entry(volume_index).or_default().file_index = file_index;
+    }
+
+    /// Records that every article of a source volume has arrived, and how long
+    /// the volume decoded to.
+    ///
+    /// The length is what makes this a fact rather than a latch: the snapshot's
+    /// `complete` bit is re-derived at every barrier from this length against the
+    /// floor being published, so a volume that finished downloading into *held*
+    /// bytes publishes `complete: false` until those bytes are actually durable.
+    pub(crate) fn note_volume_complete(&mut self, volume_index: u32, decoded_len: u64) {
+        self.volumes.entry(volume_index).or_default().decoded_len = Some(decoded_len);
     }
 
     pub(crate) fn register_destination(
@@ -567,9 +593,18 @@ impl CoverageBarrier {
         CoverageSnapshot {
             generation,
             plan_digest: self.plan_digest,
+            // Destinations with no claimed byte are **omitted**. Envelope
+            // destinations are registered for every volume of the set up front
+            // (`DirectSet::ensure_registered`), so a set that has touched three
+            // of its two thousand volumes would otherwise write 1 997 claims
+            // naming files that do not exist yet — and restart's destination
+            // probe, which refuses a missing destination, would refuse the whole
+            // row on the strength of a claim that claims nothing. A claim over
+            // zero bytes is not a claim.
             destinations: self
                 .destinations
                 .iter()
+                .filter(|(_, destination)| !destination.ranges.is_empty())
                 .map(|(member_index, destination)| DestinationClaim {
                     member_index: *member_index,
                     relative_path: destination.relative_path.clone(),
@@ -591,6 +626,18 @@ impl CoverageBarrier {
                         .map(|volume| volume.file_index)
                         .unwrap_or_default(),
                     floor: *floor,
+                    // Re-evaluated here, against *this* barrier's floor, and
+                    // never latched independently of it: the bit restart reads
+                    // as "skip every segment of this file" is only true when the
+                    // download finished **and** the floor about to be published
+                    // covers the whole decoded volume. A volume whose bytes are
+                    // still held publishes `false` and is refetched — the safe
+                    // direction — until a later barrier's floor catches up.
+                    complete: self
+                        .volumes
+                        .get(volume_index)
+                        .and_then(|volume| volume.decoded_len)
+                        .is_some_and(|decoded_len| *floor >= decoded_len),
                 })
                 .collect(),
         }

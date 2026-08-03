@@ -2,7 +2,7 @@
 //!
 //! Fixture names are invented throughout — never real media titles.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,10 +16,13 @@ use super::barrier::{
 };
 use super::plan::DirectSetPlan;
 use super::restart::{
-    CoverageRejection, DestinationProbe, ExpectedSet, ProbedDestination, coverage_skip_plan,
-    refetch_floors, restore_job, restore_set, restore_set_with_probe,
+    CoverageRejection, DestinationProbe, ExpectedSet, ProbedDestination, complete_files,
+    coverage_skip_plan, refetch_floors, restore_job, restore_set, restore_set_with_probe,
 };
-use super::router::{CrcRuns, SparseImage};
+use super::router::{
+    CrcRuns, DemotionReason, DirectSetRouter, HoldsScratch, SparseImage,
+    restored_volume_is_confirmed,
+};
 use super::snapshot::{
     CoverageSnapshot, DestinationClaim, DestinationExtent, SNAPSHOT_MAGIC, SNAPSHOT_SCHEMA_VERSION,
     SnapshotError, VolumeFloor, decode, encode,
@@ -226,6 +229,7 @@ fn sample_snapshot() -> CoverageSnapshot {
             volume_index: 0,
             file_index: 0,
             floor: 60,
+            complete: false,
         }],
     }
 }
@@ -236,6 +240,7 @@ fn sample_expected() -> ExpectedSet {
     ExpectedSet {
         plan_digest: PLAN_DIGEST,
         volume_files: HashMap::from([(0u32, 0u32)]),
+        fact_volumes: HashSet::from([0u32]),
     }
 }
 
@@ -327,11 +332,13 @@ fn snapshot_round_trips_exactly() {
                 volume_index: 0,
                 file_index: 3,
                 floor: 4096,
+                complete: false,
             },
             VolumeFloor {
                 volume_index: 1,
                 file_index: 4,
                 floor: 6 * 1024 * 1024 * 1024,
+                complete: false,
             },
         ],
     };
@@ -359,6 +366,7 @@ fn snapshot_encoding_is_deterministic_regardless_of_input_order() {
         volume_index: 5,
         file_index: 5,
         floor: 11,
+        complete: false,
     });
     shuffled.floors.reverse();
 
@@ -372,6 +380,7 @@ fn snapshot_encoding_is_deterministic_regardless_of_input_order() {
         volume_index: 5,
         file_index: 5,
         floor: 11,
+        complete: false,
     });
 
     assert_eq!(encode(&shuffled).unwrap(), encode(&canonical).unwrap());
@@ -386,6 +395,7 @@ fn two_thousand_volume_snapshot_round_trips_in_a_sane_blob() {
             volume_index,
             file_index: volume_index,
             floor: 50 * 1024 * 1024 * u64::from(volume_index + 1),
+            complete: false,
         })
         .collect::<Vec<_>>();
     let snapshot = CoverageSnapshot {
@@ -454,11 +464,13 @@ fn snapshot_decode_refuses_a_structurally_invalid_body() {
             volume_index: 4,
             file_index: 4,
             floor: 10,
+            complete: false,
         },
         VolumeFloor {
             volume_index: 1,
             file_index: 1,
             floor: 10,
+            complete: false,
         },
     ];
     assert!(matches!(
@@ -903,19 +915,21 @@ fn a_crash_between_persist_and_publish_leaves_the_committed_checkpoint_authorita
             .iter()
             .find(|claim| claim.member_index == member_index)
             .map(|claim| claim.extents.clone())
-            .unwrap()
     };
     assert_eq!(
         claims(0),
-        vec![DestinationExtent {
+        Some(vec![DestinationExtent {
             start: 0,
             end: 8_192
-        }],
+        }]),
         "the committed claim stops where the barrier did"
     );
-    assert!(
-        claims(1).is_empty(),
-        "the second member was first written after the barrier, so nothing claims it"
+    assert_eq!(
+        claims(1),
+        None,
+        "the second member was first written after the barrier, so it is not in the row at \
+         all — a claim over zero bytes is omitted, because restart's destination probe would \
+         otherwise refuse the row over a file that claims nothing and does not exist yet"
     );
     assert_eq!(
         resumed.dirty_bytes(),
@@ -1411,8 +1425,8 @@ async fn restart_refuses_a_flipped_file_index() {
     // A volume the plan does not have at all is the same refusal.
     let blob = encode(&sample_snapshot()).unwrap();
     let expected = ExpectedSet {
-        plan_digest: PLAN_DIGEST,
         volume_files: HashMap::new(),
+        ..sample_expected()
     };
     assert_eq!(
         restore_set(temp_dir.path(), &blob, &expected).await,
@@ -1563,7 +1577,7 @@ fn segment(segment_number: u32) -> SegmentId {
 #[test]
 fn coverage_skip_plan_skips_only_whole_segments_below_the_floor() {
     let spec = direct_job_spec();
-    let plan = coverage_skip_plan(JOB, &spec, &HashMap::from([(0u32, 30u64)]));
+    let plan = coverage_skip_plan(JOB, &spec, &HashMap::from([(0u32, 30u64)]), &HashSet::new());
 
     assert_eq!(plan.skip.len(), 2);
     assert!(plan.skip.contains(&segment(0)));
@@ -1574,7 +1588,7 @@ fn coverage_skip_plan_skips_only_whole_segments_below_the_floor() {
 #[test]
 fn coverage_skip_plan_does_not_skip_a_partial_segment() {
     let spec = direct_job_spec();
-    let plan = coverage_skip_plan(JOB, &spec, &HashMap::from([(0u32, 25u64)]));
+    let plan = coverage_skip_plan(JOB, &spec, &HashMap::from([(0u32, 25u64)]), &HashSet::new());
 
     assert_eq!(plan.skip, [segment(0)].into_iter().collect());
     assert_eq!(plan.file_progress.get(&0), Some(&10));
@@ -1585,7 +1599,7 @@ fn coverage_skip_plan_never_consults_destination_length() {
     // No file exists anywhere: for a direct set the source volume never does.
     // The legacy path would clamp to `metadata.len()` and zero this floor.
     let spec = direct_job_spec();
-    let plan = coverage_skip_plan(JOB, &spec, &HashMap::from([(0u32, 60u64)]));
+    let plan = coverage_skip_plan(JOB, &spec, &HashMap::from([(0u32, 60u64)]), &HashSet::new());
 
     assert_eq!(plan.skip.len(), 3);
     assert_eq!(plan.file_progress.get(&0), Some(&60));
@@ -1594,7 +1608,7 @@ fn coverage_skip_plan_never_consults_destination_length() {
 #[test]
 fn coverage_skip_plan_leaves_unlisted_files_alone() {
     let spec = direct_job_spec();
-    let plan = coverage_skip_plan(JOB, &spec, &HashMap::new());
+    let plan = coverage_skip_plan(JOB, &spec, &HashMap::new(), &HashSet::new());
     assert!(plan.skip.is_empty());
     assert!(plan.file_progress.is_empty());
 }
@@ -1607,11 +1621,13 @@ fn refetch_floors_take_the_lowest_floor_for_a_repeated_file_index() {
             volume_index: 0,
             file_index: 0,
             floor: 900,
+            complete: false,
         },
         VolumeFloor {
             volume_index: 1,
             file_index: 0,
             floor: 100,
+            complete: false,
         },
     ];
     assert_eq!(refetch_floors(&snapshot), HashMap::from([(0u32, 100u64)]));
@@ -2943,4 +2959,408 @@ fn a_write_to_a_virtual_volume_is_refused() {
         error.to_string().contains("virtual"),
         "the refusal should say why, got {error}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Restart primitives (plan 135, D6) — the pieces the end-to-end restart tests
+// exercise only in combination, where a wrong answer in one can be masked by
+// another. B1 and B2 both hid here.
+// ---------------------------------------------------------------------------
+
+fn floor_entry(volume_index: u32, file_index: u32, floor: u64, complete: bool) -> VolumeFloor {
+    VolumeFloor {
+        volume_index,
+        file_index,
+        floor,
+        complete,
+    }
+}
+
+#[test]
+fn complete_files_names_only_the_files_every_entry_agrees_are_complete() {
+    let mut snapshot = sample_snapshot();
+    snapshot.floors = vec![
+        floor_entry(0, 0, 900, true),
+        floor_entry(1, 1, 100, false),
+        floor_entry(2, 2, 500, true),
+    ];
+    assert_eq!(complete_files(&snapshot), HashSet::from([0u32, 2]));
+
+    // A malformed blob repeating a file index is resolved the safe way: one
+    // entry saying "not complete" refutes the file, whatever the others claim.
+    // Anything else would skip segments on the strength of the entry that
+    // happened to be read last.
+    snapshot.floors = vec![
+        floor_entry(0, 0, 900, true),
+        floor_entry(1, 0, 100, false),
+        floor_entry(2, 2, 500, true),
+    ];
+    assert_eq!(complete_files(&snapshot), HashSet::from([2u32]));
+}
+
+#[test]
+fn coverage_skip_plan_skips_every_segment_of_a_complete_file() {
+    let spec = direct_job_spec();
+    // The floor is deliberately far below the file: a complete volume's floor
+    // counts *decoded* bytes while the spec's segment sizes are yEnc-encoded, so
+    // the two never meet and the `complete` bit is the only thing that can say
+    // the file is finished.
+    let plan = coverage_skip_plan(
+        JOB,
+        &spec,
+        &HashMap::from([(0u32, 30u64)]),
+        &HashSet::from([0u32]),
+    );
+
+    assert_eq!(
+        plan.skip,
+        [segment(0), segment(1), segment(2)].into_iter().collect(),
+        "a complete file skips every segment, not only the ones under its floor"
+    );
+    assert_eq!(
+        plan.file_progress.get(&0),
+        Some(&60),
+        "and its progress is the file's whole declared size"
+    );
+
+    // Without the bit the very same floor skips only what it covers. This is the
+    // difference B1 turned into a zombie: the bit is worth three segments here
+    // and worth the whole job's correctness when it is wrong.
+    let plan = coverage_skip_plan(JOB, &spec, &HashMap::from([(0u32, 30u64)]), &HashSet::new());
+    assert_eq!(plan.skip.len(), 2);
+}
+
+#[tokio::test]
+async fn restart_refuses_a_row_claiming_a_volume_the_layout_has_no_facts_for() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    write_destination(temp_dir.path(), "silver-horizon.mkv.direct.partial", 60);
+    let blob = encode(&sample_snapshot()).unwrap();
+
+    // M5. The layout rebuild is tolerant of a missing volume — it contributes no
+    // member, so the plan digest is unchanged and every other check passes — and
+    // the set then cannot classify a byte of it.
+    let expected = ExpectedSet {
+        fact_volumes: HashSet::new(),
+        ..sample_expected()
+    };
+    assert_eq!(
+        restore_set(temp_dir.path(), &blob, &expected).await,
+        Err(CoverageRejection::UnclassifiableVolume { volume_index: 0 }),
+        "a row claiming coverage in a volume with no cached facts must be refused, not \
+         accepted into a set that can never place those bytes"
+    );
+
+    // A volume the row claims *nothing* in is not a reason to retire the row:
+    // refusing on it would redownload sets whose later volumes had simply not
+    // started.
+    let mut unstarted = sample_snapshot();
+    unstarted.floors = vec![floor_entry(0, 0, 0, false)];
+    let blob = encode(&unstarted).unwrap();
+    assert!(
+        restore_set(temp_dir.path(), &blob, &expected).await.is_ok(),
+        "a zero floor with no completion claims nothing and must not refuse the row"
+    );
+}
+
+#[test]
+fn a_restored_volume_is_confirmed_only_by_a_proof_it_actually_has() {
+    let mut whole = ByteRanges::new();
+    whole.insert(0, 1_000);
+    let mut short = ByteRanges::new();
+    short.insert(0, 400);
+    let mut gapped = ByteRanges::new();
+    gapped.insert(0, 400);
+    gapped.insert(600, 400);
+
+    // Proof one: the cached facts carry an end-of-archive record saying more
+    // volumes follow, which is the last header this volume can hold.
+    assert!(restored_volume_is_confirmed(&short, None, true));
+
+    // Proof two: the checkpoint calls the volume complete *and* the coverage in
+    // front of us is contiguous to its whole decoded length.
+    assert!(restored_volume_is_confirmed(&whole, Some(1_000), false));
+
+    // The claim is checked, not taken. A row whose `complete` bit disagrees with
+    // its own coverage — a pre-B1 writer's latched bit, a torn row — proves
+    // nothing.
+    assert!(!restored_volume_is_confirmed(&short, Some(1_000), false));
+    assert!(!restored_volume_is_confirmed(&gapped, Some(1_000), false));
+
+    // And neither proof means unconfirmed, which is what the completion seam
+    // turns into an explicit demotion rather than a silently held tail.
+    assert!(!restored_volume_is_confirmed(&short, None, false));
+    assert!(!restored_volume_is_confirmed(&whole, None, false));
+}
+
+// ---------------------------------------------------------------------------
+// The restart gate re-arm, over a router rebuilt from cached facts
+// ---------------------------------------------------------------------------
+
+/// One member header record, in the shape a split RAR5 member has. Callers set
+/// the four fields that differ between a chain's parts on the value returned.
+fn member_facts(
+    name: &str,
+    data_offset: u64,
+    data_size: u64,
+    unpacked_size: u64,
+) -> weaver_unrar::RarVolumeMemberFacts {
+    weaver_unrar::RarVolumeMemberFacts {
+        order: 0,
+        name: name.to_string(),
+        name_raw: None,
+        unpacked_size: Some(unpacked_size),
+        data_crc32: None,
+        data_blake2_hash: None,
+        version: None,
+        packed_crc32: None,
+        packed_blake2_hash: None,
+        packed_hash_uses_mac: false,
+        split_before: false,
+        split_after: false,
+        is_directory: false,
+        is_encrypted: false,
+        host_os: None,
+        attributes: None,
+        owner: None,
+        mtime_ns: None,
+        ctime_ns: None,
+        atime_ns: None,
+        data_offset,
+        data_size,
+        compression_method: 0,
+        compression_version: 0,
+        compression_solid: false,
+        dict_size: 0,
+        use_hash_mac: false,
+        redirection_type: None,
+        redirection_target: None,
+        redirection_target_raw: None,
+        redirection_target_is_directory: false,
+    }
+}
+
+fn volume_facts(
+    volume_number: u32,
+    more_volumes: bool,
+    members: Vec<weaver_unrar::RarVolumeMemberFacts>,
+) -> weaver_unrar::RarVolumeFacts {
+    weaver_unrar::RarVolumeFacts {
+        // RAR5.
+        format: 5,
+        volume_number,
+        more_volumes,
+        is_solid: false,
+        is_encrypted: false,
+        is_volume: true,
+        has_recovery_record: false,
+        is_locked: false,
+        has_authenticity_verification: false,
+        has_locator: false,
+        quick_open_offset: None,
+        recovery_record_offset: None,
+        original_name: None,
+        original_name_raw: None,
+        original_creation_time_ns: None,
+        members,
+        services: Vec::new(),
+    }
+}
+
+const REARM_PART: u64 = 400;
+const REARM_MEMBER: &str = "Silver.Horizon.S01E04.mkv";
+
+/// A router rebuilt exactly the way restore rebuilds one: from cached facts for
+/// a two-volume set holding a single member split across both, with the whole
+/// member seeded as restart coverage.
+fn rearm_router() -> DirectSetRouter {
+    let plan = DirectSetPlan {
+        set_name: SET.to_string(),
+        volumes: [(0u32, 0u32), (1u32, 1u32)].into_iter().collect(),
+        files: [(0u32, 0u32), (1u32, 1u32)].into_iter().collect(),
+        working_dir: std::path::PathBuf::from("/nonexistent"),
+    };
+    let mut router = DirectSetRouter::new(plan);
+    let facts = std::collections::BTreeMap::from([
+        (
+            0u32,
+            volume_facts(0, true, {
+                // The chain's first part: continues into volume 1, and carries
+                // the CRC32 of *its own* packed bytes the way RAR5 states it.
+                let mut first = member_facts(REARM_MEMBER, 64, REARM_PART, REARM_PART * 2);
+                first.split_after = true;
+                first.packed_crc32 = Some(0x1111_1111);
+                vec![first]
+            }),
+        ),
+        (
+            1u32,
+            volume_facts(1, false, {
+                // The final part: closes the chain and carries the whole-member
+                // CRC32 instead.
+                let mut last = member_facts(REARM_MEMBER, 64, REARM_PART, REARM_PART * 2);
+                last.split_before = true;
+                last.data_crc32 = Some(0x2222_2222);
+                vec![last]
+            }),
+        ),
+    ]);
+    router.restore_layout(&facts).expect("the facts rebuild");
+    let partial = format!("{REARM_MEMBER}.direct.partial");
+    router
+        .restore_member_coverage(&partial, &[(0, REARM_PART * 2)])
+        .expect("the member is in the rebuilt layout");
+    router
+}
+
+#[test]
+fn the_restart_read_plan_splits_a_members_coverage_at_its_part_boundaries() {
+    let plan = rearm_router().restart_read_plan();
+
+    assert_eq!(
+        plan.iter()
+            .map(|run| (run.logical_offset, run.len))
+            .collect::<Vec<_>>(),
+        vec![(0, REARM_PART), (REARM_PART, REARM_PART)],
+        "one seeded range spanning two parts must be read as two runs: the composition \
+         the re-read feeds is per part, so a run straddling a boundary composes against \
+         no reference at all"
+    );
+    assert!(
+        plan.iter()
+            .all(|run| run.relative_partial.ends_with(".direct.partial")),
+        "every run names the partial that holds it, so the reader opens each file once"
+    );
+}
+
+#[test]
+fn a_rearm_run_the_layout_cannot_place_demotes_instead_of_failing_open() {
+    let mut router = rearm_router();
+
+    // M4. A member id the layout does not have. Returning `Ok(())` here — which
+    // it used to — leaves the seeded range in place, so `try_verify_member`
+    // refuses the member forever while the completion gate re-reads it on every
+    // check: a set that neither finalizes nor demotes.
+    assert_eq!(
+        router.note_restored_member_crc(4242, 0, REARM_PART, 0x1111_1111),
+        Err(DemotionReason::RestartRearmUnplaceable),
+    );
+
+    // Same verdict for an offset no part of a real member covers.
+    let mut router = rearm_router();
+    assert_eq!(
+        router.note_restored_member_crc(0, REARM_PART * 9, REARM_PART, 0x1111_1111),
+        Err(DemotionReason::RestartRearmUnplaceable),
+    );
+}
+
+#[test]
+fn a_rearm_run_that_disagrees_with_its_parts_checksum_demotes() {
+    let mut router = rearm_router();
+    assert_eq!(
+        router.note_restored_member_crc(0, 0, REARM_PART, 0xDEAD_BEEF),
+        Err(DemotionReason::PartChecksumMismatch),
+        "a byte that changed on disk while the process was down must fail here, which is \
+         the whole point of re-reading rather than trusting the checkpoint"
+    );
+}
+
+#[test]
+fn a_rearm_run_that_matches_clears_its_seeded_range() {
+    let mut router = rearm_router();
+    assert!(router.has_restart_seeded_coverage());
+    router
+        .note_restored_member_crc(0, 0, REARM_PART, 0x1111_1111)
+        .expect("the first part composes to its header's packed CRC32");
+    assert!(
+        router.has_restart_seeded_coverage(),
+        "the member's second part is still seeded"
+    );
+    assert_eq!(
+        router.restart_read_plan().len(),
+        1,
+        "and a second pass reads only what the first did not clear"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The holds scratch and its region index (D2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn holds_scratch_hands_out_stable_regions_and_reads_them_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".weaver-holds.silver.horizon.f0");
+    let mut scratch = HoldsScratch::new(path.clone(), 1024);
+
+    let first = scratch.append(b"header bytes").unwrap();
+    let second = scratch.append(b"payload").unwrap();
+    assert_eq!(
+        (first, second),
+        (0, "header bytes".len() as u64),
+        "regions are handed out as append offsets, and the index that names them is the \
+         offset itself"
+    );
+    assert_eq!(
+        scratch.bytes(),
+        ("header bytes".len() + "payload".len()) as u64
+    );
+    assert_eq!(
+        scratch.read(second, "payload".len() as u64).as_deref(),
+        Some(&b"payload"[..]),
+        "a region reads back exactly what was appended at it, positionally, so a later \
+         append cannot disturb it"
+    );
+    assert_eq!(
+        scratch.read(first, "header bytes".len() as u64).as_deref(),
+        Some(&b"header bytes"[..]),
+        "including one written before it — the file is write-once per region"
+    );
+
+    scratch.discard();
+    assert!(!path.exists(), "discard deletes the file it created");
+    assert_eq!(scratch.bytes(), 0);
+}
+
+#[test]
+fn holds_scratch_refuses_an_append_past_its_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".weaver-holds.silver.horizon.f0");
+    let mut scratch = HoldsScratch::new(path.clone(), 8);
+
+    scratch.append(b"12345").unwrap();
+    assert_eq!(
+        scratch.append(b"678901"),
+        Err(DemotionReason::HoldsScratchCeiling),
+        "the ceiling is checked before the write, so a breach costs nothing on disk"
+    );
+    assert_eq!(
+        scratch.bytes(),
+        5,
+        "and leaves the append cursor where it was"
+    );
+}
+
+#[test]
+fn a_scratch_that_never_appended_a_byte_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".weaver-holds.silver.horizon.f0");
+
+    // Never opened at all: nothing to delete, and nothing to blame for a
+    // neighbouring file that happens to share the path.
+    let mut scratch = HoldsScratch::new(path.clone(), 1024);
+    std::fs::write(&path, b"someone else's file").unwrap();
+    scratch.discard();
+    assert!(
+        path.exists(),
+        "a scratch that never opened its file must not delete whatever is at that path"
+    );
+    std::fs::remove_file(&path).unwrap();
+
+    // Opened and appended: deleted, cursor reset, and idempotent.
+    let mut scratch = HoldsScratch::new(path.clone(), 1024);
+    scratch.append(b"held").unwrap();
+    assert!(path.exists());
+    scratch.discard();
+    scratch.discard();
+    assert!(!path.exists());
 }

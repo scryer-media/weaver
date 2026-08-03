@@ -57,6 +57,11 @@ use crate::events::model::PipelineEvent;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::pipeline::{BufferedDecodedSegment, DecodedChunk, Pipeline};
 
+/// Read chunk for the restart gate re-arm. Matches the reconstruction sweep's:
+/// large enough that a big part is a few hundred iterations, small enough to
+/// keep the whole plan's resident cost to one buffer.
+const REARM_CHUNK_BYTES: usize = 256 * 1024;
+
 /// Per-pipeline direct-store state. Empty and inert while the gate is off.
 #[derive(Default)]
 pub(crate) struct DirectStoreRuntime {
@@ -71,6 +76,9 @@ pub(crate) struct DirectStoreRuntime {
     /// Test-only holds ceiling applied to every set this runtime admits.
     #[cfg(test)]
     holds_budget_override: Option<u64>,
+    /// Test-only scratch ceiling (D2), same idea.
+    #[cfg(test)]
+    holds_scratch_ceiling_override: Option<u64>,
 }
 
 impl std::fmt::Debug for DirectStoreRuntime {
@@ -100,6 +108,36 @@ impl DirectStoreRuntime {
         self.holds_budget_override = Some(bytes);
     }
 
+    /// Test hook: lower the scratch ceiling so a breach is reachable without
+    /// paging half a gigabyte.
+    #[cfg(test)]
+    pub(crate) fn set_holds_scratch_ceiling(&mut self, bytes: u64) {
+        self.holds_scratch_ceiling_override = Some(bytes);
+    }
+
+    /// Applies this runtime's configured holds/scratch ceilings to a set it is
+    /// about to own. A no-op in release builds, where both are compile-time
+    /// constants.
+    ///
+    /// Every path that builds a `DirectSet` goes through here, restore included.
+    /// Restore used to skip it, so a restart test could set a budget and then
+    /// watch the restored set quietly use the 64 MiB / 512 MiB defaults — which
+    /// makes every budget assertion about a restored set vacuous, and those are
+    /// exactly the assertions D2's ceilings need after a restart.
+    pub(crate) fn apply_ceilings(&self, set: &mut DirectSet) {
+        #[cfg(test)]
+        {
+            if let Some(bytes) = self.holds_budget_override {
+                set.router.set_holds_budget(bytes);
+            }
+            if let Some(bytes) = self.holds_scratch_ceiling_override {
+                set.router.set_holds_scratch_ceiling(bytes);
+            }
+        }
+        #[cfg(not(test))]
+        let _ = set;
+    }
+
     /// Drops every trace of a job. Called from the job-removal seam: a barrier
     /// for a job that no longer exists must stop being polled, and its sets
     /// hold the routed byte state of a working directory that is being deleted.
@@ -107,6 +145,17 @@ impl DirectStoreRuntime {
         self.sets.remove(&job_id);
         self.examined.remove(&job_id);
         self.prepared_dirs.remove(&job_id);
+    }
+
+    /// Installs the sets a job restore rebuilt, and marks the job examined so
+    /// the lazy admission seam does not rediscover them from the spec and throw
+    /// the restored coverage away.
+    pub(crate) fn install_restored(&mut self, job_id: JobId, sets: Vec<DirectSet>) {
+        self.examined.insert(job_id);
+        if sets.is_empty() {
+            return;
+        }
+        self.sets.insert(job_id, sets);
     }
 
     #[cfg(test)]
@@ -245,9 +294,7 @@ impl Pipeline {
         if admitted.is_empty() {
             return;
         }
-        #[cfg(test)]
-        let holds_budget_override = self.direct_store.holds_budget_override;
-        let sets = admitted
+        let sets: Vec<DirectSet> = admitted
             .into_iter()
             .map(|plan| {
                 info!(
@@ -259,12 +306,8 @@ impl Pipeline {
                 // No format is chosen here: the router reads it from the first
                 // volume's signature, so a RAR4 set routes as RAR4 rather than
                 // demoting on its first header (H1).
-                #[allow(unused_mut)]
                 let mut set = DirectSet::new(job_id, plan);
-                #[cfg(test)]
-                if let Some(bytes) = holds_budget_override {
-                    set.router.set_holds_budget(bytes);
-                }
+                self.direct_store.apply_ceilings(&mut set);
                 set
             })
             .collect();
@@ -352,7 +395,7 @@ impl Pipeline {
             .and_then(|state| state.assembly.file(file_id))
             .map(|file| file.received_bytes())
             .unwrap_or(0);
-        let len = received.max(set.volume_coverage(volume_index).end());
+        let len = set.virtual_volume_len(volume_index, received);
         let lengths = std::collections::BTreeMap::from([(volume_index, len)]);
         Some((volume_index, len, set.virtual_provider(&lengths)))
     }
@@ -407,7 +450,7 @@ impl Pipeline {
                     .and_then(|state| state.assembly.file(file_id))
                     .map(|file| file.received_bytes())
                     .unwrap_or(0);
-                let len = received.max(set.volume_coverage(*volume_index).end());
+                let len = set.virtual_volume_len(*volume_index, received);
                 lengths.insert(*volume_index, len);
                 bindings.insert(*volume_index, (*file_index, binding.par2_file_id));
             }
@@ -745,6 +788,12 @@ impl Pipeline {
             }
         };
 
+        // Before the writes, so a fact can never be newer on disk than in the
+        // cache the restart reader rebuilds from (D6). Cheap when nothing
+        // parsed: a set parses a volume once provisionally and once
+        // confirmingly, so this is two writes per volume for the life of the job.
+        self.cache_direct_volume_facts(job_id, set_index).await;
+
         if !self
             .place_direct_spans(job_id, set_index, &spans, dropped)
             .await
@@ -825,6 +874,190 @@ impl Pipeline {
             set.record_writes(spans, Instant::now());
         }
         true
+    }
+
+    /// Caches whatever volume facts the set's parse just accepted, so a restart
+    /// can rebuild its layout (D6).
+    ///
+    /// The rows go into `active_rar_volume_facts` — the same table, keyed the
+    /// same way, that the conventional path fills from a parsed volume file.
+    /// There is no writer conflict: `try_update_archive_topology` needs a file to
+    /// parse and D7 suppresses it for direct volumes, so for a live direct set
+    /// this is the only writer, and after a demotion the conventional path
+    /// upserts the same facts over the materialized volumes.
+    async fn cache_direct_volume_facts(&mut self, job_id: JobId, set_index: usize) {
+        let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
+            return;
+        };
+        let dirty = set.router.take_dirty_facts();
+        if dirty.is_empty() {
+            return;
+        }
+        let set_name = set.set_name().to_string();
+        for (volume_index, facts) in dirty {
+            let encoded = match rmp_serde::to_vec_named(&facts) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    warn!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        volume = volume_index,
+                        error = %error,
+                        "failed to encode direct-store volume facts"
+                    );
+                    continue;
+                }
+            };
+            let name = set_name.clone();
+            let saved = self
+                .db_blocking(move |db| {
+                    db.save_rar_volume_facts(job_id, &name, volume_index, &encoded)
+                })
+                .await;
+            if let Err(error) = saved {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    volume = volume_index,
+                    error = %error,
+                    "failed to cache direct-store volume facts; the set will redownload on restart"
+                );
+                if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
+                    set.router.remark_dirty_fact(volume_index);
+                }
+            }
+        }
+    }
+
+    /// D6's gate re-arm: recomputes the member CRC for every restart-seeded
+    /// range with **one sequential read** of the partials that hold them.
+    ///
+    /// `CrcRuns` does not survive a restart, so the bytes a previous run wrote
+    /// are covered and unverified; the whole-member gate refuses to compose over
+    /// them until they are re-read. This is D6's "PAR2 absent" arm — the direct
+    /// analogue of `checksum_completed_file`'s fallback for physical files, at
+    /// the same cost and the same assurance. It deliberately verifies what is on
+    /// **disk now**, so a byte corrupted while the process was down fails the
+    /// member gate and demotes the set instead of being committed.
+    ///
+    /// Runs **once** per set: every run it reads leaves the seeded set, so a
+    /// second call finds nothing to do — and if anything is still seeded after a
+    /// full pass, the set demotes rather than being re-read on every completion
+    /// check for the life of the job (M4).
+    async fn rearm_restart_seeded_gates(&mut self, job_id: JobId, set_index: usize) {
+        let Some(set) = self.direct_store.set(job_id, set_index) else {
+            return;
+        };
+        if set.is_demoted() || set.is_finalized() || !set.has_restart_seeded_coverage() {
+            return;
+        }
+        let working_dir = set.plan().working_dir.clone();
+        let set_name = set.set_name().to_string();
+        let runs = set.router.restart_read_plan();
+        if runs.is_empty() {
+            return;
+        }
+        let total: u64 = runs.iter().map(|run| run.len).sum();
+        info!(
+            job_id = job_id.0,
+            set_name = %set_name,
+            runs = runs.len(),
+            bytes = total,
+            "re-reading restart-seeded direct-store coverage to re-arm the member gates"
+        );
+
+        let read_runs = runs.clone();
+        let read_dir = working_dir.clone();
+        let checksums =
+            tokio::task::spawn_blocking(move || read_restart_seeded_runs(&read_dir, &read_runs))
+                .await;
+        let checksums = match checksums {
+            Ok(Ok(checksums)) => checksums,
+            Ok(Err(error)) => {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    error = %error,
+                    "failed to re-read restart-seeded direct-store coverage; demoting the set"
+                );
+                self.demote_direct_set(
+                    job_id,
+                    set_index,
+                    DemotionReason::RestartRereadFailed,
+                    None,
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    error = %error,
+                    "the restart-seeded re-read task did not complete; demoting the set"
+                );
+                self.demote_direct_set(
+                    job_id,
+                    set_index,
+                    DemotionReason::RestartRereadFailed,
+                    None,
+                )
+                .await;
+                return;
+            }
+        };
+
+        crate::runtime::perf_probe::record_value("direct_store.restart.reread_bytes", total);
+        let mut failure = None;
+        if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
+            for (run, crc) in runs.iter().zip(checksums) {
+                if let Err(reason) = set.router.note_restored_member_crc(
+                    run.member_id,
+                    run.logical_offset,
+                    run.len,
+                    crc,
+                ) {
+                    failure = Some(reason);
+                    break;
+                }
+            }
+        }
+        if let Some(reason) = failure {
+            warn!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                reason = reason.metric(),
+                "restart-seeded direct-store coverage failed its checksum on re-read"
+            );
+            self.demote_direct_set(job_id, set_index, reason, None)
+                .await;
+            return;
+        }
+
+        // M4's terminating condition. The pass above read every run the plan
+        // named, so nothing may still be seeded — a range that survives it is one
+        // no plan reached, and re-running the pass would read the same runs and
+        // reach the same place. Left alone, `try_verify_member` refuses that
+        // member forever while the completion gate calls this back on every
+        // check: a zombie that costs I/O. One pass, then a verdict.
+        if self
+            .direct_store
+            .set(job_id, set_index)
+            .is_some_and(|set| !set.is_demoted() && set.has_restart_seeded_coverage())
+        {
+            warn!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                "restart-seeded direct-store coverage survived its re-read pass; demoting the set"
+            );
+            self.demote_direct_set(
+                job_id,
+                set_index,
+                DemotionReason::RestartRearmUnplaceable,
+                None,
+            )
+            .await;
+        }
     }
 
     /// Groups routed spans into one sub-batch per destination path.
@@ -1035,10 +1268,15 @@ impl Pipeline {
             return;
         }
 
+        // `total_bytes` — the assembly's decoded `received_bytes`, not the spec's
+        // yEnc-encoded segment sizes — travels with the completion so the
+        // checkpoint can tell "the download finished" from "every byte of it is
+        // durable". Only the conjunction licenses restart to skip the volume's
+        // segments; see `snapshot::VolumeFloor::complete`.
         let outcome = self
             .direct_store
             .set_mut(job_id, set_index)
-            .map(|set| set.note_volume_complete(volume_index));
+            .map(|set| set.note_volume_complete(volume_index, total_bytes));
         match outcome {
             Some(Err(reason)) => {
                 self.demote_direct_set(job_id, set_index, reason, None)
@@ -1050,6 +1288,7 @@ impl Pipeline {
             // could appear there — so those spans are written here, before the
             // set is allowed to finalize and delete its envelopes.
             Some(Ok(spans)) => {
+                self.cache_direct_volume_facts(job_id, set_index).await;
                 if !self
                     .place_direct_spans(job_id, set_index, &spans, None)
                     .await
@@ -1058,6 +1297,21 @@ impl Pipeline {
                 }
             }
             None => return,
+        }
+
+        // D6's phase-change demand. The set's download phase ends exactly here,
+        // at its last volume, and for a par2-bearing job the next thing that
+        // happens is a verification wait that can run for the whole PAR2
+        // download — which is precisely the window a restart is most likely to
+        // land in. Checkpointing at the boundary means that restart resumes a
+        // byte-complete set instead of refetching one.
+        if self
+            .direct_store
+            .set(job_id, set_index)
+            .is_some_and(|set| set.all_volumes_complete() && !set.is_demoted())
+        {
+            self.demand_direct_store_barriers(job_id, BarrierDemand::PhaseChange)
+                .await;
         }
 
         self.finalize_ready_direct_sets(job_id).await;
@@ -1074,6 +1328,23 @@ impl Pipeline {
     pub(crate) async fn finalize_ready_direct_sets(&mut self, job_id: JobId) {
         if self.direct_store.sets_for(job_id).is_empty() {
             return;
+        }
+        // D6's gate re-arm, and deliberately **before** the PAR2 wait: the
+        // re-read is about the member gates, not about verification, and running
+        // it at the download/verify boundary means a par2-bearing set is already
+        // gate-passed the moment its job's verification concludes. A set still
+        // receiving articles is skipped — its unwritten ranges are holes, not
+        // coverage to verify.
+        let seeded: Vec<usize> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| set.all_volumes_complete() && set.has_restart_seeded_coverage())
+            .map(|(index, _)| index)
+            .collect();
+        for set_index in seeded {
+            self.rearm_restart_seeded_gates(job_id, set_index).await;
         }
         if self.direct_finalization_waits_for_par2(job_id) {
             return;
@@ -1385,6 +1656,19 @@ impl Pipeline {
             crate::pipeline::release_cached_write_handle(envelope);
             let _ = tokio::fs::remove_file(envelope).await;
         }
+        // D2: the scratch dies with the set, and its high-water is reported
+        // separately from RAM so the disk claim stays legible against the 1.05×
+        // acceptance target.
+        if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
+            let scratch_bytes = set.router.scratch_bytes();
+            if scratch_bytes > 0 {
+                crate::runtime::perf_probe::record_value(
+                    "direct_store.holds.scratch_bytes",
+                    scratch_bytes,
+                );
+            }
+            set.router.discard_scratch();
+        }
 
         let mut persist = DatabaseCoveragePersist::new(self.db.clone());
         if let Some(set) = self.direct_store.set_mut(job_id, set_index)
@@ -1506,7 +1790,7 @@ impl Pipeline {
                 .unwrap_or(0);
             lengths.insert(
                 *volume_index,
-                received.max(set.volume_coverage(*volume_index).end()),
+                set.virtual_volume_len(*volume_index, received),
             );
         }
         let first_volume = *lengths
@@ -1728,8 +2012,10 @@ impl Pipeline {
             let coverage = set.volume_coverage(*volume_index);
             // A volume that never completed has no authoritative length; its
             // received bytes are the most that can be on disk, which is exactly
-            // what bounds the sweep.
-            let len = received.max(coverage.end());
+            // what bounds the sweep. A restart-seeded volume's received bytes
+            // are the spec's yEnc-encoded sizes and would overstate it, so the
+            // coverage map answers for those instead.
+            let len = set.virtual_volume_len(*volume_index, received);
             lengths.insert(*volume_index, len);
             extents_by_volume.insert(*volume_index, set.segment_extents(*volume_index));
             let path = working_dir.join(&filename);
@@ -1862,11 +2148,14 @@ impl Pipeline {
         self.refetch_direct_volumes(job_id, &volumes, dropped).await;
     }
 
-    /// Deletes a set's partial members and envelope files.
+    /// Deletes a set's partial members, envelope files and holds scratch.
     ///
     /// A sparse half-written output would masquerade as finished work (D1), and
-    /// the envelopes are scratch by construction.
+    /// the envelopes and the scratch are scratch by construction.
     async fn delete_direct_outputs(&mut self, job_id: JobId, set_index: usize) {
+        if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
+            set.router.discard_scratch();
+        }
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
         };
@@ -2151,6 +2440,56 @@ impl Pipeline {
 
 /// One contiguous copy of a decoded span. Routing splits the span at
 /// destination boundaries, which a batched chunk list cannot express.
+/// Reads every restart-seeded run and returns its CRC32, in the order asked.
+///
+/// **One sequential pass per file**: the plan arrives grouped by member and in
+/// ascending offset, and the reader keeps the file open across a member's runs
+/// and seeks forward only. A short read is a failure, not a zero-filled answer —
+/// a partial that is shorter than the coverage claimed for it is exactly the
+/// state restart's length probe refuses, and reaching it here means the file
+/// changed under a validated checkpoint.
+///
+/// **Streamed, not slurped.** A run is one whole RAR *part*, which is a whole
+/// volume's worth of a member — hundreds of megabytes on an ordinary set, and
+/// this runs on the blocking pool at restore for every restored set at once. The
+/// CRC32 composes over a rolling buffer, so the resident cost is one
+/// [`REARM_CHUNK_BYTES`] buffer for the whole plan rather than the largest part
+/// in it.
+fn read_restart_seeded_runs(
+    working_dir: &std::path::Path,
+    runs: &[super::router::RestartReadRun],
+) -> std::io::Result<Vec<u32>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut checksums = Vec::with_capacity(runs.len());
+    let mut open: Option<(String, std::fs::File)> = None;
+    let mut buffer = vec![0u8; REARM_CHUNK_BYTES];
+    for run in runs {
+        let file = match &mut open {
+            Some((path, file)) if path == &run.relative_partial => file,
+            _ => {
+                let file = std::fs::File::open(working_dir.join(&run.relative_partial))?;
+                open = Some((run.relative_partial.clone(), file));
+                &mut open.as_mut().expect("just assigned").1
+            }
+        };
+        file.seek(SeekFrom::Start(run.logical_offset))?;
+        let mut hasher = crc32fast::Hasher::new();
+        let mut remaining = run.len;
+        while remaining > 0 {
+            let want = (remaining.min(buffer.len() as u64)) as usize;
+            // `read_exact` rather than `read`: a run the checkpoint claims must be
+            // wholly present, and a short read here is the file having changed
+            // under a validated row — not a partial answer to compose over.
+            file.read_exact(&mut buffer[..want])?;
+            hasher.update(&buffer[..want]);
+            remaining -= want as u64;
+        }
+        checksums.push(hasher.finalize());
+    }
+    Ok(checksums)
+}
+
 fn contiguous_bytes(data: &DecodedChunk) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len_bytes());
     data.for_each_slice(|slice| out.extend_from_slice(slice));

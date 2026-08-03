@@ -6,6 +6,8 @@
 
 use super::*;
 
+use std::path::Path;
+
 use crate::pipeline::direct_store::DirectStoreGate;
 use crate::pipeline::direct_store::router::DemotionReason;
 
@@ -196,11 +198,35 @@ async fn run_direct_store_gate_with_budget(
     volumes: &[(String, Vec<u8>)],
     arrivals: &[(u32, u32)],
 ) -> GateOutcome {
+    run_direct_store_gate_with_ceilings(
+        gate,
+        holds_budget,
+        None,
+        job_id,
+        member_name,
+        volumes,
+        arrivals,
+    )
+    .await
+}
+
+async fn run_direct_store_gate_with_ceilings(
+    gate: DirectStoreGate,
+    holds_budget: Option<u64>,
+    scratch_ceiling: Option<u64>,
+    job_id: JobId,
+    member_name: &str,
+    volumes: &[(String, Vec<u8>)],
+    arrivals: &[(u32, u32)],
+) -> GateOutcome {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(gate);
     if let Some(bytes) = holds_budget {
         pipeline.direct_store.set_holds_budget(bytes);
+    }
+    if let Some(bytes) = scratch_ceiling {
+        pipeline.direct_store.set_holds_scratch_ceiling(bytes);
     }
     pipeline.live_par2.set_enabled(false);
 
@@ -1315,8 +1341,13 @@ fn payload_before_header_arrivals(volume_count: usize) -> Vec<(u32, u32)> {
     arrivals
 }
 
+/// D2's paging, at the seam the RAM budget used to demote at.
+///
+/// The first article is pure payload with no header yet, so it has nowhere to go
+/// and is held; the budget is far below it. Wave 3 pages it to the set's scratch
+/// file instead of demoting, and the set stays live.
 #[tokio::test]
-async fn direct_store_demotes_when_held_bytes_exceed_their_budget() {
+async fn direct_store_pages_held_bytes_to_scratch_instead_of_demoting() {
     let member_name = "Silver.Horizon.S01E12.mkv";
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 149) as u8).collect();
     let volumes = single_member_store_set(member_name, &payload, 3);
@@ -1324,8 +1355,6 @@ async fn direct_store_demotes_when_held_bytes_exceed_their_budget() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    // Phase 4 has no scratch paging, so the ceiling is a demotion trigger
-    // rather than a back-pressure signal; 64 MiB is unreachable in a test.
     pipeline.direct_store.set_holds_budget(64);
     pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41018);
@@ -1336,8 +1365,128 @@ async fn direct_store_demotes_when_held_bytes_exceed_their_budget() {
 
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
-        shape.contains("Demoted(HoldsBudgetExceeded)"),
-        "payload with no destination and no room to hold it must demote, got {shape}"
+        !shape.contains("Demoted"),
+        "a holds breach must page, not demote, got {shape}"
+    );
+    let set = pipeline.direct_store.set(job_id, 0).unwrap();
+    assert!(
+        set.router.scratch_bytes() > 0,
+        "the held payload must have reached the scratch file"
+    );
+    assert!(
+        set.router.resident_staged_bytes() <= 64,
+        "paging must bring RAM back inside the budget, got {}",
+        set.router.resident_staged_bytes()
+    );
+    // Named from the set so the restart sweep can find it by prefix, and
+    // disambiguated by the set's lowest NZB file index so two set names that
+    // sanitize to one component never share a scratch file — and with it, an
+    // append cursor and a region index.
+    assert!(
+        working_dir.join(".weaver-holds.silver.horizon.f0").exists(),
+        "the scratch file is named from the set, with its disambiguator, so the restart \
+         sweep can find it"
+    );
+    assert_eq!(
+        set.router.unaccounted_staged_bytes(),
+        0,
+        "every staged byte is either RAM-resident or paged; neither ceiling may be blind to it"
+    );
+}
+
+/// The paged holds are not merely stored — they route, and the set finishes
+/// byte-identically to a run that never breached its budget.
+#[tokio::test]
+async fn a_set_that_paged_its_holds_still_one_passes_byte_identically() {
+    let member_name = "Silver.Horizon.S01E13.mkv";
+    let payload: Vec<u8> = (0..3000u32).map(|index| (index % 151) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    // Every volume's payload before any header, so every one of them is held.
+    let arrivals = payload_before_header_arrivals(volumes.len());
+
+    let paged = run_direct_store_gate_with_budget(
+        DirectStoreGate::Enabled,
+        Some(64),
+        JobId(41051),
+        member_name,
+        &volumes,
+        &arrivals,
+    )
+    .await;
+    let unpaged = run_direct_store_gate(
+        DirectStoreGate::Enabled,
+        JobId(41052),
+        member_name,
+        &volumes,
+        &arrivals,
+    )
+    .await;
+    let conventional = run_direct_store_gate(
+        DirectStoreGate::Disabled,
+        JobId(41053),
+        member_name,
+        &volumes,
+        &arrivals,
+    )
+    .await;
+
+    assert_eq!(
+        conventional.member.as_deref(),
+        Some(payload.as_slice()),
+        "the conventional gate must produce the member"
+    );
+    assert!(
+        !paged.volume_file_seen,
+        "paging holds must not materialize a source volume"
+    );
+    assert_eq!(
+        (
+            paged.member.as_ref(),
+            paged.member_location,
+            paged.status.clone()
+        ),
+        (
+            unpaged.member.as_ref(),
+            unpaged.member_location,
+            unpaged.status
+        ),
+        "a paged run must match an unpaged direct run exactly"
+    );
+    assert_eq!(
+        (paged.member, paged.member_location, paged.status),
+        (
+            conventional.member,
+            conventional.member_location,
+            conventional.status
+        ),
+        "a paged run must match the conventional extractor exactly"
+    );
+}
+
+/// The scratch ceiling is the last lever: past it there is nowhere left to put
+/// the holds, and the set demotes with its own reason rather than the RAM one.
+#[tokio::test]
+async fn a_scratch_ceiling_breach_demotes_the_set() {
+    let member_name = "Silver.Horizon.S01E14.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 149) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.direct_store.set_holds_budget(64);
+    pipeline.direct_store.set_holds_scratch_ceiling(16);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(41054);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted(HoldsScratchCeiling)"),
+        "a scratch ceiling breach must demote with its own reason, got {shape}"
     );
     assert!(
         !working_dir
@@ -1352,7 +1501,7 @@ async fn a_demoted_set_completes_byte_identically_to_the_conventional_gate() {
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
     let volumes = single_member_store_set(member_name, &payload, 3);
 
-    // Payload first, with a holds ceiling too small to absorb it: the set
+    // Payload first, with neither RAM nor scratch room to absorb it: the set
     // demotes on its very first article and the archive itself stays perfectly
     // valid, so the refetch has to reproduce the conventional result exactly.
     // The trailing arrival is that first article coming back — exactly what the
@@ -1360,9 +1509,10 @@ async fn a_demoted_set_completes_byte_identically_to_the_conventional_gate() {
     let mut arrivals = payload_before_header_arrivals(volumes.len());
     arrivals.push((0, 1));
 
-    let direct = run_direct_store_gate_with_budget(
+    let direct = run_direct_store_gate_with_ceilings(
         DirectStoreGate::Enabled,
         Some(64),
+        Some(16),
         JobId(41019),
         member_name,
         &volumes,
@@ -2813,24 +2963,46 @@ async fn retained_envelope_bytes_count_against_the_staged_budget() {
     );
 
     // Part three: the same sequence under a budget smaller than the retained
-    // region demotes. Counting only unrouted holds — as the first shape did —
-    // would have found nothing to count at all.
+    // region pages it out (D2). Counting only unrouted holds — as the first
+    // shape did — would have found nothing to count at all, so nothing would
+    // have breached and nothing would have paged; the retained recovery record
+    // is what proves the accounting reaches the term RSS actually pays for.
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     pipeline.direct_store.set_holds_budget(BUDGET);
     pipeline.live_par2.set_enabled(false);
-    let job_id = JobId(41054);
+    let job_id = JobId(41055);
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
-    insert_active_job(&mut pipeline, job_id, spec).await;
+    let paged_dir = insert_active_job(&mut pipeline, job_id, spec).await;
     for (file_index, segment_number) in [(0u32, 0u32), (0, 1), (1, 0)] {
         submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
     }
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
-        shape.contains("Demoted(HoldsBudgetExceeded)"),
+        !shape.contains("Demoted"),
         "the retained recovery record is {RR_BYTES} bytes of RSS against a {BUDGET}-byte \
-         budget and must demote the set, got {shape}"
+         budget and must page rather than demote, got {shape}"
+    );
+    let set = pipeline.direct_store.set(job_id, 0).unwrap();
+    assert!(
+        set.router.scratch_bytes() >= RR_BYTES as u64,
+        "the retained recovery record must be what went to scratch, got {} bytes",
+        set.router.scratch_bytes()
+    );
+    assert!(
+        set.router.resident_staged_bytes() <= BUDGET,
+        "paging must bring RAM back inside the budget, got {}",
+        set.router.resident_staged_bytes()
+    );
+    // The envelope on disk is unaffected: paging moves the router's *retained
+    // copy*, never the routed bytes.
+    let envelope = std::fs::read(paged_dir.join("silver.horizon.vol00001.envelope"))
+        .expect("volume 1's envelope exists");
+    assert_eq!(
+        &envelope[rr_at..rr_at + RR_BYTES],
+        &volumes[1].1[rr_at..rr_at + RR_BYTES],
+        "paging the retained copy must not disturb what was already written"
     );
 }
 
@@ -3701,5 +3873,1237 @@ async fn a_tolerated_member_sharing_a_volume_with_a_routed_extent_extracts_befor
         "the tolerated member must be extracted through virtual volumes whose stored \
          extents still resolve, and both members must be byte-identical to the \
          conventional extractor"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Restart (plan 135, D6) — wave 3
+// ---------------------------------------------------------------------------
+
+use crate::pipeline::direct_store::barrier::BarrierDemand;
+
+/// The "before" half of a restart differential.
+///
+/// Runs a job's first articles with routing on, demands a barrier so the
+/// coverage is durable, and drops the pipeline — which is the process going
+/// away. The database and the working directory both live under `temp_dir`, so
+/// the "after" half opens exactly the state a real restart would find.
+async fn direct_store_before_restart(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    arrivals: &[(u32, u32)],
+    articles: usize,
+) -> PathBuf {
+    let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let spec = direct_store_job_spec_with_articles("Silver Horizon", volumes, articles);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in arrivals {
+        submit_volume_article_of(
+            &mut pipeline,
+            job_id,
+            volumes,
+            *file_index,
+            *segment_number,
+            articles,
+        )
+        .await;
+    }
+    pipeline
+        .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
+        .await;
+    working_dir
+}
+
+/// [`queued_segments`] without draining: restart tests need to *read* the queue
+/// and then keep feeding the pipeline, and a drained queue makes the completion
+/// gate conclude the download is exhausted and fail the job.
+fn peek_queued_segments(pipeline: &mut Pipeline, job_id: JobId) -> Vec<(u32, u32)> {
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    let work = state.download_queue.drain_all();
+    let mut out: Vec<(u32, u32)> = work
+        .iter()
+        .map(|item| {
+            (
+                item.segment_id.file_id.file_index,
+                item.segment_id.segment_number,
+            )
+        })
+        .collect();
+    for item in work {
+        state.download_queue.push(item);
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Pops one article off the queue — standing in for the dispatch that would have
+/// fetched it — and feeds its decoded bytes in.
+async fn dispatch_and_submit(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    file_index: u32,
+    segment_number: u32,
+    articles: usize,
+) {
+    take_queued_segment(
+        pipeline,
+        job_id,
+        SegmentId {
+            file_id: NzbFileId { job_id, file_index },
+            segment_number,
+        },
+    );
+    submit_volume_article_of(
+        pipeline,
+        job_id,
+        volumes,
+        file_index,
+        segment_number,
+        articles,
+    )
+    .await;
+}
+
+/// The "after" half: a fresh pipeline over the same database and working
+/// directory, with the job restored through the real restore seam.
+///
+/// `complete_files` and `file_progress` are deliberately **empty**. D7 keeps
+/// both of them empty for a direct set's source volumes — no legacy floor, no
+/// completed-file row — so a restore that skips anything at all is skipping it
+/// on the strength of the direct checkpoint and nothing else.
+async fn direct_store_after_restart(
+    temp_dir: &TempDir,
+    gate: DirectStoreGate,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    articles: usize,
+    working_dir: &Path,
+) -> Pipeline {
+    let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
+    pipeline.direct_store.set_gate(gate);
+    pipeline.live_par2.set_enabled(false);
+    let spec = direct_store_job_spec_with_articles("Silver Horizon", volumes, articles);
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            complete_files: HashSet::new(),
+            file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir: working_dir.to_path_buf(),
+        })
+        .await
+        .unwrap();
+    pipeline
+}
+
+/// Reads the member out of wherever the gate left it, the same two candidate
+/// places every other differential here checks.
+fn member_after_gate(
+    complete_dir: &Path,
+    working_dir: &Path,
+    member_name: &str,
+) -> (Option<Vec<u8>>, Option<&'static str>) {
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    match (
+        std::fs::read(output_root.join(member_name)).ok(),
+        std::fs::read(working_dir.join(member_name)).ok(),
+    ) {
+        (Some(bytes), _) => (Some(bytes), Some("complete")),
+        (None, Some(bytes)) => (Some(bytes), Some("working")),
+        (None, None) => (None, None),
+    }
+}
+
+/// The headline restart differential.
+///
+/// Volume 0 arrives whole, volume 1 arrives half. After the restart the
+/// checkpoint's floors must keep every article below them off the download
+/// queue, everything above them must come back, and the finished member must be
+/// byte-identical to a run that was never interrupted — and to the conventional
+/// extractor.
+#[tokio::test]
+async fn a_mid_download_restart_honours_its_floors_and_completes_byte_identically() {
+    const ARTICLES: usize = 4;
+    let member_name = "Silver.Horizon.S01E30.mkv";
+    let payload: Vec<u8> = (0..8000u32).map(|index| (index % 251) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41060);
+    // Volume 0 complete, volume 1 half — so the restore has one file it can skip
+    // entirely and one it must skip only part of.
+    let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1)];
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+
+    // The set came back from its checkpoint rather than from zero.
+    let set = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the restored job must carry its direct set");
+    assert!(
+        set.has_restart_seeded_coverage(),
+        "coverage restored from a checkpoint is seeded and unverified until it is re-read"
+    );
+    // D7 re-armed: a restored set's source volumes are still direct, so no
+    // legacy floor, completed-file row or archive re-probe may be written for
+    // them. The restore itself relies on the same thing in the other direction —
+    // no completed-file row exists for a direct volume by construction, so the
+    // legacy skip plan contributes nothing and the coverage row is the only
+    // reason anything is skipped at all.
+    assert!(
+        (0..volumes.len() as u32)
+            .all(|file_index| pipeline.is_direct_source_file(NzbFileId { job_id, file_index })),
+        "every restored source volume must still be suppressed as a direct volume"
+    );
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| state.assembly.archive_topologies().is_empty()),
+        "a restored direct set must not enter the archive topology"
+    );
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        !queued.iter().any(|(file_index, _)| *file_index == 0),
+        "volume 0 was complete at the barrier; none of its articles may be refetched, got {queued:?}"
+    );
+    assert!(
+        !queued.contains(&(1, 0)),
+        "volume 1's checkpointed articles must not be refetched, got {queued:?}"
+    );
+    // Volume 1's *second* article is checkpointed too and still comes back. The
+    // floor counts **decoded** source bytes while the spec's `<segment bytes>`
+    // is the yEnc-encoded size (~3% larger), so walking the spec against a
+    // decoded floor always stops one article short. That is safe — it refetches
+    // — and it is bounded to one article per *partially covered* volume, which
+    // is one article per volume in flight. A volume the checkpoint calls
+    // complete does not pay it at all, which is what the `complete` bit is for
+    // and what volume 0 above demonstrates.
+    assert!(
+        queued.contains(&(1, 1)) && queued.contains(&(1, 2)) && queued.contains(&(1, 3)),
+        "volume 1's uncheckpointed articles must come back, got {queued:?}"
+    );
+    assert!(
+        (0..ARTICLES as u32).all(|segment| queued.contains(&(2, segment))),
+        "volume 2 never arrived at all and must be refetched whole, got {queued:?}"
+    );
+
+    // Non-vacuity: the restart really did save work.
+    assert!(
+        queued.len() < volumes.len() * ARTICLES,
+        "a restart that refetches everything is not honouring any floor"
+    );
+
+    // Feed exactly what the restore asked for, and nothing else.
+    for (file_index, segment_number) in queued.clone() {
+        dispatch_and_submit(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES,
+        )
+        .await;
+    }
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_none_or(|set| !set.has_restart_seeded_coverage()),
+        "the member gate must have re-read the pre-restart ranges before finalizing"
+    );
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+    let complete_dir = temp_dir.path().join("complete");
+    let (restarted_member, restarted_location) =
+        member_after_gate(&complete_dir, &working_dir, member_name);
+    let restarted_status = job_status_for_assert(&pipeline, job_id);
+    assert!(
+        !volumes
+            .iter()
+            .any(|(filename, _)| working_dir.join(filename).exists()),
+        "a restarted direct set must still never materialize a source volume"
+    );
+    drop(pipeline);
+
+    let uninterrupted = run_direct_store_gate(
+        DirectStoreGate::Enabled,
+        JobId(41061),
+        member_name,
+        &volumes,
+        &in_order_arrivals(volumes.len()),
+    )
+    .await;
+    let conventional = run_direct_store_gate(
+        DirectStoreGate::Disabled,
+        JobId(41062),
+        member_name,
+        &volumes,
+        &in_order_arrivals(volumes.len()),
+    )
+    .await;
+
+    assert_eq!(
+        conventional.member.as_deref(),
+        Some(payload.as_slice()),
+        "the conventional gate must produce the member"
+    );
+    assert_eq!(
+        (
+            restarted_member.as_deref(),
+            restarted_location,
+            &restarted_status
+        ),
+        (
+            uninterrupted.member.as_deref(),
+            uninterrupted.member_location,
+            &uninterrupted.status
+        ),
+        "a restarted direct job must finish exactly as an uninterrupted one"
+    );
+    assert_eq!(
+        (restarted_member.as_deref(), restarted_location),
+        (conventional.member.as_deref(), conventional.member_location),
+        "a restarted direct job must finish exactly as the conventional extractor"
+    );
+}
+
+/// A byte corrupted on disk while the process was down is caught by the re-read,
+/// not committed (D6).
+#[tokio::test]
+async fn a_byte_corrupted_while_the_process_was_down_fails_the_member_gate() {
+    const ARTICLES: usize = 2;
+    let member_name = "Silver.Horizon.S01E31.mkv";
+    let payload: Vec<u8> = (0..4000u32).map(|index| (index % 241) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 2);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41063);
+    let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1)];
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
+
+    // Flip a byte the checkpoint claims, while "the process is down".
+    let partial = working_dir.join(format!("{member_name}.direct.partial"));
+    let mut bytes = std::fs::read(&partial).expect("volume 0 routed into the member partial");
+    assert!(!bytes.is_empty(), "the partial must hold routed bytes");
+    bytes[10] ^= 0xff;
+    std::fs::write(&partial, &bytes).unwrap();
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    for (file_index, segment_number) in queued {
+        dispatch_and_submit(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES,
+        )
+        .await;
+    }
+
+    // The **reason**, not merely "something demoted". A bare `Demoted` passes for
+    // a set that never got as far as the re-read — a refused row, a rebuild
+    // failure, a missing destination — and this test's whole subject is the
+    // re-read catching a byte that changed on disk.
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted(MemberChecksumMismatch)")
+            || shape.contains("Demoted(PartChecksumMismatch)"),
+        "corruption introduced while the process was down must fail the re-read gate on a \
+         checksum, not on some earlier refusal, got {shape}"
+    );
+    // The demotion deletes the set's partial outputs rather than committing
+    // them, and requeues the volumes for the conventional path — which in this
+    // harness has no server behind it, so the job stops here rather than
+    // finishing. What matters is that the corrupted bytes were never promoted to
+    // a destination.
+    let complete_dir = temp_dir.path().join("complete");
+    let (member, _) = member_after_gate(&complete_dir, &working_dir, member_name);
+    assert_eq!(
+        member, None,
+        "corrupt coverage must not be committed to the member's destination"
+    );
+    assert!(
+        !partial.exists(),
+        "a demoted set deletes its partials rather than leaving corrupt bytes behind"
+    );
+}
+
+/// With the gate off the rows are ignored, the job redownloads conventionally,
+/// and the direct-store files nothing claims are swept out of the way.
+#[tokio::test]
+async fn a_restart_with_the_gate_off_redownloads_and_sweeps_the_orphans() {
+    const ARTICLES: usize = 2;
+    let member_name = "Silver.Horizon.S01E32.mkv";
+    let payload: Vec<u8> = (0..4000u32).map(|index| (index % 233) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 2);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41064);
+    let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1), (1, 0)];
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
+
+    let partial = working_dir.join(format!("{member_name}.direct.partial"));
+    let envelope = working_dir.join("silver.horizon.vol00000.envelope");
+    assert!(partial.exists() && envelope.exists(), "non-vacuity");
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Disabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert_eq!(
+        queued.len(),
+        volumes.len() * ARTICLES,
+        "a disabled gate must redownload the whole job, got {queued:?}"
+    );
+    assert!(!partial.exists(), "the orphaned partial must be swept");
+    assert!(!envelope.exists(), "the orphaned envelope must be swept");
+    // Rows are **ignored**, not deleted: a re-enabled binary can still judge
+    // them, and it refuses them on the destination probe.
+    let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+    assert!(
+        !rows.is_empty(),
+        "a disabled gate must not destroy coverage a re-enabled one could judge"
+    );
+}
+
+/// A row written against a different layout plan is refused, its files are
+/// swept, and the row is deleted.
+#[tokio::test]
+async fn a_digest_mismatch_sweeps_the_sets_files_and_deletes_the_row() {
+    const ARTICLES: usize = 2;
+    let member_name = "Silver.Horizon.S01E33.mkv";
+    let payload: Vec<u8> = (0..4000u32).map(|index| (index % 229) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 2);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41065);
+    let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1), (1, 0)];
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
+
+    // Corrupt the row's plan digest by rewriting the blob's tail. Any decode or
+    // digest failure lands on the same refusal path.
+    {
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+        let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+        let (set_name, blob) = rows.into_iter().next().expect("a committed coverage row");
+        let mut corrupted = blob;
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xff;
+        pipeline
+            .db
+            .save_direct_coverage(job_id, &set_name, &corrupted)
+            .unwrap();
+    }
+
+    let partial = working_dir.join(format!("{member_name}.direct.partial"));
+    assert!(partial.exists(), "non-vacuity");
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert_eq!(
+        queued.len(),
+        volumes.len() * ARTICLES,
+        "a refused row must redownload the whole set, got {queued:?}"
+    );
+    assert!(
+        !partial.exists(),
+        "a refused set's partial must be swept before it redownloads"
+    );
+    assert!(
+        pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "a refused row is deleted"
+    );
+}
+
+/// Holds scratch from a killed run is swept at restore: it is append-only and
+/// meaningless without the in-memory index that named its regions.
+#[tokio::test]
+async fn restart_sweeps_stale_holds_scratch() {
+    const ARTICLES: usize = 2;
+    let member_name = "Silver.Horizon.S01E34.mkv";
+    let payload: Vec<u8> = (0..4000u32).map(|index| (index % 227) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 2);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41066);
+    let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1)];
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
+
+    // A killed run's scratch for a set this spec no longer produces: no plan
+    // names it, so the prefix rule is the only thing that can find it.
+    let stale_scratch = working_dir.join(".weaver-holds.a-set-that-is-gone");
+    std::fs::write(&stale_scratch, vec![0u8; 4096]).unwrap();
+    let unrelated = working_dir.join("keep-me.txt");
+    std::fs::write(&unrelated, b"not direct-store's").unwrap();
+
+    // Collateral the sweep used to take with it. `.envelope` is an extension a
+    // user's archive can carry, and the walk descends eight levels into a tree
+    // whose shape the archive controls — so a member extracted under that name is
+    // a file the sweep must leave completely alone.
+    let extracted_member = working_dir.join("chapter.envelope");
+    std::fs::write(&extracted_member, b"an extracted member, not an envelope").unwrap();
+    let nested = working_dir.join("Season 01");
+    std::fs::create_dir_all(&nested).unwrap();
+    let nested_member = nested.join("notes.envelope");
+    std::fs::write(&nested_member, b"also a member").unwrap();
+    // …and a holds-scratch *name* below the top level is not holds scratch
+    // either: the real one lives at the working-directory root by construction.
+    let nested_lookalike = nested.join(".weaver-holds.not-really");
+    std::fs::write(&nested_lookalike, b"still not direct-store's").unwrap();
+
+    let _pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+
+    assert!(
+        !stale_scratch.exists(),
+        "scratch from a killed run has no index and must be swept"
+    );
+    assert!(
+        unrelated.exists(),
+        "the sweep must only touch direct-store's own files"
+    );
+    for kept in [&extracted_member, &nested_member, &nested_lookalike] {
+        assert!(
+            kept.exists(),
+            "{} is a file the archive named, not one direct-store owns; the sweep must \
+             not delete it",
+            kept.display()
+        );
+    }
+}
+
+/// A restart inside the PAR2 finalization wait — the common case since wave 2,
+/// because a par2-bearing set stays byte-complete-but-uncommitted for the whole
+/// PAR2 download and verify.
+///
+/// Nothing of the set may be refetched: only the PAR2 index is still owed.
+#[tokio::test]
+async fn a_restart_during_the_par2_wait_refetches_nothing_of_the_set() {
+    let member_name = "Silver.Horizon.S01E35.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 199) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let par2_bytes = par2_index_over_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41070);
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
+
+    // Phase one: every volume arrives, the PAR2 index does not. The set is
+    // routed, gated and byte-complete, and finalization is waiting.
+    let working_dir = {
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+        pipeline.live_par2.set_enabled(true);
+        let working_dir = insert_active_job(&mut pipeline, job_id, spec.clone()).await;
+        for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+            submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number)
+                .await;
+        }
+        let set = pipeline
+            .direct_store
+            .set(job_id, 0)
+            .expect("the set must still exist: finalization is waiting for PAR2");
+        assert!(
+            set.all_volumes_complete() && !set.is_finalized() && !set.is_demoted(),
+            "the set must be byte-complete and unfinalized, which is the window this test is about"
+        );
+        // The last volume's completion already demanded a `PhaseChange` barrier,
+        // so the coverage is durable without a shutdown; demanding shutdown here
+        // only proves the row is there to read.
+        pipeline
+            .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
+            .await;
+        working_dir
+    };
+
+    let (mut pipeline, _, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(true);
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            complete_files: HashSet::new(),
+            file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir: working_dir.clone(),
+        })
+        .await
+        .unwrap();
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        queued
+            .iter()
+            .all(|(file_index, _)| *file_index == index_file_index),
+        "a byte-complete set must refetch nothing; only the PAR2 index is still owed, got {queued:?}"
+    );
+    assert!(
+        !queued.is_empty(),
+        "non-vacuity: the PAR2 index really was still outstanding"
+    );
+
+    take_queued_segment(
+        &mut pipeline,
+        job_id,
+        SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: index_file_index,
+            },
+            segment_number: 0,
+        },
+    );
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+
+    // The set is byte-perfect — its virtual volumes read back exactly the
+    // volumes the conventional gate would have written — and nothing of it was
+    // refetched. It must now also *stay* direct.
+    //
+    // The gate that used to break this is upstream of direct-store:
+    // `clean_par2_integrity_gate` was computed from the job's **archive
+    // topology**, which a direct set never enters by construction (D7). While
+    // the job is live that never showed, because live PAR2 (phase 2) verifies
+    // from the decode buffer and short-circuits the authoritative pass — rev 9's
+    // "live PAR2 is load-bearing". After a restart there is no decode buffer: no
+    // article of the set arrives, live PAR2 has nothing to hash, the gate read
+    // `None`, and the completion gate took its repair branch — which materializes
+    // every still-routing set and redownloads a set that was already perfect.
+    // Direct RAR sets now contribute `StrongDecode` themselves.
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        !shape.contains("Demoted"),
+        "a byte-complete direct set must survive a par2-bearing restart rather than \
+         being materialized and redownloaded, got {shape}"
+    );
+
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+    let complete_dir = temp_dir.path().join("complete");
+    let (member, location) = member_after_gate(&complete_dir, &working_dir, member_name);
+    assert_eq!(
+        (member.as_deref(), location),
+        (Some(payload.as_slice()), Some("complete")),
+        "the restarted par2-bearing job must finish where the conventional gate does"
+    );
+    assert!(
+        !volumes
+            .iter()
+            .any(|(filename, _)| working_dir.join(filename).exists()),
+        "and must still never materialize a source volume"
+    );
+}
+
+/// The predicate that keeps the `StrongDecode` contribution honest: the fold is
+/// job-wide and the strongest contribution wins, so a restored direct RAR set in
+/// a job that also carries a conventional split archive must contribute
+/// **nothing** — otherwise the split archive's authoritative PAR2 pass is skipped
+/// on the strength of member CRCs that say nothing about it.
+///
+/// The set is restored rather than live so the *other* two predicates are
+/// satisfied and `only_rar_archives` is the one thing deciding the outcome.
+#[tokio::test]
+async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritative_pass() {
+    let member_name = "Silver.Horizon.S01E42.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 197) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let split_bytes: Vec<u8> = (0..1500u32).map(|index| (index % 211) as u8).collect();
+
+    // One PAR2 index describing the RAR volumes *and* the split archive's parts,
+    // so a single par2 set covers both populations of the job.
+    let split_parts: Vec<(String, Vec<u8>)> = (0..2usize)
+        .map(|part| {
+            let chunk = split_bytes.len().div_ceil(2);
+            let start = part * chunk;
+            let end = ((part + 1) * chunk).min(split_bytes.len());
+            (
+                format!("silver.horizon.iso.{:03}", part + 1),
+                split_bytes[start..end].to_vec(),
+            )
+        })
+        .collect();
+    let mut all_files = volumes.clone();
+    all_files.extend(split_parts.iter().cloned());
+    let described: Vec<(&str, &[u8])> = all_files
+        .iter()
+        .map(|(filename, bytes)| (filename.as_str(), bytes.as_slice()))
+        .collect();
+    let par2_bytes = build_test_par2_index_for_files(&described, PAR2_SLICE_BYTES);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41082);
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &all_files, &par2_bytes);
+
+    // Phase one: everything but the PAR2 index arrives, then the process dies
+    // inside the finalization wait — the restart the gate change is about.
+    let working_dir = {
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+        pipeline.live_par2.set_enabled(false);
+        let working_dir = insert_active_job(&mut pipeline, job_id, spec.clone()).await;
+        for (file_index, segment_number) in in_order_arrivals(all_files.len()) {
+            submit_volume_article(
+                &mut pipeline,
+                job_id,
+                &all_files,
+                file_index,
+                segment_number,
+            )
+            .await;
+        }
+        pipeline
+            .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
+            .await;
+        working_dir
+    };
+
+    let (mut pipeline, _, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            complete_files: HashSet::new(),
+            file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir: working_dir.clone(),
+        })
+        .await
+        .unwrap();
+
+    // The split archive is not direct-store's, so restart owes its articles;
+    // feeding them back is what puts it into the archive topology.
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    for (file_index, segment_number) in queued {
+        if file_index == index_file_index {
+            continue;
+        }
+        dispatch_and_submit(
+            &mut pipeline,
+            job_id,
+            &all_files,
+            file_index,
+            segment_number,
+            2,
+        )
+        .await;
+    }
+
+    assert!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| set.was_restored() && !set.is_demoted()),
+        "non-vacuity: the RAR set really did come back from its checkpoint, which is \
+         what satisfies the gate's other two predicates"
+    );
+    assert!(
+        pipeline.jobs.get(&job_id).is_some_and(|state| state
+            .assembly
+            .archive_topologies()
+            .values()
+            .any(|topology| topology.archive_type != crate::jobs::assembly::ArchiveType::Rar)),
+        "non-vacuity: the split archive really is in the topology as a non-RAR archive, \
+         so `only_rar_archives` is false and is the predicate under test"
+    );
+
+    assert!(
+        !pipeline.direct_rar_contributes_strong_decode(job_id),
+        "a restored direct RAR set must contribute nothing to a job that also carries a \
+         conventional split archive: the fold is job-wide and the strongest contribution \
+         wins, so contributing here skips the authoritative pass for the split archive — \
+         whose integrity the RAR members' CRC32s say nothing about"
+    );
+
+    // The other side of the same predicate, through the same harness: the RAR
+    // volumes alone — the identical set, restored the identical way — do earn the
+    // contribution. Without this the assertion above passes for any reason at
+    // all, including the contribution being dead.
+    let rar_only_job = JobId(41083);
+    let (rar_spec, _) = par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
+    let rar_working_dir = {
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+        pipeline.live_par2.set_enabled(false);
+        let working_dir = insert_active_job(&mut pipeline, rar_only_job, rar_spec.clone()).await;
+        for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+            submit_volume_article(
+                &mut pipeline,
+                rar_only_job,
+                &volumes,
+                file_index,
+                segment_number,
+            )
+            .await;
+        }
+        pipeline
+            .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
+            .await;
+        working_dir
+    };
+    let (mut rar_pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    rar_pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    rar_pipeline.live_par2.set_enabled(false);
+    rar_pipeline
+        .restore_job(RestoreJobRequest {
+            job_id: rar_only_job,
+            job_hash: [0; 32],
+            spec: rar_spec,
+            complete_files: HashSet::new(),
+            file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir: rar_working_dir,
+        })
+        .await
+        .unwrap();
+    // The contribution is only earned once D6's gate re-arm has re-read the
+    // restored bytes — that is the third predicate — and the re-arm runs at the
+    // download/verify boundary, which for a byte-complete set is here.
+    assert!(
+        rar_pipeline
+            .direct_store
+            .set(rar_only_job, 0)
+            .is_some_and(|set| set.was_restored() && set.has_restart_seeded_coverage()),
+        "non-vacuity: the set came back seeded and unverified, which is the state the \
+         third predicate refuses"
+    );
+    assert!(
+        !rar_pipeline.direct_rar_contributes_strong_decode(rar_only_job),
+        "a set still carrying unverified restart-seeded bytes has decoded nothing this \
+         run and must not claim decode strength"
+    );
+    rar_pipeline.finalize_ready_direct_sets(rar_only_job).await;
+    assert!(
+        rar_pipeline.direct_rar_contributes_strong_decode(rar_only_job),
+        "non-vacuity: the same restored set in an all-RAR job does earn the contribution \
+         once its gates are re-armed, so the refusal above is the split archive's doing \
+         and not a dead predicate"
+    );
+}
+
+/// D2's last failure mode: the scratch file cannot be opened at all.
+#[tokio::test]
+async fn a_scratch_io_failure_demotes_the_set() {
+    let member_name = "Silver.Horizon.S01E36.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 149) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.direct_store.set_holds_budget(64);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(41072);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // A directory where the scratch file belongs: every open of it fails, on
+    // every platform, without needing permission games.
+    std::fs::create_dir(working_dir.join(".weaver-holds.silver.horizon.f0")).unwrap();
+
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted(HoldsScratchFailed)"),
+        "a scratch that cannot be written must demote with its own reason, got {shape}"
+    );
+}
+
+/// D6's pause demand, driven through the command seam it is wired at.
+#[tokio::test]
+async fn pausing_a_job_with_dirty_direct_coverage_demands_a_barrier() {
+    let member_name = "Silver.Horizon.S01E37.mkv";
+    let payload: Vec<u8> = (0..3000u32).map(|index| (index % 191) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(41073);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in [(0u32, 0u32), (0, 1)] {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+
+    let generation = |pipeline: &Pipeline| -> u64 {
+        pipeline
+            .db
+            .load_direct_coverage(job_id)
+            .unwrap()
+            .values()
+            .next()
+            .map(|blob| {
+                crate::pipeline::direct_store::snapshot::decode(blob)
+                    .unwrap()
+                    .generation
+            })
+            .unwrap_or(0)
+    };
+    // Neither the byte threshold nor the 5 s timer has fired: the coverage is
+    // dirty and uncheckpointed, which is exactly the state a pause must not
+    // leave behind.
+    let before = generation(&pipeline);
+
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    let command = SchedulerCommand::PauseJob { job_id, reply };
+    let scope = Pipeline::pause_barrier_scope(&command)
+        .expect("a pause command must be classified as a barrier demand");
+    pipeline.demand_direct_store_barriers_for_pause(scope).await;
+
+    let after = generation(&pipeline);
+    assert!(
+        after > before,
+        "pausing a job with dirty direct coverage must advance the row's generation \
+         ({before} -> {after})"
+    );
+
+    // And a command that is not a pause raises no demand at all.
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    assert!(
+        Pipeline::pause_barrier_scope(&SchedulerCommand::ResumeJob { job_id, reply }).is_none(),
+        "only pause commands demand a barrier"
+    );
+}
+
+/// Reads the one accepted coverage row of a job back out of the database.
+fn coverage_snapshot_of(
+    pipeline: &Pipeline,
+    job_id: JobId,
+) -> crate::pipeline::direct_store::snapshot::CoverageSnapshot {
+    let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+    let blob = rows
+        .values()
+        .next()
+        .expect("the set must have checkpointed at least once");
+    crate::pipeline::direct_store::snapshot::decode(blob).expect("the row must decode")
+}
+
+/// B1: the checkpoint's per-volume `complete` bit means *all bytes durable*, and
+/// restart skips every segment of the file on the strength of it.
+///
+/// A volume can finish downloading while every one of its bytes is still held —
+/// here a middle volume arrives whole before the volume whose chain would let
+/// the layout place it — and a bit latched at the article-complete seam
+/// checkpoints `{floor: header prefix only, complete: true}`. Restart then skips
+/// every segment of a volume whose payload does not exist, and the set can
+/// neither finalize (its member gate has nothing to compose) nor demote (its
+/// reconstruction has nothing to read): a permanent zombie.
+#[tokio::test]
+async fn a_volume_completing_into_held_bytes_is_not_checkpointed_complete() {
+    const ARTICLES: usize = 2;
+    const HELD: u32 = 1;
+    let member_name = "Silver.Horizon.S01E40.mkv";
+    let payload: Vec<u8> = (0..6000u32).map(|index| (index % 239) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41080);
+    // The middle volume arrives whole while the volume that starts the member's
+    // chain is entirely absent, so the layout cannot place a byte of it.
+    let arrivals: Vec<(u32, u32)> = vec![(HELD, 0), (HELD, 1)];
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
+
+    // What the row actually says about that volume, read straight out of the
+    // database the restart is about to consult.
+    {
+        let (probe, _, _) = new_direct_pipeline(&temp_dir).await;
+        let snapshot = coverage_snapshot_of(&probe, job_id);
+        let entry = snapshot
+            .floors
+            .iter()
+            .find(|entry| entry.file_index == HELD)
+            .expect("the completed volume must appear in the checkpoint");
+        // Only the volume's own header prefix could be classified — its payload
+        // belongs to a member chain the layout cannot place without the volume
+        // before it — so the floor stops far short of the volume.
+        assert!(
+            entry.floor > 0 && entry.floor < volumes[HELD as usize].1.len() as u64,
+            "non-vacuity: this volume's payload really is all held, so its floor covers \
+             only the header prefix (floor {} of {} bytes)",
+            entry.floor,
+            volumes[HELD as usize].1.len()
+        );
+        assert!(
+            !entry.complete,
+            "a volume whose floor covers none of its payload must not be checkpointed \
+             complete: restart would skip every segment of a volume whose bytes do not \
+             exist ({entry:?})"
+        );
+    }
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        (0..ARTICLES as u32).all(|segment| queued.contains(&(HELD, segment))),
+        "every segment of a volume whose bytes were held must come back, got {queued:?}"
+    );
+    assert_eq!(
+        queued.len(),
+        volumes.len() * ARTICLES,
+        "only a header prefix was durable, so the whole job is owed, got {queued:?}"
+    );
+
+    for (file_index, segment_number) in queued {
+        dispatch_and_submit(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES,
+        )
+        .await;
+    }
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+    let complete_dir = temp_dir.path().join("complete");
+    let (member, _) = member_after_gate(&complete_dir, &working_dir, member_name);
+    assert_eq!(
+        member.as_deref(),
+        Some(payload.as_slice()),
+        "the job must finish rather than wedge on a volume it was told it already had"
+    );
+}
+
+/// B2's other half: a restored volume whose header walk the previous run never
+/// finished cannot be confirmed by a parse — its pre-restart bytes are on disk
+/// rather than in the staged image — and the format cannot vouch for its tail
+/// either, because the volume *closes* the member chain and a second member's
+/// header could sit past the first's data area.
+///
+/// It must therefore leave direct mode by the front door, with its own reason,
+/// rather than hold its end-of-archive record for the life of the set and let a
+/// byte-perfect set read short to PAR2.
+#[tokio::test]
+async fn a_restored_last_volume_that_cannot_reconfirm_demotes_by_name() {
+    const ARTICLES: usize = 4;
+    let member_name = "Silver.Horizon.S01E41.mkv";
+    let payload: Vec<u8> = (0..8000u32).map(|index| (index % 229) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41081);
+    // Restart lands mid-download of the **last** volume: its end-of-archive
+    // record has not arrived, so the cached facts stop short of it.
+    let arrivals: Vec<(u32, u32)> = vec![
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+        (1, 3),
+        (2, 0),
+        (2, 1),
+    ];
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| !set.is_demoted()),
+        "non-vacuity: the set came back from its checkpoint still routing"
+    );
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        queued.iter().any(|(file_index, _)| *file_index == 2),
+        "non-vacuity: the last volume really was still owed articles, got {queued:?}"
+    );
+    for (file_index, segment_number) in queued {
+        dispatch_and_submit(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES,
+        )
+        .await;
+    }
+
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted(UnconfirmedRestoredVolume)"),
+        "a restored volume that can never be confirmed must demote under its own \
+         reason rather than hold its tail, got {shape}"
+    );
+    // Never wedged. The demotion is a *transition*, not a dead end: the set's
+    // routed output is gone and the conventional path owns the volumes now,
+    // either as materialized files or as work back on the queue. What must not
+    // happen — and what holding the tail produced — is a set that stays direct,
+    // finalizes nothing and refetches nothing.
+    let materialized = volumes
+        .iter()
+        .filter(|(filename, _)| working_dir.join(filename).exists())
+        .count();
+    let requeued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        materialized > 0 || !requeued.is_empty(),
+        "a demoted set must hand its volumes to the conventional path, either \
+         materialized or refetched (materialized {materialized}, requeued {requeued:?})"
+    );
+    for (filename, bytes) in &volumes {
+        let Some(on_disk) = std::fs::read(working_dir.join(filename)).ok() else {
+            continue;
+        };
+        assert_eq!(
+            on_disk.as_slice(),
+            bytes.as_slice(),
+            "{filename} was materialized, so it must be byte-exact"
+        );
+    }
+    let complete_dir = temp_dir.path().join("complete");
+    let (member, _) = member_after_gate(&complete_dir, &working_dir, member_name);
+    assert_eq!(
+        member, None,
+        "an unconfirmed volume's set must not commit a member it could not prove"
     );
 }

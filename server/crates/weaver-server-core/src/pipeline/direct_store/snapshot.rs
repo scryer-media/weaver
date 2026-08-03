@@ -23,9 +23,19 @@ use crate::pipeline::extraction::validate_sanitized_rar_member_path;
 /// `W`eaver `D`irect `S`tore `C`overage.
 pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 
-/// Bump on any change to the body layout below. Decoding is forward-refusing:
-/// a newer writer's blob is rejected outright rather than partially trusted.
-pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+/// Bump on any change to the body layout below. Decoding accepts **exactly**
+/// this version — a newer writer's blob is rejected rather than partially
+/// trusted, and so is an older one — so a bump is also the way to retire rows
+/// whose *meaning* changed under a field that kept its type.
+///
+/// - 2: `VolumeFloor::complete` added.
+/// - 3: `VolumeFloor::complete` narrowed from "every article arrived" to "every
+///   article arrived **and** the floor covers all of them". A v2 writer could
+///   publish `{floor: 0, complete: true}` for a volume whose bytes were still
+///   held, and a v3 reader trusting that bit would skip every segment of a
+///   volume no byte of which exists. Refusing the row costs one redownload;
+///   trusting it wedges the set permanently.
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 
 const FRAME_HEADER_LEN: usize = 6;
 
@@ -76,6 +86,48 @@ pub(crate) struct VolumeFloor {
     /// Contiguous bytes of the source volume durably written to destinations.
     /// Everything above this is redownloaded.
     pub(crate) floor: u64,
+    /// Every article of the source volume arrived **and** every one of its bytes
+    /// is below `floor`, so restart may skip the volume's segments outright.
+    ///
+    /// Carried explicitly because the floor **cannot** say it. A floor counts
+    /// *decoded* source bytes, while an NZB's `<segment bytes>` is the
+    /// yEnc-**encoded** size — about 3% larger — so walking the spec's segments
+    /// against a decoded floor always stops one article short of the truth. That
+    /// is safe (it refetches), but for a byte-complete volume it means refetching
+    /// the last article of every volume of a set that is entirely on disk, which
+    /// is precisely the restart the PAR2 finalization wait makes common. This
+    /// flag is the one bit that closes the gap, and it is a bit **per volume**,
+    /// not per segment, so it costs nothing the D6 shape objects to.
+    ///
+    /// # It is a conjunction, not a latch
+    ///
+    /// "Every article arrived" on its own is **not** what restart reads. Restart
+    /// reads this as *all bytes durable* and skips every segment of the file on
+    /// the strength of it. A volume can finish downloading while its bytes are
+    /// still held — payload staged before the header that classifies it, an
+    /// out-of-order volume the layout cannot place yet — and a bit latched at the
+    /// article-complete seam would checkpoint `{floor: 0, complete: true}`. That
+    /// row skips every segment of a volume no byte of which exists: the set can
+    /// then neither finalize (its member gate has nothing to compose) nor demote
+    /// (its reconstruction has nothing to read), which is a permanent zombie.
+    ///
+    /// So the writer re-derives it at **every** barrier as `download finished &&
+    /// floor >= decoded length` ([`super::barrier::CoverageBarrier`]), and a
+    /// volume whose held bytes have not reached the floor publishes `false` until
+    /// they do. `complete == true` therefore always implies `floor` is the
+    /// volume's whole decoded length, which is what the restore seam relies on
+    /// when it derives a restored volume's confirmation.
+    ///
+    /// Trusting it is bounded: the bytes it lets restart skip are the same bytes
+    /// the destination probe length-checks and the member gate re-reads and
+    /// re-composes before the set may finalize, so a wrong flag fails a checksum
+    /// rather than committing a hole.
+    ///
+    /// No `#[serde(default)]`: the body is the **compact positional** MessagePack
+    /// form, where a missing trailing field is a short array rather than an absent
+    /// name, and decoding refuses any schema version but its own — so a default
+    /// here could never fire.
+    pub(crate) complete: bool,
 }
 
 /// The decoded checkpoint.
@@ -94,8 +146,11 @@ pub(crate) struct CoverageSnapshot {
 }
 
 impl CoverageSnapshot {
-    /// Restart-side lookup; unwired with the rest of the reader (see `restart`).
-    #[allow(dead_code)]
+    /// Restart-side lookup by volume. The restore seam derives its refetch
+    /// floors per **NZB file** ([`super::restart::refetch_floors`]), which is the
+    /// coordinate segments live in; this is the layout-side view, kept for the
+    /// tests that assert the two agree.
+    #[cfg(test)]
     pub(crate) fn floor_for_volume(&self, volume_index: u32) -> Option<u64> {
         self.floors
             .binary_search_by_key(&volume_index, |entry| entry.volume_index)

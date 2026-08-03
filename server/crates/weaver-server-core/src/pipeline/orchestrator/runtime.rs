@@ -53,6 +53,7 @@ impl Pipeline {
         tokio::fs::create_dir_all(&data_dir).await?;
         tokio::fs::create_dir_all(&intermediate_dir).await?;
         tokio::fs::create_dir_all(&complete_dir).await?;
+        let extraction_limits = Arc::new(ExtractionLimits::from_env(&complete_dir)?);
 
         let (download_done_tx, download_done_rx) = mpsc::channel(256);
         let (download_refill_tx, download_refill_rx) = mpsc::channel(256);
@@ -231,6 +232,8 @@ impl Pipeline {
             par2_runtime: HashMap::new(),
             live_par2: crate::pipeline::repair::live::LivePar2Registry::new(),
             direct_store: crate::pipeline::direct_store::wiring::DirectStoreRuntime::default(),
+            extraction_limits,
+            extraction_budgets: HashMap::new(),
             extracted_members: HashMap::new(),
             extracted_archives: HashMap::new(),
             decode_retries: HashMap::new(),
@@ -757,7 +760,12 @@ impl Pipeline {
                         .await;
                         break 'run_loop;
                     }
-                    Ok(cmd) => self.handle_command(cmd).await,
+                    Ok(cmd) => {
+                        if let Some(scope) = Self::pause_barrier_scope(&cmd) {
+                            self.demand_direct_store_barriers_for_pause(scope).await;
+                        }
+                        self.handle_command(cmd).await
+                    }
                     Err(_) => break,
                 }
             }
@@ -774,7 +782,12 @@ impl Pipeline {
                                 info!("pipeline shutting down");
                                 break;
                             }
-                            Some(cmd) => self.handle_command(cmd).await,
+                            Some(cmd) => {
+                                if let Some(scope) = Self::pause_barrier_scope(&cmd) {
+                                    self.demand_direct_store_barriers_for_pause(scope).await;
+                                }
+                                self.handle_command(cmd).await
+                            }
                         }
                     }
                     Some(result) = self.download_done_rx.recv() => {
@@ -948,6 +961,35 @@ impl Pipeline {
 
         self.drain().await;
         info!("pipeline stopped");
+    }
+
+    /// D6's pause demand, at the command seam.
+    ///
+    /// A paused job stops feeding the byte trigger and its sets go quiet, so
+    /// without this the last interval's coverage would sit uncheckpointed for
+    /// however long the pause lasts — and a pause is a common thing to do
+    /// *before* stopping the process. Demanded here rather than inside
+    /// `pause_job_runtime`, which is synchronous and is also the transition every
+    /// other pause path funnels through after the fact; the command is the point
+    /// where the intent is known and the job has not stopped yet.
+    /// Classified synchronously and by value: a `&SchedulerCommand` held across
+    /// the await below would make the whole pipeline future non-`Send`, because
+    /// the command carries reply channels whose payloads are `Send` but not
+    /// `Sync`.
+    pub(crate) fn pause_barrier_scope(command: &SchedulerCommand) -> Option<Option<JobId>> {
+        match command {
+            SchedulerCommand::PauseJob { job_id, .. } => Some(Some(*job_id)),
+            SchedulerCommand::PauseAll { .. } => Some(None),
+            _ => None,
+        }
+    }
+
+    pub(crate) async fn demand_direct_store_barriers_for_pause(&mut self, scope: Option<JobId>) {
+        let demand = crate::pipeline::direct_store::barrier::BarrierDemand::Pause;
+        match scope {
+            Some(job_id) => self.demand_direct_store_barriers(job_id, demand).await,
+            None => self.demand_direct_store_barriers_for_all_jobs(demand).await,
+        }
     }
 
     pub(crate) fn next_restart_durable_lead_retry_delay(&self) -> Option<std::time::Duration> {

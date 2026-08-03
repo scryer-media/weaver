@@ -1425,7 +1425,7 @@ impl Pipeline {
         };
         let (stale_rar_sets, refreshed_rar_files) =
             Self::scrub_restored_par2_file_identities(&mut file_identities);
-        let restore_skip_plan = Self::build_restore_skip_plan(
+        let mut restore_skip_plan = Self::build_restore_skip_plan(
             job_id,
             &spec,
             &complete_files,
@@ -1434,6 +1434,23 @@ impl Pipeline {
             &working_dir,
         )
         .await;
+        // Plan 135, D6. A direct set's source volumes have no legacy floor and
+        // no completed-file row by construction (D7), so everything above comes
+        // back empty for them; their coverage lives in the direct checkpoint and
+        // feeds exactly the same skip set. Merged before the assembly is built,
+        // because the assembly is what turns a skipped segment into work the job
+        // does not queue.
+        let direct_restore = self
+            .restore_direct_store_coverage(job_id, &spec, &working_dir)
+            .await;
+        restore_skip_plan.skip.extend(direct_restore.skip.iter());
+        for (file_index, floor) in &direct_restore.file_progress {
+            let slot = restore_skip_plan
+                .file_progress
+                .entry(*file_index)
+                .or_insert(*floor);
+            *slot = (*slot).max(*floor);
+        }
         let (assembly, download_queue, recovery_queue) =
             Self::build_job_assembly(job_id, &spec, &restore_skip_plan.skip);
         let status = Self::normalize_restored_status(status, &download_queue, &recovery_queue);
@@ -1595,6 +1612,16 @@ impl Pipeline {
         };
         state.refresh_runtime_lanes_from_status();
         self.jobs.insert(job_id, state);
+        // After the job state exists, and before anything can decode a segment
+        // for it: `install_restored` marks the job examined, so the lazy
+        // admission seam does not rediscover the same sets from the spec and
+        // discard the coverage this restore just validated.
+        let direct_sets = direct_restore.sets;
+        let direct_accepted = direct_restore.accepted;
+        let direct_rejected = direct_restore.rejected;
+        let direct_ignored = direct_restore.ignored;
+        let direct_swept = direct_restore.swept;
+        self.direct_store.install_restored(job_id, direct_sets);
         self.restore_download_finalization_runtime(job_id).await;
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
@@ -1686,6 +1713,10 @@ impl Pipeline {
             checkpoint_floor_bytes = restore_skip_plan.stats.checkpoint_floor_bytes,
             clamped_checkpoint_files = restore_skip_plan.stats.clamped_checkpoint_files,
             missing_checkpoint_files = restore_skip_plan.stats.missing_checkpoint_files,
+            direct_accepted,
+            direct_rejected,
+            direct_ignored,
+            direct_swept,
             "job restored from journal"
         );
         if !restored_terminal_post_processing

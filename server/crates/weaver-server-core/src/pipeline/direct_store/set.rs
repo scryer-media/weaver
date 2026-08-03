@@ -1,7 +1,7 @@
 //! One live direct set: its router, its coverage barrier, and the bookkeeping
 //! that keeps the two agreeing (plan 135, D3/D6).
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Instant;
 
 use super::ByteRanges;
@@ -52,8 +52,15 @@ pub(crate) struct DirectSet {
     barrier: Option<CoverageBarrier>,
     registered_members: HashSet<u32>,
     registered_volumes: bool,
-    /// Source volumes whose NZB file has completed.
-    complete_volumes: BTreeSet<u32>,
+    /// Source volumes whose NZB file has completed, and the **decoded** length
+    /// each one turned out to be.
+    ///
+    /// The length rides along because the checkpoint's per-volume `complete` bit
+    /// is the conjunction of "download finished" and "the floor covers all of it"
+    /// — see [`super::snapshot::VolumeFloor::complete`] — and the barrier can only
+    /// evaluate the second half against a length. Replaying a completion into a
+    /// freshly built barrier (see [`Self::ensure_registered`]) needs it too.
+    complete_volumes: BTreeMap<u32, u64>,
     /// Per-volume yEnc part-CRC32 composition over *source* space (M4).
     ///
     /// A physical volume is checked against its `=yend crc32` trailer at
@@ -86,6 +93,10 @@ pub(crate) struct DirectSet {
     placed_envelope: BTreeMap<u32, ByteRanges>,
     /// Coverage restored from a checkpoint, applied when the barrier is built.
     resumed: Option<CoverageSnapshot>,
+    /// Volumes whose logical length must be read off the coverage map rather
+    /// than off the assembly's `received_bytes` — see
+    /// [`Self::virtual_volume_len`].
+    restart_seeded_volumes: BTreeSet<u32>,
     /// The demotion's one-time cleanup (delete output, retire the row, refetch)
     /// has already run. The *status* alone cannot say so: the router demotes
     /// the set from inside `route`, so by the time the wiring seam is told, the
@@ -117,12 +128,13 @@ impl DirectSet {
             barrier: None,
             registered_members: HashSet::new(),
             registered_volumes: false,
-            complete_volumes: BTreeSet::new(),
+            complete_volumes: BTreeMap::new(),
             volume_crcs: BTreeMap::new(),
             segment_extents: BTreeMap::new(),
             placed: BTreeMap::new(),
             placed_envelope: BTreeMap::new(),
             resumed: None,
+            restart_seeded_volumes: BTreeSet::new(),
             demotion_cleaned_up: false,
             latched_direct: false,
             latched_materialized: false,
@@ -130,12 +142,156 @@ impl DirectSet {
         }
     }
 
-    /// Seeds the set with an accepted checkpoint. The barrier is rebuilt from it
-    /// as soon as the layout names a member again. Reached only from the restart
-    /// reader, which phase 4 left unwired (see `restart`'s module docs).
-    #[allow(dead_code)]
-    pub(crate) fn resume_from(&mut self, snapshot: CoverageSnapshot) {
-        self.resumed = Some(snapshot);
+    /// Rebuilds the set's layout from its cached volume facts (D6).
+    ///
+    /// Runs **before** the checkpoint is validated, because validating it needs
+    /// the plan digest and the digest binds the member destinations, which only
+    /// exist once the layout has named them. A set whose facts no longer form a
+    /// routable archive demotes here and redownloads — the same outcome a refused
+    /// checkpoint produces, reached one step earlier.
+    pub(crate) fn restore_layout(
+        &mut self,
+        facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
+    ) -> Result<(), DemotionReason> {
+        match self.router.restore_layout(facts) {
+            Ok(()) => Ok(()),
+            Err(reason) => {
+                self.demote(reason);
+                Err(reason)
+            }
+        }
+    }
+
+    /// Seeds the set with an accepted checkpoint: the barrier's floors and
+    /// claims, the router's coverage, and the volumes whose download is done.
+    ///
+    /// # Re-keying
+    ///
+    /// The blob's destination keys are the **previous run's** member ids, which
+    /// are in-run counters assigned as volumes arrived. This run rebuilt its
+    /// layout from the complete fact set in volume order, so it may well have
+    /// numbered the same members differently. Every claim is therefore re-keyed
+    /// by its relative path — the durable identity, derived from the header name
+    /// — and a claim naming a path this layout does not produce is **dropped**:
+    /// its bytes go unclaimed and are refetched, which is the safe direction.
+    /// Keeping it would leave the barrier with two destinations for one file and
+    /// the next snapshot claiming the same bytes twice.
+    ///
+    /// `complete_volumes` maps each volume the checkpoint calls complete to its
+    /// decoded length. That length is the row's own floor: a published `complete`
+    /// means the floor covers the whole decoded volume, so the two are the same
+    /// number by construction (see [`super::snapshot::VolumeFloor::complete`]).
+    pub(crate) fn apply_restored_snapshot(
+        &mut self,
+        snapshot: &CoverageSnapshot,
+        complete_volumes: &BTreeMap<u32, u64>,
+    ) {
+        let mut keys: HashMap<String, u32> = self
+            .router
+            .member_partials()
+            .into_iter()
+            .map(|(member_id, _, partial)| (partial.to_string(), member_id))
+            .collect();
+        for volume_index in self.router.plan().volumes.keys() {
+            keys.insert(
+                self.router.plan().envelope_relative_path(*volume_index),
+                envelope_destination_key(*volume_index),
+            );
+        }
+
+        let mut rekeyed = snapshot.clone();
+        rekeyed
+            .destinations
+            .retain_mut(|claim| match keys.get(&claim.relative_path).copied() {
+                Some(member_index) => {
+                    claim.member_index = member_index;
+                    true
+                }
+                None => false,
+            });
+        rekeyed.destinations.sort_by_key(|claim| claim.member_index);
+
+        for claim in &rekeyed.destinations {
+            let extents: Vec<(u64, u64)> = claim
+                .extents
+                .iter()
+                .map(|extent| (extent.start, extent.end))
+                .collect();
+            self.router
+                .restore_member_coverage(&claim.relative_path, &extents);
+        }
+
+        self.resumed = Some(rekeyed);
+        self.ensure_registered();
+
+        for volume_index in self
+            .router
+            .plan()
+            .volumes
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            let covered = self.volume_coverage(volume_index);
+            let decoded_len = complete_volumes.get(&volume_index).copied();
+            let complete = decoded_len.is_some();
+            if let Some(decoded_len) = decoded_len {
+                self.complete_volumes.insert(volume_index, decoded_len);
+            }
+            if covered.is_empty() && !complete {
+                continue;
+            }
+            self.latched_direct = true;
+            self.restart_seeded_volumes.insert(volume_index);
+            for &(start, end) in covered.ranges() {
+                self.placed
+                    .entry(volume_index)
+                    .or_default()
+                    .insert(start, end - start);
+            }
+            self.router
+                .restore_volume_coverage(volume_index, &covered, decoded_len);
+        }
+    }
+
+    /// The logical length to present one source volume at, given whatever the
+    /// download layer says it has received.
+    ///
+    /// For a volume this run downloaded, `received_bytes` is the sum of the
+    /// **decoded** sizes the decoder reported, which is the volume's true length
+    /// — and it is preferred, because it is right even before every byte has been
+    /// routed.
+    ///
+    /// For a volume restored from a checkpoint it is **wrong and too large**.
+    /// Restore commits the skipped segments into the assembly with the spec's
+    /// `<segment bytes>`, which is the yEnc-*encoded* size, about 3% larger than
+    /// the payload. Presenting a virtual volume at that length hands PAR2 a file
+    /// 3% longer than the one its descriptions cover, and the verifier reports
+    /// damage on a set that is byte-perfect — which is a demotion, a full
+    /// materialization and a redownload, for arithmetic. The coverage map is in
+    /// decoded space throughout, so for those volumes it is the only honest
+    /// answer: exact once the volume is complete, a lower bound while it is not,
+    /// and a mid-download set is neither verified against nor demoted for its
+    /// holes anyway (H3).
+    pub(crate) fn virtual_volume_len(&self, volume_index: u32, received_bytes: u64) -> u64 {
+        let covered_end = self.volume_coverage(volume_index).end();
+        if self.restart_seeded_volumes.contains(&volume_index) {
+            return covered_end;
+        }
+        received_bytes.max(covered_end)
+    }
+
+    /// Whether the set is carrying restart-seeded coverage no gate has verified.
+    pub(crate) fn has_restart_seeded_coverage(&self) -> bool {
+        self.router.has_restart_seeded_coverage()
+    }
+
+    /// Whether any of the set's coverage came back from a checkpoint rather than
+    /// from articles this run decoded. Latched: it stays true after the gate
+    /// re-arm has verified those bytes, because the fact it states is about where
+    /// they came from, not whether they are trusted yet.
+    pub(crate) fn was_restored(&self) -> bool {
+        !self.restart_seeded_volumes.is_empty()
     }
 
     pub(crate) fn plan(&self) -> &DirectSetPlan {
@@ -146,12 +302,12 @@ impl DirectSet {
         &self.router.plan().set_name
     }
 
-    /// Same: restart-only, and unwired in phase 4.
-    #[allow(dead_code)]
+    /// The plan facts the checkpoint reader validates a row against.
     pub(crate) fn expected_set(&self) -> ExpectedSet {
         ExpectedSet {
             plan_digest: self.plan_digest(),
             volume_files: self.router.plan().expected_volume_files(),
+            fact_volumes: self.router.fact_volumes(),
         }
     }
 
@@ -302,11 +458,29 @@ impl DirectSet {
     /// Marks a source volume complete and returns whatever the confirming parse
     /// just made routable. The caller must write those spans before recording
     /// them, exactly as it does for [`Self::route`]'s.
+    /// `decoded_len` is the volume's decoded length — the assembly's
+    /// `received_bytes`, not the spec's yEnc-encoded segment sizes — and is what
+    /// lets the checkpoint distinguish "the download finished" from "every byte
+    /// of it is durable".
+    ///
+    /// For a volume **restored** from a checkpoint it is an over-estimate rather
+    /// than the exact length: restore commits the skipped segments into the
+    /// assembly at the spec's encoded sizes, ~3% large (see
+    /// [`Self::virtual_volume_len`]). That errs in the safe direction — the
+    /// checkpoint's `complete` bit stays `false`, so a *second* restart refetches
+    /// the volume's last article instead of skipping it, which is the same
+    /// bounded cost the contiguous-floor model already pays for every partially
+    /// covered volume. An under-estimate would be the unsafe direction, and no
+    /// path produces one.
     pub(crate) fn note_volume_complete(
         &mut self,
         volume_index: u32,
+        decoded_len: u64,
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
-        self.complete_volumes.insert(volume_index);
+        self.complete_volumes.insert(volume_index, decoded_len);
+        if let Some(barrier) = self.barrier.as_mut() {
+            barrier.note_volume_complete(volume_index, decoded_len);
+        }
         match self.router.note_volume_complete(volume_index) {
             Ok(spans) => {
                 if !spans.is_empty() {
@@ -351,6 +525,13 @@ impl DirectSet {
         if !self.registered_volumes {
             for (volume_index, file_index) in &self.router.plan().volumes {
                 barrier.register_volume(*volume_index, *file_index);
+            }
+            // A volume can complete before the first member registers a barrier
+            // — a set whose first volume is pure payload, say — and after a
+            // retire the controller is rebuilt from nothing, so the completion
+            // has to be replayed rather than only recorded as it happens.
+            for (volume_index, decoded_len) in &self.complete_volumes {
+                barrier.note_volume_complete(*volume_index, *decoded_len);
             }
             self.registered_volumes = true;
         }

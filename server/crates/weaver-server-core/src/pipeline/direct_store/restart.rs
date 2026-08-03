@@ -39,28 +39,39 @@
 //! destinations were never validated is the one outcome this module exists to
 //! prevent.
 //!
-//! # Not yet called from job restore
+//! # Where job restore enters
 //!
-//! Phase 4 wired routing, the barrier and finalization; the *reader* side is
-//! still only exercised by tests. Wiring it means two things this phase did not
-//! do: rebuilding a set's stored layout at restore (the header bytes sit below
-//! the published floors, so they are not refetched — the facts have to come back
-//! from `active_rar_volume_facts` instead), and folding [`coverage_skip_plan`]
-//! into `build_restore_skip_plan` alongside the legacy floors. Until then a
-//! restarted direct set has no accepted checkpoint and redownloads, which is the
-//! safe outcome, not a silent one. The module-scoped allow below says that once
-//! rather than per item, and comes off with that wiring.
-#![allow(dead_code)]
+//! [`Pipeline::restore_direct_store_coverage`] is the seam. It runs before the
+//! job's assembly is built, because its output *is* part of the restore skip
+//! set, and it does five things in order:
+//!
+//! 1. rediscovers the job's candidate sets from the restored spec, gate-aware;
+//! 2. rebuilds each one's layout from `active_rar_volume_facts` — the header
+//!    bytes sit below the published floors and are never refetched, so the facts
+//!    are the only way back to the members, their destinations and the plan
+//!    digest;
+//! 3. validates every checkpoint row against those rebuilt plans ([`restore_job`]);
+//! 4. turns each accepted row's floors into skipped segments
+//!    ([`coverage_skip_plan`]), exactly the way legacy floors feed the same
+//!    machinery;
+//! 5. sweeps the working directory of direct-store files nothing claims.
+//!
+//! A set with no accepted row is installed **fresh**: it redownloads and routes
+//! from zero, which is what an unwired restart already did, and its stale
+//! partials and envelopes are swept first so no byte of them survives.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::DirectStoreGate;
-use super::barrier::CoveragePersist;
+use super::barrier::{CoveragePersist, DatabaseCoveragePersist};
+use super::plan::DirectSetPlan;
+use super::set::DirectSet;
 use super::snapshot::{CoverageSnapshot, SnapshotError, decode};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::JobSpec;
 use crate::jobs::service::segments_covered_by_floor;
+use crate::pipeline::Pipeline;
 
 /// Why a checkpoint row was refused. Every variant means the same thing for the
 /// set: **no coverage**, redownload from zero, and delete the row.
@@ -97,6 +108,11 @@ pub(crate) enum CoverageRejection {
     /// whose destinations went unchecked is not a checked checkpoint.
     ProbeFailed {
         error: String,
+    },
+    /// The row claims coverage in a volume the rebuilt layout has no cached facts
+    /// for, so nothing it restores for that volume could ever be classified (M5).
+    UnclassifiableVolume {
+        volume_index: u32,
     },
 }
 
@@ -145,6 +161,11 @@ impl std::fmt::Display for CoverageRejection {
                 formatter,
                 "direct-store destination probe did not complete: {error}"
             ),
+            Self::UnclassifiableVolume { volume_index } => write!(
+                formatter,
+                "direct-store checkpoint claims coverage in volume {volume_index}, which the \
+                 rebuilt layout has no cached facts for"
+            ),
         }
     }
 }
@@ -162,6 +183,19 @@ pub(crate) struct ExpectedSet {
     /// its own copy so a row is self-describing, but only the plan decides
     /// which file a volume's floor is a floor *of*.
     pub(crate) volume_files: HashMap<u32, u32>,
+    /// The volumes the rebuilt layout actually has cached facts for (M5).
+    ///
+    /// Not the same question as `volume_files`, which is what the *plan* has. A
+    /// set's facts are cached per volume and any subset of them can be missing —
+    /// a volume that never finished its confirming parse, a row that failed to
+    /// decode — and the layout rebuild happily proceeds without them, because a
+    /// volume that contributed no member changes nothing the plan digest covers.
+    /// The digest therefore still matches, and the row is accepted for a set with
+    /// a volume the router cannot classify a byte of: its restored coverage can
+    /// never be mapped, so its bytes are held for the life of the set and it
+    /// wedges exactly the way B1 and B2 do. A row claiming coverage in a volume
+    /// that is not in here is refused instead.
+    pub(crate) fact_volumes: HashSet<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -250,6 +284,24 @@ where
                 volume_index: entry.volume_index,
                 expected: planned,
                 found: entry.file_index,
+            });
+        }
+        // M5. The layout rebuild is per volume and tolerant: a volume whose
+        // cached facts did not come back simply contributes no member, which
+        // changes neither the plan digest nor the member destinations the digest
+        // binds — so the row sails through every check above and is accepted for
+        // a set that cannot classify a byte of that volume. Its restored
+        // coverage then maps to nothing, its refetched articles are held rather
+        // than routed, and the set neither finalizes nor demotes.
+        //
+        // Only a volume the row actually claims matters: a floor of zero with no
+        // completion claims nothing, and refusing on it would retire perfectly
+        // good rows for volumes that had simply not started.
+        if (entry.floor > 0 || entry.complete)
+            && !expected.fact_volumes.contains(&entry.volume_index)
+        {
+            return Err(CoverageRejection::UnclassifiableVolume {
+                volume_index: entry.volume_index,
             });
         }
     }
@@ -379,6 +431,28 @@ pub(crate) fn refetch_floors(snapshot: &CoverageSnapshot) -> HashMap<u32, u64> {
     floors
 }
 
+/// NZB file indices whose source volume the checkpoint says finished
+/// downloading.
+///
+/// Kept apart from [`refetch_floors`] because it answers a different question in
+/// different units: a floor is decoded source bytes and the spec's segment sizes
+/// are yEnc-encoded, so no floor can ever prove a file complete. A repeated file
+/// index in a malformed blob is resolved the same conservative way — every entry
+/// naming the file must agree it is complete.
+pub(crate) fn complete_files(snapshot: &CoverageSnapshot) -> HashSet<u32> {
+    let mut complete: HashSet<u32> = HashSet::new();
+    let mut refuted: HashSet<u32> = HashSet::new();
+    for entry in &snapshot.floors {
+        if entry.complete {
+            complete.insert(entry.file_index);
+        } else {
+            refuted.insert(entry.file_index);
+        }
+    }
+    complete.retain(|file_index| !refuted.contains(file_index));
+    complete
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct DirectSkipPlan {
     pub(crate) skip: HashSet<SegmentId>,
@@ -397,6 +471,7 @@ pub(crate) fn coverage_skip_plan(
     job_id: JobId,
     spec: &JobSpec,
     floors: &HashMap<u32, u64>,
+    complete: &HashSet<u32>,
 ) -> DirectSkipPlan {
     let mut plan = DirectSkipPlan::default();
     for (file_index, file_spec) in spec.files.iter().enumerate() {
@@ -405,6 +480,25 @@ pub(crate) fn coverage_skip_plan(
             continue;
         };
         let file_id = NzbFileId { job_id, file_index };
+        // A volume the checkpoint calls complete skips **every** segment. The
+        // floor cannot reach the last one — see
+        // [`super::snapshot::VolumeFloor::complete`] — and refetching it for a
+        // set that is entirely on disk is the exact cost the flag exists to
+        // remove.
+        if complete.contains(&file_index) {
+            let total: u64 = file_spec
+                .segments
+                .iter()
+                .map(|segment| segment.bytes as u64)
+                .sum();
+            plan.skip
+                .extend(file_spec.segments.iter().map(|segment| SegmentId {
+                    file_id,
+                    segment_number: segment.ordinal,
+                }));
+            plan.file_progress.insert(file_index, total);
+            continue;
+        }
         if floor == 0 {
             plan.file_progress.insert(file_index, 0);
             continue;
@@ -414,4 +508,429 @@ pub(crate) fn coverage_skip_plan(
         plan.file_progress.insert(file_index, covered.floor);
     }
     plan
+}
+
+/// Everything a job restore learned about its direct sets.
+#[derive(Debug, Default)]
+pub(crate) struct DirectRestore {
+    /// Rebuilt sets, ready to install once the job state exists.
+    pub(crate) sets: Vec<DirectSet>,
+    /// Segments the accepted checkpoints cover, to union into the restore skip
+    /// set exactly like legacy floors.
+    pub(crate) skip: HashSet<SegmentId>,
+    pub(crate) file_progress: HashMap<u32, u64>,
+    pub(crate) accepted: usize,
+    pub(crate) rejected: usize,
+    pub(crate) ignored: usize,
+    pub(crate) swept: usize,
+}
+
+/// Filename markers of the files direct-store owns inside a working directory.
+///
+/// Only the partial suffix is still matched as a *pattern*; envelopes are swept
+/// by name, from the plans that produce them, because `.envelope` is an extension
+/// an extracted member can legitimately carry. See
+/// [`sweep_orphan_direct_files`].
+const DIRECT_PARTIAL_SUFFIX: &str = ".direct.partial";
+/// Prefix of the holds scratch files (D2). Matched as a prefix rather than a
+/// suffix because the set name is the tail of the component.
+pub(crate) const HOLDS_SCRATCH_PREFIX: &str = ".weaver-holds.";
+
+/// How deep the sweep walks below the working directory. Member partials live
+/// wherever their member's stored path puts them, which is archive-controlled;
+/// a bound keeps a hostile or pathological tree from turning the sweep into an
+/// unbounded startup cost.
+const SWEEP_MAX_DEPTH: usize = 8;
+
+impl Pipeline {
+    /// Restores a job's direct-store sets and the segments their coverage lets
+    /// the job skip (plan 135, D6).
+    ///
+    /// Called from `restore_job` before the assembly is built. It never inserts
+    /// anything into the pipeline itself — the job state does not exist yet — so
+    /// the caller installs [`DirectRestore::sets`] once it does.
+    pub(crate) async fn restore_direct_store_coverage(
+        &mut self,
+        job_id: JobId,
+        spec: &JobSpec,
+        working_dir: &Path,
+    ) -> DirectRestore {
+        let gate = self.direct_store.gate();
+        // Discovery is pure planning over the spec, so it runs whatever the gate
+        // says: the sweep below needs to know which files direct-store *could*
+        // own in this working directory even when nothing will route into them,
+        // and those are the files a previously enabled binary wrote over the same
+        // spec.
+        let (planned, refused) = DirectSetPlan::discover(spec, working_dir);
+        if gate.is_enabled() {
+            // The same counters the live admission seam emits. Restoring a job is
+            // an admission decision too, and a set refused here is one whose
+            // coverage is about to be swept — leaving it uncounted made a
+            // restart-only refusal invisible to the metric that exists to explain
+            // exactly that. Scoped to an enabled gate because a refusal is only a
+            // decision when something would otherwise have been admitted.
+            for (set_name, refusal) in &refused {
+                crate::runtime::perf_probe::record_owned(
+                    format!("direct_store.refused.{}", refusal.metric()),
+                    std::time::Duration::from_nanos(1),
+                );
+                tracing::debug!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    reason = refusal.metric(),
+                    "direct-store set refused at restore"
+                );
+            }
+        }
+        let admitted: Vec<DirectSetPlan> = if gate.is_enabled() {
+            planned.clone()
+        } else {
+            Vec::new()
+        };
+
+        let rows = match self
+            .db_blocking(move |db| db.load_direct_coverage(job_id))
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(
+                    job_id = job_id.0,
+                    %error,
+                    "failed to load direct-store coverage rows; the job redownloads"
+                );
+                HashMap::new()
+            }
+        };
+        // Nothing to validate and nothing admitted still leaves the sweep to
+        // run: a job that used to route and no longer does (the gate went off,
+        // the spec changed) is exactly the job whose working directory holds
+        // partials nothing will ever claim again.
+        let facts = if admitted.is_empty() {
+            HashMap::new()
+        } else {
+            self.load_direct_volume_facts(job_id).await
+        };
+
+        // Step 2: rebuild every admitted set's layout from its cached facts. A
+        // set whose facts no longer form a routable archive is dropped from
+        // `expected` on purpose — `restore_job` then refuses its row as
+        // `UnknownSet` and deletes it, which is the same redownload a digest
+        // mismatch produces.
+        let mut restored: HashMap<String, DirectSet> = HashMap::new();
+        let mut expected: HashMap<String, ExpectedSet> = HashMap::new();
+        for plan in &admitted {
+            let set_name = plan.set_name.clone();
+            let mut set = DirectSet::new(job_id, plan.clone());
+            self.direct_store.apply_ceilings(&mut set);
+            let volume_facts = facts.get(&set_name).cloned().unwrap_or_default();
+            if volume_facts.is_empty() {
+                continue;
+            }
+            if set.restore_layout(&volume_facts).is_err() {
+                tracing::info!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    "cached RAR facts no longer rebuild the direct set's layout; it redownloads"
+                );
+                continue;
+            }
+            expected.insert(set_name.clone(), set.expected_set());
+            restored.insert(set_name, set);
+        }
+
+        let mut persist = DatabaseCoveragePersist::new(self.db.clone());
+        let outcome = restore_job(gate, job_id, working_dir, rows, &expected, &mut persist).await;
+        for (set_name, rejection) in &outcome.rejected {
+            crate::runtime::perf_probe::record_owned(
+                "direct_store.restart.rejected".to_string(),
+                std::time::Duration::from_nanos(1),
+            );
+            tracing::info!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                reason = %rejection,
+                "direct-store coverage refused at restore; the set redownloads"
+            );
+        }
+
+        let mut result = DirectRestore {
+            accepted: outcome.accepted.len(),
+            rejected: outcome.rejected.len(),
+            ignored: outcome.ignored,
+            ..DirectRestore::default()
+        };
+
+        // Step 4: floors become skipped segments, and a file every one of whose
+        // segments is skipped is a source volume whose download is finished.
+        let mut applied: HashMap<String, BTreeMap<u32, u64>> = HashMap::new();
+        for (set_name, snapshot) in &outcome.accepted {
+            let Some(set) = restored.get(set_name) else {
+                continue;
+            };
+            let floors = refetch_floors(snapshot);
+            let complete = complete_files(snapshot);
+            let plan = coverage_skip_plan(job_id, spec, &floors, &complete);
+            // Volume index to the volume's decoded length. A published `complete`
+            // means the floor covers every decoded byte of the volume — the
+            // barrier re-derives the bit from exactly that comparison — so the
+            // row's own floor *is* the length, and a "complete" volume with no
+            // floor entry at all (which the encoder cannot produce) is dropped
+            // rather than assumed.
+            let volume_floors: HashMap<u32, u64> = snapshot
+                .floors
+                .iter()
+                .map(|entry| (entry.volume_index, entry.floor))
+                .collect();
+            let complete_volumes: BTreeMap<u32, u64> = set
+                .plan()
+                .volumes
+                .iter()
+                .filter(|(_, file_index)| complete.contains(file_index))
+                .filter_map(|(volume_index, _)| {
+                    volume_floors
+                        .get(volume_index)
+                        .map(|floor| (*volume_index, *floor))
+                })
+                .collect();
+            for (file_index, floor) in plan.file_progress {
+                let slot = result.file_progress.entry(file_index).or_insert(floor);
+                *slot = (*slot).max(floor);
+            }
+            result.skip.extend(plan.skip);
+            applied.insert(set_name.clone(), complete_volumes);
+        }
+
+        // Step 5's claim set, and step 3's installation. A set only keeps its
+        // rebuilt state when its row was accepted; everything else starts fresh,
+        // which is what makes the sweep below safe to run against it.
+        let mut claimed: HashSet<PathBuf> = HashSet::new();
+        for plan in &admitted {
+            let accepted = applied.get(&plan.set_name).cloned();
+            let mut set = match (accepted.as_ref(), restored.remove(&plan.set_name)) {
+                (Some(_), Some(set)) => set,
+                _ => {
+                    let mut set = DirectSet::new(job_id, plan.clone());
+                    self.direct_store.apply_ceilings(&mut set);
+                    set
+                }
+            };
+            if let (Some(complete_volumes), Some(snapshot)) =
+                (accepted, outcome.accepted.get(&plan.set_name))
+            {
+                set.apply_restored_snapshot(snapshot, &complete_volumes);
+                for volume_index in plan.volumes.keys() {
+                    claimed.insert(plan.envelope_path(*volume_index));
+                }
+                for (_, _, partial) in set.router.member_partials() {
+                    claimed.insert(working_dir.join(partial));
+                }
+                // Holds scratch is deliberately **not** claimed, not even by a
+                // set whose checkpoint was accepted. Its regions are named by an
+                // in-memory index that did not survive, so the file is bytes
+                // with no meaning: the set re-pages what it needs from a fresh
+                // one. Sweeping it here is what keeps a killed run's scratch
+                // from accumulating across restarts.
+                tracing::info!(
+                    job_id = job_id.0,
+                    set_name = %plan.set_name,
+                    volumes = plan.volumes.len(),
+                    "direct-store set resumed from its coverage checkpoint"
+                );
+            }
+            result.sets.push(set);
+        }
+
+        // Every file direct-store could own in this working directory, named
+        // rather than pattern-matched (nit). Envelopes and holds scratch are
+        // derivable from the plan alone, so they are enumerable for a set whose
+        // row was refused as well as one whose row was kept; member partials come
+        // from the rebuilt layout, which is why `restored` is consulted before it
+        // is drained above rather than after.
+        let mut owned: HashSet<PathBuf> = HashSet::new();
+        for plan in &planned {
+            owned.insert(plan.holds_scratch_path());
+            for volume_index in plan.volumes.keys() {
+                owned.insert(plan.envelope_path(*volume_index));
+            }
+        }
+        for set in result.sets.iter() {
+            for (_, _, partial) in set.router.member_partials() {
+                owned.insert(working_dir.join(partial));
+            }
+        }
+        for set in restored.values() {
+            for (_, _, partial) in set.router.member_partials() {
+                owned.insert(working_dir.join(partial));
+            }
+        }
+
+        // The sweep is a directory walk, and it runs at restore for every job.
+        // A job whose spec declares no RAR volume cannot have produced a
+        // `.direct.partial`, an envelope or a holds scratch — routing only ever
+        // touches a set discovered from those roles — so it is skipped outright
+        // rather than paying a walk per restored job at startup. Gate-independent
+        // on purpose: the files a *disabled* gate has to sweep were written by an
+        // enabled one, over the same spec.
+        let could_have_routed = spec
+            .files
+            .iter()
+            .any(|file| matches!(file.role, weaver_model::files::FileRole::RarVolume { .. }));
+        if could_have_routed {
+            result.swept = sweep_orphan_direct_files(working_dir, &claimed, &owned).await;
+        }
+        result
+    }
+
+    /// The cached facts for every set of a job, decoded and keyed by set name.
+    async fn load_direct_volume_facts(
+        &self,
+        job_id: JobId,
+    ) -> HashMap<String, BTreeMap<u32, weaver_unrar::RarVolumeFacts>> {
+        let rows = match self
+            .db_blocking(move |db| db.load_all_rar_volume_facts(job_id))
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(
+                    job_id = job_id.0,
+                    %error,
+                    "failed to load cached RAR volume facts; direct sets redownload"
+                );
+                return HashMap::new();
+            }
+        };
+        let mut decoded: HashMap<String, BTreeMap<u32, weaver_unrar::RarVolumeFacts>> =
+            HashMap::new();
+        for (set_name, volumes) in rows {
+            for (volume_index, blob) in volumes {
+                match rmp_serde::from_slice::<weaver_unrar::RarVolumeFacts>(&blob) {
+                    Ok(facts) => {
+                        decoded
+                            .entry(set_name.clone())
+                            .or_default()
+                            .insert(volume_index, facts);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            job_id = job_id.0,
+                            set_name = %set_name,
+                            volume = volume_index,
+                            %error,
+                            "failed to decode cached RAR volume facts"
+                        );
+                    }
+                }
+            }
+        }
+        decoded
+    }
+}
+
+/// Deletes every direct-store file in the working directory that no restored set
+/// claims (revision 8's wave-3 requirement).
+///
+/// Three populations end up here and all three are dead weight:
+///
+/// - a set whose checkpoint was refused, whose partials and envelopes hold bytes
+///   nothing may read and which is about to redownload over them;
+/// - a set that was killed before its first barrier, so no row exists at all;
+/// - holds scratch (D2) from a killed run, which is append-only and meaningless
+///   without the in-memory index that named its regions.
+///
+/// With the gate **off** nothing is claimed, so everything direct-store owns is
+/// swept. That is deliberate even though the rows themselves are kept: an
+/// operator who turns the switch off wants the working directory to be what the
+/// conventional path expects, and a re-enabled binary refuses the surviving rows
+/// on the destination probe rather than trusting them — the safe direction either
+/// way.
+///
+/// # What "direct-store's" means here
+///
+/// `owned` is the set of paths this job's *plans* name — every envelope, every
+/// holds scratch, every member partial the rebuilt layouts produce — and it is
+/// the primary rule. Matching by extension alone was collateral waiting to
+/// happen: the walk descends eight levels into an archive-controlled tree, and an
+/// **extracted member** called `chapter.envelope` is a file a user's archive can
+/// perfectly well contain. Deleting it is silent data loss in a job that
+/// otherwise succeeded.
+///
+/// Two pattern rules survive, each for a file that exists precisely because it is
+/// *not* in any current plan:
+///
+/// - holds scratch at the **top level only**, by prefix. A killed run's scratch
+///   for a set this spec no longer produces has no plan to name it, and it lives
+///   at the top level by construction ([`DirectSetPlan::holds_scratch_path`]).
+/// - `.direct.partial` at any depth. A member partial's path comes from the RAR
+///   header, so a set whose cached facts no longer rebuild has no way to name
+///   its own partials — and the suffix is a two-part one this codebase invented,
+///   not an extension an archive plausibly carries.
+async fn sweep_orphan_direct_files(
+    working_dir: &Path,
+    claimed: &HashSet<PathBuf>,
+    owned: &HashSet<PathBuf>,
+) -> usize {
+    let root = working_dir.to_path_buf();
+    let claimed = claimed.clone();
+    let owned = owned.clone();
+    tokio::task::spawn_blocking(move || sweep_orphan_direct_files_blocking(&root, &claimed, &owned))
+        .await
+        .unwrap_or(0)
+}
+
+fn sweep_orphan_direct_files_blocking(
+    working_dir: &Path,
+    claimed: &HashSet<PathBuf>,
+    owned: &HashSet<PathBuf>,
+) -> usize {
+    let mut swept = 0usize;
+    let mut queue = vec![(working_dir.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = queue.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            // `file_type` does not follow symlinks, which is what keeps the walk
+            // inside the working directory: a symlinked directory is never
+            // descended and a symlink to a file is never matched.
+            if file_type.is_dir() {
+                if depth < SWEEP_MAX_DEPTH {
+                    queue.push((path, depth + 1));
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let is_direct = owned.contains(&path)
+                || name.ends_with(DIRECT_PARTIAL_SUFFIX)
+                || (depth == 0 && name.starts_with(HOLDS_SCRATCH_PREFIX));
+            if !is_direct || claimed.contains(&path) {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    swept += 1;
+                    tracing::info!(
+                        path = %path.display(),
+                        "swept an unclaimed direct-store file at restore"
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "failed to sweep an unclaimed direct-store file"
+                ),
+            }
+        }
+    }
+    swept
 }

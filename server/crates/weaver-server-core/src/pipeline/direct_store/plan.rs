@@ -131,10 +131,7 @@ impl DirectSetPlan {
         self.files.get(&file_index).copied()
     }
 
-    /// The plan facts a checkpoint is validated against at restart. Reached
-    /// only from the restart reader, which phase 4 left unwired (see
-    /// `restart`'s module docs).
-    #[allow(dead_code)]
+    /// The plan facts a checkpoint is validated against at restart.
     pub(crate) fn expected_volume_files(&self) -> HashMap<u32, u32> {
         self.volumes
             .iter()
@@ -177,6 +174,42 @@ impl DirectSetPlan {
     pub(crate) fn envelope_path(&self, volume_index: u32) -> PathBuf {
         self.working_dir
             .join(self.envelope_relative_path(volume_index))
+    }
+
+    /// Working-directory-relative holds scratch file for this set (D2).
+    ///
+    /// One file per set, at the top level, named from the set so the restart
+    /// sweep can recognise it by prefix and so two sets of one job never share a
+    /// region index. Append-only and write-once while the set is open, deleted
+    /// at finalization or demotion.
+    ///
+    /// # The disambiguator is not decoration
+    ///
+    /// `sanitize_dirname` is many-to-one and `path_component_with_suffix` clamps
+    /// long names, so two sets of one job can reach the same stem — `A/B` and
+    /// `A_B`, or two long names differing past the clamp. Sharing one scratch
+    /// file between two sets is silent corruption of the worst kind: the file is
+    /// append-only with an *in-memory* region index per set, so each set hands
+    /// out offsets the other is also writing at, and a paged hold reads back as
+    /// the other set's bytes. The set's lowest NZB file index disambiguates it —
+    /// unique across a job by construction (a file belongs to one set) and
+    /// derived from the spec, so it is the same on every restart. It goes in the
+    /// *suffix* argument so the clamp shortens the stem around it and can never
+    /// shorten it away.
+    pub(crate) fn holds_scratch_relative_path(&self) -> String {
+        let discriminator = self.volumes.values().min().copied().unwrap_or_default();
+        weaver_model::files::path_component_with_suffix(
+            &format!(
+                "{}{}",
+                crate::pipeline::direct_store::restart::HOLDS_SCRATCH_PREFIX,
+                crate::jobs::working_dir::sanitize_dirname(&self.set_name)
+            ),
+            &format!(".f{discriminator}"),
+        )
+    }
+
+    pub(crate) fn holds_scratch_path(&self) -> PathBuf {
+        self.working_dir.join(self.holds_scratch_relative_path())
     }
 
     /// Every envelope file the set can own, in volume order.

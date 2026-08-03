@@ -56,9 +56,28 @@ use weaver_unrar::{
 use super::ByteRanges;
 use super::plan::DirectSetPlan;
 
-/// Default RAM ceiling for holds across one set. Phase 4 has no scratch paging
-/// (phase 5 owns it), so a breach demotes.
+/// Default RAM ceiling for holds across one set. A breach pages to the set's
+/// holds scratch (D2); only a paging failure demotes.
 pub(crate) const DEFAULT_HOLDS_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// D2's **explicit** scratch ceiling, counted against the disk acceptance target
+/// rather than derived from RAM the way the oracle's auto 4×-RAM rule is.
+///
+/// **Per archive set, not per job or per process.** Each set owns one scratch
+/// file and one [`HoldsScratch`] carrying its own copy of this number, so a job
+/// with three sets can have three times this on disk at once, and a busy server
+/// that multiple. That is the same shape [`DEFAULT_HOLDS_BUDGET_BYTES`] has for
+/// RAM, and it is deliberate at this size: the ceiling exists to stop one
+/// pathological set from filling the disk, not to be a global disk quota — which
+/// would need a shared accountant across sets and jobs, and a policy for what a
+/// set does when another set is using the budget. If the aggregate ever needs
+/// bounding, that is the design, not a smaller constant.
+///
+/// A `const` for now, deliberately: plan 135's open question 1 (config vs env
+/// for direct-store's own switch) is unresolved, and adding a second operator
+/// surface before that is settled would have to be undone. Phase 7 moves both
+/// together.
+pub(crate) const HOLDS_SCRATCH_CEILING_BYTES: u64 = 512 * 1024 * 1024;
 
 /// D1's absolute packed ceiling for the bounded small-member tolerance. The
 /// effective ceiling is `min(this, 1% of the archive's packed bytes)`; the
@@ -126,11 +145,45 @@ pub(crate) enum DemotionReason {
     /// volumes at finalization. The stored members are correct; the tolerated
     /// one is not produced, so the set is rebuilt the ordinary way.
     ToleratedExtractionFailed,
-    /// Holds exceeded the RAM budget and phase 4 has no scratch paging.
+    /// Holds exceeded the RAM budget and paging could not bring it back — every
+    /// pageable run is already in scratch and RAM is still over, which means one
+    /// staged run is larger than the whole budget.
     HoldsBudgetExceeded,
+    /// The holds scratch file could not be created, written or read (D2).
+    HoldsScratchFailed,
+    /// Paging would push the holds scratch past its configured ceiling (D2).
+    /// Counted separately from the RAM budget because they say different things:
+    /// this one is the *disk* claim direct-store makes against its own 1.05×
+    /// acceptance target.
+    HoldsScratchCeiling,
     /// A confirming parse disagreed with the provisional one, or a volume was
     /// re-added with facts that are not an extension of what it stated before.
     ConflictingVolumeFacts,
+    /// A volume restored from a checkpoint finished downloading without ever
+    /// being confirmed, so its trailing region could never be classified (B2).
+    ///
+    /// Its pre-restart bytes live on disk rather than in the staged image, so
+    /// the confirming parse has a hole from offset zero and cannot succeed. The
+    /// alternative to demoting is holding the volume's end record and recovery
+    /// record for the life of the set, which reads as PAR2 damage and costs a
+    /// full redownload — this costs a materialization from bytes already on
+    /// disk.
+    UnconfirmedRestoredVolume,
+    /// A restart-seeded run could not be placed back into the layout it was
+    /// planned against, so its member gate can never be re-armed (M4).
+    ///
+    /// Failing open here is the one thing that must not happen: the seeded range
+    /// stays, the member stays unverifiable, and the set is neither finalizable
+    /// nor demotable while the completion gate re-reads it forever.
+    RestartRearmUnplaceable,
+    /// A restart-seeded run could not be **read back** from the partial that is
+    /// supposed to hold it.
+    ///
+    /// Distinct from [`Self::DestinationWriteFailed`], which this used to borrow:
+    /// nothing was being written, and a run that will not read is a partial that
+    /// changed under a validated checkpoint — a different operational story and a
+    /// different metric.
+    RestartRereadFailed,
     /// The volume's headers could not be parsed from the staged image.
     UnparsableVolume,
     /// A non-final part's packed CRC32 did not match the bytes routed for it.
@@ -212,7 +265,12 @@ impl DemotionReason {
             Self::Par2Unbindable => "par2_unbindable",
             Self::ToleratedExtractionFailed => "tolerated_extraction_failed",
             Self::HoldsBudgetExceeded => "holds_budget",
+            Self::HoldsScratchFailed => "holds_scratch_io",
+            Self::HoldsScratchCeiling => "holds_scratch_ceiling",
             Self::ConflictingVolumeFacts => "conflicting_volume_facts",
+            Self::UnconfirmedRestoredVolume => "unconfirmed_restored_volume",
+            Self::RestartRearmUnplaceable => "restart_rearm_unplaceable",
+            Self::RestartRereadFailed => "restart_reread_failed",
             Self::UnparsableVolume => "unparsable_volume",
             Self::PartChecksumMismatch => "part_checksum_mismatch",
             Self::MemberChecksumMismatch => "member_checksum_mismatch",
@@ -356,6 +414,194 @@ impl CrcRuns {
     }
 }
 
+/// One staged run, in RAM or paged out to the set's holds scratch (D2).
+///
+/// A scratch region is **write-once and append-only** for the life of the set,
+/// so an offset handed out here is valid until the set closes — which is what
+/// makes reading one back a single positioned read with no locking and no
+/// re-validation. Nothing is ever reclaimed or compacted: the file's high-water
+/// is bounded by the total bytes the set ever held, and phase 7 revisits that if
+/// measurement says the bound is too loose in practice.
+#[derive(Debug, Clone)]
+enum StagedChunk {
+    Memory(std::sync::Arc<[u8]>),
+    Scratch { offset: u64, len: u64 },
+}
+
+impl StagedChunk {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Memory(bytes) => bytes.len() as u64,
+            Self::Scratch { len, .. } => *len,
+        }
+    }
+
+    /// RAM cost, which is what the holds budget bounds. A paged chunk is zero
+    /// here and is counted against the scratch ceiling instead.
+    fn resident_len(&self) -> u64 {
+        match self {
+            Self::Memory(bytes) => bytes.len() as u64,
+            Self::Scratch { .. } => 0,
+        }
+    }
+
+    /// The sub-chunk covering `[from, from + len)` of this chunk.
+    fn slice_of(&self, from: u64, len: u64) -> Self {
+        match self {
+            Self::Memory(bytes) => Self::Memory(std::sync::Arc::from(
+                &bytes[from as usize..(from + len) as usize],
+            )),
+            Self::Scratch { offset, .. } => Self::Scratch {
+                offset: offset.saturating_add(from),
+                len,
+            },
+        }
+    }
+}
+
+/// Positioned read, so a shared handle needs no seek and no exclusive access.
+fn read_at(file: &std::fs::File, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(out, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut written = 0usize;
+        while written < out.len() {
+            let read = file.seek_read(&mut out[written..], offset + written as u64)?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "holds scratch ended early",
+                ));
+            }
+            written += read;
+        }
+        Ok(())
+    }
+}
+
+fn write_at(file: &std::fs::File, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(bytes, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut written = 0usize;
+        while written < bytes.len() {
+            // A zero-byte `seek_write` is not an error and not progress, so
+            // trusting the loop condition alone spins forever on a device that
+            // reports it. `WriteZero` is what `write_all` raises for exactly this
+            // and is what the caller already turns into a scratch failure.
+            let progress = file.seek_write(&bytes[written..], offset + written as u64)?;
+            if progress == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "positional write reported no progress",
+                ));
+            }
+            written += progress;
+        }
+        Ok(())
+    }
+}
+
+/// The per-set holds scratch file (plan 135, D2).
+///
+/// Append-only, write-once, with an in-memory index that lives in the staging
+/// map: a paged chunk *is* its `(offset, len)`. There is no free list and no
+/// compaction, deliberately — reclaiming space in a file whose regions are
+/// handed out as stable offsets means either rewriting them (which breaks the
+/// write-once property the lock-free read depends on) or a free-list allocator,
+/// and neither is worth building before measurement says the append-only bound
+/// hurts. The bound is stated rather than hidden: **scratch never exceeds the
+/// total bytes the set holds over its life**, and the ceiling below is what
+/// keeps that from being unbounded.
+#[derive(Debug)]
+pub(crate) struct HoldsScratch {
+    path: std::path::PathBuf,
+    file: Option<std::sync::Arc<std::fs::File>>,
+    /// Append cursor, and the file's length.
+    len: u64,
+    ceiling: u64,
+}
+
+impl HoldsScratch {
+    pub(super) fn new(path: std::path::PathBuf, ceiling: u64) -> Self {
+        Self {
+            path,
+            file: None,
+            len: 0,
+            ceiling,
+        }
+    }
+
+    pub(super) fn bytes(&self) -> u64 {
+        self.len
+    }
+
+    fn handle(&self) -> Option<std::sync::Arc<std::fs::File>> {
+        self.file.clone()
+    }
+
+    /// Appends one run and returns its offset. `None` on a ceiling breach, which
+    /// the caller turns into a demotion.
+    pub(super) fn append(&mut self, bytes: &[u8]) -> Result<u64, DemotionReason> {
+        let len = bytes.len() as u64;
+        let end = self
+            .len
+            .checked_add(len)
+            .ok_or(DemotionReason::HoldsScratchCeiling)?;
+        if end > self.ceiling {
+            return Err(DemotionReason::HoldsScratchCeiling);
+        }
+        if self.file.is_none() {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&self.path)
+                .map_err(|_| DemotionReason::HoldsScratchFailed)?;
+            self.file = Some(std::sync::Arc::new(file));
+        }
+        let file = self.file.as_ref().expect("just opened");
+        write_at(file, self.len, bytes).map_err(|_| DemotionReason::HoldsScratchFailed)?;
+        let offset = self.len;
+        self.len = end;
+        Ok(offset)
+    }
+
+    pub(super) fn read(&self, offset: u64, len: u64) -> Option<Vec<u8>> {
+        let file = self.file.as_ref()?;
+        let mut out = vec![0u8; len as usize];
+        read_at(file, offset, &mut out).ok()?;
+        Some(out)
+    }
+
+    /// Closes and deletes the file. Called at finalization and demotion, and by
+    /// the restart sweep for a file no set claims.
+    ///
+    /// Keyed on whether the file was ever **opened**, not on whether anything was
+    /// appended: `append` creates the file before its first `write_at`, so a
+    /// first write that fails leaves a zero-length scratch on disk that a
+    /// `len > 0` test would walk straight past — and the set is demoting, so
+    /// nothing comes back for it until the next restart's sweep.
+    pub(super) fn discard(&mut self) {
+        let created = self.file.take().is_some() || self.len > 0;
+        if created {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        self.len = 0;
+    }
+}
+
 /// A sparse byte image of one volume, read through by the header parser.
 ///
 /// Reads inside a staged run return real bytes; reads anywhere else return
@@ -369,17 +615,39 @@ impl CrcRuns {
 /// `'static`, so a plain borrow is not available; sharing the chunks is the
 /// same zero-copy with an ownership story that outlives the borrow.
 pub(super) struct SparseImage {
-    runs: Vec<(u64, std::sync::Arc<[u8]>)>,
+    runs: Vec<(u64, StagedChunk)>,
+    /// Read handle for the scratch-resident runs. Held as an `Arc<File>` so the
+    /// image satisfies the parser's `'static` bound without reopening the file
+    /// per parse, and read positionally so nothing here disturbs a concurrent
+    /// append.
+    scratch: Option<std::sync::Arc<std::fs::File>>,
     position: u64,
 }
 
 impl SparseImage {
+    fn from_staged(
+        chunks: &BTreeMap<u64, StagedChunk>,
+        scratch: Option<std::sync::Arc<std::fs::File>>,
+    ) -> Self {
+        Self {
+            runs: chunks
+                .iter()
+                .map(|(offset, chunk)| (*offset, chunk.clone()))
+                .collect(),
+            scratch,
+            position: 0,
+        }
+    }
+
+    /// Test constructor: a purely RAM-resident image.
+    #[cfg(test)]
     pub(super) fn from_chunks(chunks: &BTreeMap<u64, std::sync::Arc<[u8]>>) -> Self {
         Self {
             runs: chunks
                 .iter()
-                .map(|(offset, bytes)| (*offset, std::sync::Arc::clone(bytes)))
+                .map(|(offset, bytes)| (*offset, StagedChunk::Memory(std::sync::Arc::clone(bytes))))
                 .collect(),
+            scratch: None,
             position: 0,
         }
     }
@@ -395,14 +663,30 @@ impl Read for SparseImage {
         let Some(index) = index.checked_sub(1) else {
             return Ok(0);
         };
-        let (start, bytes) = &self.runs[index];
+        let (start, chunk) = &self.runs[index];
         let inside = position - start;
-        if inside >= bytes.len() as u64 {
+        if inside >= chunk.len() {
             return Ok(0);
         }
-        let available = &bytes[inside as usize..];
-        let taken = available.len().min(out.len());
-        out[..taken].copy_from_slice(&available[..taken]);
+        let taken = (chunk.len() - inside).min(out.len() as u64) as usize;
+        match chunk {
+            StagedChunk::Memory(bytes) => {
+                out[..taken].copy_from_slice(&bytes[inside as usize..inside as usize + taken]);
+            }
+            // Paged out: read back exactly what the walk asked for, which for a
+            // header walk is a header at a time, never the data area it seeks
+            // over. A missing handle answers `Ok(0)`, the same clean stop a hole
+            // produces — a parse that cannot see a byte must never see a
+            // fabricated one.
+            StagedChunk::Scratch { offset, .. } => {
+                let Some(file) = self.scratch.as_ref() else {
+                    return Ok(0);
+                };
+                if read_at(file, offset.saturating_add(inside), &mut out[..taken]).is_err() {
+                    return Ok(0);
+                }
+            }
+        }
         self.position = position.saturating_add(taken as u64);
         Ok(taken)
     }
@@ -439,8 +723,9 @@ impl Seek for SparseImage {
 #[derive(Debug, Default)]
 struct VolumeStaging {
     /// Non-overlapping byte runs, keyed by physical offset. Shared rather than
-    /// owned so the header parser's image is a pointer copy (M2).
-    chunks: BTreeMap<u64, std::sync::Arc<[u8]>>,
+    /// owned so the header parser's image is a pointer copy (M2), and each one
+    /// either RAM-resident or paged out to the set's holds scratch (D2).
+    chunks: BTreeMap<u64, StagedChunk>,
     /// Physical ranges already routed to a destination.
     routed: ByteRanges,
     /// Physical ranges staged but not yet routed — the holds.
@@ -453,6 +738,17 @@ struct VolumeStaging {
     /// walks is byte-contiguously complete: no header can still show up in a
     /// region the walk has already passed.
     source_complete: bool,
+    /// The volume's coverage was seeded from a checkpoint rather than from
+    /// articles this run decoded.
+    ///
+    /// Load-bearing for confirmation, not just bookkeeping: a restored volume's
+    /// bytes are on **disk**, not in `chunks`, so the confirming parse
+    /// [`DirectSetRouter::try_parse_volume`] runs has a hole from zero and
+    /// cannot succeed however many further articles arrive. Confirmation has to
+    /// be decided at restore ([`restored_volume_is_confirmed`]) or not at all,
+    /// and a volume that reaches completion still unconfirmed demotes rather
+    /// than holding its trailing region for the life of the set.
+    restored: bool,
     /// Physical end of the last member extent the walk has reached.
     ///
     /// **The frontier of proven classification.** Below it the walk arrived
@@ -467,6 +763,47 @@ struct VolumeStaging {
     tail_base: u64,
 }
 
+/// Whether a volume seeded from a checkpoint may be treated as **confirmed** —
+/// its header walk finished, so no further header can appear in its trailing
+/// region and the drain may route those bytes into the envelope.
+///
+/// This is decided here or not at all. A restored volume's pre-restart bytes are
+/// on disk, not in [`VolumeStaging::chunks`], so the image
+/// [`DirectSetRouter::try_parse_volume`] walks has a hole from offset zero: the
+/// confirming parse fails, silently and identically, however many further
+/// articles arrive. Getting it wrong in the permissive direction files a
+/// member's payload into an envelope that finalization deletes; getting it wrong
+/// in the strict direction holds the volume's end record forever, which reads as
+/// PAR2 damage and costs a full redownload. So: two proofs, and only two.
+///
+/// - **The cached facts reached the end record.** `more_volumes` can only be true
+///   when the library parsed an end-of-archive header, which is the last header a
+///   volume can carry. (It is one-directional: the *last* volume of a set has no
+///   `more_volumes` flag to raise, so this proof is silent about it — that is what
+///   the second one is for.)
+/// - **The coverage is contiguous from zero to the volume's whole decoded
+///   length.** The previous run therefore held a byte-contiguously complete image
+///   of the volume when it parsed, which is exactly the `source_complete` proof
+///   the live path uses. `decoded_len` is `Some` only when the checkpoint calls
+///   the volume complete, and the contiguity is re-checked rather than assumed:
+///   the bit and the bytes are separate claims and this is the seam that can
+///   still compare them.
+///
+/// Chain closure (`!split_after`) is deliberately **not** a third proof, for the
+/// same reason it is not one in the live parse: a truncated prefix closes the
+/// chain the moment the first member's final part is read, while a second
+/// member's header sits unread past that member's data area.
+pub(super) fn restored_volume_is_confirmed(
+    covered: &ByteRanges,
+    decoded_len: Option<u64>,
+    more_volumes: bool,
+) -> bool {
+    if more_volumes {
+        return true;
+    }
+    decoded_len.is_some_and(|len| covered.contiguous_from_zero() >= len)
+}
+
 impl VolumeStaging {
     /// Stores the parts of `[offset, offset + len)` that are neither routed nor
     /// already pending, and marks them pending. Returns the newly staged bytes.
@@ -476,8 +813,10 @@ impl VolumeStaging {
             for (start, end) in self.pending.missing(start, end - start) {
                 let from = (start - offset) as usize;
                 let to = (end - offset) as usize;
-                self.chunks
-                    .insert(start, std::sync::Arc::from(&data[from..to]));
+                self.chunks.insert(
+                    start,
+                    StagedChunk::Memory(std::sync::Arc::from(&data[from..to])),
+                );
                 self.pending.insert(start, end - start);
                 staged = staged.saturating_add(end - start);
             }
@@ -496,31 +835,54 @@ impl VolumeStaging {
     /// counting only `pending` left the largest term in the set's RSS outside
     /// the budget that exists to bound it.
     fn staged_bytes(&self) -> u64 {
-        self.chunks.values().fold(0u64, |total, bytes| {
-            total.saturating_add(bytes.len() as u64)
+        self.chunks
+            .values()
+            .fold(0u64, |total, chunk| total.saturating_add(chunk.len()))
+    }
+
+    /// The RAM half of [`Self::staged_bytes`] — what the holds budget bounds.
+    /// A paged chunk still costs a scratch region, which the ceiling bounds
+    /// separately (D2).
+    fn resident_bytes(&self) -> u64 {
+        self.chunks.values().fold(0u64, |total, chunk| {
+            total.saturating_add(chunk.resident_len())
         })
     }
 
     /// Copies `[offset, offset + len)` out of the staged chunks. `None` when
     /// the range is not wholly staged, which the drain never asks for.
-    fn slice(&self, offset: u64, len: u64) -> Option<Vec<u8>> {
+    ///
+    /// A paged chunk costs **one positioned read** per drained run, which is the
+    /// whole reason scratch regions are write-once: the offset was handed out
+    /// when the bytes were paged and nothing can have moved them since.
+    fn slice(&self, offset: u64, len: u64, scratch: &HoldsScratch) -> Option<Vec<u8>> {
         let mut out = Vec::with_capacity(len as usize);
         let mut cursor = offset;
         let end = offset.saturating_add(len);
         while cursor < end {
-            let index = self
+            let (start, chunk) = self
                 .chunks
                 .range(..=cursor)
                 .next_back()
-                .map(|(start, bytes)| (*start, bytes.as_ref()))?;
-            let (start, bytes) = index;
+                .map(|(start, chunk)| (*start, chunk.clone()))?;
             let inside = cursor - start;
-            if inside >= bytes.len() as u64 {
+            if inside >= chunk.len() {
                 return None;
             }
-            let take = ((bytes.len() as u64 - inside).min(end - cursor)) as usize;
-            out.extend_from_slice(&bytes[inside as usize..inside as usize + take]);
-            cursor = cursor.saturating_add(take as u64);
+            let take = (chunk.len() - inside).min(end - cursor);
+            match &chunk {
+                StagedChunk::Memory(bytes) => {
+                    out.extend_from_slice(&bytes[inside as usize..(inside + take) as usize]);
+                }
+                StagedChunk::Scratch {
+                    offset: scratch_offset,
+                    ..
+                } => {
+                    let bytes = scratch.read(scratch_offset.saturating_add(inside), take)?;
+                    out.extend_from_slice(&bytes);
+                }
+            }
+            cursor = cursor.saturating_add(take);
         }
         Some(out)
     }
@@ -530,22 +892,34 @@ impl VolumeStaging {
     fn trim(&mut self, keep: &ByteRanges) {
         let offsets: Vec<u64> = self.chunks.keys().copied().collect();
         for offset in offsets {
-            let Some(bytes) = self.chunks.get(&offset) else {
+            let Some(chunk) = self.chunks.get(&offset) else {
                 continue;
             };
-            let len = bytes.len() as u64;
+            let len = chunk.len();
             let retained = intersect(keep, offset, len);
             if retained.len() == 1 && retained[0] == (offset, offset + len) {
                 continue;
             }
             let chunk = self.chunks.remove(&offset).expect("chunk was just read");
             for (start, end) in retained {
-                let from = (start - offset) as usize;
-                let to = (end - offset) as usize;
                 self.chunks
-                    .insert(start, std::sync::Arc::from(&chunk[from..to]));
+                    .insert(start, chunk.slice_of(start - offset, end - start));
             }
         }
+    }
+
+    /// RAM-resident chunks, largest first, for the pager to choose from.
+    fn resident_chunks(&self) -> Vec<(u64, u64)> {
+        let mut chunks: Vec<(u64, u64)> = self
+            .chunks
+            .iter()
+            .filter_map(|(offset, chunk)| match chunk {
+                StagedChunk::Memory(bytes) => Some((*offset, bytes.len() as u64)),
+                StagedChunk::Scratch { .. } => None,
+            })
+            .collect();
+        chunks.sort_unstable_by_key(|chunk| std::cmp::Reverse(chunk.1));
+        chunks
     }
 }
 
@@ -584,6 +958,18 @@ struct MemberRouting {
     parts: BTreeMap<u32, CrcRuns>,
     /// Parts whose packed CRC32 has already been checked.
     checked_parts: BTreeMap<u32, u32>,
+    /// Logical ranges this run did **not** write: they were claimed by a
+    /// checkpoint a previous run committed, and restart seeded them into
+    /// [`Self::covered`] so they are not refetched (D6).
+    ///
+    /// `CrcRuns` never survives a restart, so these bytes are covered and
+    /// **unverified** — the gates stay disarmed over them until the bytes are
+    /// re-read from disk. Non-empty is therefore a hard refusal in
+    /// [`DirectSetRouter::try_verify_member`], not merely an absence of runs:
+    /// composing around a seeded range would pass a member on the strength of
+    /// what a previous process claimed to have written rather than on what is on
+    /// disk now, which is exactly the assurance D6 refuses to trade away.
+    restart_seeded: ByteRanges,
     /// The whole-member gate has passed.
     verified: bool,
 }
@@ -608,6 +994,16 @@ pub(crate) struct DirectSetRouter {
     /// makes that rebuild possible, and comparing against them is what tells an
     /// *extension* (fine, rebuild) from a genuine *disagreement* (demote).
     volume_facts: BTreeMap<u32, RarVolumeFacts>,
+    /// Volumes whose facts this run has accepted and the caller has not yet
+    /// cached (D6's restart input).
+    ///
+    /// A direct set never writes a volume file, so `try_update_archive_topology`
+    /// — the only thing that normally fills `active_rar_volume_facts` — has
+    /// nothing to parse and D7 suppresses it anyway. The router's own parse is
+    /// therefore the **only** producer of these facts, and without caching them
+    /// a restart has no way to rebuild the layout: the header bytes sit below the
+    /// published floors and are never refetched.
+    dirty_facts: std::collections::BTreeSet<u32>,
     staging: BTreeMap<u32, VolumeStaging>,
     /// Routing state by stable member id.
     members: BTreeMap<u32, MemberRouting>,
@@ -641,6 +1037,10 @@ pub(crate) struct DirectSetRouter {
     /// per volume — where the read is per span.
     member_order_stale: bool,
     holds_budget: u64,
+    /// D2's paging destination. Opened on the first breach and never before, so
+    /// a set that stays inside its RAM budget — which is nearly all of them —
+    /// touches the filesystem for it exactly zero times.
+    scratch: HoldsScratch,
     demoted: Option<DemotionReason>,
 }
 
@@ -663,9 +1063,11 @@ impl std::fmt::Debug for DirectSetRouter {
 impl DirectSetRouter {
     pub(crate) fn new(plan: DirectSetPlan) -> Self {
         Self {
+            scratch: HoldsScratch::new(plan.holds_scratch_path(), HOLDS_SCRATCH_CEILING_BYTES),
             plan,
             layout: None,
             volume_facts: BTreeMap::new(),
+            dirty_facts: std::collections::BTreeSet::new(),
             staging: BTreeMap::new(),
             members: BTreeMap::new(),
             member_ids: HashMap::new(),
@@ -676,6 +1078,82 @@ impl DirectSetRouter {
             holds_budget: DEFAULT_HOLDS_BUDGET_BYTES,
             demoted: None,
         }
+    }
+
+    /// Lowers the scratch ceiling so a test can breach it without paging
+    /// gigabytes.
+    #[cfg(test)]
+    pub(crate) fn set_holds_scratch_ceiling(&mut self, bytes: u64) {
+        self.scratch.ceiling = bytes;
+    }
+
+    /// Bytes currently paged out to the set's holds scratch (D2), counted
+    /// separately from RAM so the two ceilings stay legible in metrics.
+    pub(crate) fn scratch_bytes(&self) -> u64 {
+        self.scratch.bytes()
+    }
+
+    /// Closes and deletes the scratch file. Idempotent; called at finalization
+    /// and demotion.
+    pub(crate) fn discard_scratch(&mut self) {
+        self.scratch.discard();
+    }
+
+    /// Pages RAM-resident staged runs out to scratch until the holds budget is
+    /// satisfied (D2).
+    ///
+    /// Largest chunks first, across every volume: the goal is to get back under
+    /// the ceiling in as few writes as possible, and a big run is exactly the
+    /// recovery record or held payload the budget exists to bound. Whether a
+    /// chunk is a hold or a retained envelope run does not matter — both are
+    /// read back the same way, one positioned read per drained slice, and the
+    /// header walk seeks over data areas rather than reading them.
+    fn page_holds_to_scratch(&mut self) -> Result<(), DemotionReason> {
+        let mut candidates: Vec<(u64, u32, u64)> = Vec::new();
+        for (volume_index, staging) in &self.staging {
+            for (offset, len) in staging.resident_chunks() {
+                candidates.push((len, *volume_index, offset));
+            }
+        }
+        candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.0));
+
+        for (_, volume_index, offset) in candidates {
+            if self.resident_bytes() <= self.holds_budget {
+                return Ok(());
+            }
+            let bytes = match self
+                .staging
+                .get(&volume_index)
+                .and_then(|staging| staging.chunks.get(&offset))
+            {
+                Some(StagedChunk::Memory(bytes)) => std::sync::Arc::clone(bytes),
+                _ => continue,
+            };
+            let scratch_offset = self.scratch.append(&bytes)?;
+            if let Some(staging) = self.staging.get_mut(&volume_index) {
+                staging.chunks.insert(
+                    offset,
+                    StagedChunk::Scratch {
+                        offset: scratch_offset,
+                        len: bytes.len() as u64,
+                    },
+                );
+            }
+        }
+        if self.resident_bytes() > self.holds_budget {
+            // Everything pageable is paged and RAM is still over: the budget is
+            // smaller than one staged run, which is a configuration the set
+            // cannot route inside.
+            return Err(DemotionReason::HoldsBudgetExceeded);
+        }
+        Ok(())
+    }
+
+    /// RAM-resident staged bytes across the set — what the holds budget bounds.
+    fn resident_bytes(&self) -> u64 {
+        self.staging.values().fold(0u64, |total, staging| {
+            total.saturating_add(staging.resident_bytes())
+        })
     }
 
     pub(crate) fn plan(&self) -> &DirectSetPlan {
@@ -712,17 +1190,37 @@ impl DirectSetRouter {
         self.demoted.get_or_insert(reason);
     }
 
-    /// Total bytes the set is currently holding in RAM: the holds proper, plus
-    /// the envelope-classified bytes retained for the header walk (M1).
+    /// Total bytes the set is currently holding, RAM and scratch together: the
+    /// holds proper, plus the envelope-classified bytes retained for the header
+    /// walk (M1).
     ///
-    /// Breaching the budget demotes. Paging the retained region out to scratch —
-    /// which would let a large `-rr` set stay direct instead of materializing —
-    /// is **wave 3**; until it exists the only lever is the demotion, so the
-    /// count has to include everything RSS is actually paying for.
+    /// The *RAM* half is [`Self::resident_bytes`], which is what the holds
+    /// budget bounds and what a breach pages down; the paged half is
+    /// [`Self::scratch_bytes`]. Both terms have to be counted somewhere — a
+    /// `-rr` volume's recovery record is envelope-classified and is a percentage
+    /// of the volume, per volume — and the point of paging is to move that term
+    /// from the one ceiling to the other rather than to demote the set.
+    #[cfg(test)]
     pub(crate) fn staged_bytes(&self) -> u64 {
         self.staging.values().fold(0u64, |total, staging| {
             total.saturating_add(staging.staged_bytes())
         })
+    }
+
+    /// RAM-resident staged bytes across the set. Exposed for the tests that
+    /// assert the budget actually bounds RSS rather than bookkeeping.
+    #[cfg(test)]
+    pub(crate) fn resident_staged_bytes(&self) -> u64 {
+        self.resident_bytes()
+    }
+
+    /// Bytes the set is holding that are neither RAM-resident nor paged — which
+    /// must always be zero, since every staged chunk is one or the other.
+    #[cfg(test)]
+    pub(crate) fn unaccounted_staged_bytes(&self) -> u64 {
+        self.staged_bytes()
+            .saturating_sub(self.resident_bytes())
+            .saturating_sub(self.scratch_bytes())
     }
 
     /// Members the router has learned, in **archive order**:
@@ -853,8 +1351,12 @@ impl DirectSetRouter {
             spans.extend(self.drain_volume(volume)?);
         }
 
-        if self.staged_bytes() > self.holds_budget {
-            return Err(self.fail(DemotionReason::HoldsBudgetExceeded));
+        // D2: a breach pages rather than demoting. Demotion is what is left when
+        // paging itself fails — a scratch I/O error, or the ceiling.
+        if self.resident_bytes() > self.holds_budget
+            && let Err(reason) = self.page_holds_to_scratch()
+        {
+            return Err(self.fail(reason));
         }
         Ok(spans)
     }
@@ -883,6 +1385,31 @@ impl DirectSetRouter {
             .or_default()
             .source_complete = true;
         self.try_parse_volume(volume_index)?;
+        // B2. A restored volume the parse above could not confirm will never be
+        // confirmed *by a parse*: its pre-restart bytes are on disk rather than
+        // in `chunks`, so the image the parser walks has a hole from offset zero
+        // and every later attempt fails the same silent way.
+        //
+        // Leaving it unconfirmed is the failure that hides. The trailing region
+        // — the end-of-archive record, and a `-rr` set's whole recovery record —
+        // stays held for the life of the set, so the envelope never receives it,
+        // so the virtual volume reads short, so PAR2 calls a byte-perfect set
+        // damaged and the job pays a full redownload. Either the format proves
+        // the region holds no undiscovered member, or the set demotes here:
+        // named, counted, and while its routed bytes can still materialize the
+        // volumes.
+        if self
+            .staging
+            .get(&volume_index)
+            .is_some_and(|staging| staging.restored && !staging.confirmed)
+        {
+            if !self.restored_volume_completes_confirmed(volume_index) {
+                return Err(self.fail(DemotionReason::UnconfirmedRestoredVolume));
+            }
+            if let Some(staging) = self.staging.get_mut(&volume_index) {
+                staging.confirmed = true;
+            }
+        }
         self.check_eligibility()?;
         let volumes: Vec<u32> = self.staging.keys().copied().collect();
         let mut spans = Vec::new();
@@ -890,6 +1417,53 @@ impl DirectSetRouter {
             spans.extend(self.drain_volume(volume)?);
         }
         Ok(spans)
+    }
+
+    /// Whether a **restored** volume that has just finished downloading may be
+    /// confirmed without the parse it can no longer run (B2).
+    ///
+    /// Two conditions, both necessary:
+    ///
+    /// 1. **Every byte of the volume is accounted for, with no gap** — the
+    ///    checkpoint's restored ranges and this run's staged holds together form
+    ///    one run from offset zero. The caller has already established that no
+    ///    further article is coming, so a single run from zero *is* coverage to
+    ///    the volume's decoded length; it is expressed as contiguity rather than
+    ///    compared against a number because the assembly's `received_bytes` for a
+    ///    restored volume is the spec's yEnc-**encoded** total, ~3% too large.
+    ///    This is the same fact `source_complete` states in the live path:
+    ///    nothing of this volume is still outstanding.
+    /// 2. **The volume's last known member continues into the next volume**
+    ///    (`split_after`). A split member is by construction the last *file* in
+    ///    its volume — that is what splitting means: the volume filled up — so the
+    ///    unproven region above `tail_base` can only hold service data (a `-rr`
+    ///    recovery record) and the end-of-archive record, which are envelope
+    ///    content by definition. No undiscovered member can live there, which is
+    ///    the one thing the confirming parse was there to rule out.
+    ///
+    /// Condition 2 is what keeps this honest, and why the volume that *closes* a
+    /// chain — the last of a set, or one whose member ends inside it — is not
+    /// confirmed this way: a second member's header can sit past the first's data
+    /// area, which is exactly the shape `payload_past_the_last_known_header…`
+    /// pins. Those demote instead.
+    fn restored_volume_completes_confirmed(&self, volume_index: u32) -> bool {
+        let Some(staging) = self.staging.get(&volume_index) else {
+            return false;
+        };
+        let mut held = ByteRanges::new();
+        for &(start, end) in staging.routed.ranges() {
+            held.insert(start, end - start);
+        }
+        for &(start, end) in staging.pending.ranges() {
+            held.insert(start, end - start);
+        }
+        if !matches!(held.ranges(), [(0, _)]) {
+            return false;
+        }
+        self.volume_facts
+            .get(&volume_index)
+            .and_then(|facts| facts.members.last())
+            .is_some_and(|member| member.split_after)
     }
 
     fn fail(&mut self, reason: DemotionReason) -> DemotionReason {
@@ -916,7 +1490,7 @@ impl DirectSetRouter {
             return Err(self.fail(DemotionReason::UnparsableVolume));
         }
 
-        let image = SparseImage::from_chunks(&staging.chunks);
+        let image = SparseImage::from_staged(&staging.chunks, self.scratch.handle());
         let Ok(facts) = weaver_unrar::RarArchive::parse_volume_facts(image, None) else {
             // A prefix too short to hold a whole header is normal early on; the
             // next article retries. A genuinely unparsable volume is caught by
@@ -956,15 +1530,21 @@ impl DirectSetRouter {
             // that only learned more *about the volume* (it finally reached the
             // end-of-archive record, say) needs no layout work at all.
             Some(previous) if previous.members == facts.members => {
+                let changed = *previous != facts;
                 self.volume_facts.insert(volume_index, facts.clone());
+                if changed {
+                    self.dirty_facts.insert(volume_index);
+                }
             }
             Some(previous) if members_extend(previous, &facts) => {
                 self.volume_facts.insert(volume_index, facts.clone());
+                self.dirty_facts.insert(volume_index);
                 self.rebuild_layout()?;
             }
             Some(_) => return Err(self.fail(DemotionReason::ConflictingVolumeFacts)),
             None => {
                 self.volume_facts.insert(volume_index, facts.clone());
+                self.dirty_facts.insert(volume_index);
                 let added = self
                     .layout
                     .as_mut()
@@ -1111,6 +1691,7 @@ impl DirectSetRouter {
                     covered: ByteRanges::new(),
                     parts: BTreeMap::new(),
                     checked_parts: BTreeMap::new(),
+                    restart_seeded: ByteRanges::new(),
                     verified: false,
                 },
             );
@@ -1304,7 +1885,7 @@ impl DirectSetRouter {
                         let bytes = self
                             .staging
                             .get(&volume_index)
-                            .and_then(|staging| staging.slice(cursor, len));
+                            .and_then(|staging| staging.slice(cursor, len, &self.scratch));
                         if let Some(bytes) = bytes {
                             spans.push(RoutedSpan {
                                 destination: DirectDestination::Envelope { volume_index },
@@ -1339,7 +1920,7 @@ impl DirectSetRouter {
                         let bytes = self
                             .staging
                             .get(&volume_index)
-                            .and_then(|staging| staging.slice(cursor, len));
+                            .and_then(|staging| staging.slice(cursor, len, &self.scratch));
                         if let Some(bytes) = bytes {
                             self.note_member_bytes(
                                 member_id,
@@ -1419,7 +2000,7 @@ impl DirectSetRouter {
             let chunks: Vec<(u64, u64)> = staging
                 .chunks
                 .iter()
-                .map(|(offset, bytes)| (*offset, bytes.len() as u64))
+                .map(|(offset, chunk)| (*offset, chunk.len()))
                 .collect();
             for (offset, len) in chunks {
                 let mut cursor = offset;
@@ -1552,6 +2133,20 @@ impl DirectSetRouter {
         {
             return Ok(());
         }
+        // D6's re-arm rule, stated as a refusal. A member carrying restart-seeded
+        // coverage has bytes on disk that no `CrcRuns` in this process ever saw,
+        // so there is no composed value for them — and there must not be one
+        // until they are re-read. The composition below would already stall on
+        // the missing `checked_parts` entry in every shape this can take; saying
+        // it here means a future part-granularity change cannot quietly turn
+        // "unverifiable" into "verified".
+        if self
+            .members
+            .get(&member_id)
+            .is_some_and(|member| !member.restart_seeded.is_empty())
+        {
+            return Ok(());
+        }
         if unpacked_size == 0 {
             // A zero-length stored member (B2). Nothing will ever be routed for
             // it, so the byte-driven gate below can never fire: the first shape
@@ -1591,6 +2186,395 @@ impl DirectSetRouter {
             member.verified = true;
         }
         Ok(())
+    }
+
+    // ---- Restart (plan 135, D6) -------------------------------------------
+    //
+    // A restarted set rebuilds its layout from the **cached volume facts**, not
+    // from bytes: the header bytes sit below the published floors, so they are
+    // not refetched and nothing would re-parse them. Everything the router
+    // derives from a parse — members, ids, destinations, the plan digest — comes
+    // back from the same `add_volume` calls the live path makes, in ascending
+    // volume order so the rebuild is deterministic.
+    //
+    // What deliberately does **not** come back is any integrity state. Coverage
+    // is re-derived (it says which bytes are on disk); `CrcRuns` is not (it would
+    // say those bytes are *good*, on the authority of a process that is gone).
+
+    /// Takes the volume facts this run has accepted and not yet cached.
+    ///
+    /// Drained by the caller, which owns the database, and cleared only by the
+    /// take: a failed write leaves nothing dirty, so the cache would go stale
+    /// silently. That is deliberate — the caller re-marks on failure, and losing
+    /// a fact costs a redownload of that set on the next restart, never a wrong
+    /// restore, because the checkpoint's plan digest is computed from the same
+    /// facts and a missing one cannot reproduce it.
+    pub(crate) fn take_dirty_facts(&mut self) -> Vec<(u32, RarVolumeFacts)> {
+        let dirty = std::mem::take(&mut self.dirty_facts);
+        dirty
+            .into_iter()
+            .filter_map(|volume_index| {
+                self.volume_facts
+                    .get(&volume_index)
+                    .map(|facts| (volume_index, facts.clone()))
+            })
+            .collect()
+    }
+
+    /// Puts a volume back in the dirty set after a failed cache write.
+    pub(crate) fn remark_dirty_fact(&mut self, volume_index: u32) {
+        if self.volume_facts.contains_key(&volume_index) {
+            self.dirty_facts.insert(volume_index);
+        }
+    }
+
+    /// Rebuilds the layout from cached `RarVolumeFacts`.
+    ///
+    /// The facts are the ones this router itself accepted before the restart, so
+    /// re-adding them exercises exactly the paths the live parse does — the
+    /// format check, the layout's conflict detection, member adoption, the
+    /// collision keys and the chain-close eligibility rule. A set whose cached
+    /// facts no longer form a routable archive demotes here, at restore, rather
+    /// than after its first refetched article.
+    pub(crate) fn restore_layout(
+        &mut self,
+        facts: &BTreeMap<u32, RarVolumeFacts>,
+    ) -> Result<(), DemotionReason> {
+        for (volume_index, volume_facts) in facts {
+            if !self.plan.volumes.contains_key(volume_index) {
+                // The row names a volume this job no longer plans. Refusing is
+                // the same stance the checkpoint reader takes on an unknown set.
+                return Err(self.fail(DemotionReason::ConflictingVolumeFacts));
+            }
+            if self.layout.is_none() {
+                let format = volume_facts.archive_format();
+                if !matches!(format, ArchiveFormat::Rar4 | ArchiveFormat::Rar5) {
+                    return Err(self.fail(DemotionReason::UnsupportedFormat));
+                }
+                self.layout = Some(StoredLayoutBuilder::new(format));
+            }
+            let added = self
+                .layout
+                .as_mut()
+                .expect("the layout was bound above")
+                .add_volume(*volume_index, volume_facts);
+            match added {
+                Ok(()) => {}
+                Err(StoredLayoutError::ConflictingVolume { .. }) => {
+                    return Err(self.fail(DemotionReason::ConflictingVolumeFacts));
+                }
+                Err(StoredLayoutError::FormatMismatch { .. }) => {
+                    return Err(self.fail(DemotionReason::FormatMismatch));
+                }
+            }
+            self.volume_facts
+                .insert(*volume_index, volume_facts.clone());
+            self.member_order_stale = true;
+        }
+        if self.layout.is_none() {
+            return Ok(());
+        }
+        self.sync_members()?;
+        self.check_eligibility()?;
+        Ok(())
+    }
+
+    /// Seeds one member's coverage from a checkpoint's destination claim.
+    ///
+    /// `extents` are half-open logical ranges of the member's `.direct.partial`.
+    /// They enter [`MemberRouting::covered`], so those bytes are neither
+    /// refetched nor re-routed, and [`MemberRouting::restart_seeded`], so the
+    /// whole-member gate stays disarmed over them until they are re-read.
+    ///
+    /// Keyed by the destination's **relative path** rather than by the blob's
+    /// member index: the index is an in-run counter, and a set whose volumes
+    /// arrived in a different order last run numbered its members differently.
+    /// The path is derived from the header name, which is the layout's own key.
+    pub(crate) fn restore_member_coverage(
+        &mut self,
+        relative_partial: &str,
+        extents: &[(u64, u64)],
+    ) -> Option<u32> {
+        let member_id = self.members.iter().find_map(|(member_id, member)| {
+            (member.relative_partial == relative_partial).then_some(*member_id)
+        })?;
+        let member = self.members.get_mut(&member_id)?;
+        for (start, end) in extents {
+            let len = end.saturating_sub(*start);
+            if len == 0 {
+                continue;
+            }
+            member.covered.insert(*start, len);
+            member.restart_seeded.insert(*start, len);
+        }
+        Some(member_id)
+    }
+
+    /// Seeds one source volume's restored state: what is already on disk, and
+    /// whether the volume's header walk is finished.
+    ///
+    /// Three things depend on this and none of them can be re-derived from
+    /// bytes, because the bytes are not coming back:
+    ///
+    /// - `routed` stops a refetched article from re-staging a range the previous
+    ///   run already placed;
+    /// - `confirmed` is what lets the drain route the volume's trailing region
+    ///   instead of holding it as unproven classification — an unconfirmed volume
+    ///   holds every envelope byte at or past `tail_base`, which for a restored
+    ///   volume is offset zero, so without this a restart would hold the whole
+    ///   volume and demote on the holds budget;
+    /// - the routed-extent history is what the hybrid provider reads a virtual
+    ///   volume through, and it is a **history**, not a classification (B1).
+    ///
+    /// The history is re-derived by mapping the covered physical ranges through
+    /// the rebuilt layout and clipping each member slice to that member's own
+    /// restored claim: a byte is claimed as a member's only when the volume floor
+    /// and the destination claim agree it was written, which is the same
+    /// both-sides rule the barrier records writes under.
+    ///
+    /// `decoded_len` is `Some(len)` exactly when the checkpoint calls the volume
+    /// complete, and `len` is then the volume's whole decoded length — the same
+    /// number as the row's floor, because the published `complete` bit is itself
+    /// the conjunction of "the download finished" and "the floor covers all of
+    /// it". It is passed as a length rather than a flag so the confirmation
+    /// derivation can *check* the claim against the coverage in front of it
+    /// instead of trusting a bit.
+    pub(crate) fn restore_volume_coverage(
+        &mut self,
+        volume_index: u32,
+        covered: &ByteRanges,
+        decoded_len: Option<u64>,
+    ) {
+        let source_complete = decoded_len.is_some();
+        let confirmed = restored_volume_is_confirmed(
+            covered,
+            decoded_len,
+            self.volume_facts
+                .get(&volume_index)
+                .is_some_and(|facts| facts.more_volumes),
+        );
+        let tail_base = self
+            .volume_facts
+            .get(&volume_index)
+            .map(|facts| {
+                facts
+                    .members
+                    .iter()
+                    .map(|member| member.data_offset.saturating_add(member.data_size))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+
+        let ranges: Vec<(u64, u64)> = covered.ranges().to_vec();
+        {
+            let staging = self.staging.entry(volume_index).or_default();
+            for (start, end) in &ranges {
+                staging.routed.insert(*start, end - start);
+            }
+            staging.provisional = true;
+            staging.confirmed = confirmed;
+            staging.source_complete = source_complete;
+            staging.restored = true;
+            staging.tail_base = staging.tail_base.max(tail_base);
+        }
+
+        for (start, end) in ranges {
+            let mut cursor = start;
+            for slice in self.map_physical_range(volume_index, start, end - start) {
+                let MappedSlice::Member {
+                    member_index,
+                    logical_offset,
+                    len,
+                } = slice
+                else {
+                    cursor = cursor.saturating_add(slice_len(&slice));
+                    continue;
+                };
+                let Some(member_id) = self.member_id_for_layout(member_index) else {
+                    cursor = cursor.saturating_add(len);
+                    continue;
+                };
+                // Clip to what the member's own claim backs. A gap here is not a
+                // contradiction to resolve — it is a byte the previous run's
+                // floor covered but whose destination write the checkpoint never
+                // claimed, so nothing may read it back.
+                let claimed = self
+                    .members
+                    .get(&member_id)
+                    .map(|member| &member.covered)
+                    .map(|covered| covered.missing(logical_offset, len))
+                    .unwrap_or_else(|| vec![(logical_offset, logical_offset + len)]);
+                let mut logical_cursor = logical_offset;
+                let logical_end = logical_offset.saturating_add(len);
+                let mut runs: Vec<(u64, u64)> = Vec::new();
+                for (gap_start, gap_end) in claimed {
+                    if gap_start > logical_cursor {
+                        runs.push((logical_cursor, gap_start));
+                    }
+                    logical_cursor = gap_end;
+                }
+                if logical_cursor < logical_end {
+                    runs.push((logical_cursor, logical_end));
+                }
+                for (run_start, run_end) in runs {
+                    self.record_routed_extent(
+                        volume_index,
+                        MemberExtent {
+                            member_id,
+                            physical_offset: cursor.saturating_add(run_start - logical_offset),
+                            logical_offset: run_start,
+                            len: run_end - run_start,
+                        },
+                    );
+                }
+                cursor = cursor.saturating_add(len);
+            }
+        }
+    }
+
+    /// The volumes the router holds parsed facts for — the volumes whose bytes
+    /// it can classify. The restore seam validates a checkpoint's claims against
+    /// this (M5).
+    pub(crate) fn fact_volumes(&self) -> std::collections::HashSet<u32> {
+        self.volume_facts.keys().copied().collect()
+    }
+
+    /// Whether any member is still carrying restart-seeded, unverified coverage.
+    pub(crate) fn has_restart_seeded_coverage(&self) -> bool {
+        self.members
+            .values()
+            .any(|member| !member.restart_seeded.is_empty())
+    }
+
+    /// The runs of member partials that must be re-read from disk before the
+    /// whole-member gates can compose (D6's "PAR2 absent" arm).
+    ///
+    /// Split at part boundaries, because the composition is per part, and
+    /// returned in `(member, ascending offset)` order so the caller's read is one
+    /// forward pass per file rather than a seek per run.
+    pub(crate) fn restart_read_plan(&self) -> Vec<RestartReadRun> {
+        let mut plan = Vec::new();
+        for member_id in &self.member_order {
+            let Some(member) = self.members.get(member_id) else {
+                continue;
+            };
+            if member.restart_seeded.is_empty() {
+                continue;
+            }
+            let boundaries = self.part_boundaries(*member_id);
+            for &(start, end) in member.restart_seeded.ranges() {
+                let mut cursor = start;
+                while cursor < end {
+                    let stop = boundaries
+                        .iter()
+                        .copied()
+                        .find(|boundary| *boundary > cursor)
+                        .unwrap_or(end)
+                        .min(end);
+                    plan.push(RestartReadRun {
+                        member_id: *member_id,
+                        relative_partial: member.relative_partial.clone(),
+                        logical_offset: cursor,
+                        len: stop - cursor,
+                    });
+                    cursor = stop;
+                }
+            }
+        }
+        plan
+    }
+
+    /// Exclusive logical end offsets of every part of a member's chain.
+    fn part_boundaries(&self, member_id: u32) -> Vec<u64> {
+        let Some(layout_index) = self.layout_index_for_member(member_id) else {
+            return Vec::new();
+        };
+        let Some(member) = self.layout_members().get(layout_index) else {
+            return Vec::new();
+        };
+        member
+            .parts
+            .iter()
+            .map(|part| {
+                part.logical_offset
+                    .unwrap_or(0)
+                    .saturating_add(part.data_size)
+            })
+            .collect()
+    }
+
+    /// Feeds one re-read run's CRC32 back into the member's composition and
+    /// clears it from the restart-seeded set.
+    ///
+    /// This is the whole re-arm: the value comes from the bytes **on disk now**,
+    /// so corruption introduced while the process was down fails the member gate
+    /// exactly as a bad article would have.
+    ///
+    /// # Cannot-locate demotes (M4)
+    ///
+    /// A run whose part the layout cannot place — the member is gone from the
+    /// layout, no part covers the offset, the member's routing state has been
+    /// dropped — used to return `Ok(())` and leave the seeded range in place.
+    /// That reads as success to the caller and as *never verifiable* to
+    /// [`Self::try_verify_member`], so the set neither finalizes nor demotes: it
+    /// sits there being re-read on every completion check for the life of the
+    /// job. None of these are runtime conditions — each one means the layout the
+    /// read plan was built from is not the layout in front of us — so each one
+    /// demotes and lets the conventional path have the set.
+    pub(crate) fn note_restored_member_crc(
+        &mut self,
+        member_id: u32,
+        logical_offset: u64,
+        len: u64,
+        crc: u32,
+    ) -> Result<(), DemotionReason> {
+        let Some(layout_index) = self.layout_index_for_member(member_id) else {
+            return Err(self.fail(DemotionReason::RestartRearmUnplaceable));
+        };
+        let part = self
+            .layout_members()
+            .get(layout_index)
+            .and_then(|member| {
+                member.parts.iter().enumerate().find(|(_, part)| {
+                    let start = part.logical_offset.unwrap_or(0);
+                    logical_offset >= start && logical_offset < start.saturating_add(part.data_size)
+                })
+            })
+            .map(|(position, part)| {
+                (
+                    position as u32,
+                    part.logical_offset.unwrap_or(0),
+                    part.data_size,
+                    part.packed_crc32,
+                )
+            });
+        let Some((part_position, part_logical_offset, part_len, packed_crc32)) = part else {
+            return Err(self.fail(DemotionReason::RestartRearmUnplaceable));
+        };
+        let Some(member) = self.members.get_mut(&member_id) else {
+            return Err(self.fail(DemotionReason::RestartRearmUnplaceable));
+        };
+        member.parts.entry(part_position).or_default().insert(
+            logical_offset.saturating_sub(part_logical_offset),
+            len,
+            crc,
+        );
+        member.restart_seeded = subtract(&member.restart_seeded, logical_offset, len);
+
+        let part_value = member
+            .parts
+            .get(&part_position)
+            .and_then(|runs| runs.compose(0, part_len));
+        if let Some(value) = part_value {
+            member.checked_parts.insert(part_position, value);
+            if let Some(expected) = packed_crc32
+                && expected != value
+            {
+                return Err(self.fail(DemotionReason::PartChecksumMismatch));
+            }
+        }
+        self.try_verify_member(member_id)
     }
 
     /// Files one emitted member extent into the volume's routing history,
@@ -1737,6 +2721,25 @@ fn continues(held: MemberExtent, next: MemberExtent) -> bool {
     held.member_id == next.member_id
         && held.physical_offset.saturating_add(held.len) == next.physical_offset
         && held.logical_offset.saturating_add(held.len) == next.logical_offset
+}
+
+/// One run of a member's `.direct.partial` that restart seeded and the
+/// finalization re-read must recompute (D6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RestartReadRun {
+    pub(crate) member_id: u32,
+    pub(crate) relative_partial: String,
+    pub(crate) logical_offset: u64,
+    pub(crate) len: u64,
+}
+
+/// The byte length of any mapped slice, whatever it maps to.
+fn slice_len(slice: &MappedSlice) -> u64 {
+    match slice {
+        MappedSlice::Member { len, .. }
+        | MappedSlice::Envelope { len }
+        | MappedSlice::Unroutable { len } => *len,
+    }
 }
 
 /// One direct-routed member's slice of a volume, in both coordinate spaces.
