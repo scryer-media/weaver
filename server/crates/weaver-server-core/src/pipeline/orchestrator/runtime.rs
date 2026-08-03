@@ -230,6 +230,7 @@ impl Pipeline {
             write_buffers: HashMap::new(),
             par2_runtime: HashMap::new(),
             live_par2: crate::pipeline::repair::live::LivePar2Registry::new(),
+            direct_store: crate::pipeline::direct_store::wiring::DirectStoreRuntime::default(),
             extracted_members: HashMap::new(),
             extracted_archives: HashMap::new(),
             decode_retries: HashMap::new(),
@@ -465,6 +466,14 @@ impl Pipeline {
         contiguous_bytes_written: u64,
         force_flush: bool,
     ) {
+        // Plan 135, D7: a direct set's source volume has no file, so its legacy
+        // floor stays at zero — an older binary then sees no coverage and
+        // redownloads instead of trusting bytes that were never written there.
+        // The routing seam already returns before this is reached; the guard is
+        // here so any *other* caller inherits the same rule.
+        if self.is_direct_source_file(file_id) {
+            return;
+        }
         let current = self
             .pending_file_progress
             .get(&file_id)
@@ -556,6 +565,11 @@ impl Pipeline {
             .retain(|file_id, _| file_id.job_id != job_id);
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
+        // Plan 135: the direct-store runtime is per-job state like every map
+        // above it. Left behind, its sets keep a removed job "active" and the
+        // barrier poll keeps demanding checkpoints for a working directory that
+        // is being deleted.
+        self.direct_store.clear_job(job_id);
     }
 
     pub(crate) fn note_download_activity(&mut self, job_id: JobId) {
@@ -715,6 +729,11 @@ impl Pipeline {
             }
 
             self.dispatch_downloads();
+            // Plan 135, D6: the byte and age triggers are polled on the loop's
+            // existing periodic seam rather than on a timer of their own, so an
+            // idle set still checkpoints and a busy one is never checked more
+            // often than the pipeline turns.
+            self.poll_direct_store_barriers().await;
 
             let rate_delay = self.rate_limiter.time_until_ready();
             let rate_sleep = tokio::time::sleep(rate_delay);
@@ -732,6 +751,10 @@ impl Pipeline {
                 match self.cmd_rx.try_recv() {
                     Ok(SchedulerCommand::Shutdown) => {
                         info!("pipeline shutting down");
+                        self.demand_direct_store_barriers_for_all_jobs(
+                            crate::pipeline::direct_store::barrier::BarrierDemand::Shutdown,
+                        )
+                        .await;
                         break 'run_loop;
                     }
                     Ok(cmd) => self.handle_command(cmd).await,
@@ -1271,6 +1294,23 @@ enum DiskWriteCommand {
             Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError>,
         >,
     },
+    /// One direct-store destination's share of a routed article (plan 135, D3).
+    ///
+    /// Raw bytes rather than a `BufferedDecodedSegment`, because a routed run is
+    /// a *fragment* of an article: one decoded span is split across a member
+    /// partial and the set's envelope, and neither piece is a segment.
+    RawBatch {
+        path: std::path::PathBuf,
+        writes: Vec<(u64, Vec<u8>)>,
+        queued_at: Instant,
+        response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
+    },
+    /// Durably syncs one destination, on the thread that owns its handle so the
+    /// sync is ordered behind every batch queued before it (D6 step 2).
+    SyncPath {
+        path: std::path::PathBuf,
+        response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
+    },
     CloseHandles {
         scope: CloseHandleScope,
         ack: Option<tokio::sync::oneshot::Sender<()>>,
@@ -1354,6 +1394,51 @@ impl DiskWriteOwnerPool {
                 unwritten: Vec::new(),
             })
         })
+    }
+
+    /// Queues one destination's sub-batch and hands back its completion. Split
+    /// from awaiting so a multi-path article submits every sub-batch first and
+    /// only then joins them — otherwise the fan-out would be a sequence.
+    fn submit_raw_batch(
+        &self,
+        path: std::path::PathBuf,
+        writes: Vec<(u64, Vec<u8>)>,
+    ) -> tokio::sync::oneshot::Receiver<std::io::Result<()>> {
+        let (response, response_rx) = tokio::sync::oneshot::channel();
+        let sender_index = self.owner_index_for_path(&path);
+        let command = DiskWriteCommand::RawBatch {
+            path,
+            writes,
+            queued_at: Instant::now(),
+            response,
+        };
+        if let Err(error) = self.senders[sender_index].send(command) {
+            let DiskWriteCommand::RawBatch { response, .. } = error.0 else {
+                unreachable!("raw batch send returned a different command");
+            };
+            let _ = response.send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "disk write owner thread stopped",
+            )));
+        }
+        response_rx
+    }
+
+    async fn sync_path(&self, path: std::path::PathBuf) -> std::io::Result<()> {
+        let (response, response_rx) = tokio::sync::oneshot::channel();
+        let sender_index = self.owner_index_for_path(&path);
+        if self.senders[sender_index]
+            .send(DiskWriteCommand::SyncPath { path, response })
+            .is_err()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "disk write owner thread stopped",
+            ));
+        }
+        response_rx
+            .await
+            .unwrap_or_else(|error| Err(std::io::Error::other(error)))
     }
 
     fn release_handle(&self, path: &std::path::Path) {
@@ -1499,6 +1584,24 @@ fn run_disk_write_owner(rx: std::sync::mpsc::Receiver<DiskWriteCommand>) {
                     write_segments_to_disk_blocking(&mut handles, path, segments, queued_at);
                 let _ = response.send(result);
             }
+            Ok(DiskWriteCommand::RawBatch {
+                path,
+                writes,
+                queued_at,
+                response,
+            }) => {
+                let result = write_raw_batch_blocking(&mut handles, path, writes, queued_at);
+                let _ = response.send(result);
+            }
+            Ok(DiskWriteCommand::SyncPath { path, response }) => {
+                let result = handles
+                    .open_or_reuse(&path)
+                    .and_then(|file| file.sync_data());
+                if result.is_err() {
+                    handles.discard(&path);
+                }
+                let _ = response.send(result);
+            }
             Ok(DiskWriteCommand::CloseHandles { scope, ack }) => {
                 handles.close_matching(&scope);
                 if let Some(ack) = ack {
@@ -1587,6 +1690,81 @@ fn write_segments_into_file(
     }
 
     Ok(written)
+}
+
+fn write_raw_batch_blocking(
+    handles: &mut DiskWriteHandleCache,
+    path: std::path::PathBuf,
+    writes: Vec<(u64, Vec<u8>)>,
+    queued_at: Instant,
+) -> std::io::Result<()> {
+    use std::io::{Seek, Write};
+
+    crate::runtime::perf_probe::record(
+        "download.disk_write.owner.queue_wait",
+        Instant::now().duration_since(queued_at),
+    );
+    let file = handles.open_or_reuse(&path)?;
+    let mut next_offset = None;
+    for (offset, bytes) in &writes {
+        if next_offset != Some(*offset)
+            && let Err(source) = file.seek(std::io::SeekFrom::Start(*offset))
+        {
+            handles.discard(&path);
+            return Err(source);
+        }
+        if let Err(source) = file.write_all(bytes) {
+            handles.discard(&path);
+            return Err(source);
+        }
+        next_offset = Some(offset + bytes.len() as u64);
+    }
+    Ok(())
+}
+
+/// One routed article's fragments, grouped into one sub-batch per destination
+/// file: `(destination path, [(offset, bytes)])`.
+pub(crate) type DirectWriteBatches = Vec<(std::path::PathBuf, Vec<(u64, Vec<u8>)>)>;
+
+/// Writes one routed article's fragments to **every** destination it touches,
+/// fanning the per-path sub-batches out to their owner threads and joining them
+/// all (plan 135, D3).
+///
+/// The article counts as placed only when every destination write returned;
+/// a partial failure is reported as an error and leaves orphan bytes, which is
+/// safe because the coverage map — not the bytes — is the truth.
+pub(crate) async fn write_direct_batches(batches: DirectWriteBatches) -> std::io::Result<()> {
+    if batches.is_empty() {
+        return Ok(());
+    }
+    let pool = disk_write_owner_pool();
+    // Every sub-batch is queued before any of them is awaited, so the owner
+    // threads run in parallel; joining them all is what makes the article
+    // "placed only when every destination write returned".
+    let mut pending = Vec::with_capacity(batches.len());
+    for (path, writes) in batches {
+        pending.push(pool.submit_raw_batch(path, writes));
+    }
+    let mut first_error = None;
+    for response in pending {
+        let result = response
+            .await
+            .unwrap_or_else(|error| Err(std::io::Error::other(error)));
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Durably syncs one direct-store destination through its owner thread.
+pub(crate) async fn sync_direct_destination(path: &std::path::Path) -> std::io::Result<()> {
+    disk_write_owner_pool().sync_path(path.to_path_buf()).await
 }
 
 pub(crate) async fn write_segments_to_disk(

@@ -79,6 +79,18 @@ pub(crate) enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
 
+        /// Password for encrypted archive contents in the submitted NZB.
+        #[arg(long, value_name = "PASSWORD")]
+        password: Option<String>,
+
+        /// Write an immutable JSON terminal-status report after completion.
+        #[arg(long, value_name = "PATH")]
+        report: Option<PathBuf>,
+
+        /// Wait up to 30 seconds for this file after writing --report.
+        #[arg(long, value_name = "PATH", requires = "report")]
+        report_ack: Option<PathBuf>,
+
         /// Bypass semantic duplicate blocking for this submission.
         #[arg(long)]
         force: bool,
@@ -182,6 +194,37 @@ mod tests {
             cli.resolved_config_path(),
             PathBuf::from("custom-weaver.toml")
         );
+    }
+
+    #[test]
+    fn standalone_download_password_and_report_are_preserved() {
+        let cli = Cli::parse_from([
+            "weaver",
+            "download",
+            "fixture.nzb",
+            "--password",
+            "fixture-password",
+            "--report",
+            "result.json",
+            "--report-ack",
+            "result.ack",
+        ]);
+
+        match cli.command.expect("download command") {
+            Command::Download {
+                nzb,
+                password,
+                report,
+                report_ack,
+                ..
+            } => {
+                assert_eq!(nzb, PathBuf::from("fixture.nzb"));
+                assert_eq!(password.as_deref(), Some("fixture-password"));
+                assert_eq!(report, Some(PathBuf::from("result.json")));
+                assert_eq!(report_ack, Some(PathBuf::from("result.ack")));
+            }
+            _ => panic!("download arguments should parse as a download command"),
+        }
     }
 
     #[cfg(not(windows))]

@@ -38,6 +38,19 @@
 //! refusal ([`CoverageRejection::ProbeFailed`]): accepting a checkpoint whose
 //! destinations were never validated is the one outcome this module exists to
 //! prevent.
+//!
+//! # Not yet called from job restore
+//!
+//! Phase 4 wired routing, the barrier and finalization; the *reader* side is
+//! still only exercised by tests. Wiring it means two things this phase did not
+//! do: rebuilding a set's stored layout at restore (the header bytes sit below
+//! the published floors, so they are not refetched — the facts have to come back
+//! from `active_rar_volume_facts` instead), and folding [`coverage_skip_plan`]
+//! into `build_restore_skip_plan` alongside the legacy floors. Until then a
+//! restarted direct set has no accepted checkpoint and redownloads, which is the
+//! safe outcome, not a silent one. The module-scoped allow below says that once
+//! rather than per item, and comes off with that wiring.
+#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

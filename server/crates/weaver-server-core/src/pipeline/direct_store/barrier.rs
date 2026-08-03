@@ -62,6 +62,11 @@ fn failure_backoff(consecutive_failures: u32) -> Duration {
 
 /// Why the caller is demanding a barrier. The caller decides when these happen;
 /// the controller only records which one it served.
+// `Pause` and `Demotion` have no caller yet: pause routes through the same
+// shutdown path for now, and D8's demotion *deletes* the row rather than
+// checkpointing it. Both are the vocabulary the demand seam is specified in, so
+// they stay named rather than being re-invented when phases 5 and 6 use them.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BarrierDemand {
     Pause,
@@ -102,6 +107,7 @@ pub(crate) enum BarrierError {
 }
 
 impl BarrierError {
+    #[allow(dead_code)]
     pub(crate) fn step(&self) -> BarrierStep {
         match self {
             Self::Drain(_) => BarrierStep::Drain,
@@ -353,20 +359,26 @@ impl CoverageBarrier {
         barrier
     }
 
+    /// Reporting accessors the barrier publishes for a health surface phase 4
+    /// does not wire; exercised by this module's own tests.
+    #[allow(dead_code)]
     pub(crate) fn generation(&self) -> u64 {
         self.committed_generation
     }
 
+    #[allow(dead_code)]
     pub(crate) fn dirty_bytes(&self) -> u64 {
         self.dirty_bytes
     }
 
+    #[allow(dead_code)]
     pub(crate) fn published_floors(&self) -> &BTreeMap<u32, u64> {
         &self.published_floors
     }
 
     /// Barriers that have failed in a row, for the caller's health reporting.
     /// Zero after any success.
+    #[allow(dead_code)]
     pub(crate) fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures
     }
@@ -374,6 +386,7 @@ impl CoverageBarrier {
     /// When the age trigger becomes eligible again after a failure. `None` when
     /// no barrier is in backoff. A caller scheduling its own wake-ups can use
     /// this instead of polling.
+    #[allow(dead_code)]
     pub(crate) fn cooldown_until(&self) -> Option<Instant> {
         self.cooldown_until
     }

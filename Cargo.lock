@@ -5400,7 +5400,15 @@ dependencies = [
  "rayon",
  "thiserror 2.0.19",
  "tracing",
- "weaver-reed-solomon",
+ "weaver-reed-solomon 0.2.3 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "weaver-reed-solomon"
+version = "0.2.3"
+dependencies = [
+ "memmap2",
+ "rayon",
 ]
 
 [[package]]
@@ -5512,8 +5520,6 @@ dependencies = [
 [[package]]
 name = "weaver-unrar"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1a9d525299791540ff2b3609dfdd08d8b9a4eec2924eedad998f06bf08a1729"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys 0.42.0",
@@ -5530,7 +5536,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tracing",
  "unicode-normalization",
- "weaver-reed-solomon",
+ "weaver-reed-solomon 0.2.3",
  "windows-sys 0.61.2",
  "zeroize",
 ]

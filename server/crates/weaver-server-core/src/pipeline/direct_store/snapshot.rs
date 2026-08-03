@@ -94,6 +94,8 @@ pub(crate) struct CoverageSnapshot {
 }
 
 impl CoverageSnapshot {
+    /// Restart-side lookup; unwired with the rest of the reader (see `restart`).
+    #[allow(dead_code)]
     pub(crate) fn floor_for_volume(&self, volume_index: u32) -> Option<u64> {
         self.floors
             .binary_search_by_key(&volume_index, |entry| entry.volume_index)

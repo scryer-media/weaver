@@ -99,3 +99,8 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Branch-local (0.8.0): weaver-unrar with stored_layout is unpublished; drop this
+# patch when 0.4.0 ships to crates.io (see plan 135 phase 4 dependency decision).
+[patch.crates-io]
+weaver-unrar = { path = "../rarpar/crates/weaver-unrar" }

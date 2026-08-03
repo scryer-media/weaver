@@ -1807,6 +1807,9 @@ pub struct Pipeline {
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
     /// In-stream PAR2 block verification state for every live job.
     pub(super) live_par2: repair::live::LivePar2Registry,
+    /// Direct-store routing state: admitted archive sets, their routers and
+    /// their coverage barriers (plan 135, phase 4). Inert while the gate is off.
+    pub(super) direct_store: direct_store::wiring::DirectStoreRuntime,
     /// RAR members already extracted per job (for incremental RAR extraction).
     pub(super) extracted_members: HashMap<JobId, HashSet<String>>,
     /// Archives whose extraction has completed successfully (by archive name).

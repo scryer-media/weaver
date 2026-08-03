@@ -150,6 +150,17 @@ impl FileAssembly {
         self.received_bytes = self.total_bytes;
     }
 
+    /// Whether one specific segment has been received.
+    ///
+    /// Out-of-range segment numbers read as not received rather than panicking:
+    /// callers iterate a spec, which can disagree with the assembly only if the
+    /// job was rebuilt underneath them.
+    pub fn has_segment(&self, segment_number: u32) -> bool {
+        self.received
+            .get(segment_number as usize)
+            .is_some_and(|received| *received)
+    }
+
     /// How many segments are still missing.
     pub fn missing_count(&self) -> u32 {
         self.total_segments - self.received.count_ones() as u32

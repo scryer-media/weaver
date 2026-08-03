@@ -5,6 +5,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::time::Instant;
 
 use super::*;
+use crate::pipeline::direct_store::wiring::DirectRouteOutcome;
 
 const MAX_DEFERRED_FILE_HASH_DATA_BYTES: usize = 128 * 1024 * 1024;
 const OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS: usize = 16;
@@ -1398,6 +1399,35 @@ impl Pipeline {
             if let Some(state) = self.jobs.get_mut(&job_id) {
                 state.downloaded_bytes += decoded_size as u64;
             }
+
+            // Plan 135, D3: a direct set's source volume never becomes a file,
+            // so its bytes leave the conventional path here — before the write
+            // reorder buffer, before `write_segments_to_disk`, and therefore
+            // before any legacy progress floor or completed-file row (D7).
+            if let Some((set_index, volume_index)) = self.direct_route_target(file_id) {
+                drop(_cpu_scope);
+                let outcome = self
+                    .handle_direct_decode_success(
+                        set_index,
+                        volume_index,
+                        buffered_segment,
+                        file_offset,
+                    )
+                    .await;
+                // D1's per-article half of `sets == direct + materialized`: an
+                // article either reached a destination or handed its volume
+                // back, and the two counts must add up to the articles that
+                // entered the seam.
+                crate::runtime::perf_probe::record(
+                    match outcome {
+                        DirectRouteOutcome::Routed => "direct_store.article.routed",
+                        DirectRouteOutcome::Demoted => "direct_store.article.demoted",
+                    },
+                    std::time::Duration::from_nanos(1),
+                );
+                return;
+            }
+
             let buffered_len = buffered_segment.len_bytes();
 
             let ready = {

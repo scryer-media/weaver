@@ -22,6 +22,8 @@ use super::snapshot::{
     CoverageSnapshot, DestinationClaim, DestinationExtent, SNAPSHOT_MAGIC, SNAPSHOT_SCHEMA_VERSION,
     SnapshotError, VolumeFloor, decode, encode,
 };
+use super::plan::{DirectSetPlan, ENVELOPE_SLOT_BYTES, ENVELOPE_SLOT_HALF};
+use super::router::{CrcRuns, SparseImage};
 use super::{ByteRanges, DirectStoreGate, parse_enabled};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, SegmentSpec};
@@ -1769,4 +1771,209 @@ fn the_gate_defaults_off_and_only_explicit_on_words_enable_it() {
     assert!(parse_enabled(Some(" TRUE ")));
     assert!(parse_enabled(Some("on")));
     assert!(parse_enabled(Some("yes")));
+}
+
+// ---------------------------------------------------------------------------
+// Router internals: the pieces every routed byte passes through
+// ---------------------------------------------------------------------------
+
+#[test]
+fn crc_runs_compose_neighbours_and_ignore_an_overlapping_re_insert() {
+    let payload: Vec<u8> = (0..600u32).map(|index| (index % 251) as u8).collect();
+    let whole = weaver_par2::checksum::crc32(&payload);
+
+    // Fed out of order — the tail, then the head, then the middle that joins
+    // them — which is the only order the router ever guarantees.
+    let mut runs = CrcRuns::default();
+    runs.insert(400, 200, weaver_par2::checksum::crc32(&payload[400..600]));
+    assert_eq!(runs.exact(0, 600), None, "a gap is not a composition");
+    runs.insert(0, 100, weaver_par2::checksum::crc32(&payload[..100]));
+    assert_eq!(runs.exact(0, 600), None);
+    runs.insert(100, 300, weaver_par2::checksum::crc32(&payload[100..400]));
+
+    assert_eq!(
+        runs.exact(0, 600),
+        Some(whole),
+        "adjacent runs compose to the whole-space CRC32"
+    );
+}
+
+#[test]
+fn crc_runs_refuse_every_shape_of_overlap() {
+    let base = |start: u64, len: u64| {
+        let mut runs = CrcRuns::default();
+        runs.insert(100, 100, 0xAAAA_AAAA);
+        runs.insert(start, len, 0xBBBB_BBBB);
+        runs
+    };
+    let untouched = base(0, 0);
+
+    // Straddling the front, straddling the back, wholly inside, wholly
+    // containing, and exactly duplicate: none may advance the composition.
+    for (start, len) in [(50, 100), (150, 100), (120, 10), (50, 200), (100, 100)] {
+        assert_eq!(
+            base(start, len),
+            untouched,
+            "an overlapping run at {start}+{len} must be ignored"
+        );
+    }
+
+    // Butting up against either edge is not an overlap, and must merge.
+    let mut runs = base(200, 50);
+    assert_eq!(runs.exact(100, 150).is_some(), true);
+    runs = base(50, 50);
+    assert!(runs.exact(50, 150).is_some());
+
+    // A zero-length run is a no-op, not an insertion at offset zero.
+    assert_eq!(base(0, 0), untouched);
+}
+
+#[test]
+fn a_sparse_image_reads_across_run_boundaries_and_stops_at_every_hole() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut chunks = std::collections::BTreeMap::new();
+    chunks.insert(0u64, vec![1u8, 2, 3, 4]);
+    chunks.insert(4u64, vec![5u8, 6]);
+    chunks.insert(16u64, vec![9u8, 9, 9]);
+    let mut image = SparseImage::from_chunks(&chunks);
+
+    // Adjacent runs are still separate runs: a read stops at the boundary and
+    // the next read continues, which is exactly what `read_exact` loops on.
+    let mut out = [0u8; 6];
+    let first = image.read(&mut out).unwrap();
+    assert_eq!(first, 4);
+    let second = image.read(&mut out[first..]).unwrap();
+    assert_eq!(second, 2);
+    assert_eq!(out, [1, 2, 3, 4, 5, 6]);
+
+    // The hole reads as EOF, which the header walk turns into a clean stop.
+    assert_eq!(image.read(&mut out).unwrap(), 0);
+
+    // Seeking over a data area and landing inside a later run is the whole
+    // point: that is how a second member's header is reached.
+    assert_eq!(image.seek(SeekFrom::Start(17)).unwrap(), 17);
+    let mut tail = [0u8; 4];
+    assert_eq!(image.read(&mut tail).unwrap(), 2);
+    assert_eq!(&tail[..2], &[9, 9]);
+
+    // Seeks past everything staged succeed and read as EOF.
+    assert_eq!(image.seek(SeekFrom::Start(1 << 40)).unwrap(), 1 << 40);
+    assert_eq!(image.read(&mut tail).unwrap(), 0);
+
+    // Relative seeks are supported; end-relative ones are refused, because the
+    // image has no end — the last staged run is wherever the last article
+    // happened to reach.
+    image.seek(SeekFrom::Start(2)).unwrap();
+    assert_eq!(image.seek(SeekFrom::Current(2)).unwrap(), 4);
+    assert_eq!(image.seek(SeekFrom::Current(-3)).unwrap(), 1);
+    let refused = image.seek(SeekFrom::End(0)).unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::Unsupported);
+}
+
+fn envelope_plan() -> DirectSetPlan {
+    DirectSetPlan {
+        set_name: "Silver.Horizon.S01E05".to_string(),
+        volumes: [(0u32, 0u32), (1, 1)].into_iter().collect(),
+        files: [(0u32, 0u32), (1, 1)].into_iter().collect(),
+        working_dir: std::path::PathBuf::from("/tmp/silver-horizon"),
+    }
+}
+
+#[test]
+fn envelope_offsets_split_each_volume_slot_into_a_head_and_a_tail() {
+    let plan = envelope_plan();
+
+    // No member extents known yet: everything addresses from the head.
+    assert_eq!(plan.envelope_offset(0, 0, 64, 0), Some(0));
+    assert_eq!(plan.envelope_offset(1, 0, 64, 0), Some(ENVELOPE_SLOT_BYTES));
+
+    // With a tail base, a run below it is head-relative and a run at or above
+    // it is tail-relative, so the trailer can never grow into the head.
+    let tail_base = 10_000_000u64;
+    assert_eq!(plan.envelope_offset(0, 128, 64, tail_base), Some(128));
+    assert_eq!(
+        plan.envelope_offset(0, tail_base, 64, tail_base),
+        Some(ENVELOPE_SLOT_HALF)
+    );
+    assert_eq!(
+        plan.envelope_offset(1, tail_base + 32, 8, tail_base),
+        Some(ENVELOPE_SLOT_BYTES + ENVELOPE_SLOT_HALF + 32)
+    );
+
+    // A run that does not fit its half slot is refused — that is the signal
+    // the set carries more than headers and must demote.
+    assert_eq!(
+        plan.envelope_offset(0, ENVELOPE_SLOT_HALF - 8, 16, 0),
+        None
+    );
+    assert_eq!(plan.envelope_offset(0, 0, ENVELOPE_SLOT_HALF + 1, 0), None);
+    assert_eq!(
+        plan.envelope_offset(0, ENVELOPE_SLOT_HALF, 1, 0),
+        None,
+        "a head run beyond the half slot has nowhere to go"
+    );
+
+    // Overflow refuses rather than wrapping into another volume's slot.
+    assert_eq!(plan.envelope_offset(u32::MAX, 0, 8, 0), None);
+    assert_eq!(plan.envelope_offset(0, 0, u64::MAX, 0), None);
+    assert_eq!(
+        plan.envelope_offset(0, u64::MAX, 8, u64::MAX),
+        None,
+        "a tail run at the top of the space overflows its slot"
+    );
+}
+
+#[test]
+fn byte_ranges_report_exactly_the_sub_ranges_they_do_not_cover() {
+    let mut ranges = ByteRanges::new();
+    ranges.insert(100, 100);
+    ranges.insert(300, 100);
+
+    // Wholly covered, wholly missing, and every partial straddle.
+    assert_eq!(ranges.missing(120, 40), vec![]);
+    assert_eq!(ranges.missing(200, 100), vec![(200, 300)]);
+    assert_eq!(ranges.missing(50, 100), vec![(50, 100)]);
+    assert_eq!(ranges.missing(150, 100), vec![(200, 250)]);
+    assert_eq!(ranges.missing(0, 500), vec![(0, 100), (200, 300), (400, 500)]);
+
+    // Degenerate windows contribute nothing rather than a zero-length gap.
+    assert_eq!(ranges.missing(120, 0), vec![]);
+    assert_eq!(ranges.missing(u64::MAX, 2), vec![]);
+
+    // An empty set is missing everything asked of it.
+    assert_eq!(ByteRanges::new().missing(7, 3), vec![(7, 10)]);
+}
+
+#[test]
+fn member_partials_keep_their_directory_and_hostile_names_are_refused() {
+    let plan = envelope_plan();
+
+    assert_eq!(
+        plan.member_partial_path("Silver.Horizon.S01E05.mkv"),
+        Ok("Silver.Horizon.S01E05.mkv.direct.partial".to_string())
+    );
+    // The directory component survives: the partial lives beside where the
+    // member will land, not flattened into the working directory root.
+    assert_eq!(
+        plan.member_partial_path("Silver.Horizon/S01E05.mkv"),
+        Ok("Silver.Horizon/S01E05.mkv.direct.partial".to_string())
+    );
+    assert_eq!(
+        plan.member_partial_path("Silver.Horizon\\S01E05.mkv")
+            .map(|path| path.contains('/')),
+        Ok(cfg!(windows)),
+        "backslashes are separators on Windows and ordinary name bytes elsewhere"
+    );
+    assert_eq!(
+        plan.member_partial_path("./nested/./S01E05.mkv"),
+        Ok("nested/S01E05.mkv.direct.partial".to_string())
+    );
+
+    for hostile in ["", "../escape.mkv", "/absolute.mkv", "a/../../escape.mkv", "."] {
+        assert!(
+            plan.member_partial_path(hostile).is_err(),
+            "{hostile} must not name a destination"
+        );
+    }
 }

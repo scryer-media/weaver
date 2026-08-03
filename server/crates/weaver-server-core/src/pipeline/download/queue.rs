@@ -187,6 +187,15 @@ impl DownloadQueue {
             .count()
     }
 
+    /// Adds every queued segment id to `out`.
+    ///
+    /// For callers that build work items from a spec rather than from the
+    /// queue and so must not re-queue an article the queue already owns —
+    /// pushing a second copy would download it twice.
+    pub fn extend_segment_ids(&self, out: &mut std::collections::HashSet<SegmentId>) {
+        out.extend(self.heap.iter().map(|item| item.0.work.segment_id));
+    }
+
     pub fn has_primary_work(&self) -> bool {
         self.heap.iter().any(|item| !item.0.work.is_recovery)
     }

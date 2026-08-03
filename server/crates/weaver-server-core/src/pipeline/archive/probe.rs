@@ -150,6 +150,16 @@ impl Pipeline {
         file_id: NzbFileId,
         allow_probe: bool,
     ) {
+        // Plan 135, D7. A direct set's source volume has no file: classifying
+        // it probes a path that does not exist, and the topology update it
+        // feeds would then dispatch incremental extraction over volumes nobody
+        // ever wrote. The routing seam suppresses its own call, but this
+        // function has nine other callers — completion checks, PAR2 merge, RAR
+        // finalization, the job service — and every one of them fires for a
+        // complete direct volume. The rule belongs at the entry, once.
+        if self.is_direct_source_file(file_id) {
+            return;
+        }
         self.classify_completed_file(job_id, file_id, allow_probe)
             .await;
 

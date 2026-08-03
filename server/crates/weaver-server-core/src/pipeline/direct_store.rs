@@ -27,36 +27,29 @@
 //!
 //! # Scope of this phase
 //!
-//! Nothing here is wired into the live download path. Phase 4's range router
-//! feeds [`barrier::CoverageBarrier`]; until then the only callers are tests,
-//! and the [`DirectStoreGate`] defaults **off**.
-//!
-//! In particular, and deliberately: this phase does **not** touch legacy
-//! `active_file_progress` writes or completed-file persistence. D7's
-//! suppression of legacy source-volume state is only correct once routing
-//! exists — a direct volume's floor stays at zero so an older binary sees no
-//! coverage and redownloads, but there are no direct volumes yet, so
-//! suppressing anything now would only break physical sets.
+//! Phase 4 wires the rest in: [`router`] splits every decoded source span
+//! across its destinations, [`plan`] admits sets and names those destinations,
+//! and [`set`] joins a router to its [`barrier::CoverageBarrier`] so a routed
+//! write becomes durable coverage. The [`DirectStoreGate`] still defaults
+//! **off**.
 //!
 //! # Two checkpoint systems
 //!
 //! `pipeline::extraction::rar::checkpoint` (`extraction_chunks`) covers the
 //! extraction phase. This one covers the download phase. They must never both
-//! claim the same member; that assertion belongs with routing, in phase 4.
-// Phase 4 (the range router) is this subsystem's only production caller, so in
-// phase 3 *every* item here — the gate, the range set, the barrier, the codec,
-// the restart reader — is reached from tests alone. Per-item `cfg(test)` would
-// therefore be the same statement written forty times, and would have to be
-// unpicked again the moment routing lands; the module-wide allow says it once.
-// REMOVE THIS ALLOW IN PHASE 4: once routing calls in, anything still
-// unreferenced is genuinely dead and should be deleted rather than tolerated.
-#![allow(dead_code)]
+//! claim the same member: a direct set is marked extracted at finalization
+//! without ever entering the incremental extractor, and
+//! [`set::DirectSet::assert_not_extraction_owned`] is where that is asserted.
 
 use std::sync::OnceLock;
 
 pub(crate) mod barrier;
+pub(crate) mod plan;
 pub(crate) mod restart;
+pub(crate) mod router;
+pub(crate) mod set;
 pub(crate) mod snapshot;
+pub(crate) mod wiring;
 
 #[cfg(test)]
 mod tests;
@@ -136,6 +129,7 @@ impl ByteRanges {
         self.ranges.is_empty()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.ranges.len()
     }
@@ -240,7 +234,42 @@ impl ByteRanges {
     }
 
     /// Highest covered offset, exclusive. Zero when empty.
+    #[allow(dead_code)]
     pub(crate) fn end(&self) -> u64 {
         self.ranges.last().map(|&(_, end)| end).unwrap_or(0)
+    }
+
+    /// The sub-ranges of `[start, start + len)` this set does **not** cover, in
+    /// order. The router asks this on every arriving article: a duplicate
+    /// segment must contribute no bytes at all rather than be re-routed, and a
+    /// partially overlapping one must contribute only its new part.
+    pub(crate) fn missing(&self, start: u64, len: u64) -> Vec<(u64, u64)> {
+        let Some(end) = start.checked_add(len) else {
+            return Vec::new();
+        };
+        if len == 0 {
+            return Vec::new();
+        }
+        let mut gaps = Vec::new();
+        let mut cursor = start;
+        for &(range_start, range_end) in &self.ranges {
+            if range_end <= cursor {
+                continue;
+            }
+            if range_start >= end {
+                break;
+            }
+            if range_start > cursor {
+                gaps.push((cursor, range_start.min(end)));
+            }
+            cursor = cursor.max(range_end);
+            if cursor >= end {
+                break;
+            }
+        }
+        if cursor < end {
+            gaps.push((cursor, end));
+        }
+        gaps
     }
 }

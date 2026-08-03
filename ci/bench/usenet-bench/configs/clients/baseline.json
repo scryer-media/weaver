@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "description": "The auditable baseline shared by the Weaver, SABnzbd, and NZBGet adapters. A run artifact must include the rendered client configuration and immutable image/binary identity in addition to this contract.",
+  "execution_targets": [
+    {
+      "id": "docker-linux",
+      "os": "linux",
+      "packaging": "digest-pinned Docker image",
+      "cpu_time": "container-cgroup CPU delta",
+      "instructions_retired": "native-Linux cgroup perf counter when available"
+    },
+    {
+      "id": "macos-native",
+      "os": "macos",
+      "packaging": "native executable/distributable",
+      "cpu_time": "foreground launcher process user-plus-system CPU time",
+      "instructions_retired": "explicit unavailable result until a calibrated native collector is added"
+    },
+    {
+      "id": "windows-native",
+      "os": "windows",
+      "packaging": "native executable/distributable",
+      "cpu_time": "foreground launcher process user-plus-system CPU time",
+      "instructions_retired": "explicit unavailable result until a calibrated native collector is added"
+    }
+  ],
+  "common": {
+    "server_count": 1,
+    "connections": 8,
+    "article_segment_bytes": 768000,
+    "repair": "disabled (fixtures are verified clean)",
+    "unpack": "enabled",
+    "completion_metric": "all expected unpacked output files pass size and SHA-256 verification",
+    "state": "fresh client state, cache, queue, download directory, and completion directory for every run",
+    "scheduling": "sequential randomized blocks; each fixture/transport/repetition/execution-target block contains each client exactly once",
+    "server_link": "one transparent server-aggregate egress profile per saved plan; clients never share it in a timed run",
+    "wall_clock": "successful queue acceptance to client-reported terminal completion (Weaver CLI report or SABnzbd/NZBGet API), accepted only after independent output verification",
+    "cpu_time": "target-specific measured scope recorded with every result; never benchmark-controller CPU and never aggregated across mismatched scopes",
+    "instructions_retired": "native-Linux cgroup perf for Docker when available; explicit unavailable reason for unsupported native collectors"
+  },
+  "profiles": {
+    "stock": {
+      "description": "Required NNTP, path, unpack, and control settings only. SABnzbd direct_unpack is disabled; NZBGet DirectWrite and DirectUnpack are disabled; Weaver uses its normal download/extraction pipeline through the one-shot CLI."
+    },
+    "equivalent-throughput": {
+      "description": "Enables SABnzbd direct_unpack and NZBGet DirectWrite plus DirectUnpack. Weaver uses the same normal pipeline because it has no separate benchmark-only direct-path toggle. Every effective setting is rendered into the artifact; no fixture-specific exception is allowed."
+    }
+  },
+  "transports": {
+    "plaintext": {
+      "nntp_port": 119,
+      "tls": false,
+      "certificate_validation": "not_applicable"
+    },
+    "tls": {
+      "nntp_port": 563,
+      "tls": true,
+      "certificate_validation": "client-specific; reported on every run"
+    }
+  },
+  "clients": [
+    {
+      "id": "weaver",
+      "execution": "one-shot production CLI with terminal report acknowledgement; no HTTP listener or GraphQL control plane",
+      "tls_validation": "ca_verified",
+      "require_tls_ca_mount": true
+    },
+    {
+      "id": "sabnzbd",
+      "tls_validation": "disabled",
+      "result_transport_label": "tls-unverified",
+      "scope": "only the isolated benchmark server network",
+      "sabnzbd_server_settings": {
+        "ssl": 1,
+        "ssl_verify": 0
+      },
+      "rationale": "SABnzbd cannot currently consume the generated local CA reliably in this harness. This preserves encrypted transport throughput but is not authenticated TLS."
+    },
+    {
+      "id": "nzbget",
+      "tls_validation": "ca_verified",
+      "require_tls_ca_mount": true
+    }
+  ]
+}

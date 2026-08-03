@@ -46,6 +46,7 @@ macro_rules! segment_spec {
 mod archive_topology;
 mod core;
 mod decode_and_files;
+mod direct_store;
 mod download_dispatch;
 mod health_probe;
 mod par2_completion;
