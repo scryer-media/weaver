@@ -73,9 +73,27 @@ fn single_member_store_set(
         .collect()
 }
 
+/// The decoded extent of one article, for a volume cut into `articles` equal
+/// pieces. At `articles == 2` this is the head/tail split every phase 4 fixture
+/// uses.
+fn article_extent(volume_len: usize, segment_number: u32, articles: usize) -> (usize, usize) {
+    let chunk = volume_len.div_ceil(articles);
+    let start = (segment_number as usize * chunk).min(volume_len);
+    let end = ((segment_number as usize + 1) * chunk).min(volume_len);
+    (start, end)
+}
+
 /// Two articles per volume, so a volume's payload arrives after its header and
 /// routing has to split at least one article across destinations.
 fn direct_store_job_spec(name: &str, volumes: &[(String, Vec<u8>)]) -> JobSpec {
+    direct_store_job_spec_with_articles(name, volumes, 2)
+}
+
+fn direct_store_job_spec_with_articles(
+    name: &str,
+    volumes: &[(String, Vec<u8>)],
+    articles: usize,
+) -> JobSpec {
     JobSpec {
         name: name.to_string(),
         password: None,
@@ -88,27 +106,21 @@ fn direct_store_job_spec(name: &str, volumes: &[(String, Vec<u8>)]) -> JobSpec {
         files: volumes
             .iter()
             .enumerate()
-            .map(|(index, (filename, bytes))| {
-                let split = bytes.len().div_ceil(2) as u32;
-                let rest = bytes.len() as u32 - split;
-                FileSpec {
-                    filename: filename.clone(),
-                    role: FileRole::from_filename(filename),
-                    groups: vec!["alt.binaries.test".to_string()],
-                    posted_at_epoch: None,
-                    segments: vec![
+            .map(|(index, (filename, bytes))| FileSpec {
+                filename: filename.clone(),
+                role: FileRole::from_filename(filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: (0..articles as u32)
+                    .map(|segment_number| {
+                        let (start, end) = article_extent(bytes.len(), segment_number, articles);
                         segment_spec! {
-                            number: 0,
-                            bytes: yenc_declared_bytes(split),
-                            message_id: format!("direct-{index}-0@example.com"),
-                        },
-                        segment_spec! {
-                            number: 1,
-                            bytes: yenc_declared_bytes(rest),
-                            message_id: format!("direct-{index}-1@example.com"),
-                        },
-                    ],
-                }
+                            number: segment_number,
+                            bytes: yenc_declared_bytes((end - start) as u32),
+                            message_id: format!("direct-{index}-{segment_number}@example.com"),
+                        }
+                    })
+                    .collect(),
             })
             .collect(),
     }
@@ -128,19 +140,25 @@ async fn submit_volume_article(
     file_index: u32,
     segment_number: u32,
 ) {
+    submit_volume_article_of(pipeline, job_id, volumes, file_index, segment_number, 2).await;
+}
+
+async fn submit_volume_article_of(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    file_index: u32,
+    segment_number: u32,
+    articles: usize,
+) {
     let (filename, bytes) = &volumes[file_index as usize];
-    let split = bytes.len().div_ceil(2);
-    let (offset, payload) = if segment_number == 0 {
-        (0u64, &bytes[..split])
-    } else {
-        (split as u64, &bytes[split..])
-    };
+    let (start, end) = article_extent(bytes.len(), segment_number, articles);
     submit_decoded_segment(
         pipeline,
         NzbFileId { job_id, file_index },
         segment_number,
-        offset,
-        payload,
+        start as u64,
+        &bytes[start..end],
         filename,
         None,
     )
@@ -450,8 +468,15 @@ fn store_set_with_a_member_hidden_past_the_first(
     ]
 }
 
+/// Phase 4's `direct_store_refuses_a_set_whose_last_volume_hides_a_second_member`,
+/// upgraded: the hidden member is now **adopted** rather than demoting the set.
+///
+/// Phase 4 had two reasons to demote here — the layout refused the re-add, and
+/// even if it had not, a second routable member was out of scope. Wave 1 removes
+/// both: the router rebuilds its layout from every volume's newest facts when a
+/// longer prefix reveals a header, and routes as many members as the archive has.
 #[tokio::test]
-async fn direct_store_refuses_a_set_whose_last_volume_hides_a_second_member() {
+async fn a_member_hiding_past_the_first_is_adopted_and_routes_direct() {
     let member_name = "Silver.Horizon.S01E07.mkv";
     let tail_name = "Silver.Horizon.nfo";
     let payload: Vec<u8> = (0..3000u32).map(|index| (index % 251) as u8).collect();
@@ -474,7 +499,7 @@ async fn direct_store_refuses_a_set_whose_last_volume_hides_a_second_member() {
     );
 
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     pipeline.live_par2.set_enabled(false);
     let job_id = JobId(41010);
@@ -492,48 +517,34 @@ async fn direct_store_refuses_a_set_whose_last_volume_hides_a_second_member() {
         .await;
     }
 
-    // The confirming parse must have caught the extra member. Either demotion
-    // reason is correct — the re-add conflicts, and the layout it conflicts
-    // with is one the set may not route anyway.
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
-        shape.contains("Demoted(ConflictingVolumeFacts)")
-            || shape.contains("Demoted(MultipleMembers)"),
-        "a second member past the first member's data area must demote the set, got {shape}"
+        !shape.contains("Demoted"),
+        "the confirming parse must adopt the hidden member rather than demoting, got {shape}"
+    );
+    assert!(
+        shape.contains("Finalized"),
+        "both members pass their gates, so the set finalizes, got {shape}"
     );
 
-    // And the job still finishes with *both* files: the demoted volumes are
-    // refetched conventionally and the ordinary extractor produces the set.
-    for (file_index, segment_number) in &arrivals {
-        submit_volume_article(
-            &mut pipeline,
-            job_id,
-            &volumes,
-            *file_index,
-            *segment_number,
-        )
-        .await;
+    for (name, expected) in [
+        (member_name, payload.as_slice()),
+        (tail_name, tail.as_slice()),
+    ] {
+        assert_eq!(
+            std::fs::read(crate::pipeline::Pipeline::member_output_paths(&working_dir, name).0)
+                .ok()
+                .as_deref(),
+            Some(expected),
+            "{name} must be committed byte for byte"
+        );
     }
-    drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
-
-    let output_root =
-        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
-    let read_member = |name: &str| {
-        std::fs::read(output_root.join(name))
-            .ok()
-            .or_else(|| std::fs::read(working_dir.join(name)).ok())
-    };
-    assert_eq!(
-        read_member(member_name).as_deref(),
-        Some(payload.as_slice()),
-        "the first member must survive the demotion"
-    );
-    assert_eq!(
-        read_member(tail_name).as_deref(),
-        Some(tail.as_slice()),
-        "the member hiding past the first one's data area must not be lost"
-    );
+    for (filename, _) in &volumes {
+        assert!(
+            !working_dir.join(filename).exists(),
+            "adopting a hidden member must not cost the set its volumes"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -734,40 +745,38 @@ fn queued_segments(pipeline: &mut Pipeline, job_id: JobId) -> Vec<(u32, u32)> {
     out
 }
 
-#[tokio::test]
-async fn a_demoted_set_refetches_only_what_nothing_else_owns() {
-    let member_name = "Silver.Horizon.S01E10.mkv";
-    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
-    let volumes = single_member_store_set(member_name, &payload, 3);
-
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+/// Drives one set to "volume 0 fully routed, volumes 1 and 2 still queued" and
+/// then demotes it. Returns the pipeline so the caller can inspect the fallout.
+async fn demote_mid_download(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    before_demotion: impl FnOnce(&Pipeline, &std::path::Path),
+) -> (Pipeline, std::path::PathBuf, u64) {
+    let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     pipeline.live_par2.set_enabled(false);
-    let job_id = JobId(41015);
-    let spec = direct_store_job_spec("Silver Horizon", &volumes);
-    insert_active_job(&mut pipeline, job_id, spec).await;
+    let spec = direct_store_job_spec("Silver Horizon", volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
     // A job-wide counter seeded by a *different* file's bytes, so "subtract the
     // set's contribution" is distinguishable from "zero the counter".
     const OTHER_FILE_BYTES: u64 = 7_000_000;
     pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes += OTHER_FILE_BYTES;
 
-    // Volume 0 arrives and routes; volumes 1 and 2 stay queued, exactly as
-    // they would mid-download.
-    for segment_number in [0, 1] {
+    // Volume 0 arrives whole; volume 1 gets only its first article, so the set
+    // demotes with one fully covered volume and one partially covered one.
+    // Volume 2 never arrives at all.
+    for (file_index, segment_number) in [(0u32, 0u32), (0, 1), (1, 0)] {
         take_queued_segment(
             &mut pipeline,
             job_id,
             SegmentId {
-                file_id: NzbFileId {
-                    job_id,
-                    file_index: 0,
-                },
+                file_id: NzbFileId { job_id, file_index },
                 segment_number,
             },
         );
-        submit_volume_article(&mut pipeline, job_id, &volumes, 0, segment_number).await;
+        submit_volume_article(&mut pipeline, job_id, volumes, file_index, segment_number).await;
     }
     assert_eq!(
         pipeline
@@ -785,21 +794,128 @@ async fn a_demoted_set_refetches_only_what_nothing_else_owns() {
         "volume 0's bytes were routed before the demotion"
     );
 
+    before_demotion(&pipeline, &working_dir);
     pipeline
-        .demote_direct_set(job_id, 0, DemotionReason::MultipleMembers, None)
+        .demote_direct_set(job_id, 0, DemotionReason::HoldsBudgetExceeded, None)
         .await;
+    (pipeline, working_dir, OTHER_FILE_BYTES)
+}
 
-    // Volume 0's articles come back because their bytes went into destinations
-    // that were just deleted. Volumes 1 and 2 are already queued, and pushing
-    // a second copy of each would download them twice.
+#[tokio::test]
+async fn a_demoted_set_materializes_its_covered_volumes_instead_of_refetching_them() {
+    let member_name = "Silver.Horizon.S01E10.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41015);
+    let (mut pipeline, working_dir, other_file_bytes) =
+        demote_mid_download(&temp_dir, job_id, &volumes, |_, _| {}).await;
+
+    // D8: volume 0 was covered end to end, so it is rebuilt byte-exactly from
+    // its envelope plus the member partial — the whole point of reconstruction
+    // is that those two articles never touch the network again.
+    assert_eq!(
+        std::fs::read(working_dir.join(&volumes[0].0))
+            .ok()
+            .as_deref(),
+        Some(volumes[0].1.as_slice()),
+        "the covered volume must be reconstructed byte for byte"
+    );
+    // Volume 1 is rebuilt only as far as its coverage reaches: the prefix its
+    // first article carried, and not one byte of the article that never came.
+    let volume_one_prefix = volumes[1].1.len().div_ceil(2);
+    assert_eq!(
+        std::fs::read(working_dir.join(&volumes[1].0))
+            .ok()
+            .as_deref(),
+        Some(&volumes[1].1[..volume_one_prefix]),
+        "a partially covered volume is rebuilt exactly as far as its coverage"
+    );
+
     assert_eq!(
         queued_segments(&mut pipeline, job_id),
-        vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)],
-        "every article is queued exactly once after a demotion"
+        vec![(1, 1), (2, 0), (2, 1)],
+        "a reconstructed article must not be fetched from the server again, and \
+         everything above the floor must be"
     );
     assert_eq!(
         pipeline.jobs.get(&job_id).unwrap().downloaded_bytes,
-        OTHER_FILE_BYTES,
+        other_file_bytes + volumes[0].1.len() as u64 + volume_one_prefix as u64,
+        "bytes that survived as a real volume stay counted; nothing else does"
+    );
+
+    // The direct outputs are gone: a sparse half-written member would
+    // masquerade as finished work, and the envelopes are scratch.
+    assert!(
+        !working_dir
+            .join(format!("{member_name}.direct.partial"))
+            .exists()
+    );
+    for volume_index in 0..volumes.len() as u32 {
+        assert!(
+            !working_dir
+                .join(format!("silver.horizon.vol{volume_index:05}.envelope"))
+                .exists(),
+            "envelope {volume_index} must be deleted once the volume is real"
+        );
+    }
+
+    // Reconciliation persisted legacy state in D8's order and shape: a whole
+    // volume becomes a completed-file row, a partial one a contiguous floor,
+    // and the direct coverage row is retired behind both.
+    let (floors, complete) = pipeline.db.load_active_file_runtime(job_id).unwrap();
+    assert!(
+        complete.contains(&0),
+        "a fully reconstructed volume is persisted as a completed file, got {complete:?}"
+    );
+    assert!(
+        !complete.contains(&1),
+        "a partially reconstructed volume must not be claimed complete"
+    );
+    assert_eq!(
+        floors.get(&1).copied(),
+        Some(volume_one_prefix as u64),
+        "the partial volume persists a contiguous, segment-aligned floor"
+    );
+    assert!(
+        pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "the direct coverage row is retired once the legacy state replaces it"
+    );
+}
+
+#[tokio::test]
+async fn a_demotion_falls_back_to_refetching_when_its_envelope_is_gone() {
+    // Reconstruction is an optimisation; every one of its failure modes has to
+    // land on phase 4's always-correct refetch rather than on a half-written
+    // volume. Deleting the envelope out from under the sweep is the bluntest of
+    // them: the header bytes it needs are simply not there any more.
+    let member_name = "Silver.Horizon.S01E20.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41031);
+    let (mut pipeline, working_dir, other_file_bytes) =
+        demote_mid_download(&temp_dir, job_id, &volumes, |_, working_dir| {
+            let envelope = working_dir.join("silver.horizon.vol00000.envelope");
+            assert!(envelope.exists(), "the envelope must exist to be deleted");
+            std::fs::remove_file(&envelope).unwrap();
+        })
+        .await;
+
+    assert!(
+        !working_dir.join(&volumes[0].0).exists(),
+        "a failed reconstruction must not leave a partly written volume behind"
+    );
+    assert_eq!(
+        queued_segments(&mut pipeline, job_id),
+        vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)],
+        "the fallback refetches every article exactly once"
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().downloaded_bytes,
+        other_file_bytes,
         "the job counter loses the set's routed bytes and keeps every other file's"
     );
 }
@@ -979,6 +1095,49 @@ async fn direct_store_demotes_when_the_chain_closes_with_a_blake2_only_member() 
             .exists(),
         "the demotion deletes the bytes routed while the member was provisional"
     );
+
+    // The label is not the outcome (B1). The demotion runs reconstruction, and
+    // the member whose eligibility just flipped is the one holding most of every
+    // volume's bytes: a sweep that asked the *current* classification where they
+    // live would be told "the envelope", read a sparse hole, and write zeros
+    // into a volume file under a published floor. Whatever the demotion decides
+    // to do, what lands on disk has to be the volume.
+    assert_volumes_are_never_fabricated(&working_dir, &volumes);
+    for volume_index in [0usize, 1] {
+        let (filename, bytes) = &volumes[volume_index];
+        assert_eq!(
+            std::fs::read(working_dir.join(filename)).ok().as_deref(),
+            Some(bytes.as_slice()),
+            "volume {volume_index} was covered end to end and must be rebuilt byte for byte \
+             from the partial its now-ineligible member still holds"
+        );
+    }
+}
+
+/// Every source volume of `volumes` that exists on disk is a byte-exact prefix
+/// of the volume that was posted.
+///
+/// The assertion demotion has to satisfy however it goes: a reconstruction
+/// writes the volume, a refetch fallback writes nothing, and neither may leave
+/// bytes that were never downloaded looking like bytes that were.
+fn assert_volumes_are_never_fabricated(
+    working_dir: &std::path::Path,
+    volumes: &[(String, Vec<u8>)],
+) {
+    for (filename, bytes) in volumes {
+        let Ok(written) = std::fs::read(working_dir.join(filename)) else {
+            continue;
+        };
+        assert!(
+            written.len() <= bytes.len(),
+            "{filename} was materialized longer than the volume it stands for"
+        );
+        assert_eq!(
+            written.as_slice(),
+            &bytes[..written.len()],
+            "{filename} was materialized with bytes the set never downloaded"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,5 +1421,1139 @@ async fn a_rar4_set_routes_directly_because_the_format_is_read_not_assumed() {
             .as_deref(),
         Some(payload.as_slice()),
         "the routed RAR4 member must reproduce the payload byte for byte"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-member sets (phase 5 wave 1)
+// ---------------------------------------------------------------------------
+
+/// A store set carrying several members, split across `volume_count` volumes.
+///
+/// The members are laid end to end and the concatenation is cut into equal
+/// volume payloads, so member boundaries and volume boundaries deliberately do
+/// **not** line up: members start mid-volume, at least one is split across
+/// volumes, and one volume carries the tail of one member and the head of the
+/// next. That is the shape a season pack posts as, and the shape phase 4
+/// demoted on sight.
+fn multi_member_store_set(
+    members: &[(&str, Vec<u8>)],
+    volume_count: usize,
+) -> Vec<(String, Vec<u8>)> {
+    assert!(volume_count >= 1);
+    let total: usize = members.iter().map(|(_, bytes)| bytes.len()).sum();
+    let chunk = total.div_ceil(volume_count);
+
+    // Each member's span in the concatenated payload space.
+    let mut spans = Vec::with_capacity(members.len());
+    let mut cursor = 0usize;
+    for (name, bytes) in members {
+        spans.push((*name, bytes.as_slice(), cursor, cursor + bytes.len()));
+        cursor += bytes.len();
+    }
+
+    (0..volume_count)
+        .map(|volume| {
+            let window_start = (volume * chunk).min(total);
+            let window_end = ((volume + 1) * chunk).min(total);
+            let is_first = volume == 0;
+            let is_last = volume + 1 == volume_count;
+
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&TEST_RAR5_SIG);
+            bytes.extend_from_slice(&build_test_rar_main_header(
+                if is_first { 0x0001 } else { 0x0001 | 0x0002 },
+                (!is_first).then_some(volume as u64),
+            ));
+
+            for (name, payload, start, end) in &spans {
+                let part_start = (*start).max(window_start);
+                let part_end = (*end).min(window_end);
+                if part_start >= part_end {
+                    continue;
+                }
+                let part = &payload[part_start - start..part_end - start];
+                let split_before = part_start > *start;
+                let split_after = part_end < *end;
+
+                let mut split_flags = 0u64;
+                if split_before {
+                    split_flags |= 0x0008;
+                }
+                if split_after {
+                    split_flags |= 0x0010;
+                }
+                // The RAR5 rule D4 layer 1 reads: a non-final part states the
+                // CRC32 of *its own* packed bytes, the final part the whole
+                // member's.
+                let data_crc = if split_after {
+                    checksum::crc32(part)
+                } else {
+                    checksum::crc32(payload)
+                };
+                bytes.extend_from_slice(&build_test_rar_file_header(
+                    name,
+                    split_flags,
+                    part.len() as u64,
+                    payload.len() as u64,
+                    Some(data_crc),
+                ));
+                bytes.extend_from_slice(part);
+            }
+
+            bytes.extend_from_slice(&build_test_rar_end_header(!is_last));
+            (format!("silver.horizon.part{:02}.rar", volume + 1), bytes)
+        })
+        .collect()
+}
+
+/// One member as a gate saw it: name, bytes, and which of the two candidate
+/// directories it landed in.
+type GateMember = (String, Option<Vec<u8>>, Option<&'static str>);
+
+/// What one whole job gate produced for a multi-member set.
+#[derive(Debug, PartialEq, Eq)]
+struct MultiGateOutcome {
+    /// One entry per requested member name, in the order asked for.
+    members: Vec<GateMember>,
+    status: Option<JobStatus>,
+    volume_file_seen: bool,
+}
+
+async fn run_multi_member_gate(
+    gate: DirectStoreGate,
+    job_id: JobId,
+    member_names: &[&str],
+    volumes: &[(String, Vec<u8>)],
+    arrivals: &[(u32, u32)],
+) -> MultiGateOutcome {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(gate);
+    pipeline.live_par2.set_enabled(false);
+
+    let spec = direct_store_job_spec("Silver Horizon", volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let mut volume_file_seen = false;
+    for (file_index, segment_number) in arrivals {
+        submit_volume_article(&mut pipeline, job_id, volumes, *file_index, *segment_number).await;
+        for (filename, _) in volumes {
+            if working_dir.join(filename).exists() {
+                volume_file_seen = true;
+            }
+        }
+    }
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    let members = member_names
+        .iter()
+        .map(|name| {
+            let completed = std::fs::read(output_root.join(name)).ok();
+            let left_behind = std::fs::read(working_dir.join(name)).ok();
+            assert!(
+                completed.is_none() || left_behind.is_none(),
+                "{name} must exist in exactly one place"
+            );
+            match (completed, left_behind) {
+                (Some(bytes), _) => (name.to_string(), Some(bytes), Some("complete")),
+                (None, Some(bytes)) => (name.to_string(), Some(bytes), Some("working")),
+                (None, None) => (name.to_string(), None, None),
+            }
+        })
+        .collect();
+    MultiGateOutcome {
+        members,
+        status: job_status_for_assert(&pipeline, job_id),
+        volume_file_seen,
+    }
+}
+
+#[tokio::test]
+async fn a_two_member_store_set_routes_and_matches_the_conventional_extractor() {
+    let episode = "Silver.Horizon.S01E01.mkv";
+    let notes = "Silver.Horizon.S01E01.nfo";
+    let members = vec![
+        (
+            episode,
+            (0..3400u32).map(|index| (index % 251) as u8).collect(),
+        ),
+        // A tiny member, so one volume carries the tail of the first and the
+        // whole of the second.
+        (notes, b"invented notes for an invented release".to_vec()),
+    ];
+    let volumes = multi_member_store_set(&members, 3);
+    let arrivals = in_order_arrivals(volumes.len());
+    let names: Vec<&str> = members.iter().map(|(name, _)| *name).collect();
+
+    let conventional = run_multi_member_gate(
+        DirectStoreGate::Disabled,
+        JobId(41040),
+        &names,
+        &volumes,
+        &arrivals,
+    )
+    .await;
+    let direct = run_multi_member_gate(
+        DirectStoreGate::Enabled,
+        JobId(41041),
+        &names,
+        &volumes,
+        &arrivals,
+    )
+    .await;
+
+    assert!(
+        conventional.volume_file_seen,
+        "the conventional gate should have written source volumes"
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "a multi-member set must route without materializing a volume"
+    );
+    for (name, bytes, _) in &conventional.members {
+        let expected = members
+            .iter()
+            .find(|(member, _)| member == name)
+            .map(|(_, payload)| payload.as_slice());
+        assert_eq!(
+            bytes.as_deref(),
+            expected,
+            "the conventional extractor should reproduce {name}"
+        );
+    }
+    assert_eq!(
+        (direct.members, direct.status),
+        (conventional.members, conventional.status),
+        "a two-member direct set must be byte-identical to the conventional extractor"
+    );
+}
+
+#[tokio::test]
+async fn a_three_member_set_with_a_directory_member_matches_the_conventional_extractor() {
+    let inside = "Silver.Horizon/S01E02.mkv";
+    let episode = "Silver.Horizon.S01E03.mkv";
+    let notes = "Silver.Horizon.nfo";
+    let members = vec![
+        // A member stored inside a directory: routing has to create the parent
+        // before the first byte lands, where extraction creates it as it writes.
+        (
+            inside,
+            (0..2600u32).map(|index| (index % 241) as u8).collect(),
+        ),
+        (
+            episode,
+            (0..3100u32).map(|index| (index % 193) as u8).collect(),
+        ),
+        (notes, b"an invented release, described briefly".to_vec()),
+    ];
+    let volumes = multi_member_store_set(&members, 4);
+    let arrivals = in_order_arrivals(volumes.len());
+    let names: Vec<&str> = members.iter().map(|(name, _)| *name).collect();
+
+    let conventional = run_multi_member_gate(
+        DirectStoreGate::Disabled,
+        JobId(41042),
+        &names,
+        &volumes,
+        &arrivals,
+    )
+    .await;
+    let direct = run_multi_member_gate(
+        DirectStoreGate::Enabled,
+        JobId(41043),
+        &names,
+        &volumes,
+        &arrivals,
+    )
+    .await;
+
+    assert!(conventional.volume_file_seen);
+    assert!(!direct.volume_file_seen);
+    for (name, bytes, location) in &conventional.members {
+        let expected = members
+            .iter()
+            .find(|(member, _)| member == name)
+            .map(|(_, payload)| payload.as_slice());
+        assert_eq!(
+            bytes.as_deref(),
+            expected,
+            "the conventional extractor should reproduce {name}"
+        );
+        assert_eq!(*location, Some("complete"));
+    }
+    assert_eq!(
+        (direct.members, direct.status),
+        (conventional.members, conventional.status),
+        "a three-member direct set must be byte-identical to the conventional extractor, \
+         directory member included"
+    );
+}
+
+#[tokio::test]
+async fn two_members_that_sanitize_to_one_destination_demote_the_set() {
+    // `ensure_unique_sanitized_rar_member_paths` refuses an archive whose
+    // members collide after sanitization, so the extractor never overwrites one
+    // with the other — and neither may direct routing, which is why the set
+    // demotes and lets the ordinary path produce today's outcome. The commit
+    // loop still walks members in archive order, which is what makes this
+    // decidable at all rather than dependent on arrival order.
+    let members = vec![
+        (
+            "./Silver.Horizon.nfo",
+            b"the first of two names for one destination".to_vec(),
+        ),
+        (
+            "Silver.Horizon.nfo",
+            b"the second of two names for one destination".to_vec(),
+        ),
+    ];
+    let volumes = multi_member_store_set(&members, 2);
+    let arrivals = in_order_arrivals(volumes.len());
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (shape, working_dir) =
+        run_direct_store_routing_only(&temp_dir, JobId(41044), &volumes, &arrivals).await;
+
+    assert!(
+        shape.contains("Demoted(CollidingDestinations)"),
+        "two members sanitizing to one path must demote rather than overwrite, got {shape}"
+    );
+    assert!(
+        !working_dir.join("Silver.Horizon.nfo").exists(),
+        "neither colliding member may be committed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Envelope v2: recovery records route (phase 5 wave 1)
+// ---------------------------------------------------------------------------
+
+/// A store set whose volumes each carry a recovery record after the payload.
+///
+/// The RR is a service header plus a data area belonging to no member, so every
+/// byte of it is envelope. At `rr_bytes` well over phase 4's 32 KiB half-slot
+/// this set could not route at all before envelope v2 — it demoted with
+/// `EnvelopeTooLarge`, which is why every `-rr` post did.
+fn recovery_record_store_set(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    rr_bytes: usize,
+) -> Vec<(String, Vec<u8>)> {
+    let member_crc = checksum::crc32(payload);
+    let chunk = payload.len().div_ceil(volume_count);
+
+    (0..volume_count)
+        .map(|volume| {
+            let start = (volume * chunk).min(payload.len());
+            let end = ((volume + 1) * chunk).min(payload.len());
+            let part = &payload[start..end];
+            let is_first = volume == 0;
+            let is_last = volume + 1 == volume_count;
+
+            let mut split_flags = 0u64;
+            if !is_first {
+                split_flags |= 0x0008;
+            }
+            if !is_last {
+                split_flags |= 0x0010;
+            }
+
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&TEST_RAR5_SIG);
+            bytes.extend_from_slice(&build_test_rar_main_header(
+                if is_first { 0x0001 } else { 0x0001 | 0x0002 },
+                (!is_first).then_some(volume as u64),
+            ));
+            bytes.extend_from_slice(&build_test_rar_file_header(
+                member_name,
+                split_flags,
+                part.len() as u64,
+                payload.len() as u64,
+                Some(if is_last {
+                    member_crc
+                } else {
+                    checksum::crc32(part)
+                }),
+            ));
+            bytes.extend_from_slice(part);
+            bytes.extend_from_slice(&build_test_rar_service_header("RR", rr_bytes as u64));
+            bytes.extend((0..rr_bytes).map(|index| ((index * 7 + volume * 13) % 256) as u8));
+            bytes.extend_from_slice(&build_test_rar_end_header(!is_last));
+
+            (format!("silver.horizon.part{:02}.rar", volume + 1), bytes)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_recovery_record_set_routes_direct_and_its_envelopes_carry_the_recovery_data() {
+    const RR_BYTES: usize = 48 * 1024;
+    let member_name = "Silver.Horizon.S01E18.mkv";
+    let payload: Vec<u8> = (0..40_000u32).map(|index| (index % 251) as u8).collect();
+    let volumes = recovery_record_store_set(member_name, &payload, 3, RR_BYTES);
+    let arrivals = in_order_arrivals(volumes.len());
+
+    // Non-vacuity: the recovery record alone is bigger than the whole 64 KiB
+    // slot phase 4 gave a volume, let alone the 32 KiB half it addressed the
+    // head from. This set could not have routed a byte before envelope v2.
+    const { assert!(RR_BYTES > 32 * 1024) };
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(41045);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // Halfway through, the envelope files must already hold the recovery data at
+    // its true physical offset — the property that makes the whole scheme
+    // restart-stable and unbounded.
+    for (file_index, segment_number) in &arrivals {
+        submit_volume_article(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            *file_index,
+            *segment_number,
+        )
+        .await;
+        if (*file_index, *segment_number) == (0, 1) {
+            let envelope = working_dir.join("silver.horizon.vol00000.envelope");
+            let written = std::fs::read(&envelope).expect("volume 0's envelope exists");
+            let rr_at = find_recovery_offset(&volumes[0].1, RR_BYTES);
+            assert!(
+                written.len() >= rr_at + RR_BYTES,
+                "the envelope must be long enough to hold the recovery record at its \
+                 physical offset ({} < {})",
+                written.len(),
+                rr_at + RR_BYTES
+            );
+            assert_eq!(
+                &written[rr_at..rr_at + RR_BYTES],
+                &volumes[0].1[rr_at..rr_at + RR_BYTES],
+                "the recovery record must land in the envelope byte for byte, at its \
+                 true physical offset"
+            );
+        }
+    }
+
+    let set = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the set was admitted");
+    assert!(
+        set.is_finalized(),
+        "an -rr set routes and finalizes under envelope v2, got {set:?}"
+    );
+    assert_eq!(
+        std::fs::read(crate::pipeline::Pipeline::member_output_paths(&working_dir, member_name).0)
+            .ok()
+            .as_deref(),
+        Some(payload.as_slice()),
+        "the member must be byte-correct even with a recovery record between the parts"
+    );
+    for (filename, _) in &volumes {
+        assert!(!working_dir.join(filename).exists());
+    }
+    for volume_index in 0..volumes.len() as u32 {
+        assert!(
+            !working_dir
+                .join(format!("silver.horizon.vol{volume_index:05}.envelope"))
+                .exists(),
+            "finalization must delete envelope {volume_index}"
+        );
+    }
+}
+
+/// Physical offset of the recovery record's data area inside a fixture volume.
+///
+/// Found by construction rather than by scanning for a byte pattern: the RR data
+/// is the last `rr_bytes` before the end-of-archive header, whose encoded length
+/// the builder fixes.
+fn find_recovery_offset(volume: &[u8], rr_bytes: usize) -> usize {
+    let end_header = build_test_rar_end_header(true).len();
+    volume.len() - end_header - rr_bytes
+}
+
+// ---------------------------------------------------------------------------
+// The hybrid virtual-volume provider, differentially (phase 5 wave 1)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_virtual_volume_reads_back_the_volume_the_conventional_gate_would_have_written() {
+    use std::io::Read;
+
+    // The unit tests build a virtual volume by hand; this one builds it the way
+    // production does — out of whatever routing happened to put where — and
+    // holds it to the only standard that matters: byte-for-byte agreement with
+    // the volume the conventional gate writes to disk.
+    let members = vec![
+        (
+            "Silver.Horizon.S01E19.mkv",
+            (0..3400u32).map(|index| (index % 251) as u8).collect(),
+        ),
+        (
+            "Silver.Horizon.nfo",
+            b"invented notes for an invented release".to_vec(),
+        ),
+    ];
+    let volumes = multi_member_store_set(&members, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(41046);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // Volumes 0 and 1 whole, volume 2 only its first article — so the same
+    // provider has to answer both "this volume is complete" and "this volume
+    // stops here" without the caller telling it which is which.
+    for (file_index, segment_number) in [(0u32, 0u32), (0, 1), (1, 0), (1, 1), (2, 0)] {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        !shape.contains("Demoted"),
+        "the set is still routing, got {shape}"
+    );
+
+    let set = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the set was admitted");
+    let prefix = volumes[2].1.len().div_ceil(2);
+    let lengths: std::collections::BTreeMap<u32, u64> = [
+        (0u32, volumes[0].1.len() as u64),
+        (1, volumes[1].1.len() as u64),
+        (2, volumes[2].1.len() as u64),
+    ]
+    .into_iter()
+    .collect();
+    let provider = set.virtual_provider(&lengths);
+
+    for volume_index in [0usize, 1] {
+        let mut reader = provider
+            .open(volume_index as u32)
+            .expect("the volume is registered");
+        let mut read_back = Vec::new();
+        reader.read_to_end(&mut read_back).unwrap();
+        assert_eq!(
+            read_back, volumes[volume_index].1,
+            "virtual volume {volume_index} must equal the source volume byte for byte"
+        );
+    }
+
+    // The half-arrived volume reads its covered prefix and then reports a hole
+    // rather than pretending the volume ends there.
+    let mut reader = provider.open(2).unwrap();
+    let mut read_back = vec![0u8; prefix];
+    reader.read_exact(&mut read_back).unwrap();
+    assert_eq!(
+        read_back,
+        volumes[2].1[..prefix],
+        "a partly arrived volume still reads back exactly what did arrive"
+    );
+    let error = reader.read(&mut [0u8; 16]).unwrap_err();
+    assert!(
+        crate::pipeline::direct_store::provider::is_hole(&error),
+        "the bytes that never arrived must read as a hole, got {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The classification frontier (phase 5 wave 1)
+// ---------------------------------------------------------------------------
+
+/// A two-volume store set whose second volume carries a second member after the
+/// first, with both members' payloads sized so that — cut into three articles —
+/// the second member's *header* lands in the middle article and its *data*
+/// spans the middle/last boundary.
+///
+/// That geometry is the whole point: with the middle article missing, the header
+/// walk seeks to the end of the first member's data, finds a hole where the
+/// second member's header should be, and stops. Everything the last article
+/// carries is then a member's payload that the layout cannot name yet.
+fn set_with_a_second_member_behind_a_header_hole(
+    first_name: &str,
+    first_payload: &[u8],
+    second_name: &str,
+    second_payload: &[u8],
+) -> Vec<(String, Vec<u8>)> {
+    let split = first_payload.len() / 2;
+    let (head, tail) = first_payload.split_at(split);
+
+    let mut part01 = Vec::new();
+    part01.extend_from_slice(&TEST_RAR5_SIG);
+    part01.extend_from_slice(&build_test_rar_main_header(0x0001, None));
+    part01.extend_from_slice(&build_test_rar_file_header(
+        first_name,
+        0x0010,
+        head.len() as u64,
+        first_payload.len() as u64,
+        Some(checksum::crc32(head)),
+    ));
+    part01.extend_from_slice(head);
+    part01.extend_from_slice(&build_test_rar_end_header(true));
+
+    let mut part02 = Vec::new();
+    part02.extend_from_slice(&TEST_RAR5_SIG);
+    part02.extend_from_slice(&build_test_rar_main_header(0x0001 | 0x0002, Some(1)));
+    part02.extend_from_slice(&build_test_rar_file_header(
+        first_name,
+        0x0008,
+        tail.len() as u64,
+        first_payload.len() as u64,
+        Some(checksum::crc32(first_payload)),
+    ));
+    part02.extend_from_slice(tail);
+    part02.extend_from_slice(&build_test_rar_file_header(
+        second_name,
+        0,
+        second_payload.len() as u64,
+        second_payload.len() as u64,
+        Some(checksum::crc32(second_payload)),
+    ));
+    part02.extend_from_slice(second_payload);
+    part02.extend_from_slice(&build_test_rar_end_header(false));
+
+    vec![
+        ("silver.horizon.part01.rar".to_string(), part01),
+        ("silver.horizon.part02.rar".to_string(), part02),
+    ]
+}
+
+#[tokio::test]
+async fn payload_past_the_last_known_header_is_held_until_the_walk_proves_what_it_is() {
+    // Adopting a late member (the confirming parse) is only safe if its bytes
+    // are still routable when it is adopted. A byte past the last member extent
+    // the walk has *reached* has no proven classification: it can be an
+    // envelope byte, or it can be an undiscovered member's payload. Filing it as
+    // envelope on a guess loses a whole file, because finalization deletes the
+    // envelopes.
+    let episode = "Silver.Horizon.S01E21.mkv";
+    let notes = "Silver.Horizon.S01E21.nfo";
+    let episode_payload: Vec<u8> = (0..1200u32).map(|index| (index % 251) as u8).collect();
+    let notes_payload: Vec<u8> = (0..600u32).map(|index| (index % 197) as u8).collect();
+    let volumes = set_with_a_second_member_behind_a_header_hole(
+        episode,
+        &episode_payload,
+        notes,
+        &notes_payload,
+    );
+
+    // Non-vacuity: with the middle article absent, the second member's header
+    // really is unreachable and its data really does reach into the last one.
+    let last = &volumes[1].1;
+    let header_at = last
+        .windows(notes.len())
+        .position(|window| window == notes.as_bytes())
+        .expect("the fixture carries the second member's header");
+    let (first_end, _) = article_extent(last.len(), 0, 3);
+    let (middle_start, middle_end) = article_extent(last.len(), 1, 3);
+    assert!(
+        header_at >= middle_start && header_at < middle_end,
+        "the second member's header must sit in the middle article ({header_at} not in \
+         {middle_start}..{middle_end})"
+    );
+    assert!(
+        last.len() - middle_end > 0 && first_end < middle_start,
+        "its data must reach into the last article"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(41047);
+    let spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, 3);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // Volume 0 whole, then volume 1's first and *last* articles — leaving the
+    // header hole open — and only afterwards the middle one that closes it.
+    for (file_index, segment_number) in [(0u32, 0u32), (0, 1), (0, 2), (1, 0), (1, 2), (1, 1)] {
+        submit_volume_article_of(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            3,
+        )
+        .await;
+    }
+
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Finalized"),
+        "the set must adopt the member behind the header hole and finalize, got {shape}"
+    );
+    for (name, expected) in [
+        (episode, episode_payload.as_slice()),
+        (notes, notes_payload.as_slice()),
+    ] {
+        assert_eq!(
+            std::fs::read(crate::pipeline::Pipeline::member_output_paths(&working_dir, name).0)
+                .ok()
+                .as_deref(),
+            Some(expected),
+            "{name} must be byte-correct — its payload arrived before its header did"
+        );
+    }
+    for (filename, _) in &volumes {
+        assert!(!working_dir.join(filename).exists());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Demotion after a routed member turns ineligible (B1)
+// ---------------------------------------------------------------------------
+
+/// Three volumes, each carrying a recovery record, whose split member's chain
+/// closes with a BLAKE2sp digest and no CRC32 (`-htb`), and whose last volume
+/// hides a second member past the first's data area.
+///
+/// Every ingredient earns its place. The `-htb` close is the confirmed-reachable
+/// transition that flips a member from `ProvisionallyDirect` to `Ineligible`
+/// *after* its bytes have been routed. The recovery record makes each envelope
+/// file long and sparse, so a read at the member's physical offsets succeeds and
+/// returns zeros instead of failing — which is what makes the failure silent.
+/// The hidden member is what a real multi-member store looks like at the moment
+/// the demotion fires: one member routed, one the layout has not reached.
+fn blake2_close_with_recovery_and_hidden_member(
+    member_name: &str,
+    payload: &[u8],
+    hidden_name: &str,
+    hidden_payload: &[u8],
+    volume_count: usize,
+    rr_bytes: usize,
+) -> Vec<(String, Vec<u8>)> {
+    let chunk = payload.len().div_ceil(volume_count);
+    (0..volume_count)
+        .map(|volume| {
+            let start = (volume * chunk).min(payload.len());
+            let end = ((volume + 1) * chunk).min(payload.len());
+            let part = &payload[start..end];
+            let is_first = volume == 0;
+            let is_last = volume + 1 == volume_count;
+
+            let mut split_flags = 0u64;
+            if !is_first {
+                split_flags |= 0x0008;
+            }
+            if !is_last {
+                split_flags |= 0x0010;
+            }
+
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&TEST_RAR5_SIG);
+            bytes.extend_from_slice(&build_test_rar_main_header(
+                if is_first { 0x0001 } else { 0x0001 | 0x0002 },
+                (!is_first).then_some(volume as u64),
+            ));
+            let extra = if is_last {
+                build_test_rar_blake2_extra([0x37; 32])
+            } else {
+                Vec::new()
+            };
+            bytes.extend_from_slice(&build_test_rar_file_header_with_extra(
+                member_name,
+                split_flags,
+                part.len() as u64,
+                payload.len() as u64,
+                (!is_last).then(|| checksum::crc32(part)),
+                &extra,
+            ));
+            bytes.extend_from_slice(part);
+            if is_last {
+                bytes.extend_from_slice(&build_test_rar_file_header(
+                    hidden_name,
+                    0,
+                    hidden_payload.len() as u64,
+                    hidden_payload.len() as u64,
+                    Some(checksum::crc32(hidden_payload)),
+                ));
+                bytes.extend_from_slice(hidden_payload);
+            }
+            bytes.extend_from_slice(&build_test_rar_service_header("RR", rr_bytes as u64));
+            bytes.extend((0..rr_bytes).map(|index| ((index * 11 + volume * 17) % 256) as u8));
+            bytes.extend_from_slice(&build_test_rar_end_header(!is_last));
+
+            (format!("silver.horizon.part{:02}.rar", volume + 1), bytes)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_member_that_turns_ineligible_after_routing_never_materializes_fabricated_bytes() {
+    const RR_BYTES: usize = 4096;
+    let member_name = "Silver.Horizon.S01E23.mkv";
+    let hidden_name = "Silver.Horizon.S01E23.nfo";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 167) as u8).collect();
+    let hidden_payload: Vec<u8> = (0..600u32).map(|index| (index % 197) as u8).collect();
+    let volumes = blake2_close_with_recovery_and_hidden_member(
+        member_name,
+        &payload,
+        hidden_name,
+        &hidden_payload,
+        3,
+        RR_BYTES,
+    );
+    let arrivals = in_order_arrivals(volumes.len());
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (shape, working_dir) =
+        run_direct_store_routing_only(&temp_dir, JobId(41051), &volumes, &arrivals).await;
+    assert!(
+        shape.contains("Demoted(MemberIneligible(Blake2OnlyNoCrc32))"),
+        "the chain closing blake2-only must demote the set, got {shape}"
+    );
+
+    // Non-vacuity: the envelope for a volume whose member data was routed away is
+    // sparse across exactly those offsets, and long enough — the recovery record
+    // sits past them — that a read there returns zeros rather than short. That is
+    // the read a sweep taking its extents from the current classification would
+    // have made.
+    assert!(
+        RR_BYTES > payload.len(),
+        "the recovery record must extend the envelope well past the member's data"
+    );
+
+    assert_volumes_are_never_fabricated(&working_dir, &volumes);
+    for volume_index in [0usize, 1] {
+        let (filename, bytes) = &volumes[volume_index];
+        assert_eq!(
+            std::fs::read(working_dir.join(filename)).ok().as_deref(),
+            Some(bytes.as_slice()),
+            "volume {volume_index} must come back byte for byte: its member bytes from the \
+             partial the router wrote them to, its recovery record from the envelope"
+        );
+    }
+    assert!(
+        !working_dir.join(&volumes[2].0).exists(),
+        "the volume the demotion fired on covered nothing, so it is refetched whole"
+    );
+    assert!(
+        !working_dir
+            .join(format!("{member_name}.direct.partial"))
+            .exists(),
+        "the direct outputs are deleted once the volumes are real"
+    );
+}
+
+#[tokio::test]
+async fn a_partially_covered_volume_is_verified_before_it_is_materialized() {
+    // M3 plus B1(c): a volume covered only as far as its first article still has
+    // a composed reference for that prefix, and the sweep checks it. Corrupting
+    // the member partial under the covered prefix is what a partial that came
+    // back wrong looks like — and it has to end in the refetch, not in a volume
+    // file nothing verified.
+    let member_name = "Silver.Horizon.S01E24.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    // Volume 1 carries the member's logical bytes from 800 onwards, and only its
+    // first article was covered, so this offset is inside the *partially*
+    // covered volume's run and outside volume 0's.
+    const CORRUPTED_LOGICAL_OFFSET: u64 = 850;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41052);
+    let (mut pipeline, working_dir, other_file_bytes) =
+        demote_mid_download(&temp_dir, job_id, &volumes, |_, working_dir| {
+            use std::io::{Seek, SeekFrom, Write};
+            let partial = working_dir.join(format!("{member_name}.direct.partial"));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&partial)
+                .expect("the member partial holds the routed bytes");
+            file.seek(SeekFrom::Start(CORRUPTED_LOGICAL_OFFSET))
+                .unwrap();
+            file.write_all(&[0xFF]).unwrap();
+            file.sync_all().unwrap();
+        })
+        .await;
+
+    for (filename, _) in &volumes {
+        assert!(
+            !working_dir.join(filename).exists(),
+            "a run that fails its composed CRC32 must leave no volume behind, not even \
+             the volumes that verified"
+        );
+    }
+    assert_eq!(
+        queued_segments(&mut pipeline, job_id),
+        vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)],
+        "the fallback refetches every article exactly once"
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().downloaded_bytes,
+        other_file_bytes,
+        "nothing survived as a real volume, so nothing stays counted"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The staged-bytes budget (M1)
+// ---------------------------------------------------------------------------
+
+/// A two-volume set whose **last** volume carries a recovery record between the
+/// split member's final part and a second, whole member.
+///
+/// The geometry is what makes the retained region observable: the second
+/// member's data area ends far past the volume's first article, so the volume is
+/// unconfirmed while that article is routed — and the recovery record, sitting
+/// *below* the last known member extent, is classified envelope, written, and
+/// then held in RAM for the header walk to seek through.
+///
+/// Returns the physical offset of the recovery record's data inside volume 1.
+fn recovery_record_between_members_set(
+    first_name: &str,
+    first_payload: &[u8],
+    second_name: &str,
+    second_payload: &[u8],
+    rr_bytes: usize,
+) -> (Vec<(String, Vec<u8>)>, usize) {
+    let split = first_payload.len() / 2;
+    let (head, tail) = first_payload.split_at(split);
+
+    let mut part01 = Vec::new();
+    part01.extend_from_slice(&TEST_RAR5_SIG);
+    part01.extend_from_slice(&build_test_rar_main_header(0x0001, None));
+    part01.extend_from_slice(&build_test_rar_file_header(
+        first_name,
+        0x0010,
+        head.len() as u64,
+        first_payload.len() as u64,
+        Some(checksum::crc32(head)),
+    ));
+    part01.extend_from_slice(head);
+    part01.extend_from_slice(&build_test_rar_end_header(true));
+
+    let mut part02 = Vec::new();
+    part02.extend_from_slice(&TEST_RAR5_SIG);
+    part02.extend_from_slice(&build_test_rar_main_header(0x0001 | 0x0002, Some(1)));
+    part02.extend_from_slice(&build_test_rar_file_header(
+        first_name,
+        0x0008,
+        tail.len() as u64,
+        first_payload.len() as u64,
+        Some(checksum::crc32(first_payload)),
+    ));
+    part02.extend_from_slice(tail);
+    part02.extend_from_slice(&build_test_rar_service_header("RR", rr_bytes as u64));
+    let rr_at = part02.len();
+    part02.extend((0..rr_bytes).map(|index| ((index * 5 + 3) % 256) as u8));
+    part02.extend_from_slice(&build_test_rar_file_header(
+        second_name,
+        0,
+        second_payload.len() as u64,
+        second_payload.len() as u64,
+        Some(checksum::crc32(second_payload)),
+    ));
+    part02.extend_from_slice(second_payload);
+    part02.extend_from_slice(&build_test_rar_end_header(false));
+
+    (
+        vec![
+            ("silver.horizon.part01.rar".to_string(), part01),
+            ("silver.horizon.part02.rar".to_string(), part02),
+        ],
+        rr_at,
+    )
+}
+
+#[tokio::test]
+async fn retained_envelope_bytes_count_against_the_staged_budget() {
+    const RR_BYTES: usize = 48 * 1024;
+    const BUDGET: u64 = 16 * 1024;
+    let episode = "Silver.Horizon.S01E25.mkv";
+    let notes = "Silver.Horizon.S01E25.nfo";
+    let episode_payload: Vec<u8> = (0..2000u32).map(|index| (index % 251) as u8).collect();
+    let notes_payload: Vec<u8> = (0..60_000u32).map(|index| (index % 197) as u8).collect();
+    let (volumes, rr_at) = recovery_record_between_members_set(
+        episode,
+        &episode_payload,
+        notes,
+        &notes_payload,
+        RR_BYTES,
+    );
+
+    // Non-vacuity, part one: the recovery record is wholly inside volume 1's
+    // first article, and the second member's data runs well past that article —
+    // so the volume is still unconfirmed when the article is routed, and the
+    // recovery record is below the last known member extent rather than above
+    // it. Those are exactly the conditions under which the bytes are *routed*
+    // and then retained.
+    let (article_start, article_end) = article_extent(volumes[1].1.len(), 0, 2);
+    assert!(
+        article_start == 0 && rr_at + RR_BYTES < article_end,
+        "the recovery record must sit inside volume 1's first article \
+         ({rr_at}+{RR_BYTES} not inside {article_start}..{article_end})"
+    );
+    assert!(
+        volumes[1].1.len() > article_end,
+        "the second member's data must reach past that article"
+    );
+
+    // Part two: with a budget it cannot breach, the same arrival sequence routes
+    // the recovery record into the envelope file. Bytes on disk are routed
+    // bytes, not holds — so nothing here is pending, and the breach below can
+    // only come from what routing retained.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(41053);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in [(0u32, 0u32), (0, 1), (1, 0)] {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        !shape.contains("Demoted"),
+        "the default budget is nowhere near breached by this set, got {shape}"
+    );
+    let envelope = std::fs::read(working_dir.join("silver.horizon.vol00001.envelope"))
+        .expect("volume 1's envelope exists");
+    assert_eq!(
+        &envelope[rr_at..rr_at + RR_BYTES],
+        &volumes[1].1[rr_at..rr_at + RR_BYTES],
+        "the recovery record was routed into the envelope, so it is not a hold"
+    );
+
+    // Part three: the same sequence under a budget smaller than the retained
+    // region demotes. Counting only unrouted holds — as the first shape did —
+    // would have found nothing to count at all.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.direct_store.set_holds_budget(BUDGET);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(41054);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in [(0u32, 0u32), (0, 1), (1, 0)] {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted(HoldsBudgetExceeded)"),
+        "the retained recovery record is {RR_BYTES} bytes of RSS against a {BUDGET}-byte \
+         budget and must demote the set, got {shape}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Zero-length stored members (B2)
+// ---------------------------------------------------------------------------
+
+/// A two-volume store set whose last volume declares a zero-length member after
+/// the split one. An empty stored file is ordinary in a real archive — a
+/// placeholder, a `.nfo` that never got written — and RAR states its CRC32 as
+/// `0x00000000`, the checksum of no bytes.
+fn store_set_with_an_empty_member(
+    member_name: &str,
+    payload: &[u8],
+    empty_name: &str,
+) -> Vec<(String, Vec<u8>)> {
+    let split = payload.len() / 2;
+    let (head, tail) = payload.split_at(split);
+
+    let mut part01 = Vec::new();
+    part01.extend_from_slice(&TEST_RAR5_SIG);
+    part01.extend_from_slice(&build_test_rar_main_header(0x0001, None));
+    part01.extend_from_slice(&build_test_rar_file_header(
+        member_name,
+        0x0010,
+        head.len() as u64,
+        payload.len() as u64,
+        Some(checksum::crc32(head)),
+    ));
+    part01.extend_from_slice(head);
+    part01.extend_from_slice(&build_test_rar_end_header(true));
+
+    let mut part02 = Vec::new();
+    part02.extend_from_slice(&TEST_RAR5_SIG);
+    part02.extend_from_slice(&build_test_rar_main_header(0x0001 | 0x0002, Some(1)));
+    part02.extend_from_slice(&build_test_rar_file_header(
+        member_name,
+        0x0008,
+        tail.len() as u64,
+        payload.len() as u64,
+        Some(checksum::crc32(payload)),
+    ));
+    part02.extend_from_slice(tail);
+    part02.extend_from_slice(&build_test_rar_file_header(
+        empty_name,
+        0,
+        0,
+        0,
+        Some(checksum::crc32(&[])),
+    ));
+    part02.extend_from_slice(&build_test_rar_end_header(false));
+
+    vec![
+        ("silver.horizon.part01.rar".to_string(), part01),
+        ("silver.horizon.part02.rar".to_string(), part02),
+    ]
+}
+
+#[tokio::test]
+async fn a_zero_length_member_finalizes_with_its_empty_file_present() {
+    // B2: nothing is ever routed for a zero-length member, so the byte-driven
+    // whole-member gate can never fire for it. The first shape left it
+    // unverified for the life of the job: the set never finalized, never
+    // demoted, and kept its D7 suppressions armed over files that would never
+    // exist. It verifies trivially instead — CRC32 of no bytes is zero, which is
+    // what the header states — and finalization creates the file.
+    let episode = "Silver.Horizon.S01E26.mkv";
+    let empty = "Silver.Horizon.S01E26.nfo";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 251) as u8).collect();
+    let volumes = store_set_with_an_empty_member(episode, &payload, empty);
+    let arrivals = in_order_arrivals(volumes.len());
+    let names = [episode, empty];
+
+    let conventional = run_multi_member_gate(
+        DirectStoreGate::Disabled,
+        JobId(41055),
+        &names,
+        &volumes,
+        &arrivals,
+    )
+    .await;
+    let direct = run_multi_member_gate(
+        DirectStoreGate::Enabled,
+        JobId(41056),
+        &names,
+        &volumes,
+        &arrivals,
+    )
+    .await;
+
+    assert!(
+        conventional.volume_file_seen,
+        "the conventional gate should have written source volumes"
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "a set with an empty member must still route without materializing a volume"
+    );
+    assert_eq!(
+        direct.members[1].1.as_deref(),
+        Some(&[][..]),
+        "the empty member exists and is empty"
+    );
+    assert_eq!(
+        (direct.members, direct.status),
+        (conventional.members, conventional.status),
+        "a set with a zero-length member must be byte-identical to the conventional extractor"
     );
 }

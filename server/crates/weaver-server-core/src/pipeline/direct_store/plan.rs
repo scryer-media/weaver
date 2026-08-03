@@ -35,6 +35,19 @@ pub(crate) enum AdmissionRefusal {
     Par2Present,
 }
 
+/// Appends `suffix` to the final component of a working-directory-relative
+/// path, shortening the component's stem so the result stays inside
+/// [`weaver_model::files::DOWNLOAD_FILENAME_MAX_BYTES`].
+fn with_suffix(relative: &str, suffix: &str) -> String {
+    match relative.rsplit_once('/') {
+        Some((parent, name)) => format!(
+            "{parent}/{}",
+            weaver_model::files::path_component_with_suffix(name, suffix)
+        ),
+        None => weaver_model::files::path_component_with_suffix(relative, suffix),
+    }
+}
+
 impl AdmissionRefusal {
     pub(crate) fn metric(self) -> &'static str {
         match self {
@@ -165,9 +178,16 @@ impl DirectSetPlan {
     /// Zero-padded so a lexical listing of a 2 000-volume set sorts in volume
     /// order.
     pub(crate) fn envelope_relative_path(&self, volume_index: u32) -> String {
-        format!(
-            "{}.vol{volume_index:05}.envelope",
-            crate::jobs::working_dir::sanitize_dirname(&self.set_name)
+        // Clamped as one component rather than formatted (nit): the suffix is 18
+        // bytes and a set name is an NZB-supplied string, so a long one produced
+        // a filename the filesystem refuses and the set demoted on its first
+        // routed byte — with `DestinationWriteFailed`, which says nothing about
+        // the name being the cause. `path_component_with_suffix` shortens the
+        // *stem* and keeps the suffix whole, so the volume number and the
+        // extension survive.
+        weaver_model::files::path_component_with_suffix(
+            &crate::jobs::working_dir::sanitize_dirname(&self.set_name),
+            &format!(".vol{volume_index:05}.envelope"),
         )
     }
 
@@ -184,26 +204,49 @@ impl DirectSetPlan {
             .collect()
     }
 
-    /// Working-directory-relative `.direct.partial` for one member.
+    /// A raw header name resolved the way the incremental extractor resolves it
+    /// (D3: reuse, don't invent) — `weaver_unrar::sanitize_path` first, then the
+    /// validator that refuses anything escaping the directory it is joined onto.
     ///
-    /// Gated by the same validator RAR extraction gates member paths with, so a
-    /// hostile name cannot escape the working directory here either.
-    pub(crate) fn member_partial_path(&self, member_name: &str) -> Result<String, ()> {
-        let safe = crate::pipeline::extraction::validate_sanitized_rar_member_path(member_name)
+    /// Both steps matter, and phase 4 only had the second: `sanitize_path`
+    /// normalizes separators and strips a drive or root prefix, so a name the
+    /// extractor would have written to `Silver.Horizon/S01E01.mkv` and one that
+    /// direct routing would otherwise have refused now resolve identically. With
+    /// several members per set that difference is reachable, where a
+    /// single-member set could only ever have demoted on it.
+    fn resolve_member_path(member_name: &str) -> Result<String, ()> {
+        let sanitized = weaver_unrar::sanitize_path(member_name);
+        let safe = crate::pipeline::extraction::validate_sanitized_rar_member_path(&sanitized)
             .map_err(|_| ())?;
         let safe = safe.to_string_lossy().replace('\\', "/");
         if safe.is_empty() {
             return Err(());
         }
-        Ok(format!("{safe}.direct.partial"))
+        Ok(safe)
     }
 
-    /// Final destination for a member, resolved exactly as the incremental
-    /// extractor resolves it (D3: reuse, don't invent).
+    /// The key the extractor decides two members collide on: the sanitized path,
+    /// case-folded, exactly as `ensure_unique_sanitized_rar_member_paths` folds
+    /// it. Two members sharing one is an archive today's extractor refuses
+    /// outright, so a direct set carrying one demotes rather than inventing
+    /// overwrite semantics that nothing downstream shares.
+    pub(crate) fn member_collision_key(member_name: &str) -> Result<String, ()> {
+        Self::resolve_member_path(member_name).map(|safe| safe.to_ascii_lowercase())
+    }
+
+    /// Working-directory-relative `.direct.partial` for one member.
+    ///
+    /// Only the **last** component is clamped, and only the stem inside it: a
+    /// member stored inside a directory keeps its directory, and the
+    /// `.direct.partial` suffix keeps its whole length so nothing downstream has
+    /// to guess whether a truncated name still names a partial (nit).
+    pub(crate) fn member_partial_path(&self, member_name: &str) -> Result<String, ()> {
+        Self::resolve_member_path(member_name).map(|safe| with_suffix(&safe, ".direct.partial"))
+    }
+
+    /// Final destination for a member.
     pub(crate) fn member_output_path(&self, member_name: &str) -> Result<PathBuf, ()> {
-        let safe = crate::pipeline::extraction::validate_sanitized_rar_member_path(member_name)
-            .map_err(|_| ())?;
-        let safe = safe.to_string_lossy().replace('\\', "/");
+        let safe = Self::resolve_member_path(member_name)?;
         Ok(crate::pipeline::Pipeline::member_output_paths(&self.working_dir, &safe).0)
     }
 

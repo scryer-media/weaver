@@ -540,6 +540,36 @@ fn build_test_rar_file_header_with_extra(
     data_crc: Option<u32>,
     extra: &[u8],
 ) -> Vec<u8> {
+    build_test_rar_data_header(
+        2,
+        filename,
+        common_flags_extra,
+        data_size,
+        unpacked_size,
+        data_crc,
+        extra,
+    )
+}
+
+/// A RAR5 **service** header (type 3) with a data area.
+///
+/// Recovery records (`-rr`) and quick-open blocks take exactly this shape: the
+/// header body is a file header's, and the data area that follows belongs to no
+/// member — so a direct-store router files every byte of it into the envelope.
+fn build_test_rar_service_header(name: &str, data_size: u64) -> Vec<u8> {
+    build_test_rar_data_header(3, name, 0, data_size, data_size, None, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_test_rar_data_header(
+    header_type: u64,
+    filename: &str,
+    common_flags_extra: u64,
+    data_size: u64,
+    unpacked_size: u64,
+    data_crc: Option<u32>,
+    extra: &[u8],
+) -> Vec<u8> {
     let file_flags: u64 = if data_crc.is_some() { 0x0004 } else { 0 };
     let mut type_body = Vec::new();
     type_body.extend_from_slice(&encode_test_rar_vint(file_flags));
@@ -560,7 +590,7 @@ fn build_test_rar_file_header_with_extra(
         common_flags |= 0x0001;
     }
     let mut body = Vec::new();
-    body.extend_from_slice(&encode_test_rar_vint(2));
+    body.extend_from_slice(&encode_test_rar_vint(header_type));
     body.extend_from_slice(&encode_test_rar_vint(common_flags));
     if !extra.is_empty() {
         body.extend_from_slice(&encode_test_rar_vint(extra.len() as u64));

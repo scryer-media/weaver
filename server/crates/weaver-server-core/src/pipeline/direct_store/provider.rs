@@ -31,6 +31,17 @@
 //! difference: that image answers `Ok(0)` at a hole so a truncated header walk
 //! stops cleanly, while this one is read by callers that must never mistake a
 //! hole for the end of the data.
+//!
+//! Coverage is therefore tracked **per source, not per volume** (B1). Knowing
+//! that a physical byte was placed says nothing about *which* file received it,
+//! and the envelope is a sparse file: a read at an offset the envelope never
+//! received returns the filesystem's zeros, indistinguishable from real data, as
+//! long as some later offset made the file that long. So the envelope answers
+//! only for [`VirtualVolume::envelope_covered`] — the ranges an envelope write
+//! actually recorded — and a member extent answers only inside itself. A byte
+//! the volume-level map calls covered but no source claims is a hole, which is
+//! the invariant this module's title states, held unconditionally rather than as
+//! a consequence of the extent list happening to be right.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -69,6 +80,17 @@ pub(crate) fn is_hole(error: &std::io::Error) -> bool {
         .is_some_and(|inner| inner.downcast_ref::<HoleError>().is_some())
 }
 
+/// The end of the coalesced run of `ranges` containing `position`, or `None`
+/// when `position` is outside every run.
+fn covered_run_end(ranges: &ByteRanges, position: u64) -> Option<u64> {
+    let runs = ranges.ranges();
+    let index = runs
+        .partition_point(|(start, _)| *start <= position)
+        .checked_sub(1)?;
+    let (_, end) = runs[index];
+    (position < end).then_some(end)
+}
+
 fn hole(volume_index: u32, offset: u64) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -86,12 +108,23 @@ pub(crate) struct VirtualVolume {
     pub(crate) volume_index: u32,
     /// Absolute path of this volume's sparse envelope file.
     pub(crate) envelope: PathBuf,
-    /// Direct-routed member extents in physical order, disjoint.
+    /// Direct-routed member extents in physical order, disjoint. The order is
+    /// what makes the binary searches in [`VirtualVolumeReader`] valid, and
+    /// `map_physical_range` produces it that way.
     pub(crate) extents: Vec<MemberExtent>,
     /// Absolute `.direct.partial` path per member id.
     pub(crate) partials: HashMap<u32, PathBuf>,
     /// Physical ranges that were actually placed. Everything else is a hole.
     pub(crate) covered: ByteRanges,
+    /// Of `covered`, the physical ranges the **envelope file** received.
+    ///
+    /// Never derived here from `covered` minus the extents: the whole failure
+    /// this exists to stop is an extent going missing, and a derivation would
+    /// hand the missing member's range straight back to the envelope. It comes
+    /// from the writes recorded against the envelope destination, so a range no
+    /// envelope write ever claimed reads as a hole no matter what the extent
+    /// list says.
+    pub(crate) envelope_covered: ByteRanges,
     /// Logical length of the volume: what a `SeekFrom::End` means and where
     /// reads stop returning bytes.
     pub(crate) len: u64,
@@ -113,6 +146,10 @@ impl HybridVolumeProvider {
         }
     }
 
+    /// The registered shape of one virtual volume. No production caller yet —
+    /// wave 2's PAR2 adapter needs it to size a settle read — so it is test-only
+    /// rather than carrying a dead-code allow that would outlive its reason.
+    #[cfg(test)]
     pub(crate) fn volume(&self, volume_index: u32) -> Option<&VirtualVolume> {
         self.volumes.get(&volume_index)
     }
@@ -187,57 +224,93 @@ impl VirtualVolumeReader {
         }
     }
 
+    /// Same: the reconstruction sweep carries its own length, so this exists for
+    /// the tests that hold the reader to a real file's `SeekFrom::End` semantics.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> u64 {
         self.volume.len
     }
 
-    /// How far the current run of the *same* source reaches: the nearest of the
-    /// covered run's end, the member extent's end, and the volume's end.
-    fn run_end(&self, position: u64) -> Option<u64> {
-        let covered_end = self
-            .volume
-            .covered
-            .ranges()
-            .iter()
-            .find(|(start, end)| *start <= position && position < *end)
-            .map(|(_, end)| *end)?;
-        let extent_end = self
+    /// The member extent containing `position`, if any.
+    ///
+    /// Binary search rather than a scan: a header walk over a many-member volume
+    /// issues thousands of small reads, and a linear probe per read would make
+    /// that quadratic in the member count.
+    fn extent_at(&self, position: u64) -> Option<&MemberExtent> {
+        let candidate = self
             .volume
             .extents
-            .iter()
-            .find(|extent| {
-                extent.physical_offset <= position
-                    && position < extent.physical_offset.saturating_add(extent.len)
-            })
-            .map(|extent| extent.physical_offset.saturating_add(extent.len))
-            // Not inside a member extent: the run reaches the next extent that
-            // starts after here, because that is where the envelope stops
-            // owning bytes.
-            .or_else(|| {
+            .partition_point(|extent| extent.physical_offset <= position)
+            .checked_sub(1)?;
+        let extent = &self.volume.extents[candidate];
+        (position < extent.physical_offset.saturating_add(extent.len)).then_some(extent)
+    }
+
+    /// How far the current run of the *same* source reaches: the nearest of the
+    /// volume's covered run end, the run end of the source that answers this
+    /// byte, the source's own boundary (the member extent's end, or the next
+    /// extent's start when the envelope owns these bytes), and the volume's end.
+    ///
+    /// `None` means `position` is a hole — either nothing was placed there, or
+    /// something was and no source on disk backs it.
+    fn run_end(&self, position: u64) -> Option<u64> {
+        let covered_end = covered_run_end(&self.volume.covered, position)?;
+
+        let (source_end, boundary) = match self.extent_at(position) {
+            // A routed member's partial holds every byte of its own extent that
+            // the volume map calls covered; a partial too short for that is
+            // caught as a hole by the short read.
+            Some(extent) => (
+                covered_end,
+                extent.physical_offset.saturating_add(extent.len),
+            ),
+            // The envelope owns these bytes as far as the next member extent —
+            // but only as far as an envelope write actually reached.
+            None => (
+                covered_run_end(&self.volume.envelope_covered, position)?,
                 self.volume
                     .extents
-                    .iter()
-                    .filter(|extent| extent.physical_offset > position)
+                    .get(
+                        self.volume
+                            .extents
+                            .partition_point(|extent| extent.physical_offset <= position),
+                    )
                     .map(|extent| extent.physical_offset)
-                    .min()
-            })
-            .unwrap_or(u64::MAX);
-        Some(covered_end.min(extent_end).min(self.volume.len))
+                    .unwrap_or(u64::MAX),
+            ),
+        };
+        Some(
+            covered_end
+                .min(source_end)
+                .min(boundary)
+                .min(self.volume.len),
+        )
     }
 
     fn source_at(&self, position: u64) -> Source {
-        for extent in &self.volume.extents {
-            let end = extent.physical_offset.saturating_add(extent.len);
-            if extent.physical_offset <= position && position < end {
-                return Source::Member {
-                    member_id: extent.member_id,
-                    offset: extent
-                        .logical_offset
-                        .saturating_add(position - extent.physical_offset),
-                };
-            }
+        match self.extent_at(position) {
+            Some(extent) => Source::Member {
+                member_id: extent.member_id,
+                offset: extent
+                    .logical_offset
+                    .saturating_add(position - extent.physical_offset),
+            },
+            None => Source::Envelope { offset: position },
         }
-        Source::Envelope { offset: position }
+    }
+
+    /// A destination file that is not there holds no bytes, which is what a hole
+    /// *is*. Reporting it as a plain `NotFound` would make a caller treat a
+    /// deleted partial as an infrastructure failure rather than as "refetch
+    /// this", which is the whole distinction [`is_hole`] exists to draw.
+    fn open_or_hole(&self, path: &std::path::Path) -> std::io::Result<File> {
+        File::open(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                hole(self.volume.volume_index, self.position)
+            } else {
+                error
+            }
+        })
     }
 
     fn read_from(&mut self, source: Source, out: &mut [u8]) -> std::io::Result<usize> {
@@ -248,8 +321,9 @@ impl VirtualVolumeReader {
                         .volume
                         .partials
                         .get(&member_id)
-                        .ok_or_else(|| hole(self.volume.volume_index, self.position))?;
-                    let file = File::open(path)?;
+                        .ok_or_else(|| hole(self.volume.volume_index, self.position))?
+                        .clone();
+                    let file = self.open_or_hole(&path)?;
                     self.partial_handles.insert(member_id, file);
                 }
                 let file = self
@@ -261,7 +335,8 @@ impl VirtualVolumeReader {
             }
             Source::Envelope { offset } => {
                 if self.envelope_handle.is_none() {
-                    self.envelope_handle = Some(File::open(&self.volume.envelope)?);
+                    let path = self.volume.envelope.clone();
+                    self.envelope_handle = Some(self.open_or_hole(&path)?);
                 }
                 let file = self
                     .envelope_handle

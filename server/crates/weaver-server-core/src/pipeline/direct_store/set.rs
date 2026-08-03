@@ -34,12 +34,6 @@ pub(crate) const fn envelope_destination_key(volume_index: u32) -> u32 {
     u32::MAX - volume_index
 }
 
-/// The volume behind an envelope destination key, or `None` for a member key.
-pub(crate) const fn envelope_destination_volume(key: u32, volume_count: u32) -> Option<u32> {
-    let volume = u32::MAX - key;
-    if volume < volume_count { Some(volume) } else { None }
-}
-
 /// Whether a set is still routing, and if not, why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectSetStatus {
@@ -77,6 +71,19 @@ pub(crate) struct DirectSet {
     /// must not be fetched again. Recording it here is the only place the true
     /// decoded geometry is known.
     segment_extents: BTreeMap<u32, BTreeMap<u32, (u64, u64)>>,
+    /// Post-write accounting, kept alongside the barrier's and by the same call:
+    /// per source volume, the physical ranges every destination write returned
+    /// for, and the subset of those the **envelope** received.
+    ///
+    /// The barrier is still the durable truth, and where it exists it is what
+    /// gets read. This exists because it also has to be right *before* the
+    /// barrier does — a set can demote before its first member registers one —
+    /// and the router's own routed map is not an answer to that question: it
+    /// records what routing handed over, including spans whose write later
+    /// failed. Claiming those would have the demotion sweep read bytes back out
+    /// of a file that never received them (B1).
+    placed: BTreeMap<u32, ByteRanges>,
+    placed_envelope: BTreeMap<u32, ByteRanges>,
     /// Coverage restored from a checkpoint, applied when the barrier is built.
     resumed: Option<CoverageSnapshot>,
     /// The demotion's one-time cleanup (delete output, retire the row, refetch)
@@ -113,6 +120,8 @@ impl DirectSet {
             complete_volumes: BTreeSet::new(),
             volume_crcs: BTreeMap::new(),
             segment_extents: BTreeMap::new(),
+            placed: BTreeMap::new(),
+            placed_envelope: BTreeMap::new(),
             resumed: None,
             demotion_cleaned_up: false,
             latched_direct: false,
@@ -149,13 +158,13 @@ impl DirectSet {
     /// The digest the checkpoint is written under. Stable across volume growth;
     /// see [`DirectSetPlan::digest`].
     pub(crate) fn plan_digest(&self) -> [u8; 32] {
-        let members: Vec<(String, u64)> = self
-            .router
-            .member_partials()
-            .into_iter()
-            .map(|(_, name, _)| (name.to_string(), 0))
-            .collect();
-        self.router.plan().digest(&members)
+        // The real declared sizes, not a literal zero (nit). The digest's own
+        // reason for excluding the per-part extents is that "any change to the
+        // facts a claimed extent depends on shows up as a different member name
+        // or unpacked size" — which only holds if the size is actually in it.
+        self.router
+            .plan()
+            .digest(&self.router.member_digest_entries())
     }
 
     pub(crate) fn is_demoted(&self) -> bool {
@@ -217,9 +226,28 @@ impl DirectSet {
     /// The composed whole-volume CRC32, when the parts cover `[0, len)` end to
     /// end.
     pub(crate) fn volume_crc(&self, volume_index: u32, len: u64) -> Option<u32> {
+        self.volume_crc_run(volume_index, 0, len)
+    }
+
+    /// The composed CRC32 of one exact source run of a volume, when the yEnc
+    /// part composition happens to have coalesced into precisely that run.
+    ///
+    /// Deliberately exact rather than "the value covering this range": a run the
+    /// composition can only bound is no reference value at all, and D8 asks for
+    /// verification *where available*.
+    pub(crate) fn volume_crc_run(&self, volume_index: u32, start: u64, len: u64) -> Option<u32> {
         self.volume_crcs
             .get(&volume_index)
-            .and_then(|runs| runs.exact(0, len))
+            .and_then(|runs| runs.compose(start, len))
+    }
+
+    /// The whole yEnc part composition for one volume, for a caller that has to
+    /// ask about several sub-ranges of it (D8's reconstruction sweep).
+    pub(crate) fn volume_crc_runs(&self, volume_index: u32) -> CrcRuns {
+        self.volume_crcs
+            .get(&volume_index)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub(crate) fn mark_finalized(&mut self) {
@@ -260,10 +288,21 @@ impl DirectSet {
             && self.router.all_members_verified()
     }
 
-    pub(crate) fn note_volume_complete(&mut self, volume_index: u32) -> Result<(), DemotionReason> {
+    /// Marks a source volume complete and returns whatever the confirming parse
+    /// just made routable. The caller must write those spans before recording
+    /// them, exactly as it does for [`Self::route`]'s.
+    pub(crate) fn note_volume_complete(
+        &mut self,
+        volume_index: u32,
+    ) -> Result<Vec<RoutedSpan>, DemotionReason> {
         self.complete_volumes.insert(volume_index);
         match self.router.note_volume_complete(volume_index) {
-            Ok(()) => Ok(()),
+            Ok(spans) => {
+                if !spans.is_empty() {
+                    self.latched_direct = true;
+                }
+                Ok(spans)
+            }
             Err(reason) => {
                 self.demote(reason);
                 Err(reason)
@@ -377,6 +416,22 @@ impl DirectSet {
             "direct-store emitted envelope spans for {} before any member registered a barrier",
             self.set_name()
         );
+        // Recorded before the barrier is consulted, and whether or not one
+        // exists: this is the account [`Self::volume_coverage`] falls back on,
+        // and it must describe writes that *returned*, exactly like the
+        // barrier's.
+        for span in spans {
+            self.placed
+                .entry(span.volume_index)
+                .or_default()
+                .insert(span.source_offset, span.len());
+            if let DirectDestination::Envelope { volume_index } = span.destination {
+                self.placed_envelope
+                    .entry(volume_index)
+                    .or_default()
+                    .insert(span.destination_offset, span.len());
+            }
+        }
         let Some(barrier) = self.barrier.as_mut() else {
             return;
         };
@@ -466,14 +521,38 @@ impl DirectSet {
     ///
     /// The barrier is authoritative: it only learns about writes whose every
     /// destination returned. Before the first member registers there is no
-    /// barrier at all, and the router's own routed map is the only account
-    /// there is — a set that demotes that early has written envelope bytes and
-    /// nothing else.
+    /// barrier at all — a set that demotes that early has written envelope bytes
+    /// and nothing else — and the fallback is [`Self::placed`], which is fed by
+    /// the same call and under the same rule. Deliberately **not** the router's
+    /// routed map: that records what routing emitted, including spans whose
+    /// write failed, and claiming one of those would send the demotion sweep to
+    /// read a byte back out of a file that never received it (B1).
     pub(crate) fn volume_coverage(&self, volume_index: u32) -> ByteRanges {
         self.barrier
             .as_ref()
             .and_then(|barrier| barrier.volume_coverage(volume_index))
-            .unwrap_or_else(|| self.router.routed_ranges(volume_index))
+            .unwrap_or_else(|| self.placed.get(&volume_index).cloned().unwrap_or_default())
+    }
+
+    /// The physical ranges one volume's **envelope file** received.
+    ///
+    /// The provider needs this separately from [`Self::volume_coverage`]: an
+    /// envelope is sparse, so a read at an offset it never received answers with
+    /// zeros rather than failing, and "the volume placed this byte somewhere" is
+    /// not evidence that the envelope is where it went.
+    pub(crate) fn envelope_coverage(&self, volume_index: u32) -> ByteRanges {
+        self.barrier
+            .as_ref()
+            .and_then(|barrier| {
+                barrier.destination_coverage(envelope_destination_key(volume_index))
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                self.placed_envelope
+                    .get(&volume_index)
+                    .cloned()
+                    .unwrap_or_default()
+            })
     }
 
     /// A [`HybridVolumeProvider`] over this set's partials and envelopes.
@@ -502,6 +581,7 @@ impl DirectSet {
                 extents: self.router.volume_member_extents(*volume_index),
                 partials: partials.clone(),
                 covered: self.volume_coverage(*volume_index),
+                envelope_covered: self.envelope_coverage(*volume_index),
                 len: *len,
             })
             .collect();

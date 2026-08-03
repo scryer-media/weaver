@@ -27,11 +27,30 @@
 //!
 //! # Scope of this phase
 //!
-//! Phase 4 wires the rest in: [`router`] splits every decoded source span
+//! Phase 4 wired the rest in: [`router`] splits every decoded source span
 //! across its destinations, [`plan`] admits sets and names those destinations,
 //! and [`set`] joins a router to its [`barrier::CoverageBarrier`] so a routed
 //! write becomes durable coverage. The [`DirectStoreGate`] still defaults
 //! **off**.
+//!
+//! Phase 5 wave 1 adds three things on top:
+//!
+//! - **Envelope v2.** Each source volume gets its own sparse envelope file
+//!   holding every non-member byte at its true physical offset, replacing phase
+//!   4's fixed 64 KiB half-slots in one per-set file. Unbounded by construction,
+//!   restart-stable by construction, and the reason `-rr` and `-qo` sets route
+//!   at all — the slot ceiling demoted every one of them.
+//! - **Multi-member sets.** Admission, routing, the per-member gates,
+//!   finalization (in archive order) and demotion all carry several members per
+//!   set. An *ineligible* member still demotes the whole set; D1's bounded
+//!   tolerance is wave 2.
+//! - [`provider`] and [`reconstruct`] — the hybrid virtual-volume provider that
+//!   answers reads over partials plus envelopes as if the volume existed, and
+//!   D8's demotion by byte-exact reconstruction, which materializes a demoting
+//!   set's volumes from its own routed bytes instead of refetching them.
+//!
+//! PAR2-bearing jobs are still refused at admission; the `FileAccess` adapter
+//! that lets the verifier read through [`provider`] is wave 2.
 //!
 //! # Two checkpoint systems
 //!
@@ -229,6 +248,7 @@ impl ByteRanges {
     }
 
     /// Total covered bytes.
+    #[allow(dead_code)]
     pub(crate) fn covered(&self) -> u64 {
         self.ranges.iter().fold(0u64, |total, &(start, end)| {
             total.saturating_add(end - start)

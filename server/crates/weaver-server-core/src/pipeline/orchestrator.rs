@@ -9,7 +9,7 @@ pub(crate) use runtime::check_disk_space;
 pub(super) use runtime::timestamp_secs;
 pub(crate) use runtime::{
     DirectWriteBatches, close_cached_write_handles_under, is_terminal_status,
-    release_cached_write_handle, sync_direct_destination, write_direct_batches,
+    release_cached_write_handle, sync_direct_destinations, write_direct_batches,
     write_segment_to_disk, write_segments_to_disk,
 };
 #[cfg(test)]

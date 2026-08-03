@@ -412,6 +412,21 @@ impl CoverageBarrier {
         Some(coverage)
     }
 
+    /// Everything durably placed in **one destination's own space**.
+    ///
+    /// Unlike [`Self::volume_coverage`] these ranges are never trimmed against a
+    /// floor, because a destination's claim is what restart re-probes and what
+    /// the hybrid provider reads back: a floor describes a *source volume*'s
+    /// refetch point and says nothing about which file holds a byte. For a
+    /// volume's envelope the destination space **is** the physical space, so
+    /// this is the exact answer to "did the envelope ever receive this offset"
+    /// (B1).
+    pub(crate) fn destination_coverage(&self, member_index: u32) -> Option<&ByteRanges> {
+        self.destinations
+            .get(&member_index)
+            .map(|destination| &destination.ranges)
+    }
+
     /// Destination paths touched since the last successful barrier, in member
     /// order.
     pub(crate) fn touched_destinations(&self) -> Vec<&str> {

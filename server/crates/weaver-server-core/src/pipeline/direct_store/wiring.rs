@@ -11,9 +11,11 @@
 //!    every destination it touches in one multi-path batch, and only then
 //!    records coverage, feeds live PAR2 and commits the segment.
 //! 3. **Finalization / demotion** — a set whose members all pass the
-//!    whole-member gate commits its partials to the extractor's destinations
-//!    and is marked extracted; a set that demotes deletes its direct output,
-//!    retires its checkpoint row and refetches its volumes conventionally.
+//!    whole-member gate commits its partials to the extractor's destinations in
+//!    archive order and is marked extracted; a set that demotes materializes its
+//!    volumes from its own routed bytes (D8), persists the legacy state that
+//!    replaces its coverage, and hands them to the conventional path — falling
+//!    back to refetching everything only when reconstruction is impossible.
 //!
 //! # D7, stated as suppression points
 //!
@@ -47,6 +49,7 @@ use tracing::{debug, info, warn};
 use super::DirectStoreGate;
 use super::barrier::{BarrierDemand, BarrierDrain, DatabaseCoveragePersist, DestinationSync};
 use super::plan::DirectSetPlan;
+use super::reconstruct::{ReconstructionFailure, VolumeReconstruction};
 use super::router::{DemotionReason, DirectDestination, RoutedSpan};
 use super::set::DirectSet;
 use crate::DownloadWork;
@@ -323,6 +326,15 @@ impl Pipeline {
                 return DirectRouteOutcome::Demoted;
             };
             set.note_volume_part_crc(volume_index, file_offset, u64::from(decoded_size), part_crc);
+            // The decoded geometry of this article, which only the decoder
+            // knows: demotion-by-reconstruction uses it to decide which articles
+            // it does *not* have to fetch again (D8).
+            set.note_segment_extent(
+                volume_index,
+                segment_id.segment_number,
+                file_offset,
+                u64::from(decoded_size),
+            );
             set.route(volume_index, file_offset, &bytes)
         };
         let spans = match routed {
@@ -334,42 +346,11 @@ impl Pipeline {
             }
         };
 
-        if !spans.is_empty() {
-            let batches = self.direct_write_batches(job_id, set_index, &spans);
-            self.prepare_direct_destination_dirs(job_id, &batches).await;
-            if let Err(error) = crate::pipeline::orchestrator::write_direct_batches(batches).await {
-                // A destination write failure is a demotion, not a job
-                // failure: the conventional path writes the same bytes to a
-                // different file, and only if *that* also fails is the job
-                // genuinely unfinishable (M6).
-                warn!(
-                    job_id = job_id.0,
-                    segment = %segment_id,
-                    error = %error,
-                    "direct-store destination write failed; demoting the set"
-                );
-                self.demote_direct_set(
-                    job_id,
-                    set_index,
-                    DemotionReason::DestinationWriteFailed,
-                    dropped,
-                )
-                .await;
-                if !self
-                    .direct_store
-                    .set(job_id, set_index)
-                    .is_some_and(DirectSet::is_demoted)
-                {
-                    self.fail_job(
-                        job_id,
-                        format!("direct-store destination write failed for {segment_id}: {error}"),
-                    );
-                }
-                return DirectRouteOutcome::Demoted;
-            }
-            if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
-                set.record_writes(&spans, Instant::now());
-            }
+        if !self
+            .place_direct_spans(job_id, set_index, &spans, dropped)
+            .await
+        {
+            return DirectRouteOutcome::Demoted;
         }
 
         // Ordering contract (D5): every routed destination write for this span
@@ -390,6 +371,63 @@ impl Pipeline {
         DirectRouteOutcome::Routed
     }
 
+    /// Writes every destination a batch of routed spans touches, then records
+    /// them as coverage. `false` means the set demoted and the caller must stop.
+    ///
+    /// The record only happens once **all** the writes returned: partial failure
+    /// leaves orphan bytes, and the coverage map is the truth, not the bytes.
+    /// Both span producers go through here — the routing seam and the confirming
+    /// parse's drain at volume completion — so neither can grow its own,
+    /// subtly different, ordering.
+    async fn place_direct_spans(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        spans: &[RoutedSpan],
+        dropped: Option<(SegmentId, u64)>,
+    ) -> bool {
+        if spans.is_empty() {
+            return true;
+        }
+        let batches = self.direct_write_batches(job_id, set_index, spans);
+        self.prepare_direct_destination_dirs(job_id, &batches).await;
+        if let Err(error) = crate::pipeline::orchestrator::write_direct_batches(batches).await {
+            // A destination write failure is a demotion, not a job failure: the
+            // conventional path writes the same bytes to a different file, and
+            // only if *that* also fails is the job genuinely unfinishable (M6).
+            warn!(
+                job_id = job_id.0,
+                error = %error,
+                "direct-store destination write failed; demoting the set"
+            );
+            self.demote_direct_set(
+                job_id,
+                set_index,
+                DemotionReason::DestinationWriteFailed,
+                dropped,
+            )
+            .await;
+            if !self
+                .direct_store
+                .set(job_id, set_index)
+                .is_some_and(DirectSet::is_demoted)
+            {
+                self.fail_job(
+                    job_id,
+                    format!(
+                        "direct-store destination write failed for job {}: {error}",
+                        job_id.0
+                    ),
+                );
+            }
+            return false;
+        }
+        if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
+            set.record_writes(spans, Instant::now());
+        }
+        true
+    }
+
     /// Groups routed spans into one sub-batch per destination path.
     fn direct_write_batches(
         &self,
@@ -405,18 +443,25 @@ impl Pipeline {
             .router
             .member_partials()
             .into_iter()
-            .map(|(index, _, partial)| (index, partial.to_string()))
+            .map(|(member_id, _, partial)| (member_id, partial.to_string()))
             .collect();
-        let envelope = set.plan().envelope_relative_path();
 
         let mut grouped: HashMap<PathBuf, Vec<(u64, Vec<u8>)>> = HashMap::new();
         for span in spans {
             let relative = match span.destination {
-                DirectDestination::Member { member_index } => match partials.get(&member_index) {
+                DirectDestination::Member { member_id } => match partials.get(&member_id) {
                     Some(path) => path.clone(),
                     None => continue,
                 },
-                DirectDestination::Envelope => envelope.clone(),
+                // Envelope v2: one file per volume, written at true physical
+                // offsets. The owner thread seeks to the offset and writes, so
+                // the gaps member routing carried away are ordinary filesystem
+                // holes on every platform that gives them for free. Windows
+                // needs `FSCTL_SET_SPARSE` at creation to get the same, which is
+                // phase 7.
+                DirectDestination::Envelope { volume_index } => {
+                    set.plan().envelope_relative_path(volume_index)
+                }
             };
             grouped
                 .entry(working_dir.join(relative))
@@ -586,10 +631,25 @@ impl Pipeline {
             .direct_store
             .set_mut(job_id, set_index)
             .map(|set| set.note_volume_complete(volume_index));
-        if let Some(Err(reason)) = outcome {
-            self.demote_direct_set(job_id, set_index, reason, None)
-                .await;
-            return;
+        match outcome {
+            Some(Err(reason)) => {
+                self.demote_direct_set(job_id, set_index, reason, None)
+                    .await;
+                return;
+            }
+            // The confirming parse can make the volume's trailing region
+            // routable — it was held until the parse proved no further header
+            // could appear there — so those spans are written here, before the
+            // set is allowed to finalize and delete its envelopes.
+            Some(Ok(spans)) => {
+                if !self
+                    .place_direct_spans(job_id, set_index, &spans, None)
+                    .await
+                {
+                    return;
+                }
+            }
+            None => return,
         }
 
         if self
@@ -677,14 +737,22 @@ impl Pipeline {
             })
             .collect();
 
-        let mut results = HashMap::with_capacity(touched.len());
-        for relative in touched {
-            let path = working_dir.join(&relative);
-            let outcome = crate::pipeline::orchestrator::sync_direct_destination(&path)
-                .await
-                .map_err(|error| error.to_string());
-            results.insert(relative, outcome);
-        }
+        // Every sync is queued to its owner thread before any of them is
+        // awaited (M4). Envelope v2 made this set `members + volumes` rather
+        // than two, and one `await` per destination serialized that many
+        // independent fsyncs on the pipeline task; the barrier's contract only
+        // asks that they have all completed before it persists, not that they
+        // happened one after another.
+        let paths: Vec<PathBuf> = touched
+            .iter()
+            .map(|relative| working_dir.join(relative))
+            .collect();
+        let outcomes = crate::pipeline::orchestrator::sync_direct_destinations(paths).await;
+        let results: HashMap<String, Result<(), String>> = touched
+            .into_iter()
+            .zip(outcomes)
+            .map(|(relative, outcome)| (relative, outcome.map_err(|error| error.to_string())))
+            .collect();
 
         let mut drain = InlineDrain;
         let mut sync = PreSyncedDestinations { results };
@@ -729,14 +797,26 @@ impl Pipeline {
         };
         let set_name = set.set_name().to_string();
         let working_dir = set.plan().working_dir.clone();
-        let envelope = set.plan().envelope_path();
-        let members: Vec<(String, PathBuf, PathBuf)> = set
+        let envelopes = set.plan().envelope_paths();
+        // `member_partials` is in **archive order** — `(first volume, physical
+        // offset)` — and the commit loop below walks it in that order, so two
+        // members whose names sanitize to the same destination overwrite each
+        // other exactly the way the incremental extractor makes them overwrite
+        // each other: last one in the archive wins (D3).
+        let unpacked_sizes: HashMap<String, u64> =
+            set.router.member_digest_entries().into_iter().collect();
+        let members: Vec<(String, u64, PathBuf, PathBuf)> = set
             .router
             .member_partials()
             .into_iter()
             .filter_map(|(_, name, partial)| {
                 let destination = set.plan().member_output_path(name).ok()?;
-                Some((name.to_string(), working_dir.join(partial), destination))
+                Some((
+                    name.to_string(),
+                    unpacked_sizes.get(name).copied().unwrap_or(0),
+                    working_dir.join(partial),
+                    destination,
+                ))
             })
             .collect();
         let extracted_members = self
@@ -751,7 +831,19 @@ impl Pipeline {
         // ever look at them again, so the job would sit in `Extracting`
         // forever. Demote instead — the volumes are refetched and the ordinary
         // extractor produces the same member (nit).
-        for (name, partial, destination) in &members {
+        //
+        // A failure **part way through the loop** leaves the members before it
+        // already renamed to their destinations, and the demotion then deletes
+        // the partials of the ones after it and refetches every volume of the
+        // set. The already-committed members are overwritten by the extractor
+        // with byte-identical content, so the outcome is correct and the cost is
+        // one wasted extraction of the members that had already landed.
+        // Reviewed and accepted: unwinding the renames would mean moving
+        // finished output back into scratch paths on a path that is already the
+        // unhappy one, and the alternative — staging every rename and
+        // committing them together — needs a directory-level atomic swap the
+        // filesystem does not offer.
+        for (name, unpacked_size, partial, destination) in &members {
             crate::pipeline::release_cached_write_handle(partial);
             if let Some(parent) = destination.parent()
                 && let Err(error) = tokio::fs::create_dir_all(parent).await
@@ -761,7 +853,19 @@ impl Pipeline {
                     .await;
                 return;
             }
-            if let Err(error) = tokio::fs::rename(partial, destination).await {
+            // A zero-length stored member never had a byte routed for it, so it
+            // has no partial to rename — but the archive declares the file and
+            // the conventional extractor creates it, so finalization does too,
+            // in the same archive order as every other member (B2).
+            let committed = match tokio::fs::rename(partial, destination).await {
+                Err(error)
+                    if *unpacked_size == 0 && error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    tokio::fs::File::create(destination).await.map(drop)
+                }
+                other => other,
+            };
+            if let Err(error) = committed {
                 warn!(
                     job_id = job_id.0,
                     member = %name,
@@ -777,8 +881,10 @@ impl Pipeline {
                 .or_default()
                 .insert(name.clone());
         }
-        crate::pipeline::release_cached_write_handle(&envelope);
-        let _ = tokio::fs::remove_file(&envelope).await;
+        for envelope in &envelopes {
+            crate::pipeline::release_cached_write_handle(envelope);
+            let _ = tokio::fs::remove_file(envelope).await;
+        }
 
         let mut persist = DatabaseCoveragePersist::new(self.db.clone());
         if let Some(set) = self.direct_store.set_mut(job_id, set_index)
@@ -805,12 +911,27 @@ impl Pipeline {
         );
     }
 
-    /// Abandons direct output for a set and hands its volumes back.
+    /// Abandons direct output for a set and hands its volumes back (D8's
+    /// **archive-group demotion**, the transition that ends direct mode).
     ///
-    /// Phase 4's demotion is the conservative form: the routed bytes are
-    /// discarded and the volumes refetched, rather than reconstructed
-    /// byte-exactly from the envelope (phase 5 owns that). Losing already-routed
-    /// bytes to a refetch is the accepted cost.
+    /// Two shapes, and the first one is tried first:
+    ///
+    /// 1. **Reconstruction.** Every volume is rebuilt byte-exactly from the
+    ///    envelope plus the member extents, its covered runs are verified against
+    ///    the yEnc part-CRC composition, and only then are legacy floors and
+    ///    completed-file rows persisted, the coverage row retired, and the
+    ///    partials and envelopes deleted. Covered bytes are never refetched.
+    /// 2. **Refetch** — phase 4's conservative form, kept as the fallback for
+    ///    everything reconstruction cannot do: a deleted envelope, a truncated
+    ///    partial, a covered run whose CRC32 disagrees. The routed bytes are
+    ///    thrown away and every article comes back off the wire.
+    ///
+    /// Ordering is normative. Unlike *repair* over checkpoint-covered output —
+    /// which deletes the checkpoint row **first**, because it is about to
+    /// overwrite the very bytes the row claims — demotion retires the row as
+    /// part of reconciliation, after the legacy state that replaces it is
+    /// durable. Retiring first would leave a window where neither the direct
+    /// coverage nor the legacy floors describe what is on disk.
     pub(in crate::pipeline) async fn demote_direct_set(
         &mut self,
         job_id: JobId,
@@ -830,15 +951,6 @@ impl Pipeline {
             return;
         }
         let set_name = set.set_name().to_string();
-        let working_dir = set.plan().working_dir.clone();
-        let envelope = set.plan().envelope_path();
-        let partials: Vec<PathBuf> = set
-            .router
-            .member_partials()
-            .into_iter()
-            .map(|(_, _, partial)| working_dir.join(partial))
-            .collect();
-        let volumes: Vec<u32> = set.plan().volumes.values().copied().collect();
 
         crate::runtime::perf_probe::record_owned(
             format!("direct_store.demoted.{}", reason.metric()),
@@ -848,12 +960,214 @@ impl Pipeline {
             job_id = job_id.0,
             set_name = %set_name,
             reason = reason.metric(),
-            "direct-store set demoted; refetching its volumes conventionally"
+            "direct-store set demoted"
         );
 
-        // D8: the checkpoint row goes first, because everything it claims is
-        // about to be deleted. A crash between here and the refetch costs a
-        // redownload, which is what the demotion is doing anyway.
+        match self
+            .reconstruct_demoted_set(job_id, set_index, dropped)
+            .await
+        {
+            Ok(volumes) => {
+                crate::runtime::perf_probe::record(
+                    "direct_store.demoted.reconstructed",
+                    std::time::Duration::from_nanos(1),
+                );
+                info!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    volumes,
+                    "direct-store set materialized from its own routed bytes"
+                );
+            }
+            Err(failure) => {
+                crate::runtime::perf_probe::record_owned(
+                    format!("direct_store.demote_refetch.{}", failure.metric()),
+                    std::time::Duration::from_nanos(1),
+                );
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    failure = %failure,
+                    "direct-store reconstruction is not possible; refetching the set's volumes"
+                );
+                self.refetch_demoted_set(job_id, set_index, dropped).await;
+            }
+        }
+    }
+
+    /// D8's reconstruction path. `Ok(n)` when `n` volumes were materialized.
+    async fn reconstruct_demoted_set(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        dropped: Option<(SegmentId, u64)>,
+    ) -> Result<usize, ReconstructionFailure> {
+        let Some(set) = self.direct_store.set(job_id, set_index) else {
+            return Err(ReconstructionFailure::NoLayout);
+        };
+        if set.router.member_partials().is_empty() {
+            // Nothing was ever routed to a member, so there is nothing to
+            // reconstruct *from* beyond headers. Refetching is both correct and
+            // cheaper than materializing header-only volumes.
+            return Err(ReconstructionFailure::NoLayout);
+        }
+        let working_dir = set.plan().working_dir.clone();
+        let volume_files: Vec<(u32, u32)> = set
+            .plan()
+            .volumes
+            .iter()
+            .map(|(volume_index, file_index)| (*volume_index, *file_index))
+            .collect();
+
+        // Decoded volume lengths and per-volume article geometry, both of which
+        // only the download layer knows.
+        let mut lengths = std::collections::BTreeMap::new();
+        let mut targets = Vec::with_capacity(volume_files.len());
+        let mut extents_by_volume = HashMap::new();
+        for (volume_index, file_index) in &volume_files {
+            let file_id = NzbFileId {
+                job_id,
+                file_index: *file_index,
+            };
+            let Some(state) = self.jobs.get(&job_id) else {
+                return Err(ReconstructionFailure::NoLayout);
+            };
+            let Some(file_asm) = state.assembly.file(file_id) else {
+                continue;
+            };
+            // The same name the conventional write path resolves, not the
+            // assembly's raw one: a file whose identity was rewritten (a PAR2
+            // canonical name, say) is about to be downloaded into *that* path,
+            // and reconstructing into a different one would leave the refetch
+            // filling a file with a hole where the rebuilt prefix should be.
+            let filename = self.current_filename_for_file(job_id, file_asm);
+            let received = file_asm.received_bytes();
+            let coverage = set.volume_coverage(*volume_index);
+            // A volume that never completed has no authoritative length; its
+            // received bytes are the most that can be on disk, which is exactly
+            // what bounds the sweep.
+            let len = received.max(coverage.end());
+            lengths.insert(*volume_index, len);
+            extents_by_volume.insert(*volume_index, set.segment_extents(*volume_index));
+            let path = working_dir.join(&filename);
+            targets.push((
+                *volume_index,
+                *file_index,
+                filename,
+                VolumeReconstruction {
+                    volume_index: *volume_index,
+                    path,
+                    len,
+                    assembly_complete: file_asm.is_complete(),
+                    covered: coverage,
+                    crcs: set.volume_crc_runs(*volume_index),
+                },
+            ));
+        }
+
+        let provider = set.virtual_provider(&lengths);
+        let plans: Vec<VolumeReconstruction> =
+            targets.iter().map(|(_, _, _, plan)| plan.clone()).collect();
+        let rebuilt = tokio::task::spawn_blocking(move || {
+            crate::pipeline::direct_store::reconstruct::reconstruct_volumes(&provider, &plans)
+        })
+        .await
+        .map_err(|error| ReconstructionFailure::WriteFailed {
+            volume_index: u32::MAX,
+            error: error.to_string(),
+        })??;
+
+        // Everything above is read-only against the job; from here the
+        // reconciliation mutates durable state, in D8's order: legacy floors and
+        // completed-file rows, then the coverage row, then the direct outputs.
+        let mut materialized = 0usize;
+        let mut keep: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (outcome, (volume_index, file_index, filename, plan)) in
+            rebuilt.iter().zip(targets.iter())
+        {
+            debug_assert_eq!(outcome.volume_index, *volume_index);
+            let file_id = NzbFileId {
+                job_id,
+                file_index: *file_index,
+            };
+            let extents = extents_by_volume.remove(volume_index).unwrap_or_default();
+            let (on_disk, floor) = crate::pipeline::direct_store::reconstruct::segments_on_disk(
+                &extents,
+                outcome.contiguous,
+            );
+            keep.insert(*file_index, on_disk);
+            if outcome.contiguous == 0 {
+                continue;
+            }
+            materialized += 1;
+
+            self.pending_file_progress.remove(&file_id);
+            self.persisted_file_progress.remove(&file_id);
+            if outcome.complete && outcome.contiguous >= plan.len {
+                let md5 = outcome.md5;
+                let name = filename.clone();
+                let index = *file_index;
+                if let Err(error) = self
+                    .db_blocking(move |db| {
+                        db.complete_file_with_optional_hash(job_id, index, &name, md5.as_ref())
+                    })
+                    .await
+                {
+                    warn!(
+                        job_id = job_id.0,
+                        file_index, error = %error,
+                        "failed to record a reconstructed volume as complete"
+                    );
+                }
+            } else if floor > 0 {
+                // A partial volume persists only a contiguous, segment-aligned
+                // floor (D8). `note_file_progress_floor` suppresses direct source
+                // files, and this one still is one until the set's status is read
+                // again — so the upsert goes straight to the batch the flush
+                // drains, which is the same row `coverage_skip_plan` and
+                // `segments_covered_by_floor` read back at restart.
+                self.pending_file_progress.insert(file_id, floor);
+            }
+        }
+        // Awaited, not fire-and-forget: the coverage row is retired immediately
+        // below, so until these floors are committed the job has no durable
+        // account of the volumes at all.
+        if let Err(error) = self
+            .flush_file_progress_batch_awaited("direct_store.demote.reconstructed_floors")
+            .await
+        {
+            warn!(job_id = job_id.0, error = %error, "failed to persist reconstructed volume floors");
+        }
+
+        let mut persist = DatabaseCoveragePersist::new(self.db.clone());
+        if let Some(set) = self.direct_store.set_mut(job_id, set_index)
+            && let Err(error) = set.retire(&mut persist)
+        {
+            warn!(job_id = job_id.0, error = %error, "failed to retire a reconstructed direct-store checkpoint");
+        }
+        self.delete_direct_outputs(job_id, set_index).await;
+        self.requeue_after_reconstruction(job_id, set_index, &keep, dropped)
+            .await;
+        Ok(materialized)
+    }
+
+    /// Phase 4's demotion, kept as the fallback: throw the routed bytes away and
+    /// hand every article back to the download queue.
+    async fn refetch_demoted_set(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        dropped: Option<(SegmentId, u64)>,
+    ) {
+        let Some(set) = self.direct_store.set(job_id, set_index) else {
+            return;
+        };
+        let volumes: Vec<u32> = set.plan().volumes.values().copied().collect();
+
+        // D8: on this path the checkpoint row goes first, because everything it
+        // claims is about to be deleted and nothing replaces it. A crash between
+        // here and the refetch costs a redownload, which is what the fallback is
+        // doing anyway.
         let mut persist = DatabaseCoveragePersist::new(self.db.clone());
         if let Some(set) = self.direct_store.set_mut(job_id, set_index)
             && let Err(error) = set.retire(&mut persist)
@@ -861,12 +1175,186 @@ impl Pipeline {
             warn!(job_id = job_id.0, error = %error, "failed to retire a demoted direct-store checkpoint");
         }
 
-        for partial in partials.iter().chain(std::iter::once(&envelope)) {
-            crate::pipeline::release_cached_write_handle(partial);
-            let _ = tokio::fs::remove_file(partial).await;
+        self.delete_direct_outputs(job_id, set_index).await;
+        self.refetch_direct_volumes(job_id, &volumes, dropped).await;
+    }
+
+    /// Deletes a set's partial members and envelope files.
+    ///
+    /// A sparse half-written output would masquerade as finished work (D1), and
+    /// the envelopes are scratch by construction.
+    async fn delete_direct_outputs(&mut self, job_id: JobId, set_index: usize) {
+        let Some(set) = self.direct_store.set(job_id, set_index) else {
+            return;
+        };
+        let working_dir = set.plan().working_dir.clone();
+        let mut doomed: Vec<PathBuf> = set
+            .router
+            .member_partials()
+            .into_iter()
+            .map(|(_, _, partial)| working_dir.join(partial))
+            .collect();
+        doomed.extend(set.plan().envelope_paths());
+        for path in doomed {
+            crate::pipeline::release_cached_write_handle(&path);
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+    }
+
+    /// Hands a reconstructed set back to the conventional path, keeping the
+    /// articles that are now genuinely on disk.
+    ///
+    /// This is the difference between D8's demotion and phase 4's: `keep` names,
+    /// per NZB file, the articles whose decoded extents lie wholly below the
+    /// contiguous prefix the sweep rebuilt. Those stay committed in the assembly
+    /// and are never fetched again. Everything else — an article held in RAM and
+    /// never written, an article above a coverage hole, the one article the
+    /// routing seam dropped — comes back, exactly as the refetch path would have
+    /// brought it back.
+    ///
+    /// A file with nothing kept takes the full refetch treatment, including
+    /// `mark_file_incomplete`: there is no reconstructed state to protect.
+    async fn requeue_after_reconstruction(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        keep: &HashMap<u32, Vec<u32>>,
+        dropped: Option<(SegmentId, u64)>,
+    ) {
+        let Some(set) = self.direct_store.set(job_id, set_index) else {
+            return;
+        };
+        let volume_files: Vec<(u32, u32)> = set
+            .plan()
+            .volumes
+            .iter()
+            .map(|(volume_index, file_index)| (*volume_index, *file_index))
+            .collect();
+        let extents: HashMap<u32, std::collections::BTreeMap<u32, (u64, u64)>> = volume_files
+            .iter()
+            .map(|(volume_index, file_index)| (*file_index, set.segment_extents(*volume_index)))
+            .collect();
+
+        let scheduled_retries: HashSet<SegmentId> = self
+            .pending_retries_by_segment
+            .keys()
+            .copied()
+            .filter(|segment_id| segment_id.file_id.job_id == job_id)
+            .collect();
+
+        let mut work = Vec::new();
+        let mut fully_reset: Vec<u32> = Vec::new();
+        {
+            let Some(state) = self.jobs.get_mut(&job_id) else {
+                return;
+            };
+            let mut queued: HashSet<SegmentId> = HashSet::new();
+            state.download_queue.extend_segment_ids(&mut queued);
+            state.recovery_queue.extend_segment_ids(&mut queued);
+
+            let mut lost_bytes = 0u64;
+            for (_, file_index) in &volume_files {
+                let file_id = NzbFileId {
+                    job_id,
+                    file_index: *file_index,
+                };
+                let kept: HashSet<u32> = keep
+                    .get(file_index)
+                    .map(|segments| segments.iter().copied().collect())
+                    .unwrap_or_default();
+                if kept.is_empty() {
+                    fully_reset.push(*file_index);
+                }
+                let Some(file) = state.spec.files.get(*file_index as usize) else {
+                    continue;
+                };
+                let file = file.clone();
+                let Some(file_asm) = state.assembly.file(file_id) else {
+                    continue;
+                };
+                let previously_received = file_asm.received_bytes();
+                let committed: HashSet<u32> = file
+                    .segments
+                    .iter()
+                    .filter(|segment| file_asm.has_segment(segment.ordinal))
+                    .map(|segment| segment.ordinal)
+                    .collect();
+
+                // Rebuild the assembly to exactly the kept set. `commit_segment`
+                // is the only way in and `reset` the only way out, so the
+                // sequence is reset-then-re-commit rather than a surgical
+                // removal; the decoded sizes come from the recorded extents, so
+                // the byte counters land where they were.
+                if let Some(file_asm) = state.assembly.file_mut(file_id) {
+                    file_asm.reset();
+                }
+                let mut kept_bytes = 0u64;
+                let file_extents = extents.get(file_index).cloned().unwrap_or_default();
+                for segment_number in &kept {
+                    let Some((_, len)) = file_extents.get(segment_number).copied() else {
+                        continue;
+                    };
+                    if let Some(file_asm) = state.assembly.file_mut(file_id)
+                        && file_asm.commit_segment(*segment_number, len as u32).is_ok()
+                    {
+                        kept_bytes = kept_bytes.saturating_add(len);
+                    }
+                }
+                lost_bytes =
+                    lost_bytes.saturating_add(previously_received.saturating_sub(kept_bytes));
+
+                for segment in &file.segments {
+                    if kept.contains(&segment.ordinal) {
+                        continue;
+                    }
+                    let segment_id = SegmentId {
+                        file_id,
+                        segment_number: segment.ordinal,
+                    };
+                    if queued.contains(&segment_id) || scheduled_retries.contains(&segment_id) {
+                        continue;
+                    }
+                    let was_dropped = dropped.is_some_and(|(id, _)| id == segment_id);
+                    if !committed.contains(&segment.ordinal) && !was_dropped {
+                        continue;
+                    }
+                    work.push(DownloadWork {
+                        segment_id,
+                        message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
+                        groups: file.groups.clone(),
+                        priority: file.role.download_priority(),
+                        byte_estimate: segment.bytes,
+                        retry_count: 0,
+                        is_recovery: false,
+                        exclude_servers: vec![],
+                        avoid_server: None,
+                    });
+                }
+            }
+            let dropped_bytes = dropped.map(|(_, bytes)| bytes).unwrap_or(0);
+            state.downloaded_bytes = state
+                .downloaded_bytes
+                .saturating_sub(lost_bytes.saturating_add(dropped_bytes));
         }
 
-        self.refetch_direct_volumes(job_id, &volumes, dropped).await;
+        // Only files the sweep rebuilt nothing for: everything else has legacy
+        // rows this path just wrote, and `mark_file_incomplete` deletes exactly
+        // those.
+        for file_index in fully_reset {
+            let file_id = NzbFileId { job_id, file_index };
+            self.pending_file_progress.remove(&file_id);
+            self.persisted_file_progress.remove(&file_id);
+            if let Err(error) = self.db.mark_file_incomplete(job_id, file_index) {
+                warn!(
+                    job_id = job_id.0,
+                    file_index, error = %error,
+                    "failed to invalidate a demoted direct-store volume"
+                );
+            }
+        }
+        for item in work {
+            self.requeue_retry_work(item);
+        }
     }
 
     /// Hands a demoted set's source volumes back to the conventional path.

@@ -14,7 +14,7 @@ use super::barrier::{
     BarrierDemand, BarrierDrain, BarrierError, BarrierStep, BarrierTrigger, CoverageBarrier,
     CoveragePersist, DatabaseCoveragePersist, DestinationSync, RoutedWrite, WriteRefused,
 };
-use super::plan::{DirectSetPlan, ENVELOPE_SLOT_BYTES, ENVELOPE_SLOT_HALF};
+use super::plan::DirectSetPlan;
 use super::restart::{
     CoverageRejection, DestinationProbe, ExpectedSet, ProbedDestination, coverage_skip_plan,
     refetch_floors, restore_job, restore_set, restore_set_with_probe,
@@ -1786,16 +1786,60 @@ fn crc_runs_compose_neighbours_and_ignore_an_overlapping_re_insert() {
     // them — which is the only order the router ever guarantees.
     let mut runs = CrcRuns::default();
     runs.insert(400, 200, weaver_par2::checksum::crc32(&payload[400..600]));
-    assert_eq!(runs.exact(0, 600), None, "a gap is not a composition");
+    assert_eq!(runs.compose(0, 600), None, "a gap is not a composition");
     runs.insert(0, 100, weaver_par2::checksum::crc32(&payload[..100]));
-    assert_eq!(runs.exact(0, 600), None);
+    assert_eq!(runs.compose(0, 600), None);
     runs.insert(100, 300, weaver_par2::checksum::crc32(&payload[100..400]));
 
     assert_eq!(
-        runs.exact(0, 600),
+        runs.compose(0, 600),
         Some(whole),
         "adjacent runs compose to the whole-space CRC32"
     );
+}
+
+#[test]
+fn crc_runs_compose_any_sub_range_that_lands_on_run_boundaries() {
+    // M3: a merged-only composition could answer for the whole space and
+    // nothing else, so a covered range that stopped short of it — a held tail,
+    // a volume that stopped mid-download — was reconstructed with no reference
+    // value at all. Every prefix and interior span a coverage map can name for
+    // wholly routed articles has to compose.
+    let payload: Vec<u8> = (0..600u32).map(|index| (index % 251) as u8).collect();
+    let mut runs = CrcRuns::default();
+    for (start, len) in [(0usize, 100usize), (100, 300), (400, 200)] {
+        runs.insert(
+            start as u64,
+            len as u64,
+            weaver_par2::checksum::crc32(&payload[start..start + len]),
+        );
+    }
+
+    for (start, len) in [
+        (0usize, 100usize),
+        (0, 400),
+        (0, 600),
+        (100, 300),
+        (100, 500),
+        (400, 200),
+    ] {
+        assert_eq!(
+            runs.compose(start as u64, len as u64),
+            Some(weaver_par2::checksum::crc32(&payload[start..start + len])),
+            "the sub-range at {start}+{len} lands on run boundaries and must compose"
+        );
+    }
+
+    // A range that starts or ends inside a run has no composed value, and
+    // "no value" is a refusal everywhere it is read — never a pass.
+    for (start, len) in [(50u64, 100u64), (0, 350), (150, 100), (0, 700)] {
+        assert_eq!(
+            runs.compose(start, len),
+            None,
+            "the sub-range at {start}+{len} cuts a run and must not compose"
+        );
+    }
+    assert_eq!(runs.compose(0, 0), None, "an empty range is not a checksum");
 }
 
 #[test]
@@ -1818,9 +1862,9 @@ fn crc_runs_refuse_every_shape_of_overlap() {
         );
     }
 
-    // Butting up against either edge is not an overlap, and must merge.
-    assert!(base(200, 50).exact(100, 150).is_some());
-    assert!(base(50, 50).exact(50, 150).is_some());
+    // Butting up against either edge is not an overlap, and must compose.
+    assert!(base(200, 50).compose(100, 150).is_some());
+    assert!(base(50, 50).compose(50, 150).is_some());
 
     // A zero-length run is a no-op, not an insertion at offset zero.
     assert_eq!(base(0, 0), untouched);
@@ -1830,10 +1874,11 @@ fn crc_runs_refuse_every_shape_of_overlap() {
 fn a_sparse_image_reads_across_run_boundaries_and_stops_at_every_hole() {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut chunks = std::collections::BTreeMap::new();
-    chunks.insert(0u64, vec![1u8, 2, 3, 4]);
-    chunks.insert(4u64, vec![5u8, 6]);
-    chunks.insert(16u64, vec![9u8, 9, 9]);
+    let mut chunks: std::collections::BTreeMap<u64, std::sync::Arc<[u8]>> =
+        std::collections::BTreeMap::new();
+    chunks.insert(0u64, std::sync::Arc::from(&[1u8, 2, 3, 4][..]));
+    chunks.insert(4u64, std::sync::Arc::from(&[5u8, 6][..]));
+    chunks.insert(16u64, std::sync::Arc::from(&[9u8, 9, 9][..]));
     let mut image = SparseImage::from_chunks(&chunks);
 
     // Adjacent runs are still separate runs: a read stops at the boundary and
@@ -1878,55 +1923,62 @@ fn envelope_plan() -> DirectSetPlan {
     }
 }
 
+/// Envelope v2 replaces phase 4's `envelope_offsets_split_each_volume_slot…`
+/// test, which asserted a 64 KiB half-slot layout that no longer exists: there
+/// is no slot arithmetic to overflow, because a byte's envelope offset *is* its
+/// physical offset in the volume.
 #[test]
-fn envelope_offsets_split_each_volume_slot_into_a_head_and_a_tail() {
+fn each_volume_owns_a_separate_sparse_envelope_file() {
     let plan = envelope_plan();
 
-    // No member extents known yet: everything addresses from the head.
-    assert_eq!(plan.envelope_offset(0, 0, 64, 0), Some(0));
-    assert_eq!(plan.envelope_offset(1, 0, 64, 0), Some(ENVELOPE_SLOT_BYTES));
-
-    // With a tail base, a run below it is head-relative and a run at or above
-    // it is tail-relative, so the trailer can never grow into the head.
-    let tail_base = 10_000_000u64;
-    assert_eq!(plan.envelope_offset(0, 128, 64, tail_base), Some(128));
     assert_eq!(
-        plan.envelope_offset(0, tail_base, 64, tail_base),
-        Some(ENVELOPE_SLOT_HALF)
+        plan.envelope_relative_path(0),
+        "Silver.Horizon.S01E05.vol00000.envelope"
     );
     assert_eq!(
-        plan.envelope_offset(1, tail_base + 32, 8, tail_base),
-        Some(ENVELOPE_SLOT_BYTES + ENVELOPE_SLOT_HALF + 32)
+        plan.envelope_relative_path(7),
+        "Silver.Horizon.S01E05.vol00007.envelope",
+        "zero padding keeps a lexical listing of a 2 000-volume set in volume order"
     );
-
-    // A run that does not fit its half slot is refused — that is the signal
-    // the set carries more than headers and must demote.
-    assert_eq!(plan.envelope_offset(0, ENVELOPE_SLOT_HALF - 8, 16, 0), None);
-    assert_eq!(plan.envelope_offset(0, 0, ENVELOPE_SLOT_HALF + 1, 0), None);
+    assert_ne!(
+        plan.envelope_relative_path(0),
+        plan.envelope_relative_path(1),
+        "two volumes must never share an envelope file — the offsets inside one \
+         are physical, so they would collide byte for byte"
+    );
     assert_eq!(
-        plan.envelope_offset(0, ENVELOPE_SLOT_HALF, 1, 0),
-        None,
-        "a head run beyond the half slot has nowhere to go"
+        plan.envelope_paths(),
+        vec![plan.envelope_path(0), plan.envelope_path(1)],
+        "the set owns exactly one envelope per planned volume"
     );
 
-    // Slot arithmetic is `u64` end to end, so even the top volume index
-    // addresses a real slot rather than wrapping.
-    assert_eq!(
-        plan.envelope_offset(u32::MAX, 0, 8, 0),
-        Some(u64::from(u32::MAX) * ENVELOPE_SLOT_BYTES)
-    );
-    // Offsets that would overflow refuse rather than wrapping into another
-    // volume's slot.
-    assert_eq!(plan.envelope_offset(0, 0, u64::MAX, 0), None);
-    assert_eq!(
-        plan.envelope_offset(0, u64::MAX, 8, 0),
-        None,
-        "a head run at the top of the space overflows its slot"
-    );
-    assert_eq!(
-        plan.envelope_offset(0, u64::MAX - 4, 8, u64::MAX - 8),
-        Some(ENVELOPE_SLOT_HALF + 4),
-        "a tail run stays inside its half slot however high the volume sits"
+    // The checkpoint blob carries destination paths and revalidates them at
+    // restart with the RAR member-path validator, so an envelope name that the
+    // validator refuses would make every barrier unreadable.
+    for volume_index in [0u32, 7, u32::MAX] {
+        assert!(
+            crate::pipeline::extraction::validate_sanitized_rar_member_path(
+                &plan.envelope_relative_path(volume_index)
+            )
+            .is_ok(),
+            "envelope paths must survive the same validator the snapshot codec applies"
+        );
+    }
+}
+
+#[test]
+fn envelope_destination_keys_count_down_from_the_top_of_the_member_space() {
+    use super::set::envelope_destination_key;
+
+    assert_eq!(envelope_destination_key(0), u32::MAX);
+    assert_eq!(envelope_destination_key(1), u32::MAX - 1);
+    assert_ne!(envelope_destination_key(0), envelope_destination_key(1));
+    // Member ids are handed out from zero upwards, so the two bands only meet
+    // at an unreachable set size. The barrier keys destinations by this number
+    // and a collision would silently merge a member's claim with an envelope's.
+    assert!(
+        envelope_destination_key(2_000) > 2_000,
+        "a 2 000-volume set's envelope keys must stay clear of its member ids"
     );
 }
 
@@ -1981,18 +2033,88 @@ fn member_partials_keep_their_directory_and_hostile_names_are_refused() {
         Ok("nested/S01E05.mkv.direct.partial".to_string())
     );
 
-    for hostile in [
-        "",
-        "../escape.mkv",
-        "/absolute.mkv",
-        "a/../../escape.mkv",
-        ".",
-    ] {
+    // Wave 1 runs a raw header name through `weaver_unrar::sanitize_path` before
+    // the validator, which is what the incremental extractor does — D3's
+    // "sanitize-don't-reject" rule. A traversal is therefore *stripped* rather
+    // than refused, exactly as the extractor strips it, and only a name that
+    // sanitizes to nothing at all has no destination. The invariant that matters
+    // is unchanged: whatever comes out is confined to the working directory.
+    for hostile in ["../escape.mkv", "/absolute.mkv", "a/../../escape.mkv"] {
+        let resolved = plan
+            .member_partial_path(hostile)
+            .unwrap_or_else(|()| panic!("{hostile} sanitizes to a usable name"));
+        let path = std::path::Path::new(&resolved);
         assert!(
-            plan.member_partial_path(hostile).is_err(),
-            "{hostile} must not name a destination"
+            !path.is_absolute()
+                && path
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_))),
+            "{hostile} resolved to {resolved}, which is not confined to the working directory"
         );
     }
+    for empty in ["", ".", "./"] {
+        assert!(
+            plan.member_partial_path(empty).is_err(),
+            "{empty} names nothing at all and must not resolve to a destination"
+        );
+    }
+
+    // Two members whose sanitized paths collide are an archive the extractor
+    // refuses outright, so the key that decides it has to agree with the key
+    // `ensure_unique_sanitized_rar_member_paths` folds.
+    assert_eq!(
+        DirectSetPlan::member_collision_key("./Silver.Horizon.nfo"),
+        DirectSetPlan::member_collision_key("SILVER.HORIZON.NFO"),
+        "the collision key is the sanitized path, case-folded"
+    );
+    assert_ne!(
+        DirectSetPlan::member_collision_key("Silver.Horizon.nfo"),
+        DirectSetPlan::member_collision_key("Silver.Horizon/S01E05.mkv")
+    );
+}
+
+#[test]
+fn destination_names_stay_inside_the_filename_ceiling_with_their_suffix() {
+    // Both suffixes are appended to a string an NZB supplies, so both could push
+    // the component past what the filesystem accepts — and the failure was a
+    // demotion on the set's first routed byte, reported as
+    // `DestinationWriteFailed`, which says nothing about the name (nit).
+    let limit = weaver_model::files::DOWNLOAD_FILENAME_MAX_BYTES;
+    let long = "S".repeat(400);
+    let plan = DirectSetPlan {
+        set_name: long.clone(),
+        volumes: [(0u32, 0u32), (7, 7)].into_iter().collect(),
+        files: [(0u32, 0u32), (7, 7)].into_iter().collect(),
+        working_dir: std::path::PathBuf::from("/tmp/silver-horizon"),
+    };
+
+    for volume_index in [0u32, 7, u32::MAX] {
+        let envelope = plan.envelope_relative_path(volume_index);
+        assert!(
+            envelope.len() <= limit,
+            "envelope {volume_index} is {} bytes: {envelope}",
+            envelope.len()
+        );
+        assert!(
+            envelope.ends_with(".envelope") && envelope.contains(&format!(".vol{volume_index:05}")),
+            "the clamp shortens the stem and keeps the whole suffix, got {envelope}"
+        );
+    }
+    // Two volumes of a long-named set must still name two different files.
+    assert_ne!(
+        plan.envelope_relative_path(0),
+        plan.envelope_relative_path(7)
+    );
+
+    let partial = plan
+        .member_partial_path(&format!("Silver.Horizon/{long}.mkv"))
+        .expect("a long member name resolves");
+    let (parent, name) = partial.rsplit_once('/').expect("the directory survives");
+    assert_eq!(parent, "Silver.Horizon");
+    assert!(
+        name.len() <= limit && name.ends_with(".direct.partial"),
+        "only the last component is clamped, and the suffix survives whole: {name}"
+    );
 }
 
 #[test]
@@ -2024,8 +2146,561 @@ fn a_finalized_set_refuses_to_be_demoted() {
     // it would delete completed output (B5).
     let mut set = super::set::DirectSet::new(JOB, envelope_plan());
     set.mark_finalized();
-    set.demote(super::router::DemotionReason::MultipleMembers);
+    set.demote(super::router::DemotionReason::HoldsBudgetExceeded);
 
     assert!(set.is_finalized());
     assert!(!set.is_demoted());
+}
+
+// ---------------------------------------------------------------------------
+// The hybrid virtual-volume provider (plan 135, phase 5 wave 1)
+// ---------------------------------------------------------------------------
+
+/// A hand-built virtual volume over one envelope and two member partials.
+///
+/// The physical layout is deliberately the awkward one: header, member A, a gap
+/// of envelope, member B, trailer — so a whole-volume read crosses four
+/// destination boundaries in both directions.
+struct ProviderFixture {
+    _dir: tempfile::TempDir,
+    volume: super::provider::VirtualVolume,
+    /// The bytes a conventionally downloaded volume would have held.
+    conventional: Vec<u8>,
+}
+
+const PROVIDER_HEADER: usize = 40;
+const PROVIDER_MEMBER_A: usize = 300;
+const PROVIDER_GAP: usize = 24;
+const PROVIDER_MEMBER_B: usize = 180;
+const PROVIDER_TRAILER: usize = 16;
+
+/// The physical ranges this fixture's envelope file actually received: the
+/// non-member regions, clipped to what was covered.
+///
+/// Derived from the fixture's own layout rather than from the `extents` the
+/// [`super::provider::VirtualVolume`] is given, because the failure the provider
+/// has to survive is exactly an extent going missing — a map derived from the
+/// extents would hand the missing member's range straight back to the envelope.
+fn provider_envelope_covered(covered: &ByteRanges) -> ByteRanges {
+    let member_a_at = PROVIDER_HEADER as u64;
+    let member_b_at = (PROVIDER_HEADER + PROVIDER_MEMBER_A + PROVIDER_GAP) as u64;
+    let mut envelope = ByteRanges::new();
+    for (start, len) in [
+        (0u64, PROVIDER_HEADER as u64),
+        (member_a_at + PROVIDER_MEMBER_A as u64, PROVIDER_GAP as u64),
+        (
+            member_b_at + PROVIDER_MEMBER_B as u64,
+            PROVIDER_TRAILER as u64,
+        ),
+    ] {
+        let end = start + len;
+        for &(covered_start, covered_end) in covered.ranges() {
+            let overlap_start = covered_start.max(start);
+            let overlap_end = covered_end.min(end);
+            if overlap_start < overlap_end {
+                envelope.insert(overlap_start, overlap_end - overlap_start);
+            }
+        }
+    }
+    envelope
+}
+
+fn provider_fixture(covered: ByteRanges) -> ProviderFixture {
+    provider_fixture_with_extents(covered, true)
+}
+
+/// `with_extents == false` builds the volume the router used to hand the
+/// provider once a routed member turned ineligible: the bytes are covered, the
+/// partial still holds them, and the extent that says so is gone.
+fn provider_fixture_with_extents(covered: ByteRanges, with_extents: bool) -> ProviderFixture {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tempfile::tempdir().unwrap();
+    let total =
+        PROVIDER_HEADER + PROVIDER_MEMBER_A + PROVIDER_GAP + PROVIDER_MEMBER_B + PROVIDER_TRAILER;
+    // Distinct per offset, so a read that returns the *wrong* file's bytes at
+    // the right length still fails.
+    let conventional: Vec<u8> = (0..total).map(|index| (index % 251) as u8).collect();
+
+    let member_a_at = PROVIDER_HEADER;
+    let member_b_at = PROVIDER_HEADER + PROVIDER_MEMBER_A + PROVIDER_GAP;
+
+    // The envelope is a sparse image of the volume: every non-member byte at its
+    // true physical offset, holes where the members were routed away.
+    let envelope = dir.path().join("silver.horizon.vol00000.envelope");
+    let mut file = std::fs::File::create(&envelope).unwrap();
+    for (offset, len) in [
+        (0usize, PROVIDER_HEADER),
+        (member_a_at + PROVIDER_MEMBER_A, PROVIDER_GAP),
+        (member_b_at + PROVIDER_MEMBER_B, PROVIDER_TRAILER),
+    ] {
+        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        file.write_all(&conventional[offset..offset + len]).unwrap();
+    }
+    drop(file);
+
+    let partial_a = dir.path().join("Silver.Horizon.S01E01.mkv.direct.partial");
+    std::fs::write(
+        &partial_a,
+        &conventional[member_a_at..member_a_at + PROVIDER_MEMBER_A],
+    )
+    .unwrap();
+    let partial_b = dir.path().join("Silver.Horizon.S01E01.nfo.direct.partial");
+    std::fs::write(
+        &partial_b,
+        &conventional[member_b_at..member_b_at + PROVIDER_MEMBER_B],
+    )
+    .unwrap();
+
+    let extents = if with_extents {
+        vec![
+            super::router::MemberExtent {
+                member_id: 0,
+                physical_offset: member_a_at as u64,
+                logical_offset: 0,
+                len: PROVIDER_MEMBER_A as u64,
+            },
+            super::router::MemberExtent {
+                member_id: 1,
+                physical_offset: member_b_at as u64,
+                logical_offset: 0,
+                len: PROVIDER_MEMBER_B as u64,
+            },
+        ]
+    } else {
+        Vec::new()
+    };
+    let envelope_covered = provider_envelope_covered(&covered);
+
+    ProviderFixture {
+        volume: super::provider::VirtualVolume {
+            volume_index: 0,
+            envelope,
+            extents,
+            partials: [(0u32, partial_a), (1u32, partial_b)].into_iter().collect(),
+            covered,
+            envelope_covered,
+            len: total as u64,
+        },
+        _dir: dir,
+        conventional,
+    }
+}
+
+fn whole_volume_covered() -> ByteRanges {
+    let mut covered = ByteRanges::new();
+    covered.insert(
+        0,
+        (PROVIDER_HEADER + PROVIDER_MEMBER_A + PROVIDER_GAP + PROVIDER_MEMBER_B + PROVIDER_TRAILER)
+            as u64,
+    );
+    covered
+}
+
+#[test]
+fn a_virtual_volume_reads_back_exactly_what_a_downloaded_volume_would_hold() {
+    use std::io::{Read, Seek};
+
+    let fixture = provider_fixture(whole_volume_covered());
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let mut reader = provider.open(0).expect("the volume is registered");
+    assert_eq!(reader.len(), fixture.conventional.len() as u64);
+
+    // A sequential sweep crosses envelope -> member A -> envelope -> member B ->
+    // envelope. `read_to_end` loops over the short reads each boundary produces.
+    let mut sequential = Vec::new();
+    reader.read_to_end(&mut sequential).unwrap();
+    assert_eq!(
+        sequential, fixture.conventional,
+        "a whole-volume sequential read must be byte-identical to the real volume"
+    );
+
+    // Every read that straddles a boundary, in one-byte steps around it, using
+    // `read_exact` — which is what the RAR header walk and PAR2 both use.
+    let boundaries = [
+        PROVIDER_HEADER,
+        PROVIDER_HEADER + PROVIDER_MEMBER_A,
+        PROVIDER_HEADER + PROVIDER_MEMBER_A + PROVIDER_GAP,
+        PROVIDER_HEADER + PROVIDER_MEMBER_A + PROVIDER_GAP + PROVIDER_MEMBER_B,
+    ];
+    for boundary in boundaries {
+        for span in [1usize, 2, 8, 33] {
+            let start = boundary - span;
+            // The last boundary is the volume's own tail, so clamp rather than
+            // asking for bytes past the end — that is a different test.
+            let len = (span * 2).min(fixture.conventional.len() - start);
+            let mut reader = provider.open(0).unwrap();
+            reader.seek(std::io::SeekFrom::Start(start as u64)).unwrap();
+            let mut out = vec![0u8; len];
+            reader.read_exact(&mut out).unwrap();
+            assert_eq!(
+                out,
+                &fixture.conventional[start..start + len],
+                "a read straddling the boundary at {boundary} by {span} bytes must be exact"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_virtual_volume_seeks_the_way_a_file_does() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let fixture = provider_fixture(whole_volume_covered());
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let mut reader = provider.open(0).unwrap();
+    let total = fixture.conventional.len() as u64;
+
+    assert_eq!(reader.seek(SeekFrom::Start(100)).unwrap(), 100);
+    assert_eq!(reader.seek(SeekFrom::Current(50)).unwrap(), 150);
+    assert_eq!(reader.seek(SeekFrom::Current(-100)).unwrap(), 50);
+    // Unlike the router's in-memory image, a virtual volume has a real length,
+    // so `End` means what it does on a file — the whole reason PAR2's readers
+    // can use it at all.
+    assert_eq!(reader.seek(SeekFrom::End(0)).unwrap(), total);
+    assert_eq!(reader.read(&mut [0u8; 8]).unwrap(), 0, "EOF is EOF");
+    assert_eq!(reader.seek(SeekFrom::End(-4)).unwrap(), total - 4);
+    let mut tail = [0u8; 4];
+    reader.read_exact(&mut tail).unwrap();
+    assert_eq!(tail, fixture.conventional[fixture.conventional.len() - 4..]);
+}
+
+#[test]
+fn a_virtual_volume_reports_a_hole_rather_than_inventing_zeros() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    // The failure this is named for, constructed exactly (B1): every byte of the
+    // volume is covered, the member partials hold their bytes, and the extent
+    // list that says which file owns them is **empty** — the shape the provider
+    // was handed once a routed member's eligibility flipped at chain close and
+    // `map_physical_range` stopped calling its packed range a member.
+    //
+    // The envelope file is 560 bytes long and sparse from 40 to 340, so a plain
+    // read there succeeds and returns zeros. Nothing downstream can tell those
+    // from data: reconstruction would write them into a volume file under a
+    // published floor and the articles would never be fetched again.
+    let fixture = provider_fixture_with_extents(whole_volume_covered(), false);
+    let member_a_at = PROVIDER_HEADER as u64;
+    assert!(
+        std::fs::metadata(&fixture.volume.envelope).unwrap().len()
+            > member_a_at + PROVIDER_MEMBER_A as u64,
+        "the envelope must be long enough to answer the member's offsets with zeros"
+    );
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let mut reader = provider.open(0).unwrap();
+    reader.seek(SeekFrom::Start(member_a_at + 100)).unwrap();
+    let error = reader
+        .read(&mut [0u8; 16])
+        .expect_err("a covered range no source backs must not read as data");
+    assert!(
+        super::provider::is_hole(&error),
+        "a covered range with no extent must report a hole, got {error}"
+    );
+
+    // The header before it still reads: the envelope answers for what the
+    // envelope was actually written, and only that.
+    let mut reader = provider.open(0).unwrap();
+    let mut head = vec![0u8; PROVIDER_HEADER];
+    reader.read_exact(&mut head).unwrap();
+    assert_eq!(head, &fixture.conventional[..PROVIDER_HEADER]);
+    assert!(super::provider::is_hole(
+        &reader.read(&mut [0u8; 16]).unwrap_err()
+    ));
+
+    // And with the extent restored the same bytes read back as the real volume,
+    // so the refusal above is about the missing extent and nothing else.
+    let honest = provider_fixture(whole_volume_covered());
+    let provider = super::provider::HybridVolumeProvider::new(vec![honest.volume.clone()]);
+    let mut reader = provider.open(0).unwrap();
+    let mut whole = Vec::new();
+    reader.read_to_end(&mut whole).unwrap();
+    assert_eq!(whole, honest.conventional);
+}
+
+#[test]
+fn a_virtual_volume_reports_an_uncovered_range_as_a_hole() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    // Everything but a window inside member A and a window inside the trailer.
+    let mut covered = ByteRanges::new();
+    let hole_start = (PROVIDER_HEADER + 100) as u64;
+    let hole_end = (PROVIDER_HEADER + 200) as u64;
+    covered.insert(0, hole_start);
+    covered.insert(
+        hole_end,
+        (PROVIDER_HEADER + PROVIDER_MEMBER_A + PROVIDER_GAP + PROVIDER_MEMBER_B) as u64 - hole_end,
+    );
+    let fixture = provider_fixture(covered);
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+
+    // A read starting inside the hole fails, and fails *distinguishably*: a
+    // caller has to be able to tell "not downloaded" from "the disk is broken".
+    let mut reader = provider.open(0).unwrap();
+    reader.seek(SeekFrom::Start(hole_start + 10)).unwrap();
+    let error = reader.read(&mut [0u8; 16]).unwrap_err();
+    assert!(
+        super::provider::is_hole(&error),
+        "a read inside a hole must report a hole, got {error}"
+    );
+
+    // A read that *runs into* the hole returns the bytes before it and then
+    // fails, rather than silently stopping short as if at EOF.
+    let mut reader = provider.open(0).unwrap();
+    reader.seek(SeekFrom::Start(hole_start - 8)).unwrap();
+    let mut out = vec![0u8; 32];
+    let read = reader.read(&mut out).unwrap();
+    assert_eq!(read, 8, "the read stops at the edge of the hole");
+    assert_eq!(
+        &out[..8],
+        &fixture.conventional[hole_start as usize - 8..hole_start as usize]
+    );
+    let error = reader.read(&mut out).unwrap_err();
+    assert!(super::provider::is_hole(&error));
+
+    // The trailer was never covered either, so the volume's own tail is a hole
+    // even though the file it would come from exists and is long enough.
+    let mut reader = provider.open(0).unwrap();
+    reader
+        .seek(SeekFrom::Start(
+            (PROVIDER_HEADER + PROVIDER_MEMBER_A + PROVIDER_GAP + PROVIDER_MEMBER_B) as u64,
+        ))
+        .unwrap();
+    assert!(super::provider::is_hole(
+        &reader.read(&mut out).unwrap_err()
+    ));
+
+    // And a plain I/O failure is *not* a hole, so the two never get confused.
+    let missing = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+    assert!(!super::provider::is_hole(&missing));
+}
+
+#[test]
+fn a_deleted_partial_reads_as_a_hole_not_as_an_infrastructure_failure() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let fixture = provider_fixture(whole_volume_covered());
+    let partial = fixture
+        .volume
+        .partials
+        .get(&1)
+        .expect("member 1 has a partial")
+        .clone();
+    std::fs::remove_file(&partial).unwrap();
+
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let mut reader = provider.open(0).unwrap();
+    reader
+        .seek(SeekFrom::Start(
+            (PROVIDER_HEADER + PROVIDER_MEMBER_A + PROVIDER_GAP) as u64,
+        ))
+        .unwrap();
+    let error = reader.read(&mut [0u8; 16]).unwrap_err();
+    assert!(
+        super::provider::is_hole(&error),
+        "a destination that is not there holds no bytes, which is what a hole is"
+    );
+
+    // The rest of the volume still reads: one missing partial does not poison
+    // the envelope or its sibling.
+    let mut reader = provider.open(0).unwrap();
+    let mut head = vec![0u8; PROVIDER_HEADER + PROVIDER_MEMBER_A];
+    reader.read_exact(&mut head).unwrap();
+    assert_eq!(head, &fixture.conventional[..head.len()]);
+}
+
+#[test]
+fn the_volume_provider_trait_refuses_a_volume_the_set_does_not_have() {
+    use weaver_unrar::VolumeProvider;
+
+    let fixture = provider_fixture(whole_volume_covered());
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    assert!(provider.get_volume(0).is_ok());
+    assert!(
+        provider.get_volume(1).is_err(),
+        "an unregistered volume is unavailable, not an empty one"
+    );
+    assert!(provider.volume(0).is_some());
+    assert!(provider.volume(9).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// D8's reconstruction sweep, and the verification that gates it
+// ---------------------------------------------------------------------------
+
+/// One article per 100 bytes of the fixture volume, which is the granularity the
+/// coverage map's boundaries actually fall on.
+fn provider_article_crcs(conventional: &[u8]) -> CrcRuns {
+    let mut runs = CrcRuns::default();
+    let mut offset = 0usize;
+    while offset < conventional.len() {
+        let end = (offset + 100).min(conventional.len());
+        runs.insert(
+            offset as u64,
+            (end - offset) as u64,
+            weaver_par2::checksum::crc32(&conventional[offset..end]),
+        );
+        offset = end;
+    }
+    runs
+}
+
+fn reconstruction_target(
+    fixture: &ProviderFixture,
+    path: std::path::PathBuf,
+    covered: ByteRanges,
+    crcs: CrcRuns,
+) -> super::reconstruct::VolumeReconstruction {
+    super::reconstruct::VolumeReconstruction {
+        volume_index: 0,
+        path,
+        len: fixture.conventional.len() as u64,
+        assembly_complete: false,
+        covered,
+        crcs,
+    }
+}
+
+#[test]
+fn a_partially_covered_volume_is_rebuilt_and_verified_run_by_run() {
+    // M3: the composition is over the runs it was fed, so a covered prefix that
+    // stops short of the whole volume still has a reference value. Before that,
+    // only a range exactly equal to a merged run had one — which a partial
+    // volume never is — and the sweep wrote it with nothing checking it.
+    let fixture = provider_fixture(whole_volume_covered());
+    let crcs = provider_article_crcs(&fixture.conventional);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    // A prefix that crosses the header into member A, and a second run above a
+    // hole — both on article boundaries, neither equal to the whole volume.
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 200);
+    covered.insert(300, 100);
+
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let rebuilt = super::reconstruct::reconstruct_volumes(
+        &provider,
+        &[reconstruction_target(
+            &fixture,
+            path.clone(),
+            covered,
+            crcs.clone(),
+        )],
+    )
+    .expect("every covered run composes a reference and matches it");
+
+    assert_eq!(rebuilt[0].contiguous, 200, "the floor stops at the hole");
+    assert!(!rebuilt[0].complete);
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(
+        &written[..200],
+        &fixture.conventional[..200],
+        "the covered prefix is byte-exact"
+    );
+    assert_eq!(
+        &written[300..400],
+        &fixture.conventional[300..400],
+        "so is the covered run above the hole"
+    );
+    assert!(
+        written[200..300].iter().all(|byte| *byte == 0),
+        "the hole is left for the refetch to fill"
+    );
+}
+
+#[test]
+fn a_covered_run_with_no_composed_reference_refuses_to_be_rebuilt() {
+    // B1(c): "verify where available" is the wrong default for a sweep that
+    // reads through sparse files. A run with no reference value is refused, and
+    // the fallback refetches — which is always correct — rather than putting
+    // bytes nothing checked under a published floor.
+    let fixture = provider_fixture(whole_volume_covered());
+    let crcs = provider_article_crcs(&fixture.conventional);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    // Ends inside an article, so no composition can vouch for it.
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 250);
+
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let failure = super::reconstruct::reconstruct_volumes(
+        &provider,
+        &[reconstruction_target(&fixture, path.clone(), covered, crcs)],
+    )
+    .expect_err("a run with no reference must not be written");
+    assert_eq!(
+        failure,
+        super::reconstruct::ReconstructionFailure::UnverifiableRun {
+            volume_index: 0,
+            offset: 0,
+        }
+    );
+    assert!(
+        !path.exists(),
+        "a refused reconstruction leaves nothing for the refetch to write around"
+    );
+}
+
+#[test]
+fn a_rebuilt_run_that_fails_its_reference_falls_back_to_refetching() {
+    let fixture = provider_fixture(whole_volume_covered());
+    // Corrupt one member byte after the CRCs were taken, which is exactly what a
+    // partial that came back wrong — or an envelope answering a member's offsets
+    // with zeros — looks like from here.
+    let mut corrupted = fixture.conventional.clone();
+    corrupted[PROVIDER_HEADER + 10] ^= 0xFF;
+    let crcs = provider_article_crcs(&corrupted);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let failure = super::reconstruct::reconstruct_volumes(
+        &provider,
+        &[reconstruction_target(
+            &fixture,
+            path.clone(),
+            whole_volume_covered(),
+            crcs,
+        )],
+    )
+    .expect_err("a run that disagrees with its composed CRC32 must not be trusted");
+    assert!(matches!(
+        failure,
+        super::reconstruct::ReconstructionFailure::ChecksumMismatch {
+            volume_index: 0,
+            ..
+        }
+    ));
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_rebuild_truncates_a_stale_file_already_sitting_at_the_volumes_path() {
+    // An interrupted earlier attempt can leave a longer file where the volume
+    // goes. Its tail sits above everything the sweep writes and would be read as
+    // the volume's own bytes (nit).
+    let fixture = provider_fixture(whole_volume_covered());
+    let crcs = provider_article_crcs(&fixture.conventional);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+    std::fs::write(&path, vec![0xEEu8; fixture.conventional.len() + 4096]).unwrap();
+
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    super::reconstruct::reconstruct_volumes(
+        &provider,
+        &[reconstruction_target(
+            &fixture,
+            path.clone(),
+            whole_volume_covered(),
+            crcs,
+        )],
+    )
+    .expect("the volume is wholly covered and verifiable");
+
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        fixture.conventional,
+        "the rebuilt volume is the volume, with no stale tail past its end"
+    );
 }

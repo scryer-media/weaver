@@ -1424,21 +1424,26 @@ impl DiskWriteOwnerPool {
         response_rx
     }
 
-    async fn sync_path(&self, path: std::path::PathBuf) -> std::io::Result<()> {
+    /// Queues one sync without waiting for it, so a caller with several
+    /// destinations can have them all in flight before it awaits any.
+    fn submit_sync_path(
+        &self,
+        path: std::path::PathBuf,
+    ) -> tokio::sync::oneshot::Receiver<std::io::Result<()>> {
         let (response, response_rx) = tokio::sync::oneshot::channel();
         let sender_index = self.owner_index_for_path(&path);
-        if self.senders[sender_index]
-            .send(DiskWriteCommand::SyncPath { path, response })
-            .is_err()
+        if let Err(error) =
+            self.senders[sender_index].send(DiskWriteCommand::SyncPath { path, response })
         {
-            return Err(std::io::Error::new(
+            let DiskWriteCommand::SyncPath { response, .. } = error.0 else {
+                unreachable!("sync path send returned a different command");
+            };
+            let _ = response.send(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "disk write owner thread stopped",
-            ));
+            )));
         }
         response_rx
-            .await
-            .unwrap_or_else(|error| Err(std::io::Error::other(error)))
     }
 
     fn release_handle(&self, path: &std::path::Path) {
@@ -1762,9 +1767,31 @@ pub(crate) async fn write_direct_batches(batches: DirectWriteBatches) -> std::io
     }
 }
 
-/// Durably syncs one direct-store destination through its owner thread.
-pub(crate) async fn sync_direct_destination(path: &std::path::Path) -> std::io::Result<()> {
-    disk_write_owner_pool().sync_path(path.to_path_buf()).await
+/// Durably syncs every destination one coverage barrier touched, in parallel.
+///
+/// Same shape as [`write_direct_batches`], and for the same reason: every sync
+/// is queued to its owner thread before any of them is awaited. Envelope v2
+/// turned a barrier's sync set from two destinations into `members + volumes`,
+/// so awaiting them one at a time serialized `n` independent fsyncs behind each
+/// other on the pipeline task. The ordering guarantee is unchanged — the barrier
+/// still sees every sync's outcome before it persists anything.
+pub(crate) async fn sync_direct_destinations(
+    paths: Vec<std::path::PathBuf>,
+) -> Vec<std::io::Result<()>> {
+    let pool = disk_write_owner_pool();
+    let pending: Vec<_> = paths
+        .into_iter()
+        .map(|path| pool.submit_sync_path(path))
+        .collect();
+    let mut results = Vec::with_capacity(pending.len());
+    for response in pending {
+        results.push(
+            response
+                .await
+                .unwrap_or_else(|error| Err(std::io::Error::other(error))),
+        );
+    }
+    results
 }
 
 pub(crate) async fn write_segments_to_disk(
