@@ -13,19 +13,6 @@ use weaver_model::files::{FileRole, archive_base_name};
 
 use crate::jobs::model::JobSpec;
 
-/// Bytes of the envelope file reserved per source volume.
-///
-/// The envelope file is addressed deterministically — slot base plus the run's
-/// offset — rather than by append order, so the same bytes land at the same
-/// place after a restart. A volume whose envelope does not fit its slot is not
-/// the "headers only" shape phase 4 admits, and demotes.
-pub(crate) const ENVELOPE_SLOT_BYTES: u64 = 64 * 1024;
-
-/// Half a slot: the head of a volume (signature, main and file headers) takes
-/// the low half and its trailer (service blocks, end-of-archive record) the
-/// high half, so neither can grow into the other.
-pub(crate) const ENVELOPE_SLOT_HALF: u64 = ENVELOPE_SLOT_BYTES / 2;
-
 /// Why a candidate set was not admitted. Reported as a metric so
 /// `sets == direct + materialized` stays checkable (D1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,39 +146,42 @@ impl DirectSetPlan {
             .collect()
     }
 
-    /// Working-directory-relative envelope file for the set.
-    pub(crate) fn envelope_relative_path(&self) -> String {
+    /// Working-directory-relative envelope file for **one source volume**
+    /// (envelope v2, plan 135 D3's "sparse envelope files", plural).
+    ///
+    /// Phase 4 packed every volume's envelope into fixed 64 KiB half-slots of a
+    /// single per-set file. That ceiling is what demoted every `-rr` and `-qo`
+    /// set, and it was a phase-4 narrowing, not a design. Envelope v2 gives each
+    /// volume its own file holding every non-member byte **at its true physical
+    /// offset**, with holes where member data was routed away:
+    ///
+    /// - unbounded by construction — recovery records, quick-open blocks and
+    ///   ineligible members' packed ranges fit because the file *is* the volume;
+    /// - restart-stable by construction — an offset is physical, never
+    ///   append-order, so the same byte lands in the same place every time;
+    /// - and it is the natural backing store for the hybrid virtual-volume
+    ///   provider, which overlays member partials onto exactly this image.
+    ///
+    /// Zero-padded so a lexical listing of a 2 000-volume set sorts in volume
+    /// order.
+    pub(crate) fn envelope_relative_path(&self, volume_index: u32) -> String {
         format!(
-            "{}.direct-envelope",
+            "{}.vol{volume_index:05}.envelope",
             crate::jobs::working_dir::sanitize_dirname(&self.set_name)
         )
     }
 
-    pub(crate) fn envelope_path(&self) -> PathBuf {
-        self.working_dir.join(self.envelope_relative_path())
+    pub(crate) fn envelope_path(&self, volume_index: u32) -> PathBuf {
+        self.working_dir
+            .join(self.envelope_relative_path(volume_index))
     }
 
-    /// Deterministic envelope offset for one run of a volume's non-member bytes.
-    ///
-    /// `None` when the run does not fit its half-slot, which for phase 4's shape
-    /// means the set carries more than headers and must demote.
-    pub(crate) fn envelope_offset(
-        &self,
-        volume_index: u32,
-        physical_offset: u64,
-        len: u64,
-        tail_base: u64,
-    ) -> Option<u64> {
-        let slot = (volume_index as u64).checked_mul(ENVELOPE_SLOT_BYTES)?;
-        let (half_base, inside) = if tail_base > 0 && physical_offset >= tail_base {
-            (ENVELOPE_SLOT_HALF, physical_offset - tail_base)
-        } else {
-            (0, physical_offset)
-        };
-        if inside.checked_add(len)? > ENVELOPE_SLOT_HALF {
-            return None;
-        }
-        slot.checked_add(half_base)?.checked_add(inside)
+    /// Every envelope file the set can own, in volume order.
+    pub(crate) fn envelope_paths(&self) -> Vec<PathBuf> {
+        self.volumes
+            .keys()
+            .map(|volume_index| self.envelope_path(*volume_index))
+            .collect()
     }
 
     /// Working-directory-relative `.direct.partial` for one member.
@@ -228,9 +218,16 @@ impl DirectSetPlan {
     /// only ever extends — the library guarantees no offset moves while the
     /// member still routes — and any change to the facts a claimed extent
     /// depends on shows up as a different member name or unpacked size.
-    pub(crate) fn digest(&self, members: &[(u32, String, u64)]) -> [u8; 32] {
+    ///
+    /// Members are bound **by name**, sorted, with no index: a multi-member set
+    /// discovers its members in whatever order its volumes arrive, and weaver's
+    /// per-member destination key is an in-run counter, so digesting the index
+    /// would make the same set produce different digests on different runs. The
+    /// name is the layout's own key and the only thing a destination path is
+    /// derived from.
+    pub(crate) fn digest(&self, members: &[(String, u64)]) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"weaver.direct_store.plan.v1\0");
+        hasher.update(b"weaver.direct_store.plan.v2\0");
         hasher.update(self.set_name.as_bytes());
         hasher.update(&[0]);
         hasher.update(&(self.volumes.len() as u64).to_le_bytes());
@@ -239,10 +236,9 @@ impl DirectSetPlan {
             hasher.update(&file.to_le_bytes());
         }
         let mut members = members.to_vec();
-        members.sort_by_key(|(index, _, _)| *index);
+        members.sort();
         hasher.update(&(members.len() as u64).to_le_bytes());
-        for (index, name, unpacked_size) in &members {
-            hasher.update(&index.to_le_bytes());
+        for (name, unpacked_size) in &members {
             hasher.update(name.as_bytes());
             hasher.update(&[0]);
             hasher.update(&unpacked_size.to_le_bytes());

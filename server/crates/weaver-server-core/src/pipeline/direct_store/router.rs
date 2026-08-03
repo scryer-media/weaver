@@ -30,9 +30,12 @@
 //!   payload, and routing starts.
 //! - **Confirming**, once the volume's trailing bytes have arrived: the walk now
 //!   reaches the end-of-archive record. If it finds a member the provisional
-//!   parse did not, [`StoredLayoutBuilder::add_volume`] rejects the re-add and
-//!   the set demotes. Without this a second member hiding past the first one's
-//!   data area would have its bytes silently filed as envelope — a lost file.
+//!   parse did not, that member is **adopted** — the layout is rebuilt from every
+//!   volume's newest facts, because [`StoredLayoutBuilder::add_volume`] refuses a
+//!   differing re-add and has no removal API. Phase 4 demoted here instead, which
+//!   was safe (the file was not lost, it was refetched) but cost the whole set.
+//!   A parse whose members are *not* an extension of the previous one is a real
+//!   disagreement and still demotes.
 //!
 //! A volume stops re-parsing only on **proof** that no further header can
 //! appear: either `more_volumes` (which the library sets from a parsed
@@ -42,16 +45,16 @@
 //! member's header can sit past the first member's data area, beyond anything
 //! the prefix reached.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 
 use weaver_unrar::{
-    ArchiveFormat, IneligibilityReason, MappedSlice, MemberEligibility, StoredLayoutBuilder,
-    StoredLayoutError,
+    ArchiveFormat, IneligibilityReason, MappedSlice, MemberEligibility, RarVolumeFacts,
+    StoredLayoutBuilder, StoredLayoutError,
 };
 
 use super::ByteRanges;
-use super::plan::{DirectSetPlan, ENVELOPE_SLOT_BYTES, ENVELOPE_SLOT_HALF};
+use super::plan::DirectSetPlan;
 
 /// Default RAM ceiling for holds across one set. Phase 4 has no scratch paging
 /// (phase 5 owns it), so a breach demotes.
@@ -69,16 +72,20 @@ pub(crate) const MAX_HEADER_PREFIX_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) enum DemotionReason {
     /// A member the layout classified `Ineligible` — including a provisional
     /// member that resolved ineligible when its chain closed (revision 6).
+    ///
+    /// **Wave 1 narrowing, deliberate:** an ineligible member demotes the
+    /// *whole* set, even when the rest of it is a clean multi-member store.
+    /// D1's bounded small-member tolerance — route the ineligible members'
+    /// packed ranges into the envelope and extract only those indices through
+    /// `extract_member_streaming` at finalization, within
+    /// `min(64 MiB, 1% of packed archive bytes)` packed and 256 MiB unpacked —
+    /// is phase 5 wave 2, and needs the hybrid provider wired into the
+    /// extractor before it can be honest. Until then the set materializes.
     MemberIneligible(MemberIneligibility),
-    /// More than one direct-routable member. Phase 5 owns multi-member sets.
-    MultipleMembers,
     /// Holds exceeded the RAM budget and phase 4 has no scratch paging.
     HoldsBudgetExceeded,
-    /// A volume's envelope did not fit its deterministic slot in the envelope
-    /// file, which for phase 4's shape means the set is not "headers only".
-    EnvelopeTooLarge,
     /// A confirming parse disagreed with the provisional one, or a volume was
-    /// re-added with different facts.
+    /// re-added with facts that are not an extension of what it stated before.
     ConflictingVolumeFacts,
     /// The volume's headers could not be parsed from the staged image.
     UnparsableVolume,
@@ -149,9 +156,7 @@ impl DemotionReason {
             Self::MemberIneligible(MemberIneligibility::Blake2OnlyNoCrc32) => "member_blake2_only",
             Self::MemberIneligible(MemberIneligibility::NoChecksum) => "member_no_checksum",
             Self::MemberIneligible(MemberIneligibility::MalformedChain) => "member_malformed_chain",
-            Self::MultipleMembers => "multiple_members",
             Self::HoldsBudgetExceeded => "holds_budget",
-            Self::EnvelopeTooLarge => "envelope_too_large",
             Self::ConflictingVolumeFacts => "conflicting_volume_facts",
             Self::UnparsableVolume => "unparsable_volume",
             Self::PartChecksumMismatch => "part_checksum_mismatch",
@@ -176,9 +181,19 @@ impl std::fmt::Display for DemotionReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectDestination {
     /// A direct-routed member's `.direct.partial`, at a logical offset.
-    Member { member_index: u32 },
-    /// The set's envelope file, at the volume's deterministic slot.
-    Envelope,
+    ///
+    /// `member_id` is **weaver's** stable per-set identity, not the layout's
+    /// index. The layout numbers members in first-seen order, and a confirming
+    /// parse that finds a member hiding in an *earlier* volume renumbers
+    /// everything after it; bytes already written must not change destination
+    /// because of that. The id is assigned once per member name and never
+    /// reused, and the durable identity in the checkpoint blob is the
+    /// destination's relative path, which is derived from the same name.
+    Member { member_id: u32 },
+    /// The volume's own envelope file, at the byte's **true physical offset**
+    /// inside that volume (envelope v2). Holes are wherever member data was
+    /// routed away.
+    Envelope { volume_index: u32 },
 }
 
 /// One run of bytes the caller must write before the article counts as placed.
@@ -263,6 +278,10 @@ impl CrcRuns {
             self.runs[index] = (start, len.saturating_add(next_len), combined);
             self.runs.remove(index + 1);
         }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.runs.is_empty()
     }
 
     /// The composed value for `[start, start + len)`, when exactly one run
@@ -365,9 +384,6 @@ struct VolumeStaging {
     /// walks is byte-contiguously complete: no header can still show up in a
     /// region the walk has already passed.
     source_complete: bool,
-    /// Physical end of the last member extent, once facts are known. Envelope
-    /// runs at or above it take the slot's tail half.
-    tail_base: u64,
 }
 
 impl VolumeStaging {
@@ -456,10 +472,10 @@ fn intersect(ranges: &ByteRanges, offset: u64, len: u64) -> Vec<(u64, u64)> {
     out
 }
 
-/// Per-member routing state.
+/// Per-member routing state, keyed by weaver's stable member id.
 #[derive(Debug)]
 struct MemberRouting {
-    /// Raw header name, the layout's key.
+    /// Raw header name, the layout's key and the source of the stable id.
     name: String,
     /// Working-directory-relative `.direct.partial`.
     relative_partial: String,
@@ -488,8 +504,21 @@ pub(crate) struct DirectSetRouter {
     /// first parse succeeds, so binding it there costs a branch and rebinds
     /// nothing.
     layout: Option<StoredLayoutBuilder>,
+    /// The newest accepted header facts per volume.
+    ///
+    /// [`StoredLayoutBuilder::add_volume`] refuses a re-add whose facts differ,
+    /// and it has no removal API — so when a longer prefix reveals a header the
+    /// provisional parse could not reach, the only way to adopt it is to build a
+    /// fresh layout from every volume's newest facts. Keeping them here is what
+    /// makes that rebuild possible, and comparing against them is what tells an
+    /// *extension* (fine, rebuild) from a genuine *disagreement* (demote).
+    volume_facts: BTreeMap<u32, RarVolumeFacts>,
     staging: BTreeMap<u32, VolumeStaging>,
+    /// Routing state by stable member id.
     members: BTreeMap<u32, MemberRouting>,
+    /// Member name to stable id. Assigned once, never reused, never renumbered.
+    member_ids: HashMap<String, u32>,
+    next_member_id: u32,
     holds_budget: u64,
     demoted: Option<DemotionReason>,
 }
@@ -515,8 +544,11 @@ impl DirectSetRouter {
         Self {
             plan,
             layout: None,
+            volume_facts: BTreeMap::new(),
             staging: BTreeMap::new(),
             members: BTreeMap::new(),
+            member_ids: HashMap::new(),
+            next_member_id: 0,
             holds_budget: DEFAULT_HOLDS_BUDGET_BYTES,
             demoted: None,
         }
@@ -563,18 +595,69 @@ impl DirectSetRouter {
         })
     }
 
-    /// Members the router has learned, in layout order.
+    /// Members the router has learned, in **archive order**:
+    /// `(stable member id, raw name, working-dir-relative partial)`.
+    ///
+    /// Archive order is `(first volume, physical offset in that volume)`, not
+    /// the order weaver happened to discover them in and not the layout's
+    /// first-seen index — volumes arrive out of order, and finalization commits
+    /// members to their sanitized destinations in archive order so that two
+    /// members sanitizing to the same path collide exactly the way the
+    /// incremental extractor makes them collide (D3).
     pub(crate) fn member_partials(&self) -> Vec<(u32, &str, &str)> {
-        self.members
-            .iter()
-            .map(|(index, member)| {
-                (
-                    *index,
+        let mut ordered: Vec<(u32, u64, u32)> = self
+            .members
+            .keys()
+            .map(|member_id| {
+                let position = self.archive_position(*member_id);
+                (position.0, position.1, *member_id)
+            })
+            .collect();
+        ordered.sort_unstable();
+        ordered
+            .into_iter()
+            .filter_map(|(_, _, member_id)| {
+                let member = self.members.get(&member_id)?;
+                Some((
+                    member_id,
                     member.name.as_str(),
                     member.relative_partial.as_str(),
-                )
+                ))
             })
             .collect()
+    }
+
+    /// `(first volume, physical offset in it)` for one member, or the far end of
+    /// the space while the layout has not placed it yet — an unplaced member
+    /// sorts last rather than jumping to the front of the commit order.
+    fn archive_position(&self, member_id: u32) -> (u32, u64) {
+        let Some(member) = self.members.get(&member_id) else {
+            return (u32::MAX, u64::MAX);
+        };
+        self.layout_members()
+            .iter()
+            .find(|candidate| candidate.name == member.name)
+            .and_then(|candidate| {
+                let part = candidate.parts.first()?;
+                Some((part.volume, part.data_offset))
+            })
+            .unwrap_or((u32::MAX, u64::MAX))
+    }
+
+    /// Stable id for a layout index, or `None` while the router has not adopted
+    /// that member (an ineligible one, or one a parse has not synced yet).
+    fn member_id_for_layout(&self, layout_index: usize) -> Option<u32> {
+        let name = &self.layout_members().get(layout_index)?.name;
+        self.member_ids.get(name).copied()
+    }
+
+    /// The layout index behind a stable member id, which is what the layout's
+    /// per-part facts are keyed by.
+    fn layout_index_for_member(&self, member_id: u32) -> Option<usize> {
+        let name = &self.members.get(&member_id)?.name;
+        self.layout_members()
+            .iter()
+            .position(|member| &member.name == name)
     }
 
     /// Whether every learned member has passed its whole-member gate.
@@ -690,31 +773,45 @@ impl DirectSetRouter {
             }
             self.layout = Some(StoredLayoutBuilder::new(format));
         }
-        let added = self
-            .layout
-            .as_mut()
-            .expect("the layout was bound above")
-            .add_volume(volume_index, &facts);
-        match added {
-            Ok(()) => {}
-            Err(StoredLayoutError::ConflictingVolume { .. }) => {
-                return Err(self.fail(DemotionReason::ConflictingVolumeFacts));
+
+        // What this parse says about the volume, against what the last accepted
+        // one said. A longer staged prefix can only *append* headers — the walk
+        // is sequential from offset 0 — so an extension is the confirming parse
+        // doing its job, and anything else is a real disagreement.
+        match self.volume_facts.get(&volume_index) {
+            // The layout consumes the member list and nothing else, so a parse
+            // that only learned more *about the volume* (it finally reached the
+            // end-of-archive record, say) needs no layout work at all.
+            Some(previous) if previous.members == facts.members => {
+                self.volume_facts.insert(volume_index, facts.clone());
             }
-            Err(StoredLayoutError::FormatMismatch { .. }) => {
-                return Err(self.fail(DemotionReason::FormatMismatch));
+            Some(previous) if members_extend(previous, &facts) => {
+                self.volume_facts.insert(volume_index, facts.clone());
+                self.rebuild_layout()?;
+            }
+            Some(_) => return Err(self.fail(DemotionReason::ConflictingVolumeFacts)),
+            None => {
+                self.volume_facts.insert(volume_index, facts.clone());
+                let added = self
+                    .layout
+                    .as_mut()
+                    .expect("the layout was bound above")
+                    .add_volume(volume_index, &facts);
+                match added {
+                    Ok(()) => {}
+                    Err(StoredLayoutError::ConflictingVolume { .. }) => {
+                        return Err(self.fail(DemotionReason::ConflictingVolumeFacts));
+                    }
+                    Err(StoredLayoutError::FormatMismatch { .. }) => {
+                        return Err(self.fail(DemotionReason::FormatMismatch));
+                    }
+                }
             }
         }
 
-        let tail_base = facts
-            .members
-            .iter()
-            .map(|member| member.data_offset.saturating_add(member.data_size))
-            .max()
-            .unwrap_or(0);
         if let Some(staging) = self.staging.get_mut(&volume_index) {
             staging.provisional = true;
             staging.confirmed = reached_end;
-            staging.tail_base = tail_base;
         }
 
         self.sync_members()?;
@@ -722,33 +819,63 @@ impl DirectSetRouter {
         Ok(())
     }
 
+    /// Rebuilds the layout from every volume's newest facts.
+    ///
+    /// Volumes are re-added in ascending order so the rebuild is deterministic,
+    /// and members keep their weaver-side identity because that identity is the
+    /// header name, not the layout's index — which the rebuild is free to move.
+    fn rebuild_layout(&mut self) -> Result<(), DemotionReason> {
+        let Some(format) = self.layout.as_ref().map(StoredLayoutBuilder::format) else {
+            return Ok(());
+        };
+        let mut rebuilt = StoredLayoutBuilder::new(format);
+        for (volume_index, facts) in &self.volume_facts {
+            match rebuilt.add_volume(*volume_index, facts) {
+                Ok(()) => {}
+                Err(StoredLayoutError::ConflictingVolume { .. }) => {
+                    return Err(self.fail(DemotionReason::ConflictingVolumeFacts));
+                }
+                Err(StoredLayoutError::FormatMismatch { .. }) => {
+                    return Err(self.fail(DemotionReason::FormatMismatch));
+                }
+            }
+        }
+        self.layout = Some(rebuilt);
+        Ok(())
+    }
+
     /// Adopts every direct-routable member the layout now knows about.
+    ///
+    /// Phase 4 demoted a set the moment a second routable member appeared. There
+    /// is nothing in the router that needs one member — the layout already maps
+    /// several members' extents inside one volume, per-member state is a map,
+    /// and every gate is per member. What the restriction bought was the
+    /// finalization and demotion bookkeeping being trivially per-set; wave 1
+    /// pays for those properly instead.
     fn sync_members(&mut self) -> Result<(), DemotionReason> {
-        let mut routable: Vec<(u32, String, u64)> = Vec::new();
-        for (index, member) in self.layout_members().iter().enumerate() {
+        let mut routable: Vec<(String, u64)> = Vec::new();
+        for member in self.layout_members() {
             if !member.eligibility.routes_direct() {
                 continue;
             }
-            routable.push((
-                index as u32,
-                member.name.clone(),
-                member.unpacked_size.unwrap_or(0),
-            ));
+            routable.push((member.name.clone(), member.unpacked_size.unwrap_or(0)));
         }
-        if routable.len() > 1 {
-            return Err(self.fail(DemotionReason::MultipleMembers));
-        }
-        for (index, name, unpacked_size) in routable {
-            if let Some(existing) = self.members.get_mut(&index) {
-                existing.unpacked_size = unpacked_size;
+        for (name, unpacked_size) in routable {
+            if let Some(member_id) = self.member_ids.get(&name).copied() {
+                if let Some(existing) = self.members.get_mut(&member_id) {
+                    existing.unpacked_size = unpacked_size;
+                }
                 continue;
             }
             let relative_partial = match self.plan.member_partial_path(&name) {
                 Ok(path) => path,
                 Err(()) => return Err(self.fail(DemotionReason::UnsafeDestination)),
             };
+            let member_id = self.next_member_id;
+            self.next_member_id = self.next_member_id.saturating_add(1);
+            self.member_ids.insert(name.clone(), member_id);
             self.members.insert(
-                index,
+                member_id,
                 MemberRouting {
                     name,
                     relative_partial,
@@ -765,6 +892,11 @@ impl DirectSetRouter {
 
     /// Revision 6 amendment 1: a provisional member that resolves `Ineligible`
     /// at chain close demotes the group at that transition.
+    ///
+    /// Wave 1 keeps this **whole-set**: one ineligible member in an otherwise
+    /// clean multi-member store demotes the lot. See
+    /// [`DemotionReason::MemberIneligible`] for why the D1 tolerance is not here
+    /// yet.
     fn check_eligibility(&mut self) -> Result<(), DemotionReason> {
         let ineligible = self
             .layout_members()
@@ -789,7 +921,6 @@ impl DirectSetRouter {
             return Ok(Vec::new());
         }
         let pending: Vec<(u64, u64)> = staging.pending.ranges().to_vec();
-        let tail_base = staging.tail_base;
         let mut spans = Vec::new();
         let mut routed = Vec::new();
 
@@ -801,22 +932,20 @@ impl DirectSetRouter {
                         cursor = cursor.saturating_add(len);
                     }
                     MappedSlice::Envelope { len } => {
-                        let destination_offset =
-                            match self
-                                .plan
-                                .envelope_offset(volume_index, cursor, len, tail_base)
-                            {
-                                Some(offset) => offset,
-                                None => return Err(self.fail(DemotionReason::EnvelopeTooLarge)),
-                            };
+                        // Envelope v2: the destination offset *is* the physical
+                        // offset, so there is no slot arithmetic left to
+                        // overflow and no ceiling left to demote against. A
+                        // recovery record, a quick-open block or an ineligible
+                        // member's packed range fits by definition — the file is
+                        // a sparse image of the volume it came from.
                         let bytes = self
                             .staging
                             .get(&volume_index)
                             .and_then(|staging| staging.slice(cursor, len));
                         if let Some(bytes) = bytes {
                             spans.push(RoutedSpan {
-                                destination: DirectDestination::Envelope,
-                                destination_offset,
+                                destination: DirectDestination::Envelope { volume_index },
+                                destination_offset: cursor,
                                 volume_index,
                                 source_offset: cursor,
                                 bytes,
@@ -830,20 +959,28 @@ impl DirectSetRouter {
                         logical_offset,
                         len,
                     } => {
-                        let member_index = member_index as u32;
+                        // Unreachable by construction: the layout only maps a
+                        // member the router has adopted, and adoption assigns
+                        // the id. Leaving the run pending rather than asserting
+                        // keeps a would-be panic as a holds-budget demotion.
+                        let Some(member_id) = self.member_id_for_layout(member_index) else {
+                            debug_assert!(
+                                false,
+                                "the layout mapped member {member_index} of {}, which the router \
+                                 never adopted",
+                                self.plan.set_name
+                            );
+                            cursor = cursor.saturating_add(len);
+                            continue;
+                        };
                         let bytes = self
                             .staging
                             .get(&volume_index)
                             .and_then(|staging| staging.slice(cursor, len));
                         if let Some(bytes) = bytes {
-                            self.note_member_bytes(
-                                member_index,
-                                volume_index,
-                                logical_offset,
-                                &bytes,
-                            )?;
+                            self.note_member_bytes(member_id, volume_index, logical_offset, &bytes)?;
                             spans.push(RoutedSpan {
-                                destination: DirectDestination::Member { member_index },
+                                destination: DirectDestination::Member { member_id },
                                 destination_offset: logical_offset,
                                 volume_index,
                                 source_offset: cursor,
@@ -876,11 +1013,27 @@ impl DirectSetRouter {
 
     /// Keeps only what the header parser still needs: the envelope, and any
     /// bytes still waiting for a destination.
+    ///
+    /// Once a volume is **confirmed** the parser will never walk it again, so
+    /// its envelope bytes are dropped from RAM entirely. That matters much more
+    /// with envelope v2 than it did with the 64 KiB slots: a `-rr` volume's
+    /// recovery record is envelope-classified and can be percent-of-volume
+    /// sized, so keeping it staged for the life of the set would put an
+    /// unbounded, volume-count-proportional term in RSS. Until confirmation it
+    /// is retained, because the walk has to seek past the recovery service
+    /// header to reach the end-of-archive record.
     fn trim_volume(&mut self, volume_index: u32) {
         let mut keep = ByteRanges::new();
         if let Some(staging) = self.staging.get(&volume_index) {
             for (start, end) in staging.pending.ranges() {
                 keep.insert(*start, end - start);
+            }
+            if staging.confirmed {
+                let pending = keep;
+                if let Some(staging) = self.staging.get_mut(&volume_index) {
+                    staging.trim(&pending);
+                }
+                return;
             }
             let chunks: Vec<(u64, u64)> = staging
                 .chunks
@@ -908,17 +1061,20 @@ impl DirectSetRouter {
     /// Feeds one routed member run into the integrity gates (D4 layers 1 and 2).
     fn note_member_bytes(
         &mut self,
-        member_index: u32,
+        member_id: u32,
         volume_index: u32,
         logical_offset: u64,
         bytes: &[u8],
     ) -> Result<(), DemotionReason> {
         let len = bytes.len() as u64;
-        let Some(part) = self.part_for(member_index, volume_index) else {
+        let Some(layout_index) = self.layout_index_for_member(member_id) else {
+            return Ok(());
+        };
+        let Some(part) = self.part_for(layout_index, volume_index) else {
             return Ok(());
         };
         let (part_position, part_logical_offset, part_len, packed_crc32) = part;
-        let Some(member) = self.members.get_mut(&member_index) else {
+        let Some(member) = self.members.get_mut(&member_id) else {
             return Ok(());
         };
         if member.covered.insert(logical_offset, len) == 0 {
@@ -946,17 +1102,17 @@ impl DirectSetRouter {
             }
         }
 
-        self.try_verify_member(member_index)
+        self.try_verify_member(member_id)
     }
 
     /// `(position in chain, logical offset, packed length, packed CRC32)` for
-    /// the part of `member_index` living in `volume_index`.
+    /// the part of the layout member at `layout_index` living in `volume_index`.
     fn part_for(
         &self,
-        member_index: u32,
+        layout_index: usize,
         volume_index: u32,
     ) -> Option<(u32, u64, u64, Option<u32>)> {
-        let member = self.layout_members().get(member_index as usize)?;
+        let member = self.layout_members().get(layout_index)?;
         member
             .parts
             .iter()
@@ -974,8 +1130,11 @@ impl DirectSetRouter {
 
     /// Layer 2: the whole-member CRC32, composed from the parts in logical
     /// order once every part is complete and the chain has closed.
-    fn try_verify_member(&mut self, member_index: u32) -> Result<(), DemotionReason> {
-        let Some(layout_member) = self.layout_members().get(member_index as usize) else {
+    fn try_verify_member(&mut self, member_id: u32) -> Result<(), DemotionReason> {
+        let Some(layout_index) = self.layout_index_for_member(member_id) else {
+            return Ok(());
+        };
+        let Some(layout_member) = self.layout_members().get(layout_index) else {
             return Ok(());
         };
         if !layout_member.chain_complete {
@@ -992,7 +1151,7 @@ impl DirectSetRouter {
             .map(|part| part.data_size)
             .collect();
         let unpacked_size = layout_member.unpacked_size.unwrap_or(0);
-        let Some(member) = self.members.get_mut(&member_index) else {
+        let Some(member) = self.members.get_mut(&member_id) else {
             return Ok(());
         };
         if member.verified {
@@ -1012,11 +1171,90 @@ impl DirectSetRouter {
         if composed != expected {
             return Err(self.fail(DemotionReason::MemberChecksumMismatch));
         }
-        if let Some(member) = self.members.get_mut(&member_index) {
+        if let Some(member) = self.members.get_mut(&member_id) {
             member.verified = true;
         }
         Ok(())
     }
+
+    /// The physical map of one volume, as the hybrid virtual-volume provider
+    /// needs it: every direct-routed member extent, in physical order, with the
+    /// logical offset the extent starts at inside its member's partial.
+    ///
+    /// This is [`StoredLayoutBuilder::map_physical_range`] run **in reverse** —
+    /// the router asks it "what owns these physical bytes" while routing, and
+    /// the provider asks the same question to decide which file to read a
+    /// physical byte back from. Everything not in a returned extent is envelope,
+    /// which lives at its own physical offset in the volume's envelope file.
+    pub(crate) fn volume_member_extents(&self, volume_index: u32) -> Vec<MemberExtent> {
+        let mut extents = Vec::new();
+        let mut cursor = 0u64;
+        for slice in self.map_physical_range(volume_index, 0, u64::MAX) {
+            match slice {
+                MappedSlice::Member {
+                    member_index,
+                    logical_offset,
+                    len,
+                } => {
+                    if let Some(member_id) = self.member_id_for_layout(member_index) {
+                        extents.push(MemberExtent {
+                            member_id,
+                            physical_offset: cursor,
+                            logical_offset,
+                            len,
+                        });
+                    }
+                    cursor = cursor.saturating_add(len);
+                }
+                MappedSlice::Envelope { len } | MappedSlice::Unroutable { len } => {
+                    cursor = cursor.saturating_add(len);
+                }
+            }
+        }
+        extents
+    }
+
+    /// Physical ranges of one volume the router has emitted spans for.
+    ///
+    /// The *barrier* is the durable truth (it only learns about writes that
+    /// returned); this is the router's own view and is used where the barrier
+    /// has nothing to say — chiefly a set that demotes before its first barrier.
+    pub(crate) fn routed_ranges(&self, volume_index: u32) -> ByteRanges {
+        self.staging
+            .get(&volume_index)
+            .map(|staging| staging.routed.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// One direct-routed member's slice of a volume, in both coordinate spaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MemberExtent {
+    pub(crate) member_id: u32,
+    /// Offset of the extent inside the source volume.
+    pub(crate) physical_offset: u64,
+    /// Offset of the same bytes inside the member's partial.
+    pub(crate) logical_offset: u64,
+    pub(crate) len: u64,
+}
+
+/// Whether `candidate`'s member list is `previous`'s with more members appended.
+///
+/// The header walk is sequential from offset 0, so a longer staged prefix can
+/// only ever reveal *further* headers: the members it already reported keep
+/// their facts and their order, and the new ones land at the end. Anything else
+/// — a member's facts changing, or one disappearing — is a real disagreement
+/// between two parses of the same volume, which is what
+/// [`DemotionReason::ConflictingVolumeFacts`] exists for.
+///
+/// Only the member list is compared. The volume-level fields legitimately grow
+/// with the prefix — `more_volumes` flips the moment the walk reaches the
+/// end-of-archive record, a recovery-record or locator service header appears
+/// later than the file headers — and the layout consumes none of them beyond
+/// the archive format, which is checked separately.
+fn members_extend(previous: &RarVolumeFacts, candidate: &RarVolumeFacts) -> bool {
+    candidate.members.len() > previous.members.len()
+        && candidate.members[..previous.members.len()] == previous.members[..]
 }
 
 /// `ranges` minus `[start, start + len)`.

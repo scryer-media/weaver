@@ -391,6 +391,27 @@ impl CoverageBarrier {
         self.cooldown_until
     }
 
+    /// Everything the controller knows is durably on disk for one source
+    /// volume: the published floor, plus the coalesced ranges above it that
+    /// have been written but not yet checkpointed.
+    ///
+    /// This is the truth demotion-by-reconstruction reads (D8). Deliberately
+    /// *this* rather than the router's own routed map: the controller is only
+    /// told about writes whose every destination returned, so a span whose write
+    /// failed is absent here and will be refetched rather than read back from a
+    /// file that never received it.
+    pub(crate) fn volume_coverage(&self, volume_index: u32) -> Option<ByteRanges> {
+        let volume = self.volumes.get(&volume_index)?;
+        let mut coverage = ByteRanges::new();
+        if volume.floor > 0 {
+            coverage.insert(0, volume.floor);
+        }
+        for &(start, end) in volume.ranges.ranges() {
+            coverage.insert(start, end - start);
+        }
+        Some(coverage)
+    }
+
     /// Destination paths touched since the last successful barrier, in member
     /// order.
     pub(crate) fn touched_destinations(&self) -> Vec<&str> {

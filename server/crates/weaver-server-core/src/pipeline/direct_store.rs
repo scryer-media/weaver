@@ -45,6 +45,8 @@ use std::sync::OnceLock;
 
 pub(crate) mod barrier;
 pub(crate) mod plan;
+pub(crate) mod provider;
+pub(crate) mod reconstruct;
 pub(crate) mod restart;
 pub(crate) mod router;
 pub(crate) mod set;

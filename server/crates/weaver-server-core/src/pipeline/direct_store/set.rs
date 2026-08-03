@@ -4,22 +4,41 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Instant;
 
+use super::ByteRanges;
 use super::barrier::{
     BarrierError, BarrierReport, BarrierTrigger, CoverageBarrier, CoveragePersist, RoutedWrite,
 };
 use super::plan::DirectSetPlan;
+use super::provider::{HybridVolumeProvider, VirtualVolume};
 use super::restart::ExpectedSet;
 use super::router::{CrcRuns, DemotionReason, DirectDestination, DirectSetRouter, RoutedSpan};
 use super::snapshot::CoverageSnapshot;
 use crate::jobs::ids::JobId;
 
-/// Member index the envelope file is registered under.
+/// Destination key for volume `volume_index`'s envelope file.
 ///
-/// Real member indices are the layout's positions, which start at zero and stay
-/// small; the top of the space is free and keeps the envelope inside the same
-/// registration, sync and claim machinery as a member rather than growing a
-/// parallel one.
-pub(crate) const ENVELOPE_MEMBER_INDEX: u32 = u32::MAX;
+/// Envelope v2 gives every source volume its own sparse envelope file, so the
+/// barrier now tracks *n+1* destination identities per set rather than two. The
+/// encoding is **`u32::MAX - volume_index`**: destination keys are member ids,
+/// which the router hands out from zero upwards, so counting volumes down from
+/// the top keeps envelopes inside the same registration, sync and claim
+/// machinery as members with no parallel bookkeeping and no ambiguity.
+///
+/// The two bands can only meet if one set had `u32::MAX` distinct destinations,
+/// which is bounded by (members + volumes) of a single archive;
+/// [`DirectSet::ensure_registered`] asserts the gap anyway. The *durable*
+/// identity in the checkpoint blob is the destination's relative path
+/// (`<set>.vol00007.envelope`), not this key, so restart stays coherent even if
+/// the encoding is ever changed.
+pub(crate) const fn envelope_destination_key(volume_index: u32) -> u32 {
+    u32::MAX - volume_index
+}
+
+/// The volume behind an envelope destination key, or `None` for a member key.
+pub(crate) const fn envelope_destination_volume(key: u32, volume_count: u32) -> Option<u32> {
+    let volume = u32::MAX - key;
+    if volume < volume_count { Some(volume) } else { None }
+}
 
 /// Whether a set is still routing, and if not, why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +67,16 @@ pub(crate) struct DirectSet {
     /// per-article part CRCs compose into exactly the same value, so the gate
     /// survives without a byte of extra I/O.
     volume_crcs: BTreeMap<u32, CrcRuns>,
+    /// Per volume, the **decoded** extent of every article that has been routed
+    /// into it: `segment number -> (offset, length)`.
+    ///
+    /// The NZB's `<segment bytes>` is the yEnc-*encoded* size, ~3% larger, so
+    /// nothing derived from the spec can say which source bytes an article
+    /// actually covers. Demotion-by-reconstruction needs exactly that: which
+    /// articles are wholly on disk in the volume it just materialized, and so
+    /// must not be fetched again. Recording it here is the only place the true
+    /// decoded geometry is known.
+    segment_extents: BTreeMap<u32, BTreeMap<u32, (u64, u64)>>,
     /// Coverage restored from a checkpoint, applied when the barrier is built.
     resumed: Option<CoverageSnapshot>,
     /// The demotion's one-time cleanup (delete output, retire the row, refetch)
@@ -83,6 +112,7 @@ impl DirectSet {
             registered_volumes: false,
             complete_volumes: BTreeSet::new(),
             volume_crcs: BTreeMap::new(),
+            segment_extents: BTreeMap::new(),
             resumed: None,
             demotion_cleaned_up: false,
             latched_direct: false,
@@ -119,11 +149,11 @@ impl DirectSet {
     /// The digest the checkpoint is written under. Stable across volume growth;
     /// see [`DirectSetPlan::digest`].
     pub(crate) fn plan_digest(&self) -> [u8; 32] {
-        let members: Vec<(u32, String, u64)> = self
+        let members: Vec<(String, u64)> = self
             .router
             .member_partials()
             .into_iter()
-            .map(|(index, name, _)| (index, name.to_string(), 0))
+            .map(|(_, name, _)| (name.to_string(), 0))
             .collect();
         self.router.plan().digest(&members)
     }
@@ -274,15 +304,54 @@ impl DirectSet {
             }
             self.registered_volumes = true;
         }
-        for (index, partial) in members {
-            if self.registered_members.insert(index) {
-                barrier.register_destination(index, partial);
+        for (member_id, partial) in members {
+            if self.registered_members.insert(member_id) {
+                barrier.register_destination(member_id, partial);
             }
         }
-        if self.registered_members.insert(ENVELOPE_MEMBER_INDEX) {
-            let envelope = self.router.plan().envelope_relative_path();
-            barrier.register_destination(ENVELOPE_MEMBER_INDEX, envelope);
+        // Envelope v2: one destination per source volume, keyed down from the
+        // top of the space. Registered up front rather than on first envelope
+        // byte, so `record_write` can never meet an unregistered envelope.
+        let volumes: Vec<u32> = self.router.plan().volumes.keys().copied().collect();
+        debug_assert!(
+            self.router
+                .member_partials()
+                .iter()
+                .all(|(member_id, _, _)| volumes
+                    .iter()
+                    .all(|volume| *member_id < envelope_destination_key(*volume))),
+            "a member id reached into the envelope destination band of {}",
+            self.set_name()
+        );
+        for volume_index in volumes {
+            let key = envelope_destination_key(volume_index);
+            if self.registered_members.insert(key) {
+                let envelope = self.router.plan().envelope_relative_path(volume_index);
+                barrier.register_destination(key, envelope);
+            }
         }
+    }
+
+    /// Records the decoded extent of one article of a source volume.
+    pub(crate) fn note_segment_extent(
+        &mut self,
+        volume_index: u32,
+        segment_number: u32,
+        source_offset: u64,
+        len: u64,
+    ) {
+        self.segment_extents
+            .entry(volume_index)
+            .or_default()
+            .insert(segment_number, (source_offset, len));
+    }
+
+    /// The decoded extents recorded for one volume's articles.
+    pub(crate) fn segment_extents(&self, volume_index: u32) -> BTreeMap<u32, (u64, u64)> {
+        self.segment_extents
+            .get(&volume_index)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Records spans whose writes have **all** returned. A refusal here is a
@@ -290,7 +359,7 @@ impl DirectSet {
     pub(crate) fn record_writes(&mut self, spans: &[RoutedSpan], now: Instant) {
         self.ensure_registered();
         // Ordering assumption, asserted rather than assumed: the barrier comes
-        // into existence with the *first member*, and the envelope is
+        // into existence with the *first member*, and every volume's envelope is
         // registered in the same call. A span can therefore only be recorded
         // once its destination is registered — including envelope spans, which
         // the router emits only after a parse that also named a member. A set
@@ -304,7 +373,7 @@ impl DirectSet {
                 || self.barrier.is_some()
                 || spans
                     .iter()
-                    .all(|span| span.destination != DirectDestination::Envelope),
+                    .all(|span| !matches!(span.destination, DirectDestination::Envelope { .. })),
             "direct-store emitted envelope spans for {} before any member registered a barrier",
             self.set_name()
         );
@@ -313,8 +382,10 @@ impl DirectSet {
         };
         for span in spans {
             let member_index = match span.destination {
-                DirectDestination::Member { member_index } => member_index,
-                DirectDestination::Envelope => ENVELOPE_MEMBER_INDEX,
+                DirectDestination::Member { member_id } => member_id,
+                DirectDestination::Envelope { volume_index } => {
+                    envelope_destination_key(volume_index)
+                }
             };
             let _ = barrier.record_write(
                 &RoutedWrite {
@@ -389,6 +460,52 @@ impl DirectSet {
         self.registered_members.clear();
         self.registered_volumes = false;
         Ok(())
+    }
+
+    /// Everything durably placed for one source volume, in physical space.
+    ///
+    /// The barrier is authoritative: it only learns about writes whose every
+    /// destination returned. Before the first member registers there is no
+    /// barrier at all, and the router's own routed map is the only account
+    /// there is — a set that demotes that early has written envelope bytes and
+    /// nothing else.
+    pub(crate) fn volume_coverage(&self, volume_index: u32) -> ByteRanges {
+        self.barrier
+            .as_ref()
+            .and_then(|barrier| barrier.volume_coverage(volume_index))
+            .unwrap_or_else(|| self.router.routed_ranges(volume_index))
+    }
+
+    /// A [`HybridVolumeProvider`] over this set's partials and envelopes.
+    ///
+    /// `volume_lengths` gives each volume its logical length — the provider
+    /// cannot know it, because a direct volume's length is the decoded total the
+    /// download layer tracks, not anything a partial or an envelope states.
+    /// Volumes absent from the map are omitted, since a reader with no length
+    /// could not answer `SeekFrom::End` or stop at the right place.
+    pub(crate) fn virtual_provider(
+        &self,
+        volume_lengths: &BTreeMap<u32, u64>,
+    ) -> HybridVolumeProvider {
+        let working_dir = &self.router.plan().working_dir;
+        let partials: std::collections::HashMap<u32, std::path::PathBuf> = self
+            .router
+            .member_partials()
+            .into_iter()
+            .map(|(member_id, _, partial)| (member_id, working_dir.join(partial)))
+            .collect();
+        let volumes = volume_lengths
+            .iter()
+            .map(|(volume_index, len)| VirtualVolume {
+                volume_index: *volume_index,
+                envelope: self.router.plan().envelope_path(*volume_index),
+                extents: self.router.volume_member_extents(*volume_index),
+                partials: partials.clone(),
+                covered: self.volume_coverage(*volume_index),
+                len: *len,
+            })
+            .collect();
+        HybridVolumeProvider::new(volumes)
     }
 
     /// The two checkpoint systems must never both own a member (D6 risk list).
