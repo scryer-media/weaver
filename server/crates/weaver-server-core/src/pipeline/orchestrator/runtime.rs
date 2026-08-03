@@ -34,11 +34,23 @@ impl Pipeline {
         let decode_backlog_budget_bytes =
             compute_decode_backlog_budget_bytes(&profile, &buffers, write_backlog_budget_bytes);
         let tuner = RuntimeTuner::with_connection_limit(profile, total_connections);
-        let (initial_bandwidth_policy, ip_replacement_trial_extra_connections) = {
+        let (
+            initial_bandwidth_policy,
+            ip_replacement_trial_extra_connections,
+            direct_store_settings,
+        ) = {
             let cfg = config.read().await;
             (
                 cfg.isp_bandwidth_cap.clone(),
                 cfg.ip_replacement_trial_extra_connections(),
+                // Plan 135, phase 7: config, with `WEAVER_RAR_DIRECT_STORE`
+                // overriding it. Resolved once here and held for the life of
+                // the pipeline — a set admitted under an enabled gate must not
+                // find it disabled at finalization, and the kill switch's
+                // contract is that turning it off at *startup* sweeps and
+                // redownloads mid-flight direct work, not that it takes effect
+                // mid-job.
+                crate::pipeline::direct_store::DirectStoreSettings::resolve(&cfg),
             )
         };
         metrics.set_ip_replacement_trial_extra_connections(ip_replacement_trial_extra_connections);
@@ -49,6 +61,16 @@ impl Pipeline {
             total_connections,
             "pipeline tuner initialized"
         );
+        if direct_store_settings.gate.is_enabled() {
+            // Logged only when on: the default is off, and an operator reading
+            // a startup log wants to see the non-default. The ceiling goes with
+            // it because the two are configured together and a demotion for
+            // `holds_scratch_ceiling` is otherwise unattributable.
+            info!(
+                holds_scratch_ceiling_bytes = direct_store_settings.holds_scratch_ceiling_bytes,
+                "RAR direct-store routing enabled"
+            );
+        }
 
         tokio::fs::create_dir_all(&data_dir).await?;
         tokio::fs::create_dir_all(&intermediate_dir).await?;
@@ -231,7 +253,9 @@ impl Pipeline {
             write_buffers: HashMap::new(),
             par2_runtime: HashMap::new(),
             live_par2: crate::pipeline::repair::live::LivePar2Registry::new(),
-            direct_store: crate::pipeline::direct_store::wiring::DirectStoreRuntime::default(),
+            direct_store: crate::pipeline::direct_store::wiring::DirectStoreRuntime::with_settings(
+                direct_store_settings,
+            ),
             extraction_limits,
             extraction_budgets: HashMap::new(),
             extracted_members: HashMap::new(),

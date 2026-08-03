@@ -3,7 +3,9 @@ use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidt
 use crate::jobs::{DuplicateAction, DuplicatePolicy};
 use crate::persistence::Database;
 use crate::settings::record::SettingRecord;
-use crate::settings::{BufferPoolOverrides, Config, RetryOverrides, TunerOverrides};
+use crate::settings::{
+    BufferPoolOverrides, Config, DirectStoreOverrides, RetryOverrides, TunerOverrides,
+};
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
 impl Database {
@@ -164,6 +166,26 @@ impl Database {
             }
         };
 
+        // Plan 135, phase 7. Absent keys mean "defaults", and a partially
+        // configured table is normal: an operator who only ever flips `enabled`
+        // should not have to restate the scratch ceiling.
+        let direct_store = {
+            let enabled = settings
+                .get("direct_store.enabled")
+                .and_then(|v| v.parse().ok());
+            let holds_scratch_ceiling_bytes = settings
+                .get("direct_store.holds_scratch_ceiling_bytes")
+                .and_then(|v| v.parse().ok());
+            if enabled.is_some() || holds_scratch_ceiling_bytes.is_some() {
+                Some(DirectStoreOverrides {
+                    enabled,
+                    holds_scratch_ceiling_bytes,
+                })
+            } else {
+                None
+            }
+        };
+
         let default_duplicate_policy = DuplicatePolicy::default();
         let duplicate_policy = DuplicatePolicy {
             strict_active_or_success: setting_duplicate_action(
@@ -210,6 +232,7 @@ impl Database {
             ip_replacement_trial_extra_connections,
             watch_folder,
             duplicate_policy,
+            direct_store,
             config_path: None,
         })
     }
@@ -319,6 +342,18 @@ impl Database {
             }
             if let Some(v) = tuner.decode_thread_count {
                 self.set_setting("tuner.decode_thread_count", &v.to_string())?;
+            }
+        }
+
+        if let Some(ref direct_store) = config.direct_store {
+            if let Some(enabled) = direct_store.enabled {
+                self.set_setting("direct_store.enabled", &enabled.to_string())?;
+            }
+            if let Some(bytes) = direct_store.holds_scratch_ceiling_bytes {
+                self.set_setting(
+                    "direct_store.holds_scratch_ceiling_bytes",
+                    &bytes.to_string(),
+                )?;
             }
         }
 

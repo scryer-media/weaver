@@ -96,6 +96,25 @@ If you run the container as root, the entrypoint will re-own `/config` to `PUID`
 For hardened deployments, `weaver` supports `--read-only=true` as long as `/config` remains writable.
 
 
+## RAR direct-store (opt-in, off by default)
+
+A store-only RAR release normally costs about twice its size on disk: first the `.rar` volumes, then the extracted files. With direct-store enabled, Weaver writes the payload of unencrypted `Store` members straight to its final destination as the articles arrive, so the volumes never exist as files and the release lands once.
+
+It is **off by default** while it matures. Turn it on with the `direct_store` settings:
+
+| Setting | Environment override | Default | Meaning |
+| --- | --- | --- | --- |
+| `direct_store.enabled` | `WEAVER_RAR_DIRECT_STORE` | `false` | Route eligible RAR `Store` sets straight to their destinations. |
+| `direct_store.holds_scratch_ceiling_bytes` | `WEAVER_RAR_DIRECT_STORE_SCRATCH_CEILING_BYTES` | 536870912 (512 MiB) | Per-archive-set ceiling on the scratch file that holds decoded bytes whose destination is not resolved yet. Breaching it makes that one set fall back to the ordinary path. |
+
+**Precedence is environment over settings over default.** The environment variable is an operator override for incident response, so it wins in both directions: `WEAVER_RAR_DIRECT_STORE=0` forces direct-store off even when the setting says on, and `=1` forces it on. Values it does not recognise are ignored rather than treated as "off", so a typo cannot silently disable a feature you configured. Both are read once at startup; changing them takes effect on the next restart.
+
+**Turning it off is a kill switch, not just a refusal.** With direct-store disabled at startup, a job that was mid-flight under an enabled build does not resume as a direct job: its partially written destinations and internal envelope files are swept out of the working directory and the job redownloads conventionally. Nothing half-written is left where finished work belongs. The stored coverage records are kept rather than deleted, so re-enabling the feature later is a supported round trip — a re-enabled build re-validates them and redownloads anything it cannot prove.
+
+**Expect an instant, or absent-looking, `Extracting` phase.** For a direct-store job the payload is already at its destination when the download finishes, so there is nothing left to extract: the extraction phase completes immediately and may not be visible at all in the UI or the API. This is the feature working, not a stalled or skipped step, and progress reporting is otherwise unchanged — Weaver does not insert an artificial delay to make the phase visible, and the GraphQL surface is identical either way. A job that starts direct and later falls back reports both, so a release that ended up on the ordinary path still shows a normal extraction phase.
+
+Sets Weaver cannot route this way — compressed, encrypted, solid, or checksummed in a way it cannot verify out of order — simply take the ordinary download-then-extract path, with no change in output.
+
 ## API
 
 Weaver exposes a **GraphQL API** at `/graphql` with full query, mutation, and subscription support. The same API powers the web UI, so anything you can do in the interface is available programmatically.

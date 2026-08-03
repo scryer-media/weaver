@@ -787,6 +787,26 @@ impl Pipeline {
         if could_have_routed {
             result.swept = sweep_orphan_direct_files(working_dir, &claimed, &owned).await;
         }
+
+        // The restart ledger, in the four numbers that separate "resumed" from
+        // "rolled back" (plan 135, Observability). `rejected` already has its
+        // own counter above; these are the three that were only ever visible as
+        // a log line, plus the segments the accepted floors actually saved —
+        // without which "restart discarded a barrier interval" is unfalsifiable
+        // in production.
+        crate::runtime::perf_probe::record_value(
+            "direct_store.restart.accepted_sets",
+            result.accepted as u64,
+        );
+        crate::runtime::perf_probe::record_value(
+            "direct_store.restart.ignored_rows",
+            result.ignored as u64,
+        );
+        crate::runtime::perf_probe::record_value("direct_store.restart.swept", result.swept as u64);
+        crate::runtime::perf_probe::record_value(
+            "direct_store.restart.skipped_segments",
+            result.skip.len() as u64,
+        );
         result
     }
 

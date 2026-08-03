@@ -126,6 +126,10 @@ fn config_roundtrip() {
             scanning_paused: false,
         },
         duplicate_policy: Default::default(),
+        direct_store: Some(crate::settings::DirectStoreOverrides {
+            enabled: Some(true),
+            holds_scratch_ceiling_bytes: Some(128 * 1024 * 1024),
+        }),
         config_path: None,
     };
 
@@ -162,6 +166,29 @@ fn config_roundtrip() {
         Some("/media/movies".to_string())
     );
     assert_eq!(loaded.categories[0].aliases, "movie*, film*");
+    // Plan 135, phase 7: direct-store's switches are ordinary settings rows, so
+    // they survive a save/load like everything else here.
+    let direct_store = loaded
+        .direct_store
+        .expect("the direct-store table must survive the round trip");
+    assert_eq!(direct_store.enabled, Some(true));
+    assert_eq!(
+        direct_store.holds_scratch_ceiling_bytes,
+        Some(128 * 1024 * 1024)
+    );
+}
+
+/// An install that never touched direct-store loads no table at all, which is
+/// what "every default" looks like — and it must not be confused with a table
+/// that explicitly says `false`.
+#[test]
+fn an_unconfigured_direct_store_loads_as_absent() {
+    let db = Database::open_in_memory().unwrap();
+    db.set_setting("data_dir", "/tmp/weaver").unwrap();
+
+    let loaded = db.load_config().unwrap();
+
+    assert!(loaded.direct_store.is_none());
 }
 
 #[test]

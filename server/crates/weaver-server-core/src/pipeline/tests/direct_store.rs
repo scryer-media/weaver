@@ -6349,3 +6349,222 @@ async fn an_interior_hole_sizes_the_repair_by_the_slices_it_actually_touches() {
         "and no volume file may exist at the end of it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 7: the config surface, and D3's sparse marking
+// ---------------------------------------------------------------------------
+
+/// Every other test here reaches for `set_gate`. This one comes through
+/// configuration, which is what phase 7 made the operator surface: the
+/// `[direct_store]` table turns routing on, and turning it **off** at startup
+/// makes a restart ignore and sweep the mid-flight direct state and redownload
+/// the job conventionally (plan 135, Risks — kill switch).
+#[tokio::test]
+async fn the_config_gate_routes_and_a_config_off_restart_sweeps_and_redownloads() {
+    use crate::settings::DirectStoreOverrides;
+
+    // `DirectStoreSettings::resolve` reads the real environment, and the env
+    // override deliberately beats config. A developer with the variable
+    // exported would be testing the override, not the config.
+    if crate::pipeline::direct_store::env_override().is_some() {
+        return;
+    }
+
+    const ARTICLES: usize = 2;
+    let member_name = "Silver.Horizon.S01E52.mkv";
+    let payload: Vec<u8> = (0..4000u32).map(|index| (index % 239) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 2);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41090);
+    let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1), (1, 0)];
+
+    // Phase 1: config on. The job routes, so partials, envelopes and a coverage
+    // row exist — the non-vacuity the sweep assertions below depend on.
+    let working_dir = {
+        let (mut pipeline, _, _) = new_config_gated_direct_pipeline(
+            &temp_dir,
+            DirectStoreOverrides {
+                enabled: Some(true),
+                holds_scratch_ceiling_bytes: None,
+            },
+        )
+        .await;
+        pipeline.live_par2.set_enabled(false);
+        let spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, ARTICLES);
+        let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+        for (file_index, segment_number) in &arrivals {
+            submit_volume_article_of(
+                &mut pipeline,
+                job_id,
+                &volumes,
+                *file_index,
+                *segment_number,
+                ARTICLES,
+            )
+            .await;
+        }
+        pipeline
+            .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
+            .await;
+        working_dir
+    };
+
+    let partial = working_dir.join(format!("{member_name}.direct.partial"));
+    let envelope = working_dir.join("silver.horizon.vol00000.envelope");
+    assert!(
+        partial.exists() && envelope.exists(),
+        "the config table must be able to turn routing on at all"
+    );
+    assert!(
+        volumes
+            .iter()
+            .all(|(filename, _)| !working_dir.join(filename).exists()),
+        "and a config-gated direct job writes no source volume either"
+    );
+
+    // Phase 2: config off. Same working directory, same spec, a fresh pipeline.
+    let (mut pipeline, _, _) = new_config_gated_direct_pipeline(
+        &temp_dir,
+        DirectStoreOverrides {
+            enabled: Some(false),
+            holds_scratch_ceiling_bytes: None,
+        },
+    )
+    .await;
+    pipeline.live_par2.set_enabled(false);
+    let rows_before = pipeline.db.load_direct_coverage(job_id).unwrap();
+    assert!(!rows_before.is_empty(), "phase 1 must have checkpointed");
+    let spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, ARTICLES);
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            complete_files: HashSet::new(),
+            file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir: working_dir.clone(),
+        })
+        .await
+        .unwrap();
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert_eq!(
+        queued.len(),
+        volumes.len() * ARTICLES,
+        "a config-disabled gate must redownload the whole job conventionally, got {queued:?}"
+    );
+    assert!(
+        !partial.exists(),
+        "mid-flight direct partials must be swept when config turns the gate off"
+    );
+    assert!(!envelope.exists(), "and so must their envelopes");
+    assert!(
+        pipeline.direct_store.sets_for(job_id).is_empty(),
+        "and no direct set may survive the restore"
+    );
+    // Ignored, not deleted: a re-enabled binary can still judge the rows, and it
+    // refuses them on the destination probe.
+    assert!(
+        !pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "a disabled gate must not destroy coverage a re-enabled one could judge"
+    );
+}
+
+/// D3: a destination that cannot be marked sparse demotes the set, and the
+/// refusal happens before the file holds a hole — so nothing it created is left
+/// on disk.
+#[tokio::test]
+async fn a_destination_that_cannot_be_marked_sparse_demotes_before_it_holds_a_hole() {
+    use crate::pipeline::direct_store::sparse::SparseMarking;
+
+    let member_name = "Silver.Horizon.S01E53.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 151) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline
+        .direct_store
+        .set_sparse_marking(SparseMarking::AlwaysFail);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(41091);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted(SparseMarkFailed)"),
+        "a destination that cannot be marked sparse must demote with its own reason, got {shape}"
+    );
+    assert!(
+        !working_dir
+            .join(format!("{member_name}.direct.partial"))
+            .exists(),
+        "the refused destination must not be left behind"
+    );
+    assert!(
+        !working_dir
+            .join("silver.horizon.vol00000.envelope")
+            .exists(),
+        "nor the envelope the same batch would have created"
+    );
+}
+
+/// The same rule for the holds scratch, which the router creates itself rather
+/// than through the destination-preparation seam.
+#[tokio::test]
+async fn a_holds_scratch_that_cannot_be_marked_sparse_demotes_the_set() {
+    use crate::pipeline::direct_store::sparse::SparseMarking;
+
+    let member_name = "Silver.Horizon.S01E54.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 149) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.direct_store.set_holds_budget(64);
+    pipeline
+        .direct_store
+        .set_sparse_marking(SparseMarking::AlwaysFail);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(41092);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // Article 1 of volume 0 lands before its header, so it has to be held; the
+    // 64-byte budget forces the very first hold to page.
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted(HoldsScratchFailed)"),
+        "an unmarkable scratch must demote with the scratch's own reason, got {shape}"
+    );
+    let scratch_files: Vec<String> = std::fs::read_dir(&working_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(".weaver-holds."))
+        .collect();
+    assert!(
+        scratch_files.is_empty(),
+        "the scratch it could not mark must not survive, got {scratch_files:?}"
+    );
+}

@@ -71,6 +71,7 @@ fn sample_config() -> Config {
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
+        direct_store: None,
         config_path: None,
     }
 }

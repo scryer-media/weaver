@@ -57,15 +57,50 @@
 //!   volume files that do not exist. A direct set therefore **finalizes only
 //!   once its job's PAR2 verification has concluded** — before then its
 //!   envelopes and partials are the only copy of the volume image, and the
-//!   verifier needs them. Verification **verdicts** only: damage on a direct
-//!   set demotes it (D8) and the conventional path repairs the materialized
-//!   volumes, because repair over a virtual volume is phase 6.
+//!   verifier needs them. Wave 2 produced verification **verdicts** only, and a
+//!   damaged direct set demoted whole.
 //! - **D1's bounded small-member tolerance.** A set whose only ineligible
 //!   members are small unencrypted non-solid regular files still routes: their
 //!   packed ranges land in the envelope, and at finalization *only* those
 //!   member indices are extracted through
 //!   `weaver_unrar::RarArchive::extract_member_streaming` over the hybrid
 //!   provider. Direct `Store` outputs are never re-extracted or overwritten.
+//!
+//! Phase 6 replaces that last demotion with D8's other transition. [`repair`]
+//! materializes **only the damaged volumes** into scratch files, repairs them
+//! with every clean volume still read virtually, routes the repaired spans back
+//! through the router with replacement semantics — destination bytes overwrite,
+//! and so does the CRC composition — re-verifies through the same gates, and
+//! deletes the scratch. Clean volumes never materialize, the set stays direct,
+//! and no direct output is deleted. Two consequences worth naming:
+//!
+//! - the set's checkpoint row is **deleted before** anything the row claims is
+//!   rewritten, and the next barrier recreates coverage from scratch. That is
+//!   deliberately lossy — a crash in that window costs a full redownload of the
+//!   set — and it is far simpler than selectively lowering per-volume floors to
+//!   expose the repaired ranges (D8);
+//! - every refusal along the way falls back to wave 2's whole-set demotion,
+//!   which is always correct, under its own metric.
+//!
+//! Phase 7 is the hardening pass, and it lands four things:
+//!
+//! - **Windows sparse marking.** [`sparse`] marks every file this subsystem
+//!   creates with holes in it — member partials, envelopes, repair and holds
+//!   scratch — at creation and before any length is set or byte written. A
+//!   marking failure demotes before a long-lived hole exists, so the worst case
+//!   is a set on the conventional path rather than one silently paying 1× per
+//!   volume in NTFS-allocated zeros.
+//! - **A real config surface.** [`DirectStoreSettings`] resolves the gate and
+//!   the per-set scratch ceiling from `Config`, with the `WEAVER_*` variables
+//!   overriding it in both directions for incident response — plan 135's open
+//!   question 1, answered as config *and* env rather than either alone. The
+//!   gate still defaults **off**; flipping that default is a release decision.
+//! - **Quick Open, dropped.** D2 permitted QO priming behind mandatory
+//!   physical-header confirmation and said to delete it if the confirmation
+//!   erased the benefit. It does — see the decision recorded at
+//!   [`router::DirectSetRouter::try_parse_volume`] — so there is no QO code
+//!   here.
+//! - **The metric families** the plan enumerates, under `direct_store.*`.
 //!
 //! # Two checkpoint systems
 //!
@@ -82,10 +117,12 @@ pub(crate) mod par2_access;
 pub(crate) mod plan;
 pub(crate) mod provider;
 pub(crate) mod reconstruct;
+pub(crate) mod repair;
 pub(crate) mod restart;
 pub(crate) mod router;
 pub(crate) mod set;
 pub(crate) mod snapshot;
+pub(crate) mod sparse;
 pub(crate) mod wiring;
 
 #[cfg(test)]
@@ -93,40 +130,123 @@ mod tests;
 
 /// Operator kill switch for direct-store routing and its coverage checkpoint.
 ///
-/// Env-only is the **phase 3 placeholder**, not a settled decision: plan 135's
-/// open question 1 (config vs env, and whether a per-job opt-out is wanted) is
-/// still open, and its risk list notes that every other non-test `WEAVER_*` var
-/// in the tree is infrastructure rather than operator-facing. Phase 2's
-/// `WEAVER_LIVE_PAR2` landed env-only as the same placeholder. If direct-store
-/// is meant to be operator-facing it belongs in config, and the switch moves
-/// there before phase 7.
+/// **Overrides the config option**, and that direction is the whole point: the
+/// incident this variable exists for is one where the operator cannot reach the
+/// settings UI, or where the config write itself is what they distrust. Setting
+/// it to an off word forces the gate off no matter what the database says;
+/// setting it to an on word forces it on. Leaving it unset defers to config.
+///
+/// Answering plan 135's open question 1 this way — config *and* env, config as
+/// the durable operator surface and env as the override — is phase 7's
+/// decision. Phase 2's `WEAVER_LIVE_PAR2` remains env-only; it guards a
+/// different feature and moving it is not this phase's business.
 pub(crate) const DIRECT_STORE_ENV: &str = "WEAVER_RAR_DIRECT_STORE";
 
-/// Whether direct-store is enabled. Read once, in the style of `e2e_failpoint`.
+/// Env override for the per-set holds-scratch ceiling, in **bytes**.
 ///
-/// **Defaults off.** A coverage checkpoint over physical volumes duplicates
-/// what `active_file_progress` already does, so this earns its way on only
-/// alongside phase 4's routing.
-pub(crate) fn env_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| parse_enabled(std::env::var(DIRECT_STORE_ENV).ok().as_deref()))
+/// Same precedence rule as [`DIRECT_STORE_ENV`]. An unparseable or absent value
+/// defers to config, and config defers to
+/// [`router::HOLDS_SCRATCH_CEILING_BYTES`].
+pub(crate) const DIRECT_STORE_SCRATCH_CEILING_ENV: &str =
+    "WEAVER_RAR_DIRECT_STORE_SCRATCH_CEILING_BYTES";
+
+/// Whether the env override forces direct-store on or off, if it says anything
+/// at all. Read once, in the style of `e2e_failpoint`.
+pub(crate) fn env_override() -> Option<bool> {
+    static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| parse_enabled(std::env::var(DIRECT_STORE_ENV).ok().as_deref()))
 }
 
-/// Only the explicit on words enable. Note this is the inverse of
-/// `WEAVER_LIVE_PAR2`, which is a kill switch for a shipped feature and so
-/// defaults on; this gate guards a feature that is not finished.
-fn parse_enabled(raw: Option<&str>) -> bool {
-    let Some(value) = raw else {
-        return false;
-    };
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "on" | "yes"
-    )
+/// The env scratch ceiling, if one is set and parses. Read once.
+fn env_scratch_ceiling() -> Option<u64> {
+    static CEILING: OnceLock<Option<u64>> = OnceLock::new();
+    *CEILING.get_or_init(|| {
+        std::env::var(DIRECT_STORE_SCRATCH_CEILING_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+    })
+}
+
+/// `Some(true)` for the on words, `Some(false)` for the off words, `None` for
+/// absent or unrecognised.
+///
+/// Unrecognised deferring to config rather than to "off" is deliberate: a
+/// typo'd override must not silently disable a feature the operator turned on
+/// in config, and the direction that surprises least is the one where the
+/// variable simply does not apply.
+fn parse_enabled(raw: Option<&str>) -> Option<bool> {
+    let value = raw?.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Everything direct-store reads out of configuration, resolved once at
+/// pipeline construction (plan 135, phase 7 — Risks, and open question 1).
+///
+/// Precedence, for both fields: **environment, then config, then default.**
+/// Resolving it here rather than at each read point is what keeps the gate
+/// consistent for the life of a pipeline — a set admitted under an enabled gate
+/// must not find it disabled at finalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectStoreSettings {
+    pub(crate) gate: DirectStoreGate,
+    pub(crate) holds_scratch_ceiling_bytes: u64,
+}
+
+impl Default for DirectStoreSettings {
+    fn default() -> Self {
+        Self {
+            gate: DirectStoreGate::Disabled,
+            holds_scratch_ceiling_bytes: router::HOLDS_SCRATCH_CEILING_BYTES,
+        }
+    }
+}
+
+impl DirectStoreSettings {
+    /// Resolves against a loaded config, with the environment winning.
+    pub(crate) fn resolve(config: &crate::settings::Config) -> Self {
+        Self::resolve_parts(
+            config.direct_store.as_ref().and_then(|cfg| cfg.enabled),
+            config
+                .direct_store
+                .as_ref()
+                .and_then(|cfg| cfg.holds_scratch_ceiling_bytes),
+            env_override(),
+            env_scratch_ceiling(),
+        )
+    }
+
+    /// The precedence rule itself, with the environment passed in so it is
+    /// testable without mutating process state.
+    pub(crate) fn resolve_parts(
+        config_enabled: Option<bool>,
+        config_ceiling: Option<u64>,
+        env_enabled: Option<bool>,
+        env_ceiling: Option<u64>,
+    ) -> Self {
+        let enabled = env_enabled.or(config_enabled).unwrap_or(false);
+        Self {
+            gate: if enabled {
+                DirectStoreGate::Enabled
+            } else {
+                DirectStoreGate::Disabled
+            },
+            holds_scratch_ceiling_bytes: env_ceiling
+                .or(config_ceiling)
+                .unwrap_or(router::HOLDS_SCRATCH_CEILING_BYTES),
+        }
+    }
 }
 
 /// Resolved gate value, passed explicitly so callers and tests do not race the
 /// process-wide `OnceLock`.
+///
+/// **Defaults off.** Flipping the default to on is a release decision — the
+/// feature has to earn it on real fixtures and a Windows validation run — not a
+/// config-default edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectStoreGate {
     Enabled,
@@ -134,14 +254,6 @@ pub(crate) enum DirectStoreGate {
 }
 
 impl DirectStoreGate {
-    pub(crate) fn from_env() -> Self {
-        if env_enabled() {
-            Self::Enabled
-        } else {
-            Self::Disabled
-        }
-    }
-
     pub(crate) fn is_enabled(self) -> bool {
         matches!(self, Self::Enabled)
     }

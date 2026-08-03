@@ -269,6 +269,7 @@ mod tests {
             ip_replacement_trial_extra_connections: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
+            direct_store: None,
             config_path: None,
         }));
         let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
@@ -301,6 +302,7 @@ mod tests {
             ip_replacement_trial_extra_connections: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
+            direct_store: None,
             config_path: None,
         }));
         let (cmd_tx, mut cmd_rx) = mpsc::channel(1);

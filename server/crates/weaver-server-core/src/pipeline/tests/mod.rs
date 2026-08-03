@@ -97,6 +97,7 @@ impl TestHarness {
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
+            direct_store: None,
             config_path: None,
         }));
 
@@ -323,6 +324,22 @@ async fn new_direct_pipeline_with_buffers(
     buffer_config: BufferPoolConfig,
     total_connections: usize,
 ) -> (Pipeline, PathBuf, PathBuf) {
+    new_direct_pipeline_with(temp_dir, buffer_config, total_connections, None).await
+}
+
+/// [`new_direct_pipeline_with_buffers`], plus the `[direct_store]` config table
+/// (plan 135, phase 7).
+///
+/// Everything else in this module reaches for `set_gate`, which bypasses
+/// configuration entirely. The tests that exist to prove the *config* is the
+/// gate — and that the kill switch's sweep fires off it — must come through
+/// here instead.
+async fn new_direct_pipeline_with(
+    temp_dir: &TempDir,
+    buffer_config: BufferPoolConfig,
+    total_connections: usize,
+    direct_store: Option<crate::settings::DirectStoreOverrides>,
+) -> (Pipeline, PathBuf, PathBuf) {
     let data_dir = temp_dir.path().join("data");
     let intermediate_dir = temp_dir.path().join("intermediate");
     let complete_dir = temp_dir.path().join("complete");
@@ -342,6 +359,7 @@ async fn new_direct_pipeline_with_buffers(
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
+        direct_store,
         config_path: None,
     }));
 
@@ -408,6 +426,24 @@ async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf)
             large_count: 2,
         },
         0,
+    )
+    .await
+}
+
+/// [`new_direct_pipeline`] whose direct-store gate comes from configuration.
+async fn new_config_gated_direct_pipeline(
+    temp_dir: &TempDir,
+    direct_store: crate::settings::DirectStoreOverrides,
+) -> (Pipeline, PathBuf, PathBuf) {
+    new_direct_pipeline_with(
+        temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        0,
+        Some(direct_store),
     )
     .await
 }

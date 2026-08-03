@@ -52,6 +52,9 @@ pub struct Config {
     /// Duplicate admission handling policy.
     #[serde(default)]
     pub duplicate_policy: DuplicatePolicy,
+    /// RAR direct-store routing (plan 135). Absent means "every default".
+    #[serde(default)]
+    pub direct_store: Option<DirectStoreOverrides>,
     /// Path to the config file on disk. Not serialized to TOML.
     #[serde(skip)]
     pub config_path: Option<PathBuf>,
@@ -168,6 +171,30 @@ impl Config {
     }
 }
 
+/// Operator-facing switches for RAR direct-store routing (plan 135, phase 7).
+///
+/// These answer the plan's open question 1 — config, not env-only — while
+/// keeping an env override for incident response. Precedence is
+/// **environment over config over default**, and it is resolved in
+/// `pipeline::direct_store::DirectStoreSettings::resolve`; see that type for
+/// the exact variable names.
+///
+/// Every field is optional so an absent `[direct_store]` table, a partially
+/// filled one and an older config file all mean "use the defaults".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DirectStoreOverrides {
+    /// Route eligible unencrypted RAR `Store` sets straight to their final
+    /// destinations, so their volumes never exist as files.
+    ///
+    /// **Defaults to off.** Turning the default on is a release decision, not a
+    /// config default change.
+    pub enabled: Option<bool>,
+    /// Per-set ceiling on the holds scratch file, in bytes. Decoded bytes whose
+    /// destination is not yet known are held in RAM and paged here on a breach;
+    /// breaching *this* ceiling demotes that one set. Defaults to 512 MiB.
+    pub holds_scratch_ceiling_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BufferPoolOverrides {
     pub small_count: Option<usize>,
@@ -228,6 +255,7 @@ mod tests {
             ip_replacement_trial_extra_connections: None,
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: DuplicatePolicy::default(),
+            direct_store: None,
             config_path: None,
         }
     }

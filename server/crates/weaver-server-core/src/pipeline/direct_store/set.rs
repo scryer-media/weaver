@@ -749,6 +749,16 @@ impl DirectSet {
         self.barrier.as_ref().and_then(|barrier| barrier.due(now))
     }
 
+    /// Aggregate unique dirty bytes the set is carrying, i.e. what the barrier
+    /// is about to make durable. Read before a barrier runs, because running it
+    /// resets the count.
+    pub(crate) fn dirty_bytes(&self) -> u64 {
+        self.barrier
+            .as_ref()
+            .map(|barrier| barrier.dirty_bytes())
+            .unwrap_or(0)
+    }
+
     /// Destination paths touched since the last successful barrier, resolved to
     /// absolute paths for the sync step.
     pub(crate) fn touched_paths(&self) -> Vec<std::path::PathBuf> {

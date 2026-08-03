@@ -57,6 +57,7 @@ use std::path::PathBuf;
 use super::ByteRanges;
 use super::provider::{HybridVolumeProvider, is_hole};
 use super::router::CrcRuns;
+use super::sparse::SparseMarking;
 
 /// Read/write chunk for the sweep. Large enough that a 50 MiB volume is a few
 /// hundred iterations, small enough to stay off the large-allocation path.
@@ -125,6 +126,10 @@ pub(crate) enum ReconstructionFailure {
     UnverifiableRun { volume_index: u32, offset: u64 },
     /// The volume file could not be written.
     WriteFailed { volume_index: u32, error: String },
+    /// The volume file could not be marked sparse (D3). Refused **before**
+    /// `set_len` opens a hole, so on Windows nothing has been allocated yet and
+    /// the refetch pays only what the conventional path always pays.
+    SparseMarkFailed { volume_index: u32, error: String },
 }
 
 impl ReconstructionFailure {
@@ -135,6 +140,7 @@ impl ReconstructionFailure {
             Self::ChecksumMismatch { .. } => "checksum_mismatch",
             Self::UnverifiableRun { .. } => "unverifiable_run",
             Self::WriteFailed { .. } => "write_failed",
+            Self::SparseMarkFailed { .. } => "sparse_mark_failed",
         }
     }
 }
@@ -171,6 +177,13 @@ impl std::fmt::Display for ReconstructionFailure {
                 formatter,
                 "volume {volume_index} could not be written: {error}"
             ),
+            Self::SparseMarkFailed {
+                volume_index,
+                error,
+            } => write!(
+                formatter,
+                "volume {volume_index} could not be marked sparse: {error}"
+            ),
         }
     }
 }
@@ -179,10 +192,11 @@ impl std::fmt::Display for ReconstructionFailure {
 pub(crate) fn reconstruct_volumes(
     provider: &HybridVolumeProvider,
     volumes: &[VolumeReconstruction],
+    sparse: SparseMarking,
 ) -> Result<Vec<ReconstructedVolume>, ReconstructionFailure> {
     let mut rebuilt = Vec::with_capacity(volumes.len());
     for volume in volumes {
-        match reconstruct_volume(provider, volume) {
+        match reconstruct_volume(provider, volume, sparse) {
             Ok(outcome) => rebuilt.push(outcome),
             Err(failure) => {
                 // All or nothing. The fallback refetches every article of the
@@ -204,6 +218,7 @@ pub(crate) fn reconstruct_volumes(
 fn reconstruct_volume(
     provider: &HybridVolumeProvider,
     volume: &VolumeReconstruction,
+    sparse: SparseMarking,
 ) -> Result<ReconstructedVolume, ReconstructionFailure> {
     if volume.covered.is_empty() || volume.len == 0 {
         return Ok(ReconstructedVolume {
@@ -217,14 +232,24 @@ fn reconstruct_volume(
     let mut reader = provider
         .open(volume.volume_index)
         .ok_or(ReconstructionFailure::NoLayout)?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&volume.path)
-        .map_err(|error| ReconstructionFailure::WriteFailed {
-            volume_index: volume.volume_index,
-            error: error.to_string(),
+    // Marked sparse at creation and **before** the `set_len` below (D3): the
+    // sweep seeks past every hole, so on Windows an unmarked file would have
+    // NTFS allocate and zero-fill the whole volume the moment the length is
+    // set. A marking failure is refused here, with no hole yet in existence.
+    let mut file =
+        super::sparse::create_sparse(&volume.path, &sparse).map_err(|error| match error {
+            // An ordinary create failure is the write failure it has always
+            // been; only a refused *marking* is D3's own bucket.
+            super::sparse::SparseCreateError::Open(error) => ReconstructionFailure::WriteFailed {
+                volume_index: volume.volume_index,
+                error: error.to_string(),
+            },
+            super::sparse::SparseCreateError::Mark(error) => {
+                ReconstructionFailure::SparseMarkFailed {
+                    volume_index: volume.volume_index,
+                    error: error.to_string(),
+                }
+            }
         })?;
     // Opened without truncating, so the sweep can leave holes for the refetch to
     // fill rather than rewriting them as zeros — but a file already sitting at

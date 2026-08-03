@@ -57,6 +57,7 @@ impl Harness {
             cleanup_after_extract: Some(true),
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
+            direct_store: None,
             config_path: None,
         }));
         let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);

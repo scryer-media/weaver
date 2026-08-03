@@ -6,4 +6,6 @@ pub mod record;
 pub mod repository;
 pub mod service;
 
-pub use model::{BufferPoolOverrides, Config, RetryOverrides, SharedConfig, TunerOverrides};
+pub use model::{
+    BufferPoolOverrides, Config, DirectStoreOverrides, RetryOverrides, SharedConfig, TunerOverrides,
+};

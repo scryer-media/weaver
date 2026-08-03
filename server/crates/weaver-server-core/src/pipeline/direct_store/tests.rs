@@ -1777,16 +1777,104 @@ fn a_two_thousand_floor_checkpoint_round_trips_through_the_database() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_gate_defaults_off_and_only_explicit_on_words_enable_it() {
-    assert!(!parse_enabled(None), "phase 3 ships the gate off");
-    assert!(!parse_enabled(Some("")));
-    assert!(!parse_enabled(Some("0")));
-    assert!(!parse_enabled(Some("off")));
-    assert!(!parse_enabled(Some("maybe")));
-    assert!(parse_enabled(Some("1")));
-    assert!(parse_enabled(Some(" TRUE ")));
-    assert!(parse_enabled(Some("on")));
-    assert!(parse_enabled(Some("yes")));
+fn the_env_override_recognises_both_directions_and_defers_when_it_cannot() {
+    // Absent and unrecognised both mean "the variable does not apply", so the
+    // config value decides. A typo'd override must never silently disable a
+    // feature an operator turned on in config.
+    assert_eq!(parse_enabled(None), None);
+    assert_eq!(parse_enabled(Some("")), None);
+    assert_eq!(parse_enabled(Some("maybe")), None);
+    assert_eq!(parse_enabled(Some("0")), Some(false));
+    assert_eq!(parse_enabled(Some("off")), Some(false));
+    assert_eq!(parse_enabled(Some(" FALSE ")), Some(false));
+    assert_eq!(parse_enabled(Some("no")), Some(false));
+    assert_eq!(parse_enabled(Some("1")), Some(true));
+    assert_eq!(parse_enabled(Some(" TRUE ")), Some(true));
+    assert_eq!(parse_enabled(Some("on")), Some(true));
+    assert_eq!(parse_enabled(Some("yes")), Some(true));
+}
+
+#[test]
+fn settings_resolve_env_over_config_over_default() {
+    use super::DirectStoreSettings;
+    use super::router::HOLDS_SCRATCH_CEILING_BYTES;
+
+    // Nothing configured anywhere: off, at the 512 MiB default ceiling.
+    let defaults = DirectStoreSettings::resolve_parts(None, None, None, None);
+    assert_eq!(defaults, DirectStoreSettings::default());
+    assert!(!defaults.gate.is_enabled(), "the default is off");
+    assert_eq!(
+        defaults.holds_scratch_ceiling_bytes,
+        HOLDS_SCRATCH_CEILING_BYTES
+    );
+
+    // Config alone decides when the environment says nothing.
+    let configured = DirectStoreSettings::resolve_parts(Some(true), Some(4096), None, None);
+    assert!(configured.gate.is_enabled());
+    assert_eq!(configured.holds_scratch_ceiling_bytes, 4096);
+
+    // The env override wins in both directions — that is what makes it a kill
+    // switch rather than a second way to say the same thing.
+    let killed =
+        DirectStoreSettings::resolve_parts(Some(true), Some(4096), Some(false), Some(8192));
+    assert!(!killed.gate.is_enabled(), "env off beats config on");
+    assert_eq!(killed.holds_scratch_ceiling_bytes, 8192);
+    let forced = DirectStoreSettings::resolve_parts(Some(false), None, Some(true), None);
+    assert!(forced.gate.is_enabled(), "env on beats config off");
+    assert_eq!(
+        forced.holds_scratch_ceiling_bytes, HOLDS_SCRATCH_CEILING_BYTES,
+        "an unset ceiling override falls through config to the default"
+    );
+}
+
+#[test]
+fn settings_resolve_reads_the_config_table() {
+    use super::DirectStoreSettings;
+    use crate::settings::DirectStoreOverrides;
+
+    let mut config = crate::settings::Config {
+        data_dir: "/tmp/weaver-direct-store".to_string(),
+        intermediate_dir: None,
+        complete_dir: None,
+        buffer_pool: None,
+        tuner: None,
+        servers: Vec::new(),
+        categories: Vec::new(),
+        retry: None,
+        max_download_speed: None,
+        cleanup_after_extract: None,
+        isp_bandwidth_cap: None,
+        ip_replacement_trial_extra_connections: None,
+        watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+        duplicate_policy: crate::jobs::DuplicatePolicy::default(),
+        direct_store: None,
+        config_path: None,
+    };
+    // Skipped rather than asserted when the developer running the suite has an
+    // override exported: `resolve` reads the real process environment, and the
+    // precedence rule itself is covered above with the environment injected.
+    if super::env_override().is_some() || super::env_scratch_ceiling().is_some() {
+        return;
+    }
+
+    // An absent table is "every default", which is what an existing install's
+    // config file looks like.
+    assert!(!DirectStoreSettings::resolve(&config).gate.is_enabled());
+
+    config.direct_store = Some(DirectStoreOverrides {
+        enabled: Some(true),
+        holds_scratch_ceiling_bytes: Some(64 * 1024 * 1024),
+    });
+    let resolved = DirectStoreSettings::resolve(&config);
+    assert!(
+        resolved.gate.is_enabled(),
+        "the config table reaches the gate"
+    );
+    assert_eq!(
+        resolved.holds_scratch_ceiling_bytes,
+        64 * 1024 * 1024,
+        "the configured ceiling reaches the resolved settings"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2604,6 +2692,7 @@ fn a_partially_covered_volume_is_rebuilt_and_verified_run_by_run() {
             covered,
             crcs.clone(),
         )],
+        super::sparse::SparseMarking::Platform,
     )
     .expect("every covered run composes a reference and matches it");
 
@@ -2645,6 +2734,7 @@ fn a_covered_run_with_no_composed_reference_refuses_to_be_rebuilt() {
     let failure = super::reconstruct::reconstruct_volumes(
         &provider,
         &[reconstruction_target(&fixture, path.clone(), covered, crcs)],
+        super::sparse::SparseMarking::Platform,
     )
     .expect_err("a run with no reference must not be written");
     assert_eq!(
@@ -2681,6 +2771,7 @@ fn a_rebuilt_run_that_fails_its_reference_falls_back_to_refetching() {
             whole_volume_covered(),
             crcs,
         )],
+        super::sparse::SparseMarking::Platform,
     )
     .expect_err("a run that disagrees with its composed CRC32 must not be trusted");
     assert!(matches!(
@@ -2713,6 +2804,7 @@ fn a_rebuild_truncates_a_stale_file_already_sitting_at_the_volumes_path() {
             whole_volume_covered(),
             crcs,
         )],
+        super::sparse::SparseMarking::Platform,
     )
     .expect("the volume is wholly covered and verifiable");
 
@@ -3958,4 +4050,138 @@ fn a_rewrite_widens_to_whole_articles_so_the_volume_composition_stays_exact() {
         widen_to_articles(&[(200, 264)], &sparse, 300),
         vec![(200, 264)]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Sparse marking (D3, phase 7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn creating_a_sparse_file_leaves_it_empty_and_writable() {
+    use super::sparse::{SparseMarking, create_sparse};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.vol00000.envelope");
+
+    let file = create_sparse(&path, &SparseMarking::Platform)
+        .expect("the platform marker must succeed on a fresh file");
+
+    assert!(path.exists(), "the destination is created here, not later");
+    assert_eq!(
+        file.metadata().unwrap().len(),
+        0,
+        "marking happens before any length is set or byte written"
+    );
+    // Writable through the returned handle, which is what the holds scratch
+    // relies on rather than reopening.
+    use std::io::Write;
+    (&file).write_all(b"header").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"header");
+}
+
+#[test]
+fn creating_a_sparse_file_over_an_existing_one_keeps_its_bytes() {
+    use super::sparse::{SparseMarking, create_sparse};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Silver.Horizon.S01E01.mkv.direct.partial");
+    std::fs::write(&path, b"already routed").unwrap();
+
+    create_sparse(&path, &SparseMarking::Platform).expect("re-marking is allowed");
+
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"already routed",
+        "a restart re-marks a destination that already holds routed bytes; \
+         truncating there would throw away the coverage the checkpoint claims"
+    );
+}
+
+#[test]
+fn a_marking_failure_removes_the_file_it_created_but_never_a_pre_existing_one() {
+    use super::sparse::{SparseMarking, create_sparse};
+
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = dir.path().join("fresh.direct.partial");
+    let existing = dir.path().join("existing.direct.partial");
+    std::fs::write(&existing, b"routed bytes").unwrap();
+
+    create_sparse(&fresh, &SparseMarking::AlwaysFail)
+        .expect_err("an unmarkable destination must be refused");
+    assert!(
+        !fresh.exists(),
+        "the caller demotes, so nothing it created may be left for the restart \
+         sweep to reason about"
+    );
+
+    create_sparse(&existing, &SparseMarking::AlwaysFail)
+        .expect_err("an unmarkable destination must be refused");
+    assert_eq!(
+        std::fs::read(&existing).unwrap(),
+        b"routed bytes",
+        "a marking failure on restart must not destroy the bytes the \
+         conventional path is about to reconstruct from"
+    );
+}
+
+#[test]
+fn the_platform_marker_reports_success_where_holes_are_free() {
+    use super::sparse::{SparseMarker, SparseMarking};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("probe.bin");
+    let file = std::fs::File::create(&path).unwrap();
+
+    // Unix files are sparse by writing past a hole, so the marker must succeed
+    // rather than report `Unsupported` — the caller's failure arm is a
+    // demotion, and demoting every set on Linux would be an outage.
+    #[cfg(not(windows))]
+    SparseMarking::Platform
+        .mark_sparse(&file)
+        .expect("the unix marker is a no-op that succeeds");
+    // On Windows this is the real `FSCTL_SET_SPARSE`; a temp dir on NTFS
+    // supports it, and a filesystem that does not is exactly the case the
+    // demotion arm exists for.
+    #[cfg(windows)]
+    let _ = SparseMarking::Platform.mark_sparse(&file);
+    let _ = file;
+}
+
+#[test]
+fn every_reconstruction_failure_has_its_own_metric_label() {
+    use super::reconstruct::ReconstructionFailure;
+
+    // `sparse_mark_failed` is phase 7's addition, and a duplicate label would
+    // silently merge two very different diagnoses in the demotion counters.
+    let labels = [
+        ReconstructionFailure::NoLayout.metric(),
+        ReconstructionFailure::MissingBytes {
+            volume_index: 0,
+            offset: 0,
+        }
+        .metric(),
+        ReconstructionFailure::ChecksumMismatch {
+            volume_index: 0,
+            offset: 0,
+        }
+        .metric(),
+        ReconstructionFailure::UnverifiableRun {
+            volume_index: 0,
+            offset: 0,
+        }
+        .metric(),
+        ReconstructionFailure::WriteFailed {
+            volume_index: 0,
+            error: String::new(),
+        }
+        .metric(),
+        ReconstructionFailure::SparseMarkFailed {
+            volume_index: 0,
+            error: String::new(),
+        }
+        .metric(),
+    ];
+    let unique: std::collections::BTreeSet<&str> = labels.iter().copied().collect();
+    assert_eq!(unique.len(), labels.len(), "labels must be distinct");
+    assert!(unique.contains("sparse_mark_failed"));
 }

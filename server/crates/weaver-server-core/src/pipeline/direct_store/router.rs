@@ -55,6 +55,7 @@ use weaver_unrar::{
 
 use super::ByteRanges;
 use super::plan::DirectSetPlan;
+use super::sparse::SparseMarking;
 
 /// Default RAM ceiling for holds across one set. A breach pages to the set's
 /// holds scratch (D2); only a paging failure demotes.
@@ -228,6 +229,11 @@ pub(crate) enum DemotionReason {
     /// writes the same bytes to a different file, so this is a demotion rather
     /// than a job failure.
     DestinationWriteFailed,
+    /// One of the set's destinations could not be marked sparse (D3). Raised
+    /// **before** the file holds a hole, so demoting here is what keeps a
+    /// Windows filesystem from allocating a whole volume's worth of zeros
+    /// behind a member partial whose first routed byte lands near its end.
+    SparseMarkFailed,
     /// Committing a verified set to its destinations failed. The bytes are
     /// good; the filesystem refused the rename, so the set is rebuilt the
     /// ordinary way rather than left half-committed.
@@ -299,6 +305,7 @@ impl DemotionReason {
             Self::CollidingDestinations => "colliding_destinations",
             Self::VolumeCrcMismatch => "volume_crc_mismatch",
             Self::DestinationWriteFailed => "destination_write_failed",
+            Self::SparseMarkFailed => "sparse_mark_failed",
             Self::FinalizationFailed => "finalization_failed",
         }
     }
@@ -593,6 +600,11 @@ pub(crate) struct HoldsScratch {
     /// Append cursor, and the file's length.
     len: u64,
     ceiling: u64,
+    /// D3's sparse marker. The scratch is append-only so it holds no hole of
+    /// its own, but it is a direct-store-created file in the working directory
+    /// and it inherits the same rule: marked at creation, before a byte is
+    /// written, and a marking failure demotes rather than proceeding.
+    sparse: SparseMarking,
 }
 
 impl HoldsScratch {
@@ -602,6 +614,7 @@ impl HoldsScratch {
             file: None,
             len: 0,
             ceiling,
+            sparse: SparseMarking::default(),
         }
     }
 
@@ -625,12 +638,13 @@ impl HoldsScratch {
             return Err(DemotionReason::HoldsScratchCeiling);
         }
         if self.file.is_none() {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .read(true)
-                .write(true)
-                .open(&self.path)
+            // Marked sparse before the first `write_at` (D3). A killed run's
+            // scratch is swept at restart, so an existing file here is not
+            // state to preserve — truncating it is what keeps the append cursor
+            // (`len`, reset to zero by `discard`) agreeing with the file.
+            let file = super::sparse::create_sparse(&self.path, &self.sparse)
+                .map_err(|_| DemotionReason::HoldsScratchFailed)?;
+            file.set_len(0)
                 .map_err(|_| DemotionReason::HoldsScratchFailed)?;
             self.file = Some(std::sync::Arc::new(file));
         }
@@ -1284,11 +1298,16 @@ impl DirectSetRouter {
         }
     }
 
-    /// Lowers the scratch ceiling so a test can breach it without paging
+    /// Sets the per-set scratch ceiling (D2). Configured, with the env override
+    /// winning; the tests lower it so a breach is reachable without paging
     /// gigabytes.
-    #[cfg(test)]
     pub(crate) fn set_holds_scratch_ceiling(&mut self, bytes: u64) {
         self.scratch.ceiling = bytes;
+    }
+
+    /// Sets the sparse marker every file this set creates goes through (D3).
+    pub(crate) fn set_sparse_marking(&mut self, marking: SparseMarking) {
+        self.scratch.sparse = marking;
     }
 
     /// Bytes currently paged out to the set's holds scratch (D2), counted
@@ -1807,6 +1826,49 @@ impl DirectSetRouter {
 
     /// Parses the volume's headers out of its staged image, provisionally the
     /// first time and confirmingly once the walk reaches the archive end.
+    ///
+    /// # Quick Open is dropped, not implemented (plan 135, D2 — phase 7)
+    ///
+    /// D2 allowed RAR5 Quick Open records to *prime* the layout, under one hard
+    /// condition: no byte routes on QO evidence alone, so the corresponding
+    /// physical header must be parsed and confirmed identical first. It also
+    /// said, in the same breath, that if the confirmation erases the benefit the
+    /// feature should be deleted rather than weakened. It does, and it is:
+    ///
+    /// - **The fetch saving QO exists for is already banked.** QO's purpose is
+    ///   avoiding a seek-and-read walk across a large archive. This router never
+    ///   walks an archive: each volume's mapping comes from *that volume's own*
+    ///   headers, parsed out of the prefix its first article delivers during
+    ///   ordinary download. There is no extra fetch for QO to save, because
+    ///   there is no extra fetch.
+    /// - **Confirmation would cost strictly more than it saves.** The physical
+    ///   headers must be parsed anyway to admit the volume; priming from QO
+    ///   first would add a second parse and a field-by-field comparison to reach
+    ///   the same mapping.
+    /// - **QO records live at the end of the archive**, past every member's
+    ///   payload, so on a set that is still downloading they are the *last*
+    ///   thing to arrive. Priming from them would resolve mappings after the
+    ///   bytes they describe, which is the wrong end of the job.
+    ///
+    /// So there is no QO code here and none is wanted. What there *is* — and
+    /// this is the part a future reader must not mistake for QO being absent —
+    /// is the library's own preference: `parse_volume_facts` calls
+    /// `parse_all_headers`, which on seeing a main header carrying a locator
+    /// Quick Open offset tries the QO records first and returns **those**
+    /// headers when they parse cleanly through an end-of-archive record. On a
+    /// truncated prefix that read hits a hole and falls back to the physical
+    /// walk, so a provisional parse is always physical; a *confirming* parse of
+    /// a fully staged `-qo` volume can be QO-derived.
+    ///
+    /// Two of the three outcomes are already safe here: QO agreeing with the
+    /// physical parse changes nothing, and QO disagreeing is
+    /// [`DemotionReason::ConflictingVolumeFacts`]. The third — a forged QO
+    /// record *appending* a member the physical walk never saw — would be
+    /// adopted by the `members_extend` arm below on QO evidence alone, which is
+    /// exactly what D2 forbids and what the RAR spec warns is craftable. Closing
+    /// it needs the library to be able to parse with QO suppressed
+    /// (`weaver-unrar` is not this crate's to change), so it is recorded here
+    /// and carried as a follow-up rather than papered over with a heuristic.
     fn try_parse_volume(&mut self, volume_index: u32) -> Result<(), DemotionReason> {
         let Some(staging) = self.staging.get(&volume_index) else {
             return Ok(());

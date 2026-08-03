@@ -46,12 +46,13 @@ use std::time::Instant;
 
 use tracing::{debug, info, warn};
 
-use super::DirectStoreGate;
 use super::barrier::{BarrierDemand, BarrierDrain, DatabaseCoveragePersist, DestinationSync};
 use super::plan::DirectSetPlan;
 use super::reconstruct::{ReconstructionFailure, VolumeReconstruction};
 use super::router::{DemotionReason, DirectDestination, RoutedSpan};
 use super::set::DirectSet;
+use super::sparse::SparseMarking;
+use super::{DirectStoreGate, DirectStoreSettings};
 use crate::DownloadWork;
 use crate::events::model::PipelineEvent;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
@@ -65,20 +66,30 @@ const REARM_CHUNK_BYTES: usize = 256 * 1024;
 /// Per-pipeline direct-store state. Empty and inert while the gate is off.
 #[derive(Default)]
 pub(crate) struct DirectStoreRuntime {
-    gate: Option<DirectStoreGate>,
+    /// Resolved once at pipeline construction from config plus the env
+    /// override, and never re-read: a set admitted under an enabled gate must
+    /// not find it disabled at finalization. `None` only in the tests that
+    /// build a runtime by hand, where [`Self::gate`] falls back to the
+    /// all-defaults resolution (gate off).
+    settings: Option<DirectStoreSettings>,
     /// Jobs whose spec has already been examined for candidate sets.
     examined: HashSet<JobId>,
     sets: HashMap<JobId, Vec<DirectSet>>,
-    /// Destination parent directories already created, per job (B3). A member
-    /// stored inside a directory names a partial inside that directory, and
-    /// nothing else creates it.
-    prepared_dirs: HashMap<JobId, HashSet<PathBuf>>,
+    /// Destinations already created and marked sparse, per job (B3, D3). A
+    /// member stored inside a directory names a partial inside that directory
+    /// and nothing else creates it, and every destination has to carry the
+    /// sparse attribute before its first routed byte.
+    prepared_destinations: HashMap<JobId, HashSet<PathBuf>>,
     /// Test-only holds ceiling applied to every set this runtime admits.
     #[cfg(test)]
     holds_budget_override: Option<u64>,
-    /// Test-only scratch ceiling (D2), same idea.
+    /// Test-only scratch ceiling (D2), which shortcuts the configured one so a
+    /// breach is reachable without paging half a gigabyte.
     #[cfg(test)]
     holds_scratch_ceiling_override: Option<u64>,
+    /// Sparse marker for every file this runtime's sets create (D3). Only the
+    /// tests that drive the marking-failure demotion ever change it.
+    sparse: SparseMarking,
     /// Source volumes a repair has materialized over this pipeline's life (D8).
     ///
     /// Counted because "only the damaged volumes materialize" is the claim
@@ -121,14 +132,29 @@ impl std::fmt::Debug for DirectStoreRuntime {
 }
 
 impl DirectStoreRuntime {
-    pub(crate) fn gate(&mut self) -> DirectStoreGate {
-        *self.gate.get_or_insert_with(DirectStoreGate::from_env)
+    /// Builds a runtime from the settings resolved at pipeline construction
+    /// (config, with the env override winning).
+    pub(crate) fn with_settings(settings: DirectStoreSettings) -> Self {
+        Self {
+            settings: Some(settings),
+            ..Self::default()
+        }
     }
 
-    /// Test hook: force the gate without racing the process-wide `OnceLock`.
+    pub(crate) fn settings(&self) -> DirectStoreSettings {
+        self.settings.unwrap_or_default()
+    }
+
+    pub(crate) fn gate(&mut self) -> DirectStoreGate {
+        self.settings().gate
+    }
+
+    /// Test hook: force the gate without going through a config load.
     #[cfg(test)]
     pub(crate) fn set_gate(&mut self, gate: DirectStoreGate) {
-        self.gate = Some(gate);
+        let mut settings = self.settings();
+        settings.gate = gate;
+        self.settings = Some(settings);
     }
 
     /// Test hook: lower the holds ceiling so a breach is reachable without
@@ -145,9 +171,19 @@ impl DirectStoreRuntime {
         self.holds_scratch_ceiling_override = Some(bytes);
     }
 
-    /// Applies this runtime's configured holds/scratch ceilings to a set it is
-    /// about to own. A no-op in release builds, where both are compile-time
-    /// constants.
+    /// Test hook: make every sparse marking attempt fail, which is the only way
+    /// to reach D3's demotion arm on a platform whose marker cannot fail.
+    #[cfg(test)]
+    pub(crate) fn set_sparse_marking(&mut self, marking: SparseMarking) {
+        self.sparse = marking;
+    }
+
+    pub(crate) fn sparse_marking(&self) -> SparseMarking {
+        self.sparse
+    }
+
+    /// Applies this runtime's configured ceilings and sparse marker to a set it
+    /// is about to own.
     ///
     /// Every path that builds a `DirectSet` goes through here, restore included.
     /// Restore used to skip it, so a restart test could set a budget and then
@@ -155,6 +191,9 @@ impl DirectStoreRuntime {
     /// makes every budget assertion about a restored set vacuous, and those are
     /// exactly the assertions D2's ceilings need after a restart.
     pub(crate) fn apply_ceilings(&self, set: &mut DirectSet) {
+        set.router
+            .set_holds_scratch_ceiling(self.settings().holds_scratch_ceiling_bytes);
+        set.router.set_sparse_marking(self.sparse);
         #[cfg(test)]
         {
             if let Some(bytes) = self.holds_budget_override {
@@ -164,8 +203,6 @@ impl DirectStoreRuntime {
                 set.router.set_holds_scratch_ceiling(bytes);
             }
         }
-        #[cfg(not(test))]
-        let _ = set;
     }
 
     /// Drops every trace of a job. Called from the job-removal seam: a barrier
@@ -174,7 +211,7 @@ impl DirectStoreRuntime {
     pub(crate) fn clear_job(&mut self, job_id: JobId) {
         self.sets.remove(&job_id);
         self.examined.remove(&job_id);
-        self.prepared_dirs.remove(&job_id);
+        self.prepared_destinations.remove(&job_id);
     }
 
     /// Installs the sets a job restore rebuilt, and marks the job examined so
@@ -192,7 +229,7 @@ impl DirectStoreRuntime {
     pub(crate) fn is_empty_for(&self, job_id: JobId) -> bool {
         !self.sets.contains_key(&job_id)
             && !self.examined.contains(&job_id)
-            && !self.prepared_dirs.contains_key(&job_id)
+            && !self.prepared_destinations.contains_key(&job_id)
     }
 
     pub(crate) fn sets_for(&self, job_id: JobId) -> &[DirectSet] {
@@ -396,6 +433,17 @@ impl Pipeline {
         let sets: Vec<DirectSet> = admitted
             .into_iter()
             .map(|plan| {
+                // The admission counter the refusal counters are read against:
+                // `refused.*` alone cannot say whether a quiet install is
+                // admitting everything or admitting nothing.
+                crate::runtime::perf_probe::record(
+                    "direct_store.admitted",
+                    std::time::Duration::from_nanos(1),
+                );
+                crate::runtime::perf_probe::record_value(
+                    "direct_store.admitted.volumes",
+                    plan.volumes.len() as u64,
+                );
                 info!(
                     job_id = job_id.0,
                     set_name = %plan.set_name,
@@ -1186,6 +1234,7 @@ impl Pipeline {
         let verification = verification.clone();
         let damaged_for_task = damaged.clone();
         let pp_pool = self.pp_pool.clone();
+        let sparse = self.direct_store.sparse_marking();
         let outcome = tokio::task::spawn_blocking(move || {
             pp_pool.install(move || {
                 super::repair::repair_damaged_volumes(
@@ -1196,6 +1245,7 @@ impl Pipeline {
                     &volumes,
                     &damaged_for_task,
                     memory_limit,
+                    sparse,
                 )
             })
         })
@@ -1220,6 +1270,15 @@ impl Pipeline {
             recovery_blocks = outcome.recovery_blocks_used,
             rewrite_bytes,
             "repaired a direct set's damaged volumes in place; its clean volumes stayed virtual"
+        );
+        // "Only the damaged volumes materialize" is the claim repair-while-direct
+        // rests on, and the scratch is deleted as soon as its spans are routed —
+        // so this counter is the only thing that can contradict it in
+        // production. The test build asserts the same number through
+        // `repair_materialized_volumes`.
+        crate::runtime::perf_probe::record_value(
+            "direct_store.repair.materialized_volumes",
+            outcome.materialized_volumes as u64,
         );
         crate::runtime::perf_probe::record_value(
             "direct_store.repair.recovery_blocks",
@@ -1686,7 +1745,19 @@ impl Pipeline {
             return true;
         }
         let batches = self.direct_write_batches(job_id, set_index, spans);
-        self.prepare_direct_destination_dirs(job_id, &batches).await;
+        if let Err(path) = self.prepare_direct_destinations(job_id, &batches).await {
+            // D3: a destination that could not be marked sparse is refused
+            // *before* it holds a hole, so nothing has been allocated for it
+            // yet. Demote and let the conventional path own the bytes.
+            warn!(
+                job_id = job_id.0,
+                path = %path.display(),
+                "could not mark a direct-store destination sparse; demoting the set"
+            );
+            self.demote_direct_set(job_id, set_index, DemotionReason::SparseMarkFailed, dropped)
+                .await;
+            return false;
+        }
         if let Err(error) = crate::pipeline::orchestrator::write_direct_batches(batches).await {
             // A destination write failure is a demotion, not a job failure: the
             // conventional path writes the same bytes to a different file, and
@@ -1717,6 +1788,26 @@ impl Pipeline {
                 );
             }
             return false;
+        }
+        // Where the bytes went, split by destination kind (plan 135,
+        // Observability). Two counters answer the question the disk acceptance
+        // target is stated in: how much of a set landed at its final offset
+        // versus how much rode the envelope as service data. Summed over the
+        // spans already in hand, and `record_value` is a no-op unless the
+        // profiler is on.
+        let (member_bytes, envelope_bytes) =
+            spans.iter().fold((0u64, 0u64), |(member, envelope), span| {
+                let len = span.bytes.len() as u64;
+                match span.destination {
+                    DirectDestination::Member { .. } => (member + len, envelope),
+                    DirectDestination::Envelope { .. } => (member, envelope + len),
+                }
+            });
+        if member_bytes > 0 {
+            crate::runtime::perf_probe::record_value("direct_store.bytes.member", member_bytes);
+        }
+        if envelope_bytes > 0 {
+            crate::runtime::perf_probe::record_value("direct_store.bytes.envelope", envelope_bytes);
         }
         if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
             set.record_writes(spans, Instant::now());
@@ -1959,8 +2050,9 @@ impl Pipeline {
         batches
     }
 
-    /// Creates the parent directory of every destination that needs one, once
-    /// per job (B3).
+    /// Creates the parent directory of every destination that needs one, and
+    /// creates the destination file itself **marked sparse**, once per job
+    /// (B3, and D3's Windows rule).
     ///
     /// A member stored inside a directory — `Silver.Horizon/S01E06.mkv` — names
     /// a partial inside that directory, and the disk owner thread opens
@@ -1968,24 +2060,35 @@ impl Pipeline {
     /// first routed byte would fail with `ENOENT`. The conventional path never
     /// hits this because extraction creates the directory as it writes the
     /// member out; routing writes the member *before* extraction exists.
-    async fn prepare_direct_destination_dirs(
+    ///
+    /// The file is created here for the same reason, one step earlier than the
+    /// disk owner would: `FSCTL_SET_SPARSE` has to be issued on a handle that
+    /// has had nothing written through it, and the owner pool is shared with
+    /// every conventional write in the process — it is not the place to teach
+    /// about direct-store's sparseness. Creating (and marking) here leaves the
+    /// pool's `open_or_reuse` opening a file that already exists and already
+    /// carries the attribute, on Windows and everywhere else.
+    ///
+    /// `Err(path)` names the first destination that could not be marked. The
+    /// caller demotes; nothing has a hole yet.
+    async fn prepare_direct_destinations(
         &mut self,
         job_id: JobId,
         batches: &crate::pipeline::orchestrator::DirectWriteBatches,
-    ) {
+    ) -> Result<(), PathBuf> {
+        let marking = self.direct_store.sparse_marking();
         for (path, _) in batches {
-            let Some(parent) = path.parent() else {
-                continue;
-            };
             if self
                 .direct_store
-                .prepared_dirs
+                .prepared_destinations
                 .get(&job_id)
-                .is_some_and(|prepared| prepared.contains(parent))
+                .is_some_and(|prepared| prepared.contains(path))
             {
                 continue;
             }
-            if let Err(error) = tokio::fs::create_dir_all(parent).await {
+            if let Some(parent) = path.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
                 warn!(
                     job_id = job_id.0,
                     path = %parent.display(),
@@ -1994,15 +2097,62 @@ impl Pipeline {
                 );
                 // Left unprepared on purpose: the write below fails and demotes,
                 // and a later attempt retries the directory rather than trusting
-                // a failure it never saw succeed.
+                // a failure it never saw succeed. Not a sparse refusal — the
+                // write error path already distinguishes it.
                 continue;
             }
+            let created = {
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || {
+                    super::sparse::create_sparse(&path, &marking).map(drop)
+                })
+                .await
+            };
+            match created {
+                Ok(Ok(())) => {}
+                Ok(Err(super::sparse::SparseCreateError::Open(error))) => {
+                    // An ordinary filesystem failure, and exactly the one the
+                    // first routed write would have hit. Left unprepared so the
+                    // write path reports it as `destination_write_failed`,
+                    // which is what it is.
+                    warn!(
+                        job_id = job_id.0,
+                        path = %path.display(),
+                        error = %error,
+                        "failed to create a direct-store destination"
+                    );
+                    continue;
+                }
+                Ok(Err(error @ super::sparse::SparseCreateError::Mark(_))) => {
+                    warn!(
+                        job_id = job_id.0,
+                        path = %path.display(),
+                        error = %error,
+                        "a direct-store destination could not be marked sparse"
+                    );
+                    return Err(path.clone());
+                }
+                Err(error) => {
+                    warn!(
+                        job_id = job_id.0,
+                        path = %path.display(),
+                        error = %error,
+                        "the sparse-marking task did not complete"
+                    );
+                    return Err(path.clone());
+                }
+            }
+            // Keyed on the destination itself rather than its directory: the
+            // marking is per file, and the directory is created on the way to
+            // it. One entry per destination, which is `members + volumes` for
+            // the life of the job.
             self.direct_store
-                .prepared_dirs
+                .prepared_destinations
                 .entry(job_id)
                 .or_default()
-                .insert(parent.to_path_buf());
+                .insert(path.clone());
         }
+        Ok(())
     }
 
     /// The D7-suppressed twin of `commit_persisted_segment`.
@@ -2032,6 +2182,16 @@ impl Pipeline {
             }
         };
         let (file_complete, was_duplicate) = commit;
+        if was_duplicate {
+            // D3: a duplicate must not advance CRC composition, coverage or
+            // progress twice. Counted because a run where this is *never* zero
+            // is a server or retry problem, and because the counter is what
+            // makes "the duplicate did nothing" observable rather than assumed.
+            crate::runtime::perf_probe::record(
+                "direct_store.article.duplicate",
+                std::time::Duration::from_nanos(1),
+            );
+        }
         if !was_duplicate {
             self.metrics
                 .bytes_committed
@@ -2304,6 +2464,12 @@ impl Pipeline {
             return;
         };
         let working_dir = set.plan().working_dir.clone();
+        // Read before the barrier runs, which resets it. Two numbers, because
+        // the interesting one is the second: the barrier's 256 MiB trigger is
+        // checked per routed batch, so anything above it is the overshoot D6
+        // bounds to "one decoded write batch" — and an overshoot that starts
+        // tracking set size instead is the shape that regression looks like.
+        let dirty_bytes = set.dirty_bytes();
         let touched: Vec<String> = set
             .touched_paths()
             .into_iter()
@@ -2344,6 +2510,18 @@ impl Pipeline {
                     "direct_store.barrier.snapshot_bytes",
                     report.snapshot_bytes as u64,
                 );
+                crate::runtime::perf_probe::record_value(
+                    "direct_store.barrier.dirty_bytes",
+                    dirty_bytes,
+                );
+                crate::runtime::perf_probe::record_value(
+                    "direct_store.barrier.overshoot_bytes",
+                    dirty_bytes.saturating_sub(super::barrier::BARRIER_DIRTY_BYTES),
+                );
+                crate::runtime::perf_probe::record_value(
+                    "direct_store.barrier.synced_destinations",
+                    report.synced_destinations as u64,
+                );
                 debug!(
                     job_id = job_id.0,
                     generation = report.generation,
@@ -2361,6 +2539,18 @@ impl Pipeline {
     /// Commits a finished set: every member's partial becomes its destination
     /// through the extractor's own path resolution, and the set is marked
     /// extracted so the `Extracting` phase is pure bookkeeping.
+    ///
+    /// # The phase looks instant, and that is the documented behaviour
+    ///
+    /// There is nothing left to extract here — the payload has been at its
+    /// destination since the articles arrived — so `Extracting` completes
+    /// immediately and may not be visible at all. Plan 135's open question 2
+    /// settles what to do about that: **document it, add no synthetic delay,
+    /// and change no GraphQL surface.** The README carries the user-facing
+    /// wording; the rule for this function is that it must not slow down, and
+    /// must not emit a phase it did not really run, to make the UI look more
+    /// familiar. A set that demotes reports a real extraction phase because it
+    /// really runs one.
     async fn finalize_direct_set(&mut self, job_id: JobId, set_index: usize) {
         self.run_direct_barrier(
             job_id,
@@ -2718,6 +2908,17 @@ impl Pipeline {
                 archive
                     .extract_member_streaming(index, &options, &scoped, &mut file)
                     .map_err(|error| format!("failed to extract '{name}': {error}"))?;
+                // The tolerated half of the byte account: everything else a
+                // direct set produces is counted at the router as
+                // `direct_store.bytes.member`, and a set whose tolerated bytes
+                // start rivalling its stored ones is one the D1 budget is no
+                // longer holding.
+                if let Ok(metadata) = file.metadata() {
+                    crate::runtime::perf_probe::record_value(
+                        "direct_store.bytes.tolerated",
+                        metadata.len(),
+                    );
+                }
                 produced.push(name.clone());
             }
             Ok::<Vec<String>, String>(produced)
@@ -2798,6 +2999,15 @@ impl Pipeline {
                 crate::runtime::perf_probe::record(
                     "direct_store.demoted.reconstructed",
                     std::time::Duration::from_nanos(1),
+                );
+                // The other half of D8's materialization account: a whole-set
+                // demotion materializes *every* volume of the group, and this
+                // is how many that was. Read against
+                // `direct_store.repair.materialized_volumes`, whose whole point
+                // is being much smaller.
+                crate::runtime::perf_probe::record_value(
+                    "direct_store.demote.materialized_volumes",
+                    volumes as u64,
                 );
                 info!(
                     job_id = job_id.0,
@@ -2897,8 +3107,11 @@ impl Pipeline {
         let provider = set.virtual_provider(&lengths);
         let plans: Vec<VolumeReconstruction> =
             targets.iter().map(|(_, _, _, plan)| plan.clone()).collect();
+        let sparse = self.direct_store.sparse_marking();
         let rebuilt = tokio::task::spawn_blocking(move || {
-            crate::pipeline::direct_store::reconstruct::reconstruct_volumes(&provider, &plans)
+            crate::pipeline::direct_store::reconstruct::reconstruct_volumes(
+                &provider, &plans, sparse,
+            )
         })
         .await
         .map_err(|error| ReconstructionFailure::WriteFailed {

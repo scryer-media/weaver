@@ -225,6 +225,7 @@ fn sample_config() -> Config {
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
+        direct_store: None,
         config_path: None,
     }
 }
@@ -1795,6 +1796,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
+            direct_store: None,
             config_path: None,
         })
         .unwrap();
@@ -1816,6 +1818,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
+            direct_store: None,
             config_path: None,
         },
     );

@@ -341,6 +341,10 @@ pub(crate) fn widen_to_articles(
 /// The caller must already have deleted the set's checkpoint row (D8): the
 /// re-route this produces overwrites bytes the row claims, and a row that
 /// survived it would let a restart trust floors over bytes that changed.
+// Every argument is an independent input the blocking half genuinely needs, and
+// they cross a `spawn_blocking` boundary — bundling them into a struct would
+// mean a type that exists only to be destructured on the other side.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn repair_damaged_volumes(
     par2_set: &Par2FileSet,
     verification: &VerificationResult,
@@ -349,6 +353,7 @@ pub(crate) fn repair_damaged_volumes(
     virtual_volumes: &[super::par2_access::VirtualPar2Volume],
     damaged: &[DamagedDirectVolume],
     memory_limit: Option<usize>,
+    sparse: super::sparse::SparseMarking,
 ) -> Result<DirectRepairOutcome, DirectRepairFailure> {
     let scratch: Vec<PathBuf> = damaged.iter().map(|volume| volume.path.clone()).collect();
     let cleanup = |failure: DirectRepairFailure| {
@@ -362,7 +367,7 @@ pub(crate) fn repair_damaged_volumes(
         .iter()
         .map(|volume| volume.reconstruction.clone())
         .collect();
-    if let Err(failure) = reconstruct_volumes(provider, &plans) {
+    if let Err(failure) = reconstruct_volumes(provider, &plans, sparse) {
         return Err(cleanup(DirectRepairFailure::Materialization(failure)));
     }
 
