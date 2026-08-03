@@ -50,6 +50,11 @@ pub(crate) struct DirectSet {
     volume_crcs: BTreeMap<u32, CrcRuns>,
     /// Coverage restored from a checkpoint, applied when the barrier is built.
     resumed: Option<CoverageSnapshot>,
+    /// The demotion's one-time cleanup (delete output, retire the row, refetch)
+    /// has already run. The *status* alone cannot say so: the router demotes
+    /// the set from inside `route`, so by the time the wiring seam is told, the
+    /// set already reads as demoted.
+    demotion_cleaned_up: bool,
     /// Latched reporting bits: never cleared, so a set that started fast and
     /// later demoted reads as "partly on disk" — that is what happened (D1).
     pub(crate) latched_direct: bool,
@@ -79,6 +84,7 @@ impl DirectSet {
             complete_volumes: BTreeSet::new(),
             volume_crcs: BTreeMap::new(),
             resumed: None,
+            demotion_cleaned_up: false,
             latched_direct: false,
             latched_materialized: false,
             status: DirectSetStatus::Routing,
@@ -142,6 +148,24 @@ impl DirectSet {
         self.router.demote(reason);
         self.latched_materialized = true;
         self.status = DirectSetStatus::Demoted(reason);
+    }
+
+    /// Claims the demotion's one-time cleanup.
+    ///
+    /// `true` exactly once per set, and never for a finalized one. Separate
+    /// from [`Self::demote`] because the router demotes from inside `route`, so
+    /// the status is already `Demoted` by the time the wiring seam — which owns
+    /// deleting the output, retiring the row and refetching — is asked.
+    pub(crate) fn claim_demotion(&mut self, reason: DemotionReason) -> bool {
+        if self.is_finalized() {
+            return false;
+        }
+        self.demote(reason);
+        if self.demotion_cleaned_up {
+            return false;
+        }
+        self.demotion_cleaned_up = true;
+        true
     }
 
     /// Feeds one article's yEnc part CRC32 into its volume's composition (M4).

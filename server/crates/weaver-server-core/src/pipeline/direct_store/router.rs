@@ -500,7 +500,10 @@ impl std::fmt::Debug for DirectSetRouter {
             .debug_struct("DirectSetRouter")
             .field("set_name", &self.plan.set_name)
             .field("volumes", &self.plan.volumes.len())
-            .field("format", &self.layout.as_ref().map(|layout| layout.format()))
+            .field(
+                "format",
+                &self.layout.as_ref().map(|layout| layout.format()),
+            )
             .field("members", &self.members.len())
             .field("demoted", &self.demoted)
             .finish()

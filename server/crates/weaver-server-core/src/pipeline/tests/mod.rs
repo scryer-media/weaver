@@ -506,6 +506,40 @@ fn build_test_rar_file_header(
     unpacked_size: u64,
     data_crc: Option<u32>,
 ) -> Vec<u8> {
+    build_test_rar_file_header_with_extra(
+        filename,
+        common_flags_extra,
+        data_size,
+        unpacked_size,
+        data_crc,
+        &[],
+    )
+}
+
+/// A RAR5 file header carrying only a BLAKE2sp digest — no CRC32.
+///
+/// BLAKE2sp accepts bytes in order only, so a member whose *closing* header
+/// states one and nothing else can never be verified out of order.
+fn build_test_rar_blake2_extra(digest: [u8; 32]) -> Vec<u8> {
+    // `vint(record size) || vint(record type = FILE_HASH) || vint(algo =
+    // BLAKE2sp) || digest`, where the size covers everything after itself.
+    let mut record = Vec::new();
+    record.extend_from_slice(&encode_test_rar_vint(2));
+    record.extend_from_slice(&encode_test_rar_vint(0));
+    record.extend_from_slice(&digest);
+    let mut out = encode_test_rar_vint(record.len() as u64);
+    out.extend_from_slice(&record);
+    out
+}
+
+fn build_test_rar_file_header_with_extra(
+    filename: &str,
+    common_flags_extra: u64,
+    data_size: u64,
+    unpacked_size: u64,
+    data_crc: Option<u32>,
+    extra: &[u8],
+) -> Vec<u8> {
     let file_flags: u64 = if data_crc.is_some() { 0x0004 } else { 0 };
     let mut type_body = Vec::new();
     type_body.extend_from_slice(&encode_test_rar_vint(file_flags));
@@ -519,11 +553,21 @@ fn build_test_rar_file_header(
     type_body.extend_from_slice(&encode_test_rar_vint(filename.len() as u64));
     type_body.extend_from_slice(filename.as_bytes());
 
+    // Field order is fixed by the format: type, flags, extra size (when the
+    // extra-area flag is set), data size, type body, extra area last.
+    let mut common_flags = 0x0002 | common_flags_extra;
+    if !extra.is_empty() {
+        common_flags |= 0x0001;
+    }
     let mut body = Vec::new();
     body.extend_from_slice(&encode_test_rar_vint(2));
-    body.extend_from_slice(&encode_test_rar_vint(0x0002 | common_flags_extra));
+    body.extend_from_slice(&encode_test_rar_vint(common_flags));
+    if !extra.is_empty() {
+        body.extend_from_slice(&encode_test_rar_vint(extra.len() as u64));
+    }
     body.extend_from_slice(&encode_test_rar_vint(data_size));
     body.extend_from_slice(&type_body);
+    body.extend_from_slice(extra);
 
     let header_size = body.len() as u64;
     let header_size_bytes = encode_test_rar_vint(header_size);
@@ -534,6 +578,63 @@ fn build_test_rar_file_header(
     result.extend_from_slice(&header_size_bytes);
     result.extend_from_slice(&body);
     result
+}
+
+const TEST_RAR4_SIG: [u8; 7] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
+
+/// RAR4's fixed-layout common header: `crc16, type, flags, header size`.
+///
+/// The CRC16 is left zero — the parser warns on a mismatch and carries on, which
+/// is deliberate recovery behaviour, so a fixture does not need to compute it.
+fn build_test_rar4_block(header_type: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+    let header_size = (7 + body.len()) as u16;
+    let mut out = Vec::with_capacity(header_size as usize);
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.push(header_type);
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(&header_size.to_le_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+fn build_test_rar4_main_header(is_first_volume: bool) -> Vec<u8> {
+    // VOLUME | NEW_NUMBERING, plus FIRST_VOLUME on volume 0.
+    let mut flags = 0x0001u16 | 0x0010;
+    if is_first_volume {
+        flags |= 0x0100;
+    }
+    let mut body = Vec::new();
+    body.extend_from_slice(&0u16.to_le_bytes()); // high_pos_av
+    body.extend_from_slice(&0u32.to_le_bytes()); // pos_av
+    build_test_rar4_block(0x73, flags, &body)
+}
+
+fn build_test_rar4_end_header(more_volumes: bool) -> Vec<u8> {
+    let flags: u16 = if more_volumes { 0x0001 } else { 0 };
+    build_test_rar4_block(0x7b, flags, &[])
+}
+
+/// A stored RAR4 file header. `unpack_version` 29 is what makes a split part's
+/// CRC32 describe that part's packed bytes rather than nothing at all.
+fn build_test_rar4_file_header(
+    filename: &str,
+    split_flags: u16,
+    packed_size: u32,
+    unpacked_size: u32,
+    data_crc: u32,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&packed_size.to_le_bytes());
+    body.extend_from_slice(&unpacked_size.to_le_bytes());
+    body.push(3); // host OS: Unix
+    body.extend_from_slice(&data_crc.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // mtime
+    body.push(29); // unpack version
+    body.push(0x30); // method: store
+    body.extend_from_slice(&(filename.len() as u16).to_le_bytes());
+    body.extend_from_slice(&0o644u32.to_le_bytes());
+    body.extend_from_slice(filename.as_bytes());
+    build_test_rar4_block(0x74, 0x8000 | split_flags, &body)
 }
 
 fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {

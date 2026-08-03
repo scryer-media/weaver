@@ -14,16 +14,16 @@ use super::barrier::{
     BarrierDemand, BarrierDrain, BarrierError, BarrierStep, BarrierTrigger, CoverageBarrier,
     CoveragePersist, DatabaseCoveragePersist, DestinationSync, RoutedWrite, WriteRefused,
 };
+use super::plan::{DirectSetPlan, ENVELOPE_SLOT_BYTES, ENVELOPE_SLOT_HALF};
 use super::restart::{
     CoverageRejection, DestinationProbe, ExpectedSet, ProbedDestination, coverage_skip_plan,
     refetch_floors, restore_job, restore_set, restore_set_with_probe,
 };
+use super::router::{CrcRuns, SparseImage};
 use super::snapshot::{
     CoverageSnapshot, DestinationClaim, DestinationExtent, SNAPSHOT_MAGIC, SNAPSHOT_SCHEMA_VERSION,
     SnapshotError, VolumeFloor, decode, encode,
 };
-use super::plan::{DirectSetPlan, ENVELOPE_SLOT_BYTES, ENVELOPE_SLOT_HALF};
-use super::router::{CrcRuns, SparseImage};
 use super::{ByteRanges, DirectStoreGate, parse_enabled};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, SegmentSpec};
@@ -1819,10 +1819,8 @@ fn crc_runs_refuse_every_shape_of_overlap() {
     }
 
     // Butting up against either edge is not an overlap, and must merge.
-    let mut runs = base(200, 50);
-    assert_eq!(runs.exact(100, 150).is_some(), true);
-    runs = base(50, 50);
-    assert!(runs.exact(50, 150).is_some());
+    assert!(base(200, 50).exact(100, 150).is_some());
+    assert!(base(50, 50).exact(50, 150).is_some());
 
     // A zero-length run is a no-op, not an insertion at offset zero.
     assert_eq!(base(0, 0), untouched);
@@ -1903,10 +1901,7 @@ fn envelope_offsets_split_each_volume_slot_into_a_head_and_a_tail() {
 
     // A run that does not fit its half slot is refused — that is the signal
     // the set carries more than headers and must demote.
-    assert_eq!(
-        plan.envelope_offset(0, ENVELOPE_SLOT_HALF - 8, 16, 0),
-        None
-    );
+    assert_eq!(plan.envelope_offset(0, ENVELOPE_SLOT_HALF - 8, 16, 0), None);
     assert_eq!(plan.envelope_offset(0, 0, ENVELOPE_SLOT_HALF + 1, 0), None);
     assert_eq!(
         plan.envelope_offset(0, ENVELOPE_SLOT_HALF, 1, 0),
@@ -1914,13 +1909,24 @@ fn envelope_offsets_split_each_volume_slot_into_a_head_and_a_tail() {
         "a head run beyond the half slot has nowhere to go"
     );
 
-    // Overflow refuses rather than wrapping into another volume's slot.
-    assert_eq!(plan.envelope_offset(u32::MAX, 0, 8, 0), None);
+    // Slot arithmetic is `u64` end to end, so even the top volume index
+    // addresses a real slot rather than wrapping.
+    assert_eq!(
+        plan.envelope_offset(u32::MAX, 0, 8, 0),
+        Some(u64::from(u32::MAX) * ENVELOPE_SLOT_BYTES)
+    );
+    // Offsets that would overflow refuse rather than wrapping into another
+    // volume's slot.
     assert_eq!(plan.envelope_offset(0, 0, u64::MAX, 0), None);
     assert_eq!(
-        plan.envelope_offset(0, u64::MAX, 8, u64::MAX),
+        plan.envelope_offset(0, u64::MAX, 8, 0),
         None,
-        "a tail run at the top of the space overflows its slot"
+        "a head run at the top of the space overflows its slot"
+    );
+    assert_eq!(
+        plan.envelope_offset(0, u64::MAX - 4, 8, u64::MAX - 8),
+        Some(ENVELOPE_SLOT_HALF + 4),
+        "a tail run stays inside its half slot however high the volume sits"
     );
 }
 
@@ -1935,7 +1941,10 @@ fn byte_ranges_report_exactly_the_sub_ranges_they_do_not_cover() {
     assert_eq!(ranges.missing(200, 100), vec![(200, 300)]);
     assert_eq!(ranges.missing(50, 100), vec![(50, 100)]);
     assert_eq!(ranges.missing(150, 100), vec![(200, 250)]);
-    assert_eq!(ranges.missing(0, 500), vec![(0, 100), (200, 300), (400, 500)]);
+    assert_eq!(
+        ranges.missing(0, 500),
+        vec![(0, 100), (200, 300), (400, 500)]
+    );
 
     // Degenerate windows contribute nothing rather than a zero-length gap.
     assert_eq!(ranges.missing(120, 0), vec![]);
@@ -1959,21 +1968,64 @@ fn member_partials_keep_their_directory_and_hostile_names_are_refused() {
         plan.member_partial_path("Silver.Horizon/S01E05.mkv"),
         Ok("Silver.Horizon/S01E05.mkv.direct.partial".to_string())
     );
+    // A backslash names a directory on every platform: Windows treats it as a
+    // separator, and everywhere else the same rewrite the extractor applies to
+    // its own destinations turns it into one. Both sides agree, which is what
+    // lets the partial be renamed onto the member's output path.
     assert_eq!(
-        plan.member_partial_path("Silver.Horizon\\S01E05.mkv")
-            .map(|path| path.contains('/')),
-        Ok(cfg!(windows)),
-        "backslashes are separators on Windows and ordinary name bytes elsewhere"
+        plan.member_partial_path("Silver.Horizon\\S01E05.mkv"),
+        Ok("Silver.Horizon/S01E05.mkv.direct.partial".to_string())
     );
     assert_eq!(
         plan.member_partial_path("./nested/./S01E05.mkv"),
         Ok("nested/S01E05.mkv.direct.partial".to_string())
     );
 
-    for hostile in ["", "../escape.mkv", "/absolute.mkv", "a/../../escape.mkv", "."] {
+    for hostile in [
+        "",
+        "../escape.mkv",
+        "/absolute.mkv",
+        "a/../../escape.mkv",
+        ".",
+    ] {
         assert!(
             plan.member_partial_path(hostile).is_err(),
             "{hostile} must not name a destination"
         );
     }
+}
+
+#[test]
+fn retiring_a_set_that_never_built_a_barrier_still_deletes_its_row() {
+    // A set can be resumed from a checkpoint written before a restart and then
+    // demote before its layout names a member again — `FormatMismatch` and
+    // `UnparsableVolume` both land there. That is exactly the case where the
+    // row exists and the in-memory controller does not, so the delete cannot be
+    // conditional on the controller (M1).
+    let mut set = super::set::DirectSet::new(JOB, envelope_plan());
+    let recorder = Recorder::default();
+    let mut persist = recorder.clone();
+
+    set.retire(&mut persist).unwrap();
+
+    assert_eq!(
+        recorder.ops(),
+        vec![Op::Delete {
+            set_name: "Silver.Horizon.S01E05".to_string()
+        }],
+        "the row is deleted by (job, set name) whether or not a barrier exists"
+    );
+}
+
+#[test]
+fn a_finalized_set_refuses_to_be_demoted() {
+    // The two terminal states are mutually exclusive, and finalization is the
+    // one that already renamed members onto their destinations. Demoting after
+    // it would delete completed output (B5).
+    let mut set = super::set::DirectSet::new(JOB, envelope_plan());
+    set.mark_finalized();
+    set.demote(super::router::DemotionReason::MultipleMembers);
+
+    assert!(set.is_finalized());
+    assert!(!set.is_demoted());
 }

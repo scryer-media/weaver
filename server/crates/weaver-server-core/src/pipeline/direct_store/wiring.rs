@@ -24,6 +24,19 @@
 //! **no completed-file row**, no whole-volume hashing, no archive re-probe and
 //! no incremental-extraction dispatch. Live reporting keeps using
 //! `FileAssembly`, which is source-space truth either way.
+//!
+//! Suppressing it *here* is not enough, because these are not the only callers:
+//!
+//! - `refresh_archive_state_for_completed_file` has nine callers — completion
+//!   checks, PAR2 merge, RAR finalization, the job service — every one of which
+//!   fires for a complete file whether or not routing suppressed its own call.
+//!   It carries the rule at its own entry instead.
+//! - `try_rar_extraction` is job-scoped and needs no guard: it dispatches from
+//!   the archive topology, and the topology's only non-test writer is
+//!   `try_update_archive_topology`, whose only non-test caller is the refresh
+//!   above. A direct set therefore never enters the topology at all.
+//! - The completed-file row has exactly one pipeline writer, in the conventional
+//!   file-complete path the routing seam returns before.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -166,6 +179,19 @@ pub(crate) enum DirectRouteOutcome {
     Demoted,
 }
 
+/// What the decode seam should do with one file's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectFileTarget {
+    /// A live set's source volume: route it.
+    Route { set_index: usize, volume_index: u32 },
+    /// A **finalized** set's source volume. The set's members are already at
+    /// their destinations and the volume was never a file, so a late duplicate
+    /// has nowhere to go: routing it would write through stale partial paths,
+    /// and writing it conventionally would materialize a volume the whole
+    /// point was never to create. It is dropped (B5).
+    Discard,
+}
+
 impl Pipeline {
     /// Admits the job's candidate RAR sets, once per job.
     ///
@@ -226,25 +252,30 @@ impl Pipeline {
         self.direct_store.sets.insert(job_id, sets);
     }
 
-    /// `(set index, volume index)` when this NZB file is a live direct set's
-    /// source volume. `None` once the set has demoted, which is what hands the
-    /// volume back to the conventional path, and `None` once it has finalized:
-    /// a finalized set's partials have already been renamed to their
-    /// destinations, so a late duplicate article routed into them would write
-    /// into completed output through a stale path (B5).
-    pub(crate) fn direct_route_target(&mut self, file_id: NzbFileId) -> Option<(usize, u32)> {
+    /// What to do with one NZB file's decoded bytes.
+    ///
+    /// `None` when the file is not a direct set's source volume, and `None`
+    /// once its set has demoted — which is exactly what hands the volume back
+    /// to the conventional path.
+    pub(crate) fn direct_route_target(&mut self, file_id: NzbFileId) -> Option<DirectFileTarget> {
         self.ensure_direct_sets(file_id.job_id);
         self.direct_store
             .sets_for(file_id.job_id)
             .iter()
             .enumerate()
             .find_map(|(index, set)| {
-                if set.is_demoted() || set.is_finalized() {
+                if set.is_demoted() {
                     return None;
                 }
-                set.plan()
-                    .volume_for_file(file_id.file_index)
-                    .map(|volume| (index, volume))
+                let volume_index = set.plan().volume_for_file(file_id.file_index)?;
+                Some(if set.is_finalized() {
+                    DirectFileTarget::Discard
+                } else {
+                    DirectFileTarget::Route {
+                        set_index: index,
+                        volume_index,
+                    }
+                })
             })
     }
 
@@ -291,12 +322,7 @@ impl Pipeline {
             let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
                 return DirectRouteOutcome::Demoted;
             };
-            set.note_volume_part_crc(
-                volume_index,
-                file_offset,
-                u64::from(decoded_size),
-                part_crc,
-            );
+            set.note_volume_part_crc(volume_index, file_offset, u64::from(decoded_size), part_crc);
             set.route(volume_index, file_offset, &bytes)
         };
         let spans = match routed {
@@ -551,13 +577,8 @@ impl Pipeline {
                 composed = format!("{composed:08x}"),
                 "direct source volume failed its yEnc whole-file CRC32"
             );
-            self.demote_direct_set(
-                job_id,
-                set_index,
-                DemotionReason::VolumeCrcMismatch,
-                None,
-            )
-            .await;
+            self.demote_direct_set(job_id, set_index, DemotionReason::VolumeCrcMismatch, None)
+                .await;
             return;
         }
 
@@ -566,7 +587,8 @@ impl Pipeline {
             .set_mut(job_id, set_index)
             .map(|set| set.note_volume_complete(volume_index));
         if let Some(Err(reason)) = outcome {
-            self.demote_direct_set(job_id, set_index, reason, None).await;
+            self.demote_direct_set(job_id, set_index, reason, None)
+                .await;
             return;
         }
 
@@ -735,13 +757,8 @@ impl Pipeline {
                 && let Err(error) = tokio::fs::create_dir_all(parent).await
             {
                 warn!(job_id = job_id.0, error = %error, "failed to create direct-store destination directory; demoting the set");
-                self.demote_direct_set(
-                    job_id,
-                    set_index,
-                    DemotionReason::FinalizationFailed,
-                    None,
-                )
-                .await;
+                self.demote_direct_set(job_id, set_index, DemotionReason::FinalizationFailed, None)
+                    .await;
                 return;
             }
             if let Err(error) = tokio::fs::rename(partial, destination).await {
@@ -751,13 +768,8 @@ impl Pipeline {
                     error = %error,
                     "failed to commit a direct-store member to its destination; demoting the set"
                 );
-                self.demote_direct_set(
-                    job_id,
-                    set_index,
-                    DemotionReason::FinalizationFailed,
-                    None,
-                )
-                .await;
+                self.demote_direct_set(job_id, set_index, DemotionReason::FinalizationFailed, None)
+                    .await;
                 return;
             }
             self.extracted_members
@@ -799,7 +811,7 @@ impl Pipeline {
     /// discarded and the volumes refetched, rather than reconstructed
     /// byte-exactly from the envelope (phase 5 owns that). Losing already-routed
     /// bytes to a refetch is the accepted cost.
-    async fn demote_direct_set(
+    pub(in crate::pipeline) async fn demote_direct_set(
         &mut self,
         job_id: JobId,
         set_index: usize,
@@ -809,14 +821,14 @@ impl Pipeline {
         let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
             return;
         };
-        // Either terminal state stops a demotion, and they are mutually
-        // exclusive so it has to be `||`: with `&&` a finalized set could be
+        // One cleanup per set, and never for a finalized one. The original
+        // guard read `is_demoted() && is_finalized()`, which two mutually
+        // exclusive states can never both satisfy, so a finalized set could be
         // flipped to `Demoted` and have its committed members deleted out from
-        // under a job that already counted them (B5).
-        if set.is_demoted() || set.is_finalized() {
+        // under a job that had already counted them (B5).
+        if !set.claim_demotion(reason) {
             return;
         }
-        set.demote(reason);
         let set_name = set.set_name().to_string();
         let working_dir = set.plan().working_dir.clone();
         let envelope = set.plan().envelope_path();
