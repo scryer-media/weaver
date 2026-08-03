@@ -30,6 +30,46 @@ struct RestoreSkipPlan {
     stats: RestoreSkipStats,
 }
 
+/// Whole segments that a contiguous byte floor covers, and the floor those
+/// segments actually account for.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct FloorCoveredSegments {
+    pub(crate) segments: Vec<SegmentId>,
+    /// Never a partial segment: the end offset of the last segment lying
+    /// entirely below the requested floor.
+    pub(crate) floor: u64,
+}
+
+/// Walks `segments` in NZB order and returns every segment lying entirely below
+/// `floor`, together with the contiguous byte floor those whole segments
+/// account for.
+///
+/// Clamping belongs to the caller. `build_restore_skip_plan` clamps its floor
+/// to the declared file size and the partial file's on-disk length before
+/// calling. Direct-store coverage floors deliberately do not: for a direct set
+/// the source volume has no file at all, and file length never implies coverage
+/// (plan 135, D6).
+pub(crate) fn segments_covered_by_floor(
+    file_id: NzbFileId,
+    segments: &[crate::jobs::model::SegmentSpec],
+    floor: u64,
+) -> FloorCoveredSegments {
+    let mut covered = FloorCoveredSegments::default();
+    let mut segment_end = 0u64;
+    for segment in segments {
+        segment_end = segment_end.saturating_add(segment.bytes as u64);
+        if segment_end > floor {
+            break;
+        }
+        covered.segments.push(SegmentId {
+            file_id,
+            segment_number: segment.ordinal,
+        });
+        covered.floor = segment_end;
+    }
+    covered
+}
+
 impl Pipeline {
     async fn restore_has_open_download_finalization(&self, job_id: JobId) -> bool {
         let events = match self
@@ -533,23 +573,13 @@ impl Pipeline {
                 stats.clamped_checkpoint_files += 1;
             }
 
-            let mut segment_end = 0u64;
-            let mut checkpoint_floor = 0u64;
-            for segment in &file_spec.segments {
-                segment_end = segment_end.saturating_add(segment.bytes as u64);
-                if segment_end > clamped_floor {
-                    break;
-                }
-
-                let segment_id = SegmentId {
-                    file_id,
-                    segment_number: segment.ordinal,
-                };
+            let covered = segments_covered_by_floor(file_id, &file_spec.segments, clamped_floor);
+            for segment_id in covered.segments {
                 if skip.insert(segment_id) {
                     stats.checkpoint_segments += 1;
                 }
-                checkpoint_floor = segment_end;
             }
+            let checkpoint_floor = covered.floor;
 
             stats.checkpoint_floor_bytes = stats
                 .checkpoint_floor_bytes

@@ -4,6 +4,7 @@ pub(crate) use archive::rar_state;
 mod capacity;
 mod completion;
 mod decode;
+mod direct_store;
 pub mod download;
 mod extraction;
 mod health;

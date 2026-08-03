@@ -2633,6 +2633,118 @@ impl Database {
         })
     }
 
+    /// Replaces the direct-store coverage checkpoint for one archive set
+    /// (plan 135, D6).
+    ///
+    /// One statement, one row, one encoded blob — the whole checkpoint,
+    /// including every per-volume floor. A barrier must cost the same number of
+    /// round trips on a 2 000-volume set as on a single-volume one, which is
+    /// why nothing here is normalized per volume.
+    ///
+    /// **Single writer per (job, set).** This is an unconditional replace: the
+    /// generation counter lives inside the blob, not in the predicate, so a
+    /// stale writer would overwrite a newer checkpoint with older floors and
+    /// nothing would notice. Exactly one pipeline owns a job's archive sets,
+    /// which is what makes that unreachable; a second concurrent writer would
+    /// need a generation guard in this statement first.
+    pub fn save_direct_coverage(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        snapshot: &[u8],
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let set_name = set_name.to_string();
+        let snapshot = snapshot.to_vec();
+        self.run_sql_blocking(async move {
+            let args = [
+                SqlArg::I64(job_id.0 as i64),
+                SqlArg::Text(set_name),
+                SqlArg::Bytes(snapshot),
+                SqlArg::I64(job_id.0 as i64),
+            ];
+            match datastore.engine() {
+                // The statement guards itself with FOR KEY SHARE, so it runs as
+                // a single autocommit statement rather than a redundant
+                // BEGIN/COMMIT round trip.
+                SqlEngine::Postgres => {
+                    SqlRuntime::execute(
+                        datastore.read_exec(),
+                        "INSERT INTO active_direct_coverage (job_id, set_name, snapshot)
+                         SELECT {}, {}, {}
+                         FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_direct_coverage_parent
+                         ON CONFLICT(job_id, set_name) DO UPDATE SET snapshot = excluded.snapshot",
+                        &args,
+                    )
+                    .await?;
+                }
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "save_direct_coverage", |tx| {
+                        let args = args.clone();
+                        Box::pin(async move {
+                            tx.execute(
+                                "INSERT INTO active_direct_coverage (job_id, set_name, snapshot)
+                                 SELECT {}, {}, {}
+                                 WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                                 ON CONFLICT(job_id, set_name) DO UPDATE SET snapshot = excluded.snapshot",
+                                &args,
+                            )
+                            .await
+                        })
+                    })
+                    .await?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Retires one archive set's direct-store coverage checkpoint. Repair over
+    /// checkpoint-covered output deletes the row and lets the next barrier
+    /// recreate coverage from scratch (plan 135, D8).
+    pub fn delete_direct_coverage(&self, job_id: JobId, set_name: &str) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let set_name = set_name.to_string();
+        self.run_sql_blocking(async move {
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "delete_direct_coverage", |tx| {
+                        let set_name = set_name.clone();
+                        Box::pin(async move {
+                            lock_active_job_for_write_tx(tx, job_id).await?;
+                            tx.execute(
+                                "DELETE FROM active_direct_coverage WHERE job_id = {} AND set_name = {}",
+                                &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(set_name)],
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // Deleting a gone job's child rows is already a no-op and is
+                // idempotent with a racing archive cascade, so the lock adds
+                // nothing: plain autocommit DELETE.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.read_exec(),
+                        "DELETE FROM active_direct_coverage WHERE job_id = {} AND set_name = {}",
+                        &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(set_name)],
+                    )
+                    .await
+                    .map(|_| ());
+                    crate::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "delete_direct_coverage",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
+        })
+    }
+
     pub fn save_detected_archive_identity(
         &self,
         job_id: JobId,

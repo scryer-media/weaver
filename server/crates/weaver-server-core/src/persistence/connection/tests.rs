@@ -2298,6 +2298,50 @@ async fn postgres_runtime_smoke_when_configured() {
     admin_pool.close().await;
 }
 
+/// Plan 135, D6: the direct-store coverage checkpoint is one replaced row per
+/// archive set. This is the Postgres twin of the sqlite roundtrip in
+/// `jobs::repository::tests`, so both engines are proven to upsert, read back
+/// and delete through the same three statements.
+#[tokio::test]
+async fn postgres_direct_coverage_roundtrip_when_configured() {
+    let Some((admin_pool, schema, target_url)) =
+        create_postgres_test_schema("postgres_direct_coverage").await
+    else {
+        return;
+    };
+
+    let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
+    let job_id = crate::jobs::ids::JobId(4242);
+    db.create_active_job(&postgres_sample_job(job_id)).unwrap();
+
+    db.save_direct_coverage(job_id, "Silver.Horizon.S01", &[1, 2, 3])
+        .unwrap();
+    db.save_direct_coverage(job_id, "Amber.Circuit", &[4, 5])
+        .unwrap();
+    let coverage = db.load_direct_coverage(job_id).unwrap();
+    assert_eq!(coverage.len(), 2);
+    assert_eq!(coverage["Silver.Horizon.S01"], vec![1, 2, 3]);
+
+    db.save_direct_coverage(job_id, "Silver.Horizon.S01", &[9, 9, 9, 9])
+        .unwrap();
+    let coverage = db.load_direct_coverage(job_id).unwrap();
+    assert_eq!(coverage.len(), 2, "a barrier replaces, it never appends");
+    assert_eq!(coverage["Silver.Horizon.S01"], vec![9, 9, 9, 9]);
+
+    db.delete_direct_coverage(job_id, "Silver.Horizon.S01")
+        .unwrap();
+    let coverage = db.load_direct_coverage(job_id).unwrap();
+    assert_eq!(coverage.len(), 1);
+    assert!(coverage.contains_key("Amber.Circuit"));
+
+    db.delete_active_job(job_id).unwrap();
+    assert!(db.load_direct_coverage(job_id).unwrap().is_empty());
+
+    drop(db);
+    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
+    admin_pool.close().await;
+}
+
 #[tokio::test]
 async fn postgres_reserve_next_job_id_is_unique_under_concurrency_when_configured() {
     let Some((admin_pool, schema, target_url)) =

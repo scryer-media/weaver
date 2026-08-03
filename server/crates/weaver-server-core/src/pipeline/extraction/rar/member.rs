@@ -143,7 +143,11 @@ pub(crate) struct RarExtractionOpenSelection {
     pub(crate) validated_password: Option<String>,
 }
 
-fn validate_sanitized_rar_member_path(member_name: &str) -> Result<PathBuf, String> {
+/// Rejects any path that would escape the directory it is joined onto: absolute
+/// paths, `..`, root and prefix components, Windows drive letters, embedded NUL,
+/// and the empty path. Shared with the direct-store coverage snapshot through
+/// `pipeline::extraction`'s re-export — one validator, one stance.
+pub(crate) fn validate_sanitized_rar_member_path(member_name: &str) -> Result<PathBuf, String> {
     if member_name.contains('\0') {
         return Err(format!("unsafe RAR member path: {member_name}"));
     }

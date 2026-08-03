@@ -614,6 +614,31 @@ impl Database {
         })
     }
 
+    /// Reads every direct-store coverage checkpoint for a job, keyed by archive
+    /// set name (plan 135, D6). One statement, one row per set — restart never
+    /// pays a per-volume round trip.
+    pub fn load_direct_coverage(
+        &self,
+        job_id: JobId,
+    ) -> Result<HashMap<String, Vec<u8>>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT set_name, snapshot FROM active_direct_coverage
+                 WHERE job_id = {}
+                 ORDER BY set_name",
+                &[SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?;
+            let mut coverage = HashMap::new();
+            for row in rows {
+                coverage.insert(row.text("set_name")?, row.bytes("snapshot")?);
+            }
+            Ok(coverage)
+        })
+    }
+
     pub fn load_deleted_volume_statuses(
         &self,
         job_id: JobId,
