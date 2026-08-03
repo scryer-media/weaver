@@ -362,10 +362,16 @@ impl Pipeline {
     /// is the whole answer.
     ///
     /// A volume is included only when its PAR2 identity resolves unambiguously
-    /// through the same name candidates live verification binds on. One that
-    /// does not resolve is left out, and the pass then reads it off disk, finds
-    /// nothing, and reports it missing — which demotes the set through the
-    /// damage path rather than silently verifying a set nobody could name.
+    /// through the same name candidates live verification binds on. An
+    /// unresolved one is skipped **here**, but that skip is not the safety net:
+    /// a half-bound set would have the pass read its remaining volumes off a
+    /// disk they are not on and report them missing, and
+    /// [`Self::demote_direct_sets_with_par2_damage`] could not even attribute
+    /// that damage back to the set, because attribution is keyed by the very
+    /// binding that failed. The net is
+    /// [`Self::demote_unbindable_direct_sets`], which runs *before* the pass and
+    /// demotes any live set with an unbindable volume outright, so what reaches
+    /// here is either a fully bound set or no set at all (B2).
     pub(crate) fn direct_par2_overlay(&self, job_id: JobId) -> Option<DirectPar2Overlay> {
         let mut volumes = Vec::new();
         let mut virtual_volumes = Vec::new();
@@ -378,10 +384,15 @@ impl Pipeline {
             // answer a verifier's reads with holes and report damage that is not
             // there. Finalization is gated on the job's verdict for exactly this
             // reason, so a set can only be finalized here on a *re*-verify, and
-            // then the ordinary file access is the honest answer.
+            // then the ordinary file access is the honest answer — see
+            // `forgive_finalized_direct_volumes` for what makes it honest.
             if set.is_demoted() || set.is_finalized() {
                 continue;
             }
+            // One `virtual_volumes` call for the whole set, so the shared
+            // partial-path map is built once rather than once per volume (nit).
+            let mut lengths = std::collections::BTreeMap::new();
+            let mut bindings = HashMap::new();
             for (volume_index, file_index) in &set.plan().volumes {
                 let file_id = NzbFileId {
                     job_id,
@@ -397,18 +408,24 @@ impl Pipeline {
                     .map(|file| file.received_bytes())
                     .unwrap_or(0);
                 let len = received.max(set.volume_coverage(*volume_index).end());
-                let lengths = std::collections::BTreeMap::from([(*volume_index, len)]);
-                let mut built = set.virtual_volumes(&lengths);
-                let Some(mut volume) = built.pop() else {
+                lengths.insert(*volume_index, len);
+                bindings.insert(*volume_index, (*file_index, binding.par2_file_id));
+            }
+            for mut volume in set.virtual_volumes(&lengths) {
+                let Some((file_index, par2_file_id)) = bindings.get(&volume.volume_index).copied()
+                else {
                     continue;
                 };
-                volume.volume_index = *file_index;
+                // Re-keyed from the set's own volume index to the job's file
+                // index: a job can hold several sets, each numbering its volumes
+                // from zero, and one provider answers for all of them.
+                volume.volume_index = file_index;
                 virtual_volumes.push(volume);
                 volumes.push(super::par2_access::VirtualPar2Volume {
-                    par2_file_id: binding.par2_file_id,
-                    volume_index: *file_index,
+                    par2_file_id,
+                    volume_index: file_index,
                 });
-                sets.insert(binding.par2_file_id, set_index);
+                sets.insert(par2_file_id, set_index);
             }
         }
         if volumes.is_empty() {
@@ -419,6 +436,162 @@ impl Pipeline {
             volumes,
             sets,
         })
+    }
+
+    /// Whether the authoritative PAR2 pass may run over `job_id`'s direct sets
+    /// yet, or has to wait for their payload (plan 135, D5; H3).
+    ///
+    /// Deliberately the same shape as the completion gate's own
+    /// `par2_primary_payload_ready`: **every live set's volumes have finished
+    /// downloading, or nothing more is coming**. A set that is still receiving
+    /// articles reads its outstanding ranges as holes, and PAR2 cannot tell a
+    /// hole from corruption — so a pass run early would report damage that is
+    /// only a download in progress, demote a healthy set and hand the repairer
+    /// volumes it would have to rebuild from scratch. The second half of the
+    /// disjunction is what keeps this from waiting forever: once the download
+    /// pipeline has drained, the holes are permanent and the verdict is real.
+    ///
+    /// `true` for every job with no live direct set, which is every conventional
+    /// job — the gate is unchanged for them by construction.
+    pub(crate) fn direct_sets_ready_for_authoritative_par2(&self, job_id: JobId) -> bool {
+        let waiting = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| !set.is_demoted() && !set.is_finalized() && !set.all_volumes_complete());
+        !waiting || !self.job_has_pending_download_pipeline_work(job_id)
+    }
+
+    /// Demotes every live direct set of `job_id` holding a source volume that
+    /// cannot be bound, unambiguously, to a PAR2 description (B2).
+    ///
+    /// The overlay is keyed by PAR2 file id, so an unbound volume is one the
+    /// pass cannot be told about *and* one whose verdict cannot be attributed
+    /// back to its set. Leaving it out — which is all
+    /// [`Self::direct_par2_overlay`] can do on its own — produces the worst of
+    /// both: the pass reads that volume off a disk it is not on and calls it
+    /// missing, `demote_direct_sets_with_par2_damage` finds no set to blame, and
+    /// the repairer is handed a virtual volume to write into. A set with *every*
+    /// volume unbound does not even produce an overlay, so the damage path is
+    /// skipped entirely.
+    ///
+    /// Demoting up front is what makes the pass's world binary: either a fully
+    /// bound virtual set, or real files on disk.
+    pub(crate) async fn demote_unbindable_direct_sets(&mut self, job_id: JobId) -> bool {
+        // Without a parsed recovery set nothing can bind, and demoting every
+        // direct set of a job whose PAR2 has simply not arrived yet would undo
+        // the whole feature.
+        if self.par2_set(job_id).is_none() {
+            return false;
+        }
+        let unbindable: Vec<(usize, u32)> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| !set.is_demoted() && !set.is_finalized())
+            .filter_map(|(set_index, set)| {
+                set.plan()
+                    .volumes
+                    .iter()
+                    .find(|(_, file_index)| {
+                        self.resolve_live_par2_binding(NzbFileId {
+                            job_id,
+                            file_index: **file_index,
+                        })
+                        .is_none()
+                    })
+                    .map(|(volume_index, _)| (set_index, *volume_index))
+            })
+            .collect();
+        if unbindable.is_empty() {
+            return false;
+        }
+        for (set_index, volume_index) in unbindable {
+            warn!(
+                job_id = job_id.0,
+                volume_index,
+                "a direct set's source volume has no unambiguous PAR2 identity; demoting \
+                 so the authoritative pass reads a real file instead of a volume it \
+                 cannot name"
+            );
+            self.demote_direct_set(job_id, set_index, DemotionReason::Par2Unbindable, None)
+                .await;
+        }
+        true
+    }
+
+    /// Rewrites `Missing` to `Complete` for every source volume of a
+    /// **finalized** direct set, before the caller counts damage (B1).
+    ///
+    /// Exactly the eager-delete precedent, and for exactly the same reason: the
+    /// bytes were verified and the file is legitimately absent. A finalized set
+    /// passed the whole-member CRC32 gate on every member *and* the job's own
+    /// PAR2 verdict — finalization is gated on that verdict — and then renamed
+    /// its partials to their destinations and deleted its envelopes. Nothing on
+    /// disk answers for its source volumes afterwards, and nothing should: they
+    /// were never written and never will be.
+    ///
+    /// Without this, any *later* pass over the same job — a conventional set's
+    /// extraction failing after the direct set finalized is enough — reports
+    /// every finalized volume missing and either fails the job as unrepairable
+    /// or has the repairer reconstruct source volumes onto disk that the job
+    /// already finished without.
+    ///
+    /// Live and demoted sets are deliberately untouched: a live set's volumes
+    /// are served virtually and its verdict is real, and a demoted set's are
+    /// materializing or being refetched, so missing means missing.
+    ///
+    /// Returns the number of missing slices forgiven.
+    pub(crate) fn forgive_finalized_direct_volumes(
+        &self,
+        job_id: JobId,
+        verification: &mut weaver_par2::VerificationResult,
+    ) -> u32 {
+        if self.par2_set(job_id).is_none() {
+            return 0;
+        }
+        let finalized: HashSet<weaver_par2::FileId> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .filter(|set| set.is_finalized() && !set.is_demoted())
+            .flat_map(|set| set.plan().volumes.values().copied())
+            .filter_map(|file_index| {
+                let file_id = NzbFileId { job_id, file_index };
+                // Belt and braces: the set says the volume is its own, and
+                // `is_direct_source_file` is the rule every other suppression
+                // point reads, so the two cannot drift apart here.
+                if !self.is_direct_source_file(file_id) {
+                    return None;
+                }
+                self.resolve_live_par2_binding(file_id)
+                    .map(|binding| binding.par2_file_id)
+            })
+            .collect();
+        if finalized.is_empty() {
+            return 0;
+        }
+
+        let mut forgiven = 0u32;
+        for file in &mut verification.files {
+            if !matches!(file.status, weaver_par2::verify::FileStatus::Missing)
+                || !finalized.contains(&file.file_id)
+            {
+                continue;
+            }
+            forgiven = forgiven.saturating_add(file.missing_slice_count);
+            file.status = weaver_par2::verify::FileStatus::Complete;
+            file.valid_slices.fill(true);
+            file.missing_slice_count = 0;
+        }
+        if forgiven == 0 {
+            return 0;
+        }
+        verification.total_missing_blocks =
+            verification.total_missing_blocks.saturating_sub(forgiven);
+        verification.refresh_repairability();
+        forgiven
     }
 
     /// Demotes every direct set the PAR2 pass found damage on, and reports
@@ -438,6 +611,14 @@ impl Pipeline {
         let Some(overlay) = self.direct_par2_overlay(job_id) else {
             return false;
         };
+        // H3's second guard, paired with
+        // [`Self::direct_sets_ready_for_authoritative_par2`]: while articles are
+        // still arriving, a set's outstanding ranges read as holes and PAR2
+        // calls them damage. The caller is supposed to have deferred already, so
+        // this is the belt to that braces — and it is scoped the same way, so a
+        // set whose bytes are genuinely never coming still demotes and still
+        // gets materialized for the conventional repair path.
+        let payload_settled = !self.job_has_pending_download_pipeline_work(job_id);
         let mut damaged: Vec<(usize, String)> = Vec::new();
         for file in &verification.files {
             if matches!(
@@ -466,6 +647,20 @@ impl Pipeline {
                 .set(job_id, set_index)
                 .is_some_and(|set| !set.is_demoted() && !set.is_finalized())
             {
+                continue;
+            }
+            if !payload_settled
+                && !self
+                    .direct_store
+                    .set(job_id, set_index)
+                    .is_some_and(DirectSet::all_volumes_complete)
+            {
+                debug!(
+                    job_id = job_id.0,
+                    volume = %filename,
+                    "PAR2 reported damage on a direct set that is still downloading; \
+                     leaving it direct until its volumes complete"
+                );
                 continue;
             }
             warn!(
@@ -1089,6 +1284,47 @@ impl Pipeline {
             .unwrap_or_default();
         set.assert_not_extraction_owned(&extracted_members);
 
+        // D1's tolerance, and strictly **before** the commit loop below (M4).
+        // The extraction reads the *virtual volumes*, which are the envelopes
+        // overlaid with the members' `.direct.partial`s — so every one of those
+        // files has to still be where the provider says it is. Running it after
+        // the renames pointed the provider's partial map at paths that had just
+        // been renamed away, turning every stored member's extent into a hole:
+        // it happened to work only while a tolerated member's header walk and
+        // decode never read through a stored extent, and its failure mode was a
+        // demotion that could no longer reconstruct, i.e. a full redownload.
+        //
+        // Nothing here needs the commit to have happened: the overwrite refusal
+        // compares `plan().member_output_path` against the tolerated
+        // destinations, which is derived from the layout and not from the
+        // filesystem. It still has to run before the envelopes are deleted.
+        match self.extract_tolerated_members(job_id, set_index).await {
+            Ok(extracted) => {
+                for name in extracted {
+                    self.extracted_members
+                        .entry(job_id)
+                        .or_default()
+                        .insert(name);
+                }
+            }
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    error = %error,
+                    "failed to extract a tolerated member from the virtual volumes; demoting the set"
+                );
+                self.demote_direct_set(
+                    job_id,
+                    set_index,
+                    DemotionReason::ToleratedExtractionFailed,
+                    None,
+                )
+                .await;
+                return;
+            }
+        }
+
         // A failure here leaves the set neither committed nor abandoned: its
         // partials still hold every verified byte, but nothing downstream will
         // ever look at them again, so the job would sit in `Extracting`
@@ -1143,39 +1379,6 @@ impl Pipeline {
                 .entry(job_id)
                 .or_default()
                 .insert(name.clone());
-        }
-
-        // D1's tolerance, and strictly after the stored members are committed:
-        // the extraction reads the *virtual volumes*, whose member extents are
-        // served out of the `.direct.partial`s — so it has to run before the
-        // envelopes are deleted, and its own reads never touch a stored member's
-        // destination because the tolerated set is disjoint from it by
-        // construction (asserted in `extract_tolerated_members`).
-        match self.extract_tolerated_members(job_id, set_index).await {
-            Ok(extracted) => {
-                for name in extracted {
-                    self.extracted_members
-                        .entry(job_id)
-                        .or_default()
-                        .insert(name);
-                }
-            }
-            Err(error) => {
-                warn!(
-                    job_id = job_id.0,
-                    set_name = %set_name,
-                    error = %error,
-                    "failed to extract a tolerated member from the virtual volumes; demoting the set"
-                );
-                self.demote_direct_set(
-                    job_id,
-                    set_index,
-                    DemotionReason::ToleratedExtractionFailed,
-                    None,
-                )
-                .await;
-                return;
-            }
         }
 
         for envelope in &envelopes {
@@ -1233,10 +1436,32 @@ impl Pipeline {
         }
         let set_name = set.set_name().to_string();
 
-        // Every stored member's committed destination, so the assertion below
+        // The ordering invariant this extraction depends on, stated where it is
+        // depended on (M4). The provider serves every stored member's extent out
+        // of its `.direct.partial`; the commit loop renames those away and
+        // records the member in `extracted_members` as it goes. Running after it
+        // therefore hands the header walk and the decode a volume whose stored
+        // extents are all holes, and the failure path costs a full redownload.
+        debug_assert!(
+            !self
+                .extracted_members
+                .get(&job_id)
+                .is_some_and(|committed| {
+                    set.router
+                        .member_partials()
+                        .iter()
+                        .any(|(_, name, _)| committed.contains(*name))
+                }),
+            "a stored member of {set_name} was committed before its set's tolerated \
+             members were extracted; the virtual volumes no longer resolve"
+        );
+
+        // Every stored member's *eventual* destination, so the assertion below
         // compares resolved paths rather than raw header names — two names can
         // sanitize onto one path, which is exactly the collision that would let
-        // a tolerated member overwrite verified direct output.
+        // a tolerated member overwrite verified direct output. Derived from the
+        // layout, not from the filesystem, which is what lets this run before
+        // the commit loop renames anything (M4).
         let mut stored_outputs: HashSet<PathBuf> = HashSet::new();
         for (_, name, _) in set.router.member_partials() {
             if let Ok(destination) = set.plan().member_output_path(name) {

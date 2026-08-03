@@ -112,6 +112,16 @@ pub(crate) enum DemotionReason {
     /// routed bytes and hands them to the conventional repair path, which is
     /// exactly the shape a job with no direct set would have taken.
     Par2Damaged,
+    /// One of the set's source volumes could not be bound, unambiguously, to a
+    /// PAR2 description in the job's recovery set.
+    ///
+    /// An unbound volume cannot be served through the virtual-volume overlay —
+    /// the overlay is keyed by PAR2 file id — so the authoritative pass would
+    /// read it off a disk it is not on, report it missing, and hand the repairer
+    /// a file to write into that does not exist. Demoting before the pass runs
+    /// is what keeps that pass looking at either a *fully* bound virtual set or
+    /// at real files, never at a half-bound one (B2).
+    Par2Unbindable,
     /// A member riding D1's tolerance could not be extracted from the virtual
     /// volumes at finalization. The stored members are correct; the tolerated
     /// one is not produced, so the set is rebuilt the ordinary way.
@@ -199,6 +209,7 @@ impl DemotionReason {
             Self::MemberIneligible(MemberIneligibility::MalformedChain) => "member_malformed_chain",
             Self::ToleranceBudgetExceeded => "tolerance_budget",
             Self::Par2Damaged => "par2_damaged",
+            Self::Par2Unbindable => "par2_unbindable",
             Self::ToleratedExtractionFailed => "tolerated_extraction_failed",
             Self::HoldsBudgetExceeded => "holds_budget",
             Self::ConflictingVolumeFacts => "conflicting_volume_facts",
@@ -1670,10 +1681,16 @@ fn tolerable_member_budget(
     reason: IneligibilityReason,
 ) -> Option<ToleratedMemberBudget> {
     match reason {
-        // The library's classification order has already ruled out encrypted,
-        // solid, directory, redirection and malformed-chain members by the time
-        // it reaches `Compressed`, so this arm carries D1's precondition rather
-        // than restating it.
+        // Ordering, stated exactly: `classify` reaches `Compressed` only after
+        // the parse-level malformed reason, directory, redirection, encrypted
+        // and solid have all been ruled out, so this arm may rely on those five
+        // and on nothing else. The chain's *size* and *completeness* checks —
+        // the `ExceedsDeclaredSize`, `SizeMismatch` and `MissingUnpackedSize`
+        // malformed reasons — come after it and are therefore **not** implied
+        // here: a member reaching this arm is not proven to be a well-formed
+        // chain. That is why both declared totals stay `Option` and why the
+        // caller re-checks the budget at every parse instead of waiting for
+        // `totals_final`.
         IneligibilityReason::Compressed {
             packed_bytes,
             unpacked_bytes,

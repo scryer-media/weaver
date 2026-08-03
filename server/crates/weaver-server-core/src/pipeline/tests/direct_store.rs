@@ -812,6 +812,10 @@ struct DamagedGateOutcome {
     /// direct gate they are what demotion reconstructed, and the two must agree
     /// byte for byte or the reconstruction fabricated something.
     volume_files: Vec<Option<Vec<u8>>>,
+    /// Whether the gate re-armed its own completion check on the way out of the
+    /// demotion, sampled before anything else drives the job (M5). Without it
+    /// the job's next move waits on the 30 s reconcile sweep.
+    rearmed_after_demotion: bool,
 }
 
 async fn run_damaged_par2_gate(
@@ -845,6 +849,10 @@ async fn run_damaged_par2_gate(
     )
     .await;
     let sets_after_verification = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    // Sampled here, before anything else drives the job: the gate has just
+    // returned from its demotion, and whether it queued its own next check is
+    // the difference between "one loop turn" and "the 30 s reconcile sweep".
+    let rearmed_after_demotion = pipeline.pending_completion_checks.contains(&job_id);
     // Snapshotted before the job reaches a terminal state, because a failed job
     // takes its working directory with it. This is the interesting moment
     // anyway: the direct gate's volumes here are what *demotion reconstructed*,
@@ -881,6 +889,7 @@ async fn run_damaged_par2_gate(
             .ok()
             .or_else(|| std::fs::read(working_dir.join(member_name)).ok()),
         volume_files,
+        rearmed_after_demotion,
     };
     (outcome, sets_after_verification)
 }
@@ -924,6 +933,12 @@ async fn par2_damage_a_direct_set_cannot_see_demotes_it_and_ends_where_the_conve
         "PAR2 verification must catch damage the RAR and yEnc gates cannot see, on a \
          volume that only ever existed virtually, and demote — repairing a virtual \
          volume is phase 6 — got {direct_sets}"
+    );
+    assert!(
+        direct.rearmed_after_demotion,
+        "the demotion must re-arm the completion check on its way out (M5): the \
+         materialized volumes are already on disk, and leaving the job's next move \
+         to the 30 s reconcile sweep is a stall, not a wait"
     );
     // Non-vacuity, two ways. First: the same fixture *without* the damaged byte
     // runs clean through this very harness, so the outcome below is caused by
@@ -3262,5 +3277,429 @@ async fn a_solid_ineligible_member_demotes_rather_than_riding_the_tolerance() {
         shape.contains("Demoted(MemberIneligible(Solid))"),
         "a solid member must demote on its own reason, not on the tolerance budget, \
          got {shape}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 wave 2 review fixes: what a *later* PAR2 pass sees (B1), what an
+// unbindable volume does (B2), and what a mid-download set is protected from
+// (H3).
+// ---------------------------------------------------------------------------
+
+/// Runs a par2-bearing direct job up to its verification verdict and hands the
+/// **live** pipeline back, so a test can keep driving the completion gate.
+///
+/// Live verification is on, as it is in production: a direct set never enters
+/// the archive topology, so `clean_par2_integrity_gate` reads `None` for it and
+/// the completion gate would take its repair-first branch — which materializes
+/// every live set — rather than letting one finalize. The live short-circuit is
+/// what reaches a clean verdict for a par2-bearing direct job.
+async fn direct_job_after_verification(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    par2_bytes: &[u8],
+) -> (Pipeline, PathBuf) {
+    let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(true);
+
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", volumes, par2_bytes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article(&mut pipeline, job_id, volumes, file_index, segment_number).await;
+    }
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    (pipeline, working_dir)
+}
+
+fn no_volume_file(working_dir: &std::path::Path, volumes: &[(String, Vec<u8>)]) -> bool {
+    volumes
+        .iter()
+        .all(|(filename, _)| !working_dir.join(filename).exists())
+}
+
+#[tokio::test]
+async fn a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass() {
+    // B1. Finalization is what makes a direct set's source volumes permanently
+    // absent: the partials are renamed to their destinations and the envelopes
+    // are deleted. Every *later* pass over the same job — and one conventional
+    // member failing extraction after the direct set finalized is enough to
+    // cause one, because `par2_validation_needed` is already false so the
+    // repair-first branch is skipped — would otherwise read those volumes off a
+    // disk they were never on and call the job unrepairable.
+    let member_name = "Silver.Horizon.S01E21.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 197) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let par2_bytes = par2_index_over_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41051);
+    let (mut pipeline, working_dir) =
+        direct_job_after_verification(&temp_dir, job_id, &volumes, &par2_bytes).await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        sets.contains("Finalized"),
+        "the set must have finalized on the job's PAR2 verdict for this test to \
+         mean anything, got {sets}"
+    );
+    assert!(
+        no_volume_file(&working_dir, &volumes),
+        "finalization must not have written a source volume"
+    );
+
+    // A conventional member's extraction fails afterwards. That is the whole
+    // trigger: `has_crc_failures` re-opens the completion gate on a job whose
+    // PAR2 is already marked verified.
+    pipeline.failed_extractions.insert(
+        job_id,
+        ["Amber.Trail.S01E01.mkv".to_string()].into_iter().collect(),
+    );
+    let verifies_before = pipeline.par2_authoritative_verify_calls;
+    pipeline.check_job_completion(job_id).await;
+
+    assert!(
+        pipeline.par2_authoritative_verify_calls > verifies_before,
+        "non-vacuity: the later authoritative pass must actually have run, \
+         calls={verifies_before} -> {}",
+        pipeline.par2_authoritative_verify_calls
+    );
+    let status = job_status_for_assert(&pipeline, job_id);
+    if let Some(JobStatus::Failed { error, .. }) = &status {
+        panic!("a finalized direct set must not fail a later PAR2 pass, got: {error}");
+    }
+    assert!(
+        no_volume_file(&working_dir, &volumes),
+        "the later pass must not have had the repairer reconstruct source volumes \
+         the job already finished without; status={status:?}"
+    );
+    assert!(
+        pipeline
+            .failed_extractions
+            .get(&job_id)
+            .is_none_or(HashSet::is_empty),
+        "and the conventional failure must still have been cleared for its retry, \
+         exactly as a clean PAR2 verdict does with the gate off"
+    );
+}
+
+#[tokio::test]
+async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pass() {
+    // B2. The overlay is keyed by PAR2 file id, so a volume whose identity does
+    // not resolve to exactly one description can neither be served virtually nor
+    // be blamed for the damage the pass then reports about it. Before this fix
+    // the set stayed direct and the repairer was handed a virtual volume.
+    let member_name = "Silver.Horizon.S01E22.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 193) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let par2_bytes = par2_index_over_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41052);
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // The index first, so the ambiguity is provable before anything acts on it —
+    // and so the PAR2 identity pass, which rewrites every file's identity as the
+    // set parses, cannot undo it.
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    // Volume 0's identity now carries a canonical name that is *another*
+    // volume's PAR2 name, so its candidate set spans two descriptions of the
+    // same recovery set and `resolve_live_par2_binding` refuses to pick one.
+    // This is the shape a rewritten identity produces in the wild; the recovery
+    // set itself stays completely honest, which is what lets the job finish
+    // conventionally below.
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .file_identities
+        .insert(
+            0,
+            crate::jobs::record::ActiveFileIdentity {
+                file_index: 0,
+                source_filename: volumes[0].0.clone(),
+                current_filename: volumes[0].0.clone(),
+                canonical_filename: Some(volumes[1].0.clone()),
+                classification: None,
+                classification_source: crate::jobs::record::FileIdentitySource::Par2,
+            },
+        );
+    assert!(
+        pipeline
+            .resolve_live_par2_binding(NzbFileId {
+                job_id,
+                file_index: 0
+            })
+            .is_none(),
+        "non-vacuity: volume 0's name candidates must match two descriptions, so no \
+         single PAR2 identity can be chosen for it"
+    );
+    assert!(
+        pipeline
+            .resolve_live_par2_binding(NzbFileId {
+                job_id,
+                file_index: 1
+            })
+            .is_some(),
+        "and the rest of the set must still bind, so the demotion below is about the \
+         one volume rather than about a job with no recovery set"
+    );
+
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        sets.contains("Demoted(Par2Unbindable)"),
+        "a set holding a volume PAR2 cannot name must leave direct mode before the \
+         pass, on its own reason, got {sets}"
+    );
+    // Demotion materialized the volumes from the set's own routed bytes, which
+    // is what the pass then reads — nothing repaired a virtual volume.
+    for (filename, bytes) in &volumes {
+        assert_eq!(
+            std::fs::read(working_dir.join(filename)).ok().as_deref(),
+            Some(bytes.as_slice()),
+            "{filename} must have been materialized byte-exactly by the demotion"
+        );
+    }
+
+    // The ambiguity was a property of the *identity*, and the fixture's rewritten
+    // canonical name is a lie about which file this is — one the conventional
+    // path would go on acting on long after it has served its purpose here.
+    // Dropped now that the demotion it existed to cause has happened, so what
+    // the rest of this test exercises is an ordinary conventional finish over
+    // the materialized volumes.
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .file_identities
+        .remove(&0);
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    let produced = std::fs::read(output_root.join(member_name))
+        .ok()
+        .or_else(|| std::fs::read(working_dir.join(member_name)).ok());
+    assert_eq!(
+        produced.as_deref(),
+        Some(payload.as_slice()),
+        "and the job must finish conventionally from the materialized volumes; \
+         status={:?}",
+        job_status_for_assert(&pipeline, job_id)
+    );
+}
+
+#[tokio::test]
+async fn a_mid_download_direct_set_is_neither_verified_against_nor_demoted_for_its_holes() {
+    // H3. A set that is still receiving articles has holes where the rest of its
+    // payload will go, and PAR2 cannot tell a hole from corruption. Both guards
+    // are asserted: the completion gate's readiness predicate, and the demotion
+    // helper that must not act on such a verdict even if one reaches it.
+    let member_name = "Silver.Horizon.S01E23.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 181) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let par2_bytes = par2_index_over_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41053);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    // On, as in production: it is the live short-circuit that reaches a clean
+    // verdict for a par2-bearing direct set (a direct set never enters the
+    // archive topology, so the clean-integrity gate reads `None` for it).
+    pipeline.live_par2.set_enabled(true);
+
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // The index first, so a recovery set exists to verify against, then every
+    // article except the last volume's tail.
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if (file_index, segment_number) == (volumes.len() as u32 - 1, 1) {
+            continue;
+        }
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+
+    assert!(
+        !pipeline.direct_sets_ready_for_authoritative_par2(job_id),
+        "a set whose last volume is still downloading is not ready to be verified"
+    );
+
+    // The verdict such a pass would reach: every one of the set's volumes
+    // reported missing, which is what a hole looks like from PAR2's side.
+    let overlay = pipeline
+        .direct_par2_overlay(job_id)
+        .expect("the live set's volumes bind and are served virtually");
+    let verification = weaver_par2::VerificationResult {
+        files: overlay
+            .volumes
+            .iter()
+            .map(|volume| weaver_par2::verify::FileVerification {
+                file_id: volume.par2_file_id,
+                filename: format!("virtual volume {}", volume.volume_index),
+                status: weaver_par2::verify::FileStatus::Missing,
+                valid_slices: vec![false; 4],
+                missing_slice_count: 4,
+            })
+            .collect(),
+        recovery_blocks_available: 0,
+        total_missing_blocks: 4 * overlay.volumes.len() as u32,
+        repairable: weaver_par2::verify::Repairability::NotNeeded,
+    };
+    assert!(
+        !pipeline
+            .demote_direct_sets_with_par2_damage(job_id, &verification)
+            .await,
+        "hole-damage on a set that is still downloading must not demote it"
+    );
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        !sets.contains("Demoted"),
+        "the set must still be routing, got {sets}"
+    );
+    assert!(
+        no_volume_file(&working_dir, &volumes),
+        "and nothing may have materialized or repaired a volume file"
+    );
+
+    // The last article lands: the same set is now verifiable, and the gate lets
+    // the pass run.
+    let verifies_before = pipeline.par2_authoritative_verify_calls;
+    submit_volume_article(&mut pipeline, job_id, &volumes, volumes.len() as u32 - 1, 1).await;
+    assert!(
+        pipeline.direct_sets_ready_for_authoritative_par2(job_id),
+        "once every volume has completed the set is ready to be verified"
+    );
+    let settled = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        pipeline.par2_authoritative_verify_calls > verifies_before
+            || pipeline.live_par2.metrics().full_verify_skips > 0
+            || settled.contains("Finalized"),
+        "and verification must have proceeded normally rather than being deferred \
+         forever; sets={settled}"
+    );
+    assert!(
+        no_volume_file(&working_dir, &volumes),
+        "a clean par2-bearing direct job still never writes a source volume"
+    );
+}
+
+#[tokio::test]
+async fn a_tolerated_member_sharing_a_volume_with_a_routed_extent_extracts_before_the_commit() {
+    // M4. The tolerated extraction reads the *virtual volumes*: the envelopes
+    // overlaid with each direct-routed member's `.direct.partial`. The commit
+    // loop renames those partials to their destinations, so running the
+    // extraction afterwards pointed the provider's map at paths that no longer
+    // existed and turned every stored extent into a hole. It only survived
+    // because a RAR header walk seeks over data areas rather than reading them;
+    // the moment a read crosses a stored extent the extraction fails, and its
+    // failure path is a demotion that can no longer reconstruct — a full
+    // redownload.
+    //
+    // The shape here is the one that makes the dependency real: two volumes the
+    // stored member is split across, with the tolerated member's header and data
+    // sitting *after* a routed extent inside the last of them, so the walk
+    // traverses the region the partial owns to reach it. The ordering itself is
+    // held by a `debug_assert!` in `extract_tolerated_members`, which this test
+    // exercises with a stored member present.
+    let store_name = "Silver.Horizon.S01E24.mkv";
+    let extra_name = "Silver.Horizon.S01E24.nfo";
+    let store_payload: Vec<u8> = (0..30_000u32).map(|index| (index % 251) as u8).collect();
+    let extra_payload: Vec<u8> = (0..200u32).map(|index| (index % 89) as u8).collect();
+    let volumes = store_set_with_extra_member(
+        store_name,
+        &store_payload,
+        extra_name,
+        &extra_payload,
+        2,
+        ToleranceExtra::Blake2OnlyStore,
+    );
+    let arrivals = in_order_arrivals(volumes.len());
+
+    let conventional = run_multi_member_gate(
+        DirectStoreGate::Disabled,
+        JobId(41054),
+        &[store_name, extra_name],
+        &volumes,
+        &arrivals,
+    )
+    .await;
+    let direct = run_multi_member_gate(
+        DirectStoreGate::Enabled,
+        JobId(41055),
+        &[store_name, extra_name],
+        &volumes,
+        &arrivals,
+    )
+    .await;
+
+    assert!(
+        !direct.volume_file_seen,
+        "the mixed set still routes: no source volume may appear on disk"
+    );
+    assert_eq!(
+        conventional.members[0].1.as_deref(),
+        Some(store_payload.as_slice()),
+        "the conventional extractor should reproduce the routed member"
+    );
+    assert_eq!(
+        conventional.members[1].1.as_deref(),
+        Some(extra_payload.as_slice()),
+        "the conventional extractor should reproduce the tolerated member"
+    );
+    assert_eq!(
+        (direct.members, direct.status),
+        (conventional.members, conventional.status),
+        "the tolerated member must be extracted through virtual volumes whose stored \
+         extents still resolve, and both members must be byte-identical to the \
+         conventional extractor"
     );
 }

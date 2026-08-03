@@ -2277,7 +2277,9 @@ fn provider_fixture_with_extents(covered: ByteRanges, with_extents: bool) -> Pro
             volume_index: 0,
             envelope,
             extents,
-            partials: [(0u32, partial_a), (1u32, partial_b)].into_iter().collect(),
+            partials: std::sync::Arc::new(
+                [(0u32, partial_a), (1u32, partial_b)].into_iter().collect(),
+            ),
             covered,
             envelope_covered,
             len: total as u64,
@@ -2859,6 +2861,69 @@ fn a_hole_reads_as_a_short_file_and_never_as_zeros() {
     assert!(
         !weaver_par2::verify_full_hash(&par2_set, &file_id, &access).unwrap_or(true),
         "a volume with a hole must not verify"
+    );
+}
+
+#[test]
+fn an_interior_hole_costs_the_sequential_reader_everything_after_it() {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir().unwrap();
+    // A hole in the middle of member A, with the whole rest of the volume —
+    // member A's tail, the envelope gap, member B and the trailer — present.
+    let hole_at = (PROVIDER_HEADER + 64) as u64;
+    let hole_len = 32u64;
+    let total =
+        (PROVIDER_HEADER + PROVIDER_MEMBER_A + PROVIDER_GAP + PROVIDER_MEMBER_B + PROVIDER_TRAILER)
+            as u64;
+    let mut covered = ByteRanges::new();
+    covered.insert(0, hole_at);
+    covered.insert(hole_at + hole_len, total - hole_at - hole_len);
+    let fixture = provider_fixture(covered);
+    let par2_set = descriptor_only_par2_set("silver.horizon.part01.rar", &fixture.conventional);
+    let (access, file_id) = virtual_file_access(&fixture, &par2_set, dir.path());
+
+    // The sequential reader is a stream: it stops at the *first* hole, so every
+    // byte after an interior gap is unreachable through it even though both the
+    // partial and the envelope still hold those bytes.
+    let mut streamed = Vec::new();
+    access
+        .open_sequential_reader(&file_id)
+        .expect("the volume is registered")
+        .expect("a direct volume answers with a reader")
+        .read_to_end(&mut streamed)
+        .expect("a hole is end-of-file, not an error");
+    assert_eq!(
+        streamed.len() as u64,
+        hole_at,
+        "the sequential sweep must stop at the first hole, not skip it"
+    );
+
+    // Addressed directly, the bytes past the gap are all there — which is what
+    // makes the paragraph above a property of the *stream*, not of the data.
+    let after = access
+        .read_file_range(&file_id, hole_at + hole_len, 128)
+        .expect("a read that starts inside coverage succeeds");
+    assert_eq!(
+        after,
+        fixture.conventional[(hole_at + hole_len) as usize..(hole_at + hole_len) as usize + 128],
+        "the bytes after an interior hole are present and readable when addressed"
+    );
+
+    // The consequence, stated so phase 6 inherits it rather than rediscovers it:
+    // any sweep that consumes the sequential reader — the no-IFSC whole-file
+    // MD5, and PAR2's batched slice pass — sees a file that ends at the first
+    // hole, so every slice after an interior gap is reported damaged even where
+    // the bytes are intact. Wave 2 only produces a verdict, so the cost is a
+    // demotion that materializes and refetches slightly more than it had to.
+    // Phase 6 sizes a *repair* from that same count, and a repair sized from
+    // "damaged" rather than "absent" would rebuild good slices: it must either
+    // read holes per slice through the ranged path, or subtract the hole ranges
+    // from the damage set before planning.
+    let hole_slice = (hole_at + hole_len) / par2_set.slice_size;
+    assert!(
+        hole_slice + 1 < total / par2_set.slice_size,
+        "the fixture must have slices *after* the interior hole for that claim to bite"
     );
 }
 

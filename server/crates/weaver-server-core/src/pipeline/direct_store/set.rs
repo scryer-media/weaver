@@ -284,8 +284,19 @@ impl DirectSet {
     pub(crate) fn ready_to_finalize(&self) -> bool {
         !self.is_demoted()
             && !self.is_finalized()
-            && self.complete_volumes.len() == self.router.plan().volumes.len()
+            && self.all_volumes_complete()
             && self.router.all_members_verified()
+    }
+
+    /// Every source volume the set plans has finished downloading.
+    ///
+    /// The payload half of [`Self::ready_to_finalize`], on its own: a PAR2
+    /// verdict over a set that is still receiving articles reads its not-yet
+    /// downloaded ranges as holes, and a hole is indistinguishable from damage
+    /// at that layer. Callers that must not confuse "not here yet" with
+    /// "corrupt" ask this first (H3).
+    pub(crate) fn all_volumes_complete(&self) -> bool {
+        self.complete_volumes.len() == self.router.plan().volumes.len()
     }
 
     /// Marks a source volume complete and returns whatever the confirming parse
@@ -581,19 +592,26 @@ impl DirectSet {
         volume_lengths: &BTreeMap<u32, u64>,
     ) -> Vec<VirtualVolume> {
         let working_dir = &self.router.plan().working_dir;
-        let partials: std::collections::HashMap<u32, std::path::PathBuf> = self
-            .router
-            .member_partials()
-            .into_iter()
-            .map(|(member_id, _, partial)| (member_id, working_dir.join(partial)))
-            .collect();
+        // Built once and shared, never cloned per volume: every volume of a set
+        // resolves member ids against the *same* partial paths, and a set with
+        // `v` volumes and `m` members would otherwise pay `v * m` path clones
+        // every time a provider is assembled — which is once per authoritative
+        // PAR2 pass, per demotion sweep and per tolerated extraction (nit).
+        let partials: std::sync::Arc<std::collections::HashMap<u32, std::path::PathBuf>> =
+            std::sync::Arc::new(
+                self.router
+                    .member_partials()
+                    .into_iter()
+                    .map(|(member_id, _, partial)| (member_id, working_dir.join(partial)))
+                    .collect(),
+            );
         volume_lengths
             .iter()
             .map(|(volume_index, len)| VirtualVolume {
                 volume_index: *volume_index,
                 envelope: self.router.plan().envelope_path(*volume_index),
                 extents: self.router.volume_member_extents(*volume_index),
-                partials: partials.clone(),
+                partials: std::sync::Arc::clone(&partials),
                 covered: self.volume_coverage(*volume_index),
                 envelope_covered: self.envelope_coverage(*volume_index),
                 len: *len,

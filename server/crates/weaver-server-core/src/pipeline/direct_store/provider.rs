@@ -47,6 +47,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use weaver_unrar::{ReadSeek, VolumeProvider, VolumeProviderError};
 
@@ -113,7 +114,10 @@ pub(crate) struct VirtualVolume {
     /// `map_physical_range` produces it that way.
     pub(crate) extents: Vec<MemberExtent>,
     /// Absolute `.direct.partial` path per member id.
-    pub(crate) partials: HashMap<u32, PathBuf>,
+    ///
+    /// Shared rather than owned: every volume of a set resolves member ids
+    /// against the same map, and the provider only ever reads it.
+    pub(crate) partials: Arc<HashMap<u32, PathBuf>>,
     /// Physical ranges that were actually placed. Everything else is a hole.
     pub(crate) covered: ByteRanges,
     /// Of `covered`, the physical ranges the **envelope file** received.

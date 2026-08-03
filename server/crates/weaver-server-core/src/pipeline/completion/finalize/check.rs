@@ -884,6 +884,19 @@ impl Pipeline {
                 retained_suspect_blocks, "retained suspect eagerly-deleted volumes in damage count"
             );
         }
+        // Plan 135, D5 (B1): the same forgiveness the verify path applies. This
+        // pass is reachable with a finalized direct set whenever `par2_verified`
+        // was cleared underneath it — an extension asking for PAR re-entry does
+        // exactly that — and a finalized set's source volumes are absent by
+        // design.
+        let forgiven_direct_blocks =
+            self.forgive_finalized_direct_volumes(job_id, &mut outcome.verification);
+        if forgiven_direct_blocks > 0 {
+            info!(
+                job_id = job_id.0,
+                forgiven_direct_blocks, "excluded finalized direct-store volumes from damage count"
+            );
+        }
 
         outcome.missing_blocks = outcome.verification.total_missing_blocks;
         self.recompute_volume_safety_from_verification(job_id, &outcome.verification);
@@ -960,14 +973,17 @@ impl Pipeline {
                 };
 
                 // The scan walked a directory the direct volumes are absent
-                // from, so it left every one of them `unresolved` — and an
-                // unresolved id is what the placement machinery later tries to
-                // rename. A direct volume is at its declared name by
-                // construction (its identity is resolved *by* that name, in
-                // `direct_par2_overlay`), and there is no file to move anyway,
-                // so it is recorded `exact`: the same classification the scan
-                // would have produced for a volume sitting correctly on disk,
-                // and the one classification that emits no filesystem action.
+                // from, so it left every one of them `unresolved`. Reclassifying
+                // them `exact` changes no behaviour today — the plan's only
+                // consumers are `PlacementFileAccess::from_plan`,
+                // `apply_placement_plan` and the plan log, and all three read
+                // `swaps` and `renames` only, never `exact` or `unresolved`. It
+                // is kept as defence: a direct volume *is* at its declared name
+                // by construction (its identity is resolved by that name, in
+                // `direct_par2_overlay`) and has no file to move, so the moment
+                // anything does start reading these two lists it must see the
+                // classification a correctly placed volume would have had, not
+                // the one that invites a rename of a file that is not there.
                 let direct_ids: HashSet<weaver_par2::FileId> = direct
                     .volumes
                     .iter()
@@ -1023,6 +1039,24 @@ impl Pipeline {
             info!(
                 job_id = job_id.0,
                 retained_suspect_blocks, "retained suspect eagerly-deleted volumes in damage count"
+            );
+        }
+        // Plan 135, D5 (B1). A *finalized* direct set's source volumes were
+        // never written and never will be: its partials are at their
+        // destinations and its envelopes are gone, and the whole-member CRC32
+        // gates plus this job's own earlier PAR2 verdict are what let it commit
+        // in the first place. Every later pass — and one conventional set
+        // failing extraction after the direct set finalized is enough to cause
+        // one — would otherwise report those volumes missing and either fail the
+        // job as unrepairable or have the repairer write source volumes the job
+        // already finished without. Same justification, same shape and the same
+        // position in the pass as `apply_eager_delete_exclusions` above.
+        let forgiven_direct_blocks =
+            self.forgive_finalized_direct_volumes(job_id, &mut verification);
+        if forgiven_direct_blocks > 0 {
+            info!(
+                job_id = job_id.0,
+                forgiven_direct_blocks, "excluded finalized direct-store volumes from damage count"
             );
         }
 
@@ -2284,6 +2318,36 @@ impl Pipeline {
 
             if let Some(par2_set) = par2_set {
                 let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
+                // Plan 135, D5: two direct-store preconditions for *any*
+                // authoritative pass below, whichever branch it takes. Both are
+                // no-ops for a job with no live direct set, so a conventional
+                // job reaches the same code it always did.
+                //
+                // H3: a set that is still receiving articles has holes where its
+                // outstanding ranges will go, and PAR2 cannot tell a hole from
+                // corruption — so the pass waits for the same thing the branch
+                // above waits for in `par2_primary_payload_ready`: the payload,
+                // or the download pipeline draining. `needs_completion_repair_
+                // evaluation` can be true well before either (another set's
+                // extraction failing is enough), which is how a healthy
+                // mid-download set would otherwise be demoted for damage that is
+                // just bytes in flight.
+                if !self.direct_sets_ready_for_authoritative_par2(job_id) {
+                    debug!(
+                        job_id = job_id.0,
+                        "deferring PAR2 verification — a direct set is still downloading"
+                    );
+                    self.schedule_job_completion_check(job_id);
+                    return;
+                }
+                // B2: a volume with no unambiguous PAR2 identity cannot be put
+                // behind the overlay *or* attributed back to its set afterwards,
+                // so it leaves direct mode before the pass rather than being
+                // discovered as unattributable damage inside it.
+                if self.demote_unbindable_direct_sets(job_id).await {
+                    self.schedule_job_completion_check(job_id);
+                    return;
+                }
                 if authoritative_par2_verification_needed {
                     // The repairer reads and *writes* volume files through
                     // `DiskFileAccess`, which a virtual volume has none of. This
@@ -2293,6 +2357,10 @@ impl Pipeline {
                     // rather than a live path: any set still routing here
                     // materializes first, and the repairer sees real files.
                     if self.demote_live_direct_sets_for_par2_repair(job_id).await {
+                        // Re-armed rather than left to the 30 s reconcile
+                        // sweep: the job is one pass away from its verdict and
+                        // the materialized volumes are already on disk (M5).
+                        self.schedule_job_completion_check(job_id);
                         return;
                     }
                     let repair_analysis = match self
@@ -2631,6 +2699,10 @@ impl Pipeline {
                     .demote_direct_sets_with_par2_damage(job_id, &verification)
                     .await
                 {
+                    // Re-armed rather than left to the 30 s reconcile sweep:
+                    // demotion has already materialized (or queued the refetch
+                    // of) the volumes, so the next pass can run immediately (M5).
+                    self.schedule_job_completion_check(job_id);
                     return;
                 }
                 let damaged = verification.total_missing_blocks;
