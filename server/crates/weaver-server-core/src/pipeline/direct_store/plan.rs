@@ -25,6 +25,10 @@ pub(crate) enum AdmissionRefusal {
     Empty,
 }
 
+/// Extension of a damaged volume's repair scratch (plan 135, D8). Matched as a
+/// suffix by the restart sweep, exactly as `.envelope` is.
+pub(crate) const REPAIR_SUFFIX: &str = ".repair";
+
 /// Appends `suffix` to the final component of a working-directory-relative
 /// path, shortening the component's stem so the result stays inside
 /// [`weaver_model::files::DOWNLOAD_FILENAME_MAX_BYTES`].
@@ -210,6 +214,39 @@ impl DirectSetPlan {
 
     pub(crate) fn holds_scratch_path(&self) -> PathBuf {
         self.working_dir.join(self.holds_scratch_relative_path())
+    }
+
+    /// Working-directory-relative **repair scratch** for one source volume
+    /// (plan 135, D8's *repair while still direct*).
+    ///
+    /// A PAR2 repair needs a file to write recovered slices into, and a virtual
+    /// volume is not one. Phase 6 materializes *only the damaged volumes* into
+    /// these files, repairs them there, routes the repaired spans back through
+    /// the router, and deletes them again — clean volumes stay virtual and no
+    /// direct output is deleted.
+    ///
+    /// Deliberately **not** the volume's own `.partNN.rar` name: that path is
+    /// what a demotion materializes into, and a leftover half-repaired file
+    /// sitting there would be read as a downloaded volume by every conventional
+    /// path. This suffix is swept at restart alongside envelopes and partials.
+    pub(crate) fn repair_relative_path(&self, volume_index: u32) -> String {
+        weaver_model::files::path_component_with_suffix(
+            &crate::jobs::working_dir::sanitize_dirname(&self.set_name),
+            &format!(".vol{volume_index:05}{REPAIR_SUFFIX}"),
+        )
+    }
+
+    pub(crate) fn repair_path(&self, volume_index: u32) -> PathBuf {
+        self.working_dir
+            .join(self.repair_relative_path(volume_index))
+    }
+
+    /// Every repair scratch file the set can own, in volume order.
+    pub(crate) fn repair_paths(&self) -> Vec<PathBuf> {
+        self.volumes
+            .keys()
+            .map(|volume_index| self.repair_path(*volume_index))
+            .collect()
     }
 
     /// Every envelope file the set can own, in volume order.

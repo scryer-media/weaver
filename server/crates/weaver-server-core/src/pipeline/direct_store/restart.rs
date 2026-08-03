@@ -752,6 +752,14 @@ impl Pipeline {
             owned.insert(plan.holds_scratch_path());
             for volume_index in plan.volumes.keys() {
                 owned.insert(plan.envelope_path(*volume_index));
+                // Repair scratch (D8), owned but never *claimed*: a repair that
+                // was interrupted mid-flight left a materialized volume whose
+                // spans were never routed back, and the coverage row it would
+                // have been read against was deleted before the repair started.
+                // The bytes are meaningless without it, so the file is swept and
+                // the set repairs again from its own routed bytes if the damage
+                // is still there.
+                owned.insert(plan.repair_path(*volume_index));
             }
         }
         for set in result.sets.iter() {

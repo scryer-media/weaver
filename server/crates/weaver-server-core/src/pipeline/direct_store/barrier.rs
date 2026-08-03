@@ -74,6 +74,11 @@ pub(crate) enum BarrierDemand {
     PhaseChange,
     Demotion,
     Finalization,
+    /// A PAR2 repair rewrote bytes the deleted row used to claim (plan 135, D8).
+    /// Demanded immediately after the repaired spans are routed, so the window
+    /// where the set has no durable coverage at all is as short as the code can
+    /// make it rather than one 5 s timer.
+    RepairRecreate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -753,16 +758,43 @@ impl CoverageBarrier {
         })
     }
 
-    /// Deletes the set's checkpoint row. Used before repairing over
-    /// checkpoint-covered output and on demotion (D8): deliberately lossy, and
-    /// bounded by one barrier interval.
+    /// Deletes the durable row and **keeps** the in-memory controller
+    /// (plan 135, D8's repair-while-direct).
+    ///
+    /// The difference from [`Self::retire`] is the whole of D8's distinction
+    /// between its two transitions. A demotion is leaving: the destinations are
+    /// about to be deleted, so every extent and floor is meaningless and keeping
+    /// one would let the next barrier write a checkpoint strictly worse than
+    /// none. A repair is *staying*: the destinations keep existing, at the same
+    /// offsets, holding better bytes than before — so the controller's account of
+    /// what is on disk is still exactly right, and it is also what the hybrid
+    /// provider reads to answer the re-verify.
+    ///
+    /// What must not survive is the **row**, because a crash mid-repair would
+    /// otherwise leave floors claiming bytes that are half-rewritten. Clearing
+    /// the committed generation is what makes the next barrier write a fresh row
+    /// from scratch rather than an increment of a row that is gone.
+    pub(crate) fn delete_committed_row<P: CoveragePersist + ?Sized>(
+        &mut self,
+        persist: &mut P,
+    ) -> Result<(), BarrierError> {
+        persist
+            .delete(self.job_id, &self.set_name)
+            .map_err(BarrierError::Persist)?;
+        self.committed_generation = 0;
+        Ok(())
+    }
+
+    /// Deletes the set's checkpoint row **and retires the controller with it**.
+    /// Demotion's half of D8's pair; [`Self::delete_committed_row`] is the
+    /// repair's.
     ///
     /// The controller is reset to a fresh one, not merely un-generationed.
-    /// Repair rewrites the very bytes the destination claims and demotion
-    /// deletes the destinations outright, so every extent, floor and touched
-    /// entry retire with the row. Anything kept would let the next barrier
-    /// write a checkpoint claiming extents in files that no longer contain
-    /// them — a checkpoint strictly worse than none, because restart trusts it.
+    /// Demotion deletes the destinations outright, so every extent, floor and
+    /// touched entry retire with the row. Anything kept would let the next
+    /// barrier write a checkpoint claiming extents in files that no longer
+    /// contain them — a checkpoint strictly worse than none, because restart
+    /// trusts it.
     ///
     /// A retired controller is therefore unregistered: the caller re-registers
     /// its volumes and destinations before routing resumes, and until it does,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::pipeline::direct_store::wiring::DirectPar2Resolution;
 use crate::runtime::fs as runtime_fs;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -17,6 +18,27 @@ const DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 fn default_par2_repair_memory_limit_bytes() -> usize {
     DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
+}
+
+/// Missing blocks [`Pipeline::apply_direct_damage_adjustments`] moved out of (or
+/// deliberately left in) a PAR2 verdict's damage count.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct DamageAdjustments {
+    /// Eagerly-deleted, CRC-verified RAR volumes excused as `Complete`.
+    pub(crate) skipped_blocks: u32,
+    /// Eagerly-deleted volumes that were *not* excused, because something still
+    /// holds them suspect.
+    pub(crate) retained_suspect_blocks: u32,
+    /// Source volumes of a finalized direct set, excused as `Complete`.
+    pub(crate) forgiven_direct_blocks: u32,
+}
+
+impl DamageAdjustments {
+    pub(crate) fn any(self) -> bool {
+        self.skipped_blocks > 0
+            || self.retained_suspect_blocks > 0
+            || self.forgiven_direct_blocks > 0
+    }
 }
 
 fn configured_par2_repair_memory_limit_bytes() -> usize {
@@ -513,6 +535,18 @@ impl Pipeline {
         }
 
         Self::fold_integrity_gate(gate, self.direct_rar_integrity_gate(job_id))
+    }
+
+    /// The operator's PAR2 repair workspace ceiling, for the one repair seam
+    /// that does not go through `Par2Repairer` (plan 135, D8).
+    ///
+    /// Direct-store's repair-while-direct drives `plan_repair`/`execute_repair`
+    /// itself, because the repairer is filesystem-bound and a virtual volume has
+    /// no file to give it. Sharing the knob is the point: the limit has to mean
+    /// the same thing whichever seam spends it, and a method on `Pipeline` is
+    /// how that crosses the module boundary without re-exporting the parser.
+    pub(in crate::pipeline) fn par2_repair_memory_limit_bytes(&self) -> usize {
+        configured_par2_repair_memory_limit_bytes()
     }
 
     /// Job-wide fold. The **strongest** contribution wins, which is why a
@@ -1099,6 +1133,12 @@ impl Pipeline {
                 debug!(
                     virtual_volumes = direct.volumes.len(),
                     sequential_opens = counters.sequential_opens(),
+                    // Plan 135 phase 6: volumes whose interior holes made the
+                    // sequential sweep a lie, so the pass took the per-slice
+                    // ranged path instead. Non-zero means the job paid for an
+                    // accurate damage count, which is what a repair is sized
+                    // from.
+                    sequential_refusals = counters.sequential_refusals(),
                     ranged_reads = counters.ranged_reads(),
                     "authoritative PAR2 pass read a direct set's volumes virtually"
                 );
@@ -1116,36 +1156,26 @@ impl Pipeline {
         };
         Self::log_placement_plan(job_id, &placement_plan);
 
-        let (skipped_blocks, retained_suspect_blocks) =
-            self.apply_eager_delete_exclusions(job_id, &mut verification);
-        if skipped_blocks > 0 {
+        let adjustments = self.apply_direct_damage_adjustments(job_id, &mut verification);
+        if adjustments.skipped_blocks > 0 {
             info!(
                 job_id = job_id.0,
-                skipped_blocks, "excluded eagerly-deleted CRC-verified volumes from damage count"
+                skipped_blocks = adjustments.skipped_blocks,
+                "excluded eagerly-deleted CRC-verified volumes from damage count"
             );
         }
-        if retained_suspect_blocks > 0 {
+        if adjustments.retained_suspect_blocks > 0 {
             info!(
                 job_id = job_id.0,
-                retained_suspect_blocks, "retained suspect eagerly-deleted volumes in damage count"
+                retained_suspect_blocks = adjustments.retained_suspect_blocks,
+                "retained suspect eagerly-deleted volumes in damage count"
             );
         }
-        // Plan 135, D5 (B1). A *finalized* direct set's source volumes were
-        // never written and never will be: its partials are at their
-        // destinations and its envelopes are gone, and the whole-member CRC32
-        // gates plus this job's own earlier PAR2 verdict are what let it commit
-        // in the first place. Every later pass — and one conventional set
-        // failing extraction after the direct set finalized is enough to cause
-        // one — would otherwise report those volumes missing and either fail the
-        // job as unrepairable or have the repairer write source volumes the job
-        // already finished without. Same justification, same shape and the same
-        // position in the pass as `apply_eager_delete_exclusions` above.
-        let forgiven_direct_blocks =
-            self.forgive_finalized_direct_volumes(job_id, &mut verification);
-        if forgiven_direct_blocks > 0 {
+        if adjustments.forgiven_direct_blocks > 0 {
             info!(
                 job_id = job_id.0,
-                forgiven_direct_blocks, "excluded finalized direct-store volumes from damage count"
+                forgiven_direct_blocks = adjustments.forgiven_direct_blocks,
+                "excluded finalized direct-store volumes from damage count"
             );
         }
 
@@ -1159,6 +1189,37 @@ impl Pipeline {
         }
 
         Ok((verification, placement_plan))
+    }
+
+    /// What [`Pipeline::apply_direct_damage_adjustments`] moved, so each caller
+    /// can log it in its own voice.
+    ///
+    /// Counts rather than a bool: "how many blocks were forgiven" is the number
+    /// the operator needs to tell a job that was never damaged from one whose
+    /// damage was excused.
+    pub(crate) fn apply_direct_damage_adjustments(
+        &self,
+        job_id: JobId,
+        verification: &mut weaver_par2::VerificationResult,
+    ) -> DamageAdjustments {
+        let (skipped_blocks, retained_suspect_blocks) =
+            self.apply_eager_delete_exclusions(job_id, verification);
+        // Plan 135, D5 (B1). A *finalized* direct set's source volumes were
+        // never written and never will be: its partials are at their
+        // destinations and its envelopes are gone, and the whole-member CRC32
+        // gates plus this job's own earlier PAR2 verdict are what let it commit
+        // in the first place. Every later pass — and one conventional set
+        // failing extraction after the direct set finalized is enough to cause
+        // one — would otherwise report those volumes missing and either fail the
+        // job as unrepairable or have the repairer write source volumes the job
+        // already finished without. Same justification, same shape and the same
+        // position in the pass as `apply_eager_delete_exclusions` above.
+        let forgiven_direct_blocks = self.forgive_finalized_direct_volumes(job_id, verification);
+        DamageAdjustments {
+            skipped_blocks,
+            retained_suspect_blocks,
+            forgiven_direct_blocks,
+        }
     }
 
     /// Records the job as PAR2-verified and releases any direct set that was
@@ -2437,14 +2498,40 @@ impl Pipeline {
                     self.schedule_job_completion_check(job_id);
                     return;
                 }
+                // Plan 135, phase 6 (D8). A live direct set reaches this branch
+                // as a matter of course, not as defence in depth: it contributes
+                // nothing to `clean_par2_integrity_gate` — a direct set never
+                // enters the archive topology — so a `None` gate sends it
+                // straight here, damaged or not. The repairer cannot read a
+                // virtual volume, so before it is allowed to force a whole-set
+                // materialization the sets get one direct-aware verdict of their
+                // own: damage repairs in place, and a clean verdict skips the
+                // repairer so the ordinary verify path below can record it.
+                let mut run_par2_repairer = authoritative_par2_verification_needed;
                 if authoritative_par2_verification_needed {
+                    match self
+                        .resolve_direct_sets_before_par2_repairer(
+                            job_id,
+                            Arc::clone(&par2_set),
+                            working_dir.clone(),
+                        )
+                        .await
+                    {
+                        DirectPar2Resolution::Repaired => {
+                            self.schedule_job_completion_check(job_id);
+                            return;
+                        }
+                        DirectPar2Resolution::Clean => run_par2_repairer = false,
+                        DirectPar2Resolution::Unresolved => {}
+                    }
+                }
+                if run_par2_repairer {
                     // The repairer reads and *writes* volume files through
-                    // `DiskFileAccess`, which a virtual volume has none of. This
-                    // branch is only reached after an extraction already failed
-                    // — which a still-direct set cannot have caused, since it
-                    // never enters the extractor — so it is defence in depth
-                    // rather than a live path: any set still routing here
-                    // materializes first, and the repairer sees real files.
+                    // `DiskFileAccess`, which a virtual volume has none of. So
+                    // any set still routing here — one whose repair refused, or
+                    // one whose damage is not the reason the job is in this
+                    // branch — materializes first, and the repairer sees real
+                    // files.
                     if self.demote_live_direct_sets_for_par2_repair(job_id).await {
                         // Re-armed rather than left to the 30 s reconcile
                         // sweep: the job is one pass away from its verdict and
@@ -2777,18 +2864,23 @@ impl Pipeline {
                         return;
                     }
                 };
-                // Plan 135, phase 5 wave 2: verification verdicts only. Damage
-                // on a virtual volume has nothing to repair *into* — the bytes
-                // live in a member's partial and an envelope, and a recovered
-                // slice belongs to neither — so the set demotes, materializes
-                // its volumes from its own routed bytes and refetches what it
-                // could not verify. The job then re-runs this gate over real
-                // files and the conventional repair path owns it.
+                // Plan 135, phase 6 (D8). Damage on a virtual volume has nothing
+                // to repair *into* — the bytes live in a member's partial and an
+                // envelope, and a recovered slice belongs to neither — so the
+                // set materializes **only its damaged volumes** into scratch,
+                // repairs those while every clean volume is still read
+                // virtually, routes the repaired spans back through the router
+                // and throws the scratch away. The set stays direct and loses no
+                // output. Every refusal along the way falls back to wave 2's
+                // whole-set demotion, which materializes everything and hands
+                // the job to the conventional repair path. Either way the job's
+                // next move is this gate again, over bytes that changed.
                 if self
-                    .demote_direct_sets_with_par2_damage(job_id, &verification)
+                    .resolve_direct_sets_with_par2_damage(job_id, &verification)
                     .await
                 {
-                    // Re-armed rather than left to the 30 s reconcile sweep:
+                    // Re-armed rather than left to the 30 s reconcile sweep: the
+                    // repaired bytes are already in the partials, or the
                     // demotion has already materialized (or queued the refetch
                     // of) the volumes, so the next pass can run immediately (M5).
                     self.schedule_job_completion_check(job_id);

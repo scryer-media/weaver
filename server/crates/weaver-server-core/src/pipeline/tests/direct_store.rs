@@ -153,7 +153,52 @@ async fn submit_volume_article_of(
     segment_number: u32,
     articles: usize,
 ) {
-    let (filename, bytes) = &volumes[file_index as usize];
+    submit_volume_article_indexed_of(
+        pipeline,
+        job_id,
+        volumes,
+        file_index,
+        file_index,
+        segment_number,
+        articles,
+    )
+    .await;
+}
+
+/// [`submit_volume_article`] for a set whose volumes are **not** NZB files
+/// `0..n-1`: `ordinal` picks the bytes out of `volumes`, `file_index` is what
+/// the job knows the file as. The two are the same number only when nothing
+/// precedes the set in the NZB.
+async fn submit_volume_article_indexed(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    ordinal: u32,
+    file_index: u32,
+    segment_number: u32,
+) {
+    submit_volume_article_indexed_of(
+        pipeline,
+        job_id,
+        volumes,
+        ordinal,
+        file_index,
+        segment_number,
+        2,
+    )
+    .await;
+}
+
+async fn submit_volume_article_indexed_of(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    ordinal: u32,
+    file_index: u32,
+    segment_number: u32,
+    articles: usize,
+) {
+    let (filename, bytes) = &volumes[ordinal as usize];
     let (start, end) = article_extent(bytes.len(), segment_number, articles);
     submit_decoded_segment(
         pipeline,
@@ -5105,5 +5150,1202 @@ async fn a_restored_last_volume_that_cannot_reconfirm_demotes_by_name() {
     assert_eq!(
         member, None,
         "an unconfirmed volume's set must not commit a member it could not prove"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 — repair while still direct (plan 135, D8)
+// ---------------------------------------------------------------------------
+
+/// A PAR2 index over the set's decoded volume bytes that also carries
+/// **recovery blocks**, so the damage it describes can actually be repaired.
+///
+/// `build_test_par2_index_for_files` stops at descriptions and slice checksums,
+/// which is why every damaged-set test before phase 6 could only assert a
+/// verdict: with no recovery stream neither gate can repair, so "repairs while
+/// direct" had nothing to compare against. The blocks are computed over the
+/// global input-slice ordering PAR2 defines — files in main-packet order, slices
+/// in order within each file, each padded to `slice_size` — which is the same
+/// ordering `plan_repair` reconstructs from the parsed set.
+fn build_test_par2_with_recovery(
+    files: &[(&str, &[u8])],
+    slice_size: u64,
+    recovery_block_count: usize,
+) -> Vec<u8> {
+    let mut stream = build_test_par2_index_for_files(files, slice_size);
+    if recovery_block_count == 0 {
+        return stream;
+    }
+    // Recomputed rather than parsed back: the recovery-set id is the MD5 of the
+    // main packet body, and every packet's own hash covers it, so the two
+    // builders have to agree on the derivation or nothing merges.
+    let mut main_body = Vec::new();
+    main_body.extend_from_slice(&slice_size.to_le_bytes());
+    main_body.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    for (filename, data) in files {
+        let hash_16k = checksum::md5(&data[..data.len().min(16 * 1024)]);
+        let mut file_id_input = Vec::new();
+        file_id_input.extend_from_slice(&hash_16k);
+        file_id_input.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        file_id_input.extend_from_slice(filename.as_bytes());
+        main_body.extend_from_slice(&checksum::md5(&file_id_input));
+    }
+    let recovery_set_id = checksum::md5(&main_body);
+
+    let slice_size_bytes = slice_size as usize;
+    let word_count = slice_size_bytes / 2;
+    // Every input slice of every file, padded, concatenated in PAR2's global
+    // ordering.
+    let mut padded: Vec<u8> = Vec::new();
+    for (_, data) in files {
+        let slices = (data.len() as u64).div_ceil(slice_size) as usize;
+        let mut block = data.to_vec();
+        block.resize(slices * slice_size_bytes, 0);
+        padded.extend_from_slice(&block);
+    }
+    let slice_count = padded.len() / slice_size_bytes;
+    let constants = weaver_par2::input_slice_constants(slice_count);
+
+    for exponent in 0..recovery_block_count as u32 {
+        let mut recovery = vec![0u8; slice_size_bytes];
+        for (input_index, &constant) in constants.iter().enumerate() {
+            let factor = weaver_par2::gf_pow(constant, exponent);
+            for word_index in 0..word_count {
+                let at = input_index * slice_size_bytes + word_index * 2;
+                let input_word = u16::from_le_bytes([padded[at], padded[at + 1]]);
+                let contribution = weaver_par2::gf_mul(input_word, factor);
+                let current =
+                    u16::from_le_bytes([recovery[word_index * 2], recovery[word_index * 2 + 1]]);
+                let updated = weaver_par2::gf_add(current, contribution).to_le_bytes();
+                recovery[word_index * 2] = updated[0];
+                recovery[word_index * 2 + 1] = updated[1];
+            }
+        }
+        let mut body = Vec::with_capacity(4 + slice_size_bytes);
+        body.extend_from_slice(&exponent.to_le_bytes());
+        body.extend_from_slice(&recovery);
+        stream.extend_from_slice(&build_test_par2_packet(
+            weaver_par2::packet::header::TYPE_RECOVERY,
+            &body,
+            recovery_set_id,
+        ));
+    }
+    stream
+}
+
+fn repairable_par2_index(volumes: &[(String, Vec<u8>)], recovery_blocks: usize) -> Vec<u8> {
+    let described: Vec<(&str, &[u8])> = volumes
+        .iter()
+        .map(|(filename, bytes)| (filename.as_str(), bytes.as_slice()))
+        .collect();
+    build_test_par2_with_recovery(&described, PAR2_SLICE_BYTES, recovery_blocks)
+}
+
+/// What one repairable-damage gate produced.
+#[derive(Debug)]
+struct RepairGateOutcome {
+    status: Option<JobStatus>,
+    member: Option<Vec<u8>>,
+    /// Whether any source volume file existed at any point. For the direct gate
+    /// this must stay false: repair-while-direct materializes only the *damaged*
+    /// volumes, and it does so under a scratch name, never the volume's own.
+    volume_file_seen: bool,
+    /// Repair scratch left behind. Always zero — the temporaries are deleted
+    /// whether the repair succeeded or fell back.
+    repair_scratch_left: usize,
+    /// The set's `Debug` shape immediately after verification concluded.
+    sets: String,
+    /// Source volumes a repair materialized. The scratch is deleted as soon as
+    /// its spans are routed, so nothing on disk can distinguish "materialized
+    /// one volume" from "materialized every volume and tidied up".
+    materialized: usize,
+    /// Sets that committed their members from their own partials. Sticky,
+    /// because a set can finalize, complete its job and be pruned inside one
+    /// completion check — so `sets` below may never show the state.
+    finalized: usize,
+}
+
+/// Keeps the last non-empty reading of a job's direct sets, and never lets a
+/// later one hide a `Finalized` it already saw.
+///
+/// The runtime is pruned the moment the job finishes, and finalization is a
+/// different completion check from the one that repairs — so a single snapshot
+/// can only ever show one of the two, and which one it shows depends on how many
+/// steps the harness happened to take.
+fn sample_direct_sets(pipeline: &Pipeline, job_id: JobId, sets: &mut String) {
+    let current = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    if current == "[]" {
+        return;
+    }
+    if sets.contains("Finalized") && !current.contains("Finalized") {
+        return;
+    }
+    *sets = current;
+}
+
+/// Every path a direct set could have materialized a volume at, damaged or not.
+fn direct_scratch_left(working_dir: &Path) -> usize {
+    let mut left = 0usize;
+    let Ok(entries) = std::fs::read_dir(working_dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".repair") {
+            left += 1;
+        }
+    }
+    left
+}
+
+/// Where the PAR2 index sits **in the NZB**, which decides whether a set's
+/// volume indices and its job file indices happen to be the same numbers.
+///
+/// Appended last is the usual posting order, and it is also the one that hides
+/// bugs: the set's volumes are then files `0..n-1`, so volume index and file
+/// index coincide and a seam that confuses the two still works. Leading, they
+/// never agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexPosition {
+    First,
+    Last,
+}
+
+impl IndexPosition {
+    /// The NZB file index of the set's volume `ordinal`.
+    fn volume_file_index(self, ordinal: u32) -> u32 {
+        match self {
+            Self::First => ordinal + 1,
+            Self::Last => ordinal,
+        }
+    }
+}
+
+/// [`par2_bearing_job_spec`] with the index placed at either end of the NZB.
+fn par2_bearing_job_spec_positioned(
+    name: &str,
+    volumes: &[(String, Vec<u8>)],
+    par2_bytes: &[u8],
+    position: IndexPosition,
+) -> (JobSpec, u32) {
+    let (mut spec, file_index) = par2_bearing_job_spec(name, volumes, par2_bytes);
+    match position {
+        IndexPosition::Last => (spec, file_index),
+        IndexPosition::First => {
+            let index = spec.files.remove(file_index as usize);
+            spec.files.insert(0, index);
+            (spec, 0)
+        }
+    }
+}
+
+async fn run_repairable_par2_gate(
+    gate: DirectStoreGate,
+    job_id: JobId,
+    member_name: &str,
+    volumes: &[(String, Vec<u8>)],
+    par2_bytes: &[u8],
+) -> RepairGateOutcome {
+    run_repairable_par2_gate_at(
+        gate,
+        job_id,
+        member_name,
+        volumes,
+        par2_bytes,
+        IndexPosition::Last,
+    )
+    .await
+}
+
+async fn run_repairable_par2_gate_at(
+    gate: DirectStoreGate,
+    job_id: JobId,
+    member_name: &str,
+    volumes: &[(String, Vec<u8>)],
+    par2_bytes: &[u8],
+    position: IndexPosition,
+) -> RepairGateOutcome {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(gate);
+    pipeline.live_par2.set_enabled(true);
+
+    let (spec, index_file_index) =
+        par2_bearing_job_spec_positioned("Silver Horizon", volumes, par2_bytes, position);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let mut volume_file_seen = false;
+    for (ordinal, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article_indexed(
+            &mut pipeline,
+            job_id,
+            volumes,
+            ordinal,
+            position.volume_file_index(ordinal),
+            segment_number,
+        )
+        .await;
+        volume_file_seen |= volumes
+            .iter()
+            .any(|(filename, _)| working_dir.join(filename).exists());
+    }
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    // Tracked rather than snapshotted once: verification runs when the index
+    // completes, but finalization is a *later* completion check, and a job that
+    // finishes has its direct-store runtime pruned — so the last non-empty
+    // reading is the only one that can show both.
+    let mut sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    volume_file_seen |= volumes
+        .iter()
+        .any(|(filename, _)| working_dir.join(filename).exists());
+
+    // The harness delivers articles without dequeuing them, so the download
+    // pipeline never looks exhausted; draining is what lets the repair gate
+    // reach its verdict, and both gates get it.
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
+        state.recovery_queue = crate::DownloadQueue::new();
+    }
+    // Deliberately not `drive_extractions_to_terminal`: that helper blocks on
+    // the extraction channel and panics on a job that is legitimately not going
+    // to extract, which the unrepairable variant of this gate is. This one polls
+    // instead and lets the caller assert whatever the job actually reached.
+    for _ in 0..48 {
+        if matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete) | Some(JobStatus::Failed { .. })
+        ) {
+            break;
+        }
+        drain_rar_refreshes(&mut pipeline).await;
+        pipeline.check_job_completion(job_id).await;
+        sample_direct_sets(&pipeline, job_id, &mut sets);
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        sample_direct_sets(&pipeline, job_id, &mut sets);
+        settle_inflight_moves(&mut pipeline).await;
+        if let Ok(Some(done)) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            pipeline.extract_done_rx.recv(),
+        )
+        .await
+        {
+            pipeline.handle_extraction_done(done).await;
+            pump_pipeline_runtime_queues(&mut pipeline).await;
+            settle_inflight_moves(&mut pipeline).await;
+        }
+        volume_file_seen |= volumes
+            .iter()
+            .any(|(filename, _)| working_dir.join(filename).exists());
+        sample_direct_sets(&pipeline, job_id, &mut sets);
+    }
+
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    RepairGateOutcome {
+        status: job_status_for_assert(&pipeline, job_id),
+        member: std::fs::read(output_root.join(member_name))
+            .ok()
+            .or_else(|| std::fs::read(working_dir.join(member_name)).ok()),
+        volume_file_seen,
+        repair_scratch_left: direct_scratch_left(&working_dir),
+        sets,
+        materialized: pipeline.direct_store.repair_materialized_volumes,
+        finalized: pipeline.direct_store.finalized_sets,
+    }
+}
+
+#[tokio::test]
+async fn par2_damage_in_the_envelope_repairs_while_the_set_stays_direct() {
+    // D8's first transition, end to end. The damaged byte is in a recovery
+    // record's data area: outside every member's packed range, so neither the
+    // per-part packed CRC32 nor the whole-member CRC32 covers it, and inside a
+    // service block's data rather than a header, so the walk still parses and
+    // the volume still confirms. PAR2 is the only layer that can see it — which
+    // is exactly the set-up wave 2 could only demote on.
+    let member_name = "Silver.Horizon.S01E21.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 211) as u8).collect();
+    let rr_bytes = 512;
+    let clean = recovery_record_store_set(member_name, &payload, 3, rr_bytes);
+    // The PAR2 set describes the *clean* volumes and carries enough recovery to
+    // rebuild the damaged slice; the job downloads a damaged volume.
+    let par2_bytes = repairable_par2_index(&clean, 4);
+    let mut volumes = clean.clone();
+    damage_recovery_record(&mut volumes, 1, rr_bytes);
+
+    let conventional = run_repairable_par2_gate(
+        DirectStoreGate::Disabled,
+        JobId(41061),
+        member_name,
+        &volumes,
+        &par2_bytes,
+    )
+    .await;
+    let direct = run_repairable_par2_gate(
+        DirectStoreGate::Enabled,
+        JobId(41062),
+        member_name,
+        &volumes,
+        &par2_bytes,
+    )
+    .await;
+
+    assert_eq!(
+        conventional.member.as_deref(),
+        Some(payload.as_slice()),
+        "the gate-off reference must repair the volume and extract the member; \
+         status={:?}",
+        conventional.status
+    );
+    assert_eq!(
+        direct.member.as_deref(),
+        conventional.member.as_deref(),
+        "a direct set must repair in place and produce the same bytes the \
+         gate-off gate produces after its repair; sets = {}",
+        direct.sets
+    );
+    assert!(
+        !direct.sets.contains("Demoted"),
+        "the set must stay direct through the repair — that is the whole \
+         transition, and demoting instead costs a materialization of every \
+         volume; got {}",
+        direct.sets
+    );
+    assert_eq!(
+        direct.finalized, 1,
+        "and it must finalize once the re-verify clears it — committing its own \
+         partials, which is the only way a member reaches its destination \
+         without a volume file ever existing; sets = {}",
+        direct.sets
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "no volume may materialize under its own name: that path belongs to \
+         demotion, and a half-repaired file sitting there would be read as a \
+         downloaded volume by every conventional path"
+    );
+    assert_eq!(
+        direct.materialized, 1,
+        "exactly the one damaged volume materializes. The other two are read as \
+         repair *sources* through the hybrid provider, which is what makes the \
+         expansion set empty by construction rather than merely small"
+    );
+    assert_eq!(
+        direct.repair_scratch_left, 0,
+        "the repair scratch is deleted once its spans are routed, so the set \
+         returns to fully virtual"
+    );
+    assert!(
+        matches!(direct.status, Some(JobStatus::Complete)),
+        "the job must complete, got {:?} with sets {}",
+        direct.status,
+        direct.sets
+    );
+}
+
+#[tokio::test]
+async fn a_repair_reads_its_sources_by_file_index_when_the_par2_index_leads_the_nzb() {
+    // The index-space regression, and the reason every other phase 6 fixture is
+    // blind to it. A repair materializes its damaged volumes through the hybrid
+    // provider, and that provider is keyed by **job file index** so one instance
+    // can answer for every set of a job. The reconstruction plan was built with
+    // the set's own **volume index**. The two are the same number exactly when a
+    // set's volumes are NZB files `0..n-1` — true whenever the PAR2 is appended
+    // last, which is every fixture and most real NZBs, and false the moment a
+    // `.par2` or `.nfo` leads or a job carries two sets.
+    //
+    // When they differ the sweep reads a *different volume's* bytes: volume 1
+    // asks for file index 1 and is handed volume 0, fails its composed CRC32,
+    // and the whole set demotes with `materialization_failed` as the only signal
+    // that anything went wrong. Volume 0 asks for file index 0 — the PAR2 index
+    // — and finds nothing at all.
+    //
+    // Same fixture and same damage as
+    // `par2_damage_in_the_envelope_repairs_while_the_set_stays_direct`, with the
+    // index moved to NZB position 0 and nothing else changed.
+    let member_name = "Silver.Horizon.S01E26.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 211) as u8).collect();
+    let rr_bytes = 512;
+    let clean = recovery_record_store_set(member_name, &payload, 3, rr_bytes);
+    let par2_bytes = repairable_par2_index(&clean, 4);
+    let mut volumes = clean.clone();
+    damage_recovery_record(&mut volumes, 1, rr_bytes);
+
+    let direct = run_repairable_par2_gate_at(
+        DirectStoreGate::Enabled,
+        JobId(41065),
+        member_name,
+        &volumes,
+        &par2_bytes,
+        IndexPosition::First,
+    )
+    .await;
+
+    assert_eq!(
+        direct.member.as_deref(),
+        Some(payload.as_slice()),
+        "the repair must produce the member byte for byte, whatever number the \
+         NZB happens to give the set's volumes; sets = {}",
+        direct.sets
+    );
+    assert!(
+        !direct.sets.contains("Demoted"),
+        "and the set must stay direct: reading the wrong volume's bytes fails a \
+         composed CRC32 and demotes the whole set, which is the failure this \
+         asserts against; got {}",
+        direct.sets
+    );
+    assert_eq!(
+        direct.materialized, 1,
+        "still exactly the one damaged volume; sets = {}",
+        direct.sets
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "no volume may materialize under its own name"
+    );
+    assert_eq!(direct.repair_scratch_left, 0);
+    assert!(
+        matches!(direct.status, Some(JobStatus::Complete)),
+        "the job must complete, got {:?} with sets {}",
+        direct.status,
+        direct.sets
+    );
+}
+
+#[tokio::test]
+async fn an_unrepairable_direct_set_still_demotes_whole() {
+    // The fallback, unchanged: with no recovery blocks the damage cannot be
+    // repaired, so phase 6 refuses before it materializes anything and wave 2's
+    // whole-set demotion answers instead. Same fixture, same damage, one
+    // difference — the recovery stream.
+    let member_name = "Silver.Horizon.S01E22.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 197) as u8).collect();
+    let rr_bytes = 512;
+    let clean = recovery_record_store_set(member_name, &payload, 3, rr_bytes);
+    let par2_bytes = repairable_par2_index(&clean, 0);
+    let mut volumes = clean.clone();
+    damage_recovery_record(&mut volumes, 1, rr_bytes);
+
+    let direct = run_repairable_par2_gate(
+        DirectStoreGate::Enabled,
+        JobId(41063),
+        member_name,
+        &volumes,
+        &par2_bytes,
+    )
+    .await;
+
+    assert!(
+        direct.sets.contains("Demoted(Par2Damaged)"),
+        "an unrepairable direct set must demote whole, exactly as it did before \
+         phase 6, got {}",
+        direct.sets
+    );
+    assert!(
+        direct.volume_file_seen,
+        "and the demotion must materialize its volumes for the conventional path"
+    );
+    assert_eq!(
+        direct.repair_scratch_left, 0,
+        "a refused repair leaves no scratch behind"
+    );
+    assert!(
+        !matches!(direct.status, Some(JobStatus::Complete)),
+        "an unrepairable job must not complete, got {:?}",
+        direct.status
+    );
+}
+
+/// A par2-bearing direct job driven to the point where its one set is live and
+/// carries repairable PAR2 damage, with the live pipeline handed back so a test
+/// can drive phase 6's seam itself and watch what it refuses.
+async fn live_damaged_direct_job(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    par2_bytes: &[u8],
+    holds_budget: Option<u64>,
+) -> (Pipeline, PathBuf) {
+    let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(true);
+    if let Some(bytes) = holds_budget {
+        pipeline.direct_store.set_holds_budget(bytes);
+    }
+
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", volumes, par2_bytes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article(&mut pipeline, job_id, volumes, file_index, segment_number).await;
+    }
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    // The harness delivers articles without dequeuing them, so without this the
+    // download pipeline never looks exhausted and H3's settle guard defers every
+    // verdict.
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
+        state.recovery_queue = crate::DownloadQueue::new();
+    }
+    (pipeline, working_dir)
+}
+
+/// The envelope-damage fixture every phase 6 repair test is built on: three
+/// volumes carrying one stored member and a recovery record, with the record's
+/// data area damaged in the middle volume.
+fn repairable_envelope_damage(
+    member_name: &str,
+    payload: &[u8],
+) -> (Vec<(String, Vec<u8>)>, Vec<u8>) {
+    let rr_bytes = 512;
+    let clean = recovery_record_store_set(member_name, payload, 3, rr_bytes);
+    let par2_bytes = repairable_par2_index(&clean, 4);
+    let mut volumes = clean;
+    damage_recovery_record(&mut volumes, 1, rr_bytes);
+    (volumes, par2_bytes)
+}
+
+#[tokio::test]
+async fn a_rewrite_over_the_holds_budget_demotes_before_it_materializes_anything() {
+    // F3. Every repaired byte re-enters the router as a hold, so a rewrite is
+    // charged against the same RAM ceiling ordinary staging is — and the first
+    // shape never checked: it read every rewrite span of every damaged volume
+    // whole, then let the router copy them into staging, so a missing-volume
+    // repair of a large set peaked at about twice the repaired bytes with
+    // nothing bounding either term.
+    //
+    // The A/B is the budget and nothing else. Phase 7 revisits the bound itself
+    // — routing a repaired volume in budget-sized instalments lifts it — but
+    // until then an over-budget rewrite demotes, and it must do so before the
+    // checkpoint delete, so finding out costs the set nothing.
+    let member_name = "Silver.Horizon.S01E28.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 211) as u8).collect();
+    let (volumes, par2_bytes) = repairable_envelope_damage(member_name, &payload);
+
+    let inside_dir = tempfile::tempdir().unwrap();
+    let (inside, _) =
+        live_damaged_direct_job(&inside_dir, JobId(41101), &volumes, &par2_bytes, None).await;
+    let inside_sets = format!("{:?}", inside.direct_store.sets_for(JobId(41101)));
+    assert_eq!(
+        inside.direct_store.repair_materialized_volumes, 1,
+        "non-vacuity: inside the default budget this fixture repairs while \
+         direct, so the only thing the run below changes is the ceiling; \
+         sets = {inside_sets}"
+    );
+    assert!(
+        !inside_sets.contains("Demoted"),
+        "and it stays direct doing it; got {inside_sets}"
+    );
+
+    let over_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41102);
+    // One byte: under every rewrite, and small enough to be unambiguous. Routing
+    // itself survives it — holds page out to scratch rather than demoting.
+    let (over, working_dir) =
+        live_damaged_direct_job(&over_dir, job_id, &volumes, &par2_bytes, Some(1)).await;
+
+    let sets = format!("{:?}", over.direct_store.sets_for(job_id));
+    assert_eq!(
+        over.direct_store.repair_materialized_volumes, 0,
+        "an over-budget repair must refuse before the materialization, not after \
+         reading the bytes it exists to avoid reading; sets = {sets}"
+    );
+    assert_eq!(
+        over.direct_store.repair_attempts, 0,
+        "and before the checkpoint delete, so it does not spend the set's one \
+         repair attempt on a refusal that cost it nothing; sets = {sets}"
+    );
+    assert!(
+        sets.contains("Demoted"),
+        "the set then takes the whole-set demotion, which is always correct; \
+         got {sets}"
+    );
+    assert_eq!(
+        direct_scratch_left(&working_dir),
+        0,
+        "no repair scratch may exist: none was ever opened"
+    );
+}
+
+#[tokio::test]
+async fn a_second_damage_verdict_after_a_repair_demotes_instead_of_repairing_again() {
+    // F8. Nothing else terminates the loop. A set that is damaged again after a
+    // completed repair produces the same verdict on every completion check, and
+    // without a bound each one materializes, repairs, re-routes and re-verifies
+    // — forever. One attempt, then the whole-set demotion.
+    let member_name = "Silver.Horizon.S01E29.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 191) as u8).collect();
+    let (volumes, par2_bytes) = repairable_envelope_damage(member_name, &payload);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41103);
+    let (mut pipeline, working_dir) =
+        live_damaged_direct_job(&temp_dir, job_id, &volumes, &par2_bytes, None).await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert_eq!(
+        (
+            pipeline.direct_store.repair_attempts,
+            pipeline.direct_store.repair_materialized_volumes
+        ),
+        (1, 1),
+        "non-vacuity: the set must have had its one real repair before the \
+         second verdict can be a repeat; sets = {sets}"
+    );
+    assert!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| !set.is_demoted() && !set.is_finalized() && set.repair_attempted()),
+        "and it must still be live with its latch burned; got {sets}"
+    );
+
+    // Fresh damage under the repaired set, in the member partial the virtual
+    // volume reads its member bytes back out of. This is the shape the bound
+    // exists for: a repair that did not leave the set verifiable, however it got
+    // there.
+    let partial = std::fs::read_dir(&working_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".direct.partial"))
+        })
+        .expect("the live set still holds its member partial");
+    let mut bytes = std::fs::read(&partial).unwrap();
+    bytes[10] ^= 0xFF;
+    std::fs::write(&partial, &bytes).unwrap();
+
+    let par2_set = pipeline
+        .par2_set(job_id)
+        .cloned()
+        .expect("the index parsed");
+    let resolution = pipeline
+        .resolve_direct_sets_before_par2_repairer(job_id, par2_set, working_dir.clone())
+        .await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert_eq!(
+        resolution,
+        crate::pipeline::direct_store::wiring::DirectPar2Resolution::Unresolved,
+        "a set that has had its attempt must fall through to the demotion rather \
+         than report a repair; sets = {sets}"
+    );
+    assert_eq!(
+        pipeline.direct_store.repair_attempts, 1,
+        "and no second attempt may be made at all — that is the loop, one lap of \
+         it. Counted rather than inferred: an attempt that refuses downstream \
+         leaves the same traces as one that was never made; sets = {sets}"
+    );
+    assert_eq!(
+        direct_scratch_left(&working_dir),
+        0,
+        "no scratch, for the same reason"
+    );
+}
+
+/// Renames a generated set's volume files onto a different archive base name,
+/// so one job can carry two direct sets.
+///
+/// Safe by construction: a RAR5 volume's own bytes carry its *number* in the
+/// main header and nothing about the filename, which is what
+/// `archive_base_name` groups on.
+fn renamed_set(base: &str, volumes: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
+    volumes
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| (format!("{base}.part{:02}.rar", index + 1), bytes))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_finalized_set_does_not_stop_its_live_neighbour_repairing_while_direct() {
+    // F2. The quiet pass phase 6 runs in front of the repairer used to be a bare
+    // `verify_all`, without the two damage-attribution adjustments the
+    // authoritative pass applies to its own verdict. A **finalized** direct set
+    // has no source volumes on disk and never will — its partials are at their
+    // destinations and its envelopes are deleted — so every one of them reads
+    // `Missing` in that pass. `damaged_files_by_set` then finds no live owner
+    // for them and refuses the whole attempt with `DamageOutsideDirectSets`, so
+    // the set that *is* live and *is* repairable demotes instead, for damage
+    // that belongs to files the job legitimately finished without.
+    let finalized_member = "Silver.Horizon.S01E27.mkv";
+    let live_member = "Amber.Trail.S01E01.mkv";
+    let finalized_payload: Vec<u8> = (0..2400u32).map(|index| (index % 199) as u8).collect();
+    let live_payload: Vec<u8> = (0..3000u32).map(|index| (index % 227) as u8).collect();
+    let finalized_set = single_member_store_set(finalized_member, &finalized_payload, 2);
+    let live_set = renamed_set(
+        "amber.trail",
+        recovery_record_store_set(live_member, &live_payload, 3, 256),
+    );
+    let volumes: Vec<(String, Vec<u8>)> = finalized_set
+        .iter()
+        .chain(live_set.iter())
+        .cloned()
+        .collect();
+    let par2_bytes = repairable_par2_index(&volumes, 16);
+    // The live set's middle volume loses its second half — member payload, the
+    // recovery record and the end-of-archive record together, which is what
+    // keeps that set's member gate open so it does not finalize alongside its
+    // neighbour.
+    let lost = (finalized_set.len() as u32 + 1, 1u32);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41091);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(true);
+
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if (file_index, segment_number) == lost {
+            continue;
+        }
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    // The lost article is never coming, so the pass may treat holes as damage.
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
+        state.recovery_queue = crate::DownloadQueue::new();
+    }
+
+    // Reaching the state directly, because it is a *state*, not a sequence: a
+    // job whose PAR2 already read clean once released its ready sets, and one of
+    // them being ready while the other is not is the whole shape. Later passes
+    // happen for reasons that have nothing to do with the direct sets — a
+    // conventional member failing extraction is enough.
+    pipeline.par2_verified.insert(job_id);
+    pipeline.finalize_ready_direct_sets(job_id).await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert_eq!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .filter(|set| set.is_finalized())
+            .count(),
+        1,
+        "non-vacuity: exactly one set must have finalized, or there is no \
+         finalized neighbour to be confused by; got {sets}"
+    );
+    assert_eq!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .filter(|set| !set.is_finalized() && !set.is_demoted())
+            .count(),
+        1,
+        "and exactly one must still be live and damaged; got {sets}"
+    );
+
+    let par2_set = pipeline
+        .par2_set(job_id)
+        .cloned()
+        .expect("the index parsed");
+    pipeline
+        .resolve_direct_sets_before_par2_repairer(job_id, par2_set, working_dir.clone())
+        .await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    // The observable is **which set the damage was attributed to**, read off the
+    // repair once-latch: it is burned inside `repair_one_direct_set` and nowhere
+    // else, so it is set exactly when the pass decided this set owned the damage
+    // and went to work on it. Before the fix the whole attempt was refused up
+    // front with `DamageOutsideDirectSets` — the finalized neighbour's absent
+    // volumes counted as damage nobody owns — and no set was ever reached.
+    assert!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| !set.is_finalized() && set.repair_attempted()),
+        "the live set's damage is its own, so the pass must attribute it there \
+         and attempt the repair; a set that was never reached is the finalized \
+         neighbour being blamed for it. sets = {sets}"
+    );
+    assert!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .all(|set| !set.is_finalized() || !set.repair_attempted()),
+        "and the finalized set is never the one repaired: its volumes are gone \
+         on purpose. sets = {sets}"
+    );
+    assert!(
+        live_set
+            .iter()
+            .all(|(filename, _)| !working_dir.join(filename).exists()),
+        "nothing may materialize under a live volume's own name while the \
+         attempt is in progress"
+    );
+}
+
+/// [`run_repairable_par2_gate`] with an article that never arrives.
+///
+/// A **lost article** is the only shape member-payload damage can reach PAR2 in.
+/// Corrupted member bytes are caught far earlier and far more cheaply by D4's
+/// own gates — the per-part packed CRC32 at part completion, the whole-member
+/// CRC32 at member completion — which demote the set during the download, before
+/// a PAR2 index has even been parsed. What those gates cannot do is *manufacture*
+/// bytes that never came, so a hole in a member's packed range survives to the
+/// PAR2 pass, and repairing it is exactly what phase 6 is for.
+async fn run_lost_article_gate(
+    gate: DirectStoreGate,
+    job_id: JobId,
+    member_name: &str,
+    volumes: &[(String, Vec<u8>)],
+    par2_bytes: &[u8],
+    lost: (u32, u32),
+) -> RepairGateOutcome {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(gate);
+    pipeline.live_par2.set_enabled(true);
+
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", volumes, par2_bytes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let mut volume_file_seen = false;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if (file_index, segment_number) == lost {
+            continue;
+        }
+        submit_volume_article(&mut pipeline, job_id, volumes, file_index, segment_number).await;
+        volume_file_seen |= volumes
+            .iter()
+            .any(|(filename, _)| working_dir.join(filename).exists());
+    }
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    let mut sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+
+    // The lost article is never coming, and the harness has no server to say so
+    // — draining the queues is what makes the download pipeline look exhausted,
+    // which is the condition every PAR2 gate waits for before treating a hole as
+    // damage rather than as work in flight.
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
+        state.recovery_queue = crate::DownloadQueue::new();
+    }
+    for _ in 0..48 {
+        if matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete) | Some(JobStatus::Failed { .. })
+        ) {
+            break;
+        }
+        drain_rar_refreshes(&mut pipeline).await;
+        pipeline.check_job_completion(job_id).await;
+        sample_direct_sets(&pipeline, job_id, &mut sets);
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        sample_direct_sets(&pipeline, job_id, &mut sets);
+        settle_inflight_moves(&mut pipeline).await;
+        if let Ok(Some(done)) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            pipeline.extract_done_rx.recv(),
+        )
+        .await
+        {
+            pipeline.handle_extraction_done(done).await;
+            pump_pipeline_runtime_queues(&mut pipeline).await;
+            settle_inflight_moves(&mut pipeline).await;
+        }
+        volume_file_seen |= volumes
+            .iter()
+            .any(|(filename, _)| working_dir.join(filename).exists());
+        sample_direct_sets(&pipeline, job_id, &mut sets);
+    }
+
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    RepairGateOutcome {
+        status: job_status_for_assert(&pipeline, job_id),
+        member: std::fs::read(output_root.join(member_name))
+            .ok()
+            .or_else(|| std::fs::read(working_dir.join(member_name)).ok()),
+        volume_file_seen,
+        repair_scratch_left: direct_scratch_left(&working_dir),
+        sets,
+        materialized: pipeline.direct_store.repair_materialized_volumes,
+        finalized: pipeline.direct_store.finalized_sets,
+    }
+}
+
+#[tokio::test]
+async fn a_lost_article_inside_a_member_repairs_and_reconfirms_the_volume() {
+    // Two things at once, because one article carries both.
+    //
+    // The lost article is the **second half** of the middle volume: member
+    // payload, the recovery record, and the end-of-archive header. So the repair
+    // has to route bytes back into a `.direct.partial` at a range the member's
+    // coverage map never held — re-arming a whole-member gate that could not
+    // previously fire — *and* into the envelope, where the restored end record
+    // is what lets the header walk finish and confirm a volume that had no proof
+    // no further header could appear.
+    let member_name = "Silver.Horizon.S01E23.mkv";
+    let payload: Vec<u8> = (0..3000u32).map(|index| (index % 223) as u8).collect();
+    let rr_bytes = 256;
+    let volumes = recovery_record_store_set(member_name, &payload, 3, rr_bytes);
+    let par2_bytes = repairable_par2_index(&volumes, 12);
+
+    let conventional = run_lost_article_gate(
+        DirectStoreGate::Disabled,
+        JobId(41071),
+        member_name,
+        &volumes,
+        &par2_bytes,
+        (1, 1),
+    )
+    .await;
+    let direct = run_lost_article_gate(
+        DirectStoreGate::Enabled,
+        JobId(41072),
+        member_name,
+        &volumes,
+        &par2_bytes,
+        (1, 1),
+    )
+    .await;
+
+    assert_eq!(
+        conventional.member.as_deref(),
+        Some(payload.as_slice()),
+        "the gate-off reference must repair the lost article and extract the \
+         member; status={:?}",
+        conventional.status
+    );
+    assert_eq!(
+        direct.member.as_deref(),
+        conventional.member.as_deref(),
+        "a direct set must repair a hole in a member's packed range in place and \
+         produce the gate-off bytes; sets = {}",
+        direct.sets
+    );
+    assert!(
+        !direct.sets.contains("Demoted"),
+        "and it must not demote to do it, got {}",
+        direct.sets
+    );
+    assert_eq!(
+        direct.finalized, 1,
+        "a volume whose end record arrived only in the repaired bytes must still \
+         confirm, or the set could never finalize; sets = {}",
+        direct.sets
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "no volume file, repaired or otherwise"
+    );
+    assert_eq!(
+        direct.materialized, 1,
+        "only the volume that lost an article materializes"
+    );
+    assert_eq!(direct.repair_scratch_left, 0);
+    assert!(
+        matches!(direct.status, Some(JobStatus::Complete)),
+        "the job must complete, got {:?} with sets {}",
+        direct.status,
+        direct.sets
+    );
+}
+
+/// [`par2_bearing_job_spec`] with a chosen article count per volume, so a
+/// fixture can lose a *middle* article and leave an interior hole rather than a
+/// truncated tail.
+fn par2_bearing_job_spec_with_articles(
+    name: &str,
+    volumes: &[(String, Vec<u8>)],
+    par2_bytes: &[u8],
+    articles: usize,
+) -> (JobSpec, u32) {
+    let mut spec = direct_store_job_spec_with_articles(name, volumes, articles);
+    let index_filename = "silver.horizon.par2".to_string();
+    let file_index = spec.files.len() as u32;
+    spec.total_bytes += u64::from(yenc_declared_bytes(par2_bytes.len() as u32));
+    spec.files.push(FileSpec {
+        role: FileRole::from_filename(&index_filename),
+        filename: index_filename,
+        groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
+        segments: vec![segment_spec! {
+            number: 0,
+            bytes: yenc_declared_bytes(par2_bytes.len() as u32),
+            message_id: "direct-par2-index@example.com".to_string(),
+        }],
+    });
+    (spec, file_index)
+}
+
+#[tokio::test]
+async fn an_interior_hole_sizes_the_repair_by_the_slices_it_actually_touches() {
+    // The wave-2 review note, priced. The middle article of the middle volume is
+    // lost, so the volume has an interior hole with healthy bytes on both sides.
+    // Before phase 6 the verifier's sequential sweep stopped at that hole and
+    // called every slice after it damaged; a repair sized from that count spends
+    // a recovery block per slice, and the ones past the hole are blocks spent
+    // rebuilding bytes that were never broken. Enough of them and a repairable
+    // set reads as unrepairable.
+    const ARTICLES: usize = 3;
+    let member_name = "Silver.Horizon.S01E24.mkv";
+    let payload: Vec<u8> = (0..6000u32).map(|index| (index % 229) as u8).collect();
+    let volumes = recovery_record_store_set(member_name, &payload, 3, 256);
+    let par2_bytes = repairable_par2_index(&volumes, 64);
+
+    let volume_len = volumes[1].1.len();
+    let (hole_start, hole_end) = article_extent(volume_len, 1, ARTICLES);
+    // Slices the hole overlaps, and slices from the hole to the volume's end —
+    // the honest count and the inflated one. The fixture is only interesting
+    // while the two differ.
+    let slice = PAR2_SLICE_BYTES as usize;
+    let touched = hole_end.div_ceil(slice) - hole_start / slice;
+    let to_the_end = volume_len.div_ceil(slice) - hole_start / slice;
+    assert!(
+        touched < to_the_end,
+        "the fixture must have healthy slices after the hole, or the accounting \
+         fix is untestable: touched={touched} to_the_end={to_the_end}"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(true);
+    let job_id = JobId(41081);
+    let (spec, index_file_index) =
+        par2_bearing_job_spec_with_articles("Silver Horizon", &volumes, &par2_bytes, ARTICLES);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for file_index in 0..volumes.len() as u32 {
+        for segment_number in 0..ARTICLES as u32 {
+            if (file_index, segment_number) == (1, 1) {
+                continue;
+            }
+            submit_volume_article_of(
+                &mut pipeline,
+                job_id,
+                &volumes,
+                file_index,
+                segment_number,
+                ARTICLES,
+            )
+            .await;
+        }
+    }
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
+        state.recovery_queue = crate::DownloadQueue::new();
+    }
+    let mut sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    for _ in 0..48 {
+        if matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete) | Some(JobStatus::Failed { .. })
+        ) {
+            break;
+        }
+        drain_rar_refreshes(&mut pipeline).await;
+        pipeline.check_job_completion(job_id).await;
+        sample_direct_sets(&pipeline, job_id, &mut sets);
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        settle_inflight_moves(&mut pipeline).await;
+        if let Ok(Some(done)) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            pipeline.extract_done_rx.recv(),
+        )
+        .await
+        {
+            pipeline.handle_extraction_done(done).await;
+            pump_pipeline_runtime_queues(&mut pipeline).await;
+            settle_inflight_moves(&mut pipeline).await;
+        }
+        sample_direct_sets(&pipeline, job_id, &mut sets);
+    }
+
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    assert_eq!(
+        std::fs::read(output_root.join(member_name)).ok().as_deref(),
+        Some(payload.as_slice()),
+        "the interior hole must repair and the member must come out whole; \
+         sets = {sets}"
+    );
+    assert_eq!(
+        pipeline.direct_store.repair_recovery_blocks_used, touched,
+        "the repair must spend one recovery block per slice the hole actually \
+         touches ({touched}), not one per slice from the hole to the end of the \
+         volume ({to_the_end}); sets = {sets}"
+    );
+    assert_eq!(pipeline.direct_store.repair_materialized_volumes, 1);
+    assert_eq!(direct_scratch_left(&working_dir), 0);
+    assert!(
+        volumes
+            .iter()
+            .all(|(filename, _)| !working_dir.join(filename).exists()),
+        "and no volume file may exist at the end of it"
     );
 }

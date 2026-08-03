@@ -102,6 +102,19 @@ pub(crate) struct DirectSet {
     /// the set from inside `route`, so by the time the wiring seam is told, the
     /// set already reads as demoted.
     demotion_cleaned_up: bool,
+    /// A repair-while-direct has already been carried out for this set, so a
+    /// second damage verdict demotes instead of repairing again (phase 6
+    /// review).
+    ///
+    /// The bound is a **once-latch**, the same shape the completion gate's
+    /// `normalization_retried` uses, and it is load-bearing rather than
+    /// defensive: nothing else terminates the loop. A repair that leaves the
+    /// set damaged — a rewrite the layout placed differently than the verifier
+    /// read it, recovery that was sufficient on paper and not in practice —
+    /// produces the very same verdict on the next completion check, which would
+    /// materialize, repair, re-route and re-verify again, forever. One attempt,
+    /// then the whole-set demotion that is always correct.
+    repair_attempted: bool,
     /// Latched reporting bits: never cleared, so a set that started fast and
     /// later demoted reads as "partly on disk" — that is what happened (D1).
     pub(crate) latched_direct: bool,
@@ -136,6 +149,7 @@ impl DirectSet {
             resumed: None,
             restart_seeded_volumes: BTreeSet::new(),
             demotion_cleaned_up: false,
+            repair_attempted: false,
             latched_direct: false,
             latched_materialized: false,
             status: DirectSetStatus::Routing,
@@ -404,6 +418,90 @@ impl DirectSet {
             .get(&volume_index)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Rewrites one volume's yEnc composition over a span a PAR2 repair
+    /// changed (plan 135, D4).
+    ///
+    /// `insert` would be wrong here for the same reason it is wrong for a
+    /// member: the bytes on disk moved, so a composition that kept the old value
+    /// would describe a volume that no longer exists — and the next
+    /// reconstruction would compare rebuilt bytes against it and refuse a volume
+    /// that is now correct.
+    ///
+    /// Unlike the member-space twin in
+    /// [`super::router::DirectSetRouter::note_member_bytes`], the gaps
+    /// [`CrcRuns::overwrite`] reports here must always be **empty**, and the
+    /// caller discards them rather than re-reading them. That is not an
+    /// oversight, it is the whole point of
+    /// [`super::repair::widen_to_articles`]: a rewrite span is widened to whole
+    /// articles wherever the decoded geometry is known, so it lands run for run
+    /// on the article-shaped volume composition, and a span in a region no
+    /// article ever covered has no run to half-cover. A gap here would mean the
+    /// widening stopped covering the composition it exists to keep whole, and
+    /// the next reconstruction sweep would refuse the volume with
+    /// `UnverifiableRun` — so it is asserted, mirroring
+    /// [`super::router::DirectSetRouter::note_restored_member_crc`].
+    pub(crate) fn note_repaired_volume_crcs(
+        &mut self,
+        volume_index: u32,
+        spans: &[super::repair::RepairedSpan],
+    ) {
+        let runs = self.volume_crcs.entry(volume_index).or_default();
+        let owned: Vec<&super::repair::RepairedSpan> = spans
+            .iter()
+            .filter(|span| span.volume_index == volume_index)
+            .collect();
+        for span in owned {
+            let gaps = runs.overwrite(span.source_offset, span.len, span.crc32);
+            debug_assert!(
+                gaps.is_empty(),
+                "the article-widened rewrite of volume {volume_index} at {} left the \
+                 volume composition with gaps at {gaps:?}",
+                span.source_offset
+            );
+        }
+    }
+
+    /// Whether a repair-while-direct has already run for this set. See
+    /// [`Self::repair_attempted`].
+    pub(crate) fn repair_attempted(&self) -> bool {
+        self.repair_attempted
+    }
+
+    /// Burns the repair once-latch. Called at the first irreversible step of a
+    /// repair — the checkpoint delete — so a refusal that costs the set nothing
+    /// does not spend the one attempt it gets.
+    pub(crate) fn note_repair_attempted(&mut self) {
+        self.repair_attempted = true;
+    }
+
+    /// The RAM ceiling this set's holds are bounded by (D2), which is also what
+    /// a repair's rewrite is sized against before it is planned: every repaired
+    /// byte re-enters the router as a hold.
+    pub(crate) fn holds_budget(&self) -> u64 {
+        self.router.holds_budget()
+    }
+
+    /// Routes one repaired span back through the router with D3's replacement
+    /// semantics. A refusal demotes the set, exactly as [`Self::route`] does.
+    pub(crate) fn route_repaired(
+        &mut self,
+        volume_index: u32,
+        spans: &[super::router::RepairedChunk],
+    ) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        match self.router.route_repaired(volume_index, spans) {
+            Ok(spans) => {
+                if !spans.is_empty() {
+                    self.latched_direct = true;
+                }
+                Ok(spans)
+            }
+            Err(reason) => {
+                self.demote(reason);
+                Err(reason)
+            }
+        }
     }
 
     pub(crate) fn mark_finalized(&mut self) {
@@ -684,8 +782,29 @@ impl DirectSet {
         Some(barrier.barrier(trigger, now, drain, sync, persist))
     }
 
-    /// Deletes the set's checkpoint row (D8). Used on demotion and before
-    /// repairing over checkpoint-covered output.
+    /// Deletes the set's checkpoint row and keeps everything else (D8's
+    /// repair-while-direct), so the coverage the hybrid provider reads survives
+    /// a repair that only rewrote bytes in place.
+    ///
+    /// [`Self::retire`] is the demotion form and it is not interchangeable: it
+    /// resets the controller, which is right when the destinations are about to
+    /// be deleted and catastrophic when they are not — a repaired set whose
+    /// coverage was reset reports every volume it did not touch as *missing* to
+    /// the re-verify, and the whole set demotes for damage that is an empty map.
+    pub(crate) fn delete_checkpoint_row<P: CoveragePersist + ?Sized>(
+        &mut self,
+        persist: &mut P,
+    ) -> Result<(), BarrierError> {
+        match self.barrier.as_mut() {
+            Some(barrier) => barrier.delete_committed_row(persist),
+            None => persist
+                .delete(self.job_id, &self.router.plan().set_name)
+                .map_err(BarrierError::Persist),
+        }
+    }
+
+    /// Deletes the set's checkpoint row **and** retires the controller (D8).
+    /// Used on demotion, where the destinations it describes are about to go.
     ///
     /// The delete runs even with no barrier built. A set can be resumed from a
     /// checkpoint written before a restart and then demote before its layout

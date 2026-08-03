@@ -1,5 +1,5 @@
 //! A [`weaver_par2::FileAccess`] over a direct set's virtual volumes
-//! (plan 135, D5).
+//! (plan 135, D5/D8).
 //!
 //! PAR2 describes **source volumes**: every file id in the recovery set names a
 //! `.partNN.rar`, and every slice checksum is defined at an offset inside it. A
@@ -27,16 +27,39 @@
 //! volume, which is what keeps direct and conventional verdicts the same shape.
 //! No byte is ever fabricated: a stopped read yields fewer bytes, not zeros.
 //!
-//! # Writes are refused
+//! # An interior hole refuses the sequential path (phase 6)
 //!
-//! Repair is phase 6. A virtual volume has nowhere to put a repaired slice —
-//! the member bytes belong to a member and the envelope holds the rest — so
-//! [`FileAccess::write_file_range`] fails loudly rather than silently writing
-//! into a file the set does not own. Wave 2 demotes a damaged direct set and
-//! lets the conventional path repair the materialized volumes.
+//! That short-read contract is exact for a **truncated** volume and wrong for a
+//! volume with an interior hole. `verify_slices_batched_md5` and
+//! `verify_quick_and_full_hash` both prefer [`FileAccess::open_sequential_reader`],
+//! and a `Read` has no way to say "skip 64 KiB, then resume": the sweep stops at
+//! the first hole and marks every slice after it damaged, however healthy those
+//! slices are. A repair sized from that count rebuilds good slices, spends
+//! recovery capacity it did not need, and can turn a repairable set into an
+//! unrepairable one — the wave-2 review note this phase opens with.
+//!
+//! So the reader is offered only when the volume's readable image is a prefix
+//! (see [`super::provider::VirtualVolume::readable_prefix`]). Otherwise the
+//! adapter answers `Ok(None)` and weaver-par2 falls back to its ranged path,
+//! which opens at each slice's own offset and therefore seeks past the hole —
+//! damaging exactly the slices that touch it, which is the verdict a physically
+//! sparse volume produces. Clean volumes, the overwhelming majority and the only
+//! ones where D5's whole-file-MD5 cost argument bites, keep the sequential path.
+//!
+//! # Writes: refused for virtual, allowed for materialized
+//!
+//! A virtual volume still has nowhere to put a repaired slice — the member bytes
+//! belong to a member and the envelope holds the rest — so
+//! [`FileAccess::write_file_range`] fails loudly for one rather than silently
+//! writing into a file the set does not own. D8's repair-while-direct is what
+//! makes that survivable: it materializes *only the damaged volumes* into
+//! [`super::plan::DirectSetPlan::repair_path`] scratch files and registers them
+//! here as [`MaterializedPar2Volume`]s, so the repairer reads every clean volume
+//! virtually and writes only into files that really exist.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,21 +74,44 @@ pub(crate) struct VirtualPar2Volume {
     pub(crate) volume_index: u32,
 }
 
+/// One damaged direct source volume that has been materialized to a real file
+/// so a repair has somewhere to write (plan 135, D8).
+///
+/// `len` is the volume's decoded length, which is what PAR2 describes; the file
+/// is created at exactly that length with holes wherever the set never placed a
+/// byte, so a slice the repairer is about to rebuild reads short rather than as
+/// fabricated zeros.
+#[derive(Debug, Clone)]
+pub(crate) struct MaterializedPar2Volume {
+    pub(crate) par2_file_id: FileId,
+    pub(crate) path: PathBuf,
+    pub(crate) len: u64,
+}
+
 /// Which read path the pass actually took.
 ///
 /// D5 requires the sequential path to exist, because whole-file MD5 for a set
 /// with no IFSC packets — and the batched slice sweep — otherwise degrade into
 /// thousands of ranged reads across member partials, and the "no worse than
-/// today" claim fails. Counting both is what lets a test prove which one ran.
+/// today" claim fails. Counting all three is what lets a test prove which one
+/// ran, including the phase-6 refusal that trades the fast path for an accurate
+/// per-slice damage count.
 #[derive(Debug, Default)]
 pub(crate) struct DirectAccessCounters {
     sequential_opens: AtomicU64,
+    sequential_refusals: AtomicU64,
     ranged_reads: AtomicU64,
 }
 
 impl DirectAccessCounters {
     pub(crate) fn sequential_opens(&self) -> u64 {
         self.sequential_opens.load(Ordering::Relaxed)
+    }
+
+    /// Sequential reads refused because the volume has an interior hole, so the
+    /// caller re-reads it through the per-slice ranged path instead.
+    pub(crate) fn sequential_refusals(&self) -> u64 {
+        self.sequential_refusals.load(Ordering::Relaxed)
     }
 
     pub(crate) fn ranged_reads(&self) -> u64 {
@@ -79,6 +125,10 @@ pub(crate) struct DirectVolumeFileAccess {
     inner: PlacementFileAccess,
     provider: HybridVolumeProvider,
     volumes: HashMap<FileId, u32>,
+    /// Damaged volumes that have been materialized for a repair. Checked before
+    /// [`Self::volumes`], so a volume that is both registered virtually and
+    /// materialized reads and writes through the real file.
+    materialized: HashMap<FileId, MaterializedPar2Volume>,
     counters: Arc<DirectAccessCounters>,
 }
 
@@ -95,8 +145,19 @@ impl DirectVolumeFileAccess {
                 .iter()
                 .map(|volume| (volume.par2_file_id, volume.volume_index))
                 .collect(),
+            materialized: HashMap::new(),
             counters: Arc::new(DirectAccessCounters::default()),
         }
+    }
+
+    /// Registers materialized damaged volumes, which take precedence over the
+    /// virtual answer for the same file id (D8).
+    pub(crate) fn with_materialized(mut self, volumes: Vec<MaterializedPar2Volume>) -> Self {
+        self.materialized = volumes
+            .into_iter()
+            .map(|volume| (volume.par2_file_id, volume))
+            .collect();
+        self
     }
 
     pub(crate) fn counters(&self) -> Arc<DirectAccessCounters> {
@@ -105,6 +166,10 @@ impl DirectVolumeFileAccess {
 
     fn volume_index(&self, file_id: &FileId) -> Option<u32> {
         self.volumes.get(file_id).copied()
+    }
+
+    fn materialized(&self, file_id: &FileId) -> Option<&MaterializedPar2Volume> {
+        self.materialized.get(file_id)
     }
 
     /// A reader over one virtual volume, positioned at `offset`, that reports a
@@ -139,18 +204,44 @@ impl DirectVolumeFileAccess {
         }
         Ok(read)
     }
+
+    /// A positioned read of a materialized volume. Short reads are honest: the
+    /// file was created at the volume's length with holes where the set placed
+    /// nothing, so the repairer's own slice checks decide what to rebuild.
+    fn read_materialized_into(
+        &self,
+        volume: &MaterializedPar2Volume,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> io::Result<usize> {
+        self.counters.ranged_reads.fetch_add(1, Ordering::Relaxed);
+        if offset >= volume.len {
+            return Ok(0);
+        }
+        let want = ((volume.len - offset) as usize).min(dst.len());
+        let mut file = std::fs::File::open(&volume.path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut read = 0usize;
+        while read < want {
+            match file.read(&mut dst[read..want])? {
+                0 => break,
+                n => read += n,
+            }
+        }
+        Ok(read)
+    }
 }
 
 impl FileAccess for DirectVolumeFileAccess {
     fn read_file_range(&self, file_id: &FileId, offset: u64, len: u64) -> io::Result<Vec<u8>> {
-        let Some(volume_index) = self.volume_index(file_id) else {
+        if self.materialized(file_id).is_none() && self.volume_index(file_id).is_none() {
             return self.inner.read_file_range(file_id, offset, len);
-        };
+        }
         let Ok(len) = usize::try_from(len) else {
             return Ok(Vec::new());
         };
         let mut bytes = vec![0u8; len];
-        let read = self.read_virtual_into(volume_index, offset, &mut bytes)?;
+        let read = self.read_file_range_into(file_id, offset, &mut bytes)?;
         bytes.truncate(read);
         Ok(bytes)
     }
@@ -161,16 +252,37 @@ impl FileAccess for DirectVolumeFileAccess {
         offset: u64,
         dst: &mut [u8],
     ) -> io::Result<usize> {
+        if let Some(volume) = self.materialized(file_id) {
+            return self.read_materialized_into(volume, offset, dst);
+        }
         match self.volume_index(file_id) {
             Some(volume_index) => self.read_virtual_into(volume_index, offset, dst),
             None => self.inner.read_file_range_into(file_id, offset, dst),
         }
     }
 
+    /// Offered only when a whole-file forward sweep tells the truth about this
+    /// volume — see the module docs on interior holes.
     fn open_sequential_reader(&self, file_id: &FileId) -> io::Result<Option<Box<dyn Read>>> {
+        if let Some(volume) = self.materialized(file_id) {
+            self.counters
+                .sequential_opens
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(Box::new(std::fs::File::open(&volume.path)?)));
+        }
         let Some(volume_index) = self.volume_index(file_id) else {
             return self.inner.open_sequential_reader(file_id);
         };
+        if self
+            .provider
+            .volume(volume_index)
+            .is_none_or(super::provider::VirtualVolume::has_interior_hole)
+        {
+            self.counters
+                .sequential_refusals
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
         self.counters
             .sequential_opens
             .fetch_add(1, Ordering::Relaxed);
@@ -183,7 +295,13 @@ impl FileAccess for DirectVolumeFileAccess {
     /// the router knows about but never received a byte for holds nothing, and
     /// reporting it as present would have the pass read a whole file's worth of
     /// holes to conclude what `Missing` says in one call.
+    ///
+    /// A materialized volume always exists: it was created, at the volume's
+    /// length, before this access was built.
     fn file_exists(&self, file_id: &FileId) -> bool {
+        if self.materialized(file_id).is_some() {
+            return true;
+        }
         match self.volume_index(file_id) {
             Some(volume_index) => self
                 .provider
@@ -198,6 +316,9 @@ impl FileAccess for DirectVolumeFileAccess {
     /// is the only length in the coordinate space PAR2 describes; the NZB's
     /// declared totals are yEnc-encoded and never equal it.
     fn file_length(&self, file_id: &FileId) -> Option<u64> {
+        if let Some(volume) = self.materialized(file_id) {
+            return Some(volume.len);
+        }
         match self.volume_index(file_id) {
             Some(volume_index) => self.provider.volume(volume_index).map(|volume| volume.len),
             None => self.inner.file_length(file_id),
@@ -205,9 +326,20 @@ impl FileAccess for DirectVolumeFileAccess {
     }
 
     fn read_file(&self, file_id: &FileId) -> io::Result<Vec<u8>> {
+        if let Some(volume) = self.materialized(file_id) {
+            self.counters
+                .sequential_opens
+                .fetch_add(1, Ordering::Relaxed);
+            return std::fs::read(&volume.path);
+        }
         let Some(volume_index) = self.volume_index(file_id) else {
             return self.inner.read_file(file_id);
         };
+        // Deliberately still a forward sweep, hole rule and all: `read_file`
+        // asks for one contiguous buffer, which is a question an interior hole
+        // has no honest answer to. Nothing in verification or repair calls it —
+        // both go through the ranged and sequential paths above — so the
+        // per-slice attribution the interior-hole rule protects is unaffected.
         self.counters
             .sequential_opens
             .fetch_add(1, Ordering::Relaxed);
@@ -217,13 +349,46 @@ impl FileAccess for DirectVolumeFileAccess {
     }
 
     fn write_file_range(&mut self, file_id: &FileId, offset: u64, data: &[u8]) -> io::Result<()> {
+        if let Some(volume) = self.materialized.get(file_id) {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(false)
+                .open(&volume.path)?;
+            return write_all_at(&file, offset, data);
+        }
         let Some(volume_index) = self.volume_index(file_id) else {
             return self.inner.write_file_range(file_id, offset, data);
         };
         Err(io::Error::other(format!(
-            "direct-store volume {volume_index} is virtual and cannot be written (plan 135 \
-             phase 6 owns repair); a damaged direct set demotes instead"
+            "direct-store volume {volume_index} is virtual and cannot be written; D8 \
+             materializes a damaged volume before repairing it"
         )))
+    }
+}
+
+/// Positioned write, so the repairer's out-of-order slice writes need no seek
+/// discipline and no exclusive handle.
+fn write_all_at(file: &std::fs::File, offset: u64, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(bytes, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let progress = file.seek_write(&bytes[written..], offset + written as u64)?;
+            if progress == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "positional write reported no progress",
+                ));
+            }
+            written += progress;
+        }
+        Ok(())
     }
 }
 

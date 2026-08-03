@@ -184,6 +184,23 @@ pub(crate) enum DemotionReason {
     /// changed under a validated checkpoint — a different operational story and a
     /// different metric.
     RestartRereadFailed,
+    /// A PAR2-repaired span could not be routed back into the set (D8/D3).
+    ///
+    /// The repair itself succeeded — the materialized volume is correct — but
+    /// the router could not place its bytes: the layout maps part of the span
+    /// to nothing, or a destination write for it failed. Demoting here is safe
+    /// and cheap, because the repaired bytes that *were* routed are already in
+    /// the partials and the composition was overwritten with them, so
+    /// reconstruction rebuilds the repaired volume rather than the damaged one.
+    RepairRerouteFailed,
+    /// A stale composition gap left by a repair could not be re-read from the
+    /// partial that holds it (D4).
+    ///
+    /// A gap is bytes nothing currently vouches for, so leaving the member
+    /// "verified" over one would pass a member on the strength of a value that
+    /// describes different bytes. Unreadable means unverifiable, and
+    /// unverifiable demotes.
+    RepairGapUnreadable,
     /// The volume's headers could not be parsed from the staged image.
     UnparsableVolume,
     /// A non-final part's packed CRC32 did not match the bytes routed for it.
@@ -271,6 +288,8 @@ impl DemotionReason {
             Self::UnconfirmedRestoredVolume => "unconfirmed_restored_volume",
             Self::RestartRearmUnplaceable => "restart_rearm_unplaceable",
             Self::RestartRereadFailed => "restart_reread_failed",
+            Self::RepairRerouteFailed => "repair_reroute_failed",
+            Self::RepairGapUnreadable => "repair_gap_unreadable",
             Self::UnparsableVolume => "unparsable_volume",
             Self::PartChecksumMismatch => "part_checksum_mismatch",
             Self::MemberChecksumMismatch => "member_checksum_mismatch",
@@ -374,6 +393,50 @@ impl CrcRuns {
             }
         }
         self.runs.insert(position, (start, len, crc));
+    }
+
+    /// Replaces every run overlapping `[start, start + len)` with a single run
+    /// for the rewritten span, and returns the sub-ranges of the discarded runs
+    /// that fall **outside** it — the stale gaps (plan 135, D3/D4).
+    ///
+    /// This is what a PAR2 repair needs and what [`Self::insert`] must never do.
+    /// A duplicate article clips: its bytes are the same bytes, and advancing
+    /// the composition twice would double-count them. A repaired span is the
+    /// opposite — the bytes on disk **changed**, so the composed value has to
+    /// change with them, or finalization demotes a job whose output is correct
+    /// while the composition still carries the wire-damaged value.
+    ///
+    /// The gaps exist because the runs are article-shaped and a repair is
+    /// slice-shaped: rewriting the middle of an article discards that article's
+    /// value, and the bytes on either side of the rewrite are then covered by no
+    /// run at all. They are not composed away and they are not assumed good —
+    /// the caller re-reads them from the routed bytes on disk and feeds the
+    /// value back, and a gap that cannot be read leaves the member unverifiable,
+    /// which demotes rather than passes.
+    pub(crate) fn overwrite(&mut self, start: u64, len: u64, crc: u32) -> Vec<(u64, u64)> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let end = start.saturating_add(len);
+        let mut gaps = Vec::new();
+        self.runs.retain(|&(run_start, run_len, _)| {
+            let run_end = run_start.saturating_add(run_len);
+            if run_end <= start || run_start >= end {
+                return true;
+            }
+            if run_start < start {
+                gaps.push((run_start, start));
+            }
+            if run_end > end {
+                gaps.push((end, run_end));
+            }
+            false
+        });
+        let position = self
+            .runs
+            .partition_point(|(run_start, _, _)| *run_start < start);
+        self.runs.insert(position, (start, len, crc));
+        gaps
     }
 
     /// The composed value for `[start, start + len)`, when the runs fed in tile
@@ -718,10 +781,20 @@ impl Seek for SparseImage {
     }
 }
 
+/// One staged run of a repaired span, in exactly the shape [`VolumeStaging`]
+/// holds it: a physical offset and reference-counted bytes.
+///
+/// Reference-counted rather than borrowed so the reader that streams a repaired
+/// volume off its scratch file can hand each bounded chunk **straight** into
+/// staging. The first shape read every rewrite span whole into an owned `Vec`
+/// and let `stage_repaired` copy it, so a repair peaked at twice the repaired
+/// bytes with nothing bounding either term (phase 6 review, F3).
+pub(crate) type RepairedChunk = (u64, std::sync::Arc<[u8]>);
+
 /// Per-volume staging: the bytes the router still needs, and what it has
 /// already placed.
 #[derive(Debug, Default)]
-struct VolumeStaging {
+pub(super) struct VolumeStaging {
     /// Non-overlapping byte runs, keyed by physical offset. Shared rather than
     /// owned so the header parser's image is a pointer copy (M2), and each one
     /// either RAM-resident or paged out to the set's holds scratch (D2).
@@ -749,6 +822,19 @@ struct VolumeStaging {
     /// and a volume that reaches completion still unconfirmed demotes rather
     /// than holding its trailing region for the life of the set.
     restored: bool,
+    /// Physical ranges force-staged by a PAR2 repair (plan 135, D3/D8).
+    ///
+    /// The **repair marker**. A repaired span re-enters the router over bytes
+    /// the volume already routed, so without a mark the drain cannot tell it
+    /// from a duplicate article — and the two must behave in opposite ways: a
+    /// duplicate clips (the same bytes, composed once), a repair overwrites (new
+    /// bytes, so the composed value has to move with them). Marking the *range*
+    /// rather than the router is what keeps a genuine duplicate arriving in the
+    /// same drain on the clipping path.
+    ///
+    /// Cleared as the range drains, so the mark lives exactly as long as the
+    /// bytes it describes.
+    repaired: ByteRanges,
     /// Physical end of the last member extent the walk has reached.
     ///
     /// **The frontier of proven classification.** Below it the walk arrived
@@ -822,6 +908,68 @@ impl VolumeStaging {
             }
         }
         staged
+    }
+
+    /// Stores `[offset, offset + data.len())` **unconditionally**, replacing
+    /// whatever was staged there and re-opening it for routing (D8).
+    ///
+    /// [`Self::stage`] deliberately refuses a range that is already routed —
+    /// that is the duplicate-article rule. A repaired span is the one case
+    /// where the same physical range must be routed twice, because the bytes
+    /// changed, so it goes through here instead and is marked in
+    /// [`Self::repaired`] for the drain.
+    fn stage_repaired(&mut self, offset: u64, data: std::sync::Arc<[u8]>) {
+        self.force_stage(offset, data, true);
+    }
+
+    /// [`Self::stage_repaired`] without the repair mark: the same force-stage of
+    /// an already-routed range, marked as an ordinary duplicate.
+    ///
+    /// Test-only, and only because the shape it builds is otherwise unreachable
+    /// by construction from outside: a duplicate never re-stages a routed range
+    /// (that is what [`Self::stage`] refuses), so the one thing that can put
+    /// unrepaired bytes next to repaired ones in a single drained run is state
+    /// the router reached earlier and could not place. See
+    /// `a_drain_run_straddling_repaired_and_duplicate_bytes_splits_at_the_boundary`.
+    #[cfg(test)]
+    fn stage_duplicate(&mut self, offset: u64, data: std::sync::Arc<[u8]>) {
+        self.force_stage(offset, data, false);
+    }
+
+    fn force_stage(&mut self, offset: u64, data: std::sync::Arc<[u8]>, repaired: bool) {
+        let len = data.len() as u64;
+        if len == 0 {
+            return;
+        }
+        let end = offset.saturating_add(len);
+        // Chunks are keyed by start offset and never overlap, so a rewritten
+        // range can only touch chunks starting below `end`, and the one it
+        // starts inside is the last starting at or before `offset`.
+        let touched: Vec<u64> = self
+            .chunks
+            .range(..end)
+            .filter(|(start, chunk)| start.saturating_add(chunk.len()) > offset)
+            .map(|(start, _)| *start)
+            .collect();
+        for start in touched {
+            let Some(chunk) = self.chunks.remove(&start) else {
+                continue;
+            };
+            let chunk_end = start.saturating_add(chunk.len());
+            if start < offset {
+                self.chunks.insert(start, chunk.slice_of(0, offset - start));
+            }
+            if chunk_end > end {
+                self.chunks
+                    .insert(end, chunk.slice_of(end - start, chunk_end - end));
+            }
+        }
+        self.chunks.insert(offset, StagedChunk::Memory(data));
+        self.routed = subtract(&self.routed, offset, len);
+        self.pending.insert(offset, len);
+        if repaired {
+            self.repaired.insert(offset, len);
+        }
     }
 
     /// Every byte this volume is still holding in RAM, routed or not.
@@ -908,6 +1056,51 @@ impl VolumeStaging {
         }
     }
 
+    /// Whether `[offset, offset + len)` was force-staged by a repair, so the
+    /// drain must overwrite the composition rather than clip it.
+    fn is_repaired(&self, offset: u64, len: u64) -> bool {
+        len > 0 && self.repaired.missing(offset, len).is_empty()
+    }
+
+    /// Splits `[start, end)` at every [`Self::repaired`] boundary inside it, so
+    /// each sub-range is **wholly** repaired or wholly not.
+    ///
+    /// The drain's `replace` flag is all-or-nothing per emitted run, and the two
+    /// things that decide a run's extent decide it for unrelated reasons:
+    /// `map_physical_range` splits at member and envelope boundaries, and
+    /// `pending` coalesces every staged range that abuts another. A repair
+    /// therefore routinely produces one member run covering repaired *and*
+    /// unrepaired bytes, and that run took `replace = false` — so
+    /// `CrcRuns::insert` refused it as overlapping, the wire-damaged value
+    /// survived the repair, and the member failed its gate on bytes that are
+    /// correct on disk. Splitting here first is what makes the flag exact
+    /// (phase 6 review, F4).
+    ///
+    /// A volume with no repair in flight — every volume, nearly always — returns
+    /// the range unchanged and costs one `is_empty` check.
+    fn repair_partition(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        if end <= start {
+            return Vec::new();
+        }
+        if self.repaired.is_empty() {
+            return vec![(start, end)];
+        }
+        let len = end - start;
+        let mut split = Vec::new();
+        let mut cursor = start;
+        for (gap_start, gap_end) in self.repaired.missing(start, len) {
+            if gap_start > cursor {
+                split.push((cursor, gap_start));
+            }
+            split.push((gap_start, gap_end));
+            cursor = gap_end;
+        }
+        if cursor < end {
+            split.push((cursor, end));
+        }
+        split
+    }
+
     /// RAM-resident chunks, largest first, for the pager to choose from.
     fn resident_chunks(&self) -> Vec<(u64, u64)> {
         let mut chunks: Vec<(u64, u64)> = self
@@ -970,6 +1163,17 @@ struct MemberRouting {
     /// what a previous process claimed to have written rather than on what is on
     /// disk now, which is exactly the assurance D6 refuses to trade away.
     restart_seeded: ByteRanges,
+    /// Logical ranges whose composed value a **repair** discarded (D4).
+    ///
+    /// A repaired span is slice-shaped and the runs are article-shaped, so
+    /// [`CrcRuns::overwrite`] drops the articles it straddles and the bytes on
+    /// either side of the rewrite are left composed by nothing. They are still
+    /// covered and still correct — nobody wrote over them — but no value in this
+    /// process describes them, which is the same position restart-seeded
+    /// coverage is in and gets the same treatment: a hard refusal in
+    /// [`DirectSetRouter::try_verify_member`] until they are re-read from the
+    /// partial and their value fed back.
+    stale_gaps: ByteRanges,
     /// The whole-member gate has passed.
     verified: bool,
 }
@@ -1167,6 +1371,53 @@ impl DirectSetRouter {
         self.holds_budget = bytes;
     }
 
+    /// The RAM ceiling this set's holds are bounded by (D2). Read by the repair
+    /// seam, which must size its rewrite against it *before* reading a byte back
+    /// — every repaired byte re-enters the router as a hold.
+    pub(crate) fn holds_budget(&self) -> u64 {
+        self.holds_budget
+    }
+
+    /// Test hook: force-stage a range without draining it, so a test can build
+    /// the one drain shape ordinary routing reaches only through history — bytes
+    /// the router staged and could not place, sitting next to a repaired range.
+    /// `repaired` picks which of the two force-stage rules applies.
+    #[cfg(test)]
+    pub(crate) fn force_stage_for_test(
+        &mut self,
+        volume_index: u32,
+        offset: u64,
+        data: &[u8],
+        repaired: bool,
+    ) {
+        let staging = self.staging.entry(volume_index).or_default();
+        let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(data);
+        if repaired {
+            staging.stage_repaired(offset, bytes);
+        } else {
+            staging.stage_duplicate(offset, bytes);
+        }
+    }
+
+    /// Test hook: stage a range the ordinary way, so a fixture can seed a
+    /// volume's first, undamaged pass without a parseable RAR image.
+    #[cfg(test)]
+    pub(crate) fn stage_for_test(&mut self, volume_index: u32, offset: u64, data: &[u8]) {
+        self.staging
+            .entry(volume_index)
+            .or_default()
+            .stage(offset, data);
+    }
+
+    /// Test hook: one drain, with no parse in front of it.
+    #[cfg(test)]
+    pub(crate) fn drain_for_test(
+        &mut self,
+        volume_index: u32,
+    ) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        self.drain_volume(volume_index)
+    }
+
     /// The layout's members, or nothing while the format is still unknown.
     fn layout_members(&self) -> &[weaver_unrar::StoredMember] {
         self.layout
@@ -1353,6 +1604,89 @@ impl DirectSetRouter {
 
         // D2: a breach pages rather than demoting. Demotion is what is left when
         // paging itself fails — a scratch I/O error, or the ceiling.
+        if self.resident_bytes() > self.holds_budget
+            && let Err(reason) = self.page_holds_to_scratch()
+        {
+            return Err(self.fail(reason));
+        }
+        Ok(spans)
+    }
+
+    /// Re-enters the router with a span a PAR2 repair rebuilt (plan 135, D3/D8).
+    ///
+    /// A repaired span is late-arriving article data with one difference that
+    /// changes everything downstream: the bytes it carries are **not** the bytes
+    /// already on disk for that range. So it takes the same path as an article —
+    /// stage, parse, drain, one span per intersecting destination — through
+    /// [`VolumeStaging::stage_repaired`], which force-stages the range and marks
+    /// it so the drain overwrites the composition instead of clipping it as a
+    /// duplicate.
+    ///
+    /// Two jobs, and the second is easy to overlook. The obvious one is the
+    /// bytes: destination writes must land at the mapped offsets, or the member
+    /// on disk stays damaged. The other is the **parse**: the lost articles that
+    /// made the volume damaged may also have carried the header the walk stopped
+    /// at, so feeding the repaired bytes back is what lets the walk resume — a
+    /// repaired tail holding the end-of-archive record confirms a volume that
+    /// could not otherwise be confirmed, and the set finishes instead of
+    /// demoting.
+    ///
+    /// The returned spans must all be written before the caller records them,
+    /// exactly as for [`Self::route`].
+    /// Takes **all** of one volume's repaired spans at once, deliberately.
+    /// Staging them one at a time would let the classification frontier hold an
+    /// early span — its bytes sit at or past the header walk's tail, so they
+    /// could still be an undiscovered member's payload — until a *later* span
+    /// carrying the end record confirmed the volume. That is a real ordering,
+    /// not a hypothetical: the article a set loses is often the last one, and it
+    /// carries both a member's tail and the record that closes the archive.
+    pub(crate) fn route_repaired(
+        &mut self,
+        volume_index: u32,
+        chunks: &[RepairedChunk],
+    ) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        if let Some(reason) = self.demoted {
+            return Err(reason);
+        }
+        if !self.plan.volumes.contains_key(&volume_index) {
+            return Err(self.fail(DemotionReason::ConflictingVolumeFacts));
+        }
+        let staging = self.staging.entry(volume_index).or_default();
+        let mut staged = false;
+        for (source_offset, data) in chunks {
+            if data.is_empty() {
+                continue;
+            }
+            staging.stage_repaired(*source_offset, std::sync::Arc::clone(data));
+            staged = true;
+        }
+        if !staged {
+            return Ok(Vec::new());
+        }
+
+        self.try_parse_volume(volume_index)?;
+        let volumes: Vec<u32> = self.staging.keys().copied().collect();
+        let mut spans = Vec::new();
+        for volume in volumes {
+            spans.extend(self.drain_volume(volume)?);
+        }
+
+        // Every repaired byte must have found a destination. Unlike an ordinary
+        // article — whose bytes may legitimately be held above the
+        // classification frontier until a later header proves what they are —
+        // a repair runs after the volume has finished downloading and been
+        // parsed, so a byte with nowhere to go means the layout in front of us
+        // cannot place bytes it previously placed. That is a demotion, not a
+        // hold: leaving it staged would sit on a repaired byte the member is
+        // waiting for, forever.
+        if self
+            .staging
+            .get(&volume_index)
+            .is_some_and(|staging| !staging.repaired.is_empty())
+        {
+            return Err(self.fail(DemotionReason::RepairRerouteFailed));
+        }
+
         if self.resident_bytes() > self.holds_budget
             && let Err(reason) = self.page_holds_to_scratch()
         {
@@ -1692,6 +2026,7 @@ impl DirectSetRouter {
                     parts: BTreeMap::new(),
                     checked_parts: BTreeMap::new(),
                     restart_seeded: ByteRanges::new(),
+                    stale_gaps: ByteRanges::new(),
                     verified: false,
                 },
             );
@@ -1851,7 +2186,16 @@ impl DirectSetRouter {
         if staging.pending.is_empty() {
             return Ok(Vec::new());
         }
-        let pending: Vec<(u64, u64)> = staging.pending.ranges().to_vec();
+        // Split at the repair boundaries **before** anything is mapped: the
+        // emitted run's `replace` flag is all-or-nothing, and neither the layout
+        // nor `pending`'s coalescing knows where a repair starts and stops
+        // ([`VolumeStaging::repair_partition`]).
+        let pending: Vec<(u64, u64)> = staging
+            .pending
+            .ranges()
+            .iter()
+            .flat_map(|(start, end)| staging.repair_partition(*start, *end))
+            .collect();
         // Beyond this the volume's classification is unproven; see
         // [`VolumeStaging::tail_base`]. A confirmed volume has no such region.
         let unproven_from = if staging.confirmed {
@@ -1917,16 +2261,22 @@ impl DirectSetRouter {
                             cursor = cursor.saturating_add(len);
                             continue;
                         };
-                        let bytes = self
-                            .staging
-                            .get(&volume_index)
-                            .and_then(|staging| staging.slice(cursor, len, &self.scratch));
+                        let staging = self.staging.get(&volume_index);
+                        // The repair marker (D3): read before the slice, from
+                        // the same staging entry, so the decision is made on
+                        // the range that is about to drain rather than on a
+                        // router-wide mode a concurrent duplicate could ride.
+                        let replace =
+                            staging.is_some_and(|staging| staging.is_repaired(cursor, len));
+                        let bytes =
+                            staging.and_then(|staging| staging.slice(cursor, len, &self.scratch));
                         if let Some(bytes) = bytes {
                             self.note_member_bytes(
                                 member_id,
                                 volume_index,
                                 logical_offset,
                                 &bytes,
+                                replace,
                             )?;
                             // Recorded here, at the moment a member destination
                             // is chosen, and never revisited: this is the only
@@ -1966,6 +2316,10 @@ impl DirectSetRouter {
             }
             for (start, len) in &routed {
                 still_pending = subtract(&still_pending, *start, *len);
+                // The repair marker lives exactly as long as the bytes it
+                // describes: a routed range is composed, so a duplicate of it
+                // arriving later is a duplicate again and must clip.
+                staging.repaired = subtract(&staging.repaired, *start, *len);
             }
             staging.pending = still_pending;
         }
@@ -2021,12 +2375,19 @@ impl DirectSetRouter {
     }
 
     /// Feeds one routed member run into the integrity gates (D4 layers 1 and 2).
+    ///
+    /// `replace` is D3's repair marker. Without it a run whose bytes the
+    /// coverage map already claims is a duplicate and contributes nothing; with
+    /// it the run is a PAR2 repair of those very bytes, so the composition is
+    /// **overwritten** and whatever the rewrite half-covered becomes a stale gap
+    /// the caller must re-read.
     fn note_member_bytes(
         &mut self,
         member_id: u32,
         volume_index: u32,
         logical_offset: u64,
         bytes: &[u8],
+        replace: bool,
     ) -> Result<(), DemotionReason> {
         let len = bytes.len() as u64;
         let Some(layout_index) = self.layout_index_for_member(member_id) else {
@@ -2039,16 +2400,44 @@ impl DirectSetRouter {
         let Some(member) = self.members.get_mut(&member_id) else {
             return Ok(());
         };
-        if member.covered.insert(logical_offset, len) == 0 {
+        if member.covered.insert(logical_offset, len) == 0 && !replace {
             // Wholly duplicate: never advance a gate twice.
             return Ok(());
         }
         let crc = weaver_par2::checksum::crc32(bytes);
-        member.parts.entry(part_position).or_default().insert(
-            logical_offset.saturating_sub(part_logical_offset),
-            len,
-            crc,
-        );
+        let part_relative = logical_offset.saturating_sub(part_logical_offset);
+        if replace {
+            let gaps =
+                member
+                    .parts
+                    .entry(part_position)
+                    .or_default()
+                    .overwrite(part_relative, len, crc);
+            // A repaired span can only *resolve* gaps that fall inside it, so
+            // the rewritten range leaves the stale set before the new gaps join
+            // it — and both are recorded in member-logical space, which is what
+            // the re-read plan and the coverage map speak.
+            member.stale_gaps = subtract(&member.stale_gaps, logical_offset, len);
+            for (start, end) in gaps {
+                member.stale_gaps.insert(
+                    start.saturating_add(part_logical_offset),
+                    end.saturating_sub(start),
+                );
+            }
+            // Both of these described bytes that no longer exist. Dropping the
+            // part's checked value is what keeps a stale one from surviving the
+            // rewrite: while the gaps are open the composition below yields
+            // nothing, so without the removal the member would go on verifying
+            // against the value the damaged bytes produced.
+            member.checked_parts.remove(&part_position);
+            member.verified = false;
+        } else {
+            member
+                .parts
+                .entry(part_position)
+                .or_default()
+                .insert(part_relative, len, crc);
+        }
 
         // Layer 1: the part's packed CRC32, as soon as the part is complete.
         //
@@ -2140,11 +2529,14 @@ impl DirectSetRouter {
         // the missing `checked_parts` entry in every shape this can take; saying
         // it here means a future part-granularity change cannot quietly turn
         // "unverifiable" into "verified".
-        if self
-            .members
-            .get(&member_id)
-            .is_some_and(|member| !member.restart_seeded.is_empty())
-        {
+        //
+        // D4 says the same thing about a repair's stale gaps, and for the same
+        // reason: they are covered bytes whose composed value a rewrite threw
+        // away, so composing around them would pass the member on the strength
+        // of runs that describe a *different* span than the one on disk.
+        if self.members.get(&member_id).is_some_and(|member| {
+            !member.restart_seeded.is_empty() || !member.stale_gaps.is_empty()
+        }) {
             return Ok(());
         }
         if unpacked_size == 0 {
@@ -2454,16 +2846,36 @@ impl DirectSetRouter {
     /// returned in `(member, ascending offset)` order so the caller's read is one
     /// forward pass per file rather than a seek per run.
     pub(crate) fn restart_read_plan(&self) -> Vec<RestartReadRun> {
+        self.reread_plan(|member| &member.restart_seeded)
+    }
+
+    /// Whether any member is carrying a repair's stale composition gaps (D4).
+    pub(crate) fn has_stale_gaps(&self) -> bool {
+        self.members
+            .values()
+            .any(|member| !member.stale_gaps.is_empty())
+    }
+
+    /// The runs a repair left composed by nothing, in the same shape
+    /// [`Self::restart_read_plan`] produces — the two are the same problem
+    /// (covered bytes with no value in this process) reached from two
+    /// directions, so they share a reader and a re-arm.
+    pub(crate) fn stale_gap_read_plan(&self) -> Vec<RestartReadRun> {
+        self.reread_plan(|member| &member.stale_gaps)
+    }
+
+    fn reread_plan(&self, pick: impl Fn(&MemberRouting) -> &ByteRanges) -> Vec<RestartReadRun> {
         let mut plan = Vec::new();
         for member_id in &self.member_order {
             let Some(member) = self.members.get(member_id) else {
                 continue;
             };
-            if member.restart_seeded.is_empty() {
+            let ranges = pick(member);
+            if ranges.is_empty() {
                 continue;
             }
             let boundaries = self.part_boundaries(*member_id);
-            for &(start, end) in member.restart_seeded.ranges() {
+            for &(start, end) in ranges.ranges() {
                 let mut cursor = start;
                 while cursor < end {
                     let stop = boundaries
@@ -2555,12 +2967,22 @@ impl DirectSetRouter {
         let Some(member) = self.members.get_mut(&member_id) else {
             return Err(self.fail(DemotionReason::RestartRearmUnplaceable));
         };
-        member.parts.entry(part_position).or_default().insert(
+        // `overwrite`, not `insert`: a stale gap is by construction a *fragment*
+        // of a run a repair discarded, and a plain insert would refuse it as
+        // overlapping if any neighbour survived. Its own gaps are empty by
+        // construction — the run it replaces was already removed — so this
+        // cannot cascade.
+        let gaps = member.parts.entry(part_position).or_default().overwrite(
             logical_offset.saturating_sub(part_logical_offset),
             len,
             crc,
         );
+        debug_assert!(
+            gaps.is_empty(),
+            "re-reading member {member_id} at {logical_offset} left new stale gaps behind"
+        );
         member.restart_seeded = subtract(&member.restart_seeded, logical_offset, len);
+        member.stale_gaps = subtract(&member.stale_gaps, logical_offset, len);
 
         let part_value = member
             .parts
@@ -2580,10 +3002,120 @@ impl DirectSetRouter {
     /// Files one emitted member extent into the volume's routing history,
     /// coalescing it with the extent it continues (B1).
     ///
-    /// A physical byte is routed at most once — [`VolumeStaging::stage`] never
-    /// re-stages a routed range — so the history is disjoint by construction and
-    /// an insert is either an extension of the previous extent or a new one.
+    /// A physical byte is routed at most once *by ordinary routing* —
+    /// [`VolumeStaging::stage`] never re-stages a routed range — but a PAR2
+    /// repair re-routes bytes the history already holds
+    /// ([`VolumeStaging::stage_repaired`]), so the parts already recorded are
+    /// subtracted before anything is filed. The history stays disjoint, and a
+    /// repair that also fills a range the set never routed (a slice lost to a
+    /// missing article) still records that part.
+    ///
+    /// The subtraction is gated behind an **overlap pre-check**, because this
+    /// runs once per emitted member run for the whole life of every set and the
+    /// overlapping case is only ever a repair: without the gate, every ordinary
+    /// article paid a `Vec` the length of the volume's extent history for a
+    /// subtraction that removes nothing (phase 6 review, F7). The history is
+    /// sorted by physical offset and disjoint, so its ends are monotonic too and
+    /// one `partition_point` finds the first extent that could overlap.
     fn record_routed_extent(&mut self, volume_index: u32, extent: MemberExtent) {
+        if extent.len == 0 {
+            return;
+        }
+        let end = extent.physical_offset.saturating_add(extent.len);
+        let overlapping = self
+            .routed_extents
+            .get(&volume_index)
+            .map(|extents| {
+                let first = extents.partition_point(|held| {
+                    held.physical_offset.saturating_add(held.len) <= extent.physical_offset
+                });
+                &extents[first..]
+            })
+            .filter(|extents| {
+                extents
+                    .first()
+                    .is_some_and(|held| held.physical_offset < end)
+            });
+        let held: Vec<(u64, u64)> = overlapping
+            .map(|extents| {
+                extents
+                    .iter()
+                    .map(|held| (held.physical_offset, held.physical_offset + held.len))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !held.is_empty() {
+            // Re-routing a physical byte to a *different* destination is not a
+            // shape this history can express: the overlapping part is subtracted
+            // rather than corrected, so the old destination silently survives.
+            // Nothing can produce it — a repair rewrites bytes, never the layout
+            // that placed them, and a layout rebuild that moved a member would
+            // have demoted the set — so it is asserted rather than handled.
+            debug_assert!(
+                self.routed_extents
+                    .get(&volume_index)
+                    .into_iter()
+                    .flatten()
+                    .filter(|old| {
+                        old.physical_offset < end
+                            && old.physical_offset.saturating_add(old.len) > extent.physical_offset
+                    })
+                    .all(|old| {
+                        // The offset delta as a *signed* quantity: a member's
+                        // logical offset routinely sits below the physical one
+                        // (the volume's header comes first), so an unsigned
+                        // `checked_sub` would answer `None` on both sides and
+                        // make the comparison vacuously true — which is the one
+                        // thing an assertion must never be.
+                        old.member_id == extent.member_id
+                            && i128::from(old.logical_offset) - i128::from(old.physical_offset)
+                                == i128::from(extent.logical_offset)
+                                    - i128::from(extent.physical_offset)
+                    }),
+                "volume {volume_index} re-routed the bytes at {} to a different member \
+                 destination than the history already holds for them",
+                extent.physical_offset
+            );
+            let mut cursor = extent.physical_offset;
+            let mut fresh = Vec::new();
+            for (start, stop) in held {
+                if stop <= cursor {
+                    continue;
+                }
+                if start >= end {
+                    break;
+                }
+                if start > cursor {
+                    fresh.push((cursor, start.min(end)));
+                }
+                cursor = cursor.max(stop);
+                if cursor >= end {
+                    break;
+                }
+            }
+            if cursor < end {
+                fresh.push((cursor, end));
+            }
+            for (start, stop) in fresh {
+                self.record_fresh_extent(
+                    volume_index,
+                    MemberExtent {
+                        member_id: extent.member_id,
+                        physical_offset: start,
+                        logical_offset: extent
+                            .logical_offset
+                            .saturating_add(start - extent.physical_offset),
+                        len: stop - start,
+                    },
+                );
+            }
+            return;
+        }
+        self.record_fresh_extent(volume_index, extent);
+    }
+
+    /// [`Self::record_routed_extent`] once the range is known to be new.
+    fn record_fresh_extent(&mut self, volume_index: u32, extent: MemberExtent) {
         if extent.len == 0 {
             return;
         }

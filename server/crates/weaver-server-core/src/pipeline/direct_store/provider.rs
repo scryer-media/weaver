@@ -134,6 +134,73 @@ pub(crate) struct VirtualVolume {
     pub(crate) len: u64,
 }
 
+impl VirtualVolume {
+    /// The physical ranges a [`VirtualVolumeReader`] can actually answer, in
+    /// order: covered, inside the volume, and claimed by a source that holds
+    /// them — a member extent, or an envelope write that really happened.
+    ///
+    /// This is [`VirtualVolumeReader::run_end`]'s decision, hoisted out of the
+    /// read loop so a caller can ask about the volume's *shape* without reading
+    /// a byte of it.
+    pub(crate) fn readable_ranges(&self) -> Vec<(u64, u64)> {
+        let mut sources = ByteRanges::new();
+        for extent in &self.extents {
+            sources.insert(extent.physical_offset, extent.len);
+        }
+        for &(start, end) in self.envelope_covered.ranges() {
+            sources.insert(start, end.saturating_sub(start));
+        }
+
+        let mut readable = Vec::new();
+        for &(start, end) in self.covered.ranges() {
+            let end = end.min(self.len);
+            if end <= start {
+                continue;
+            }
+            for &(source_start, source_end) in sources.ranges() {
+                let overlap = (source_start.max(start), source_end.min(end));
+                if overlap.0 < overlap.1 {
+                    match readable.last_mut() {
+                        Some((_, last_end)) if *last_end == overlap.0 => *last_end = overlap.1,
+                        _ => readable.push(overlap),
+                    }
+                }
+            }
+        }
+        readable
+    }
+
+    /// `Some(end)` when everything readable is one run from zero — the volume
+    /// reads exactly like a whole or truncated file — and `None` when an
+    /// **interior hole** sits below readable bytes.
+    ///
+    /// The distinction is the one D5's `FileAccess` adapter turns on, and it is
+    /// a damage-accounting fact rather than a performance one. A sequential
+    /// reader has no way to say "these bytes are unknown, the next ones are
+    /// fine": it stops at the hole, and every PAR2 slice after it reads zero
+    /// bytes and is counted damaged. Sizing a repair from that count rebuilds
+    /// slices that were never broken — wasting recovery capacity, and able to
+    /// flip a repairable set to unrepairable. A ranged read seeks past the hole
+    /// and attributes damage to the slices that actually touch it, which is
+    /// exactly the verdict a physically sparse volume produces, so refusing the
+    /// sequential path here is what keeps direct and conventional verdicts the
+    /// same shape.
+    pub(crate) fn readable_prefix(&self) -> Option<u64> {
+        match self.readable_ranges().as_slice() {
+            [] => Some(0),
+            [(0, end)] => Some(*end),
+            _ => None,
+        }
+    }
+
+    /// Whether an interior hole makes a sequential sweep lie about which slices
+    /// are damaged. The inverse of [`Self::readable_prefix`], named for the
+    /// question the adapter asks.
+    pub(crate) fn has_interior_hole(&self) -> bool {
+        self.readable_prefix().is_none()
+    }
+}
+
 /// A [`VolumeProvider`] over a direct set's partials and envelopes.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HybridVolumeProvider {

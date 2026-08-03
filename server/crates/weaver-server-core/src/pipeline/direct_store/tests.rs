@@ -2881,7 +2881,7 @@ fn a_hole_reads_as_a_short_file_and_never_as_zeros() {
 }
 
 #[test]
-fn an_interior_hole_costs_the_sequential_reader_everything_after_it() {
+fn an_interior_hole_refuses_the_sequential_reader_rather_than_lying_through_it() {
     use std::io::Read;
 
     let dir = tempfile::tempdir().unwrap();
@@ -2899,21 +2899,37 @@ fn an_interior_hole_costs_the_sequential_reader_everything_after_it() {
     let par2_set = descriptor_only_par2_set("silver.horizon.part01.rar", &fixture.conventional);
     let (access, file_id) = virtual_file_access(&fixture, &par2_set, dir.path());
 
-    // The sequential reader is a stream: it stops at the *first* hole, so every
-    // byte after an interior gap is unreachable through it even though both the
-    // partial and the envelope still hold those bytes.
+    // The underlying stream really does stop at the first hole — a `Read` has no
+    // way to say "skip 32 bytes, then resume" — so every byte after an interior
+    // gap is unreachable through it even though both the partial and the
+    // envelope still hold those bytes.
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
     let mut streamed = Vec::new();
-    access
-        .open_sequential_reader(&file_id)
-        .expect("the volume is registered")
-        .expect("a direct volume answers with a reader")
-        .read_to_end(&mut streamed)
-        .expect("a hole is end-of-file, not an error");
+    let mut reader = provider.open(0).expect("the volume is registered");
+    let _ = reader.read_to_end(&mut streamed);
     assert_eq!(
         streamed.len() as u64,
         hole_at,
-        "the sequential sweep must stop at the first hole, not skip it"
+        "the sequential sweep stops at the first hole; it cannot skip it"
     );
+
+    // Which is why the adapter does not offer one. Wave 2 did, and every sweep
+    // that consumed it — the no-IFSC whole-file MD5, PAR2's batched slice pass —
+    // saw a file ending at the first hole and reported every slice after an
+    // interior gap damaged, intact bytes included. Wave 2 only produced a
+    // verdict, so the cost was a demotion that refetched slightly more than it
+    // had to; phase 6 sizes a *repair* from that same count, and a repair sized
+    // from "damaged" rather than "absent" spends recovery blocks rebuilding good
+    // slices — enough of them and a repairable set reads as unrepairable.
+    assert!(
+        access
+            .open_sequential_reader(&file_id)
+            .expect("the volume is registered")
+            .is_none(),
+        "the adapter must refuse the sequential reader for an interior hole and \
+         let the caller fall back to the ranged, per-slice path"
+    );
+    assert_eq!(access.counters().sequential_refusals(), 1);
 
     // Addressed directly, the bytes past the gap are all there — which is what
     // makes the paragraph above a property of the *stream*, not of the data.
@@ -2926,16 +2942,6 @@ fn an_interior_hole_costs_the_sequential_reader_everything_after_it() {
         "the bytes after an interior hole are present and readable when addressed"
     );
 
-    // The consequence, stated so phase 6 inherits it rather than rediscovers it:
-    // any sweep that consumes the sequential reader — the no-IFSC whole-file
-    // MD5, and PAR2's batched slice pass — sees a file that ends at the first
-    // hole, so every slice after an interior gap is reported damaged even where
-    // the bytes are intact. Wave 2 only produces a verdict, so the cost is a
-    // demotion that materializes and refetches slightly more than it had to.
-    // Phase 6 sizes a *repair* from that same count, and a repair sized from
-    // "damaged" rather than "absent" would rebuild good slices: it must either
-    // read holes per slice through the ranged path, or subtract the hole ranges
-    // from the damage set before planning.
     let hole_slice = (hole_at + hole_len) / par2_set.slice_size;
     assert!(
         hole_slice + 1 < total / par2_set.slice_size,
@@ -3363,4 +3369,593 @@ fn a_scratch_that_never_appended_a_byte_leaves_nothing_behind() {
     scratch.discard();
     scratch.discard();
     assert!(!path.exists());
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: damage accounting over an interior hole (D8's opening note)
+// ---------------------------------------------------------------------------
+
+/// A PAR2 set describing one file with **slice checksums**, which is what makes
+/// per-slice damage attribution a question at all.
+fn sliced_par2_set(filename: &str, bytes: &[u8], slice_size: u64) -> weaver_par2::Par2FileSet {
+    let file_id = weaver_par2::FileId::from_bytes([11u8; 16]);
+    let mut checksums = Vec::new();
+    let mut offset = 0u64;
+    while offset < bytes.len() as u64 {
+        let end = (offset + slice_size).min(bytes.len() as u64);
+        let mut state = weaver_par2::SliceChecksumState::new();
+        state.update(&bytes[offset as usize..end as usize]);
+        let (crc32, md5) = state.finalize((end - offset < slice_size).then_some(slice_size));
+        checksums.push(weaver_par2::SliceChecksum { crc32, md5 });
+        offset = end;
+    }
+    weaver_par2::Par2FileSet {
+        recovery_set_id: weaver_par2::RecoverySetId::from_bytes([4; 16]),
+        slice_size,
+        recovery_file_ids: vec![file_id],
+        non_recovery_file_ids: Vec::new(),
+        files: HashMap::from([(
+            file_id,
+            weaver_par2::FileDescription {
+                file_id,
+                hash_full: weaver_par2::checksum::md5(bytes),
+                hash_16k: weaver_par2::checksum::md5(&bytes[..bytes.len().min(16 * 1024)]),
+                length: bytes.len() as u64,
+                par2_name: filename.to_string(),
+                filename: filename.to_string(),
+            },
+        )]),
+        slice_checksums: HashMap::from([(file_id, checksums)]),
+        recovery_slices: std::collections::BTreeMap::new(),
+        creator: None,
+    }
+}
+
+/// The provider fixture's volume with one **interior** hole: everything is
+/// covered except `[hole_start, hole_end)`, which sits in the middle of member A
+/// with healthy bytes on both sides.
+fn covered_with_interior_hole(hole_start: u64, hole_end: u64) -> ByteRanges {
+    let total =
+        (PROVIDER_HEADER + PROVIDER_MEMBER_A + PROVIDER_GAP + PROVIDER_MEMBER_B + PROVIDER_TRAILER)
+            as u64;
+    let mut covered = ByteRanges::new();
+    covered.insert(0, hole_start);
+    covered.insert(hole_end, total - hole_end);
+    covered
+}
+
+/// Which slices `verify_slices` calls damaged, as a set of indices.
+fn damaged_slice_indices(valid: &[bool]) -> Vec<usize> {
+    valid
+        .iter()
+        .enumerate()
+        .filter_map(|(index, valid)| (!*valid).then_some(index))
+        .collect()
+}
+
+const HOLE_SLICE_SIZE: u64 = 64;
+
+#[test]
+fn an_interior_hole_damages_only_the_slices_it_touches() {
+    // The wave-2 review note, as a test. The sequential sweep
+    // `verify_slices_batched_md5` prefers stops at the first hole and reports
+    // every slice after it damaged — on this fixture that is 5 slices instead of
+    // 2 — and the repair those numbers size rebuilds three healthy slices with
+    // recovery blocks it did not need to spend.
+    let dir = tempfile::tempdir().unwrap();
+    let hole = (100u64, 180u64);
+    let fixture = provider_fixture(covered_with_interior_hole(hole.0, hole.1));
+    let par2_set = sliced_par2_set(
+        "silver.horizon.part01.rar",
+        &fixture.conventional,
+        HOLE_SLICE_SIZE,
+    );
+    let (access, file_id) = virtual_file_access(&fixture, &par2_set, dir.path());
+    let counters = access.counters();
+
+    let valid = weaver_par2::verify_slices(&par2_set, &file_id, &access)
+        .expect("the description names a registered virtual volume");
+    let damaged = damaged_slice_indices(&valid);
+
+    // Only the slices the hole actually overlaps: `[100, 180)` at a 64-byte
+    // slice size is slices 1 and 2.
+    let expected: Vec<usize> = (0..valid.len())
+        .filter(|index| {
+            let start = *index as u64 * HOLE_SLICE_SIZE;
+            let end = start + HOLE_SLICE_SIZE;
+            start < hole.1 && hole.0 < end
+        })
+        .collect();
+    assert_eq!(
+        damaged, expected,
+        "an interior hole must damage only the slices that touch it; a count \
+         inflated by the sequential sweep sizes the repair from healthy slices \
+         and can flip repairable to unrepairable"
+    );
+    assert!(
+        counters.sequential_refusals() > 0,
+        "the adapter must refuse the sequential reader for a volume with an \
+         interior hole — that refusal is what makes the count above accurate"
+    );
+    assert!(
+        damaged.len() < valid.len() - 1,
+        "non-vacuity: the fixture must have healthy slices *after* the hole, or \
+         the accounting fix would be untestable here"
+    );
+}
+
+#[test]
+fn interior_hole_verdicts_match_a_physically_sparse_volume() {
+    // Verdict parity is the acceptance rule for the seam choice: whatever the
+    // adapter answers, it must be what the same job would have concluded with
+    // the gate off, where the missing articles leave a sparse file with real
+    // zeros in the hole.
+    let dir = tempfile::tempdir().unwrap();
+    let hole = (100u64, 180u64);
+    let fixture = provider_fixture(covered_with_interior_hole(hole.0, hole.1));
+    let filename = "silver.horizon.part01.rar";
+    let par2_set = sliced_par2_set(filename, &fixture.conventional, HOLE_SLICE_SIZE);
+    let (access, file_id) = virtual_file_access(&fixture, &par2_set, dir.path());
+    let virtual_valid = weaver_par2::verify_slices(&par2_set, &file_id, &access)
+        .expect("the virtual volume verifies");
+
+    // The same volume as the conventional path would have left it: written at
+    // its offsets, with a filesystem hole where the articles never arrived.
+    let physical_dir = tempfile::tempdir().unwrap();
+    let path = physical_dir.path().join(filename);
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&fixture.conventional[..hole.0 as usize])
+            .unwrap();
+        file.seek(SeekFrom::Start(hole.1)).unwrap();
+        file.write_all(&fixture.conventional[hole.1 as usize..])
+            .unwrap();
+    }
+    let physical = weaver_par2::PlacementFileAccess::new(
+        physical_dir.path().to_path_buf(),
+        &par2_set,
+        HashMap::new(),
+    );
+    let physical_valid =
+        weaver_par2::verify_slices(&par2_set, &file_id, &physical).expect("the file verifies");
+
+    assert_eq!(
+        virtual_valid, physical_valid,
+        "a direct set's verdict must be the verdict the same damage produces on \
+         a real sparse volume, slice for slice"
+    );
+}
+
+#[test]
+fn a_truncated_volume_still_takes_the_sequential_path() {
+    // The refusal is scoped to *interior* holes on purpose. A volume covered
+    // from zero and stopping short reads exactly like a truncated file, which is
+    // what a sequential sweep already reports correctly — so the fast path D5
+    // requires survives for every shape except the one that lies.
+    let dir = tempfile::tempdir().unwrap();
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 200);
+    let fixture = provider_fixture(covered);
+    let par2_set = sliced_par2_set(
+        "silver.horizon.part01.rar",
+        &fixture.conventional,
+        HOLE_SLICE_SIZE,
+    );
+    let (access, file_id) = virtual_file_access(&fixture, &par2_set, dir.path());
+    let counters = access.counters();
+
+    let valid = weaver_par2::verify_slices(&par2_set, &file_id, &access)
+        .expect("the truncated volume verifies");
+    assert_eq!(
+        damaged_slice_indices(&valid),
+        (3..valid.len()).collect::<Vec<_>>(),
+        "a volume covered to byte 200 has three whole 64-byte slices and nothing else"
+    );
+    assert_eq!(
+        counters.sequential_refusals(),
+        0,
+        "a prefix-readable volume must keep the sequential reader"
+    );
+    assert!(counters.sequential_opens() > 0);
+}
+
+#[test]
+fn readable_prefix_reports_the_shape_the_reader_can_answer() {
+    let whole = provider_fixture(whole_volume_covered());
+    assert_eq!(
+        whole.volume.readable_prefix(),
+        Some(whole.conventional.len() as u64),
+        "a fully covered volume reads end to end"
+    );
+    assert!(!whole.volume.has_interior_hole());
+
+    let holed = provider_fixture(covered_with_interior_hole(100, 180));
+    assert_eq!(holed.volume.readable_prefix(), None);
+    assert!(holed.volume.has_interior_hole());
+
+    // Covered, but by no source that holds the bytes: the extents that said the
+    // members owned them are gone (B1's ineligible-member case), so those ranges
+    // are holes however loudly the volume-level map claims coverage.
+    let unbacked = provider_fixture_with_extents(whole_volume_covered(), false);
+    let member_a_at = PROVIDER_HEADER as u64;
+    let member_b_at = (PROVIDER_HEADER + PROVIDER_MEMBER_A + PROVIDER_GAP) as u64;
+    assert_eq!(
+        unbacked.volume.readable_ranges(),
+        vec![
+            (0, member_a_at),
+            (
+                member_a_at + PROVIDER_MEMBER_A as u64,
+                member_a_at + PROVIDER_MEMBER_A as u64 + PROVIDER_GAP as u64
+            ),
+            (
+                member_b_at + PROVIDER_MEMBER_B as u64,
+                member_b_at + PROVIDER_MEMBER_B as u64 + PROVIDER_TRAILER as u64
+            ),
+        ],
+        "the readable image is what a *source* holds, never what the volume map \
+         claims — a byte with no source is a hole, which is the invariant that \
+         keeps fabricated zeros out of a reconstruction"
+    );
+    assert!(
+        unbacked.volume.has_interior_hole(),
+        "and the shape query says so, so nothing offers a stream over it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: CRC composition under repair (D3/D4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn overwrite_replaces_a_run_and_reports_no_gap_when_it_lines_up() {
+    let mut runs = CrcRuns::default();
+    runs.insert(0, 100, 0x1111_1111);
+    runs.insert(100, 100, 0x2222_2222);
+
+    let gaps = runs.overwrite(100, 100, 0x3333_3333);
+    assert!(
+        gaps.is_empty(),
+        "a rewrite that covers whole runs leaves nothing composed by nothing"
+    );
+    assert_eq!(
+        runs.compose(0, 200),
+        Some(weaver_par2::checksum::Crc32CombineOp::new(100).combine(0x1111_1111, 0x3333_3333)),
+        "the composition must carry the repaired value, not the value the \
+         damaged bytes produced"
+    );
+}
+
+#[test]
+fn overwrite_leaves_the_uncovered_edges_as_stale_gaps() {
+    let mut runs = CrcRuns::default();
+    runs.insert(0, 100, 0x1111_1111);
+
+    // A slice-shaped rewrite inside one article-shaped run: the article's value
+    // describes bytes that no longer exist, and the bytes on either side of the
+    // rewrite are left vouched for by nothing.
+    let gaps = runs.overwrite(40, 20, 0x4444_4444);
+    assert_eq!(
+        gaps,
+        vec![(0, 40), (60, 100)],
+        "both edges of the discarded run become stale gaps"
+    );
+    assert_eq!(
+        runs.compose(0, 100),
+        None,
+        "and until they are re-read the range composes to nothing, which every \
+         caller treats as refuse rather than pass"
+    );
+
+    // Closing them is what re-arms the composition.
+    let head = runs.overwrite(0, 40, 0x5555_5555);
+    let tail = runs.overwrite(60, 40, 0x6666_6666);
+    assert!(head.is_empty() && tail.is_empty());
+    let expected = weaver_par2::checksum::Crc32CombineOp::new(20).combine(0x5555_5555, 0x4444_4444);
+    let expected = weaver_par2::checksum::Crc32CombineOp::new(40).combine(expected, 0x6666_6666);
+    assert_eq!(runs.compose(0, 100), Some(expected));
+}
+
+#[test]
+fn insert_still_clips_a_duplicate_after_a_repair_overwrote_the_same_run() {
+    // The distinction phase 6 turns on. A repair moved the bytes, so the
+    // composition moved with them; a duplicate article carrying the *old* bytes
+    // must not move it back, and `insert`'s overlap refusal is what stops it.
+    let mut runs = CrcRuns::default();
+    runs.insert(0, 100, 0xDEAD_BEEF);
+    runs.overwrite(0, 100, 0xFEED_FACE);
+
+    runs.insert(0, 100, 0xDEAD_BEEF);
+    assert_eq!(
+        runs.compose(0, 100),
+        Some(0xFEED_FACE),
+        "a duplicate must clip against the repaired run, never replace it"
+    );
+}
+
+/// A one-volume set holding one whole stored member, rebuilt from facts the way
+/// restore rebuilds one — so a test can drive [`DirectSetRouter`]'s drain
+/// without a parseable RAR image in front of it.
+///
+/// `member` is the member's final (post-repair) bytes: the layout's whole-member
+/// CRC32 is taken over them, so the set verifies exactly when the composition
+/// ends up describing the repaired image and not the damaged one.
+fn straddle_router(member: &[u8], header_bytes: u64) -> (DirectSetRouter, u32) {
+    let plan = DirectSetPlan {
+        set_name: SET.to_string(),
+        volumes: [(0u32, 0u32)].into_iter().collect(),
+        files: [(0u32, 0u32)].into_iter().collect(),
+        working_dir: std::path::PathBuf::from("/nonexistent"),
+    };
+    let mut router = DirectSetRouter::new(plan);
+    let facts = std::collections::BTreeMap::from([(
+        0u32,
+        volume_facts(0, false, {
+            let mut only = member_facts(
+                STRADDLE_MEMBER,
+                header_bytes,
+                member.len() as u64,
+                member.len() as u64,
+            );
+            // One part, chain closed, so the whole-member gate is armed the
+            // moment the composition covers it. No packed CRC32: layer 1 would
+            // otherwise fire on the *damaged* prefix during the set-up drain and
+            // demote before the repair the test is about ever happens.
+            only.data_crc32 = Some(weaver_par2::checksum::crc32(member));
+            vec![only]
+        }),
+    )]);
+    router.restore_layout(&facts).expect("the facts rebuild");
+    let member_id = router
+        .member_partials()
+        .first()
+        .map(|(member_id, _, _)| *member_id)
+        .expect("the member was adopted");
+    (router, member_id)
+}
+
+const STRADDLE_MEMBER: &str = "Silver.Horizon.S01E25.mkv";
+
+#[test]
+fn a_drain_run_straddling_repaired_and_duplicate_bytes_splits_at_the_boundary() {
+    // F4, the load-bearing gap. The drain's `replace` flag is all-or-nothing per
+    // emitted run, and the two things that fix a run's extent do it for
+    // unrelated reasons: `map_physical_range` splits at member boundaries, and
+    // `pending` coalesces everything that abuts. So a repair routinely produces
+    // **one** member run covering repaired and unrepaired bytes together — and
+    // that run used to take `replace = false`, which makes `CrcRuns::insert`
+    // refuse it as overlapping. The bytes reach the partial correctly and the
+    // composition keeps describing the wire-damaged ones, so the member fails a
+    // gate it should pass and the set demotes, throwing away a repair that
+    // worked.
+    const HEADER: u64 = 64;
+    const MEMBER: u64 = 400;
+    let damaged: Vec<u8> = (0..MEMBER as u32)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let mut repaired = damaged.clone();
+    // The repair rewrites the second half and fills a tail the set never had.
+    for (index, byte) in repaired.iter_mut().enumerate().skip(200) {
+        *byte = ((index * 7 + 3) % 256) as u8;
+    }
+
+    let (mut router, member_id) = straddle_router(&repaired, HEADER);
+
+    // The set's own download: the member's first 300 bytes, damaged. Short of
+    // the member, so neither gate fires yet and the set-up cannot demote.
+    router.stage_for_test(0, HEADER, &damaged[..300]);
+    router.drain_for_test(0).expect("the first drain routes");
+
+    // Now the shape. `[100, 200)` re-enters as an ordinary duplicate — bytes the
+    // router staged and could not place, which is the only way unrepaired bytes
+    // sit next to repaired ones in one pending run — and `[200, 400)` as the
+    // repair. `pending` coalesces the two into `[100, 400)`, and the layout maps
+    // that as a single member run.
+    router.force_stage_for_test(0, HEADER + 100, &damaged[100..200], false);
+    router.force_stage_for_test(0, HEADER + 200, &repaired[200..], true);
+    let spans = router
+        .drain_for_test(0)
+        .expect("the straddling drain routes");
+    assert_eq!(
+        spans.iter().map(|span| span.bytes.len()).sum::<usize>(),
+        300,
+        "both halves must still reach the member's partial — the bug was never \
+         about the bytes, only about what the composition then claims about them"
+    );
+
+    // The repaired sub-range **overwrote**: that is what discards the article's
+    // old value and leaves its uncovered head as a stale gap. Without the split
+    // there is no overwrite, so there is no gap either — and nothing to re-read,
+    // which is how the damaged value survived in silence.
+    assert!(
+        router.has_stale_gaps(),
+        "the repaired sub-range must have overwritten the composition, which is \
+         what opens the stale gap D4's re-read then closes"
+    );
+    assert_eq!(
+        router
+            .stale_gap_read_plan()
+            .iter()
+            .map(|run| (run.member_id, run.logical_offset, run.len))
+            .collect::<Vec<_>>(),
+        vec![(member_id, 0, 200)],
+        "and exactly the head of the discarded article is stale: the duplicate \
+         sub-range clipped, so it neither re-inserted its own value nor widened \
+         the gap"
+    );
+
+    // Closing the gap the way `reread_direct_stale_gaps` does. It composes to
+    // the repaired image, so the whole-member gate passes — the repair survived.
+    router
+        .note_restored_member_crc(
+            member_id,
+            0,
+            200,
+            weaver_par2::checksum::crc32(&repaired[..200]),
+        )
+        .expect("the re-read closes the gap");
+    assert!(
+        !router.has_stale_gaps(),
+        "one pass over the plan closes every gap it named"
+    );
+    assert!(
+        router.all_members_verified(),
+        "and the member must verify against the *repaired* whole-member CRC32; \
+         a composition still carrying the damaged run demotes a set whose bytes \
+         on disk are correct"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: D8's ordering, and what a crash in its window costs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deleting_the_row_before_a_repair_keeps_the_coverage_the_provider_reads() {
+    // D8's ordering rule, and the distinction that makes it survivable. The row
+    // has to go *before* a repair rewrites the bytes it claims — otherwise a
+    // crash mid-repair leaves floors over half-rewritten data. What must **not**
+    // go with it is the controller: a repair leaves every destination in place,
+    // at the same offsets, holding better bytes, so its account of what is on
+    // disk is still exactly right — and it is also what the hybrid provider
+    // reads to answer the re-verify that follows.
+    let recorder = Recorder::default();
+    let mut barrier = sample_barrier();
+    barrier.register_volume(0, 0);
+    barrier.register_destination(0, "Silver.Horizon.S01E04.mkv.direct.partial");
+    barrier
+        .record_write(&write(0, 0, 4096, 0), Instant::now())
+        .unwrap();
+    run_barrier(
+        &mut barrier,
+        &recorder,
+        BarrierTrigger::Demand(BarrierDemand::Pause),
+    )
+    .unwrap();
+    assert_eq!(barrier.generation(), 1);
+    let covered_before = barrier.volume_coverage(0);
+    assert_eq!(covered_before.as_ref().map(ByteRanges::covered), Some(4096));
+
+    barrier.delete_committed_row(&mut recorder.clone()).unwrap();
+    assert_eq!(recorder.deletes(), 1, "the durable row is gone");
+    assert_eq!(
+        barrier.volume_coverage(0),
+        covered_before,
+        "and the in-memory coverage is untouched, so the re-verify still reads a \
+         volume rather than a hole"
+    );
+    assert_eq!(
+        barrier.destination_coverage(0).map(ByteRanges::covered),
+        Some(4096),
+        "the destination claim survives too — it is what says the envelope or \
+         partial really received a byte, which no volume-level map can answer"
+    );
+
+    // And the next barrier writes a fresh row rather than an increment of one
+    // that no longer exists.
+    barrier
+        .record_write(&write(0, 4096, 4096, 0), Instant::now())
+        .unwrap();
+    run_barrier(
+        &mut barrier,
+        &recorder,
+        BarrierTrigger::Demand(BarrierDemand::RepairRecreate),
+    )
+    .unwrap();
+    assert_eq!(
+        barrier.generation(),
+        1,
+        "the generation restarts from zero, because the row it would have \
+         incremented was deleted"
+    );
+}
+
+#[test]
+fn a_crash_between_the_row_delete_and_the_next_barrier_leaves_nothing_to_trust() {
+    // The deliberately lossy half, stated as a test. Between the delete and the
+    // barrier that recreates coverage there is no row at all, so a restart in
+    // that window finds nothing, claims nothing, and redownloads the set — which
+    // is the bounded cost D8 accepts in exchange for not having to selectively
+    // lower per-volume floors around the repaired ranges.
+    let recorder = Recorder::default();
+    let mut barrier = sample_barrier();
+    barrier.register_volume(0, 0);
+    barrier.register_destination(0, "Silver.Horizon.S01E04.mkv.direct.partial");
+    barrier
+        .record_write(&write(0, 0, 4096, 0), Instant::now())
+        .unwrap();
+    run_barrier(
+        &mut barrier,
+        &recorder,
+        BarrierTrigger::Demand(BarrierDemand::Pause),
+    )
+    .unwrap();
+    assert!(recorder.committed().is_some());
+
+    barrier.delete_committed_row(&mut recorder.clone()).unwrap();
+    assert!(
+        recorder.committed().is_none(),
+        "nothing durable survives the delete, so a restart here has no floors to \
+         trust and refetches the set"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: what the repair is sized from (D8)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn damaged_ranges_name_only_the_slices_par2_called_invalid() {
+    use super::repair::damaged_ranges;
+
+    // Slices 1 and 4 damaged, on a file whose last slice is short.
+    let valid = [true, false, true, true, false];
+    assert_eq!(
+        damaged_ranges(&valid, 64, 300),
+        vec![(64, 128), (256, 300)],
+        "the repair is sized from the per-slice verdict, and the tail slice is \
+         clipped to the file rather than to the slice size"
+    );
+    assert_eq!(
+        damaged_ranges(&[true, true], 64, 128),
+        Vec::new(),
+        "a clean file contributes nothing to rewrite"
+    );
+    assert_eq!(
+        damaged_ranges(&[false, false, false], 64, 192),
+        vec![(0, 192)],
+        "adjacent damaged slices coalesce into one rewrite"
+    );
+}
+
+#[test]
+fn a_rewrite_widens_to_whole_articles_so_the_volume_composition_stays_exact() {
+    use super::repair::widen_to_articles;
+
+    // Three articles of 100 bytes. A 64-byte slice-shaped rewrite at 120 cuts
+    // the second one in half.
+    let extents = std::collections::BTreeMap::from([
+        (0u32, (0u64, 100u64)),
+        (1, (100, 100)),
+        (2, (200, 100)),
+    ]);
+    assert_eq!(
+        widen_to_articles(&[(120, 184)], &extents, 300),
+        vec![(100, 200)],
+        "the rewrite is read back as whole articles, so the volume's yEnc \
+         composition is replaced run for run and leaves no stale gap"
+    );
+    assert_eq!(
+        widen_to_articles(&[(0, 300)], &extents, 300),
+        vec![(0, 300)],
+        "a rewrite that already covers whole articles is unchanged"
+    );
+    // A range no article ever reached — the set never received a byte of it —
+    // has no run to half-cover, so widening it would only read bytes nothing
+    // asked for.
+    let sparse = std::collections::BTreeMap::from([(0u32, (0u64, 100u64))]);
+    assert_eq!(
+        widen_to_articles(&[(200, 264)], &sparse, 300),
+        vec![(200, 264)]
+    );
 }
