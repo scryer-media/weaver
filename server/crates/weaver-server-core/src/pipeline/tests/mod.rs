@@ -879,56 +879,74 @@ fn build_test_par2_packet(
 }
 
 fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size: u64) -> Vec<u8> {
-    let file_length = file_data.len() as u64;
-    let hash_full = checksum::md5(file_data);
-    let hash_16k = checksum::md5(&file_data[..file_data.len().min(16 * 1024)]);
+    build_test_par2_index_for_files(&[(filename, file_data)], slice_size)
+}
 
-    let mut file_id_input = Vec::new();
-    file_id_input.extend_from_slice(&hash_16k);
-    file_id_input.extend_from_slice(&file_length.to_le_bytes());
-    file_id_input.extend_from_slice(filename.as_bytes());
-    let file_id_bytes = checksum::md5(&file_id_input);
-
-    let num_slices = if file_length == 0 {
-        0
-    } else {
-        file_length.div_ceil(slice_size) as usize
-    };
-
-    let mut checksums = Vec::new();
-    for slice_index in 0..num_slices {
-        let start = slice_index as u64 * slice_size;
-        let end = ((start + slice_size) as usize).min(file_data.len());
-        let slice_data = &file_data[start as usize..end];
-        let mut state = weaver_par2::SliceChecksumState::new();
-        state.update(slice_data);
-        let (crc32, md5) =
-            state.finalize(((slice_data.len() as u64) < slice_size).then_some(slice_size));
-        checksums.push(weaver_par2::SliceChecksum { crc32, md5 });
+fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_size: u64) -> Vec<u8> {
+    struct IndexedFile {
+        id: [u8; 16],
+        desc_body: Vec<u8>,
+        ifsc_body: Vec<u8>,
     }
+
+    let indexed: Vec<IndexedFile> = files
+        .iter()
+        .map(|(filename, file_data)| {
+            let file_length = file_data.len() as u64;
+            let hash_full = checksum::md5(file_data);
+            let hash_16k = checksum::md5(&file_data[..file_data.len().min(16 * 1024)]);
+
+            let mut file_id_input = Vec::new();
+            file_id_input.extend_from_slice(&hash_16k);
+            file_id_input.extend_from_slice(&file_length.to_le_bytes());
+            file_id_input.extend_from_slice(filename.as_bytes());
+            let id = checksum::md5(&file_id_input);
+
+            let num_slices = if file_length == 0 {
+                0
+            } else {
+                file_length.div_ceil(slice_size) as usize
+            };
+
+            let mut desc_body = Vec::new();
+            desc_body.extend_from_slice(&id);
+            desc_body.extend_from_slice(&hash_full);
+            desc_body.extend_from_slice(&hash_16k);
+            desc_body.extend_from_slice(&file_length.to_le_bytes());
+            desc_body.extend_from_slice(filename.as_bytes());
+            while desc_body.len() % 4 != 0 {
+                desc_body.push(0);
+            }
+
+            let mut ifsc_body = Vec::new();
+            ifsc_body.extend_from_slice(&id);
+            for slice_index in 0..num_slices {
+                let start = slice_index as u64 * slice_size;
+                let end = ((start + slice_size) as usize).min(file_data.len());
+                let slice_data = &file_data[start as usize..end];
+                let mut state = weaver_par2::SliceChecksumState::new();
+                state.update(slice_data);
+                let (crc32, md5) =
+                    state.finalize(((slice_data.len() as u64) < slice_size).then_some(slice_size));
+                ifsc_body.extend_from_slice(&md5);
+                ifsc_body.extend_from_slice(&crc32.to_le_bytes());
+            }
+
+            IndexedFile {
+                id,
+                desc_body,
+                ifsc_body,
+            }
+        })
+        .collect();
 
     let mut main_body = Vec::new();
     main_body.extend_from_slice(&slice_size.to_le_bytes());
-    main_body.extend_from_slice(&1u32.to_le_bytes());
-    main_body.extend_from_slice(&file_id_bytes);
+    main_body.extend_from_slice(&(indexed.len() as u32).to_le_bytes());
+    for file in &indexed {
+        main_body.extend_from_slice(&file.id);
+    }
     let recovery_set_id = checksum::md5(&main_body);
-
-    let mut file_desc_body = Vec::new();
-    file_desc_body.extend_from_slice(&file_id_bytes);
-    file_desc_body.extend_from_slice(&hash_full);
-    file_desc_body.extend_from_slice(&hash_16k);
-    file_desc_body.extend_from_slice(&file_length.to_le_bytes());
-    file_desc_body.extend_from_slice(filename.as_bytes());
-    while file_desc_body.len() % 4 != 0 {
-        file_desc_body.push(0);
-    }
-
-    let mut ifsc_body = Vec::new();
-    ifsc_body.extend_from_slice(&file_id_bytes);
-    for checksum in checksums {
-        ifsc_body.extend_from_slice(&checksum.md5);
-        ifsc_body.extend_from_slice(&checksum.crc32.to_le_bytes());
-    }
 
     let mut stream = Vec::new();
     stream.extend_from_slice(&build_test_par2_packet(
@@ -936,16 +954,18 @@ fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size: u64) -> V
         &main_body,
         recovery_set_id,
     ));
-    stream.extend_from_slice(&build_test_par2_packet(
-        weaver_par2::packet::header::TYPE_FILE_DESC,
-        &file_desc_body,
-        recovery_set_id,
-    ));
-    stream.extend_from_slice(&build_test_par2_packet(
-        weaver_par2::packet::header::TYPE_IFSC,
-        &ifsc_body,
-        recovery_set_id,
-    ));
+    for file in &indexed {
+        stream.extend_from_slice(&build_test_par2_packet(
+            weaver_par2::packet::header::TYPE_FILE_DESC,
+            &file.desc_body,
+            recovery_set_id,
+        ));
+        stream.extend_from_slice(&build_test_par2_packet(
+            weaver_par2::packet::header::TYPE_IFSC,
+            &file.ifsc_body,
+            recovery_set_id,
+        ));
+    }
     stream
 }
 

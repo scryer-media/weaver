@@ -42,6 +42,15 @@ fn parse_par2_repair_memory_limit_bytes(raw: Option<&str>) -> usize {
     }
 }
 
+/// A clean PAR2 verdict reached without the authoritative pass, plus the two
+/// failure strings that name which fast path produced it.
+struct CleanPar2Verification {
+    verification: weaver_par2::VerificationResult,
+    placement_plan: weaver_par2::PlacementPlan,
+    incomplete_message: &'static str,
+    retry_message: &'static str,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CleanPar2IntegrityGate {
     None,
@@ -711,6 +720,9 @@ impl Pipeline {
         }
 
         if renamed > 0 {
+            // Renames move the bytes live verification bound to a name, so the
+            // job's live state is retired rather than re-resolved.
+            self.live_par2.remove_job(job_id);
             info!(job_id = job_id.0, renamed, "PAR2 deobfuscation complete");
         }
 
@@ -731,6 +743,12 @@ impl Pipeline {
             } else {
                 self.par2_repairer_analyze_calls += 1;
             }
+        }
+
+        if repair {
+            // A repair rewrites bytes the live verifier never saw, so its
+            // block state is retired rather than trusted afterwards.
+            self.live_par2.remove_job(job_id);
         }
 
         let memory_limit = configured_par2_repair_memory_limit_bytes();
@@ -1139,6 +1157,106 @@ impl Pipeline {
                 conflicts: conflict_ids.into_iter().collect(),
             },
         )))
+    }
+
+    /// Shared completion handling for a clean PAR2 verdict.
+    ///
+    /// Every fast path that proves a job clean without the authoritative pass
+    /// funnels through here, so their downstream effects — placement, identity,
+    /// reconciliation, `par2_verified`, status transitions — are the same code,
+    /// not parallel copies that can drift.
+    async fn finish_clean_par2_verification(
+        &mut self,
+        job_id: JobId,
+        working_dir: std::path::PathBuf,
+        outcome: CleanPar2Verification,
+        has_crc_failures: bool,
+        archive_extraction_applicable: bool,
+    ) {
+        let CleanPar2Verification {
+            verification,
+            placement_plan,
+            incomplete_message,
+            retry_message,
+        } = outcome;
+        Self::log_placement_plan(job_id, &placement_plan);
+
+        self.try_deobfuscate_files_with_par2(job_id).await;
+        if let Err(error) = self
+            .apply_placement_plan_for_retry_or_repair(job_id, working_dir, &placement_plan)
+            .await
+        {
+            self.fail_job(job_id, error);
+            return;
+        }
+        self.retry_par2_authoritative_identity(job_id).await;
+        self.refresh_verified_complete_archive_topologies(job_id, &verification)
+            .await;
+        if let Err(error) = self
+            .reconcile_verified_par2_files(job_id, &verification)
+            .await
+        {
+            self.fail_job(job_id, error);
+            return;
+        }
+
+        let still_incomplete = self.jobs.get(&job_id).is_some_and(|state| {
+            state.assembly.complete_data_file_count() < state.assembly.data_file_count()
+        });
+        if still_incomplete && !has_crc_failures {
+            warn!(job_id = job_id.0, error = %incomplete_message);
+            self.fail_job(job_id, incomplete_message.to_string());
+            return;
+        }
+
+        self.par2_verified.insert(job_id);
+
+        if has_crc_failures {
+            if self.normalization_retried.contains(&job_id) {
+                let msg = "clean PAR2 verification but extraction still failing after retry";
+                warn!(job_id = job_id.0, error = %msg);
+                self.fail_job(job_id, msg.to_string());
+                return;
+            }
+
+            self.set_normalization_retried_state(job_id, true);
+            let failed_members = self
+                .failed_extractions
+                .get(&job_id)
+                .cloned()
+                .unwrap_or_default();
+            self.replace_failed_extraction_members(job_id, HashSet::new());
+            let cleared = failed_members.len();
+            self.recompute_rar_retry_frontier(job_id).await;
+            if let Some(reason) = self.invalid_rar_retry_frontier_reason(job_id) {
+                if !failed_members.is_empty() {
+                    self.replace_failed_extraction_members(job_id, failed_members);
+                }
+                let msg =
+                    format!("invalid RAR retry frontier after placement correction: {reason}");
+                warn!(job_id = job_id.0, error = %msg);
+                self.fail_job(job_id, msg);
+                return;
+            }
+
+            info!(
+                job_id = job_id.0,
+                cleared, retry_message, "cleared failed extractions after clean PAR2 verification"
+            );
+
+            self.retry_archive_extraction_after_verify_or_repair(job_id)
+                .await;
+            return;
+        }
+
+        if archive_extraction_applicable {
+            self.retry_archive_extraction_after_verify_or_repair(job_id)
+                .await;
+            return;
+        }
+
+        self.reconcile_job_progress(job_id).await;
+        self.schedule_job_completion_check(job_id);
     }
 
     async fn reconcile_verified_par2_files(
@@ -1762,16 +1880,20 @@ impl Pipeline {
                     clean_par2_integrity_gate,
                     CleanPar2IntegrityGate::WeakTransform | CleanPar2IntegrityGate::None
                 ));
+        // Shared by every fast path that skips the authoritative pass, so the
+        // live short-circuit can never fire where the quick path would be
+        // refused.
+        let clean_par2_integrity_gate_allows_fast_path = match clean_par2_integrity_gate {
+            CleanPar2IntegrityGate::StrongDecode => {
+                only_rar_archives && (has_crc_failures || rar_waiting_for_missing_volumes)
+            }
+            CleanPar2IntegrityGate::WeakTransform | CleanPar2IntegrityGate::None => true,
+        };
         let quick_par2_verification_allowed = par2_validation_needed
             && !matches!(current_status, JobStatus::Repairing)
             && !extension_repair_requested
             && (!has_incomplete_data_files || !download_pipeline_exhausted)
-            && match clean_par2_integrity_gate {
-                CleanPar2IntegrityGate::StrongDecode => {
-                    only_rar_archives && (has_crc_failures || rar_waiting_for_missing_volumes)
-                }
-                CleanPar2IntegrityGate::WeakTransform | CleanPar2IntegrityGate::None => true,
-            };
+            && clean_par2_integrity_gate_allows_fast_path;
         let needs_completion_repair_evaluation = has_crc_failures
             || (has_incomplete_data_files && download_pipeline_exhausted)
             || rar_waiting_for_missing_volumes
@@ -1961,6 +2083,64 @@ impl Pipeline {
             }
 
             let par2_set = self.par2_set(job_id).cloned();
+
+            // Live in-stream block verification (plan 135, D5). Deliberately
+            // conservative: it only applies to a clean, fully downloaded job
+            // that is not mid-repair, and only when every recovery-set file is
+            // matched with every one of its blocks proven Ok. Every other case
+            // — a single Pending or Bad block, an unmatched file, an inactive
+            // verifier — falls through to the passes below unchanged.
+            let live_par2_short_circuit_allowed = self.live_par2.enabled()
+                && par2_validation_needed
+                && !has_crc_failures
+                && !has_incomplete_data_files
+                && !rar_waiting_for_missing_volumes
+                && !extension_repair_requested
+                && !matches!(current_status, JobStatus::Repairing)
+                && clean_par2_integrity_gate_allows_fast_path
+                // A suspect volume is damage the full pass deliberately keeps:
+                // `apply_eager_delete_exclusions` retains its missing blocks
+                // instead of forgiving them. Live block state says nothing
+                // about that, so any suspect volume refuses the short-circuit.
+                && self.suspect_rar_volumes_for_job(job_id).is_empty();
+            if live_par2_short_circuit_allowed && par2_set.is_some() {
+                self.settle_live_par2_job(job_id).await;
+                if let Some((verification, placement_plan)) =
+                    self.live_par2_clean_verification(job_id).await
+                {
+                    let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
+                    Self::trip_par2_verification_started_failpoint();
+                    self.live_par2.note_full_verify_skip();
+                    let live_metrics = self.live_par2.metrics();
+                    info!(
+                        job_id = job_id.0,
+                        files = verification.files.len(),
+                        blocks_in_stream = live_metrics.blocks_claimed_in_stream,
+                        blocks_backfilled = live_metrics.blocks_backfilled,
+                        blocks_settled = live_metrics.blocks_settled,
+                        partials_abandoned = live_metrics.partials_abandoned,
+                        partial_bytes_peak = live_metrics.partial_bytes_peak,
+                        "live PAR2 block verification proved the set clean — skipping the full verify pass"
+                    );
+                    self.finish_clean_par2_verification(
+                        job_id,
+                        working_dir,
+                        CleanPar2Verification {
+                            verification,
+                            placement_plan,
+                            incomplete_message:
+                                "clean live PAR2 verification but job still has incomplete data files after reconciliation",
+                            retry_message:
+                                "cleared failed extractions after live verify — retrying",
+                        },
+                        has_crc_failures,
+                        archive_extraction_applicable,
+                    )
+                    .await;
+                    return;
+                }
+            }
+
             if quick_par2_verification_allowed && let Some(par2_set) = par2_set.as_ref() {
                 let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
                 Self::trip_par2_verification_started_failpoint();
@@ -1977,93 +2157,21 @@ impl Pipeline {
                             job_id = job_id.0,
                             "quick PAR2 verification passed for clean exhausted job"
                         );
-                        Self::log_placement_plan(job_id, &placement_plan);
-
-                        self.try_deobfuscate_files_with_par2(job_id).await;
-                        if let Err(error) = self
-                            .apply_placement_plan_for_retry_or_repair(
-                                job_id,
-                                working_dir.clone(),
-                                &placement_plan,
-                            )
-                            .await
-                        {
-                            self.fail_job(job_id, error);
-                            return;
-                        }
-                        self.retry_par2_authoritative_identity(job_id).await;
-                        self.refresh_verified_complete_archive_topologies(job_id, &verification)
-                            .await;
-                        if let Err(error) = self
-                            .reconcile_verified_par2_files(job_id, &verification)
-                            .await
-                        {
-                            self.fail_job(job_id, error);
-                            return;
-                        }
-
-                        let still_incomplete = self.jobs.get(&job_id).is_some_and(|state| {
-                            state.assembly.complete_data_file_count()
-                                < state.assembly.data_file_count()
-                        });
-                        if still_incomplete && !has_crc_failures {
-                            let msg = "clean PAR2 quick verification but job still has incomplete data files after reconciliation".to_string();
-                            warn!(job_id = job_id.0, error = %msg);
-                            self.fail_job(job_id, msg);
-                            return;
-                        }
-
-                        self.par2_verified.insert(job_id);
-
-                        if has_crc_failures {
-                            if self.normalization_retried.contains(&job_id) {
-                                let msg =
-                                    "clean PAR2 verification but extraction still failing after retry"
-                                        .to_string();
-                                warn!(job_id = job_id.0, error = %msg);
-                                self.fail_job(job_id, msg);
-                                return;
-                            }
-
-                            self.set_normalization_retried_state(job_id, true);
-                            let failed_members = self
-                                .failed_extractions
-                                .get(&job_id)
-                                .cloned()
-                                .unwrap_or_default();
-                            self.replace_failed_extraction_members(job_id, HashSet::new());
-                            let cleared = failed_members.len();
-                            self.recompute_rar_retry_frontier(job_id).await;
-                            if let Some(reason) = self.invalid_rar_retry_frontier_reason(job_id) {
-                                if !failed_members.is_empty() {
-                                    self.replace_failed_extraction_members(job_id, failed_members);
-                                }
-                                let msg = format!(
-                                    "invalid RAR retry frontier after placement correction: {reason}"
-                                );
-                                warn!(job_id = job_id.0, error = %msg);
-                                self.fail_job(job_id, msg);
-                                return;
-                            }
-
-                            info!(
-                                job_id = job_id.0,
-                                cleared, "cleared failed extractions after quick verify — retrying"
-                            );
-
-                            self.retry_archive_extraction_after_verify_or_repair(job_id)
-                                .await;
-                            return;
-                        }
-
-                        if archive_extraction_applicable {
-                            self.retry_archive_extraction_after_verify_or_repair(job_id)
-                                .await;
-                            return;
-                        }
-
-                        self.reconcile_job_progress(job_id).await;
-                        self.schedule_job_completion_check(job_id);
+                        self.finish_clean_par2_verification(
+                            job_id,
+                            working_dir.clone(),
+                            CleanPar2Verification {
+                                verification,
+                                placement_plan,
+                                incomplete_message:
+                                    "clean PAR2 quick verification but job still has incomplete data files after reconciliation",
+                                retry_message:
+                                    "cleared failed extractions after quick verify — retrying",
+                            },
+                            has_crc_failures,
+                            archive_extraction_applicable,
+                        )
+                        .await;
                         return;
                     }
                     Ok(None) => {

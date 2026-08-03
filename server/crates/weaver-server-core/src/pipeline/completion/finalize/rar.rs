@@ -496,6 +496,10 @@ impl Pipeline {
         .await
         .map_err(|e| format!("placement normalization task panicked: {e}"))??;
 
+        // Placement moved bytes out from under the names live verification
+        // bound, so the job's live state is retired rather than re-resolved.
+        self.live_par2.remove_job(job_id);
+
         info!(
             job_id = job_id.0,
             swaps = plan.swaps.len(),

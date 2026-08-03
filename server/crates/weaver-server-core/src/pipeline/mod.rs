@@ -1804,6 +1804,8 @@ pub struct Pipeline {
     pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<BufferedDecodedSegment>>,
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
+    /// In-stream PAR2 block verification state for every live job.
+    pub(super) live_par2: repair::live::LivePar2Registry,
     /// RAR members already extracted per job (for incremental RAR extraction).
     pub(super) extracted_members: HashMap<JobId, HashSet<String>>,
     /// Archives whose extraction has completed successfully (by archive name).

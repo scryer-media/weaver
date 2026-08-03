@@ -913,6 +913,12 @@ impl Pipeline {
         self.pending_file_progress.remove(&file_id);
         self.persisted_file_progress.remove(&file_id);
         self.mark_file_hash_reread_required_for(file_id, "whole_file_crc_recovery");
+        // CRC recovery rewrites this file's bytes through `write_segment_to_disk`
+        // directly — its early returns never reach the live seam — so blocks
+        // live already claimed would sit `Ok` over changed disk content. The
+        // job's live state is retired here for the same reason the yEnc hash
+        // state is invalidated above.
+        self.live_par2.remove_job(file_id.job_id);
 
         self.file_crc_recoveries.insert(
             file_id,
@@ -1746,6 +1752,12 @@ impl Pipeline {
                         .send(PipelineEvent::SegmentCommitted { segment_id });
                 }
 
+                // Ordering contract: this seam runs only after
+                // `write_segments_to_disk` returned for this segment, so these
+                // bytes are already on disk and a later live-PAR2 settle read
+                // of the same range sees exactly them (plan 135, D5).
+                self.note_live_par2_segment(file_id, file_offset, &data);
+
                 let use_crc_metadata = self.should_use_completed_file_crc_metadata(file_id);
                 match hash_mode {
                     SegmentHashMode::UpdateNow if use_crc_metadata => {
@@ -1840,6 +1852,13 @@ impl Pipeline {
                     // thread, so the fd is released before verification,
                     // repair, or the final move touch this path.
                     crate::pipeline::release_cached_write_handle(file_path);
+
+                    // In-memory only: the settle read-backs that claim whatever
+                    // in-stream feeding did not (including the leftover flush
+                    // above, which writes directly without re-entering this
+                    // seam) belong to the completion-gate sweep, not to the
+                    // download path.
+                    self.note_live_par2_file_complete(file_id, total_bytes);
 
                     let expected_file_crc = self.expected_file_crcs.get(&file_id).copied();
                     let file_checksum = match self

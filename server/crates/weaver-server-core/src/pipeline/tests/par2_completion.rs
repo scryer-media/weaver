@@ -2851,3 +2851,865 @@ async fn pause_rejects_queued_repair_state() {
         Some(queued_at)
     );
 }
+
+/// A real NZB's `<segment bytes=…>` is the *yEnc-encoded* article size, about
+/// 3% larger than the decoded payload PAR2 describes. Every live-PAR2 fixture
+/// declares inflated sizes so the declared total never equals the decoded
+/// length — the shape production always has.
+fn yenc_declared_bytes(decoded_len: u32) -> u32 {
+    decoded_len + decoded_len.div_ceil(32) + 2
+}
+
+fn live_par2_payload_split(payload_len: u32) -> u32 {
+    payload_len * 3 / 8
+}
+
+fn live_par2_job_spec(
+    name: &str,
+    payload_filename: &str,
+    payload_len: u32,
+    index_filename: &str,
+    index_len: u32,
+) -> JobSpec {
+    let first_segment = live_par2_payload_split(payload_len);
+    let declared_first = yenc_declared_bytes(first_segment);
+    let declared_second = yenc_declared_bytes(payload_len - first_segment);
+    let declared_index = yenc_declared_bytes(index_len);
+    JobSpec {
+        name: name.to_string(),
+        password: None,
+        total_bytes: (declared_first + declared_second + declared_index) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: payload_filename.to_string(),
+                role: FileRole::from_filename(payload_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![
+                    segment_spec! {
+                        number: 0,
+                        bytes: declared_first,
+                        message_id: "live-par2-payload-0@example.com".to_string(),
+                    },
+                    segment_spec! {
+                        number: 1,
+                        bytes: declared_second,
+                        message_id: "live-par2-payload-1@example.com".to_string(),
+                    },
+                ],
+            },
+            FileSpec {
+                filename: index_filename.to_string(),
+                role: FileRole::from_filename(index_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: declared_index,
+                    message_id: "live-par2-index@example.com".to_string(),
+                }],
+            },
+        ],
+    }
+}
+
+async fn submit_live_par2_payload(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    payload_filename: &str,
+    written_payload: &[u8],
+) {
+    let payload_file = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    // Segment 0 stops mid-block, so block 0 is staged across the boundary and
+    // block 1 is claimed whole.
+    let split = live_par2_payload_split(written_payload.len() as u32) as usize;
+    submit_decoded_segment(
+        pipeline,
+        payload_file,
+        0,
+        0,
+        &written_payload[..split],
+        payload_filename,
+        None,
+    )
+    .await;
+    submit_decoded_segment(
+        pipeline,
+        payload_file,
+        1,
+        split as u64,
+        &written_payload[split..],
+        payload_filename,
+        None,
+    )
+    .await;
+}
+
+async fn submit_live_par2_index(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    index_filename: &str,
+    par2_bytes: &[u8],
+) {
+    submit_decoded_segment(
+        pipeline,
+        NzbFileId {
+            job_id,
+            file_index: 1,
+        },
+        0,
+        0,
+        par2_bytes,
+        index_filename,
+        None,
+    )
+    .await;
+}
+
+async fn drain_live_par2_job(pipeline: &mut Pipeline, job_id: JobId) {
+    {
+        // A damaged job can already have failed and been retired by the time
+        // the last segment commits; nothing left to drain.
+        let Some(state) = pipeline.jobs.get_mut(&job_id) else {
+            return;
+        };
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.status = JobStatus::Downloading;
+        state.refresh_runtime_lanes_from_status();
+    }
+    pipeline.check_job_completion(job_id).await;
+}
+
+#[tokio::test]
+async fn live_par2_verification_skips_the_full_pass_for_a_clean_job() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.live_par2.set_enabled(true);
+    let job_id = JobId(30460);
+    let payload_filename = "Silver.Horizon.S01E01.mkv";
+    let index_filename = "Silver.Horizon.S01E01.par2";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let par2_bytes = build_test_par2_index(payload_filename, &payload, 64);
+    let spec = live_par2_job_spec(
+        "Live PAR2 Clean Skip",
+        payload_filename,
+        payload.len() as u32,
+        index_filename,
+        par2_bytes.len() as u32,
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    submit_live_par2_index(&mut pipeline, job_id, index_filename, &par2_bytes).await;
+    submit_live_par2_payload(&mut pipeline, job_id, payload_filename, &payload).await;
+
+    // The fixture is only meaningful while it stays realistic: the declared
+    // (yEnc) total must stay above the decoded length, which is what made a
+    // declared-total binding unreachable in production.
+    {
+        let file = pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .assembly
+            .file(NzbFileId {
+                job_id,
+                file_index: 0,
+            })
+            .unwrap();
+        assert!(file.total_bytes() > file.received_bytes());
+        assert_eq!(file.received_bytes(), payload.len() as u64);
+    }
+
+    drain_live_par2_job(&mut pipeline, job_id).await;
+
+    let metrics = pipeline.live_par2.metrics();
+    assert_eq!(metrics.full_verify_skips, 1);
+    assert_eq!(metrics.blocks_bad, 0);
+    assert_eq!(metrics.blocks_claimed_in_stream, 2);
+    assert_eq!(metrics.blocks_settled, 0);
+    assert_eq!(pipeline.par2_repairer_analyze_calls, 0);
+    assert_eq!(pipeline.par2_authoritative_verify_calls, 0);
+    assert!(pipeline.par2_verified.contains(&job_id));
+
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+}
+
+#[tokio::test]
+async fn clean_job_reaches_the_same_status_with_live_par2_disabled() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(30461);
+    let payload_filename = "Silver.Horizon.S01E01.mkv";
+    let index_filename = "Silver.Horizon.S01E01.par2";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let par2_bytes = build_test_par2_index(payload_filename, &payload, 64);
+    let spec = live_par2_job_spec(
+        "Live PAR2 Clean Skip Disabled",
+        payload_filename,
+        payload.len() as u32,
+        index_filename,
+        par2_bytes.len() as u32,
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    submit_live_par2_index(&mut pipeline, job_id, index_filename, &par2_bytes).await;
+    submit_live_par2_payload(&mut pipeline, job_id, payload_filename, &payload).await;
+    drain_live_par2_job(&mut pipeline, job_id).await;
+
+    let metrics = pipeline.live_par2.metrics();
+    assert_eq!(metrics.full_verify_skips, 0);
+    assert_eq!(metrics.blocks_claimed_in_stream, 0);
+    assert!(pipeline.par2_verified.contains(&job_id));
+
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+}
+
+#[tokio::test]
+async fn damaged_job_keeps_the_existing_verify_path_with_live_par2_enabled() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.live_par2.set_enabled(true);
+    let job_id = JobId(30462);
+    let payload_filename = "Silver.Horizon.S01E02.mkv";
+    let index_filename = "Silver.Horizon.S01E02.par2";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let mut damaged = payload.clone();
+    damaged[70] ^= 0xFF;
+    let par2_bytes = build_test_par2_index(payload_filename, &payload, 64);
+    let spec = live_par2_job_spec(
+        "Live PAR2 Damaged Payload",
+        payload_filename,
+        payload.len() as u32,
+        index_filename,
+        par2_bytes.len() as u32,
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    submit_live_par2_index(&mut pipeline, job_id, index_filename, &par2_bytes).await;
+    submit_live_par2_payload(&mut pipeline, job_id, payload_filename, &damaged).await;
+    drain_live_par2_job(&mut pipeline, job_id).await;
+
+    let metrics = pipeline.live_par2.metrics();
+    assert_eq!(metrics.full_verify_skips, 0);
+    assert_eq!(metrics.blocks_bad, 1);
+    assert_eq!(metrics.blocks_claimed_in_stream, 1);
+    assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
+    assert!(!pipeline.par2_verified.contains(&job_id));
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { error }) if error.contains("not repairable")
+    ));
+}
+
+#[tokio::test]
+async fn damaged_job_outcome_is_unchanged_with_live_par2_disabled() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(30463);
+    let payload_filename = "Silver.Horizon.S01E02.mkv";
+    let index_filename = "Silver.Horizon.S01E02.par2";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let mut damaged = payload.clone();
+    damaged[70] ^= 0xFF;
+    let par2_bytes = build_test_par2_index(payload_filename, &payload, 64);
+    let spec = live_par2_job_spec(
+        "Live PAR2 Damaged Payload Disabled",
+        payload_filename,
+        payload.len() as u32,
+        index_filename,
+        par2_bytes.len() as u32,
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    submit_live_par2_index(&mut pipeline, job_id, index_filename, &par2_bytes).await;
+    submit_live_par2_payload(&mut pipeline, job_id, payload_filename, &damaged).await;
+    drain_live_par2_job(&mut pipeline, job_id).await;
+
+    assert_eq!(pipeline.live_par2.metrics().full_verify_skips, 0);
+    assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
+    assert!(!pipeline.par2_verified.contains(&job_id));
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { error }) if error.contains("not repairable")
+    ));
+}
+
+#[tokio::test]
+async fn live_par2_backfills_payload_that_landed_before_the_index() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.live_par2.set_enabled(true);
+    let job_id = JobId(30464);
+    let payload_filename = "Silver.Horizon.S01E03.mkv";
+    let index_filename = "Silver.Horizon.S01E03.par2";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let par2_bytes = build_test_par2_index(payload_filename, &payload, 64);
+    let spec = live_par2_job_spec(
+        "Live PAR2 Late Activation",
+        payload_filename,
+        payload.len() as u32,
+        index_filename,
+        par2_bytes.len() as u32,
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // Payload first: its spans are recorded as coalesced ranges only, then
+    // read back from disk when the index installs the set.
+    submit_live_par2_payload(&mut pipeline, job_id, payload_filename, &payload).await;
+    assert_eq!(pipeline.live_par2.metrics().blocks_claimed_in_stream, 0);
+
+    submit_live_par2_index(&mut pipeline, job_id, index_filename, &par2_bytes).await;
+    drain_live_par2_job(&mut pipeline, job_id).await;
+
+    let metrics = pipeline.live_par2.metrics();
+    assert_eq!(metrics.blocks_backfilled, 2);
+    assert_eq!(metrics.blocks_claimed_in_stream, 0);
+    assert_eq!(metrics.full_verify_skips, 1);
+    assert_eq!(pipeline.par2_authoritative_verify_calls, 0);
+    assert_eq!(pipeline.par2_repairer_analyze_calls, 0);
+
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+}
+
+#[tokio::test]
+async fn live_par2_refuses_the_short_circuit_when_the_file_name_does_not_match() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.live_par2.set_enabled(true);
+    let job_id = JobId(30465);
+    let obfuscated_filename = "a1b2c3d4e5f60718.bin";
+    let index_filename = "Silver.Horizon.S01E04.par2";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    // The description names the deobfuscated file, which nothing in this job
+    // carries: no file can bind, so the short-circuit must never fire.
+    let par2_bytes = build_test_par2_index("Silver.Horizon.S01E04.mkv", &payload, 64);
+    let spec = live_par2_job_spec(
+        "Live PAR2 Name Mismatch",
+        obfuscated_filename,
+        payload.len() as u32,
+        index_filename,
+        par2_bytes.len() as u32,
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    submit_live_par2_index(&mut pipeline, job_id, index_filename, &par2_bytes).await;
+    submit_live_par2_payload(&mut pipeline, job_id, obfuscated_filename, &payload).await;
+    drain_live_par2_job(&mut pipeline, job_id).await;
+
+    let metrics = pipeline.live_par2.metrics();
+    assert_eq!(metrics.full_verify_skips, 0);
+    assert_eq!(
+        metrics.blocks_claimed_in_stream, 0,
+        "a file whose name matches no description must never bind"
+    );
+    // The existing passes still take the job to a clean verdict, exactly as
+    // they would with live verification compiled out.
+    assert!(pipeline.par2_verified.contains(&job_id));
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+}
+
+fn live_par2_multi_payload_job_spec(
+    name: &str,
+    payloads: &[(&str, u32)],
+    index_filename: &str,
+    index_len: u32,
+) -> JobSpec {
+    let mut files: Vec<FileSpec> = payloads
+        .iter()
+        .enumerate()
+        .map(|(index, (filename, len))| FileSpec {
+            filename: (*filename).to_string(),
+            role: FileRole::from_filename(filename),
+            groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
+            segments: vec![segment_spec! {
+                number: 0,
+                bytes: yenc_declared_bytes(*len),
+                message_id: format!("live-par2-multi-{index}@example.com"),
+            }],
+        })
+        .collect();
+    files.push(FileSpec {
+        filename: index_filename.to_string(),
+        role: FileRole::from_filename(index_filename),
+        groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
+        segments: vec![segment_spec! {
+            number: 0,
+            bytes: yenc_declared_bytes(index_len),
+            message_id: "live-par2-multi-index@example.com".to_string(),
+        }],
+    });
+    JobSpec {
+        name: name.to_string(),
+        password: None,
+        total_bytes: files
+            .iter()
+            .flat_map(|file| file.segments.iter())
+            .map(|segment| segment.bytes as u64)
+            .sum(),
+        category: None,
+        metadata: vec![],
+        files,
+    }
+}
+
+#[tokio::test]
+async fn live_par2_refuses_a_partially_bound_recovery_set() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.live_par2.set_enabled(true);
+    let job_id = JobId(30466);
+    let bound_filename = "Silver.Horizon.S01E05.part1.mkv";
+    let obfuscated_filename = "77f3ba90c1d2e3f4.bin";
+    let described_second = "Silver.Horizon.S01E05.part2.mkv";
+    let index_filename = "Silver.Horizon.S01E05.par2";
+    let first: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let second: Vec<u8> = (0..128u32).map(|value| (value % 241) as u8).collect();
+    // Both files are in the recovery set, but only the first one can bind:
+    // a clean verdict for the bound subset is not a clean verdict for the set.
+    let par2_bytes = build_test_par2_index_for_files(
+        &[
+            (bound_filename, first.as_slice()),
+            (described_second, second.as_slice()),
+        ],
+        64,
+    );
+    let spec = live_par2_multi_payload_job_spec(
+        "Live PAR2 Partial Binding",
+        &[
+            (bound_filename, first.len() as u32),
+            (obfuscated_filename, second.len() as u32),
+        ],
+        index_filename,
+        par2_bytes.len() as u32,
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: 2,
+        },
+        0,
+        0,
+        &par2_bytes,
+        index_filename,
+        None,
+    )
+    .await;
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        0,
+        0,
+        &first,
+        bound_filename,
+        None,
+    )
+    .await;
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: 1,
+        },
+        0,
+        0,
+        &second,
+        obfuscated_filename,
+        None,
+    )
+    .await;
+    drain_live_par2_job(&mut pipeline, job_id).await;
+
+    let metrics = pipeline.live_par2.metrics();
+    assert_eq!(
+        metrics.blocks_claimed_in_stream, 2,
+        "the bound file must still verify in stream"
+    );
+    assert_eq!(metrics.full_verify_skips, 0);
+    assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
+}
+
+#[tokio::test]
+async fn whole_file_crc_recovery_retires_live_par2_state() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.live_par2.set_enabled(true);
+    let job_id = JobId(30467);
+    let payload_filename = "Silver.Horizon.S01E06.mkv";
+    let index_filename = "Silver.Horizon.S01E06.par2";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let expected_crc = weaver_par2::checksum::crc32(&payload);
+    let par2_bytes = build_test_par2_index(payload_filename, &payload, 64);
+    let spec = live_par2_job_spec(
+        "Live PAR2 CRC Recovery",
+        payload_filename,
+        payload.len() as u32,
+        index_filename,
+        par2_bytes.len() as u32,
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let payload_file = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let split = live_par2_payload_split(payload.len() as u32) as usize;
+
+    submit_live_par2_index(&mut pipeline, job_id, index_filename, &par2_bytes).await;
+    submit_decoded_segment_from_server(
+        &mut pipeline,
+        payload_file,
+        0,
+        0,
+        &payload[..split],
+        payload_filename,
+        Some(expected_crc),
+        true,
+        Some(0),
+        Vec::new(),
+    )
+    .await;
+    assert!(pipeline.live_par2.is_active(job_id));
+
+    // An unverified tail that does not match the whole-file CRC: recovery
+    // re-downloads it and rewrites the bytes through a path that never reaches
+    // the live seam, so the job's live state must not survive it.
+    let mut damaged_tail = payload[split..].to_vec();
+    damaged_tail[3] ^= 0xFF;
+    submit_decoded_segment_from_server(
+        &mut pipeline,
+        payload_file,
+        1,
+        split as u64,
+        &damaged_tail,
+        payload_filename,
+        Some(expected_crc),
+        false,
+        Some(0),
+        Vec::new(),
+    )
+    .await;
+
+    assert!(pipeline.file_crc_recoveries.contains_key(&payload_file));
+    assert!(!pipeline.live_par2.is_active(job_id));
+
+    submit_decoded_segment_from_server(
+        &mut pipeline,
+        payload_file,
+        1,
+        split as u64,
+        &payload[split..],
+        payload_filename,
+        Some(expected_crc),
+        true,
+        Some(1),
+        vec![0],
+    )
+    .await;
+    drain_live_par2_job(&mut pipeline, job_id).await;
+
+    assert!(!pipeline.live_par2.is_active(job_id));
+    assert_eq!(pipeline.live_par2.metrics().full_verify_skips, 0);
+    assert!(pipeline.par2_verified.contains(&job_id));
+}
+
+/// Job with one single-segment payload plus its PAR2 index, for the gate tests
+/// that install completion state directly instead of driving the decode path
+/// (a file completing through the decode worker rebuilds archive state, which
+/// would wipe the very state under test).
+fn live_par2_single_segment_job_spec(
+    name: &str,
+    payload_filename: &str,
+    payload_len: u32,
+    index_filename: &str,
+    index_len: u32,
+) -> JobSpec {
+    live_par2_multi_payload_job_spec(
+        name,
+        &[(payload_filename, payload_len)],
+        index_filename,
+        index_len,
+    )
+}
+
+/// Complete both files on disk, install the parsed set, and hand the payload's
+/// bytes to the live seam exactly as the decode worker would — leaving live
+/// with a clean, block-complete verdict and no completion check run yet.
+async fn stage_clean_live_par2_verdict(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    payload_filename: &str,
+    payload: &[u8],
+    index_filename: &str,
+    par2_bytes: &[u8],
+) {
+    write_and_complete_file(pipeline, job_id, 0, payload_filename, payload).await;
+    write_and_complete_file(pipeline, job_id, 1, index_filename, par2_bytes).await;
+    install_test_par2_runtime(
+        pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, payload, 64, 0),
+        &[],
+    );
+    pipeline.activate_live_par2(job_id).await;
+    pipeline.note_live_par2_segment(
+        NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        0,
+        &DecodedChunk::from(payload.to_vec()),
+    );
+    assert_eq!(pipeline.live_par2.metrics().blocks_claimed_in_stream, 2);
+}
+
+#[tokio::test]
+async fn live_par2_refuses_the_short_circuit_on_the_strong_decode_integrity_gate() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.live_par2.set_enabled(true);
+    let job_id = JobId(30468);
+    let payload_filename = "Silver.Horizon.S01E07.7z";
+    let index_filename = "Silver.Horizon.S01E07.par2";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let par2_bytes = build_test_par2_index(payload_filename, &payload, 64);
+    let spec = live_par2_single_segment_job_spec(
+        "Live PAR2 Strong Decode Gate",
+        payload_filename,
+        payload.len() as u32,
+        index_filename,
+        par2_bytes.len() as u32,
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    stage_clean_live_par2_verdict(
+        &mut pipeline,
+        job_id,
+        payload_filename,
+        &payload,
+        index_filename,
+        &par2_bytes,
+    )
+    .await;
+
+    // A multi-volume 7z topology puts the job on the strong-decode arm, where
+    // the quick path is refused — so the live path must be refused too rather
+    // than adding refresh/reconcile side effects that arm never had.
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.assembly.set_archive_topology(
+            payload_filename.to_string(),
+            crate::jobs::assembly::ArchiveTopology {
+                archive_type: crate::jobs::assembly::ArchiveType::SevenZip,
+                volume_map: HashMap::from([
+                    (payload_filename.to_string(), 0),
+                    ("Silver.Horizon.S01E07.7z.002".to_string(), 1),
+                ]),
+                complete_volumes: [0u32, 1].into_iter().collect(),
+                expected_volume_count: Some(2),
+                members: Vec::new(),
+                unresolved_spans: Vec::new(),
+            },
+        );
+    }
+
+    drain_live_par2_job(&mut pipeline, job_id).await;
+
+    assert_eq!(pipeline.live_par2.metrics().full_verify_skips, 0);
+    assert_eq!(pipeline.par2_authoritative_verify_calls, 0);
+    assert_eq!(pipeline.par2_repairer_analyze_calls, 0);
+}
+
+#[tokio::test]
+async fn live_par2_refuses_the_short_circuit_while_a_suspect_volume_is_recorded() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.live_par2.set_enabled(true);
+    let job_id = JobId(30469);
+    let payload_filename = "Silver.Horizon.S01E08.mkv";
+    let index_filename = "Silver.Horizon.S01E08.par2";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let par2_bytes = build_test_par2_index(payload_filename, &payload, 64);
+    let spec = live_par2_single_segment_job_spec(
+        "Live PAR2 Suspect Volume",
+        payload_filename,
+        payload.len() as u32,
+        index_filename,
+        par2_bytes.len() as u32,
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    stage_clean_live_par2_verdict(
+        &mut pipeline,
+        job_id,
+        payload_filename,
+        &payload,
+        index_filename,
+        &par2_bytes,
+    )
+    .await;
+
+    // A suspect volume is damage the full pass deliberately retains for
+    // eagerly-deleted sources; live block state knows nothing about it.
+    pipeline.rar_sets.insert(
+        (job_id, "Silver.Horizon.S01E08".to_string()),
+        rar_state::RarSetState {
+            verified_suspect_volumes: HashSet::from([1u32]),
+            ..Default::default()
+        },
+    );
+
+    drain_live_par2_job(&mut pipeline, job_id).await;
+
+    assert_eq!(pipeline.live_par2.metrics().full_verify_skips, 0);
+    assert_eq!(
+        pipeline
+            .live_par2
+            .fully_verified_files(job_id)
+            .map(|verified| verified.len()),
+        Some(1),
+        "the refusal must come from the gate, not from an unproven file"
+    );
+}
+
+#[tokio::test]
+async fn par2_repair_execution_retires_live_par2_state() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.live_par2.set_enabled(true);
+    let job_id = JobId(30471);
+    let payload_filename = "Silver.Horizon.S01E10.7z";
+    let index_filename = "Silver.Horizon.S01E10.par2";
+    let recovery_filename = "Silver.Horizon.S01E10.vol00+01.par2";
+    let original_payload = vec![0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0x00, 0x04];
+    let damaged_payload = vec![0u8; original_payload.len()];
+    let slice_size = original_payload.len() as u64;
+    let par2_bytes = build_test_par2_index(payload_filename, &original_payload, slice_size);
+    let recovery_bytes = vec![0xCC; original_payload.len()];
+    let spec = live_par2_multi_payload_job_spec(
+        "Live PAR2 Repair Retirement",
+        &[
+            (payload_filename, original_payload.len() as u32),
+            (recovery_filename, recovery_bytes.len() as u32),
+        ],
+        index_filename,
+        par2_bytes.len() as u32,
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    write_and_complete_file(&mut pipeline, job_id, 0, payload_filename, &damaged_payload).await;
+    write_and_complete_file(&mut pipeline, job_id, 1, recovery_filename, &recovery_bytes).await;
+    write_and_complete_file(&mut pipeline, job_id, 2, index_filename, &par2_bytes).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(payload_filename, &original_payload, slice_size, 1),
+        &[
+            (2, index_filename, 0, false),
+            (1, recovery_filename, 1, true),
+        ],
+    );
+    pipeline.activate_live_par2(job_id).await;
+    pipeline.note_live_par2_segment(
+        NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        0,
+        &DecodedChunk::from(damaged_payload.clone()),
+    );
+    assert!(pipeline.live_par2.is_active(job_id));
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    pipeline.check_job_completion(job_id).await;
+
+    // The repair rewrote bytes the live verifier never saw. The job survives
+    // the pass — it goes on to extraction — so nothing but the repair seam can
+    // explain the live state being gone.
+    assert_eq!(pipeline.par2_repairer_execute_calls, 1);
+    assert!(
+        pipeline.jobs.contains_key(&job_id),
+        "the job must still be live for this assertion to mean anything"
+    );
+    assert!(!pipeline.live_par2.is_active(job_id));
+    assert_eq!(pipeline.live_par2.metrics().full_verify_skips, 0);
+    assert_eq!(
+        tokio::fs::read(pipeline.jobs[&job_id].working_dir.join(payload_filename))
+            .await
+            .unwrap(),
+        original_payload
+    );
+}
+
+#[tokio::test]
+async fn live_par2_refuses_the_short_circuit_when_the_on_disk_length_disagrees() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.live_par2.set_enabled(true);
+    let job_id = JobId(30470);
+    let payload_filename = "Silver.Horizon.S01E09.mkv";
+    let index_filename = "Silver.Horizon.S01E09.par2";
+    let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let par2_bytes = build_test_par2_index(payload_filename, &payload, 64);
+    let spec = live_par2_job_spec(
+        "Live PAR2 Disk Length Mismatch",
+        payload_filename,
+        payload.len() as u32,
+        index_filename,
+        par2_bytes.len() as u32,
+    );
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    submit_live_par2_payload(&mut pipeline, job_id, payload_filename, &payload).await;
+
+    // Every described block still hashes clean, but the file grew past the
+    // description: `scan_placement` rejects that on length alone, so the
+    // short-circuit must too.
+    let mut grown = payload.clone();
+    grown.extend_from_slice(&[0u8; 16]);
+    tokio::fs::write(working_dir.join(payload_filename), &grown)
+        .await
+        .unwrap();
+
+    submit_live_par2_index(&mut pipeline, job_id, index_filename, &par2_bytes).await;
+    drain_live_par2_job(&mut pipeline, job_id).await;
+
+    let metrics = pipeline.live_par2.metrics();
+    assert_eq!(
+        metrics.blocks_backfilled, 2,
+        "the described blocks must still have verified clean"
+    );
+    assert_eq!(metrics.full_verify_skips, 0);
+}
