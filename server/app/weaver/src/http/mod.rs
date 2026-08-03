@@ -117,6 +117,7 @@ pub async fn run_server(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let base_url = runtime.base_url.clone();
     let cors = cors_layer(&runtime.security)?;
+    let host_security = runtime.security.clone();
     let app = routes::build_router(runtime)
         .layer(compression_layer())
         .layer(
@@ -127,6 +128,7 @@ pub async fn run_server(
                 .zstd(true),
         )
         .layer(cors);
+    let app = routes::with_http_host_validation(app, host_security);
 
     info!(%addr, base_url = if base_url.is_empty() { "/" } else { &base_url }, "starting HTTP server");
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {

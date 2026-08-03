@@ -2,9 +2,11 @@ use std::env;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use http::uri::Authority;
 use reqwest::Url;
 
 pub const ENV_HTTP_BIND_ADDRESS: &str = "WEAVER_HTTP_BIND_ADDRESS";
+pub const ENV_HTTP_ALLOWED_HOSTS: &str = "WEAVER_HTTP_ALLOWED_HOSTS";
 pub const ENV_METRICS_AUTH_REQUIRED: &str = "WEAVER_METRICS_AUTH_REQUIRED";
 pub const ENV_CORS_ALLOWED_ORIGINS: &str = "WEAVER_CORS_ALLOWED_ORIGINS";
 pub const ENV_SECURE_COOKIES: &str = "WEAVER_SECURE_COOKIES";
@@ -22,8 +24,105 @@ pub const DEFAULT_NZB_UPLOAD_LIMIT_BYTES: u64 = 268_435_456;
 pub const DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES: u64 = 536_870_912;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpAuthority {
+    host: String,
+    port: Option<u16>,
+    ip_literal: bool,
+}
+
+impl HttpAuthority {
+    pub fn parse(value: &str) -> Result<Self, HttpAuthorityError> {
+        let value = value.trim();
+        if value.is_empty()
+            || value.contains(['/', '@', '*', '?', '#'])
+            || value.contains("://")
+            || (value.contains(':') && !value.starts_with('[') && value.matches(':').count() > 1)
+        {
+            return Err(HttpAuthorityError);
+        }
+
+        let port = if value.starts_with('[') {
+            let closing_bracket = value.find(']').ok_or(HttpAuthorityError)?;
+            match &value[closing_bracket + 1..] {
+                "" => None,
+                suffix => Some(
+                    suffix
+                        .strip_prefix(':')
+                        .filter(|port| !port.is_empty())
+                        .ok_or(HttpAuthorityError)?
+                        .parse::<u16>()
+                        .map_err(|_| HttpAuthorityError)?,
+                ),
+            }
+        } else {
+            value
+                .rsplit_once(':')
+                .map(|(_, port)| {
+                    if port.is_empty() {
+                        return Err(HttpAuthorityError);
+                    }
+                    port.parse::<u16>().map_err(|_| HttpAuthorityError)
+                })
+                .transpose()?
+        };
+
+        let authority = value.parse::<Authority>().map_err(|_| HttpAuthorityError)?;
+        let raw_host = authority.host();
+        let unbracketed = raw_host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(raw_host);
+        let ip = unbracketed.parse::<IpAddr>().ok();
+        if unbracketed.contains(':') && ip.is_none() {
+            return Err(HttpAuthorityError);
+        }
+
+        let host = if let Some(ip) = ip {
+            ip.to_string()
+        } else {
+            if !unbracketed.is_ascii()
+                || unbracketed
+                    .chars()
+                    .any(|ch| ch.is_ascii_control() || ch.is_ascii_whitespace())
+            {
+                return Err(HttpAuthorityError);
+            }
+            unbracketed
+                .strip_suffix('.')
+                .unwrap_or(unbracketed)
+                .to_ascii_lowercase()
+        };
+        if host.is_empty() || host.ends_with('.') {
+            return Err(HttpAuthorityError);
+        }
+
+        Ok(Self {
+            host,
+            port,
+            ip_literal: ip.is_some(),
+        })
+    }
+
+    pub fn matches(&self, other: &Self) -> bool {
+        self.host == other.host && self.port == other.port
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpAuthorityError;
+
+impl fmt::Display for HttpAuthorityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("invalid HTTP authority")
+    }
+}
+
+impl std::error::Error for HttpAuthorityError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSecurityConfig {
     pub http_bind_address: IpAddr,
+    pub http_allowed_hosts: Vec<HttpAuthority>,
     pub metrics_auth_required: bool,
     pub cors_allowed_origins: Vec<String>,
     pub secure_cookies: bool,
@@ -38,6 +137,7 @@ impl RuntimeSecurityConfig {
     pub fn from_env() -> Result<Self, SecurityConfigError> {
         Ok(Self {
             http_bind_address: parse_ip_env(ENV_HTTP_BIND_ADDRESS, DEFAULT_HTTP_BIND_ADDRESS)?,
+            http_allowed_hosts: parse_http_allowed_hosts_env()?,
             metrics_auth_required: parse_bool_env(ENV_METRICS_AUTH_REQUIRED, true)?,
             cors_allowed_origins: parse_origin_list_env(ENV_CORS_ALLOWED_ORIGINS)?,
             secure_cookies: parse_bool_env(ENV_SECURE_COOKIES, false)?,
@@ -66,6 +166,17 @@ impl RuntimeSecurityConfig {
         !login_enabled && !self.http_bind_address.is_loopback()
     }
 
+    pub fn is_http_authority_allowed(&self, authority: &HttpAuthority) -> bool {
+        if authority.ip_literal || authority.host == "localhost" {
+            return true;
+        }
+
+        self.http_allowed_hosts.iter().any(|allowed| {
+            allowed.host == authority.host
+                && allowed.port.is_none_or(|port| authority.port == Some(port))
+        })
+    }
+
     pub fn strict_security_violation(&self, login_enabled: bool) -> Option<String> {
         if self.strict_security && self.exposes_admin_without_login(login_enabled) {
             return Some(format!(
@@ -81,6 +192,7 @@ impl Default for RuntimeSecurityConfig {
     fn default() -> Self {
         Self {
             http_bind_address: DEFAULT_HTTP_BIND_ADDRESS,
+            http_allowed_hosts: Vec::new(),
             metrics_auth_required: true,
             cors_allowed_origins: Vec::new(),
             secure_cookies: false,
@@ -139,6 +251,32 @@ fn parse_ip_env(name: &str, default: IpAddr) -> Result<IpAddr, SecurityConfigErr
     trimmed
         .parse::<IpAddr>()
         .map_err(|_| SecurityConfigError::new(format!("{name} must be an IPv4 or IPv6 address")))
+}
+
+fn parse_http_allowed_hosts_env() -> Result<Vec<HttpAuthority>, SecurityConfigError> {
+    let Ok(value) = env::var(ENV_HTTP_ALLOWED_HOSTS) else {
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    value
+        .split(',')
+        .map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return Err(SecurityConfigError::new(format!(
+                    "{ENV_HTTP_ALLOWED_HOSTS} must not contain empty entries"
+                )));
+            }
+            HttpAuthority::parse(entry).map_err(|_| {
+                SecurityConfigError::new(format!(
+                    "{ENV_HTTP_ALLOWED_HOSTS} contains invalid authority {entry:?}; use exact hostnames or host:port entries"
+                ))
+            })
+        })
+        .collect()
 }
 
 fn parse_u64_env(name: &str, default: u64) -> Result<u64, SecurityConfigError> {
@@ -292,6 +430,7 @@ mod tests {
     fn clear_env() {
         for name in [
             ENV_HTTP_BIND_ADDRESS,
+            ENV_HTTP_ALLOWED_HOSTS,
             ENV_METRICS_AUTH_REQUIRED,
             ENV_CORS_ALLOWED_ORIGINS,
             ENV_SECURE_COOKIES,
@@ -314,6 +453,7 @@ mod tests {
 
         assert_eq!(config.http_bind_address, DEFAULT_HTTP_BIND_ADDRESS);
         assert_eq!(config.http_bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert!(config.http_allowed_hosts.is_empty());
         assert!(config.metrics_auth_required);
         assert!(config.cors_allowed_origins.is_empty());
         assert!(!config.secure_cookies);
@@ -339,6 +479,10 @@ mod tests {
         clear_env();
         unsafe {
             env::set_var(ENV_HTTP_BIND_ADDRESS, "127.0.0.1");
+            env::set_var(
+                ENV_HTTP_ALLOWED_HOSTS,
+                "Weaver.Example.Test.,proxy.internal:8443",
+            );
             env::set_var(ENV_METRICS_AUTH_REQUIRED, "off");
             env::set_var(
                 ENV_CORS_ALLOWED_ORIGINS,
@@ -355,6 +499,13 @@ mod tests {
         let config = RuntimeSecurityConfig::from_env().unwrap();
 
         assert_eq!(config.http_bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(
+            config.http_allowed_hosts,
+            vec![
+                HttpAuthority::parse("weaver.example.test").unwrap(),
+                HttpAuthority::parse("proxy.internal:8443").unwrap(),
+            ]
+        );
         assert!(!config.metrics_auth_required);
         assert_eq!(
             config.cors_allowed_origins,
@@ -437,6 +588,68 @@ mod tests {
         unsafe { env::set_var(ENV_CORS_ALLOWED_ORIGINS, "http://localhost:5173/path") };
         assert!(RuntimeSecurityConfig::from_env().is_err());
         clear_env();
+
+        for value in [
+            "example.test,,proxy.test",
+            "https://example.test",
+            "*.example.test",
+            "user@example.test",
+            "[::1",
+            "example.test:not-a-port",
+            "example.test:65536",
+            "[::1]:not-a-port",
+        ] {
+            unsafe { env::set_var(ENV_HTTP_ALLOWED_HOSTS, value) };
+            assert!(
+                RuntimeSecurityConfig::from_env().is_err(),
+                "accepted {value}"
+            );
+            clear_env();
+        }
+    }
+
+    #[test]
+    fn http_authority_policy_is_exact_and_port_aware() {
+        let config = RuntimeSecurityConfig {
+            http_allowed_hosts: vec![
+                HttpAuthority::parse("weaver.example.test").unwrap(),
+                HttpAuthority::parse("proxy.example.test:8443").unwrap(),
+            ],
+            ..RuntimeSecurityConfig::default()
+        };
+
+        for allowed in [
+            "localhost",
+            "LOCALHOST.:9090",
+            "127.0.0.1:9090",
+            "[::1]:9090",
+            "weaver.example.test:9090",
+            "WEAVER.EXAMPLE.TEST.",
+            "proxy.example.test:8443",
+        ] {
+            let authority = HttpAuthority::parse(allowed).unwrap();
+            assert!(
+                config.is_http_authority_allowed(&authority),
+                "denied {allowed}"
+            );
+        }
+
+        for denied in [
+            "localhost.example.test",
+            "127.0.0.1.example.test",
+            "attacker.example.test",
+            "proxy.example.test",
+            "proxy.example.test:9090",
+        ] {
+            let authority = HttpAuthority::parse(denied).unwrap();
+            assert!(
+                !config.is_http_authority_allowed(&authority),
+                "allowed {denied}"
+            );
+        }
+
+        assert!(HttpAuthority::parse("2001:db8::1").is_err());
+        assert!(HttpAuthority::parse("[2001:db8::1]:9090").is_ok());
     }
 
     #[test]

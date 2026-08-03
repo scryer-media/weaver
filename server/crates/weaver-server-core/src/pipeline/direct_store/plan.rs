@@ -23,16 +23,6 @@ pub(crate) enum AdmissionRefusal {
     VolumeGap,
     /// The set has no volumes at all.
     Empty,
-    /// The job carries PAR2 recovery files.
-    ///
-    /// Every PAR2 path — the live short-circuit, the quick verify and the full
-    /// analyze — reads the *volume files* the set's descriptions name, and a
-    /// direct set has none: the analyze runs over zero volume files and reports
-    /// "not repairable", so a par2-bearing job that routed directly could never
-    /// complete. Phase 5's hybrid provider, which answers those reads from the
-    /// envelope plus the routed member bytes, is what unlocks this; until then
-    /// the job stays conventional end to end.
-    Par2Present,
 }
 
 /// Appends `suffix` to the final component of a working-directory-relative
@@ -54,7 +44,6 @@ impl AdmissionRefusal {
             Self::DuplicateVolume => "duplicate_volume",
             Self::VolumeGap => "volume_gap",
             Self::Empty => "empty_set",
-            Self::Par2Present => "par2_present",
         }
     }
 }
@@ -91,21 +80,15 @@ impl DirectSetPlan {
                 .push((volume_number, file_index as u32));
         }
 
-        // A whole-job refusal, decided before any per-set shape is looked at:
-        // PAR2 covers the *volumes*, and repair reads files direct routing
-        // never creates. See [`AdmissionRefusal::Par2Present`].
-        let par2_present = spec
-            .files
-            .iter()
-            .any(|file| matches!(file.role, FileRole::Par2 { .. }));
-
+        // Phase 4 refused the whole job here when its spec carried a PAR2 file:
+        // every PAR2 path reads the *volume files* the descriptions name, and a
+        // direct set has none. Wave 2's `par2_access` adapter answers those
+        // reads out of the envelope plus the routed member bytes, so the
+        // refusal is gone — a par2-bearing set routes, and its finalization
+        // waits for the job's verification to conclude (see the module docs).
         let mut admitted = Vec::new();
         let mut refused = Vec::new();
         for (set_name, mut entries) in candidates {
-            if par2_present {
-                refused.push((set_name, AdmissionRefusal::Par2Present));
-                continue;
-            }
             entries.sort_unstable();
             if entries.is_empty() {
                 refused.push((set_name, AdmissionRefusal::Empty));

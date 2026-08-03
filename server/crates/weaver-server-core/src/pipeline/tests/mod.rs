@@ -551,6 +551,39 @@ fn build_test_rar_file_header_with_extra(
     )
 }
 
+/// RAR5 compression info for a member that is **not** stored.
+///
+/// The field is bit-packed — version in bits 0-5 (0 = RAR5), the per-member
+/// solid flag in bit 6, the method in bits 7-9 — and the stored-layout
+/// classifier reads exactly those three: a non-zero method makes a member
+/// `Compressed`, and the solid bit makes it `Solid`, which the classifier checks
+/// first. The data area a header like this describes is not really compressed,
+/// so a fixture using it is only good for what the *classification* decides.
+fn test_rar_compression_info(method: u64, solid: bool) -> u64 {
+    ((method & 0x07) << 7) | u64::from(solid) << 6
+}
+
+/// A RAR5 file header whose member is compressed (and optionally solid).
+fn build_test_rar_compressed_file_header(
+    filename: &str,
+    common_flags_extra: u64,
+    data_size: u64,
+    unpacked_size: u64,
+    data_crc: Option<u32>,
+    compression_info: u64,
+) -> Vec<u8> {
+    build_test_rar_data_header_with_compression(
+        2,
+        filename,
+        common_flags_extra,
+        data_size,
+        unpacked_size,
+        data_crc,
+        &[],
+        compression_info,
+    )
+}
+
 /// A RAR5 **service** header (type 3) with a data area.
 ///
 /// Recovery records (`-rr`) and quick-open blocks take exactly this shape: the
@@ -570,6 +603,29 @@ fn build_test_rar_data_header(
     data_crc: Option<u32>,
     extra: &[u8],
 ) -> Vec<u8> {
+    build_test_rar_data_header_with_compression(
+        header_type,
+        filename,
+        common_flags_extra,
+        data_size,
+        unpacked_size,
+        data_crc,
+        extra,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_test_rar_data_header_with_compression(
+    header_type: u64,
+    filename: &str,
+    common_flags_extra: u64,
+    data_size: u64,
+    unpacked_size: u64,
+    data_crc: Option<u32>,
+    extra: &[u8],
+    compression_info: u64,
+) -> Vec<u8> {
     let file_flags: u64 = if data_crc.is_some() { 0x0004 } else { 0 };
     let mut type_body = Vec::new();
     type_body.extend_from_slice(&encode_test_rar_vint(file_flags));
@@ -578,7 +634,7 @@ fn build_test_rar_data_header(
     if let Some(data_crc) = data_crc {
         type_body.extend_from_slice(&data_crc.to_le_bytes());
     }
-    type_body.extend_from_slice(&encode_test_rar_vint(0));
+    type_body.extend_from_slice(&encode_test_rar_vint(compression_info));
     type_body.extend_from_slice(&encode_test_rar_vint(1));
     type_body.extend_from_slice(&encode_test_rar_vint(filename.len() as u64));
     type_body.extend_from_slice(filename.as_bytes());

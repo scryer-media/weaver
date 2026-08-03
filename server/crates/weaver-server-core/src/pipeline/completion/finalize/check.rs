@@ -936,9 +936,15 @@ impl Pipeline {
 
         let verify_dir = working_dir.clone();
         let pp_pool = self.pp_pool.clone();
+        // Plan 135 D5: a direct set's source volumes are not on disk, so the
+        // pass reads them through the hybrid virtual-volume provider. Everything
+        // else in the job — the PAR2 volumes, any conventional data file, a
+        // demoted set's materialized volumes — keeps reading through
+        // `PlacementFileAccess` exactly as before.
+        let direct = self.direct_par2_overlay(job_id);
         let verify_result = tokio::task::spawn_blocking(move || {
             pp_pool.install(move || {
-                let plan = weaver_par2::scan_placement(&verify_dir, &par2_set)
+                let mut plan = weaver_par2::scan_placement(&verify_dir, &par2_set)
                     .map_err(|error| format!("placement scan failed: {error}"))?;
                 if !plan.conflicts.is_empty() {
                     return Err(format!(
@@ -947,9 +953,51 @@ impl Pipeline {
                     ));
                 }
 
-                let file_access =
+                let Some(direct) = direct else {
+                    let file_access =
+                        weaver_par2::PlacementFileAccess::from_plan(verify_dir, &par2_set, &plan);
+                    return Ok((weaver_par2::verify_all(&par2_set, &file_access), plan));
+                };
+
+                // The scan walked a directory the direct volumes are absent
+                // from, so it left every one of them `unresolved` — and an
+                // unresolved id is what the placement machinery later tries to
+                // rename. A direct volume is at its declared name by
+                // construction (its identity is resolved *by* that name, in
+                // `direct_par2_overlay`), and there is no file to move anyway,
+                // so it is recorded `exact`: the same classification the scan
+                // would have produced for a volume sitting correctly on disk,
+                // and the one classification that emits no filesystem action.
+                let direct_ids: HashSet<weaver_par2::FileId> = direct
+                    .volumes
+                    .iter()
+                    .map(|volume| volume.par2_file_id)
+                    .collect();
+                plan.unresolved
+                    .retain(|file_id| !direct_ids.contains(file_id));
+                for file_id in &direct.volumes {
+                    if !plan.exact.contains(&file_id.par2_file_id) {
+                        plan.exact.push(file_id.par2_file_id);
+                    }
+                }
+
+                let inner =
                     weaver_par2::PlacementFileAccess::from_plan(verify_dir, &par2_set, &plan);
-                Ok((weaver_par2::verify_all(&par2_set, &file_access), plan))
+                let file_access =
+                    crate::pipeline::direct_store::par2_access::DirectVolumeFileAccess::new(
+                        inner,
+                        direct.provider,
+                        &direct.volumes,
+                    );
+                let counters = file_access.counters();
+                let verification = weaver_par2::verify_all(&par2_set, &file_access);
+                debug!(
+                    virtual_volumes = direct.volumes.len(),
+                    sequential_opens = counters.sequential_opens(),
+                    ranged_reads = counters.ranged_reads(),
+                    "authoritative PAR2 pass read a direct set's volumes virtually"
+                );
+                Ok((verification, plan))
             })
         })
         .await;
@@ -988,6 +1036,19 @@ impl Pipeline {
         }
 
         Ok((verification, placement_plan))
+    }
+
+    /// Records the job as PAR2-verified and releases any direct set that was
+    /// holding its virtual volume image for the verifier (plan 135, D5).
+    ///
+    /// A par2-bearing direct set stays uncommitted until here: its envelopes and
+    /// `.direct.partial`s *are* the source volumes, and finalization renames the
+    /// partials away and deletes the envelopes. Releasing at the same statement
+    /// that records the verdict is what keeps the two from drifting — there is
+    /// no path that marks a job verified without also letting its sets commit.
+    async fn mark_par2_verified(&mut self, job_id: JobId) {
+        self.par2_verified.insert(job_id);
+        self.finalize_ready_direct_sets(job_id).await;
     }
 
     fn emit_job_verification_started(&self, job_id: JobId) {
@@ -1209,7 +1270,7 @@ impl Pipeline {
             return;
         }
 
-        self.par2_verified.insert(job_id);
+        self.mark_par2_verified(job_id).await;
 
         if has_crc_failures {
             if self.normalization_retried.contains(&job_id) {
@@ -1838,6 +1899,13 @@ impl Pipeline {
 
         self.reapply_promoted_recovery_queue(job_id);
 
+        // Plan 135, D5: a direct set whose job carries no PAR2 set to verify
+        // against — bypassed, or no recovery article ever landed — would
+        // otherwise wait forever for a verdict that is not coming. Asked here,
+        // once per completion check, because this is where the job's PAR2 state
+        // is settled; `mark_par2_verified` covers the verdict case.
+        self.finalize_ready_direct_sets(job_id).await;
+
         let par2_bypassed = self.par2_bypassed.contains(&job_id);
         let par2_loaded = self.par2_set(job_id).is_some();
         let download_pipeline_exhausted = !self.job_has_pending_download_pipeline_work(job_id);
@@ -2198,7 +2266,7 @@ impl Pipeline {
 
                         self.try_deobfuscate_files_with_par2(job_id).await;
                         self.retry_par2_authoritative_identity(job_id).await;
-                        self.par2_verified.insert(job_id);
+                        self.mark_par2_verified(job_id).await;
 
                         if archive_extraction_applicable {
                             self.retry_archive_extraction_after_verify_or_repair(job_id)
@@ -2217,6 +2285,16 @@ impl Pipeline {
             if let Some(par2_set) = par2_set {
                 let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
                 if authoritative_par2_verification_needed {
+                    // The repairer reads and *writes* volume files through
+                    // `DiskFileAccess`, which a virtual volume has none of. This
+                    // branch is only reached after an extraction already failed
+                    // — which a still-direct set cannot have caused, since it
+                    // never enters the extractor — so it is defence in depth
+                    // rather than a live path: any set still routing here
+                    // materializes first, and the repairer sees real files.
+                    if self.demote_live_direct_sets_for_par2_repair(job_id).await {
+                        return;
+                    }
                     let repair_analysis = match self
                         .analyze_par2_with_repairer(
                             job_id,
@@ -2281,7 +2359,7 @@ impl Pipeline {
                             self.fail_job(job_id, msg);
                             return;
                         }
-                        self.par2_verified.insert(job_id);
+                        self.mark_par2_verified(job_id).await;
 
                         if has_crc_failures {
                             if self.normalization_retried.contains(&job_id) {
@@ -2482,7 +2560,7 @@ impl Pipeline {
                                 self.fail_job(job_id, msg);
                                 return;
                             }
-                            self.par2_verified.insert(job_id);
+                            self.mark_par2_verified(job_id).await;
                             self.transition_postprocessing_status(
                                 job_id,
                                 JobStatus::Downloading,
@@ -2542,6 +2620,19 @@ impl Pipeline {
                         return;
                     }
                 };
+                // Plan 135, phase 5 wave 2: verification verdicts only. Damage
+                // on a virtual volume has nothing to repair *into* — the bytes
+                // live in a member's partial and an envelope, and a recovered
+                // slice belongs to neither — so the set demotes, materializes
+                // its volumes from its own routed bytes and refetches what it
+                // could not verify. The job then re-runs this gate over real
+                // files and the conventional repair path owns it.
+                if self
+                    .demote_direct_sets_with_par2_damage(job_id, &verification)
+                    .await
+                {
+                    return;
+                }
                 let damaged = verification.total_missing_blocks;
                 let recovery_now = verification.recovery_blocks_available;
                 let total_recovery_capacity = self.total_recovery_block_capacity(job_id);
@@ -2595,7 +2686,7 @@ impl Pipeline {
                         self.fail_job(job_id, msg);
                         return;
                     }
-                    self.par2_verified.insert(job_id);
+                    self.mark_par2_verified(job_id).await;
 
                     if has_crc_failures {
                         if self.normalization_retried.contains(&job_id) {
@@ -2853,7 +2944,7 @@ impl Pipeline {
                                 self.fail_job(job_id, msg);
                                 return;
                             }
-                            self.par2_verified.insert(job_id);
+                            self.mark_par2_verified(job_id).await;
                             self.transition_postprocessing_status(
                                 job_id,
                                 JobStatus::Downloading,

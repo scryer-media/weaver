@@ -354,6 +354,84 @@ fn move_sources_regular_file_bytes(
     total
 }
 
+fn complete_parent_for_category(
+    complete_dir: &std::path::Path,
+    categories: &[crate::categories::CategoryConfig],
+    category: Option<&str>,
+) -> Result<PathBuf, String> {
+    let Some(category) = category.filter(|category| !category.is_empty()) else {
+        return Ok(complete_dir.to_path_buf());
+    };
+
+    if let Some(custom_dest) = categories
+        .iter()
+        .find(|configured| configured.name.eq_ignore_ascii_case(category))
+        .and_then(|configured| configured.dest_dir.as_deref())
+        .filter(|destination| !destination.is_empty())
+    {
+        return Ok(PathBuf::from(custom_dest));
+    }
+
+    let category = crate::categories::validate_category_path_component(category)
+        .map_err(|error| format!("unsafe completion category: {error}"))?;
+    let parent = complete_dir.join(category);
+    if !parent.starts_with(complete_dir) {
+        return Err("unsafe completion category escaped the complete directory".to_string());
+    }
+    Ok(parent)
+}
+
+#[cfg(test)]
+mod category_destination_tests {
+    use super::*;
+
+    fn category(name: &str, dest_dir: Option<&str>) -> crate::categories::CategoryConfig {
+        crate::categories::CategoryConfig {
+            id: 1,
+            name: name.to_string(),
+            dest_dir: dest_dir.map(str::to_string),
+            aliases: String::new(),
+        }
+    }
+
+    #[test]
+    fn safe_categories_and_collision_suffixes_remain_beneath_complete_dir() {
+        let complete = std::path::Path::new("/downloads/complete");
+        let parent = complete_parent_for_category(complete, &[], Some("tv-hd")).unwrap();
+        assert_eq!(parent, complete.join("tv-hd"));
+
+        let collision = parent.join(weaver_model::files::path_component_with_suffix(
+            "release", ".#42.1",
+        ));
+        assert!(collision.starts_with(complete));
+    }
+
+    #[test]
+    fn configured_destination_override_remains_trusted_admin_input() {
+        let complete = std::path::Path::new("/downloads/complete");
+        let categories = vec![category("custom/name", Some("/mnt/admin-selected"))];
+
+        assert_eq!(
+            complete_parent_for_category(complete, &categories, Some("custom/name")).unwrap(),
+            PathBuf::from("/mnt/admin-selected")
+        );
+    }
+
+    #[test]
+    fn malicious_or_legacy_unsafe_categories_fail_before_a_destination_is_returned() {
+        let complete = std::path::Path::new("/downloads/complete");
+        for unsafe_category in ["/tmp", "../../outside", "nested/path", "C:\\outside"] {
+            assert!(
+                complete_parent_for_category(complete, &[], Some(unsafe_category)).is_err(),
+                "accepted {unsafe_category:?}"
+            );
+        }
+
+        let legacy = vec![category("legacy/unsafe", None)];
+        assert!(complete_parent_for_category(complete, &legacy, Some("legacy/unsafe")).is_err());
+    }
+}
+
 impl Pipeline {
     fn complete_destination_is_reserved(&self, job_id: JobId, candidate: &std::path::Path) -> bool {
         self.reserved_complete_destinations
@@ -368,34 +446,16 @@ impl Pipeline {
         job_id: JobId,
         job_name: &str,
         category: Option<&str>,
-    ) -> PathBuf {
+    ) -> Result<PathBuf, String> {
         let dir_name = crate::jobs::working_dir::sanitize_dirname(job_name);
-        let base_dest = {
+        let parent = {
             let cfg = self.config.read().await;
-            let cat_dest = category.and_then(|cat| {
-                cfg.categories
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(cat))
-                    .and_then(|c| c.dest_dir.as_ref())
-                    .filter(|d| !d.is_empty())
-                    .map(PathBuf::from)
-            });
-
-            if let Some(custom_dest) = cat_dest {
-                custom_dest.join(&dir_name)
-            } else {
-                let mut dest = self.complete_dir.clone();
-                if let Some(cat) = category
-                    && !cat.is_empty()
-                {
-                    dest = dest.join(cat);
-                }
-                dest.join(&dir_name)
-            }
+            complete_parent_for_category(&self.complete_dir, &cfg.categories, category)?
         };
+        let base_dest = parent.join(&dir_name);
 
         if !base_dest.exists() && !self.complete_destination_is_reserved(job_id, &base_dest) {
-            return base_dest;
+            return Ok(base_dest);
         }
 
         let parent = base_dest
@@ -406,7 +466,7 @@ impl Pipeline {
             &format!(".#{}", job_id.0),
         ));
         if !suffixed.exists() && !self.complete_destination_is_reserved(job_id, &suffixed) {
-            return suffixed;
+            return Ok(suffixed);
         }
 
         let mut attempt = 1u32;
@@ -416,7 +476,7 @@ impl Pipeline {
                 &format!(".#{}.{}", job_id.0, attempt),
             ));
             if !candidate.exists() && !self.complete_destination_is_reserved(job_id, &candidate) {
-                return candidate;
+                return Ok(candidate);
             }
             attempt += 1;
         }
@@ -480,7 +540,7 @@ impl Pipeline {
 
         let dest = self
             .compute_complete_destination(job_id, &job_name, category.as_deref())
-            .await;
+            .await?;
         self.reserved_complete_destinations
             .insert(job_id, dest.clone());
         self.inflight_moves.insert(job_id);

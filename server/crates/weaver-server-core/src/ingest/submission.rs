@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::Database;
 use crate::jobs::JobSpec;
@@ -67,15 +67,8 @@ struct PreparedSubmission {
     submit_started: Instant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CategoryResolutionMode {
-    ResolveConfigured,
-    PreserveSubmitted,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionOptions {
-    pub category_resolution: CategoryResolutionMode,
     pub add_paused: bool,
     pub duplicate_mode: DuplicateMode,
     pub semantic_duplicate: Option<SemanticDuplicate>,
@@ -87,7 +80,6 @@ pub struct SubmissionOptions {
 impl Default for SubmissionOptions {
     fn default() -> Self {
         Self {
-            category_resolution: CategoryResolutionMode::ResolveConfigured,
             add_paused: false,
             duplicate_mode: DuplicateMode::Enforce,
             semantic_duplicate: None,
@@ -116,6 +108,8 @@ pub enum SubmitNzbError {
     Fetch(String),
     #[error("NZB response was not valid XML")]
     NotXml,
+    #[error("invalid category: {0}")]
+    InvalidCategory(#[from] crate::categories::CategoryValidationError),
     #[error("duplicate submission blocked")]
     DuplicateBlocked { decision: DuplicateDecision },
     #[error("idempotency key is already bound to job {job_id}")]
@@ -214,37 +208,9 @@ pub fn nzb_to_submission_spec(
 pub async fn resolve_submission_category(
     config: &SharedConfig,
     category: Option<&str>,
-) -> Option<String> {
-    resolve_submission_category_with_mode(
-        config,
-        category,
-        CategoryResolutionMode::ResolveConfigured,
-    )
-    .await
-}
-
-pub async fn resolve_submission_category_with_mode(
-    config: &SharedConfig,
-    category: Option<&str>,
-    mode: CategoryResolutionMode,
-) -> Option<String> {
-    let category = category?;
-    if matches!(mode, CategoryResolutionMode::PreserveSubmitted) {
-        return Some(category.to_string());
-    }
-
+) -> Result<Option<String>, crate::categories::CategoryValidationError> {
     let cfg = config.read().await;
-    if cfg.categories.is_empty() {
-        return Some(category.to_string());
-    }
-
-    match crate::categories::resolve_category(&cfg.categories, category) {
-        Some(canonical) => Some(canonical),
-        None => {
-            warn!(category = %category, "unknown category, submitting without category");
-            None
-        }
-    }
+    crate::categories::resolve_submission_category(&cfg.categories, category)
 }
 
 async fn persist_submission_plan(
@@ -315,12 +281,7 @@ async fn submit_prepared_nzb(
         submit_started,
     } = prepared;
 
-    let resolved_category = resolve_submission_category_with_mode(
-        config,
-        category.as_deref(),
-        options.category_resolution,
-    )
-    .await;
+    let resolved_category = resolve_submission_category(config, category.as_deref()).await?;
     let job_hash = persisted_nzb::hash_persisted_nzb_bytes(&nzb_zstd);
     let spec = nzb_to_submission_spec(
         &nzb,

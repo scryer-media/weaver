@@ -2704,3 +2704,178 @@ fn a_rebuild_truncates_a_stale_file_already_sitting_at_the_volumes_path() {
         "the rebuilt volume is the volume, with no stale tail past its end"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The PAR2 `FileAccess` adapter over virtual volumes (D5)
+// ---------------------------------------------------------------------------
+
+use super::par2_access::{DirectVolumeFileAccess, VirtualPar2Volume};
+use weaver_par2::FileAccess;
+
+/// A PAR2 set describing one file with **descriptions only** — no IFSC packet,
+/// so no slice checksums.
+///
+/// That is the shape D5 names: with no per-slice data the verifier falls back to
+/// a whole-file MD5, which is the read that degrades into thousands of ranged
+/// reads across member partials unless the adapter offers a real sequential
+/// reader.
+fn descriptor_only_par2_set(filename: &str, bytes: &[u8]) -> weaver_par2::Par2FileSet {
+    let file_id = weaver_par2::FileId::from_bytes([7u8; 16]);
+    weaver_par2::Par2FileSet {
+        recovery_set_id: weaver_par2::RecoverySetId::from_bytes([3; 16]),
+        slice_size: 64,
+        recovery_file_ids: vec![file_id],
+        non_recovery_file_ids: Vec::new(),
+        files: HashMap::from([(
+            file_id,
+            weaver_par2::FileDescription {
+                file_id,
+                hash_full: weaver_par2::checksum::md5(bytes),
+                hash_16k: weaver_par2::checksum::md5(&bytes[..bytes.len().min(16 * 1024)]),
+                length: bytes.len() as u64,
+                par2_name: filename.to_string(),
+                filename: filename.to_string(),
+            },
+        )]),
+        slice_checksums: HashMap::new(),
+        recovery_slices: std::collections::BTreeMap::new(),
+        creator: None,
+    }
+}
+
+/// The adapter under test, over the provider fixture's single virtual volume.
+fn virtual_file_access(
+    fixture: &ProviderFixture,
+    par2_set: &weaver_par2::Par2FileSet,
+    base_dir: &Path,
+) -> (DirectVolumeFileAccess, weaver_par2::FileId) {
+    let file_id = par2_set.recovery_file_ids[0];
+    let inner = weaver_par2::PlacementFileAccess::new(
+        base_dir.to_path_buf(),
+        par2_set,
+        std::collections::HashMap::new(),
+    );
+    let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    (
+        DirectVolumeFileAccess::new(
+            inner,
+            provider,
+            &[VirtualPar2Volume {
+                par2_file_id: file_id,
+                volume_index: fixture.volume.volume_index,
+            }],
+        ),
+        file_id,
+    )
+}
+
+#[test]
+fn a_no_ifsc_whole_file_md5_streams_through_the_sequential_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = provider_fixture(whole_volume_covered());
+    let par2_set = descriptor_only_par2_set("silver.horizon.part01.rar", &fixture.conventional);
+    let (access, file_id) = virtual_file_access(&fixture, &par2_set, dir.path());
+    let counters = access.counters();
+
+    assert!(
+        weaver_par2::verify_full_hash(&par2_set, &file_id, &access)
+            .expect("the description names a registered virtual volume"),
+        "the whole-file MD5 of a virtual volume must match the volume the \
+         conventional gate would have written"
+    );
+    assert!(
+        counters.sequential_opens() > 0,
+        "the whole-file MD5 must stream through `open_sequential_reader`"
+    );
+    assert_eq!(
+        counters.ranged_reads(),
+        0,
+        "D5 requires the sequential path so a no-IFSC set does not degrade into \
+         ranged reads across member partials"
+    );
+}
+
+#[test]
+fn the_adapter_answers_existence_length_and_ranges_like_a_downloaded_volume() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = provider_fixture(whole_volume_covered());
+    let par2_set = descriptor_only_par2_set("silver.horizon.part01.rar", &fixture.conventional);
+    let (access, file_id) = virtual_file_access(&fixture, &par2_set, dir.path());
+
+    assert!(access.file_exists(&file_id));
+    assert_eq!(
+        access.file_length(&file_id),
+        Some(fixture.conventional.len() as u64)
+    );
+    // A range that crosses the header, a member extent, the envelope gap and the
+    // second member — every source the overlay has — in one call.
+    let range = access
+        .read_file_range(&file_id, 8, (fixture.conventional.len() - 12) as u64)
+        .expect("a covered range reads");
+    assert_eq!(
+        range,
+        fixture.conventional[8..fixture.conventional.len() - 4],
+        "a ranged read must reassemble the source volume across every backing file"
+    );
+    assert!(
+        access
+            .read_file_range(&file_id, 0, 1)
+            .is_ok_and(|bytes| bytes == fixture.conventional[..1]),
+        "the first byte comes from the envelope"
+    );
+}
+
+#[test]
+fn a_hole_reads_as_a_short_file_and_never_as_zeros() {
+    let dir = tempfile::tempdir().unwrap();
+    // Everything below the second member is covered; the tail is not.
+    let mut covered = ByteRanges::new();
+    let hole_at = (PROVIDER_HEADER + PROVIDER_MEMBER_A + PROVIDER_GAP) as u64;
+    covered.insert(0, hole_at);
+    let fixture = provider_fixture(covered);
+    let par2_set = descriptor_only_par2_set("silver.horizon.part01.rar", &fixture.conventional);
+    let (access, file_id) = virtual_file_access(&fixture, &par2_set, dir.path());
+
+    // The length is still the volume's — coverage says what is *there*, not how
+    // long the volume is — so a short read is what tells the pass the file is
+    // damaged, exactly as a truncated volume file would.
+    assert_eq!(
+        access.file_length(&file_id),
+        Some(fixture.conventional.len() as u64)
+    );
+    let read = access
+        .read_file_range(&file_id, 0, fixture.conventional.len() as u64)
+        .expect("a read that starts inside coverage succeeds");
+    assert_eq!(
+        read.len() as u64,
+        hole_at,
+        "the read must stop at the hole rather than fabricating the rest"
+    );
+    assert_eq!(
+        read,
+        fixture.conventional[..hole_at as usize],
+        "and the bytes it did return must be the volume's"
+    );
+    assert!(
+        !weaver_par2::verify_full_hash(&par2_set, &file_id, &access).unwrap_or(true),
+        "a volume with a hole must not verify"
+    );
+}
+
+#[test]
+fn a_write_to_a_virtual_volume_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = provider_fixture(whole_volume_covered());
+    let par2_set = descriptor_only_par2_set("silver.horizon.part01.rar", &fixture.conventional);
+    let (mut access, file_id) = virtual_file_access(&fixture, &par2_set, dir.path());
+
+    // Repair over a virtual volume is phase 6. Wave 2 must fail loudly rather
+    // than write a recovered slice into a file the set does not own.
+    let error = access
+        .write_file_range(&file_id, 0, b"repaired")
+        .expect_err("a virtual volume has nowhere to put a repaired slice");
+    assert!(
+        error.to_string().contains("virtual"),
+        "the refusal should say why, got {error}"
+    );
+}

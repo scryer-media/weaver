@@ -15,6 +15,36 @@ pub(crate) const PROMOTED_RECOVERY_PRIORITY: u32 = 2;
 const PAR2_PACKET_ALIGNMENT: u64 = 4;
 const PAR2_RECOVERY_PACKET_OVERHEAD: u64 = 68; // 64-byte header + 4-byte exponent
 
+/// Where one live-PAR2 read-back gets its bytes.
+///
+/// A conventional file is re-read from disk; a direct set's source volume has
+/// no file, so it is read through the hybrid virtual-volume provider (plan 135,
+/// D5). Both are owned values so the read can move onto the blocking pool.
+enum LiveReadSource {
+    OnDisk(std::path::PathBuf),
+    Virtual(
+        u32,
+        crate::pipeline::direct_store::provider::HybridVolumeProvider,
+    ),
+}
+
+/// One file's length check for the live short-circuit.
+///
+/// `scan_placement` rejects a file whose length disagrees with its description,
+/// and the short-circuit has to reach the same verdict without running it. For
+/// a direct volume the length is the provider's, not a `stat`'s.
+enum LiveLengthCheck {
+    OnDisk {
+        path: std::path::PathBuf,
+        expected: u64,
+    },
+    Virtual {
+        volume_index: u32,
+        actual: u64,
+        expected: u64,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryCountSource {
     Exact,
@@ -517,7 +547,7 @@ impl Pipeline {
 
     /// Whether the job's spec declares any PAR2 file at all. A job without one
     /// can never activate live verification, so it never records coverage.
-    fn job_spec_has_par2_file(&self, job_id: JobId) -> bool {
+    pub(crate) fn job_spec_has_par2_file(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|state| {
             state
                 .spec
@@ -539,7 +569,10 @@ impl Pipeline {
     /// decoded length to equal `desc.length` and every block to match its IFSC
     /// checksum, which is what makes the placement scan's content match
     /// structurally implied rather than assumed.
-    fn resolve_live_par2_binding(&self, file_id: NzbFileId) -> Option<live::LiveBinding> {
+    pub(crate) fn resolve_live_par2_binding(
+        &self,
+        file_id: NzbFileId,
+    ) -> Option<live::LiveBinding> {
         let job_id = file_id.job_id;
         let par2_set = self.par2_set(job_id)?;
         let state = self.jobs.get(&job_id)?;
@@ -627,13 +660,37 @@ impl Pipeline {
 
     async fn run_live_par2_reads(&mut self, reads: Vec<live::LiveRead>, from_backfill: bool) {
         for read in reads {
-            let Some((_, _, _, file_path)) = self.write_target_for_file(read.file_id) else {
-                continue;
+            // A direct set's source volume has no file (D7), so the read goes
+            // through the hybrid virtual-volume provider instead — the same
+            // bytes, in the same source-volume coordinate space, assembled from
+            // the envelope plus the routed member partials. A range that lands
+            // on a hole comes back short, exactly as a truncated file would, and
+            // those blocks stay `Pending` for the authoritative pass.
+            let source = match self.direct_virtual_volume(read.file_id) {
+                Some((volume_index, _, provider)) => {
+                    LiveReadSource::Virtual(volume_index, provider)
+                }
+                None => match self.write_target_for_file(read.file_id) {
+                    Some((_, _, _, file_path)) => LiveReadSource::OnDisk(file_path),
+                    None => continue,
+                },
             };
             let bytes = match tokio::task::spawn_blocking(move || {
                 let _cpu_scope =
                     crate::runtime::perf_probe::cpu_scope("verify.live_par2.range_read");
-                live::read_range_best_effort(&file_path, read.offset, read.len)
+                match source {
+                    LiveReadSource::OnDisk(file_path) => {
+                        live::read_range_best_effort(&file_path, read.offset, read.len)
+                    }
+                    LiveReadSource::Virtual(volume_index, provider) => {
+                        live::read_virtual_range_best_effort(
+                            &provider,
+                            volume_index,
+                            read.offset,
+                            read.len,
+                        )
+                    }
+                }
             })
             .await
             {
@@ -663,30 +720,61 @@ impl Pipeline {
     }
 
     /// The clean verification a full PAR2 pass would produce, when live
-    /// results already prove it — plus the on-disk length check that pass
-    /// would have performed while reading the files.
+    /// results already prove it — plus the length check that pass would have
+    /// performed while reading the files.
     pub(crate) async fn live_par2_clean_verification(
         &self,
         job_id: JobId,
     ) -> Option<(weaver_par2::VerificationResult, weaver_par2::PlacementPlan)> {
         let (verification, placement_plan, length_checks) =
             self.live_par2_clean_verification_shape(job_id)?;
-        if !Self::live_par2_on_disk_lengths_match(job_id, length_checks).await {
+        if !Self::live_par2_lengths_match(job_id, length_checks).await {
             return None;
         }
         Some((verification, placement_plan))
     }
 
-    /// Mirrors `scan_placement`'s length rejection: a file whose size on disk
+    /// Mirrors `scan_placement`'s length rejection: a file whose size
     /// disagrees with its description is not the file that description names,
     /// whatever its blocks hashed to in stream. A stat that fails at all is a
     /// refusal too — the existing pass then runs and reports properly.
-    async fn live_par2_on_disk_lengths_match(
-        job_id: JobId,
-        checks: Vec<(std::path::PathBuf, u64)>,
-    ) -> bool {
+    ///
+    /// A **direct set's source volume has no file to stat** (D7), so its check
+    /// is answered from the virtual volume's own length instead — the decoded
+    /// total the download layer tracks, taken to at least the end of the
+    /// coverage map, which is exactly the length the PAR2 `FileAccess` adapter
+    /// reports for the same volume. Those entries cost no I/O and are settled
+    /// before the blocking task is spawned, so a job made only of direct volumes
+    /// short-circuits without touching the filesystem at all.
+    async fn live_par2_lengths_match(job_id: JobId, checks: Vec<LiveLengthCheck>) -> bool {
+        let mut on_disk = Vec::with_capacity(checks.len());
+        for check in checks {
+            match check {
+                LiveLengthCheck::OnDisk { path, expected } => on_disk.push((path, expected)),
+                LiveLengthCheck::Virtual {
+                    volume_index,
+                    actual,
+                    expected,
+                } => {
+                    if actual != expected {
+                        debug!(
+                            job_id = job_id.0,
+                            volume_index,
+                            actual,
+                            expected,
+                            "live PAR2 short-circuit refused — a direct volume's virtual length \
+                             disagrees with the PAR2 description"
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+        if on_disk.is_empty() {
+            return true;
+        }
         let mismatch = tokio::task::spawn_blocking(move || {
-            checks.into_iter().find(|(path, expected)| {
+            on_disk.into_iter().find(|(path, expected)| {
                 !std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == *expected)
             })
         })
@@ -730,7 +818,7 @@ impl Pipeline {
     ) -> Option<(
         weaver_par2::VerificationResult,
         weaver_par2::PlacementPlan,
-        Vec<(std::path::PathBuf, u64)>,
+        Vec<LiveLengthCheck>,
     )> {
         let par2_set = self.par2_set(job_id)?;
         if par2_set.recovery_file_ids.is_empty() {
@@ -761,7 +849,17 @@ impl Pipeline {
             if current_filename != correct_filename {
                 return None;
             }
-            length_checks.push((state.working_dir.join(&current_filename), desc.length));
+            length_checks.push(match self.direct_virtual_volume(file_id) {
+                Some((volume_index, len, _)) => LiveLengthCheck::Virtual {
+                    volume_index,
+                    actual: len,
+                    expected: desc.length,
+                },
+                None => LiveLengthCheck::OnDisk {
+                    path: state.working_dir.join(&current_filename),
+                    expected: desc.length,
+                },
+            });
 
             let slice_count = par2_set.slice_count_for_file(desc.length) as usize;
             files.push(weaver_par2::verify::FileVerification {

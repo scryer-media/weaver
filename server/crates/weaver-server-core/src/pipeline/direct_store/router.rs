@@ -60,6 +60,20 @@ use super::plan::DirectSetPlan;
 /// (phase 5 owns it), so a breach demotes.
 pub(crate) const DEFAULT_HOLDS_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
+/// D1's absolute packed ceiling for the bounded small-member tolerance. The
+/// effective ceiling is `min(this, 1% of the archive's packed bytes)`; the
+/// relative half can only be applied once the archive's packed total is final,
+/// so this one is the guard that holds from the first tolerated byte.
+pub(crate) const TOLERANCE_PACKED_CEILING_BYTES: u64 = 64 * 1024 * 1024;
+
+/// D1's unpacked ceiling. Read from the headers' declared unpacked size, which
+/// is stated up front rather than accumulated, so this one is checkable the
+/// moment a member turns ineligible.
+pub(crate) const TOLERANCE_UNPACKED_CEILING_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The "1% of packed archive bytes" half of D1's packed ceiling, as a divisor.
+const TOLERANCE_ARCHIVE_PERCENT: u64 = 100;
+
 /// How far into a volume the provisional header parse may stage bytes before
 /// the set is declared unroutable. Real RAR headers are a few hundred bytes;
 /// this only exists so a set whose first article is entirely payload (a
@@ -70,18 +84,38 @@ pub(crate) const MAX_HEADER_PREFIX_BYTES: u64 = 4 * 1024 * 1024;
 /// Why a set left direct mode. Every variant is its own metric bucket (D1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DemotionReason {
-    /// A member the layout classified `Ineligible` — including a provisional
-    /// member that resolved ineligible when its chain closed (revision 6).
+    /// A member the layout classified `Ineligible` for a reason D1's tolerance
+    /// does not cover — including a provisional member that resolved ineligible
+    /// when its chain closed (revision 6).
     ///
-    /// **Wave 1 narrowing, deliberate:** an ineligible member demotes the
-    /// *whole* set, even when the rest of it is a clean multi-member store.
-    /// D1's bounded small-member tolerance — route the ineligible members'
-    /// packed ranges into the envelope and extract only those indices through
-    /// `extract_member_streaming` at finalization, within
-    /// `min(64 MiB, 1% of packed archive bytes)` packed and 256 MiB unpacked —
-    /// is phase 5 wave 2, and needs the hybrid provider wired into the
-    /// extractor before it can be honest. Until then the set materializes.
+    /// Solid, encrypted, directory, redirection and malformed-chain members
+    /// always land here: the tolerance extracts its members with
+    /// `extract_member_streaming`, which needs a per-member non-solid regular
+    /// file it can decode on its own, and a solid member is only decodable
+    /// against the rest of the solid run. A *compressed* or *BLAKE2sp-only*
+    /// member instead rides [`Self::ToleranceBudgetExceeded`]'s budget.
     MemberIneligible(MemberIneligibility),
+    /// The ineligible members are individually tolerable but collectively over
+    /// D1's budget: `min(64 MiB, 1% of the archive's packed bytes)` packed, or
+    /// 256 MiB unpacked.
+    ///
+    /// Distinct from [`Self::MemberIneligible`] on purpose — "this set has one
+    /// small compressed extra" and "this set is half compressed" are different
+    /// populations, and only the second one says direct-store's reach is
+    /// narrower than the plan assumes.
+    ToleranceBudgetExceeded,
+    /// PAR2 verification found damage on one of the set's virtual volumes.
+    ///
+    /// Wave 2 produces verification **verdicts** only: repairing a virtual
+    /// volume means writing a repaired slice into a file that does not exist,
+    /// which is phase 6. Demoting materializes the volumes from the set's own
+    /// routed bytes and hands them to the conventional repair path, which is
+    /// exactly the shape a job with no direct set would have taken.
+    Par2Damaged,
+    /// A member riding D1's tolerance could not be extracted from the virtual
+    /// volumes at finalization. The stored members are correct; the tolerated
+    /// one is not produced, so the set is rebuilt the ordinary way.
+    ToleratedExtractionFailed,
     /// Holds exceeded the RAM budget and phase 4 has no scratch paging.
     HoldsBudgetExceeded,
     /// A confirming parse disagreed with the provisional one, or a volume was
@@ -163,6 +197,9 @@ impl DemotionReason {
             Self::MemberIneligible(MemberIneligibility::Blake2OnlyNoCrc32) => "member_blake2_only",
             Self::MemberIneligible(MemberIneligibility::NoChecksum) => "member_no_checksum",
             Self::MemberIneligible(MemberIneligibility::MalformedChain) => "member_malformed_chain",
+            Self::ToleranceBudgetExceeded => "tolerance_budget",
+            Self::Par2Damaged => "par2_damaged",
+            Self::ToleratedExtractionFailed => "tolerated_extraction_failed",
             Self::HoldsBudgetExceeded => "holds_budget",
             Self::ConflictingVolumeFacts => "conflicting_volume_facts",
             Self::UnparsableVolume => "unparsable_volume",
@@ -1076,24 +1113,141 @@ impl DirectSetRouter {
     }
 
     /// Revision 6 amendment 1: a provisional member that resolves `Ineligible`
-    /// at chain close demotes the group at that transition.
+    /// at chain close demotes the group at that transition — **unless** it fits
+    /// inside D1's bounded small-member tolerance.
     ///
-    /// Wave 1 keeps this **whole-set**: one ineligible member in an otherwise
-    /// clean multi-member store demotes the lot. See
-    /// [`DemotionReason::MemberIneligible`] for why the D1 tolerance is not here
-    /// yet.
+    /// The tolerance is a deliberate weaver extension over the oracle, and it is
+    /// bounded three ways, each of which demotes on breach:
+    ///
+    /// 1. **By kind.** Only `Compressed` and `Blake2OnlyNoCrc32` are tolerable.
+    ///    The library's classification order (malformed → directory →
+    ///    redirection → encrypted → solid → compressed) means a `Compressed`
+    ///    verdict already proves the member is an unencrypted, non-solid,
+    ///    per-member regular file with a well-formed chain, which is exactly
+    ///    D1's precondition — so the precondition is read off the reason rather
+    ///    than re-derived from flags weaver would have to trust separately.
+    /// 2. **By size**, aggregated over every tolerated member:
+    ///    `min(64 MiB, 1% of the archive's packed bytes)` packed and 256 MiB
+    ///    unpacked.
+    /// 3. **By the set still being a store set.** A set whose members are *all*
+    ///    ineligible has nothing to route and no benefit to gain; it demotes and
+    ///    the ordinary extractor produces every member.
+    ///
+    /// **Provisional totals.** `packed_bytes` is a running sum over the parts
+    /// seen so far until the member's chain closes (`totals_final`), so an open
+    /// chain's value is a *lower bound*: breaching the budget on a lower bound
+    /// demotes immediately, and staying under it admits only provisionally. The
+    /// relative (1%) half needs the archive's packed total, which is final only
+    /// once every planned volume has been parsed and every chain has closed —
+    /// so it is enforced there, which is the close this rule re-checks at. A
+    /// member whose true total breaches at close demotes exactly then, before
+    /// the set can finalize.
     fn check_eligibility(&mut self) -> Result<(), DemotionReason> {
-        let ineligible = self
-            .layout_members()
-            .iter()
-            .find_map(|member| match member.eligibility {
-                MemberEligibility::Ineligible(reason) => Some(reason),
-                _ => None,
-            });
-        if let Some(reason) = ineligible {
-            return Err(self.fail(DemotionReason::MemberIneligible(reason.into())));
+        let mut packed = 0u64;
+        let mut unpacked = 0u64;
+        let mut tolerated = 0usize;
+        let mut routable = 0usize;
+        let mut first_tolerated: Option<IneligibilityReason> = None;
+
+        for member in self.layout_members() {
+            let MemberEligibility::Ineligible(reason) = member.eligibility else {
+                routable += 1;
+                continue;
+            };
+            // A member the router **adopted** routed bytes into its own
+            // `.direct.partial` while it was still `ProvisionallyDirect` — a
+            // split BLAKE2sp-only member is the reachable case, since the digest
+            // only disqualifies it once its chain closes. Those bytes are not in
+            // the envelope, so the virtual volume the tolerated extraction reads
+            // is not the volume the archive describes, and finalization would
+            // additionally commit the partial as if it were a stored member's.
+            // Moving them back is real work with no owner yet; until it has one,
+            // an adopted member is not tolerable and the set demotes on its own
+            // reason, exactly as wave 1 did.
+            let already_routed = self.member_ids.contains_key(&member.name);
+            let budget = tolerable_member_budget(member, reason).filter(|_| !already_routed);
+            let Some(budget) = budget else {
+                return Err(self.fail(DemotionReason::MemberIneligible(reason.into())));
+            };
+            tolerated += 1;
+            first_tolerated.get_or_insert(reason);
+            // Saturating rather than checked: the ceilings below are far under
+            // `u64::MAX`, so a saturated sum breaches and demotes, which is the
+            // fail-closed answer a header claiming impossible sizes deserves.
+            packed = packed.saturating_add(budget.packed_bytes);
+            unpacked = unpacked.saturating_add(budget.unpacked_bytes);
+        }
+
+        let Some(first_tolerated) = first_tolerated else {
+            debug_assert_eq!(tolerated, 0);
+            return Ok(());
+        };
+        if routable == 0 {
+            // Nothing to route: every byte would land in the envelope and every
+            // member would be extracted conventionally at the end, which is the
+            // conventional path with an extra copy of the volumes in it. Reported
+            // under the member's *own* reason, not the tolerance's — the set is
+            // not over a budget, it is simply not a store set.
+            return Err(self.fail(DemotionReason::MemberIneligible(first_tolerated.into())));
+        }
+        if packed > TOLERANCE_PACKED_CEILING_BYTES || unpacked > TOLERANCE_UNPACKED_CEILING_BYTES {
+            return Err(self.fail(DemotionReason::ToleranceBudgetExceeded));
+        }
+        if self.archive_totals_final() {
+            let archive_packed = self.archive_packed_bytes().unwrap_or(u64::MAX);
+            // `packed * 100 > archive_packed`, without the multiply: a large
+            // archive would overflow it, and the overflowing case is precisely
+            // the one that must not demote.
+            if packed > archive_packed / TOLERANCE_ARCHIVE_PERCENT {
+                return Err(self.fail(DemotionReason::ToleranceBudgetExceeded));
+            }
         }
         Ok(())
+    }
+
+    /// Whether every planned volume has been parsed and every member's chain has
+    /// closed, so the archive's packed total can no longer grow.
+    fn archive_totals_final(&self) -> bool {
+        self.volume_facts.len() == self.plan.volumes.len()
+            && self
+                .layout_members()
+                .iter()
+                .all(|member| member.chain_complete)
+    }
+
+    /// Packed bytes over every member of the archive. `None` on overflow, which
+    /// only a hostile header can claim.
+    fn archive_packed_bytes(&self) -> Option<u64> {
+        let mut total = 0u64;
+        for member in self.layout_members() {
+            for part in &member.parts {
+                total = total.checked_add(part.data_size)?;
+            }
+        }
+        Some(total)
+    }
+
+    /// Members riding D1's tolerance, by raw header name, in archive order.
+    ///
+    /// Finalization extracts exactly these and nothing else: the direct-routed
+    /// members are already at their destinations, and re-extracting one would
+    /// overwrite verified output with a second decode of the same bytes.
+    pub(crate) fn tolerated_member_names(&self) -> Vec<String> {
+        let mut names: Vec<(u32, u64, String)> = self
+            .layout_members()
+            .iter()
+            .filter(|member| matches!(member.eligibility, MemberEligibility::Ineligible(_)))
+            .map(|member| {
+                let position = member
+                    .parts
+                    .first()
+                    .map(|part| (part.volume, part.data_offset))
+                    .unwrap_or((u32::MAX, u64::MAX));
+                (position.0, position.1, member.name.clone())
+            })
+            .collect();
+        names.sort_unstable();
+        names.into_iter().map(|(_, _, name)| name).collect()
     }
 
     /// Maps and emits every pending byte of one volume whose destination the
@@ -1492,6 +1646,67 @@ impl DirectSetRouter {
     // back out of a file that never received it (B1). Everything that needs to
     // know what reached disk asks `DirectSet`, which is told only about writes
     // that returned.
+}
+
+/// What one ineligible member costs D1's tolerance budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ToleratedMemberBudget {
+    /// Packed bytes: the member's total when the chain has closed, a lower
+    /// bound over the parts seen so far otherwise.
+    packed_bytes: u64,
+    /// Unpacked bytes the headers declare. Stated up front, never accumulated.
+    unpacked_bytes: u64,
+}
+
+/// The budget cost of one ineligible member, or `None` when the member is not
+/// tolerable at all and the set must demote.
+///
+/// Fail-closed on every unknown: a packed sum that overflowed `u64`, or a
+/// member whose headers declare no unpacked size, has no budget that can be
+/// checked, and admitting an unbounded member under a bounded rule would make
+/// the rule decorative.
+fn tolerable_member_budget(
+    member: &weaver_unrar::StoredMember,
+    reason: IneligibilityReason,
+) -> Option<ToleratedMemberBudget> {
+    match reason {
+        // The library's classification order has already ruled out encrypted,
+        // solid, directory, redirection and malformed-chain members by the time
+        // it reaches `Compressed`, so this arm carries D1's precondition rather
+        // than restating it.
+        IneligibilityReason::Compressed {
+            packed_bytes,
+            unpacked_bytes,
+            // Read, and deliberately unused as a gate: a non-final total is a
+            // lower bound, and the caller demotes on a lower bound that already
+            // breaches while re-checking at every parse until the chain closes.
+            totals_final: _,
+        } => Some(ToleratedMemberBudget {
+            packed_bytes: packed_bytes?,
+            unpacked_bytes: unpacked_bytes?,
+        }),
+        // A stored member with a BLAKE2sp digest and no CRC32. Out-of-order
+        // routing cannot verify it (D4), but `extract_member_streaming` feeds
+        // the codec in order and checks BLAKE2sp natively — which is exactly
+        // why D4 scopes its whole-member-CRC32 requirement to *direct-routed*
+        // members and sends this one through the tolerance instead.
+        IneligibilityReason::Blake2OnlyNoCrc32 => {
+            let mut packed_bytes = 0u64;
+            for part in &member.parts {
+                packed_bytes = packed_bytes.checked_add(part.data_size)?;
+            }
+            Some(ToleratedMemberBudget {
+                packed_bytes,
+                unpacked_bytes: member.unpacked_size?,
+            })
+        }
+        IneligibilityReason::Encrypted
+        | IneligibilityReason::Solid
+        | IneligibilityReason::Directory
+        | IneligibilityReason::Redirection
+        | IneligibilityReason::NoChecksum
+        | IneligibilityReason::MalformedChain(_) => None,
+    }
 }
 
 /// Whether `next` continues `held` in **both** coordinate spaces for the same

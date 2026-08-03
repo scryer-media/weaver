@@ -27,6 +27,7 @@ unicase = { version = "2.9.0", default-features = false }
 crc32fast = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
+http = { workspace = true }
 crossbeam-queue = { workspace = true }
 bitvec = { workspace = true }
 tokio = { workspace = true }

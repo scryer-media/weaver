@@ -5481,6 +5481,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "hmac 0.13.0",
+ "http",
  "keyring",
  "keyring-core",
  "libc",

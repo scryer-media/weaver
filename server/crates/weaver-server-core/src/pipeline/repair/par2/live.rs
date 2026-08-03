@@ -988,5 +988,45 @@ pub(crate) fn read_range_best_effort(
     Ok(bytes)
 }
 
+/// [`read_range_best_effort`] over a direct set's virtual volume (plan 135, D5).
+///
+/// Same contract, same shape: a range the set never placed comes back short
+/// rather than as an error, so those blocks stay `Pending` and the
+/// authoritative pass owns them. The provider reports a hole as an error, which
+/// is *stronger* than a short read — it distinguishes "not downloaded" from "the
+/// disk is broken" — and this is the one caller that deliberately flattens the
+/// two, because live verification is advisory and neither one is a verdict.
+pub(crate) fn read_virtual_range_best_effort(
+    provider: &crate::pipeline::direct_store::provider::HybridVolumeProvider,
+    volume_index: u32,
+    offset: u64,
+    len: u64,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(len) = usize::try_from(len) else {
+        return Ok(Vec::new());
+    };
+    let mut reader = provider.open(volume_index).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("direct-store volume {volume_index} is not registered"),
+        )
+    })?;
+    reader.seek(SeekFrom::Start(offset))?;
+    let mut bytes = vec![0u8; len];
+    let mut read = 0usize;
+    while read < len {
+        match reader.read(&mut bytes[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(error) if crate::pipeline::direct_store::provider::is_hole(&error) => break,
+            Err(error) => return Err(error),
+        }
+    }
+    bytes.truncate(read);
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests;

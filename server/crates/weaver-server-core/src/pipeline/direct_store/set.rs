@@ -566,6 +566,20 @@ impl DirectSet {
         &self,
         volume_lengths: &BTreeMap<u32, u64>,
     ) -> HybridVolumeProvider {
+        HybridVolumeProvider::new(self.virtual_volumes(volume_lengths))
+    }
+
+    /// The same volumes as [`Self::virtual_provider`], unassembled.
+    ///
+    /// A job can hold several direct sets, and every set numbers its volumes
+    /// from zero — so a caller that has to put *all* of them behind one provider
+    /// (the PAR2 `FileAccess` adapter, which sees one job's whole recovery set)
+    /// needs to re-key them first. That caller gets the parts; everything else
+    /// wants the assembled provider.
+    pub(crate) fn virtual_volumes(
+        &self,
+        volume_lengths: &BTreeMap<u32, u64>,
+    ) -> Vec<VirtualVolume> {
         let working_dir = &self.router.plan().working_dir;
         let partials: std::collections::HashMap<u32, std::path::PathBuf> = self
             .router
@@ -573,7 +587,7 @@ impl DirectSet {
             .into_iter()
             .map(|(member_id, _, partial)| (member_id, working_dir.join(partial)))
             .collect();
-        let volumes = volume_lengths
+        volume_lengths
             .iter()
             .map(|(volume_index, len)| VirtualVolume {
                 volume_index: *volume_index,
@@ -584,8 +598,7 @@ impl DirectSet {
                 envelope_covered: self.envelope_coverage(*volume_index),
                 len: *len,
             })
-            .collect();
-        HybridVolumeProvider::new(volumes)
+            .collect()
     }
 
     /// The two checkpoint systems must never both own a member (D6 risk list).

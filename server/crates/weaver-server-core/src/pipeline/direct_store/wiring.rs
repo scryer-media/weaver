@@ -172,6 +172,22 @@ impl DestinationSync for PreSyncedDestinations {
     }
 }
 
+/// Everything the authoritative PAR2 pass needs to read a job's direct sets
+/// virtually (plan 135, D5).
+///
+/// The provider is keyed by **NZB file index**, not by volume index: one job can
+/// carry several direct sets and every set numbers its volumes from zero, so the
+/// volume index is not unique inside a job while the file index always is. The
+/// adapter only ever uses the key to reach a reader, so any injective key works,
+/// and this one is already the identity the PAR2 binding is resolved through.
+pub(crate) struct DirectPar2Overlay {
+    pub(crate) provider: super::provider::HybridVolumeProvider,
+    pub(crate) volumes: Vec<super::par2_access::VirtualPar2Volume>,
+    /// Which direct set owns each bound PAR2 file, so damage demotes the set
+    /// that produced the bytes rather than every set of the job.
+    sets: HashMap<weaver_par2::FileId, usize>,
+}
+
 /// What the routing seam did with an article.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectRouteOutcome {
@@ -299,6 +315,194 @@ impl Pipeline {
             .any(|set| {
                 !set.is_demoted() && set.plan().volume_for_file(file_id.file_index).is_some()
             })
+    }
+
+    /// The virtual volume behind one direct source file, as a **one-volume**
+    /// provider plus its logical length (plan 135, D5).
+    ///
+    /// Live PAR2's settle and backfill reads are defined in source-volume space,
+    /// which is exactly the space a virtual volume answers in — but they arrive
+    /// one file at a time, so building the whole set's provider per read would
+    /// be O(volumes) work for a one-volume question. The length is the decoded
+    /// total the download layer tracks, never a file's `metadata().len()`: for a
+    /// direct volume there is no file to ask.
+    ///
+    /// `None` for anything that is not a live direct set's source volume,
+    /// including a demoted set's — whose volumes are materializing or being
+    /// refetched, and are read from disk like any other file.
+    pub(crate) fn direct_virtual_volume(
+        &self,
+        file_id: NzbFileId,
+    ) -> Option<(u32, u64, super::provider::HybridVolumeProvider)> {
+        let job_id = file_id.job_id;
+        let (set, volume_index) =
+            self.direct_store
+                .sets_for(job_id)
+                .iter()
+                .find_map(|set| match set.is_demoted() {
+                    true => None,
+                    false => set
+                        .plan()
+                        .volume_for_file(file_id.file_index)
+                        .map(|volume_index| (set, volume_index)),
+                })?;
+        let received = self
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.assembly.file(file_id))
+            .map(|file| file.received_bytes())
+            .unwrap_or(0);
+        let len = received.max(set.volume_coverage(volume_index).end());
+        let lengths = std::collections::BTreeMap::from([(volume_index, len)]);
+        Some((volume_index, len, set.virtual_provider(&lengths)))
+    }
+
+    /// The direct sets of `job_id` that the authoritative PAR2 pass must read
+    /// virtually, or `None` when it has none and today's `PlacementFileAccess`
+    /// is the whole answer.
+    ///
+    /// A volume is included only when its PAR2 identity resolves unambiguously
+    /// through the same name candidates live verification binds on. One that
+    /// does not resolve is left out, and the pass then reads it off disk, finds
+    /// nothing, and reports it missing — which demotes the set through the
+    /// damage path rather than silently verifying a set nobody could name.
+    pub(crate) fn direct_par2_overlay(&self, job_id: JobId) -> Option<DirectPar2Overlay> {
+        let mut volumes = Vec::new();
+        let mut virtual_volumes = Vec::new();
+        let mut sets = HashMap::new();
+        for (set_index, set) in self.direct_store.sets_for(job_id).iter().enumerate() {
+            // A demoted set's volumes are materializing or being refetched, and
+            // a **finalized** set no longer owns a readable volume image at all:
+            // its partials have been renamed to their destinations and its
+            // envelopes deleted. Serving either one through the provider would
+            // answer a verifier's reads with holes and report damage that is not
+            // there. Finalization is gated on the job's verdict for exactly this
+            // reason, so a set can only be finalized here on a *re*-verify, and
+            // then the ordinary file access is the honest answer.
+            if set.is_demoted() || set.is_finalized() {
+                continue;
+            }
+            for (volume_index, file_index) in &set.plan().volumes {
+                let file_id = NzbFileId {
+                    job_id,
+                    file_index: *file_index,
+                };
+                let Some(binding) = self.resolve_live_par2_binding(file_id) else {
+                    continue;
+                };
+                let received = self
+                    .jobs
+                    .get(&job_id)
+                    .and_then(|state| state.assembly.file(file_id))
+                    .map(|file| file.received_bytes())
+                    .unwrap_or(0);
+                let len = received.max(set.volume_coverage(*volume_index).end());
+                let lengths = std::collections::BTreeMap::from([(*volume_index, len)]);
+                let mut built = set.virtual_volumes(&lengths);
+                let Some(mut volume) = built.pop() else {
+                    continue;
+                };
+                volume.volume_index = *file_index;
+                virtual_volumes.push(volume);
+                volumes.push(super::par2_access::VirtualPar2Volume {
+                    par2_file_id: binding.par2_file_id,
+                    volume_index: *file_index,
+                });
+                sets.insert(binding.par2_file_id, set_index);
+            }
+        }
+        if volumes.is_empty() {
+            return None;
+        }
+        Some(DirectPar2Overlay {
+            provider: super::provider::HybridVolumeProvider::new(virtual_volumes),
+            volumes,
+            sets,
+        })
+    }
+
+    /// Demotes every direct set the PAR2 pass found damage on, and reports
+    /// whether any did (plan 135, D5/D8).
+    ///
+    /// Wave 2 produces **verdicts**, not repairs: repairing a virtual volume
+    /// means writing a recovered slice into a file that does not exist, which is
+    /// phase 6. So a damaged set materializes its volumes from its own routed
+    /// bytes, refetches whatever reconstruction could not verify, and hands the
+    /// job to the conventional repair path — which is exactly the shape the same
+    /// job would have had with the gate off.
+    pub(crate) async fn demote_direct_sets_with_par2_damage(
+        &mut self,
+        job_id: JobId,
+        verification: &weaver_par2::VerificationResult,
+    ) -> bool {
+        let Some(overlay) = self.direct_par2_overlay(job_id) else {
+            return false;
+        };
+        let mut damaged: Vec<(usize, String)> = Vec::new();
+        for file in &verification.files {
+            if matches!(
+                file.status,
+                weaver_par2::verify::FileStatus::Complete
+                    | weaver_par2::verify::FileStatus::Renamed(_)
+            ) {
+                continue;
+            }
+            let Some(set_index) = overlay.sets.get(&file.file_id).copied() else {
+                continue;
+            };
+            if damaged.iter().any(|(index, _)| *index == set_index) {
+                continue;
+            }
+            damaged.push((set_index, file.filename.clone()));
+        }
+        let mut demoted = false;
+        for (set_index, filename) in damaged {
+            // Claimed before the log line, so "demoted" means a set really left
+            // direct mode. A caller that returned early on a set it did not
+            // actually demote would leave the job waiting for a materialization
+            // that never happens.
+            if !self
+                .direct_store
+                .set(job_id, set_index)
+                .is_some_and(|set| !set.is_demoted() && !set.is_finalized())
+            {
+                continue;
+            }
+            warn!(
+                job_id = job_id.0,
+                volume = %filename,
+                "PAR2 verification found damage on a direct set's virtual volume; \
+                 demoting so the conventional path can repair a materialized volume"
+            );
+            self.demote_direct_set(job_id, set_index, DemotionReason::Par2Damaged, None)
+                .await;
+            demoted = true;
+        }
+        demoted
+    }
+
+    /// Demotes every set of `job_id` that is still routing, because a PAR2
+    /// **repair** is about to run and repair needs a file to write into.
+    ///
+    /// Returns whether anything demoted, so the caller can let the job go round
+    /// again over materialized volumes rather than repairing against nothing.
+    pub(crate) async fn demote_live_direct_sets_for_par2_repair(&mut self, job_id: JobId) -> bool {
+        let live: Vec<usize> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| !set.is_demoted() && !set.is_finalized())
+            .map(|(index, _)| index)
+            .collect();
+        if live.is_empty() {
+            return false;
+        }
+        for set_index in live {
+            self.demote_direct_set(job_id, set_index, DemotionReason::Par2Damaged, None)
+                .await;
+        }
+        true
     }
 
     /// The routing seam. Replaces the conventional write for one decoded
@@ -586,6 +790,15 @@ impl Pipeline {
             total_bytes,
         });
 
+        // D5: the live verifier's fail-safe length verdict, which the
+        // conventional file-complete path feeds at exactly this point. A direct
+        // volume has no file to `stat`, but `received_bytes` is the decoded
+        // length — the space PAR2 describes — so the check is the same one, from
+        // the same number, and a volume whose decoded length disagrees with its
+        // description retires its live state instead of short-circuiting on
+        // blocks that hashed clean against the wrong file.
+        self.note_live_par2_file_complete(file_id, total_bytes);
+
         // The file-complete state a physical volume drops here (M5/M7). Every
         // one of these is keyed by a file that will never exist, so leaving
         // them behind leaks for the life of the job and, worse, leaves
@@ -652,14 +865,64 @@ impl Pipeline {
             None => return,
         }
 
-        if self
+        self.finalize_ready_direct_sets(job_id).await;
+        self.check_job_completion(job_id).await;
+    }
+
+    /// Commits every set of `job_id` whose members have all passed their gates
+    /// and whose job is allowed to finalize (see
+    /// [`Self::direct_finalization_waits_for_par2`]).
+    ///
+    /// Called from the routing seam and from the completion gate, because those
+    /// are the two moments the answer can change: the last article of the last
+    /// volume, and the verification that clears a par2-bearing job.
+    pub(crate) async fn finalize_ready_direct_sets(&mut self, job_id: JobId) {
+        if self.direct_store.sets_for(job_id).is_empty() {
+            return;
+        }
+        if self.direct_finalization_waits_for_par2(job_id) {
+            return;
+        }
+        let ready: Vec<usize> = self
             .direct_store
-            .set(job_id, set_index)
-            .is_some_and(DirectSet::ready_to_finalize)
-        {
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| set.ready_to_finalize())
+            .map(|(index, _)| index)
+            .collect();
+        for set_index in ready {
             self.finalize_direct_set(job_id, set_index).await;
         }
-        self.check_job_completion(job_id).await;
+    }
+
+    /// Whether a direct set must keep its envelopes and partials because the
+    /// job's PAR2 verification has not concluded (plan 135, D5).
+    ///
+    /// Finalization renames the partials to their destinations and deletes the
+    /// envelopes, which together *are* the virtual volume image: after it,
+    /// nothing can answer a PAR2 read about a source volume, and nothing can
+    /// reconstruct one for a demotion either. A par2-bearing set therefore
+    /// waits — routed, gated, byte-complete, but uncommitted — until the job is
+    /// verified, bypassed, or has no parsed PAR2 set to verify against.
+    ///
+    /// The release conditions are the completion gate's own, so a job that will
+    /// never verify releases rather than waiting for something that is not
+    /// coming — which matters because PAR2 is posted last and downloaded last:
+    /// at the moment a set's final volume lands there is usually **no parsed
+    /// PAR2 set yet**, and "no set" must mean "not yet" while an article can
+    /// still arrive, and "never" once the download pipeline has drained.
+    fn direct_finalization_waits_for_par2(&self, job_id: JobId) -> bool {
+        if !self.job_spec_has_par2_file(job_id) {
+            return false;
+        }
+        if self.par2_bypassed.contains(&job_id) || self.par2_verified.contains(&job_id) {
+            return false;
+        }
+        if self.par2_set(job_id).is_some() {
+            return true;
+        }
+        self.job_has_pending_download_pipeline_work(job_id)
     }
 
     /// Polls the automatic barrier triggers for every live set. Called from the
@@ -881,6 +1144,40 @@ impl Pipeline {
                 .or_default()
                 .insert(name.clone());
         }
+
+        // D1's tolerance, and strictly after the stored members are committed:
+        // the extraction reads the *virtual volumes*, whose member extents are
+        // served out of the `.direct.partial`s — so it has to run before the
+        // envelopes are deleted, and its own reads never touch a stored member's
+        // destination because the tolerated set is disjoint from it by
+        // construction (asserted in `extract_tolerated_members`).
+        match self.extract_tolerated_members(job_id, set_index).await {
+            Ok(extracted) => {
+                for name in extracted {
+                    self.extracted_members
+                        .entry(job_id)
+                        .or_default()
+                        .insert(name);
+                }
+            }
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    error = %error,
+                    "failed to extract a tolerated member from the virtual volumes; demoting the set"
+                );
+                self.demote_direct_set(
+                    job_id,
+                    set_index,
+                    DemotionReason::ToleratedExtractionFailed,
+                    None,
+                )
+                .await;
+                return;
+            }
+        }
+
         for envelope in &envelopes {
             crate::pipeline::release_cached_write_handle(envelope);
             let _ = tokio::fs::remove_file(envelope).await;
@@ -909,6 +1206,167 @@ impl Pipeline {
             members = members.len(),
             "direct-store set finalized without materializing a volume"
         );
+    }
+
+    /// D1's bounded small-member tolerance: extracts **only** the tolerated
+    /// member indices, through the hybrid virtual-volume provider, straight to
+    /// their destinations.
+    ///
+    /// Returns the raw member names that were produced, for
+    /// `extracted_members`. The distinction that separates this from the
+    /// out-of-scope per-member physical fallback is that it extracts a strict
+    /// *subset*: a direct-routed `Store` member is never re-extracted and never
+    /// overwritten here, which is checked rather than assumed — a tolerated
+    /// member resolving onto a stored member's destination is refused, and the
+    /// set demotes.
+    async fn extract_tolerated_members(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+    ) -> Result<Vec<String>, String> {
+        let Some(set) = self.direct_store.set(job_id, set_index) else {
+            return Ok(Vec::new());
+        };
+        let names = set.router.tolerated_member_names();
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let set_name = set.set_name().to_string();
+
+        // Every stored member's committed destination, so the assertion below
+        // compares resolved paths rather than raw header names — two names can
+        // sanitize onto one path, which is exactly the collision that would let
+        // a tolerated member overwrite verified direct output.
+        let mut stored_outputs: HashSet<PathBuf> = HashSet::new();
+        for (_, name, _) in set.router.member_partials() {
+            if let Ok(destination) = set.plan().member_output_path(name) {
+                stored_outputs.insert(destination);
+            }
+        }
+
+        let mut targets: Vec<(String, PathBuf)> = Vec::with_capacity(names.len());
+        for name in &names {
+            let destination = set
+                .plan()
+                .member_output_path(name)
+                .map_err(|()| format!("tolerated member '{name}' has no safe destination"))?;
+            if stored_outputs.contains(&destination) {
+                return Err(format!(
+                    "tolerated member '{name}' resolves onto a direct-store output at {}",
+                    destination.display()
+                ));
+            }
+            targets.push((name.clone(), destination));
+        }
+        debug_assert!(
+            targets
+                .iter()
+                .all(|(_, destination)| !stored_outputs.contains(destination)),
+            "a tolerated member of {set_name} would overwrite a direct-store output"
+        );
+
+        // The volumes' decoded lengths, which only the download layer knows: a
+        // virtual volume has no file whose length could be read instead.
+        let mut lengths = std::collections::BTreeMap::new();
+        for (volume_index, file_index) in &set.plan().volumes {
+            let file_id = NzbFileId {
+                job_id,
+                file_index: *file_index,
+            };
+            let received = self
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.assembly.file(file_id))
+                .map(|file| file.received_bytes())
+                .unwrap_or(0);
+            lengths.insert(
+                *volume_index,
+                received.max(set.volume_coverage(*volume_index).end()),
+            );
+        }
+        let first_volume = *lengths
+            .keys()
+            .next()
+            .ok_or_else(|| format!("direct set '{set_name}' has no volumes to extract from"))?;
+        let provider = set.virtual_provider(&lengths);
+        let other_volumes: Vec<u32> = lengths
+            .keys()
+            .copied()
+            .filter(|volume_index| *volume_index != first_volume)
+            .collect();
+
+        for (_, destination) in &targets {
+            if let Some(parent) = destination.parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                return Err(format!(
+                    "failed to create {} for a tolerated member: {error}",
+                    parent.display()
+                ));
+            }
+        }
+
+        let extracted = tokio::task::spawn_blocking(move || {
+            let reader = provider
+                .open(first_volume)
+                .ok_or_else(|| format!("virtual volume {first_volume} is not registered"))?;
+            let mut archive = weaver_unrar::RarArchive::open(reader)
+                .map_err(|error| format!("failed to open the virtual archive: {error}"))?;
+            // The same decode ceilings the incremental extractor applies. A
+            // tolerated member is small by budget, but the *declared* dictionary
+            // in a hostile header is not bounded by anything the budget checks.
+            crate::pipeline::extraction::apply_server_rar_limits(&mut archive);
+            for volume_index in other_volumes {
+                let Some(reader) = provider.open(volume_index) else {
+                    continue;
+                };
+                archive
+                    .add_volume(volume_index as usize, Box::new(reader))
+                    .map_err(|error| {
+                        format!("failed to add virtual volume {volume_index}: {error}")
+                    })?;
+            }
+            let options = weaver_unrar::ExtractOptions {
+                verify: true,
+                password: None,
+                restore_owners: false,
+            };
+            let mut produced = Vec::with_capacity(targets.len());
+            for (name, destination) in &targets {
+                let index = archive
+                    .find_member(name)
+                    .ok_or_else(|| format!("tolerated member '{name}' is not in the archive"))?;
+                let base = archive
+                    .member_info(index)
+                    .map(|member| member.volumes.first_volume as u32)
+                    .unwrap_or(0);
+                // `extract_member_streaming` addresses volumes relative to the
+                // member's first one; the set speaks absolute indices.
+                let scoped = provider.rebased(base);
+                let mut file = std::fs::File::create(destination).map_err(|error| {
+                    format!("failed to create {}: {error}", destination.display())
+                })?;
+                archive
+                    .extract_member_streaming(index, &options, &scoped, &mut file)
+                    .map_err(|error| format!("failed to extract '{name}': {error}"))?;
+                produced.push(name.clone());
+            }
+            Ok::<Vec<String>, String>(produced)
+        })
+        .await
+        .map_err(|error| format!("tolerated extraction task panicked: {error}"))??;
+
+        crate::runtime::perf_probe::record(
+            "direct_store.tolerated_members_extracted",
+            std::time::Duration::from_nanos(1),
+        );
+        info!(
+            job_id = job_id.0,
+            set_name = %set_name,
+            members = extracted.len(),
+            "extracted D1-tolerated members from the virtual volumes"
+        );
+        Ok(extracted)
     }
 
     /// Abandons direct output for a set and hands its volumes back (D8's

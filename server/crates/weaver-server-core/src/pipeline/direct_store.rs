@@ -42,15 +42,30 @@
 //!   at all — the slot ceiling demoted every one of them.
 //! - **Multi-member sets.** Admission, routing, the per-member gates,
 //!   finalization (in archive order) and demotion all carry several members per
-//!   set. An *ineligible* member still demotes the whole set; D1's bounded
-//!   tolerance is wave 2.
+//!   set.
 //! - [`provider`] and [`reconstruct`] — the hybrid virtual-volume provider that
 //!   answers reads over partials plus envelopes as if the volume existed, and
 //!   D8's demotion by byte-exact reconstruction, which materializes a demoting
 //!   set's volumes from its own routed bytes instead of refetching them.
 //!
-//! PAR2-bearing jobs are still refused at admission; the `FileAccess` adapter
-//! that lets the verifier read through [`provider`] is wave 2.
+//! Phase 5 wave 2 puts the provider to work, which is what lifts wave 1's two
+//! remaining narrowings:
+//!
+//! - **PAR2-bearing jobs route.** [`par2_access`] presents each source volume
+//!   to `weaver_par2` as a file, so live verification's settle reads and the
+//!   authoritative pass both read through [`provider`] instead of against
+//!   volume files that do not exist. A direct set therefore **finalizes only
+//!   once its job's PAR2 verification has concluded** — before then its
+//!   envelopes and partials are the only copy of the volume image, and the
+//!   verifier needs them. Verification **verdicts** only: damage on a direct
+//!   set demotes it (D8) and the conventional path repairs the materialized
+//!   volumes, because repair over a virtual volume is phase 6.
+//! - **D1's bounded small-member tolerance.** A set whose only ineligible
+//!   members are small unencrypted non-solid regular files still routes: their
+//!   packed ranges land in the envelope, and at finalization *only* those
+//!   member indices are extracted through
+//!   `weaver_unrar::RarArchive::extract_member_streaming` over the hybrid
+//!   provider. Direct `Store` outputs are never re-extracted or overwritten.
 //!
 //! # Two checkpoint systems
 //!
@@ -63,6 +78,7 @@
 use std::sync::OnceLock;
 
 pub(crate) mod barrier;
+pub(crate) mod par2_access;
 pub(crate) mod plan;
 pub(crate) mod provider;
 pub(crate) mod reconstruct;

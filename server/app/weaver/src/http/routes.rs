@@ -2,15 +2,66 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Extension, Request};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use weaver_server_core::auth::generate_api_key;
+use weaver_server_core::security::{HttpAuthority, RuntimeSecurityConfig};
 
 pub(super) const NZBGET_RPC_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostRejection {
+    BadRequest,
+}
+
+fn request_authority(req: &Request) -> Result<HttpAuthority, HostRejection> {
+    let uri_authority = req
+        .uri()
+        .authority()
+        .map(|authority| HttpAuthority::parse(authority.as_str()))
+        .transpose()
+        .map_err(|_| HostRejection::BadRequest)?;
+
+    let mut host_values = req.headers().get_all(header::HOST).iter();
+    let host_authority = host_values
+        .next()
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| HostRejection::BadRequest)
+                .and_then(|value| {
+                    HttpAuthority::parse(value).map_err(|_| HostRejection::BadRequest)
+                })
+        })
+        .transpose()?;
+    if host_values.next().is_some() {
+        return Err(HostRejection::BadRequest);
+    }
+
+    match (uri_authority, host_authority) {
+        (Some(uri), Some(host)) if !uri.matches(&host) => Err(HostRejection::BadRequest),
+        (Some(authority), _) | (_, Some(authority)) => Ok(authority),
+        (None, None) => Err(HostRejection::BadRequest),
+    }
+}
+
+async fn enforce_http_host(security: &RuntimeSecurityConfig, req: Request, next: Next) -> Response {
+    match request_authority(&req) {
+        Ok(authority) if security.is_http_authority_allowed(&authority) => next.run(req).await,
+        Ok(_) => (
+            StatusCode::MISDIRECTED_REQUEST,
+            "request Host is not allowed",
+        )
+            .into_response(),
+        Err(HostRejection::BadRequest) => {
+            (StatusCode::BAD_REQUEST, "invalid Host header").into_response()
+        }
+    }
+}
 
 pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
     let super::ServerRuntime {
@@ -115,6 +166,14 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
     }
 }
 
+pub(super) fn with_http_host_validation(router: Router, security: RuntimeSecurityConfig) -> Router {
+    let host_security = Arc::new(security);
+    router.layer(middleware::from_fn(move |req, next| {
+        let security = Arc::clone(&host_security);
+        async move { enforce_http_host(&security, req, next).await }
+    }))
+}
+
 pub(super) fn build_nzbget_rpc_routes(
     nzbget_context: super::nzbget::NzbgetFacadeContext,
 ) -> Router {
@@ -156,4 +215,157 @@ pub(super) fn build_nzbget_rpc_routes(
             }
         }))
         .layer(Extension(nzbget_context))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use tower::ServiceExt;
+
+    use super::*;
+
+    fn guarded_router(security: RuntimeSecurityConfig, hits: Arc<AtomicUsize>) -> Router {
+        let router = Router::new().fallback(move || {
+            let hits = Arc::clone(&hits);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let mut response = StatusCode::OK.into_response();
+                response.headers_mut().insert(
+                    header::SET_COOKIE,
+                    "weaver_session=local-admin"
+                        .parse()
+                        .expect("valid test cookie"),
+                );
+                response
+            }
+        });
+        with_http_host_validation(router, security)
+    }
+
+    #[tokio::test]
+    async fn disallowed_host_is_rejected_before_every_route_surface() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = guarded_router(RuntimeSecurityConfig::default(), Arc::clone(&hits));
+
+        for (method, path) in [
+            (Method::GET, "/"),
+            (Method::GET, "/weaver/"),
+            (Method::POST, "/graphql"),
+            (Method::GET, "/graphql/ws"),
+            (Method::POST, "/jsonrpc"),
+            (Method::POST, "/api/backup/restore"),
+            (Method::GET, "/metrics"),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::HOST, "attacker.example.test")
+                .body(Body::from(vec![0u8; 16 * 1024]))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+
+            assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST, "{path}");
+            assert!(
+                response.headers().get(header::SET_COOKIE).is_none(),
+                "{path}"
+            );
+        }
+
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn host_guard_accepts_local_and_configured_authorities() {
+        let security = RuntimeSecurityConfig {
+            http_allowed_hosts: vec![HttpAuthority::parse("weaver.internal:8443").unwrap()],
+            ..RuntimeSecurityConfig::default()
+        };
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = guarded_router(security, Arc::clone(&hits));
+
+        for host in [
+            "localhost:9090",
+            "127.0.0.1:9090",
+            "[::1]:9090",
+            "WEAVER.INTERNAL.:8443",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(header::HOST, host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{host}");
+        }
+
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn host_guard_rejects_missing_duplicate_malformed_and_conflicting_authorities() {
+        let app = guarded_router(
+            RuntimeSecurityConfig::default(),
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let missing = Request::builder().uri("/").body(Body::empty()).unwrap();
+        assert_eq!(
+            app.clone().oneshot(missing).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let malformed = Request::builder()
+            .uri("/")
+            .header(header::HOST, "https://localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(malformed).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut duplicate = Request::builder()
+            .uri("/")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        duplicate
+            .headers_mut()
+            .append(header::HOST, "localhost".parse().unwrap());
+        assert_eq!(
+            app.clone().oneshot(duplicate).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let conflicting = Request::builder()
+            .uri("http://localhost/")
+            .header(header::HOST, "127.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(conflicting).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let forwarded_host = Request::builder()
+            .uri("/")
+            .header(header::HOST, "attacker.example.test")
+            .header("x-forwarded-host", "localhost")
+            .header("forwarded", "host=localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(forwarded_host).await.unwrap().status(),
+            StatusCode::MISDIRECTED_REQUEST
+        );
+    }
 }

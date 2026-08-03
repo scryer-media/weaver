@@ -548,77 +548,445 @@ async fn a_member_hiding_past_the_first_is_adopted_and_routes_direct() {
 }
 
 // ---------------------------------------------------------------------------
-// PAR2 admission refusal (B2)
+// PAR2 over virtual volumes (plan 135 phase 5 wave 2, D5)
 // ---------------------------------------------------------------------------
 
-/// The same spec with one PAR2 recovery file appended. Recovery volumes are not
-/// data files, so the job still completes without them being delivered.
-fn with_par2_recovery_file(mut spec: JobSpec) -> JobSpec {
-    let filename = "silver.horizon.vol000+01.par2".to_string();
+/// Slice size for the PAR2 fixtures. Small enough that every volume carries
+/// several slices — so a single damaged article shows up as damaged *slices*
+/// rather than as one whole-file verdict — and large enough that the sets stay
+/// quick to build.
+const PAR2_SLICE_BYTES: u64 = 256;
+
+/// A real PAR2 index over the set's **decoded volume bytes**.
+///
+/// The descriptions therefore name the volume files direct routing never
+/// creates, which is exactly the shape the adapter has to answer for: file id,
+/// length and every slice checksum are defined in source-volume space.
+fn par2_index_over_volumes(volumes: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let described: Vec<(&str, &[u8])> = volumes
+        .iter()
+        .map(|(filename, bytes)| (filename.as_str(), bytes.as_slice()))
+        .collect();
+    build_test_par2_index_for_files(&described, PAR2_SLICE_BYTES)
+}
+
+/// The set's spec plus a real, parseable PAR2 index file.
+///
+/// The index is a data file the pipeline downloads and parses like any other,
+/// so `par2_set` loads through the production path rather than being installed
+/// into the runtime by hand.
+fn par2_bearing_job_spec(
+    name: &str,
+    volumes: &[(String, Vec<u8>)],
+    par2_bytes: &[u8],
+) -> (JobSpec, u32) {
+    let mut spec = direct_store_job_spec(name, volumes);
+    let index_filename = "silver.horizon.par2".to_string();
+    let file_index = spec.files.len() as u32;
+    spec.total_bytes += u64::from(yenc_declared_bytes(par2_bytes.len() as u32));
     spec.files.push(FileSpec {
-        role: FileRole::from_filename(&filename),
-        filename,
+        role: FileRole::from_filename(&index_filename),
+        filename: index_filename,
         groups: vec!["alt.binaries.test".to_string()],
         posted_at_epoch: None,
         segments: vec![segment_spec! {
             number: 0,
-            bytes: 4096,
-            message_id: "direct-par2-0@example.com".to_string(),
+            bytes: yenc_declared_bytes(par2_bytes.len() as u32),
+            message_id: "direct-par2-index@example.com".to_string(),
         }],
     });
-    spec
+    (spec, file_index)
 }
 
-async fn run_par2_bearing_gate(
-    gate: DirectStoreGate,
-    job_id: JobId,
-    volumes: &[(String, Vec<u8>)],
-) -> (Vec<Option<Vec<u8>>>, bool) {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    pipeline.direct_store.set_gate(gate);
-    pipeline.live_par2.set_enabled(false);
+/// What one par2-bearing job gate produced.
+#[derive(Debug)]
+struct Par2GateOutcome {
+    member: Option<Vec<u8>>,
+    member_location: Option<&'static str>,
+    status: Option<JobStatus>,
+    volume_file_seen: bool,
+    admitted: bool,
+    full_verify_skips: u64,
+    authoritative_verify_calls: usize,
+    demotions: String,
+}
 
-    let spec = with_par2_recovery_file(direct_store_job_spec("Silver Horizon", volumes));
+/// Runs one whole par2-bearing job gate.
+///
+/// The PAR2 index arrives **after** every volume, which is both the realistic
+/// posting order and the one that matters: at the moment the last volume
+/// completes there is no parsed PAR2 set yet, so a set that finalized on its own
+/// gates would have deleted the volume image the verifier is about to need.
+async fn run_par2_direct_gate(
+    gate: DirectStoreGate,
+    live_par2: bool,
+    job_id: JobId,
+    member_name: &str,
+    volumes: &[(String, Vec<u8>)],
+) -> Par2GateOutcome {
+    let par2_bytes = par2_index_over_volumes(volumes);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(gate);
+    pipeline.live_par2.set_enabled(live_par2);
+
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", volumes, &par2_bytes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let mut volume_file_seen = false;
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
         submit_volume_article(&mut pipeline, job_id, volumes, file_index, segment_number).await;
+        for (filename, _) in volumes {
+            if working_dir.join(filename).exists() {
+                volume_file_seen = true;
+            }
+        }
+    }
+    let admitted = !pipeline.direct_store.sets_for(job_id).is_empty();
+
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    for (filename, _) in volumes {
+        if working_dir.join(filename).exists() {
+            volume_file_seen = true;
+        }
     }
 
-    let admitted = !pipeline.direct_store.sets_for(job_id).is_empty();
-    let files = volumes
+    // Snapshotted here, not at the end: the PAR2 index completing is what runs
+    // the verification, and a job that then completes has its direct-store
+    // runtime pruned, so the sets are gone by the time extraction is terminal.
+    let sets_after_verification = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+    let volume_file_at_end = volumes
         .iter()
-        .map(|(filename, _)| std::fs::read(working_dir.join(filename)).ok())
-        .collect();
-    (files, admitted)
+        .any(|(filename, _)| working_dir.join(filename).exists());
+    let volume_file_seen = volume_file_seen || volume_file_at_end;
+
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    let completed = std::fs::read(output_root.join(member_name)).ok();
+    let left_behind = std::fs::read(working_dir.join(member_name)).ok();
+    let (member, member_location) = match (completed, left_behind) {
+        (Some(bytes), _) => (Some(bytes), Some("complete")),
+        (None, Some(bytes)) => (Some(bytes), Some("working")),
+        (None, None) => (None, None),
+    };
+    Par2GateOutcome {
+        member,
+        member_location,
+        status: job_status_for_assert(&pipeline, job_id),
+        volume_file_seen,
+        admitted,
+        full_verify_skips: pipeline.live_par2.metrics().full_verify_skips,
+        authoritative_verify_calls: pipeline.par2_authoritative_verify_calls,
+        demotions: sets_after_verification,
+    }
 }
 
 #[tokio::test]
-async fn a_par2_bearing_job_is_refused_at_admission_and_stays_conventional() {
+async fn a_par2_bearing_direct_job_completes_byte_identically_and_never_writes_a_volume() {
+    // Wave 1 refused this job at admission (`direct_store.refused.par2_present`)
+    // because every PAR2 path read the volume files routing never creates. Wave
+    // 2's `FileAccess` adapter answers those reads out of the envelope plus the
+    // routed member bytes, so the refusal is gone and this test states the new
+    // behaviour: the set routes, the job verifies against *virtual* volumes, and
+    // the output is what the conventional extractor would have produced.
     let member_name = "Silver.Horizon.S01E08.mkv";
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 199) as u8).collect();
     let volumes = single_member_store_set(member_name, &payload, 3);
 
-    let (with_gate, admitted) =
-        run_par2_bearing_gate(DirectStoreGate::Enabled, JobId(41011), &volumes).await;
-    let (without_gate, _) =
-        run_par2_bearing_gate(DirectStoreGate::Disabled, JobId(41012), &volumes).await;
+    let conventional = run_par2_direct_gate(
+        DirectStoreGate::Disabled,
+        true,
+        JobId(41011),
+        member_name,
+        &volumes,
+    )
+    .await;
+    let direct = run_par2_direct_gate(
+        DirectStoreGate::Enabled,
+        true,
+        JobId(41012),
+        member_name,
+        &volumes,
+    )
+    .await;
 
     assert!(
-        !admitted,
-        "every PAR2 repair path reads the volume files direct routing never creates, \
-         so a par2-bearing job may not admit a set at all"
+        direct.admitted,
+        "a par2-bearing job must admit its sets now that the verifier can read them virtually"
     );
-    for (index, (routed, conventional)) in with_gate.iter().zip(&without_gate).enumerate() {
-        assert!(
-            conventional.is_some(),
-            "the conventional gate should have written volume {index}"
-        );
-        assert_eq!(
-            routed, conventional,
-            "with the gate on, a par2-bearing job must materialize volume {index} identically"
-        );
+    assert!(
+        conventional.volume_file_seen,
+        "the conventional gate should have written source volumes"
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "a par2-bearing direct job must never create a source volume file, got {}",
+        direct.demotions
+    );
+    assert_eq!(
+        conventional.member.as_deref(),
+        Some(payload.as_slice()),
+        "the conventional extractor should reproduce the member payload"
+    );
+    assert_eq!(
+        (
+            direct.member.as_deref(),
+            direct.member_location,
+            &direct.status
+        ),
+        (
+            conventional.member.as_deref(),
+            conventional.member_location,
+            &conventional.status
+        ),
+        "a par2-bearing direct job must produce the conventional gate's output, \
+         in the same place, with the same status; sets = {}",
+        direct.demotions
+    );
+    assert!(
+        matches!(direct.status, Some(JobStatus::Complete)),
+        "the job should have completed, got {:?} with sets {}",
+        direct.status,
+        direct.demotions
+    );
+    assert!(
+        direct.demotions.contains("Finalized"),
+        "the set should have finalized once verification cleared it, got {}",
+        direct.demotions
+    );
+    // The point of D5: verification finishes with the download. Either the live
+    // short-circuit fired, or the authoritative pass ran and did so entirely
+    // against virtual volumes — both are wave-2 behaviour, and a job that did
+    // neither would have failed the byte comparison above against zero files.
+    assert!(
+        direct.full_verify_skips > 0 || direct.authoritative_verify_calls > 0,
+        "the job must have reached a PAR2 verdict; skips={} authoritative={}",
+        direct.full_verify_skips,
+        direct.authoritative_verify_calls
+    );
+}
+
+/// Corrupts one byte of a volume's **recovery-record data area** — envelope
+/// bytes that belong to no member and to no header.
+///
+/// The placement is the whole point, and it is the only placement that isolates
+/// PAR2 as the detector:
+///
+/// - the yEnc layer is regenerated per article by the harness, so the transport
+///   gate passes;
+/// - the byte is outside every member's packed range, so neither the per-part
+///   packed CRC32 nor the whole-member CRC32 covers it;
+/// - it is inside a service block's *data*, not a header, so the header walk
+///   still parses and the volume still confirms — damaging a header instead
+///   would stop the walk and demote the set for a different reason entirely.
+///
+/// PAR2 covers the volume image, so PAR2 is the only layer left that can see it.
+fn damage_recovery_record(volumes: &mut [(String, Vec<u8>)], volume: usize, rr_bytes: usize) {
+    let offset = find_recovery_offset(&volumes[volume].1, rr_bytes);
+    volumes[volume].1[offset + rr_bytes / 2] ^= 0xFF;
+}
+
+/// What one damaged par2-bearing gate ended up with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DamagedGateOutcome {
+    status: Option<JobStatus>,
+    member: Option<Vec<u8>>,
+    /// Every volume's bytes as they finally sit in the working directory. For
+    /// the conventional gate these are what the articles delivered; for the
+    /// direct gate they are what demotion reconstructed, and the two must agree
+    /// byte for byte or the reconstruction fabricated something.
+    volume_files: Vec<Option<Vec<u8>>>,
+}
+
+async fn run_damaged_par2_gate(
+    gate: DirectStoreGate,
+    job_id: JobId,
+    member_name: &str,
+    volumes: &[(String, Vec<u8>)],
+    par2_bytes: &[u8],
+) -> (DamagedGateOutcome, String) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(gate);
+    pipeline.live_par2.set_enabled(true);
+
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", volumes, par2_bytes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article(&mut pipeline, job_id, volumes, file_index, segment_number).await;
     }
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    let sets_after_verification = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    // Snapshotted before the job reaches a terminal state, because a failed job
+    // takes its working directory with it. This is the interesting moment
+    // anyway: the direct gate's volumes here are what *demotion reconstructed*,
+    // and the conventional gate's are what the articles delivered.
+    let volume_files: Vec<Option<Vec<u8>>> = volumes
+        .iter()
+        .map(|(filename, _)| std::fs::read(working_dir.join(filename)).ok())
+        .collect();
+
+    // The harness delivers articles without dequeuing them, so the download
+    // pipeline never looks exhausted and the repair gate waits forever for
+    // targeted recovery that is not coming. Draining the queues is what lets the
+    // gate reach its verdict, and it is what both gates get.
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
+        state.recovery_queue = crate::DownloadQueue::new();
+    }
+    for _ in 0..24 {
+        if matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete) | Some(JobStatus::Failed { .. })
+        ) {
+            break;
+        }
+        pipeline.check_job_completion(job_id).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+    }
+
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    let outcome = DamagedGateOutcome {
+        status: job_status_for_assert(&pipeline, job_id),
+        member: std::fs::read(output_root.join(member_name))
+            .ok()
+            .or_else(|| std::fs::read(working_dir.join(member_name)).ok()),
+        volume_files,
+    };
+    (outcome, sets_after_verification)
+}
+
+#[tokio::test]
+async fn par2_damage_a_direct_set_cannot_see_demotes_it_and_ends_where_the_conventional_gate_does()
+{
+    let member_name = "Silver.Horizon.S01E14.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 211) as u8).collect();
+    let rr_bytes = 512;
+    let clean = recovery_record_store_set(member_name, &payload, 3, rr_bytes);
+    // The PAR2 set describes the *clean* volumes; the job downloads damaged
+    // ones. Building the index first is what makes the damage detectable.
+    let par2_bytes = par2_index_over_volumes(&clean);
+    let mut volumes = clean.clone();
+    damage_recovery_record(&mut volumes, 1, rr_bytes);
+
+    let (conventional, conventional_sets) = run_damaged_par2_gate(
+        DirectStoreGate::Disabled,
+        JobId(41031),
+        member_name,
+        &volumes,
+        &par2_bytes,
+    )
+    .await;
+    let (direct, direct_sets) = run_damaged_par2_gate(
+        DirectStoreGate::Enabled,
+        JobId(41032),
+        member_name,
+        &volumes,
+        &par2_bytes,
+    )
+    .await;
+
+    assert!(
+        conventional_sets == "[]",
+        "the conventional gate should never have admitted a set, got {conventional_sets}"
+    );
+    assert!(
+        direct_sets.contains("Demoted(Par2Damaged)"),
+        "PAR2 verification must catch damage the RAR and yEnc gates cannot see, on a \
+         volume that only ever existed virtually, and demote — repairing a virtual \
+         volume is phase 6 — got {direct_sets}"
+    );
+    // Non-vacuity, two ways. First: the same fixture *without* the damaged byte
+    // runs clean through this very harness, so the outcome below is caused by
+    // the damage rather than by the harness.
+    let (clean_direct, clean_sets) = run_damaged_par2_gate(
+        DirectStoreGate::Enabled,
+        JobId(41033),
+        member_name,
+        &clean,
+        &par2_bytes,
+    )
+    .await;
+    assert!(
+        matches!(clean_direct.status, Some(JobStatus::Complete)),
+        "the undamaged fixture must complete through the same harness, got {:?} with \
+         sets {clean_sets}",
+        clean_direct.status
+    );
+    assert!(
+        !clean_sets.contains("Demoted"),
+        "an undamaged par2-bearing direct set must never demote, got {clean_sets}"
+    );
+    // Second: the conventional gate saw the same damage — the set is
+    // unrepairable (the fixture's PAR2 carries no recovery blocks), so it does
+    // not complete either.
+    assert!(
+        !matches!(conventional.status, Some(JobStatus::Complete)),
+        "the conventional gate should have been stopped by the same damage, got {:?}",
+        conventional.status
+    );
+    assert!(
+        direct.volume_files.iter().all(Option::is_some),
+        "the demotion must materialize every volume for the conventional path to \
+         repair, got {:?}",
+        direct
+            .volume_files
+            .iter()
+            .map(Option::is_some)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        direct.volume_files, conventional.volume_files,
+        "the volumes demotion reconstructed from the set's own routed bytes must be \
+         byte-identical to the ones the conventional gate downloaded — damage included, \
+         since reconstruction rebuilds what arrived and does not judge it; \
+         sets = {direct_sets}"
+    );
+    assert_eq!(
+        direct.member, conventional.member,
+        "neither gate may produce a member out of an unrepairable set; sets = {direct_sets}"
+    );
+    assert!(
+        !matches!(direct.status, Some(JobStatus::Complete)),
+        "the direct gate must not complete an unrepairable job, got {:?}",
+        direct.status
+    );
+    // Job *status* is deliberately not compared. This fixture's PAR2 carries
+    // descriptions and slice checksums but no recovery blocks — the test harness
+    // has no builder for a parseable multi-file recovery stream — so neither gate
+    // can repair, and the two reach that dead end through different waits (the
+    // direct gate through its demotion, the conventional one through the
+    // targeted-recovery wait). What wave 2 owns is the verdict and the bytes,
+    // and both are asserted above; repair-to-success is phase 6's differential.
 }
 
 // ---------------------------------------------------------------------------
@@ -2555,5 +2923,344 @@ async fn a_zero_length_member_finalizes_with_its_empty_file_present() {
         (direct.members, direct.status),
         (conventional.members, conventional.status),
         "a set with a zero-length member must be byte-identical to the conventional extractor"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D1's bounded small-member tolerance (plan 135 phase 5 wave 2)
+// ---------------------------------------------------------------------------
+
+/// What the extra, ineligible member of a tolerance fixture looks like.
+#[derive(Clone, Copy)]
+enum ToleranceExtra {
+    /// An **unsplit** stored member whose header carries a real BLAKE2sp digest
+    /// and no CRC32.
+    ///
+    /// Unsplit is load-bearing: the classifier only reaches the hash fields once
+    /// the chain is complete, so a *split* BLAKE2sp-only member is
+    /// `ProvisionallyDirect` — and routes into a partial — until its last header
+    /// lands. An unsplit one is `Ineligible` from its single header, so every
+    /// byte of it goes to the envelope, which is the shape D1's tolerance
+    /// describes and the one the extraction can read back.
+    Blake2OnlyStore,
+    /// An unsplit compressed member. The data area is not really compressed —
+    /// nothing extracts it — so this is only good for what the *classification*
+    /// and the budget decide.
+    Compressed { declared_unpacked: u64, solid: bool },
+    /// A compressed member split across the last two volumes, so its packed
+    /// total is a lower bound until the chain closes.
+    CompressedSplit,
+}
+
+/// A store set of `volume_count` volumes carrying one split stored member plus
+/// one extra, ineligible member.
+fn store_set_with_extra_member(
+    store_name: &str,
+    store_payload: &[u8],
+    extra_name: &str,
+    extra_payload: &[u8],
+    volume_count: usize,
+    extra: ToleranceExtra,
+) -> Vec<(String, Vec<u8>)> {
+    assert!(volume_count >= 2);
+    let member_crc = checksum::crc32(store_payload);
+    let chunk = store_payload.len().div_ceil(volume_count);
+    // The split-compressed shape puts its first half one volume earlier.
+    let split_extra = matches!(extra, ToleranceExtra::CompressedSplit);
+    let extra_first_volume = if split_extra {
+        volume_count - 2
+    } else {
+        volume_count - 1
+    };
+
+    (0..volume_count)
+        .map(|volume| {
+            let start = (volume * chunk).min(store_payload.len());
+            let end = ((volume + 1) * chunk).min(store_payload.len());
+            let part = &store_payload[start..end];
+            let is_first = volume == 0;
+            let is_last = volume + 1 == volume_count;
+
+            let mut split_flags = 0u64;
+            if !is_first {
+                split_flags |= 0x0008;
+            }
+            if !is_last {
+                split_flags |= 0x0010;
+            }
+
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&TEST_RAR5_SIG);
+            bytes.extend_from_slice(&build_test_rar_main_header(
+                if is_first { 0x0001 } else { 0x0001 | 0x0002 },
+                (!is_first).then_some(volume as u64),
+            ));
+            bytes.extend_from_slice(&build_test_rar_file_header(
+                store_name,
+                split_flags,
+                part.len() as u64,
+                store_payload.len() as u64,
+                Some(if is_last {
+                    member_crc
+                } else {
+                    checksum::crc32(part)
+                }),
+            ));
+            bytes.extend_from_slice(part);
+
+            if volume >= extra_first_volume {
+                let extra_split = extra_payload.len() / 2;
+                let (extra_part, extra_flags): (&[u8], u64) = match (split_extra, is_last) {
+                    (true, false) => (&extra_payload[..extra_split], 0x0010),
+                    (true, true) => (&extra_payload[extra_split..], 0x0008),
+                    (false, _) => (extra_payload, 0),
+                };
+                let header = match extra {
+                    ToleranceExtra::Blake2OnlyStore => build_test_rar_file_header_with_extra(
+                        extra_name,
+                        extra_flags,
+                        extra_part.len() as u64,
+                        extra_payload.len() as u64,
+                        None,
+                        &build_test_rar_blake2_extra(weaver_unrar::crypto::blake2sp_hash(
+                            extra_payload,
+                        )),
+                    ),
+                    ToleranceExtra::Compressed {
+                        declared_unpacked,
+                        solid,
+                    } => build_test_rar_compressed_file_header(
+                        extra_name,
+                        extra_flags,
+                        extra_part.len() as u64,
+                        declared_unpacked,
+                        Some(checksum::crc32(extra_part)),
+                        test_rar_compression_info(3, solid),
+                    ),
+                    ToleranceExtra::CompressedSplit => build_test_rar_compressed_file_header(
+                        extra_name,
+                        extra_flags,
+                        extra_part.len() as u64,
+                        extra_payload.len() as u64,
+                        Some(checksum::crc32(extra_part)),
+                        test_rar_compression_info(3, false),
+                    ),
+                };
+                bytes.extend_from_slice(&header);
+                bytes.extend_from_slice(extra_part);
+            }
+
+            bytes.extend_from_slice(&build_test_rar_end_header(!is_last));
+            (format!("silver.horizon.part{:02}.rar", volume + 1), bytes)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_small_blake2_only_member_rides_the_tolerance_and_both_members_match_the_extractor() {
+    let store_name = "Silver.Horizon.S01E15.mkv";
+    let extra_name = "Silver.Horizon.S01E15.nfo";
+    // The store member has to be at least 100x the extra for the extra to fit
+    // under `min(64 MiB, 1% of packed archive bytes)`.
+    let store_payload: Vec<u8> = (0..30_000u32).map(|index| (index % 251) as u8).collect();
+    let extra_payload: Vec<u8> = (0..200u32).map(|index| (index % 97) as u8).collect();
+    let volumes = store_set_with_extra_member(
+        store_name,
+        &store_payload,
+        extra_name,
+        &extra_payload,
+        4,
+        ToleranceExtra::Blake2OnlyStore,
+    );
+    let arrivals = in_order_arrivals(volumes.len());
+
+    let conventional = run_multi_member_gate(
+        DirectStoreGate::Disabled,
+        JobId(41041),
+        &[store_name, extra_name],
+        &volumes,
+        &arrivals,
+    )
+    .await;
+    let direct = run_multi_member_gate(
+        DirectStoreGate::Enabled,
+        JobId(41042),
+        &[store_name, extra_name],
+        &volumes,
+        &arrivals,
+    )
+    .await;
+
+    assert!(
+        conventional.volume_file_seen,
+        "the conventional gate should have written source volumes"
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "a set riding the tolerance still routes: no source volume may appear on disk"
+    );
+    assert_eq!(
+        conventional.members[0].1.as_deref(),
+        Some(store_payload.as_slice()),
+        "the conventional extractor should reproduce the stored member"
+    );
+    assert_eq!(
+        conventional.members[1].1.as_deref(),
+        Some(extra_payload.as_slice()),
+        "the conventional extractor should reproduce the BLAKE2sp-only member"
+    );
+    assert_eq!(
+        (direct.members, direct.status),
+        (conventional.members, conventional.status),
+        "the stored member routes directly and the tolerated one is extracted through \
+         the virtual volumes; both must be byte-identical to the conventional extractor"
+    );
+}
+
+/// The set's final router shape after every article of every volume.
+async fn tolerance_shape(job_id: JobId, volumes: &[(String, Vec<u8>)]) -> String {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let arrivals = in_order_arrivals(volumes.len());
+    let (shape, _) = run_direct_store_routing_only(&temp_dir, job_id, volumes, &arrivals).await;
+    shape
+}
+
+#[tokio::test]
+async fn an_ineligible_member_just_over_the_packed_budget_demotes() {
+    let store_name = "Silver.Horizon.S01E16.mkv";
+    let extra_name = "Silver.Horizon.S01E16.nfo";
+    let store_payload: Vec<u8> = (0..30_000u32).map(|index| (index % 251) as u8).collect();
+
+    // 200 packed bytes against ~30 200 archive bytes is under 1%; 600 is over.
+    let under = store_set_with_extra_member(
+        store_name,
+        &store_payload,
+        extra_name,
+        &(0..200u32)
+            .map(|index| (index % 97) as u8)
+            .collect::<Vec<u8>>(),
+        4,
+        ToleranceExtra::Blake2OnlyStore,
+    );
+    let over = store_set_with_extra_member(
+        store_name,
+        &store_payload,
+        extra_name,
+        &(0..600u32)
+            .map(|index| (index % 97) as u8)
+            .collect::<Vec<u8>>(),
+        4,
+        ToleranceExtra::Blake2OnlyStore,
+    );
+
+    let under_shape = tolerance_shape(JobId(41043), &under).await;
+    let over_shape = tolerance_shape(JobId(41044), &over).await;
+
+    // The pair is the point: the same fixture on both sides of the ceiling, so
+    // the demotion below is the budget and not the shape.
+    assert!(
+        !under_shape.contains("Demoted"),
+        "a member inside the packed budget must ride the tolerance, got {under_shape}"
+    );
+    assert!(
+        over_shape.contains("Demoted(ToleranceBudgetExceeded)"),
+        "a member past `min(64 MiB, 1% of packed archive bytes)` must demote, got {over_shape}"
+    );
+}
+
+#[tokio::test]
+async fn a_declared_unpacked_size_over_the_tolerance_ceiling_demotes() {
+    let store_name = "Silver.Horizon.S01E17.mkv";
+    let extra_name = "Silver.Horizon.S01E17.bin";
+    let store_payload: Vec<u8> = (0..30_000u32).map(|index| (index % 251) as u8).collect();
+    let extra_payload: Vec<u8> = (0..200u32).map(|index| (index % 97) as u8).collect();
+
+    // Packed bytes are comfortably inside the budget, so the only ceiling that
+    // can fire is the 256 MiB unpacked one — a compressed member declaring an
+    // expansion the tolerance will not pay for.
+    let volumes = store_set_with_extra_member(
+        store_name,
+        &store_payload,
+        extra_name,
+        &extra_payload,
+        4,
+        ToleranceExtra::Compressed {
+            declared_unpacked: 300 * 1024 * 1024,
+            solid: false,
+        },
+    );
+    let shape = tolerance_shape(JobId(41045), &volumes).await;
+    assert!(
+        shape.contains("Demoted(ToleranceBudgetExceeded)"),
+        "a declared unpacked size over 256 MiB must demote whatever its packed size is, \
+         got {shape}"
+    );
+}
+
+#[tokio::test]
+async fn a_provisional_packed_total_that_breaches_at_chain_close_demotes() {
+    let store_name = "Silver.Horizon.S01E18.mkv";
+    let extra_name = "Silver.Horizon.S01E18.bin";
+    let store_payload: Vec<u8> = (0..30_000u32).map(|index| (index % 251) as u8).collect();
+    // 600 packed bytes total, split in half across the last two volumes: 300 is
+    // inside the 1% ceiling, 600 is not.
+    let extra_payload: Vec<u8> = (0..600u32).map(|index| (index % 97) as u8).collect();
+    let volumes = store_set_with_extra_member(
+        store_name,
+        &store_payload,
+        extra_name,
+        &extra_payload,
+        4,
+        ToleranceExtra::CompressedSplit,
+    );
+
+    // Everything up to (and including) the extra's first part: the chain is
+    // still open, its packed total is a lower bound inside the budget, and the
+    // set keeps routing. Non-vacuity for the demotion below.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut partial_arrivals = in_order_arrivals(volumes.len());
+    partial_arrivals.truncate(2 * (volumes.len() - 1));
+    let (open_shape, _) =
+        run_direct_store_routing_only(&temp_dir, JobId(41046), &volumes, &partial_arrivals).await;
+    assert!(
+        !open_shape.contains("Demoted"),
+        "a provisional packed total inside the budget must keep routing, got {open_shape}"
+    );
+
+    let closed_shape = tolerance_shape(JobId(41047), &volumes).await;
+    assert!(
+        closed_shape.contains("Demoted(ToleranceBudgetExceeded)"),
+        "the budget re-check when the chain closes must demote on the true total, \
+         got {closed_shape}"
+    );
+}
+
+#[tokio::test]
+async fn a_solid_ineligible_member_demotes_rather_than_riding_the_tolerance() {
+    let store_name = "Silver.Horizon.S01E19.mkv";
+    let extra_name = "Silver.Horizon.S01E19.bin";
+    let store_payload: Vec<u8> = (0..30_000u32).map(|index| (index % 251) as u8).collect();
+    let extra_payload: Vec<u8> = (0..200u32).map(|index| (index % 97) as u8).collect();
+
+    // Identical to a tolerated member in every budget dimension; only the
+    // per-member solid flag differs. `extract_member_streaming` can only decode
+    // a solid member against the rest of its solid run, so the tolerance must
+    // not take it however small it is.
+    let volumes = store_set_with_extra_member(
+        store_name,
+        &store_payload,
+        extra_name,
+        &extra_payload,
+        4,
+        ToleranceExtra::Compressed {
+            declared_unpacked: extra_payload.len() as u64,
+            solid: true,
+        },
+    );
+    let shape = tolerance_shape(JobId(41048), &volumes).await;
+    assert!(
+        shape.contains("Demoted(MemberIneligible(Solid))"),
+        "a solid member must demote on its own reason, not on the tolerance budget, \
+         got {shape}"
     );
 }

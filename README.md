@@ -79,12 +79,15 @@ services:
       - PGID=1000
       - TZ=Etc/UTC
       - UMASK=022 # optional
+      - WEAVER_HTTP_ALLOWED_HOSTS=weaver # permit the Compose service name
     volumes:
       - /path/to/weaver/config:/config
     ports:
       - 9090:9090
     restart: unless-stopped
 ```
+
+Weaver always validates the HTTP `Host` authority. Direct access through `localhost` or an IPv4/IPv6 literal works without configuration. Set `WEAVER_HTTP_ALLOWED_HOSTS` to a comma-separated list of exact DNS, container, or reverse-proxy names used to reach Weaver. An entry without a port allows that hostname on any port; `host:port` restricts it to that port. Schemes, paths, credentials, and wildcards are rejected, and forwarded-host headers are not trusted.
 
 If you run the container as root, the entrypoint will re-own `/config` to `PUID` / `PGID` and then drop privileges before starting `weaver`. If you run with `--user=1000:1000`, make sure the bind mount is already owned by that uid/gid because the ownership repair path is skipped in non-root mode.
 

@@ -469,12 +469,14 @@ impl JobsMutation {
     ) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
         let mut base_update = JobUpdate::default();
-        if let Some(category) = category {
-            base_update.category = if category.is_empty() {
-                FieldUpdate::Clear
-            } else {
-                FieldUpdate::Set(category)
-            };
+        if let Some(category) = category.as_deref() {
+            let resolved = weaver_server_core::ingest::resolve_submission_category(
+                ctx.data::<SharedConfig>()?,
+                Some(category),
+            )
+            .await
+            .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
+            base_update.category = resolved.map_or(FieldUpdate::Clear, FieldUpdate::Set);
         }
 
         let normalized_priority = priority

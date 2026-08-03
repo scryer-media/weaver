@@ -929,6 +929,48 @@ async fn nzbget_append_canonicalizes_submitted_category_for_facade() {
 }
 
 #[tokio::test]
+async fn nzbget_append_rejects_unsafe_category_before_queuing() {
+    use base64::Engine as _;
+
+    let db = Database::open_in_memory().unwrap();
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        db,
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let nzb_b64 =
+        base64::engine::general_purpose::STANDARD.encode(minimal_nzb("Unsafe.Category.Release"));
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "append",
+            "params": [
+                "Unsafe.Category.Release.nzb",
+                nzb_b64,
+                "../../outside",
+                0,
+                false,
+                false,
+                "",
+                0,
+                "all",
+                []
+            ],
+            "id": "append-unsafe-category"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["error"]["code"], 2);
+    assert!(handle.list_jobs().is_empty());
+}
+
+#[tokio::test]
 async fn nzbget_append_rejection_returns_zero_for_invalid_nzb() {
     use base64::Engine as _;
 
@@ -1848,6 +1890,20 @@ async fn nzbget_editqueue_category_priority_and_parameter_updates() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["result"], true);
+    assert_eq!(handle.list_jobs()[0].category.as_deref(), Some("movies"));
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupSetCategory", 0, "../../outside", [90]],
+            "id": "unsafe-category"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["error"]["code"], 2);
     assert_eq!(handle.list_jobs()[0].category.as_deref(), Some("movies"));
 
     let (status, payload) = post_nzbget(

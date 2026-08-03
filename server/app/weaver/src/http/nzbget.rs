@@ -12,10 +12,10 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use weaver_server_api::{
-    Attribute, AttributeInput, CLIENT_REQUEST_ID_ATTRIBUTE_KEY, CategoryResolutionMode,
-    PRIORITY_ATTRIBUTE_KEY, QueueItem, QueueItemState, QueuePhase, SubmissionOptions,
-    SubmitNzbError, fetch_nzb_from_url, history_item_from_row, normalize_priority_value,
-    queue_item_from_job, submit_metadata, submit_nzb_bytes_with_options,
+    Attribute, AttributeInput, CLIENT_REQUEST_ID_ATTRIBUTE_KEY, PRIORITY_ATTRIBUTE_KEY, QueueItem,
+    QueueItemState, QueuePhase, SubmissionOptions, SubmitNzbError, fetch_nzb_from_url,
+    history_item_from_row, normalize_priority_value, queue_item_from_job, submit_metadata,
+    submit_nzb_bytes_with_options,
 };
 use weaver_server_core::auth::{ApiKeyCache, CallerScope, LoginAuthCache};
 use weaver_server_core::settings::model::SharedConfig;
@@ -939,7 +939,6 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
         request.category.clone(),
         metadata,
         SubmissionOptions {
-            category_resolution: CategoryResolutionMode::ResolveConfigured,
             add_paused: request.add_paused,
             duplicate_mode: nzbget_duplicate_mode(
                 dupe_mode.as_deref(),
@@ -2433,13 +2432,12 @@ async fn set_job_category(
     job_id: JobId,
     category: &str,
 ) -> Result<(), SchedulerError> {
-    let category = category.trim();
+    let category =
+        weaver_server_core::ingest::resolve_submission_category(&ctx.config, Some(category))
+            .await
+            .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?;
     let update = JobUpdate {
-        category: if category.is_empty() {
-            FieldUpdate::Clear
-        } else {
-            FieldUpdate::Set(category.to_string())
-        },
+        category: category.map_or(FieldUpdate::Clear, FieldUpdate::Set),
         ..JobUpdate::default()
     };
     ctx.handle.update_job(job_id, update).await

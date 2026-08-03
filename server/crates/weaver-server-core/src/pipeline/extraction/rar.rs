@@ -16,6 +16,8 @@ pub(crate) use member::{RarArchiveOpenMode, RarExtractionContext, RarExtractionO
 
 pub(crate) use member::validate_sanitized_rar_member_path;
 
+pub(crate) use member::apply_server_rar_limits;
+
 #[cfg(test)]
 pub(crate) use member::RarArchiveSnapshotOpenRequest;
 

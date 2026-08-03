@@ -2,7 +2,7 @@ use async_graphql::{Context, Object, Result};
 use std::sync::LazyLock;
 use tracing::info;
 
-use crate::auth::AdminGuard;
+use crate::auth::{AdminGuard, graphql_error};
 use crate::categories::types::{Category, CategoryInput};
 use crate::observability::{
     persist_then_update_config, spawn_blocking_db, with_timed_config_read, with_timed_config_write,
@@ -17,6 +17,14 @@ static CATEGORY_MUTATION_GUARD: LazyLock<tokio::sync::Mutex<()>> =
 #[derive(Default)]
 pub(crate) struct CategoriesMutation;
 
+fn validate_category_name(name: &str, dest_dir: Option<&str>) -> Result<()> {
+    if dest_dir.is_none_or(str::is_empty) {
+        weaver_server_core::categories::validate_category_path_component(name)
+            .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
+    }
+    Ok(())
+}
+
 #[Object]
 impl CategoriesMutation {
     /// Add a new category.
@@ -30,6 +38,8 @@ impl CategoriesMutation {
         if name.is_empty() {
             return Err(async_graphql::Error::new("category name must not be empty"));
         }
+        let dest_dir = input.dest_dir.filter(|value| !value.is_empty());
+        validate_category_name(&name, dest_dir.as_deref())?;
 
         with_timed_config_read(config, "categories.mutation.add_category.validate", |cfg| {
             if cfg
@@ -57,7 +67,7 @@ impl CategoriesMutation {
         let cat = weaver_server_core::categories::CategoryConfig {
             id,
             name: name.clone(),
-            dest_dir: input.dest_dir.filter(|s| !s.is_empty()),
+            dest_dir,
             aliases: input.aliases,
         };
 
@@ -111,6 +121,8 @@ impl CategoriesMutation {
         if name.is_empty() {
             return Err(async_graphql::Error::new("category name must not be empty"));
         }
+        let dest_dir = input.dest_dir.filter(|value| !value.is_empty());
+        validate_category_name(&name, dest_dir.as_deref())?;
 
         let updated = with_timed_config_read(
             config,
@@ -136,7 +148,7 @@ impl CategoriesMutation {
                 Ok(weaver_server_core::categories::CategoryConfig {
                     id,
                     name: name.clone(),
-                    dest_dir: input.dest_dir.clone().filter(|value| !value.is_empty()),
+                    dest_dir: dest_dir.clone(),
                     aliases: input.aliases.clone(),
                 })
             },
