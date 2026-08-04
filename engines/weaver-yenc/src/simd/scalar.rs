@@ -1,6 +1,5 @@
 use super::*;
 
-#[cfg(any(test, not(target_arch = "aarch64")))]
 pub(super) fn decode_kernel_scalar(
     input: &[u8],
     output: &mut [u8],

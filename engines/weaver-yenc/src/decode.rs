@@ -1048,6 +1048,46 @@ mod tests {
     }
 
     #[test]
+    fn decode_body_long_raw_exact_output_uses_bounded_fallback() {
+        let mut encoded = b"\r\n".repeat(99);
+        encoded.push(b'A');
+        let mut output = [0u8; 1];
+        let mut crc = Crc32::new();
+
+        let written = decode_body(
+            &encoded,
+            &mut output,
+            &mut crc,
+            DecodeOptions {
+                dot_unstuffing: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(written, 1);
+        assert_eq!(output, [b'A'.wrapping_sub(42)]);
+    }
+
+    #[test]
+    fn decode_body_long_raw_small_output_returns_error() {
+        let mut encoded = b"\r\n".repeat(99);
+        encoded.extend_from_slice(b"AA");
+        let mut output = [0u8; 1];
+        let mut crc = Crc32::new();
+
+        let result = decode_body(
+            &encoded,
+            &mut output,
+            &mut crc,
+            DecodeOptions {
+                dot_unstuffing: true,
+            },
+        );
+
+        assert!(matches!(result, Err(YencError::BufferTooSmall { .. })));
+    }
+
+    #[test]
     fn decode_body_streaming_crc() {
         let original = b"Hello, World!";
         let encoded = encode_raw(original);

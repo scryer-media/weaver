@@ -272,6 +272,21 @@ fn decode_kernel(
     preserve_pending: bool,
     search_end: bool,
 ) -> Result<KernelOutcome, YencError> {
+    // The rapidyenc-derived SIMD kernels deliberately use full-width stores
+    // and require destination capacity at least as large as the encoded input.
+    // Keep those branch-free hot loops for callers with that headroom, while
+    // preserving this crate's stronger safe-API contract for compact buffers.
+    if output.len() < input.len() {
+        return decode_kernel_scalar(
+            input,
+            output,
+            state,
+            dot_unstuffing,
+            preserve_pending,
+            search_end,
+        );
+    }
+
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512vbmi2")
