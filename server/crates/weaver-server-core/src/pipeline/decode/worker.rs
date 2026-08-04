@@ -1804,57 +1804,90 @@ impl Pipeline {
                 // `write_segments_to_disk` returned for this segment, so these
                 // bytes are already on disk and a later live-PAR2 settle read
                 // of the same range sees exactly them (plan 135, D5).
+                //
+                // A duplicate is fed here on purpose, unlike the file hash
+                // below. Live PAR2 is positional, not sequential: a whole-block
+                // re-feed recomputes the same verdict from the same bytes, and
+                // a partial re-feed of a block that already has a verdict
+                // retires it to the settle read (`stage_partial` names this
+                // case). It is also required rather than merely harmless — this
+                // arrival rewrote the range, so if the replay carried different
+                // bytes than the first copy did, skipping the feed would leave
+                // a verdict describing content that is no longer on disk.
                 self.note_live_par2_segment(file_id, file_offset, &data);
 
-                let use_crc_metadata = self.should_use_completed_file_crc_metadata(file_id);
-                match hash_mode {
-                    SegmentHashMode::UpdateNow if use_crc_metadata => {
-                        let decoded_len = data.len_bytes();
-                        self.defer_file_hash_crc_metadata(
-                            file_id,
-                            file_offset,
-                            decoded_len,
-                            part_crc,
-                            part_crc_verified,
-                        );
-                        drop(data);
-                    }
-                    SegmentHashMode::UpdateNow => {
-                        self.drain_deferred_file_hash_ranges(file_id, file_path)
-                            .await;
-                        self.note_file_hash_decoded_chunk(
-                            file_id,
-                            file_offset,
-                            &data,
-                            part_crc,
-                            part_crc_verified,
-                        );
-                        self.drain_deferred_file_hash_ranges(file_id, file_path)
-                            .await;
-                        drop(data);
-                    }
-                    SegmentHashMode::DeferRange if use_crc_metadata => {
-                        let decoded_len = data.len_bytes();
-                        self.defer_file_hash_crc_metadata(
-                            file_id,
-                            file_offset,
-                            decoded_len,
-                            part_crc,
-                            part_crc_verified,
-                        );
-                        drop(data);
-                    }
-                    SegmentHashMode::DeferRange => {
-                        self.defer_file_hash_chunk(
-                            file_id,
-                            file_offset,
-                            data,
-                            part_crc,
-                            part_crc_verified,
-                        );
+                // The file hash is a *running* stream: every chunk must be fed
+                // once, in offset order. A duplicate's bytes were already fed
+                // by the original arrival, so re-feeding them is what trips the
+                // running-offset check in `note_file_hash_*` and condemns a
+                // perfectly good file to a whole-file re-read at completion.
+                // Below-cursor duplicates reach this seam by design since
+                // 815f1a12 (they are handed back and rewritten idempotently
+                // rather than wedging the reorder buffer), so the feed — both
+                // the immediate and the deferred arm — is skipped for them.
+                if was_duplicate {
+                    drop(data);
+                } else {
+                    let use_crc_metadata = self.should_use_completed_file_crc_metadata(file_id);
+                    match hash_mode {
+                        SegmentHashMode::UpdateNow if use_crc_metadata => {
+                            let decoded_len = data.len_bytes();
+                            self.defer_file_hash_crc_metadata(
+                                file_id,
+                                file_offset,
+                                decoded_len,
+                                part_crc,
+                                part_crc_verified,
+                            );
+                            drop(data);
+                        }
+                        SegmentHashMode::UpdateNow => {
+                            self.drain_deferred_file_hash_ranges(file_id, file_path)
+                                .await;
+                            self.note_file_hash_decoded_chunk(
+                                file_id,
+                                file_offset,
+                                &data,
+                                part_crc,
+                                part_crc_verified,
+                            );
+                            self.drain_deferred_file_hash_ranges(file_id, file_path)
+                                .await;
+                            drop(data);
+                        }
+                        SegmentHashMode::DeferRange if use_crc_metadata => {
+                            let decoded_len = data.len_bytes();
+                            self.defer_file_hash_crc_metadata(
+                                file_id,
+                                file_offset,
+                                decoded_len,
+                                part_crc,
+                                part_crc_verified,
+                            );
+                            drop(data);
+                        }
+                        SegmentHashMode::DeferRange => {
+                            self.defer_file_hash_chunk(
+                                file_id,
+                                file_offset,
+                                data,
+                                part_crc,
+                                part_crc_verified,
+                            );
+                        }
                     }
                 }
 
+                // Deliberately not gated on `was_duplicate`: completion is a
+                // property of the file, not of this arrival. A duplicate leaves
+                // the received bitvec untouched, so it can never *newly*
+                // complete a file — `file_complete` is true here only when the
+                // file was already complete, and this branch runs the same
+                // finalization it would have run for the arrival that finished
+                // it. Skipping the hash feed above is safe for that case too:
+                // `finalize_completed_file_hash` drains its own deferred ranges
+                // and falls back to the whole-file read when the streamed state
+                // does not cover the file.
                 if file_complete {
                     crate::runtime::perf_probe::record(
                         "download.file_progress.complete_file_row_covers_restart",

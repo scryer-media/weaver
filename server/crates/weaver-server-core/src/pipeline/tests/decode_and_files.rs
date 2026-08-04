@@ -697,6 +697,160 @@ async fn replayed_article_mid_download_still_completes_the_file() {
     assert_eq!(pipeline.write_buffered_segments, 0);
 }
 
+/// A segmented spec whose file streams the *running* file hash on every commit.
+///
+/// A `Standalone` file that declares a whole-file CRC32 takes the deferred
+/// CRC-metadata arm instead, which is keyed by offset and so never consults the
+/// running offset at all. Only the streaming arm can observe a duplicate being
+/// fed twice, and a RAR volume in a set with no PAR2 is the ordinary shape that
+/// reaches it.
+fn streaming_hash_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) -> JobSpec {
+    let mut spec = segmented_job_spec(name, filename, segment_sizes);
+    spec.files[0].role = FileRole::RarVolume { volume_number: 0 };
+    spec
+}
+
+#[tokio::test]
+async fn replayed_article_mid_download_does_not_force_a_whole_file_reread() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20007);
+    let filename = "replayed-hash.part01.rar";
+    let payload = b"aaaabbbbcccc";
+    let whole_file_crc = weaver_par2::checksum::crc32(payload);
+    let spec = streaming_hash_job_spec("Replayed Article Hash", filename, &[4, 4, 4]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_decoded_segment(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        &payload[0..4],
+        filename,
+        Some(whole_file_crc),
+    )
+    .await;
+    assert_eq!(
+        pipeline
+            .file_hash_states
+            .get(&file_id)
+            .map(|state| state.bytes_fed()),
+        Some(4)
+    );
+
+    // The same article again, landing behind the file's write cursor. Its bytes
+    // are already in the running file hash, so re-feeding them is what used to
+    // trip the hash's offset check and condemn a healthy file to a re-read.
+    submit_decoded_segment(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        &payload[0..4],
+        filename,
+        Some(whole_file_crc),
+    )
+    .await;
+    assert!(
+        !pipeline.file_hash_reread_required.contains(&file_id),
+        "a duplicate article must not force a whole-file re-read of a healthy file"
+    );
+    assert_eq!(
+        pipeline
+            .file_hash_states
+            .get(&file_id)
+            .map(|state| state.bytes_fed()),
+        Some(4),
+        "the duplicate's bytes must not be fed to the running hash a second time"
+    );
+
+    for (segment_number, offset, chunk) in [(1u32, 4u64, &payload[4..8]), (2, 8, &payload[8..12])] {
+        submit_decoded_segment(
+            &mut pipeline,
+            file_id,
+            segment_number,
+            offset,
+            chunk,
+            filename,
+            Some(whole_file_crc),
+        )
+        .await;
+    }
+
+    // `expected_file_crc` is supplied, so a wrong streamed CRC32 fails the job
+    // rather than completing it: FileComplete here is the whole-file gate
+    // passing on a hash that never left the streaming path.
+    let drained_events = drain_job_events(&mut events, job_id);
+    assert!(
+        drained_events.iter().any(|event| matches!(
+            event,
+            PipelineEvent::FileComplete { total_bytes, .. }
+                if *total_bytes == payload.len() as u64
+        )),
+        "{drained_events:?}"
+    );
+    assert!(
+        !drained_events
+            .iter()
+            .any(|event| matches!(event, PipelineEvent::JobFailed { .. })),
+        "{drained_events:?}"
+    );
+}
+
+#[tokio::test]
+async fn out_of_order_non_duplicate_arrival_still_forces_a_whole_file_reread() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20008);
+    let filename = "out-of-order-hash.part01.rar";
+    let payload = b"aaaabbbbcccc";
+    let whole_file_crc = weaver_par2::checksum::crc32(payload);
+    let spec = streaming_hash_job_spec("Out Of Order Hash", filename, &[4, 4, 4]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_decoded_segment(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        &payload[0..4],
+        filename,
+        Some(whole_file_crc),
+    )
+    .await;
+    assert!(!pipeline.file_hash_reread_required.contains(&file_id));
+
+    // Negative control for the duplicate skip above: a *different* segment
+    // reaching the same seam behind the write cursor is not a replay of bytes
+    // the hash already holds, so the running offset really is broken and the
+    // whole-file re-read is the only way back to a trustworthy checksum.
+    submit_decoded_segment(
+        &mut pipeline,
+        file_id,
+        1,
+        0,
+        &payload[4..8],
+        filename,
+        Some(whole_file_crc),
+    )
+    .await;
+    assert!(
+        pipeline.file_hash_reread_required.contains(&file_id),
+        "a genuine out-of-order arrival must still fall back to the whole-file re-read"
+    );
+    assert!(!pipeline.file_hash_states.contains_key(&file_id));
+}
+
 #[tokio::test]
 async fn disk_write_failure_fails_job_before_commit() {
     let temp_dir = tempfile::tempdir().unwrap();
