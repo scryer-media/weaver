@@ -528,8 +528,9 @@ impl DirectSet {
         &mut self,
         volume_index: u32,
         spans: &[super::router::RepairedChunk],
+        lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
-        match self.router.route_repaired(volume_index, spans) {
+        match self.router.route_repaired(volume_index, spans, lead_in) {
             Ok(spans) => {
                 if !spans.is_empty() {
                     self.latched_direct = true;
@@ -1006,6 +1007,10 @@ impl DirectSet {
                     .map(|(member_id, _, partial)| (member_id, working_dir.join(partial)))
                     .collect(),
             );
+        // Plan 136, E-D4. Shared for the same reason the paths are, and empty
+        // for every set with no encrypted member — which is what leaves the
+        // provider's read path exactly as plan 135 built it.
+        let ciphers = std::sync::Arc::new(self.router.member_ciphers());
         volume_lengths
             .iter()
             .map(|(volume_index, len)| VirtualVolume {
@@ -1016,6 +1021,7 @@ impl DirectSet {
                 covered: self.volume_coverage(*volume_index),
                 envelope_covered: self.envelope_coverage(*volume_index),
                 len: *len,
+                ciphers: std::sync::Arc::clone(&ciphers),
             })
             .collect()
     }
@@ -1067,6 +1073,10 @@ impl DirectSet {
         let Some(partials) = self.committed_member_paths() else {
             return false;
         };
+        // The committed member file is byte-for-byte the partial — a commit is a
+        // rename — so an encrypted set's retained image re-encrypts out of it
+        // exactly as the live one did (plan 136, E2).
+        let ciphers = std::sync::Arc::new(self.router.member_ciphers());
         let volumes: Vec<VirtualVolume> = volume_lengths
             .iter()
             .map(|(volume_index, len)| VirtualVolume {
@@ -1077,6 +1087,7 @@ impl DirectSet {
                 covered: self.volume_coverage(*volume_index),
                 envelope_covered: self.envelope_coverage(*volume_index),
                 len: *len,
+                ciphers: std::sync::Arc::clone(&ciphers),
             })
             .collect();
         if !volumes

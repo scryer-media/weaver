@@ -42,17 +42,56 @@
 //! the volume-level map calls covered but no source claims is a hole, which is
 //! the invariant this module's title states, held unconditionally rather than as
 //! a consequence of the extent list happening to be right.
+//!
+//! # The re-encrypting overlay (plan 136, E-D4)
+//!
+//! For an **encrypted** set the two images no longer agree with the volume they
+//! describe. The envelope still holds what was posted — headers, service
+//! records, and the last cipher block's tail padding — but a routed member's
+//! `.direct.partial` holds its *plaintext*, because plan 136 decrypts at write
+//! time so the payload lands once. Every caller of this module wants posted
+//! bytes: PAR2 checksums them, reconstruction writes them into a volume file, a
+//! repair reads them as Reed–Solomon inputs.
+//!
+//! So a member extent belonging to an encrypted member is re-encrypted on the
+//! way out ([`VirtualVolume::ciphers`]). AES-CBC encryption is deterministic
+//! given key, IV and plaintext, so the posted stream is always reproducible —
+//! the only question is where a read's CBC chain starts, since block *N*'s
+//! cipher needs block *N−1*'s:
+//!
+//! - a **sequential** sweep chains naturally from each member's start, and
+//!   [`VirtualVolumeReader::chains`] carries the frontier from one `read` to the
+//!   next so a whole-volume pass re-encrypts every byte exactly once;
+//! - a **ranged** read seeds from the nearest retained cipher checkpoint at or
+//!   below its offset ([`super::router::crypt::MemberCipher::seed`]), and where
+//!   there is none it chains from the member's IV — the sequential path, bounded
+//!   and honest, rather than a guessed predecessor.
+//!
+//! Three things make a read **refuse** rather than fabricate, all of them
+//! reported as [`HoleError`] because "refetch this" is exactly what they mean:
+//! plaintext missing anywhere between the seed and the requested bytes; a read
+//! touching the member's final cipher block with no retained tail padding; and a
+//! member extent whose member has no cipher facts at all.
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use weaver_unrar::{ReadSeek, VolumeProvider, VolumeProviderError};
 
 use super::ByteRanges;
 use super::router::MemberExtent;
+use super::router::crypt::{MemberCipher, block_ceil, block_floor};
+
+/// How much plaintext a chain-to-seed pass re-encrypts per iteration.
+///
+/// Only the last 16 bytes of each pass survive it, so this bounds the transient
+/// buffer a checkpoint miss costs — not the work, which is whatever the distance
+/// to the seed is.
+const CHAIN_CHUNK_BYTES: usize = 256 * 1024;
 
 /// A read landed on a byte the set never placed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +171,57 @@ pub(crate) struct VirtualVolume {
     /// Logical length of the volume: what a `SeekFrom::End` means and where
     /// reads stop returning bytes.
     pub(crate) len: u64,
+    /// Read-side crypt facts per member id, for the re-encrypting overlay
+    /// (plan 136, E-D4). Empty for every unencrypted set, which is the overlay
+    /// switched off by construction.
+    ///
+    /// Shared with the partial paths and for the same reason: every volume of a
+    /// set resolves the same member ids, and the facts carry a checkpoint map
+    /// that is not free to clone per volume.
+    pub(crate) ciphers: Arc<HashMap<u32, MemberCipher>>,
+}
+
+/// What the re-encrypting overlay did, so a test can prove which path a read
+/// took rather than only that it produced the right bytes (plan 136 open
+/// question 1).
+#[derive(Debug, Default)]
+pub(crate) struct CipherOverlayCounters {
+    reencrypted_bytes: AtomicU64,
+    chained_bytes: AtomicU64,
+    seeded_from_checkpoint: AtomicU64,
+    seeded_from_start: AtomicU64,
+    refusals: AtomicU64,
+}
+
+impl CipherOverlayCounters {
+    /// Member bytes the overlay turned back into cipher and handed to a caller.
+    pub(crate) fn reencrypted_bytes(&self) -> u64 {
+        self.reencrypted_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes re-encrypted **only** to reach a read's CBC seed and then thrown
+    /// away. The whole cost of a checkpoint miss, and the number
+    /// [`super::router::crypt::CHECKPOINT_STRIDE`] exists to bound.
+    pub(crate) fn chained_bytes(&self) -> u64 {
+        self.chained_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Reads whose chain started at a retained checkpoint or at the frontier the
+    /// previous read left, i.e. those that paid nothing to seed.
+    pub(crate) fn seeded_from_checkpoint(&self) -> u64 {
+        self.seeded_from_checkpoint.load(Ordering::Relaxed)
+    }
+
+    /// Reads that had to chain from the member's IV — the sequential fallback.
+    pub(crate) fn seeded_from_start(&self) -> u64 {
+        self.seeded_from_start.load(Ordering::Relaxed)
+    }
+
+    /// Reads the overlay refused rather than fabricate: missing plaintext below
+    /// the requested bytes, or a final block with no retained tail padding.
+    pub(crate) fn refusals(&self) -> u64 {
+        self.refusals.load(Ordering::Relaxed)
+    }
 }
 
 impl VirtualVolume {
@@ -205,6 +295,10 @@ impl VirtualVolume {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HybridVolumeProvider {
     volumes: HashMap<u32, VirtualVolume>,
+    /// Shared across clones on purpose: the provider is cloned into every
+    /// `spawn_blocking` that reads it, and the overlay accounting is about the
+    /// whole pass rather than about one closure.
+    cipher_counters: Arc<CipherOverlayCounters>,
 }
 
 impl HybridVolumeProvider {
@@ -214,7 +308,13 @@ impl HybridVolumeProvider {
                 .into_iter()
                 .map(|volume| (volume.volume_index, volume))
                 .collect(),
+            cipher_counters: Arc::new(CipherOverlayCounters::default()),
         }
+    }
+
+    /// What the re-encrypting overlay has done through this provider.
+    pub(crate) fn cipher_counters(&self) -> Arc<CipherOverlayCounters> {
+        Arc::clone(&self.cipher_counters)
     }
 
     /// The registered shape of one virtual volume. Wave 2's PAR2 adapter reads
@@ -231,7 +331,7 @@ impl HybridVolumeProvider {
         self.volumes
             .get(&volume_index)
             .cloned()
-            .map(VirtualVolumeReader::new)
+            .map(|volume| VirtualVolumeReader::new(volume, Arc::clone(&self.cipher_counters)))
     }
 }
 
@@ -272,6 +372,46 @@ pub(crate) struct VirtualVolumeReader {
     position: u64,
     envelope_handle: Option<File>,
     partial_handles: HashMap<u32, File>,
+    /// Per-member CBC frontier: the cipher offset the last re-encryption ended
+    /// at and the 16 cipher bytes ending there (plan 136, E-D4).
+    ///
+    /// This is what makes a sequential sweep of an encrypted volume linear:
+    /// every `read` continues the previous one's chain instead of seeding
+    /// itself. It also carries a *ranged* caller forward when its reads happen
+    /// to ascend, which a PAR2 slice sweep's do.
+    chains: HashMap<u32, CipherChain>,
+    counters: Arc<CipherOverlayCounters>,
+}
+
+/// One member's CBC frontier inside a reader.
+///
+/// Two seeds, not one, because a read rarely ends on a block boundary: a
+/// sequential sweep's runs are article- and extent-shaped, so the next read
+/// usually starts *inside* the last block this one produced. `frontier` answers
+/// a read that starts where the last one stopped; `resume` answers one that
+/// re-enters the last block. Without the second, every unaligned continuation
+/// would fall back to a checkpoint and a whole-volume sweep would be quadratic.
+#[derive(Debug, Clone, Copy)]
+struct CipherChain {
+    /// Cipher offset immediately past the last block produced.
+    frontier: u64,
+    /// The 16 cipher bytes ending at `frontier`.
+    frontier_block: [u8; 16],
+    /// Start of the last block produced.
+    resume: u64,
+    /// The 16 cipher bytes ending at `resume` — that block's CBC predecessor.
+    resume_block: [u8; 16],
+}
+
+impl CipherChain {
+    /// The predecessor of the block starting at `block_start`, if this frontier
+    /// happens to hold it.
+    fn seed_for(&self, block_start: u64) -> Option<[u8; 16]> {
+        if self.frontier == block_start {
+            return Some(self.frontier_block);
+        }
+        (self.resume == block_start).then_some(self.resume_block)
+    }
 }
 
 impl std::fmt::Debug for VirtualVolumeReader {
@@ -286,12 +426,14 @@ impl std::fmt::Debug for VirtualVolumeReader {
 }
 
 impl VirtualVolumeReader {
-    pub(crate) fn new(volume: VirtualVolume) -> Self {
+    pub(crate) fn new(volume: VirtualVolume, counters: Arc<CipherOverlayCounters>) -> Self {
         Self {
             volume,
             position: 0,
             envelope_handle: None,
             partial_handles: HashMap::new(),
+            chains: HashMap::new(),
+            counters,
         }
     }
 
@@ -387,22 +529,15 @@ impl VirtualVolumeReader {
     fn read_from(&mut self, source: Source, out: &mut [u8]) -> std::io::Result<usize> {
         match source {
             Source::Member { member_id, offset } => {
-                if !self.partial_handles.contains_key(&member_id) {
-                    let path = self
-                        .volume
-                        .partials
-                        .get(&member_id)
-                        .ok_or_else(|| hole(self.volume.volume_index, self.position))?
-                        .clone();
-                    let file = self.open_or_hole(&path)?;
-                    self.partial_handles.insert(member_id, file);
+                // Plan 136, E-D4. An encrypted member's partial holds plaintext
+                // and this reader answers in *posted* space, so the bytes are
+                // re-encrypted on the way out. Every other member reads through
+                // unchanged, which is what keeps the overlay off for a set that
+                // has no encrypted member at all.
+                if self.volume.ciphers.contains_key(&member_id) {
+                    return self.read_member_cipher(member_id, offset, out);
                 }
-                let file = self
-                    .partial_handles
-                    .get_mut(&member_id)
-                    .expect("the handle was just inserted");
-                file.seek(SeekFrom::Start(offset))?;
-                file.read(out)
+                self.read_member_plain(member_id, offset, out)
             }
             Source::Envelope { offset } => {
                 if self.envelope_handle.is_none() {
@@ -417,6 +552,215 @@ impl VirtualVolumeReader {
                 file.read(out)
             }
         }
+    }
+
+    /// One member's bytes straight out of its partial, which for an unencrypted
+    /// member is what was posted.
+    fn read_member_plain(
+        &mut self,
+        member_id: u32,
+        offset: u64,
+        out: &mut [u8],
+    ) -> std::io::Result<usize> {
+        if !self.partial_handles.contains_key(&member_id) {
+            let path = self
+                .volume
+                .partials
+                .get(&member_id)
+                .ok_or_else(|| hole(self.volume.volume_index, self.position))?
+                .clone();
+            let file = self.open_or_hole(&path)?;
+            self.partial_handles.insert(member_id, file);
+        }
+        let file = self
+            .partial_handles
+            .get_mut(&member_id)
+            .expect("the handle was just inserted");
+        file.seek(SeekFrom::Start(offset))?;
+        file.read(out)
+    }
+
+    // ---- The re-encrypting overlay (plan 136, E-D4) ------------------------
+
+    /// One encrypted member's **posted** bytes for `[offset, offset + out.len())`.
+    ///
+    /// Whole blocks are re-encrypted and the requested window sliced out of
+    /// them, because CBC has no smaller unit. The blocks needed are
+    /// `[floor(offset), ceil(offset + len))`, clamped at the member's cipher
+    /// size — the final one of which runs past `unpacked_size` into the retained
+    /// tail padding, which is exactly why that padding is retained.
+    fn read_member_cipher(
+        &mut self,
+        member_id: u32,
+        offset: u64,
+        out: &mut [u8],
+    ) -> std::io::Result<usize> {
+        let ciphers = Arc::clone(&self.volume.ciphers);
+        let Some(facts) = ciphers.get(&member_id) else {
+            return Err(self.refuse());
+        };
+        let want = out.len() as u64;
+        if want == 0 {
+            return Ok(0);
+        }
+        let end = offset.saturating_add(want);
+        // A member extent stops at `unpacked_size`: the tail padding's cipher
+        // was routed to the envelope at its true physical offset, so it is the
+        // envelope's to answer and never reaches here.
+        if end > facts.unpacked_size() {
+            return Err(self.refuse());
+        }
+        let block_start = block_floor(offset);
+        let block_end = block_ceil(end).min(facts.cipher_size());
+
+        let preceding = self.chain_to(member_id, facts, block_start)?;
+        let plain = self.member_plaintext(member_id, facts, block_start, block_end)?;
+        let cipher = facts.encrypt(&preceding, &plain);
+        self.remember_chain(member_id, block_end, &cipher, preceding);
+        let at = (offset - block_start) as usize;
+        out.copy_from_slice(&cipher[at..at + want as usize]);
+        self.counters
+            .reencrypted_bytes
+            .fetch_add(want, Ordering::Relaxed);
+        Ok(out.len())
+    }
+
+    /// The 16 cipher bytes immediately before `block_start`, chaining forward
+    /// from the nearest seed when no checkpoint sits exactly there.
+    ///
+    /// The chain is the *sequential path*, taken deliberately rather than
+    /// guessing a predecessor: a wrong one corrupts exactly the first block and
+    /// leaves the rest correct, which no checksum downstream could attribute.
+    fn chain_to(
+        &mut self,
+        member_id: u32,
+        facts: &MemberCipher,
+        block_start: u64,
+    ) -> std::io::Result<[u8; 16]> {
+        let chain = self.chains.get(&member_id).copied();
+        // The frontier this reader already reached beats every checkpoint, and
+        // for a sequential sweep it *is* the answer.
+        if let Some(preceding) = chain.and_then(|chain| chain.seed_for(block_start)) {
+            self.counters
+                .seeded_from_checkpoint
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(preceding);
+        }
+        let seed = facts.seed(block_start);
+        let (mut cursor, mut preceding) = match chain {
+            Some(chain) if chain.frontier <= block_start && chain.frontier > seed.chain_start => {
+                (chain.frontier, chain.frontier_block)
+            }
+            _ => (seed.chain_start, seed.preceding),
+        };
+        match cursor {
+            0 => self
+                .counters
+                .seeded_from_start
+                .fetch_add(1, Ordering::Relaxed),
+            _ => self
+                .counters
+                .seeded_from_checkpoint
+                .fetch_add(1, Ordering::Relaxed),
+        };
+
+        while cursor < block_start {
+            let step = (block_start - cursor).min(CHAIN_CHUNK_BYTES as u64);
+            let plain = self.member_plaintext(member_id, facts, cursor, cursor + step)?;
+            let cipher = facts.encrypt(&preceding, &plain);
+            preceding.copy_from_slice(&cipher[cipher.len() - 16..]);
+            cursor += step;
+            self.counters
+                .chained_bytes
+                .fetch_add(step, Ordering::Relaxed);
+        }
+        Ok(preceding)
+    }
+
+    /// The plaintext behind `[from, to)` of a member's cipher stream: its
+    /// partial below `unpacked_size`, the retained tail padding above it.
+    ///
+    /// Refuses — as a hole, because "refetch this" is what it means — whenever a
+    /// byte of that range is not really there. The coverage test is the load
+    /// bearing one: a partial is a sparse file, so a gap reads back as zeros,
+    /// and CBC would turn those zeros into perfectly well-formed cipher for
+    /// every block from there to the member's end.
+    fn member_plaintext(
+        &mut self,
+        member_id: u32,
+        facts: &MemberCipher,
+        from: u64,
+        to: u64,
+    ) -> std::io::Result<Vec<u8>> {
+        if !facts.plaintext_present(from, to) {
+            return Err(self.refuse());
+        }
+        let mut plain = vec![0u8; (to - from) as usize];
+        let on_disk = to.min(facts.unpacked_size());
+        if on_disk > from {
+            let mut read = 0usize;
+            let want = (on_disk - from) as usize;
+            while read < want {
+                match self.read_member_plain(
+                    member_id,
+                    from + read as u64,
+                    &mut plain[read..want],
+                )? {
+                    0 => return Err(self.refuse()),
+                    progress => read += progress,
+                }
+            }
+        }
+        if to > facts.unpacked_size() {
+            // The final block. Its plaintext past the member's end is the
+            // retained padding, and a member that never captured it whole cannot
+            // serve this block at all — nor the destination bytes inside it.
+            let Some(tail) = facts.tail_plain() else {
+                return Err(self.refuse());
+            };
+            let at = (facts.unpacked_size().max(from) - from) as usize;
+            let take = (to - facts.unpacked_size()) as usize;
+            if take > tail.len() {
+                return Err(self.refuse());
+            }
+            plain[at..at + take].copy_from_slice(&tail[..take]);
+        }
+        Ok(plain)
+    }
+
+    /// Files both seeds a following read could want: the frontier, and the
+    /// predecessor of the last block produced.
+    fn remember_chain(
+        &mut self,
+        member_id: u32,
+        frontier: u64,
+        cipher: &[u8],
+        preceding: [u8; 16],
+    ) {
+        let Ok(frontier_block) = <[u8; 16]>::try_from(&cipher[cipher.len() - 16..]) else {
+            return;
+        };
+        let resume_block = match cipher.len() >= 32 {
+            true => <[u8; 16]>::try_from(&cipher[cipher.len() - 32..cipher.len() - 16])
+                .unwrap_or(preceding),
+            // One block: its predecessor is what this call was handed.
+            false => preceding,
+        };
+        self.chains.insert(
+            member_id,
+            CipherChain {
+                frontier,
+                frontier_block,
+                resume: frontier.saturating_sub(16),
+                resume_block,
+            },
+        );
+    }
+
+    /// A refusal by the overlay, counted and reported as a hole.
+    fn refuse(&self) -> std::io::Error {
+        self.counters.refusals.fetch_add(1, Ordering::Relaxed);
+        hole(self.volume.volume_index, self.position)
     }
 }
 

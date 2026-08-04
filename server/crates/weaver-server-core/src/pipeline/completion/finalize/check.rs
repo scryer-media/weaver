@@ -1122,6 +1122,11 @@ impl Pipeline {
 
                 let inner =
                     weaver_par2::PlacementFileAccess::from_plan(verify_dir, &par2_set, &plan);
+                // Plan 136, E2. Taken before the provider is moved into the
+                // access: for an encrypted set the pass reads posted bytes the
+                // overlay re-derives, and these are the only numbers that say
+                // what that cost. Zero for every unencrypted set.
+                let cipher = direct.provider.cipher_counters();
                 let file_access =
                     crate::pipeline::direct_store::par2_access::DirectVolumeFileAccess::new(
                         inner,
@@ -1140,6 +1145,19 @@ impl Pipeline {
                     // from.
                     sequential_refusals = counters.sequential_refusals(),
                     ranged_reads = counters.ranged_reads(),
+                    // Plan 136 open question 1, in production. `chained_bytes`
+                    // is what checkpoint misses cost — bytes re-encrypted only
+                    // to reach a ranged read's CBC seed and then discarded — and
+                    // `seeded_from_start` counts the reads that had no reachable
+                    // checkpoint at all. Both large against `reencrypted_bytes`
+                    // means the checkpoint stride is too wide for this shape.
+                    reencrypted_bytes = cipher.reencrypted_bytes(),
+                    chained_bytes = cipher.chained_bytes(),
+                    seeded_from_checkpoint = cipher.seeded_from_checkpoint(),
+                    seeded_from_start = cipher.seeded_from_start(),
+                    // A read the overlay would not answer: unreproducible posted
+                    // bytes, which the pass sees as damage.
+                    cipher_refusals = cipher.refusals(),
                     "authoritative PAR2 pass read a direct set's volumes virtually"
                 );
                 Ok((verification, plan))

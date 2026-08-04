@@ -2608,6 +2608,9 @@ fn provider_fixture_with_extents(covered: ByteRanges, with_extents: bool) -> Pro
             covered,
             envelope_covered,
             len: total as u64,
+            // No encrypted member: the re-encrypting overlay is off, which is
+            // the shape every plan 135 assertion below was written against.
+            ciphers: std::sync::Arc::default(),
         },
         _dir: dir,
         conventional,
@@ -2848,6 +2851,352 @@ fn the_volume_provider_trait_refuses_a_volume_the_set_does_not_have() {
     );
     assert!(provider.volume(0).is_some());
     assert!(provider.volume(9).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// The re-encrypting overlay (plan 136, E-D4)
+// ---------------------------------------------------------------------------
+
+const CIPHER_SALT: [u8; 16] = [0x2B; 16];
+const CIPHER_IV: [u8; 16] = [0x7C; 16];
+const CIPHER_LG2: u8 = 4;
+
+/// A whole encrypted member, built the way the write side builds one: derive the
+/// real key material, encrypt the padded plaintext, then feed the cipher through
+/// [`super::router::crypt::MemberCrypt::decrypt_range`] in `chunk`-sized pieces
+/// so the checkpoints and the retained padding come out of the production path
+/// rather than out of a constructor.
+///
+/// Returns `(posted cipher, plaintext, write-side state, destination coverage)`;
+/// the read-side facts come from `crypt.cipher_facts(len, &covered)`, which is
+/// the production hand-off, and a test wanting a *holed* member simply passes a
+/// coverage map with a gap in it.
+fn encrypted_member_facts(
+    payload_len: usize,
+    chunk: usize,
+) -> (
+    Vec<u8>,
+    Vec<u8>,
+    super::router::crypt::MemberCrypt,
+    ByteRanges,
+) {
+    let material = weaver_unrar::derive_rar5_material("moonlit-harbour", &CIPHER_SALT, CIPHER_LG2)
+        .expect("the fixture KDF count is derivable");
+    let facts = weaver_unrar::RarVolumeMemberEncryptionFacts {
+        version: 0,
+        kdf_count_lg2: CIPHER_LG2,
+        salt: CIPHER_SALT,
+        iv: CIPHER_IV,
+        psw_check_present: false,
+        psw_check: None,
+    };
+    let plain: Vec<u8> = (0..payload_len).map(|index| (index % 251) as u8).collect();
+    let cipher_len = payload_len.div_ceil(16) * 16;
+    let mut padded = plain.clone();
+    // The padding a real writer emits is whatever was in its buffer; a
+    // recognisable pattern proves the overlay reads the *retained* bytes rather
+    // than zero-filling.
+    for index in payload_len..cipher_len {
+        padded.push(0xE0 | (index % 16) as u8);
+    }
+    let posted = weaver_unrar::test_support::encrypt_aes256_cbc(&material.key, &CIPHER_IV, &padded);
+
+    let mut crypt = super::router::crypt::MemberCrypt::new(
+        super::router::crypt::MemberKeys {
+            key: material.key,
+            hash_key: material.hash_key,
+        },
+        &facts,
+    );
+    crypt.observe(&weaver_unrar::EncryptedStore {
+        crypt: Some(facts),
+        rar4_salt: None,
+        cipher_size: Some(cipher_len as u64),
+        tail_padding: Some((cipher_len - payload_len) as u8),
+        resolved: true,
+    });
+    let mut covered = ByteRanges::new();
+    let mut preceding = CIPHER_IV;
+    let mut at = 0usize;
+    while at < cipher_len {
+        let step = chunk.min(cipher_len - at);
+        let mut piece = posted[at..at + step].to_vec();
+        let next: [u8; 16] = posted[at + step - 16..at + step]
+            .try_into()
+            .expect("a whole block");
+        assert!(crypt.decrypt_range(at as u64, &preceding, &mut piece));
+        crypt.retain_tail_padding(payload_len as u64, at as u64, &piece);
+        let destination = payload_len.saturating_sub(at).min(step);
+        if destination > 0 {
+            covered.insert(at as u64, destination as u64);
+        }
+        preceding = next;
+        at += step;
+    }
+    (posted, plain, crypt, covered)
+}
+
+/// A one-member virtual volume whose whole image is that member, so a read at
+/// physical offset *n* is a read at member-logical offset *n*.
+fn cipher_volume(
+    dir: &Path,
+    plain: &[u8],
+    facts: super::router::crypt::MemberCipher,
+    volume_len: u64,
+) -> super::provider::VirtualVolume {
+    let partial = dir.join("Silver.Horizon.S04E02.mkv.direct.partial");
+    std::fs::write(&partial, plain).unwrap();
+    let envelope = dir.join("silver.horizon.vol00000.envelope");
+    std::fs::write(&envelope, Vec::new()).unwrap();
+    let mut covered = ByteRanges::new();
+    covered.insert(0, volume_len);
+    super::provider::VirtualVolume {
+        volume_index: 0,
+        envelope,
+        extents: vec![super::router::MemberExtent {
+            member_id: 0,
+            physical_offset: 0,
+            logical_offset: 0,
+            len: plain.len() as u64,
+        }],
+        partials: Arc::new([(0u32, partial)].into_iter().collect()),
+        covered,
+        envelope_covered: ByteRanges::new(),
+        len: volume_len,
+        ciphers: Arc::new([(0u32, facts)].into_iter().collect()),
+    }
+}
+
+#[test]
+fn the_overlay_reads_an_encrypted_member_back_as_it_was_posted() {
+    use std::io::Read;
+
+    // The whole point of E-D4 in one assertion: what is on disk is plaintext,
+    // and what comes out of the provider is the cipher that was posted —
+    // including the final block, whose plaintext runs past the member's end into
+    // the retained tail padding.
+    let dir = tempfile::tempdir().unwrap();
+    let (posted, plain, crypt, covered) = encrypted_member_facts(3000, 256);
+    assert_ne!(posted[..plain.len()], plain[..], "the fixture must encrypt");
+    let facts = crypt
+        .cipher_facts(plain.len() as u64, &covered)
+        .expect("a sized member has read-side facts");
+    let volume = cipher_volume(dir.path(), &plain, facts, plain.len() as u64);
+    let provider = super::provider::HybridVolumeProvider::new(vec![volume]);
+
+    let mut reader = provider.open(0).expect("registered");
+    let mut read_back = Vec::new();
+    reader.read_to_end(&mut read_back).unwrap();
+    assert_eq!(
+        read_back,
+        posted[..plain.len()],
+        "a sequential sweep must reproduce the posted stream exactly"
+    );
+    let counters = provider.cipher_counters();
+    assert_eq!(counters.refusals(), 0);
+    assert_eq!(
+        counters.chained_bytes(),
+        0,
+        "a sequential sweep carries its own chain and must never re-encrypt a \
+         byte twice"
+    );
+}
+
+#[test]
+fn a_ranged_read_across_every_checkpoint_boundary_reproduces_the_posted_bytes() {
+    // The checkpoint risk plan 136 names: a stale or wrong 16-byte seed corrupts
+    // exactly the first block of a read and leaves the rest correct, which no
+    // checksum downstream could attribute. So every window that starts and ends
+    // on either side of a boundary is read on its own, through a *fresh* reader
+    // each time, so nothing rides the previous read's chain.
+    let dir = tempfile::tempdir().unwrap();
+    // Two strides plus change, decrypted in stride-crossing pieces, so the
+    // checkpoint map has both frontier and strided entries in it.
+    let stride = super::router::crypt::CHECKPOINT_STRIDE as usize;
+    let (posted, plain, crypt, covered) =
+        encrypted_member_facts(stride * 2 + 3000, stride / 2 + 48);
+    let facts = crypt
+        .cipher_facts(plain.len() as u64, &covered)
+        .expect("a sized member has read-side facts");
+    assert!(
+        facts.checkpoint_count() >= 3,
+        "non-vacuity: the fixture must retain strided checkpoints, got {}",
+        facts.checkpoint_count()
+    );
+    let volume = cipher_volume(dir.path(), &plain, facts, plain.len() as u64);
+    let provider = super::provider::HybridVolumeProvider::new(vec![volume]);
+
+    let mut offsets: Vec<u64> = Vec::new();
+    for boundary in [stride as u64, (stride * 2) as u64] {
+        // Straddling, exactly on, just under and just over — in both block-
+        // aligned and misaligned form.
+        offsets.extend([
+            boundary - 33,
+            boundary - 16,
+            boundary - 1,
+            boundary,
+            boundary + 1,
+            boundary + 16,
+        ]);
+    }
+    // And an offset far below every checkpoint, which has no reachable seed and
+    // must take the sequential fallback rather than guess one.
+    offsets.push(64);
+    offsets.push(0);
+
+    let mut reads = 0u64;
+    for offset in offsets {
+        for len in [1u64, 15, 16, 17, 4096] {
+            let end = (offset + len).min(plain.len() as u64);
+            if end <= offset {
+                continue;
+            }
+            // A fresh reader per window, so nothing rides the previous read's
+            // chain and every one of these really does seed itself.
+            let mut reader = provider.open(0).expect("registered");
+            std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(offset)).unwrap();
+            let mut got = vec![0u8; (end - offset) as usize];
+            std::io::Read::read_exact(&mut reader, &mut got).unwrap();
+            assert_eq!(
+                got,
+                posted[offset as usize..end as usize],
+                "a ranged read at {offset} for {len} must reproduce the posted bytes"
+            );
+            reads += 1;
+        }
+    }
+    let counters = provider.cipher_counters();
+    assert_eq!(counters.refusals(), 0, "nothing here may refuse");
+    assert!(
+        counters.seeded_from_checkpoint() > 0,
+        "the checkpoints must actually have been used"
+    );
+    assert!(
+        counters.seeded_from_start() > 0,
+        "and the no-reachable-checkpoint case must really have taken the \
+         sequential fallback"
+    );
+    // The bound the stride exists for, and the answer to plan 136's open
+    // question 1: a read below the first checkpoint chains from the member's
+    // start, and every other one chains at most one stride — never the whole
+    // member, which is what a frontier-only checkpoint map would have cost.
+    assert!(
+        counters.chained_bytes() <= reads * super::router::crypt::CHECKPOINT_STRIDE,
+        "checkpoint misses must stay bounded by the stride: {} chained over {reads} reads",
+        counters.chained_bytes()
+    );
+}
+
+#[test]
+fn a_member_whose_tail_padding_is_not_whole_refuses_its_final_block() {
+    use std::io::Read;
+
+    // Plan 136 E-D2/F4, read from the other end. The final cipher block covers
+    // bytes past `unpacked_size` that no destination holds, so without them it
+    // cannot be re-encrypted — and neither can the destination bytes *inside*
+    // it. Fabricating a padding would produce a structurally perfect cipher
+    // block that is not the one that was posted, which PAR2 would report as
+    // damage in a byte-perfect volume.
+    let dir = tempfile::tempdir().unwrap();
+    let material = weaver_unrar::derive_rar5_material("moonlit-harbour", &CIPHER_SALT, CIPHER_LG2)
+        .expect("derivable");
+    let facts = weaver_unrar::RarVolumeMemberEncryptionFacts {
+        version: 0,
+        kdf_count_lg2: CIPHER_LG2,
+        salt: CIPHER_SALT,
+        iv: CIPHER_IV,
+        psw_check_present: false,
+        psw_check: None,
+    };
+    let payload_len = 3000usize;
+    let cipher_len = payload_len.div_ceil(16) * 16;
+    let plain: Vec<u8> = (0..payload_len).map(|index| (index % 251) as u8).collect();
+
+    // Everything decrypted and every destination byte covered — but the padding
+    // never retained, which is what a run that stopped before the final
+    // article's second half leaves behind.
+    let mut crypt = super::router::crypt::MemberCrypt::new(
+        super::router::crypt::MemberKeys {
+            key: material.key,
+            hash_key: material.hash_key,
+        },
+        &facts,
+    );
+    crypt.observe(&weaver_unrar::EncryptedStore {
+        crypt: Some(facts),
+        rar4_salt: None,
+        cipher_size: Some(cipher_len as u64),
+        tail_padding: Some((cipher_len - payload_len) as u8),
+        resolved: true,
+    });
+    let mut covered = ByteRanges::new();
+    covered.insert(0, payload_len as u64);
+    let read_side = crypt
+        .cipher_facts(payload_len as u64, &covered)
+        .expect("a sized member still has facts");
+    assert!(
+        read_side.tail_plain().is_none(),
+        "non-vacuity: the padding must really be missing"
+    );
+
+    let volume = cipher_volume(dir.path(), &plain, read_side, payload_len as u64);
+    let provider = super::provider::HybridVolumeProvider::new(vec![volume]);
+    let mut reader = provider.open(0).expect("registered");
+    let mut read_back = Vec::new();
+    let error = reader
+        .read_to_end(&mut read_back)
+        .expect_err("the final block has no byte-exact source");
+    assert!(
+        super::provider::is_hole(&error),
+        "the refusal must read as a hole — 'refetch this' — rather than as a \
+         broken disk, got {error}"
+    );
+
+    // And the refusal is scoped to the block it is about: everything below the
+    // final cipher block still has a byte-exact source and is still served.
+    let last_block = (payload_len / 16) * 16;
+    let mut reader = provider.open(0).expect("registered");
+    let mut below = vec![0u8; last_block];
+    reader
+        .read_exact(&mut below)
+        .expect("every whole block below the final one is reproducible");
+    let mut reader = provider.open(0).expect("registered");
+    std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(last_block as u64)).unwrap();
+    let error = reader
+        .read(&mut [0u8; 8])
+        .expect_err("the final block itself has nothing to re-encrypt from");
+    assert!(super::provider::is_hole(&error), "got {error}");
+}
+
+#[test]
+fn the_overlay_refuses_a_member_whose_plaintext_has_a_hole_below_the_read() {
+    // CBC's own consequence, stated so it is not rediscovered as a bug: cipher
+    // block N needs block N−1, so a gap anywhere below an offset makes every
+    // byte above it unreproducible. The partial is a sparse file, so the gap
+    // reads back as zeros — well-formed plaintext that would encrypt into
+    // well-formed cipher nothing ever posted.
+    let dir = tempfile::tempdir().unwrap();
+    let (_posted, plain, crypt, _) = encrypted_member_facts(3000, 256);
+    // Same member, same partial — but a destination coverage map with a gap in
+    // its middle, which is what a run that lost an article leaves behind.
+    let mut holed = ByteRanges::new();
+    holed.insert(0, 1000);
+    holed.insert(2000, 1000);
+    let facts = crypt
+        .cipher_facts(plain.len() as u64, &holed)
+        .expect("a sized member still has facts");
+    let volume = cipher_volume(dir.path(), &plain, facts, plain.len() as u64);
+    let provider = super::provider::HybridVolumeProvider::new(vec![volume]);
+
+    let mut reader = provider.open(0).expect("registered");
+    std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(2048)).unwrap();
+    let error = std::io::Read::read(&mut reader, &mut [0u8; 64])
+        .expect_err("bytes above a gap cannot be re-encrypted");
+    assert!(
+        super::provider::is_hole(&error),
+        "an unreproducible range is a hole, got {error}"
+    );
+    assert!(provider.cipher_counters().refusals() > 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -3124,6 +3473,65 @@ fn a_no_ifsc_whole_file_md5_streams_through_the_sequential_reader() {
         "D5 requires the sequential path so a no-IFSC set does not degrade into \
          ranged reads across member partials"
     );
+}
+
+#[test]
+fn an_encrypted_no_ifsc_whole_file_md5_streams_through_the_sequential_reader() {
+    // D5's cost argument, over cipher (plan 136, E2). A set with no IFSC packets
+    // is verified by whole-file MD5, and the MD5 it has to match is the
+    // **posted** volume's — so this is both the strongest byte-for-byte
+    // statement about the overlay and the one place its read *shape* matters:
+    // degrade into ranged reads here and every no-IFSC encrypted set pays a seek
+    // per slice across the member partials, which is the "no worse than today"
+    // claim failing.
+    let dir = tempfile::tempdir().unwrap();
+    let (posted, plain, crypt, covered) = encrypted_member_facts(3000, 256);
+    let facts = crypt
+        .cipher_facts(plain.len() as u64, &covered)
+        .expect("a sized member has read-side facts");
+    let volume = cipher_volume(dir.path(), &plain, facts, plain.len() as u64);
+    let par2_set = descriptor_only_par2_set("silver.horizon.part01.rar", &posted[..plain.len()]);
+    let file_id = par2_set.recovery_file_ids[0];
+    let inner = weaver_par2::PlacementFileAccess::new(
+        dir.path().to_path_buf(),
+        &par2_set,
+        std::collections::HashMap::new(),
+    );
+    let provider = super::provider::HybridVolumeProvider::new(vec![volume]);
+    let cipher_counters = provider.cipher_counters();
+    let access = DirectVolumeFileAccess::new(
+        inner,
+        provider,
+        &[VirtualPar2Volume {
+            par2_file_id: file_id,
+            volume_index: 0,
+        }],
+    );
+    let counters = access.counters();
+
+    assert!(
+        weaver_par2::verify_full_hash(&par2_set, &file_id, &access)
+            .expect("the description names a registered virtual volume"),
+        "the whole-file MD5 of an encrypted virtual volume must match the volume \
+         as it was posted, not as it was decrypted"
+    );
+    assert!(
+        counters.sequential_opens() > 0,
+        "the whole-file MD5 must stream through `open_sequential_reader`"
+    );
+    assert_eq!(
+        counters.ranged_reads(),
+        0,
+        "an encrypted no-IFSC set must not degrade into ranged reads across the \
+         member partials"
+    );
+    assert_eq!(
+        cipher_counters.chained_bytes(),
+        0,
+        "and the sequential sweep must carry its own CBC chain, so no byte is \
+         re-encrypted twice"
+    );
+    assert_eq!(cipher_counters.refusals(), 0);
 }
 
 #[test]

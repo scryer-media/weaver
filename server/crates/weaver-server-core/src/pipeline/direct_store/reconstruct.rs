@@ -130,17 +130,17 @@ pub(crate) enum ReconstructionFailure {
     /// `set_len` opens a hole, so on Windows nothing has been allocated yet and
     /// the refetch pays only what the conventional path always pays.
     SparseMarkFailed { volume_index: u32, error: String },
-    /// The set routed an **encrypted** member, so its destinations hold
-    /// plaintext where the source volume holds cipher (plan 136, E-D2).
+    /// The set routed an **encrypted** member whose posted bytes the provider
+    /// overlay cannot reproduce (plan 136, E2).
     ///
-    /// Reconstruction reads posted bytes back out of those destinations, and
-    /// re-encrypting them on the fly is the provider overlay E-D4 specifies and
-    /// phase E2 builds. Until it exists this refuses rather than writing
-    /// plaintext into a volume under a published floor — which no checksum here
-    /// would catch, because the yEnc part CRCs it compares against describe the
-    /// posted bytes and the composition would simply never match. Refetching is
-    /// always correct, and an encrypted set demoting at all is already the
-    /// exceptional path.
+    /// Reconstruction reads posted bytes back out of destinations that hold
+    /// plaintext, and the overlay re-encrypts them on the way — so an encrypted
+    /// set is reconstructed like any other. This is what is left when the
+    /// overlay itself refuses: a routed member with no declared cipher size, or
+    /// one whose tail padding never arrived whole, so its final block has no
+    /// byte-exact source. Refused up front rather than discovered mid-sweep,
+    /// because the alternative is a volume that is right everywhere except one
+    /// block and a floor published over it.
     EncryptedPostedBytes,
 }
 
@@ -199,8 +199,7 @@ impl std::fmt::Display for ReconstructionFailure {
             ),
             Self::EncryptedPostedBytes => write!(
                 formatter,
-                "the set routed encrypted members, whose posted bytes cannot be reproduced until \
-                 the re-encrypting provider overlay exists"
+                "an encrypted member the set routed cannot reproduce its posted bytes"
             ),
         }
     }

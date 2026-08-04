@@ -34,12 +34,38 @@
 //! the destination file because they are not in it. They are kept per member and
 //! carried in the coverage snapshot.
 //!
-//! # What phase E2 inherits, and the one precondition it must not assume
+//! # The read side (E2): posted bytes are re-derived, never stored
 //!
-//! E1 decrypts on the way in and never has to answer in cipher space again.
-//! E2's re-encrypting overlay does, and it will read this module's two caches to
-//! do it — so the precondition they are maintained under has to be written down
-//! rather than rediscovered (E1 review F6).
+//! Everything above is the write side. Phase E2 adds the inverse — every
+//! consumer that needs the bytes as they were **posted** gets cipher, which
+//! nothing on disk holds any more. AES-CBC encryption is deterministic given
+//! key, IV and plaintext, so the posted stream is always reproducible: the
+//! provider overlay reads a member's plaintext back out of its `.direct.partial`
+//! and re-encrypts it. [`MemberCipher`] is the read-side facts that makes that
+//! possible, and [`MemberCrypt::cipher_facts`] is where the write side hands
+//! them over.
+//!
+//! Two things are not re-derivable and are therefore kept:
+//!
+//! - the **tail padding's plaintext**, because the final block's cipher covers
+//!   bytes past `unpacked_size` that the destination never received;
+//! - a **CBC seed** for any offset a read starts at that is not the member's
+//!   start. Block *N*'s cipher needs block *N−1*'s, so re-encrypting from an
+//!   interior offset needs 16 cipher bytes that only existed while the wire
+//!   bytes were in hand. [`MemberCrypt::checkpoints`] retains them: at every
+//!   contiguous decrypted run's frontier, and additionally every
+//!   [`CHECKPOINT_STRIDE`] bytes inside one.
+//!
+//! The stride is E2's answer to plan 136's open question 1. A run frontier alone
+//! is the wrong shape for a *ranged* read: an ordinary in-order download keeps
+//! exactly one checkpoint and it sits at the download frontier, which is past
+//! every interior offset a verifier or a repair ever asks about — so every
+//! ranged read would chain from the member's start and a slice-by-slice sweep
+//! would be quadratic in the member's size. The stride bounds that chain to one
+//! stride's worth of AES, costs 24 bytes per stride per member in memory and in
+//! the snapshot, and needs no second in-memory tier on top.
+//!
+//! # The one precondition the overlay must not assume (E1 review F6)
 //!
 //! [`MemberCrypt::edge_plain`] and [`MemberCrypt::checkpoints`] are only ever
 //! valid for the bytes that produced them. A **repair** rewrites a span in
@@ -47,18 +73,17 @@
 //! takes the repaired plaintext, and the composition is overwritten — but a
 //! cached edge block covering the same offsets still holds the plaintext of the
 //! *damaged* bytes, and a checkpoint at that frontier still holds the damaged
-//! cipher. Nothing in E1 reads either one afterwards, which is why E1 is correct
-//! without touching them: the destination is the only consumer of a decrypted
-//! edge block, and it has already been written.
+//! cipher. E1 was correct without touching them because nothing read either one
+//! afterwards: the destination is the only consumer of a decrypted edge block,
+//! and it has already been written.
 //!
-//! E2 must not carry that assumption over. Re-encrypting a repaired edge block
-//! from `edge_plain`, or chaining a re-encryption from a `checkpoints` entry a
-//! repair has invalidated, would emit cipher for bytes the volume no longer
-//! holds — silently, because the values are structurally well-formed. The
-//! requirement is therefore explicit: **a span that arrives with `replace` set
-//! must invalidate every cached edge block and checkpoint its cipher range
-//! touches before the overlay may read them.** Where E1 has no reason to spend
-//! that work, E2 has no licence to skip it.
+//! E2 reads both, so it may not carry that assumption over. Re-encrypting a
+//! repaired edge block from `edge_plain`, or chaining a re-encryption from a
+//! `checkpoints` entry a repair has invalidated, would emit cipher for bytes the
+//! volume no longer holds — silently, because the values stay structurally
+//! well-formed. [`MemberCrypt::invalidate_repaired`] is the discharge of that
+//! requirement, and [`super::DirectSetRouter::route_encrypted_slice`] calls it
+//! on every `replace` span **before** a byte of that span is resolved.
 //!
 //! # Privacy note: the retained padding is the user's plaintext
 //!
@@ -82,6 +107,22 @@ use crate::pipeline::direct_store::ByteRanges;
 
 /// AES block size, in the one place this module states it.
 pub(crate) const AES_BLOCK: u64 = 16;
+
+/// How far apart the cipher checkpoints a ranged re-encryption can seed from are
+/// kept inside one contiguous decrypted run (E2, plan 136 open question 1).
+///
+/// The run *frontier* checkpoint E1 keeps answers the write side's question —
+/// "where does the next arriving span chain from" — and answers the read side's
+/// not at all: an in-order download holds exactly one, at the download frontier,
+/// which is past every interior offset a verifier or a repair asks about. Every
+/// ranged read would then chain from the member's start, and a slice-by-slice
+/// sweep of an *n*-byte member would re-encrypt O(n²) bytes.
+///
+/// 4 MiB bounds a ranged read's chain to ~2 ms of AES on any machine weaver
+/// runs on, and costs 24 bytes per stride per member — 6 KiB per GiB, in memory
+/// and in the coverage snapshot alike. Smaller stride, more snapshot; larger
+/// stride, more chaining. Nothing else in the system depends on the value.
+pub(crate) const CHECKPOINT_STRIDE: u64 = 4 * 1024 * 1024;
 
 /// The block-aligned offset at or below `offset`.
 pub(crate) fn block_floor(offset: u64) -> u64 {
@@ -113,24 +154,6 @@ pub(crate) enum CryptRefusal {
     /// member (file encryption for RAR4/RAR3 is phase E3), or a KDF count the
     /// crate refuses.
     Unkeyable,
-    /// The job's own spec declares a PAR2 file, and an encrypted set's
-    /// destinations hold plaintext where PAR2 describes the posted cipher
-    /// (plan 136, E1 review F1).
-    ///
-    /// Refused **at admission**, before a byte routes, rather than left to the
-    /// guard that runs behind the authoritative pass: that guard cannot fire
-    /// until the whole set has downloaded, and by then a demotion costs a full
-    /// refetch of every volume because an encrypted set's partials cannot
-    /// reconstruct posted bytes. Refusing here reproduces exactly what a
-    /// pre-plan-136 build did with the same job — one hard demotion on the first
-    /// header parse, one article back on the wire — instead of doubling it.
-    ///
-    /// Distinct from [`super::DemotionReason::EncryptedPar2Unsupported`], which
-    /// stays as the belt for a recovery set that genuinely appears late: a PAR2
-    /// file the spec did not classify as one at add time (a deobfuscated or
-    /// renamed file) can still turn up mid-job, and the set is already routing
-    /// by then.
-    Par2Declared,
 }
 
 impl CryptRefusal {
@@ -139,7 +162,6 @@ impl CryptRefusal {
             Self::NoPassword => "encrypted_no_password",
             Self::WrongPassword => "encrypted_wrong_password",
             Self::Unkeyable => "encrypted_unkeyable",
-            Self::Par2Declared => "encrypted_par2_declared",
         }
     }
 }
@@ -182,10 +204,6 @@ pub(crate) struct KeyRing {
     /// Whether any encrypted member has been admitted. Read by the eligibility
     /// gate, which counts an encrypted member routable only with one.
     admitted: bool,
-    /// The job declares a PAR2 file, so no encrypted member of this set may be
-    /// admitted at all ([`CryptRefusal::Par2Declared`]). Set once, from the
-    /// spec, when the set is built.
-    par2_declared: bool,
 }
 
 impl std::fmt::Debug for KeyRing {
@@ -196,7 +214,6 @@ impl std::fmt::Debug for KeyRing {
             .field("tuples", &self.keys.len())
             .field("refusal", &self.refusal)
             .field("admitted", &self.admitted)
-            .field("par2_declared", &self.par2_declared)
             .finish()
     }
 }
@@ -215,20 +232,7 @@ impl KeyRing {
             keys: BTreeMap::new(),
             refusal: None,
             admitted: false,
-            par2_declared: false,
         }
-    }
-
-    /// Refuses every encrypted member of this set because the job's spec
-    /// declares a PAR2 file (plan 136, E1 review F1).
-    ///
-    /// Deliberately **not** a sticky refusal: `refusal` going non-`None` here
-    /// would close [`Self::wants_password`] for a set with no encrypted member
-    /// at all, and the whole point is that a plaintext set in a par2-bearing job
-    /// is untouched by this. The verdict is reached at
-    /// [`Self::admit`] instead, which only an encrypted member reaches.
-    pub(crate) fn refuse_encrypted_for_par2(&mut self) {
-        self.par2_declared = true;
     }
 
     /// Whether the set is still willing to take a password.
@@ -281,9 +285,14 @@ impl KeyRing {
     /// The E-D1 decision for one encrypted member, made **before any byte of it
     /// routes**.
     ///
-    /// - The job declares a PAR2 file: refuse ([`CryptRefusal::Par2Declared`]).
-    ///   Nothing about the key is wrong; the set simply may not route, and this
-    ///   is the last moment refusing is free.
+    /// A PAR2-bearing job used to be refused outright here (E1 review F1),
+    /// because an encrypted set's destinations hold plaintext where PAR2
+    /// describes the posted cipher and nothing could turn one back into the
+    /// other. E2's re-encrypting overlay is what retires that refusal: the
+    /// authoritative pass, live verification, repair and reconstruction all read
+    /// posted bytes through it now, so a recovery set is no longer a reason to
+    /// leave direct mode.
+    ///
     /// - No password: refuse. An encrypted set routes only with one.
     /// - [`PasswordCheck::Wrong`]: refuse. The header states a value this
     ///   password does not reproduce, so every byte it decrypted would be
@@ -304,9 +313,6 @@ impl KeyRing {
     ) -> Result<MemberKeys, CryptRefusal> {
         if let Some(refusal) = self.refusal {
             return Err(refusal);
-        }
-        if self.par2_declared {
-            return Err(self.refuse(CryptRefusal::Par2Declared));
         }
         let Some(password) = self.password.clone() else {
             return Err(self.refuse(CryptRefusal::NoPassword));
@@ -390,6 +396,143 @@ pub(crate) struct MemberCryptSnapshot {
     /// `(cipher offset, the 16 cipher bytes ending there)`, one per contiguous
     /// decrypted run — which for an ordinary download is exactly one.
     pub(crate) checkpoints: Vec<(u64, [u8; 16])>,
+}
+
+/// One encrypted member's **read-side** facts: everything the provider overlay
+/// needs to turn the plaintext in a `.direct.partial` back into the bytes that
+/// were posted (E-D4, phase E2).
+///
+/// A snapshot of the write side, taken whenever a provider is assembled, and
+/// deliberately not a handle on it: the overlay runs on the blocking pool, often
+/// inside `spawn_blocking`, while the router keeps taking articles.
+///
+/// The key is in here because re-encryption needs it. It is never printed, never
+/// serialized and never leaves the process — see [`Self::fmt`].
+#[derive(Clone)]
+pub(crate) struct MemberCipher {
+    key: [u8; 32],
+    /// The member's own CBC IV: the predecessor of cipher block 0.
+    iv: [u8; 16],
+    /// Plaintext length — how much of the member's partial is destination bytes,
+    /// and where the tail padding starts.
+    unpacked_size: u64,
+    /// `align16(unpacked_size)`: how far the posted cipher stream runs.
+    cipher_size: u64,
+    /// The ≤15 plaintext bytes past `unpacked_size`, or `None` when they are not
+    /// all in hand.
+    ///
+    /// `None` is a **refusal**, not an absence: without them the final block
+    /// cannot be re-encrypted, and every byte of that block — including the
+    /// destination bytes below `unpacked_size` — is unreproducible. Fabricating
+    /// them (zeros, say) would produce a structurally valid cipher block that is
+    /// not the one that was posted, which PAR2 would report as damage in a
+    /// byte-perfect volume.
+    tail_plain: Option<Vec<u8>>,
+    /// `(cipher offset, the 16 cipher bytes ending there)` — the CBC seeds a
+    /// ranged re-encryption can start from. See [`CHECKPOINT_STRIDE`].
+    checkpoints: BTreeMap<u64, [u8; 16]>,
+    /// The member's destination coverage, in member-logical (== cipher) space.
+    ///
+    /// The overlay's other precondition, and the one a volume-level coverage map
+    /// cannot answer: re-encrypting `[O, O + n)` reads plaintext from the seed
+    /// all the way to `O`, which for a split member crosses source volumes
+    /// inside one partial file. A gap anywhere in that span is a range the
+    /// filesystem answers with zeros, and CBC would turn those zeros into
+    /// well-formed cipher for every block from there to the member's end.
+    covered: ByteRanges,
+}
+
+impl std::fmt::Debug for MemberCipher {
+    /// Never prints key bytes, and never prints the retained padding either —
+    /// that is decrypted user content.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemberCipher")
+            .field("unpacked_size", &self.unpacked_size)
+            .field("cipher_size", &self.cipher_size)
+            .field("tail_retained", &self.tail_plain.is_some())
+            .field("checkpoints", &self.checkpoints.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where a ranged re-encryption may start, and what it costs to get there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CipherSeed {
+    /// Block-aligned cipher offset the chain starts at.
+    pub(crate) chain_start: u64,
+    /// The 16 cipher bytes immediately before `chain_start`.
+    pub(crate) preceding: [u8; 16],
+}
+
+impl MemberCipher {
+    pub(crate) fn unpacked_size(&self) -> u64 {
+        self.unpacked_size
+    }
+
+    pub(crate) fn cipher_size(&self) -> u64 {
+        self.cipher_size
+    }
+
+    /// The retained tail padding, or `None` when the member cannot serve any
+    /// read that touches its final cipher block.
+    pub(crate) fn tail_plain(&self) -> Option<&[u8]> {
+        self.tail_plain.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_count(&self) -> usize {
+        self.checkpoints.len()
+    }
+
+    /// The nearest place a re-encryption reaching `block_start` may chain from:
+    /// the member's IV at offset 0, or the greatest retained checkpoint at or
+    /// below it.
+    ///
+    /// Never `None` and never a guess — the IV is always a legitimate seed, and
+    /// chaining from it is exactly "fall back to the sequential path". What the
+    /// caller learns from `chain_start` is how much plaintext it has to read and
+    /// re-encrypt to get there, which is the whole cost of a checkpoint miss.
+    pub(crate) fn seed(&self, block_start: u64) -> CipherSeed {
+        debug_assert_eq!(block_start % AES_BLOCK, 0);
+        match self
+            .checkpoints
+            .range(..=block_start)
+            .next_back()
+            .map(|(offset, block)| (*offset, *block))
+        {
+            Some((chain_start, preceding)) => CipherSeed {
+                chain_start,
+                preceding,
+            },
+            None => CipherSeed {
+                chain_start: 0,
+                preceding: self.iv,
+            },
+        }
+    }
+
+    /// Whether every byte of `[start, end)` really is in the member's partial.
+    ///
+    /// Clamped at `unpacked_size`, because the coverage map stops there: the
+    /// padding is not destination bytes and is vouched for by
+    /// [`Self::tail_plain`] instead.
+    pub(crate) fn plaintext_present(&self, start: u64, end: u64) -> bool {
+        let end = end.min(self.unpacked_size);
+        end <= start || self.covered.missing(start, end - start).is_empty()
+    }
+
+    /// CBC-encrypts `plain` — a whole number of blocks starting immediately
+    /// after `preceding` — back into the bytes that were posted.
+    ///
+    /// The inverse of [`decrypt_cipher_range`], and deliberately the *same*
+    /// backend: `weaver-unrar` picks AWS-LC or the pure-Rust cipher per target
+    /// and pins the two equal with differential tests, so re-encrypting through
+    /// it cannot drift from the decrypt weaver already trusts.
+    pub(crate) fn encrypt(&self, preceding: &[u8; 16], plain: &[u8]) -> Vec<u8> {
+        debug_assert!(plain.len().is_multiple_of(AES_BLOCK as usize));
+        weaver_unrar::test_support::encrypt_aes256_cbc(&self.key, preceding, plain)
+    }
 }
 
 /// Why a restored member's crypt facts were refused.
@@ -567,13 +710,67 @@ impl MemberCrypt {
         debug_assert_eq!(len % AES_BLOCK, 0);
         let mut trailing = [0u8; 16];
         trailing.copy_from_slice(&cipher[cipher.len() - 16..]);
+        // Taken before the decrypt, which is the only moment this cipher exists:
+        // the run's frontier block (the write side's seed) plus one block per
+        // stride boundary the range crosses (the read side's, E2). Both are
+        // stored under "the cipher offset the block ends at", so a lookup keyed
+        // by a block start finds the predecessor it needs.
+        let mut strided: Vec<(u64, [u8; 16])> = Vec::new();
+        let first = start
+            .div_ceil(CHECKPOINT_STRIDE)
+            .saturating_mul(CHECKPOINT_STRIDE)
+            .max(CHECKPOINT_STRIDE);
+        let mut at = first;
+        while at < start + len {
+            if at >= start + AES_BLOCK {
+                let offset = (at - start) as usize;
+                let mut block = [0u8; 16];
+                block.copy_from_slice(&cipher[offset - 16..offset]);
+                strided.push((at, block));
+            }
+            at = at.saturating_add(CHECKPOINT_STRIDE);
+        }
         if decrypt_cipher_range(&self.keys.key, preceding, cipher).is_err() {
             return false;
         }
         self.decrypted.insert(start, len);
         self.checkpoints.insert(start + len, trailing);
+        self.checkpoints.extend(strided);
         self.prune_checkpoints();
         true
+    }
+
+    /// Discharges E1 review F6: forgets every cached edge block and every
+    /// checkpoint a repaired span's cipher range touches.
+    ///
+    /// Both caches describe the bytes that produced them, and a `replace` span
+    /// is the router being told those bytes are gone. Neither value goes stale
+    /// in a way anything can detect — a 16-byte plaintext block and a 16-byte
+    /// cipher block are structurally valid whatever they hold — so the only
+    /// defence is to drop them before anything reads them. The repaired span's
+    /// own decrypt re-files whatever it is entitled to re-file.
+    ///
+    /// Called on the way *in*, before the span is resolved: `route_encrypted_slice`
+    /// asks `edge_plain` for the head and tail blocks it cannot decrypt alone,
+    /// and would otherwise be handed the plaintext of the damage it is replacing.
+    pub(crate) fn invalidate_repaired(&mut self, cipher_offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let from = block_floor(cipher_offset);
+        let to = block_ceil(cipher_offset.saturating_add(len));
+        self.edge_plain
+            .retain(|start, _| *start < from || *start >= to);
+        // A checkpoint at `k` is the block `[k - 16, k)`, so it survives exactly
+        // when that block does not overlap the rewrite.
+        self.checkpoints
+            .retain(|end, _| *end <= from || end.saturating_sub(AES_BLOCK) >= to);
+        // The rewritten range is no longer decrypted by this process, so it can
+        // neither hold a checkpoint of its own nor keep one alive through
+        // `prune_checkpoints`. The span's own `decrypt_range` puts back exactly
+        // what it re-derived.
+        self.decrypted = super::subtract(&self.decrypted, from, to.saturating_sub(from));
+        self.prune_checkpoints();
     }
 
     /// Files the plaintext of a block the caller could only emit part of.
@@ -718,6 +915,39 @@ impl MemberCrypt {
         })
     }
 
+    /// The read-side facts for this member (E2), or `None` when it cannot serve
+    /// posted bytes at all.
+    ///
+    /// `None` on a member whose headers have not yet declared a size: nothing
+    /// has routed either, so there is nothing to serve — but a caller that
+    /// assembled an overlay without noticing would answer that member's extents
+    /// out of the *plaintext*, which is the one failure this whole phase exists
+    /// to prevent. Refusing here is what lets
+    /// [`super::DirectSetRouter::posted_bytes_unavailable`] be a set-level
+    /// question with a yes/no answer.
+    ///
+    /// `covered` is the member's destination coverage, passed in rather than
+    /// held here: the crypt state tracks *cipher* coverage (which includes the
+    /// padding, and so cannot be compared against a plaintext extent), while the
+    /// overlay reads plaintext and needs the map that describes the partial.
+    pub(crate) fn cipher_facts(
+        &self,
+        unpacked_size: u64,
+        covered: &ByteRanges,
+    ) -> Option<MemberCipher> {
+        Some(MemberCipher {
+            key: self.keys.key,
+            iv: self.iv,
+            unpacked_size,
+            cipher_size: self.cipher_size?,
+            tail_plain: self
+                .tail_padding_retained()
+                .then(|| self.tail_plain[..usize::from(self.tail_padding)].to_vec()),
+            checkpoints: self.checkpoints.clone(),
+            covered: covered.clone(),
+        })
+    }
+
     /// Seeds a restored member (E-D4).
     ///
     /// Refuses when the row disagrees with what the rebuilt layout states: the
@@ -773,16 +1003,28 @@ impl MemberCrypt {
     }
 
     /// Keeps one checkpoint per contiguous decrypted run — the frontier a
-    /// resumed span will start at. Without it a long download would retain 16
-    /// bytes per article for the life of the set.
+    /// resumed span will start at — plus one per [`CHECKPOINT_STRIDE`] inside a
+    /// run, which is what a ranged re-encryption seeds from (E2).
+    ///
+    /// Without the first rule a long download would retain 16 bytes per article
+    /// for the life of the set; without the second, every ranged read would
+    /// chain from the member's start. Both are answered off `decrypted`, so a
+    /// checkpoint describing bytes this process no longer claims — a repair's,
+    /// after [`Self::invalidate_repaired`] — is dropped by the same pass.
     fn prune_checkpoints(&mut self) {
-        let ends: std::collections::BTreeSet<u64> = self
-            .decrypted
-            .ranges()
-            .iter()
-            .map(|(_, end)| *end)
-            .collect();
-        self.checkpoints.retain(|offset, _| ends.contains(offset));
+        let runs: Vec<(u64, u64)> = self.decrypted.ranges().to_vec();
+        self.checkpoints.retain(|offset, _| {
+            let strided = offset.is_multiple_of(CHECKPOINT_STRIDE);
+            runs.iter().any(|(start, end)| {
+                // A frontier checkpoint sits exactly at a run's end; a strided
+                // one sits inside a run, and the block it names must be inside
+                // it too — the block is `[offset - 16, offset)`.
+                if *offset == *end {
+                    return true;
+                }
+                strided && *offset <= *end && offset.saturating_sub(AES_BLOCK) >= *start
+            })
+        });
     }
 }
 
@@ -863,27 +1105,6 @@ mod tests {
     }
 
     #[test]
-    fn a_par2_bearing_job_refuses_every_encrypted_member_at_admission() {
-        // E1 review F1. The guard behind the authoritative pass cannot fire
-        // until the whole set has downloaded; this one fires on the first header
-        // parse, which is where the pre-plan-136 hard demotion was.
-        let mut ring = KeyRing::new();
-        ring.set_password(Some("right"));
-        ring.refuse_encrypted_for_par2();
-        assert_eq!(
-            ring.admit(&facts(None)).err(),
-            Some(CryptRefusal::Par2Declared)
-        );
-        assert!(!ring.admitted());
-        // Sticky, and by its own name rather than the key ring's fallback.
-        assert_eq!(ring.refusal(), Some(CryptRefusal::Par2Declared));
-        assert_eq!(
-            CryptRefusal::Par2Declared.metric(),
-            "encrypted_par2_declared"
-        );
-    }
-
-    #[test]
     fn a_wrong_password_with_no_check_admits_provisionally() {
         let mut ring = KeyRing::new();
         ring.set_password(Some("wrong"));
@@ -925,6 +1146,111 @@ mod tests {
         let mut bytes = vec![0u8; 32];
         assert!(crypt.decrypt_range(32, &[0u8; 16], &mut bytes));
         assert_eq!(crypt.checkpoints.keys().copied().collect::<Vec<_>>(), [80]);
+    }
+
+    /// A `MemberCrypt` over `size` cipher bytes with a real derivable key, so
+    /// the encrypt/decrypt round trip below is over the cipher weaver actually
+    /// uses rather than over a made-up key.
+    fn keyed_crypt(size: u64, padding: u8) -> (MemberCrypt, MemberKeys) {
+        let material = derive_rar5_material("moonlit-harbour", &[7u8; 16], 4).expect("derivable");
+        let keys = MemberKeys {
+            key: material.key,
+            hash_key: material.hash_key,
+        };
+        let mut crypt = MemberCrypt::new(keys, &facts(None));
+        crypt.cipher_size = Some(size);
+        crypt.tail_padding = padding;
+        (crypt, keys)
+    }
+
+    #[test]
+    fn checkpoints_are_kept_every_stride_so_a_ranged_read_never_chains_from_zero() {
+        // Plan 136 open question 1, answered in the state that produces it. An
+        // in-order download decrypts one long run, and the frontier rule alone
+        // would leave exactly one checkpoint — at the frontier, past every
+        // interior offset a verifier asks about.
+        let span = (CHECKPOINT_STRIDE * 2 + 8192) as usize;
+        let (mut crypt, keys) = keyed_crypt(span as u64, 0);
+        let plain: Vec<u8> = (0..span).map(|index| (index % 251) as u8).collect();
+        let mut cipher =
+            weaver_unrar::test_support::encrypt_aes256_cbc(&keys.key, &[9u8; 16], &plain);
+        assert!(crypt.decrypt_range(0, &[9u8; 16], &mut cipher));
+        assert_eq!(
+            cipher, plain,
+            "the fixture must decrypt to its own plaintext"
+        );
+
+        let facts = crypt
+            .cipher_facts(span as u64, &{
+                let mut covered = ByteRanges::new();
+                covered.insert(0, span as u64);
+                covered
+            })
+            .expect("a sized member has read-side facts");
+        assert_eq!(
+            facts.checkpoint_count(),
+            3,
+            "two stride boundaries plus the run frontier"
+        );
+        // A read at the last stride boundary seeds there, not at zero: the chain
+        // is bounded by the stride however large the member is.
+        let seed = facts.seed(CHECKPOINT_STRIDE * 2);
+        assert_eq!(seed.chain_start, CHECKPOINT_STRIDE * 2);
+        // And the seed really is the predecessor: re-encrypting from it
+        // reproduces the posted bytes exactly.
+        let at = (CHECKPOINT_STRIDE * 2) as usize;
+        let reencrypted = facts.encrypt(&seed.preceding, &plain[at..at + 4096]);
+        let posted = weaver_unrar::test_support::encrypt_aes256_cbc(&keys.key, &[9u8; 16], &plain);
+        assert_eq!(reencrypted, posted[at..at + 4096]);
+
+        // An offset below every checkpoint falls back to the member's IV, which
+        // is the sequential path rather than a guess.
+        assert_eq!(facts.seed(64).chain_start, 0);
+        assert_eq!(facts.seed(64).preceding, [9u8; 16]);
+    }
+
+    #[test]
+    fn a_repaired_span_invalidates_the_edge_block_and_checkpoint_it_overwrites() {
+        // E1 review F6, now due. Both caches stay structurally valid across a
+        // repair — a 16-byte block is a 16-byte block — so the only defence is
+        // dropping them before the overlay reads them.
+        let (mut crypt, keys) = keyed_crypt(256, 0);
+        let plain: Vec<u8> = (0..256u16).map(|index| (index % 251) as u8).collect();
+        let posted = weaver_unrar::test_support::encrypt_aes256_cbc(&keys.key, &[9u8; 16], &plain);
+        let last_block: [u8; 16] = posted[240..].try_into().expect("one block");
+        let mut cipher = posted.clone();
+        assert!(crypt.decrypt_range(0, &[9u8; 16], &mut cipher));
+        crypt.retain_edge(48, [0xAB; 16]);
+        crypt.retain_edge(160, [0xCD; 16]);
+        assert_eq!(crypt.checkpoints.keys().copied().collect::<Vec<_>>(), [256]);
+        assert_eq!(crypt.preceding_block(256), Some(last_block));
+
+        // A repair over `[48, 96)` takes the edge block it covers and leaves the
+        // frontier checkpoint, whose own block it does not touch.
+        crypt.invalidate_repaired(48, 48);
+        assert_eq!(
+            crypt.edge_plain(48),
+            None,
+            "the repaired edge block must go"
+        );
+        assert_eq!(
+            crypt.edge_plain(160),
+            Some([0xCD; 16]),
+            "an edge block the rewrite never touched must survive"
+        );
+        assert_eq!(
+            crypt.preceding_block(256),
+            Some(last_block),
+            "a checkpoint past the rewrite is still the bytes that produced it"
+        );
+
+        // And one whose block the rewrite *does* touch goes with it.
+        crypt.invalidate_repaired(240, 16);
+        assert_eq!(
+            crypt.preceding_block(256),
+            None,
+            "a checkpoint over rewritten cipher must not survive to seed a re-encryption"
+        );
     }
 
     #[test]

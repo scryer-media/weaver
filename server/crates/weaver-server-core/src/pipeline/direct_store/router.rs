@@ -151,17 +151,23 @@ pub(crate) enum DemotionReason {
     /// coverage gate keeps passing, because coverage is about *where* bytes are
     /// and says nothing about what they decrypt to.
     EncryptedFactsDisagree,
-    /// A PAR2-bearing job holds a live encrypted direct set (plan 136).
+    /// An encrypted set that cannot reproduce its own posted bytes is about to
+    /// be read as if it could (plan 136, E2).
     ///
-    /// The authoritative pass reads the set's source volumes through the hybrid
-    /// provider, which serves member ranges out of `.direct.partial` files — and
-    /// for an encrypted set those hold plaintext while PAR2 describes the posted
-    /// cipher. Every slice would mismatch, the set would be called damaged, and
-    /// the repair would be handed a virtual volume to fix that was never broken.
-    /// Demoting before the pass keeps its world binary, exactly as
-    /// [`Self::Par2Unbindable`] does: either a fully readable virtual set, or
-    /// real files on disk. Phase E2's re-encrypting overlay retires this.
-    EncryptedPar2Unsupported,
+    /// E1 demoted **every** encrypted set in a PAR2-bearing job under this name,
+    /// because nothing could turn a decrypted destination back into what was
+    /// posted. E2's re-encrypting overlay retires that, and this reason narrows
+    /// to the residual the overlay itself refuses:
+    /// [`DirectSetRouter::posted_bytes_unavailable`] — an encrypted member with
+    /// routed extents whose declared cipher size never arrived, or whose tail
+    /// padding is not whole, so its final block has no byte-exact source.
+    ///
+    /// Still checked in front of the authoritative pass, and still a demotion
+    /// rather than a fallback, for the reason [`Self::Par2Unbindable`] gives:
+    /// the pass's world has to stay binary — a fully readable virtual set, or
+    /// real files on disk — because a half-answerable set has the pass report
+    /// damage that is not there and hand the repairer a volume nobody can write.
+    EncryptedPostedBytesUnavailable,
     /// The ineligible members are individually tolerable but collectively over
     /// D1's budget: `min(64 MiB, 1% of the archive's packed bytes)` packed, or
     /// 256 MiB unpacked.
@@ -342,7 +348,7 @@ impl DemotionReason {
             Self::MemberIneligible(MemberIneligibility::MalformedChain) => "member_malformed_chain",
             Self::EncryptedMemberRefused(refusal) => refusal.metric(),
             Self::EncryptedFactsDisagree => "encrypted_facts_disagree",
-            Self::EncryptedPar2Unsupported => "encrypted_par2_unsupported",
+            Self::EncryptedPostedBytesUnavailable => "encrypted_posted_bytes_unavailable",
             Self::ToleranceBudgetExceeded => "tolerance_budget",
             Self::Par2Damaged => "par2_damaged",
             Self::Par2Unbindable => "par2_unbindable",
@@ -1096,12 +1102,21 @@ impl VolumeStaging {
     /// [`Self::stage_repaired`] without the repair mark: the same force-stage of
     /// an already-routed range, marked as an ordinary duplicate.
     ///
-    /// Test-only, and only because the shape it builds is otherwise unreachable
-    /// by construction from outside: a duplicate never re-stages a routed range
-    /// (that is what [`Self::stage`] refuses), so the one thing that can put
-    /// unrepaired bytes next to repaired ones in a single drained run is state
-    /// the router reached earlier and could not place. See
+    /// Two callers, and both need the *absence* of the mark. A repair's cipher
+    /// lead-in (plan 136, E2) restages bytes that did not change, purely so an
+    /// encrypted member's drain can rebuild the CBC chain into the span above
+    /// them: marking them repaired would have them overwrite a composition they
+    /// did not change and would put them under `route_repaired`'s "every
+    /// repaired byte finds a destination" rule, which they cannot satisfy when
+    /// they land in an unroutable region. The test caller builds the one shape
+    /// that is otherwise unreachable from outside — unrepaired bytes next to
+    /// repaired ones in a single drained run — since [`Self::stage`] refuses a
+    /// routed range outright. See
     /// `a_drain_run_straddling_repaired_and_duplicate_bytes_splits_at_the_boundary`.
+    fn stage_lead_in(&mut self, offset: u64, data: std::sync::Arc<[u8]>) {
+        self.force_stage(offset, data, false);
+    }
+
     #[cfg(test)]
     fn stage_duplicate(&mut self, offset: u64, data: std::sync::Arc<[u8]>) {
         self.force_stage(offset, data, false);
@@ -1546,12 +1561,6 @@ impl DirectSetRouter {
         self.crypt.set_password(password);
     }
 
-    /// Refuses encrypted admission outright because the job declares a PAR2 file
-    /// (plan 136, E1 review F1). Set once, when the set is built.
-    pub(crate) fn refuse_encrypted_for_par2(&mut self) {
-        self.crypt.refuse_encrypted_for_par2();
-    }
-
     /// The key ring's own `Debug`, for the test that proves a password cannot
     /// reach a log through it. The router's `Debug` does not print the ring at
     /// all, so this is the only way to assert on the type that holds the
@@ -1564,35 +1573,166 @@ impl DirectSetRouter {
     /// Whether this set has admitted an encrypted member, i.e. whether any of
     /// its bytes are being decrypted on the way to their destination.
     ///
-    /// Read by every consumer of **posted** bytes, because for such a set the
-    /// destinations hold plaintext and the source volumes held cipher: until
-    /// phase E2's re-encrypting overlay exists, those consumers must refuse
-    /// rather than read plaintext where cipher belongs.
-    ///
-    /// The three that do, and why each one is a refusal rather than a fallback:
-    ///
-    /// - demotion-by-reconstruction, which would rebuild a source volume out of
-    ///   decrypted partials (`reconstruct_demoted_set`);
-    /// - the authoritative PAR2 overlay, which is what
-    ///   `demote_unbindable_direct_sets`' encrypted arm keeps a set out of;
-    /// - **live PAR2** (E1 review F3). Its in-stream feed is honest — those are
-    ///   the posted bytes, taken before routing — but every block straddling an
-    ///   article boundary is settled by a *read-back*, and the read-back goes
-    ///   through `direct_virtual_volume` to the member's `.direct.partial`,
-    ///   which is plaintext. So an encrypted set is kept out of live
-    ///   verification entirely rather than fed a stream it can only ever settle
-    ///   into `Bad` blocks.
-    ///
-    /// One residual, bounded and stated rather than left to be discovered: this
-    /// only goes true at the first header parse, so an article that arrives
-    /// *before* it — the payload-before-header case — is fed. Those bytes are
-    /// correct posted cipher, and the blocks they cover simply never settle:
-    /// the read-back that would finish them finds no virtual volume and no file,
-    /// so they stay `Pending` for the authoritative pass rather than turning
-    /// `Bad`. The cost is a few recorded ranges against the live partial budget,
-    /// never a wrong verdict.
+    /// In E1 this was the refusal every consumer of **posted** bytes read, since
+    /// nothing could turn a decrypted destination back into what was posted. E2
+    /// makes it a statement of fact instead: [`Self::member_ciphers`] is how
+    /// those consumers get posted bytes now, and the question they ask before
+    /// trusting one is [`Self::posted_bytes_unavailable`].
     pub(crate) fn routes_encrypted(&self) -> bool {
         self.crypt.admitted()
+    }
+
+    /// The read-side crypt facts for every encrypted member the set has routed
+    /// bytes for, keyed by stable member id (E2).
+    ///
+    /// This is what makes a virtual volume answer in **cipher** space: the
+    /// provider overlay resolves a physical byte to a member extent exactly as
+    /// it always did, then re-encrypts the plaintext it reads back out of the
+    /// partial. Empty for every unencrypted set, which is the overlay switched
+    /// off by construction.
+    pub(crate) fn member_ciphers(&self) -> HashMap<u32, crypt::MemberCipher> {
+        self.members
+            .iter()
+            .filter_map(|(member_id, member)| {
+                let facts = member
+                    .crypt
+                    .as_ref()?
+                    .cipher_facts(member.unpacked_size, &member.covered)?;
+                Some((*member_id, facts))
+            })
+            .collect()
+    }
+
+    /// Posted cipher bytes in **other** volumes that a repair of `volume_index`
+    /// needs staged beside it (plan 136, E2).
+    ///
+    /// A member's cipher blocks do not respect volume boundaries: a split
+    /// member's part ends wherever the volume filled up, so the block at each
+    /// edge of a member extent is usually half in this volume and half in its
+    /// neighbour. During a download both halves are staged at once and whichever
+    /// drain reaches the block first decrypts it for the other; a repair stages
+    /// one volume long after the neighbour's bytes were routed and dropped, so
+    /// the edge block cannot be assembled at all — and `route_repaired`'s "every
+    /// repaired byte finds a destination" rule then demotes the whole set.
+    ///
+    /// Returns `(volume, physical offset, length)` reads, each at most 15 bytes,
+    /// that the caller answers **through the provider overlay** — those bytes did
+    /// not change, so re-encrypting them from the neighbour's own destination
+    /// reproduces exactly what was posted — and hands back to
+    /// [`Self::route_repaired`] as unrepaired lead-in.
+    pub(crate) fn cipher_edge_reads(&self, volume_index: u32) -> Vec<(u32, u64, u64)> {
+        let mut reads = Vec::new();
+        for extent in self.volume_member_extents(volume_index) {
+            let Some(member) = self.members.get(&extent.member_id) else {
+                continue;
+            };
+            let Some(cipher_size) = member.crypt.as_ref().and_then(MemberCrypt::cipher_size) else {
+                continue;
+            };
+            let low = extent.logical_offset;
+            let high = extent.logical_offset.saturating_add(extent.len);
+            for (from, to) in [
+                (block_floor(low), low),
+                (high, block_ceil(high).min(cipher_size)),
+            ] {
+                if from >= to {
+                    continue;
+                }
+                reads.extend(self.locate_member_cipher(extent.member_id, from, to - from));
+            }
+        }
+        reads.retain(|(volume, _, _)| *volume != volume_index);
+        reads
+    }
+
+    /// Where a member-logical (== cipher) range physically lives, as
+    /// `(volume, physical offset, length)` per volume it crosses.
+    ///
+    /// Read off the **routed extent history** rather than the layout's part
+    /// table, for B1's reason: the history is what the destinations actually
+    /// are, and a member that turned ineligible after routing would otherwise
+    /// map its own bytes to the envelope.
+    fn locate_member_cipher(
+        &self,
+        member_id: u32,
+        logical_offset: u64,
+        len: u64,
+    ) -> Vec<(u32, u64, u64)> {
+        let end = logical_offset.saturating_add(len);
+        let mut found = Vec::new();
+        for (volume, extents) in &self.routed_extents {
+            for extent in extents {
+                if extent.member_id != member_id {
+                    continue;
+                }
+                let extent_end = extent.logical_offset.saturating_add(extent.len);
+                let from = logical_offset.max(extent.logical_offset);
+                let to = end.min(extent_end);
+                if from < to {
+                    found.push((
+                        *volume,
+                        extent.physical_offset + (from - extent.logical_offset),
+                        to - from,
+                    ));
+                }
+            }
+        }
+        found
+    }
+
+    /// Whether some encrypted member this set has **routed bytes for** cannot
+    /// reproduce them (E2).
+    ///
+    /// The fail-closed question behind every posted-byte consumer, and the
+    /// residual the `EncryptedPar2Unsupported` demotion now names. Two shapes
+    /// reach it, and both are refusals rather than approximations:
+    ///
+    /// - a member with no declared `cipher_size`, so no read-side facts exist at
+    ///   all. Nothing should have routed for such a member, and if anything did,
+    ///   its extents would otherwise be answered out of the plaintext;
+    /// - a member that has routed into its **final cipher block** without the
+    ///   tail padding being whole. That block's plaintext runs past
+    ///   `unpacked_size` into bytes no destination holds, so without them
+    ///   neither it nor the destination bytes inside it can be re-encrypted.
+    ///
+    /// Both are scoped to a member with **routed extents**, and the second to
+    /// one whose extents actually reach the final block. A member the set mapped
+    /// but never wrote is nothing for the overlay to answer; one that is simply
+    /// still downloading has no reads in the region it cannot serve, and
+    /// demoting either is a refetch for no benefit. The guard's own caller only
+    /// runs once the payload is in, so "still downloading" is belt rather than
+    /// braces — but it is the difference between a narrow refusal and one that
+    /// fires on every non-block-aligned member mid-flight.
+    pub(crate) fn posted_bytes_unavailable(&self) -> bool {
+        if !self.crypt.admitted() {
+            return false;
+        }
+        let routed: std::collections::BTreeSet<u32> = self
+            .routed_extents
+            .values()
+            .flatten()
+            .map(|extent| extent.member_id)
+            .collect();
+        routed.iter().any(|member_id| {
+            let Some(member) = self.members.get(member_id) else {
+                return false;
+            };
+            let Some(crypt) = member.crypt.as_ref() else {
+                // Not an encrypted member: its extents are plaintext both ways.
+                return false;
+            };
+            let Some(facts) = crypt.cipher_facts(member.unpacked_size, &member.covered) else {
+                return true;
+            };
+            if facts.tail_plain().is_some() {
+                return false;
+            }
+            // The final block's destination bytes. Nothing has asked the overlay
+            // for them until something is written there.
+            let from = block_floor(member.unpacked_size);
+            let len = member.unpacked_size.saturating_sub(from);
+            len > 0 && member.covered.missing(from, len) != vec![(from, from + len)]
+        })
     }
 
     /// Sets the per-set scratch ceiling (D2). Configured, with the env override
@@ -1960,6 +2100,7 @@ impl DirectSetRouter {
         &mut self,
         volume_index: u32,
         chunks: &[RepairedChunk],
+        lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
         if let Some(reason) = self.demoted {
             return Err(reason);
@@ -1967,14 +2108,33 @@ impl DirectSetRouter {
         if !self.plan.volumes.contains_key(&volume_index) {
             return Err(self.fail(DemotionReason::ConflictingVolumeFacts));
         }
-        let staging = self.staging.entry(volume_index).or_default();
         let mut staged = false;
-        for (source_offset, data) in chunks {
+        {
+            let staging = self.staging.entry(volume_index).or_default();
+            for (source_offset, data) in chunks {
+                if data.is_empty() {
+                    continue;
+                }
+                staging.stage_repaired(*source_offset, std::sync::Arc::clone(data));
+                staged = true;
+            }
+        }
+        // Plan 136, E2. Posted bytes an encrypted member's drain needs beside the
+        // repaired span: the ones just below it, so the block its first byte
+        // lands in and that block's CBC predecessor can be assembled, and the
+        // ≤15 in a *neighbouring volume* that complete an edge block of a member
+        // extent ([`Self::cipher_edge_reads`]). Marked **unrepaired** on purpose:
+        // they did not change, so they must not overwrite a composition, and the
+        // "every repaired byte finds a destination" rule below must not answer
+        // for them.
+        for (volume, source_offset, data) in lead_in {
             if data.is_empty() {
                 continue;
             }
-            staging.stage_repaired(*source_offset, std::sync::Arc::clone(data));
-            staged = true;
+            self.staging
+                .entry(*volume)
+                .or_default()
+                .stage_lead_in(*source_offset, std::sync::Arc::clone(data));
         }
         if !staged {
             return Ok(Vec::new());
@@ -3563,6 +3723,22 @@ impl DirectSetRouter {
         };
         let slice_end = logical_offset.saturating_add(len);
         debug_assert!(slice_end <= cipher_size);
+
+        // E1 review F6, discharged before a byte of this span is resolved. A
+        // `replace` span is a PAR2 repair of these very cipher bytes, and both
+        // write-side caches still describe the damaged ones: `encrypted_block_plain`
+        // below would hand back the *damaged* plaintext for an edge block, and a
+        // checkpoint over the rewrite would seed E2's overlay from cipher the
+        // volume no longer holds. Neither goes structurally invalid, so nothing
+        // downstream could notice.
+        if replace
+            && let Some(crypt) = self
+                .members
+                .get_mut(&member_id)
+                .and_then(|member| member.crypt.as_mut())
+        {
+            crypt.invalidate_repaired(logical_offset, len);
+        }
 
         let head_block =
             (!logical_offset.is_multiple_of(AES_BLOCK)).then(|| block_floor(logical_offset));

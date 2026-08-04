@@ -145,6 +145,16 @@ pub(crate) struct RepairedSpan {
     /// CRC32 of the whole span, so the volume's yEnc composition can be
     /// rewritten without hashing the span a second time.
     pub(crate) crc32: u32,
+    /// Up to [`CIPHER_LEAD_IN_BYTES`] posted bytes immediately **below**
+    /// `source_offset`, for an encrypted set's re-route (plan 136, E2).
+    ///
+    /// Deliberately not part of `chunks`, `len` or `crc32`: these bytes did not
+    /// change, they are staged only so the drain can decrypt the span above
+    /// them, and folding them into the span would have
+    /// [`super::set::DirectSet::note_repaired_volume_crcs`] rewrite the volume's
+    /// article-shaped composition over a range that is not article-shaped — the
+    /// one thing [`widen_to_articles`] exists to prevent.
+    pub(crate) lead_in: Option<super::router::RepairedChunk>,
 }
 
 /// What the repaired volumes came out as.
@@ -331,6 +341,22 @@ pub(crate) fn widen_to_articles(
     widened
 }
 
+/// How many posted bytes are read back below a repaired span so an **encrypted**
+/// member's re-route has its CBC predecessor (plan 136, E2).
+///
+/// A repaired span decrypts on the way in, which needs the whole of the cipher
+/// block its first byte lands in **and** the 16 bytes before that block. During
+/// a download both belong to the previous article and are staged beside it; a
+/// repair runs long after that article's bytes were routed and dropped, so
+/// without a lead-in the span has no predecessor at all — it holds, and
+/// `route_repaired`'s "every repaired byte must find a destination" rule demotes
+/// the whole set under `RepairRerouteFailed`.
+///
+/// Two blocks is exactly enough for any alignment: the span's first byte sits at
+/// most 15 bytes into its block, and that block's own predecessor is 16 more.
+/// The bytes come off the **materialized** volume, so they are the posted ones.
+const CIPHER_LEAD_IN_BYTES: u64 = 32;
+
 /// Materializes the damaged volumes and repairs them. Blocking: call it on the
 /// blocking pool.
 ///
@@ -445,14 +471,30 @@ pub(crate) fn repair_damaged_volumes(
 /// staged before its volume's end record would be held rather than routed.
 pub(crate) fn read_repaired_spans(
     volume: &DamagedDirectVolume,
+    cipher_lead_in: bool,
 ) -> Result<Vec<RepairedSpan>, DirectRepairFailure> {
     let mut spans = Vec::with_capacity(volume.rewrite.len());
     for &(start, end) in &volume.rewrite {
         match read_span_chunked(&volume.path, start, end.saturating_sub(start)) {
-            Ok(Some(span)) => spans.push(RepairedSpan {
-                volume_index: volume.volume_index,
-                ..span
-            }),
+            Ok(Some(span)) => {
+                let lead_in = match cipher_lead_in && start > 0 {
+                    true => {
+                        let from = start.saturating_sub(CIPHER_LEAD_IN_BYTES);
+                        read_span_chunked(&volume.path, from, start - from)
+                            .map_err(|error| DirectRepairFailure::ReadBackFailed {
+                                volume_index: volume.volume_index,
+                                error: error.to_string(),
+                            })?
+                            .and_then(|lead| lead.chunks.into_iter().next())
+                    }
+                    false => None,
+                };
+                spans.push(RepairedSpan {
+                    volume_index: volume.volume_index,
+                    lead_in,
+                    ..span
+                });
+            }
             Ok(None) => {}
             Err(error) => {
                 return Err(DirectRepairFailure::ReadBackFailed {
@@ -507,6 +549,7 @@ fn read_span_chunked(
         chunks,
         len,
         crc32,
+        lead_in: None,
     }))
 }
 

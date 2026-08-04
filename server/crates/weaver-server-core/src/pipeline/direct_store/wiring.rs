@@ -429,9 +429,6 @@ impl Pipeline {
         if !self.direct_store.gate().is_enabled() {
             return;
         }
-        // Plan 136, E1 review F1. Read before the sets exist, because it decides
-        // whether an encrypted member of any of them may be admitted at all.
-        let par2_declared = self.job_spec_has_par2_file(job_id);
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
@@ -481,19 +478,6 @@ impl Pipeline {
                 // with, if any; `refresh_direct_passwords` picks up one that
                 // arrives later. Held in memory only.
                 set.router.set_password(password.as_deref());
-                // E1 review F1. A par2-bearing job refuses encrypted admission
-                // on the *first* header parse, where the refusal costs one
-                // article. The `EncryptedPar2Unsupported` guard behind the
-                // authoritative pass stays as the belt for a recovery set the
-                // spec did not declare — a deobfuscated or renamed PAR2 file can
-                // still turn up mid-job — but as the *only* guard it fired after
-                // the whole set had downloaded, and an encrypted set cannot
-                // reconstruct posted bytes from its plaintext partials, so the
-                // demotion refetched every volume. Twice the bytes and twice the
-                // wall for a job that used to pay one article.
-                if par2_declared {
-                    set.router.refuse_encrypted_for_par2();
-                }
                 set
             })
             .collect();
@@ -602,24 +586,6 @@ impl Pipeline {
             })
     }
 
-    /// Whether this file is a source volume of a live direct set that is
-    /// **decrypting on the way to its destinations** (plan 136, E1 review F3).
-    ///
-    /// The one question every posted-byte consumer has to ask before it reads a
-    /// virtual volume: for such a set the partials hold plaintext and the volume
-    /// it is being asked to answer for held cipher, so the honest answer is no
-    /// answer at all.
-    pub(crate) fn direct_volume_routes_encrypted(&self, file_id: NzbFileId) -> bool {
-        self.direct_store
-            .sets_for(file_id.job_id)
-            .iter()
-            .any(|set| {
-                !set.is_demoted()
-                    && set.router.routes_encrypted()
-                    && set.plan().volume_for_file(file_id.file_index).is_some()
-            })
-    }
-
     /// The virtual volume behind one direct source file, as a **one-volume**
     /// provider plus its logical length (plan 135, D5).
     ///
@@ -634,20 +600,14 @@ impl Pipeline {
     /// including a demoted set's — whose volumes are materializing or being
     /// refetched, and are read from disk like any other file.
     ///
-    /// Also `None` for an **encrypted** set's volume (E1 review F3). The
-    /// provider would assemble the answer out of the envelope plus the member
-    /// partials, and those partials are plaintext where the source volume held
-    /// cipher — so every read that crossed a routed member would come back
-    /// wrong, and PAR2 would call a byte-perfect volume damaged. A caller that
-    /// falls back to the on-disk path finds no file and leaves its blocks
-    /// pending, which is the correct verdict: nothing has been verified.
+    /// An **encrypted** set answers here like any other since E2 (it was `None`
+    /// in E1, review F3): the provider re-encrypts the member ranges it reads
+    /// out of the partials, so what comes back is the posted bytes the caller
+    /// asked for rather than the plaintext sitting on disk.
     pub(crate) fn direct_virtual_volume(
         &self,
         file_id: NzbFileId,
     ) -> Option<(u32, u64, super::provider::HybridVolumeProvider)> {
-        if self.direct_volume_routes_encrypted(file_id) {
-            return None;
-        }
         let job_id = file_id.job_id;
         let (set, volume_index) =
             self.direct_store
@@ -830,32 +790,34 @@ impl Pipeline {
         if self.par2_set(job_id).is_none() {
             return false;
         }
-        // Plan 136. An encrypted set's destinations hold plaintext and PAR2
-        // describes the posted cipher, so serving one to the pass would report
-        // every slice damaged. Demoted here rather than refused at admission
-        // because the PAR2 file can arrive at any point in a job's life, long
-        // after the set started routing — this is the seam that already knows a
-        // recovery set exists, and it is the seam the pass runs behind.
-        let encrypted: Vec<usize> = self
+        // Plan 136, E2. An encrypted set is served to the pass through the
+        // re-encrypting overlay like any other — but only while the overlay can
+        // really reproduce what was posted. The residual it cannot is a routed
+        // encrypted member with no declared cipher size, or one whose tail
+        // padding is not whole, and such a set is taken out here rather than
+        // half-answered: the pass's world has to stay binary, exactly as the
+        // unbindable rule below keeps it.
+        let unavailable: Vec<usize> = self
             .direct_store
             .sets_for(job_id)
             .iter()
             .enumerate()
             .filter(|(_, set)| !set.is_demoted() && !set.is_finalized())
-            .filter(|(_, set)| set.router.routes_encrypted())
+            .filter(|(_, set)| set.router.posted_bytes_unavailable())
             .map(|(set_index, _)| set_index)
             .collect();
-        let mut demoted_any = !encrypted.is_empty();
-        for set_index in encrypted {
+        let mut demoted_any = !unavailable.is_empty();
+        for set_index in unavailable {
             warn!(
                 job_id = job_id.0,
-                "a PAR2-bearing job holds an encrypted direct set; demoting so the authoritative \
-                 pass reads posted bytes instead of decrypted destinations"
+                "an encrypted direct set cannot reproduce its posted bytes; demoting so the \
+                 authoritative pass reads real files instead of a volume the overlay can only \
+                 half answer"
             );
             self.demote_direct_set(
                 job_id,
                 set_index,
-                DemotionReason::EncryptedPar2Unsupported,
+                DemotionReason::EncryptedPostedBytesUnavailable,
                 None,
             )
             .await;
@@ -1269,6 +1231,15 @@ impl Pipeline {
         };
         let set_name = set.set_name().to_string();
         let holds_budget = set.holds_budget();
+        // The set's own volume lengths, in *set* volume space, which is what a
+        // provider over this set alone needs — the overlay's own copy is the
+        // same numbers under the same key, and it is the only place they live.
+        let set_lengths: std::collections::BTreeMap<u32, u64> = overlay
+            .lengths
+            .iter()
+            .find(|(index, _)| *index == set_index)
+            .map(|(_, lengths)| lengths.clone())
+            .unwrap_or_default();
 
         // The damaged volumes, in the set's own volume space. `overlay` is keyed
         // by the job's file index, which is what makes one provider answer for
@@ -1494,7 +1465,7 @@ impl Pipeline {
         }
 
         let routed = self
-            .route_repaired_volumes(job_id, set_index, &damaged)
+            .route_repaired_volumes(job_id, set_index, &damaged, &set_lengths)
             .await;
         for path in &outcome.scratch {
             let _ = tokio::fs::remove_file(path).await;
@@ -1573,12 +1544,24 @@ impl Pipeline {
         job_id: JobId,
         set_index: usize,
         damaged: &[super::repair::DamagedDirectVolume],
+        lengths: &std::collections::BTreeMap<u32, u64>,
     ) -> bool {
+        // Plan 136, E2: an encrypted member's repaired span decrypts on the way
+        // in, and every byte its CBC chain needs was dropped from staging when
+        // the original article was routed. Two sources put them back, and
+        // neither of them changes a byte: the ones just below the span come off
+        // the materialized volume, and the ≤15 in a *neighbouring* volume that
+        // complete an edge block of a member extent come off that neighbour's
+        // own virtual volume, re-encrypted by the overlay.
+        let cipher_lead_in = self
+            .direct_store
+            .set(job_id, set_index)
+            .is_some_and(|set| set.router.routes_encrypted());
         for volume in damaged {
             let volume_index = volume.volume_index;
             let for_task = volume.clone();
             let spans = match tokio::task::spawn_blocking(move || {
-                super::repair::read_repaired_spans(&for_task)
+                super::repair::read_repaired_spans(&for_task, cipher_lead_in)
             })
             .await
             {
@@ -1605,6 +1588,16 @@ impl Pipeline {
             if spans.is_empty() {
                 continue;
             }
+            // The neighbouring-volume halves of this volume's member edge
+            // blocks, read through the overlay so what is staged is what was
+            // posted rather than the plaintext on disk. A read that refuses —
+            // the neighbour has a hole there — simply contributes nothing, and
+            // the span that needed it holds, which `route_repaired` turns into
+            // the whole-set demotion the fallback exists for.
+            let edges = match cipher_lead_in {
+                true => self.read_cipher_edges(job_id, set_index, volume_index, lengths),
+                false => Vec::new(),
+            };
             let routed = {
                 let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
                     return false;
@@ -1617,7 +1610,13 @@ impl Pipeline {
                     .iter()
                     .flat_map(|span| span.chunks.iter().cloned())
                     .collect();
-                set.route_repaired(volume_index, &staged)
+                let mut lead_in: Vec<(u32, u64, std::sync::Arc<[u8]>)> = spans
+                    .iter()
+                    .filter_map(|span| span.lead_in.clone())
+                    .map(|(offset, data)| (volume_index, offset, data))
+                    .collect();
+                lead_in.extend(edges);
+                set.route_repaired(volume_index, &staged, &lead_in)
             };
             drop(spans);
             let routed = match routed {
@@ -1642,6 +1641,46 @@ impl Pipeline {
             }
         }
         true
+    }
+
+    /// The ≤15 posted bytes per member-extent edge that live in a **neighbouring**
+    /// volume of the same set (plan 136, E2).
+    ///
+    /// Read through the set's own virtual provider, which re-encrypts them out
+    /// of the neighbour's destination — those bytes did not change, so what
+    /// comes back is exactly what was posted there. Blocking work, but bounded
+    /// at 30 bytes per member extent of one volume, so it is done inline rather
+    /// than on the pool.
+    fn read_cipher_edges(
+        &self,
+        job_id: JobId,
+        set_index: usize,
+        volume_index: u32,
+        lengths: &std::collections::BTreeMap<u32, u64>,
+    ) -> Vec<(u32, u64, std::sync::Arc<[u8]>)> {
+        let Some(set) = self.direct_store.set(job_id, set_index) else {
+            return Vec::new();
+        };
+        let reads = set.router.cipher_edge_reads(volume_index);
+        if reads.is_empty() {
+            return Vec::new();
+        }
+        let provider = set.virtual_provider(lengths);
+        let mut edges = Vec::with_capacity(reads.len());
+        for (volume, offset, len) in reads {
+            let Some(mut reader) = provider.open(volume) else {
+                continue;
+            };
+            if std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(offset)).is_err() {
+                continue;
+            }
+            let mut bytes = vec![0u8; len as usize];
+            if std::io::Read::read_exact(&mut reader, &mut bytes).is_err() {
+                continue;
+            }
+            edges.push((volume, offset, std::sync::Arc::from(bytes.as_slice())));
+        }
+        edges
     }
 
     /// Closes the composition gaps a repair's rewrite left, with one bounded
@@ -1917,17 +1956,14 @@ impl Pipeline {
         // The call stays because the refusal is phase 4's, not the seam's:
         // phase 5 admits those jobs and this is where their coverage comes from.
         //
-        // Plan 136, E1 review F3: an encrypted set is kept out of live
-        // verification entirely. These bytes are honest — posted cipher, taken
-        // before the write transform — but a block straddling an article
-        // boundary is only ever settled by a read-back, and the read-back
-        // resolves to the member's plaintext partial. Feeding a stream whose
-        // every boundary block must come back `Bad` is worse than not feeding
-        // one, so the refusal is on both halves and `direct_virtual_volume` is
-        // the other.
-        if !self.direct_volume_routes_encrypted(file_id) {
-            self.note_live_par2_segment(file_id, file_offset, &segment.data);
-        }
+        // Plan 136: an **encrypted** set is fed here too, since E2. The feed half
+        // was always correct — `segment.data` is the posted cipher, taken before
+        // the write transform — and E1 suppressed it only because the other half
+        // could not settle a straddling block: the read-back went through
+        // `direct_virtual_volume` to the member's plaintext partial, so every
+        // boundary block came back `Bad`. The re-encrypting overlay is what makes
+        // that read-back answer in posted space, so both halves are live again.
+        self.note_live_par2_segment(file_id, file_offset, &segment.data);
         drop(bytes);
 
         self.commit_direct_segment(segment_id, decoded_size, set_index, volume_index)
@@ -3003,12 +3039,10 @@ impl Pipeline {
     /// - a job with no PAR2 file: there is no repair to serve;
     /// - a set with no **live** neighbour: nothing left in this job can ask, and
     ///   the release sweep below deletes what the last one held;
-    /// - an **encrypted** set (plan 136, E1). Its destinations hold plaintext
-    ///   and PAR2 describes the posted cipher, so an image assembled from them
-    ///   would answer every read that crossed a member with the wrong bytes.
-    ///   Such a set is refused admission on a par2-bearing job and demoted by
-    ///   `demote_unbindable_direct_sets` if a recovery set turns up later, so
-    ///   this is the belt: it stays until E2's re-encrypting overlay exists;
+    /// - an **encrypted** set that cannot reproduce its posted bytes (plan 136,
+    ///   E2). One that can is retained like any other: a commit is a rename, so
+    ///   the overlay re-encrypts out of the committed member exactly as it did
+    ///   out of the partial;
     /// - an image with a hole in it — see
     ///   [`DirectSet::retain_finalized_volumes`].
     ///
@@ -3021,7 +3055,7 @@ impl Pipeline {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return false;
         };
-        if set.router.routes_encrypted() {
+        if set.router.posted_bytes_unavailable() {
             return false;
         }
         // A neighbour that can still reach the repair path. Demoted is terminal
@@ -3432,15 +3466,15 @@ impl Pipeline {
             // cheaper than materializing header-only volumes.
             return Err(ReconstructionFailure::NoLayout);
         }
-        if set.router.routes_encrypted() {
-            // Plan 136, E-D2/E-D4. The member partials hold **plaintext**; the
-            // volume being rebuilt holds cipher. Reading one back as the other
-            // is the one way this path can put wrong bytes under a published
-            // floor, and the yEnc part CRCs it checks against describe the
-            // posted bytes, so the mismatch would surface as a refusal rather
-            // than as a corrupt volume — but only after writing. Refuse up
-            // front; phase E2's re-encrypting overlay is what makes this path
-            // available to an encrypted set.
+        if set.router.posted_bytes_unavailable() {
+            // Plan 136, E2. The member partials hold **plaintext**; the volume
+            // being rebuilt holds cipher, and the overlay is what turns one into
+            // the other on the way out. This is the residual it cannot do — a
+            // routed encrypted member with no declared cipher size, or one whose
+            // tail padding never arrived whole — and the sweep must refuse
+            // rather than write a volume that is right except for one block,
+            // because the yEnc part CRCs it checks against would then refuse
+            // *after* the write rather than before it.
             return Err(ReconstructionFailure::EncryptedPostedBytes);
         }
         let working_dir = set.plan().working_dir.clone();
