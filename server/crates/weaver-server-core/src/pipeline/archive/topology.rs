@@ -155,6 +155,124 @@ mod tests {
         );
     }
 
+    /// The same six volumes as [`holey_cached_rebuild_input`] — files for 0-2
+    /// and 5, a cached snapshot over those four — except volumes 3 and 4 now
+    /// have facts without files: the shape eager deletion leaves behind, since
+    /// it removes the volume file and keeps the per-volume facts. `volume_paths`
+    /// drops a deleted volume (it is built from paths that still exist) while
+    /// `state.facts` carries it forever, so the header chain stays reachable
+    /// across the hole and the waited-on volume 5 sits *inside* the facts ∪
+    /// paths prefix instead of past a true gap.
+    fn facts_bridged_gap_rebuild_input(temp_dir: &tempfile::TempDir) -> RarSetComputeInput {
+        let mut input = holey_cached_rebuild_input(temp_dir);
+        let files = build_many_volume_rar_set(6);
+        for volume in [3usize, 4] {
+            input.facts.insert(
+                volume as u32,
+                weaver_unrar::RarArchive::parse_volume_facts(
+                    Cursor::new(files[volume].1.clone()),
+                    None,
+                )
+                .expect("synthetic RAR volume facts should parse"),
+            );
+        }
+        input
+    }
+
+    #[test]
+    fn rar_plan_rebuild_retries_from_live_volumes_when_facts_bridge_deleted_volume_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let input = facts_bridged_gap_rebuild_input(&temp_dir);
+        let facts = input.facts.clone();
+        let volume_paths = input.volume_paths.clone();
+
+        // Both halves of the predicate the retry turns on: on disk alone the
+        // chain stops at volume 2, so a paths-only reachability test would put
+        // the waited-on volume 5 past a gap and suppress the retry. Facts carry
+        // the chain to the end of the set.
+        assert_eq!(rar_state::contiguous_prefix_end(&volume_paths), Some(2));
+        assert_eq!(rar_state::contiguous_prefix_end(&facts), Some(5));
+
+        // The cached snapshot must survive its own consistency check, otherwise
+        // the volume-0 rebuild asserted below could be that check's doing
+        // rather than the present-waiting guard's.
+        let archive = Pipeline::deserialize_rar_headers_with_password_candidates(
+            "show",
+            input.cached_headers.as_ref().unwrap(),
+            &[],
+            std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+        )
+        .expect("fixture snapshot should deserialize")
+        .value;
+        assert_eq!(
+            cached_rar_snapshot_alignment_with_volume_facts(&facts, &archive),
+            CachedRarSnapshotAlignment::CompletedGrowthRequiresRefresh
+        );
+
+        let _tracking = rar_refresh_open_tracking::start();
+        let computed = Pipeline::compute_rar_set_state_blocking(input)
+            .expect("facts-bridged gap should still rebuild the plan");
+
+        assert_eq!(computed.rebuild_source.as_str(), "volume-0");
+        assert!(
+            rar_refresh_open_tracking::opened().contains(&volume_paths[&0]),
+            "retry from live volumes should reopen volume 0: {:?}",
+            rar_refresh_open_tracking::opened()
+        );
+        // The wait itself is not the anomaly and survives the live rebuild —
+        // volume 5 is present, waited on, and inside the reachable prefix, which
+        // is exactly the input the guard fires on.
+        assert!(
+            computed.plan.waiting_on_volumes.contains(&5),
+            "fixture must leave volume 5 waiting: {:?}",
+            computed.plan.waiting_on_volumes
+        );
+        assert_eq!(
+            present_waiting_rar_volumes(&computed.plan, &facts, &volume_paths),
+            vec![5]
+        );
+    }
+
+    #[test]
+    fn cached_header_and_volume_zero_rar_plans_agree_across_a_true_gap() {
+        let cached_dir = tempfile::tempdir().unwrap();
+        let cached =
+            Pipeline::compute_rar_set_state_blocking(holey_cached_rebuild_input(&cached_dir))
+                .expect("cached headers should rebuild the plan");
+
+        let live_dir = tempfile::tempdir().unwrap();
+        let mut live_input = holey_cached_rebuild_input(&live_dir);
+        live_input.cached_headers = None;
+        let live = Pipeline::compute_rar_set_state_blocking(live_input)
+            .expect("live volumes should rebuild the plan");
+
+        assert_eq!(cached.rebuild_source.as_str(), "cached-headers");
+        assert_eq!(live.rebuild_source.as_str(), "volume-0");
+
+        // The claim the post-gap carve-out rests on: a volume-0 rebuild reads
+        // the same files and reproduces the same wait, so suppressing the retry
+        // costs nothing.
+        let waiting = |plan: &RarDerivedPlan| {
+            let mut volumes: Vec<u32> = plan.waiting_on_volumes.iter().copied().collect();
+            volumes.sort_unstable();
+            volumes
+        };
+        let ready = |plan: &RarDerivedPlan| {
+            plan.ready_members
+                .iter()
+                .map(|member| member.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !waiting(&cached.plan).is_empty(),
+            "fixture must leave the set waiting or the comparison is vacuous"
+        );
+        assert_eq!(waiting(&cached.plan), waiting(&live.plan));
+        assert_eq!(ready(&cached.plan), ready(&live.plan));
+        assert_eq!(cached.plan.member_names, live.plan.member_names);
+        assert_eq!(cached.plan.phase.as_str(), live.plan.phase.as_str());
+    }
+
     #[test]
     fn rar_plan_rebuild_falls_back_to_volume_zero_without_usable_cached_headers() {
         for cached_headers in [None, Some(b"not-a-cached-header-snapshot".to_vec())] {
@@ -437,6 +555,22 @@ fn cached_rar_plan_is_incoherent(
         })
 }
 
+/// Volumes whose plan decision claims no owner while `facts` still show a named
+/// member on them.
+///
+/// This only says anything when `plan` and `facts` come from different
+/// generations, which is why its one call site is the live check in
+/// `ownerless_live_rar_plan_error_for_set`: there the plan is whatever was last
+/// applied to the set and the facts are the set's current ones, so a volume
+/// that gained named members after the plan was built shows up as ownerless.
+///
+/// Measured against the same facts a plan was built from it is vacuous by
+/// construction: `rar_state::build_plan` backfills empty `owners` from
+/// `fact_owner_claims`, which accepts a member under exactly the predicate
+/// below — non-directory-or-nonempty and a non-empty sanitized name. Callers on
+/// the compute path would therefore always get an empty vector back. Narrowing
+/// that fallback in `build_plan` is what would make a compute-path check
+/// meaningful again.
 pub(in crate::pipeline) fn ownerless_present_member_volumes(
     plan: &RarDerivedPlan,
     facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
@@ -516,10 +650,10 @@ pub(in crate::pipeline) fn is_incoherent_rar_waiting_state_error(error: &str) ->
     error.contains(INCOHERENT_RAR_WAITING_STATE_ERROR_MARKER)
 }
 
-pub(in crate::pipeline) fn is_ownerless_rar_plan_error(error: &str) -> bool {
-    error.contains(OWNERLESS_RAR_PLAN_ERROR_MARKER)
-}
-
+/// Formats the error `ownerless_live_rar_plan_error_for_set` fails a job with.
+/// Nothing matches on the marker any more: the compute path cannot produce this
+/// error, and the live path returns it straight to the caller that fails the
+/// job.
 pub(in crate::pipeline) fn ownerless_rar_plan_error(set_name: &str, volumes: &[u32]) -> String {
     format!("RAR set '{set_name}' {OWNERLESS_RAR_PLAN_ERROR_MARKER}: {volumes:?}")
 }
@@ -1059,23 +1193,15 @@ impl Pipeline {
             )?;
         }
 
-        let ownerless_volumes = ownerless_present_member_volumes(&plan, &facts);
-        if used_cached_headers && !ownerless_volumes.is_empty() && volume_paths.contains_key(&0) {
-            warn!(
-                set_name = %set_name_owned,
-                volumes = ?ownerless_volumes,
-                "cached RAR headers produced ownerless present volumes; retrying from live volumes"
-            );
-
-            let selection = open_from_volume_zero()?;
-            (plan, headers, rebuild_source, used_cached_headers) = attach_volumes_and_build_plan(
-                selection.value,
-                RarTopologyRebuildSource::VolumeZero,
-                false,
-                false,
-            )?;
-        }
-
+        // Ownerless present volumes are deliberately not checked on this path,
+        // neither as a retry trigger nor as an error: every plan this function
+        // can hold came out of `rar_state::build_plan` over the same `facts`,
+        // and that builder's fact-derived owner fallback fills `owners` under
+        // exactly the predicate `ownerless_present_member_volumes` tests, so
+        // the check can only ever come back empty here. The live-path call in
+        // `ownerless_live_rar_plan_error_for_set` — where the plan and the
+        // facts it is measured against are different generations — is the real
+        // backstop.
         if used_cached_headers
             && cached_rar_plan_is_incoherent(&plan, &failed, worker_active, &facts, &volume_paths)
             && volume_paths.contains_key(&0)
@@ -1092,14 +1218,6 @@ impl Pipeline {
                 false,
                 false,
             )?;
-        }
-
-        let ownerless_volumes = ownerless_present_member_volumes(&plan, &facts);
-        if !ownerless_volumes.is_empty() {
-            return Err(ownerless_rar_plan_error(
-                &set_name_owned,
-                &ownerless_volumes,
-            ));
         }
 
         if cached_rar_plan_is_incoherent(&plan, &failed, worker_active, &facts, &volume_paths) {
@@ -1159,11 +1277,6 @@ impl Pipeline {
         existing: RarSetState,
         error: String,
     ) -> Result<(), String> {
-        if is_ownerless_rar_plan_error(&error) {
-            self.clear_rar_snapshot(job_id, set_name);
-            return Err(error);
-        }
-
         let mut fallback = existing.plan.clone().unwrap_or_else(|| RarDerivedPlan {
             phase: RarSetPhase::FallbackFullSet,
             is_solid: false,
