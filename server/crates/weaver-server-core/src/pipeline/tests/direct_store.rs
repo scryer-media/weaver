@@ -884,6 +884,15 @@ fn par2_bearing_job_spec(
     par2_bytes: &[u8],
 ) -> (JobSpec, u32) {
     let mut spec = direct_store_job_spec(name, volumes);
+    let file_index = append_par2_index(&mut spec, par2_bytes);
+    (spec, file_index)
+}
+
+/// Appends the index as one more downloadable file and returns its NZB index.
+///
+/// Split out of [`par2_bearing_job_spec`] so a spec built with a different
+/// article count — the restart harness's — can carry one too.
+fn append_par2_index(spec: &mut JobSpec, par2_bytes: &[u8]) -> u32 {
     let index_filename = "silver.horizon.par2".to_string();
     let file_index = spec.files.len() as u32;
     spec.total_bytes += u64::from(yenc_declared_bytes(par2_bytes.len() as u32));
@@ -898,7 +907,7 @@ fn par2_bearing_job_spec(
             message_id: "direct-par2-index@example.com".to_string(),
         }],
     });
-    (spec, file_index)
+    file_index
 }
 
 /// What one par2-bearing job gate produced.
@@ -927,13 +936,29 @@ async fn run_par2_direct_gate(
     member_name: &str,
     volumes: &[(String, Vec<u8>)],
 ) -> Par2GateOutcome {
+    run_par2_direct_gate_with_password(gate, live_par2, job_id, member_name, volumes, None).await
+}
+
+/// [`run_par2_direct_gate`] with plan 136's one extra input, so an encrypted
+/// set's par2-bearing differential runs through exactly the same code the
+/// plaintext one does.
+async fn run_par2_direct_gate_with_password(
+    gate: DirectStoreGate,
+    live_par2: bool,
+    job_id: JobId,
+    member_name: &str,
+    volumes: &[(String, Vec<u8>)],
+    password: Option<&str>,
+) -> Par2GateOutcome {
     let par2_bytes = par2_index_over_volumes(volumes);
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(gate);
     pipeline.live_par2.set_enabled(live_par2);
 
-    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", volumes, &par2_bytes);
+    let (mut spec, index_file_index) =
+        par2_bearing_job_spec("Silver Horizon", volumes, &par2_bytes);
+    spec.password = password.map(str::to_owned);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
     let mut volume_file_seen = false;
@@ -6246,10 +6271,12 @@ async fn run_repairable_par2_gate(
         volumes,
         par2_bytes,
         IndexPosition::Last,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_repairable_par2_gate_at(
     gate: DirectStoreGate,
     job_id: JobId,
@@ -6257,14 +6284,16 @@ async fn run_repairable_par2_gate_at(
     volumes: &[(String, Vec<u8>)],
     par2_bytes: &[u8],
     position: IndexPosition,
+    password: Option<&str>,
 ) -> RepairGateOutcome {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(gate);
     pipeline.live_par2.set_enabled(true);
 
-    let (spec, index_file_index) =
+    let (mut spec, index_file_index) =
         par2_bearing_job_spec_positioned("Silver Horizon", volumes, par2_bytes, position);
+    spec.password = password.map(str::to_owned);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
     let mut volume_file_seen = false;
@@ -6482,6 +6511,7 @@ async fn a_repair_reads_its_sources_by_file_index_when_the_par2_index_leads_the_
         &volumes,
         &par2_bytes,
         IndexPosition::First,
+        None,
     )
     .await;
 
@@ -7185,20 +7215,17 @@ async fn a_job_that_dies_inside_the_retention_window_sweeps_its_envelopes_on_res
 }
 
 #[tokio::test]
-async fn an_encrypted_finalized_set_is_refused_a_retained_image() {
-    // Plan 136, E1, read against the retention path. An encrypted set's
-    // destinations hold **plaintext** and PAR2 describes the posted **cipher**,
-    // so an image assembled from the committed members would answer every read
-    // that crossed a member with the wrong bytes — and a repair fed those would
-    // spend recovery blocks rebuilding good slices from bad inputs. The refusal
-    // is explicit and stays until E2's re-encrypting overlay exists.
+async fn an_encrypted_finalized_set_keeps_a_retained_image_that_reads_back_as_posted() {
+    // Plan 136, E2, read against the retention path. E1 refused an encrypted set
+    // a retained image outright: its destinations hold **plaintext** while PAR2
+    // describes the posted **cipher**, so an image assembled from the committed
+    // members answered every read that crossed a member with the wrong bytes.
     //
-    // The window it lives in is the one E1's own belt exists for: a par2-bearing
-    // job refuses encrypted admission on the first header parse, but the PAR2
-    // file can be deobfuscated or renamed into the spec *after* the set was
-    // admitted, so a set that routes encrypted and a job that declares a
-    // recovery set can coexist. The fixture reproduces it exactly — admitted
-    // while the job looks par2-less, then the role goes back.
+    // The re-encrypting overlay is what makes that image honest, and a commit is
+    // a rename, so the committed member is byte-for-byte the partial the live
+    // image read. The assertion is therefore not "it retained something" but
+    // that the retained image reads back **as the source volumes were posted** —
+    // which is the only property the neighbour's repair depends on.
     let encrypted_member = "Silver.Horizon.S02E18.mkv";
     let live_member = "Amber.Trail.S01E03.mkv";
     let encrypted_payload: Vec<u8> = (0..2400u32).map(|index| (index % 191) as u8).collect();
@@ -7227,48 +7254,10 @@ async fn an_encrypted_finalized_set_is_refused_a_retained_image() {
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     pipeline.live_par2.set_enabled(true);
-    let (mut spec, index_file_index) =
+    let (mut spec, _index_file_index) =
         par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
     spec.password = Some("moonlit-harbour".to_string());
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
-
-    // Admitted while the spec's PAR2 role is stripped, so admission's own
-    // refusal does not fire and the set really does route encrypted; the role
-    // goes back before a byte flows. The index itself is never posted, which
-    // keeps `par2_set` empty and therefore keeps the *other* encrypted guard —
-    // `demote_unbindable_direct_sets` — out of the way, so what this test
-    // observes is the retention refusal and nothing else.
-    let index_role = pipeline
-        .jobs
-        .get(&job_id)
-        .expect("the job is live")
-        .spec
-        .files[index_file_index as usize]
-        .role
-        .clone();
-    pipeline
-        .jobs
-        .get_mut(&job_id)
-        .expect("the job is live")
-        .spec
-        .files[index_file_index as usize]
-        .role = weaver_model::files::FileRole::Unknown;
-    assert!(
-        pipeline
-            .direct_route_target(NzbFileId {
-                job_id,
-                file_index: 0,
-            })
-            .is_some(),
-        "the sets must be admitted while the job looks par2-less"
-    );
-    pipeline
-        .jobs
-        .get_mut(&job_id)
-        .expect("the job is live")
-        .spec
-        .files[index_file_index as usize]
-        .role = index_role;
 
     // The encrypted set arrives whole, so it is the one that finalizes. Its
     // neighbour gets each volume's first article only: enough to open an
@@ -7320,14 +7309,13 @@ async fn an_encrypted_finalized_set_is_refused_a_retained_image() {
          from the ordinary no-neighbour delete; got {sets}"
     );
 
-    assert!(
-        pipeline
-            .direct_store
-            .set(job_id, encrypted_index)
-            .is_some_and(|set| set.retained_volumes().is_none()),
-        "an encrypted set must never be handed a retained image: its destinations \
-         hold plaintext and PAR2 describes the cipher that was posted"
-    );
+    let retained = pipeline
+        .direct_store
+        .set(job_id, encrypted_index)
+        .and_then(|set| set.retained_volumes().map(<[_]>::to_vec))
+        .unwrap_or_else(|| {
+            panic!("an encrypted set the overlay can serve must keep its image; got {sets}")
+        });
     let envelopes = pipeline
         .direct_store
         .set(job_id, encrypted_index)
@@ -7335,15 +7323,35 @@ async fn an_encrypted_finalized_set_is_refused_a_retained_image() {
         .plan()
         .envelope_paths();
     assert!(
-        envelopes.iter().all(|envelope| !envelope.exists()),
-        "and the refusal must be a real delete rather than a flag: the envelopes \
-         go at finalization, exactly as they did before retention existed"
+        envelopes.iter().any(|envelope| envelope.exists()),
+        "a retained image reads through the envelopes, so they must outlive \
+         finalization with it"
     );
     assert!(
         direct_envelopes_left(&working_dir) > 0,
-        "non-vacuity for that check: the live neighbour's own envelopes must \
-         still be there, so the assertion above is about the encrypted set \
-         rather than about an empty directory"
+        "non-vacuity for that check"
+    );
+
+    // The property the whole thing exists for: the image answers in **posted**
+    // space. Reading it back must reproduce the encrypted source volumes byte
+    // for byte, even though the bytes it is assembled from are the decrypted
+    // member at its committed destination plus the envelopes.
+    let provider = crate::pipeline::direct_store::provider::HybridVolumeProvider::new(retained);
+    for (ordinal, (_, posted)) in encrypted_set.iter().enumerate() {
+        let mut reader = provider
+            .open(ordinal as u32)
+            .expect("every retained volume is registered");
+        let mut read_back = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut read_back).unwrap();
+        assert_eq!(
+            &read_back, posted,
+            "retained encrypted volume {ordinal} must read back as it was posted"
+        );
+    }
+    assert!(
+        provider.cipher_counters().reencrypted_bytes() > 0,
+        "non-vacuity: the read above must really have gone through the overlay \
+         rather than past an empty cipher map"
     );
 }
 
@@ -7989,6 +7997,36 @@ fn encrypted_store_set(
     check_for: Option<&str>,
     keyed_checksum: bool,
 ) -> Vec<(String, Vec<u8>)> {
+    encrypted_store_set_with_recovery(
+        member_name,
+        payload,
+        volume_count,
+        data_password,
+        check_for,
+        keyed_checksum,
+        0,
+    )
+}
+
+/// [`encrypted_store_set`] with a recovery record after each volume's payload.
+///
+/// The RR is what makes PAR2 the *only* layer that can see a damaged byte: it
+/// belongs to no member, so neither the per-part packed CRC32 over cipher nor
+/// the keyed whole-member fold over plaintext covers it, and it is a service
+/// block's data rather than a header, so the walk still parses and the volume
+/// still confirms. Every byte of it is envelope, posted in the clear, and
+/// routing carries it through untouched — which is exactly why a damaged one
+/// survives to the pass.
+#[allow(clippy::too_many_arguments)]
+fn encrypted_store_set_with_recovery(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    data_password: &str,
+    check_for: Option<&str>,
+    keyed_checksum: bool,
+    rr_bytes: usize,
+) -> Vec<(String, Vec<u8>)> {
     let material =
         weaver_unrar::derive_rar5_material(data_password, &TEST_CRYPT_SALT, TEST_CRYPT_KDF_LG2)
             .expect("the fixture KDF count is derivable");
@@ -8053,6 +8091,10 @@ fn encrypted_store_set(
                 &extra,
             ));
             bytes.extend_from_slice(part);
+            if rr_bytes > 0 {
+                bytes.extend_from_slice(&build_test_rar_service_header("RR", rr_bytes as u64));
+                bytes.extend((0..rr_bytes).map(|index| ((index * 7 + volume * 13) % 256) as u8));
+            }
             bytes.extend_from_slice(&build_test_rar_end_header(!is_last));
 
             (format!("silver.horizon.part{:02}.rar", volume + 1), bytes)
@@ -8964,44 +9006,23 @@ async fn encrypted_routing_leaves_the_plan_135_guarantees_untouched() {
     );
 }
 
-/// Every file direct routing owns in `working_dir`: member partials, volume
-/// envelopes and the holds scratch.
-///
-/// "Never routed a byte" is a statement about all three, not just the partials:
-/// an envelope is written by the same drain, out of the same articles, and its
-/// existence would mean the set had been live long enough to classify bytes.
-fn direct_artifacts(working_dir: &std::path::Path) -> Vec<String> {
-    let mut found: Vec<String> = std::fs::read_dir(working_dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .filter(|name| {
-                    name.ends_with(".direct.partial")
-                        || name.contains(".envelope")
-                        || name.contains(".holds")
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    found.sort();
-    found
-}
-
 #[tokio::test]
-async fn a_par2_bearing_encrypted_job_refuses_admission_and_never_routes_a_byte() {
-    // E1 review F1. An encrypted set's destinations hold plaintext while PAR2
-    // describes the posted cipher, so such a set may not be served to the
-    // authoritative pass — but the guard that catches it *behind* that pass
-    // cannot fire until the whole set has downloaded, and by then the demotion
-    // costs a full refetch, because plaintext partials cannot reconstruct posted
-    // bytes. That is twice the bytes and twice the wall for a job a
-    // pre-plan-136 build finished having paid one article.
+async fn a_par2_bearing_encrypted_job_routes_direct_and_completes_byte_identically() {
+    // E2's headline differential, and the one the phase exists for. E1 refused
+    // this job at admission (`EncryptedMemberRefused(Par2Declared)`) because an
+    // encrypted set's destinations hold plaintext while PAR2 describes the
+    // posted cipher — and nearly every encrypted release carries PAR2, so that
+    // refusal reached almost every set the feature was built for.
     //
-    // So the decision moves to admission, where the spec already answers it. The
-    // assertion is that nothing is ever written and the set leaves direct mode
-    // on its **first** header parse.
+    // The re-encrypting overlay retires it: the pass reads the set's source
+    // volumes virtually, the overlay turns the member ranges back into what was
+    // posted, and the verdict is the one a physical volume would have produced.
+    // Held to exactly the standard the plaintext par2-bearing differential is:
+    // same bytes, same place, same status as the gate-off run with the same
+    // password, and not one source volume file at any point.
     let member_name = "Silver.Horizon.S02E12.mkv";
+    // 2400 is a multiple of 16, so the *other* differential below carries the
+    // tail padding; this one pins the block-aligned shape.
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 193) as u8).collect();
     let volumes = encrypted_store_set(
         member_name,
@@ -9011,99 +9032,101 @@ async fn a_par2_bearing_encrypted_job_refuses_admission_and_never_routes_a_byte(
         Some("moonlit-harbour"),
         true,
     );
-    let par2_bytes = par2_index_over_volumes(&volumes);
 
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
-    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    pipeline.live_par2.set_enabled(false);
-    let job_id = JobId(43111);
-    let (mut spec, index_file_index) =
-        par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
-    spec.password = Some("moonlit-harbour".to_string());
-    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
-
-    // One article: the first of the first volume, which is the first header
-    // parse and therefore the first moment admission can be decided.
-    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
-    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
-    assert!(
-        shape.contains("Demoted(EncryptedMemberRefused(Par2Declared))"),
-        "a par2-bearing encrypted set must be refused at admission, by its own name, got {shape}"
-    );
-    assert_eq!(
-        direct_artifacts(&working_dir),
-        Vec::<String>::new(),
-        "the refusal must land before a destination, an envelope or a scratch file exists"
-    );
-    // The cheap demotion, in the only unit that matters: the set gave up having
-    // consumed one article, so the other five are still ahead of the download
-    // rather than behind it. The pass-side guard could not have fired until all
-    // six had been fetched and routed, and would then have thrown all six away.
-    let queued = peek_queued_segments(&mut pipeline, job_id);
-    assert!(
-        queued.contains(&(0, 0)),
-        "the article the seam was holding must come back, got {queued:?}"
-    );
-
-    // And the job finishes conventionally, byte-identically, with the source
-    // volumes written the way a job with no direct store at all writes them.
-    let mut volume_file_seen = false;
-    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
-        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
-        assert_eq!(
-            direct_artifacts(&working_dir),
-            Vec::<String>::new(),
-            "a refused set must never write anything, at any point in the job"
-        );
-        volume_file_seen |= volumes
-            .iter()
-            .any(|(filename, _)| working_dir.join(filename).exists());
-    }
-    submit_decoded_segment(
-        &mut pipeline,
-        NzbFileId {
-            job_id,
-            file_index: index_file_index,
-        },
-        0,
-        0,
-        &par2_bytes,
-        "silver.horizon.par2",
-        None,
+    let conventional = run_par2_direct_gate_with_password(
+        DirectStoreGate::Disabled,
+        true,
+        JobId(43110),
+        member_name,
+        &volumes,
+        Some("moonlit-harbour"),
     )
     .await;
-    drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    let direct = run_par2_direct_gate_with_password(
+        DirectStoreGate::Enabled,
+        true,
+        JobId(43111),
+        member_name,
+        &volumes,
+        Some("moonlit-harbour"),
+    )
+    .await;
 
-    let (member, location) = member_after_gate(&complete_dir, &working_dir, member_name);
-    assert_eq!(
-        member.as_deref(),
-        Some(payload.as_slice()),
-        "the conventional path must produce the member the refusal handed it"
-    );
-    assert_eq!(location, Some("complete"));
     assert!(
-        volume_file_seen,
-        "a refused set hands its volumes to the conventional path, which writes them — \
-         which is what makes this the pre-plan-136 behaviour and not a new one"
+        direct.admitted,
+        "a par2-bearing job must admit its encrypted sets now that the verifier \
+         can read them as they were posted"
+    );
+    assert!(
+        !direct.demotions.contains("Demoted"),
+        "nothing here may demote the set, got {}",
+        direct.demotions
+    );
+    assert!(
+        conventional.volume_file_seen,
+        "the gate-off reference must have written the encrypted source volumes"
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "a par2-bearing encrypted direct job must never create a source volume \
+         file, got {}",
+        direct.demotions
+    );
+    assert_eq!(
+        conventional.member.as_deref(),
+        Some(payload.as_slice()),
+        "the gate-off reference must decrypt the member with the job's password"
+    );
+    assert_eq!(
+        (
+            direct.member.as_deref(),
+            direct.member_location,
+            &direct.status
+        ),
+        (
+            conventional.member.as_deref(),
+            conventional.member_location,
+            &conventional.status
+        ),
+        "an encrypted par2-bearing job routed plaintext-once must be byte-identical \
+         to the gate-off run with the same password; sets = {}",
+        direct.demotions
+    );
+    assert!(
+        direct.demotions.contains("Finalized"),
+        "the set should have finalized once verification cleared it, got {}",
+        direct.demotions
+    );
+    // D5's point, unchanged by encryption: verification finishes with the
+    // download. The live short-circuit is what settles a clean set, and it can
+    // only settle one whose straddling blocks come back from a read that answers
+    // in posted space — which is the overlay.
+    assert!(
+        direct.full_verify_skips > 0,
+        "the clean encrypted set must take the live short-circuit; skips={} \
+         authoritative={}",
+        direct.full_verify_skips,
+        direct.authoritative_verify_calls
     );
 }
 
 #[tokio::test]
-async fn live_par2_never_records_an_encrypted_direct_volume() {
-    // E1 review F3. Live verification's in-stream feed is honest — those are the
-    // posted cipher bytes, taken before the write transform — but a block that
-    // straddles an article boundary is only ever settled by a *read-back*, and
-    // the read-back resolves through the virtual volume to the member's
-    // `.direct.partial`, which is plaintext. Feeding a stream whose every
-    // boundary block must come back `Bad` is worse than not feeding one, so an
-    // encrypted set is kept out of live verification on both halves.
+async fn live_par2_settles_an_encrypted_direct_volume_through_the_overlay() {
+    // E1 review F3, inverted by E2. Live verification's in-stream feed was
+    // always honest — those are the posted cipher bytes, taken before the write
+    // transform — but a block straddling an article boundary is only ever
+    // settled by a *read-back*, and in E1 that read-back resolved through the
+    // virtual volume to the member's plaintext `.direct.partial`. Every boundary
+    // block would have come back `Bad`, so both halves refused.
     //
-    // Every other encrypted test in this file runs with live PAR2 off, which is
-    // exactly why this path was never exercised.
+    // The overlay makes the read-back answer in posted space, so both halves are
+    // live again. The assertion is the strong one: coverage is recorded, blocks
+    // really do settle, and **not one of them is `Bad`** — which is precisely
+    // what would have happened had the read-back returned plaintext.
     let member_name = "Silver.Horizon.S02E17.mkv";
-    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 193) as u8).collect();
+    // Not a multiple of 16: the member carries tail padding, so its last cipher
+    // block is one the overlay can only re-encrypt from the retained padding.
+    let payload: Vec<u8> = (0..2405u32).map(|index| (index % 193) as u8).collect();
     let volumes = encrypted_store_set(
         member_name,
         &payload,
@@ -9124,43 +9147,6 @@ async fn live_par2_never_records_an_encrypted_direct_volume() {
     spec.password = Some("moonlit-harbour".to_string());
     insert_active_job(&mut pipeline, job_id, spec).await;
 
-    // The direct sets are admitted here, while the spec's PAR2 role is stripped,
-    // so admission's own par2 refusal does not fire and the set really does
-    // route encrypted. The role goes back before any byte flows, so live
-    // verification sees the job it would see in production. This is the narrow
-    // window the `EncryptedPar2Unsupported` belt exists for, written down.
-    let index_role = pipeline
-        .jobs
-        .get(&job_id)
-        .expect("the job is live")
-        .spec
-        .files[index_file_index as usize]
-        .role
-        .clone();
-    pipeline
-        .jobs
-        .get_mut(&job_id)
-        .expect("the job is live")
-        .spec
-        .files[index_file_index as usize]
-        .role = weaver_model::files::FileRole::Unknown;
-    assert!(
-        pipeline
-            .direct_route_target(NzbFileId {
-                job_id,
-                file_index: 0,
-            })
-            .is_some(),
-        "the sets must be admitted while the job looks par2-less"
-    );
-    pipeline
-        .jobs
-        .get_mut(&job_id)
-        .expect("the job is live")
-        .spec
-        .files[index_file_index as usize]
-        .role = index_role;
-
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
         submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
     }
@@ -9172,26 +9158,33 @@ async fn live_par2_never_records_an_encrypted_direct_volume() {
         "non-vacuity: the set under test must really be decrypting at write time"
     );
 
-    // The feed half. Nothing about these volumes may have been recorded, so
-    // there is no coverage for activation to bind and nothing to settle.
-    for file_index in 0..volumes.len() as u32 {
-        assert_eq!(
-            pipeline
-                .live_par2
-                .recorded_ranges(NzbFileId { job_id, file_index }),
-            None,
-            "live verification must hold no coverage for encrypted direct volume {file_index}"
-        );
-    }
-
-    // The read-back half, at its own seam: the virtual volume such a read would
-    // go through refuses to answer at all.
+    // The feed half: posted cipher, recorded against every volume.
     for file_index in 0..volumes.len() as u32 {
         assert!(
             pipeline
-                .direct_virtual_volume(NzbFileId { job_id, file_index })
-                .is_none(),
-            "an encrypted set's virtual volume must not answer a posted-byte read"
+                .live_par2
+                .recorded_ranges(NzbFileId { job_id, file_index })
+                .is_some_and(|ranges| !ranges.is_empty()),
+            "live verification must record posted coverage for encrypted direct \
+             volume {file_index}"
+        );
+    }
+
+    // The read-back half: the virtual volume answers, and it answers in posted
+    // space — the bytes a settle read would consume are the volume's own.
+    for (file_index, (_, posted)) in volumes.iter().enumerate().take(volumes.len() - 1) {
+        let file_index = file_index as u32;
+        let (volume_index, len, provider) = pipeline
+            .direct_virtual_volume(NzbFileId { job_id, file_index })
+            .unwrap_or_else(|| panic!("volume {file_index} must answer through the overlay"));
+        assert_eq!(len, posted.len() as u64);
+        let mut reader = provider.open(volume_index).expect("registered");
+        let mut read_back = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut read_back).unwrap();
+        assert_eq!(
+            &read_back, posted,
+            "a settle read of encrypted direct volume {file_index} must see the \
+             bytes that were posted"
         );
     }
 
@@ -9212,45 +9205,52 @@ async fn live_par2_never_records_an_encrypted_direct_volume() {
 
     assert!(
         pipeline.live_par2.is_active(job_id),
-        "non-vacuity: live verification must really be switched on for this job, or \
-         'it recorded nothing' says nothing"
+        "non-vacuity: live verification must really be switched on for this job"
     );
     assert_eq!(
         pipeline.live_par2.metrics().blocks_bad,
         0,
-        "an encrypted set must not poison a single live block"
+        "not one live block may come back Bad — a read-back that returned \
+         plaintext would have failed every block straddling an article boundary"
     );
-    for file_index in 0..volumes.len() as u32 {
-        assert_eq!(
-            pipeline
-                .live_par2
-                .block_states(NzbFileId { job_id, file_index }),
-            None,
-            "encrypted direct volume {file_index} must have no live block state at all"
-        );
-    }
+    let metrics = pipeline.live_par2.metrics();
+    assert!(
+        metrics.blocks_backfilled + metrics.blocks_settled > 0,
+        "non-vacuity for that: blocks must really have been settled by a
+         **read-back** through the virtual volume, which is the half E1 could not
+         do at all; got {metrics:?}"
+    );
+    assert!(
+        metrics.full_verify_skips > 0,
+        "and every one of them must have come back Ok, or the short-circuit could
+         not have fired; got {metrics:?}"
+    );
     assert!(
         pipeline.par2_set(job_id).is_some(),
-        "the recovery set must have parsed, or the pass this protects never runs"
+        "the recovery set must have parsed, or nothing above verified anything"
     );
 }
 
 #[tokio::test]
-async fn an_encrypted_set_demotes_when_a_recovery_set_the_spec_never_declared_turns_up() {
-    // The belt behind E1 review F1's admission refusal, and the case it is
-    // genuinely for: a PAR2 file the job's spec did **not** classify as one — a
-    // deobfuscated or renamed file — whose recovery set only becomes real
-    // mid-job. Admission had nothing to refuse on, the set is already routing
-    // encrypted, and the guard in front of the authoritative pass has to take it
-    // out of direct mode before that pass reads plaintext where cipher belongs.
+async fn a_recovery_set_the_spec_never_declared_no_longer_demotes_an_encrypted_set() {
+    // The E1 belt, and what E2 leaves of it. A PAR2 file the job's spec did
+    // **not** classify as one — a deobfuscated or renamed file — can make a
+    // recovery set real mid-job, long after an encrypted set started routing.
+    // E1 had to demote such a set before the authoritative pass, because the
+    // pass would otherwise have read plaintext where cipher belongs; the whole
+    // set's volumes then came back off the wire.
+    //
+    // With the overlay the pass reads posted bytes, so the belt no longer fires
+    // on "encrypted" at all. It fires only on
+    // `posted_bytes_unavailable`, and this set can serve every byte it routed —
+    // so the assertion is that the set is **still direct** and that its virtual
+    // volumes really do answer as posted.
     //
     // Modelled by stripping the PAR2 role from the *spec* after the job is
     // inserted: the assembly keeps its own copy, so the index still parses
-    // through the production path, while `job_spec_has_par2_file` — which is
-    // what admission reads, and what the finalization wait reads — answers no.
+    // through the production path, while `job_spec_has_par2_file` answers no.
     // The last article is held back so the set is still live when the recovery
-    // set lands, which is the only state the guard has anything to do in: a set
-    // that already finalized is forgiven by name, and a demoted one has left.
+    // set lands, which is the only state the guard has anything to do in.
     let member_name = "Silver.Horizon.S02E15.mkv";
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 193) as u8).collect();
     let volumes = encrypted_store_set(
@@ -9288,7 +9288,7 @@ async fn an_encrypted_set_demotes_when_a_recovery_set_the_spec_never_declared_tu
         submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
     }
     // Non-vacuity: it really did route the encrypted set before the recovery set
-    // turned up, so the demotion below is the belt firing and not admission.
+    // turned up, so what the guard decides below is about a live encrypted set.
     assert!(
         pipeline
             .direct_store
@@ -9317,33 +9317,422 @@ async fn an_encrypted_set_demotes_when_a_recovery_set_the_spec_never_declared_tu
     );
 
     assert!(
-        pipeline.demote_unbindable_direct_sets(job_id).await,
-        "the guard in front of the authoritative pass must report that it demoted"
+        !pipeline.demote_unbindable_direct_sets(job_id).await,
+        "a late recovery set must no longer take an encrypted set out of direct mode"
     );
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
-        shape.contains("Demoted(EncryptedPar2Unsupported)"),
-        "a late recovery set must take an encrypted set out of direct mode before the \
-         authoritative pass, got {shape}"
+        !shape.contains("Demoted"),
+        "the set must still be routing after the guard has run, got {shape}"
+    );
+    assert!(
+        volumes
+            .iter()
+            .all(|(filename, _)| !working_dir.join(filename).exists()),
+        "and nothing may have been materialized: the set never left direct mode"
     );
 
-    // The demotion refetches rather than reconstructs, which is the other half
-    // of the same rule: the member partials hold plaintext, so materializing a
-    // volume out of them would write decrypted bytes where PAR2 expects cipher.
-    // Every article comes back, and no volume was fabricated in the meantime.
+    // The reason it may stay: every volume it has bytes for answers as posted.
+    // The last one is deliberately short an article, so this also pins that a
+    // half-arrived volume reads its covered prefix rather than refusing whole.
+    for (file_index, (_, posted)) in volumes.iter().enumerate().take(volumes.len() - 1) {
+        let file_index = file_index as u32;
+        let (volume_index, _, provider) = pipeline
+            .direct_virtual_volume(NzbFileId { job_id, file_index })
+            .unwrap_or_else(|| panic!("volume {file_index} must answer through the overlay"));
+        let mut reader = provider.open(volume_index).expect("registered");
+        let mut read_back = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut read_back).unwrap();
+        assert_eq!(
+            &read_back, posted,
+            "encrypted direct volume {file_index} must read back as it was posted"
+        );
+    }
+    let _ = &complete_dir;
+}
+
+#[tokio::test]
+async fn par2_damage_in_an_encrypted_sets_envelope_repairs_while_the_set_stays_direct() {
+    // D8's first transition, over cipher. The damaged byte is in a recovery
+    // record's data area — outside the member's packed range, so neither the
+    // per-part packed CRC32 over cipher nor the keyed whole-member fold over
+    // plaintext covers it, and inside a service block's data rather than a
+    // header, so the walk still parses and the volume still confirms. PAR2 is
+    // the only layer that can see it.
+    //
+    // Everything the repair then does goes through the overlay: the damaged
+    // volume is **materialized** out of the set's own bytes, which for an
+    // encrypted set means re-encrypting every member range it covers, and the
+    // repaired spans re-enter the router with `replace` set, which is the path
+    // E1 review F6's cache invalidation guards. Held to the same standard as
+    // the plaintext version: the gate-off run with the same password.
+    let member_name = "Silver.Horizon.S02E21.mkv";
+    // Not a multiple of 16, so the member carries tail padding and the
+    // materialization has to re-encrypt a final block out of it.
+    let payload: Vec<u8> = (0..2405u32).map(|index| (index % 211) as u8).collect();
+    let rr_bytes = 512;
+    let clean = encrypted_store_set_with_recovery(
+        member_name,
+        &payload,
+        3,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+        rr_bytes,
+    );
+    // The PAR2 set describes the *clean* volumes and carries enough recovery to
+    // rebuild the damaged slice; the job downloads a damaged volume.
+    let par2_bytes = repairable_par2_index(&clean, 4);
+    let mut volumes = clean.clone();
+    damage_recovery_record(&mut volumes, 1, rr_bytes);
+
+    let conventional = run_repairable_par2_gate_at(
+        DirectStoreGate::Disabled,
+        JobId(43121),
+        member_name,
+        &volumes,
+        &par2_bytes,
+        IndexPosition::Last,
+        Some("moonlit-harbour"),
+    )
+    .await;
+    let direct = run_repairable_par2_gate_at(
+        DirectStoreGate::Enabled,
+        JobId(43122),
+        member_name,
+        &volumes,
+        &par2_bytes,
+        IndexPosition::Last,
+        Some("moonlit-harbour"),
+    )
+    .await;
+
+    assert_eq!(
+        conventional.member.as_deref(),
+        Some(payload.as_slice()),
+        "the gate-off reference must repair the volume and decrypt the member; \
+         status={:?}",
+        conventional.status
+    );
+    assert_eq!(
+        (direct.member.as_deref(), &direct.status),
+        (conventional.member.as_deref(), &conventional.status),
+        "a repaired encrypted direct set must produce the gate-off output, with \
+         the same status; sets = {}",
+        direct.sets
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "repair-while-direct materializes only under a scratch name, never the \
+         volume's own; sets = {}",
+        direct.sets
+    );
+    assert_eq!(
+        direct.repair_scratch_left, 0,
+        "the materialized copies must be deleted whether the repair succeeded or fell back"
+    );
+    assert_eq!(
+        direct.materialized, 1,
+        "only the damaged volume may be materialized, and it must have been; \
+         sets = {}",
+        direct.sets
+    );
+    assert!(
+        direct.finalized > 0,
+        "the set must have stayed direct and committed its members from its own \
+         partials; sets = {}",
+        direct.sets
+    );
+    assert!(
+        !direct.sets.contains("Demoted"),
+        "nothing here may demote the set, got {}",
+        direct.sets
+    );
+}
+
+#[tokio::test]
+async fn an_encrypted_set_that_demotes_rebuilds_byte_exact_posted_volumes() {
+    // D8's *other* transition, over cipher. E1 refused reconstruction for an
+    // encrypted set outright (`ReconstructionFailure::EncryptedPostedBytes`) and
+    // refetched every article instead, because the member partials hold
+    // plaintext where the volume holds cipher.
+    //
+    // The overlay makes the sweep read posted bytes, so a demoting encrypted set
+    // materializes its volumes out of its own routed bytes like any other — and
+    // the standard is byte-exactness against what was posted, not merely "a file
+    // appeared", because reconstruction publishes a floor over what it writes
+    // and nothing downstream ever re-checks those bytes.
+    //
+    // The demotion is forced by a reason that has nothing to do with encryption
+    // — a scratch failure — so what is under test is the sweep and only the
+    // sweep. What keeps the set *live* while every article is in is the job's
+    // PAR2 file: finalization waits for a verdict, and the index is never
+    // posted, so the set sits in the wait a demotion can still reach. (A
+    // finalized set can never be demoted, and one that has committed its members
+    // has nothing left to reconstruct from.)
+    //
+    // Every article, deliberately. An encrypted member's last cipher block in
+    // volume *n* straddles into volume *n+1*, so a set missing any article holds
+    // the ≤15 bytes below that boundary — and the covered run then stops
+    // mid-article with nothing in the yEnc composition to vouch for it, which is
+    // `UnverifiableRun` and a refusal to reconstruct at all. That is correct,
+    // fail-closed behaviour; it is simply not what this test is about.
+    let member_name = "Silver.Horizon.S02E22.mkv";
+    let payload: Vec<u8> = (0..2405u32).map(|index| (index % 197) as u8).collect();
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        3,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+    let par2_bytes = par2_index_over_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(43131);
+    let (mut spec, _index_file_index) =
+        par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
+    spec.password = Some("moonlit-harbour".to_string());
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // Dequeued as they are delivered, so the queue at the end says what the
+    // demotion put *back* rather than what the harness never took out.
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        take_queued_segment(
+            &mut pipeline,
+            job_id,
+            SegmentId {
+                file_id: NzbFileId { job_id, file_index },
+                segment_number,
+            },
+        );
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| !set.is_demoted() && set.router.routes_encrypted()),
+        "non-vacuity: the set must have routed encrypted before it is demoted"
+    );
+
+    pipeline
+        .demote_direct_set(job_id, 0, DemotionReason::HoldsScratchFailed, None)
+        .await;
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted"),
+        "the set must have demoted, got {shape}"
+    );
+
+    // The whole point: real files, byte-exact against what was *posted* rather
+    // than against what the destinations hold.
+    for (filename, posted) in &volumes {
+        let rebuilt = std::fs::read(working_dir.join(filename))
+            .unwrap_or_else(|error| panic!("{filename} must have been materialized: {error}"));
+        assert_eq!(
+            &rebuilt, posted,
+            "{filename} must be rebuilt byte-exactly as it was posted, not as it \
+             was decrypted"
+        );
+    }
+    // And not one volume article came back off the wire — E1's refusal here
+    // refetched every one of them, which is exactly what the sweep exists to
+    // avoid. The PAR2 index is still outstanding because it was never posted.
     let queued = peek_queued_segments(&mut pipeline, job_id);
     assert!(
-        !queued.is_empty(),
-        "an encrypted set that demotes must refetch its volumes rather than materialize them"
+        queued
+            .iter()
+            .all(|(file_index, _)| *file_index as usize >= volumes.len()),
+        "an encrypted set that reconstructs must not also refetch its volumes, \
+         got {queued:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_par2_bearing_encrypted_set_restarted_mid_download_verifies_and_completes_byte_identically()
+ {
+    // E2's restart differential, and the shape E1 could not reach: a
+    // par2-bearing job was refused encrypted admission outright, so nothing
+    // encrypted ever survived a restart *and* faced a verifier.
+    //
+    // Three things have to hold together here. The floors have to be honoured
+    // (nothing below them comes back off the wire); the keyed member gate has to
+    // re-arm by re-reading the pre-restart **plaintext** from disk; and the
+    // overlay has to serve **posted** bytes over coverage this process never
+    // wrote — which means the crypt facts, the cipher checkpoints and the
+    // retained tail padding all came back through snapshot schema v4.
+    const ARTICLES: usize = 4;
+    let member_name = "Silver.Horizon.S02E23.mkv";
+    // Not a multiple of 16, so the retained tail padding is part of what the
+    // snapshot has to carry across the restart.
+    let payload: Vec<u8> = (0..8005u32).map(|index| (index % 251) as u8).collect();
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        3,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+    let par2_bytes = par2_index_over_volumes(&volumes);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(43141);
+
+    // Volume 0 whole, volume 1 half: one file the restore skips entirely and one
+    // it skips only part of, with a part boundary that is not 16-aligned — so
+    // the resumed run decrypts at a coverage frontier whose predecessor cipher
+    // block died with the process that wrote it.
+    let (working_dir, index_file_index) = {
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+        pipeline.live_par2.set_enabled(false);
+        let mut spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, ARTICLES);
+        let index_file_index = append_par2_index(&mut spec, &par2_bytes);
+        spec.password = Some("moonlit-harbour".to_string());
+        let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+        for (file_index, segment_number) in [(0u32, 0u32), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1)] {
+            submit_volume_article_of(
+                &mut pipeline,
+                job_id,
+                &volumes,
+                file_index,
+                segment_number,
+                ARTICLES,
+            )
+            .await;
+        }
+        pipeline
+            .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
+            .await;
+        (working_dir, index_file_index)
+    };
+
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(true);
+    let mut spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, ARTICLES);
+    append_par2_index(&mut spec, &par2_bytes);
+    spec.password = Some("moonlit-harbour".to_string());
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            complete_files: HashSet::new(),
+            file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir: working_dir.clone(),
+        })
+        .await
+        .unwrap();
+
+    let set = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the restored par2-bearing encrypted job must carry its direct set");
+    assert!(
+        !set.is_demoted(),
+        "a par2-bearing encrypted set must survive a restart now that the pass \
+         can read it as posted"
     );
     assert!(
-        volumes.iter().all(|(filename, _)| working_dir
-            .join(filename)
-            .metadata()
-            .map(|meta| meta.len())
-            .unwrap_or(0)
-            == 0),
-        "no source volume may have been reconstructed out of decrypted destinations"
+        set.has_restart_seeded_coverage(),
+        "restored coverage is seeded and unverified until it is re-read as plaintext"
     );
-    let _ = &complete_dir;
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        !queued.iter().any(|(file_index, _)| *file_index == 0),
+        "volume 0 was complete at the barrier; none of its articles may be \
+         refetched, got {queued:?}"
+    );
+    assert!(
+        !queued.contains(&(1, 0)),
+        "volume 1's checkpointed articles must not be refetched, got {queued:?}"
+    );
+
+    // The restored set answers in posted space before a single new article
+    // arrives — which is only possible if the snapshot carried the crypt facts,
+    // the cipher checkpoints and the tail padding across the restart.
+    let (volume_index, _, provider) = pipeline
+        .direct_virtual_volume(NzbFileId {
+            job_id,
+            file_index: 0,
+        })
+        .expect("the restored volume must answer through the overlay");
+    let mut reader = provider.open(volume_index).expect("registered");
+    let mut read_back = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut read_back).unwrap();
+    assert_eq!(
+        read_back, volumes[0].1,
+        "a restored encrypted volume must read back exactly as it was posted"
+    );
+
+    for (file_index, segment_number) in queued.clone() {
+        if file_index == index_file_index {
+            continue;
+        }
+        dispatch_and_submit(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES,
+        )
+        .await;
+    }
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_none_or(|set| !set.has_restart_seeded_coverage()),
+        "the keyed member gate must have re-read the pre-restart plaintext before \
+         finalizing"
+    );
+
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    let (member, location) = member_after_gate(&complete_dir, &working_dir, member_name);
+    assert_eq!(
+        member.as_deref(),
+        Some(payload.as_slice()),
+        "a restarted par2-bearing encrypted set must still produce the member"
+    );
+    assert_eq!(location, Some("complete"));
+    assert!(
+        volumes
+            .iter()
+            .all(|(filename, _)| !working_dir.join(filename).exists()),
+        "and it must never have materialized a source volume"
+    );
 }
