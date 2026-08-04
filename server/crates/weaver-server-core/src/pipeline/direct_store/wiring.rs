@@ -339,6 +339,11 @@ impl DirectPar2Overlay {
     /// materializes and re-routes between the pass and the repair, and the
     /// coverage the sets carry afterwards is the coverage the repair's reads
     /// must see.
+    ///
+    /// A **retained** finalized set is the one exception, and for the same
+    /// reason: its image was captured at finalization precisely because nothing
+    /// can re-derive it afterwards — the coverage controller has been retired
+    /// and the partials renamed away — so it is replayed rather than rebuilt.
     pub(crate) fn virtual_volumes_for(
         &self,
         runtime: &DirectStoreRuntime,
@@ -347,7 +352,11 @@ impl DirectPar2Overlay {
         let mut volumes = Vec::new();
         for (set_index, lengths) in &self.lengths {
             let set = runtime.set(job_id, *set_index)?;
-            for mut volume in set.virtual_volumes(lengths) {
+            let set_volumes = match set.retained_volumes() {
+                Some(retained) => retained.to_vec(),
+                None => set.virtual_volumes(lengths),
+            };
+            for mut volume in set_volumes {
                 let file_index = set
                     .plan()
                     .volumes
@@ -684,16 +693,24 @@ impl Pipeline {
         let mut file_indices = HashMap::new();
         let mut set_lengths = Vec::new();
         for (set_index, set) in self.direct_store.sets_for(job_id).iter().enumerate() {
-            // A demoted set's volumes are materializing or being refetched, and
-            // a **finalized** set no longer owns a readable volume image at all:
-            // its partials have been renamed to their destinations and its
-            // envelopes deleted. Serving either one through the provider would
-            // answer a verifier's reads with holes and report damage that is not
-            // there. Finalization is gated on the job's verdict for exactly this
-            // reason, so a set can only be finalized here on a *re*-verify, and
-            // then the ordinary file access is the honest answer — see
-            // `forgive_finalized_direct_volumes` for what makes it honest.
-            if set.is_demoted() || set.is_finalized() {
+            // A demoted set's volumes are materializing or being refetched, so
+            // they are read from disk like any other file.
+            if set.is_demoted() {
+                continue;
+            }
+            // A **finalized** set has renamed its partials to their destinations
+            // and — unless it was asked to keep them for a live neighbour —
+            // deleted its envelopes, so nothing answers for its source volumes
+            // and serving it would report damage that is not there. One that
+            // *did* keep them serves the very same image out of the committed
+            // members instead, which is what lets a neighbour's repair read the
+            // surviving input slices Reed–Solomon needs from every file the
+            // recovery set describes (F2 follow-up). Either way it is never a
+            // repair *target*: `repair_direct_sets_with_par2_damage` skips a
+            // finalized set, and `forgive_finalized_direct_volumes` still
+            // excuses one whose image was not kept.
+            let retained = set.retained_volumes();
+            if set.is_finalized() && retained.is_none() {
                 continue;
             }
             // One `virtual_volumes` call for the whole set, so the shared
@@ -708,17 +725,33 @@ impl Pipeline {
                 let Some(binding) = self.resolve_live_par2_binding(file_id) else {
                     continue;
                 };
-                let received = self
-                    .jobs
-                    .get(&job_id)
-                    .and_then(|state| state.assembly.file(file_id))
-                    .map(|file| file.received_bytes())
-                    .unwrap_or(0);
-                let len = set.virtual_volume_len(*volume_index, received);
+                // A retained image carries the lengths it was captured with, so
+                // it stops depending on an assembly the job may have moved on
+                // from.
+                let len = match retained {
+                    Some(volumes) => volumes
+                        .iter()
+                        .find(|volume| volume.volume_index == *volume_index)
+                        .map(|volume| volume.len)
+                        .unwrap_or_default(),
+                    None => {
+                        let received = self
+                            .jobs
+                            .get(&job_id)
+                            .and_then(|state| state.assembly.file(file_id))
+                            .map(|file| file.received_bytes())
+                            .unwrap_or(0);
+                        set.virtual_volume_len(*volume_index, received)
+                    }
+                };
                 lengths.insert(*volume_index, len);
                 bindings.insert(*volume_index, (*file_index, binding.par2_file_id));
             }
-            for mut volume in set.virtual_volumes(&lengths) {
+            let set_volumes = match retained {
+                Some(volumes) => volumes.to_vec(),
+                None => set.virtual_volumes(&lengths),
+            };
+            for mut volume in set_volumes {
                 let Some((file_index, par2_file_id)) = bindings.get(&volume.volume_index).copied()
                 else {
                     continue;
@@ -885,6 +918,25 @@ impl Pipeline {
     /// Live and demoted sets are deliberately untouched: a live set's volumes
     /// are served virtually and its verdict is real, and a demoted set's are
     /// materializing or being refetched, so missing means missing.
+    ///
+    /// # Retention does not replace it, and does not fight it either
+    ///
+    /// A set that finalized beside a live neighbour keeps its envelopes and
+    /// serves its volumes out of the committed members
+    /// ([`Self::retain_finalized_direct_volumes`]), so in that window they read
+    /// `Complete` on their own and there is nothing here to forgive — the same
+    /// verdict, reached by reading rather than by excusing. This still runs, and
+    /// still has to: retention covers one window of one shape, and the pass that
+    /// motivated this rule is the *later* one, over a job whose sets are all
+    /// committed and whose envelopes are therefore gone. It is also the only
+    /// answer on the paths that read no overlay at all — `analyze_par2_damage`'s
+    /// filesystem-bound repairer among them.
+    ///
+    /// Deliberately confined to `Missing`. A retained volume that read `Damaged`
+    /// would be one whose destination moved or whose image is short, and
+    /// excusing that would hand the repair bytes it should not trust; it is left
+    /// as damage, the repair refuses on an unmaterialized write target, and the
+    /// job falls back to the demotion path.
     ///
     /// Returns the number of missing slices forgiven.
     pub(crate) fn forgive_finalized_direct_volumes(
@@ -2525,6 +2577,9 @@ impl Pipeline {
         for set_index in ready {
             self.finalize_direct_set(job_id, set_index).await;
         }
+        // The last set of a job finalizing is one of the two moments the answer
+        // to "can anything still read a retained image" changes.
+        self.release_retained_direct_volumes(job_id).await;
     }
 
     /// Whether a direct set must keep its envelopes and partials because the
@@ -2721,11 +2776,14 @@ impl Pipeline {
         };
         let set_name = set.set_name().to_string();
         let working_dir = set.plan().working_dir.clone();
-        // Repair scratch rides with the envelopes: both are the set's own
-        // working files, both are meaningless once the members are committed,
-        // and a repair that ran earlier in this job has already deleted its own.
-        let mut envelopes = set.plan().envelope_paths();
-        envelopes.extend(set.plan().repair_paths());
+        // Both are the set's own working files and both are meaningless once the
+        // members are committed, but they part company under retention: the
+        // envelopes *are* the virtual volume image and can be asked to outlive
+        // finalization, while repair scratch is a materialized write target
+        // nothing reads afterwards. A repair that ran earlier in this job has
+        // already deleted its own.
+        let envelopes = set.plan().envelope_paths();
+        let repair_scratch = set.plan().repair_paths();
         // `member_partials` is in **archive order** — `(first volume, physical
         // offset)` — and the commit loop below walks it in that order, so two
         // members whose names sanitize to the same destination overwrite each
@@ -2851,9 +2909,25 @@ impl Pipeline {
                 .insert(name.clone());
         }
 
-        for envelope in &envelopes {
-            crate::pipeline::release_cached_write_handle(envelope);
-            let _ = tokio::fs::remove_file(envelope).await;
+        for scratch in &repair_scratch {
+            crate::pipeline::release_cached_write_handle(scratch);
+            let _ = tokio::fs::remove_file(scratch).await;
+        }
+        // The set's members are at their destinations now, which is the earliest
+        // moment the retained image can point at them and the last moment its
+        // coverage is still readable — `retire` below resets the controller.
+        if self.retain_finalized_direct_volumes(job_id, set_index) {
+            info!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                "keeping a finalized direct set's envelopes so a live neighbour's PAR2 repair \
+                 can still read its source volumes"
+            );
+        } else {
+            for envelope in &envelopes {
+                crate::pipeline::release_cached_write_handle(envelope);
+                let _ = tokio::fs::remove_file(envelope).await;
+            }
         }
         // D2: the scratch dies with the set, and its high-water is reported
         // separately from RAM so the disk claim stays legible against the 1.05×
@@ -2900,6 +2974,158 @@ impl Pipeline {
             members = members.len(),
             "direct-store set finalized without materializing a volume"
         );
+    }
+
+    /// Keeps a finalizing set's virtual volume image alive past its own
+    /// commit, when the job's PAR2 story can still need it (phase 6 review, F2
+    /// follow-up).
+    ///
+    /// # The gap this closes
+    ///
+    /// Finalization renames a set's member partials to their destinations and
+    /// deletes its per-volume envelopes, so nothing can serve its source volumes
+    /// afterwards. If the job's recovery set also covers a **second** direct set
+    /// that is later found damaged, Reed–Solomon needs the surviving input
+    /// slices from *every* file it describes — the finalized set's volumes
+    /// included — and `execute_repair` fails on the ones it cannot open. The two
+    /// halves were mutually exclusive: with the finalized set's volumes absent
+    /// the neighbour could not repair, and materializing them under their own
+    /// names is the whole thing direct-store exists not to do.
+    ///
+    /// Retaining is the narrow answer. The bytes are already on disk twice over
+    /// — the envelope holds every non-member byte at its true physical offset,
+    /// and the member bytes are byte-identical at their destinations, because a
+    /// commit is a rename — so the image needs no reconstruction, only a pointer
+    /// swap and a stay of execution for the envelopes.
+    ///
+    /// # What is *not* retained
+    ///
+    /// - a job with no PAR2 file: there is no repair to serve;
+    /// - a set with no **live** neighbour: nothing left in this job can ask, and
+    ///   the release sweep below deletes what the last one held;
+    /// - an **encrypted** set (plan 136, E1). Its destinations hold plaintext
+    ///   and PAR2 describes the posted cipher, so an image assembled from them
+    ///   would answer every read that crossed a member with the wrong bytes.
+    ///   Such a set is refused admission on a par2-bearing job and demoted by
+    ///   `demote_unbindable_direct_sets` if a recovery set turns up later, so
+    ///   this is the belt: it stays until E2's re-encrypting overlay exists;
+    /// - an image with a hole in it — see
+    ///   [`DirectSet::retain_finalized_volumes`].
+    ///
+    /// A set that retains nothing keeps today's behaviour exactly, and
+    /// `forgive_finalized_direct_volumes` keeps excusing its absent volumes.
+    fn retain_finalized_direct_volumes(&mut self, job_id: JobId, set_index: usize) -> bool {
+        if !self.job_spec_has_par2_file(job_id) {
+            return false;
+        }
+        let Some(set) = self.direct_store.set(job_id, set_index) else {
+            return false;
+        };
+        if set.router.routes_encrypted() {
+            return false;
+        }
+        // A neighbour that can still reach the repair path. Demoted is terminal
+        // for this purpose too: a demoted set's volumes go back on disk and its
+        // repair is the filesystem-bound `Par2Repairer`'s, which reads no
+        // overlay at all.
+        let has_live_neighbour =
+            self.direct_store
+                .sets_for(job_id)
+                .iter()
+                .enumerate()
+                .any(|(index, other)| {
+                    index != set_index && !other.is_finalized() && !other.is_demoted()
+                });
+        if !has_live_neighbour {
+            return false;
+        }
+
+        // The same lengths `direct_par2_overlay` would have derived, captured
+        // here because the assembly is the only place a virtual volume's length
+        // lives and a retained image has to stop depending on it.
+        let mut lengths = std::collections::BTreeMap::new();
+        for (volume_index, file_index) in &set.plan().volumes {
+            let file_id = NzbFileId {
+                job_id,
+                file_index: *file_index,
+            };
+            let received = self
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.assembly.file(file_id))
+                .map(|file| file.received_bytes())
+                .unwrap_or(0);
+            lengths.insert(
+                *volume_index,
+                set.virtual_volume_len(*volume_index, received),
+            );
+        }
+        let retained = self
+            .direct_store
+            .set_mut(job_id, set_index)
+            .is_some_and(|set| set.retain_finalized_volumes(&lengths));
+        crate::runtime::perf_probe::record_owned(
+            format!(
+                "direct_store.finalized_retained.{}",
+                if retained { "kept" } else { "refused" }
+            ),
+            std::time::Duration::from_nanos(1),
+        );
+        retained
+    }
+
+    /// Deletes what [`Self::retain_finalized_direct_volumes`] kept, once the job
+    /// has no live direct set left to ask for it.
+    ///
+    /// The window is deliberately the job's *direct* sets rather than the job:
+    /// the only reader of a retained image is the repair behind
+    /// [`Self::resolve_direct_sets_before_par2_repairer`], which runs for live
+    /// sets only, so the moment the last one finalizes or demotes there is
+    /// nothing left that can read one. Called from the two seams that can change
+    /// that answer — a set finalizing and a set demoting — so the deferral costs
+    /// one directory of envelopes for one job for the span between them and not
+    /// a byte longer.
+    ///
+    /// Anything a crash leaves behind is swept at restart: a finalized set
+    /// retired its checkpoint row, so restore rebuilds it fresh, claims none of
+    /// its envelopes and `sweep_orphan_direct_files` deletes every one of them.
+    /// Nothing about retention is persisted, and nothing needs to be.
+    async fn release_retained_direct_volumes(&mut self, job_id: JobId) {
+        let sets = self.direct_store.sets_for(job_id);
+        if sets.iter().all(|set| set.retained_volumes().is_none()) {
+            return;
+        }
+        if sets
+            .iter()
+            .any(|set| !set.is_finalized() && !set.is_demoted())
+        {
+            return;
+        }
+        let retained: Vec<usize> = sets
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| set.retained_volumes().is_some())
+            .map(|(index, _)| index)
+            .collect();
+        for set_index in retained {
+            let Some(set) = self.direct_store.set(job_id, set_index) else {
+                continue;
+            };
+            let set_name = set.set_name().to_string();
+            let envelopes = set.plan().envelope_paths();
+            for envelope in &envelopes {
+                crate::pipeline::release_cached_write_handle(envelope);
+                let _ = tokio::fs::remove_file(envelope).await;
+            }
+            if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
+                set.release_retained_volumes();
+            }
+            debug!(
+                job_id = job_id.0,
+                set_name = %set_name,
+                "released a finalized direct set's retained envelopes"
+            );
+        }
     }
 
     /// D1's bounded small-member tolerance: extracts **only** the tolerated
@@ -3183,6 +3409,11 @@ impl Pipeline {
                 self.refetch_demoted_set(job_id, set_index, dropped).await;
             }
         }
+        // The other moment a retained image can lose its last possible reader: a
+        // demoted set is repaired by the filesystem-bound `Par2Repairer`, which
+        // reads no overlay, so a job whose last live set demotes has nothing
+        // left that could open one.
+        self.release_retained_direct_volumes(job_id).await;
     }
 
     /// D8's reconstruction path. `Ok(n)` when `n` volumes were materialized.

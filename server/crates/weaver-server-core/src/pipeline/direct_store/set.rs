@@ -125,6 +125,22 @@ pub(crate) struct DirectSet {
     pub(crate) latched_direct: bool,
     pub(crate) latched_materialized: bool,
     pub(crate) status: DirectSetStatus,
+    /// The set's virtual volume image, captured at finalization and kept alive
+    /// past it so a **neighbour's** PAR2 repair can still read this set's source
+    /// volumes (phase 6 review, F2 follow-up).
+    ///
+    /// Captured rather than re-derived, for two reasons that are both fatal
+    /// otherwise: finalization calls [`Self::retire`], which resets the coverage
+    /// controller, so `volume_coverage` would answer from `placed` alone — empty
+    /// for every range a *restart* seeded rather than this run writing — and the
+    /// member paths inside it point at the committed destinations, which only
+    /// this capture knows to substitute for the `.direct.partial`s the renames
+    /// took away.
+    ///
+    /// `None` for every set that is not finalized, and for a finalized set whose
+    /// envelopes were deleted the moment it committed — which is every set of a
+    /// job with no live neighbour, i.e. the overwhelming majority.
+    retained: Option<Vec<VirtualVolume>>,
 }
 
 impl std::fmt::Debug for DirectSet {
@@ -159,6 +175,7 @@ impl DirectSet {
             latched_direct: false,
             latched_materialized: false,
             status: DirectSetStatus::Routing,
+            retained: None,
         }
     }
 
@@ -975,12 +992,12 @@ impl DirectSet {
         &self,
         volume_lengths: &BTreeMap<u32, u64>,
     ) -> Vec<VirtualVolume> {
-        let working_dir = &self.router.plan().working_dir;
         // Built once and shared, never cloned per volume: every volume of a set
         // resolves member ids against the *same* partial paths, and a set with
         // `v` volumes and `m` members would otherwise pay `v * m` path clones
         // every time a provider is assembled — which is once per authoritative
         // PAR2 pass, per demotion sweep and per tolerated extraction (nit).
+        let working_dir = &self.router.plan().working_dir;
         let partials: std::sync::Arc<std::collections::HashMap<u32, std::path::PathBuf>> =
             std::sync::Arc::new(
                 self.router
@@ -1001,6 +1018,89 @@ impl DirectSet {
                 len: *len,
             })
             .collect()
+    }
+
+    /// [`Self::virtual_volumes`]' member map, pointed at the **committed
+    /// destinations** instead of the `.direct.partial`s finalization renamed
+    /// away. Byte-for-byte the same file — a commit is a rename — so the extents
+    /// resolve unchanged.
+    ///
+    /// `None` when a member has no resolvable destination, which is the one
+    /// shape a retained image must never be built over: a missing entry reads as
+    /// a hole, and a hole inside a member extent is a volume the verifier calls
+    /// damaged. `sync_members` already demotes a set whose members cannot all be
+    /// resolved *and* refuses two that collide onto one destination, so this can
+    /// only fire if those two ever drift — but the whole point of serving a
+    /// committed member is that the path is the member's own, so it is checked
+    /// here rather than assumed.
+    fn committed_member_paths(
+        &self,
+    ) -> Option<std::sync::Arc<std::collections::HashMap<u32, std::path::PathBuf>>> {
+        let mut paths: std::collections::HashMap<u32, std::path::PathBuf> =
+            std::collections::HashMap::new();
+        for (member_id, name, _) in self.router.member_partials() {
+            paths.insert(member_id, self.router.plan().member_output_path(name).ok()?);
+        }
+        Some(std::sync::Arc::new(paths))
+    }
+
+    /// Captures the set's virtual volume image so it survives finalization, and
+    /// reports whether it is worth keeping (phase 6 review, F2 follow-up).
+    ///
+    /// Must be called **before** [`Self::retire`] and **after** the members have
+    /// been renamed to their destinations: the first because retiring resets the
+    /// coverage controller this reads, the second because nothing but the rename
+    /// makes the substituted paths real.
+    ///
+    /// `false` — and nothing retained — unless every planned volume reads as one
+    /// unbroken run from zero to its length. A retained image exists to answer a
+    /// *neighbour's* repair, and a repair reads its surviving inputs whole: an
+    /// image with a hole in it would have the pass call this set damaged, plan a
+    /// repair of volumes nobody can write, and refuse the neighbour's along with
+    /// it. Refusing to retain leaves the job on the pre-existing path, where
+    /// `forgive_finalized_direct_volumes` excuses the absent volumes instead.
+    pub(crate) fn retain_finalized_volumes(&mut self, volume_lengths: &BTreeMap<u32, u64>) -> bool {
+        self.retained = None;
+        if volume_lengths.len() != self.router.plan().volumes.len() {
+            return false;
+        }
+        let Some(partials) = self.committed_member_paths() else {
+            return false;
+        };
+        let volumes: Vec<VirtualVolume> = volume_lengths
+            .iter()
+            .map(|(volume_index, len)| VirtualVolume {
+                volume_index: *volume_index,
+                envelope: self.router.plan().envelope_path(*volume_index),
+                extents: self.router.volume_member_extents(*volume_index),
+                partials: std::sync::Arc::clone(&partials),
+                covered: self.volume_coverage(*volume_index),
+                envelope_covered: self.envelope_coverage(*volume_index),
+                len: *len,
+            })
+            .collect();
+        if !volumes
+            .iter()
+            .all(|volume| volume.readable_prefix() == Some(volume.len) && volume.len > 0)
+        {
+            return false;
+        }
+        self.retained = Some(volumes);
+        true
+    }
+
+    /// The retained image, or `None` for a set that never kept one or has since
+    /// released it.
+    pub(crate) fn retained_volumes(&self) -> Option<&[VirtualVolume]> {
+        self.retained.as_deref()
+    }
+
+    /// Drops the retained image. The caller deletes the envelope files it named
+    /// in the same breath — they are what the image reads through, and keeping
+    /// either without the other is a lie in one direction or dead bytes in the
+    /// other.
+    pub(crate) fn release_retained_volumes(&mut self) {
+        self.retained = None;
     }
 
     /// The two checkpoint systems must never both own a member (D6 risk list).

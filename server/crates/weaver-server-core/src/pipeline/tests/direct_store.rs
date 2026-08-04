@@ -6776,25 +6776,51 @@ fn renamed_set(base: &str, volumes: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<
         .collect()
 }
 
-#[tokio::test]
-async fn a_finalized_set_does_not_stop_its_live_neighbour_repairing_while_direct() {
-    // F2. The quiet pass phase 6 runs in front of the repairer used to be a bare
-    // `verify_all`, without the two damage-attribution adjustments the
-    // authoritative pass applies to its own verdict. A **finalized** direct set
-    // has no source volumes on disk and never will — its partials are at their
-    // destinations and its envelopes are deleted — so every one of them reads
-    // `Missing` in that pass. `damaged_files_by_set` then finds no live owner
-    // for them and refuses the whole attempt with `DamageOutsideDirectSets`, so
-    // the set that *is* live and *is* repairable demotes instead, for damage
-    // that belongs to files the job legitimately finished without.
-    let finalized_member = "Silver.Horizon.S01E27.mkv";
-    let live_member = "Amber.Trail.S01E01.mkv";
-    let finalized_payload: Vec<u8> = (0..2400u32).map(|index| (index % 199) as u8).collect();
-    let live_payload: Vec<u8> = (0..3000u32).map(|index| (index % 227) as u8).collect();
-    let finalized_set = single_member_store_set(finalized_member, &finalized_payload, 2);
+/// Envelope files still sitting in `working_dir`.
+///
+/// Top level only, and by suffix, which is enough here and deliberately not
+/// enough in production: `sweep_orphan_direct_files` walks eight levels into a
+/// tree the *archive* names, where `chapter.envelope` is a file a real archive
+/// can perfectly well contain. These fixtures name their own members.
+fn direct_envelopes_left(working_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(working_dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".envelope"))
+        .count()
+}
+
+/// One recovery set over two direct sets, one of which finalizes while the other
+/// is still damaged.
+struct TwoSetPar2Fixture {
+    /// Both sets' volumes, in NZB order: set A first, then set B.
+    volumes: Vec<(String, Vec<u8>)>,
+    /// Set B's volumes alone, for the assertions about what must not appear
+    /// under a live volume's own name.
+    live_set: Vec<(String, Vec<u8>)>,
+    par2_bytes: Vec<u8>,
+    /// The `(file index, segment number)` that never arrives.
+    lost: (u32, u32),
+}
+
+/// Builds the F2 fixture.
+///
+/// Set A is clean and gate-passed. Set B loses the second half of its middle
+/// volume — member payload, recovery record and end-of-archive record together —
+/// which is what keeps its member gate open so it cannot finalize alongside its
+/// neighbour, and what leaves damage only PAR2 can answer.
+fn two_set_par2_fixture(
+    finalized_member: &str,
+    live_member: &str,
+    finalized_payload: &[u8],
+    live_payload: &[u8],
+) -> TwoSetPar2Fixture {
+    let finalized_set = single_member_store_set(finalized_member, finalized_payload, 2);
     let live_set = renamed_set(
         "amber.trail",
-        recovery_record_store_set(live_member, &live_payload, 3, 256),
+        recovery_record_store_set(live_member, live_payload, 3, 256),
     );
     let volumes: Vec<(String, Vec<u8>)> = finalized_set
         .iter()
@@ -6802,35 +6828,51 @@ async fn a_finalized_set_does_not_stop_its_live_neighbour_repairing_while_direct
         .cloned()
         .collect();
     let par2_bytes = repairable_par2_index(&volumes, 16);
-    // The live set's middle volume loses its second half — member payload, the
-    // recovery record and the end-of-archive record together, which is what
-    // keeps that set's member gate open so it does not finalize alongside its
-    // neighbour.
     let lost = (finalized_set.len() as u32 + 1, 1u32);
+    TwoSetPar2Fixture {
+        volumes,
+        live_set,
+        par2_bytes,
+        lost,
+    }
+}
 
-    let temp_dir = tempfile::tempdir().unwrap();
-    let job_id = JobId(41091);
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+/// Drives the F2 fixture to the state the capability lives in: every article but
+/// the lost one delivered, the PAR2 index parsed, the download pipeline drained,
+/// and set A finalized while set B is still live and damaged.
+///
+/// Reaching the state directly, because it is a *state*, not a sequence: a job
+/// whose PAR2 already read clean once released its ready sets, and one of them
+/// being ready while the other is not is the whole shape. Later passes happen
+/// for reasons that have nothing to do with the direct sets — a conventional
+/// member failing extraction is enough.
+async fn direct_job_with_one_finalized_neighbour(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    par2_bytes: &[u8],
+    lost: (u32, u32),
+) -> PathBuf {
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     pipeline.live_par2.set_enabled(true);
 
-    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
-    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", volumes, par2_bytes);
+    let working_dir = insert_active_job(pipeline, job_id, spec).await;
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
         if (file_index, segment_number) == lost {
             continue;
         }
-        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+        submit_volume_article(pipeline, job_id, volumes, file_index, segment_number).await;
     }
     submit_decoded_segment(
-        &mut pipeline,
+        pipeline,
         NzbFileId {
             job_id,
             file_index: index_file_index,
         },
         0,
         0,
-        &par2_bytes,
+        par2_bytes,
         "silver.horizon.par2",
         None,
     )
@@ -6841,11 +6883,6 @@ async fn a_finalized_set_does_not_stop_its_live_neighbour_repairing_while_direct
         state.recovery_queue = crate::DownloadQueue::new();
     }
 
-    // Reaching the state directly, because it is a *state*, not a sequence: a
-    // job whose PAR2 already read clean once released its ready sets, and one of
-    // them being ready while the other is not is the whole shape. Later passes
-    // happen for reasons that have nothing to do with the direct sets — a
-    // conventional member failing extraction is enough.
     pipeline.par2_verified.insert(job_id);
     pipeline.finalize_ready_direct_sets(job_id).await;
 
@@ -6871,31 +6908,110 @@ async fn a_finalized_set_does_not_stop_its_live_neighbour_repairing_while_direct
         1,
         "and exactly one must still be live and damaged; got {sets}"
     );
+    working_dir
+}
+
+#[tokio::test]
+async fn a_finalized_set_does_not_stop_its_live_neighbour_repairing_while_direct() {
+    // F2, second round: the capability itself, where the first round could only
+    // assert the absence of the bug it fixed.
+    //
+    // Round one fixed the **attribution**. The quiet pass phase 6 runs in front
+    // of the repairer was a bare `verify_all`, without the two damage
+    // adjustments the authoritative pass applies to its own verdict, so a
+    // finalized set's absent volumes all read `Missing`, `damaged_files_by_set`
+    // found no live owner for them and refused the whole attempt with
+    // `DamageOutsideDirectSets` — and the set that *was* live and *was*
+    // repairable demoted instead, for damage belonging to files the job
+    // legitimately finished without. After it, the pass reached the right set.
+    //
+    // It still could not repair it, and that is what this test is now about.
+    // PAR2 repair is Reed–Solomon over the whole recovery set: rebuilding one
+    // slice reads the surviving slice of *every other file* at the same index,
+    // the finalized set's volumes included — and those had no image left, their
+    // partials renamed to their destinations and their envelopes deleted, so
+    // `execute_repair` failed on the first one it could not open. The two halves
+    // were mutually exclusive: stage the finalized set's volumes and the bug
+    // round one fixed does not trigger; leave them absent and the neighbour
+    // cannot repair. The old assertion was the honest end state of that
+    // stalemate — an attempt was made, and it failed.
+    //
+    // Retention closes it. A set finalizing beside a live neighbour keeps its
+    // envelopes and re-points its member extents at the committed destinations
+    // — the same bytes, because a commit is a rename — so it stays readable for
+    // exactly as long as something in this job can ask.
+    let finalized_member = "Silver.Horizon.S01E27.mkv";
+    let live_member = "Amber.Trail.S01E01.mkv";
+    let finalized_payload: Vec<u8> = (0..2400u32).map(|index| (index % 199) as u8).collect();
+    let live_payload: Vec<u8> = (0..3000u32).map(|index| (index % 227) as u8).collect();
+    let TwoSetPar2Fixture {
+        volumes,
+        live_set,
+        par2_bytes,
+        lost,
+    } = two_set_par2_fixture(
+        finalized_member,
+        live_member,
+        &finalized_payload,
+        &live_payload,
+    );
+
+    // The reference: the same job, the same lost article, the conventional
+    // repairer over real volume files. What the direct run has to match.
+    let conventional = run_lost_article_gate(
+        DirectStoreGate::Disabled,
+        JobId(41090),
+        live_member,
+        &volumes,
+        &par2_bytes,
+        lost,
+    )
+    .await;
+    assert_eq!(
+        conventional.member.as_deref(),
+        Some(live_payload.as_slice()),
+        "non-vacuity: the gate-off reference must repair the lost article and \
+         extract the damaged set's member, or there is nothing to be identical \
+         to; status={:?}",
+        conventional.status
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41091);
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let working_dir =
+        direct_job_with_one_finalized_neighbour(&mut pipeline, job_id, &volumes, &par2_bytes, lost)
+            .await;
+    assert!(
+        direct_envelopes_left(&working_dir) > 0,
+        "non-vacuity for the retention itself: the finalized set must still own \
+         its envelopes here, or the repair below is reading nothing it would not \
+         have had anyway"
+    );
+    assert_eq!(
+        std::fs::read(working_dir.join(finalized_member)).ok(),
+        Some(finalized_payload.clone()),
+        "and its member must be committed at its destination, because that is \
+         what the retained image reads the member extents back out of"
+    );
 
     let par2_set = pipeline
         .par2_set(job_id)
         .cloned()
         .expect("the index parsed");
-    pipeline
+    let resolution = pipeline
         .resolve_direct_sets_before_par2_repairer(job_id, par2_set, working_dir.clone())
         .await;
 
     let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
-    // The observable is **which set the damage was attributed to**, read off the
-    // repair once-latch: it is burned inside `repair_one_direct_set` and nowhere
-    // else, so it is set exactly when the pass decided this set owned the damage
-    // and went to work on it. Before the fix the whole attempt was refused up
-    // front with `DamageOutsideDirectSets` — the finalized neighbour's absent
-    // volumes counted as damage nobody owns — and no set was ever reached.
-    assert!(
-        pipeline
-            .direct_store
-            .sets_for(job_id)
-            .iter()
-            .any(|set| !set.is_finalized() && set.repair_attempted()),
-        "the live set's damage is its own, so the pass must attribute it there \
-         and attempt the repair; a set that was never reached is the finalized \
-         neighbour being blamed for it. sets = {sets}"
+    assert_eq!(
+        resolution,
+        crate::pipeline::direct_store::wiring::DirectPar2Resolution::Repaired,
+        "the live set's damage is its own and its inputs are all readable — the \
+         finalized neighbour's through its retained envelopes and committed \
+         members — so the repair must succeed in place. `Unresolved` is the old \
+         stalemate: attributed correctly, then `execute_repair` failing on a \
+         source volume nothing could open. sets = {sets}"
     );
     assert!(
         pipeline
@@ -6903,15 +7019,331 @@ async fn a_finalized_set_does_not_stop_its_live_neighbour_repairing_while_direct
             .sets_for(job_id)
             .iter()
             .all(|set| !set.is_finalized() || !set.repair_attempted()),
-        "and the finalized set is never the one repaired: its volumes are gone \
-         on purpose. sets = {sets}"
+        "and the finalized set is never the one repaired: it is a repair \
+         *source*, never a target — nothing may write into a set whose members \
+         are already committed. sets = {sets}"
     );
     assert!(
         live_set
             .iter()
             .all(|(filename, _)| !working_dir.join(filename).exists()),
-        "nothing may materialize under a live volume's own name while the \
-         attempt is in progress"
+        "nothing may materialize under a live volume's own name: that path \
+         belongs to demotion"
+    );
+
+    // From here it is an ordinary finish: the repaired set re-verifies, its
+    // member gate re-arms, it finalizes, and the job completes.
+    let mut envelopes_when_all_terminal = None;
+    for _ in 0..48 {
+        if matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete) | Some(JobStatus::Failed { .. })
+        ) {
+            break;
+        }
+        drain_rar_refreshes(&mut pipeline).await;
+        pipeline.check_job_completion(job_id).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        settle_inflight_moves(&mut pipeline).await;
+        if let Ok(Some(done)) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            pipeline.extract_done_rx.recv(),
+        )
+        .await
+        {
+            pipeline.handle_extraction_done(done).await;
+            pump_pipeline_runtime_queues(&mut pipeline).await;
+            settle_inflight_moves(&mut pipeline).await;
+        }
+        // Sampled at the first moment both sets are committed, which is where
+        // the job's PAR2 story concludes and the retention window shuts. Read
+        // here rather than after the loop because a completed job's working
+        // directory is cleaned up, and an assertion over a directory that is not
+        // there passes for the wrong reason.
+        if envelopes_when_all_terminal.is_none() && pipeline.direct_store.finalized_sets >= 2 {
+            envelopes_when_all_terminal = Some(direct_envelopes_left(&working_dir));
+        }
+    }
+
+    let status = job_status_for_assert(&pipeline, job_id);
+    let (member, from) = member_after_gate(&complete_dir, &working_dir, live_member);
+    assert_eq!(
+        member.as_deref(),
+        conventional.member.as_deref(),
+        "the repaired member must be byte-identical to the gate-off run over the \
+         same damage; status={status:?} found_in={from:?}"
+    );
+    assert_eq!(
+        member_after_gate(&complete_dir, &working_dir, finalized_member).0,
+        Some(finalized_payload),
+        "and the finalized neighbour's own output must be untouched by having \
+         been read as a repair source"
+    );
+    assert_eq!(
+        envelopes_when_all_terminal,
+        Some(0),
+        "once both sets are committed nothing in this job can ask for a virtual \
+         volume again, so every retained envelope must be gone — promptly, and \
+         without waiting for the working directory to be cleaned up"
+    );
+    assert_eq!(
+        direct_scratch_left(&working_dir),
+        0,
+        "and the repair scratch dies with the repair, as it always has"
+    );
+}
+
+#[tokio::test]
+async fn a_job_that_dies_inside_the_retention_window_sweeps_its_envelopes_on_restart() {
+    // Retention is in-memory bookkeeping over files on disk, and nothing about
+    // it is persisted — deliberately, because there is nothing a restart could
+    // do with it. A finalized set retires its checkpoint row, so restore rebuilds
+    // it fresh, claims none of its envelopes, and phase 5's orphan sweep takes
+    // every one of them. The point of the test is that deferring the delete did
+    // not quietly move an envelope out of the sweep's reach.
+    let finalized_member = "Silver.Horizon.S01E28.mkv";
+    let live_member = "Amber.Trail.S01E02.mkv";
+    let finalized_payload: Vec<u8> = (0..2400u32).map(|index| (index % 193) as u8).collect();
+    let live_payload: Vec<u8> = (0..3000u32).map(|index| (index % 229) as u8).collect();
+    let TwoSetPar2Fixture {
+        volumes,
+        par2_bytes,
+        lost,
+        ..
+    } = two_set_par2_fixture(
+        finalized_member,
+        live_member,
+        &finalized_payload,
+        &live_payload,
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41092);
+    let working_dir = {
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let working_dir = direct_job_with_one_finalized_neighbour(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            &par2_bytes,
+            lost,
+        )
+        .await;
+        assert!(
+            direct_envelopes_left(&working_dir) > 0,
+            "non-vacuity: the job must die holding retained envelopes"
+        );
+        working_dir
+    };
+
+    // The restart. Same working directory, same spec, fresh pipeline: exactly
+    // what a killed process leaves behind.
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let (spec, _) = par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            complete_files: HashSet::new(),
+            file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir: working_dir.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        direct_envelopes_left(&working_dir),
+        0,
+        "a retained envelope is claimed by nothing after a restart — its set's \
+         checkpoint row was retired at finalization — so the orphan sweep must \
+         delete it rather than leave it for the job's whole second life"
+    );
+    assert!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .all(|set| set.retained_volumes().is_none()),
+        "and no restored set may believe it is holding an image: retention is \
+         never restored, because there is nothing on disk left to serve"
+    );
+}
+
+#[tokio::test]
+async fn an_encrypted_finalized_set_is_refused_a_retained_image() {
+    // Plan 136, E1, read against the retention path. An encrypted set's
+    // destinations hold **plaintext** and PAR2 describes the posted **cipher**,
+    // so an image assembled from the committed members would answer every read
+    // that crossed a member with the wrong bytes — and a repair fed those would
+    // spend recovery blocks rebuilding good slices from bad inputs. The refusal
+    // is explicit and stays until E2's re-encrypting overlay exists.
+    //
+    // The window it lives in is the one E1's own belt exists for: a par2-bearing
+    // job refuses encrypted admission on the first header parse, but the PAR2
+    // file can be deobfuscated or renamed into the spec *after* the set was
+    // admitted, so a set that routes encrypted and a job that declares a
+    // recovery set can coexist. The fixture reproduces it exactly — admitted
+    // while the job looks par2-less, then the role goes back.
+    let encrypted_member = "Silver.Horizon.S02E18.mkv";
+    let live_member = "Amber.Trail.S01E03.mkv";
+    let encrypted_payload: Vec<u8> = (0..2400u32).map(|index| (index % 191) as u8).collect();
+    let live_payload: Vec<u8> = (0..3000u32).map(|index| (index % 233) as u8).collect();
+    let encrypted_set = encrypted_store_set(
+        encrypted_member,
+        &encrypted_payload,
+        2,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+    let live_set = renamed_set(
+        "amber.trail",
+        recovery_record_store_set(live_member, &live_payload, 3, 256),
+    );
+    let volumes: Vec<(String, Vec<u8>)> = encrypted_set
+        .iter()
+        .chain(live_set.iter())
+        .cloned()
+        .collect();
+    let par2_bytes = repairable_par2_index(&volumes, 16);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41093);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(true);
+    let (mut spec, index_file_index) =
+        par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
+    spec.password = Some("moonlit-harbour".to_string());
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // Admitted while the spec's PAR2 role is stripped, so admission's own
+    // refusal does not fire and the set really does route encrypted; the role
+    // goes back before a byte flows. The index itself is never posted, which
+    // keeps `par2_set` empty and therefore keeps the *other* encrypted guard —
+    // `demote_unbindable_direct_sets` — out of the way, so what this test
+    // observes is the retention refusal and nothing else.
+    let index_role = pipeline
+        .jobs
+        .get(&job_id)
+        .expect("the job is live")
+        .spec
+        .files[index_file_index as usize]
+        .role
+        .clone();
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .expect("the job is live")
+        .spec
+        .files[index_file_index as usize]
+        .role = weaver_model::files::FileRole::Unknown;
+    assert!(
+        pipeline
+            .direct_route_target(NzbFileId {
+                job_id,
+                file_index: 0,
+            })
+            .is_some(),
+        "the sets must be admitted while the job looks par2-less"
+    );
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .expect("the job is live")
+        .spec
+        .files[index_file_index as usize]
+        .role = index_role;
+
+    // The encrypted set arrives whole, so it is the one that finalizes. Its
+    // neighbour gets each volume's first article only: enough to open an
+    // envelope of its own — which the last assertion reads as a control — and
+    // far from enough to finalize alongside.
+    for (file_index, segment_number) in in_order_arrivals(encrypted_set.len()) {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    for file_index in encrypted_set.len() as u32..volumes.len() as u32 {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, 0).await;
+    }
+    assert!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| !set.is_demoted() && set.router.routes_encrypted()),
+        "non-vacuity: the set under test must really be decrypting at write time"
+    );
+
+    pipeline.par2_verified.insert(job_id);
+    pipeline.finalize_ready_direct_sets(job_id).await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    let encrypted_index = pipeline
+        .direct_store
+        .sets_for(job_id)
+        .iter()
+        .position(|set| set.router.routes_encrypted())
+        .unwrap_or_else(|| panic!("the encrypted set must still be there; got {sets}"));
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, encrypted_index)
+            .is_some_and(|set| set.is_finalized()),
+        "non-vacuity: the encrypted set must have finalized beside a live \
+         neighbour, which is the only state the refusal has anything to do in; \
+         got {sets}"
+    );
+    assert_eq!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .filter(|set| !set.is_finalized() && !set.is_demoted())
+            .count(),
+        1,
+        "and its neighbour must still be live, or the refusal is indistinguishable \
+         from the ordinary no-neighbour delete; got {sets}"
+    );
+
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, encrypted_index)
+            .is_some_and(|set| set.retained_volumes().is_none()),
+        "an encrypted set must never be handed a retained image: its destinations \
+         hold plaintext and PAR2 describes the cipher that was posted"
+    );
+    let envelopes = pipeline
+        .direct_store
+        .set(job_id, encrypted_index)
+        .expect("the encrypted set is there")
+        .plan()
+        .envelope_paths();
+    assert!(
+        envelopes.iter().all(|envelope| !envelope.exists()),
+        "and the refusal must be a real delete rather than a flag: the envelopes \
+         go at finalization, exactly as they did before retention existed"
+    );
+    assert!(
+        direct_envelopes_left(&working_dir) > 0,
+        "non-vacuity for that check: the live neighbour's own envelopes must \
+         still be there, so the assertion above is about the encrypted set \
+         rather than about an empty directory"
     );
 }
 
