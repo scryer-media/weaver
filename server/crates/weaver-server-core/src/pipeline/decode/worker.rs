@@ -1314,24 +1314,28 @@ impl Pipeline {
                 }
             };
             let decoded_len = data.len_bytes();
-            if let Err(mismatch) = validate_yenc_layout(expected_layout, yenc_layout, decoded_len) {
+            let file_offset = match validate_yenc_layout(expected_layout, yenc_layout, decoded_len) {
+                Ok(file_offset) => file_offset,
+                Err(mismatch) => {
                 let error = format_yenc_layout_mismatch(
                     mismatch,
                     expected_layout,
                     yenc_layout,
                     decoded_len,
                 );
-                self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
-                self.handle_decode_failure(
-                    segment_id,
-                    &error,
-                    &source.exclude_servers,
-                    source.source_server_idx,
-                );
-                return;
-            }
-            let file_offset = expected_layout.file_offset;
-            let decoded_size = expected_layout.decoded_size;
+                    self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                    self.handle_decode_failure(
+                        segment_id,
+                        &error,
+                        &source.exclude_servers,
+                        source.source_server_idx,
+                    );
+                    return;
+                }
+            };
+            // The bytes that actually decoded, not what the NZB declared: its
+            // sizes are yEnc-encoded and run ~3% large.
+            let decoded_size = decoded_len as u32;
 
             self.metrics
                 .bytes_decoded
