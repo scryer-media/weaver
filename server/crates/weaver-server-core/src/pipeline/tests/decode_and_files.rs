@@ -640,6 +640,64 @@ async fn fail_job_clears_write_backlog_accounting() {
 }
 
 #[tokio::test]
+async fn replayed_article_mid_download_still_completes_the_file() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20006);
+    let filename = "replayed.bin";
+    let payload = b"aaaabbbbcccc";
+    let whole_file_crc = weaver_par2::checksum::crc32(payload);
+    let spec = segmented_job_spec("Replayed Article", filename, &[4, 4, 4]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    for (segment_number, offset, chunk) in [
+        (0u32, 0u64, &payload[0..4]),
+        // The same article is delivered twice, landing behind the file's
+        // write cursor. It must not stall the segments still to come.
+        (0, 0, &payload[0..4]),
+        (1, 4, &payload[4..8]),
+        (2, 8, &payload[8..12]),
+    ] {
+        submit_decoded_segment(
+            &mut pipeline,
+            file_id,
+            segment_number,
+            offset,
+            chunk,
+            filename,
+            Some(whole_file_crc),
+        )
+        .await;
+    }
+
+    // The whole-file CRC32 gate runs off the assembled bytes, so a completion
+    // event here also says the replay did not corrupt what landed on disk.
+    let drained_events = drain_job_events(&mut events, job_id);
+    assert!(
+        drained_events.iter().any(|event| matches!(
+            event,
+            PipelineEvent::FileComplete { total_bytes, .. }
+                if *total_bytes == payload.len() as u64
+        )),
+        "a replayed article must not wedge the file's write reorder buffer: {drained_events:?}"
+    );
+    assert!(
+        !drained_events
+            .iter()
+            .any(|event| matches!(event, PipelineEvent::JobFailed { .. })),
+        "{drained_events:?}"
+    );
+    assert!(!pipeline.write_buffers.contains_key(&file_id));
+    assert_eq!(pipeline.write_buffered_bytes, 0);
+    assert_eq!(pipeline.write_buffered_segments, 0);
+}
+
+#[tokio::test]
 async fn disk_write_failure_fails_job_before_commit() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
