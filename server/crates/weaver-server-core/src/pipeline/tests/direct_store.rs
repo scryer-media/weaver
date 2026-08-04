@@ -75,6 +75,207 @@ fn single_member_store_set(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Quick Open: the cache is a hint, and direct-store never routes on one
+// ---------------------------------------------------------------------------
+
+/// The RAR5 extra record that points a main header at a `QO` block: a LOCATOR
+/// record carrying the quick-open offset **relative to the main header itself**.
+fn build_test_rar_locator_extra(qopen_offset_from_main: u64) -> Vec<u8> {
+    let mut record = Vec::new();
+    record.extend_from_slice(&encode_test_rar_vint(0x01)); // LOCATOR.
+    record.extend_from_slice(&encode_test_rar_vint(0x01)); // LOCATOR_QLIST.
+    record.extend_from_slice(&encode_test_rar_vint(qopen_offset_from_main));
+    let mut out = encode_test_rar_vint(record.len() as u64);
+    out.extend_from_slice(&record);
+    out
+}
+
+/// One cached header inside a `QO` block: `crc32(size || body) || size || body`,
+/// where the body is the header's offset *back* from the `QO` header, its
+/// length, and the header bytes themselves.
+fn build_test_rar_qopen_record(
+    qopen_header_offset: u64,
+    original_header_offset: u64,
+    cached_header: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&encode_test_rar_vint(0)); // flags, unused here.
+    body.extend_from_slice(&encode_test_rar_vint(
+        qopen_header_offset - original_header_offset,
+    ));
+    body.extend_from_slice(&encode_test_rar_vint(cached_header.len() as u64));
+    body.extend_from_slice(cached_header);
+
+    let size = encode_test_rar_vint(body.len() as u64);
+    let crc = checksum::crc32(&[size.as_slice(), body.as_slice()].concat());
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&size);
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Where the `QO` block starts in the last volume. Fixed rather than derived,
+/// because the locator that names it lives in the main header *before* it and
+/// its own vint width would otherwise depend on the answer.
+const QOPEN_OFFSET: u64 = 512;
+
+/// A two-volume stored set whose **last** volume carries a locator and a `QO`
+/// cache, past its end-of-archive record where a real archiver puts one.
+///
+/// `forged_name` is the whole point. `None` builds an honest cache that echoes
+/// exactly the header the physical walk finds. `Some(name)` appends a second
+/// cached file header that no physical header describes — the shape the RAR spec
+/// warns can be crafted, and the one D2 forbids routing a byte on.
+fn quick_open_store_set(
+    member_name: &str,
+    payload: &[u8],
+    forged_name: Option<&str>,
+) -> Vec<(String, Vec<u8>)> {
+    let member_crc = checksum::crc32(payload);
+    let split = payload.len() / 2;
+
+    let mut first = Vec::new();
+    first.extend_from_slice(&TEST_RAR5_SIG);
+    first.extend_from_slice(&build_test_rar_main_header(0x0001, None));
+    first.extend_from_slice(&build_test_rar_file_header(
+        member_name,
+        0x0010,
+        split as u64,
+        payload.len() as u64,
+        Some(checksum::crc32(&payload[..split])),
+    ));
+    first.extend_from_slice(&payload[..split]);
+    first.extend_from_slice(&build_test_rar_end_header(true));
+
+    let main = {
+        let mut type_body = Vec::new();
+        type_body.extend_from_slice(&encode_test_rar_vint(0x0001 | 0x0002));
+        type_body.extend_from_slice(&encode_test_rar_vint(1));
+        build_test_rar_header(
+            1,
+            0,
+            &type_body,
+            &build_test_rar_locator_extra(QOPEN_OFFSET - TEST_RAR5_SIG.len() as u64),
+        )
+    };
+    let real_header = build_test_rar_file_header(
+        member_name,
+        0x0008,
+        (payload.len() - split) as u64,
+        payload.len() as u64,
+        Some(member_crc),
+    );
+    let real_header_offset = (TEST_RAR5_SIG.len() + main.len()) as u64;
+
+    let mut second = Vec::new();
+    second.extend_from_slice(&TEST_RAR5_SIG);
+    second.extend_from_slice(&main);
+    second.extend_from_slice(&real_header);
+    second.extend_from_slice(&payload[split..]);
+    second.extend_from_slice(&build_test_rar_end_header(false));
+    assert!(
+        second.len() as u64 <= QOPEN_OFFSET,
+        "the physical headers must end before the QO block"
+    );
+    second.resize(QOPEN_OFFSET as usize, 0);
+
+    let mut records = build_test_rar_qopen_record(QOPEN_OFFSET, real_header_offset, &real_header);
+    if let Some(forged_name) = forged_name {
+        // Cached at an offset inside the padding, so nothing physical sits
+        // there: the only thing that says this member exists is the cache.
+        records.extend_from_slice(&build_test_rar_qopen_record(
+            QOPEN_OFFSET,
+            QOPEN_OFFSET - 64,
+            &build_test_rar_file_header(forged_name, 0, 16, 16, Some(0)),
+        ));
+    }
+    records.extend_from_slice(&build_test_rar_qopen_record(
+        QOPEN_OFFSET,
+        QOPEN_OFFSET - 32,
+        &build_test_rar_end_header(false),
+    ));
+    second.extend_from_slice(&build_test_rar_service_header("QO", records.len() as u64));
+    second.extend_from_slice(&records);
+
+    vec![
+        ("silver.horizon.part01.rar".to_string(), first),
+        ("silver.horizon.part02.rar".to_string(), second),
+    ]
+}
+
+/// The member names the library reports for a volume under its **default**
+/// options, which consult the Quick Open cache.
+fn library_default_member_names(volume: &[u8]) -> Vec<String> {
+    weaver_unrar::RarArchive::parse_volume_facts(std::io::Cursor::new(volume.to_vec()), None)
+        .expect("the fixture volume parses")
+        .members
+        .into_iter()
+        .map(|member| member.name)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_forged_quick_open_member_never_reaches_the_router() {
+    let member_name = "Silver.Horizon.S01E61.mkv";
+    let forged_name = "Silver.Horizon.S01E61.forged";
+    let payload: Vec<u8> = (0..400u32).map(|index| (index % 251) as u8).collect();
+    let volumes = quick_open_store_set(member_name, &payload, Some(forged_name));
+
+    // Non-vacuity, stated against the library rather than against weaver: with
+    // Quick Open left on — which is `parse_all_headers`' default and what
+    // `parse_volume_facts` still uses — the forged member *is* reported, and
+    // `members_extend` would have adopted it and routed payload into it.
+    assert_eq!(
+        library_default_member_names(&volumes[1].1),
+        vec![member_name.to_string(), forged_name.to_string()],
+        "the fixture must actually forge a member the physical walk cannot see"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let arrivals = in_order_arrivals(volumes.len());
+    let (shape, working_dir) =
+        run_direct_store_routing_only(&temp_dir, JobId(41101), &volumes, &arrivals).await;
+
+    assert!(
+        shape.contains("Demoted(QuickOpenMismatch)"),
+        "a volume whose headers disagree with its physical walk must leave direct mode \
+         under its own reason, got {shape}"
+    );
+    assert!(
+        !working_dir
+            .join(format!("{forged_name}.direct.partial"))
+            .exists(),
+        "no destination may be created for a member only the Quick Open cache claims"
+    );
+}
+
+#[tokio::test]
+async fn an_honest_quick_open_cache_still_routes() {
+    let member_name = "Silver.Horizon.S01E62.mkv";
+    let payload: Vec<u8> = (0..400u32).map(|index| (index % 251) as u8).collect();
+    let volumes = quick_open_store_set(member_name, &payload, None);
+
+    // The other half of the non-vacuity: the same fixture, same locator, same
+    // `QO` block — and the cache agrees with the walk, so nothing is refused.
+    assert_eq!(
+        library_default_member_names(&volumes[1].1),
+        vec![member_name.to_string()],
+        "an honest cache reports exactly the physical member"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let arrivals = in_order_arrivals(volumes.len());
+    let (shape, _) =
+        run_direct_store_routing_only(&temp_dir, JobId(41102), &volumes, &arrivals).await;
+    assert!(
+        !shape.contains("Demoted"),
+        "the cross-check must refuse a *disagreement*, not the presence of a cache, got {shape}"
+    );
+}
+
 /// The decoded extent of one article, for a volume cut into `articles` equal
 /// pieces. At `articles == 2` this is the head/tail split every phase 4 fixture
 /// uses.
@@ -3206,6 +3407,16 @@ enum ToleranceExtra {
     /// byte of it goes to the envelope, which is the shape D1's tolerance
     /// describes and the one the extraction can read back.
     Blake2OnlyStore,
+    /// A stored member with a real BLAKE2sp digest and no CRC32, **split**
+    /// across the last two volumes.
+    ///
+    /// The case the unsplit variant above cannot reach: the classifier only sees
+    /// the hash fields when the chain completes, so this member is
+    /// `ProvisionallyDirect` from its first header, gets adopted, and routes its
+    /// first part into a `.direct.partial` — and only then, at chain close,
+    /// resolves `Blake2OnlyNoCrc32`. Its already-routed bytes are in the wrong
+    /// file for the tolerance, which is what the migration exists to fix.
+    Blake2OnlySplit,
     /// An unsplit compressed member. The data area is not really compressed —
     /// nothing extracts it — so this is only good for what the *classification*
     /// and the budget decide.
@@ -3228,8 +3439,11 @@ fn store_set_with_extra_member(
     assert!(volume_count >= 2);
     let member_crc = checksum::crc32(store_payload);
     let chunk = store_payload.len().div_ceil(volume_count);
-    // The split-compressed shape puts its first half one volume earlier.
-    let split_extra = matches!(extra, ToleranceExtra::CompressedSplit);
+    // The split shapes put their first half one volume earlier.
+    let split_extra = matches!(
+        extra,
+        ToleranceExtra::CompressedSplit | ToleranceExtra::Blake2OnlySplit
+    );
     let extra_first_volume = if split_extra {
         volume_count - 2
     } else {
@@ -3287,6 +3501,22 @@ fn store_set_with_extra_member(
                         None,
                         &build_test_rar_blake2_extra(weaver_unrar::crypto::blake2sp_hash(
                             extra_payload,
+                        )),
+                    ),
+                    // What `rar -m0 -htb` writes for a member split across
+                    // volumes: **no** CRC32 anywhere, a BLAKE2sp packed hash per
+                    // non-final part and the whole-member BLAKE2sp on the last.
+                    // The open chain is what makes it `ProvisionallyDirect` —
+                    // routable, and routed — and the final header is what
+                    // resolves it `Blake2OnlyNoCrc32`.
+                    ToleranceExtra::Blake2OnlySplit => build_test_rar_file_header_with_extra(
+                        extra_name,
+                        extra_flags,
+                        extra_part.len() as u64,
+                        extra_payload.len() as u64,
+                        None,
+                        &build_test_rar_blake2_extra(weaver_unrar::crypto::blake2sp_hash(
+                            if is_last { extra_payload } else { extra_part },
                         )),
                     ),
                     ToleranceExtra::Compressed {
@@ -3378,6 +3608,159 @@ async fn a_small_blake2_only_member_rides_the_tolerance_and_both_members_match_t
         "the stored member routes directly and the tolerated one is extracted through \
          the virtual volumes; both must be byte-identical to the conventional extractor"
     );
+}
+
+/// The case wave 2 could only demote: a BLAKE2sp-only member the router adopted
+/// while its chain was open, whose routed bytes are migrated out of its partial
+/// and into the envelope so it can ride the tolerance after all.
+#[tokio::test]
+async fn a_split_blake2_only_member_migrates_to_the_envelope_and_matches_the_extractor() {
+    let store_name = "Silver.Horizon.S01E51.mkv";
+    let extra_name = "Silver.Horizon.S01E51.nfo";
+    // At least 100x the extra, so the extra fits under
+    // `min(64 MiB, 1% of packed archive bytes)`.
+    let store_payload: Vec<u8> = (0..30_000u32).map(|index| (index % 251) as u8).collect();
+    let extra_payload: Vec<u8> = (0..200u32).map(|index| (index % 97) as u8).collect();
+    let volumes = store_set_with_extra_member(
+        store_name,
+        &store_payload,
+        extra_name,
+        &extra_payload,
+        4,
+        ToleranceExtra::Blake2OnlySplit,
+    );
+    let arrivals = in_order_arrivals(volumes.len());
+
+    let conventional = run_multi_member_gate(
+        DirectStoreGate::Disabled,
+        JobId(41091),
+        &[store_name, extra_name],
+        &volumes,
+        &arrivals,
+    )
+    .await;
+    let direct = run_multi_member_gate(
+        DirectStoreGate::Enabled,
+        JobId(41092),
+        &[store_name, extra_name],
+        &volumes,
+        &arrivals,
+    )
+    .await;
+
+    assert!(
+        conventional.volume_file_seen,
+        "the conventional gate should have written source volumes"
+    );
+    // Non-vacuity, and the whole point: wave 2 demoted this set, and a demotion
+    // materializes every volume. A run with no volume on disk is a run that
+    // stayed direct through the chain close.
+    assert!(
+        !direct.volume_file_seen,
+        "the migration must keep the set direct: no source volume may appear on disk"
+    );
+    assert_eq!(
+        conventional.members[1].1.as_deref(),
+        Some(extra_payload.as_slice()),
+        "the conventional extractor should reproduce the BLAKE2sp-only member"
+    );
+    assert_eq!(
+        (direct.members, direct.status),
+        (conventional.members, conventional.status),
+        "the migrated member is extracted from the virtual volumes and the stored one \
+         from its own partial; both must be byte-identical to the conventional extractor"
+    );
+}
+
+#[tokio::test]
+async fn a_split_blake2_only_member_over_the_budget_demotes_on_its_own_reason() {
+    let store_name = "Silver.Horizon.S01E52.mkv";
+    let extra_name = "Silver.Horizon.S01E52.nfo";
+    // Ten percent of the archive, not one: nothing this size may be moved into
+    // the envelope, however cheap the copy would be.
+    let store_payload: Vec<u8> = (0..2_000u32).map(|index| (index % 251) as u8).collect();
+    let extra_payload: Vec<u8> = (0..200u32).map(|index| (index % 97) as u8).collect();
+    let volumes = store_set_with_extra_member(
+        store_name,
+        &store_payload,
+        extra_name,
+        &extra_payload,
+        4,
+        ToleranceExtra::Blake2OnlySplit,
+    );
+
+    let shape = tolerance_shape(JobId(41093), &volumes).await;
+    // Its **own** reason, not the tolerance's: the member is over the budget,
+    // but what ended its routing is that direct-store cannot verify it, and that
+    // is the population the metric has always counted here.
+    assert!(
+        shape.contains("Demoted(MemberIneligible(Blake2OnlyNoCrc32))"),
+        "an adopted member too large to migrate must demote exactly as it did before \
+         the migration existed, got {shape}"
+    );
+}
+
+#[tokio::test]
+async fn a_migration_that_cannot_read_its_partial_demotes_cleanly() {
+    let store_name = "Silver.Horizon.S01E53.mkv";
+    let extra_name = "Silver.Horizon.S01E53.nfo";
+    let store_payload: Vec<u8> = (0..30_000u32).map(|index| (index % 251) as u8).collect();
+    let extra_payload: Vec<u8> = (0..200u32).map(|index| (index % 97) as u8).collect();
+    let volumes = store_set_with_extra_member(
+        store_name,
+        &store_payload,
+        extra_name,
+        &extra_payload,
+        4,
+        ToleranceExtra::Blake2OnlySplit,
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41094);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // Everything up to the volume that closes the chain. The extra member's
+    // first part is routed into its partial by the volume before it.
+    let last = volumes.len() as u32 - 1;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if file_index == last {
+            continue;
+        }
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    let partial = working_dir.join(format!("{extra_name}.direct.partial"));
+    assert!(
+        std::fs::metadata(&partial).is_ok_and(|metadata| metadata.len() > 0),
+        "non-vacuity: the member must really have been adopted and routed before the \
+         migration is asked to move its bytes"
+    );
+    // The migration's read is what fails: the bytes it is told are there are
+    // gone. Truncation rather than deletion, so the destination the checkpoint
+    // claims still exists and only the read can fail.
+    std::fs::File::create(&partial).unwrap();
+
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if file_index != last {
+            continue;
+        }
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted(MemberIneligible(Blake2OnlyNoCrc32))"),
+        "a migration that cannot read the bytes it is moving must demote exactly as a \
+         set with no migration at all would have, got {shape}"
+    );
+    // Cleanly: nothing half-moved, and nothing fabricated. The migration mutates
+    // no state until every byte is in hand, so the routing history still claims
+    // the member's extents and the demotion sweep reads them from the partial —
+    // which is now empty, so it refuses rather than writing zeros into a volume.
+    assert_volumes_are_never_fabricated(&working_dir, &volumes);
 }
 
 /// The set's final router shape after every article of every volume.
@@ -5119,17 +5502,20 @@ async fn a_volume_completing_into_held_bytes_is_not_checkpointed_complete() {
     );
 }
 
-/// B2's other half: a restored volume whose header walk the previous run never
-/// finished cannot be confirmed by a parse — its pre-restart bytes are on disk
-/// rather than in the staged image — and the format cannot vouch for its tail
-/// either, because the volume *closes* the member chain and a second member's
-/// header could sit past the first's data area.
+/// A restart mid-download of a set's **last** volume.
 ///
-/// It must therefore leave direct mode by the front door, with its own reason,
-/// rather than hold its end-of-archive record for the life of the set and let a
-/// byte-perfect set read short to PAR2.
+/// The one shape the structural proof cannot reach: the cached facts stopped
+/// short of the end-of-archive record, and the volume *closes* the member chain,
+/// so `split_after` says nothing about whether a second member's header sits past
+/// the first's data area. Wave 3 demoted here by design.
+///
+/// The expensive arm does the only thing that actually answers the question: it
+/// rebuilds the walk's reader out of the volume's **envelope**, which holds every
+/// non-member byte at its true physical offset and is therefore exactly the
+/// header region, and re-parses. The set finishes one-pass and byte-identically
+/// instead of paying a materialization.
 #[tokio::test]
-async fn a_restored_last_volume_that_cannot_reconfirm_demotes_by_name() {
+async fn a_restored_last_volume_reconfirms_from_its_envelope_and_finalizes() {
     const ARTICLES: usize = 4;
     let member_name = "Silver.Horizon.S01E41.mkv";
     let payload: Vec<u8> = (0..8000u32).map(|index| (index % 229) as u8).collect();
@@ -5187,11 +5573,100 @@ async fn a_restored_last_volume_that_cannot_reconfirm_demotes_by_name() {
         )
         .await;
     }
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        !shape.contains("Demoted"),
+        "the re-parse must confirm the restored last volume rather than demote it, got {shape}"
+    );
+    // One pass: a demotion is what would have written these.
+    for (filename, _) in &volumes {
+        assert!(
+            !working_dir.join(filename).exists(),
+            "{filename} must never reach disk for a set that stayed direct"
+        );
+    }
+    let complete_dir = temp_dir.path().join("complete");
+    let (member, _) = member_after_gate(&complete_dir, &working_dir, member_name);
+    assert_eq!(
+        member.as_deref(),
+        Some(payload.as_slice()),
+        "the reconfirmed set must commit its member byte for byte"
+    );
+}
+
+/// The other half of the same seam: the re-parse is a *proof*, not a permission.
+///
+/// With the restored volume's envelope gone, the walk's reader has a hole where
+/// the headers were — nothing can prove the tail holds no undiscovered member —
+/// and the volume must demote under its own name exactly as wave 3 had it. What
+/// must not happen is confirming on the strength of "every article arrived",
+/// which would file an unproven region into an envelope that finalization
+/// deletes.
+#[tokio::test]
+async fn a_restored_last_volume_whose_envelope_is_gone_still_demotes_by_name() {
+    const ARTICLES: usize = 4;
+    let member_name = "Silver.Horizon.S01E42.mkv";
+    let payload: Vec<u8> = (0..8000u32).map(|index| (index % 229) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41082);
+    let arrivals: Vec<(u32, u32)> = vec![
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+        (1, 3),
+        (2, 0),
+        (2, 1),
+    ];
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+    // The last volume's envelope, gone from under an already-validated
+    // checkpoint. Deleted *after* the restore so the row itself is untouched and
+    // this isolates the re-parse: the remaining articles recreate the file, but
+    // only with the tail bytes they carry, so the header region the walk has to
+    // read is a hole.
+    let envelope = working_dir.join("silver.horizon.vol00002.envelope");
+    assert!(
+        envelope.exists(),
+        "non-vacuity: the volume must have had an envelope to lose"
+    );
+    crate::pipeline::release_cached_write_handle(&envelope);
+    std::fs::remove_file(&envelope).unwrap();
+
+    for (file_index, segment_number) in peek_queued_segments(&mut pipeline, job_id) {
+        dispatch_and_submit(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES,
+        )
+        .await;
+    }
 
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
         shape.contains("Demoted(UnconfirmedRestoredVolume)"),
-        "a restored volume that can never be confirmed must demote under its own \
+        "a restored volume the re-parse cannot run over must demote under its own \
          reason rather than hold its tail, got {shape}"
     );
     // Never wedged. The demotion is a *transition*, not a dead end: the set's

@@ -97,6 +97,12 @@ pub(crate) const TOLERANCE_UNPACKED_CEILING_BYTES: u64 = 256 * 1024 * 1024;
 /// The "1% of packed archive bytes" half of D1's packed ceiling, as a divisor.
 const TOLERANCE_ARCHIVE_PERCENT: u64 = 100;
 
+/// How much of a migrated member one envelope span carries. The whole migration
+/// is bounded by the tolerance's packed ceiling, so this only bounds the
+/// *individual* allocation and lets the write fan out across the disk owner
+/// threads the way ordinary routing does.
+const MIGRATION_SPAN_BYTES: u64 = 4 * 1024 * 1024;
+
 /// How far into a volume the provisional header parse may stage bytes before
 /// the set is declared unroutable. Real RAR headers are a few hundred bytes;
 /// this only exists so a set whose first article is entirely payload (a
@@ -201,6 +207,16 @@ pub(crate) enum DemotionReason {
     /// A confirming parse disagreed with the provisional one, or a volume was
     /// re-added with facts that are not an extension of what it stated before.
     ConflictingVolumeFacts,
+    /// A volume's headers, as the library reported them, are not the headers a
+    /// **physical** walk of the same image finds — so they came, wholly or
+    /// partly, from the archive's Quick Open cache (D2).
+    ///
+    /// The cache is a listing optimization the RAR spec explicitly says can be
+    /// crafted to disagree with the real archive, and direct-store's parse is a
+    /// routing decision: where posted bytes are written, and which members exist
+    /// at all. A set whose two answers differ is refused rather than reconciled,
+    /// because nothing in the format says which one is true.
+    QuickOpenMismatch,
     /// A volume restored from a checkpoint finished downloading without ever
     /// being confirmed, so its trailing region could never be classified (B2).
     ///
@@ -335,6 +351,7 @@ impl DemotionReason {
             Self::HoldsScratchFailed => "holds_scratch_io",
             Self::HoldsScratchCeiling => "holds_scratch_ceiling",
             Self::ConflictingVolumeFacts => "conflicting_volume_facts",
+            Self::QuickOpenMismatch => "quick_open_mismatch",
             Self::UnconfirmedRestoredVolume => "unconfirmed_restored_volume",
             Self::RestartRearmUnplaceable => "restart_rearm_unplaceable",
             Self::RestartRereadFailed => "restart_reread_failed",
@@ -723,6 +740,30 @@ impl HoldsScratch {
     }
 }
 
+/// One run of a [`SparseImage`], and where its bytes are read back from.
+enum ImageRun {
+    /// A run the router is still holding for this volume — in RAM, or paged out
+    /// to the set's holds scratch.
+    Staged(StagedChunk),
+    /// A run the volume's own **envelope file** holds, at its true physical
+    /// offset (envelope v2), read back positionally on demand.
+    ///
+    /// The run's start *is* the file offset, so the variant carries only a
+    /// length. Only a restored volume's image has these: its pre-restart bytes
+    /// are on disk rather than in `chunks`, and the envelope is where every
+    /// non-member byte of them went.
+    Envelope { len: u64 },
+}
+
+impl ImageRun {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Staged(chunk) => chunk.len(),
+            Self::Envelope { len } => *len,
+        }
+    }
+}
+
 /// A sparse byte image of one volume, read through by the header parser.
 ///
 /// Reads inside a staged run return real bytes; reads anywhere else return
@@ -735,13 +776,20 @@ impl HoldsScratch {
 /// is handed a reader by value and the library's entry point requires
 /// `'static`, so a plain borrow is not available; sharing the chunks is the
 /// same zero-copy with an ownership story that outlives the borrow.
+///
+/// [`Self::over_envelope`] keeps that property against a file: it adds runs the
+/// envelope backs, and each one is read only if and when the walk asks for it —
+/// which for a header walk is a header at a time, never the recovery record it
+/// seeks over.
 pub(super) struct SparseImage {
-    runs: Vec<(u64, StagedChunk)>,
+    runs: Vec<(u64, ImageRun)>,
     /// Read handle for the scratch-resident runs. Held as an `Arc<File>` so the
     /// image satisfies the parser's `'static` bound without reopening the file
     /// per parse, and read positionally so nothing here disturbs a concurrent
     /// append.
     scratch: Option<std::sync::Arc<std::fs::File>>,
+    /// Read handle for [`ImageRun::Envelope`] runs, held for the same reason.
+    envelope: Option<std::sync::Arc<std::fs::File>>,
     position: u64,
 }
 
@@ -753,9 +801,56 @@ impl SparseImage {
         Self {
             runs: chunks
                 .iter()
-                .map(|(offset, chunk)| (*offset, chunk.clone()))
+                .map(|(offset, chunk)| (*offset, ImageRun::Staged(chunk.clone())))
                 .collect(),
             scratch,
+            envelope: None,
+            position: 0,
+        }
+    }
+
+    /// [`Self::from_staged`] plus the bytes the volume's envelope file already
+    /// holds — the image a **restored** volume's confirming parse needs (B2).
+    ///
+    /// `envelope_ranges` are the physical ranges the envelope is known to hold:
+    /// the volume's routed coverage minus every member extent the routing
+    /// history claims (B1). Anything outside them stays a hole, so a byte that
+    /// went to a `.direct.partial` — or one a failed write never placed — is
+    /// never served out of the sparse hole standing in for it.
+    fn over_envelope(
+        chunks: &BTreeMap<u64, StagedChunk>,
+        scratch: Option<std::sync::Arc<std::fs::File>>,
+        envelope: std::sync::Arc<std::fs::File>,
+        envelope_ranges: &ByteRanges,
+    ) -> Self {
+        // Staged runs win wherever the two describe the same byte. They are the
+        // same bytes either way — `trim_volume` retains an unconfirmed volume's
+        // envelope bytes in RAM precisely so the walk can seek through them — and
+        // preferring RAM keeps the read off the disk. Overlap is resolved by
+        // subtraction rather than by priority at read time because the run list
+        // has to stay disjoint and sorted for the binary search below.
+        let mut only_envelope = ByteRanges::new();
+        for &(start, end) in envelope_ranges.ranges() {
+            only_envelope.insert(start, end - start);
+        }
+        for (offset, chunk) in chunks {
+            only_envelope = subtract(&only_envelope, *offset, chunk.len());
+        }
+        let mut runs: Vec<(u64, ImageRun)> = chunks
+            .iter()
+            .map(|(offset, chunk)| (*offset, ImageRun::Staged(chunk.clone())))
+            .chain(
+                only_envelope
+                    .ranges()
+                    .iter()
+                    .map(|&(start, end)| (start, ImageRun::Envelope { len: end - start })),
+            )
+            .collect();
+        runs.sort_unstable_by_key(|(start, _)| *start);
+        Self {
+            runs,
+            scratch,
+            envelope: Some(envelope),
             position: 0,
         }
     }
@@ -766,9 +861,15 @@ impl SparseImage {
         Self {
             runs: chunks
                 .iter()
-                .map(|(offset, bytes)| (*offset, StagedChunk::Memory(std::sync::Arc::clone(bytes))))
+                .map(|(offset, bytes)| {
+                    (
+                        *offset,
+                        ImageRun::Staged(StagedChunk::Memory(std::sync::Arc::clone(bytes))),
+                    )
+                })
                 .collect(),
             scratch: None,
+            envelope: None,
             position: 0,
         }
     }
@@ -784,14 +885,14 @@ impl Read for SparseImage {
         let Some(index) = index.checked_sub(1) else {
             return Ok(0);
         };
-        let (start, chunk) = &self.runs[index];
+        let (start, run) = &self.runs[index];
         let inside = position - start;
-        if inside >= chunk.len() {
+        if inside >= run.len() {
             return Ok(0);
         }
-        let taken = (chunk.len() - inside).min(out.len() as u64) as usize;
-        match chunk {
-            StagedChunk::Memory(bytes) => {
+        let taken = (run.len() - inside).min(out.len() as u64) as usize;
+        match run {
+            ImageRun::Staged(StagedChunk::Memory(bytes)) => {
                 out[..taken].copy_from_slice(&bytes[inside as usize..inside as usize + taken]);
             }
             // Paged out: read back exactly what the walk asked for, which for a
@@ -799,11 +900,23 @@ impl Read for SparseImage {
             // over. A missing handle answers `Ok(0)`, the same clean stop a hole
             // produces — a parse that cannot see a byte must never see a
             // fabricated one.
-            StagedChunk::Scratch { offset, .. } => {
+            ImageRun::Staged(StagedChunk::Scratch { offset, .. }) => {
                 let Some(file) = self.scratch.as_ref() else {
                     return Ok(0);
                 };
                 if read_at(file, offset.saturating_add(inside), &mut out[..taken]).is_err() {
+                    return Ok(0);
+                }
+            }
+            // Same rule against the envelope file, and the same failure
+            // handling: a short envelope — one the previous run never finished
+            // writing — reads as a hole, so the walk stops there instead of
+            // walking whatever the filesystem answers.
+            ImageRun::Envelope { .. } => {
+                let Some(file) = self.envelope.as_ref() else {
+                    return Ok(0);
+                };
+                if read_at(file, position, &mut out[..taken]).is_err() {
                     return Ok(0);
                 }
             }
@@ -1313,6 +1426,16 @@ pub(crate) struct DirectSetRouter {
     /// and untouched for a set with no encrypted member — which is every set
     /// plan 135 routed.
     crypt: KeyRing,
+    /// Envelope spans produced by a member **migration** (D1's tolerance),
+    /// waiting to be handed to the caller.
+    ///
+    /// A migration is decided inside `check_eligibility`, which runs from the
+    /// middle of a parse and has no way to return bytes. The spans are parked
+    /// here and drained by whichever public entry point is on the stack, so they
+    /// go out through the one path that writes spans, records them against the
+    /// coverage barrier and syncs the envelope before publishing a floor — the
+    /// same treatment every other envelope byte gets.
+    migrated: Vec<RoutedSpan>,
     /// How many times the drain has held a cipher block because the other half
     /// of it had not arrived (E-D2). The production account of this is the
     /// `direct_store.encrypted.block_held` probe; this is the same fact in a
@@ -1356,6 +1479,7 @@ impl DirectSetRouter {
             member_order_stale: false,
             holds_budget: DEFAULT_HOLDS_BUDGET_BYTES,
             crypt: KeyRing::new(),
+            migrated: Vec::new(),
             #[cfg(test)]
             blocks_held: 0,
             demoted: None,
@@ -1768,7 +1892,7 @@ impl DirectSetRouter {
         // resolves a *later* volume's split-continuation offset, so its holds
         // become routable in the same call.
         let volumes: Vec<u32> = self.staging.keys().copied().collect();
-        let mut spans = Vec::new();
+        let mut spans = self.take_migrated_spans();
         for volume in volumes {
             spans.extend(self.drain_volume(volume)?);
         }
@@ -1837,7 +1961,7 @@ impl DirectSetRouter {
 
         self.try_parse_volume(volume_index)?;
         let volumes: Vec<u32> = self.staging.keys().copied().collect();
-        let mut spans = Vec::new();
+        let mut spans = self.take_migrated_spans();
         for volume in volumes {
             spans.extend(self.drain_volume(volume)?);
         }
@@ -1891,24 +2015,26 @@ impl DirectSetRouter {
             .source_complete = true;
         self.try_parse_volume(volume_index)?;
         // B2. A restored volume the parse above could not confirm will never be
-        // confirmed *by a parse*: its pre-restart bytes are on disk rather than
-        // in `chunks`, so the image the parser walks has a hole from offset zero
-        // and every later attempt fails the same silent way.
+        // confirmed by a parse of the **staged** image: its pre-restart bytes
+        // are on disk rather than in `chunks`, so that image has a hole from
+        // offset zero and every later attempt fails the same silent way.
         //
         // Leaving it unconfirmed is the failure that hides. The trailing region
         // — the end-of-archive record, and a `-rr` set's whole recovery record —
         // stays held for the life of the set, so the envelope never receives it,
         // so the virtual volume reads short, so PAR2 calls a byte-perfect set
-        // damaged and the job pays a full redownload. Either the format proves
-        // the region holds no undiscovered member, or the set demotes here:
-        // named, counted, and while its routed bytes can still materialize the
-        // volumes.
+        // damaged and the job pays a full redownload. So: the cheap structural
+        // proof first, then the expensive arm that rebuilds the image the parse
+        // needs out of the envelope, and only then the demotion — named,
+        // counted, and while its routed bytes can still materialize the volumes.
         if self
             .staging
             .get(&volume_index)
             .is_some_and(|staging| staging.restored && !staging.confirmed)
         {
-            if !self.restored_volume_completes_confirmed(volume_index) {
+            if !self.restored_volume_completes_confirmed(volume_index)
+                && !self.reconfirm_restored_volume(volume_index)?
+            {
                 return Err(self.fail(DemotionReason::UnconfirmedRestoredVolume));
             }
             if let Some(staging) = self.staging.get_mut(&volume_index) {
@@ -1917,11 +2043,112 @@ impl DirectSetRouter {
         }
         self.check_eligibility()?;
         let volumes: Vec<u32> = self.staging.keys().copied().collect();
-        let mut spans = Vec::new();
+        let mut spans = self.take_migrated_spans();
         for volume in volumes {
             spans.extend(self.drain_volume(volume)?);
         }
         Ok(spans)
+    }
+
+    /// The expensive arm of B2: re-parse a restored volume's headers out of its
+    /// **envelope file**, so the confirming walk can actually run.
+    ///
+    /// [`restored_volume_completes_confirmed`](Self::restored_volume_completes_confirmed)
+    /// covers the volume whose last member splits into the next one — the middle
+    /// of a set — by a structural argument. It deliberately cannot cover the
+    /// volume that *closes* a chain, which is every set's **last** volume: a
+    /// second member's header can sit past the first member's data area, and no
+    /// argument short of a walk rules that out. Those demoted.
+    ///
+    /// They no longer have to. The envelope is a sparse image of the volume
+    /// holding every non-member byte at its true physical offset — which is
+    /// exactly the header region, because a header is a non-member byte by
+    /// definition. Overlaying this run's staged bytes on it reconstitutes the
+    /// reader the live path parses through, and the ordinary confirming parse
+    /// runs over that.
+    ///
+    /// # It produces wave 1's proof, it does not bypass it
+    ///
+    /// Wave 1's rule is that a volume is `confirmed` only on a parsed end block
+    /// or a byte-complete image. `source_complete` alone cannot be that proof
+    /// here: the envelope-backed image has holes exactly where member data was
+    /// routed away, and a hole the walk needs to *read* stops it silently — at
+    /// which point "every article arrived" would confirm a volume whose walk
+    /// ended in the middle. So two things are checked instead:
+    ///
+    /// 1. **Every byte of the volume is accounted for** (condition 1 of the
+    ///    structural proof, reused): routed plus staged is one run from zero, so
+    ///    the volume's extent is known and nothing is outstanding.
+    /// 2. **The walk could reach that extent.** The image's own runs, plus the
+    ///    data areas the parsed headers declare — the regions a header walk
+    ///    *seeks over* rather than reads — must tile the volume contiguously
+    ///    from zero. If they do, a walk that stopped early is impossible: every
+    ///    byte above the stopping point was either readable (so it would have
+    ///    continued) or inside a declared data area (so it would have skipped
+    ///    it). If they do not, the image had a hole the walk needed, and this
+    ///    returns `false` rather than confirming on a truncated answer.
+    ///
+    /// Every other failure — no envelope file, a short or unreadable one, a
+    /// parse that fails, facts that disagree with the cached ones — is `false`
+    /// or a demotion in its own right, which leaves the caller's behaviour
+    /// exactly as it was.
+    fn reconfirm_restored_volume(&mut self, volume_index: u32) -> Result<bool, DemotionReason> {
+        let Some(staging) = self.staging.get(&volume_index) else {
+            return Ok(false);
+        };
+        let mut accounted = ByteRanges::new();
+        for &(start, end) in staging.routed.ranges() {
+            accounted.insert(start, end - start);
+        }
+        for &(start, end) in staging.pending.ranges() {
+            accounted.insert(start, end - start);
+        }
+        let [(0, volume_end)] = accounted.ranges() else {
+            return Ok(false);
+        };
+        let volume_end = *volume_end;
+
+        let Some(image) = self.volume_image(volume_index, VolumeImage::Envelope) else {
+            return Ok(false);
+        };
+        let Ok(facts) = weaver_unrar::RarArchive::parse_volume_facts(image, None) else {
+            return Ok(false);
+        };
+        if facts.members.is_empty() || !self.walk_covered_volume(volume_index, &facts, volume_end) {
+            return Ok(false);
+        }
+
+        // `reached_end` is `true` on the strength of the tiling check above:
+        // this walk saw every byte it could have needed, which is wave 1's
+        // byte-complete image. A disagreement with the cached facts is still a
+        // demotion, and a member the walk found in the tail is still adopted —
+        // both through the one seam the live path uses.
+        self.accept_volume_facts(volume_index, facts, true, VolumeImage::Envelope)?;
+        Ok(true)
+    }
+
+    /// Whether the header walk could have reached `volume_end`: every byte below
+    /// it is either one the image can serve or one inside a data area the parsed
+    /// headers declare, and the two together leave no gap.
+    fn walk_covered_volume(
+        &self,
+        volume_index: u32,
+        facts: &RarVolumeFacts,
+        volume_end: u64,
+    ) -> bool {
+        let mut reachable = self.envelope_backed_ranges(volume_index);
+        if let Some(staging) = self.staging.get(&volume_index) {
+            for (offset, chunk) in &staging.chunks {
+                reachable.insert(*offset, chunk.len());
+            }
+        }
+        for member in &facts.members {
+            reachable.insert(member.data_offset, member.data_size);
+        }
+        for service in &facts.services {
+            reachable.insert(service.data_offset, service.data_size);
+        }
+        reachable.contiguous_from_zero() >= volume_end
     }
 
     /// Whether a **restored** volume that has just finished downloading may be
@@ -1950,7 +2177,9 @@ impl DirectSetRouter {
     /// chain — the last of a set, or one whose member ends inside it — is not
     /// confirmed this way: a second member's header can sit past the first's data
     /// area, which is exactly the shape `payload_past_the_last_known_header…`
-    /// pins. Those demote instead.
+    /// pins. Those go to [`Self::reconfirm_restored_volume`], which pays for a
+    /// real walk instead of arguing from the format, and demote only if that
+    /// walk cannot be run or cannot be trusted.
     fn restored_volume_completes_confirmed(&self, volume_index: u32) -> bool {
         let Some(staging) = self.staging.get(&volume_index) else {
             return false;
@@ -2002,7 +2231,7 @@ impl DirectSetRouter {
     ///   thing to arrive. Priming from them would resolve mappings after the
     ///   bytes they describe, which is the wrong end of the job.
     ///
-    /// So there is no QO code here and none is wanted. What there *is* — and
+    /// So there is no QO code here and none is wanted. What there *was* — and
     /// this is the part a future reader must not mistake for QO being absent —
     /// is the library's own preference: `parse_volume_facts` calls
     /// `parse_all_headers`, which on seeing a main header carrying a locator
@@ -2010,17 +2239,11 @@ impl DirectSetRouter {
     /// headers when they parse cleanly through an end-of-archive record. On a
     /// truncated prefix that read hits a hole and falls back to the physical
     /// walk, so a provisional parse is always physical; a *confirming* parse of
-    /// a fully staged `-qo` volume can be QO-derived.
+    /// a fully staged `-qo` volume could be QO-derived.
     ///
-    /// Two of the three outcomes are already safe here: QO agreeing with the
-    /// physical parse changes nothing, and QO disagreeing is
-    /// [`DemotionReason::ConflictingVolumeFacts`]. The third — a forged QO
-    /// record *appending* a member the physical walk never saw — would be
-    /// adopted by the `members_extend` arm below on QO evidence alone, which is
-    /// exactly what D2 forbids and what the RAR spec warns is craftable. Closing
-    /// it needs the library to be able to parse with QO suppressed
-    /// (`weaver-unrar` is not this crate's to change), so it is recorded here
-    /// and carried as a follow-up rather than papered over with a heuristic.
+    /// [`Self::refuse_quick_open_derived_facts`] closes that: every parse whose
+    /// facts could have come from the cache is now checked against the physical
+    /// walk before a single member reaches the layout.
     fn try_parse_volume(&mut self, volume_index: u32) -> Result<(), DemotionReason> {
         let Some(staging) = self.staging.get(&volume_index) else {
             return Ok(());
@@ -2060,6 +2283,28 @@ impl DirectSetRouter {
             .get(&volume_index)
             .is_some_and(|staging| staging.source_complete);
         let reached_end = facts.more_volumes || source_complete;
+        self.accept_volume_facts(volume_index, facts, reached_end, VolumeImage::Staged)
+    }
+
+    /// Files one parse's facts against the layout and drains what they unlock.
+    ///
+    /// Split out of [`Self::try_parse_volume`] because there are two readers a
+    /// volume's headers can come from — the staged image, and a restored
+    /// volume's envelope-backed one ([`Self::reconfirm_restored_volume`]) — and
+    /// everything downstream of "these are the volume's members" must be
+    /// identical for both. `source` names the reader the facts came from, so the
+    /// Quick Open cross-check below re-reads the same image the claim came from.
+    fn accept_volume_facts(
+        &mut self,
+        volume_index: u32,
+        facts: RarVolumeFacts,
+        reached_end: bool,
+        source: VolumeImage,
+    ) -> Result<(), DemotionReason> {
+        // Before anything is adopted: the library may have answered this parse
+        // out of the archive's Quick Open cache, which is not authoritative and
+        // is craftable (D2). Nothing may enter the layout on that evidence.
+        self.refuse_quick_open_derived_facts(volume_index, &facts, source)?;
 
         if self.layout.is_none() {
             let format = facts.archive_format();
@@ -2140,6 +2385,160 @@ impl DirectSetRouter {
         }
         self.check_eligibility()?;
         Ok(())
+    }
+
+    /// Rebuilds the reader one volume's headers were parsed out of.
+    ///
+    /// `None` means the image cannot be built at all — no staging entry, or a
+    /// restored volume whose envelope file will not open — which every caller
+    /// treats as "no parse", never as "an empty parse".
+    fn volume_image(&self, volume_index: u32, source: VolumeImage) -> Option<SparseImage> {
+        let staging = self.staging.get(&volume_index)?;
+        match source {
+            VolumeImage::Staged => Some(SparseImage::from_staged(
+                &staging.chunks,
+                self.scratch.handle(),
+            )),
+            VolumeImage::Envelope => {
+                let file = std::fs::File::open(self.plan.envelope_path(volume_index)).ok()?;
+                Some(SparseImage::over_envelope(
+                    &staging.chunks,
+                    self.scratch.handle(),
+                    std::sync::Arc::new(file),
+                    &self.envelope_backed_ranges(volume_index),
+                ))
+            }
+        }
+    }
+
+    /// The physical ranges of one volume its **envelope file** holds: everything
+    /// the router routed, minus every member extent the routing history claims
+    /// (B1).
+    ///
+    /// Derived from the history rather than from the layout's current answer for
+    /// the same reason [`Self::volume_member_extents`] is: a member that turned
+    /// ineligible after routing maps to the envelope *now*, and reading its
+    /// offsets out of the envelope file would read the sparse hole standing in
+    /// for bytes that went to a `.direct.partial`.
+    ///
+    /// Deliberately **not** named `envelope_coverage`, which `DirectSet` already
+    /// uses for a different fact: that one is what *reached disk*, and is the
+    /// truth the provider serves a virtual volume from. This one is what routing
+    /// *emitted*, which is weaker — and the difference matters, because a hole
+    /// inside a file's length reads as zeros rather than as an error, so a range
+    /// claimed here that the envelope never received would feed the header walk
+    /// fabricated bytes.
+    ///
+    /// It is sound at the one place it is read from. A restored volume's
+    /// `routed` comes from the checkpoint, which records only writes that
+    /// returned; a live volume's comes from drains whose writes either returned
+    /// or demoted the set on the spot; and the only caller runs from
+    /// [`Self::note_volume_complete`], **before** that call's own drain, so no
+    /// span of the article in hand is claimed yet.
+    fn envelope_backed_ranges(&self, volume_index: u32) -> ByteRanges {
+        let mut coverage = ByteRanges::new();
+        let Some(staging) = self.staging.get(&volume_index) else {
+            return coverage;
+        };
+        for &(start, end) in staging.routed.ranges() {
+            coverage.insert(start, end - start);
+        }
+        for extent in self.routed_extents.get(&volume_index).into_iter().flatten() {
+            coverage = subtract(&coverage, extent.physical_offset, extent.len);
+        }
+        coverage
+    }
+
+    /// Refuses a parse whose headers may have come from the archive's Quick Open
+    /// cache rather than from the physical header walk (plan 135, D2).
+    ///
+    /// # Why this is a direct-store decision and not a library default
+    ///
+    /// A `QO` service block caches every header of the archive, and the main
+    /// header's locator record points at it. The format binds nothing: the RAR
+    /// spec itself warns that "it would be possible to see one file name and
+    /// extract another in case the quick open data and real archive data are
+    /// intentionally created different". `parse_all_headers` consults the cache
+    /// by default — the right default for *listing* an archive, and the wrong
+    /// one for a component that decides where posted bytes get written.
+    ///
+    /// Two of the three disagreement shapes were already safe here: QO agreeing
+    /// with the physical walk changes nothing, and QO contradicting a previous
+    /// parse of the same volume is [`DemotionReason::ConflictingVolumeFacts`].
+    /// The third is not: a forged record *appending* a member the physical walk
+    /// never saw is a strict extension of the previous facts, so `members_extend`
+    /// adopts it, `sync_members` gives it a destination and the drain routes
+    /// payload into it — all on cache evidence alone.
+    ///
+    /// So the cache is cross-examined. Only a parse that could have used it pays
+    /// for this: `quick_open_offset` is `Some` exactly when a RAR5 main header
+    /// carried a locator naming one, which is the sole path into
+    /// `try_parse_quick_open_headers`. The walk that answers is the same one the
+    /// library would have fallen back to — `allow_quick_open: false`, over the
+    /// very image the claim came from — and its file headers must match the
+    /// claim's members one for one on identity, extent and split flags.
+    ///
+    /// Weaver's **conventional** extraction paths are deliberately untouched:
+    /// they open a real volume file that PAR2 and the whole-file hashes have
+    /// already vouched for, and they are not choosing destinations for bytes off
+    /// the wire.
+    fn refuse_quick_open_derived_facts(
+        &mut self,
+        volume_index: u32,
+        facts: &RarVolumeFacts,
+        source: VolumeImage,
+    ) -> Result<(), DemotionReason> {
+        if facts.quick_open_offset.is_none() {
+            return Ok(());
+        }
+        let claimed: Vec<MemberIdentity> = facts.members.iter().map(MemberIdentity::of).collect();
+        let physical = self.physical_member_identities(volume_index, source);
+        // A physical walk that will not run at all is a refusal, not a pass: the
+        // whole point is that nothing enters the layout without it.
+        if physical.as_deref() != Some(claimed.as_slice()) {
+            return Err(self.fail(DemotionReason::QuickOpenMismatch));
+        }
+        Ok(())
+    }
+
+    /// The file headers a **physical** walk of one volume's image finds, with
+    /// the archive's Quick Open cache suppressed.
+    ///
+    /// `None` when the walk cannot be run or does not complete cleanly, which
+    /// the caller treats as a refusal.
+    fn physical_member_identities(
+        &self,
+        volume_index: u32,
+        source: VolumeImage,
+    ) -> Option<Vec<MemberIdentity>> {
+        let mut image = self.volume_image(volume_index, source)?;
+        // The library's own entry point expects a reader positioned just past
+        // the signature, and reading it here is what proves this is the RAR5
+        // stream the locator belongs to rather than an assumption about it.
+        if weaver_unrar::signature::read_signature(&mut image).ok()? != ArchiveFormat::Rar5 {
+            return None;
+        }
+        let parsed = weaver_unrar::header::parse_all_headers_with_options(
+            &mut image,
+            None,
+            weaver_unrar::header::HeaderParseOptions {
+                allow_quick_open: false,
+            },
+        )
+        .ok()?;
+        Some(
+            parsed
+                .files
+                .iter()
+                .map(|file| MemberIdentity {
+                    name: file.header.name.clone(),
+                    data_offset: file.header.data_offset,
+                    data_size: file.header.data_size,
+                    split_before: file.header.split_before,
+                    split_after: file.header.split_after,
+                })
+                .collect(),
+        )
     }
 
     /// Rebuilds the layout from every volume's newest facts.
@@ -2392,6 +2791,11 @@ impl DirectSetRouter {
         let mut tolerated = 0usize;
         let mut routable = 0usize;
         let mut first_tolerated: Option<IneligibilityReason> = None;
+        // Adopted members that must have their routed bytes moved into the
+        // envelope before they can ride the tolerance. Collected rather than
+        // migrated in place: the loop holds a borrow of the layout, and the
+        // decision is not final until the aggregate budget below has passed.
+        let mut migrating: Vec<(u32, IneligibilityReason)> = Vec::new();
 
         for member in self.layout_members() {
             let reason = match member.eligibility {
@@ -2418,6 +2822,9 @@ impl DirectSetRouter {
                 }
                 MemberEligibility::Ineligible(reason) => reason,
             };
+            let Some(budget) = tolerable_member_budget(member, reason) else {
+                return Err(self.fail(DemotionReason::MemberIneligible(reason.into())));
+            };
             // A member the router **adopted** routed bytes into its own
             // `.direct.partial` while it was still `ProvisionallyDirect` — a
             // split BLAKE2sp-only member is the reachable case, since the digest
@@ -2425,14 +2832,17 @@ impl DirectSetRouter {
             // the envelope, so the virtual volume the tolerated extraction reads
             // is not the volume the archive describes, and finalization would
             // additionally commit the partial as if it were a stored member's.
-            // Moving them back is real work with no owner yet; until it has one,
-            // an adopted member is not tolerable and the set demotes on its own
-            // reason, exactly as wave 1 did.
-            let already_routed = self.member_ids.contains_key(&member.name);
-            let budget = tolerable_member_budget(member, reason).filter(|_| !already_routed);
-            let Some(budget) = budget else {
-                return Err(self.fail(DemotionReason::MemberIneligible(reason.into())));
-            };
+            //
+            // Wave 2 demoted the whole set on sight for that. It no longer has
+            // to: the bytes are moved back into the envelope at their true
+            // physical offsets, the member is un-adopted, and it is extracted
+            // conventionally at finalization exactly like a member that was
+            // never adopted at all. The migration is deferred until the budget
+            // below has passed, because a member that cannot ride the tolerance
+            // must not have been half-moved to find that out.
+            if let Some(member_id) = self.member_ids.get(&member.name).copied() {
+                migrating.push((member_id, reason));
+            }
             tolerated += 1;
             first_tolerated.get_or_insert(reason);
             // Saturating rather than checked: the ceilings below are far under
@@ -2444,6 +2854,7 @@ impl DirectSetRouter {
 
         let Some(first_tolerated) = first_tolerated else {
             debug_assert_eq!(tolerated, 0);
+            debug_assert!(migrating.is_empty());
             return Ok(());
         };
         if routable == 0 {
@@ -2454,19 +2865,174 @@ impl DirectSetRouter {
             // not over a budget, it is simply not a store set.
             return Err(self.fail(DemotionReason::MemberIneligible(first_tolerated.into())));
         }
-        if packed > TOLERANCE_PACKED_CEILING_BYTES || unpacked > TOLERANCE_UNPACKED_CEILING_BYTES {
+        let over_budget = packed > TOLERANCE_PACKED_CEILING_BYTES
+            || unpacked > TOLERANCE_UNPACKED_CEILING_BYTES
+            || (self.archive_totals_final()
+                // `packed * 100 > archive_packed`, without the multiply: a large
+                // archive would overflow it, and the overflowing case is
+                // precisely the one that must not demote.
+                && packed > self.archive_packed_bytes().unwrap_or(u64::MAX)
+                    / TOLERANCE_ARCHIVE_PERCENT);
+        if over_budget {
+            // An **adopted** member over the budget keeps wave 2's answer, byte
+            // for byte: its own ineligibility is what ends its routing, and the
+            // tolerance ceiling was only ever the permission slip for moving its
+            // bytes. Reporting a budget breach for it instead would rename a
+            // population — "this set has one small compressed extra" is what
+            // `ToleranceBudgetExceeded` means, and a set whose *routed* member
+            // turned out unverifiable is not that.
+            if let Some((_, reason)) = migrating.first() {
+                return Err(self.fail(DemotionReason::MemberIneligible((*reason).into())));
+            }
             return Err(self.fail(DemotionReason::ToleranceBudgetExceeded));
         }
-        if self.archive_totals_final() {
-            let archive_packed = self.archive_packed_bytes().unwrap_or(u64::MAX);
-            // `packed * 100 > archive_packed`, without the multiply: a large
-            // archive would overflow it, and the overflowing case is precisely
-            // the one that must not demote.
-            if packed > archive_packed / TOLERANCE_ARCHIVE_PERCENT {
-                return Err(self.fail(DemotionReason::ToleranceBudgetExceeded));
-            }
+        for (member_id, reason) in migrating {
+            self.migrate_member_to_envelope(member_id, reason)?;
         }
         Ok(())
+    }
+
+    /// Moves an already-adopted member's routed bytes out of its
+    /// `.direct.partial` and into the envelopes, then un-adopts it, so it can
+    /// ride D1's tolerance instead of demoting the set.
+    ///
+    /// # What has to move, and what has to stop claiming
+    ///
+    /// The bytes are read back from the partial at the logical offsets the
+    /// **routing history** records for them and re-emitted as envelope spans at
+    /// their physical offsets (B1). The history is the right source and the
+    /// layout is not: by the time this runs the member is `Ineligible`, so
+    /// `map_physical_range` already calls its packed range envelope, and the
+    /// history is the only record of where the bytes actually went. It is then
+    /// dropped for this member — the whole point, since a migrated member's
+    /// extents must stop claiming member space or the hybrid provider would keep
+    /// answering those offsets out of a partial that is about to disappear.
+    ///
+    /// The member's routing state goes with it: coverage, per-part `CrcRuns`,
+    /// checked parts, restart seeds and stale gaps. None of it survives, and
+    /// none of it should — the composition existed to gate a member weaver was
+    /// writing itself, and `extract_member_streaming` verifies this one natively
+    /// (BLAKE2sp included) when finalization extracts it.
+    ///
+    /// # Two things this deliberately does not do
+    ///
+    /// It does not run for an **encrypted** member. Its destination holds
+    /// plaintext where the volume held cipher, so moving those bytes into the
+    /// envelope would file plaintext at offsets the posted volume has ciphertext
+    /// at — visible to PAR2, to reconstruction and to any later reader. Such a
+    /// member demotes on its own reason, as before.
+    ///
+    /// It does not fsync anything, and it does not need to: the spans go back
+    /// through the ordinary write path, so the coverage barrier records them,
+    /// syncs the envelope and only then publishes a floor. A crash before that
+    /// barrier leaves the envelope without the bytes — and the provider refuses
+    /// an envelope range it has no positive coverage for rather than serving the
+    /// hole, so the set refetches instead of reading zeros.
+    ///
+    /// # The one thing it cannot clean up
+    ///
+    /// The coverage barrier keeps claiming the deleted `.direct.partial` in every
+    /// later checkpoint: destinations are registered once and there is no
+    /// unregister, and that is `CoverageBarrier`'s to add, not the router's. A
+    /// restart in the window between the migration and the set finishing
+    /// therefore refuses the row on a missing destination and redownloads the
+    /// set — safe, and no worse than the demotion this replaced, which threw the
+    /// checkpoint away outright. Retiring the destination would make the window
+    /// free instead of merely safe.
+    fn migrate_member_to_envelope(
+        &mut self,
+        member_id: u32,
+        reason: IneligibilityReason,
+    ) -> Result<(), DemotionReason> {
+        let refuse =
+            |router: &mut Self| router.fail(DemotionReason::MemberIneligible(reason.into()));
+        let Some(member) = self.members.get(&member_id) else {
+            return Ok(());
+        };
+        if member.crypt.is_some() {
+            return Err(refuse(self));
+        }
+        let partial = self.plan.working_dir.join(&member.relative_partial);
+
+        // Every extent the member ever had bytes written for, by volume, in
+        // physical order within each — so the envelope is written the way it is
+        // laid out. The whole move is bounded by the tolerance's packed ceiling;
+        // `MIGRATION_SPAN_BYTES` bounds each individual allocation inside it.
+        let extents: Vec<(u32, MemberExtent)> = self
+            .routed_extents
+            .iter()
+            .flat_map(|(volume_index, extents)| {
+                extents
+                    .iter()
+                    .filter(|extent| extent.member_id == member_id)
+                    .map(|extent| (*volume_index, *extent))
+            })
+            .collect();
+
+        let mut spans = Vec::new();
+        if !extents.is_empty() {
+            let Ok(file) = std::fs::File::open(&partial) else {
+                return Err(refuse(self));
+            };
+            for (volume_index, extent) in &extents {
+                let mut moved = 0u64;
+                while moved < extent.len {
+                    let take = (extent.len - moved).min(MIGRATION_SPAN_BYTES);
+                    let mut bytes = vec![0u8; take as usize];
+                    if read_at(
+                        &file,
+                        extent.logical_offset.saturating_add(moved),
+                        &mut bytes,
+                    )
+                    .is_err()
+                    {
+                        return Err(refuse(self));
+                    }
+                    let offset = extent.physical_offset.saturating_add(moved);
+                    spans.push(RoutedSpan {
+                        destination: DirectDestination::Envelope {
+                            volume_index: *volume_index,
+                        },
+                        destination_offset: offset,
+                        volume_index: *volume_index,
+                        source_offset: offset,
+                        bytes,
+                    });
+                    moved += take;
+                }
+            }
+        }
+
+        // Nothing above this line has changed any state, so every refusal so far
+        // left the set exactly as wave 2 would have.
+        for (volume_index, extent) in &extents {
+            if let Some(held) = self.routed_extents.get_mut(volume_index) {
+                held.retain(|candidate| candidate.member_id != extent.member_id);
+            }
+        }
+        self.routed_extents.retain(|_, held| !held.is_empty());
+        if let Some(member) = self.members.remove(&member_id) {
+            self.member_ids.remove(&member.name);
+        }
+        self.rebuild_member_order();
+        self.migrated.extend(spans);
+        // The partial is deleted rather than left behind: everything still in
+        // the working directory when the job completes is moved into its output,
+        // so a stray `.direct.partial` beside the extracted member would ship.
+        // Its bytes are in `migrated` already, so this cannot lose them, and a
+        // failure to unlink is not worth demoting a set over — the restart sweep
+        // knows the suffix.
+        let _ = std::fs::remove_file(&partial);
+        crate::runtime::perf_probe::record(
+            "direct_store.member.migrated_to_envelope",
+            std::time::Duration::from_nanos(1),
+        );
+        Ok(())
+    }
+
+    /// Hands the caller whatever a migration parked (D1's tolerance).
+    fn take_migrated_spans(&mut self) -> Vec<RoutedSpan> {
+        std::mem::take(&mut self.migrated)
     }
 
     /// Whether every planned volume has been parsed and every member's chain has
@@ -4239,6 +4805,42 @@ fn slice_len(slice: &MappedSlice) -> u64 {
         | MappedSlice::EncryptedMember { len, .. }
         | MappedSlice::Envelope { len }
         | MappedSlice::Unroutable { len } => *len,
+    }
+}
+
+/// Which reader one volume's headers are parsed out of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumeImage {
+    /// The bytes the router is still holding for the volume. The only image a
+    /// volume this run downloaded ever needs.
+    Staged,
+    /// The staged bytes **plus** the volume's envelope file, read back at true
+    /// physical offsets — the image a restored volume's headers live in, since
+    /// its pre-restart bytes were written out and dropped from RAM (B2).
+    Envelope,
+}
+
+/// What a member header claims about itself, in the fields a routing decision
+/// depends on. Compared field for field when a Quick Open cache's answer is
+/// cross-examined against the physical walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemberIdentity {
+    name: String,
+    data_offset: u64,
+    data_size: u64,
+    split_before: bool,
+    split_after: bool,
+}
+
+impl MemberIdentity {
+    fn of(member: &weaver_unrar::RarVolumeMemberFacts) -> Self {
+        Self {
+            name: member.name.clone(),
+            data_offset: member.data_offset,
+            data_size: member.data_size,
+            split_before: member.split_before,
+            split_after: member.split_after,
+        }
     }
 }
 
