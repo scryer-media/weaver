@@ -168,7 +168,7 @@ jobs:
           restore-keys: |
             gha-sccache-v1-weaver-rust-test-build-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-bin: false
@@ -792,7 +792,7 @@ jobs:
           restore-keys: |
             gha-sccache-v1-weaver-package-windows-x86_64-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Install NASM
         shell: pwsh
         run: |
@@ -1064,7 +1064,7 @@ jobs:
           restore-keys: |
             gha-sccache-v1-weaver-package-windows-arm64-
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Exclude build dir from Windows Defender
         shell: pwsh
         run: |
