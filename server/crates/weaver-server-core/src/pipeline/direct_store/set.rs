@@ -225,6 +225,22 @@ impl DirectSet {
             });
         rekeyed.destinations.sort_by_key(|claim| claim.member_index);
 
+        // Plan 136, E-D4. The crypt rows go in **before** any coverage does, so
+        // a row that disagrees with the rebuilt headers demotes a set that has
+        // seeded nothing rather than one half-seeded. Refusing here costs a
+        // materialization from bytes already on disk; trusting a mismatched row
+        // rebuilds a key against the wrong IV, and coverage gates cannot see
+        // that — they say where bytes are, never what they decrypt to.
+        for claim in &rekeyed.destinations {
+            if let Err(reason) = self
+                .router
+                .restore_member_crypt(&claim.relative_path, claim.crypt.as_ref())
+            {
+                self.demote(reason);
+                return;
+            }
+        }
+
         for claim in &rekeyed.destinations {
             let extents: Vec<(u64, u64)> = claim
                 .extents
@@ -788,7 +804,13 @@ impl DirectSet {
         S: super::barrier::DestinationSync + ?Sized,
         P: CoveragePersist + ?Sized,
     {
+        // Read off the router immediately before the run (plan 136, E-D4), so a
+        // checkpoint's crypt rows are never older than the coverage beside them:
+        // the retained tail padding and the cipher checkpoints are both produced
+        // by the same routing call that produced the bytes being claimed.
+        let crypt = self.router.member_crypt_snapshots();
         let barrier = self.barrier.as_mut()?;
+        barrier.set_member_crypt(crypt);
         Some(barrier.barrier(trigger, now, drain, sync, persist))
     }
 

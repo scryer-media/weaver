@@ -240,6 +240,15 @@ impl DirectStoreRuntime {
         self.sets.get_mut(&job_id)?.get_mut(index)
     }
 
+    /// Every set of one job, mutably. Used by the password refresh, which has to
+    /// touch all of a job's sets rather than one indexed set.
+    pub(crate) fn sets_mut(&mut self, job_id: JobId) -> &mut [DirectSet] {
+        self.sets
+            .get_mut(&job_id)
+            .map(Vec::as_mut_slice)
+            .unwrap_or(&mut [])
+    }
+
     pub(crate) fn set(&self, job_id: JobId, index: usize) -> Option<&DirectSet> {
         self.sets.get(&job_id)?.get(index)
     }
@@ -415,6 +424,7 @@ impl Pipeline {
             return;
         };
         let (admitted, refused) = DirectSetPlan::discover(&state.spec, &state.working_dir);
+        let password = state.spec.password.clone();
         for (set_name, refusal) in refused {
             crate::runtime::perf_probe::record_owned(
                 format!("direct_store.refused.{}", refusal.metric()),
@@ -455,10 +465,53 @@ impl Pipeline {
                 // demoting on its first header (H1).
                 let mut set = DirectSet::new(job_id, plan);
                 self.direct_store.apply_ceilings(&mut set);
+                // Plan 136, E-D1. The winning password the job was submitted
+                // with, if any; `refresh_direct_passwords` picks up one that
+                // arrives later. Held in memory only.
+                set.router.set_password(password.as_deref());
                 set
             })
             .collect();
         self.direct_store.sets.insert(job_id, sets);
+    }
+
+    /// Re-reads the job's password into every set still willing to take one
+    /// (plan 136, E-D1).
+    ///
+    /// This is the answer to plan 136's open question 2 written as code:
+    /// **weaver does support setting a password after add** — the GraphQL
+    /// `setJobPassword` mutation and the NZBGet facade's `editqueue` /
+    /// `GroupSetParameter *Unpack:Password` both mutate the live `JobSpec` in
+    /// place — and [`Self::ensure_direct_sets`] is memoized per job, so a set
+    /// built before the password arrived would never see it. Re-reading it here
+    /// costs one map lookup per article and stops the moment a set holds a
+    /// password or leaves direct mode, which for every set with no encrypted
+    /// member is the first parse.
+    ///
+    /// It deliberately does **not** re-admit a set that already demoted for a
+    /// wrong or missing password. Re-admission would mean re-decrypting every
+    /// byte already written under the old verdict, which is a demotion with
+    /// extra steps; the conventional path takes the set and asks the job's whole
+    /// candidate list, which is a superset of this one.
+    fn refresh_direct_passwords(&mut self, job_id: JobId) {
+        if !self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| set.router.wants_password())
+        {
+            return;
+        }
+        let Some(password) = self
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.spec.password.clone())
+        else {
+            return;
+        };
+        for set in self.direct_store.sets_mut(job_id) {
+            set.router.set_password(Some(password.as_str()));
+        }
     }
 
     /// What to do with one NZB file's decoded bytes.
@@ -468,6 +521,7 @@ impl Pipeline {
     /// to the conventional path.
     pub(crate) fn direct_route_target(&mut self, file_id: NzbFileId) -> Option<DirectFileTarget> {
         self.ensure_direct_sets(file_id.job_id);
+        self.refresh_direct_passwords(file_id.job_id);
         self.direct_store
             .sets_for(file_id.job_id)
             .iter()
@@ -682,6 +736,36 @@ impl Pipeline {
         if self.par2_set(job_id).is_none() {
             return false;
         }
+        // Plan 136. An encrypted set's destinations hold plaintext and PAR2
+        // describes the posted cipher, so serving one to the pass would report
+        // every slice damaged. Demoted here rather than refused at admission
+        // because the PAR2 file can arrive at any point in a job's life, long
+        // after the set started routing — this is the seam that already knows a
+        // recovery set exists, and it is the seam the pass runs behind.
+        let encrypted: Vec<usize> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| !set.is_demoted() && !set.is_finalized())
+            .filter(|(_, set)| set.router.routes_encrypted())
+            .map(|(set_index, _)| set_index)
+            .collect();
+        let mut demoted_any = !encrypted.is_empty();
+        for set_index in encrypted {
+            warn!(
+                job_id = job_id.0,
+                "a PAR2-bearing job holds an encrypted direct set; demoting so the authoritative \
+                 pass reads posted bytes instead of decrypted destinations"
+            );
+            self.demote_direct_set(
+                job_id,
+                set_index,
+                DemotionReason::EncryptedPar2Unsupported,
+                None,
+            )
+            .await;
+        }
         let unbindable: Vec<(usize, u32)> = self
             .direct_store
             .sets_for(job_id)
@@ -703,8 +787,9 @@ impl Pipeline {
             })
             .collect();
         if unbindable.is_empty() {
-            return false;
+            return demoted_any;
         }
+        demoted_any = true;
         for (set_index, volume_index) in unbindable {
             warn!(
                 job_id = job_id.0,
@@ -716,7 +801,7 @@ impl Pipeline {
             self.demote_direct_set(job_id, set_index, DemotionReason::Par2Unbindable, None)
                 .await;
         }
-        true
+        demoted_any
     }
 
     /// Rewrites `Missing` to `Complete` for every source volume of a
@@ -3047,6 +3132,17 @@ impl Pipeline {
             // reconstruct *from* beyond headers. Refetching is both correct and
             // cheaper than materializing header-only volumes.
             return Err(ReconstructionFailure::NoLayout);
+        }
+        if set.router.routes_encrypted() {
+            // Plan 136, E-D2/E-D4. The member partials hold **plaintext**; the
+            // volume being rebuilt holds cipher. Reading one back as the other
+            // is the one way this path can put wrong bytes under a published
+            // floor, and the yEnc part CRCs it checks against describe the
+            // posted bytes, so the mismatch would surface as a refusal rather
+            // than as a corrupt volume — but only after writing. Refuse up
+            // front; phase E2's re-encrypting overlay is what makes this path
+            // available to an encrypted set.
+            return Err(ReconstructionFailure::EncryptedPostedBytes);
         }
         let working_dir = set.plan().working_dir.clone();
         let volume_files: Vec<(u32, u32)> = set

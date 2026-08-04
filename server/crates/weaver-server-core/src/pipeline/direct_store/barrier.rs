@@ -317,6 +317,10 @@ pub(crate) struct CoverageBarrier {
     /// While set, the age trigger is suppressed. Byte-threshold and demanded
     /// barriers ignore it.
     cooldown_until: Option<Instant>,
+    /// The crypt rows the next checkpoint carries, by member index (plan 136,
+    /// E-D4). Empty for every set with no encrypted member, which is every set
+    /// plan 135 routed.
+    member_crypt: BTreeMap<u32, super::router::crypt::MemberCryptSnapshot>,
 }
 
 impl CoverageBarrier {
@@ -334,7 +338,22 @@ impl CoverageBarrier {
             published_floors: BTreeMap::new(),
             consecutive_failures: 0,
             cooldown_until: None,
+            member_crypt: BTreeMap::new(),
         }
+    }
+
+    /// Hands the barrier the crypt rows its next checkpoint must carry (plan
+    /// 136, E-D4).
+    ///
+    /// Pushed rather than pulled because the barrier owns no router: the set
+    /// reads them off the router immediately before every run, so a checkpoint
+    /// can never carry padding or checkpoints older than the coverage beside
+    /// them.
+    pub(crate) fn set_member_crypt(
+        &mut self,
+        rows: BTreeMap<u32, super::router::crypt::MemberCryptSnapshot>,
+    ) {
+        self.member_crypt = rows;
     }
 
     /// Rebuilds a controller from a validated checkpoint after restart.
@@ -619,6 +638,7 @@ impl CoverageBarrier {
                         .iter()
                         .map(|&(start, end)| DestinationExtent { start, end })
                         .collect(),
+                    crypt: self.member_crypt.get(member_index).cloned(),
                 })
                 .collect(),
             floors: floors

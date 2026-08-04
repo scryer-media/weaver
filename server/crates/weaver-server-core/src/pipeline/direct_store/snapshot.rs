@@ -35,7 +35,15 @@ pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 ///   held, and a v3 reader trusting that bit would skip every segment of a
 ///   volume no byte of which exists. Refusing the row costs one redownload;
 ///   trusting it wedges the set permanently.
-pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 3;
+/// - 4: `DestinationClaim::crypt` added (plan 136, E-D4). An encrypted member's
+///   destination holds **plaintext**, so the claim alone no longer describes
+///   what a resumed run needs: the crypt facts to rebuild a key without
+///   re-parsing, the ≤15 tail-padding bytes that exist nowhere on disk, and the
+///   cipher checkpoints that let a resumed span decrypt at the coverage frontier
+///   without re-encrypting the member from its IV. A v3 reader would see a claim
+///   over plaintext and treat it as posted bytes, which is why this is a version
+///   bump and not an optional field.
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 4;
 
 const FRAME_HEADER_LEN: usize = 6;
 
@@ -64,6 +72,17 @@ pub(crate) struct DestinationClaim {
     pub(crate) relative_path: String,
     /// Sorted, disjoint, coalesced.
     pub(crate) extents: Vec<DestinationExtent>,
+    /// Present exactly for an encrypted member direct-store decrypted at write
+    /// time (plan 136, E-D4). `None` for every plaintext member and for every
+    /// envelope destination.
+    ///
+    /// It carries no password and never will: what is here is what the headers
+    /// already state in the clear, plus the two things this process computed
+    /// that no restart could re-derive — the retained tail padding, and the
+    /// cipher checkpoints. A restore rebuilds the key from the job's live
+    /// password and these facts, and **refuses** when they disagree with the
+    /// headers the layout was rebuilt from.
+    pub(crate) crypt: Option<super::router::crypt::MemberCryptSnapshot>,
 }
 
 impl DestinationClaim {

@@ -872,6 +872,8 @@ fn dummy_named_rar_volume_facts(
             split_after: true,
             is_directory: false,
             is_encrypted: false,
+            encryption: None,
+            rar4_salt: None,
             host_os: Some(weaver_unrar::RarVolumeHostOs::Unix),
             attributes: Some(0o644),
             owner: None,

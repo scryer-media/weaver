@@ -264,6 +264,36 @@ async fn run_direct_store_gate_with_ceilings(
     volumes: &[(String, Vec<u8>)],
     arrivals: &[(u32, u32)],
 ) -> GateOutcome {
+    run_gate_with_password(
+        gate,
+        holds_budget,
+        scratch_ceiling,
+        job_id,
+        member_name,
+        volumes,
+        arrivals,
+        None,
+    )
+    .await
+}
+
+/// The gate runner with plan 136's one extra input: the job's password.
+///
+/// Everything else is the phase 4 harness unchanged, deliberately — the whole
+/// point of the encrypted differentials is that turning the gate off with the
+/// *same* password reproduces the same bytes, so both sides must run through
+/// exactly the same code.
+#[allow(clippy::too_many_arguments)]
+async fn run_gate_with_password(
+    gate: DirectStoreGate,
+    holds_budget: Option<u64>,
+    scratch_ceiling: Option<u64>,
+    job_id: JobId,
+    member_name: &str,
+    volumes: &[(String, Vec<u8>)],
+    arrivals: &[(u32, u32)],
+    password: Option<&str>,
+) -> GateOutcome {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(gate);
@@ -275,7 +305,8 @@ async fn run_direct_store_gate_with_ceilings(
     }
     pipeline.live_par2.set_enabled(false);
 
-    let spec = direct_store_job_spec("Silver Horizon", volumes);
+    let mut spec = direct_store_job_spec("Silver Horizon", volumes);
+    spec.password = password.map(str::to_owned);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
     let mut volume_file_seen = false;
@@ -3940,10 +3971,25 @@ async fn direct_store_before_restart(
     arrivals: &[(u32, u32)],
     articles: usize,
 ) -> PathBuf {
+    direct_store_before_restart_with_password(temp_dir, job_id, volumes, arrivals, articles, None)
+        .await
+}
+
+/// [`direct_store_before_restart`] with plan 136's extra input. The password is
+/// never persisted, so the "after" half has to be handed one of its own.
+async fn direct_store_before_restart_with_password(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    arrivals: &[(u32, u32)],
+    articles: usize,
+    password: Option<&str>,
+) -> PathBuf {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     pipeline.live_par2.set_enabled(false);
-    let spec = direct_store_job_spec_with_articles("Silver Horizon", volumes, articles);
+    let mut spec = direct_store_job_spec_with_articles("Silver Horizon", volumes, articles);
+    spec.password = password.map(str::to_owned);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
     for (file_index, segment_number) in arrivals {
         submit_volume_article_of(
@@ -4028,10 +4074,38 @@ async fn direct_store_after_restart(
     articles: usize,
     working_dir: &Path,
 ) -> Pipeline {
+    direct_store_after_restart_with_password(
+        temp_dir,
+        gate,
+        job_id,
+        volumes,
+        articles,
+        working_dir,
+        None,
+    )
+    .await
+}
+
+/// [`direct_store_after_restart`] with the password the restored job holds.
+///
+/// `None` is the "operator restarted and the password is gone" case: the set
+/// must demote by name rather than wedge, because nothing in the checkpoint can
+/// supply one.
+#[allow(clippy::too_many_arguments)]
+async fn direct_store_after_restart_with_password(
+    temp_dir: &TempDir,
+    gate: DirectStoreGate,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    articles: usize,
+    working_dir: &Path,
+    password: Option<&str>,
+) -> Pipeline {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.direct_store.set_gate(gate);
     pipeline.live_par2.set_enabled(false);
-    let spec = direct_store_job_spec_with_articles("Silver Horizon", volumes, articles);
+    let mut spec = direct_store_job_spec_with_articles("Silver Horizon", volumes, articles);
+    spec.password = password.map(str::to_owned);
     pipeline
         .restore_job(RestoreJobRequest {
             job_id,
@@ -6567,4 +6641,997 @@ async fn a_holds_scratch_that_cannot_be_marked_sparse_demotes_the_set() {
         scratch_files.is_empty(),
         "the scratch it could not mark must not survive, got {scratch_files:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Encrypted direct-store (plan 136, phase E1)
+//
+// The spine is the same differential phase 4 established, with one input added:
+// the identical job is run with routing on and off *with the same password*, and
+// the outputs must be byte-identical. With routing on, no source volume may ever
+// appear on disk — which for an encrypted set also means the ciphertext never
+// does.
+// ---------------------------------------------------------------------------
+
+/// The KDF tuple every encrypted fixture here shares. `lg2 = 4` is 16 PBKDF2
+/// rounds: real archives use 2^15 and up, and paying that per fixture would put
+/// seconds into the suite for a number nothing under test reads.
+const TEST_CRYPT_SALT: [u8; 16] = [0x5A; 16];
+const TEST_CRYPT_IV: [u8; 16] = [0xA5; 16];
+const TEST_CRYPT_KDF_LG2: u8 = 4;
+
+/// A RAR5 `FHEXTRA_CRYPT` record: `vint(size) || vint(type=1) || body`.
+///
+/// The body is the format's: version, flags, the KDF count as a raw byte, the
+/// 16-byte salt, the 16-byte IV, and — when the flags claim one — the 8-byte
+/// password check followed by the first four bytes of its SHA-256, which is the
+/// tag the parser validates before it will hand the value to anyone.
+fn build_test_rar_crypt_extra(psw_check: Option<&[u8; 8]>, keyed_checksum: bool) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&encode_test_rar_vint(0));
+    let mut flags = 0u64;
+    if psw_check.is_some() {
+        flags |= 0x0001;
+    }
+    if keyed_checksum {
+        flags |= 0x0002;
+    }
+    body.extend_from_slice(&encode_test_rar_vint(flags));
+    body.push(TEST_CRYPT_KDF_LG2);
+    body.extend_from_slice(&TEST_CRYPT_SALT);
+    body.extend_from_slice(&TEST_CRYPT_IV);
+    if let Some(check) = psw_check {
+        body.extend_from_slice(check);
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(check);
+        body.extend_from_slice(&digest[..4]);
+    }
+    let type_bytes = encode_test_rar_vint(1);
+    let mut record = encode_test_rar_vint((type_bytes.len() + body.len()) as u64);
+    record.extend_from_slice(&type_bytes);
+    record.extend_from_slice(&body);
+    record
+}
+
+/// Split points that are deliberately **off** every 16-byte boundary.
+///
+/// A real `rar -v` split lands wherever the volume filled up, and an encrypted
+/// member's parts are not individually block-aligned — only the member's total
+/// is. Aligned fixtures would never exercise the straddling block, which is the
+/// one shape E-D2's holds exist for.
+fn misaligned_parts(total: usize, count: usize) -> Vec<usize> {
+    assert!(count >= 1 && total >= count);
+    let base = total / count;
+    let mut parts = Vec::with_capacity(count);
+    let mut used = 0usize;
+    for index in 0..count - 1 {
+        let len = (base + 1 + index * 3).min(total - used - (count - 1 - index));
+        parts.push(len);
+        used += len;
+    }
+    parts.push(total - used);
+    assert_eq!(parts.iter().sum::<usize>(), total);
+    parts
+}
+
+/// One `-m0 -p` stored member split across `volume_count` volumes.
+///
+/// Mirrors what `rar a -m0 -p<password> -v<size>` writes, which is the recipe
+/// `rarpar`'s `tests/fixtures/generate_stored_layout.sh` records: the member's
+/// whole plaintext as one AES-256-CBC stream running unbroken across the volume
+/// boundaries, `align16(unpacked_size)` cipher bytes in total, one crypt record
+/// per part, plain packed CRC32s on the non-final parts and the whole-member
+/// checksum on the last.
+///
+/// - `data_password` encrypts the bytes.
+/// - `check_for` is whose password check the headers carry, or `None` for a
+///   writer that omitted it. Passing a *different* password here forges a check
+///   that admits the wrong one.
+/// - `keyed_checksum` sets `FHEXTRA_CRYPT`'s hash-MAC flag on the **final part
+///   alone** and folds the whole-member CRC32 with that password's hash key,
+///   which is the shape RARLAB `rar` 7.20 writes: only the last part's checksum
+///   is the whole member's, so only that one is keyed.
+fn encrypted_store_set(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    data_password: &str,
+    check_for: Option<&str>,
+    keyed_checksum: bool,
+) -> Vec<(String, Vec<u8>)> {
+    let material =
+        weaver_unrar::derive_rar5_material(data_password, &TEST_CRYPT_SALT, TEST_CRYPT_KDF_LG2)
+            .expect("the fixture KDF count is derivable");
+    let key = material.key;
+    let hash_key = material.hash_key;
+    let psw_check = check_for.map(|password| {
+        weaver_unrar::derive_rar5_material(password, &TEST_CRYPT_SALT, TEST_CRYPT_KDF_LG2)
+            .expect("the fixture KDF count is derivable")
+            .psw_check
+    });
+
+    let cipher_len = payload.len().div_ceil(16) * 16;
+    let mut padded = payload.to_vec();
+    padded.resize(cipher_len, 0);
+    let cipher = weaver_unrar::test_support::encrypt_aes256_cbc(&key, &TEST_CRYPT_IV, &padded);
+
+    let member_crc = checksum::crc32(payload);
+    let member_crc = if keyed_checksum {
+        weaver_unrar::convert_crc32_to_mac(member_crc, &hash_key)
+    } else {
+        member_crc
+    };
+
+    let mut offset = 0usize;
+    misaligned_parts(cipher_len, volume_count)
+        .into_iter()
+        .enumerate()
+        .map(|(volume, part_len)| {
+            let part = &cipher[offset..offset + part_len];
+            offset += part_len;
+            let is_first = volume == 0;
+            let is_last = volume + 1 == volume_count;
+
+            let mut split_flags = 0u64;
+            if !is_first {
+                split_flags |= 0x0008;
+            }
+            if !is_last {
+                split_flags |= 0x0010;
+            }
+            // Layer 1 over cipher bytes, plain: the packed hash on a non-final
+            // part covers the packed (= cipher) bytes and `rar` does not key it.
+            let data_crc = if is_last {
+                member_crc
+            } else {
+                checksum::crc32(part)
+            };
+            let extra = build_test_rar_crypt_extra(psw_check.as_ref(), keyed_checksum && is_last);
+
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&TEST_RAR5_SIG);
+            bytes.extend_from_slice(&build_test_rar_main_header(
+                if is_first { 0x0001 } else { 0x0001 | 0x0002 },
+                (!is_first).then_some(volume as u64),
+            ));
+            bytes.extend_from_slice(&build_test_rar_file_header_with_extra(
+                member_name,
+                split_flags,
+                part.len() as u64,
+                payload.len() as u64,
+                Some(data_crc),
+                &extra,
+            ));
+            bytes.extend_from_slice(part);
+            bytes.extend_from_slice(&build_test_rar_end_header(!is_last));
+
+            (format!("silver.horizon.part{:02}.rar", volume + 1), bytes)
+        })
+        .collect()
+}
+/// What one encrypted job's articles left behind, **without** driving
+/// extraction to a terminal state.
+///
+/// Used where the point is what the router decided. Deliberately not the full
+/// gate: a job whose password is wrong never reaches a terminal extraction on
+/// *either* path — the archive cannot be opened, so the conventional side sits
+/// in `Downloading` exactly as the demoted side does — and a helper that waited
+/// for terminality would spend minutes proving it.
+struct EncryptedRoutingOutcome {
+    /// The direct sets' debug shape, which carries the demotion reason.
+    shape: String,
+    /// Whether any source volume was materialized, i.e. whether the demotion
+    /// handed the bytes to the conventional path rather than dropping them.
+    volume_file_seen: bool,
+    /// Whether any `.direct.partial` exists.
+    partial_seen: bool,
+}
+
+async fn encrypted_routing_outcome(
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    arrivals: &[(u32, u32)],
+    password: Option<&str>,
+) -> EncryptedRoutingOutcome {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let mut spec = direct_store_job_spec("Silver Horizon", volumes);
+    spec.password = password.map(str::to_owned);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in arrivals {
+        submit_volume_article(&mut pipeline, job_id, volumes, *file_index, *segment_number).await;
+    }
+    drain_rar_refreshes(&mut pipeline).await;
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    let volume_file_seen = volumes
+        .iter()
+        .any(|(filename, _)| working_dir.join(filename).exists());
+    let partial_seen = std::fs::read_dir(&working_dir)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".direct.partial")
+            })
+        })
+        .unwrap_or(false);
+    EncryptedRoutingOutcome {
+        shape,
+        volume_file_seen,
+        partial_seen,
+    }
+}
+
+#[tokio::test]
+async fn an_encrypted_store_set_routes_plaintext_and_matches_the_conventional_extractor() {
+    let member_name = "Silver.Horizon.S02E01.mkv";
+    // 3000 is not a multiple of 16, so `cipher_size` is 3008 and the member
+    // carries 8 bytes of tail padding: the final block decrypts to plaintext
+    // that runs past the member's declared end, and none of it may reach the
+    // destination.
+    let payload: Vec<u8> = (0..3000u32).map(|index| (index % 251) as u8).collect();
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        4,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+    let arrivals = in_order_arrivals(volumes.len());
+
+    let conventional = run_gate_with_password(
+        DirectStoreGate::Disabled,
+        None,
+        None,
+        JobId(43001),
+        member_name,
+        &volumes,
+        &arrivals,
+        Some("moonlit-harbour"),
+    )
+    .await;
+    let direct = run_gate_with_password(
+        DirectStoreGate::Enabled,
+        None,
+        None,
+        JobId(43002),
+        member_name,
+        &volumes,
+        &arrivals,
+        Some("moonlit-harbour"),
+    )
+    .await;
+
+    assert!(
+        conventional.volume_file_seen,
+        "the conventional gate should have written the encrypted source volumes"
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "direct routing must never create a source volume file, encrypted or not"
+    );
+    assert_eq!(
+        conventional.member.as_deref(),
+        Some(payload.as_slice()),
+        "the conventional extractor should decrypt the member with the job's password"
+    );
+    assert_eq!(
+        direct.member.as_deref(),
+        Some(payload.as_slice()),
+        "the routed member must be plaintext at its final offsets, with no tail padding"
+    );
+    assert_eq!(
+        (direct.member, direct.member_location, direct.status),
+        (
+            conventional.member,
+            conventional.member_location,
+            conventional.status
+        ),
+        "an encrypted set routed plaintext-once must be byte-identical to the conventional \
+         extractor with the same password"
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_password_with_a_check_present_never_routes_a_byte() {
+    let member_name = "Silver.Horizon.S02E02.mkv";
+    let payload: Vec<u8> = (0..2048u32).map(|index| (index % 199) as u8).collect();
+    // The header states the check for the *right* password; the job holds the
+    // wrong one, so admission refutes it before a single byte is decrypted.
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        3,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+    let arrivals = in_order_arrivals(volumes.len());
+
+    let refused =
+        encrypted_routing_outcome(JobId(43011), &volumes, &arrivals, Some("wrong-key")).await;
+    assert!(
+        refused
+            .shape
+            .contains("Demoted(EncryptedMemberRefused(WrongPassword))"),
+        "a refuted password must be refused at admission, before any byte routes, got {}",
+        refused.shape
+    );
+    assert!(
+        !refused.partial_seen,
+        "nothing may be written on the strength of a refuted password"
+    );
+    assert!(
+        refused.volume_file_seen,
+        "the demotion must hand the volumes to the conventional path, not drop them — which is \
+         the parity a wrong password gets: it fails there too, for the same reason"
+    );
+
+    // Non-vacuity: the identical set with the right password routes, so the
+    // refusal above is a decision about the password and not about the fixture.
+    let admitted =
+        encrypted_routing_outcome(JobId(43012), &volumes, &arrivals, Some("moonlit-harbour")).await;
+    assert!(
+        !admitted.shape.contains("Demoted"),
+        "the same set with the right password must route, got {}",
+        admitted.shape
+    );
+    assert!(
+        !admitted.volume_file_seen,
+        "the admitted set must never materialize a source volume"
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_password_with_no_check_routes_until_the_keyed_member_gate_catches_it() {
+    let member_name = "Silver.Horizon.S02E03.mkv";
+    let payload: Vec<u8> = (0..2100u32).map(|index| (index % 211) as u8).collect();
+    // No password-check value in the header at all, so admission can conclude
+    // nothing and routes provisionally. The whole-member checksum is keyed,
+    // which makes it the only thing that can catch the wrong password: layer 1's
+    // packed hashes cover cipher bytes and pass whatever key was used, so they
+    // are wire integrity and not a password test.
+    let volumes = encrypted_store_set(member_name, &payload, 3, "moonlit-harbour", None, true);
+    let arrivals = in_order_arrivals(volumes.len());
+
+    let caught =
+        encrypted_routing_outcome(JobId(43021), &volumes, &arrivals, Some("wrong-key")).await;
+    assert!(
+        caught.shape.contains("Demoted(MemberChecksumMismatch)"),
+        "a wrong password the header could not refute must be caught by the keyed member gate, \
+         got {}",
+        caught.shape
+    );
+    // Deliberately no volume-file assertion here, unlike the check-present
+    // case: this gate fires on the *last* article, when the member's plaintext
+    // first composes, so the handover has no further articles to ride and the
+    // materialization is the demotion machinery's own — already pinned by
+    // `a_demoted_set_materializes_its_covered_volumes_instead_of_refetching_them`.
+
+    // Non-vacuity, and the E-D3 claim itself: the identical fixture with the
+    // right password verifies through the same keyed fold and completes.
+    let clean = run_gate_with_password(
+        DirectStoreGate::Enabled,
+        None,
+        None,
+        JobId(43022),
+        member_name,
+        &volumes,
+        &arrivals,
+        Some("moonlit-harbour"),
+    )
+    .await;
+    assert_eq!(
+        clean.member.as_deref(),
+        Some(payload.as_slice()),
+        "a check-less encrypted member with the right password must still verify and complete"
+    );
+}
+
+#[tokio::test]
+async fn an_encrypted_set_with_no_password_demotes_instead_of_routing_ciphertext() {
+    let member_name = "Silver.Horizon.S02E04.mkv";
+    let payload: Vec<u8> = (0..1500u32).map(|index| (index % 181) as u8).collect();
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        2,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+    let arrivals = in_order_arrivals(volumes.len());
+
+    // Checklist site 2, as a test: `EncryptedStore` is not `Ineligible`, so the
+    // predicate this replaced counted every encrypted member routable and would
+    // have sailed past the `routable == 0` demotion with nothing to route.
+    let outcome = encrypted_routing_outcome(JobId(43031), &volumes, &arrivals, None).await;
+    assert!(
+        outcome
+            .shape
+            .contains("Demoted(EncryptedMemberRefused(NoPassword))"),
+        "an encrypted set with no password must demote, by name, got {}",
+        outcome.shape
+    );
+    assert!(
+        !outcome.partial_seen,
+        "a set with no key must not create a destination for ciphertext"
+    );
+}
+
+#[tokio::test]
+async fn an_encrypted_span_that_arrives_before_its_predecessor_block_is_held_then_drained() {
+    let member_name = "Silver.Horizon.S02E05.mkv";
+    let payload: Vec<u8> = (0..2600u32).map(|index| (index % 173) as u8).collect();
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        3,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+
+    // Every volume's payload article before its header article, and the volumes
+    // themselves in reverse order: a span whose 16 preceding cipher bytes live
+    // in a volume that has not arrived, in both directions across every part
+    // boundary.
+    let mut arrivals: Vec<(u32, u32)> = (0..volumes.len() as u32)
+        .rev()
+        .map(|index| (index, 1))
+        .collect();
+    arrivals.extend((0..volumes.len() as u32).rev().map(|index| (index, 0)));
+
+    let conventional = run_gate_with_password(
+        DirectStoreGate::Disabled,
+        None,
+        None,
+        JobId(43041),
+        member_name,
+        &volumes,
+        &arrivals,
+        Some("moonlit-harbour"),
+    )
+    .await;
+    let direct = run_gate_with_password(
+        DirectStoreGate::Enabled,
+        None,
+        None,
+        JobId(43042),
+        member_name,
+        &volumes,
+        &arrivals,
+        Some("moonlit-harbour"),
+    )
+    .await;
+
+    assert_eq!(
+        direct.member.as_deref(),
+        Some(payload.as_slice()),
+        "a held straddling block must drain to the same plaintext once its other half lands"
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "holding a cipher block must not fall back to writing the volume"
+    );
+    assert_eq!(
+        (direct.member, direct.member_location, direct.status),
+        (
+            conventional.member,
+            conventional.member_location,
+            conventional.status
+        ),
+        "out-of-order encrypted arrival must be byte-identical to the conventional extractor"
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_encrypted_article_advances_nothing_twice() {
+    let member_name = "Silver.Horizon.S02E06.mkv";
+    let payload: Vec<u8> = (0..1900u32).map(|index| (index % 167) as u8).collect();
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        2,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+
+    // Every article twice. A duplicate that re-entered the cipher composition
+    // would fold the same run into layer 1 twice and fail the part gate; one
+    // that re-entered layer 2 would do the same to the keyed member fold.
+    let mut arrivals = Vec::new();
+    for file_index in 0..volumes.len() as u32 {
+        for segment_number in 0..2u32 {
+            arrivals.push((file_index, segment_number));
+            arrivals.push((file_index, segment_number));
+        }
+    }
+
+    let direct = run_gate_with_password(
+        DirectStoreGate::Enabled,
+        None,
+        None,
+        JobId(43051),
+        member_name,
+        &volumes,
+        &arrivals,
+        Some("moonlit-harbour"),
+    )
+    .await;
+    assert_eq!(
+        direct.member.as_deref(),
+        Some(payload.as_slice()),
+        "duplicate encrypted articles must leave the member exactly once-written"
+    );
+    assert!(!direct.volume_file_seen);
+}
+
+#[tokio::test]
+async fn an_encrypted_member_whose_size_is_block_aligned_carries_no_padding() {
+    // The other side of the tail-padding case: `unpacked_size % 16 == 0`, so
+    // `cipher_size == unpacked_size`, no padding exists and no envelope span is
+    // emitted for one. Byte-identical output either way is the assertion —
+    // padding arithmetic that was off by a block would show up here as a short
+    // member or an over-long one.
+    let member_name = "Silver.Horizon.S02E07.mkv";
+    let payload: Vec<u8> = (0..2048u32).map(|index| (index % 149) as u8).collect();
+    assert_eq!(payload.len() % 16, 0);
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        3,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+    let arrivals = in_order_arrivals(volumes.len());
+
+    let direct = run_gate_with_password(
+        DirectStoreGate::Enabled,
+        None,
+        None,
+        JobId(43061),
+        member_name,
+        &volumes,
+        &arrivals,
+        Some("moonlit-harbour"),
+    )
+    .await;
+    assert_eq!(direct.member.as_deref(), Some(payload.as_slice()));
+    assert!(!direct.volume_file_seen);
+}
+
+#[tokio::test]
+async fn a_password_that_arrives_after_the_job_was_added_still_admits_the_set() {
+    // Plan 136's open question 2, answered: weaver *does* support setting a
+    // password after add (`setJobPassword`, and the NZBGet facade's
+    // `*Unpack:Password`), both of which mutate the live job spec. The direct
+    // sets are built once per job and memoized, so the seam re-reads the spec
+    // while any set is still willing to take one.
+    let member_name = "Silver.Horizon.S02E08.mkv";
+    let payload: Vec<u8> = (0..1700u32).map(|index| (index % 157) as u8).collect();
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        2,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(43071);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // The set exists and has taken no password yet — nothing has parsed, so no
+    // encrypted member has been classified and nothing has demoted. Reached
+    // through the routing seam, which is what admits the sets lazily.
+    assert!(
+        pipeline
+            .direct_route_target(crate::jobs::ids::NzbFileId {
+                job_id,
+                file_index: 0,
+            })
+            .is_some(),
+        "the set should be admitted and still routing before any password exists"
+    );
+    assert!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .all(|set| !set.is_demoted()),
+        "a set with no password must not demote before it has classified anything"
+    );
+
+    // The post-add write both API surfaces perform.
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .expect("the job is live")
+        .spec
+        .password = Some("moonlit-harbour".to_string());
+
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    assert_eq!(
+        std::fs::read(output_root.join(member_name)).ok().as_deref(),
+        Some(payload.as_slice()),
+        "a password set after add must admit the set and produce the member"
+    );
+    assert!(
+        !working_dir.join(&volumes[0].0).exists(),
+        "the set admitted on a post-add password must still route, not materialize"
+    );
+}
+
+#[tokio::test]
+async fn an_encrypted_set_restarted_mid_download_honours_its_floors_and_completes_byte_identically()
+{
+    const ARTICLES: usize = 4;
+    let member_name = "Silver.Horizon.S02E09.mkv";
+    let payload: Vec<u8> = (0..8000u32).map(|index| (index % 251) as u8).collect();
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        3,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(43081);
+    // Volume 0 complete, volume 1 half: one file the restore can skip whole and
+    // one it must skip only part of — and the part boundary between them is not
+    // 16-aligned, so the resumed run has to decrypt at a coverage frontier whose
+    // predecessor cipher block is gone with the process that wrote it.
+    let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1)];
+    let working_dir = direct_store_before_restart_with_password(
+        &temp_dir,
+        job_id,
+        &volumes,
+        &arrivals,
+        ARTICLES,
+        Some("moonlit-harbour"),
+    )
+    .await;
+
+    let mut pipeline = direct_store_after_restart_with_password(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+        Some("moonlit-harbour"),
+    )
+    .await;
+
+    let set = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the restored encrypted job must carry its direct set");
+    assert!(
+        !set.is_demoted(),
+        "a restart that still has the password must re-admit the set, not demote it"
+    );
+    assert!(
+        set.has_restart_seeded_coverage(),
+        "restored coverage is seeded and unverified until it is re-read as plaintext"
+    );
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        !queued.iter().any(|(file_index, _)| *file_index == 0),
+        "volume 0 was complete at the barrier; none of its articles may be refetched, got {queued:?}"
+    );
+    assert!(
+        !queued.contains(&(1, 0)),
+        "volume 1's checkpointed articles must not be refetched, got {queued:?}"
+    );
+    assert!(
+        queued.len() < volumes.len() * ARTICLES,
+        "a restart that refetches everything is not honouring any floor"
+    );
+
+    for (file_index, segment_number) in queued.clone() {
+        dispatch_and_submit(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES,
+        )
+        .await;
+    }
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_none_or(|set| !set.has_restart_seeded_coverage()),
+        "the keyed member gate must have re-read the pre-restart plaintext before finalizing"
+    );
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+    let complete_dir = temp_dir.path().join("complete");
+    let (restarted, location) = member_after_gate(&complete_dir, &working_dir, member_name);
+    assert_eq!(
+        restarted.as_deref(),
+        Some(payload.as_slice()),
+        "a restarted encrypted set must finish byte-identical to an uninterrupted one"
+    );
+    assert_eq!(location, Some("complete"));
+    assert!(
+        !working_dir.join(&volumes[0].0).exists(),
+        "a restarted encrypted set must still never materialize a source volume"
+    );
+}
+
+#[tokio::test]
+async fn an_encrypted_set_restarted_without_its_password_demotes_by_name() {
+    const ARTICLES: usize = 2;
+    let member_name = "Silver.Horizon.S02E10.mkv";
+    let payload: Vec<u8> = (0..4000u32).map(|index| (index % 239) as u8).collect();
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        2,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(43091);
+    let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1)];
+    let working_dir = direct_store_before_restart_with_password(
+        &temp_dir,
+        job_id,
+        &volumes,
+        &arrivals,
+        ARTICLES,
+        Some("moonlit-harbour"),
+    )
+    .await;
+
+    // The password is never persisted, by design. A restore that cannot supply
+    // one has to demote — by name, and while the set's routed bytes can still
+    // materialize its volumes — rather than sit unable to decrypt and unable to
+    // give up.
+    let mut pipeline = direct_store_after_restart_with_password(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+        None,
+    )
+    .await;
+
+    // The layout rebuild runs the same admission the live parse does, so the
+    // checkpoint is refused before it can seed anything. That is the "never
+    // wedges" half: no seeded coverage means no member left permanently
+    // unverifiable, and every article comes back.
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_none_or(|set| !set.has_restart_seeded_coverage()),
+        "a set that cannot decrypt must not be left holding seeded coverage it can never re-arm"
+    );
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert_eq!(
+        queued.len(),
+        volumes.len() * ARTICLES,
+        "a refused checkpoint must skip nothing, got {queued:?}"
+    );
+
+    // And the "by name" half: the first article to arrive reaches the same
+    // admission decision and demotes under its own reason, rather than routing
+    // ciphertext or holding forever.
+    submit_volume_article_of(&mut pipeline, job_id, &volumes, 0, 0, ARTICLES).await;
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted(EncryptedMemberRefused(NoPassword))"),
+        "a restored encrypted set with no password must demote by name, got {shape}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// E-D5: the machinery plan 136 changes nothing about, asserted rather than
+// assumed. Each of these is the encrypted twin of a plan 135 guarantee.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn encrypted_routing_leaves_the_plan_135_guarantees_untouched() {
+    let member_name = "Silver.Horizon.S02E11.mkv";
+    let payload: Vec<u8> = (0..5000u32).map(|index| (index % 227) as u8).collect();
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        3,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(43101);
+    let mut spec = direct_store_job_spec("Silver Horizon", &volumes);
+    spec.password = Some("moonlit-harbour".to_string());
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // Payload before headers, so the holds machinery carries cipher bytes the
+    // layout cannot place yet — the same hold plan 135 uses, over ciphertext.
+    let mut arrivals: Vec<(u32, u32)> = (0..volumes.len() as u32).map(|index| (index, 1)).collect();
+    arrivals.extend((0..volumes.len() as u32).map(|index| (index, 0)));
+    for (file_index, segment_number) in &arrivals {
+        submit_volume_article(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            *file_index,
+            *segment_number,
+        )
+        .await;
+    }
+
+    // D7 suppression: an encrypted set's source volumes are direct volumes, so
+    // no legacy floor, completed-file row or archive re-probe may be written.
+    assert!(
+        (0..volumes.len() as u32)
+            .all(|file_index| pipeline.is_direct_source_file(NzbFileId { job_id, file_index })),
+        "every encrypted source volume must be suppressed as a direct volume"
+    );
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| state.assembly.archive_topologies().is_empty()),
+        "an encrypted direct set must not enter the archive topology"
+    );
+
+    // Coverage floors and barriers: the barrier runs and publishes floors over
+    // the *source* volumes, which are cipher space — untouched by the write
+    // transform, because the transform happens on the destination side.
+    pipeline
+        .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
+        .await;
+    let set = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the encrypted set must still be routing");
+    assert!(!set.is_demoted(), "no gate here may demote a clean set");
+    // Non-vacuity for everything below: this set really is decrypting at write
+    // time, so these are the encrypted twins of the plan 135 guarantees rather
+    // than the plaintext originals under a new name.
+    assert!(
+        set.router.routes_encrypted(),
+        "the fixture must have admitted an encrypted member"
+    );
+    assert!(
+        (0..volumes.len() as u32).all(|volume_index| set.volume_coverage(volume_index).is_empty()
+            || set.volume_coverage(volume_index).contiguous_from_zero() > 0),
+        "every touched volume must have a contiguous floor in source (cipher) space"
+    );
+
+    // The sweep and finalization wait: the job still finishes, in one place,
+    // byte-identical.
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    let (member, location) = member_after_gate(&complete_dir, &working_dir, member_name);
+    assert_eq!(member.as_deref(), Some(payload.as_slice()));
+    assert_eq!(location, Some("complete"));
+    assert!(
+        volumes
+            .iter()
+            .all(|(filename, _)| !working_dir.join(filename).exists()),
+        "the sweep must not have left a source volume behind"
+    );
+}
+
+#[tokio::test]
+async fn a_par2_bearing_encrypted_set_demotes_before_the_authoritative_pass() {
+    // The one thing an encrypted set cannot yet do (plan 136 defers it to phase
+    // E2): its destinations hold plaintext while PAR2 describes the posted
+    // cipher, so a set served to the authoritative pass would have every slice
+    // reported damaged and the repairer handed a virtual volume that was never
+    // broken. It demotes when the recovery set appears — which can be at any
+    // point in a job's life — and finishes conventionally.
+    let member_name = "Silver.Horizon.S02E12.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 193) as u8).collect();
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        3,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+    let par2_bytes = par2_index_over_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(43111);
+    let (mut spec, index_file_index) =
+        par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
+    spec.password = Some("moonlit-harbour".to_string());
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    // Non-vacuity: it really did route the encrypted set before the PAR2 index
+    // turned up, so the demotion below is the guard firing and not admission.
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| !set.is_demoted() && set.router.routes_encrypted()),
+        "the encrypted set must have been routing before the recovery set arrived"
+    );
+
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted(EncryptedPar2Unsupported)"),
+        "a PAR2-bearing encrypted set must demote before the authoritative pass, got {shape}"
+    );
+
+    // The demotion refetches rather than reconstructs, which is the other half
+    // of the same rule: the member partials hold plaintext, so materializing a
+    // volume out of them would write decrypted bytes where PAR2 expects cipher.
+    // Every article comes back, and no volume was fabricated in the meantime.
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        !queued.is_empty(),
+        "an encrypted set that demotes must refetch its volumes rather than materialize them"
+    );
+    assert!(
+        volumes.iter().all(|(filename, _)| working_dir
+            .join(filename)
+            .metadata()
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+            == 0),
+        "no source volume may have been reconstructed out of decrypted destinations"
+    );
+    let _ = &complete_dir;
 }

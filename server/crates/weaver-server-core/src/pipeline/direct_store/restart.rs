@@ -623,15 +623,25 @@ impl Pipeline {
             let set_name = plan.set_name.clone();
             let mut set = DirectSet::new(job_id, plan.clone());
             self.direct_store.apply_ceilings(&mut set);
+            // Plan 136, E-D1. Bound **before** the layout is rebuilt, because
+            // rebuilding it runs the same encrypted-store admission the live
+            // parse does: a restore with no password reaches it, refuses, and
+            // the set redownloads conventionally under a named reason. The
+            // password itself was never persisted — this is the live job spec,
+            // which restore has already re-derived from the stored NZB and the
+            // job's password override.
+            set.router.set_password(spec.password.as_deref());
             let volume_facts = facts.get(&set_name).cloned().unwrap_or_default();
             if volume_facts.is_empty() {
                 continue;
             }
-            if set.restore_layout(&volume_facts).is_err() {
+            if let Err(reason) = set.restore_layout(&volume_facts) {
                 tracing::info!(
                     job_id = job_id.0,
                     set_name = %set_name,
-                    "cached RAR facts no longer rebuild the direct set's layout; it redownloads"
+                    reason = reason.metric(),
+                    "the direct set's cached facts no longer rebuild a routable layout; it \
+                     redownloads"
                 );
                 continue;
             }
@@ -712,6 +722,7 @@ impl Pipeline {
                 _ => {
                     let mut set = DirectSet::new(job_id, plan.clone());
                     self.direct_store.apply_ceilings(&mut set);
+                    set.router.set_password(spec.password.as_deref());
                     set
                 }
             };

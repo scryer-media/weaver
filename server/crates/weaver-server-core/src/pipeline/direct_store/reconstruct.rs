@@ -130,6 +130,18 @@ pub(crate) enum ReconstructionFailure {
     /// `set_len` opens a hole, so on Windows nothing has been allocated yet and
     /// the refetch pays only what the conventional path always pays.
     SparseMarkFailed { volume_index: u32, error: String },
+    /// The set routed an **encrypted** member, so its destinations hold
+    /// plaintext where the source volume holds cipher (plan 136, E-D2).
+    ///
+    /// Reconstruction reads posted bytes back out of those destinations, and
+    /// re-encrypting them on the fly is the provider overlay E-D4 specifies and
+    /// phase E2 builds. Until it exists this refuses rather than writing
+    /// plaintext into a volume under a published floor — which no checksum here
+    /// would catch, because the yEnc part CRCs it compares against describe the
+    /// posted bytes and the composition would simply never match. Refetching is
+    /// always correct, and an encrypted set demoting at all is already the
+    /// exceptional path.
+    EncryptedPostedBytes,
 }
 
 impl ReconstructionFailure {
@@ -141,6 +153,7 @@ impl ReconstructionFailure {
             Self::UnverifiableRun { .. } => "unverifiable_run",
             Self::WriteFailed { .. } => "write_failed",
             Self::SparseMarkFailed { .. } => "sparse_mark_failed",
+            Self::EncryptedPostedBytes => "encrypted_posted_bytes",
         }
     }
 }
@@ -183,6 +196,11 @@ impl std::fmt::Display for ReconstructionFailure {
             } => write!(
                 formatter,
                 "volume {volume_index} could not be marked sparse: {error}"
+            ),
+            Self::EncryptedPostedBytes => write!(
+                formatter,
+                "the set routed encrypted members, whose posted bytes cannot be reproduced until \
+                 the re-encrypting provider overlay exists"
             ),
         }
     }

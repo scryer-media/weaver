@@ -56,6 +56,9 @@ use weaver_unrar::{
 use super::ByteRanges;
 use super::plan::DirectSetPlan;
 use super::sparse::SparseMarking;
+use crypt::{AES_BLOCK, CryptRefusal, KeyRing, MemberCrypt, block_ceil, block_floor};
+
+pub(crate) mod crypt;
 
 /// Default RAM ceiling for holds across one set. A breach pages to the set's
 /// holds scratch (D2); only a paging failure demotes.
@@ -108,13 +111,51 @@ pub(crate) enum DemotionReason {
     /// does not cover — including a provisional member that resolved ineligible
     /// when its chain closed (revision 6).
     ///
-    /// Solid, encrypted, directory, redirection and malformed-chain members
-    /// always land here: the tolerance extracts its members with
+    /// Solid, directory, redirection and malformed-chain members always land
+    /// here: the tolerance extracts its members with
     /// `extract_member_streaming`, which needs a per-member non-solid regular
     /// file it can decode on its own, and a solid member is only decodable
     /// against the rest of the solid run. A *compressed* or *BLAKE2sp-only*
     /// member instead rides [`Self::ToleranceBudgetExceeded`]'s budget.
+    ///
+    /// **Encrypted** members land here only when their encryption is not the
+    /// one shape direct-store can route (plan 136). `classify` sends a member
+    /// whose parts are all `Store` and all state the same key material to
+    /// [`MemberEligibility::EncryptedStore`] and the stored-chain path, and
+    /// reserves `Ineligible(Encrypted)` for encrypted **and** compressed,
+    /// encrypted **and** solid, and non-uniform or unkeyable encryption. An
+    /// `EncryptedStore` member that fails admission demotes under
+    /// [`Self::EncryptedMemberRefused`] instead, which says *why*.
     MemberIneligible(MemberIneligibility),
+    /// An encrypted `Store` member the set may not route: no password reached
+    /// it, the password its header states a check for is wrong, or its key
+    /// material is one this build cannot derive from (E-D1).
+    ///
+    /// Always a demotion, never a job failure: the conventional extractor asks
+    /// the job's whole password-candidate list, which is a superset of what
+    /// direct-store is handed, so demoting costs the direct route and nothing
+    /// else. A *wrong* password demotes to a conventional path that will fail
+    /// the same way, which is the parity this reason keeps.
+    EncryptedMemberRefused(CryptRefusal),
+    /// A checkpoint's crypt facts are not the facts the rebuilt layout states,
+    /// or a member this run classified encrypted has no crypt row at all (E-D4).
+    ///
+    /// Fail-closed by construction: the alternative is rebuilding a key from a
+    /// row describing a different archive, which decrypts to garbage while every
+    /// coverage gate keeps passing, because coverage is about *where* bytes are
+    /// and says nothing about what they decrypt to.
+    EncryptedFactsDisagree,
+    /// A PAR2-bearing job holds a live encrypted direct set (plan 136).
+    ///
+    /// The authoritative pass reads the set's source volumes through the hybrid
+    /// provider, which serves member ranges out of `.direct.partial` files — and
+    /// for an encrypted set those hold plaintext while PAR2 describes the posted
+    /// cipher. Every slice would mismatch, the set would be called damaged, and
+    /// the repair would be handed a virtual volume to fix that was never broken.
+    /// Demoting before the pass keeps its world binary, exactly as
+    /// [`Self::Par2Unbindable`] does: either a fully readable virtual set, or
+    /// real files on disk. Phase E2's re-encrypting overlay retires this.
+    EncryptedPar2Unsupported,
     /// The ineligible members are individually tolerable but collectively over
     /// D1's budget: `min(64 MiB, 1% of the archive's packed bytes)` packed, or
     /// 256 MiB unpacked.
@@ -283,6 +324,9 @@ impl DemotionReason {
             Self::MemberIneligible(MemberIneligibility::Blake2OnlyNoCrc32) => "member_blake2_only",
             Self::MemberIneligible(MemberIneligibility::NoChecksum) => "member_no_checksum",
             Self::MemberIneligible(MemberIneligibility::MalformedChain) => "member_malformed_chain",
+            Self::EncryptedMemberRefused(refusal) => refusal.metric(),
+            Self::EncryptedFactsDisagree => "encrypted_facts_disagree",
+            Self::EncryptedPar2Unsupported => "encrypted_par2_unsupported",
             Self::ToleranceBudgetExceeded => "tolerance_budget",
             Self::Par2Damaged => "par2_damaged",
             Self::Par2Unbindable => "par2_unbindable",
@@ -1190,6 +1234,12 @@ struct MemberRouting {
     stale_gaps: ByteRanges,
     /// The whole-member gate has passed.
     verified: bool,
+    /// Present exactly for a [`MemberEligibility::EncryptedStore`] member the
+    /// set admitted (plan 136). Its presence is what makes the drain decrypt at
+    /// write time, and its absence is what makes an encrypted member's bytes
+    /// unroutable — the two can never disagree, because the member is only
+    /// adopted at all once admission has returned keys.
+    crypt: Option<MemberCrypt>,
 }
 
 /// One archive set's router.
@@ -1259,6 +1309,10 @@ pub(crate) struct DirectSetRouter {
     /// a set that stays inside its RAM budget — which is nearly all of them —
     /// touches the filesystem for it exactly zero times.
     scratch: HoldsScratch,
+    /// The set's password and the keys derived from it (plan 136, E-D1). Empty
+    /// and untouched for a set with no encrypted member — which is every set
+    /// plan 135 routed.
+    crypt: KeyRing,
     demoted: Option<DemotionReason>,
 }
 
@@ -1294,8 +1348,36 @@ impl DirectSetRouter {
             member_order: Vec::new(),
             member_order_stale: false,
             holds_budget: DEFAULT_HOLDS_BUDGET_BYTES,
+            crypt: KeyRing::new(),
             demoted: None,
         }
+    }
+
+    /// Whether the set would still take a job password (plan 136, E-D1).
+    ///
+    /// The seam re-reads the live job spec while this is true, because a
+    /// password can arrive **after** the job was added: `setJobPassword` and the
+    /// NZBGet facade's `*Unpack:Password` both mutate the spec in place. It goes
+    /// false the moment one is held, so a set that has one — and every set with
+    /// no encrypted member, once it demotes or admits — costs nothing.
+    pub(crate) fn wants_password(&self) -> bool {
+        self.demoted.is_none() && self.crypt.wants_password()
+    }
+
+    /// Binds the job's password. Never persisted, never logged.
+    pub(crate) fn set_password(&mut self, password: Option<&str>) {
+        self.crypt.set_password(password);
+    }
+
+    /// Whether this set has admitted an encrypted member, i.e. whether any of
+    /// its bytes are being decrypted on the way to their destination.
+    ///
+    /// Read by every consumer of **posted** bytes, because for such a set the
+    /// destinations hold plaintext and the source volumes held cipher: until
+    /// phase E2's re-encrypting overlay exists, those consumers must refuse
+    /// rather than read plaintext where cipher belongs.
+    pub(crate) fn routes_encrypted(&self) -> bool {
+        self.crypt.admitted()
     }
 
     /// Sets the per-set scratch ceiling (D2). Configured, with the env override
@@ -2058,16 +2140,43 @@ impl DirectSetRouter {
             }
         }
 
-        let routable: Vec<(String, u64)> = self
+        // Plan 136 E1 checklist site 1. `routes_direct()` is now true for an
+        // encrypted store member, so this filter admits ciphertext — and would
+        // create a `.direct.partial` for it, size every extent off the
+        // *plaintext* `unpacked_size` while the cipher stream runs to
+        // `align16(unpacked_size)`, and route the bytes unchanged. Admission is
+        // therefore decided **first**, before a single destination exists: no
+        // password, a refuted one, or key material this build cannot use, and
+        // the set demotes here rather than writing anything.
+        let keys = self.admit_encrypted()?;
+
+        let routable: Vec<(String, u64, Option<weaver_unrar::EncryptedStore>)> = self
             .layout_members()
             .iter()
             .filter(|member| member.eligibility.routes_direct())
-            .map(|member| (member.name.clone(), member.unpacked_size.unwrap_or(0)))
+            .map(|member| {
+                (
+                    member.name.clone(),
+                    member.unpacked_size.unwrap_or(0),
+                    member.eligibility.encrypted_store(),
+                )
+            })
             .collect();
-        for (name, unpacked_size) in routable {
+        for (name, unpacked_size, encrypted) in routable {
+            // Unreachable while `admit_encrypted` demotes on every refusal, and
+            // stated anyway: an encrypted member with no key routes nothing, and
+            // the alternative to skipping it is a destination full of cipher.
+            if encrypted.is_some() && !keys.contains_key(&name) {
+                continue;
+            }
             if let Some(member_id) = self.member_ids.get(&name).copied() {
                 if let Some(existing) = self.members.get_mut(&member_id) {
                     existing.unpacked_size = unpacked_size;
+                    if let (Some(facts), Some(crypt)) = (encrypted, existing.crypt.as_mut()) {
+                        // The cipher extent resolves — from unknown to known —
+                        // as the headers that declare a size arrive.
+                        crypt.observe(&facts);
+                    }
                 }
                 continue;
             }
@@ -2075,6 +2184,12 @@ impl DirectSetRouter {
                 Ok(path) => path,
                 Err(()) => return Err(self.fail(DemotionReason::UnsafeDestination)),
             };
+            let crypt = encrypted.and_then(|facts| {
+                let (member_keys, record) = keys.get(&name)?;
+                let mut crypt = MemberCrypt::new(*member_keys, record);
+                crypt.observe(&facts);
+                Some(crypt)
+            });
             let member_id = self.next_member_id;
             self.next_member_id = self.next_member_id.saturating_add(1);
             self.member_ids.insert(name.clone(), member_id);
@@ -2090,6 +2205,7 @@ impl DirectSetRouter {
                     restart_seeded: ByteRanges::new(),
                     stale_gaps: ByteRanges::new(),
                     verified: false,
+                    crypt,
                 },
             );
             self.member_order_stale = true;
@@ -2099,6 +2215,68 @@ impl DirectSetRouter {
             self.member_order_stale = false;
         }
         Ok(())
+    }
+
+    /// The encrypted-store admission decision (plan 136, E-D1).
+    ///
+    /// Runs at every parse, before [`Self::sync_members`] creates anything, and
+    /// answers one question per encrypted member: is there a password that may
+    /// key it? Key derivation happens once per KDF tuple — a set whose members
+    /// share one pays a single PBKDF2 — and the RAR5 password check is verified
+    /// **before any byte routes**.
+    ///
+    /// Three refusals, all of them demotions:
+    ///
+    /// - no password: an encrypted set routes only with one;
+    /// - a check present that this password does not reproduce: nothing is
+    ///   written on the strength of a refuted password;
+    /// - key material this build cannot derive from — a RAR4 member (file
+    ///   encryption for RAR4/RAR3 is phase E3, and a RAR4 header states no
+    ///   `FHEXTRA_CRYPT` record at all), or a KDF count the crate refuses.
+    ///
+    /// A check the header **omits** admits provisionally: nothing can be
+    /// concluded before the bytes, and the member's keyed checksum gate is then
+    /// the earliest detector — the same position layer 1 is in for a plaintext
+    /// member.
+    fn admit_encrypted(
+        &mut self,
+    ) -> Result<
+        HashMap<
+            String,
+            (
+                crypt::MemberKeys,
+                weaver_unrar::RarVolumeMemberEncryptionFacts,
+            ),
+        >,
+        DemotionReason,
+    > {
+        let encrypted: Vec<(String, weaver_unrar::EncryptedStore)> = self
+            .layout_members()
+            .iter()
+            .filter_map(|member| {
+                member
+                    .eligibility
+                    .encrypted_store()
+                    .map(|facts| (member.name.clone(), facts))
+            })
+            .collect();
+        let mut keys = HashMap::with_capacity(encrypted.len());
+        for (name, facts) in encrypted {
+            let Some(record) = facts.crypt else {
+                return Err(self.fail(DemotionReason::EncryptedMemberRefused(
+                    CryptRefusal::Unkeyable,
+                )));
+            };
+            match self.crypt.admit(&record) {
+                Ok(member_keys) => {
+                    keys.insert(name, (member_keys, record));
+                }
+                Err(refusal) => {
+                    return Err(self.fail(DemotionReason::EncryptedMemberRefused(refusal)));
+                }
+            }
+        }
+        Ok(keys)
     }
 
     /// Revision 6 amendment 1: a provisional member that resolves `Ineligible`
@@ -2139,9 +2317,29 @@ impl DirectSetRouter {
         let mut first_tolerated: Option<IneligibilityReason> = None;
 
         for member in self.layout_members() {
-            let MemberEligibility::Ineligible(reason) = member.eligibility else {
-                routable += 1;
-                continue;
+            let reason = match member.eligibility {
+                MemberEligibility::DirectEligible | MemberEligibility::ProvisionallyDirect => {
+                    routable += 1;
+                    continue;
+                }
+                // Plan 136 E1 checklist site 2. The `let ... else` this replaces
+                // counted **every** non-`Ineligible` member routable, and
+                // `EncryptedStore` is not `Ineligible` — so an all-encrypted set
+                // with no password would have sailed past the `routable == 0`
+                // demotion below with nothing to route and no reason to stop,
+                // silently deleting the hard demotion this path has always
+                // guaranteed. Routable means *decryptable*: a member the key
+                // ring admitted counts, and one it did not is the set's own
+                // reason to leave direct mode.
+                MemberEligibility::EncryptedStore(_) => {
+                    if self.crypt.admitted() {
+                        routable += 1;
+                        continue;
+                    }
+                    let refusal = self.crypt.refusal().unwrap_or(CryptRefusal::NoPassword);
+                    return Err(self.fail(DemotionReason::EncryptedMemberRefused(refusal)));
+                }
+                MemberEligibility::Ineligible(reason) => reason,
             };
             // A member the router **adopted** routed bytes into its own
             // `.direct.partial` while it was still `ProvisionallyDirect` — a
@@ -2221,11 +2419,32 @@ impl DirectSetRouter {
     /// Finalization extracts exactly these and nothing else: the direct-routed
     /// members are already at their destinations, and re-extracting one would
     /// overwrite verified output with a second decode of the same bytes.
+    ///
+    /// # Plan 136 E1 checklist site 3
+    ///
+    /// `Ineligible(_)` stopped spanning "every member finalization must extract"
+    /// the moment `EncryptedStore` existed: it is not `Ineligible`, so the old
+    /// predicate dropped an encrypted member from this list while nothing put it
+    /// on the routed one — a member in neither list is a member silently missing
+    /// from the output. The decision is stated rather than implied. An
+    /// **admitted** encrypted member is direct-routed and must not be
+    /// re-extracted over its own verified bytes. One the set could **not** key
+    /// belongs here, because the conventional extractor — which asks the job's
+    /// whole password-candidate list, a superset of the single password
+    /// direct-store is handed — is the only thing that can still produce it.
+    /// (While the set lives that case is unreachable, since admission demotes
+    /// the whole set rather than routing around one member; it is written down
+    /// because the alternative to writing it down is losing a file.)
     pub(crate) fn tolerated_member_names(&self) -> Vec<String> {
+        let admitted = self.crypt.admitted();
         let mut names: Vec<(u32, u64, String)> = self
             .layout_members()
             .iter()
-            .filter(|member| matches!(member.eligibility, MemberEligibility::Ineligible(_)))
+            .filter(|member| match member.eligibility {
+                MemberEligibility::Ineligible(_) => true,
+                MemberEligibility::EncryptedStore(_) => !admitted,
+                MemberEligibility::DirectEligible | MemberEligibility::ProvisionallyDirect => false,
+            })
             .map(|member| {
                 let position = member
                     .parts
@@ -2364,6 +2583,34 @@ impl DirectSetRouter {
                         }
                         cursor = cursor.saturating_add(len);
                     }
+                    // Plan 136, E-D2. Cipher bytes: a routing decision of their
+                    // own, never a copy of the `Member` arm above — writing them
+                    // where that arm writes would put ciphertext in the
+                    // destination, which is the whole reason the layout gives
+                    // them their own variant. What they share is the
+                    // *coordinates*: cipher offset and member-logical offset are
+                    // the same number for a stored member, so every range answer
+                    // plan 135 computes is unchanged and only the bytes differ.
+                    MappedSlice::EncryptedMember {
+                        member_index,
+                        logical_offset,
+                        len,
+                    } => {
+                        let staging = self.staging.get(&volume_index);
+                        let replace =
+                            staging.is_some_and(|staging| staging.is_repaired(cursor, len));
+                        self.route_encrypted_slice(
+                            volume_index,
+                            cursor,
+                            member_index,
+                            logical_offset,
+                            len,
+                            replace,
+                            &mut spans,
+                            &mut routed,
+                        )?;
+                        cursor = cursor.saturating_add(len);
+                    }
                 }
             }
         }
@@ -2422,7 +2669,21 @@ impl DirectSetRouter {
                 let mut cursor = offset;
                 for slice in self.map_physical_range(volume_index, offset, len) {
                     match slice {
-                        MappedSlice::Member { len, .. } => cursor = cursor.saturating_add(len),
+                        // An encrypted member's bytes are as droppable as a
+                        // plaintext one's, and for the same reason: what is not
+                        // droppable is still **pending**, which `keep` starts
+                        // from. A sub-block remainder the drain could not decrypt
+                        // was never routed, so it is pending here and pending in
+                        // whichever neighbouring volume holds the rest of its
+                        // block — and each side's own `pending` is what keeps
+                        // both halves alive until the block closes. Keeping
+                        // routed cipher on top of that would retain a second copy
+                        // of the payload for the life of the volume, which is the
+                        // RSS term envelope v2's trim exists to remove.
+                        MappedSlice::Member { len, .. }
+                        | MappedSlice::EncryptedMember { len, .. } => {
+                            cursor = cursor.saturating_add(len)
+                        }
                         MappedSlice::Envelope { len } | MappedSlice::Unroutable { len } => {
                             keep.insert(cursor, len);
                             cursor = cursor.saturating_add(len);
@@ -2531,6 +2792,423 @@ impl DirectSetRouter {
         self.try_verify_member(member_id)
     }
 
+    // ---- Encrypted members: decrypt at write (plan 136, E-D2) --------------
+
+    /// Routes one encrypted member slice, decrypting on the way in.
+    ///
+    /// The nzbdav insight makes this nearly stateless: decrypting cipher block
+    /// *N* needs only cipher block *N−1*, so a router holding spans out of order
+    /// can decrypt each one the moment its predecessor has landed. There is no
+    /// chain checkpoint to maintain and no forward-only constraint.
+    ///
+    /// What is left is arithmetic on three pieces, because a slice's edges are
+    /// article- and volume-shaped while AES is block-shaped:
+    ///
+    /// - a **head** partial block, when the slice does not start on a 16-byte
+    ///   boundary — its first bytes belong to the previous article or the
+    ///   previous *volume*, since a split member's parts are not individually
+    ///   block-aligned;
+    /// - the **aligned middle**, which is all of the slice for an aligned span
+    ///   and is decrypted in one pass;
+    /// - a **tail** partial block, symmetric with the head.
+    ///
+    /// Each edge block is resolved once, by whichever side reaches it first, and
+    /// its plaintext is kept in [`MemberCrypt::edge_plain`] for the other side.
+    /// That is what stops the two halves of a straddling block from deadlocking:
+    /// a drain emits spans **only for the volume it is draining**, so without
+    /// the shared plaintext each side would sit holding its half waiting for the
+    /// other to route bytes it is not allowed to route.
+    ///
+    /// Anything that cannot be resolved is simply **not routed**: it stays
+    /// `pending` in this volume's staging and rides the existing holds
+    /// machinery, bounded by one article per member per gap.
+    ///
+    /// No new re-drain trigger is needed for that, and it is worth saying why,
+    /// because the obvious reading is that a volume whose articles have all
+    /// arrived would never be revisited. [`Self::route`] and
+    /// [`Self::note_volume_complete`] both stage first and then drain **every**
+    /// volume in the set, in ascending order, precisely so a header landing in
+    /// one volume can release another's holds. A straddling block therefore
+    /// resolves in whichever call brings its missing half: the earlier volume's
+    /// drain reads the later one's freshly staged bytes through
+    /// [`Self::member_cipher`], and the later volume's own drain — later in the
+    /// same loop — finds the plaintext waiting for it.
+    #[allow(clippy::too_many_arguments)]
+    fn route_encrypted_slice(
+        &mut self,
+        volume_index: u32,
+        cursor: u64,
+        member_index: usize,
+        logical_offset: u64,
+        len: u64,
+        replace: bool,
+        spans: &mut Vec<RoutedSpan>,
+        routed: &mut Vec<(u64, u64)>,
+    ) -> Result<(), DemotionReason> {
+        if len == 0 {
+            return Ok(());
+        }
+        let Some(member_id) = self.member_id_for_layout(member_index) else {
+            debug_assert!(
+                false,
+                "the layout mapped encrypted member {member_index} of {}, which the router never \
+                 adopted",
+                self.plan.set_name
+            );
+            return Ok(());
+        };
+        // The cipher extent, never `unpacked_size`: the stream runs to
+        // `align16(unpacked_size)` and every length check that used the declared
+        // size would be short by the tail padding.
+        let sizes = self.members.get(&member_id).and_then(|member| {
+            let crypt = member.crypt.as_ref()?;
+            Some((crypt.cipher_size()?, member.unpacked_size))
+        });
+        let Some((cipher_size, unpacked_size)) = sizes else {
+            // No declared size yet — the headers have not reached the one that
+            // states it — or a member with no keys, which admission has already
+            // demoted for. Either way the bytes stay pending.
+            return Ok(());
+        };
+        let slice_end = logical_offset.saturating_add(len);
+        debug_assert!(slice_end <= cipher_size);
+
+        let head_block =
+            (!logical_offset.is_multiple_of(AES_BLOCK)).then(|| block_floor(logical_offset));
+        let mid_start = block_ceil(logical_offset);
+        let mid_end = block_floor(slice_end);
+        let tail_block = (!slice_end.is_multiple_of(AES_BLOCK)
+            && head_block != Some(block_floor(slice_end)))
+        .then(|| block_floor(slice_end));
+
+        // `(cipher offset, cipher bytes, plaintext bytes)`, ascending.
+        let mut pieces: Vec<(u64, Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut held = false;
+
+        for edge in [head_block, tail_block].into_iter().flatten() {
+            let from = logical_offset.max(edge);
+            let to = slice_end.min(edge.saturating_add(AES_BLOCK));
+            let block = self.encrypted_block_plain(member_id, edge);
+            let cipher =
+                self.staged_bytes_at(volume_index, cursor + (from - logical_offset), to - from);
+            match (block, cipher) {
+                (Some(block), Some(cipher)) => {
+                    let plain = block[(from - edge) as usize..(to - edge) as usize].to_vec();
+                    pieces.push((from, cipher, plain));
+                }
+                _ => held = true,
+            }
+        }
+
+        if mid_start < mid_end {
+            let preceding = self.member_preceding_block(member_id, mid_start);
+            let cipher = self.staged_bytes_at(
+                volume_index,
+                cursor + (mid_start - logical_offset),
+                mid_end - mid_start,
+            );
+            match (preceding, cipher) {
+                (Some(preceding), Some(cipher)) => {
+                    let mut plain = cipher.clone();
+                    let decrypted = self
+                        .members
+                        .get_mut(&member_id)
+                        .and_then(|member| member.crypt.as_mut())
+                        .is_some_and(|crypt| {
+                            crypt.decrypt_range(mid_start, &preceding, &mut plain)
+                        });
+                    if decrypted {
+                        pieces.push((mid_start, cipher, plain));
+                    } else {
+                        held = true;
+                    }
+                }
+                _ => held = true,
+            }
+        }
+
+        if held {
+            // The one new hold shape E-D2 introduces: a cipher block whose other
+            // half has not arrived. Bounded by one article per member per gap,
+            // so a large count here says the set is arriving badly out of order,
+            // not that the transform is leaking.
+            crate::runtime::perf_probe::record(
+                "direct_store.encrypted.block_held",
+                std::time::Duration::from_nanos(1),
+            );
+        }
+        pieces.sort_by_key(|(start, _, _)| *start);
+        for (start, cipher, plain) in pieces {
+            let physical = cursor + (start - logical_offset);
+            let piece_len = cipher.len() as u64;
+            // Everything at or past the declared size is tail padding: real
+            // cipher, never a destination byte.
+            let destination_len = unpacked_size.saturating_sub(start).min(piece_len);
+            self.note_encrypted_member_bytes(
+                member_id,
+                volume_index,
+                start,
+                &cipher,
+                &plain,
+                unpacked_size,
+                replace,
+            )?;
+            if destination_len > 0 {
+                self.record_routed_extent(
+                    volume_index,
+                    MemberExtent {
+                        member_id,
+                        physical_offset: physical,
+                        logical_offset: start,
+                        len: destination_len,
+                    },
+                );
+                spans.push(RoutedSpan {
+                    destination: DirectDestination::Member { member_id },
+                    destination_offset: start,
+                    volume_index,
+                    source_offset: physical,
+                    bytes: plain[..destination_len as usize].to_vec(),
+                });
+            }
+            // The tail padding's **source** bytes (E-D2). Their plaintext is
+            // never a destination byte, but they are real posted bytes with a
+            // real physical offset, and leaving them unrouted would stall the
+            // volume's coverage floor forever — 0–15 bytes short, at the end of
+            // the last part, for the life of the job. They go to the envelope,
+            // which is a sparse image of the volume at true physical offsets, so
+            // what lands there is exactly what was posted: the one place the
+            // last cipher block still exists once the plaintext is on disk.
+            if piece_len > destination_len {
+                spans.push(RoutedSpan {
+                    destination: DirectDestination::Envelope { volume_index },
+                    destination_offset: physical + destination_len,
+                    volume_index,
+                    source_offset: physical + destination_len,
+                    bytes: cipher[destination_len as usize..].to_vec(),
+                });
+            }
+            routed.push((physical, piece_len));
+        }
+        Ok(())
+    }
+
+    /// The plaintext of one whole cipher block of an encrypted member.
+    ///
+    /// Answered from [`MemberCrypt::edge_plain`] when another volume's drain has
+    /// already decrypted it, and otherwise assembled: the block's 16 cipher
+    /// bytes — which may span two source volumes — plus its CBC predecessor.
+    /// `None` means one of those is not here yet, which is a hold, not an error.
+    fn encrypted_block_plain(&mut self, member_id: u32, block_start: u64) -> Option<[u8; 16]> {
+        if let Some(plain) = self
+            .members
+            .get(&member_id)
+            .and_then(|member| member.crypt.as_ref())
+            .and_then(|crypt| crypt.edge_plain(block_start))
+        {
+            return Some(plain);
+        }
+        let preceding = self.member_preceding_block(member_id, block_start)?;
+        let cipher = self.member_cipher(member_id, block_start, AES_BLOCK)?;
+        let mut plain = cipher;
+        let crypt = self
+            .members
+            .get_mut(&member_id)?
+            .crypt
+            .as_mut()
+            .expect("an encrypted member's crypt state is created with the member");
+        if !crypt.decrypt_range(block_start, &preceding, &mut plain) {
+            return None;
+        }
+        let block: [u8; 16] = plain.try_into().ok()?;
+        crypt.retain_edge(block_start, block);
+        Some(block)
+    }
+
+    /// The 16 cipher bytes immediately before `block_start`: the member's IV at
+    /// offset 0, a retained checkpoint at a decrypted run's frontier, or — for a
+    /// block whose predecessor is still staged — the staged bytes themselves.
+    fn member_preceding_block(&self, member_id: u32, block_start: u64) -> Option<[u8; 16]> {
+        if let Some(block) = self
+            .members
+            .get(&member_id)
+            .and_then(|member| member.crypt.as_ref())
+            .and_then(|crypt| crypt.preceding_block(block_start))
+        {
+            return Some(block);
+        }
+        let previous = block_start.checked_sub(AES_BLOCK)?;
+        self.member_cipher(member_id, previous, AES_BLOCK)?
+            .try_into()
+            .ok()
+    }
+
+    /// Reads a member-logical (== cipher) range out of whatever source volumes
+    /// hold it, through the layout's part table.
+    ///
+    /// Cross-volume by construction: the 16 bytes before a part's first byte are
+    /// the tail of the previous volume's part, and that is the ordinary case for
+    /// a split encrypted member. `None` when any byte of the range is not
+    /// staged — routed bytes are gone from staging, which is exactly why
+    /// [`MemberCrypt`] retains checkpoints and edge plaintext rather than
+    /// re-reading them here.
+    fn member_cipher(&self, member_id: u32, logical_offset: u64, len: u64) -> Option<Vec<u8>> {
+        let layout_index = self.layout_index_for_member(member_id)?;
+        let member = self.layout_members().get(layout_index)?;
+        let end = logical_offset.checked_add(len)?;
+        let mut out = Vec::with_capacity(len as usize);
+        let mut cursor = logical_offset;
+        while cursor < end {
+            let mut located = None;
+            for part in &member.parts {
+                let Some(start) = part.logical_offset else {
+                    continue;
+                };
+                let part_end = start.saturating_add(part.data_size);
+                if cursor >= start && cursor < part_end {
+                    located = Some((part.volume, part.data_offset + (cursor - start), part_end));
+                    break;
+                }
+            }
+            let (volume, physical, part_end) = located?;
+            let take = (part_end - cursor).min(end - cursor);
+            out.extend_from_slice(&self.staged_bytes_at(volume, physical, take)?);
+            cursor += take;
+        }
+        Some(out)
+    }
+
+    /// One volume's staged bytes, or `None` when the range is not wholly staged.
+    fn staged_bytes_at(&self, volume_index: u32, offset: u64, len: u64) -> Option<Vec<u8>> {
+        if len == 0 {
+            return Some(Vec::new());
+        }
+        self.staging
+            .get(&volume_index)
+            .and_then(|staging| staging.slice(offset, len, &self.scratch))
+    }
+
+    /// Feeds one decrypted run into the integrity gates (plan 136, E-D3).
+    ///
+    /// Two layers, two byte spaces, and that split is the whole point:
+    ///
+    /// - **Layer 1** composes the part's packed hash over **cipher** bytes,
+    ///   before decryption. RARLAB `rar` leaves a split member's non-final
+    ///   packed checksums *plain* even when it keys the whole-member one, so
+    ///   this layer passes over ciphertext whatever the password was: it is a
+    ///   wire-integrity check and **not** a wrong-password detector.
+    /// - **Layer 2** composes plain CRC32 over the **plaintext** runs and folds
+    ///   the result with the KDF hash key when the header keys it. That is the
+    ///   real wrong-password backstop, and for a member whose header carries no
+    ///   password check it is the *only* one.
+    #[allow(clippy::too_many_arguments)]
+    fn note_encrypted_member_bytes(
+        &mut self,
+        member_id: u32,
+        volume_index: u32,
+        cipher_offset: u64,
+        cipher: &[u8],
+        plain: &[u8],
+        unpacked_size: u64,
+        replace: bool,
+    ) -> Result<(), DemotionReason> {
+        let len = cipher.len() as u64;
+        if len == 0 {
+            return Ok(());
+        }
+        let Some(layout_index) = self.layout_index_for_member(member_id) else {
+            return Ok(());
+        };
+        let Some(part) = self.part_for(layout_index, volume_index) else {
+            return Ok(());
+        };
+        let (part_position, part_logical_offset, part_len, packed_crc32) = part;
+        let packed_uses_mac = self
+            .layout_members()
+            .get(layout_index)
+            .and_then(|member| member.parts.get(part_position as usize))
+            .is_some_and(|part| part.packed_hash_uses_mac);
+        let Some(member) = self.members.get_mut(&member_id) else {
+            return Ok(());
+        };
+        let Some(crypt) = member.crypt.as_mut() else {
+            return Ok(());
+        };
+        // Duplicate detection lives in **cipher** space here, not in the
+        // destination coverage map: the tail padding is cipher the member routed
+        // and destination bytes it never had, so a map that cannot name those
+        // offsets cannot tell a duplicate of them from a first arrival.
+        if crypt.note_emitted(cipher_offset, len) == 0 && !replace {
+            return Ok(());
+        }
+        crypt.retain_tail_padding(unpacked_size, cipher_offset, plain);
+        let destination_len = unpacked_size.saturating_sub(cipher_offset).min(len);
+        let cipher_crc = weaver_par2::checksum::crc32(cipher);
+        let part_relative = cipher_offset.saturating_sub(part_logical_offset);
+        if destination_len > 0 {
+            let plain_crc = weaver_par2::checksum::crc32(&plain[..destination_len as usize]);
+            if replace {
+                crypt
+                    .plain_runs_mut()
+                    .overwrite(cipher_offset, destination_len, plain_crc);
+            } else {
+                crypt
+                    .plain_runs_mut()
+                    .insert(cipher_offset, destination_len, plain_crc);
+            }
+        }
+        let part_complete = crypt.emitted_covers(part_logical_offset, part_len);
+        if replace {
+            let gaps = member.parts.entry(part_position).or_default().overwrite(
+                part_relative,
+                len,
+                cipher_crc,
+            );
+            member.stale_gaps = subtract(&member.stale_gaps, cipher_offset, destination_len);
+            for (start, end) in gaps {
+                member.stale_gaps.insert(
+                    start.saturating_add(part_logical_offset),
+                    end.saturating_sub(start),
+                );
+            }
+            member.checked_parts.remove(&part_position);
+            member.verified = false;
+        } else {
+            member
+                .parts
+                .entry(part_position)
+                .or_default()
+                .insert(part_relative, len, cipher_crc);
+        }
+        if destination_len > 0 {
+            member.covered.insert(cipher_offset, destination_len);
+        }
+
+        let part_value = part_complete
+            .then(|| {
+                member
+                    .parts
+                    .get(&part_position)
+                    .and_then(|runs| runs.compose(0, part_len))
+            })
+            .flatten();
+        if let Some(value) = part_value {
+            member.checked_parts.insert(part_position, value);
+            if let Some(expected) = packed_crc32 {
+                let composed = member
+                    .crypt
+                    .as_ref()
+                    .map(|crypt| crypt.fold_member_crc(value, packed_uses_mac))
+                    .unwrap_or(value);
+                if expected != composed {
+                    return Err(self.fail(DemotionReason::PartChecksumMismatch));
+                }
+            }
+        }
+
+        self.try_verify_member(member_id)
+    }
+
     /// `(position in chain, logical offset, packed length, packed CRC32)` for
     /// the part of the layout member at `layout_index` living in `volume_index`.
     fn part_for(
@@ -2619,10 +3297,41 @@ impl DirectSetRouter {
             }
             return Ok(());
         }
+        let uses_mac = layout_member.data_hash_uses_mac;
         let Some(member) = self.members.get(&member_id) else {
             return Ok(());
         };
         if member.covered.contiguous_from_zero() < unpacked_size {
+            return Ok(());
+        }
+
+        // Layer 2 for an encrypted member (plan 136, E-D3). Composed over
+        // **plaintext**, member-wide rather than per part, then folded with the
+        // KDF hash key when the header keys the checksum.
+        //
+        // This is the real wrong-password gate. Layer 1 above cannot be one: its
+        // packed hashes cover cipher bytes and are plain CRC32s on the non-final
+        // parts, so they pass identically whatever key the bytes were decrypted
+        // with — a wrong password that got past admission (no check in the
+        // header, or a forged one) reaches here with every earlier gate green.
+        //
+        // It deliberately does **not** read `checked_parts`. Those are cipher
+        // values, and after a restart the cipher is gone: only the plaintext is
+        // on disk, so a re-armed member composes exactly what its re-read
+        // produced and nothing else.
+        if let Some(crypt) = member.crypt.as_ref() {
+            if !crypt.tail_padding_retained() {
+                return Ok(());
+            }
+            let Some(composed) = crypt.plain_runs().compose(0, unpacked_size) else {
+                return Ok(());
+            };
+            if crypt.fold_member_crc(composed, uses_mac) != expected {
+                return Err(self.fail(DemotionReason::MemberChecksumMismatch));
+            }
+            if let Some(member) = self.members.get_mut(&member_id) {
+                member.verified = true;
+            }
             return Ok(());
         }
 
@@ -2760,6 +3469,14 @@ impl DirectSetRouter {
             }
             member.covered.insert(*start, len);
             member.restart_seeded.insert(*start, len);
+            // An encrypted member keeps a second, cipher-space account, because
+            // its part completeness and its duplicate filter both live there
+            // (the tail padding is cipher the destination map cannot name).
+            // Seeded, like `covered`, purely so nothing is re-emitted: the
+            // verification claim stays with `restart_seeded` alone.
+            if let Some(crypt) = member.crypt.as_mut() {
+                crypt.seed_emitted(*start, len);
+            }
         }
         Some(member_id)
     }
@@ -2836,14 +3553,40 @@ impl DirectSetRouter {
         for (start, end) in ranges {
             let mut cursor = start;
             for slice in self.map_physical_range(volume_index, start, end - start) {
-                let MappedSlice::Member {
-                    member_index,
-                    logical_offset,
-                    len,
-                } = slice
-                else {
-                    cursor = cursor.saturating_add(slice_len(&slice));
-                    continue;
+                // Plan 136 E1 checklist site 4. This was a refutable `let ...
+                // else` on `MappedSlice::Member`, which `EncryptedMember` slid
+                // straight past — silently, and *permanently* silently once
+                // `slice_len` grew an `EncryptedMember` arm, since that
+                // exhaustiveness was the only thing keeping this site loud. The
+                // effect was not a lost byte but a lost **record**:
+                // `record_routed_extent` never ran, so the routed-extent history
+                // (B1) had no claim on those offsets and the post-restart
+                // provider answered them out of the envelope — where they are a
+                // sparse hole inside its length, which is to say zeros, in a
+                // volume whose floor says the bytes are durable.
+                //
+                // An encrypted member's bytes are at exactly the same
+                // coordinates (cipher offset and member-logical offset coincide
+                // for a stored member), so the two arms share a body. The one
+                // difference needs no code: an encrypted member's final ≤15
+                // cipher bytes are tail padding that rode the envelope rather
+                // than the destination, and the clip against the member's own
+                // restored claim below already refuses to hand them back.
+                let (member_index, logical_offset, len) = match slice {
+                    MappedSlice::Member {
+                        member_index,
+                        logical_offset,
+                        len,
+                    }
+                    | MappedSlice::EncryptedMember {
+                        member_index,
+                        logical_offset,
+                        len,
+                    } => (member_index, logical_offset, len),
+                    MappedSlice::Envelope { .. } | MappedSlice::Unroutable { .. } => {
+                        cursor = cursor.saturating_add(slice_len(&slice));
+                        continue;
+                    }
                 };
                 let Some(member_id) = self.member_id_for_layout(member_index) else {
                     cursor = cursor.saturating_add(len);
@@ -2884,6 +3627,67 @@ impl DirectSetRouter {
                 }
                 cursor = cursor.saturating_add(len);
             }
+        }
+    }
+
+    /// The crypt rows the next checkpoint must carry, by member id (plan 136,
+    /// E-D4). Empty for a set with no encrypted member.
+    pub(crate) fn member_crypt_snapshots(&self) -> BTreeMap<u32, crypt::MemberCryptSnapshot> {
+        let mut rows = BTreeMap::new();
+        for (member_id, member) in &self.members {
+            let Some(state) = member.crypt.as_ref() else {
+                continue;
+            };
+            let uses_mac = self
+                .layout_index_for_member(*member_id)
+                .and_then(|index| self.layout_members().get(index))
+                .is_some_and(|layout| layout.data_hash_uses_mac);
+            if let Some(row) = state.snapshot(uses_mac) {
+                rows.insert(*member_id, row);
+            }
+        }
+        rows
+    }
+
+    /// Seeds one restored member's crypt state from its checkpoint row (plan
+    /// 136, E-D4).
+    ///
+    /// Both directions are a refusal, because both are the same mistake seen
+    /// from opposite sides: a row with facts the rebuilt layout does not state
+    /// would rebuild a key against the wrong IV or the wrong salt — and every
+    /// gate would go on passing, over ciphertext — while a row *missing* for a
+    /// member this run classified encrypted means the checkpoint was written by
+    /// something that did not know the member was encrypted at all. Demoting
+    /// costs a materialization from bytes already on disk. Trusting either one
+    /// costs the file.
+    pub(crate) fn restore_member_crypt(
+        &mut self,
+        relative_partial: &str,
+        stored: Option<&crypt::MemberCryptSnapshot>,
+    ) -> Result<(), DemotionReason> {
+        let member_id = self.members.iter().find_map(|(member_id, member)| {
+            (member.relative_partial == relative_partial).then_some(*member_id)
+        });
+        let Some(member_id) = member_id else {
+            // Not a member of this run's layout: the claim is dropped by the
+            // caller's re-keying, which is the established behaviour.
+            return Ok(());
+        };
+        let uses_mac = self
+            .layout_index_for_member(member_id)
+            .and_then(|index| self.layout_members().get(index))
+            .is_some_and(|layout| layout.data_hash_uses_mac);
+        let member = self
+            .members
+            .get_mut(&member_id)
+            .expect("the member was just located");
+        match (member.crypt.as_mut(), stored) {
+            (None, None) => Ok(()),
+            (Some(crypt), Some(stored)) => match crypt.restore(stored, uses_mac) {
+                Ok(()) => Ok(()),
+                Err(_) => Err(self.fail(DemotionReason::EncryptedFactsDisagree)),
+            },
+            _ => Err(self.fail(DemotionReason::EncryptedFactsDisagree)),
         }
     }
 
@@ -3029,6 +3833,19 @@ impl DirectSetRouter {
         let Some(member) = self.members.get_mut(&member_id) else {
             return Err(self.fail(DemotionReason::RestartRearmUnplaceable));
         };
+        // An encrypted member's re-read produces **plaintext** — that is what is
+        // in the partial — so it feeds layer 2's member-wide composition and
+        // nothing else (plan 136, E-D3). It must not touch `parts`, whose values
+        // are cipher CRCs, and it must not be compared against the part's packed
+        // hash, which describes cipher bytes this process no longer has. The
+        // keyed member fold is what re-verifies the run, exactly as D6 intends:
+        // the value comes from the bytes on disk now.
+        if let Some(crypt) = member.crypt.as_mut() {
+            crypt.plain_runs_mut().overwrite(logical_offset, len, crc);
+            member.restart_seeded = subtract(&member.restart_seeded, logical_offset, len);
+            member.stale_gaps = subtract(&member.stale_gaps, logical_offset, len);
+            return self.try_verify_member(member_id);
+        }
         // `overwrite`, not `insert`: a stale gap is by construction a *fragment*
         // of a run a repair discarded, and a plain insert would refuse it as
         // overlapping if any neighbour survived. Its own gaps are empty by
@@ -3328,9 +4145,17 @@ pub(crate) struct RestartReadRun {
 }
 
 /// The byte length of any mapped slice, whatever it maps to.
+///
+/// Its exhaustiveness was, until plan 136 E1, the *only* compile-time guard over
+/// [`DirectSetRouter::restore_volume_coverage`]'s refutable `let ... else`: add
+/// an arm here and that site went quiet forever. The restore now walks an
+/// exhaustive match of its own and no longer depends on it — it still calls this
+/// for the arms it skips, deliberately, so a future variant lands as an error in
+/// both places rather than one.
 fn slice_len(slice: &MappedSlice) -> u64 {
     match slice {
         MappedSlice::Member { len, .. }
+        | MappedSlice::EncryptedMember { len, .. }
         | MappedSlice::Envelope { len }
         | MappedSlice::Unroutable { len } => *len,
     }

@@ -224,6 +224,7 @@ fn sample_snapshot() -> CoverageSnapshot {
             member_index: 0,
             relative_path: "silver-horizon.mkv.direct.partial".to_string(),
             extents: vec![DestinationExtent { start: 0, end: 60 }],
+            crypt: None,
         }],
         floors: vec![VolumeFloor {
             volume_index: 0,
@@ -320,11 +321,13 @@ fn snapshot_round_trips_exactly() {
                         end: 5 * 1024 * 1024 * 1024,
                     },
                 ],
+                crypt: None,
             },
             DestinationClaim {
                 member_index: 4,
                 relative_path: "silver-horizon.envelope".to_string(),
                 extents: vec![DestinationExtent { start: 0, end: 17 }],
+                crypt: None,
             },
         ],
         floors: vec![
@@ -360,6 +363,7 @@ fn snapshot_encoding_is_deterministic_regardless_of_input_order() {
         member_index: 9,
         relative_path: "amber-circuit.envelope".to_string(),
         extents: vec![DestinationExtent { start: 0, end: 8 }],
+        crypt: None,
     });
     shuffled.destinations.reverse();
     shuffled.floors.push(VolumeFloor {
@@ -375,6 +379,7 @@ fn snapshot_encoding_is_deterministic_regardless_of_input_order() {
         member_index: 9,
         relative_path: "amber-circuit.envelope".to_string(),
         extents: vec![DestinationExtent { start: 0, end: 8 }],
+        crypt: None,
     });
     canonical.floors.push(VolumeFloor {
         volume_index: 5,
@@ -408,6 +413,7 @@ fn two_thousand_volume_snapshot_round_trips_in_a_sane_blob() {
                 start: 0,
                 end: 100 * 1024 * 1024 * 1024,
             }],
+            crypt: None,
         }],
         floors,
     };
@@ -3217,6 +3223,8 @@ fn member_facts(
         split_after: false,
         is_directory: false,
         is_encrypted: false,
+        encryption: None,
+        rar4_salt: None,
         host_os: None,
         attributes: None,
         owner: None,
@@ -4184,4 +4192,68 @@ fn every_reconstruction_failure_has_its_own_metric_label() {
     let unique: std::collections::BTreeSet<&str> = labels.iter().copied().collect();
     assert_eq!(unique.len(), labels.len(), "labels must be distinct");
     assert!(unique.contains("sparse_mark_failed"));
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot schema 4: the crypt row (plan 136, E-D4)
+// ---------------------------------------------------------------------------
+
+fn sample_crypt_row() -> super::router::crypt::MemberCryptSnapshot {
+    super::router::crypt::MemberCryptSnapshot {
+        salt: [0x5A; 16],
+        kdf_count_lg2: 15,
+        iv: [0xA5; 16],
+        psw_check_present: true,
+        data_hash_uses_mac: true,
+        cipher_size: 4096,
+        tail_padding: 7,
+        tail_plain: vec![1, 2, 3, 4, 5, 6, 7],
+        checkpoints: vec![(2048, [0x33; 16])],
+    }
+}
+
+#[test]
+fn a_snapshot_round_trips_its_crypt_rows_and_carries_no_password() {
+    let mut snapshot = sample_snapshot();
+    snapshot.destinations[0].crypt = Some(sample_crypt_row());
+
+    let blob = super::snapshot::encode(&snapshot).expect("the crypt row encodes");
+    assert_eq!(
+        u16::from_le_bytes([blob[4], blob[5]]),
+        4,
+        "a blob carrying crypt rows is schema 4"
+    );
+    let decoded = super::snapshot::decode(&blob).expect("the crypt row decodes");
+    assert_eq!(decoded, snapshot);
+    assert_eq!(
+        decoded.destinations[0].crypt.as_ref().map(|row| row.iv),
+        Some([0xA5; 16]),
+        "the IV a restore rebuilds a key from must survive the round trip"
+    );
+
+    // The one thing that must never be in there. Searched as bytes rather than
+    // asserted structurally, because a password could only get in by accident
+    // and an accident would not respect the struct.
+    let secret = b"moonlit-harbour";
+    assert!(
+        !blob.windows(secret.len()).any(|window| window == secret),
+        "a coverage snapshot must never carry a password"
+    );
+}
+
+#[test]
+fn a_schema_3_snapshot_is_refused_rather_than_read_as_plaintext_coverage() {
+    // The bump exists because a v3 claim over an encrypted member's destination
+    // describes plaintext while a v3 reader would take it for posted bytes.
+    // Forward- and backward-refusing, as established.
+    let blob = super::snapshot::encode(&sample_snapshot()).unwrap();
+    let mut older = blob.clone();
+    older[4..6].copy_from_slice(&3u16.to_le_bytes());
+    assert_eq!(
+        super::snapshot::decode(&older),
+        Err(super::snapshot::SnapshotError::UnsupportedVersion {
+            found: 3,
+            supported: 4,
+        })
+    );
 }
