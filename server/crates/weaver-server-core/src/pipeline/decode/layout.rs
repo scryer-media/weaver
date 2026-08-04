@@ -35,7 +35,6 @@ pub(super) enum AuthoritativeLayoutError {
     SegmentOutOfRange,
     ReversedSegmentBounds,
     SegmentTooLarge,
-    SegmentEndOverflow,
     SegmentPastFileEnd,
     InvalidPartNumber,
 }

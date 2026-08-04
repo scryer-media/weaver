@@ -1314,15 +1314,16 @@ impl Pipeline {
                 }
             };
             let decoded_len = data.len_bytes();
-            let file_offset = match validate_yenc_layout(expected_layout, yenc_layout, decoded_len) {
+            let file_offset = match validate_yenc_layout(expected_layout, yenc_layout, decoded_len)
+            {
                 Ok(file_offset) => file_offset,
                 Err(mismatch) => {
-                let error = format_yenc_layout_mismatch(
-                    mismatch,
-                    expected_layout,
-                    yenc_layout,
-                    decoded_len,
-                );
+                    let error = format_yenc_layout_mismatch(
+                        mismatch,
+                        expected_layout,
+                        yenc_layout,
+                        decoded_len,
+                    );
                     self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                     self.handle_decode_failure(
                         segment_id,
@@ -1336,6 +1337,40 @@ impl Pipeline {
             // The bytes that actually decoded, not what the NZB declared: its
             // sizes are yEnc-encoded and run ~3% large.
             let decoded_size = decoded_len as u32;
+
+            // The per-segment bounds above cannot see across segments, so they
+            // would still let an article claim a range an earlier ordinal
+            // already owns. Refuse that here, and remember this placement so
+            // the next article is checked against it.
+            let conflict = self
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.assembly.file(file_id))
+                .and_then(|file| {
+                    file.placement_conflict(segment_id.segment_number, file_offset, decoded_size)
+                });
+            if let Some(other) = conflict {
+                let error = format!(
+                    "yEnc layout conflict: segment {} claims [{file_offset}, {}) already placed by segment {other}",
+                    segment_id.segment_number,
+                    file_offset.saturating_add(u64::from(decoded_size)),
+                );
+                self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                self.handle_decode_failure(
+                    segment_id,
+                    &error,
+                    &source.exclude_servers,
+                    source.source_server_idx,
+                );
+                return;
+            }
+            if let Some(file) = self
+                .jobs
+                .get_mut(&job_id)
+                .and_then(|state| state.assembly.file_mut(file_id))
+            {
+                file.record_placement(segment_id.segment_number, file_offset, decoded_size);
+            }
 
             self.metrics
                 .bytes_decoded
