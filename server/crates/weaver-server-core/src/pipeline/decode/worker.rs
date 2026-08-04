@@ -1340,18 +1340,36 @@ impl Pipeline {
 
             // The per-segment bounds above cannot see across segments, so they
             // would still let an article claim a range an earlier ordinal
-            // already owns. Refuse that here, and remember this placement so
-            // the next article is checked against it.
-            let conflict = self
+            // already owns. Check against this segment's neighbours and record
+            // the placement in the same borrow: this is per-article work on the
+            // orchestrator thread, so it is two range probes and one insert.
+            let conflict = match self
                 .jobs
-                .get(&job_id)
-                .and_then(|state| state.assembly.file(file_id))
-                .and_then(|file| {
-                    file.placement_conflict(segment_id.segment_number, file_offset, decoded_size)
-                });
+                .get_mut(&job_id)
+                .and_then(|state| state.assembly.file_mut(file_id))
+            {
+                Some(file) => {
+                    match file.placement_conflict(
+                        segment_id.segment_number,
+                        file_offset,
+                        decoded_size,
+                    ) {
+                        Some(other) => Some(other),
+                        None => {
+                            file.record_placement(
+                                segment_id.segment_number,
+                                file_offset,
+                                decoded_size,
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
             if let Some(other) = conflict {
                 let error = format!(
-                    "yEnc layout conflict: segment {} claims [{file_offset}, {}) already placed by segment {other}",
+                    "yEnc layout conflict: segment {} claims [{file_offset}, {}) which runs into segment {other}",
                     segment_id.segment_number,
                     file_offset.saturating_add(u64::from(decoded_size)),
                 );
@@ -1363,13 +1381,6 @@ impl Pipeline {
                     source.source_server_idx,
                 );
                 return;
-            }
-            if let Some(file) = self
-                .jobs
-                .get_mut(&job_id)
-                .and_then(|state| state.assembly.file_mut(file_id))
-            {
-                file.record_placement(segment_id.segment_number, file_offset, decoded_size);
             }
 
             self.metrics

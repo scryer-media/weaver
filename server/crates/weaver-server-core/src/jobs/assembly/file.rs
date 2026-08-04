@@ -1,6 +1,7 @@
 use crate::jobs::ids::NzbFileId;
 use bitvec::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use weaver_model::files::FileRole;
 
 use super::error::AssemblyError;
@@ -66,14 +67,19 @@ pub struct FileAssembly {
     received: BitVec,
     /// Running byte count of received data.
     received_bytes: u64,
-    /// Where each segment was placed, once an article claimed it.
+    /// Where each arrived segment was placed, keyed by ordinal.
     ///
     /// The NZB cannot supply decoded offsets (its sizes are yEnc-encoded), so
     /// placement comes from the article's own header. Recording it lets a later
-    /// article be refused when it claims a range another ordinal already owns,
+    /// article be refused when it would sit outside the gap its ordinal owns,
     /// which is what stops a hostile server writing over bytes it already
     /// served correctly.
-    placements: Vec<Option<(u64, u32)>>,
+    ///
+    /// Ordered by ordinal so the check is two range probes rather than a scan:
+    /// this runs on the orchestrator thread for every decoded article, and a
+    /// linear pass would cost O(segments) each time — hundreds of microseconds
+    /// per article, and hundreds of KiB of memory traffic, on a large file.
+    placements: BTreeMap<u32, (u64, u32)>,
 }
 
 /// Result of committing a segment to assembly.
@@ -114,34 +120,40 @@ impl FileAssembly {
             cumulative_offsets,
             received: bitvec![0; total_segments as usize],
             received_bytes: 0,
-            placements: vec![None; total_segments as usize],
+            placements: BTreeMap::new(),
         }
     }
 
-    /// The segment already holding any part of `[offset, offset + len)`, if the
-    /// range is not this segment's own.
+    /// The neighbouring segment this placement would run into, if any.
     ///
-    /// Two ordinals can never legitimately cover the same byte, so an overlap
-    /// means one of the two articles is lying about where it belongs.
+    /// Segments tile the file in ordinal order, so a placement is legitimate
+    /// exactly when it starts at or after the nearest arrived lower ordinal
+    /// ends, and ends at or before the nearest arrived higher ordinal starts.
+    /// Every accepted placement therefore stays disjoint from all the others by
+    /// induction, without comparing against any but its two neighbours.
     pub fn placement_conflict(&self, segment_number: u32, offset: u64, len: u32) -> Option<u32> {
         let end = offset.saturating_add(u64::from(len));
-        self.placements
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != segment_number as usize)
-            .find_map(|(index, placed)| {
-                let (placed_offset, placed_len) = (*placed)?;
-                let placed_end = placed_offset.saturating_add(u64::from(placed_len));
-                (offset < placed_end && placed_offset < end).then_some(index as u32)
-            })
+        if let Some((previous, (previous_offset, previous_len))) =
+            self.placements.range(..segment_number).next_back()
+            && offset < previous_offset.saturating_add(u64::from(*previous_len))
+        {
+            return Some(*previous);
+        }
+        if let Some((next, (next_offset, _))) = self
+            .placements
+            .range(segment_number.saturating_add(1)..)
+            .next()
+            && end > *next_offset
+        {
+            return Some(*next);
+        }
+        None
     }
 
     /// Record where a segment was placed. Re-recording the same ordinal is the
     /// ordinary duplicate/retry case and simply overwrites.
     pub fn record_placement(&mut self, segment_number: u32, offset: u64, len: u32) {
-        if let Some(slot) = self.placements.get_mut(segment_number as usize) {
-            *slot = Some((offset, len));
-        }
+        self.placements.insert(segment_number, (offset, len));
     }
 
     /// Record that a segment has been received and decoded.
@@ -178,6 +190,7 @@ impl FileAssembly {
     pub fn reset(&mut self) {
         self.received.fill(false);
         self.received_bytes = 0;
+        self.placements.clear();
     }
 
     pub fn mark_complete(&mut self) {
