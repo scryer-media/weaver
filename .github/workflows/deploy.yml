@@ -2243,6 +2243,98 @@ jobs:
           git commit --allow-empty -m "rebuild: ${{ github.ref_name }}"
           git push origin HEAD:main
 
+  winget-submit:
+    name: winget-submit
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+    needs: [github-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    environment: release-credentials
+    steps:
+      - name: Download verified WinGet manifests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: weaver-winget-manifests-${{ github.run_id }}
+          path: winget-submission
+
+      - name: Submit WinGet manifest pull request
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "WINGET_TOKEN is required to submit the WinGet manifest pull request." >&2
+            exit 1
+          fi
+
+          VERSION="${GITHUB_REF_NAME#weaver-v}"
+          BRANCH="scryer-media-weaver-${VERSION}"
+          ARCHIVE="${GITHUB_WORKSPACE}/winget-submission/weaver-winget-manifests.tar.gz"
+          STAGING_DIR="$(mktemp -d)"
+          trap 'rm -rf "$STAGING_DIR"' EXIT
+
+          test -s "$ARCHIVE"
+          tar -xzf "$ARCHIVE" -C "$STAGING_DIR"
+          MANIFEST_SOURCE="$STAGING_DIR/ScryerMedia.Weaver/$VERSION"
+          test -f "$MANIFEST_SOURCE/ScryerMedia.Weaver.yaml"
+          test -f "$MANIFEST_SOURCE/ScryerMedia.Weaver.locale.en-US.yaml"
+          test -f "$MANIFEST_SOURCE/ScryerMedia.Weaver.installer.yaml"
+
+          FORK_OWNER="$(gh api user --jq .login)"
+          TARGET_PATH="manifests/s/ScryerMedia/Weaver/${VERSION}"
+          if gh api "repos/microsoft/winget-pkgs/contents/${TARGET_PATH}" > /dev/null 2>&1; then
+            echo "ScryerMedia.Weaver ${VERSION} is already published in winget-pkgs."
+            exit 0
+          fi
+
+          EXISTING_PR="$(gh pr list --repo microsoft/winget-pkgs --state open --head "${FORK_OWNER}:${BRANCH}" --json url --jq '.[0].url // empty')"
+          if [[ -n "$EXISTING_PR" ]]; then
+            echo "WinGet submission already awaiting review: $EXISTING_PR"
+            exit 0
+          fi
+
+          if ! gh api "repos/${FORK_OWNER}/winget-pkgs" > /dev/null 2>&1; then
+            gh repo fork microsoft/winget-pkgs --clone=false
+          fi
+          for _ in {1..12}; do
+            if gh api "repos/${FORK_OWNER}/winget-pkgs" > /dev/null 2>&1; then
+              break
+            fi
+            sleep 5
+          done
+          gh api "repos/${FORK_OWNER}/winget-pkgs" > /dev/null
+
+          git clone --depth 1 --filter=blob:none --no-checkout --branch master \
+            "https://x-access-token:${GH_TOKEN}@github.com/${FORK_OWNER}/winget-pkgs.git" winget-pkgs
+          cd winget-pkgs
+          git sparse-checkout init --cone
+          git sparse-checkout set manifests/s/ScryerMedia/Weaver
+          git checkout master
+          git checkout -b "$BRANCH"
+          MANIFEST_DESTINATION="$TARGET_PATH"
+          if [[ -e "$MANIFEST_DESTINATION" ]]; then
+            echo "Unexpected existing manifest directory: $MANIFEST_DESTINATION" >&2
+            exit 1
+          fi
+          mkdir -p "$MANIFEST_DESTINATION"
+          cp "$MANIFEST_SOURCE"/* "$MANIFEST_DESTINATION/"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$MANIFEST_DESTINATION"
+          git diff --cached --quiet && exit 0
+          git commit -m "Add ScryerMedia.Weaver version ${VERSION}"
+          git push origin "$BRANCH"
+          gh pr create \
+            --repo microsoft/winget-pkgs \
+            --base master \
+            --head "${FORK_OWNER}:${BRANCH}" \
+            --title "New version: ScryerMedia.Weaver version ${VERSION}" \
+            --body "Automated manifest submission for [ScryerMedia.Weaver ${VERSION}](https://github.com/scryer-media/weaver/releases/tag/weaver-v${VERSION})."
+
   winget-prep:
     name: winget-prep
     runs-on: ubuntu-24.04
