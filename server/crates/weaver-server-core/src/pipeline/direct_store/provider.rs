@@ -225,30 +225,6 @@ impl HybridVolumeProvider {
         self.volumes.get(&volume_index)
     }
 
-    /// The same volumes, re-keyed so `get_volume(i)` answers volume `base + i`.
-    ///
-    /// `extract_member_streaming` addresses volumes **relative to the member's
-    /// first volume** — it normalizes the member's segments to a zero base
-    /// before it ever asks the provider — while everything else in direct-store
-    /// speaks the set's own absolute volume indices. Rebasing at the call site
-    /// is what keeps the two apart: a member that starts in volume 3 gets a
-    /// provider whose volume 0 *is* volume 3, and no other caller has to know.
-    ///
-    /// Volumes below `base` are dropped rather than wrapped: an extraction that
-    /// asks for one is asking outside the member, and an absent volume is the
-    /// error the provider already reports.
-    pub(crate) fn rebased(&self, base: u32) -> Self {
-        Self {
-            volumes: self
-                .volumes
-                .iter()
-                .filter_map(|(volume_index, volume)| {
-                    Some((volume_index.checked_sub(base)?, volume.clone()))
-                })
-                .collect(),
-        }
-    }
-
     /// Opens one virtual volume directly, without the trait's `usize` index and
     /// boxing. Reconstruction and this module's tests use it.
     pub(crate) fn open(&self, volume_index: u32) -> Option<VirtualVolumeReader> {

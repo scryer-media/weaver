@@ -3052,18 +3052,14 @@ impl Pipeline {
                 let index = archive
                     .find_member(name)
                     .ok_or_else(|| format!("tolerated member '{name}' is not in the archive"))?;
-                let base = archive
-                    .member_info(index)
-                    .map(|member| member.volumes.first_volume as u32)
-                    .unwrap_or(0);
-                // `extract_member_streaming` addresses volumes relative to the
-                // member's first one; the set speaks absolute indices.
-                let scoped = provider.rebased(base);
                 let mut file = std::fs::File::create(destination).map_err(|error| {
                     format!("failed to create {}: {error}", destination.display())
                 })?;
+                // The provider is the set's, keyed by the set's own volume
+                // indices, which is what `extract_member_streaming` asks for —
+                // a member starting in volume 3 requests volume 3.
                 archive
-                    .extract_member_streaming(index, &options, &scoped, &mut file)
+                    .extract_member_streaming(index, &options, &provider, &mut file)
                     .map_err(|error| format!("failed to extract '{name}': {error}"))?;
                 // The tolerated half of the byte account: everything else a
                 // direct set produces is counted at the router as

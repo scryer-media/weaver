@@ -556,6 +556,9 @@ impl Pipeline {
                         .collect::<Result<Vec<_>, _>>()
                 })
         } else {
+            // Keyed by the set's own volume indices, which is the numbering
+            // `extract_member_streaming_chunked` asks the provider for and
+            // reports its chunks against.
             let mut provider_paths = std::collections::HashMap::new();
             for absolute_volume in first_volume..=last_volume {
                 let Some(path) = volume_paths.get(&absolute_volume) else {
@@ -563,15 +566,19 @@ impl Pipeline {
                         "missing local RAR volume {absolute_volume} for member {member_name}"
                     ));
                 };
-                provider_paths.insert((absolute_volume - first_volume) as usize, path.clone());
+                provider_paths.insert(absolute_volume as usize, path.clone());
             }
             let provider = ReadaheadVolumeProvider::new(provider_paths);
             let provider = BudgetedRarVolumeProvider::new(&provider, Arc::clone(&budget));
             let shared_ref = Rc::clone(&shared);
             let checkpoint_ref = Arc::clone(&checkpoint);
             archive
-                .extract_member_streaming_chunked(idx, options, &provider, |local_volume| {
-                    let volume_index = first_volume + local_volume as u32;
+                .extract_member_streaming_chunked(idx, options, &provider, |absolute_volume| {
+                    let volume_index = u32::try_from(absolute_volume).map_err(|_| {
+                        weaver_unrar::RarError::CorruptArchive {
+                            detail: format!("chunk volume {absolute_volume} does not fit into u32"),
+                        }
+                    })?;
                     Ok(Box::new(DirectOutputWriter {
                         shared: Some(Rc::clone(&shared_ref)),
                         bytes_written: 0,
@@ -583,8 +590,15 @@ impl Pipeline {
                 .and_then(|records| {
                     records
                         .into_iter()
-                        .map(|(local_volume, bytes_written)| {
-                            Ok((first_volume + local_volume as u32, bytes_written))
+                        .map(|(absolute_volume, bytes_written)| {
+                            let absolute_volume = u32::try_from(absolute_volume).map_err(|_| {
+                                weaver_unrar::RarError::CorruptArchive {
+                                    detail: format!(
+                                        "chunk volume {absolute_volume} does not fit into u32"
+                                    ),
+                                }
+                            })?;
+                            Ok((absolute_volume, bytes_written))
                         })
                         .collect::<Result<Vec<_>, weaver_unrar::RarError>>()
                 })
@@ -1118,6 +1132,8 @@ impl Pipeline {
 
         let first_volume = member.volumes.first_volume as u32;
         let last_volume = member.volumes.last_volume as u32;
+        // Keyed by the set's own volume indices: `extract_member_streaming`
+        // asks for the volumes the member's segments name.
         let mut provider_paths = std::collections::HashMap::new();
         for absolute_volume in first_volume..=last_volume {
             let Some(path) = volume_paths.get(&absolute_volume) else {
@@ -1126,7 +1142,7 @@ impl Pipeline {
                     member.name
                 )));
             };
-            provider_paths.insert((absolute_volume - first_volume) as usize, path.clone());
+            provider_paths.insert(absolute_volume as usize, path.clone());
         }
         let provider = ReadaheadVolumeProvider::new(provider_paths);
         let budgeted_provider =
