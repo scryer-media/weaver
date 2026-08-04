@@ -4880,6 +4880,350 @@ async fn a_digest_mismatch_sweeps_the_sets_files_and_deletes_the_row() {
     );
 }
 
+/// A member first seen in a **later volume** must not silently invalidate the
+/// checkpoint the earlier volumes wrote.
+///
+/// The plan digest binds the member names and their unpacked sizes, so it
+/// changes the moment a set adopts a member it had not seen — which is the
+/// ordinary shape of a multi-member set, whose members are discovered in
+/// whatever order their volumes arrive. A digest stamped once, at the first
+/// member, describes a plan the restart no longer computes: every row written
+/// afterwards is refused for a set nothing is wrong with, and the whole thing
+/// redownloads.
+#[tokio::test]
+async fn a_member_first_seen_in_a_later_volume_still_restarts_from_its_checkpoint() {
+    const ARTICLES: usize = 2;
+    let episode = "Silver.Horizon.S01E40.mkv";
+    let notes = "Silver.Horizon.S01E40.nfo";
+    let members = vec![
+        (
+            episode,
+            (0..2400u32).map(|index| (index % 251) as u8).collect(),
+        ),
+        // Sized so the split lands on a member boundary: the episode occupies
+        // volumes 0 and 1 whole, and volume 2 holds nothing but the notes. The
+        // notes' header therefore does not exist anywhere the barrier can see
+        // until volume 2's first article arrives, long after the barrier was
+        // built for the episode.
+        (
+            notes,
+            (0..1200u32).map(|index| (index % 241) as u8).collect(),
+        ),
+    ];
+    let volumes = multi_member_store_set(&members, 3);
+    let names: Vec<&str> = members.iter().map(|(name, _)| *name).collect();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41067);
+    // Volume 0 whole, volume 1 half, and volume 2's header — the article that
+    // introduces the second member.
+    let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1), (1, 0), (2, 0)];
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
+
+    // Non-vacuity: the run really did discover the second member after the first
+    // barrier existed, and really did route bytes for both.
+    let episode_partial = working_dir.join(format!("{episode}.direct.partial"));
+    let notes_partial = working_dir.join(format!("{notes}.direct.partial"));
+    assert!(
+        episode_partial.exists() && notes_partial.exists(),
+        "both members must have routed before the restart"
+    );
+
+    // The committed blob, captured before the restore can delete it, so the
+    // refusal path this test exists for can be named rather than inferred from a
+    // redownload.
+    let committed = {
+        let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+        rows.into_iter()
+            .next()
+            .expect("the shutdown barrier must have committed a row")
+            .1
+    };
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+
+    // The invariant itself, stated where it can be read: the digest the row
+    // carries is the digest this run computes for the same set.
+    let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+    let set = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the restored job must carry its direct set");
+    let judgement = crate::pipeline::direct_store::restart::restore_set(
+        &working_dir,
+        &committed,
+        &set.expected_set(),
+    )
+    .await;
+    assert!(
+        judgement.is_ok(),
+        "the committed row describes this very set and must be accepted, got {:?}",
+        judgement.err()
+    );
+    let blob = rows
+        .get(set.set_name())
+        .expect("an accepted row is kept until the next barrier replaces it");
+    let snapshot = crate::pipeline::direct_store::snapshot::decode(blob)
+        .expect("the committed row must decode");
+    assert_eq!(
+        snapshot.plan_digest,
+        set.expected_set().plan_digest,
+        "a checkpoint must be stamped with the digest of the plan it was written under, \
+         including members the set adopted after the barrier was built"
+    );
+    assert!(
+        set.has_restart_seeded_coverage(),
+        "the row was accepted, so its coverage came back seeded and unverified"
+    );
+    assert!(
+        episode_partial.exists() && notes_partial.exists(),
+        "an accepted row keeps its destinations; only a refused set's files are swept"
+    );
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        !queued.iter().any(|(file_index, _)| *file_index == 0),
+        "volume 0 was complete at the barrier; none of its articles may be refetched, got {queued:?}"
+    );
+    assert!(
+        queued.len() < volumes.len() * ARTICLES,
+        "a restart that refetches everything is not honouring any floor"
+    );
+
+    for (file_index, segment_number) in queued {
+        dispatch_and_submit(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES,
+        )
+        .await;
+    }
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+    let complete_dir = temp_dir.path().join("complete");
+    let restarted: Vec<GateMember> = names
+        .iter()
+        .map(|name| {
+            let (bytes, location) = member_after_gate(&complete_dir, &working_dir, name);
+            (name.to_string(), bytes, location)
+        })
+        .collect();
+    let restarted_status = job_status_for_assert(&pipeline, job_id);
+    assert!(
+        !volumes
+            .iter()
+            .any(|(filename, _)| working_dir.join(filename).exists()),
+        "a restarted direct set must still never materialize a source volume"
+    );
+    drop(pipeline);
+
+    let conventional = run_multi_member_gate(
+        DirectStoreGate::Disabled,
+        JobId(41068),
+        &names,
+        &volumes,
+        &in_order_arrivals(volumes.len()),
+    )
+    .await;
+    for (name, bytes, _) in &conventional.members {
+        let expected = members
+            .iter()
+            .find(|(member, _)| member == name)
+            .map(|(_, payload)| payload.as_slice());
+        assert_eq!(
+            bytes.as_deref(),
+            expected,
+            "the conventional extractor should reproduce {name}"
+        );
+    }
+    assert_eq!(
+        (restarted, restarted_status),
+        (conventional.members, conventional.status),
+        "a restarted multi-member direct job must finish exactly as the conventional extractor"
+    );
+}
+
+/// A restart in the window after a member migration keeps its checkpoint
+/// (`task_9ee23560`).
+///
+/// The migration moves a tolerated split BLAKE2sp-only member's bytes into the
+/// envelope and **unlinks its partial**. Both halves of this pass are needed for
+/// the row to survive that: the barrier has to stop claiming the file that is
+/// gone, and it has to re-stamp the plan digest the member's departure changed.
+/// Either one missing is a refused row and a whole-set redownload.
+#[tokio::test]
+async fn a_restart_after_a_member_migration_keeps_its_checkpoint() {
+    const ARTICLES: usize = 2;
+    let store_name = "Silver.Horizon.S01E54.mkv";
+    let extra_name = "Silver.Horizon.S01E54.nfo";
+    let store_payload: Vec<u8> = (0..30_000u32).map(|index| (index % 251) as u8).collect();
+    let extra_payload: Vec<u8> = (0..200u32).map(|index| (index % 97) as u8).collect();
+    let volumes = store_set_with_extra_member(
+        store_name,
+        &store_payload,
+        extra_name,
+        &extra_payload,
+        4,
+        ToleranceExtra::Blake2OnlySplit,
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41069);
+    // Every article but volume 1's second. The extra's chain closes on the last
+    // volume, so the migration has run; the hole in volume 1 is what keeps the
+    // set mid-download, which is the whole window this test is about.
+    let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1), (1, 0), (2, 0), (2, 1), (3, 0), (3, 1)];
+    let working_dir =
+        direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
+
+    // Non-vacuity: the migration really ran, and it really did leave the routed
+    // member's own destination alone.
+    let extra_partial = working_dir.join(format!("{extra_name}.direct.partial"));
+    let store_partial = working_dir.join(format!("{store_name}.direct.partial"));
+    assert!(
+        !extra_partial.exists(),
+        "the migration must have deleted the migrated member's partial"
+    );
+    assert!(
+        store_partial.exists(),
+        "the routed member's partial must be untouched by the migration"
+    );
+
+    let committed = {
+        let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+        rows.into_iter()
+            .next()
+            .expect("the shutdown barrier must have committed a row")
+            .1
+    };
+    let snapshot = crate::pipeline::direct_store::snapshot::decode(&committed)
+        .expect("the committed row must decode");
+    let claimed: Vec<&str> = snapshot
+        .destinations
+        .iter()
+        .map(|claim| claim.relative_path.as_str())
+        .collect();
+    assert!(
+        !claimed.contains(&format!("{extra_name}.direct.partial").as_str()),
+        "the checkpoint may not claim a destination the migration deleted, got {claimed:?}"
+    );
+    assert!(
+        claimed.contains(&format!("{store_name}.direct.partial").as_str()),
+        "non-vacuity: the surviving member is still claimed, got {claimed:?}"
+    );
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+
+    let set = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the restored job must carry its direct set");
+    let judgement = crate::pipeline::direct_store::restart::restore_set(
+        &working_dir,
+        &committed,
+        &set.expected_set(),
+    )
+    .await;
+    assert!(
+        judgement.is_ok(),
+        "a checkpoint written after a migration describes the set that comes back and must \
+         be accepted, got {:?}",
+        judgement.err()
+    );
+    assert!(
+        store_partial.exists(),
+        "an accepted row keeps its destinations; only a refused set's files are swept"
+    );
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        queued.iter().all(|(file_index, _)| *file_index == 1),
+        "every volume the checkpoint calls complete must stay off the queue, got {queued:?}"
+    );
+    // Volume 1 is the partially covered one, and it pays the documented
+    // one-article rounding: the floor counts decoded bytes while the spec
+    // declares yEnc-encoded ones, so the last checkpointed article of a
+    // part-covered volume comes back with the one that never arrived.
+    assert!(
+        queued.contains(&(1, 1)),
+        "the article that never arrived must be refetched, got {queued:?}"
+    );
+
+    for (file_index, segment_number) in queued {
+        dispatch_and_submit(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES,
+        )
+        .await;
+    }
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+    let complete_dir = temp_dir.path().join("complete");
+    let restarted: Vec<GateMember> = [store_name, extra_name]
+        .iter()
+        .map(|name| {
+            let (bytes, location) = member_after_gate(&complete_dir, &working_dir, name);
+            (name.to_string(), bytes, location)
+        })
+        .collect();
+    let restarted_status = job_status_for_assert(&pipeline, job_id);
+    assert!(
+        !volumes
+            .iter()
+            .any(|(filename, _)| working_dir.join(filename).exists()),
+        "a restarted direct set must still never materialize a source volume"
+    );
+    drop(pipeline);
+
+    let conventional = run_multi_member_gate(
+        DirectStoreGate::Disabled,
+        JobId(41070),
+        &[store_name, extra_name],
+        &volumes,
+        &in_order_arrivals(volumes.len()),
+    )
+    .await;
+    assert_eq!(
+        conventional.members[1].1.as_deref(),
+        Some(extra_payload.as_slice()),
+        "the conventional extractor should reproduce the migrated member"
+    );
+    assert_eq!(
+        (restarted, restarted_status),
+        (conventional.members, conventional.status),
+        "a set restarted after a migration must extract both members byte-identically to \
+         the conventional extractor"
+    );
+}
+
 /// Holds scratch from a killed run is swept at restore: it is append-only and
 /// meaningless without the in-memory index that named its regions.
 #[tokio::test]

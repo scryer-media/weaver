@@ -52,6 +52,11 @@ pub(crate) struct DirectSet {
     barrier: Option<CoverageBarrier>,
     registered_members: HashSet<u32>,
     registered_volumes: bool,
+    /// The router's [`DirectSetRouter::member_facts_revision`] the barrier's plan
+    /// digest was computed at, so a set that adopts nothing new re-hashes
+    /// nothing. `None` until the first push, which is how a freshly built or
+    /// retired barrier is made to take one.
+    digest_revision: Option<u64>,
     /// Source volumes whose NZB file has completed, and the **decoded** length
     /// each one turned out to be.
     ///
@@ -141,6 +146,7 @@ impl DirectSet {
             barrier: None,
             registered_members: HashSet::new(),
             registered_volumes: false,
+            digest_revision: None,
             complete_volumes: BTreeMap::new(),
             volume_crcs: BTreeMap::new(),
             segment_extents: BTreeMap::new(),
@@ -609,9 +615,26 @@ impl DirectSet {
         }
     }
 
-    /// Registers the set's volumes and every destination the router has learned.
+    /// Registers the set's volumes and every destination the router has learned,
+    /// retires the ones it has lost, and keeps the barrier's plan digest level
+    /// with the facts it is routing against.
+    ///
     /// Idempotent, and the only place a barrier comes into existence.
     pub(crate) fn ensure_registered(&mut self) {
+        // Drained first, and ahead of the `members.is_empty()` return below: a
+        // migration deletes a partial the barrier is claiming, and any snapshot
+        // built between the unlink and this retirement claims a file that is not
+        // there. A set with a migration always has a routable member left — the
+        // migration's own budget check demotes otherwise — so the early return
+        // is not reachable with one parked, and the ordering says so anyway.
+        let retired = self.router.take_retired_destinations();
+        for (member_id, relative_partial) in &retired {
+            self.registered_members.remove(member_id);
+            if let Some(barrier) = self.barrier.as_mut() {
+                barrier.retire_destination(*member_id, relative_partial);
+            }
+        }
+
         let members = self
             .router
             .member_partials()
@@ -632,6 +655,22 @@ impl DirectSet {
             self.barrier = Some(barrier);
             self.registered_volumes = false;
             self.registered_members.clear();
+            self.digest_revision = Some(self.router.member_facts_revision());
+        }
+        // The digest binds the member names and sizes, which a set learns as its
+        // volumes arrive — a member whose header lives in volume 3, a size a
+        // later header fills in, a member a migration takes away. Stamped once at
+        // the first member, the digest described a plan that stopped being true
+        // minutes later, and every row written after that was refused at restart
+        // for a set in perfect health. Re-pushed here, where every registration
+        // already passes, and only when the router says the facts moved.
+        let revision = self.router.member_facts_revision();
+        if self.digest_revision != Some(revision) {
+            let digest = self.plan_digest();
+            if let Some(barrier) = self.barrier.as_mut() {
+                barrier.set_plan_digest(digest);
+            }
+            self.digest_revision = Some(revision);
         }
         let Some(barrier) = self.barrier.as_mut() else {
             return;
@@ -804,6 +843,15 @@ impl DirectSet {
         S: super::barrier::DestinationSync + ?Sized,
         P: CoveragePersist + ?Sized,
     {
+        // Level the barrier with the router before it builds a snapshot: the
+        // plan digest it stamps and the destinations it claims must both be the
+        // ones the set is routing against *now*, not the ones it was built with.
+        // Guarded on an existing barrier so this stays a refresh — a demanded
+        // barrier for a set that has never recorded a write still writes no row,
+        // exactly as before.
+        if self.barrier.is_some() {
+            self.ensure_registered();
+        }
         // Read off the router immediately before the run (plan 136, E-D4), so a
         // checkpoint's crypt rows are never older than the coverage beside them:
         // the retained tail padding and the cipher checkpoints are both produced
@@ -857,6 +905,10 @@ impl DirectSet {
         }
         self.registered_members.clear();
         self.registered_volumes = false;
+        // A retired controller is unregistered in every sense, the digest
+        // included: the next registration re-derives it rather than trusting a
+        // revision recorded for a controller that no longer holds anything.
+        self.digest_revision = None;
         Ok(())
     }
 

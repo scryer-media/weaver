@@ -87,6 +87,16 @@ pub(crate) enum BarrierTrigger {
     DirtyBytes,
     /// Dirty data has existed for [`BARRIER_DIRTY_AGE`].
     DirtyAge,
+    /// The set's plan digest has moved since the committed row was written, so
+    /// that row would be refused at restart even though it describes this very
+    /// set (see [`CoverageBarrier::set_plan_digest`]).
+    ///
+    /// Fires with no dirty bytes at all, which no other automatic trigger does:
+    /// the work it exists to save is already durable, and what is stale is the
+    /// label the restart reader validates it against. It is damped by the same
+    /// failure cooldown as the age trigger, because a set whose persist is
+    /// failing must not re-stamp on every turn of the pipeline loop.
+    PlanDigestChanged,
     Demand(BarrierDemand),
 }
 
@@ -297,7 +307,14 @@ struct DestinationCoverage {
 pub(crate) struct CoverageBarrier {
     job_id: JobId,
     set_name: String,
+    /// The digest the **next** snapshot stamps. Pushed by the set on every
+    /// registration, because it is a function of facts that grow as volumes
+    /// arrive; see [`Self::set_plan_digest`].
     plan_digest: [u8; 32],
+    /// The digest the **committed** row carries. Only
+    /// [`BarrierTrigger::PlanDigestChanged`] reads it, and only against
+    /// `plan_digest`.
+    committed_digest: [u8; 32],
     committed_generation: u64,
     /// Transient coalesced source ranges, per source volume. In memory only —
     /// nothing per-segment is ever persisted.
@@ -329,6 +346,7 @@ impl CoverageBarrier {
             job_id,
             set_name: set_name.into(),
             plan_digest,
+            committed_digest: plan_digest,
             committed_generation: 0,
             volumes: BTreeMap::new(),
             destinations: BTreeMap::new(),
@@ -354,6 +372,75 @@ impl CoverageBarrier {
         rows: BTreeMap<u32, super::router::crypt::MemberCryptSnapshot>,
     ) {
         self.member_crypt = rows;
+    }
+
+    /// Points the next snapshot at the plan the set is **currently** routing
+    /// against (D6).
+    ///
+    /// # Why this is pushed at all
+    ///
+    /// The digest binds the member names and their declared unpacked sizes, and
+    /// a set learns those as its volumes arrive: a two-member archive whose
+    /// second member's header lives in volume 3 has a one-member digest until
+    /// volume 3 lands, and a member that migrates into the envelope leaves the
+    /// digest again. Stamping once — at the first adopted member, which is where
+    /// the barrier is built — froze a digest that was true for one instant, and
+    /// every row written afterwards was refused at restart with
+    /// `PlanDigestMismatch` on a set that was in perfect health. That is a silent
+    /// whole-set redownload, and it is the *normal* case for a multi-member set.
+    ///
+    /// # What a digest change does to already-committed coverage: nothing
+    ///
+    /// Deliberately nothing, and this is the load-bearing half. Discovering a
+    /// member does not move one byte of an existing member's destination: the
+    /// layout's logical offsets are prefix sums a later volume only extends, and
+    /// the library guarantees no offset moves while a member still routes. So
+    /// every floor and every claim already accumulated still describes exactly
+    /// the bytes it did before, and they are carried into the next snapshot
+    /// unchanged — the digest is a *label* for validating the row against a
+    /// rebuilt plan, not a checksum of the coverage. Clearing coverage here
+    /// would throw away durable work to record a fact about the plan.
+    ///
+    /// What *is* stale is the committed row's label, which is why the change
+    /// makes the barrier due: see [`BarrierTrigger::PlanDigestChanged`].
+    pub(crate) fn set_plan_digest(&mut self, plan_digest: [u8; 32]) {
+        self.plan_digest = plan_digest;
+    }
+
+    /// Drops a destination the set no longer owns, so the next snapshot carries
+    /// no claim for it.
+    ///
+    /// The reachable caller is the split-BLAKE2sp migration, which moves a
+    /// member's routed bytes into the envelope and **unlinks its partial**. A
+    /// claim on a file that no longer exists is refused at restart as a missing
+    /// destination, taking the whole row down to a redownload. Keeping it in the
+    /// sync set is worse than useless besides: the write pool opens for sync with
+    /// `create(true)`, so the barrier either fsyncs an unlinked inode or puts an
+    /// empty `.direct.partial` back beside the member it just migrated.
+    ///
+    /// The entry is **removed**, not emptied. Phase 5's rule is that a claim
+    /// over zero bytes is not a claim and is omitted from the blob, and a
+    /// destination that is gone must land in the same place rather than becoming
+    /// a zero-byte claim on a path restart would then probe.
+    ///
+    /// The path is checked, not just the key: member ids are in-run counters,
+    /// and retiring a live destination because an id was reused would drop
+    /// claims on bytes that really are on disk. A mismatch keeps the claim,
+    /// which is the safe direction — the row is refused and the set redownloads,
+    /// exactly as it did before this existed.
+    pub(crate) fn retire_destination(&mut self, member_index: u32, relative_path: &str) -> bool {
+        let matches = self
+            .destinations
+            .get(&member_index)
+            .is_some_and(|destination| destination.relative_path == relative_path);
+        if !matches {
+            return false;
+        }
+        self.destinations.remove(&member_index);
+        // Or the barrier would fsync a path nothing owns any more, and a failure
+        // there fails the whole barrier.
+        self.touched.remove(&member_index);
+        true
     }
 
     /// Rebuilds a controller from a validated checkpoint after restart.
@@ -578,9 +665,6 @@ impl CoverageBarrier {
     /// [`BarrierTrigger::Demand`] and are always honoured — a shutdown must
     /// still attempt a barrier, however many have just failed.
     pub(crate) fn due(&self, now: Instant) -> Option<BarrierTrigger> {
-        if self.dirty_bytes == 0 {
-            return None;
-        }
         // Deliberately ahead of the cooldown: the byte threshold is not damped.
         // 256 MiB of dirty bytes is enough work that retrying a failing barrier
         // is worth the attempt, and a set that keeps filling up while its
@@ -588,11 +672,19 @@ impl CoverageBarrier {
         if self.dirty_bytes >= BARRIER_DIRTY_BYTES {
             return Some(BarrierTrigger::DirtyBytes);
         }
-        // The age trigger is the one that busy-loops: a failed barrier keeps
-        // its dirty bytes, so `dirty_since` stays old and this arm would be due
-        // again on the very next poll.
+        // The damped arms. The age trigger is the one that busy-loops: a failed
+        // barrier keeps its dirty bytes, so `dirty_since` stays old and it would
+        // be due again on the very next poll. The re-stamp below is damped for
+        // the same reason — its condition is not cleared by a failed attempt
+        // either.
         if self.cooldown_until.is_some_and(|until| now < until) {
             return None;
+        }
+        // Dirty bytes are beside the point here: what is stale is the committed
+        // row's plan digest, and it stays stale — and refused at restart —
+        // however quiet the set goes. Only a row that exists can be stale.
+        if self.committed_generation > 0 && self.committed_digest != self.plan_digest {
+            return Some(BarrierTrigger::PlanDigestChanged);
         }
         if self
             .dirty_since
@@ -756,6 +848,9 @@ impl CoverageBarrier {
 
         e2e_failpoint::maybe_trip(e2e_failpoint::DIRECT_STORE_BARRIER_PUBLISH);
         self.committed_generation = generation;
+        // Read off the snapshot that was persisted, not off `self`: what
+        // satisfies the re-stamp trigger is the digest the *row* carries.
+        self.committed_digest = snapshot.plan_digest;
         for (volume_index, floor) in &floors {
             if let Some(volume) = self.volumes.get_mut(volume_index) {
                 volume.floor = *floor;

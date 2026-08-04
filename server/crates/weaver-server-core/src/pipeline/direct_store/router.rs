@@ -1436,6 +1436,25 @@ pub(crate) struct DirectSetRouter {
     /// coverage barrier and syncs the envelope before publishing a floor — the
     /// same treatment every other envelope byte gets.
     migrated: Vec<RoutedSpan>,
+    /// Destinations a migration deleted, waiting to be retired from the coverage
+    /// barrier: `(member id, working-directory-relative partial)`.
+    ///
+    /// Parked for the same reason as [`Self::migrated`] — the router owns no
+    /// barrier and the decision is taken mid-parse — and drained by
+    /// [`super::set::DirectSet::ensure_registered`]. Until it is, the barrier
+    /// still claims a file the migration unlinked, and a restart in that window
+    /// refuses the row on a missing destination.
+    retired_destinations: Vec<(u32, String)>,
+    /// Bumped whenever the facts the checkpoint's **plan digest** binds change:
+    /// a member adopted, a member migrated away, or a declared unpacked size
+    /// that actually moved.
+    ///
+    /// The digest is recomputed off this rather than on every routed batch, for
+    /// the reason [`Self::member_order`] is cached: the read is per article and
+    /// the change is per member, and hashing the whole volume map into a fresh
+    /// blake3 for every span of a 2 000-volume set is real work to conclude
+    /// nothing happened.
+    member_facts_revision: u64,
     /// How many times the drain has held a cipher block because the other half
     /// of it had not arrived (E-D2). The production account of this is the
     /// `direct_store.encrypted.block_held` probe; this is the same fact in a
@@ -1480,6 +1499,8 @@ impl DirectSetRouter {
             holds_budget: DEFAULT_HOLDS_BUDGET_BYTES,
             crypt: KeyRing::new(),
             migrated: Vec::new(),
+            retired_destinations: Vec::new(),
+            member_facts_revision: 0,
             #[cfg(test)]
             blocks_held: 0,
             demoted: None,
@@ -2640,7 +2661,14 @@ impl DirectSetRouter {
             }
             if let Some(member_id) = self.member_ids.get(&name).copied() {
                 if let Some(existing) = self.members.get_mut(&member_id) {
-                    existing.unpacked_size = unpacked_size;
+                    // A size that actually moved is a digest fact that moved:
+                    // the first header of a member can declare none at all
+                    // (`unwrap_or(0)`) and a later one fill it in, and the
+                    // checkpoint's digest binds the size it was written under.
+                    if existing.unpacked_size != unpacked_size {
+                        existing.unpacked_size = unpacked_size;
+                        self.member_facts_revision = self.member_facts_revision.saturating_add(1);
+                    }
                     if let (Some(facts), Some(crypt)) = (encrypted, existing.crypt.as_mut()) {
                         // The cipher extent resolves — from unknown to known —
                         // as the headers that declare a size arrive.
@@ -2678,6 +2706,7 @@ impl DirectSetRouter {
                 },
             );
             self.member_order_stale = true;
+            self.member_facts_revision = self.member_facts_revision.saturating_add(1);
         }
         if self.member_order_stale {
             self.rebuild_member_order();
@@ -3013,7 +3042,14 @@ impl DirectSetRouter {
         self.routed_extents.retain(|_, held| !held.is_empty());
         if let Some(member) = self.members.remove(&member_id) {
             self.member_ids.remove(&member.name);
+            // The barrier's claim on the partial goes with the partial. Parked
+            // rather than applied, because the barrier lives a layer up; the set
+            // drains it before it records the migrated spans, so no snapshot is
+            // ever built between the unlink and the retirement.
+            self.retired_destinations
+                .push((member_id, member.relative_partial));
         }
+        self.member_facts_revision = self.member_facts_revision.saturating_add(1);
         self.rebuild_member_order();
         self.migrated.extend(spans);
         // The partial is deleted rather than left behind: everything still in
@@ -3033,6 +3069,18 @@ impl DirectSetRouter {
     /// Hands the caller whatever a migration parked (D1's tolerance).
     fn take_migrated_spans(&mut self) -> Vec<RoutedSpan> {
         std::mem::take(&mut self.migrated)
+    }
+
+    /// Hands the caller the destinations a migration deleted, so their coverage
+    /// claims can be retired. Drained, so each is reported exactly once.
+    pub(crate) fn take_retired_destinations(&mut self) -> Vec<(u32, String)> {
+        std::mem::take(&mut self.retired_destinations)
+    }
+
+    /// Revision of the facts the checkpoint's plan digest binds. Changes only
+    /// when the digest would.
+    pub(crate) fn member_facts_revision(&self) -> u64 {
+        self.member_facts_revision
     }
 
     /// Whether every planned volume has been parsed and every member's chain has

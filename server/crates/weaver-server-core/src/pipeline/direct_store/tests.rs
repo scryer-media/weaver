@@ -1192,6 +1192,173 @@ fn a_barrier_after_a_retire_claims_nothing_the_retired_set_claimed() {
 }
 
 // ---------------------------------------------------------------------------
+// The stamped plan digest tracks the set's facts
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_digest_change_re_stamps_the_row_without_touching_the_coverage() {
+    let (mut barrier, recorder) = barrier_with_one_committed_checkpoint();
+    let start = Instant::now();
+    let before = decode(recorder.committed().unwrap().as_slice()).unwrap();
+    assert_eq!(before.plan_digest, PLAN_DIGEST);
+    assert_eq!(
+        barrier.due(start),
+        None,
+        "a barrier that has just committed everything it holds is not due"
+    );
+
+    // The set adopted a member it had not seen, so the digest it routes under is
+    // no longer the one the committed row carries.
+    barrier.set_plan_digest(OTHER_DIGEST);
+    assert_eq!(
+        barrier.due(start),
+        Some(BarrierTrigger::PlanDigestChanged),
+        "a committed row whose digest has gone stale would be refused at restart, so the \
+         barrier must re-stamp it — with no dirty byte in sight"
+    );
+    assert_eq!(
+        barrier.dirty_bytes(),
+        0,
+        "non-vacuity: nothing was written between the two barriers"
+    );
+
+    run_barrier(&mut barrier, &recorder, BarrierTrigger::PlanDigestChanged).unwrap();
+    let after = decode(recorder.committed().unwrap().as_slice()).unwrap();
+
+    assert_eq!(after.plan_digest, OTHER_DIGEST);
+    assert_eq!(after.generation, 2, "the row is replaced, not appended to");
+    // The load-bearing half: discovering a member moves nobody's bytes, so the
+    // coverage the previous row published is carried over exactly.
+    assert_eq!(after.destinations, before.destinations);
+    assert_eq!(after.floors, before.floors);
+    assert_eq!(
+        barrier.due(start),
+        None,
+        "the row now carries the current digest"
+    );
+}
+
+#[test]
+fn a_digest_change_before_the_first_row_forces_no_barrier() {
+    let mut barrier = sample_barrier();
+    let start = Instant::now();
+    barrier.set_plan_digest(OTHER_DIGEST);
+
+    assert_eq!(
+        barrier.due(start),
+        None,
+        "there is no committed row to go stale, so a set that is still discovering its \
+         members must not barrier once per member"
+    );
+}
+
+#[test]
+fn a_stale_digest_is_damped_by_the_failure_cooldown() {
+    let (mut barrier, recorder) = barrier_with_one_committed_checkpoint();
+    let start = Instant::now();
+    barrier.set_plan_digest(OTHER_DIGEST);
+    recorder.fail_write("database is down");
+
+    let error = run_barrier_at(
+        &mut barrier,
+        &recorder,
+        BarrierTrigger::PlanDigestChanged,
+        start,
+    )
+    .unwrap_err();
+    assert!(matches!(error, BarrierError::Persist(_)));
+
+    // The condition survives the failure — the row still carries the old digest —
+    // so without the cooldown this arm would be due again on the very next turn
+    // of the pipeline loop, forever.
+    assert_eq!(
+        barrier.due(start + BARRIER_FAILURE_BACKOFF / 2),
+        None,
+        "a failing re-stamp must not busy-loop"
+    );
+    assert_eq!(
+        barrier.due(start + BARRIER_FAILURE_BACKOFF + Duration::from_millis(1)),
+        Some(BarrierTrigger::PlanDigestChanged),
+        "and it must be retried once the cooldown is over"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Retiring one destination (task_9ee23560)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_retired_destination_is_dropped_from_the_next_snapshot_and_stays_dropped() {
+    let mut barrier = sample_barrier();
+    let start = Instant::now();
+    barrier.record_write(&write(0, 0, 4_096, 0), start).unwrap();
+    barrier.record_write(&write(1, 0, 2_048, 1), start).unwrap();
+
+    // The migration moved member 1's bytes into the envelope and unlinked its
+    // partial.
+    assert!(
+        barrier.retire_destination(1, "silver-horizon.nfo.direct.partial"),
+        "the claim named exactly this path"
+    );
+
+    let recorder = Recorder::default();
+    run_barrier(&mut barrier, &recorder, BarrierTrigger::DirtyBytes).unwrap();
+    let snapshot = decode(recorder.committed().unwrap().as_slice()).unwrap();
+
+    assert_eq!(
+        snapshot
+            .destinations
+            .iter()
+            .map(|claim| claim.relative_path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["silver-horizon.mkv.direct.partial"],
+        "a checkpoint must not claim a destination that no longer exists"
+    );
+    assert!(
+        !recorder
+            .synced()
+            .contains(&"silver-horizon.nfo.direct.partial".to_string()),
+        "and it must not fsync it either — the sync step opens with create(true), and a \
+         failure there fails the whole barrier"
+    );
+    // Phase 5's rule, not a zero-byte claim: a destination that is gone is
+    // omitted exactly as one that never received a byte is.
+    assert!(
+        snapshot
+            .destinations
+            .iter()
+            .all(|claim| claim.claimed_len() > 0)
+    );
+    // The source floor is untouched: those bytes are still durable, in the
+    // envelope the migration wrote them to.
+    assert_eq!(snapshot.floor_for_volume(1), Some(2_048));
+
+    // It cannot come back through a resume either, because the row it would come
+    // back from no longer names it.
+    let mut resumed = CoverageBarrier::resume(JOB, SET, &snapshot);
+    assert_eq!(resumed.destination_coverage(1), None);
+    assert_eq!(
+        resumed.try_record_write(&write(1, 0, 16, 1), start),
+        Err(WriteRefused::UnregisteredMember { member_index: 1 }),
+        "a retired destination is unregistered: a write naming it is refused whole"
+    );
+}
+
+#[test]
+fn retiring_a_destination_whose_path_does_not_match_keeps_the_claim() {
+    let mut barrier = sample_barrier();
+    let start = Instant::now();
+    barrier.record_write(&write(1, 0, 2_048, 1), start).unwrap();
+
+    assert!(
+        !barrier.retire_destination(1, "some-other-member.direct.partial"),
+        "member ids are in-run counters; retiring on the id alone would drop claims on \
+         bytes that really are on disk"
+    );
+    assert!(barrier.destination_coverage(1).is_some());
+}
+
+// ---------------------------------------------------------------------------
 // One row per set, independent of volume count
 // ---------------------------------------------------------------------------
 
@@ -1334,6 +1501,54 @@ async fn restart_refuses_a_plan_digest_mismatch() {
         restore_set(temp_dir.path(), &blob, &expected).await,
         Err(CoverageRejection::PlanDigestMismatch),
         "a plan-digest mismatch is a hard stop, never partial trust"
+    );
+}
+
+/// The digest still discriminates. Re-stamping it as a set's members are
+/// discovered makes the *label* track the plan; it must not make the label stop
+/// meaning anything, or a row written against genuinely different member facts
+/// would be trusted for coverage it cannot describe.
+#[tokio::test]
+async fn restart_refuses_a_row_written_under_different_member_facts() {
+    let plan = envelope_plan();
+    let one = plan.digest(&[("Silver.Horizon.S01E05.mkv".to_string(), 4_096)]);
+    let grown = plan.digest(&[
+        ("Silver.Horizon.S01E05.mkv".to_string(), 4_096),
+        ("Silver.Horizon.S01E05.nfo".to_string(), 128),
+    ]);
+    let resized = plan.digest(&[("Silver.Horizon.S01E05.mkv".to_string(), 8_192)]);
+    let renamed = plan.digest(&[("Silver.Horizon.S01E06.mkv".to_string(), 4_096)]);
+    assert_ne!(one, grown, "a member the set had not seen is a new digest");
+    assert_ne!(one, resized, "so is a declared size that moved");
+    assert_ne!(one, renamed, "so is a different member");
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    write_destination(temp_dir.path(), "silver-horizon.mkv.direct.partial", 60);
+    let blob = encode(&CoverageSnapshot {
+        plan_digest: one,
+        ..sample_snapshot()
+    })
+    .unwrap();
+
+    for (label, digest) in [("renamed", renamed), ("resized", resized)] {
+        let expected = ExpectedSet {
+            plan_digest: digest,
+            ..sample_expected()
+        };
+        assert_eq!(
+            restore_set(temp_dir.path(), &blob, &expected).await,
+            Err(CoverageRejection::PlanDigestMismatch),
+            "a row written against different member facts ({label}) must still be refused"
+        );
+    }
+
+    let expected = ExpectedSet {
+        plan_digest: one,
+        ..sample_expected()
+    };
+    assert!(
+        restore_set(temp_dir.path(), &blob, &expected).await.is_ok(),
+        "non-vacuity: the same facts are accepted"
     );
 }
 
