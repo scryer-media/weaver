@@ -1,0 +1,72 @@
+name: Backfill Weaver release signatures
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Historic Weaver release tag"
+        required: true
+        type: choice
+        options:
+          - weaver-v0.7.4
+          - weaver-v0.7.5
+          - weaver-v0.7.6
+          - weaver-v0.7.7
+          - weaver-v0.7.8
+
+permissions: read-all
+
+jobs:
+  backfill:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Checkout protected main
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign the unchanged historic release assets
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            weaver-v0.7.4|weaver-v0.7.5|weaver-v0.7.6|weaver-v0.7.7|weaver-v0.7.8) ;;
+            *) echo "release tag is not allowlisted: $RELEASE_TAG" >&2; exit 1 ;;
+          esac
+          mkdir -p release-assets
+          gh release download "$RELEASE_TAG" --dir release-assets
+          mapfile -t assets < <(find release-assets -maxdepth 1 -type f \( -name 'weaver-*.tar.gz' -o -name 'weaver-*.zip' \) -printf '%f\n' | sort)
+          test "${#assets[@]}" -gt 0
+          (
+            cd release-assets
+            for asset in "${assets[@]}"; do
+              sha256sum "$asset"
+            done
+          ) > weaver-checksums.txt
+          (
+            cd release-assets
+            sha256sum -c ../weaver-checksums.txt
+          )
+          cosign sign-blob --yes \
+            --bundle weaver-checksums.txt.sigstore.json \
+            weaver-checksums.txt
+          cosign verify-blob \
+            --bundle weaver-checksums.txt.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-signature-backfill.yml@refs/heads/main" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            weaver-checksums.txt
+          gh release upload "$RELEASE_TAG" \
+            weaver-checksums.txt \
+            weaver-checksums.txt.sigstore.json \
+            --clobber
+          note="This release has a post-publication maintainer checksum signature. It is not recreated SLSA build provenance."
+          body="$(gh release view "$RELEASE_TAG" --json body --jq .body)"
+          if [[ "$body" != *"$note"* ]]; then
+            printf '%s\n\n%s\n' "$body" "$note" > release-notes.md
+            gh release edit "$RELEASE_TAG" --notes-file release-notes.md
+          fi
