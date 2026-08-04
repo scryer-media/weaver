@@ -7075,15 +7075,15 @@ async fn an_encrypted_span_that_arrives_before_its_predecessor_block_is_held_the
         true,
     );
 
-    // Every volume's payload article before its header article, and the volumes
-    // themselves in reverse order: a span whose 16 preceding cipher bytes live
-    // in a volume that has not arrived, in both directions across every part
-    // boundary.
-    let mut arrivals: Vec<(u32, u32)> = (0..volumes.len() as u32)
-        .rev()
-        .map(|index| (index, 1))
-        .collect();
-    arrivals.extend((0..volumes.len() as u32).rev().map(|index| (index, 0)));
+    // Every volume's header article first, ascending, then the payload halves in
+    // reverse. The headers alone complete the chain, so the drain runs for every
+    // volume while each one's *predecessor* bytes are still outstanding: volume
+    // n's part starts at a non-block-aligned cipher offset, so its first block's
+    // 16 preceding bytes live in the tail of volume n-1 — which has not arrived.
+    // Every part boundary is exercised in both directions, and the reverse
+    // payload order means the holds are released from the far end back.
+    let mut arrivals: Vec<(u32, u32)> = (0..volumes.len() as u32).map(|index| (index, 0)).collect();
+    arrivals.extend((0..volumes.len() as u32).rev().map(|index| (index, 1)));
 
     let conventional = run_gate_with_password(
         DirectStoreGate::Disabled,
@@ -7096,35 +7096,114 @@ async fn an_encrypted_span_that_arrives_before_its_predecessor_block_is_held_the
         Some("moonlit-harbour"),
     )
     .await;
-    let direct = run_gate_with_password(
-        DirectStoreGate::Enabled,
-        None,
-        None,
-        JobId(43042),
-        member_name,
-        &volumes,
-        &arrivals,
-        Some("moonlit-harbour"),
-    )
-    .await;
+
+    // The direct side is driven inline rather than through the gate helper, for
+    // one assertion the helper cannot make (E1 review F11): byte-identical
+    // output proves the drain produced the right bytes, but it cannot tell a set
+    // that *held* a straddling block from one whose arrival order never made it
+    // hold. The counter is that difference, and without it this test would pass
+    // just as happily against a build that had deleted the edge-hold path.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(43042);
+    let mut spec = direct_store_job_spec("Silver Horizon", &volumes);
+    spec.password = Some("moonlit-harbour".to_string());
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in &arrivals {
+        submit_volume_article(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            *file_index,
+            *segment_number,
+        )
+        .await;
+    }
+
+    let blocks_held = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the encrypted set must still be routing")
+        .router
+        .blocks_held();
+    assert!(
+        blocks_held > 0,
+        "this arrival order must have made the drain hold a cipher block for a \
+         predecessor it did not have yet; it held {blocks_held}"
+    );
+
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    let (member, member_location) = member_after_gate(&complete_dir, &working_dir, member_name);
+    let status = job_status_for_assert(&pipeline, job_id);
 
     assert_eq!(
-        direct.member.as_deref(),
+        member.as_deref(),
         Some(payload.as_slice()),
         "a held straddling block must drain to the same plaintext once its other half lands"
     );
     assert!(
-        !direct.volume_file_seen,
+        volumes
+            .iter()
+            .all(|(filename, _)| !working_dir.join(filename).exists()),
         "holding a cipher block must not fall back to writing the volume"
     );
     assert_eq!(
-        (direct.member, direct.member_location, direct.status),
+        (member, member_location, status),
         (
             conventional.member,
             conventional.member_location,
             conventional.status
         ),
         "out-of-order encrypted arrival must be byte-identical to the conventional extractor"
+    );
+}
+
+#[tokio::test]
+async fn a_forged_password_check_admits_and_the_keyed_member_gate_catches_it_anyway() {
+    // Plan 136's Risks section, as a test. The RAR5 password check is 8
+    // unauthenticated bytes a writer chooses, so a hostile archive can carry the
+    // check for a password that does **not** decrypt its data and have admission
+    // report `Verified`. That is why the check is an admission *test* and never a
+    // reason to skip the keyed member gate: the gate is the authority.
+    let member_name = "Silver.Horizon.S02E14.mkv";
+    let payload: Vec<u8> = (0..2100u32).map(|index| (index % 211) as u8).collect();
+    // Data encrypted with one password, the header's check forged for another —
+    // and the job holds the forged one.
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        3,
+        "moonlit-harbour",
+        Some("wrong-key"),
+        true,
+    );
+    let arrivals = in_order_arrivals(volumes.len());
+
+    let caught =
+        encrypted_routing_outcome(JobId(43131), &volumes, &arrivals, Some("wrong-key")).await;
+    assert!(
+        !caught.shape.contains("EncryptedMemberRefused"),
+        "the forged check must have *passed* admission — otherwise this test proves \
+         nothing about the gate behind it, got {}",
+        caught.shape
+    );
+    assert!(
+        caught.shape.contains("Demoted(MemberChecksumMismatch)"),
+        "the keyed whole-member fold is the authority a forged check cannot reach, got {}",
+        caught.shape
+    );
+    // Deliberately no volume-file assertion, for the same reason
+    // `a_wrong_password_with_no_check_routes_until_the_keyed_member_gate_catches_it`
+    // has none: this gate fires on the *last* article, when the member's
+    // plaintext first composes, so the handover has no further articles to ride
+    // and the materialization is the demotion machinery's own.
+    assert!(
+        !caught.partial_seen,
+        "the refused member's destination must not be left on disk for the \
+         conventional extractor to find"
     );
 }
 
@@ -7207,12 +7286,21 @@ async fn an_encrypted_member_whose_size_is_block_aligned_carries_no_padding() {
 }
 
 #[tokio::test]
-async fn a_password_that_arrives_after_the_job_was_added_still_admits_the_set() {
-    // Plan 136's open question 2, answered: weaver *does* support setting a
-    // password after add (`setJobPassword`, and the NZBGet facade's
-    // `*Unpack:Password`), both of which mutate the live job spec. The direct
-    // sets are built once per job and memoized, so the seam re-reads the spec
-    // while any set is still willing to take one.
+async fn a_password_that_arrives_before_the_first_article_still_admits_the_set() {
+    // Plan 136's open question 2, answered — and named for what it actually
+    // proves (E1 review F5). weaver *does* support setting a password after add
+    // (`setJobPassword`, and the NZBGet facade's `*Unpack:Password`), both of
+    // which mutate the live job spec, and the direct sets are built once per job
+    // and memoized, so the seam re-reads the spec while any set is still willing
+    // to take one.
+    //
+    // The window is **pre-first-article**, not "any time during the download":
+    // admission runs from the first successful header parse, and its
+    // `NoPassword` refusal is a demotion. A password arriving after that finds
+    // the set already on the conventional path, which asks the job's whole
+    // candidate list anyway. Waiting for one instead would mean holding every
+    // arriving byte for a set that will most likely never get a password, and
+    // then throwing all of it away on a scratch-ceiling breach.
     let member_name = "Silver.Horizon.S02E08.mkv";
     let payload: Vec<u8> = (0..1700u32).map(|index| (index % 157) as u8).collect();
     let volumes = encrypted_store_set(
@@ -7277,6 +7365,79 @@ async fn a_password_that_arrives_after_the_job_was_added_still_admits_the_set() 
     assert!(
         !working_dir.join(&volumes[0].0).exists(),
         "the set admitted on a post-add password must still route, not materialize"
+    );
+}
+
+#[tokio::test]
+async fn a_password_corrected_before_the_first_article_admits_with_the_correction() {
+    // E1 review F5's dead branch, end to end. `KeyRing::set_password` has always
+    // handled a password *changing* while nothing is admitted — but the seam
+    // that calls it stopped asking the moment any password was held, so a job
+    // added with the wrong one and corrected before its first header parsed
+    // derived keys from the stale one, admitted on the header's check, and
+    // failed the keyed member gate a whole download later.
+    let member_name = "Silver.Horizon.S02E16.mkv";
+    let payload: Vec<u8> = (0..1700u32).map(|index| (index % 157) as u8).collect();
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        2,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(43141);
+    let mut spec = direct_store_job_spec("Silver Horizon", &volumes);
+    // Added with a typo.
+    spec.password = Some("moonlit-harbor".to_string());
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // The sets are built here, holding the wrong password — which is exactly the
+    // state the old window treated as settled.
+    assert!(
+        pipeline
+            .direct_route_target(crate::jobs::ids::NzbFileId {
+                job_id,
+                file_index: 0,
+            })
+            .is_some(),
+        "the set should be admitted and still routing before anything has parsed"
+    );
+
+    // The correction, through the same live-spec write both API surfaces do.
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .expect("the job is live")
+        .spec
+        .password = Some("moonlit-harbour".to_string());
+
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        !shape.contains("Demoted"),
+        "the correction must be the password admission derives from, got {shape}"
+    );
+
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    let (member, location) = member_after_gate(&complete_dir, &working_dir, member_name);
+    assert_eq!(
+        member.as_deref(),
+        Some(payload.as_slice()),
+        "a password corrected before the first article must produce the member"
+    );
+    assert_eq!(location, Some("complete"));
+    assert!(
+        !working_dir.join(&volumes[0].0).exists(),
+        "the corrected set must still route, not materialize"
     );
 }
 
@@ -7552,14 +7713,43 @@ async fn encrypted_routing_leaves_the_plan_135_guarantees_untouched() {
     );
 }
 
+/// Every file direct routing owns in `working_dir`: member partials, volume
+/// envelopes and the holds scratch.
+///
+/// "Never routed a byte" is a statement about all three, not just the partials:
+/// an envelope is written by the same drain, out of the same articles, and its
+/// existence would mean the set had been live long enough to classify bytes.
+fn direct_artifacts(working_dir: &std::path::Path) -> Vec<String> {
+    let mut found: Vec<String> = std::fs::read_dir(working_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| {
+                    name.ends_with(".direct.partial")
+                        || name.contains(".envelope")
+                        || name.contains(".holds")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    found
+}
+
 #[tokio::test]
-async fn a_par2_bearing_encrypted_set_demotes_before_the_authoritative_pass() {
-    // The one thing an encrypted set cannot yet do (plan 136 defers it to phase
-    // E2): its destinations hold plaintext while PAR2 describes the posted
-    // cipher, so a set served to the authoritative pass would have every slice
-    // reported damaged and the repairer handed a virtual volume that was never
-    // broken. It demotes when the recovery set appears — which can be at any
-    // point in a job's life — and finishes conventionally.
+async fn a_par2_bearing_encrypted_job_refuses_admission_and_never_routes_a_byte() {
+    // E1 review F1. An encrypted set's destinations hold plaintext while PAR2
+    // describes the posted cipher, so such a set may not be served to the
+    // authoritative pass — but the guard that catches it *behind* that pass
+    // cannot fire until the whole set has downloaded, and by then the demotion
+    // costs a full refetch, because plaintext partials cannot reconstruct posted
+    // bytes. That is twice the bytes and twice the wall for a job a
+    // pre-plan-136 build finished having paid one article.
+    //
+    // So the decision moves to admission, where the spec already answers it. The
+    // assertion is that nothing is ever written and the set leaves direct mode
+    // on its **first** header parse.
     let member_name = "Silver.Horizon.S02E12.mkv";
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 193) as u8).collect();
     let volumes = encrypted_store_set(
@@ -7582,11 +7772,272 @@ async fn a_par2_bearing_encrypted_set_demotes_before_the_authoritative_pass() {
     spec.password = Some("moonlit-harbour".to_string());
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
+    // One article: the first of the first volume, which is the first header
+    // parse and therefore the first moment admission can be decided.
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted(EncryptedMemberRefused(Par2Declared))"),
+        "a par2-bearing encrypted set must be refused at admission, by its own name, got {shape}"
+    );
+    assert_eq!(
+        direct_artifacts(&working_dir),
+        Vec::<String>::new(),
+        "the refusal must land before a destination, an envelope or a scratch file exists"
+    );
+    // The cheap demotion, in the only unit that matters: the set gave up having
+    // consumed one article, so the other five are still ahead of the download
+    // rather than behind it. The pass-side guard could not have fired until all
+    // six had been fetched and routed, and would then have thrown all six away.
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        queued.contains(&(0, 0)),
+        "the article the seam was holding must come back, got {queued:?}"
+    );
+
+    // And the job finishes conventionally, byte-identically, with the source
+    // volumes written the way a job with no direct store at all writes them.
+    let mut volume_file_seen = false;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+        assert_eq!(
+            direct_artifacts(&working_dir),
+            Vec::<String>::new(),
+            "a refused set must never write anything, at any point in the job"
+        );
+        volume_file_seen |= volumes
+            .iter()
+            .any(|(filename, _)| working_dir.join(filename).exists());
+    }
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+    let (member, location) = member_after_gate(&complete_dir, &working_dir, member_name);
+    assert_eq!(
+        member.as_deref(),
+        Some(payload.as_slice()),
+        "the conventional path must produce the member the refusal handed it"
+    );
+    assert_eq!(location, Some("complete"));
+    assert!(
+        volume_file_seen,
+        "a refused set hands its volumes to the conventional path, which writes them — \
+         which is what makes this the pre-plan-136 behaviour and not a new one"
+    );
+}
+
+#[tokio::test]
+async fn live_par2_never_records_an_encrypted_direct_volume() {
+    // E1 review F3. Live verification's in-stream feed is honest — those are the
+    // posted cipher bytes, taken before the write transform — but a block that
+    // straddles an article boundary is only ever settled by a *read-back*, and
+    // the read-back resolves through the virtual volume to the member's
+    // `.direct.partial`, which is plaintext. Feeding a stream whose every
+    // boundary block must come back `Bad` is worse than not feeding one, so an
+    // encrypted set is kept out of live verification on both halves.
+    //
+    // Every other encrypted test in this file runs with live PAR2 off, which is
+    // exactly why this path was never exercised.
+    let member_name = "Silver.Horizon.S02E17.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 193) as u8).collect();
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        3,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+    let par2_bytes = par2_index_over_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(true);
+    let job_id = JobId(43151);
+    let (mut spec, index_file_index) =
+        par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
+    spec.password = Some("moonlit-harbour".to_string());
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // The direct sets are admitted here, while the spec's PAR2 role is stripped,
+    // so admission's own par2 refusal does not fire and the set really does
+    // route encrypted. The role goes back before any byte flows, so live
+    // verification sees the job it would see in production. This is the narrow
+    // window the `EncryptedPar2Unsupported` belt exists for, written down.
+    let index_role = pipeline
+        .jobs
+        .get(&job_id)
+        .expect("the job is live")
+        .spec
+        .files[index_file_index as usize]
+        .role
+        .clone();
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .expect("the job is live")
+        .spec
+        .files[index_file_index as usize]
+        .role = weaver_model::files::FileRole::Unknown;
+    assert!(
+        pipeline
+            .direct_route_target(NzbFileId {
+                job_id,
+                file_index: 0,
+            })
+            .is_some(),
+        "the sets must be admitted while the job looks par2-less"
+    );
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .expect("the job is live")
+        .spec
+        .files[index_file_index as usize]
+        .role = index_role;
+
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
         submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
     }
-    // Non-vacuity: it really did route the encrypted set before the PAR2 index
-    // turned up, so the demotion below is the guard firing and not admission.
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| !set.is_demoted() && set.router.routes_encrypted()),
+        "non-vacuity: the set under test must really be decrypting at write time"
+    );
+
+    // The feed half. Nothing about these volumes may have been recorded, so
+    // there is no coverage for activation to bind and nothing to settle.
+    for file_index in 0..volumes.len() as u32 {
+        assert_eq!(
+            pipeline
+                .live_par2
+                .recorded_ranges(NzbFileId { job_id, file_index }),
+            None,
+            "live verification must hold no coverage for encrypted direct volume {file_index}"
+        );
+    }
+
+    // The read-back half, at its own seam: the virtual volume such a read would
+    // go through refuses to answer at all.
+    for file_index in 0..volumes.len() as u32 {
+        assert!(
+            pipeline
+                .direct_virtual_volume(NzbFileId { job_id, file_index })
+                .is_none(),
+            "an encrypted set's virtual volume must not answer a posted-byte read"
+        );
+    }
+
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    pipeline.settle_live_par2_job(job_id).await;
+
+    assert!(
+        pipeline.live_par2.is_active(job_id),
+        "non-vacuity: live verification must really be switched on for this job, or \
+         'it recorded nothing' says nothing"
+    );
+    assert_eq!(
+        pipeline.live_par2.metrics().blocks_bad,
+        0,
+        "an encrypted set must not poison a single live block"
+    );
+    for file_index in 0..volumes.len() as u32 {
+        assert_eq!(
+            pipeline
+                .live_par2
+                .block_states(NzbFileId { job_id, file_index }),
+            None,
+            "encrypted direct volume {file_index} must have no live block state at all"
+        );
+    }
+    assert!(
+        pipeline.par2_set(job_id).is_some(),
+        "the recovery set must have parsed, or the pass this protects never runs"
+    );
+}
+
+#[tokio::test]
+async fn an_encrypted_set_demotes_when_a_recovery_set_the_spec_never_declared_turns_up() {
+    // The belt behind E1 review F1's admission refusal, and the case it is
+    // genuinely for: a PAR2 file the job's spec did **not** classify as one — a
+    // deobfuscated or renamed file — whose recovery set only becomes real
+    // mid-job. Admission had nothing to refuse on, the set is already routing
+    // encrypted, and the guard in front of the authoritative pass has to take it
+    // out of direct mode before that pass reads plaintext where cipher belongs.
+    //
+    // Modelled by stripping the PAR2 role from the *spec* after the job is
+    // inserted: the assembly keeps its own copy, so the index still parses
+    // through the production path, while `job_spec_has_par2_file` — which is
+    // what admission reads, and what the finalization wait reads — answers no.
+    // The last article is held back so the set is still live when the recovery
+    // set lands, which is the only state the guard has anything to do in: a set
+    // that already finalized is forgiven by name, and a demoted one has left.
+    let member_name = "Silver.Horizon.S02E15.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 193) as u8).collect();
+    let volumes = encrypted_store_set(
+        member_name,
+        &payload,
+        3,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+    );
+    let par2_bytes = par2_index_over_volumes(&volumes);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let job_id = JobId(43112);
+    let (mut spec, index_file_index) =
+        par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
+    spec.password = Some("moonlit-harbour".to_string());
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .expect("the job is live")
+        .spec
+        .files[index_file_index as usize]
+        .role = weaver_model::files::FileRole::Unknown;
+
+    let held_back = (volumes.len() as u32 - 1, 1u32);
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if (file_index, segment_number) == held_back {
+            continue;
+        }
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    // Non-vacuity: it really did route the encrypted set before the recovery set
+    // turned up, so the demotion below is the belt firing and not admission.
     assert!(
         pipeline
             .direct_store
@@ -7608,11 +8059,21 @@ async fn a_par2_bearing_encrypted_set_demotes_before_the_authoritative_pass() {
         None,
     )
     .await;
+    assert!(
+        pipeline.par2_set(job_id).is_some(),
+        "the index must have parsed through the production path, or the guard has no \
+         recovery set to react to and the test proves nothing"
+    );
 
+    assert!(
+        pipeline.demote_unbindable_direct_sets(job_id).await,
+        "the guard in front of the authoritative pass must report that it demoted"
+    );
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
         shape.contains("Demoted(EncryptedPar2Unsupported)"),
-        "a PAR2-bearing encrypted set must demote before the authoritative pass, got {shape}"
+        "a late recovery set must take an encrypted set out of direct mode before the \
+         authoritative pass, got {shape}"
     );
 
     // The demotion refetches rather than reconstructs, which is the other half

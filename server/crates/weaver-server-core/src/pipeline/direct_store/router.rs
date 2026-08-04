@@ -1313,6 +1313,13 @@ pub(crate) struct DirectSetRouter {
     /// and untouched for a set with no encrypted member — which is every set
     /// plan 135 routed.
     crypt: KeyRing,
+    /// How many times the drain has held a cipher block because the other half
+    /// of it had not arrived (E-D2). The production account of this is the
+    /// `direct_store.encrypted.block_held` probe; this is the same fact in a
+    /// form a test can assert on, because byte-identical output cannot tell a
+    /// set that held from one that never had to (E1 review F11).
+    #[cfg(test)]
+    blocks_held: u64,
     demoted: Option<DemotionReason>,
 }
 
@@ -1349,8 +1356,17 @@ impl DirectSetRouter {
             member_order_stale: false,
             holds_budget: DEFAULT_HOLDS_BUDGET_BYTES,
             crypt: KeyRing::new(),
+            #[cfg(test)]
+            blocks_held: 0,
             demoted: None,
         }
+    }
+
+    /// Cipher blocks the drain has held for a missing predecessor or a missing
+    /// other half (E-D2). Test-only; see the field.
+    #[cfg(test)]
+    pub(crate) fn blocks_held(&self) -> u64 {
+        self.blocks_held
     }
 
     /// Whether the set would still take a job password (plan 136, E-D1).
@@ -1358,8 +1374,24 @@ impl DirectSetRouter {
     /// The seam re-reads the live job spec while this is true, because a
     /// password can arrive **after** the job was added: `setJobPassword` and the
     /// NZBGet facade's `*Unpack:Password` both mutate the spec in place. It goes
-    /// false the moment one is held, so a set that has one — and every set with
-    /// no encrypted member, once it demotes or admits — costs nothing.
+    /// false once a password is *admitted*, or once the set leaves direct mode.
+    ///
+    /// # The window is pre-first-article, and only that (E1 review F5)
+    ///
+    /// Admission runs from the first successful header parse, which is the first
+    /// article of the set's first volume — seconds into the download. A password
+    /// that arrives after it does **not** revive the set: the `NoPassword`
+    /// refusal is a demotion, `demoted` is then `Some`, and this goes false for
+    /// good. That is deliberate. Waiting instead would mean holding every
+    /// arriving byte against the holds budget for a set that will most likely
+    /// never get a password, and then demoting on a scratch-ceiling breach
+    /// having downloaded and thrown away everything up to it — the conventional
+    /// path takes the set immediately and asks the job's whole candidate list,
+    /// which is a superset of the single password direct-store sees.
+    ///
+    /// What this window *does* cover is a password **corrected** before the
+    /// first parse, which is why it is `!admitted` rather than "no password
+    /// held": see [`crypt::KeyRing::wants_password`].
     pub(crate) fn wants_password(&self) -> bool {
         self.demoted.is_none() && self.crypt.wants_password()
     }
@@ -1369,6 +1401,21 @@ impl DirectSetRouter {
         self.crypt.set_password(password);
     }
 
+    /// Refuses encrypted admission outright because the job declares a PAR2 file
+    /// (plan 136, E1 review F1). Set once, when the set is built.
+    pub(crate) fn refuse_encrypted_for_par2(&mut self) {
+        self.crypt.refuse_encrypted_for_par2();
+    }
+
+    /// The key ring's own `Debug`, for the test that proves a password cannot
+    /// reach a log through it. The router's `Debug` does not print the ring at
+    /// all, so this is the only way to assert on the type that holds the
+    /// password.
+    #[cfg(test)]
+    pub(crate) fn crypt_debug(&self) -> String {
+        format!("{:?}", self.crypt)
+    }
+
     /// Whether this set has admitted an encrypted member, i.e. whether any of
     /// its bytes are being decrypted on the way to their destination.
     ///
@@ -1376,6 +1423,29 @@ impl DirectSetRouter {
     /// destinations hold plaintext and the source volumes held cipher: until
     /// phase E2's re-encrypting overlay exists, those consumers must refuse
     /// rather than read plaintext where cipher belongs.
+    ///
+    /// The three that do, and why each one is a refusal rather than a fallback:
+    ///
+    /// - demotion-by-reconstruction, which would rebuild a source volume out of
+    ///   decrypted partials (`reconstruct_demoted_set`);
+    /// - the authoritative PAR2 overlay, which is what
+    ///   `demote_unbindable_direct_sets`' encrypted arm keeps a set out of;
+    /// - **live PAR2** (E1 review F3). Its in-stream feed is honest — those are
+    ///   the posted bytes, taken before routing — but every block straddling an
+    ///   article boundary is settled by a *read-back*, and the read-back goes
+    ///   through `direct_virtual_volume` to the member's `.direct.partial`,
+    ///   which is plaintext. So an encrypted set is kept out of live
+    ///   verification entirely rather than fed a stream it can only ever settle
+    ///   into `Bad` blocks.
+    ///
+    /// One residual, bounded and stated rather than left to be discovered: this
+    /// only goes true at the first header parse, so an article that arrives
+    /// *before* it — the payload-before-header case — is fed. Those bytes are
+    /// correct posted cipher, and the blocks they cover simply never settle:
+    /// the read-back that would finish them finds no virtual volume and no file,
+    /// so they stay `Pending` for the authoritative pass rather than turning
+    /// `Bad`. The cost is a few recorded ranges against the live partial budget,
+    /// never a wrong verdict.
     pub(crate) fn routes_encrypted(&self) -> bool {
         self.crypt.admitted()
     }
@@ -2225,8 +2295,15 @@ impl DirectSetRouter {
     /// share one pays a single PBKDF2 — and the RAR5 password check is verified
     /// **before any byte routes**.
     ///
-    /// Three refusals, all of them demotions:
+    /// Four refusals, all of them demotions:
     ///
+    /// - the job's spec declares a PAR2 file (E1 review F1). An encrypted set's
+    ///   destinations hold plaintext where PAR2 describes the posted cipher, and
+    ///   the guard that catches this behind the authoritative pass cannot run
+    ///   until the whole set has downloaded — at which point demoting costs a
+    ///   full refetch, because plaintext partials cannot reconstruct posted
+    ///   bytes. Refusing here is the pre-plan-136 behaviour exactly: one hard
+    ///   demotion on the first header parse, one article back on the wire;
     /// - no password: an encrypted set routes only with one;
     /// - a check present that this password does not reproduce: nothing is
     ///   written on the strength of a refuted password;
@@ -2928,6 +3005,10 @@ impl DirectSetRouter {
         }
 
         if held {
+            #[cfg(test)]
+            {
+                self.blocks_held = self.blocks_held.saturating_add(1);
+            }
             // The one new hold shape E-D2 introduces: a cipher block whose other
             // half has not arrived. Bounded by one article per member per gap,
             // so a large count here says the set is arriving badly out of order,

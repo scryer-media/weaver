@@ -4198,24 +4198,115 @@ fn every_reconstruction_failure_has_its_own_metric_label() {
 // Snapshot schema 4: the crypt row (plan 136, E-D4)
 // ---------------------------------------------------------------------------
 
-fn sample_crypt_row() -> super::router::crypt::MemberCryptSnapshot {
-    super::router::crypt::MemberCryptSnapshot {
-        salt: [0x5A; 16],
-        kdf_count_lg2: 15,
-        iv: [0xA5; 16],
-        psw_check_present: true,
-        data_hash_uses_mac: true,
-        cipher_size: 4096,
-        tail_padding: 7,
-        tail_plain: vec![1, 2, 3, 4, 5, 6, 7],
-        checkpoints: vec![(2048, [0x33; 16])],
+/// Deliberately all under `0x80`: MessagePack encodes those as one-byte
+/// positive fixints, so the salt survives into the blob as a literal 16-byte
+/// run and a byte scan can prove the row is really in there.
+const CRYPT_SALT: [u8; 16] = [0x5A; 16];
+const CRYPT_IV: [u8; 16] = [0x3E; 16];
+const CRYPT_KDF_LG2: u8 = 4;
+const CRYPT_MEMBER: &str = "Silver.Horizon.S01E26.mkv";
+const CRYPT_PASSWORD: &str = "moonlit-harbour";
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// A one-volume set holding one whole **encrypted** stored member, rebuilt from
+/// facts the way restore rebuilds one and then driven through the router's own
+/// routing path.
+///
+/// The point of going the long way round is that the crypt rows the test reads
+/// are then the ones a real download produces — derived keys, real AES-CBC
+/// ciphertext, a real checkpoint at the decrypted frontier and real retained
+/// padding. A hand-written row proves only that the struct it was written into
+/// serializes.
+fn encrypted_crypt_router(plain: &[u8], header_bytes: u64) -> DirectSetRouter {
+    let material = weaver_unrar::derive_rar5_material(CRYPT_PASSWORD, &CRYPT_SALT, CRYPT_KDF_LG2)
+        .expect("the fixture KDF count is derivable");
+    let cipher_len = plain.len().div_ceil(16) * 16;
+    let mut padded = plain.to_vec();
+    // Distinctive, non-zero padding. Those bytes are exactly what `tail_plain`
+    // retains, so making them recognisable is what lets the snapshot test tell
+    // the member's real trailing plaintext from a zero placeholder.
+    for index in 0..cipher_len - plain.len() {
+        padded.push(b'a' + index as u8);
     }
+    let cipher = weaver_unrar::test_support::encrypt_aes256_cbc(&material.key, &CRYPT_IV, &padded);
+
+    let plan = DirectSetPlan {
+        set_name: SET.to_string(),
+        volumes: [(0u32, 0u32)].into_iter().collect(),
+        files: [(0u32, 0u32)].into_iter().collect(),
+        working_dir: std::path::PathBuf::from("/nonexistent"),
+    };
+    let mut router = DirectSetRouter::new(plan);
+    // Before the layout, not after: admission runs from `sync_members`, which
+    // `restore_layout` calls, and an encrypted member with no password refuses
+    // the whole set rather than waiting.
+    router.set_password(Some(CRYPT_PASSWORD));
+    let facts = std::collections::BTreeMap::from([(
+        0u32,
+        volume_facts(0, false, {
+            let mut only = member_facts(
+                CRYPT_MEMBER,
+                header_bytes,
+                cipher_len as u64,
+                plain.len() as u64,
+            );
+            only.is_encrypted = true;
+            only.encryption = Some(weaver_unrar::RarVolumeMemberEncryptionFacts {
+                version: 0,
+                kdf_count_lg2: CRYPT_KDF_LG2,
+                salt: CRYPT_SALT,
+                iv: CRYPT_IV,
+                psw_check_present: false,
+                psw_check: None,
+            });
+            // Layer 2's value, over the plaintext: the member verifies, so the
+            // drain below routes rather than demoting on its own gate.
+            only.data_crc32 = Some(weaver_par2::checksum::crc32(plain));
+            vec![only]
+        }),
+    )]);
+    router.restore_layout(&facts).expect("the facts rebuild");
+    router.stage_for_test(0, header_bytes, &cipher);
+    router
+        .drain_for_test(0)
+        .expect("the encrypted drain routes rather than demoting");
+    router
 }
 
 #[test]
 fn a_snapshot_round_trips_its_crypt_rows_and_carries_no_password() {
+    // 600 is not a multiple of 16, so the member carries 8 bytes of tail
+    // padding: the row under test has a real retained tail, a real checkpoint
+    // and real key-derived state, all of it produced by the router.
+    let plain: Vec<u8> = (0..600u32).map(|index| (index % 251) as u8).collect();
+    let router = encrypted_crypt_router(&plain, 64);
+
+    let rows = router.member_crypt_snapshots();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the fixture must have routed one encrypted member"
+    );
+    let row = rows.values().next().expect("the row exists").clone();
+    assert_eq!(
+        row.tail_padding, 8,
+        "the fixture must exercise the retained padding, or the most password-adjacent \
+         field in the row is not in the blob at all"
+    );
+    assert_eq!(row.tail_plain.len(), 8);
+    assert!(
+        !row.checkpoints.is_empty(),
+        "a decrypted run must have left its frontier checkpoint"
+    );
+
     let mut snapshot = sample_snapshot();
-    snapshot.destinations[0].crypt = Some(sample_crypt_row());
+    snapshot.destinations[0].crypt = Some(row.clone());
 
     let blob = super::snapshot::encode(&snapshot).expect("the crypt row encodes");
     assert_eq!(
@@ -4227,17 +4318,67 @@ fn a_snapshot_round_trips_its_crypt_rows_and_carries_no_password() {
     assert_eq!(decoded, snapshot);
     assert_eq!(
         decoded.destinations[0].crypt.as_ref().map(|row| row.iv),
-        Some([0xA5; 16]),
+        Some(CRYPT_IV),
         "the IV a restore rebuilds a key from must survive the round trip"
+    );
+
+    // Non-vacuity, and the whole reason this drives the producer: the blob
+    // demonstrably *does* carry this member's crypt row, so a scan that finds
+    // nothing is a scan over the right bytes. The salt and the retained padding
+    // are the two things in it derived from the password's own material.
+    assert!(
+        contains_bytes(&blob, &CRYPT_SALT),
+        "the encoded blob must really contain the crypt row's salt"
+    );
+    assert!(
+        contains_bytes(&blob, &row.tail_plain),
+        "the encoded blob must really contain the retained tail padding"
     );
 
     // The one thing that must never be in there. Searched as bytes rather than
     // asserted structurally, because a password could only get in by accident
     // and an accident would not respect the struct.
-    let secret = b"moonlit-harbour";
     assert!(
-        !blob.windows(secret.len()).any(|window| window == secret),
+        !contains_bytes(&blob, CRYPT_PASSWORD.as_bytes()),
         "a coverage snapshot must never carry a password"
+    );
+
+    // And the type that actually holds it: a key ring in a log is a password on
+    // disk, so its `Debug` is part of the same guarantee.
+    let ring = router.crypt_debug();
+    assert!(
+        ring.contains("has_password: true"),
+        "non-vacuity — the ring under test is holding one, got {ring}"
+    );
+    assert!(
+        !ring.contains(CRYPT_PASSWORD),
+        "the key ring's Debug must never print the password, got {ring}"
+    );
+}
+
+#[test]
+fn a_partially_retained_padding_is_not_checkpointed_as_the_members_own_bytes() {
+    // E1 review F4, through the producer: the router's snapshot carries the
+    // padding only when every byte of it has arrived. `MemberCrypt`'s own tests
+    // pin the split arrival; this pins that the row the barrier writes agrees.
+    let plain: Vec<u8> = (0..600u32).map(|index| (index % 251) as u8).collect();
+    let router = encrypted_crypt_router(&plain, 64);
+    let row = router
+        .member_crypt_snapshots()
+        .values()
+        .next()
+        .expect("the row exists")
+        .clone();
+    assert_eq!(
+        row.tail_plain.len(),
+        usize::from(row.tail_padding),
+        "a padding retained whole is carried whole"
+    );
+    assert_eq!(
+        row.tail_plain.as_slice(),
+        b"abcdefgh",
+        "these are the member's real trailing plaintext, byte for byte — not the \
+         zero placeholders `retain_tail_padding` sizes the buffer with"
     );
 }
 

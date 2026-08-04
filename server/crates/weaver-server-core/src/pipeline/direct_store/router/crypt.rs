@@ -33,6 +33,42 @@
 //! posted-byte consumer with it) needs them, and they cannot be recovered from
 //! the destination file because they are not in it. They are kept per member and
 //! carried in the coverage snapshot.
+//!
+//! # What phase E2 inherits, and the one precondition it must not assume
+//!
+//! E1 decrypts on the way in and never has to answer in cipher space again.
+//! E2's re-encrypting overlay does, and it will read this module's two caches to
+//! do it — so the precondition they are maintained under has to be written down
+//! rather than rediscovered (E1 review F6).
+//!
+//! [`MemberCrypt::edge_plain`] and [`MemberCrypt::checkpoints`] are only ever
+//! valid for the bytes that produced them. A **repair** rewrites a span in
+//! place: the router's drain re-enters with `replace = true`, the destination
+//! takes the repaired plaintext, and the composition is overwritten — but a
+//! cached edge block covering the same offsets still holds the plaintext of the
+//! *damaged* bytes, and a checkpoint at that frontier still holds the damaged
+//! cipher. Nothing in E1 reads either one afterwards, which is why E1 is correct
+//! without touching them: the destination is the only consumer of a decrypted
+//! edge block, and it has already been written.
+//!
+//! E2 must not carry that assumption over. Re-encrypting a repaired edge block
+//! from `edge_plain`, or chaining a re-encryption from a `checkpoints` entry a
+//! repair has invalidated, would emit cipher for bytes the volume no longer
+//! holds — silently, because the values are structurally well-formed. The
+//! requirement is therefore explicit: **a span that arrives with `replace` set
+//! must invalidate every cached edge block and checkpoint its cipher range
+//! touches before the overlay may read them.** Where E1 has no reason to spend
+//! that work, E2 has no licence to skip it.
+//!
+//! # Privacy note: the retained padding is the user's plaintext
+//!
+//! Those ≤15 bytes are **decrypted content**, and the coverage snapshot is a
+//! row in weaver's database. Nothing else the snapshot carries is: the salt, the
+//! IV and the KDF count are what the archive states in the clear, and the cipher
+//! checkpoints are ciphertext. The password itself is never written anywhere.
+//! The padding is the one deliberate exception, it is bounded at 15 bytes per
+//! member, and it exists because E2's byte-exact re-encryption of the final
+//! block has no other source for it. See [`MemberCryptSnapshot::tail_plain`].
 
 use std::collections::BTreeMap;
 
@@ -77,6 +113,24 @@ pub(crate) enum CryptRefusal {
     /// member (file encryption for RAR4/RAR3 is phase E3), or a KDF count the
     /// crate refuses.
     Unkeyable,
+    /// The job's own spec declares a PAR2 file, and an encrypted set's
+    /// destinations hold plaintext where PAR2 describes the posted cipher
+    /// (plan 136, E1 review F1).
+    ///
+    /// Refused **at admission**, before a byte routes, rather than left to the
+    /// guard that runs behind the authoritative pass: that guard cannot fire
+    /// until the whole set has downloaded, and by then a demotion costs a full
+    /// refetch of every volume because an encrypted set's partials cannot
+    /// reconstruct posted bytes. Refusing here reproduces exactly what a
+    /// pre-plan-136 build did with the same job — one hard demotion on the first
+    /// header parse, one article back on the wire — instead of doubling it.
+    ///
+    /// Distinct from [`super::DemotionReason::EncryptedPar2Unsupported`], which
+    /// stays as the belt for a recovery set that genuinely appears late: a PAR2
+    /// file the spec did not classify as one at add time (a deobfuscated or
+    /// renamed file) can still turn up mid-job, and the set is already routing
+    /// by then.
+    Par2Declared,
 }
 
 impl CryptRefusal {
@@ -85,6 +139,7 @@ impl CryptRefusal {
             Self::NoPassword => "encrypted_no_password",
             Self::WrongPassword => "encrypted_wrong_password",
             Self::Unkeyable => "encrypted_unkeyable",
+            Self::Par2Declared => "encrypted_par2_declared",
         }
     }
 }
@@ -127,6 +182,10 @@ pub(crate) struct KeyRing {
     /// Whether any encrypted member has been admitted. Read by the eligibility
     /// gate, which counts an encrypted member routable only with one.
     admitted: bool,
+    /// The job declares a PAR2 file, so no encrypted member of this set may be
+    /// admitted at all ([`CryptRefusal::Par2Declared`]). Set once, from the
+    /// spec, when the set is built.
+    par2_declared: bool,
 }
 
 impl std::fmt::Debug for KeyRing {
@@ -137,6 +196,7 @@ impl std::fmt::Debug for KeyRing {
             .field("tuples", &self.keys.len())
             .field("refusal", &self.refusal)
             .field("admitted", &self.admitted)
+            .field("par2_declared", &self.par2_declared)
             .finish()
     }
 }
@@ -155,23 +215,44 @@ impl KeyRing {
             keys: BTreeMap::new(),
             refusal: None,
             admitted: false,
+            par2_declared: false,
         }
+    }
+
+    /// Refuses every encrypted member of this set because the job's spec
+    /// declares a PAR2 file (plan 136, E1 review F1).
+    ///
+    /// Deliberately **not** a sticky refusal: `refusal` going non-`None` here
+    /// would close [`Self::wants_password`] for a set with no encrypted member
+    /// at all, and the whole point is that a plaintext set in a par2-bearing job
+    /// is untouched by this. The verdict is reached at
+    /// [`Self::admit`] instead, which only an encrypted member reaches.
+    pub(crate) fn refuse_encrypted_for_par2(&mut self) {
+        self.par2_declared = true;
     }
 
     /// Whether the set is still willing to take a password.
     ///
     /// A password can arrive **after** the job was added — `setJobPassword` and
     /// the NZBGet facade's `*Unpack:Password` both mutate the live spec — so the
-    /// seam re-reads it while this is true. It stops the moment a password is
-    /// held, so a set with one costs nothing.
+    /// seam re-reads it while this is true.
+    ///
+    /// It stays true while a password is merely *held*, and goes false the
+    /// moment one is **admitted** (E1 review F5). The narrower "held" test this
+    /// replaces made [`Self::set_password`]'s changed-password branch dead code:
+    /// a job added with the wrong password and corrected before its first header
+    /// parsed would never see the correction, because the seam stopped asking
+    /// the instant any password existed. Costs one map lookup per article for a
+    /// job with no password — which is every conventional job — and one short
+    /// `String` clone per article for one that has one, until admission.
     pub(crate) fn wants_password(&self) -> bool {
-        self.password.is_none() && self.refusal.is_none()
+        !self.admitted && self.refusal.is_none()
     }
 
     /// Binds the job's password. A no-op once the same one is held, and refused
-    /// outright once a password has been refuted: re-admitting on a *changed*
-    /// password would need every routed byte re-decrypted, which is a demotion
-    /// with extra steps.
+    /// outright once a password has been refuted or admitted: re-admitting on a
+    /// *changed* password would need every routed byte re-decrypted, which is a
+    /// demotion with extra steps.
     pub(crate) fn set_password(&mut self, password: Option<&str>) {
         if self.refusal.is_some() || self.admitted {
             return;
@@ -200,6 +281,9 @@ impl KeyRing {
     /// The E-D1 decision for one encrypted member, made **before any byte of it
     /// routes**.
     ///
+    /// - The job declares a PAR2 file: refuse ([`CryptRefusal::Par2Declared`]).
+    ///   Nothing about the key is wrong; the set simply may not route, and this
+    ///   is the last moment refusing is free.
     /// - No password: refuse. An encrypted set routes only with one.
     /// - [`PasswordCheck::Wrong`]: refuse. The header states a value this
     ///   password does not reproduce, so every byte it decrypted would be
@@ -220,6 +304,9 @@ impl KeyRing {
     ) -> Result<MemberKeys, CryptRefusal> {
         if let Some(refusal) = self.refusal {
             return Err(refusal);
+        }
+        if self.par2_declared {
+            return Err(self.refuse(CryptRefusal::Par2Declared));
         }
         let Some(password) = self.password.clone() else {
             return Err(self.refuse(CryptRefusal::NoPassword));
@@ -287,8 +374,18 @@ pub(crate) struct MemberCryptSnapshot {
     pub(crate) data_hash_uses_mac: bool,
     pub(crate) cipher_size: u64,
     pub(crate) tail_padding: u8,
-    /// The ≤15 plaintext bytes past `unpacked_size`. Empty until the member's
-    /// final block has been decrypted.
+    /// The ≤15 plaintext bytes past `unpacked_size`.
+    ///
+    /// Either empty or exactly `tail_padding` long, and never a partially filled
+    /// buffer: a row is written only once every one of those bytes has really
+    /// arrived (E1 review F4). A padding that is half in hand at checkpoint time
+    /// is simply not carried, which costs nothing — the other half of its cipher
+    /// block is still outstanding, so the article carrying it comes back and the
+    /// whole block is retained in one piece on the resumed run.
+    ///
+    /// **This is decrypted user content in weaver's database.** Bounded at 15
+    /// bytes per member, and the only such field: see the module docs for why it
+    /// cannot come from anywhere else.
     pub(crate) tail_plain: Vec<u8>,
     /// `(cipher offset, the 16 cipher bytes ending there)`, one per contiguous
     /// decrypted run — which for an ordinary download is exactly one.
@@ -356,7 +453,18 @@ pub(crate) struct MemberCrypt {
     plain_runs: CrcRuns,
     /// The ≤15 plaintext bytes past `unpacked_size` (E-D2). Never written to the
     /// destination; retained because re-encrypting the final block needs them.
+    ///
+    /// **Decrypted user content**, and the only such state this module keeps —
+    /// it is also the only thing in the coverage snapshot that is not either
+    /// clear header material or ciphertext. See the module docs.
     tail_plain: Vec<u8>,
+    /// Which bytes of `tail_plain` have actually arrived: bit *i* is padding
+    /// byte *i*. `tail_plain` is resized to the full padding on the first
+    /// arrival, so its length says nothing about how much of it is real, and
+    /// [`Self::tail_padding_retained`] is a **verification precondition** —
+    /// answering it off a zero-filled buffer would let a member verify against
+    /// padding it never saw (E1 review F4).
+    tail_filled: u16,
 }
 
 impl MemberCrypt {
@@ -375,7 +483,15 @@ impl MemberCrypt {
             emitted: ByteRanges::new(),
             plain_runs: CrcRuns::default(),
             tail_plain: Vec::new(),
+            tail_filled: 0,
         }
+    }
+
+    /// The all-ones mask for `tail_padding` bytes. `tail_padding` is `0..16` by
+    /// construction (`cipher_size - unpacked_size`), and a restored row claiming
+    /// otherwise is refused as malformed before it reaches here.
+    fn tail_mask(&self) -> u16 {
+        (1u16 << u32::from(self.tail_padding.min(15))) - 1
     }
 
     /// Folds in what the newest headers say. The extent can only *resolve* —
@@ -493,7 +609,8 @@ impl MemberCrypt {
         self.emitted.missing(start, len).is_empty()
     }
 
-    /// Whether the ≤15 plaintext bytes past the member's end are in hand.
+    /// Whether the ≤15 plaintext bytes past the member's end are **all** in
+    /// hand.
     ///
     /// Read as a **verification precondition** rather than as a coverage
     /// question, because it has to survive a restart: `emitted` is per-process
@@ -502,8 +619,15 @@ impl MemberCrypt {
     /// snapshot carries the padding itself, so this answers the same way before
     /// and after a restart — and a member that is destination-complete without
     /// it is a member whose final block was never decrypted.
+    ///
+    /// Answered off the filled mask, not off `tail_plain.len()` (E1 review F4):
+    /// [`Self::retain_tail_padding`] resizes the buffer to the whole padding on
+    /// the *first* byte, so its length is true from the first arrival onwards
+    /// and would report a split arrival retained while the gaps were still
+    /// zeros — and `snapshot` would then persist those zeros as if they were the
+    /// member's own bytes.
     pub(crate) fn tail_padding_retained(&self) -> bool {
-        self.tail_plain.len() as u64 == u64::from(self.tail_padding)
+        self.tail_filled == self.tail_mask()
     }
 
     /// Seeds cipher coverage a previous run emitted (E-D4). Purely a duplicate
@@ -518,7 +642,8 @@ impl MemberCrypt {
     /// `offset` is where `plain` starts in member-logical space; only the part
     /// of it at or past `unpacked_size` is kept, and it is kept at its true
     /// position inside the padding so an out-of-order arrival cannot scramble
-    /// it.
+    /// it. Each byte's arrival is recorded in `tail_filled`, which is what
+    /// [`Self::tail_padding_retained`] answers from.
     pub(crate) fn retain_tail_padding(&mut self, unpacked_size: u64, offset: u64, plain: &[u8]) {
         let padding = u64::from(self.tail_padding);
         if padding == 0 {
@@ -537,6 +662,14 @@ impl MemberCrypt {
         let room = self.tail_plain.len().saturating_sub(at);
         let take = &take[..take.len().min(room)];
         self.tail_plain[at..at + take.len()].copy_from_slice(take);
+        // Clamped at the mask's width rather than at `tail_plain.len()`: the
+        // padding is `0..16` by construction and a restored row claiming
+        // otherwise is refused, so this can only ever be the loop bound — but a
+        // shift past 15 would be a panic rather than a wrong answer, and a
+        // header field is not something to take a panic on.
+        for index in at..(at + take.len()).min(AES_BLOCK as usize - 1) {
+            self.tail_filled |= 1u16 << (index as u32);
+        }
     }
 
     /// Layer 2's comparison (E-D3): the composed plain CRC32 over the member's
@@ -556,6 +689,14 @@ impl MemberCrypt {
     }
 
     /// The snapshot row for this member (E-D4).
+    ///
+    /// The padding is carried **only** once every byte of it has arrived (E1
+    /// review F4). A half-filled buffer is zeros in the gaps, and a row of zeros
+    /// is worse than no row: the resumed run would take it for the member's own
+    /// bytes and E2 would re-encrypt the final block from them. Dropping it
+    /// costs nothing, because a padding that is not whole means the rest of its
+    /// cipher block never arrived, so that article is still outstanding and
+    /// brings the whole block back in one piece.
     pub(crate) fn snapshot(&self, data_hash_uses_mac: bool) -> Option<MemberCryptSnapshot> {
         Some(MemberCryptSnapshot {
             salt: self.salt,
@@ -565,7 +706,10 @@ impl MemberCrypt {
             data_hash_uses_mac,
             cipher_size: self.cipher_size?,
             tail_padding: self.tail_padding,
-            tail_plain: self.tail_plain.clone(),
+            tail_plain: match self.tail_padding_retained() {
+                true => self.tail_plain.clone(),
+                false => Vec::new(),
+            },
             checkpoints: self
                 .checkpoints
                 .iter()
@@ -598,9 +742,13 @@ impl MemberCrypt {
         {
             return Err(CryptRestoreError::FactsDisagree);
         }
+        // A stored padding is all or nothing (E1 review F4): the writer only
+        // emits one it has whole, so a short-but-non-empty row is a torn or
+        // hand-made one and cannot be told from a real partial.
         if u64::from(stored.tail_padding) >= AES_BLOCK
             || !stored.cipher_size.is_multiple_of(AES_BLOCK)
-            || stored.tail_plain.len() > usize::from(stored.tail_padding)
+            || (!stored.tail_plain.is_empty()
+                && stored.tail_plain.len() != usize::from(stored.tail_padding))
             || stored.checkpoints.iter().any(|(offset, _)| {
                 !offset.is_multiple_of(AES_BLOCK) || *offset > stored.cipher_size
             })
@@ -609,6 +757,10 @@ impl MemberCrypt {
         }
         self.cipher_size = Some(stored.cipher_size);
         self.tail_plain = stored.tail_plain.clone();
+        self.tail_filled = match stored.tail_plain.is_empty() {
+            true => 0,
+            false => self.tail_mask(),
+        };
         for (offset, block) in &stored.checkpoints {
             self.checkpoints.insert(*offset, *block);
             // A checkpoint is a decrypted-run frontier, so the block it names is
@@ -684,6 +836,54 @@ mod tests {
     }
 
     #[test]
+    fn a_password_corrected_before_admission_replaces_the_one_it_was_added_with() {
+        // E1 review F5. `set_password`'s changed-password branch was dead: the
+        // seam that calls it stopped asking the moment *any* password was held,
+        // so a job added with the wrong one and corrected before its first
+        // header parsed admitted with the stale one and then failed the keyed
+        // member gate several gigabytes later.
+        let facts = facts(Some(password_check_for("right", &[7u8; 16], 4)));
+        let mut ring = KeyRing::new();
+        ring.set_password(Some("wrong"));
+        assert!(
+            ring.wants_password(),
+            "a held-but-unadmitted password must not close the window"
+        );
+        ring.set_password(Some("right"));
+        assert!(ring.admit(&facts).is_ok(), "the correction must be the one");
+        assert!(ring.admitted());
+        assert!(
+            !ring.wants_password(),
+            "admission is what closes the window, and it must close it"
+        );
+        // And it stays closed: re-decrypting every routed byte is a demotion
+        // with extra steps.
+        ring.set_password(Some("another"));
+        assert_eq!(ring.keys.len(), 1);
+    }
+
+    #[test]
+    fn a_par2_bearing_job_refuses_every_encrypted_member_at_admission() {
+        // E1 review F1. The guard behind the authoritative pass cannot fire
+        // until the whole set has downloaded; this one fires on the first header
+        // parse, which is where the pre-plan-136 hard demotion was.
+        let mut ring = KeyRing::new();
+        ring.set_password(Some("right"));
+        ring.refuse_encrypted_for_par2();
+        assert_eq!(
+            ring.admit(&facts(None)).err(),
+            Some(CryptRefusal::Par2Declared)
+        );
+        assert!(!ring.admitted());
+        // Sticky, and by its own name rather than the key ring's fallback.
+        assert_eq!(ring.refusal(), Some(CryptRefusal::Par2Declared));
+        assert_eq!(
+            CryptRefusal::Par2Declared.metric(),
+            "encrypted_par2_declared"
+        );
+    }
+
+    #[test]
     fn a_wrong_password_with_no_check_admits_provisionally() {
         let mut ring = KeyRing::new();
         ring.set_password(Some("wrong"));
@@ -745,6 +945,92 @@ mod tests {
         let plain: Vec<u8> = (32u8..48).collect();
         crypt.retain_tail_padding(43, 32, &plain);
         assert_eq!(crypt.tail_plain(), &[43, 44, 45, 46, 47]);
+        assert!(crypt.tail_padding_retained());
+    }
+
+    #[test]
+    fn a_split_arrival_padding_is_not_retained_until_every_byte_of_it_is_real() {
+        // E1 review F4. `retain_tail_padding` zero-fills the whole padding on
+        // the *first* byte, so a length test reports a half-arrived padding
+        // retained — and `snapshot` then persists the zeros as if the member had
+        // produced them. That is exactly E2's byte-exact final-block input.
+        let mut crypt = MemberCrypt::new(
+            MemberKeys {
+                key: [1u8; 32],
+                hash_key: [2u8; 32],
+            },
+            &facts(None),
+        );
+        crypt.cipher_size = Some(48);
+        crypt.tail_padding = 5;
+
+        // The tail's last two bytes only.
+        crypt.retain_tail_padding(43, 46, &[0xAA, 0xBB]);
+        assert_eq!(
+            crypt.tail_plain().len(),
+            5,
+            "the buffer is sized for the whole padding on the first arrival, which \
+             is what made the length test vacuous"
+        );
+        assert!(
+            !crypt.tail_padding_retained(),
+            "three of the five bytes are still zero placeholders"
+        );
+        assert_eq!(
+            crypt.snapshot(true).map(|row| row.tail_plain),
+            Some(Vec::new()),
+            "a padding that is not whole must not be persisted at all"
+        );
+
+        // The rest, and only now is it the member's own padding.
+        crypt.retain_tail_padding(43, 43, &[0x11, 0x22, 0x33]);
+        assert!(crypt.tail_padding_retained());
+        assert_eq!(crypt.tail_plain(), &[0x11, 0x22, 0x33, 0xAA, 0xBB]);
+        assert_eq!(
+            crypt.snapshot(true).map(|row| row.tail_plain),
+            Some(vec![0x11, 0x22, 0x33, 0xAA, 0xBB])
+        );
+    }
+
+    #[test]
+    fn a_restored_row_with_a_short_padding_is_refused_rather_than_half_trusted() {
+        // The restore side of F4: the writer emits the padding whole or not at
+        // all, so a short-but-non-empty row cannot be told from a torn one.
+        let facts = facts(None);
+        let mut crypt = MemberCrypt::new(
+            MemberKeys {
+                key: [1u8; 32],
+                hash_key: [2u8; 32],
+            },
+            &facts,
+        );
+        crypt.cipher_size = Some(48);
+        crypt.tail_padding = 5;
+        let row = MemberCryptSnapshot {
+            salt: facts.salt,
+            kdf_count_lg2: facts.kdf_count_lg2,
+            iv: facts.iv,
+            psw_check_present: false,
+            data_hash_uses_mac: true,
+            cipher_size: 48,
+            tail_padding: 5,
+            tail_plain: vec![1, 2, 3],
+            checkpoints: Vec::new(),
+        };
+        assert_eq!(crypt.restore(&row, true), Err(CryptRestoreError::Malformed));
+
+        // An empty one restores and reports the padding as still outstanding,
+        // which is the honest answer — the article holding it is coming back.
+        let mut empty = row.clone();
+        empty.tail_plain = Vec::new();
+        assert!(crypt.restore(&empty, true).is_ok());
+        assert!(!crypt.tail_padding_retained());
+
+        // And a whole one restores as retained.
+        let mut whole = row;
+        whole.tail_plain = vec![1, 2, 3, 4, 5];
+        assert!(crypt.restore(&whole, true).is_ok());
+        assert!(crypt.tail_padding_retained());
     }
 
     #[test]

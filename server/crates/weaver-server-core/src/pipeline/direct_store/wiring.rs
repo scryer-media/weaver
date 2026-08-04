@@ -420,6 +420,9 @@ impl Pipeline {
         if !self.direct_store.gate().is_enabled() {
             return;
         }
+        // Plan 136, E1 review F1. Read before the sets exist, because it decides
+        // whether an encrypted member of any of them may be admitted at all.
+        let par2_declared = self.job_spec_has_par2_file(job_id);
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
@@ -469,6 +472,19 @@ impl Pipeline {
                 // with, if any; `refresh_direct_passwords` picks up one that
                 // arrives later. Held in memory only.
                 set.router.set_password(password.as_deref());
+                // E1 review F1. A par2-bearing job refuses encrypted admission
+                // on the *first* header parse, where the refusal costs one
+                // article. The `EncryptedPar2Unsupported` guard behind the
+                // authoritative pass stays as the belt for a recovery set the
+                // spec did not declare — a deobfuscated or renamed PAR2 file can
+                // still turn up mid-job — but as the *only* guard it fired after
+                // the whole set had downloaded, and an encrypted set cannot
+                // reconstruct posted bytes from its plaintext partials, so the
+                // demotion refetched every volume. Twice the bytes and twice the
+                // wall for a job that used to pay one article.
+                if par2_declared {
+                    set.router.refuse_encrypted_for_par2();
+                }
                 set
             })
             .collect();
@@ -484,15 +500,31 @@ impl Pipeline {
     /// `GroupSetParameter *Unpack:Password` both mutate the live `JobSpec` in
     /// place — and [`Self::ensure_direct_sets`] is memoized per job, so a set
     /// built before the password arrived would never see it. Re-reading it here
-    /// costs one map lookup per article and stops the moment a set holds a
+    /// costs one map lookup per article and stops the moment a set **admits** a
     /// password or leaves direct mode, which for every set with no encrypted
     /// member is the first parse.
     ///
+    /// # The window closes at the first header parse (E1 review F5)
+    ///
+    /// Admission runs from the first successful header parse, so "after the job
+    /// was added" means *before the first article of the first volume*, not any
+    /// time during the download. A password arriving later finds the set already
+    /// demoted under `EncryptedMemberRefused(NoPassword)` and does not revive
+    /// it — see [`super::router::DirectSetRouter::wants_password`] for why
+    /// waiting instead would be worse than demoting.
+    ///
+    /// Within that window a **changed** password does land, which is the case
+    /// the narrower "still has no password" test used to drop on the floor: a
+    /// job added with the wrong password and corrected before its first parse
+    /// now admits with the correction rather than deriving keys from the stale
+    /// one and failing the keyed member gate a whole download later.
+    ///
     /// It deliberately does **not** re-admit a set that already demoted for a
-    /// wrong or missing password. Re-admission would mean re-decrypting every
-    /// byte already written under the old verdict, which is a demotion with
-    /// extra steps; the conventional path takes the set and asks the job's whole
-    /// candidate list, which is a superset of this one.
+    /// wrong or missing password, or one that has already admitted. Re-admission
+    /// would mean re-decrypting every byte already written under the old
+    /// verdict, which is a demotion with extra steps; the conventional path
+    /// takes the set and asks the job's whole candidate list, which is a
+    /// superset of this one.
     fn refresh_direct_passwords(&mut self, job_id: JobId) {
         if !self
             .direct_store
@@ -561,6 +593,24 @@ impl Pipeline {
             })
     }
 
+    /// Whether this file is a source volume of a live direct set that is
+    /// **decrypting on the way to its destinations** (plan 136, E1 review F3).
+    ///
+    /// The one question every posted-byte consumer has to ask before it reads a
+    /// virtual volume: for such a set the partials hold plaintext and the volume
+    /// it is being asked to answer for held cipher, so the honest answer is no
+    /// answer at all.
+    pub(crate) fn direct_volume_routes_encrypted(&self, file_id: NzbFileId) -> bool {
+        self.direct_store
+            .sets_for(file_id.job_id)
+            .iter()
+            .any(|set| {
+                !set.is_demoted()
+                    && set.router.routes_encrypted()
+                    && set.plan().volume_for_file(file_id.file_index).is_some()
+            })
+    }
+
     /// The virtual volume behind one direct source file, as a **one-volume**
     /// provider plus its logical length (plan 135, D5).
     ///
@@ -574,10 +624,21 @@ impl Pipeline {
     /// `None` for anything that is not a live direct set's source volume,
     /// including a demoted set's — whose volumes are materializing or being
     /// refetched, and are read from disk like any other file.
+    ///
+    /// Also `None` for an **encrypted** set's volume (E1 review F3). The
+    /// provider would assemble the answer out of the envelope plus the member
+    /// partials, and those partials are plaintext where the source volume held
+    /// cipher — so every read that crossed a routed member would come back
+    /// wrong, and PAR2 would call a byte-perfect volume damaged. A caller that
+    /// falls back to the on-disk path finds no file and leaves its blocks
+    /// pending, which is the correct verdict: nothing has been verified.
     pub(crate) fn direct_virtual_volume(
         &self,
         file_id: NzbFileId,
     ) -> Option<(u32, u64, super::provider::HybridVolumeProvider)> {
+        if self.direct_volume_routes_encrypted(file_id) {
+            return None;
+        }
         let job_id = file_id.job_id;
         let (set, volume_index) =
             self.direct_store
@@ -1803,7 +1864,18 @@ impl Pipeline {
         // first call answers `skip_job` and every later one is a set lookup.
         // The call stays because the refusal is phase 4's, not the seam's:
         // phase 5 admits those jobs and this is where their coverage comes from.
-        self.note_live_par2_segment(file_id, file_offset, &segment.data);
+        //
+        // Plan 136, E1 review F3: an encrypted set is kept out of live
+        // verification entirely. These bytes are honest — posted cipher, taken
+        // before the write transform — but a block straddling an article
+        // boundary is only ever settled by a read-back, and the read-back
+        // resolves to the member's plaintext partial. Feeding a stream whose
+        // every boundary block must come back `Bad` is worse than not feeding
+        // one, so the refusal is on both halves and `direct_virtual_volume` is
+        // the other.
+        if !self.direct_volume_routes_encrypted(file_id) {
+            self.note_live_par2_segment(file_id, file_offset, &segment.data);
+        }
         drop(bytes);
 
         self.commit_direct_segment(segment_id, decoded_size, set_index, volume_index)

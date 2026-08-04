@@ -43,6 +43,15 @@ pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 ///   without re-encrypting the member from its IV. A v3 reader would see a claim
 ///   over plaintext and treat it as posted bytes, which is why this is a version
 ///   bump and not an optional field.
+///
+/// # The v3 refusal is a release note (plan 136, E1 review F8)
+///
+/// Refusing rather than upgrading means **a direct-store set checkpointed by a
+/// pre-0.8.0 build re-downloads its volumes once on the first start after the
+/// upgrade**. Nothing is lost and no job fails — the cost is exactly one
+/// redownload per set that was mid-download across the upgrade — but it is
+/// user-visible traffic and belongs in the notes rather than in a support
+/// thread.
 pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 4;
 
 const FRAME_HEADER_LEN: usize = 6;
