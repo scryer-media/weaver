@@ -2365,7 +2365,7 @@ jobs:
           retention-days: 14
       - name: Encode SLSA subjects
         id: subjects
-        uses: slsa-framework/slsa-github-generator/actions/generator/generic/create-base64-subjects-from-file@v2.1.0
+        uses: slsa-framework/slsa-github-generator/actions/generator/generic/create-base64-subjects-from-file@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
         with:
           path: slsa-subjects.txt
 
