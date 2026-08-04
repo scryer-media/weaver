@@ -1550,9 +1550,10 @@ impl Pipeline {
         // in, and every byte its CBC chain needs was dropped from staging when
         // the original article was routed. Two sources put them back, and
         // neither of them changes a byte: the ones just below the span come off
-        // the materialized volume, and the ≤15 in a *neighbouring* volume that
-        // complete an edge block of a member extent come off that neighbour's
-        // own virtual volume, re-encrypted by the overlay.
+        // the materialized volume, and the ≤46 in a *neighbouring* volume that
+        // complete an edge block of a member extent — and, at the low edge, that
+        // block's own CBC predecessor — come off that neighbour's own virtual
+        // volume, re-encrypted by the overlay.
         let cipher_lead_in = self
             .direct_store
             .set(job_id, set_index)
@@ -1643,14 +1644,15 @@ impl Pipeline {
         true
     }
 
-    /// The ≤15 posted bytes per member-extent edge that live in a **neighbouring**
-    /// volume of the same set (plan 136, E2).
+    /// The few posted bytes per member-extent edge that live in a
+    /// **neighbouring** volume of the same set (plan 136, E2).
     ///
     /// Read through the set's own virtual provider, which re-encrypts them out
     /// of the neighbour's destination — those bytes did not change, so what
     /// comes back is exactly what was posted there. Blocking work, but bounded
-    /// at 30 bytes per member extent of one volume, so it is done inline rather
-    /// than on the pool.
+    /// at 46 bytes per member extent of one volume — ≤31 below it, which is the
+    /// straddling block plus its CBC predecessor (E2 review F1), and ≤15 above
+    /// — so it is done inline rather than on the pool.
     fn read_cipher_edges(
         &self,
         job_id: JobId,

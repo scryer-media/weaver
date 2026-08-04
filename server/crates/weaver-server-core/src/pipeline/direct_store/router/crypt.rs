@@ -98,8 +98,9 @@
 use std::collections::BTreeMap;
 
 use weaver_unrar::{
-    EncryptedStore, KdfCache, PasswordCheck, RarVolumeMemberEncryptionFacts, check_member_password,
-    convert_crc32_to_mac, decrypt_cipher_range, derive_rar5_material,
+    EncryptedStore, KdfCache, PasswordCheck, RarResult, RarVolumeMemberEncryptionFacts,
+    check_member_password, convert_crc32_to_mac, decrypt_cipher_range, derive_rar5_material,
+    encrypt_cipher_range,
 };
 
 use super::CrcRuns;
@@ -522,16 +523,26 @@ impl MemberCipher {
         end <= start || self.covered.missing(start, end - start).is_empty()
     }
 
-    /// CBC-encrypts `plain` — a whole number of blocks starting immediately
-    /// after `preceding` — back into the bytes that were posted.
+    /// CBC-encrypts `buffer` **in place** — a whole number of blocks whose
+    /// plaintext starts immediately after `preceding` — back into the bytes that
+    /// were posted.
     ///
     /// The inverse of [`decrypt_cipher_range`], and deliberately the *same*
     /// backend: `weaver-unrar` picks AWS-LC or the pure-Rust cipher per target
     /// and pins the two equal with differential tests, so re-encrypting through
     /// it cannot drift from the decrypt weaver already trusts.
-    pub(crate) fn encrypt(&self, preceding: &[u8; 16], plain: &[u8]) -> Vec<u8> {
-        debug_assert!(plain.len().is_multiple_of(AES_BLOCK as usize));
-        weaver_unrar::test_support::encrypt_aes256_cbc(&self.key, preceding, plain)
+    ///
+    /// In place, and **fallible**, for two reasons the review named (E2, F5 and
+    /// the test-support note). In place because the overlay's caller already
+    /// owns a buffer the plaintext was read into, and returning a fresh `Vec`
+    /// meant copying every re-encrypted byte twice. Fallible because the caller
+    /// is a reader on the blocking pool: a violated length contract has to come
+    /// back as a hole it can report as unavailable bytes, never as a panic
+    /// inside a `spawn_blocking` task. The contract holds by construction —
+    /// `cipher_size` is `align16` and every range here is block-derived — so
+    /// what is at stake is the failure *mode*, not a live failure.
+    pub(crate) fn encrypt(&self, preceding: &[u8; 16], buffer: &mut [u8]) -> RarResult<()> {
+        encrypt_cipher_range(&self.key, preceding, buffer)
     }
 }
 
@@ -1199,7 +1210,10 @@ mod tests {
         // And the seed really is the predecessor: re-encrypting from it
         // reproduces the posted bytes exactly.
         let at = (CHECKPOINT_STRIDE * 2) as usize;
-        let reencrypted = facts.encrypt(&seed.preceding, &plain[at..at + 4096]);
+        let mut reencrypted = plain[at..at + 4096].to_vec();
+        facts
+            .encrypt(&seed.preceding, &mut reencrypted)
+            .expect("a block-aligned range must not be refused");
         let posted = weaver_unrar::test_support::encrypt_aes256_cbc(&keys.key, &[9u8; 16], &plain);
         assert_eq!(reencrypted, posted[at..at + 4096]);
 

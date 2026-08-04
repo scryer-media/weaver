@@ -1470,6 +1470,22 @@ pub(crate) struct DirectSetRouter {
     /// blake3 for every span of a 2 000-volume set is real work to conclude
     /// nothing happened.
     member_facts_revision: u64,
+    /// Cached [`Self::member_ciphers`] (plan 136, E2 review F4).
+    ///
+    /// The read is per **PAR2 read-back**: live verification issues one read per
+    /// straddling block, each of which assembles a provider, and E2 made the
+    /// value it copies ~1000× bigger than E1's — one checkpoint per member
+    /// became one per [`crypt::CHECKPOINT_STRIDE`], so a 50 GiB member is some
+    /// 12,800 `BTreeMap` nodes plus a coverage map, deep-cloned per call. The
+    /// facts change per *decrypt*, which for the same read is nothing at all.
+    ///
+    /// Behind a lock because the read path takes `&self`; dropped by
+    /// [`Self::member_mut`], which every mutable path to a member goes through.
+    member_ciphers_cache:
+        std::sync::Mutex<Option<std::sync::Arc<HashMap<u32, crypt::MemberCipher>>>>,
+    /// How many times that cache has been built, so a test can prove it is one.
+    #[cfg(test)]
+    member_ciphers_builds: std::sync::atomic::AtomicU64,
     /// How many times the drain has held a cipher block because the other half
     /// of it had not arrived (E-D2). The production account of this is the
     /// `direct_store.encrypted.block_held` probe; this is the same fact in a
@@ -1516,6 +1532,9 @@ impl DirectSetRouter {
             migrated: Vec::new(),
             retired_destinations: Vec::new(),
             member_facts_revision: 0,
+            member_ciphers_cache: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            member_ciphers_builds: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             blocks_held: 0,
             demoted: None,
@@ -1590,7 +1609,26 @@ impl DirectSetRouter {
     /// it always did, then re-encrypts the plaintext it reads back out of the
     /// partial. Empty for every unencrypted set, which is the overlay switched
     /// off by construction.
-    pub(crate) fn member_ciphers(&self) -> HashMap<u32, crypt::MemberCipher> {
+    ///
+    /// Shared rather than rebuilt (E2 review F4): every caller wraps the result
+    /// in an `Arc` and hands it to a provider, and the facts only move when a
+    /// member's crypt state or coverage does — see [`Self::member_ciphers_cache`].
+    pub(crate) fn member_ciphers(&self) -> std::sync::Arc<HashMap<u32, crypt::MemberCipher>> {
+        let Ok(mut slot) = self.member_ciphers_cache.lock() else {
+            return std::sync::Arc::new(self.build_member_ciphers());
+        };
+        if let Some(cached) = slot.as_ref() {
+            return std::sync::Arc::clone(cached);
+        }
+        let built = std::sync::Arc::new(self.build_member_ciphers());
+        *slot = Some(std::sync::Arc::clone(&built));
+        built
+    }
+
+    fn build_member_ciphers(&self) -> HashMap<u32, crypt::MemberCipher> {
+        #[cfg(test)]
+        self.member_ciphers_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.members
             .iter()
             .filter_map(|(member_id, member)| {
@@ -1601,6 +1639,36 @@ impl DirectSetRouter {
                 Some((*member_id, facts))
             })
             .collect()
+    }
+
+    /// How many times [`Self::member_ciphers`] has really rebuilt its snapshot,
+    /// which is the only way to tell a cache from a coincidence.
+    #[cfg(test)]
+    pub(crate) fn member_ciphers_builds(&self) -> u64 {
+        self.member_ciphers_builds
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// One member, for mutation.
+    ///
+    /// **Every** `&mut` path to a member goes through here, and that is what
+    /// keeps [`Self::member_ciphers`]' snapshot honest (E2 review F4): the
+    /// snapshot copies each member's checkpoints, retained padding and coverage,
+    /// and nothing about handing out a `&mut MemberRouting` says which of those
+    /// the caller is about to move. Dropping the snapshot on every mutable
+    /// access costs one rebuild per batch of routing and cannot be forgotten the
+    /// way a list of "the mutations that matter" can.
+    fn member_mut(&mut self, member_id: u32) -> Option<&mut MemberRouting> {
+        self.invalidate_member_ciphers();
+        self.members.get_mut(&member_id)
+    }
+
+    /// Drops the cached snapshot. For the two member mutations that are not a
+    /// `&mut` borrow of an existing one — adoption and removal.
+    fn invalidate_member_ciphers(&mut self) {
+        if let Ok(slot) = self.member_ciphers_cache.get_mut() {
+            *slot = None;
+        }
     }
 
     /// Posted cipher bytes in **other** volumes that a repair of `volume_index`
@@ -1615,11 +1683,23 @@ impl DirectSetRouter {
     /// the edge block cannot be assembled at all — and `route_repaired`'s "every
     /// repaired byte finds a destination" rule then demotes the whole set.
     ///
-    /// Returns `(volume, physical offset, length)` reads, each at most 15 bytes,
-    /// that the caller answers **through the provider overlay** — those bytes did
-    /// not change, so re-encrypting them from the neighbour's own destination
-    /// reproduces exactly what was posted — and hands back to
-    /// [`Self::route_repaired`] as unrepaired lead-in.
+    /// The **low** edge is a block wider than the block that straddles it, and
+    /// that block is why (E2 review F1). Decrypting the extent's first block
+    /// needs its CBC predecessor as well as its own 16 bytes — exactly what the
+    /// same-volume lead-in spends its 32 bytes on — and for a non-first volume
+    /// that predecessor is in the neighbour too.
+    /// Reading only `[block_floor(low), low)` left it out, so damage in the
+    /// first article of any non-first volume of a split encrypted member could
+    /// not be re-routed at all: no checkpoint survives at `block_floor(low)`
+    /// once the two volumes' decrypted runs coalesce, `member_cipher` has
+    /// nothing staged below the extent, the span holds, and the whole set
+    /// demotes under `RepairRerouteFailed` into a full refetch.
+    ///
+    /// Returns `(volume, physical offset, length)` reads — at most 31 bytes at a
+    /// low edge and 15 at a high one — that the caller answers **through the
+    /// provider overlay** (those bytes did not change, so re-encrypting them
+    /// from the neighbour's own destination reproduces exactly what was posted)
+    /// and hands back to [`Self::route_repaired`] as unrepaired lead-in.
     pub(crate) fn cipher_edge_reads(&self, volume_index: u32) -> Vec<(u32, u64, u64)> {
         let mut reads = Vec::new();
         for extent in self.volume_member_extents(volume_index) {
@@ -1632,7 +1712,11 @@ impl DirectSetRouter {
             let low = extent.logical_offset;
             let high = extent.logical_offset.saturating_add(extent.len);
             for (from, to) in [
-                (block_floor(low), low),
+                // One block below the straddling block: that block's own CBC
+                // predecessor, without which it cannot be decrypted (F1). At
+                // offset 0 this collapses to an empty read, which is right —
+                // block 0's predecessor is the member's IV.
+                (block_floor(low).saturating_sub(AES_BLOCK), low),
                 (high, block_ceil(high).min(cipher_size)),
             ] {
                 if from >= to {
@@ -1703,6 +1787,26 @@ impl DirectSetRouter {
     /// runs once the payload is in, so "still downloading" is belt rather than
     /// braces — but it is the difference between a narrow refusal and one that
     /// fires on every non-block-aligned member mid-flight.
+    ///
+    /// # What it does not ask (E2 review F3)
+    ///
+    /// It never asks whether every routed byte is *reachable*. A ranged
+    /// re-encryption seeds at the nearest checkpoint at or below its offset and
+    /// chains up from there, so an **interior coverage hole** makes every read
+    /// whose seed lies below it refuse — the overlay will not chain across
+    /// plaintext it does not have — while this returns `false`.
+    ///
+    /// In the download path that shape does not arise: CBC forces every byte
+    /// above a gap to be held, so a member with a hole has no coverage above it
+    /// to be unreachable. A restart can produce it, because `restore` seeds
+    /// `covered` from the extents the checkpoint recorded and those may be
+    /// disjoint. The consequence is bounded and already true: reads in the
+    /// ≤[`crypt::CHECKPOINT_STRIDE`] band above the hole refuse, so the pass
+    /// reports damage in a region that *is* damaged — the hole itself is missing
+    /// bytes — and PAR2 repairs or the set demotes on the ordinary path. It is a
+    /// wider damage report than strictly necessary, not a byte fabricated or a
+    /// hole passed off as sound, which is why this stays a note rather than a
+    /// third refusal that would have to walk every member's coverage per call.
     pub(crate) fn posted_bytes_unavailable(&self) -> bool {
         if !self.crypt.admitted() {
             return false;
@@ -2122,8 +2226,9 @@ impl DirectSetRouter {
         // Plan 136, E2. Posted bytes an encrypted member's drain needs beside the
         // repaired span: the ones just below it, so the block its first byte
         // lands in and that block's CBC predecessor can be assembled, and the
-        // ≤15 in a *neighbouring volume* that complete an edge block of a member
-        // extent ([`Self::cipher_edge_reads`]). Marked **unrepaired** on purpose:
+        // ≤46 in a *neighbouring volume* that complete an edge block of a member
+        // extent, and its predecessor ([`Self::cipher_edge_reads`]). Marked
+        // **unrepaired** on purpose:
         // they did not change, so they must not overwrite a composition, and the
         // "every repaired byte finds a destination" rule below must not answer
         // for them.
@@ -2141,7 +2246,20 @@ impl DirectSetRouter {
         }
 
         self.try_parse_volume(volume_index)?;
-        let volumes: Vec<u32> = self.staging.keys().copied().collect();
+        // The repaired volume drains **first**, and only then does every staged
+        // volume drain in the usual ascending order (E2 review F1).
+        //
+        // A low-edge lead-in is staged in the neighbour *below* the repaired
+        // volume, which in ascending order drains before it — and that drain
+        // routes the straddling block's bytes away as an ordinary duplicate, so
+        // the volume they were read for finds them gone and holds its first
+        // block. Priming with the repaired volume costs one extra drain of a
+        // volume that is about to be drained anyway and takes nothing away from
+        // the ascending pass, which is still what lets a header in one volume
+        // release another's holds.
+        let volumes: Vec<u32> = std::iter::once(volume_index)
+            .chain(self.staging.keys().copied())
+            .collect();
         let mut spans = self.take_migrated_spans();
         for volume in volumes {
             spans.extend(self.drain_volume(volume)?);
@@ -2820,20 +2938,27 @@ impl DirectSetRouter {
                 continue;
             }
             if let Some(member_id) = self.member_ids.get(&name).copied() {
-                if let Some(existing) = self.members.get_mut(&member_id) {
+                // Recorded and applied after the member borrow ends: the member
+                // accessor borrows the whole router, because dropping the crypt
+                // snapshot is part of what it does (E2 review F4).
+                let mut size_moved = false;
+                if let Some(existing) = self.member_mut(member_id) {
                     // A size that actually moved is a digest fact that moved:
                     // the first header of a member can declare none at all
                     // (`unwrap_or(0)`) and a later one fill it in, and the
                     // checkpoint's digest binds the size it was written under.
                     if existing.unpacked_size != unpacked_size {
                         existing.unpacked_size = unpacked_size;
-                        self.member_facts_revision = self.member_facts_revision.saturating_add(1);
+                        size_moved = true;
                     }
                     if let (Some(facts), Some(crypt)) = (encrypted, existing.crypt.as_mut()) {
                         // The cipher extent resolves — from unknown to known —
                         // as the headers that declare a size arrive.
                         crypt.observe(&facts);
                     }
+                }
+                if size_moved {
+                    self.member_facts_revision = self.member_facts_revision.saturating_add(1);
                 }
                 continue;
             }
@@ -2850,6 +2975,7 @@ impl DirectSetRouter {
             let member_id = self.next_member_id;
             self.next_member_id = self.next_member_id.saturating_add(1);
             self.member_ids.insert(name.clone(), member_id);
+            self.invalidate_member_ciphers();
             self.members.insert(
                 member_id,
                 MemberRouting {
@@ -3200,6 +3326,7 @@ impl DirectSetRouter {
             }
         }
         self.routed_extents.retain(|_, held| !held.is_empty());
+        self.invalidate_member_ciphers();
         if let Some(member) = self.members.remove(&member_id) {
             self.member_ids.remove(&member.name);
             // The barrier's claim on the partial goes with the partial. Parked
@@ -3571,7 +3698,7 @@ impl DirectSetRouter {
             return Ok(());
         };
         let (part_position, part_logical_offset, part_len, packed_crc32) = part;
-        let Some(member) = self.members.get_mut(&member_id) else {
+        let Some(member) = self.member_mut(member_id) else {
             return Ok(());
         };
         if member.covered.insert(logical_offset, len) == 0 && !replace {
@@ -3733,8 +3860,7 @@ impl DirectSetRouter {
         // downstream could notice.
         if replace
             && let Some(crypt) = self
-                .members
-                .get_mut(&member_id)
+                .member_mut(member_id)
                 .and_then(|member| member.crypt.as_mut())
         {
             crypt.invalidate_repaired(logical_offset, len);
@@ -3778,8 +3904,7 @@ impl DirectSetRouter {
                 (Some(preceding), Some(cipher)) => {
                     let mut plain = cipher.clone();
                     let decrypted = self
-                        .members
-                        .get_mut(&member_id)
+                        .member_mut(member_id)
                         .and_then(|member| member.crypt.as_mut())
                         .is_some_and(|crypt| {
                             crypt.decrypt_range(mid_start, &preceding, &mut plain)
@@ -3883,8 +4008,7 @@ impl DirectSetRouter {
         let cipher = self.member_cipher(member_id, block_start, AES_BLOCK)?;
         let mut plain = cipher;
         let crypt = self
-            .members
-            .get_mut(&member_id)?
+            .member_mut(member_id)?
             .crypt
             .as_mut()
             .expect("an encrypted member's crypt state is created with the member");
@@ -3999,7 +4123,7 @@ impl DirectSetRouter {
             .get(layout_index)
             .and_then(|member| member.parts.get(part_position as usize))
             .is_some_and(|part| part.packed_hash_uses_mac);
-        let Some(member) = self.members.get_mut(&member_id) else {
+        let Some(member) = self.member_mut(member_id) else {
             return Ok(());
         };
         let Some(crypt) = member.crypt.as_mut() else {
@@ -4163,7 +4287,7 @@ impl DirectSetRouter {
             if expected != 0 {
                 return Err(self.fail(DemotionReason::MemberChecksumMismatch));
             }
-            if let Some(member) = self.members.get_mut(&member_id) {
+            if let Some(member) = self.member_mut(member_id) {
                 member.verified = true;
             }
             return Ok(());
@@ -4200,7 +4324,7 @@ impl DirectSetRouter {
             if crypt.fold_member_crc(composed, uses_mac) != expected {
                 return Err(self.fail(DemotionReason::MemberChecksumMismatch));
             }
-            if let Some(member) = self.members.get_mut(&member_id) {
+            if let Some(member) = self.member_mut(member_id) {
                 member.verified = true;
             }
             return Ok(());
@@ -4216,7 +4340,7 @@ impl DirectSetRouter {
         if composed != expected {
             return Err(self.fail(DemotionReason::MemberChecksumMismatch));
         }
-        if let Some(member) = self.members.get_mut(&member_id) {
+        if let Some(member) = self.member_mut(member_id) {
             member.verified = true;
         }
         Ok(())
@@ -4332,7 +4456,7 @@ impl DirectSetRouter {
         let member_id = self.members.iter().find_map(|(member_id, member)| {
             (member.relative_partial == relative_partial).then_some(*member_id)
         })?;
-        let member = self.members.get_mut(&member_id)?;
+        let member = self.member_mut(member_id)?;
         for (start, end) in extents {
             let len = end.saturating_sub(*start);
             if len == 0 {
@@ -4549,8 +4673,7 @@ impl DirectSetRouter {
             .and_then(|index| self.layout_members().get(index))
             .is_some_and(|layout| layout.data_hash_uses_mac);
         let member = self
-            .members
-            .get_mut(&member_id)
+            .member_mut(member_id)
             .expect("the member was just located");
         match (member.crypt.as_mut(), stored) {
             (None, None) => Ok(()),
@@ -4701,7 +4824,7 @@ impl DirectSetRouter {
         let Some((part_position, part_logical_offset, part_len, packed_crc32)) = part else {
             return Err(self.fail(DemotionReason::RestartRearmUnplaceable));
         };
-        let Some(member) = self.members.get_mut(&member_id) else {
+        let Some(member) = self.member_mut(member_id) else {
             return Err(self.fail(DemotionReason::RestartRearmUnplaceable));
         };
         // An encrypted member's re-read produces **plaintext** — that is what is

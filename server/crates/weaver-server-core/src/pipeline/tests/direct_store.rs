@@ -370,26 +370,6 @@ async fn submit_volume_article_of(
 /// `0..n-1`: `ordinal` picks the bytes out of `volumes`, `file_index` is what
 /// the job knows the file as. The two are the same number only when nothing
 /// precedes the set in the NZB.
-async fn submit_volume_article_indexed(
-    pipeline: &mut Pipeline,
-    job_id: JobId,
-    volumes: &[(String, Vec<u8>)],
-    ordinal: u32,
-    file_index: u32,
-    segment_number: u32,
-) {
-    submit_volume_article_indexed_of(
-        pipeline,
-        job_id,
-        volumes,
-        ordinal,
-        file_index,
-        segment_number,
-        2,
-    )
-    .await;
-}
-
 async fn submit_volume_article_indexed_of(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -6239,14 +6219,17 @@ impl IndexPosition {
     }
 }
 
-/// [`par2_bearing_job_spec`] with the index placed at either end of the NZB.
+/// [`par2_bearing_job_spec`] with the index placed at either end of the NZB, and
+/// a chosen number of articles per volume.
 fn par2_bearing_job_spec_positioned(
     name: &str,
     volumes: &[(String, Vec<u8>)],
     par2_bytes: &[u8],
     position: IndexPosition,
+    articles: usize,
 ) -> (JobSpec, u32) {
-    let (mut spec, file_index) = par2_bearing_job_spec(name, volumes, par2_bytes);
+    let mut spec = direct_store_job_spec_with_articles(name, volumes, articles);
+    let file_index = append_par2_index(&mut spec, par2_bytes);
     match position {
         IndexPosition::Last => (spec, file_index),
         IndexPosition::First => {
@@ -6286,25 +6269,61 @@ async fn run_repairable_par2_gate_at(
     position: IndexPosition,
     password: Option<&str>,
 ) -> RepairGateOutcome {
+    run_repairable_par2_gate_with_articles(
+        gate,
+        job_id,
+        member_name,
+        volumes,
+        par2_bytes,
+        position,
+        password,
+        2,
+    )
+    .await
+}
+
+/// [`run_repairable_par2_gate_at`] with a chosen number of articles per volume.
+///
+/// One article per volume is not a corner case — a volume small enough to post
+/// whole is ordinary — and it is the only shape in which a repair's rewrite,
+/// which is widened to whole articles, reaches a volume's **first** byte and
+/// therefore the first cipher block of a member extent that starts there (E2
+/// review F1). With two articles the damaged one is always bounded away from at
+/// least one of the extent's edges.
+#[allow(clippy::too_many_arguments)]
+async fn run_repairable_par2_gate_with_articles(
+    gate: DirectStoreGate,
+    job_id: JobId,
+    member_name: &str,
+    volumes: &[(String, Vec<u8>)],
+    par2_bytes: &[u8],
+    position: IndexPosition,
+    password: Option<&str>,
+    articles: usize,
+) -> RepairGateOutcome {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(gate);
     pipeline.live_par2.set_enabled(true);
 
     let (mut spec, index_file_index) =
-        par2_bearing_job_spec_positioned("Silver Horizon", volumes, par2_bytes, position);
+        par2_bearing_job_spec_positioned("Silver Horizon", volumes, par2_bytes, position, articles);
     spec.password = password.map(str::to_owned);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
+    let arrivals: Vec<(u32, u32)> = (0..volumes.len() as u32)
+        .flat_map(|ordinal| (0..articles as u32).map(move |segment| (ordinal, segment)))
+        .collect();
     let mut volume_file_seen = false;
-    for (ordinal, segment_number) in in_order_arrivals(volumes.len()) {
-        submit_volume_article_indexed(
+    for (ordinal, segment_number) in arrivals {
+        submit_volume_article_indexed_of(
             &mut pipeline,
             job_id,
             volumes,
             ordinal,
             position.volume_file_index(ordinal),
             segment_number,
+            articles,
         )
         .await;
         volume_file_seen |= volumes
@@ -9446,6 +9465,111 @@ async fn par2_damage_in_an_encrypted_sets_envelope_repairs_while_the_set_stays_d
     assert!(
         !direct.sets.contains("Demoted"),
         "nothing here may demote the set, got {}",
+        direct.sets
+    );
+}
+
+#[tokio::test]
+async fn par2_damage_in_a_split_encrypted_members_first_article_repairs_while_the_set_stays_direct()
+{
+    // E2 review F1, and the coverage gap that hid it: every other repair test in
+    // this file damages a *recovery record* in a volume's **last** article, so
+    // the rewrite it provokes never reaches a member extent's first cipher
+    // block. Here the damaged volume is posted as a single article, so the
+    // rewrite — widened to whole articles — starts at physical zero and the
+    // whole of volume 1's member extent is re-routed, first block included.
+    //
+    // That block straddles the volume boundary: part of it was posted in volume
+    // 0, and its CBC predecessor lies wholly in volume 0. Both were routed and
+    // dropped from staging long before the repair, and no checkpoint survives at
+    // the extent's low edge once the two volumes' decrypted runs coalesce — so
+    // `cipher_edge_reads` is the only thing that can put them back. It used to
+    // ask for the straddling bytes alone, which left the block undecryptable,
+    // the span held, and the whole set demoted under `RepairRerouteFailed` into
+    // a full refetch of every article.
+    //
+    // Held to the same standard as the other repair differentials: the gate-off
+    // run with the same password, byte for byte.
+    let member_name = "Silver.Horizon.S02E24.mkv";
+    // Not a multiple of 16, so the member also carries tail padding.
+    let payload: Vec<u8> = (0..2405u32).map(|index| (index % 223) as u8).collect();
+    let rr_bytes = 512;
+    let clean = encrypted_store_set_with_recovery(
+        member_name,
+        &payload,
+        3,
+        "moonlit-harbour",
+        Some("moonlit-harbour"),
+        true,
+        rr_bytes,
+    );
+    // The RR keeps PAR2 the only layer that can see the damage: it belongs to no
+    // member, so no packed or whole-member checksum covers it. What makes this
+    // test different is not where the damage is but how wide the *rewrite* is.
+    let par2_bytes = repairable_par2_index(&clean, 4);
+    let mut volumes = clean.clone();
+    damage_recovery_record(&mut volumes, 1, rr_bytes);
+
+    let conventional = run_repairable_par2_gate_with_articles(
+        DirectStoreGate::Disabled,
+        JobId(43151),
+        member_name,
+        &volumes,
+        &par2_bytes,
+        IndexPosition::Last,
+        Some("moonlit-harbour"),
+        1,
+    )
+    .await;
+    let direct = run_repairable_par2_gate_with_articles(
+        DirectStoreGate::Enabled,
+        JobId(43152),
+        member_name,
+        &volumes,
+        &par2_bytes,
+        IndexPosition::Last,
+        Some("moonlit-harbour"),
+        1,
+    )
+    .await;
+
+    assert_eq!(
+        conventional.member.as_deref(),
+        Some(payload.as_slice()),
+        "the gate-off reference must repair the volume and decrypt the member; \
+         status={:?}",
+        conventional.status
+    );
+    assert_eq!(
+        (direct.member.as_deref(), &direct.status),
+        (conventional.member.as_deref(), &conventional.status),
+        "a repair reaching a split encrypted member's first block must produce \
+         the gate-off output, with the same status; sets = {}",
+        direct.sets
+    );
+    assert!(
+        !direct.sets.contains("Demoted"),
+        "and it must not demote — a set that reroutes its own repair never \
+         refetches an article; got {}",
+        direct.sets
+    );
+    assert!(
+        !direct.volume_file_seen,
+        "repair-while-direct materializes only under a scratch name, never the \
+         volume's own; sets = {}",
+        direct.sets
+    );
+    assert_eq!(
+        direct.materialized, 1,
+        "only the damaged volume may be materialized, and it must have been; \
+         sets = {}",
+        direct.sets
+    );
+    assert_eq!(direct.repair_scratch_left, 0);
+    assert!(
+        direct.finalized > 0,
+        "the set must have stayed direct and committed its members from its own \
+         partials; sets = {}",
         direct.sets
     );
 }

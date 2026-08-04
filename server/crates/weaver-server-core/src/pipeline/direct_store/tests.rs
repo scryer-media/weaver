@@ -3534,6 +3534,178 @@ fn an_encrypted_no_ifsc_whole_file_md5_streams_through_the_sequential_reader() {
     assert_eq!(cipher_counters.refusals(), 0);
 }
 
+/// The adapter over one encrypted virtual volume, plus the overlay counters.
+fn encrypted_file_access(
+    volume: super::provider::VirtualVolume,
+    par2_set: &weaver_par2::Par2FileSet,
+    base_dir: &Path,
+) -> (
+    DirectVolumeFileAccess,
+    weaver_par2::FileId,
+    Arc<super::provider::CipherOverlayCounters>,
+) {
+    let file_id = par2_set.recovery_file_ids[0];
+    let volume_index = volume.volume_index;
+    let inner = weaver_par2::PlacementFileAccess::new(
+        base_dir.to_path_buf(),
+        par2_set,
+        std::collections::HashMap::new(),
+    );
+    let provider = super::provider::HybridVolumeProvider::new(vec![volume]);
+    let counters = provider.cipher_counters();
+    (
+        DirectVolumeFileAccess::new(
+            inner,
+            provider,
+            &[VirtualPar2Volume {
+                par2_file_id: file_id,
+                volume_index,
+            }],
+        ),
+        file_id,
+        counters,
+    )
+}
+
+#[test]
+fn an_ascending_ranged_sweep_reuses_one_reader_instead_of_re_seeding_every_slice() {
+    // Plan 136, E2 review F2. `read_file_range_into` used to open a reader per
+    // call, so `VirtualVolumeReader::chains` started empty every time and every
+    // PAR2 slice of an encrypted volume re-seeded from the nearest retained
+    // checkpoint — re-encrypting everything between it and the slice, and
+    // throwing all of it away. On E2's own fixture that was 51,487 bytes
+    // delivered against 125,828,800 chained.
+    //
+    // Both halves are measured here rather than asserted from a constant: the
+    // baseline sweep opens a reader per read exactly as the adapter used to, and
+    // the cached one goes through the adapter. The bytes have to agree, and the
+    // chaining has to collapse.
+    let dir = tempfile::tempdir().unwrap();
+    // No strided checkpoint fits in a member this size, so the only seed a
+    // per-read reader can reach is the member's IV — which is precisely the
+    // shape that makes the cost quadratic.
+    let (posted, plain, crypt, covered) = encrypted_member_facts(64 * 1024, 4096);
+    let facts = crypt
+        .cipher_facts(plain.len() as u64, &covered)
+        .expect("a sized member has read-side facts");
+    let volume_len = plain.len() as u64;
+    let slice = 512u64;
+    let windows: Vec<(u64, u64)> = (0..volume_len)
+        .step_by(slice as usize)
+        .map(|start| (start, slice.min(volume_len - start)))
+        .collect();
+    assert!(windows.len() > 32, "non-vacuity: the sweep must be a sweep");
+
+    // The baseline: one reader per read, which is what the adapter did.
+    let baseline_provider = super::provider::HybridVolumeProvider::new(vec![cipher_volume(
+        dir.path(),
+        &plain,
+        facts.clone(),
+        volume_len,
+    )]);
+    let baseline_counters = baseline_provider.cipher_counters();
+    let mut baseline = Vec::with_capacity(plain.len());
+    for &(start, len) in &windows {
+        let mut reader = baseline_provider.open(0).expect("registered");
+        std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(start)).unwrap();
+        let mut got = vec![0u8; len as usize];
+        std::io::Read::read_exact(&mut reader, &mut got).unwrap();
+        baseline.extend_from_slice(&got);
+    }
+    assert_eq!(
+        baseline,
+        posted[..plain.len()],
+        "non-vacuity: the baseline sweep must reproduce the posted bytes too"
+    );
+    let delivered = plain.len() as u64;
+    assert!(
+        baseline_counters.chained_bytes() > delivered * 32,
+        "non-vacuity: a reader per read must really chain orders of magnitude \
+         more than it delivers, got {} chained for {delivered} delivered",
+        baseline_counters.chained_bytes()
+    );
+
+    // And the adapter, which now keeps one reader per volume.
+    let volume = cipher_volume(dir.path(), &plain, facts, volume_len);
+    let par2_set = descriptor_only_par2_set("silver.horizon.part01.rar", &posted[..plain.len()]);
+    let (access, file_id, counters) = encrypted_file_access(volume, &par2_set, dir.path());
+    let mut cached = Vec::with_capacity(plain.len());
+    for &(start, len) in &windows {
+        cached.extend_from_slice(
+            &access
+                .read_file_range(&file_id, start, len)
+                .expect("a covered range reads"),
+        );
+    }
+    assert_eq!(
+        cached,
+        posted[..plain.len()],
+        "the cached reader must deliver exactly the posted bytes"
+    );
+    assert_eq!(
+        counters.chained_bytes(),
+        0,
+        "an ascending sweep through one reader continues the previous read's \
+         chain, so nothing is re-encrypted twice"
+    );
+    assert!(
+        counters.chained_bytes() * 100 < baseline_counters.chained_bytes(),
+        "the whole point: {} chained now against {} before",
+        counters.chained_bytes(),
+        baseline_counters.chained_bytes()
+    );
+    assert_eq!(counters.refusals(), 0);
+}
+
+#[test]
+fn a_descending_or_gapped_ranged_sequence_reads_the_same_bytes_through_the_cached_reader() {
+    // The other half of E2 review F2. A kept frontier is only ever accepted on
+    // an exact predecessor match or a strictly forward one that beats the
+    // checkpoint, so a read *below* the frontier — or one that skips over a
+    // stretch the reader never produced — falls back to the checkpoint rather
+    // than carrying a predecessor that belongs to some other block. If that ever
+    // stopped holding, the first block of each such read would be wrong and
+    // nothing downstream could attribute it.
+    let dir = tempfile::tempdir().unwrap();
+    let (posted, plain, crypt, covered) = encrypted_member_facts(32 * 1024, 4096);
+    let facts = crypt
+        .cipher_facts(plain.len() as u64, &covered)
+        .expect("a sized member has read-side facts");
+    let volume_len = plain.len() as u64;
+    let volume = cipher_volume(dir.path(), &plain, facts, volume_len);
+    let par2_set = descriptor_only_par2_set("silver.horizon.part01.rar", &posted[..plain.len()]);
+    let (access, file_id, counters) = encrypted_file_access(volume, &par2_set, dir.path());
+
+    // Descending, gapped, block-aligned and not, re-reading windows already
+    // read, and one that ends on the member's final block.
+    let mut windows: Vec<(u64, u64)> = (0..volume_len)
+        .step_by(1024)
+        .map(|start| (start, 1024u64.min(volume_len - start)))
+        .collect();
+    windows.reverse();
+    windows.extend([
+        (volume_len - 16, 16),
+        (7, 41),
+        (4096, 17),
+        (4096 + 3, 1),
+        (0, 15),
+        (volume_len / 2, 2048),
+        (7, 41),
+    ]);
+    for (start, len) in windows {
+        let end = (start + len).min(volume_len);
+        assert_eq!(
+            access
+                .read_file_range(&file_id, start, end - start)
+                .expect("a covered range reads"),
+            posted[start as usize..end as usize],
+            "a read at {start} for {len} through a reused reader must still be \
+             byte-identical to what was posted"
+        );
+    }
+    assert_eq!(counters.refusals(), 0);
+}
+
 #[test]
 fn the_adapter_answers_existence_length_and_ranges_like_a_downloaded_volume() {
     let dir = tempfile::tempdir().unwrap();
@@ -4847,6 +5019,17 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 /// padding. A hand-written row proves only that the struct it was written into
 /// serializes.
 fn encrypted_crypt_router(plain: &[u8], header_bytes: u64) -> DirectSetRouter {
+    encrypted_crypt_router_partial(plain, header_bytes, usize::MAX).0
+}
+
+/// [`encrypted_crypt_router`] with only the first `staged` cipher bytes routed,
+/// handing back the whole cipher so the caller can stage the rest and watch what
+/// moves. `staged` is clamped to the member, so `usize::MAX` is "all of it".
+fn encrypted_crypt_router_partial(
+    plain: &[u8],
+    header_bytes: u64,
+    staged: usize,
+) -> (DirectSetRouter, Vec<u8>) {
     let material = weaver_unrar::derive_rar5_material(CRYPT_PASSWORD, &CRYPT_SALT, CRYPT_KDF_LG2)
         .expect("the fixture KDF count is derivable");
     let cipher_len = plain.len().div_ceil(16) * 16;
@@ -4895,11 +5078,79 @@ fn encrypted_crypt_router(plain: &[u8], header_bytes: u64) -> DirectSetRouter {
         }),
     )]);
     router.restore_layout(&facts).expect("the facts rebuild");
-    router.stage_for_test(0, header_bytes, &cipher);
+    let staged = staged.min(cipher.len());
+    router.stage_for_test(0, header_bytes, &cipher[..staged]);
     router
         .drain_for_test(0)
         .expect("the encrypted drain routes rather than demoting");
+    (router, cipher)
+}
+
+#[test]
+fn the_member_cipher_snapshot_is_shared_until_a_member_moves() {
+    // Plan 136, E2 review F4. `member_ciphers` deep-cloned every member's
+    // checkpoint map and coverage on every call, and its callers call it per
+    // provider — which live PAR2 assembles per read-back, one per straddling
+    // block. E1 kept one checkpoint per member, so the copy was small; E2 keeps
+    // one per `CHECKPOINT_STRIDE`, which for a 50 GiB member is some 12,800
+    // `BTreeMap` nodes copied to answer a question whose answer had not changed.
+    //
+    // Two things are asserted, and the second is the one that matters: reads
+    // share the snapshot, and a mutation really does drop it — a cache that
+    // outlived a coverage change would have the overlay re-encrypt from facts
+    // the member has moved past.
+    let plain: Vec<u8> = (0..600u32).map(|index| (index % 251) as u8).collect();
+    let (mut router, cipher) = encrypted_crypt_router_partial(&plain, 64, 320);
+
+    let first = router.member_ciphers();
+    assert_eq!(
+        first.len(),
+        1,
+        "non-vacuity: the fixture must have routed an encrypted member"
+    );
+    let builds = router.member_ciphers_builds();
+    assert!(builds > 0, "non-vacuity: the snapshot must have been built");
+    for _ in 0..16 {
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &router.member_ciphers()),
+            "a read must hand back the snapshot it already has"
+        );
+    }
+    assert_eq!(
+        router.member_ciphers_builds(),
+        builds,
+        "and it must not have rebuilt one behind that"
+    );
+    let partial = first.values().next().expect("one member").clone();
+    assert!(
+        partial.tail_plain().is_none(),
+        "non-vacuity: the half-routed member must not have its padding yet"
+    );
+
+    // Routing the rest moves the member's coverage *and* its retained padding,
+    // which is exactly what a stale snapshot would go on denying.
+    router.stage_for_test(0, 64 + 320, &cipher[320..]);
     router
+        .drain_for_test(0)
+        .expect("the rest of the member routes");
+    let second = router.member_ciphers();
+    assert!(
+        !std::sync::Arc::ptr_eq(&first, &second),
+        "a mutation must have dropped the snapshot"
+    );
+    assert!(
+        router.member_ciphers_builds() > builds,
+        "and the next read must have rebuilt it"
+    );
+    let whole = second.values().next().expect("one member");
+    assert!(
+        whole.tail_plain().is_some() && whole.plaintext_present(0, plain.len() as u64),
+        "the rebuilt snapshot must describe the member as it is now"
+    );
+    assert!(
+        !partial.plaintext_present(0, plain.len() as u64),
+        "non-vacuity: which is not what the old one described"
+    );
 }
 
 #[test]

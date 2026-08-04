@@ -589,6 +589,11 @@ impl VirtualVolumeReader {
     /// `[floor(offset), ceil(offset + len))`, clamped at the member's cipher
     /// size — the final one of which runs past `unpacked_size` into the retained
     /// tail padding, which is exactly why that padding is retained.
+    ///
+    /// A read whose window *is* those blocks — which is what an aligned slice
+    /// sweep asks for — reads its plaintext straight into the caller's buffer
+    /// and encrypts it there, so the bytes are touched once instead of copied
+    /// out of a scratch `Vec` afterwards (E2 review).
     fn read_member_cipher(
         &mut self,
         member_id: u32,
@@ -614,11 +619,21 @@ impl VirtualVolumeReader {
         let block_end = block_ceil(end).min(facts.cipher_size());
 
         let preceding = self.chain_to(member_id, facts, block_start)?;
-        let plain = self.member_plaintext(member_id, facts, block_start, block_end)?;
-        let cipher = facts.encrypt(&preceding, &plain);
-        self.remember_chain(member_id, block_end, &cipher, preceding);
-        let at = (offset - block_start) as usize;
-        out.copy_from_slice(&cipher[at..at + want as usize]);
+        if block_start == offset && block_end == end {
+            self.member_plaintext_into(member_id, facts, block_start, block_end, out)?;
+            if facts.encrypt(&preceding, out).is_err() {
+                return Err(self.refuse());
+            }
+            self.remember_chain(member_id, block_end, out, preceding);
+        } else {
+            let mut buffer = self.member_plaintext(member_id, facts, block_start, block_end)?;
+            if facts.encrypt(&preceding, &mut buffer).is_err() {
+                return Err(self.refuse());
+            }
+            self.remember_chain(member_id, block_end, &buffer, preceding);
+            let at = (offset - block_start) as usize;
+            out.copy_from_slice(&buffer[at..at + want as usize]);
+        }
         self.counters
             .reencrypted_bytes
             .fetch_add(want, Ordering::Relaxed);
@@ -666,9 +681,11 @@ impl VirtualVolumeReader {
 
         while cursor < block_start {
             let step = (block_start - cursor).min(CHAIN_CHUNK_BYTES as u64);
-            let plain = self.member_plaintext(member_id, facts, cursor, cursor + step)?;
-            let cipher = facts.encrypt(&preceding, &plain);
-            preceding.copy_from_slice(&cipher[cipher.len() - 16..]);
+            let mut buffer = self.member_plaintext(member_id, facts, cursor, cursor + step)?;
+            if facts.encrypt(&preceding, &mut buffer).is_err() {
+                return Err(self.refuse());
+            }
+            preceding.copy_from_slice(&buffer[buffer.len() - 16..]);
             cursor += step;
             self.counters
                 .chained_bytes
@@ -692,10 +709,25 @@ impl VirtualVolumeReader {
         from: u64,
         to: u64,
     ) -> std::io::Result<Vec<u8>> {
+        let mut plain = vec![0u8; (to - from) as usize];
+        self.member_plaintext_into(member_id, facts, from, to, &mut plain)?;
+        Ok(plain)
+    }
+
+    /// [`Self::member_plaintext`] into a buffer the caller already owns, which
+    /// is `to - from` bytes long. The allocating form is this one plus a `vec!`.
+    fn member_plaintext_into(
+        &mut self,
+        member_id: u32,
+        facts: &MemberCipher,
+        from: u64,
+        to: u64,
+        plain: &mut [u8],
+    ) -> std::io::Result<()> {
+        debug_assert_eq!(plain.len() as u64, to - from);
         if !facts.plaintext_present(from, to) {
             return Err(self.refuse());
         }
-        let mut plain = vec![0u8; (to - from) as usize];
         let on_disk = to.min(facts.unpacked_size());
         if on_disk > from {
             let mut read = 0usize;
@@ -725,7 +757,7 @@ impl VirtualVolumeReader {
             }
             plain[at..at + take].copy_from_slice(&tail[..take]);
         }
-        Ok(plain)
+        Ok(())
     }
 
     /// Files both seeds a following read could want: the frontier, and the

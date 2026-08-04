@@ -46,6 +46,28 @@
 //! sparse volume produces. Clean volumes, the overwhelming majority and the only
 //! ones where D5's whole-file-MD5 cost argument bites, keep the sequential path.
 //!
+//! # One reader per volume, kept across ranged reads (plan 136, E2 review F2)
+//!
+//! The ranged path is the one an encrypted set pays for. A
+//! [`super::provider::VirtualVolumeReader`] carries a per-member CBC frontier
+//! across its own `read` calls, so a *sweep* through one reader re-encrypts
+//! every byte exactly once; open a fresh reader per call and that frontier
+//! starts empty every time, and each slice re-seeds from the nearest retained
+//! checkpoint — up to [`super::router::crypt::CHECKPOINT_STRIDE`] of plaintext
+//! re-encrypted and thrown away *per slice*. Measured on E2's own fixture that
+//! was 51,487 delivered bytes against 125,828,800 chained.
+//!
+//! So the reader is cached per volume and reused. It is taken out of the map
+//! for the duration of a read and put back after, which keeps concurrent reads
+//! of one volume from serialising on a lock: a caller that finds the slot empty
+//! simply opens its own reader, and the last one to finish leaves its frontier
+//! behind. Nothing about that is load bearing for correctness — a stale or
+//! absent frontier costs a checkpoint seed, never a wrong byte: the reader
+//! accepts a frontier only on an exact predecessor match or a strictly forward
+//! one that beats the checkpoint, and falls back to the checkpoint otherwise,
+//! so a descending or gapped sequence of reads reads exactly as it would have
+//! through a reader of its own.
+//!
 //! # Writes: refused for virtual, allowed for materialized
 //!
 //! A virtual volume still has nowhere to put a repaired slice — the member bytes
@@ -60,8 +82,8 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use weaver_par2::{FileAccess, FileId, PlacementFileAccess};
 
@@ -129,6 +151,13 @@ pub(crate) struct DirectVolumeFileAccess {
     /// [`Self::volumes`], so a volume that is both registered virtually and
     /// materialized reads and writes through the real file.
     materialized: HashMap<FileId, MaterializedPar2Volume>,
+    /// One reader per virtual volume, kept across ranged reads so a slice sweep
+    /// carries its CBC chain instead of re-seeding every read (E2 review F2).
+    ///
+    /// Behind a lock only because [`FileAccess`]'s reads take `&self`; the lock
+    /// is never held across a read, since the reader is removed for the call and
+    /// put back after it.
+    readers: Mutex<HashMap<u32, HoleStoppingReader>>,
     counters: Arc<DirectAccessCounters>,
 }
 
@@ -146,6 +175,7 @@ impl DirectVolumeFileAccess {
                 .map(|volume| (volume.par2_file_id, volume.volume_index))
                 .collect(),
             materialized: HashMap::new(),
+            readers: Mutex::new(HashMap::new()),
             counters: Arc::new(DirectAccessCounters::default()),
         }
     }
@@ -187,6 +217,28 @@ impl DirectVolumeFileAccess {
         Ok(HoleStoppingReader { inner: reader })
     }
 
+    /// The cached reader for `volume_index`, removed from the map so the lock is
+    /// released before a byte is read. A miss — first read of the volume, or a
+    /// concurrent read holding it — simply opens another one.
+    fn take_reader(&self, volume_index: u32) -> Option<HoleStoppingReader> {
+        self.readers.lock().ok()?.remove(&volume_index)
+    }
+
+    /// Leaves a reader — and the CBC frontier it reached — for the next read.
+    fn put_reader(&self, volume_index: u32, reader: HoleStoppingReader) {
+        if let Ok(mut readers) = self.readers.lock() {
+            readers.insert(volume_index, reader);
+        }
+    }
+
+    /// A positioned read of a virtual volume, through the volume's **cached**
+    /// reader (E2 review F2).
+    ///
+    /// Reusing the reader is what makes an ascending sweep — which is what a
+    /// PAR2 slice pass issues — carry its CBC chain from one slice to the next.
+    /// The reader is put back whatever the read returned: a refusal leaves the
+    /// chain untouched, and the next read seeks before it reads, so a
+    /// half-finished position is not state anything can observe.
     fn read_virtual_into(
         &self,
         volume_index: u32,
@@ -194,15 +246,13 @@ impl DirectVolumeFileAccess {
         dst: &mut [u8],
     ) -> io::Result<usize> {
         self.counters.ranged_reads.fetch_add(1, Ordering::Relaxed);
-        let mut reader = self.open_at(volume_index, offset)?;
-        let mut read = 0usize;
-        while read < dst.len() {
-            match reader.read(&mut dst[read..])? {
-                0 => break,
-                n => read += n,
-            }
-        }
-        Ok(read)
+        let mut reader = match self.take_reader(volume_index) {
+            Some(reader) => reader,
+            None => self.open_at(volume_index, offset)?,
+        };
+        let read = reader.read_at(offset, dst);
+        self.put_reader(volume_index, reader);
+        read
     }
 
     /// A positioned read of a materialized volume. Short reads are honest: the
@@ -395,6 +445,23 @@ fn write_all_at(file: &std::fs::File, offset: u64, bytes: &[u8]) -> io::Result<(
 /// A [`VirtualVolumeReader`] whose holes read as end-of-file.
 struct HoleStoppingReader {
     inner: VirtualVolumeReader,
+}
+
+impl HoleStoppingReader {
+    /// Fills `dst` from `offset`, stopping short at the volume's end or at a
+    /// hole. Seeking rather than assuming the position is what lets one reader
+    /// answer an arbitrary sequence of ranged reads.
+    fn read_at(&mut self, offset: u64, dst: &mut [u8]) -> io::Result<usize> {
+        self.inner.seek(SeekFrom::Start(offset))?;
+        let mut read = 0usize;
+        while read < dst.len() {
+            match self.read(&mut dst[read..])? {
+                0 => break,
+                n => read += n,
+            }
+        }
+        Ok(read)
+    }
 }
 
 impl Read for HoleStoppingReader {

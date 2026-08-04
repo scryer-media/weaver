@@ -1009,8 +1009,10 @@ impl DirectSet {
             );
         // Plan 136, E-D4. Shared for the same reason the paths are, and empty
         // for every set with no encrypted member — which is what leaves the
-        // provider's read path exactly as plan 135 built it.
-        let ciphers = std::sync::Arc::new(self.router.member_ciphers());
+        // provider's read path exactly as plan 135 built it. The router hands
+        // back its own snapshot rather than a fresh copy of it, which is what
+        // keeps a per-read provider off the checkpoint map (E2 review F4).
+        let ciphers = self.router.member_ciphers();
         volume_lengths
             .iter()
             .map(|(volume_index, len)| VirtualVolume {
@@ -1076,7 +1078,7 @@ impl DirectSet {
         // The committed member file is byte-for-byte the partial — a commit is a
         // rename — so an encrypted set's retained image re-encrypts out of it
         // exactly as the live one did (plan 136, E2).
-        let ciphers = std::sync::Arc::new(self.router.member_ciphers());
+        let ciphers = self.router.member_ciphers();
         let volumes: Vec<VirtualVolume> = volume_lengths
             .iter()
             .map(|(volume_index, len)| VirtualVolume {
