@@ -783,6 +783,12 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
         run: rustup target add x86_64-pc-windows-msvc
+      - name: Install WiX v4
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          dotnet tool install --tool-path .wix wix --version 4.0.5
+          (Resolve-Path .wix) | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Restore sccache directory
         id: windows-x86_64-sccache-restore
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -840,7 +846,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          cargo build -p weaver --release --locked --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath weaver-windows-x86_64-build.log
+          cargo build -p weaver --bins --release --locked --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath weaver-windows-x86_64-build.log
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
@@ -986,18 +992,32 @@ jobs:
               "Weaver startup log was not created at $logFile" | Set-Content $artifactLog
             }
           }
-      - name: Package zip
+      - name: Package unsigned ZIP and MSI
         shell: pwsh
         run: |
-          Compress-Archive -Path target\x86_64-pc-windows-msvc\release\weaver.exe -DestinationPath weaver-windows-x86_64.zip
+          $ErrorActionPreference = "Stop"
+          $stage = "weaver-windows-x86_64-stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\weaver.exe, target\x86_64-pc-windows-msvc\release\weaver-tray.exe, LICENSE -Destination $stage -Force
+          Compress-Archive -Path "$stage\*" -DestinationPath weaver-windows-x86_64.zip
           if (-not (Test-Path weaver-windows-x86_64.zip)) { throw "missing weaver-windows-x86_64.zip" }
+          $metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object { $_.name -eq "weaver" } | Select-Object -First 1).version
+          .\packaging\windows\build-msi.ps1 `
+            -Architecture x64 `
+            -StageDir $stage `
+            -Version $version `
+            -OutputPath weaver-windows-x86_64.msi
       - name: Validate packaged Windows artifact
         shell: pwsh
         run: |
           .\.github\scripts\validate-windows-package.ps1 `
             -Architecture x86_64 `
             -ZipPath weaver-windows-x86_64.zip `
-            -BuiltExePath target\x86_64-pc-windows-msvc\release\weaver.exe
+            -MsiPath weaver-windows-x86_64.msi `
+            -MsiMetadataPath weaver-windows-x86_64.msi.json `
+            -BuiltExePath target\x86_64-pc-windows-msvc\release\weaver.exe `
+            -BuiltTrayPath target\x86_64-pc-windows-msvc\release\weaver-tray.exe
       - name: Show sccache stats
         if: always()
         shell: pwsh
@@ -1015,6 +1035,8 @@ jobs:
           name: weaver-windows-x86_64-${{ github.run_id }}
           path: |
             weaver-windows-x86_64.zip
+            weaver-windows-x86_64.msi
+            weaver-windows-x86_64.msi.json
             weaver-windows-x86_64-build.log
             weaver-windows-x86_64-dependencies.txt
             weaver-windows-x86_64-startup.log
@@ -1022,6 +1044,7 @@ jobs:
             weaver-windows-x86_64-attachment-services.log
             weaver-windows-x86_64-noarg-startup.log
             weaver-windows-x86_64-winget-install.log
+            weaver-windows-x86_64-msi-install.log
             weaver-windows-x86_64-sccache-stats.txt
           if-no-files-found: error
           retention-days: 14
@@ -1055,6 +1078,12 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
         run: rustup target add aarch64-pc-windows-msvc
+      - name: Install WiX v4
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          dotnet tool install --tool-path .wix wix --version 4.0.5
+          (Resolve-Path .wix) | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - name: Restore sccache directory
         id: windows-arm64-sccache-restore
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -1098,7 +1127,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          cargo build -p weaver --release --locked --target aarch64-pc-windows-msvc 2>&1 | Tee-Object -FilePath weaver-windows-arm64-build.log
+          cargo build -p weaver --bins --release --locked --target aarch64-pc-windows-msvc 2>&1 | Tee-Object -FilePath weaver-windows-arm64-build.log
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
@@ -1244,18 +1273,32 @@ jobs:
               "Weaver startup log was not created at $logFile" | Set-Content $artifactLog
             }
           }
-      - name: Package zip
+      - name: Package unsigned ZIP and MSI
         shell: pwsh
         run: |
-          Compress-Archive -Path target\aarch64-pc-windows-msvc\release\weaver.exe -DestinationPath weaver-windows-arm64.zip
+          $ErrorActionPreference = "Stop"
+          $stage = "weaver-windows-arm64-stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\aarch64-pc-windows-msvc\release\weaver.exe, target\aarch64-pc-windows-msvc\release\weaver-tray.exe, LICENSE -Destination $stage -Force
+          Compress-Archive -Path "$stage\*" -DestinationPath weaver-windows-arm64.zip
           if (-not (Test-Path weaver-windows-arm64.zip)) { throw "missing weaver-windows-arm64.zip" }
+          $metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object { $_.name -eq "weaver" } | Select-Object -First 1).version
+          .\packaging\windows\build-msi.ps1 `
+            -Architecture arm64 `
+            -StageDir $stage `
+            -Version $version `
+            -OutputPath weaver-windows-arm64.msi
       - name: Validate packaged Windows artifact
         shell: pwsh
         run: |
           .\.github\scripts\validate-windows-package.ps1 `
             -Architecture arm64 `
             -ZipPath weaver-windows-arm64.zip `
-            -BuiltExePath target\aarch64-pc-windows-msvc\release\weaver.exe
+            -MsiPath weaver-windows-arm64.msi `
+            -MsiMetadataPath weaver-windows-arm64.msi.json `
+            -BuiltExePath target\aarch64-pc-windows-msvc\release\weaver.exe `
+            -BuiltTrayPath target\aarch64-pc-windows-msvc\release\weaver-tray.exe
       - name: Show sccache stats
         if: always()
         shell: pwsh
@@ -1273,6 +1316,8 @@ jobs:
           name: weaver-windows-arm64-${{ github.run_id }}
           path: |
             weaver-windows-arm64.zip
+            weaver-windows-arm64.msi
+            weaver-windows-arm64.msi.json
             weaver-windows-arm64-build.log
             weaver-windows-arm64-dependencies.txt
             weaver-windows-arm64-startup.log
@@ -1280,6 +1325,7 @@ jobs:
             weaver-windows-arm64-attachment-services.log
             weaver-windows-arm64-noarg-startup.log
             weaver-windows-arm64-winget-install.log
+            weaver-windows-arm64-msi-install.log
             weaver-windows-arm64-sccache-stats.txt
           if-no-files-found: error
           retention-days: 14
@@ -1646,6 +1692,7 @@ jobs:
       - generate-release-provenance
       - verify-container-release
     permissions:
+      attestations: write
       contents: write
       id-token: write
     environment: release-credentials
@@ -1715,8 +1762,8 @@ jobs:
           IDENTITY: ^https://github.com/${{ github.repository }}/.github/workflows/deploy.yml@refs/tags/weaver-v.*$
         run: |
           set -euo pipefail
-          mapfile -t release_assets < <(find artifacts -maxdepth 1 -type f \( -name 'weaver-*.tar.gz' -o -name 'weaver-*.zip' -o -name 'weaver-*.spdx.json' \) -printf '%f\n' | sort)
-          test "${#release_assets[@]}" -eq 20
+          mapfile -t release_assets < <(find artifacts -maxdepth 1 -type f \( -name 'weaver-*.tar.gz' -o -name 'weaver-*.zip' -o -name 'weaver-*.msi' -o -name 'weaver-*.spdx.json' \) -printf '%f\n' | sort)
+          test "${#release_assets[@]}" -eq 22
           for asset in "${release_assets[@]}"; do
             slsa-verifier verify-artifact "artifacts/${asset}" \
               --provenance-path artifacts/weaver-provenance.intoto.jsonl \
@@ -1737,6 +1784,12 @@ jobs:
             --certificate-identity-regexp "$IDENTITY" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             artifacts/weaver-checksums.txt
+      - name: Attest Windows release artifacts
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: |
+            artifacts/weaver-windows-*.zip
+            artifacts/weaver-windows-*.msi
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1746,6 +1799,8 @@ jobs:
             --generate-notes \
             artifacts/weaver-*.tar.gz \
             artifacts/weaver-*.zip \
+            artifacts/weaver-*.msi \
+            artifacts/weaver-*.msi.json \
             artifacts/weaver-*.spdx.json \
             artifacts/weaver-checksums.txt \
             artifacts/weaver-checksums.txt.sigstore.json \
@@ -2243,10 +2298,36 @@ jobs:
           git commit --allow-empty -m "rebuild: ${{ github.ref_name }}"
           git push origin HEAD:main
 
+  winget-published-install:
+    name: winget-published-install
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+    needs: [github-release]
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Download generated WinGet manifests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: weaver-winget-manifests-${{ github.run_id }}
+          path: winget-submission
+
+      - name: Install the published x64 MSI through WinGet
+        shell: pwsh
+        run: |
+          tar -xzf winget-submission/weaver-winget-manifests.tar.gz -C winget-submission
+          $version = "${{ github.ref_name }}".Replace("weaver-v", "")
+          .\.github\scripts\validate-published-winget-install.ps1 `
+            -ManifestRoot .\winget-submission `
+            -ExpectedVersion $version
+
   winget-submit:
     name: winget-submit
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
-    needs: [github-release]
+    needs: [github-release, winget-published-install]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -2291,10 +2372,6 @@ jobs:
           fi
 
           EXISTING_PR="$(gh pr list --repo microsoft/winget-pkgs --state open --head "${FORK_OWNER}:${BRANCH}" --json url --jq '.[0].url // empty')"
-          if [[ -n "$EXISTING_PR" ]]; then
-            echo "WinGet submission already awaiting review: $EXISTING_PR"
-            exit 0
-          fi
 
           if ! gh api "repos/${FORK_OWNER}/winget-pkgs" > /dev/null 2>&1; then
             gh repo fork microsoft/winget-pkgs --clone=false
@@ -2313,11 +2390,15 @@ jobs:
           git sparse-checkout init --cone
           git sparse-checkout set manifests/s/ScryerMedia/Weaver
           git checkout master
-          git checkout -b "$BRANCH"
+          if git ls-remote --exit-code origin "refs/heads/${BRANCH}" > /dev/null 2>&1; then
+            git fetch origin "$BRANCH"
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            git checkout -b "$BRANCH"
+          fi
           MANIFEST_DESTINATION="$TARGET_PATH"
-          if [[ -e "$MANIFEST_DESTINATION" ]]; then
-            echo "Unexpected existing manifest directory: $MANIFEST_DESTINATION" >&2
-            exit 1
+          if [[ -d "$MANIFEST_DESTINATION" ]]; then
+            rm -rf "$MANIFEST_DESTINATION"
           fi
           mkdir -p "$MANIFEST_DESTINATION"
           cp "$MANIFEST_SOURCE"/* "$MANIFEST_DESTINATION/"
@@ -2325,15 +2406,20 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$MANIFEST_DESTINATION"
-          git diff --cached --quiet && exit 0
-          git commit -m "Add ScryerMedia.Weaver version ${VERSION}"
-          git push origin "$BRANCH"
-          gh pr create \
-            --repo microsoft/winget-pkgs \
-            --base master \
-            --head "${FORK_OWNER}:${BRANCH}" \
-            --title "New version: ScryerMedia.Weaver version ${VERSION}" \
-            --body "Automated manifest submission for [ScryerMedia.Weaver ${VERSION}](https://github.com/scryer-media/weaver/releases/tag/weaver-v${VERSION})."
+          if ! git diff --cached --quiet; then
+            git commit -m "Add ScryerMedia.Weaver version ${VERSION}"
+            git push origin "$BRANCH"
+          fi
+          if [[ -z "$EXISTING_PR" ]]; then
+            gh pr create \
+              --repo microsoft/winget-pkgs \
+              --base master \
+              --head "${FORK_OWNER}:${BRANCH}" \
+              --title "New version: ScryerMedia.Weaver version ${VERSION}" \
+              --body "Automated manifest submission for [ScryerMedia.Weaver ${VERSION}](https://github.com/scryer-media/weaver/releases/tag/weaver-v${VERSION})."
+          else
+            echo "Updated WinGet submission awaiting review: $EXISTING_PR"
+          fi
 
   winget-prep:
     name: winget-prep
@@ -2432,6 +2518,8 @@ jobs:
           mkdir -p release-inputs
           mapfile -t archives < <(find artifacts -maxdepth 1 -type f \( -name 'weaver-*.tar.gz' -o -name 'weaver-*.zip' \) -printf '%f\n' | sort)
           test "${#archives[@]}" -eq 10
+          mapfile -t msi_packages < <(find artifacts -maxdepth 1 -type f -name 'weaver-*.msi' -printf '%f\n' | sort)
+          test "${#msi_packages[@]}" -eq 2
           for archive in "${archives[@]}"; do
             "${{ steps.syft.outputs.cmd }}" "file:artifacts/${archive}" \
               -o "spdx-json=release-inputs/${archive%.*}.spdx.json"
@@ -2440,11 +2528,14 @@ jobs:
             for archive in "${archives[@]}"; do
               sha256sum "artifacts/${archive}"
             done
+            for package in "${msi_packages[@]}"; do
+              sha256sum "artifacts/${package}"
+            done
             find release-inputs -maxdepth 1 -type f -printf '%f\n' | sort | while read -r asset; do
               sha256sum "release-inputs/${asset}"
             done
           } | sed -e 's#artifacts/##' -e 's#release-inputs/##' > slsa-subjects.txt
-          test "$(wc -l < slsa-subjects.txt)" -eq 20
+          test "$(wc -l < slsa-subjects.txt)" -eq 22
       - name: Upload release provenance inputs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

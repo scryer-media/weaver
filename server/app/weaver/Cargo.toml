@@ -10,6 +10,10 @@ repository.workspace = true
 name = "weaver"
 path = "src/main.rs"
 
+[[bin]]
+name = "weaver-tray"
+path = "src/tray.rs"
+
 [dependencies]
 weaver-server-core = { path = "../../crates/weaver-server-core", default-features = false }
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }
@@ -62,3 +66,13 @@ tower = { workspace = true, default-features = false }
 
 [target.'cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))'.dependencies]
 mimalloc = { version = "0.1.52", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
