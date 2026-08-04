@@ -1741,28 +1741,39 @@ async fn submit_decoded_segment_with_part_crc_verified(
     expected_file_crc: Option<u32>,
     part_crc_verified: bool,
 ) {
+    let file = pipeline
+        .jobs
+        .get(&file_id.job_id)
+        .and_then(|state| state.assembly.file(file_id))
+        .expect("active test file assembly");
+    let yenc_layout = YencLayoutAssertions {
+        file_size: file.total_bytes(),
+        part: Some(segment_number + 1),
+        total: Some(file.total_segments()),
+        begin: Some(file_offset + 1),
+        end: Some(file_offset + data.len() as u64),
+    };
     pipeline
-        .handle_decode_success(DecodeResult {
-            segment_id: SegmentId {
-                file_id,
-                segment_number,
+        .handle_decode_success(
+            DecodeResult {
+                segment_id: SegmentId {
+                    file_id,
+                    segment_number,
+                },
+                raw_size: data.len() as u64,
+                yenc_layout,
+                crc_valid: true,
+                part_crc_verified,
+                part_crc: weaver_par2::checksum::crc32(data),
+                expected_file_crc,
+                data: DecodedChunk::from(data.to_vec()),
+                yenc_name: filename.to_string(),
             },
-            raw_size: data.len() as u64,
-            unverified_provenance: (!part_crc_verified).then(|| {
-                Box::new(UnverifiedSegmentProvenance {
-                    source_server_idx: None,
-                    exclude_servers: Vec::new(),
-                })
-            }),
-            file_offset,
-            decoded_size: data.len() as u32,
-            crc_valid: true,
-            part_crc_verified,
-            part_crc: weaver_par2::checksum::crc32(data),
-            expected_file_crc,
-            data: DecodedChunk::from(data.to_vec()),
-            yenc_name: filename.to_string(),
-        })
+            SegmentSource {
+                source_server_idx: None,
+                exclude_servers: Vec::new(),
+            },
+        )
         .await;
 }
 
@@ -1779,28 +1790,39 @@ async fn submit_decoded_segment_from_server(
     source_server_idx: Option<usize>,
     exclude_servers: Vec<usize>,
 ) {
+    let file = pipeline
+        .jobs
+        .get(&file_id.job_id)
+        .and_then(|state| state.assembly.file(file_id))
+        .expect("active test file assembly");
+    let yenc_layout = YencLayoutAssertions {
+        file_size: file.total_bytes(),
+        part: Some(segment_number + 1),
+        total: Some(file.total_segments()),
+        begin: Some(file_offset + 1),
+        end: Some(file_offset + data.len() as u64),
+    };
     pipeline
-        .handle_decode_success(DecodeResult {
-            segment_id: SegmentId {
-                file_id,
-                segment_number,
+        .handle_decode_success(
+            DecodeResult {
+                segment_id: SegmentId {
+                    file_id,
+                    segment_number,
+                },
+                raw_size: data.len() as u64,
+                yenc_layout,
+                crc_valid: true,
+                part_crc_verified,
+                part_crc: weaver_par2::checksum::crc32(data),
+                expected_file_crc,
+                data: DecodedChunk::from(data.to_vec()),
+                yenc_name: filename.to_string(),
             },
-            raw_size: data.len() as u64,
-            unverified_provenance: (!part_crc_verified).then(|| {
-                Box::new(UnverifiedSegmentProvenance {
-                    source_server_idx,
-                    exclude_servers,
-                })
-            }),
-            file_offset,
-            decoded_size: data.len() as u32,
-            crc_valid: true,
-            part_crc_verified,
-            part_crc: weaver_par2::checksum::crc32(data),
-            expected_file_crc,
-            data: DecodedChunk::from(data.to_vec()),
-            yenc_name: filename.to_string(),
-        })
+            SegmentSource {
+                source_server_idx,
+                exclude_servers,
+            },
+        )
         .await;
 }
 

@@ -1115,7 +1115,7 @@ impl Pipeline {
         let _profile_scope = crate::runtime::perf_probe::scope("download.handle_decode_done");
 
         let (segment_id, raw_size) = match &result {
-            DecodeDone::Success(result) => (result.segment_id, result.raw_size),
+            DecodeDone::Success { result, .. } => (result.segment_id, result.raw_size),
             DecodeDone::Failed {
                 segment_id,
                 raw_size,
@@ -1126,7 +1126,9 @@ impl Pipeline {
         self.note_decode_finished(segment_id);
 
         match result {
-            DecodeDone::Success(result) => self.handle_decode_success(result).await,
+            DecodeDone::Success { result, source } => {
+                self.handle_decode_success(result, source).await;
+            }
             DecodeDone::Failed {
                 segment_id,
                 raw_size: _,
@@ -1258,14 +1260,16 @@ impl Pipeline {
         }
     }
 
-    pub(crate) async fn handle_decode_success(&mut self, result: DecodeResult) {
+    pub(crate) async fn handle_decode_success(
+        &mut self,
+        result: DecodeResult,
+        source: SegmentSource,
+    ) {
         let _profile_scope = crate::runtime::perf_probe::scope("download.handle_decode_success");
         let DecodeResult {
             segment_id,
             raw_size: _,
-            unverified_provenance,
-            file_offset,
-            decoded_size,
+            yenc_layout,
             crc_valid,
             part_crc_verified,
             part_crc,
@@ -1276,20 +1280,19 @@ impl Pipeline {
 
         let job_id = segment_id.file_id.job_id;
         let file_id = segment_id.file_id;
-        let is_file_crc_recovery = !self.file_crc_recoveries.is_empty()
-            && self
-                .file_crc_recoveries
-                .get(&file_id)
-                .is_some_and(|recovery| recovery.pending_segments.contains(&segment_id));
 
         let ready = {
             let _cpu_scope =
                 crate::runtime::perf_probe::cpu_scope("download.handle_decode_success.pre_persist");
-            if self
-                .jobs
-                .get(&job_id)
-                .is_none_or(|state| is_terminal_status(&state.status))
-            {
+            let Some(state) = self.jobs.get(&job_id) else {
+                debug!(
+                    job_id = job_id.0,
+                    segment = %segment_id,
+                    "discarding decode result for inactive job"
+                );
+                return;
+            };
+            if is_terminal_status(&state.status) {
                 debug!(
                     job_id = job_id.0,
                     segment = %segment_id,
@@ -1297,6 +1300,51 @@ impl Pipeline {
                 );
                 return;
             }
+            let expected_layout = state
+                .assembly
+                .file(file_id)
+                .ok_or(AuthoritativeLayoutError::FileMissing)
+                .and_then(|file| expected_segment_layout(file, segment_id.segment_number));
+            let expected_layout = match expected_layout {
+                Ok(layout) => layout,
+                Err(error) => {
+                    let error = format_authoritative_layout_error(error);
+                    self.fail_job(job_id, error);
+                    return;
+                }
+            };
+            let decoded_len = data.len_bytes();
+            if let Err(mismatch) = validate_yenc_layout(expected_layout, yenc_layout, decoded_len) {
+                let error = format_yenc_layout_mismatch(
+                    mismatch,
+                    expected_layout,
+                    yenc_layout,
+                    decoded_len,
+                );
+                self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                self.handle_decode_failure(
+                    segment_id,
+                    &error,
+                    &source.exclude_servers,
+                    source.source_server_idx,
+                );
+                return;
+            }
+            let file_offset = expected_layout.file_offset;
+            let decoded_size = expected_layout.decoded_size;
+
+            self.metrics
+                .bytes_decoded
+                .fetch_add(u64::from(decoded_size), Ordering::Relaxed);
+            self.metrics
+                .segments_decoded
+                .fetch_add(1, Ordering::Relaxed);
+
+            let is_file_crc_recovery = !self.file_crc_recoveries.is_empty()
+                && self
+                    .file_crc_recoveries
+                    .get(&file_id)
+                    .is_some_and(|recovery| recovery.pending_segments.contains(&segment_id));
 
             self.note_recovery_count_from_yenc_name(job_id, file_id.file_index, &yenc_name);
             if let Err(error) = self.note_expected_file_crc(file_id, expected_file_crc) {
@@ -1367,16 +1415,10 @@ impl Pipeline {
                     }
                 }
             } else {
-                let provenance = unverified_provenance
-                    .map(|provenance| *provenance)
-                    .unwrap_or(UnverifiedSegmentProvenance {
-                        source_server_idx: None,
-                        exclude_servers: Vec::new(),
-                    });
                 self.unverified_segments
                     .entry(file_id)
                     .or_default()
-                    .insert(segment_id.segment_number, provenance);
+                    .insert(segment_id.segment_number, source);
             }
 
             let buffered_segment = BufferedDecodedSegment {

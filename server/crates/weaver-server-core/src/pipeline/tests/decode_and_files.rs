@@ -404,6 +404,159 @@ async fn streamed_decode_failure_retries_excluding_actual_source_server() {
     assert_eq!(work.exclude_servers, vec![0]);
 }
 
+#[tokio::test]
+async fn queued_yenc_layout_mismatch_retries_before_decode_acceptance() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20915);
+    let filename = "queued-layout.bin";
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Queued Layout Mismatch", &[(filename.to_string(), 4)]),
+    )
+    .await;
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let mut events = pipeline.event_tx.subscribe();
+    pipeline.metrics.note_decode_task_started(4);
+    pipeline
+        .handle_decode_done(DecodeDone::Success {
+            result: DecodeResult {
+                segment_id,
+                raw_size: 4,
+                yenc_layout: YencLayoutAssertions {
+                    file_size: 4,
+                    part: Some(1),
+                    total: Some(1),
+                    begin: Some(u64::MAX),
+                    end: Some(4),
+                },
+                crc_valid: true,
+                part_crc_verified: true,
+                part_crc: weaver_par2::checksum::crc32(b"data"),
+                expected_file_crc: None,
+                data: DecodedChunk::from(b"data".to_vec()),
+                yenc_name: filename.to_string(),
+            },
+            source: SegmentSource {
+                source_server_idx: Some(1),
+                exclude_servers: vec![2],
+            },
+        })
+        .await;
+
+    assert_eq!(pipeline.metrics.bytes_decoded.load(Ordering::Relaxed), 0);
+    assert_eq!(pipeline.metrics.segments_decoded.load(Ordering::Relaxed), 0);
+    assert_eq!(pipeline.metrics.decode_errors.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .map(|state| state.downloaded_bytes),
+        Some(0)
+    );
+    assert!(!pipeline.write_buffers.contains_key(&segment_id.file_id));
+    assert!(!working_dir.join(filename).exists());
+    assert!(
+        !drain_job_events(&mut events, job_id)
+            .iter()
+            .any(|event| matches!(event, PipelineEvent::SegmentDecoded { .. }))
+    );
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let work = pipeline
+        .retry_rx
+        .try_recv()
+        .expect("queued layout mismatch should schedule a retry")
+        .work;
+    assert_eq!(work.exclude_servers, vec![2, 1]);
+}
+
+#[tokio::test]
+async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20916);
+    let filename = "fused-layout.bin";
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Fused Layout Mismatch", &[(filename.to_string(), 4)]),
+    )
+    .await;
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let mut events = pipeline.event_tx.subscribe();
+    pipeline.active_downloads += 1;
+    pipeline
+        .handle_download_done(DownloadResult {
+            runtime_generation: 0,
+            segment_id,
+            data: Ok(DownloadPayload::Decoded(DecodeResult {
+                segment_id,
+                raw_size: 8,
+                yenc_layout: YencLayoutAssertions {
+                    file_size: 5,
+                    part: None,
+                    total: None,
+                    begin: None,
+                    end: None,
+                },
+                crc_valid: true,
+                part_crc_verified: true,
+                part_crc: weaver_par2::checksum::crc32(b"data"),
+                expected_file_crc: None,
+                data: DecodedChunk::from(b"data".to_vec()),
+                yenc_name: filename.to_string(),
+            })),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(2),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: vec![3],
+            release_connection_slot: true,
+        })
+        .await;
+
+    assert_eq!(pipeline.metrics.bytes_decoded.load(Ordering::Relaxed), 0);
+    assert_eq!(pipeline.metrics.segments_decoded.load(Ordering::Relaxed), 0);
+    assert_eq!(pipeline.metrics.decode_errors.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .map(|state| state.downloaded_bytes),
+        Some(0)
+    );
+    assert!(!pipeline.write_buffers.contains_key(&segment_id.file_id));
+    assert!(!working_dir.join(filename).exists());
+    assert!(
+        !drain_job_events(&mut events, job_id)
+            .iter()
+            .any(|event| matches!(event, PipelineEvent::SegmentDecoded { .. }))
+    );
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let work = pipeline
+        .retry_rx
+        .try_recv()
+        .expect("fused layout mismatch should schedule a retry")
+        .work;
+    assert_eq!(work.exclude_servers, vec![3, 2]);
+}
+
 #[test]
 fn decode_retry_exclude_servers_appends_actual_source_server_once() {
     assert_eq!(
@@ -804,7 +957,7 @@ async fn replayed_article_mid_download_does_not_force_a_whole_file_reread() {
 }
 
 #[tokio::test]
-async fn out_of_order_non_duplicate_arrival_still_forces_a_whole_file_reread() {
+async fn mismatched_out_of_order_offset_is_rejected_before_hash_state_changes() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20008);
@@ -830,10 +983,8 @@ async fn out_of_order_non_duplicate_arrival_still_forces_a_whole_file_reread() {
     .await;
     assert!(!pipeline.file_hash_reread_required.contains(&file_id));
 
-    // Negative control for the duplicate skip above: a *different* segment
-    // reaching the same seam behind the write cursor is not a replay of bytes
-    // the hash already holds, so the running offset really is broken and the
-    // whole-file re-read is the only way back to a trustworthy checksum.
+    // A different segment claiming the first segment's range is rejected at
+    // the NZB/yEnc boundary, before it can poison the streaming hash state.
     submit_decoded_segment(
         &mut pipeline,
         file_id,
@@ -844,11 +995,15 @@ async fn out_of_order_non_duplicate_arrival_still_forces_a_whole_file_reread() {
         Some(whole_file_crc),
     )
     .await;
-    assert!(
-        pipeline.file_hash_reread_required.contains(&file_id),
-        "a genuine out-of-order arrival must still fall back to the whole-file re-read"
+    assert!(!pipeline.file_hash_reread_required.contains(&file_id));
+    assert!(pipeline.file_hash_states.contains_key(&file_id));
+    assert_eq!(
+        pipeline.decode_retries.get(&SegmentId {
+            file_id,
+            segment_number: 1,
+        }),
+        Some(&1)
     );
-    assert!(!pipeline.file_hash_states.contains_key(&file_id));
 }
 
 #[tokio::test]
@@ -867,22 +1022,32 @@ async fn disk_write_failure_fails_job_before_commit() {
         file_index: 0,
     };
     pipeline
-        .handle_decode_success(DecodeResult {
-            segment_id: SegmentId {
-                file_id,
-                segment_number: 0,
+        .handle_decode_success(
+            DecodeResult {
+                segment_id: SegmentId {
+                    file_id,
+                    segment_number: 0,
+                },
+                raw_size: 4,
+                yenc_layout: YencLayoutAssertions {
+                    file_size: 4,
+                    part: None,
+                    total: None,
+                    begin: None,
+                    end: None,
+                },
+                crc_valid: true,
+                part_crc_verified: true,
+                part_crc: weaver_par2::checksum::crc32(b"fail"),
+                expected_file_crc: None,
+                data: DecodedChunk::from(b"fail".to_vec()),
+                yenc_name: "blocked.bin".to_string(),
             },
-            raw_size: 4,
-            unverified_provenance: None,
-            file_offset: 0,
-            decoded_size: 4,
-            crc_valid: true,
-            part_crc_verified: true,
-            part_crc: weaver_par2::checksum::crc32(b"fail"),
-            expected_file_crc: None,
-            data: DecodedChunk::from(b"fail".to_vec()),
-            yenc_name: "blocked.bin".to_string(),
-        })
+            SegmentSource {
+                source_server_idx: None,
+                exclude_servers: Vec::new(),
+            },
+        )
         .await;
 
     let status = job_status_for_assert(&pipeline, job_id).unwrap();
@@ -1127,10 +1292,10 @@ async fn completed_file_uses_decoded_size_when_raw_article_bytes_are_larger() {
     let job_id = JobId(20023);
     let filename = "payload.bin";
     let payload = b"decoded payload";
-    let raw_article_bytes = payload.len() as u32 + 128;
+    let raw_article_bytes = payload.len() as u64 + 128;
     let spec = standalone_job_spec(
         "Decoded Size Completion",
-        &[(filename.to_string(), raw_article_bytes)],
+        &[(filename.to_string(), payload.len() as u32)],
     );
     insert_active_job(&mut pipeline, job_id, spec).await;
     let mut events = pipeline.event_tx.subscribe();
@@ -1140,22 +1305,32 @@ async fn completed_file_uses_decoded_size_when_raw_article_bytes_are_larger() {
     };
 
     pipeline
-        .handle_decode_success(DecodeResult {
-            segment_id: SegmentId {
-                file_id,
-                segment_number: 0,
+        .handle_decode_success(
+            DecodeResult {
+                segment_id: SegmentId {
+                    file_id,
+                    segment_number: 0,
+                },
+                raw_size: raw_article_bytes,
+                yenc_layout: YencLayoutAssertions {
+                    file_size: payload.len() as u64,
+                    part: None,
+                    total: None,
+                    begin: None,
+                    end: None,
+                },
+                crc_valid: true,
+                part_crc_verified: true,
+                part_crc: weaver_par2::checksum::crc32(payload),
+                expected_file_crc: Some(weaver_par2::checksum::crc32(payload)),
+                data: DecodedChunk::from(payload.to_vec()),
+                yenc_name: filename.to_string(),
             },
-            raw_size: raw_article_bytes as u64,
-            unverified_provenance: None,
-            file_offset: 0,
-            decoded_size: payload.len() as u32,
-            crc_valid: true,
-            part_crc_verified: true,
-            part_crc: weaver_par2::checksum::crc32(payload),
-            expected_file_crc: Some(weaver_par2::checksum::crc32(payload)),
-            data: DecodedChunk::from(payload.to_vec()),
-            yenc_name: filename.to_string(),
-        })
+            SegmentSource {
+                source_server_idx: None,
+                exclude_servers: Vec::new(),
+            },
+        )
         .await;
 
     let drained_events = drain_job_events(&mut events, job_id);

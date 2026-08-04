@@ -212,6 +212,15 @@ impl FileAssembly {
         self.cumulative_offsets[segment_number as usize]
     }
 
+    /// The trusted zero-based byte range for a segment.
+    pub fn segment_bounds(&self, segment_number: u32) -> Option<(u64, u64)> {
+        let index = segment_number as usize;
+        Some((
+            *self.cumulative_offsets.get(index)?,
+            *self.cumulative_offsets.get(index.checked_add(1)?)?,
+        ))
+    }
+
     /// Total expected bytes for the file.
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes

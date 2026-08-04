@@ -287,11 +287,13 @@ impl Pipeline {
                     "download.fused.decoded.bytes",
                     io.decoded_bytes_written,
                 );
-                let file_offset = result
-                    .metadata
-                    .begin
-                    .map(|b| b.saturating_sub(1))
-                    .unwrap_or(0);
+                let yenc_layout = YencLayoutAssertions {
+                    file_size: result.metadata.size,
+                    part: result.metadata.part,
+                    total: result.metadata.total,
+                    begin: result.metadata.begin,
+                    end: result.metadata.end,
+                };
 
                 let data = {
                     let _cpu =
@@ -302,9 +304,7 @@ impl Pipeline {
                 Ok(DownloadPayload::Decoded(DecodeResult {
                     segment_id,
                     raw_size: raw_size as u64,
-                    unverified_provenance: None,
-                    file_offset,
-                    decoded_size: result.bytes_written as u32,
+                    yenc_layout,
                     crc_valid: result.crc_valid,
                     part_crc_verified: result.expected_part_crc.is_some() && result.crc_valid,
                     part_crc: result.part_crc,

@@ -385,7 +385,7 @@ impl Pipeline {
     pub(crate) fn released_download_result_lead_bytes(result: &DownloadResult) -> u64 {
         match &result.data {
             Ok(DownloadPayload::Raw(bytes)) => bytes.len() as u64,
-            Ok(DownloadPayload::Decoded(decoded)) => decoded.decoded_size as u64,
+            Ok(DownloadPayload::Decoded(decoded)) => decoded.data.len_bytes() as u64,
             Err(_) => 0,
         }
     }
@@ -482,7 +482,7 @@ impl Pipeline {
         let (excluded_servers, source_server_idx) = {
             let _cpu_scope =
                 crate::runtime::perf_probe::cpu_scope("download.process_done.pre_match");
-            let excluded_servers = result.exclude_servers.clone();
+            let excluded_servers = result.exclude_servers;
             let source_server_idx = result.source_server_idx;
             if result.origin != DownloadResultOrigin::IpReplacementTrial {
                 self.observe_ip_rtt_attempts(&result.attempts);
@@ -555,16 +555,9 @@ impl Pipeline {
                 });
                 self.pump_decode_queue();
             }
-            Ok(DownloadPayload::Decoded(mut decoded)) => {
-                if !decoded.part_crc_verified {
-                    decoded.unverified_provenance = Some(Box::new(UnverifiedSegmentProvenance {
-                        source_server_idx,
-                        exclude_servers: excluded_servers,
-                    }));
-                }
+            Ok(DownloadPayload::Decoded(decoded)) => {
                 let raw_size_bytes = decoded.raw_size;
                 let raw_size = raw_size_bytes.min(u64::from(u32::MAX)) as u32;
-                let decoded_size = decoded.decoded_size;
                 {
                     let _cpu_scope = crate::runtime::perf_probe::cpu_scope(
                         "download.process_done.decoded_pre_success",
@@ -575,20 +568,20 @@ impl Pipeline {
                     self.metrics
                         .segments_downloaded
                         .fetch_add(1, Ordering::Relaxed);
-                    self.metrics
-                        .bytes_decoded
-                        .fetch_add(decoded_size as u64, Ordering::Relaxed);
-                    self.metrics
-                        .segments_decoded
-                        .fetch_add(1, Ordering::Relaxed);
-
                     let _ = self.event_tx.send(PipelineEvent::ArticleDownloaded {
                         segment_id: result.segment_id,
                         raw_size,
                     });
                 }
 
-                self.handle_decode_success(decoded).await;
+                self.handle_decode_success(
+                    decoded,
+                    SegmentSource {
+                        source_server_idx,
+                        exclude_servers: excluded_servers,
+                    },
+                )
+                .await;
             }
             Err(DownloadError::Decode {
                 raw_size,

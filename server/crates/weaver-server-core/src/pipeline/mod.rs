@@ -1212,11 +1212,7 @@ pub(super) struct TerminalPostProcessingDone {
 pub(super) struct DecodeResult {
     pub(super) segment_id: SegmentId,
     pub(super) raw_size: u64,
-    /// Present only when this successful decode lacked an independently
-    /// verified yEnc part CRC. Keeps provenance off the verified hot path.
-    pub(super) unverified_provenance: Option<Box<UnverifiedSegmentProvenance>>,
-    pub(super) file_offset: u64,
-    pub(super) decoded_size: u32,
+    pub(super) yenc_layout: YencLayoutAssertions,
     pub(super) crc_valid: bool,
     pub(super) part_crc_verified: bool,
     pub(super) part_crc: u32,
@@ -1226,8 +1222,17 @@ pub(super) struct DecodeResult {
     pub(super) yenc_name: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct YencLayoutAssertions {
+    pub(super) file_size: u64,
+    pub(super) part: Option<u32>,
+    pub(super) total: Option<u32>,
+    pub(super) begin: Option<u64>,
+    pub(super) end: Option<u64>,
+}
+
 #[derive(Debug)]
-pub(super) struct UnverifiedSegmentProvenance {
+pub(super) struct SegmentSource {
     pub(super) source_server_idx: Option<usize>,
     pub(super) exclude_servers: Vec<usize>,
 }
@@ -1242,7 +1247,10 @@ pub(super) struct FileCrcRecoveryState {
 /// Completion of a decode task, including explicit failures so backlog
 /// accounting is always drained.
 pub(super) enum DecodeDone {
-    Success(DecodeResult),
+    Success {
+        result: DecodeResult,
+        source: SegmentSource,
+    },
     Failed {
         segment_id: SegmentId,
         raw_size: u64,
@@ -1822,7 +1830,7 @@ pub struct Pipeline {
     pub(super) decode_retries: HashMap<SegmentId, u32>,
     /// Successfully decoded segments whose yEnc part CRC was absent. These are
     /// targeted for replacement only if the completed file CRC proves corruption.
-    pub(super) unverified_segments: HashMap<NzbFileId, HashMap<u32, UnverifiedSegmentProvenance>>,
+    pub(super) unverified_segments: HashMap<NzbFileId, HashMap<u32, SegmentSource>>,
     /// Completed files currently replacing unverified segments after a whole-file
     /// CRC mismatch. Final verification waits for the entire batch.
     pub(super) file_crc_recoveries: HashMap<NzbFileId, FileCrcRecoveryState>,

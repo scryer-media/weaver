@@ -5702,9 +5702,13 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
             data: Ok(DownloadPayload::Decoded(DecodeResult {
                 segment_id,
                 raw_size,
-                unverified_provenance: None,
-                file_offset: 0,
-                decoded_size: payload.len() as u32,
+                yenc_layout: YencLayoutAssertions {
+                    file_size: payload.len() as u64 + 1,
+                    part: Some(1),
+                    total: Some(2),
+                    begin: Some(1),
+                    end: Some(payload.len() as u64),
+                },
                 crc_valid: true,
                 part_crc_verified: false,
                 part_crc: weaver_par2::checksum::crc32(&payload),

@@ -98,16 +98,13 @@ impl Pipeline {
                 match decode_result {
                     Ok(decode_result) => {
                         output.set_len(decode_result.bytes_written);
-                        metrics
-                            .bytes_decoded
-                            .fetch_add(decode_result.bytes_written as u64, Ordering::Relaxed);
-                        metrics.segments_decoded.fetch_add(1, Ordering::Relaxed);
-
-                        let file_offset = decode_result
-                            .metadata
-                            .begin
-                            .map(|b| b.saturating_sub(1))
-                            .unwrap_or(0);
+                        let yenc_layout = YencLayoutAssertions {
+                            file_size: decode_result.metadata.size,
+                            part: decode_result.metadata.part,
+                            total: decode_result.metadata.total,
+                            begin: decode_result.metadata.begin,
+                            end: decode_result.metadata.end,
+                        };
 
                         let decoded = {
                             let _cpu_scope = crate::runtime::perf_probe::cpu_scope(
@@ -123,25 +120,23 @@ impl Pipeline {
                         let send_started = Instant::now();
                         let part_crc_verified =
                             decode_result.expected_part_crc.is_some() && decode_result.crc_valid;
-                        let unverified_provenance = (!part_crc_verified).then(|| {
-                            Box::new(UnverifiedSegmentProvenance {
+                        let _ = tx.blocking_send(DecodeDone::Success {
+                            result: DecodeResult {
+                                segment_id,
+                                raw_size,
+                                yenc_layout,
+                                crc_valid: decode_result.crc_valid,
+                                part_crc_verified,
+                                part_crc: decode_result.part_crc,
+                                expected_file_crc: decode_result.expected_file_crc,
+                                data: decoded,
+                                yenc_name: decode_result.metadata.name,
+                            },
+                            source: SegmentSource {
                                 source_server_idx,
                                 exclude_servers,
-                            })
+                            },
                         });
-                        let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
-                            segment_id,
-                            raw_size,
-                            unverified_provenance,
-                            file_offset,
-                            decoded_size: decode_result.bytes_written as u32,
-                            crc_valid: decode_result.crc_valid,
-                            part_crc_verified,
-                            part_crc: decode_result.part_crc,
-                            expected_file_crc: decode_result.expected_file_crc,
-                            data: decoded,
-                            yenc_name: decode_result.metadata.name,
-                        }));
                         crate::runtime::perf_probe::record(
                             "download.decode.done_channel.blocking_send",
                             send_started.elapsed(),
@@ -176,16 +171,13 @@ impl Pipeline {
                 };
                 match decode_result {
                     Ok(decode_result) => {
-                        metrics
-                            .bytes_decoded
-                            .fetch_add(decode_result.bytes_written as u64, Ordering::Relaxed);
-                        metrics.segments_decoded.fetch_add(1, Ordering::Relaxed);
-
-                        let file_offset = decode_result
-                            .metadata
-                            .begin
-                            .map(|b| b.saturating_sub(1))
-                            .unwrap_or(0);
+                        let yenc_layout = YencLayoutAssertions {
+                            file_size: decode_result.metadata.size,
+                            part: decode_result.metadata.part,
+                            total: decode_result.metadata.total,
+                            begin: decode_result.metadata.begin,
+                            end: decode_result.metadata.end,
+                        };
 
                         let _profile_scope =
                             crate::runtime::perf_probe::scope("download.decode.send_success");
@@ -194,25 +186,23 @@ impl Pipeline {
                         let send_started = Instant::now();
                         let part_crc_verified =
                             decode_result.expected_part_crc.is_some() && decode_result.crc_valid;
-                        let unverified_provenance = (!part_crc_verified).then(|| {
-                            Box::new(UnverifiedSegmentProvenance {
+                        let _ = tx.blocking_send(DecodeDone::Success {
+                            result: DecodeResult {
+                                segment_id,
+                                raw_size,
+                                yenc_layout,
+                                crc_valid: decode_result.crc_valid,
+                                part_crc_verified,
+                                part_crc: decode_result.part_crc,
+                                expected_file_crc: decode_result.expected_file_crc,
+                                data: DecodedChunk::from(output),
+                                yenc_name: decode_result.metadata.name,
+                            },
+                            source: SegmentSource {
                                 source_server_idx,
                                 exclude_servers,
-                            })
+                            },
                         });
-                        let _ = tx.blocking_send(DecodeDone::Success(DecodeResult {
-                            segment_id,
-                            raw_size,
-                            unverified_provenance,
-                            file_offset,
-                            decoded_size: decode_result.bytes_written as u32,
-                            crc_valid: decode_result.crc_valid,
-                            part_crc_verified,
-                            part_crc: decode_result.part_crc,
-                            expected_file_crc: decode_result.expected_file_crc,
-                            data: DecodedChunk::from(output),
-                            yenc_name: decode_result.metadata.name,
-                        }));
                         crate::runtime::perf_probe::record(
                             "download.decode.done_channel.blocking_send",
                             send_started.elapsed(),
