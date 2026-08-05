@@ -152,12 +152,70 @@ impl Pipeline {
         })
     }
 
+    /// Whether a RAR extraction has failed for this job and PAR2 has not yet
+    /// had its say about why.
+    ///
+    /// This is the recovery latch. A member that failed to extract will fail
+    /// the same way against the same bytes, so re-scheduling it before PAR2
+    /// has decided whether those bytes can be repaired is a spin: extract,
+    /// fail, re-schedule, extract. The failed-extraction marker is the only
+    /// state involved — it is already recorded, already persisted, and already
+    /// cleared by the paths that resolve a failure
+    /// ([`Self::clear_failed_extraction_member`] after a repair,
+    /// `replace_failed_extraction_members` when the set is retried).
+    ///
+    /// "No worker still running" matters: while one is, the job's inputs can
+    /// still change under it, and the failure is not settled.
+    pub(crate) fn par2_recovery_evaluation_pending(&self, job_id: JobId) -> bool {
+        let par2_authoritative = self.jobs.get(&job_id).is_some_and(|state| {
+            state.spec.par2_bytes() > 0
+                && !self.par2_bypassed.contains(&job_id)
+                && !self.par2_verified.contains(&job_id)
+        });
+        if !par2_authoritative {
+            return false;
+        }
+        if !self
+            .failed_extractions
+            .get(&job_id)
+            .is_some_and(|members| !members.is_empty())
+        {
+            return false;
+        }
+        !self.job_has_active_rar_extraction_workers(job_id)
+    }
+
+    /// Whether any of the job's RAR sets still has extraction work in flight.
+    pub(crate) fn job_has_active_rar_extraction_workers(&self, job_id: JobId) -> bool {
+        self.rar_sets
+            .iter()
+            .filter(|((set_job_id, _), _)| *set_job_id == job_id)
+            .any(|(_, state)| state.active_workers > 0 || !state.in_flight_members.is_empty())
+    }
+
     pub(crate) fn rar_ready_member_is_startable_for_batch_extraction(
         &self,
         job_id: JobId,
         set_name: &str,
         member_name: &str,
     ) -> bool {
+        // The recovery latch (see `par2_recovery_evaluation_pending`). A member
+        // that already failed does not go round again until PAR2 has decided
+        // whether its bytes can be repaired — otherwise the failure and the
+        // re-schedule chase each other. Checked per member, so the set's other
+        // members are unaffected.
+        if self
+            .failed_extractions
+            .get(&job_id)
+            .is_some_and(|members| members.contains(member_name))
+            && self.jobs.get(&job_id).is_some_and(|state| {
+                state.spec.par2_bytes() > 0
+                    && !self.par2_bypassed.contains(&job_id)
+                    && !self.par2_verified.contains(&job_id)
+            })
+        {
+            return false;
+        }
         if self
             .inflight_extractions
             .get(&job_id)
@@ -1371,6 +1429,17 @@ impl Pipeline {
                             allows_extraction: false,
                         } => {}
                         RarExtractionSettle::Idle if all_downloaded => {
+                            self.check_job_completion(job_id).await;
+                        }
+                        // The last worker of a failed batch has settled. The
+                        // job goes to completion for a PAR2 verdict, not back
+                        // to extraction: the member that failed is latched out
+                        // of scheduling until that verdict lands, so calling
+                        // `try_rar_extraction` here would either pick nothing
+                        // or pick a member the same failure is about to cover.
+                        RarExtractionSettle::Idle
+                            if self.par2_recovery_evaluation_pending(job_id) =>
+                        {
                             self.check_job_completion(job_id).await;
                         }
                         RarExtractionSettle::Idle => {

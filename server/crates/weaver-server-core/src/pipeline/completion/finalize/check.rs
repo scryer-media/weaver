@@ -2443,7 +2443,20 @@ impl Pipeline {
             self.emit_download_pipeline_drained_if_pending(job_id);
         }
         let only_rar_archives = self.job_has_only_rar_archives(job_id);
-        let par2_primary_payload_ready = !has_incomplete_data_files || download_pipeline_exhausted;
+        // A settled RAR extraction failure is the third way the payload can be
+        // "as ready as it is going to get". Ordinarily an incomplete data file
+        // defers validation until the downloads drain, which is right: PAR2
+        // cannot tell a file still arriving from a damaged one. But a failed
+        // extraction with no worker left running is evidence that this job's
+        // archives cannot be opened *now*, and the reason may well be the very
+        // volume that never arrived. Deferring there is what leaves the job
+        // waiting on downloads that will not come while the failed member is
+        // latched out of scheduling — so the authoritative pass runs, names the
+        // exact missing blocks, and either promotes recovery, repairs, or fails
+        // for good.
+        let par2_primary_payload_ready = !has_incomplete_data_files
+            || download_pipeline_exhausted
+            || self.par2_recovery_evaluation_pending(job_id);
         let par2_validation_needed = par2_loaded
             && !par2_bypassed
             && !self.par2_verified.contains(&job_id)
