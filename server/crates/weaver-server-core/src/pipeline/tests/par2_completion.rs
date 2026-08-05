@@ -3734,5 +3734,10 @@ async fn live_par2_refuses_the_short_circuit_when_the_on_disk_length_disagrees()
         payload.len() as u64,
         "the read covers what PAR2 describes, not the bytes the file grew by"
     );
+    assert_eq!(
+        metrics.strongly_verified_slices, 2,
+        "and every described block verified clean — the refusal below is the \
+         length gate's doing, not a block that failed to hash"
+    );
     assert_eq!(metrics.full_verify_skips, 0);
 }

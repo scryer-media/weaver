@@ -12552,26 +12552,52 @@ async fn the_direct_session_refuses_without_live_evidence() {
     let _ = resolution;
 }
 
-/// One whole damaged-direct job, with the retained-session gate forced.
+/// The quiet direct pass's actual verdict, flattened into something two runs
+/// can be compared on. `VerificationResult` carries no `PartialEq`, and
+/// comparing `DirectPar2Resolution` instead would compare a three-variant enum
+/// — where `Unresolved` is also what "no live set" and "the pass refused"
+/// return, so agreement there means nothing.
+type DirectVerdictSummary = (Vec<(String, String, Vec<bool>, u32)>, u32, String);
+
+fn direct_verdict_summary(verification: &par2_rs::VerificationResult) -> DirectVerdictSummary {
+    let mut files = verification
+        .files
+        .iter()
+        .map(|file| {
+            (
+                file.filename.clone(),
+                format!("{:?}", file.status),
+                file.valid_slices.clone(),
+                file.missing_slice_count,
+            )
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    (
+        files,
+        verification.total_missing_blocks,
+        format!("{:?}", verification.repairable),
+    )
+}
+
+/// Runs a whole damaged-direct job with the retained-session gate forced, and
+/// reports the verdict the pipeline's *own* quiet direct pass reached.
 ///
 /// The damage is **posted**, not written afterwards, and that is load-bearing:
 /// a set whose articles all arrive intact extracts, finalizes, and stops
-/// answering through the overlay, so it never reaches the direct pass at all.
-/// Damaged posted bytes keep the set live *and* fully adjudicated — every slice
-/// carries a verdict, one of them bad — which is the window the session arm
-/// serves, and the case phase 6 exists for.
+/// answering through the overlay, so it never reaches this pass at all.
+/// Damaged posted bytes keep the set live *and* fully adjudicated — every
+/// slice carries a verdict, one of them bad — which is the window the session
+/// arm serves, and the case phase 6 exists for.
 ///
-/// Returns the resolution, whether live verification really adjudicated the set
-/// (read from cumulative metrics, which outlive the per-job state), and how
-/// many times the session produced a direct verdict.
-async fn damaged_direct_run_with_session_gate(
+/// The pass is observed where the pipeline runs it, mid-assembly, rather than
+/// invoked afterwards: by the time a job settles, its live state has been
+/// retired and the session arm correctly refuses, so a pass called at that
+/// point measures a different situation than the one under test.
+async fn damaged_direct_verdict_with_session_gate(
     job_id: JobId,
     session_gate: bool,
-) -> (
-    crate::pipeline::direct_store::wiring::DirectPar2Resolution,
-    bool,
-    usize,
-) {
+) -> (Option<DirectVerdictSummary>, bool, usize) {
     let member_name = "Silver.Horizon.S04E02.mkv";
     let payload: Vec<u8> = (0..3072u32).map(|index| (index % 251) as u8).collect();
     let pristine = single_member_store_set(member_name, &payload, 3);
@@ -12588,7 +12614,7 @@ async fn damaged_direct_run_with_session_gate(
     pipeline.stateful_par2_session_forced = Some(session_gate);
 
     let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &pristine, &par2_bytes);
-    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    insert_active_job(&mut pipeline, job_id, spec).await;
     for (file_index, segment_number) in in_order_arrivals(posted.len()) {
         submit_volume_article(&mut pipeline, job_id, &posted, file_index, segment_number).await;
     }
@@ -12608,22 +12634,20 @@ async fn damaged_direct_run_with_session_gate(
     pipeline.settle_live_par2_job(job_id).await;
 
     let metrics = pipeline.live_par2.metrics();
-    let par2_set = pipeline
-        .par2_set(job_id)
-        .cloned()
-        .expect("the index parsed");
-    let resolution = pipeline
-        .resolve_direct_sets_before_par2_repairer(job_id, par2_set, working_dir)
-        .await;
     (
-        resolution,
+        pipeline
+            .last_direct_verdict
+            .as_ref()
+            .map(direct_verdict_summary),
         metrics.strongly_verified_slices > 0 && metrics.invalid_slices > 0,
         pipeline.direct_session_pass_calls,
     )
 }
 
 /// Plan 138, M3. The retained session drives the authoritative pass for direct
-/// sets, and reaches the verdict the read-and-verify pass would have reached.
+/// sets, and reaches the verdict the read-and-verify pass would have reached —
+/// the same files, the same per-slice validity, the same missing-block count,
+/// the same repairability.
 ///
 /// This is the substitution that matters. An access-backed session reads **no**
 /// source bytes — `analyze()` skips the scan entirely — so it can only stand in
@@ -12632,17 +12656,12 @@ async fn damaged_direct_run_with_session_gate(
 /// for. If the two arms could disagree, a direct job's verdict would depend on
 /// a gate, which is precisely what M5 has to be able to flip without changing
 /// behaviour.
-///
-/// The pass runs inside the pipeline's own completion checks, while the job is
-/// still assembling — not at the end. Anything sampled from the live engine
-/// afterwards describes a job whose per-job state has already been retired,
-/// which is why non-vacuity here reads the cumulative metrics instead.
 #[tokio::test]
 async fn the_retained_session_finds_the_same_direct_damage_as_the_pass() {
-    let (gate_off, adjudicated_off, session_passes_off) =
-        damaged_direct_run_with_session_gate(JobId(45203), false).await;
-    let (gate_on, adjudicated_on, session_passes_on) =
-        damaged_direct_run_with_session_gate(JobId(45204), true).await;
+    let (gate_off, adjudicated_off, session_calls_off) =
+        damaged_direct_verdict_with_session_gate(JobId(45203), false).await;
+    let (gate_on, adjudicated_on, session_calls_on) =
+        damaged_direct_verdict_with_session_gate(JobId(45204), true).await;
 
     assert!(
         adjudicated_off && adjudicated_on,
@@ -12650,18 +12669,37 @@ async fn the_retained_session_finds_the_same_direct_damage_as_the_pass() {
          in stream, damage included, or there is no evidence to substitute for"
     );
     assert_eq!(
-        session_passes_off, 0,
+        session_calls_off, 0,
         "with the gate off every direct verdict must come from the \
          read-and-verify pass"
     );
     assert!(
-        session_passes_on > 0,
+        session_calls_on > 0,
         "non-vacuity: with the gate on the session must really have produced a \
-         direct verdict, not silently fallen back to the pass"
+         verdict, not silently fallen back to the pass"
+    );
+
+    let (files_off, missing_off, repairable_off) =
+        gate_off.expect("the read-and-verify pass must produce a verdict");
+    let (files_on, missing_on, repairable_on) =
+        gate_on.expect("the session must produce a verdict");
+
+    // Non-vacuity for the damage itself: a verdict that found nothing wrong
+    // would make the comparison below meaningless.
+    assert!(
+        missing_off > 0
+            && files_off
+                .iter()
+                .any(|(_, _, valid, _)| valid.contains(&false)),
+        "the damaged set must really verify as damaged: {files_off:?}"
     );
     assert_eq!(
-        gate_on, gate_off,
-        "damage found by reading the volumes and damage reported from live \
-         evidence must be the same damage"
+        files_on, files_off,
+        "every file's status and per-slice validity must match"
+    );
+    assert_eq!(missing_on, missing_off, "and the missing-block count");
+    assert_eq!(
+        repairable_on, repairable_off,
+        "and the repairability verdict"
     );
 }

@@ -1186,10 +1186,8 @@ impl Pipeline {
                     let runtime = self.ensure_par2_runtime(job_id);
                     if repair || retried_source_change {
                         runtime.session_evidence_file_ids.clear();
-                        if repair {
-                            if let Some(session) = runtime.session.as_mut() {
-                                session.invalidate_all_sources();
-                            }
+                        if repair && let Some(session) = runtime.session.as_mut() {
+                            session.invalidate_all_sources();
                         }
                     } else {
                         runtime.session_evidence_file_ids.extend(admitted_file_ids);
@@ -2449,11 +2447,10 @@ impl Pipeline {
         // cannot tell a file still arriving from a damaged one. But a failed
         // extraction with no worker left running is evidence that this job's
         // archives cannot be opened *now*, and the reason may well be the very
-        // volume that never arrived. Deferring there is what leaves the job
-        // waiting on downloads that will not come while the failed member is
-        // latched out of scheduling — so the authoritative pass runs, names the
+        // volume that never arrived — so the authoritative pass runs, names the
         // exact missing blocks, and either promotes recovery, repairs, or fails
-        // for good.
+        // for good. The matching escape in the early deferral below is what
+        // lets execution reach this at all.
         let par2_primary_payload_ready = !has_incomplete_data_files
             || download_pipeline_exhausted
             || self.par2_recovery_evaluation_pending(job_id);
@@ -2587,6 +2584,12 @@ impl Pipeline {
         if has_incomplete_data_files
             && !download_pipeline_exhausted
             && !self.job_has_active_extraction_tasks(job_id)
+            // ...unless a RAR extraction has already failed and no worker is
+            // left to change that. Waiting for downloads that are not coming
+            // is how such a job stalls: its failed member is latched out of
+            // scheduling until PAR2 rules on it, and this return is what keeps
+            // PAR2 from ever being asked.
+            && !self.par2_recovery_evaluation_pending(job_id)
         {
             return;
         }

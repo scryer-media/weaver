@@ -1188,7 +1188,7 @@ impl Pipeline {
     /// a repair's size away from, and a sampled span would re-inflate it. Weaver
     /// sets the flag on no path that can reach here; the pin is in
     /// [`super::repair`]'s module docs.
-    async fn verify_direct_sets_quietly(
+    pub(crate) async fn verify_direct_sets_quietly(
         &mut self,
         job_id: JobId,
         par2_set: std::sync::Arc<par2_rs::Par2FileSet>,
@@ -1237,6 +1237,10 @@ impl Pipeline {
                 forgiven_direct_blocks = adjustments.forgiven_direct_blocks,
                 "adjusted the quiet direct-set pass before attributing damage"
             );
+        }
+        #[cfg(test)]
+        {
+            self.last_direct_verdict = Some(verification.clone());
         }
         Some(verification)
     }

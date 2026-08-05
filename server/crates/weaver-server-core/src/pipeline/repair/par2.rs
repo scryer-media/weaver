@@ -585,11 +585,18 @@ impl Pipeline {
         let state = self.jobs.get(&file_id.job_id)?;
         let file = state.assembly.file(file_id)?;
         let current_filename = self.current_filename_for_file(file_id.job_id, file);
-        let mut names = HashSet::from([current_filename.clone()]);
+        // Sanitized on the way in, because they are matched against sanitized
+        // descriptions below. Comparing a raw posted name to a sanitized one
+        // silently loses the binding — and with it live verification for that
+        // file — for every name that needed sanitizing at all.
+        let mut names = HashSet::from([
+            sanitize_download_filename(&current_filename),
+            sanitize_download_filename(file.filename()),
+        ]);
         if let Some(identity) = self.effective_file_identity(file_id.job_id, file_id) {
-            names.insert(identity.source_filename);
-            if let Some(canonical) = identity.canonical_filename {
-                names.insert(canonical);
+            names.insert(sanitize_download_filename(&identity.source_filename));
+            if let Some(canonical) = identity.canonical_filename.as_ref() {
+                names.insert(sanitize_download_filename(canonical));
             }
         }
         let candidates = set
@@ -626,7 +633,20 @@ impl Pipeline {
             return;
         };
         if self.live_par2.bind(file_id, par2_file_id, length, path) && complete {
-            self.live_par2.note_file_complete(file_id, length);
+            // The *received* length, never the described one. This is the
+            // fail-safe for a file whose decoded bytes disagree with what PAR2
+            // describes, and since `bind` was handed `desc.length` as the
+            // binding length, passing it again here would compare a value to
+            // itself: `rejected` could never fire and `completed_bytes` would
+            // always look right.
+            let received_bytes = self
+                .jobs
+                .get(&file_id.job_id)
+                .and_then(|state| state.assembly.file(file_id))
+                .map(|file| file.received_bytes());
+            if let Some(received_bytes) = received_bytes {
+                self.live_par2.note_file_complete(file_id, received_bytes);
+            }
         }
     }
 
@@ -800,8 +820,10 @@ impl Pipeline {
         if !self.stateful_par2_session_gate() {
             return Ok(None);
         }
-        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
-            if let Some(mut session) = runtime.session.take() {
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id)
+            && let Some(mut session) = runtime.session.take()
+        {
+            {
                 // A session is reusable only if it reads sources the way this
                 // caller needs them read. Where both want a handle the retained
                 // one adopts the new handle — the direct overlay snapshots its
@@ -938,23 +960,6 @@ impl Pipeline {
                 session.invalidate_all_sources();
             }
         }
-    }
-    fn par2_name_candidates_for_file(
-        &self,
-        job_id: JobId,
-        file: &crate::jobs::assembly::FileAssembly,
-    ) -> HashSet<String> {
-        let file_id = file.file_id();
-        let mut candidates = HashSet::new();
-        candidates.insert(sanitize_download_filename(file.filename()));
-        if let Some(identity) = self.effective_file_identity(job_id, file_id) {
-            candidates.insert(sanitize_download_filename(&identity.source_filename));
-            candidates.insert(sanitize_download_filename(&identity.current_filename));
-            if let Some(canonical) = identity.canonical_filename.as_ref() {
-                candidates.insert(sanitize_download_filename(canonical));
-            }
-        }
-        candidates
     }
     /// performed while reading the files.
     pub(crate) async fn live_par2_clean_verification(

@@ -152,6 +152,24 @@ impl Pipeline {
         })
     }
 
+    /// Whether PAR2 can still deliver a verdict on this job's archives.
+    ///
+    /// Deliberately keyed on a **loaded** set, not on the NZB declaring one.
+    /// A job can declare a `.par2` whose articles never arrive — routine, since
+    /// recovery volumes often sit on a different retention tier — and keying on
+    /// the declaration would latch a failed member out while waiting for a
+    /// verdict that can never come. `par2_verified` is the only release that
+    /// fires in production (`par2_bypassed` has no non-test writer), and it is
+    /// reachable only once the set has loaded, so an unloaded set must not
+    /// engage the latch at all. This is the same signal completion uses for
+    /// `par2_validation_needed`, which keeps the two from disagreeing about
+    /// whether a verdict is owed.
+    pub(crate) fn par2_is_authoritative_for_extraction(&self, job_id: JobId) -> bool {
+        self.par2_set(job_id).is_some()
+            && !self.par2_bypassed.contains(&job_id)
+            && !self.par2_verified.contains(&job_id)
+    }
+
     /// Whether a RAR extraction has failed for this job and PAR2 has not yet
     /// had its say about why.
     ///
@@ -167,18 +185,13 @@ impl Pipeline {
     /// "No worker still running" matters: while one is, the job's inputs can
     /// still change under it, and the failure is not settled.
     pub(crate) fn par2_recovery_evaluation_pending(&self, job_id: JobId) -> bool {
-        let par2_authoritative = self.jobs.get(&job_id).is_some_and(|state| {
-            state.spec.par2_bytes() > 0
-                && !self.par2_bypassed.contains(&job_id)
-                && !self.par2_verified.contains(&job_id)
-        });
-        if !par2_authoritative {
+        if !self.par2_is_authoritative_for_extraction(job_id) {
             return false;
         }
-        if !self
+        if self
             .failed_extractions
             .get(&job_id)
-            .is_some_and(|members| !members.is_empty())
+            .is_none_or(|members| members.is_empty())
         {
             return false;
         }
@@ -208,11 +221,7 @@ impl Pipeline {
             .failed_extractions
             .get(&job_id)
             .is_some_and(|members| members.contains(member_name))
-            && self.jobs.get(&job_id).is_some_and(|state| {
-                state.spec.par2_bytes() > 0
-                    && !self.par2_bypassed.contains(&job_id)
-                    && !self.par2_verified.contains(&job_id)
-            })
+            && self.par2_is_authoritative_for_extraction(job_id)
         {
             return false;
         }

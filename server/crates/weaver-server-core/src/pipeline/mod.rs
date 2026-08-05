@@ -1756,6 +1756,12 @@ pub struct Pipeline {
     /// "the session agreed" from "the session refused and fell back".
     #[cfg(test)]
     pub(super) direct_session_pass_calls: usize,
+    /// The verdict of the most recent quiet direct pass. The pipeline runs
+    /// that pass itself, mid-assembly, while live state is still intact — a
+    /// test that calls the pass afterwards observes a different situation
+    /// entirely, so the differential reads what actually happened.
+    #[cfg(test)]
+    pub(super) last_direct_verdict: Option<par2_rs::VerificationResult>,
     /// Downloaded article bodies waiting for decode scheduling.
     pub(super) pending_decode: VecDeque<PendingDecodeWork>,
     /// Jobs that should re-enter completion/post-processing on the next loop pass.

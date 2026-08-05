@@ -202,6 +202,7 @@ impl LivePar2Registry {
     /// That is the same question 0.8.0 asked of its `JobLive::Active` variant,
     /// and it is what the retirement tests assert after CRC recovery and after
     /// an authoritative repair.
+    #[cfg(test)]
     pub(crate) fn is_active(&self, job_id: JobId) -> bool {
         self.jobs
             .get(&job_id)
@@ -215,6 +216,7 @@ impl LivePar2Registry {
     /// the same thing in `pre_metadata_ranges`. Plan 136's encrypted-overlay
     /// test uses it to prove a direct volume's posted cipher really reached
     /// live verification, so the answer must stay per-file and non-empty.
+    #[cfg(test)]
     pub(crate) fn recorded_ranges(&self, file_id: NzbFileId) -> Option<Vec<(u64, u64)>> {
         self.jobs
             .get(&file_id.job_id)?
@@ -804,8 +806,10 @@ mod tests {
             file_index: 4,
         };
         let mut registry = LivePar2Registry::new();
-        let mut job = LiveJob::default();
-        job.disk_read_budget = 8;
+        let mut job = LiveJob {
+            disk_read_budget: 8,
+            ..Default::default()
+        };
         job.bindings.insert(
             file_id,
             LiveBinding {
