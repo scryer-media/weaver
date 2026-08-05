@@ -1400,18 +1400,18 @@ async fn a_duplicate_article_after_finalization_leaves_the_finished_output_alone
 /// every article, and "already queued" would cover everything.
 fn take_queued_segment(pipeline: &mut Pipeline, job_id: JobId, segment_id: SegmentId) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    let kept: Vec<_> = state
-        .download_queue
-        .drain_all()
+    let queued = state.download_queue.drain_all();
+    let before = queued.len();
+    let kept: Vec<_> = queued
         .into_iter()
         .filter(|work| work.segment_id != segment_id)
         .collect();
-    let removed = kept.len();
+    let removed = before - kept.len();
     for work in kept {
         state.download_queue.push(work);
     }
     assert!(
-        removed < state.download_queue.len() + 1,
+        removed > 0,
         "the segment must have been queued before it is dispatched"
     );
 }

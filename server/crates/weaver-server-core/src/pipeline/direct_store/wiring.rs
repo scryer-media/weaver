@@ -3309,6 +3309,12 @@ impl Pipeline {
             return Ok(Vec::new());
         }
         let set_name = set.set_name().to_string();
+        // Plan 136, E4. An `-hp` set's virtual volumes are as header-encrypted as
+        // the posted ones, so this extraction cannot even *open* the archive
+        // without the key the router proved — and for a `-p` set a tolerated
+        // member's data is encrypted too. `None` for a plaintext set, which is
+        // every set that reached here before encryption existed.
+        let password = set.router.archive_password().map(str::to_string);
 
         // The ordering invariant this extraction depends on, stated where it is
         // depended on (M4). The provider serves every stored member's extent out
@@ -3409,8 +3415,11 @@ impl Pipeline {
             let reader = provider
                 .open(first_volume)
                 .ok_or_else(|| format!("virtual volume {first_volume} is not registered"))?;
-            let mut archive = weaver_unrar::RarArchive::open(reader)
-                .map_err(|error| format!("failed to open the virtual archive: {error}"))?;
+            let mut archive = match password.as_deref() {
+                Some(password) => weaver_unrar::RarArchive::open_with_password(reader, password),
+                None => weaver_unrar::RarArchive::open(reader),
+            }
+            .map_err(|error| format!("failed to open the virtual archive: {error}"))?;
             // The same decode ceilings the incremental extractor applies. A
             // tolerated member is small by budget, but the *declared* dictionary
             // in a hostile header is not bounded by anything the budget checks.
@@ -3427,7 +3436,7 @@ impl Pipeline {
             }
             let options = weaver_unrar::ExtractOptions {
                 verify: true,
-                password: None,
+                password: password.clone(),
                 restore_owners: false,
             };
             let mut produced = Vec::with_capacity(targets.len());

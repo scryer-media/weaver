@@ -595,6 +595,16 @@ impl KeyRing {
         self.admitted
     }
 
+    /// The password this ring is deriving from, for the one consumer that needs
+    /// the string rather than a key: the tolerated-member extraction, which
+    /// hands it to `weaver-unrar` instead of decrypting anything itself.
+    ///
+    /// Every other reader wants [`Self::keys_for`]. Nothing may persist or log
+    /// this — see the type docs.
+    pub(crate) fn password(&self) -> Option<&str> {
+        self.password.as_deref()
+    }
+
     pub(crate) fn refusal(&self) -> Option<CryptRefusal> {
         self.refusal
     }

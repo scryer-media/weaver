@@ -2789,6 +2789,20 @@ impl DirectSetRouter {
         self.header_crypt.password()
     }
 
+    /// The password an extraction of this set needs, if any.
+    ///
+    /// RAR keys headers and file data from the same password, so a proved `-hp`
+    /// password is also the file password; a `-p` set has no header password and
+    /// keeps its own in the file ring. `None` for a plaintext set, which keeps
+    /// every plaintext extraction a no-password extraction exactly as before.
+    ///
+    /// This is the one place a password leaves the router as a string. The
+    /// tolerated-member extraction hands it to `weaver-unrar` rather than
+    /// decrypting anything itself, so it needs the secret and not a key.
+    pub(crate) fn archive_password(&self) -> Option<&str> {
+        self.header_password().or_else(|| self.crypt.password())
+    }
+
     /// Files one parse's facts against the layout and drains what they unlock.
     ///
     /// Split out of [`Self::try_parse_volume`] because there are two readers a
