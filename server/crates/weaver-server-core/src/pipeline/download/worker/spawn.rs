@@ -330,6 +330,11 @@ impl Pipeline {
             return;
         }
 
+        // Owned and async lanes share the same provider permits. Idle owned
+        // workers retain their connections for reuse, so release those caches
+        // before an async-only lease (notably PAR2 recovery) tries to acquire.
+        self.owned_download_lane_pool.reset();
+
         let nntp = Arc::clone(&self.nntp);
         let tx = self.download_done_tx.clone();
         let refill_tx = self.download_refill_tx.clone();

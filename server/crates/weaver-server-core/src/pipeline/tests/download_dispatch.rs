@@ -39,6 +39,48 @@ async fn owned_download_lane_pool_respects_configured_connection_count_at_startu
 }
 
 #[tokio::test]
+async fn recovery_async_handoff_resets_owned_lane_caches() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let work = DownloadWork {
+        segment_id: SegmentId {
+            file_id: NzbFileId {
+                job_id: JobId(40141),
+                file_index: 1,
+            },
+            segment_number: 1,
+        },
+        message_id: MessageId::new("recovery-handoff@example.invalid"),
+        groups: vec!["alt.binaries.test".to_string()],
+        priority: 0,
+        byte_estimate: 1024,
+        retry_count: 0,
+        is_recovery: true,
+        exclude_servers: Vec::new(),
+        avoid_server: None,
+    };
+    let compatibility = DownloadBatchCompatibility::from_work(&work);
+    let lease = DownloadBatchLease {
+        job_id: work.segment_id.file_id.job_id,
+        runtime_generation: pipeline.pool_generation,
+        lane_mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: None,
+        server_modes: Vec::new(),
+        compatibility,
+        effective_exclude_servers: Vec::new(),
+        works: vec![work],
+    };
+
+    assert_eq!(pipeline.owned_download_lane_pool.reset_calls(), 0);
+    pipeline.spawn_download_batch(lease);
+    assert_eq!(
+        pipeline.owned_download_lane_pool.reset_calls(),
+        1,
+        "async-only recovery must release permits retained by idle owned lanes"
+    );
+}
+
+#[tokio::test]
 async fn hot_lease_work_limit_scales_with_lane_throughput() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

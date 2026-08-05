@@ -3133,6 +3133,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "par2-rs"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe1b0fdb243bd26bf0b3406fdb1166fba605c7175c48aeb667bbd527229948bc"
+dependencies = [
+ "aws-lc-sys 0.42.0",
+ "bytes",
+ "crc32fast",
+ "libc",
+ "md-5",
+ "memmap2",
+ "rayon",
+ "reedsolomon-rs",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3635,6 +3653,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "reedsolomon-rs"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18344ccd1e132c50fb8d7fd88e187260a0094a30d4a230bffa076dc8510c2444"
+dependencies = [
+ "memmap2",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "rayon",
 ]
 
 [[package]]
@@ -5127,6 +5158,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "unrar-rs"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8d1007633a9928729412e249db5cb25e099eb01c0c3dd6f0c4b287d8f2168b3"
+dependencies = [
+ "aws-lc-rs",
+ "aws-lc-sys 0.42.0",
+ "blake2s_simd",
+ "crc32fast",
+ "filetime",
+ "libc",
+ "memchr",
+ "rayon",
+ "reedsolomon-rs",
+ "rmp-serde",
+ "serde",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tracing",
+ "unicode-normalization",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
 name = "untrusted"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5313,6 +5370,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "mime_guess",
+ "par2-rs",
  "quick-xml",
  "rayon",
  "reqwest",
@@ -5330,12 +5388,11 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
+ "unrar-rs",
  "weaver-nntp",
  "weaver-nzb",
- "weaver-par2",
  "weaver-server-api",
  "weaver-server-core",
- "weaver-unrar",
  "weaver-yenc",
  "windows-sys 0.61.2",
  "zip",
@@ -5384,37 +5441,6 @@ dependencies = [
  "thiserror 2.0.19",
  "tracing",
  "weaver-model",
-]
-
-[[package]]
-name = "weaver-par2"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b74ee837445f35b25156657c52f8f5574bd5a98b2c87f6b87db2194737211288"
-dependencies = [
- "aws-lc-sys 0.42.0",
- "bytes",
- "crc32fast",
- "libc",
- "md-5",
- "memmap2",
- "rayon",
- "thiserror 2.0.19",
- "tracing",
- "weaver-reed-solomon",
-]
-
-[[package]]
-name = "weaver-reed-solomon"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1db5753b42d209581b0fe20177827469bce33a883914a93dffb00a302769d5e9"
-dependencies = [
- "memmap2",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
- "rayon",
 ]
 
 [[package]]
@@ -5478,6 +5504,7 @@ dependencies = [
  "keyring-core",
  "libc",
  "notify",
+ "par2-rs",
  "pbkdf2 0.13.0",
  "quick-xml",
  "rayon",
@@ -5499,41 +5526,14 @@ dependencies = [
  "tracing",
  "unicase",
  "unicode-normalization",
+ "unrar-rs",
  "weaver-model",
  "weaver-nntp",
  "weaver-nzb",
- "weaver-par2",
- "weaver-unrar",
  "weaver-yenc",
  "windows-sys 0.61.2",
  "zip",
  "zstd",
-]
-
-[[package]]
-name = "weaver-unrar"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1a9d525299791540ff2b3609dfdd08d8b9a4eec2924eedad998f06bf08a1729"
-dependencies = [
- "aws-lc-rs",
- "aws-lc-sys 0.42.0",
- "blake2s_simd",
- "crc32fast",
- "filetime",
- "libc",
- "memchr",
- "rayon",
- "rmp-serde",
- "serde",
- "subtle",
- "tempfile",
- "thiserror 2.0.19",
- "tracing",
- "unicode-normalization",
- "weaver-reed-solomon",
- "windows-sys 0.61.2",
- "zeroize",
 ]
 
 [[package]]

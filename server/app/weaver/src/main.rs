@@ -203,12 +203,22 @@ async fn async_main() {
     }
 
     match command {
-        Command::Download { nzb, output, force } => {
+        Command::Download {
+            nzb,
+            output,
+            password,
+            report,
+            report_ack,
+            force,
+        } => {
             if let Err(error) = commands::download::run(
                 &mut config,
                 &db,
                 &nzb,
                 output.as_deref(),
+                password.as_deref(),
+                report.as_deref(),
+                report_ack.as_deref(),
                 force,
                 &data_dir,
                 &intermediate_dir,
