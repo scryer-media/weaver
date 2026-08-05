@@ -7015,6 +7015,7 @@ async fn a_finalized_set_does_not_stop_its_live_neighbour_repairing_while_direct
         &volumes,
         &par2_bytes,
         lost,
+        None,
     )
     .await;
     assert_eq!(
@@ -7391,13 +7392,15 @@ async fn run_lost_article_gate(
     volumes: &[(String, Vec<u8>)],
     par2_bytes: &[u8],
     lost: (u32, u32),
+    password: Option<&str>,
 ) -> RepairGateOutcome {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(gate);
     pipeline.live_par2.set_enabled(true);
 
-    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", volumes, par2_bytes);
+    let (mut spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", volumes, par2_bytes);
+    spec.password = password.map(str::to_owned);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
     let mut volume_file_seen = false;
@@ -7501,6 +7504,7 @@ async fn a_lost_article_inside_a_member_repairs_and_reconfirms_the_volume() {
         &volumes,
         &par2_bytes,
         (1, 1),
+        None,
     )
     .await;
     let direct = run_lost_article_gate(
@@ -7510,6 +7514,7 @@ async fn a_lost_article_inside_a_member_repairs_and_reconfirms_the_volume() {
         &volumes,
         &par2_bytes,
         (1, 1),
+        None,
     )
     .await;
 
@@ -7551,6 +7556,102 @@ async fn a_lost_article_inside_a_member_repairs_and_reconfirms_the_volume() {
         matches!(direct.status, Some(JobStatus::Complete)),
         "the job must complete, got {:?} with sets {}",
         direct.status,
+        direct.sets
+    );
+}
+
+#[tokio::test]
+async fn a_lost_article_inside_an_encrypted_member_demotes_instead_of_repairing() {
+    // The encrypted twin of `a_lost_article_inside_a_member_repairs_and_
+    // reconfirms_the_volume`, whose absence let this hide through E1-E4 (E4
+    // review F1). It pins a **known limit**, not the behaviour anyone wants.
+    //
+    // The plaintext twin above repairs the hole in place and never demotes. The
+    // same shape over an encrypted set cannot, and it fails over roughly eight
+    // bytes: the cipher block straddling the hole's edge is held, because its
+    // other half is in the article that never came, so the volume's covered run
+    // stops just short of an article boundary. `CrcRuns::compose` composes a
+    // reference only for a range that starts *and ends* on one — deliberately,
+    // since this sweep reads an overlay of sparse files where a source answering
+    // with zeros yields bytes that look like data and pass nothing — so the run
+    // is `UnverifiableRun`, materialization is refused, and the repair with it.
+    //
+    // The user still gets correct bytes: the set demotes, refetches, and the
+    // conventional path extracts. What it costs is the whole set, for a hole
+    // PAR2 could have filled. The plan's Risks section records the fix (let
+    // reconstruction take those held bytes as posted *cipher* straight from
+    // staging — materialization rebuilds posted bytes, not plaintext, so they
+    // never needed decrypting). **When that lands this test should fail**, and
+    // the right response is to rewrite it against the plaintext twin's
+    // assertions rather than to relax it.
+    let member_name = "Silver.Horizon.S01E25.mkv";
+    let password = "moonlit-harbour";
+    let payload: Vec<u8> = (0..3000u32).map(|index| (index % 223) as u8).collect();
+    let volumes = encrypted_store_set_with_recovery(
+        member_name,
+        &payload,
+        3,
+        password,
+        Some(password),
+        true,
+        256,
+    );
+    let par2_bytes = repairable_par2_index(&volumes, 12);
+
+    let conventional = run_lost_article_gate(
+        DirectStoreGate::Disabled,
+        JobId(41081),
+        member_name,
+        &volumes,
+        &par2_bytes,
+        (1, 1),
+        Some(password),
+    )
+    .await;
+    let direct = run_lost_article_gate(
+        DirectStoreGate::Enabled,
+        JobId(41082),
+        member_name,
+        &volumes,
+        &par2_bytes,
+        (1, 1),
+        Some(password),
+    )
+    .await;
+
+    // Non-vacuity: the conventional path really does repair this hole, so the
+    // direct path's failure is about the direct path and not the fixture.
+    assert_eq!(
+        conventional.member.as_deref(),
+        Some(payload.as_slice()),
+        "the gate-off reference must repair the lost article; status={:?}",
+        conventional.status
+    );
+    // The limit, stated as behaviour.
+    assert!(
+        direct.sets.contains("Demoted"),
+        "an encrypted set is expected to demote on a lost article until the \
+         reconstruction fix lands; if this now repairs in place, rewrite this \
+         test against the plaintext twin. sets = {}",
+        direct.sets
+    );
+    // What this test deliberately does **not** assert, because the harness
+    // cannot establish it either way: that the demoted set still delivers the
+    // member. It does not, here — `direct.member` is `None` against the
+    // conventional path's full payload — but the lost article is permanently
+    // gone and there is no server, so the refetch a demotion schedules can never
+    // be answered. The conventional run recovers only because it wrote real
+    // volume files as articles arrived, giving PAR2 something on disk to repair.
+    //
+    // So this either costs a refetch (the reviewer's reading) or costs the
+    // member outright (what the harness shows), and telling those apart needs a
+    // fixture that models a refetch which can actually succeed. **That is the
+    // open question**, and it is the reason the plan's Risks entry now carries
+    // the real mechanism instead of the CBC one.
+    assert!(
+        direct.member.is_none() || direct.member.as_deref() == conventional.member.as_deref(),
+        "a demoted encrypted set must either deliver the conventional bytes or \
+         nothing at all — never different bytes; sets = {}",
         direct.sets
     );
 }

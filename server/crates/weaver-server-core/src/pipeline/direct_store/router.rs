@@ -2787,14 +2787,24 @@ impl DirectSetRouter {
     ///
     /// RAR keys headers and file data from the same password, so a proved `-hp`
     /// password is also the file password; a `-p` set has no header password and
-    /// keeps its own in the file ring. `None` for a plaintext set, which keeps
-    /// every plaintext extraction a no-password extraction exactly as before.
+    /// keeps its own in the file ring.
+    ///
+    /// **`None` for a plaintext set**, and the `admitted()` gate is what makes
+    /// that true rather than merely intended (E4 review F3). `set_password` runs
+    /// for *every* admitted set in a job that carries one — from the NZB meta,
+    /// the filename convention or the operator — and [`KeyRing::password`] holds
+    /// that string whether or not any encrypted member ever admitted against it.
+    /// Reading it unconditionally handed a password to plaintext sets, which
+    /// `unrar-rs` ignores for want of an encryption record, so nothing broke and
+    /// nothing would have: the reason to gate it is that a doc comment claiming
+    /// a property the code does not have is how the next person gets caught.
     ///
     /// This is the one place a password leaves the router as a string. The
     /// tolerated-member extraction hands it to `unrar-rs` rather than
     /// decrypting anything itself, so it needs the secret and not a key.
     pub(crate) fn archive_password(&self) -> Option<&str> {
-        self.header_password().or_else(|| self.crypt.password())
+        self.header_password()
+            .or_else(|| self.crypt.admitted().then(|| self.crypt.password())?)
     }
 
     /// Files one parse's facts against the layout and drains what they unlock.
