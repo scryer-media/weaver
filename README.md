@@ -113,7 +113,7 @@ It is **off by default** while it matures. Turn it on with the `direct_store` se
 
 **Expect an instant, or absent-looking, `Extracting` phase.** For a direct-store job the payload is already at its destination when the download finishes, so there is nothing left to extract: the extraction phase completes immediately and may not be visible at all in the UI or the API. This is the feature working, not a stalled or skipped step, and progress reporting is otherwise unchanged — Weaver does not insert an artificial delay to make the phase visible, and the GraphQL surface is identical either way. A job that starts direct and later falls back reports both, so a release that ended up on the ordinary path still shows a normal extraction phase.
 
-Sets Weaver cannot route this way — compressed, encrypted, solid, or checksummed in a way it cannot verify out of order — simply take the ordinary download-then-extract path, with no change in output.
+Sets Weaver cannot route this way — compressed, solid, header-encrypted RAR4, header-encrypted RAR5 whose password it cannot prove, or checksummed in a way it cannot verify out of order — simply take the ordinary download-then-extract path, with no change in output.
 
 ## API
 

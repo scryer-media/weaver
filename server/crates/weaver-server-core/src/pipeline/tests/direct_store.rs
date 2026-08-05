@@ -246,7 +246,7 @@ async fn a_forged_quick_open_member_never_reaches_the_router() {
     );
     assert!(
         !working_dir
-            .join(format!("{forged_name}.direct.partial"))
+            .join(format!("{forged_name}.f0.direct.partial"))
             .exists(),
         "no destination may be created for a member only the Quick Open cache claims"
     );
@@ -685,7 +685,7 @@ async fn direct_store_demotes_and_still_completes_when_the_member_checksum_is_wr
     );
     assert!(
         !working_dir
-            .join(format!("{member_name}.direct.partial"))
+            .join(format!("{member_name}.f0.direct.partial"))
             .exists(),
         "demotion must delete the set's partial direct output"
     );
@@ -1389,7 +1389,7 @@ async fn a_duplicate_article_after_finalization_leaves_the_finished_output_alone
     }
     assert!(
         !working_dir
-            .join(format!("{member_name}.direct.partial"))
+            .join(format!("{member_name}.f0.direct.partial"))
             .exists(),
         "a duplicate after finalization must not recreate the partial"
     );
@@ -1540,7 +1540,7 @@ async fn a_demoted_set_materializes_its_covered_volumes_instead_of_refetching_th
     // masquerade as finished work, and the envelopes are scratch.
     assert!(
         !working_dir
-            .join(format!("{member_name}.direct.partial"))
+            .join(format!("{member_name}.f0.direct.partial"))
             .exists()
     );
     for volume_index in 0..volumes.len() as u32 {
@@ -1589,7 +1589,7 @@ async fn a_demotion_falls_back_to_refetching_when_its_envelope_is_gone() {
     let job_id = JobId(41031);
     let (mut pipeline, working_dir, other_file_bytes) =
         demote_mid_download(&temp_dir, job_id, &volumes, |_, working_dir| {
-            let envelope = working_dir.join("silver.horizon.vol00000.envelope");
+            let envelope = working_dir.join("silver.horizon.f0.vol00000.envelope");
             assert!(envelope.exists(), "the envelope must exist to be deleted");
             std::fs::remove_file(&envelope).unwrap();
         })
@@ -1772,7 +1772,7 @@ async fn a_scratch_ceiling_breach_demotes_the_set() {
     );
     assert!(
         !working_dir
-            .join(format!("{member_name}.direct.partial"))
+            .join(format!("{member_name}.f0.direct.partial"))
             .exists()
     );
 }
@@ -1906,7 +1906,7 @@ async fn direct_store_demotes_when_the_chain_closes_with_a_blake2_only_member() 
     );
     assert!(
         !working_dir
-            .join(format!("{member_name}.direct.partial"))
+            .join(format!("{member_name}.f0.direct.partial"))
             .exists(),
         "the demotion deletes the bytes routed while the member was provisional"
     );
@@ -2021,7 +2021,7 @@ async fn direct_store_demotes_a_volume_whose_yenc_whole_file_crc_disagrees() {
     );
     assert!(
         !working_dir
-            .join(format!("{member_name}.direct.partial"))
+            .join(format!("{member_name}.f0.direct.partial"))
             .exists()
     );
 }
@@ -2639,7 +2639,7 @@ async fn a_recovery_record_set_routes_direct_and_its_envelopes_carry_the_recover
         )
         .await;
         if (*file_index, *segment_number) == (0, 1) {
-            let envelope = working_dir.join("silver.horizon.vol00000.envelope");
+            let envelope = working_dir.join("silver.horizon.f0.vol00000.envelope");
             let written = std::fs::read(&envelope).expect("volume 0's envelope exists");
             let rr_at = find_recovery_offset(&volumes[0].1, RR_BYTES);
             assert!(
@@ -3057,7 +3057,7 @@ async fn a_member_that_turns_ineligible_after_routing_never_materializes_fabrica
     );
     assert!(
         !working_dir
-            .join(format!("{member_name}.direct.partial"))
+            .join(format!("{member_name}.f0.direct.partial"))
             .exists(),
         "the direct outputs are deleted once the volumes are real"
     );
@@ -3083,7 +3083,7 @@ async fn a_partially_covered_volume_is_verified_before_it_is_materialized() {
     let (mut pipeline, working_dir, other_file_bytes) =
         demote_mid_download(&temp_dir, job_id, &volumes, |_, working_dir| {
             use std::io::{Seek, SeekFrom, Write};
-            let partial = working_dir.join(format!("{member_name}.direct.partial"));
+            let partial = working_dir.join(format!("{member_name}.f0.direct.partial"));
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&partial)
@@ -3236,7 +3236,7 @@ async fn retained_envelope_bytes_count_against_the_staged_budget() {
         !shape.contains("Demoted"),
         "the default budget is nowhere near breached by this set, got {shape}"
     );
-    let envelope = std::fs::read(working_dir.join("silver.horizon.vol00001.envelope"))
+    let envelope = std::fs::read(working_dir.join("silver.horizon.f0.vol00001.envelope"))
         .expect("volume 1's envelope exists");
     assert_eq!(
         &envelope[rr_at..rr_at + RR_BYTES],
@@ -3279,7 +3279,7 @@ async fn retained_envelope_bytes_count_against_the_staged_budget() {
     );
     // The envelope on disk is unaffected: paging moves the router's *retained
     // copy*, never the routed bytes.
-    let envelope = std::fs::read(paged_dir.join("silver.horizon.vol00001.envelope"))
+    let envelope = std::fs::read(paged_dir.join("silver.horizon.f0.vol00001.envelope"))
         .expect("volume 1's envelope exists");
     assert_eq!(
         &envelope[rr_at..rr_at + RR_BYTES],
@@ -3738,7 +3738,7 @@ async fn a_migration_that_cannot_read_its_partial_demotes_cleanly() {
         }
         submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
     }
-    let partial = working_dir.join(format!("{extra_name}.direct.partial"));
+    let partial = working_dir.join(format!("{extra_name}.f0.direct.partial"));
     assert!(
         std::fs::metadata(&partial).is_ok_and(|metadata| metadata.len() > 0),
         "non-vacuity: the member must really have been adopted and routed before the \
@@ -4724,7 +4724,7 @@ async fn a_byte_corrupted_while_the_process_was_down_fails_the_member_gate() {
         direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
 
     // Flip a byte the checkpoint claims, while "the process is down".
-    let partial = working_dir.join(format!("{member_name}.direct.partial"));
+    let partial = working_dir.join(format!("{member_name}.f0.direct.partial"));
     let mut bytes = std::fs::read(&partial).expect("volume 0 routed into the member partial");
     assert!(!bytes.is_empty(), "the partial must hold routed bytes");
     bytes[10] ^= 0xff;
@@ -4795,8 +4795,8 @@ async fn a_restart_with_the_gate_off_redownloads_and_sweeps_the_orphans() {
     let working_dir =
         direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
 
-    let partial = working_dir.join(format!("{member_name}.direct.partial"));
-    let envelope = working_dir.join("silver.horizon.vol00000.envelope");
+    let partial = working_dir.join(format!("{member_name}.f0.direct.partial"));
+    let envelope = working_dir.join("silver.horizon.f0.vol00000.envelope");
     assert!(partial.exists() && envelope.exists(), "non-vacuity");
 
     let mut pipeline = direct_store_after_restart(
@@ -4857,7 +4857,7 @@ async fn a_digest_mismatch_sweeps_the_sets_files_and_deletes_the_row() {
             .unwrap();
     }
 
-    let partial = working_dir.join(format!("{member_name}.direct.partial"));
+    let partial = working_dir.join(format!("{member_name}.f0.direct.partial"));
     assert!(partial.exists(), "non-vacuity");
 
     let mut pipeline = direct_store_after_restart(
@@ -4929,8 +4929,8 @@ async fn a_member_first_seen_in_a_later_volume_still_restarts_from_its_checkpoin
 
     // Non-vacuity: the run really did discover the second member after the first
     // barrier existed, and really did route bytes for both.
-    let episode_partial = working_dir.join(format!("{episode}.direct.partial"));
-    let notes_partial = working_dir.join(format!("{notes}.direct.partial"));
+    let episode_partial = working_dir.join(format!("{episode}.f0.direct.partial"));
+    let notes_partial = working_dir.join(format!("{notes}.f0.direct.partial"));
     assert!(
         episode_partial.exists() && notes_partial.exists(),
         "both members must have routed before the restart"
@@ -5098,8 +5098,8 @@ async fn a_restart_after_a_member_migration_keeps_its_checkpoint() {
 
     // Non-vacuity: the migration really ran, and it really did leave the routed
     // member's own destination alone.
-    let extra_partial = working_dir.join(format!("{extra_name}.direct.partial"));
-    let store_partial = working_dir.join(format!("{store_name}.direct.partial"));
+    let extra_partial = working_dir.join(format!("{extra_name}.f0.direct.partial"));
+    let store_partial = working_dir.join(format!("{store_name}.f0.direct.partial"));
     assert!(
         !extra_partial.exists(),
         "the migration must have deleted the migrated member's partial"
@@ -5125,11 +5125,11 @@ async fn a_restart_after_a_member_migration_keeps_its_checkpoint() {
         .map(|claim| claim.relative_path.as_str())
         .collect();
     assert!(
-        !claimed.contains(&format!("{extra_name}.direct.partial").as_str()),
+        !claimed.contains(&format!("{extra_name}.f0.direct.partial").as_str()),
         "the checkpoint may not claim a destination the migration deleted, got {claimed:?}"
     );
     assert!(
-        claimed.contains(&format!("{store_name}.direct.partial").as_str()),
+        claimed.contains(&format!("{store_name}.f0.direct.partial").as_str()),
         "non-vacuity: the surviving member is still claimed, got {claimed:?}"
     );
 
@@ -5993,7 +5993,7 @@ async fn a_restored_last_volume_whose_envelope_is_gone_still_demotes_by_name() {
     // this isolates the re-parse: the remaining articles recreate the file, but
     // only with the tail bytes they carry, so the header region the walk has to
     // read is a hole.
-    let envelope = working_dir.join("silver.horizon.vol00002.envelope");
+    let envelope = working_dir.join("silver.horizon.f0.vol00002.envelope");
     assert!(
         envelope.exists(),
         "non-vacuity: the volume must have had an envelope to lose"
@@ -6840,6 +6840,89 @@ fn direct_envelopes_left(working_dir: &Path) -> usize {
         .flatten()
         .filter(|entry| entry.file_name().to_string_lossy().ends_with(".envelope"))
         .count()
+}
+
+#[tokio::test]
+async fn two_sets_sharing_a_clamped_partial_keep_their_bytes_apart() {
+    // Post-completion review, 2026-08-04 (P0). Internal direct-store paths were
+    // derived from names alone, and `path_component_with_suffix` clamps a long
+    // name's stem to fit `DOWNLOAD_FILENAME_MAX_BYTES` — so two members whose
+    // names differ only past the clamp point reached the *same*
+    // `.direct.partial` while their final destinations stayed distinct. Both
+    // routers then wrote one file, each passed its integrity gates over its own
+    // in-memory buffers, and one member's bytes were silently wrong on disk.
+    //
+    // The shape is deliberate in two ways. The names share their first 226
+    // bytes and differ only in the tail, because the collision under test is
+    // the clamp, not equality: members with *equal* names also collide on the
+    // final destination, where last-writer-wins is the same semantic two
+    // conventionally extracted archives already have — bytes can never witness
+    // that. Distinct finals are what make each set's output independently
+    // assertable. And the arrival order interleaves the two sets (the spec
+    // builder already orders the files that way), because sequential sets
+    // merely time-slice a shared path — each finalize renames it away before
+    // the neighbour writes — and the corruption needs both sets holding it at
+    // once.
+    let stem: String = format!("Silver.Horizon.{}", "x".repeat(211));
+    let member_a = format!("{stem}-alpha.mkv");
+    let member_b = format!("{stem}-omega.mkv");
+    let payload_a: Vec<u8> = (0..3000u32).map(|index| (index % 251) as u8).collect();
+    let payload_b: Vec<u8> = (0..2500u32).map(|index| (97 + index % 101) as u8).collect();
+    let set_a = single_member_store_set(&member_a, &payload_a, 2);
+    let set_b = renamed_set(
+        "amber.trail",
+        single_member_store_set(&member_b, &payload_b, 2),
+    );
+    let volumes: Vec<(String, Vec<u8>)> = set_a.iter().chain(set_b.iter()).cloned().collect();
+    let job_id = JobId(41120);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let mut volume_file_seen = false;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+        for (filename, _) in &volumes {
+            if working_dir.join(filename).exists() {
+                volume_file_seen = true;
+            }
+        }
+    }
+    assert_eq!(
+        pipeline.direct_store.sets_for(job_id).len(),
+        2,
+        "the fixture must admit two direct sets or it is testing nothing"
+    );
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+
+    assert_eq!(
+        pipeline.direct_store.finalized_sets, 2,
+        "both sets must finalize direct; under a shared partial one set's \
+         commit finds its bytes gone or mixed and demotes"
+    );
+    assert!(!volume_file_seen, "no source volume may ever materialize");
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    assert_eq!(
+        std::fs::read(output_root.join(&member_a)).ok().as_deref(),
+        Some(payload_a.as_slice()),
+        "set A's member must arrive whole under its own name"
+    );
+    assert_eq!(
+        std::fs::read(output_root.join(&member_b)).ok().as_deref(),
+        Some(payload_b.as_slice()),
+        "set B's member must arrive whole under its own name"
+    );
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete),
+        "a job whose sets collide only inside the clamp still completes"
+    );
 }
 
 /// One recovery set over two direct sets, one of which finalizes while the other
@@ -7864,8 +7947,8 @@ async fn the_config_gate_routes_and_a_config_off_restart_sweeps_and_redownloads(
         working_dir
     };
 
-    let partial = working_dir.join(format!("{member_name}.direct.partial"));
-    let envelope = working_dir.join("silver.horizon.vol00000.envelope");
+    let partial = working_dir.join(format!("{member_name}.f0.direct.partial"));
+    let envelope = working_dir.join("silver.horizon.f0.vol00000.envelope");
     assert!(
         partial.exists() && envelope.exists(),
         "the config table must be able to turn routing on at all"
@@ -7968,13 +8051,13 @@ async fn a_destination_that_cannot_be_marked_sparse_demotes_before_it_holds_a_ho
     );
     assert!(
         !working_dir
-            .join(format!("{member_name}.direct.partial"))
+            .join(format!("{member_name}.f0.direct.partial"))
             .exists(),
         "the refused destination must not be left behind"
     );
     assert!(
         !working_dir
-            .join("silver.horizon.vol00000.envelope")
+            .join("silver.horizon.f0.vol00000.envelope")
             .exists(),
         "nor the envelope the same batch would have created"
     );

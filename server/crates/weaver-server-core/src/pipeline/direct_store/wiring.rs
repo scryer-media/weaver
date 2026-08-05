@@ -85,6 +85,14 @@ pub(crate) struct DirectStoreRuntime {
     /// and nothing else creates it, and every destination has to carry the
     /// sparse attribute before its first routed byte.
     prepared_destinations: HashMap<JobId, HashSet<PathBuf>>,
+    /// Member names **direct finalization** wrote into `extracted_members`, per
+    /// job. `extracted_members` blends two sources — the incremental extractor
+    /// and direct sets — and the D6 claim assertions need them apart: two sets
+    /// of one job may legitimately finalize the same member *name* (last rename
+    /// wins, as two conventionally extracted archives resolve), and without
+    /// this record a sibling's finalized name is indistinguishable from an
+    /// extraction checkpoint claiming ours.
+    direct_extracted_members: HashMap<JobId, HashSet<String>>,
     /// Test-only holds ceiling applied to every set this runtime admits.
     #[cfg(test)]
     holds_budget_override: Option<u64>,
@@ -230,6 +238,7 @@ impl DirectStoreRuntime {
         self.examined.remove(&job_id);
         self.header_candidates_offered.remove(&job_id);
         self.prepared_destinations.remove(&job_id);
+        self.direct_extracted_members.remove(&job_id);
     }
 
     /// Installs the sets a job restore rebuilt, and marks the job examined so
@@ -2435,6 +2444,38 @@ impl Pipeline {
     /// pool's `open_or_reuse` opening a file that already exists and already
     /// carries the attribute, on Windows and everywhere else.
     ///
+    /// Records a member name that **direct** finalization produced, in both the
+    /// job-wide `extracted_members` (which completion reads) and the runtime's
+    /// direct-only mirror (which the D6 claim assertions subtract).
+    fn record_direct_extracted(&mut self, job_id: JobId, name: String) {
+        self.direct_store
+            .direct_extracted_members
+            .entry(job_id)
+            .or_default()
+            .insert(name.clone());
+        self.extracted_members
+            .entry(job_id)
+            .or_default()
+            .insert(name);
+    }
+
+    /// Member names the **incremental extractor** owns for this job: the blended
+    /// `extracted_members` minus everything direct finalization put there. The
+    /// D6 assertions compare against this, not the blend — a sibling direct set
+    /// finalizing the same member name is last-writer-wins by design, not a
+    /// second checkpoint system claiming the member.
+    fn extraction_claimed_members(&self, job_id: JobId) -> HashSet<String> {
+        let mut claimed = self
+            .extracted_members
+            .get(&job_id)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(direct) = self.direct_store.direct_extracted_members.get(&job_id) {
+            claimed.retain(|name| !direct.contains(name));
+        }
+        claimed
+    }
+
     /// `Err(path)` names the first destination that could not be marked. The
     /// caller demotes; nothing has a hole yet.
     async fn prepare_direct_destinations(
@@ -2962,12 +3003,11 @@ impl Pipeline {
                 ))
             })
             .collect();
-        let extracted_members = self
-            .extracted_members
-            .get(&job_id)
-            .cloned()
-            .unwrap_or_default();
-        set.assert_not_extraction_owned(&extracted_members);
+        // Extractor-claimed names only: a sibling direct set that finalized the
+        // same member *name* is rename-order semantics, not a second checkpoint
+        // system owning this member (see `extraction_claimed_members`).
+        let extraction_claimed = self.extraction_claimed_members(job_id);
+        set.assert_not_extraction_owned(&extraction_claimed);
 
         // D1's tolerance, and strictly **before** the commit loop below (M4).
         // The extraction reads the *virtual volumes*, which are the envelopes
@@ -2986,10 +3026,7 @@ impl Pipeline {
         match self.extract_tolerated_members(job_id, set_index).await {
             Ok(extracted) => {
                 for name in extracted {
-                    self.extracted_members
-                        .entry(job_id)
-                        .or_default()
-                        .insert(name);
+                    self.record_direct_extracted(job_id, name);
                 }
             }
             Err(error) => {
@@ -3060,10 +3097,7 @@ impl Pipeline {
                     .await;
                 return;
             }
-            self.extracted_members
-                .entry(job_id)
-                .or_default()
-                .insert(name.clone());
+            self.record_direct_extracted(job_id, name.clone());
         }
 
         for scratch in &repair_scratch {
@@ -3322,13 +3356,13 @@ impl Pipeline {
         // extents are all holes, and the failure path costs a full redownload.
         debug_assert!(
             !self
-                .extracted_members
-                .get(&job_id)
-                .is_some_and(|committed| {
+                .extraction_claimed_members(job_id)
+                .iter()
+                .any(|committed| {
                     set.router
                         .member_partials()
                         .iter()
-                        .any(|(_, name, _)| committed.contains(*name))
+                        .any(|(_, name, _)| committed == *name)
                 }),
             "a stored member of {set_name} was committed before its set's tolerated \
              members were extracted; the virtual volumes no longer resolve"

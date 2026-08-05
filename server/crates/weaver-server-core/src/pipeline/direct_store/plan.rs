@@ -161,6 +161,24 @@ impl DirectSetPlan {
     ///
     /// Zero-padded so a lexical listing of a 2 000-volume set sorts in volume
     /// order.
+    /// The set's stable per-job discriminator: its lowest NZB file index.
+    ///
+    /// Unique across a job by construction — a file belongs to exactly one set —
+    /// and derived from the spec, so it is the same on every restart. Every
+    /// internal path this plan derives carries it, because every one of those
+    /// namespaces has the same collision problem the holds-scratch comment below
+    /// describes: `sanitize_dirname` is many-to-one, `path_component_with_suffix`
+    /// clamps, and member names are shared freely between archives, so *any*
+    /// path derived from names alone can be reached by two sets of one job.
+    /// Envelopes, repair scratch and member partials all found that out the slow
+    /// way (post-completion review, 2026-08-04): two sets sharing a partial
+    /// interleave their writes into one file while each router's in-memory
+    /// gates pass over its own buffers — silent mixed bytes on a PAR2-less set,
+    /// which is exactly the set direct-store exists for.
+    fn set_discriminator(&self) -> u32 {
+        self.volumes.values().min().copied().unwrap_or_default()
+    }
+
     pub(crate) fn envelope_relative_path(&self, volume_index: u32) -> String {
         // Clamped as one component rather than formatted (nit): the suffix is 18
         // bytes and a set name is an NZB-supplied string, so a long one produced
@@ -168,10 +186,12 @@ impl DirectSetPlan {
         // routed byte — with `DestinationWriteFailed`, which says nothing about
         // the name being the cause. `path_component_with_suffix` shortens the
         // *stem* and keeps the suffix whole, so the volume number and the
-        // extension survive.
+        // extension survive. The discriminator rides the suffix for the same
+        // reason it does on the holds scratch: the clamp can never shorten it
+        // away, and two sets whose names sanitize identically stay two files.
         weaver_model::files::path_component_with_suffix(
             &crate::jobs::working_dir::sanitize_dirname(&self.set_name),
-            &format!(".vol{volume_index:05}.envelope"),
+            &format!(".f{}.vol{volume_index:05}.envelope", self.set_discriminator()),
         )
     }
 
@@ -201,14 +221,13 @@ impl DirectSetPlan {
     /// *suffix* argument so the clamp shortens the stem around it and can never
     /// shorten it away.
     pub(crate) fn holds_scratch_relative_path(&self) -> String {
-        let discriminator = self.volumes.values().min().copied().unwrap_or_default();
         weaver_model::files::path_component_with_suffix(
             &format!(
                 "{}{}",
                 crate::pipeline::direct_store::restart::HOLDS_SCRATCH_PREFIX,
                 crate::jobs::working_dir::sanitize_dirname(&self.set_name)
             ),
-            &format!(".f{discriminator}"),
+            &format!(".f{}", self.set_discriminator()),
         )
     }
 
@@ -232,7 +251,10 @@ impl DirectSetPlan {
     pub(crate) fn repair_relative_path(&self, volume_index: u32) -> String {
         weaver_model::files::path_component_with_suffix(
             &crate::jobs::working_dir::sanitize_dirname(&self.set_name),
-            &format!(".vol{volume_index:05}{REPAIR_SUFFIX}"),
+            &format!(
+                ".f{}.vol{volume_index:05}{REPAIR_SUFFIX}",
+                self.set_discriminator()
+            ),
         )
     }
 
@@ -293,8 +315,17 @@ impl DirectSetPlan {
     /// member stored inside a directory keeps its directory, and the
     /// `.direct.partial` suffix keeps its whole length so nothing downstream has
     /// to guess whether a truncated name still names a partial (nit).
+    ///
+    /// Carries the set discriminator, and here it is most load-bearing of all:
+    /// this is the one derived path with **no set component at all**, so two
+    /// sets of one job that both contain a `movie.mkv` reached the *same*
+    /// partial with nothing colliding but the archives' own contents. The final
+    /// destination stays undiscriminated on purpose — it is the user-visible
+    /// name, and two sets claiming it resolve by rename order exactly as two
+    /// conventionally-extracted archives resolve by extraction order.
     pub(crate) fn member_partial_path(&self, member_name: &str) -> Result<String, ()> {
-        Self::resolve_member_path(member_name).map(|safe| with_suffix(&safe, ".direct.partial"))
+        let suffix = format!(".f{}.direct.partial", self.set_discriminator());
+        Self::resolve_member_path(member_name).map(|safe| with_suffix(&safe, &suffix))
     }
 
     /// Final destination for a member.
@@ -323,7 +354,12 @@ impl DirectSetPlan {
     /// derived from.
     pub(crate) fn digest(&self, members: &[(String, u64)]) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"weaver.direct_store.plan.v2\0");
+        // v3: the derived-path shape gained the set discriminator. The digest
+        // binds names rather than paths, so a shape change is invisible to it —
+        // and a v2 row would restore claims against partials that now have
+        // different names. Bumping the domain string refuses every older row
+        // into the ordinary redownload; no v2 row ever shipped in a release.
+        hasher.update(b"weaver.direct_store.plan.v3\0");
         hasher.update(self.set_name.as_bytes());
         hasher.update(&[0]);
         hasher.update(&(self.volumes.len() as u64).to_le_bytes());

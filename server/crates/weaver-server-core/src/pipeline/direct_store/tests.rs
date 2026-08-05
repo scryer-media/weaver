@@ -211,8 +211,8 @@ fn sample_barrier() -> CoverageBarrier {
     let mut barrier = CoverageBarrier::new(JOB, SET, PLAN_DIGEST);
     barrier.register_volume(0, 0);
     barrier.register_volume(1, 1);
-    barrier.register_destination(0, "silver-horizon.mkv.direct.partial");
-    barrier.register_destination(1, "silver-horizon.nfo.direct.partial");
+    barrier.register_destination(0, "silver-horizon.mkv.f0.direct.partial");
+    barrier.register_destination(1, "silver-horizon.nfo.f0.direct.partial");
     barrier
 }
 
@@ -222,7 +222,7 @@ fn sample_snapshot() -> CoverageSnapshot {
         plan_digest: PLAN_DIGEST,
         destinations: vec![DestinationClaim {
             member_index: 0,
-            relative_path: "silver-horizon.mkv.direct.partial".to_string(),
+            relative_path: "silver-horizon.mkv.f0.direct.partial".to_string(),
             extents: vec![DestinationExtent { start: 0, end: 60 }],
             crypt: None,
         }],
@@ -310,7 +310,7 @@ fn snapshot_round_trips_exactly() {
         destinations: vec![
             DestinationClaim {
                 member_index: 0,
-                relative_path: "silver-horizon.mkv.direct.partial".to_string(),
+                relative_path: "silver-horizon.mkv.f0.direct.partial".to_string(),
                 extents: vec![
                     DestinationExtent {
                         start: 0,
@@ -408,7 +408,7 @@ fn two_thousand_volume_snapshot_round_trips_in_a_sane_blob() {
         plan_digest: PLAN_DIGEST,
         destinations: vec![DestinationClaim {
             member_index: 0,
-            relative_path: "silver-horizon.s01.mkv.direct.partial".to_string(),
+            relative_path: "silver-horizon.s01.mkv.f0.direct.partial".to_string(),
             extents: vec![DestinationExtent {
                 start: 0,
                 end: 100 * 1024 * 1024 * 1024,
@@ -549,7 +549,7 @@ fn snapshot_decode_refuses_a_destination_path_that_escapes_the_working_directory
     }
 
     let mut snapshot = sample_snapshot();
-    snapshot.destinations[0].relative_path = "nested/dir/silver-horizon.mkv.direct.partial".into();
+    snapshot.destinations[0].relative_path = "nested/dir/silver-horizon.mkv.f0.direct.partial".into();
     let blob = encode(&snapshot).unwrap();
     assert!(
         decode(&blob).is_ok(),
@@ -775,8 +775,8 @@ fn a_file_touched_early_in_an_interval_is_synced_by_that_intervals_barrier() {
     assert_eq!(
         recorder.synced(),
         vec![
-            "silver-horizon.mkv.direct.partial".to_string(),
-            "silver-horizon.nfo.direct.partial".to_string(),
+            "silver-horizon.mkv.f0.direct.partial".to_string(),
+            "silver-horizon.nfo.f0.direct.partial".to_string(),
         ],
         "the published floors cover the whole interval, so every file the \
          interval touched must be synced — not only the final batch"
@@ -804,8 +804,8 @@ fn a_failed_barrier_keeps_the_touched_set_so_the_next_one_syncs_it() {
     assert_eq!(
         recorder.synced(),
         vec![
-            "silver-horizon.mkv.direct.partial".to_string(),
-            "silver-horizon.nfo.direct.partial".to_string(),
+            "silver-horizon.mkv.f0.direct.partial".to_string(),
+            "silver-horizon.nfo.f0.direct.partial".to_string(),
         ],
         "a file touched before a failed barrier is still synced by the next \
          successful one"
@@ -1297,7 +1297,7 @@ fn a_retired_destination_is_dropped_from_the_next_snapshot_and_stays_dropped() {
     // The migration moved member 1's bytes into the envelope and unlinked its
     // partial.
     assert!(
-        barrier.retire_destination(1, "silver-horizon.nfo.direct.partial"),
+        barrier.retire_destination(1, "silver-horizon.nfo.f0.direct.partial"),
         "the claim named exactly this path"
     );
 
@@ -1311,13 +1311,13 @@ fn a_retired_destination_is_dropped_from_the_next_snapshot_and_stays_dropped() {
             .iter()
             .map(|claim| claim.relative_path.as_str())
             .collect::<Vec<_>>(),
-        vec!["silver-horizon.mkv.direct.partial"],
+        vec!["silver-horizon.mkv.f0.direct.partial"],
         "a checkpoint must not claim a destination that no longer exists"
     );
     assert!(
         !recorder
             .synced()
-            .contains(&"silver-horizon.nfo.direct.partial".to_string()),
+            .contains(&"silver-horizon.nfo.f0.direct.partial".to_string()),
         "and it must not fsync it either — the sync step opens with create(true), and a \
          failure there fails the whole barrier"
     );
@@ -1351,7 +1351,7 @@ fn retiring_a_destination_whose_path_does_not_match_keeps_the_claim() {
     barrier.record_write(&write(1, 0, 2_048, 1), start).unwrap();
 
     assert!(
-        !barrier.retire_destination(1, "some-other-member.direct.partial"),
+        !barrier.retire_destination(1, "some-other-member.f0.direct.partial"),
         "member ids are in-run counters; retiring on the id alone would drop claims on \
          bytes that really are on disk"
     );
@@ -1364,7 +1364,7 @@ fn retiring_a_destination_whose_path_does_not_match_keeps_the_claim() {
 
 fn barrier_with_volumes(volume_count: u32) -> CoverageBarrier {
     let mut barrier = CoverageBarrier::new(JOB, SET, PLAN_DIGEST);
-    barrier.register_destination(0, "silver-horizon.s01.mkv.direct.partial");
+    barrier.register_destination(0, "silver-horizon.s01.mkv.f0.direct.partial");
     let now = Instant::now();
     for volume_index in 0..volume_count {
         barrier.register_volume(volume_index, volume_index);
@@ -1434,7 +1434,7 @@ fn write_destination(dir: &Path, relative_path: &str, len: usize) {
 #[tokio::test]
 async fn restart_accepts_a_valid_row_and_yields_floors() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.direct.partial", 60);
+    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
     let blob = encode(&sample_snapshot()).unwrap();
 
     let snapshot = restore_set(temp_dir.path(), &blob, &sample_expected())
@@ -1447,7 +1447,7 @@ async fn restart_accepts_a_valid_row_and_yields_floors() {
 #[tokio::test]
 async fn restart_accepts_a_destination_longer_than_the_claim() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.direct.partial", 4_096);
+    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 4_096);
     let blob = encode(&sample_snapshot()).unwrap();
 
     assert!(
@@ -1466,7 +1466,7 @@ async fn restart_refuses_a_missing_destination() {
     assert_eq!(
         restore_set(temp_dir.path(), &blob, &sample_expected()).await,
         Err(CoverageRejection::MissingDestination {
-            path: "silver-horizon.mkv.direct.partial".to_string(),
+            path: "silver-horizon.mkv.f0.direct.partial".to_string(),
         })
     );
 }
@@ -1474,13 +1474,13 @@ async fn restart_refuses_a_missing_destination() {
 #[tokio::test]
 async fn restart_refuses_a_short_destination() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.direct.partial", 59);
+    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 59);
     let blob = encode(&sample_snapshot()).unwrap();
 
     assert_eq!(
         restore_set(temp_dir.path(), &blob, &sample_expected()).await,
         Err(CoverageRejection::ShortDestination {
-            path: "silver-horizon.mkv.direct.partial".to_string(),
+            path: "silver-horizon.mkv.f0.direct.partial".to_string(),
             claimed: 60,
             actual: 59,
         })
@@ -1490,7 +1490,7 @@ async fn restart_refuses_a_short_destination() {
 #[tokio::test]
 async fn restart_refuses_a_plan_digest_mismatch() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.direct.partial", 60);
+    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
     let blob = encode(&sample_snapshot()).unwrap();
 
     let expected = ExpectedSet {
@@ -1523,7 +1523,7 @@ async fn restart_refuses_a_row_written_under_different_member_facts() {
     assert_ne!(one, renamed, "so is a different member");
 
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.direct.partial", 60);
+    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
     let blob = encode(&CoverageSnapshot {
         plan_digest: one,
         ..sample_snapshot()
@@ -1555,7 +1555,7 @@ async fn restart_refuses_a_row_written_under_different_member_facts() {
 #[tokio::test]
 async fn restart_refuses_a_checkpoint_whose_probe_never_completed() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.direct.partial", 60);
+    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
     let blob = encode(&sample_snapshot()).unwrap();
 
     // The probe panics — a bug in it, or a runtime torn down under it during
@@ -1575,7 +1575,7 @@ async fn restart_refuses_a_checkpoint_whose_probe_never_completed() {
 #[tokio::test]
 async fn restart_refuses_a_probe_that_skipped_destinations() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.direct.partial", 60);
+    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
     let blob = encode(&sample_snapshot()).unwrap();
 
     // A probe that answers for nothing would otherwise walk an empty loop and
@@ -1596,7 +1596,7 @@ async fn restart_refuses_a_probe_that_skipped_destinations() {
 async fn restart_probes_every_claimed_destination_under_the_working_directory() {
     let temp_dir = tempfile::tempdir().unwrap();
     let blob = encode(&sample_snapshot()).unwrap();
-    let expected_path = temp_dir.path().join("silver-horizon.mkv.direct.partial");
+    let expected_path = temp_dir.path().join("silver-horizon.mkv.f0.direct.partial");
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&seen);
@@ -1618,7 +1618,7 @@ async fn restart_probes_every_claimed_destination_under_the_working_directory() 
         seen.lock().unwrap().as_slice(),
         &[DestinationProbe {
             path: expected_path,
-            relative_path: "silver-horizon.mkv.direct.partial".to_string(),
+            relative_path: "silver-horizon.mkv.f0.direct.partial".to_string(),
             claimed: 60,
         }]
     );
@@ -1627,7 +1627,7 @@ async fn restart_probes_every_claimed_destination_under_the_working_directory() 
 #[tokio::test]
 async fn restart_refuses_a_flipped_file_index() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.direct.partial", 60);
+    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
     let mut snapshot = sample_snapshot();
     snapshot.floors[0].file_index = 1;
     let blob = encode(&snapshot).unwrap();
@@ -1662,7 +1662,7 @@ async fn restart_refuses_a_flipped_file_index() {
 #[tokio::test]
 async fn restart_refuses_a_zero_generation_row() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.direct.partial", 60);
+    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
     let mut snapshot = sample_snapshot();
     snapshot.generation = 0;
     let blob = encode(&snapshot).unwrap();
@@ -1676,7 +1676,7 @@ async fn restart_refuses_a_zero_generation_row() {
 #[tokio::test]
 async fn restart_deletes_every_row_it_refuses() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.direct.partial", 60);
+    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
 
     let rows = HashMap::from([
         (SET.to_string(), encode(&sample_snapshot()).unwrap()),
@@ -1900,7 +1900,7 @@ fn a_two_thousand_floor_checkpoint_round_trips_through_the_database() {
     let mut persist = DatabaseCoveragePersist::new(database.clone());
 
     let mut barrier = CoverageBarrier::new(JOB, SET, PLAN_DIGEST);
-    barrier.register_destination(0, "silver-horizon.s01.mkv.direct.partial");
+    barrier.register_destination(0, "silver-horizon.s01.mkv.f0.direct.partial");
     let now = Instant::now();
     for volume_index in 0..2_000u32 {
         barrier.register_volume(volume_index, volume_index);
@@ -2248,6 +2248,59 @@ fn envelope_plan() -> DirectSetPlan {
     }
 }
 
+/// Every derived namespace carries the set discriminator, because every one of
+/// them can be reached by two sets of one job (post-completion review, P0):
+/// member names are shared freely between archives, and `sanitize_dirname` is
+/// many-to-one, so `A/B` and `A_B` are one stem. The discriminator — the set's
+/// lowest NZB file index, unique per job by construction — is what keeps them
+/// two files. The holds scratch had this from the start; the other three
+/// namespaces found out the slow way.
+#[test]
+fn two_sets_of_one_job_never_share_a_derived_path() {
+    let first = envelope_plan();
+    let mut second = DirectSetPlan {
+        set_name: "Silver.Horizon/S01E05".to_string(),
+        volumes: [(0u32, 2u32), (1, 3)].into_iter().collect(),
+        files: [(0u32, 2u32), (1, 3)].into_iter().collect(),
+        working_dir: first.working_dir.clone(),
+    };
+    // The set names sanitize to one stem, so without the discriminator every
+    // set-derived path below would be equal.
+    assert_ne!(
+        first.envelope_relative_path(0),
+        second.envelope_relative_path(0),
+        "envelopes must not collide across sets whose names sanitize identically"
+    );
+    assert_ne!(
+        first.repair_relative_path(0),
+        second.repair_relative_path(0),
+        "repair scratch must not collide either"
+    );
+    assert_ne!(
+        first.holds_scratch_relative_path(),
+        second.holds_scratch_relative_path(),
+        "holds scratch keeps the property it always had"
+    );
+    // The member-derived path has no set component at all, so an ordinary
+    // shared member name is all it takes.
+    assert_ne!(
+        first.member_partial_path("Silver.Horizon.S01E05.mkv"),
+        second.member_partial_path("Silver.Horizon.S01E05.mkv"),
+        "a member name shared by two sets must map to two partials"
+    );
+    // And the final destination deliberately stays undiscriminated: it is the
+    // user-visible name, resolved by rename order exactly as two conventionally
+    // extracted archives resolve by extraction order.
+    assert_eq!(
+        first.member_output_path("Silver.Horizon.S01E05.mkv"),
+        second.member_output_path("Silver.Horizon.S01E05.mkv"),
+    );
+    // Restart derives the same discriminator from the same spec: it is the
+    // minimum file index, not arrival order, so it cannot move between runs.
+    second.volumes = [(1u32, 3u32), (0, 2)].into_iter().collect();
+    assert!(second.member_partial_path("x.mkv").unwrap().contains(".f2."));
+}
+
 /// Envelope v2 replaces phase 4's `envelope_offsets_split_each_volume_slot…`
 /// test, which asserted a 64 KiB half-slot layout that no longer exists: there
 /// is no slot arithmetic to overflow, because a byte's envelope offset *is* its
@@ -2258,11 +2311,11 @@ fn each_volume_owns_a_separate_sparse_envelope_file() {
 
     assert_eq!(
         plan.envelope_relative_path(0),
-        "Silver.Horizon.S01E05.vol00000.envelope"
+        "Silver.Horizon.S01E05.f0.vol00000.envelope"
     );
     assert_eq!(
         plan.envelope_relative_path(7),
-        "Silver.Horizon.S01E05.vol00007.envelope",
+        "Silver.Horizon.S01E05.f0.vol00007.envelope",
         "zero padding keeps a lexical listing of a 2 000-volume set in volume order"
     );
     assert_ne!(
@@ -2337,13 +2390,13 @@ fn member_partials_keep_their_directory_and_hostile_names_are_refused() {
 
     assert_eq!(
         plan.member_partial_path("Silver.Horizon.S01E05.mkv"),
-        Ok("Silver.Horizon.S01E05.mkv.direct.partial".to_string())
+        Ok("Silver.Horizon.S01E05.mkv.f0.direct.partial".to_string())
     );
     // The directory component survives: the partial lives beside where the
     // member will land, not flattened into the working directory root.
     assert_eq!(
         plan.member_partial_path("Silver.Horizon/S01E05.mkv"),
-        Ok("Silver.Horizon/S01E05.mkv.direct.partial".to_string())
+        Ok("Silver.Horizon/S01E05.mkv.f0.direct.partial".to_string())
     );
     // A backslash names a directory on every platform: Windows treats it as a
     // separator, and everywhere else the same rewrite the extractor applies to
@@ -2351,11 +2404,11 @@ fn member_partials_keep_their_directory_and_hostile_names_are_refused() {
     // lets the partial be renamed onto the member's output path.
     assert_eq!(
         plan.member_partial_path("Silver.Horizon\\S01E05.mkv"),
-        Ok("Silver.Horizon/S01E05.mkv.direct.partial".to_string())
+        Ok("Silver.Horizon/S01E05.mkv.f0.direct.partial".to_string())
     );
     assert_eq!(
         plan.member_partial_path("./nested/./S01E05.mkv"),
-        Ok("nested/S01E05.mkv.direct.partial".to_string())
+        Ok("nested/S01E05.mkv.f0.direct.partial".to_string())
     );
 
     // Wave 1 runs a raw header name through `unrar_rs::sanitize_path` before
@@ -2552,7 +2605,7 @@ fn provider_fixture_with_extents(covered: ByteRanges, with_extents: bool) -> Pro
 
     // The envelope is a sparse image of the volume: every non-member byte at its
     // true physical offset, holes where the members were routed away.
-    let envelope = dir.path().join("silver.horizon.vol00000.envelope");
+    let envelope = dir.path().join("silver.horizon.f0.vol00000.envelope");
     let mut file = std::fs::File::create(&envelope).unwrap();
     for (offset, len) in [
         (0usize, PROVIDER_HEADER),
@@ -2564,13 +2617,13 @@ fn provider_fixture_with_extents(covered: ByteRanges, with_extents: bool) -> Pro
     }
     drop(file);
 
-    let partial_a = dir.path().join("Silver.Horizon.S01E01.mkv.direct.partial");
+    let partial_a = dir.path().join("Silver.Horizon.S01E01.mkv.f0.direct.partial");
     std::fs::write(
         &partial_a,
         &conventional[member_a_at..member_a_at + PROVIDER_MEMBER_A],
     )
     .unwrap();
-    let partial_b = dir.path().join("Silver.Horizon.S01E01.nfo.direct.partial");
+    let partial_b = dir.path().join("Silver.Horizon.S01E01.nfo.f0.direct.partial");
     std::fs::write(
         &partial_b,
         &conventional[member_b_at..member_b_at + PROVIDER_MEMBER_B],
@@ -2946,9 +2999,9 @@ fn cipher_volume(
     facts: super::router::crypt::MemberCipher,
     volume_len: u64,
 ) -> super::provider::VirtualVolume {
-    let partial = dir.join("Silver.Horizon.S04E02.mkv.direct.partial");
+    let partial = dir.join("Silver.Horizon.S04E02.mkv.f0.direct.partial");
     std::fs::write(&partial, plain).unwrap();
-    let envelope = dir.join("silver.horizon.vol00000.envelope");
+    let envelope = dir.join("silver.horizon.f0.vol00000.envelope");
     std::fs::write(&envelope, Vec::new()).unwrap();
     let mut covered = ByteRanges::new();
     covered.insert(0, volume_len);
@@ -3936,7 +3989,7 @@ fn coverage_skip_plan_skips_every_segment_of_a_complete_file() {
 #[tokio::test]
 async fn restart_refuses_a_row_claiming_a_volume_the_layout_has_no_facts_for() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.direct.partial", 60);
+    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
     let blob = encode(&sample_snapshot()).unwrap();
 
     // M5. The layout rebuild is tolerant of a missing volume — it contributes no
@@ -4110,7 +4163,7 @@ fn rearm_router() -> DirectSetRouter {
         ),
     ]);
     router.restore_layout(&facts).expect("the facts rebuild");
-    let partial = format!("{REARM_MEMBER}.direct.partial");
+    let partial = format!("{REARM_MEMBER}.f0.direct.partial");
     router
         .restore_member_coverage(&partial, &[(0, REARM_PART * 2)])
         .expect("the member is in the rebuilt layout");
@@ -4721,7 +4774,7 @@ fn deleting_the_row_before_a_repair_keeps_the_coverage_the_provider_reads() {
     let recorder = Recorder::default();
     let mut barrier = sample_barrier();
     barrier.register_volume(0, 0);
-    barrier.register_destination(0, "Silver.Horizon.S01E04.mkv.direct.partial");
+    barrier.register_destination(0, "Silver.Horizon.S01E04.mkv.f0.direct.partial");
     barrier
         .record_write(&write(0, 0, 4096, 0), Instant::now())
         .unwrap();
@@ -4779,7 +4832,7 @@ fn a_crash_between_the_row_delete_and_the_next_barrier_leaves_nothing_to_trust()
     let recorder = Recorder::default();
     let mut barrier = sample_barrier();
     barrier.register_volume(0, 0);
-    barrier.register_destination(0, "Silver.Horizon.S01E04.mkv.direct.partial");
+    barrier.register_destination(0, "Silver.Horizon.S01E04.mkv.f0.direct.partial");
     barrier
         .record_write(&write(0, 0, 4096, 0), Instant::now())
         .unwrap();
@@ -4868,7 +4921,7 @@ fn creating_a_sparse_file_leaves_it_empty_and_writable() {
     use super::sparse::{SparseMarking, create_sparse};
 
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("silver.horizon.vol00000.envelope");
+    let path = dir.path().join("silver.horizon.f0.vol00000.envelope");
 
     let file = create_sparse(&path, &SparseMarking::Platform)
         .expect("the platform marker must succeed on a fresh file");
@@ -4891,7 +4944,7 @@ fn creating_a_sparse_file_over_an_existing_one_keeps_its_bytes() {
     use super::sparse::{SparseMarking, create_sparse};
 
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("Silver.Horizon.S01E01.mkv.direct.partial");
+    let path = dir.path().join("Silver.Horizon.S01E01.mkv.f0.direct.partial");
     std::fs::write(&path, b"already routed").unwrap();
 
     create_sparse(&path, &SparseMarking::Platform).expect("re-marking is allowed");
@@ -4909,8 +4962,8 @@ fn a_marking_failure_removes_the_file_it_created_but_never_a_pre_existing_one() 
     use super::sparse::{SparseMarking, create_sparse};
 
     let dir = tempfile::tempdir().unwrap();
-    let fresh = dir.path().join("fresh.direct.partial");
-    let existing = dir.path().join("existing.direct.partial");
+    let fresh = dir.path().join("fresh.f0.direct.partial");
+    let existing = dir.path().join("existing.f0.direct.partial");
     std::fs::write(&existing, b"routed bytes").unwrap();
 
     create_sparse(&fresh, &SparseMarking::AlwaysFail)
