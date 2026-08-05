@@ -195,15 +195,10 @@ impl Pipeline {
         {
             return false;
         }
-        !self.job_has_active_rar_extraction_workers(job_id)
-    }
-
-    /// Whether any of the job's RAR sets still has extraction work in flight.
-    pub(crate) fn job_has_active_rar_extraction_workers(&self, job_id: JobId) -> bool {
-        self.rar_sets
-            .iter()
-            .filter(|((set_job_id, _), _)| *set_job_id == job_id)
-            .any(|(_, state)| state.active_workers > 0 || !state.in_flight_members.is_empty())
+        // The broader check, matching what completion asks: a full-set
+        // extraction in flight can still change this job's inputs just as a
+        // per-member worker can.
+        !self.job_has_active_extraction_tasks(job_id)
     }
 
     pub(crate) fn rar_ready_member_is_startable_for_batch_extraction(

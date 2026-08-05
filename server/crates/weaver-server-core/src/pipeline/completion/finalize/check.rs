@@ -2441,24 +2441,50 @@ impl Pipeline {
             self.emit_download_pipeline_drained_if_pending(job_id);
         }
         let only_rar_archives = self.job_has_only_rar_archives(job_id);
-        // A settled RAR extraction failure is the third way the payload can be
-        // "as ready as it is going to get". Ordinarily an incomplete data file
-        // defers validation until the downloads drain, which is right: PAR2
-        // cannot tell a file still arriving from a damaged one. But a failed
-        // extraction with no worker left running is evidence that this job's
-        // archives cannot be opened *now*, and the reason may well be the very
-        // volume that never arrived — so the authoritative pass runs, names the
-        // exact missing blocks, and either promotes recovery, repairs, or fails
-        // for good. The matching escape in the early deferral below is what
-        // lets execution reach this at all.
-        let par2_primary_payload_ready = !has_incomplete_data_files
-            || download_pipeline_exhausted
-            || self.par2_recovery_evaluation_pending(job_id);
+
+        // A RAR set that PAR2 owes a verdict on, in the two shapes that reach
+        // this while the downloads have not drained. Ordinarily an incomplete
+        // data file defers validation until they do, which is right — PAR2
+        // cannot tell a file still arriving from a damaged one — but in both
+        // of these the wait is for something that is not coming, and the
+        // authoritative pass is what says so.
+        let par2_may_still_rule =
+            par2_loaded && !par2_bypassed && !self.par2_verified.contains(&job_id);
+        let extraction_settled = !self.job_has_active_extraction_tasks(job_id);
+        // One: extraction was attempted and failed. The archives cannot be
+        // opened now, and the reason may well be the volume that never came.
+        // This is the same question the scheduler asks before it latches the
+        // failed member out, and it is asked through the same predicate so the
+        // two cannot answer differently — a latch with no verdict coming is a
+        // stalled job.
+        let failed_rar_par2_repair_ready = self.par2_recovery_evaluation_pending(job_id);
+        // Two: extraction was never attempted, because a volume is missing.
+        // Nothing lands in `failed_extractions` for this shape — there was no
+        // failure, only an absence — so it needs naming separately or a job
+        // whose interior volume never posted waits forever with the recovery
+        // blocks that would rebuild it sitting right there.
+        let missing_rar_volume_par2_repair_ready = par2_may_still_rule
+            && extraction_settled
+            && self.job_has_live_rar_waiting_for_missing_volumes(job_id)
+            && (self.recovery_blocks_available_or_targeted(job_id) > 0
+                || self
+                    .jobs
+                    .get(&job_id)
+                    .is_some_and(|state| state.recovery_queue.has_recovery_work()));
+        let rar_par2_repair_ready =
+            failed_rar_par2_repair_ready || missing_rar_volume_par2_repair_ready;
+
+        let par2_primary_payload_ready =
+            !has_incomplete_data_files || download_pipeline_exhausted || rar_par2_repair_ready;
         let par2_validation_needed = par2_loaded
             && !par2_bypassed
             && !self.par2_verified.contains(&job_id)
             && par2_primary_payload_ready
-            && !self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id);
+            // The residuals check reads a job still missing archive pieces as
+            // nothing to validate yet. That is the very state a repair-ready
+            // RAR set is in, so it cannot be what turns validation away.
+            && (rar_par2_repair_ready
+                || !self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id));
         let rar_waiting_for_missing_volumes = download_pipeline_exhausted
             && only_rar_archives
             && self.job_has_live_rar_waiting_for_missing_volumes(job_id);
@@ -2479,7 +2505,8 @@ impl Pipeline {
             .post_processing_repair_return_to_terminal
             .contains(&job_id);
         let authoritative_par2_verification_needed = par2_validation_needed
-            && (has_crc_failures
+            && (rar_par2_repair_ready
+                || has_crc_failures
                 || (has_incomplete_data_files && download_pipeline_exhausted)
                 || rar_waiting_for_missing_volumes
                 || matches!(current_status, JobStatus::Repairing)
@@ -2500,6 +2527,16 @@ impl Pipeline {
         let quick_par2_verification_allowed = par2_validation_needed
             && !matches!(current_status, JobStatus::Repairing)
             && !extension_repair_requested
+            // A set waiting on a volume that never posted needs the
+            // *authoritative* analyzer: only that names the exact missing
+            // blocks a recovery promotion has to target, and the quick pass has
+            // nothing to answer from — those bytes are absent, not wrong.
+            //
+            // Narrower than 0.7.9's, deliberately. A *failed* extraction whose
+            // files are all present is a case 0.8's quick pass settles on its
+            // own — swap correction, and the eager-delete retry frontier — and
+            // forcing the authoritative pass there loses both.
+            && !missing_rar_volume_par2_repair_ready
             && (!has_incomplete_data_files || !download_pipeline_exhausted)
             && clean_par2_integrity_gate_allows_fast_path;
         let needs_completion_repair_evaluation = has_crc_failures
@@ -2584,12 +2621,10 @@ impl Pipeline {
         if has_incomplete_data_files
             && !download_pipeline_exhausted
             && !self.job_has_active_extraction_tasks(job_id)
-            // ...unless a RAR extraction has already failed and no worker is
-            // left to change that. Waiting for downloads that are not coming
-            // is how such a job stalls: its failed member is latched out of
-            // scheduling until PAR2 rules on it, and this return is what keeps
-            // PAR2 from ever being asked.
-            && !self.par2_recovery_evaluation_pending(job_id)
+            // ...unless PAR2 owes this job's RAR sets a verdict. Waiting for
+            // downloads that are not coming is how such a job stalls, and this
+            // return is what keeps PAR2 from ever being asked.
+            && !rar_par2_repair_ready
         {
             return;
         }
