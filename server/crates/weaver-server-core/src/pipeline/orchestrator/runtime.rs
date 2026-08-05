@@ -229,6 +229,7 @@ impl Pipeline {
             write_buffered_segments: 0,
             write_buffers: HashMap::new(),
             par2_runtime: HashMap::new(),
+            live_par2: repair::LivePar2Registry::new(),
             extracted_members: HashMap::new(),
             extracted_archives: HashMap::new(),
             decode_retries: HashMap::new(),

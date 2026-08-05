@@ -9,9 +9,56 @@ use weaver_model::files::{
     reserve_download_filename, sanitize_download_filename,
 };
 
+pub(crate) mod live;
+
 pub(crate) const PROMOTED_RECOVERY_PRIORITY: u32 = 2;
 const PAR2_PACKET_ALIGNMENT: u64 = 4;
 const PAR2_RECOVERY_PACKET_OVERHEAD: u64 = 68; // 64-byte header + 4-byte exponent
+const PAR2_RETAINED_SESSION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const STATEFUL_PAR2_SESSION_ENV: &str = "WEAVER_STATEFUL_PAR2_SESSION";
+
+fn parse_stateful_par2_session_enabled(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim),
+        Some("1")
+            | Some("true")
+            | Some("TRUE")
+            | Some("yes")
+            | Some("YES")
+            | Some("on")
+            | Some("ON")
+    )
+}
+
+fn stateful_par2_session_enabled() -> bool {
+    parse_stateful_par2_session_enabled(std::env::var(STATEFUL_PAR2_SESSION_ENV).ok().as_deref())
+}
+
+fn select_par2_session_eviction<I>(sessions: I, protected_job_id: JobId) -> Option<JobId>
+where
+    I: IntoIterator<Item = (JobId, bool, Option<Instant>)>,
+{
+    let mut protected_available = false;
+    let mut oldest_unprotected: Option<(JobId, Option<Instant>)> = None;
+    for (job_id, has_session, last_used) in sessions {
+        if !has_session {
+            continue;
+        }
+        if job_id == protected_job_id {
+            protected_available = true;
+            continue;
+        }
+        if oldest_unprotected
+            .as_ref()
+            .is_none_or(|(_, oldest)| last_used < *oldest)
+        {
+            oldest_unprotected = Some((job_id, last_used));
+        }
+    }
+    oldest_unprotected
+        .map(|(job_id, _)| job_id)
+        .or_else(|| protected_available.then_some(protected_job_id))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryCountSource {
@@ -164,6 +211,13 @@ fn select_recovery_file_indices(
         })
 }
 
+fn unique_live_par2_candidate(candidates: &[par2_rs::FileId]) -> Option<par2_rs::FileId> {
+    let [candidate] = candidates else {
+        return None;
+    };
+    Some(*candidate)
+}
+
 impl Pipeline {
     pub(crate) fn canonical_archive_identity_from_filename(
         filename: &str,
@@ -199,7 +253,7 @@ impl Pipeline {
     async fn apply_par2_authoritative_identity(
         &mut self,
         job_id: JobId,
-        par2_set: &weaver_par2::Par2FileSet,
+        par2_set: &par2_rs::Par2FileSet,
     ) -> Result<(), String> {
         let Some(state) = self.jobs.get(&job_id) else {
             return Ok(());
@@ -483,6 +537,317 @@ impl Pipeline {
         self.par2_runtime.entry(job_id).or_default()
     }
 
+    pub(crate) fn job_spec_has_par2_file(&self, job_id: JobId) -> bool {
+        self.jobs.get(&job_id).is_some_and(|state| {
+            state
+                .spec
+                .files
+                .iter()
+                .any(|file| matches!(file.role, weaver_model::files::FileRole::Par2 { .. }))
+        })
+    }
+
+    fn resolve_live_par2_binding(
+        &self,
+        file_id: NzbFileId,
+    ) -> Option<(par2_rs::FileId, u64, std::path::PathBuf, bool)> {
+        let set = self.par2_set(file_id.job_id)?;
+        let state = self.jobs.get(&file_id.job_id)?;
+        let file = state.assembly.file(file_id)?;
+        let current_filename = self.current_filename_for_file(file_id.job_id, file);
+        let mut names = HashSet::from([current_filename.clone()]);
+        if let Some(identity) = self.effective_file_identity(file_id.job_id, file_id) {
+            names.insert(identity.source_filename);
+            if let Some(canonical) = identity.canonical_filename {
+                names.insert(canonical);
+            }
+        }
+        let candidates = set
+            .files
+            .iter()
+            .filter_map(|(par2_file_id, desc)| {
+                names
+                    .contains(&sanitize_download_filename(&desc.filename))
+                    .then_some(*par2_file_id)
+            })
+            .collect::<Vec<_>>();
+        let par2_file_id = unique_live_par2_candidate(&candidates)?;
+        Some((
+            par2_file_id,
+            file.total_bytes(),
+            state.working_dir.join(current_filename),
+            file.is_complete(),
+        ))
+    }
+
+    fn bind_live_par2_file(&mut self, file_id: NzbFileId) {
+        let Some((par2_file_id, length, path, complete)) = self.resolve_live_par2_binding(file_id)
+        else {
+            return;
+        };
+        if self.live_par2.bind(file_id, par2_file_id, length, path) && complete {
+            self.live_par2.note_file_complete(file_id, length);
+        }
+    }
+
+    fn activate_live_par2(&mut self, job_id: JobId, packets: &[par2_rs::Packet]) {
+        self.live_par2.activate(job_id, packets);
+        let file_ids = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                state
+                    .assembly
+                    .files()
+                    .map(|file| file.file_id())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for file_id in file_ids {
+            self.bind_live_par2_file(file_id);
+        }
+    }
+
+    /// Feed bytes after normal assembly made them durable.  We only retain
+    /// lightweight range shape until metadata and identity are both known.
+    pub(crate) fn note_live_par2_segment(
+        &mut self,
+        file_id: NzbFileId,
+        file_offset: u64,
+        data: &crate::pipeline::DecodedChunk,
+    ) {
+        if !self.live_par2.enabled()
+            || (!self.job_spec_has_par2_file(file_id.job_id)
+                && self.par2_set(file_id.job_id).is_none())
+        {
+            return;
+        }
+        self.bind_live_par2_file(file_id);
+        self.live_par2.note_segment(file_id, file_offset, data);
+    }
+
+    pub(crate) fn note_live_par2_file_complete(&mut self, file_id: NzbFileId, received_bytes: u64) {
+        self.bind_live_par2_file(file_id);
+        self.live_par2.note_file_complete(file_id, received_bytes);
+    }
+
+    /// Complete the bounded disk backfill/settle phase.  Any I/O error or
+    /// short read simply leaves live verification incomplete and the existing
+    /// authoritative pass remains responsible for the job.
+    pub(crate) async fn run_live_par2_reads(&mut self, job_id: JobId) {
+        let reads = self.live_par2.take_reads(job_id);
+        if reads.is_empty() {
+            return;
+        }
+        let reads = reads
+            .into_iter()
+            .filter_map(|read| self.live_par2.path_for_read(read).map(|path| (read, path)))
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let results = match tokio::task::spawn_blocking(move || {
+            reads
+                .into_iter()
+                .map(|(read, path)| {
+                    let result = (|| -> std::io::Result<Vec<u8>> {
+                        let len = usize::try_from(read.len).map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "live PAR2 read length exceeds address space",
+                            )
+                        })?;
+                        let mut file = std::fs::File::open(path)?;
+                        use std::io::{Read, Seek, SeekFrom};
+                        file.seek(SeekFrom::Start(read.offset))?;
+                        let mut bytes = vec![0; len];
+                        file.read_exact(&mut bytes)?;
+                        Ok(bytes)
+                    })();
+                    (read, result)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            Ok(results) => results,
+            Err(error) => {
+                warn!(job_id = job_id.0, error = %error, "live PAR2 disk-read task panicked");
+                return;
+            }
+        };
+        crate::runtime::perf_probe::record("verify.live_par2.disk_reads", started.elapsed());
+        for (read, result) in results {
+            match result {
+                Ok(bytes) => self.live_par2.apply_read(read, &bytes),
+                Err(error) => debug!(
+                    job_id = job_id.0,
+                    file_id = %read.file_id,
+                    offset = read.offset,
+                    len = read.len,
+                    error = %error,
+                    "live PAR2 read unavailable; falling back to authoritative verification"
+                ),
+            }
+        }
+    }
+
+    pub(crate) async fn settle_live_par2_job(&mut self, job_id: JobId) {
+        self.live_par2.schedule_settle_reads(job_id);
+        self.run_live_par2_reads(job_id).await;
+        let metrics = self.live_par2.metrics();
+        debug!(
+            job_id = job_id.0,
+            partial_bytes = self.live_par2.partial_bytes(),
+            strong_slices = metrics.strongly_verified_slices,
+            metadata_range_overflows = metrics.metadata_range_overflows,
+            backfill_reads = metrics.backfill_reads,
+            settle_reads = metrics.settle_reads,
+            disk_read_bytes = metrics.disk_read_bytes,
+            disk_read_budget_exhausted = metrics.disk_read_budget_exhausted,
+            "live PAR2 settle diagnostics"
+        );
+    }
+
+    pub(crate) fn live_par2_strong_evidence(
+        &mut self,
+        job_id: JobId,
+    ) -> Vec<(std::path::PathBuf, par2_rs::SliceEvidence)> {
+        self.live_par2.strong_evidence(job_id)
+    }
+
+    pub(crate) fn live_par2_complete_bindings(
+        &self,
+        job_id: JobId,
+    ) -> Option<HashMap<NzbFileId, par2_rs::FileId>> {
+        self.live_par2.complete_bindings_if_strong(job_id)
+    }
+
+    pub(crate) async fn take_or_open_par2_repair_session(
+        &mut self,
+        job_id: JobId,
+        working_dir: std::path::PathBuf,
+        memory_limit: usize,
+        progress: Option<par2_rs::ProgressCallback>,
+    ) -> Result<Option<(par2_rs::Par2RepairSession, bool)>, String> {
+        if !stateful_par2_session_enabled() {
+            return Ok(None);
+        }
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
+            if let Some(session) = runtime.session.take() {
+                runtime.session_last_used = Some(Instant::now());
+                return Ok(Some((session, false)));
+            }
+        }
+
+        let Some((primary_path, recovery_paths)) = self.par2_runtime(job_id).and_then(|runtime| {
+            runtime
+                .primary_path
+                .clone()
+                .map(|primary_path| (primary_path, runtime.merged_recovery_paths.clone()))
+        }) else {
+            return Ok(None);
+        };
+
+        let session_result = tokio::task::spawn_blocking(move || {
+            let mut options =
+                par2_rs::Par2RepairSessionOptions::new(working_dir, vec![primary_path]);
+            options.memory_limit = Some(memory_limit);
+            options.progress = progress;
+            let mut session = par2_rs::Par2RepairSession::open(options)
+                .map_err(|error| format!("failed to open retained PAR2 session: {error}"))?;
+            if !recovery_paths.is_empty() {
+                session
+                    .merge_recovery_paths(recovery_paths)
+                    .map_err(|error| {
+                        format!("failed to replay retained PAR2 recovery paths: {error}")
+                    })?;
+            }
+            Ok::<_, String>(session)
+        })
+        .await
+        .map_err(|error| format!("retained PAR2 session task panicked: {error}"))??;
+
+        Ok(Some((session_result, true)))
+    }
+
+    pub(crate) fn restore_par2_repair_session(
+        &mut self,
+        job_id: JobId,
+        session: par2_rs::Par2RepairSession,
+    ) {
+        let runtime = self.ensure_par2_runtime(job_id);
+        runtime.session = Some(session);
+        runtime.session_last_used = Some(Instant::now());
+        self.enforce_par2_retained_session_budget(job_id);
+    }
+
+    fn enforce_par2_retained_session_budget(&mut self, protected_job_id: JobId) {
+        loop {
+            let retained_bytes = self
+                .par2_runtime
+                .values()
+                .filter_map(|runtime| runtime.session.as_ref())
+                .map(par2_rs::Par2RepairSession::estimated_retained_bytes)
+                .sum::<usize>();
+            if retained_bytes <= PAR2_RETAINED_SESSION_BUDGET_BYTES {
+                return;
+            }
+
+            let victim = select_par2_session_eviction(
+                self.par2_runtime.iter().map(|(job_id, runtime)| {
+                    (
+                        *job_id,
+                        runtime.session.is_some(),
+                        runtime.session_last_used,
+                    )
+                }),
+                protected_job_id,
+            );
+            let Some(victim) = victim else {
+                return;
+            };
+            let runtime = self
+                .par2_runtime
+                .get_mut(&victim)
+                .expect("PAR2 session eviction target exists");
+            runtime.session = None;
+            runtime.session_last_used = None;
+            runtime.session_evidence_file_ids.clear();
+            info!(
+                job_id = victim.0,
+                retained_bytes,
+                budget_bytes = PAR2_RETAINED_SESSION_BUDGET_BYTES,
+                "evicted retained PAR2 session; it will be reopened and reanalyzed if needed"
+            );
+        }
+    }
+
+    /// A decoded write can replace bytes that were previously committed to a
+    /// retained repair session. Drop source locations before that write is
+    /// allowed to become observable; parsed PAR2 packets remain reusable.
+    pub(crate) fn invalidate_par2_session_for_file_write(&mut self, file_id: NzbFileId) {
+        let Some(runtime) = self.par2_runtime.get_mut(&file_id.job_id) else {
+            return;
+        };
+        runtime.completed_checksums.remove(&file_id);
+        runtime.session_evidence_file_ids.clear();
+        if let Some(session) = runtime.session.as_mut() {
+            session.invalidate_all_sources();
+        }
+    }
+
+    /// Identity changes can rename or rebind a path without changing the
+    /// downloaded bytes. A retained location must nevertheless be discarded:
+    /// repair always derives a fresh location from the current identity.
+    pub(crate) fn invalidate_par2_session_for_identity_rebind(&mut self, job_id: JobId) {
+        self.live_par2.invalidate_job(job_id);
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
+            runtime.session_evidence_file_ids.clear();
+            if let Some(session) = runtime.session.as_mut() {
+                session.invalidate_all_sources();
+            }
+        }
+    }
+
     pub(crate) fn note_recovery_count_from_yenc_name(
         &mut self,
         job_id: JobId,
@@ -631,8 +996,13 @@ impl Pipeline {
         }
 
         let parse_path = file_path.clone();
-        let par2_set = match tokio::task::spawn_blocking(move || {
-            weaver_par2::Par2FileSet::from_paths(&[parse_path])
+        let (par2_set, packets) = match tokio::task::spawn_blocking(move || {
+            let packets = par2_rs::scan_packets_from_path(&parse_path)?
+                .into_iter()
+                .map(|(packet, _)| packet)
+                .collect::<Vec<_>>();
+            let set = par2_rs::Par2FileSet::from_packets(packets.clone())?;
+            Ok::<_, par2_rs::Par2Error>((set, packets))
         })
         .await
         {
@@ -676,7 +1046,13 @@ impl Pipeline {
             "PAR2 metadata loaded"
         );
 
-        self.ensure_par2_runtime(job_id).set = Some(Arc::new(par2_set));
+        {
+            let runtime = self.ensure_par2_runtime(job_id);
+            runtime.primary_path = Some(file_path);
+            runtime.set = Some(Arc::new(par2_set));
+        }
+        self.activate_live_par2(job_id, &packets);
+        self.run_live_par2_reads(job_id).await;
 
         let _ = self
             .event_tx
@@ -715,7 +1091,7 @@ impl Pipeline {
 
         let parse_path = file_path.clone();
         let packet_list = match tokio::task::spawn_blocking(move || {
-            weaver_par2::scan_packets_from_path_with_set_ids(&parse_path).map(|packets| {
+            par2_rs::scan_packets_from_path_with_set_ids(&parse_path).map(|packets| {
                 packets
                     .into_iter()
                     .filter_map(|packet| {
@@ -736,6 +1112,41 @@ impl Pipeline {
                 return;
             }
         };
+
+        self.ensure_par2_runtime(job_id)
+            .merged_recovery_paths
+            .insert(file_path.clone());
+        self.live_par2.merge_packets(job_id, &packet_list);
+        if let Some(mut session) = self
+            .par2_runtime
+            .get_mut(&job_id)
+            .and_then(|runtime| runtime.session.take())
+        {
+            let session_path = file_path.clone();
+            match tokio::task::spawn_blocking(move || {
+                let result = session.merge_recovery_paths([session_path]);
+                (session, result)
+            })
+            .await
+            {
+                Ok((session, Ok(_))) => self.restore_par2_repair_session(job_id, session),
+                Ok((session, Err(error))) => {
+                    self.restore_par2_repair_session(job_id, session);
+                    warn!(
+                        job_id = job_id.0,
+                        filename = %filename,
+                        error = %error,
+                        "failed to merge recovery path into retained PAR2 session"
+                    );
+                }
+                Err(error) => warn!(
+                    job_id = job_id.0,
+                    filename = %filename,
+                    error = %error,
+                    "retained PAR2 recovery merge task panicked; session was evicted"
+                ),
+            }
+        }
 
         let merge_result = {
             let par2_set = Arc::make_mut(self.ensure_par2_runtime(job_id).set.as_mut().unwrap());

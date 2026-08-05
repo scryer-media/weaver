@@ -606,8 +606,8 @@ fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     ]
 }
 
-fn dummy_rar_volume_facts(volume_number: u32) -> weaver_unrar::RarVolumeFacts {
-    weaver_unrar::RarVolumeFacts {
+fn dummy_rar_volume_facts(volume_number: u32) -> unrar_rs::RarVolumeFacts {
+    unrar_rs::RarVolumeFacts {
         format: 5,
         volume_number,
         more_volumes: true,
@@ -628,12 +628,9 @@ fn dummy_rar_volume_facts(volume_number: u32) -> weaver_unrar::RarVolumeFacts {
     }
 }
 
-fn dummy_named_rar_volume_facts(
-    volume_number: u32,
-    member_name: &str,
-) -> weaver_unrar::RarVolumeFacts {
-    weaver_unrar::RarVolumeFacts {
-        members: vec![weaver_unrar::RarVolumeMemberFacts {
+fn dummy_named_rar_volume_facts(volume_number: u32, member_name: &str) -> unrar_rs::RarVolumeFacts {
+    unrar_rs::RarVolumeFacts {
+        members: vec![unrar_rs::RarVolumeMemberFacts {
             order: 0,
             name: member_name.to_string(),
             name_raw: Some(member_name.as_bytes().to_vec()),
@@ -648,7 +645,9 @@ fn dummy_named_rar_volume_facts(
             split_after: true,
             is_directory: false,
             is_encrypted: false,
-            host_os: Some(weaver_unrar::RarVolumeHostOs::Unix),
+            encryption: None,
+            rar4_salt: None,
+            host_os: Some(unrar_rs::RarVolumeHostOs::Unix),
             attributes: Some(0o644),
             owner: None,
             mtime_ns: None,
@@ -782,7 +781,7 @@ fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes:
 
 fn minimal_par2_file_set() -> Par2FileSet {
     Par2FileSet {
-        recovery_set_id: weaver_par2::RecoverySetId::from_bytes([0; 16]),
+        recovery_set_id: par2_rs::RecoverySetId::from_bytes([0; 16]),
         slice_size: 1,
         recovery_file_ids: Vec::new(),
         non_recovery_file_ids: Vec::new(),
@@ -806,13 +805,13 @@ fn placement_par2_file_set(files: &[(String, Vec<u8>)]) -> Par2FileSet {
     for (index, (filename, bytes)) in files.iter().enumerate() {
         let mut raw_id = [0u8; 16];
         raw_id[12..].copy_from_slice(&((index as u32) + 1).to_be_bytes());
-        let file_id = weaver_par2::FileId::from_bytes(raw_id);
-        let hash_full = weaver_par2::checksum::md5(bytes);
-        let hash_16k = weaver_par2::checksum::md5(&bytes[..bytes.len().min(16 * 1024)]);
+        let file_id = par2_rs::FileId::from_bytes(raw_id);
+        let hash_full = par2_rs::checksum::md5(bytes);
+        let hash_16k = par2_rs::checksum::md5(&bytes[..bytes.len().min(16 * 1024)]);
         recovery_file_ids.push(file_id);
         descriptions.insert(
             file_id,
-            weaver_par2::FileDescription {
+            par2_rs::FileDescription {
                 file_id,
                 hash_full,
                 hash_16k,
@@ -824,7 +823,7 @@ fn placement_par2_file_set(files: &[(String, Vec<u8>)]) -> Par2FileSet {
     }
 
     Par2FileSet {
-        recovery_set_id: weaver_par2::RecoverySetId::from_bytes([9; 16]),
+        recovery_set_id: par2_rs::RecoverySetId::from_bytes([9; 16]),
         slice_size,
         recovery_file_ids,
         non_recovery_file_ids: Vec::new(),
@@ -861,7 +860,7 @@ fn build_test_par2_packet(
     body: &[u8],
     recovery_set_id: [u8; 16],
 ) -> Vec<u8> {
-    let length = (weaver_par2::packet::header::HEADER_SIZE + body.len()) as u64;
+    let length = (par2_rs::packet::header::HEADER_SIZE + body.len()) as u64;
     let mut hash_input = Vec::new();
     hash_input.extend_from_slice(&recovery_set_id);
     hash_input.extend_from_slice(packet_type);
@@ -869,7 +868,7 @@ fn build_test_par2_packet(
     let packet_hash = checksum::md5(&hash_input);
 
     let mut data = Vec::new();
-    data.extend_from_slice(weaver_par2::packet::header::MAGIC);
+    data.extend_from_slice(par2_rs::packet::header::MAGIC);
     data.extend_from_slice(&length.to_le_bytes());
     data.extend_from_slice(&packet_hash);
     data.extend_from_slice(&recovery_set_id);
@@ -878,7 +877,7 @@ fn build_test_par2_packet(
     data
 }
 
-fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size: u64) -> Vec<u8> {
+pub(super) fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size: u64) -> Vec<u8> {
     let file_length = file_data.len() as u64;
     let hash_full = checksum::md5(file_data);
     let hash_16k = checksum::md5(&file_data[..file_data.len().min(16 * 1024)]);
@@ -900,11 +899,11 @@ fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size: u64) -> V
         let start = slice_index as u64 * slice_size;
         let end = ((start + slice_size) as usize).min(file_data.len());
         let slice_data = &file_data[start as usize..end];
-        let mut state = weaver_par2::SliceChecksumState::new();
+        let mut state = par2_rs::SliceChecksumState::new();
         state.update(slice_data);
         let (crc32, md5) =
             state.finalize(((slice_data.len() as u64) < slice_size).then_some(slice_size));
-        checksums.push(weaver_par2::SliceChecksum { crc32, md5 });
+        checksums.push(par2_rs::SliceChecksum { crc32, md5 });
     }
 
     let mut main_body = Vec::new();
@@ -932,17 +931,17 @@ fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size: u64) -> V
 
     let mut stream = Vec::new();
     stream.extend_from_slice(&build_test_par2_packet(
-        weaver_par2::packet::header::TYPE_MAIN,
+        par2_rs::packet::header::TYPE_MAIN,
         &main_body,
         recovery_set_id,
     ));
     stream.extend_from_slice(&build_test_par2_packet(
-        weaver_par2::packet::header::TYPE_FILE_DESC,
+        par2_rs::packet::header::TYPE_FILE_DESC,
         &file_desc_body,
         recovery_set_id,
     ));
     stream.extend_from_slice(&build_test_par2_packet(
-        weaver_par2::packet::header::TYPE_IFSC,
+        par2_rs::packet::header::TYPE_IFSC,
         &ifsc_body,
         recovery_set_id,
     ));
@@ -963,7 +962,7 @@ fn build_repairable_par2_set(
     file_id_input.extend_from_slice(&hash_16k);
     file_id_input.extend_from_slice(&file_length.to_le_bytes());
     file_id_input.extend_from_slice(filename.as_bytes());
-    let file_id = weaver_par2::FileId::from_bytes(checksum::md5(&file_id_input));
+    let file_id = par2_rs::FileId::from_bytes(checksum::md5(&file_id_input));
 
     let mut slice_checksums = Vec::new();
     let slice_count = if file_length == 0 {
@@ -975,11 +974,11 @@ fn build_repairable_par2_set(
         let start = slice_index as u64 * slice_size;
         let end = ((start + slice_size) as usize).min(file_data.len());
         let slice_data = &file_data[start as usize..end];
-        let mut checksum_state = weaver_par2::SliceChecksumState::new();
+        let mut checksum_state = par2_rs::SliceChecksumState::new();
         checksum_state.update(slice_data);
         let pad_to = ((slice_data.len() as u64) < slice_size).then_some(slice_size);
         let (crc32, md5) = checksum_state.finalize(pad_to);
-        slice_checksums.push(weaver_par2::SliceChecksum { crc32, md5 });
+        slice_checksums.push(par2_rs::SliceChecksum { crc32, md5 });
     }
 
     let mut main_body = Vec::new();
@@ -988,13 +987,13 @@ fn build_repairable_par2_set(
     main_body.extend_from_slice(file_id.as_bytes());
 
     let mut par2_set = Par2FileSet {
-        recovery_set_id: weaver_par2::RecoverySetId::from_bytes(checksum::md5(&main_body)),
+        recovery_set_id: par2_rs::RecoverySetId::from_bytes(checksum::md5(&main_body)),
         slice_size,
         recovery_file_ids: vec![file_id],
         non_recovery_file_ids: Vec::new(),
         files: HashMap::from([(
             file_id,
-            weaver_par2::FileDescription {
+            par2_rs::FileDescription {
                 file_id,
                 hash_full,
                 hash_16k,
@@ -1010,7 +1009,7 @@ fn build_repairable_par2_set(
 
     let slice_size_bytes = slice_size as usize;
     let word_count = (slice_size_bytes / 2).max(1);
-    let constants = weaver_par2::input_slice_constants(slice_count);
+    let constants = par2_rs::input_slice_constants(slice_count);
     let mut padded = file_data.to_vec();
     padded.resize(slice_count * slice_size_bytes, 0);
 
@@ -1019,16 +1018,16 @@ fn build_repairable_par2_set(
         let mut recovery = vec![0u8; slice_size_bytes];
 
         for (input_index, &constant) in constants.iter().enumerate() {
-            let factor = weaver_par2::gf_pow(constant, exponent);
+            let factor = par2_rs::gf_pow(constant, exponent);
             for word_index in 0..word_count {
                 let input_word = u16::from_le_bytes([
                     padded[input_index * slice_size_bytes + word_index * 2],
                     padded[input_index * slice_size_bytes + word_index * 2 + 1],
                 ]);
-                let contribution = weaver_par2::gf_mul(input_word, factor);
+                let contribution = par2_rs::gf_mul(input_word, factor);
                 let current =
                     u16::from_le_bytes([recovery[word_index * 2], recovery[word_index * 2 + 1]]);
-                let updated = weaver_par2::gf_add(current, contribution).to_le_bytes();
+                let updated = par2_rs::gf_add(current, contribution).to_le_bytes();
                 recovery[word_index * 2] = updated[0];
                 recovery[word_index * 2 + 1] = updated[1];
             }
@@ -1036,7 +1035,7 @@ fn build_repairable_par2_set(
 
         par2_set.recovery_slices.insert(
             exponent,
-            weaver_par2::RecoverySlice {
+            par2_rs::RecoverySlice {
                 exponent,
                 data: bytes::Bytes::from(recovery).into(),
             },
@@ -1512,7 +1511,7 @@ async fn submit_decoded_segment_with_part_crc_verified(
             decoded_size: data.len() as u32,
             crc_valid: true,
             part_crc_verified,
-            part_crc: weaver_par2::checksum::crc32(data),
+            part_crc: par2_rs::checksum::crc32(data),
             expected_file_crc,
             data: DecodedChunk::from(data.to_vec()),
             yenc_name: filename.to_string(),
@@ -1550,7 +1549,7 @@ async fn submit_decoded_segment_from_server(
             decoded_size: data.len() as u32,
             crc_valid: true,
             part_crc_verified,
-            part_crc: weaver_par2::checksum::crc32(data),
+            part_crc: par2_rs::checksum::crc32(data),
             expected_file_crc,
             data: DecodedChunk::from(data.to_vec()),
             yenc_name: filename.to_string(),
@@ -1566,7 +1565,7 @@ async fn persist_completed_file_hash(
     bytes: &[u8],
 ) {
     let filename = filename.to_string();
-    let hash = weaver_par2::checksum::md5(bytes);
+    let hash = par2_rs::checksum::md5(bytes);
     pipeline
         .db_blocking(move |db| db.complete_file(job_id, file_index, &filename, &hash))
         .await

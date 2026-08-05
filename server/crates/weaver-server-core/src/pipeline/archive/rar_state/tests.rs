@@ -6,9 +6,9 @@ use crate::pipeline::archive::test_support::{
     file_version_extra as build_test_file_version_extra, main_header as build_test_rar_main_header,
     redirection_extra as build_test_redirection_extra,
 };
+use par2_rs::checksum;
 use std::io::Cursor;
-use weaver_par2::checksum;
-use weaver_unrar::RarArchive;
+use unrar_rs::RarArchive;
 
 fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     let episode_a = b"episode-a-payload";
@@ -581,7 +581,7 @@ fn build_plan_uses_volume_facts_for_incremental_ownership_only() {
     cached["members"] = serde_json::json!([]);
     let archive = RarArchive::deserialize_headers_with_password(
         &rmp_serde::to_vec(
-            &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
+            &serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap(),
         )
         .unwrap(),
         None::<String>,

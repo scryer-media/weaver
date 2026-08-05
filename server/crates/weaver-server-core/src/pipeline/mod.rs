@@ -48,10 +48,10 @@ use crate::{
     JobInfo, JobSpec, JobState, JobStatus, NntpRuntimeActivation, PipelineMetrics, RuntimeTuner,
     SchedulerCommand, SchedulerError, SharedPipelineState, SpilloverDecision, TokenBucket,
 };
-use weaver_nntp::NntpClient;
 #[cfg(test)]
-use weaver_par2::checksum;
-use weaver_par2::par2_set::Par2FileSet;
+use par2_rs::checksum;
+use par2_rs::par2_set::Par2FileSet;
+use weaver_nntp::NntpClient;
 
 use self::archive::rar_state::{RarDerivedPlan, RarSetState};
 use self::download::{
@@ -1101,7 +1101,7 @@ pub(super) struct VerifiedSuspectPersistState {
 }
 
 pub(crate) enum RarPasswordAttemptError {
-    Rar(weaver_unrar::RarError),
+    Rar(unrar_rs::RarError),
     Fatal(String),
 }
 
@@ -1128,8 +1128,8 @@ impl std::fmt::Display for RarPasswordAttemptError {
     }
 }
 
-impl From<weaver_unrar::RarError> for RarPasswordAttemptError {
-    fn from(value: weaver_unrar::RarError) -> Self {
+impl From<unrar_rs::RarError> for RarPasswordAttemptError {
+    fn from(value: unrar_rs::RarError) -> Self {
         Self::Rar(value)
     }
 }
@@ -1155,15 +1155,28 @@ pub(super) struct Par2FileRuntime {
     pub(super) promoted: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub(super) struct Par2RuntimeState {
     pub(super) set: Option<Arc<Par2FileSet>>,
     pub(super) files: HashMap<u32, Par2FileRuntime>,
-    /// Scan state from the most recent analyze pass, reused by the execute
-    /// pass so a repair does not re-scan sources the analysis just hashed.
-    /// Self-invalidating: the engine re-stats every observed file and falls
-    /// back to a full scan on any drift.
-    pub(super) scan_carry: Option<Arc<weaver_par2::ScanCarry>>,
+    /// The on-disk primary PAR2 file used to reopen an evicted retained session.
+    pub(super) primary_path: Option<PathBuf>,
+    /// Recovery files already incorporated into the scheduler view and any
+    /// retained repair session. They are replayed only when a session is
+    /// evicted and reopened.
+    pub(super) merged_recovery_paths: HashSet<PathBuf>,
+    /// Stateful assessment/repair engine. It intentionally owns no open file
+    /// handles, and is invalidated before payload paths are rewritten.
+    pub(super) session: Option<par2_rs::Par2RepairSession>,
+    /// Last time the retained session was taken or restored, for global LRU
+    /// eviction when the shared retained-state budget is exceeded.
+    pub(super) session_last_used: Option<Instant>,
+    /// Completion-time checksums retained only long enough to seed a session
+    /// opened after a payload file finished downloading.
+    pub(super) completed_checksums: HashMap<NzbFileId, CompletedFileChecksum>,
+    /// Completed files whose current identity/checksum evidence was admitted
+    /// to the retained session.
+    pub(super) session_evidence_file_ids: HashSet<NzbFileId>,
 }
 
 pub(super) enum ExtractionDone {
@@ -1250,11 +1263,14 @@ pub(super) enum DecodeDone {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
 pub(super) struct CompletedFileChecksum {
     pub(super) md5: Option<[u8; 16]>,
     pub(super) crc32: u32,
+    pub(super) all_parts_crc_verified: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub(super) struct StreamedCompletedFileChecksum {
     pub(super) md5: Option<[u8; 16]>,
     pub(super) crc32: u32,
@@ -1262,9 +1278,9 @@ pub(super) struct StreamedCompletedFileChecksum {
 }
 
 pub(super) struct CompletedFileChecksumState {
-    md5: Option<weaver_par2::checksum::FileHashState>,
+    md5: Option<par2_rs::checksum::FileHashState>,
     crc32: u32,
-    crc32_combine_op: Option<(u64, weaver_par2::checksum::Crc32CombineOp)>,
+    crc32_combine_op: Option<(u64, par2_rs::checksum::Crc32CombineOp)>,
     bytes_fed: u64,
     all_parts_crc_verified: bool,
 }
@@ -1272,7 +1288,7 @@ pub(super) struct CompletedFileChecksumState {
 impl CompletedFileChecksumState {
     pub(super) fn new() -> Self {
         Self {
-            md5: Some(weaver_par2::checksum::FileHashState::new()),
+            md5: Some(par2_rs::checksum::FileHashState::new()),
             crc32: 0,
             crc32_combine_op: None,
             bytes_fed: 0,
@@ -1349,7 +1365,7 @@ impl CompletedFileChecksumState {
         let _cpu_scope =
             crate::runtime::perf_probe::cpu_scope("download.file_hash.update.crc32_combine");
         if !matches!(self.crc32_combine_op.as_ref(), Some((cached_len, _)) if *cached_len == len) {
-            self.crc32_combine_op = Some((len, weaver_par2::checksum::Crc32CombineOp::new(len)));
+            self.crc32_combine_op = Some((len, par2_rs::checksum::Crc32CombineOp::new(len)));
         }
         let op = &self
             .crc32_combine_op
@@ -1378,7 +1394,7 @@ impl CompletedFileChecksumState {
 
     pub(super) fn finalize(self) -> StreamedCompletedFileChecksum {
         StreamedCompletedFileChecksum {
-            md5: self.md5.map(weaver_par2::checksum::FileHashState::finalize),
+            md5: self.md5.map(par2_rs::checksum::FileHashState::finalize),
             crc32: self.crc32,
             all_parts_crc_verified: self.all_parts_crc_verified,
         }
@@ -1804,6 +1820,9 @@ pub struct Pipeline {
     pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<BufferedDecodedSegment>>,
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
+    /// Advisory in-stream PAR2 evidence. It owns a single partial-boundary
+    /// budget shared by every job and never replaces authoritative repair.
+    pub(super) live_par2: repair::LivePar2Registry,
     /// RAR members already extracted per job (for incremental RAR extraction).
     pub(super) extracted_members: HashMap<JobId, HashSet<String>>,
     /// Archives whose extraction has completed successfully (by archive name).

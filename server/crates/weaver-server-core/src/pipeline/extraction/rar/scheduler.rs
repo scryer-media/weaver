@@ -6,7 +6,7 @@ struct ReadyRarExtraction {
     members: Vec<String>,
     volume_paths_map: std::collections::BTreeMap<u32, PathBuf>,
     cached_headers: Option<Vec<u8>>,
-    shared_kdf_cache: std::sync::Arc<weaver_unrar::crypto::KdfCache>,
+    shared_kdf_cache: std::sync::Arc<unrar_rs::crypto::KdfCache>,
     password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
     is_solid: bool,
 }
@@ -538,7 +538,7 @@ impl Pipeline {
                 .rar_sets
                 .get(&(job_id, set_name.clone()))
                 .map(|state| state.shared_kdf_cache.clone())
-                .unwrap_or_else(|| std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()));
+                .unwrap_or_else(|| std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()));
             ready_sets.push(ReadyRarExtraction {
                 set_name,
                 members: gated_members,
@@ -660,7 +660,7 @@ impl Pipeline {
                             let selected_password = selection.password;
                             let archive_password_required = archive.metadata().is_encrypted;
 
-                            let options = weaver_unrar::ExtractOptions {
+                            let options = unrar_rs::ExtractOptions {
                                 verify: true,
                                 password: selected_password.clone(),
                                 restore_owners: false,
@@ -788,7 +788,7 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
         member_name: &str,
-    ) -> Vec<weaver_par2::FileId> {
+    ) -> Vec<par2_rs::FileId> {
         let Some(par2_set) = self.par2_set(job_id) else {
             return Vec::new();
         };
@@ -804,7 +804,7 @@ impl Pipeline {
             return Vec::new();
         };
 
-        let filename_to_file_id: HashMap<&str, weaver_par2::FileId> = par2_set
+        let filename_to_file_id: HashMap<&str, par2_rs::FileId> = par2_set
             .recovery_file_ids
             .iter()
             .filter_map(|file_id| {
@@ -874,9 +874,9 @@ impl Pipeline {
         let pp_pool = self.pp_pool.clone();
         let lower_bound = tokio::task::spawn_blocking(move || {
             pp_pool.install(move || -> Result<u32, String> {
-                let plan = weaver_par2::scan_placement(&working_dir, &par2_set)
+                let plan = par2_rs::scan_placement(&working_dir, &par2_set)
                     .map_err(|e| format!("placement scan failed: {e}"))?;
-                let selected: HashSet<weaver_par2::FileId> = file_ids.iter().copied().collect();
+                let selected: HashSet<par2_rs::FileId> = file_ids.iter().copied().collect();
                 if plan
                     .conflicts
                     .iter()
@@ -885,10 +885,8 @@ impl Pipeline {
                     return Err("placement conflicts in suspect files".to_string());
                 }
 
-                let access =
-                    weaver_par2::PlacementFileAccess::from_plan(working_dir, &par2_set, &plan);
-                let verification =
-                    weaver_par2::verify_selected_file_ids(&par2_set, &access, &file_ids);
+                let access = par2_rs::PlacementFileAccess::from_plan(working_dir, &par2_set, &plan);
+                let verification = par2_rs::verify_selected_file_ids(&par2_set, &access, &file_ids);
                 Ok(verification.total_missing_blocks)
             })
         })

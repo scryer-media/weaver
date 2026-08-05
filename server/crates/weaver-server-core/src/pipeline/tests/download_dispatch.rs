@@ -2873,7 +2873,7 @@ async fn dispatch_downloads_respects_hard_write_byte_pressure() {
         },
         decoded_size: 4096,
         data: DecodedChunk::from(vec![7u8; 4096]),
-        part_crc: weaver_par2::checksum::crc32(&vec![7u8; 4096]),
+        part_crc: par2_rs::checksum::crc32(&vec![7u8; 4096]),
         part_crc_verified: true,
         yenc_name: "queued.bin".to_string(),
     };
@@ -5707,7 +5707,7 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
                 decoded_size: payload.len() as u32,
                 crc_valid: true,
                 part_crc_verified: false,
-                part_crc: weaver_par2::checksum::crc32(&payload),
+                part_crc: par2_rs::checksum::crc32(&payload),
                 expected_file_crc: None,
                 data: DecodedChunk::from(payload.clone()),
                 yenc_name: filename.to_string(),

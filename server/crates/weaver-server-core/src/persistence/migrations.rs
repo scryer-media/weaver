@@ -361,7 +361,7 @@ fn read_journal_sync(path: &Path) -> Result<Vec<JournalEntry>, StateError> {
         );
         pos += payload_len + 4;
 
-        let computed_crc = weaver_par2::checksum::crc32(payload);
+        let computed_crc = par2_rs::checksum::crc32(payload);
         if stored_crc != computed_crc {
             tracing::warn!("CRC mismatch during journal migration — skipping entry");
             continue;

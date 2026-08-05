@@ -606,7 +606,7 @@ async fn fail_job_clears_write_backlog_accounting() {
         },
         decoded_size: 4096,
         data: DecodedChunk::from(vec![3u8; 4096]),
-        part_crc: weaver_par2::checksum::crc32(&vec![3u8; 4096]),
+        part_crc: par2_rs::checksum::crc32(&vec![3u8; 4096]),
         part_crc_verified: true,
         yenc_name: "stalled.bin".to_string(),
     };
@@ -666,7 +666,7 @@ async fn disk_write_failure_fails_job_before_commit() {
             decoded_size: 4,
             crc_valid: true,
             part_crc_verified: true,
-            part_crc: weaver_par2::checksum::crc32(b"fail"),
+            part_crc: par2_rs::checksum::crc32(b"fail"),
             expected_file_crc: None,
             data: DecodedChunk::from(b"fail".to_vec()),
             yenc_name: "blocked.bin".to_string(),
@@ -706,7 +706,7 @@ async fn completed_standalone_file_crc32_match_persists_completion_without_md5()
         0,
         payload,
         filename,
-        Some(weaver_par2::checksum::crc32(payload)),
+        Some(par2_rs::checksum::crc32(payload)),
     )
     .await;
 
@@ -761,7 +761,7 @@ async fn deferred_decoded_data_hash_range_replays_verified_crc_metadata_without_
             0,
             DeferredFileHashRange {
                 len: payload.len(),
-                part_crc: weaver_par2::checksum::crc32(payload),
+                part_crc: par2_rs::checksum::crc32(payload),
                 part_crc_verified: true,
                 source: DeferredFileHashRangeSource::DecodedData,
             },
@@ -777,7 +777,7 @@ async fn deferred_decoded_data_hash_range_replays_verified_crc_metadata_without_
         .get(&file_id)
         .expect("verified metadata should advance file hash state");
     assert_eq!(state.bytes_fed(), payload.len() as u64);
-    assert_eq!(state.crc32(), weaver_par2::checksum::crc32(payload));
+    assert_eq!(state.crc32(), par2_rs::checksum::crc32(payload));
     assert!(state.all_parts_crc_verified());
     assert!(!state.tracks_md5());
     assert!(!pipeline.deferred_file_hash_ranges.contains_key(&file_id));
@@ -809,7 +809,7 @@ async fn completed_standalone_verified_yenc_crc_skips_deferred_hash_replay() {
             0,
             DeferredFileHashRange {
                 len: 4,
-                part_crc: weaver_par2::checksum::crc32(&payload[0..4]),
+                part_crc: par2_rs::checksum::crc32(&payload[0..4]),
                 part_crc_verified: true,
                 source: DeferredFileHashRangeSource::CrcMetadata,
             },
@@ -822,7 +822,7 @@ async fn completed_standalone_verified_yenc_crc_skips_deferred_hash_replay() {
             4,
             DeferredFileHashRange {
                 len: 4,
-                part_crc: weaver_par2::checksum::crc32(&payload[4..8]),
+                part_crc: par2_rs::checksum::crc32(&payload[4..8]),
                 part_crc_verified: true,
                 source: DeferredFileHashRangeSource::CrcMetadata,
             },
@@ -834,13 +834,13 @@ async fn completed_standalone_verified_yenc_crc_skips_deferred_hash_replay() {
             filename,
             temp_dir.path().join("missing-payload.bin"),
             payload.len() as u64,
-            Some(weaver_par2::checksum::crc32(payload)),
+            Some(par2_rs::checksum::crc32(payload)),
         )
         .await
         .unwrap();
 
     assert_eq!(checksum.md5, None);
-    assert_eq!(checksum.crc32, weaver_par2::checksum::crc32(payload));
+    assert_eq!(checksum.crc32, par2_rs::checksum::crc32(payload));
     assert!(!pipeline.deferred_file_hash_ranges.contains_key(&file_id));
     assert!(!pipeline.deferred_file_hash_data.contains_key(&file_id));
     assert_eq!(pipeline.deferred_file_hash_data_bytes, 0);
@@ -872,7 +872,7 @@ async fn completed_standalone_deferred_crc_metadata_uses_actual_crc() {
             0,
             DeferredFileHashRange {
                 len: 4,
-                part_crc: weaver_par2::checksum::crc32(&payload[0..4]),
+                part_crc: par2_rs::checksum::crc32(&payload[0..4]),
                 part_crc_verified: true,
                 source: DeferredFileHashRangeSource::CrcMetadata,
             },
@@ -885,7 +885,7 @@ async fn completed_standalone_deferred_crc_metadata_uses_actual_crc() {
             4,
             DeferredFileHashRange {
                 len: 4,
-                part_crc: weaver_par2::checksum::crc32(&payload[4..8]),
+                part_crc: par2_rs::checksum::crc32(&payload[4..8]),
                 part_crc_verified: false,
                 source: DeferredFileHashRangeSource::CrcMetadata,
             },
@@ -903,7 +903,7 @@ async fn completed_standalone_deferred_crc_metadata_uses_actual_crc() {
         .unwrap();
 
     assert_eq!(checksum.md5, None);
-    assert_eq!(checksum.crc32, weaver_par2::checksum::crc32(payload));
+    assert_eq!(checksum.crc32, par2_rs::checksum::crc32(payload));
     assert_ne!(checksum.crc32, 0xdead_beef);
     assert!(!pipeline.deferred_file_hash_ranges.contains_key(&file_id));
 }
@@ -939,8 +939,8 @@ async fn completed_file_uses_decoded_size_when_raw_article_bytes_are_larger() {
             decoded_size: payload.len() as u32,
             crc_valid: true,
             part_crc_verified: true,
-            part_crc: weaver_par2::checksum::crc32(payload),
-            expected_file_crc: Some(weaver_par2::checksum::crc32(payload)),
+            part_crc: par2_rs::checksum::crc32(payload),
+            expected_file_crc: Some(par2_rs::checksum::crc32(payload)),
             data: DecodedChunk::from(payload.to_vec()),
             yenc_name: filename.to_string(),
         })
@@ -1102,7 +1102,7 @@ async fn whole_file_crc_mismatch_recovers_unverified_nonzero_segment_from_altern
     let job_id = JobId(20900);
     let filename = "payload.bin";
     let expected_payload = b"abcdefgh";
-    let expected_crc = weaver_par2::checksum::crc32(expected_payload);
+    let expected_crc = par2_rs::checksum::crc32(expected_payload);
     let spec = two_segment_standalone_job_spec("CRC Recovery", filename, 4, 4);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
     pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
@@ -1201,7 +1201,7 @@ async fn whole_file_crc_recovery_waits_for_entire_unverified_batch() {
     let job_id = JobId(20901);
     let filename = "payload.bin";
     let expected_payload = b"abcdefgh";
-    let expected_crc = weaver_par2::checksum::crc32(expected_payload);
+    let expected_crc = par2_rs::checksum::crc32(expected_payload);
     let spec = two_segment_standalone_job_spec("CRC Recovery Batch", filename, 4, 4);
     insert_active_job(&mut pipeline, job_id, spec).await;
     let file_id = NzbFileId {
@@ -1279,7 +1279,7 @@ async fn matching_whole_file_crc_accepts_unverified_part_without_retry() {
     let job_id = JobId(20902);
     let filename = "payload.bin";
     let payload = b"clean";
-    let expected_crc = weaver_par2::checksum::crc32(payload);
+    let expected_crc = par2_rs::checksum::crc32(payload);
     let spec = standalone_job_spec(
         "Unverified But Whole CRC Clean",
         &[(filename.to_string(), payload.len() as u32)],
@@ -1477,7 +1477,7 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
         },
         decoded_size: 64,
         data: DecodedChunk::from(buffered_payload.to_vec()),
-        part_crc: weaver_par2::checksum::crc32(&buffered_payload),
+        part_crc: par2_rs::checksum::crc32(&buffered_payload),
         part_crc_verified: true,
         yenc_name: "episode.bin".to_string(),
     };
@@ -1599,7 +1599,7 @@ async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() 
         },
         decoded_size: 64,
         data: DecodedChunk::from(original_payload[64..].to_vec()),
-        part_crc: weaver_par2::checksum::crc32(&original_payload[64..]),
+        part_crc: par2_rs::checksum::crc32(&original_payload[64..]),
         part_crc_verified: true,
         yenc_name: payload_filename.to_string(),
     };
@@ -1789,14 +1789,14 @@ async fn finalize_completed_file_hash_falls_back_to_disk_after_out_of_order_stre
         file_id,
         4,
         &payload[4..8],
-        weaver_par2::checksum::crc32(&payload[4..8]),
+        par2_rs::checksum::crc32(&payload[4..8]),
         true,
     );
     pipeline.note_file_hash_chunk(
         file_id,
         0,
         &payload[0..4],
-        weaver_par2::checksum::crc32(&payload[0..4]),
+        par2_rs::checksum::crc32(&payload[0..4]),
         true,
     );
 
@@ -1810,8 +1810,8 @@ async fn finalize_completed_file_hash_falls_back_to_disk_after_out_of_order_stre
         )
         .await
         .unwrap();
-    assert_eq!(checksum.md5, Some(weaver_par2::checksum::md5(payload)));
-    assert_eq!(checksum.crc32, weaver_par2::checksum::crc32(payload));
+    assert_eq!(checksum.md5, Some(par2_rs::checksum::md5(payload)));
+    assert_eq!(checksum.crc32, par2_rs::checksum::crc32(payload));
 }
 
 #[tokio::test]

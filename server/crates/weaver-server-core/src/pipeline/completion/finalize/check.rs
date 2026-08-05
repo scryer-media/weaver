@@ -1,6 +1,8 @@
 use super::*;
 use crate::runtime::fs as runtime_fs;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use weaver_model::files::{
     allocate_unique_download_filename, forget_reserved_download_filename,
@@ -14,6 +16,160 @@ const PAR2_REPAIR_MEMORY_LIMIT_ENV: &str = "WEAVER_PAR2_REPAIR_MEMORY_LIMIT_BYTE
 // batched kernels, so the default stays small and repairs coexist with
 // concurrent downloads; the env override remains for tuning.
 const DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone)]
+struct Par2SessionEvidenceCandidate {
+    file_id: NzbFileId,
+    path: std::path::PathBuf,
+    logical_name: String,
+    expected_length: u64,
+    full_md5: Option<[u8; 16]>,
+    crc32: u32,
+    contiguous_assembly_proven: bool,
+    bound_file_id: Option<par2_rs::FileId>,
+}
+
+fn committed_evidence_from_candidate(
+    candidate: &Par2SessionEvidenceCandidate,
+) -> Result<Option<par2_rs::CommittedFileEvidence>, String> {
+    if let Some(md5) = candidate.full_md5 {
+        return par2_rs::CommittedFileEvidence::from_full_md5_path(
+            &candidate.path,
+            &candidate.logical_name,
+            candidate.expected_length,
+            md5,
+            candidate.bound_file_id,
+        )
+        .map(Some)
+        .map_err(|error| format!("failed to capture PAR2 full-MD5 evidence: {error}"));
+    }
+    if !candidate.contiguous_assembly_proven {
+        return Ok(None);
+    }
+
+    let mut first_16k = Vec::with_capacity(16 * 1024);
+    File::open(&candidate.path)
+        .and_then(|file| file.take(16 * 1024).read_to_end(&mut first_16k))
+        .map_err(|error| {
+            format!(
+                "failed to capture first 16 KiB for retained PAR2 evidence {}: {error}",
+                candidate.path.display()
+            )
+        })?;
+    let proof = par2_rs::ContiguousAssemblyProof::try_new(
+        candidate.expected_length,
+        candidate.expected_length,
+        candidate.expected_length,
+        false,
+        false,
+        false,
+        true,
+    )
+    .map_err(|error| format!("invalid contiguous PAR2 assembly proof: {error}"))?;
+    par2_rs::CommittedFileEvidence::from_contiguous_assembly_path(
+        &candidate.path,
+        &candidate.logical_name,
+        candidate.expected_length,
+        candidate.crc32,
+        par2_rs::checksum::md5(&first_16k),
+        proof,
+        candidate.bound_file_id,
+    )
+    .map(Some)
+    .map_err(|error| format!("failed to capture PAR2 contiguous evidence: {error}"))
+}
+
+fn run_retained_par2_session(
+    mut session: par2_rs::Par2RepairSession,
+    candidates: Vec<Par2SessionEvidenceCandidate>,
+    live_evidence: Vec<(std::path::PathBuf, par2_rs::SliceEvidence)>,
+    repair: bool,
+) -> (
+    par2_rs::Par2RepairSession,
+    Result<(par2_rs::Par2RepairOutcome, Vec<NzbFileId>, bool), String>,
+) {
+    for (path, evidence) in live_evidence {
+        match session.add_slice_evidence(path, evidence) {
+            Ok(()) | Err(par2_rs::Par2SessionError::EvidenceDoesNotMatch { .. }) => {}
+            Err(error) => {
+                return (
+                    session,
+                    Err(format!("failed to add live PAR2 slice evidence: {error}")),
+                );
+            }
+        }
+    }
+    let mut admitted_file_ids = Vec::new();
+    for candidate in candidates {
+        let evidence = match committed_evidence_from_candidate(&candidate) {
+            Ok(Some(evidence)) => evidence,
+            Ok(None) | Err(_) => continue,
+        };
+        match session.add_committed_file(evidence) {
+            Ok(()) => admitted_file_ids.push(candidate.file_id),
+            Err(par2_rs::Par2SessionError::EvidenceDoesNotMatch { .. }) => {}
+            Err(error) => {
+                return (
+                    session,
+                    Err(format!("failed to add retained PAR2 evidence: {error}")),
+                );
+            }
+        }
+    }
+
+    let mut retried_source_change = false;
+    let mut result = if repair {
+        if session.assessment().is_err() {
+            session.analyze().and_then(|_| session.repair())
+        } else {
+            session.repair()
+        }
+    } else {
+        session.analyze()
+    };
+    if should_retry_par2_source_change(&result, retried_source_change) {
+        // One retry gets a fresh unresolved-only analysis. A second change is
+        // returned to the caller instead of repeatedly trusting a moving path.
+        retried_source_change = true;
+        admitted_file_ids.clear();
+        session.invalidate_all_sources();
+        result = session.analyze();
+        if result.is_ok() && repair {
+            result = session.repair();
+        }
+    }
+    (
+        session,
+        result
+            .map(|outcome| (outcome, admitted_file_ids, retried_source_change))
+            .map_err(|error| format!("retained PAR2 session failed: {error}")),
+    )
+}
+
+fn should_retry_par2_source_change<T>(
+    result: &Result<T, par2_rs::Par2SessionError>,
+    already_retried: bool,
+) -> bool {
+    !already_retried && matches!(result, Err(par2_rs::Par2SessionError::SourceChanged { .. }))
+}
+
+fn ensure_par2_repair_completed(
+    outcome: &par2_rs::Par2RepairOutcome,
+    repair: bool,
+) -> Result<(), String> {
+    if !repair {
+        return Ok(());
+    }
+    match outcome.status {
+        par2_rs::Par2RepairStatus::Verified | par2_rs::Par2RepairStatus::Repaired => Ok(()),
+        par2_rs::Par2RepairStatus::RepairPossible
+        | par2_rs::Par2RepairStatus::Insufficient
+        | par2_rs::Par2RepairStatus::ResourceLimited => Err(format!(
+            "PAR2 repairer did not complete repair: {:?}",
+            outcome.status
+        )),
+    }
+}
 
 fn default_par2_repair_memory_limit_bytes() -> usize {
     DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
@@ -110,7 +266,7 @@ impl PromotedRecoveryPipelineState {
     }
 }
 
-fn par2_verification_needs_repair(verification: &weaver_par2::VerificationResult) -> bool {
+fn par2_verification_needs_repair(verification: &par2_rs::VerificationResult) -> bool {
     verification.needs_repair()
 }
 
@@ -523,6 +679,74 @@ impl Pipeline {
             .map_err(|error| format!("failed to load completed-file hashes: {error}"))
     }
 
+    async fn par2_session_evidence_candidates(
+        &self,
+        job_id: JobId,
+        par2_set: &par2_rs::Par2FileSet,
+    ) -> Result<Vec<Par2SessionEvidenceCandidate>, String> {
+        let completed_hashes = self.load_existing_complete_file_hashes(job_id).await?;
+        let Some(runtime) = self.par2_runtime(job_id) else {
+            return Ok(Vec::new());
+        };
+        let completed_checksums = runtime.completed_checksums.clone();
+        let already_seeded = runtime.session_evidence_file_ids.clone();
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Ok(Vec::new());
+        };
+
+        let mut candidates = Vec::new();
+        for file in state.assembly.files() {
+            let file_id = file.file_id();
+            if !file.is_complete() || already_seeded.contains(&file_id) {
+                continue;
+            }
+
+            let current_filename = self
+                .effective_file_identity(job_id, file_id)
+                .map(|identity| identity.current_filename)
+                .unwrap_or_else(|| file.filename().to_string());
+            let expected_length = file.total_bytes();
+            let checksum = completed_checksums.get(&file_id).copied();
+            let full_md5 = checksum
+                .and_then(|checksum| checksum.md5)
+                .or_else(|| completed_hashes.get(&file_id.file_index).copied());
+            let bound_candidates = par2_set
+                .recovery_file_ids
+                .iter()
+                .chain(par2_set.non_recovery_file_ids.iter())
+                .filter_map(|par2_file_id| par2_set.file_description(par2_file_id))
+                .filter(|description| {
+                    description.length == expected_length
+                        && match full_md5 {
+                            Some(md5) => description.hash_full == md5,
+                            None => {
+                                sanitize_download_filename(&description.filename)
+                                    == current_filename
+                            }
+                        }
+                })
+                .map(|description| description.file_id)
+                .collect::<Vec<_>>();
+            let bound_file_id = (bound_candidates.len() == 1).then_some(bound_candidates[0]);
+            candidates.push(Par2SessionEvidenceCandidate {
+                file_id,
+                path: state.working_dir.join(&current_filename),
+                logical_name: current_filename,
+                expected_length,
+                full_md5,
+                crc32: checksum.map_or(0, |checksum| checksum.crc32),
+                contiguous_assembly_proven: checksum.is_some_and(|checksum| {
+                    checksum.all_parts_crc_verified
+                        && file.received_bytes() == expected_length
+                        && !file.has_duplicate_segments()
+                        && !file.has_length_mismatch()
+                }),
+                bound_file_id,
+            });
+        }
+        Ok(candidates)
+    }
+
     fn expected_hash_for_verified_file(
         file_id: NzbFileId,
         existing_hashes: &HashMap<u32, [u8; 16]>,
@@ -550,7 +774,7 @@ impl Pipeline {
             return 0;
         }
 
-        let suggestions = match weaver_par2::scan_for_renames(&rename_dir, &par2) {
+        let suggestions = match par2_rs::scan_for_renames(&rename_dir, &par2) {
             Ok(suggestions) => suggestions,
             Err(error) => {
                 warn!(
@@ -720,10 +944,10 @@ impl Pipeline {
     async fn run_par2_repairer(
         &mut self,
         job_id: JobId,
-        par2_set: Arc<weaver_par2::Par2FileSet>,
+        par2_set: Arc<par2_rs::Par2FileSet>,
         working_dir: std::path::PathBuf,
         repair: bool,
-    ) -> Result<weaver_par2::Par2RepairOutcome, String> {
+    ) -> Result<par2_rs::Par2RepairOutcome, String> {
         #[cfg(test)]
         {
             if repair {
@@ -734,28 +958,122 @@ impl Pipeline {
         }
 
         let memory_limit = configured_par2_repair_memory_limit_bytes();
-        // The analyze pass's scan carries into the execute pass so the
-        // repair does not re-scan sources the analysis just hashed. The
-        // engine re-stats every observed file and rescans on any drift.
-        let scan_carry = self
-            .par2_runtime(job_id)
-            .and_then(|runtime| runtime.scan_carry.clone());
         let phase_counters = repair.then(|| self.phase_begin(job_id, JobPhase::Repairing, None));
+        let session_progress = phase_counters.as_ref().map(|counters| {
+            let counters = Arc::clone(counters);
+            Arc::new(move |update: par2_rs::ProgressUpdate| {
+                if !matches!(
+                    update.stage,
+                    par2_rs::ProgressStage::Repairing | par2_rs::ProgressStage::WritingRepaired
+                ) {
+                    return;
+                }
+                counters
+                    .completed_bytes
+                    .fetch_max(update.bytes_processed, Ordering::Relaxed);
+                if let Some(total_bytes) = update.total_bytes {
+                    counters
+                        .total_bytes
+                        .fetch_max(total_bytes, Ordering::Relaxed);
+                }
+            }) as par2_rs::ProgressCallback
+        });
+
+        let retained_session = match self
+            .take_or_open_par2_repair_session(
+                job_id,
+                working_dir.clone(),
+                memory_limit,
+                session_progress,
+            )
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                warn!(job_id = job_id.0, error = %error, "retained PAR2 session unavailable; using one-shot repairer");
+                None
+            }
+        };
+        if let Some((session, newly_opened)) = retained_session {
+            if newly_opened {
+                self.ensure_par2_runtime(job_id)
+                    .session_evidence_file_ids
+                    .clear();
+            }
+            let candidates = match self
+                .par2_session_evidence_candidates(job_id, &par2_set)
+                .await
+            {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    self.restore_par2_repair_session(job_id, session);
+                    if repair {
+                        self.phase_end(job_id, JobPhase::Repairing);
+                    }
+                    return Err(error);
+                }
+            };
+            self.settle_live_par2_job(job_id).await;
+            let live_evidence = self.live_par2_strong_evidence(job_id);
+            let mut repair_task = tokio::task::spawn_blocking(move || {
+                if repair {
+                    crate::e2e_failpoint::maybe_delay("repair.task_start");
+                }
+                run_retained_par2_session(session, candidates, live_evidence, repair)
+            });
+            let repair_result = if repair {
+                loop {
+                    tokio::select! {
+                        result = &mut repair_task => break result,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                            self.sample_phase_progress();
+                        }
+                    }
+                }
+            } else {
+                repair_task.await
+            };
+            if repair {
+                self.phase_end(job_id, JobPhase::Repairing);
+            }
+            return match repair_result {
+                Ok((session, Ok((outcome, admitted_file_ids, retried_source_change)))) => {
+                    self.restore_par2_repair_session(job_id, session);
+                    let runtime = self.ensure_par2_runtime(job_id);
+                    if repair || retried_source_change {
+                        runtime.session_evidence_file_ids.clear();
+                        if repair {
+                            if let Some(session) = runtime.session.as_mut() {
+                                session.invalidate_all_sources();
+                            }
+                        }
+                    } else {
+                        runtime.session_evidence_file_ids.extend(admitted_file_ids);
+                    }
+                    ensure_par2_repair_completed(&outcome, repair)?;
+                    Ok(outcome)
+                }
+                Ok((session, Err(error))) => {
+                    self.restore_par2_repair_session(job_id, session);
+                    Err(error)
+                }
+                Err(error) => Err(format!("retained PAR2 session task panicked: {error}")),
+            };
+        }
+
         let mut repair_task = tokio::task::spawn_blocking(move || {
             if repair {
                 crate::e2e_failpoint::maybe_delay("repair.task_start");
             }
-            let mut options = weaver_par2::Par2RepairerOptions::new(working_dir, Vec::new());
+            let mut options = par2_rs::Par2RepairerOptions::new(working_dir, Vec::new());
             options.file_set = Some((*par2_set).clone());
             options.repair = repair;
             options.memory_limit = Some(memory_limit);
-            options.scan_carry = scan_carry;
             if let Some(counters) = phase_counters {
-                options.progress = Some(Arc::new(move |update: weaver_par2::ProgressUpdate| {
+                options.progress = Some(Arc::new(move |update: par2_rs::ProgressUpdate| {
                     if !matches!(
                         update.stage,
-                        weaver_par2::ProgressStage::Repairing
-                            | weaver_par2::ProgressStage::WritingRepaired
+                        par2_rs::ProgressStage::Repairing | par2_rs::ProgressStage::WritingRepaired
                     ) {
                         return;
                     }
@@ -769,25 +1087,12 @@ impl Pipeline {
                     }
                 }));
             }
-            let repairer = weaver_par2::Par2Repairer::new(options);
-            let (outcome, carry) = repairer
+            let repairer = par2_rs::Par2Repairer::new(options);
+            let (outcome, _) = repairer
                 .verify_or_repair_carrying()
                 .map_err(|e| format!("PAR2 repairer failed: {e}"))?;
-            if repair {
-                match outcome.status {
-                    weaver_par2::Par2RepairStatus::Verified
-                    | weaver_par2::Par2RepairStatus::Repaired => {}
-                    weaver_par2::Par2RepairStatus::RepairPossible
-                    | weaver_par2::Par2RepairStatus::Insufficient
-                    | weaver_par2::Par2RepairStatus::ResourceLimited => {
-                        return Err(format!(
-                            "PAR2 repairer did not complete repair: {:?}",
-                            outcome.status
-                        ));
-                    }
-                }
-            }
-            Ok((outcome, carry))
+            ensure_par2_repair_completed(&outcome, repair)?;
+            Ok(outcome)
         });
         let repair_result = if repair {
             loop {
@@ -807,12 +1112,7 @@ impl Pipeline {
         }
 
         match repair_result {
-            Ok(Ok((outcome, carry))) => {
-                // Keep the analyze pass's scan for the execute pass; after a
-                // repair the files just changed, so drop any stored carry.
-                self.ensure_par2_runtime(job_id).scan_carry = if repair { None } else { carry };
-                Ok(outcome)
-            }
+            Ok(Ok(outcome)) => Ok(outcome),
             Ok(Err(error)) => Err(error),
             Err(error) => Err(format!("repair task panicked: {error}")),
         }
@@ -821,10 +1121,10 @@ impl Pipeline {
     async fn analyze_par2_with_repairer(
         &mut self,
         job_id: JobId,
-        par2_set: Arc<weaver_par2::Par2FileSet>,
+        par2_set: Arc<par2_rs::Par2FileSet>,
         working_dir: std::path::PathBuf,
         preserve_repairing_status: bool,
-    ) -> Result<weaver_par2::Par2RepairOutcome, String> {
+    ) -> Result<par2_rs::Par2RepairOutcome, String> {
         if !preserve_repairing_status {
             self.transition_postprocessing_status(job_id, JobStatus::Verifying, Some("verifying"));
         } else {
@@ -881,11 +1181,11 @@ impl Pipeline {
     async fn verify_par2_with_placement(
         &mut self,
         job_id: JobId,
-        par2_set: Arc<weaver_par2::Par2FileSet>,
+        par2_set: Arc<par2_rs::Par2FileSet>,
         working_dir: std::path::PathBuf,
         preserve_repairing_status: bool,
         emit_events: bool,
-    ) -> Result<(weaver_par2::VerificationResult, weaver_par2::PlacementPlan), String> {
+    ) -> Result<(par2_rs::VerificationResult, par2_rs::PlacementPlan), String> {
         if emit_events {
             if !preserve_repairing_status {
                 self.transition_postprocessing_status(
@@ -920,7 +1220,7 @@ impl Pipeline {
         let pp_pool = self.pp_pool.clone();
         let verify_result = tokio::task::spawn_blocking(move || {
             pp_pool.install(move || {
-                let plan = weaver_par2::scan_placement(&verify_dir, &par2_set)
+                let plan = par2_rs::scan_placement(&verify_dir, &par2_set)
                     .map_err(|error| format!("placement scan failed: {error}"))?;
                 if !plan.conflicts.is_empty() {
                     return Err(format!(
@@ -930,8 +1230,8 @@ impl Pipeline {
                 }
 
                 let file_access =
-                    weaver_par2::PlacementFileAccess::from_plan(verify_dir, &par2_set, &plan);
-                Ok((weaver_par2::verify_all(&par2_set, &file_access), plan))
+                    par2_rs::PlacementFileAccess::from_plan(verify_dir, &par2_set, &plan);
+                Ok((par2_rs::verify_all(&par2_set, &file_access), plan))
             })
         })
         .await;
@@ -981,33 +1281,58 @@ impl Pipeline {
     async fn quick_verify_par2_with_placement(
         &mut self,
         job_id: JobId,
-        par2_set: Arc<weaver_par2::Par2FileSet>,
+        par2_set: Arc<par2_rs::Par2FileSet>,
         _working_dir: std::path::PathBuf,
-    ) -> Result<Option<(weaver_par2::VerificationResult, weaver_par2::PlacementPlan)>, String> {
+    ) -> Result<Option<(par2_rs::VerificationResult, par2_rs::PlacementPlan)>, String> {
         let completed_hashes = self.load_existing_complete_file_hashes(job_id).await?;
         let Some(state) = self.jobs.get(&job_id) else {
             return Ok(None);
         };
 
         let mut current_hashes_by_name = HashMap::<String, [u8; 16]>::new();
+        // Live evidence may stand in for persisted whole-file hashes only
+        // when it proves every described slice with CRC32+MD5 and a stable,
+        // complete assembly identity. Any incomplete/ambiguous live state is
+        // ignored and the existing persisted-MD5 quick path remains intact.
+        let live_bindings = self.live_par2_complete_bindings(job_id);
+        let mut live_matches_by_name = HashMap::<String, (par2_rs::FileId, String)>::new();
         for file in state.assembly.files() {
             if !file.is_complete() {
                 continue;
             }
 
             let file_id = file.file_id();
-            let Some(file_hash) = completed_hashes.get(&file_id.file_index).copied() else {
-                return Ok(None);
-            };
             let identity = self.effective_file_identity(job_id, file_id);
             let current_filename = identity
                 .as_ref()
                 .map(|value| value.current_filename.as_str())
                 .unwrap_or_else(|| file.filename());
+            if let Some(par2_file_id) = live_bindings
+                .as_ref()
+                .and_then(|bindings| bindings.get(&file_id))
+                .copied()
+            {
+                let Some(desc) = par2_set.file_description(&par2_file_id) else {
+                    return Ok(None);
+                };
+                live_matches_by_name.insert(
+                    current_filename.to_string(),
+                    (par2_file_id, sanitize_download_filename(&desc.filename)),
+                );
+                continue;
+            }
+            if live_bindings.is_some() {
+                // The live eligibility proof already covered every described
+                // file. This is an auxiliary NZB file, not a PAR2 source.
+                continue;
+            }
+            let Some(file_hash) = completed_hashes.get(&file_id.file_index).copied() else {
+                return Ok(None);
+            };
             current_hashes_by_name.insert(current_filename.to_string(), file_hash);
         }
 
-        let mut all_file_ids: Vec<weaver_par2::FileId> = par2_set
+        let mut all_file_ids: Vec<par2_rs::FileId> = par2_set
             .recovery_file_ids
             .iter()
             .chain(par2_set.non_recovery_file_ids.iter())
@@ -1016,7 +1341,7 @@ impl Pipeline {
         all_file_ids.sort_unstable_by_key(|file_id| *file_id.as_bytes());
         all_file_ids.dedup();
 
-        let mut hash_lookup = HashMap::<[u8; 16], Vec<(weaver_par2::FileId, String)>>::new();
+        let mut hash_lookup = HashMap::<[u8; 16], Vec<(par2_rs::FileId, String)>>::new();
         for file_id in &all_file_ids {
             let Some(desc) = par2_set.file_description(file_id) else {
                 continue;
@@ -1027,8 +1352,11 @@ impl Pipeline {
                 .push((*file_id, sanitize_download_filename(&desc.filename)));
         }
 
-        let mut matches = HashMap::<String, (weaver_par2::FileId, String)>::new();
-        let mut match_counts = HashMap::<weaver_par2::FileId, u32>::new();
+        let mut matches = live_matches_by_name;
+        let mut match_counts = HashMap::<par2_rs::FileId, u32>::new();
+        for (file_id, _) in matches.values() {
+            *match_counts.entry(*file_id).or_default() += 1;
+        }
         for (current_name, file_hash) in current_hashes_by_name {
             let Some(candidates) = hash_lookup.get(&file_hash) else {
                 continue;
@@ -1040,14 +1368,14 @@ impl Pipeline {
             }
         }
 
-        let conflict_ids: HashSet<weaver_par2::FileId> = match_counts
+        let conflict_ids: HashSet<par2_rs::FileId> = match_counts
             .iter()
             .filter(|(_, count)| **count > 1)
             .map(|(file_id, _)| *file_id)
             .collect();
         matches.retain(|_, (file_id, _)| !conflict_ids.contains(file_id));
 
-        let mut id_to_disk = HashMap::<weaver_par2::FileId, String>::new();
+        let mut id_to_disk = HashMap::<par2_rs::FileId, String>::new();
         for (disk_name, (file_id, _)) in &matches {
             id_to_disk.insert(*file_id, disk_name.clone());
         }
@@ -1057,7 +1385,7 @@ impl Pipeline {
         let mut swaps = Vec::new();
         let mut renames = Vec::new();
         let mut unresolved = Vec::new();
-        let mut seen_swap = HashSet::<weaver_par2::FileId>::new();
+        let mut seen_swap = HashSet::<par2_rs::FileId>::new();
         for file_id in all_file_ids.iter().copied() {
             let Some(desc) = par2_set.file_description(&file_id).cloned() else {
                 continue;
@@ -1088,12 +1416,12 @@ impl Pipeline {
                     };
                     let other_correct_filename = sanitize_download_filename(&other_desc.filename);
                     swaps.push((
-                        weaver_par2::PlacementEntry {
+                        par2_rs::PlacementEntry {
                             file_id,
                             current_name: disk_name.clone(),
                             correct_name: correct_filename.clone(),
                         },
-                        weaver_par2::PlacementEntry {
+                        par2_rs::PlacementEntry {
                             file_id: other_id,
                             current_name: correct_filename.clone(),
                             correct_name: other_correct_filename,
@@ -1102,7 +1430,7 @@ impl Pipeline {
                     seen_swap.insert(file_id);
                     seen_swap.insert(other_id);
                 } else {
-                    renames.push(weaver_par2::PlacementEntry {
+                    renames.push(par2_rs::PlacementEntry {
                         file_id,
                         current_name: disk_name.clone(),
                         correct_name: correct_filename.clone(),
@@ -1111,10 +1439,10 @@ impl Pipeline {
             }
 
             let slice_count = par2_set.slice_count_for_file(desc.length) as usize;
-            files.push(weaver_par2::verify::FileVerification {
+            files.push(par2_rs::verify::FileVerification {
                 file_id,
                 filename: correct_filename,
-                status: weaver_par2::verify::FileStatus::Complete,
+                status: par2_rs::verify::FileStatus::Complete,
                 valid_slices: vec![true; slice_count],
                 missing_slice_count: 0,
             });
@@ -1125,13 +1453,13 @@ impl Pipeline {
         }
 
         Ok(Some((
-            weaver_par2::VerificationResult {
+            par2_rs::VerificationResult {
                 files,
                 recovery_blocks_available: par2_set.recovery_block_count(),
                 total_missing_blocks: 0,
-                repairable: weaver_par2::verify::Repairability::NotNeeded,
+                repairable: par2_rs::verify::Repairability::NotNeeded,
             },
-            weaver_par2::PlacementPlan {
+            par2_rs::PlacementPlan {
                 exact,
                 swaps,
                 renames,
@@ -1144,7 +1472,7 @@ impl Pipeline {
     async fn reconcile_verified_par2_files(
         &mut self,
         job_id: JobId,
-        verification: &weaver_par2::VerificationResult,
+        verification: &par2_rs::VerificationResult,
     ) -> Result<usize, String> {
         let existing_hashes = self.load_existing_complete_file_hashes(job_id).await?;
         let files_to_complete: Vec<(NzbFileId, String, u64)> = {
@@ -1183,14 +1511,13 @@ impl Pipeline {
             for file_verification in &verification.files {
                 if !matches!(
                     file_verification.status,
-                    weaver_par2::verify::FileStatus::Complete
-                        | weaver_par2::verify::FileStatus::Renamed(_)
+                    par2_rs::verify::FileStatus::Complete | par2_rs::verify::FileStatus::Renamed(_)
                 ) {
                     continue;
                 }
 
                 let mut candidate_names = vec![file_verification.filename.clone()];
-                if let weaver_par2::verify::FileStatus::Renamed(path) = &file_verification.status
+                if let par2_rs::verify::FileStatus::Renamed(path) = &file_verification.status
                     && let Some(filename) = path.file_name()
                 {
                     candidate_names.push(filename.to_string_lossy().to_string());
@@ -1274,7 +1601,7 @@ impl Pipeline {
     async fn refresh_verified_complete_archive_topologies(
         &mut self,
         job_id: JobId,
-        verification: &weaver_par2::VerificationResult,
+        verification: &par2_rs::VerificationResult,
     ) -> usize {
         let file_ids =
             self.verified_complete_archive_file_ids_needing_refresh(job_id, verification);
@@ -1295,7 +1622,7 @@ impl Pipeline {
     pub(crate) fn verified_complete_archive_file_ids_needing_refresh(
         &self,
         job_id: JobId,
-        verification: &weaver_par2::VerificationResult,
+        verification: &par2_rs::VerificationResult,
     ) -> Vec<NzbFileId> {
         let Some(state) = self.jobs.get(&job_id) else {
             return Vec::new();
@@ -1347,12 +1674,11 @@ impl Pipeline {
         for file_verification in &verification.files {
             let renamed = matches!(
                 file_verification.status,
-                weaver_par2::verify::FileStatus::Renamed(_)
+                par2_rs::verify::FileStatus::Renamed(_)
             );
             if !matches!(
                 file_verification.status,
-                weaver_par2::verify::FileStatus::Complete
-                    | weaver_par2::verify::FileStatus::Renamed(_)
+                par2_rs::verify::FileStatus::Complete | par2_rs::verify::FileStatus::Renamed(_)
             ) {
                 continue;
             }
@@ -1426,10 +1752,10 @@ impl Pipeline {
     }
 
     fn par2_verification_candidate_names(
-        file_verification: &weaver_par2::verify::FileVerification,
+        file_verification: &par2_rs::verify::FileVerification,
     ) -> Vec<String> {
         let mut candidates = Self::name_and_basename_candidates(&file_verification.filename);
-        if let weaver_par2::verify::FileStatus::Renamed(path) = &file_verification.status {
+        if let par2_rs::verify::FileStatus::Renamed(path) = &file_verification.status {
             Self::push_name_candidate(&mut candidates, &path.to_string_lossy());
             if let Some(filename) = path.file_name() {
                 Self::push_name_candidate(&mut candidates, &filename.to_string_lossy());
@@ -1963,6 +2289,8 @@ impl Pipeline {
             let par2_set = self.par2_set(job_id).cloned();
             if quick_par2_verification_allowed && let Some(par2_set) = par2_set.as_ref() {
                 let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
+                self.settle_live_par2_job(job_id).await;
+                let live_short_circuit = self.live_par2_complete_bindings(job_id).is_some();
                 Self::trip_par2_verification_started_failpoint();
                 match self
                     .quick_verify_par2_with_placement(
@@ -1973,6 +2301,9 @@ impl Pipeline {
                     .await
                 {
                     Ok(Some((verification, placement_plan))) => {
+                        if live_short_circuit {
+                            self.live_par2.note_full_verify_skip();
+                        }
                         info!(
                             job_id = job_id.0,
                             "quick PAR2 verification passed for clean exhausted job"
@@ -2130,17 +2461,15 @@ impl Pipeline {
                     let recovery_now = repair_analysis.recovery_blocks_available;
                     let total_recovery_capacity = self.total_recovery_block_capacity(job_id);
                     let blocks_needed = match &verification.repairable {
-                        weaver_par2::verify::Repairability::NotNeeded => 0,
-                        weaver_par2::verify::Repairability::Repairable {
-                            blocks_needed, ..
+                        par2_rs::verify::Repairability::NotNeeded => 0,
+                        par2_rs::verify::Repairability::Repairable { blocks_needed, .. }
+                        | par2_rs::verify::Repairability::Insufficient { blocks_needed, .. } => {
+                            *blocks_needed
                         }
-                        | weaver_par2::verify::Repairability::Insufficient {
-                            blocks_needed, ..
-                        } => *blocks_needed,
-                        weaver_par2::verify::Repairability::ResourceLimited { .. } => 0,
+                        par2_rs::verify::Repairability::ResourceLimited { .. } => 0,
                     };
 
-                    if let weaver_par2::verify::Repairability::ResourceLimited { reason } =
+                    if let par2_rs::verify::Repairability::ResourceLimited { reason } =
                         &verification.repairable
                     {
                         let msg = format!("PAR2 verification resource limit exceeded: {reason}");
@@ -2287,8 +2616,8 @@ impl Pipeline {
 
                     if matches!(
                         &verification.repairable,
-                        weaver_par2::verify::Repairability::Insufficient { .. }
-                            | weaver_par2::verify::Repairability::ResourceLimited { .. }
+                        par2_rs::verify::Repairability::Insufficient { .. }
+                            | par2_rs::verify::Repairability::ResourceLimited { .. }
                     ) {
                         let msg = format!(
                             "not repairable: PAR2 analysis found incomplete critical repair metadata or unusable recovery despite {recovery_now} available recovery blocks"
@@ -2438,7 +2767,7 @@ impl Pipeline {
                 let recovery_now = verification.recovery_blocks_available;
                 let total_recovery_capacity = self.total_recovery_block_capacity(job_id);
 
-                if let weaver_par2::verify::Repairability::ResourceLimited { reason } =
+                if let par2_rs::verify::Repairability::ResourceLimited { reason } =
                     &verification.repairable
                 {
                     let msg = format!("PAR2 verification resource limit exceeded: {reason}");
@@ -2594,7 +2923,7 @@ impl Pipeline {
                     let damaged = repairer_damaged;
                     let recovery_now = repairer_recovery_now;
 
-                    if let weaver_par2::verify::Repairability::ResourceLimited { reason } =
+                    if let par2_rs::verify::Repairability::ResourceLimited { reason } =
                         &repair_preview.verification.repairable
                     {
                         let msg = format!("PAR2 verification resource limit exceeded: {reason}");
@@ -3143,6 +3472,69 @@ mod tests {
             parse_par2_repair_memory_limit_bytes(Some("0")),
             default_bytes
         );
+    }
+
+    #[test]
+    fn quick_proof_uses_crc_verified_contiguous_assembly() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("payload.bin");
+        let bytes = b"crc-verified-contiguous-payload";
+        std::fs::write(&path, bytes).unwrap();
+        let candidate = Par2SessionEvidenceCandidate {
+            file_id: NzbFileId {
+                job_id: JobId(1),
+                file_index: 0,
+            },
+            path,
+            logical_name: "payload.bin".to_string(),
+            expected_length: bytes.len() as u64,
+            full_md5: None,
+            crc32: par2_rs::checksum::crc32(bytes),
+            contiguous_assembly_proven: true,
+            bound_file_id: None,
+        };
+
+        let evidence = committed_evidence_from_candidate(&candidate)
+            .unwrap()
+            .expect("contiguous CRC-verified assembly should be quick-proved");
+        assert!(evidence.assembly_proof().is_some());
+        assert_eq!(evidence.assembly_crc32(), Some(candidate.crc32));
+    }
+
+    #[test]
+    fn quick_proof_refuses_unproven_assembly() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("payload.bin");
+        std::fs::write(&path, b"payload").unwrap();
+        let candidate = Par2SessionEvidenceCandidate {
+            file_id: NzbFileId {
+                job_id: JobId(1),
+                file_index: 0,
+            },
+            path,
+            logical_name: "payload.bin".to_string(),
+            expected_length: 7,
+            full_md5: None,
+            crc32: 0,
+            contiguous_assembly_proven: false,
+            bound_file_id: None,
+        };
+
+        assert!(
+            committed_evidence_from_candidate(&candidate)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn source_changed_retry_is_limited_to_one_fresh_analysis() {
+        let changed: Result<(), par2_rs::Par2SessionError> =
+            Err(par2_rs::Par2SessionError::SourceChanged {
+                path: std::path::PathBuf::from("payload.bin"),
+            });
+        assert!(should_retry_par2_source_change(&changed, false));
+        assert!(!should_retry_par2_source_change(&changed, true));
     }
 
     #[test]

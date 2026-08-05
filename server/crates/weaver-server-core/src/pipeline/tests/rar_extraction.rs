@@ -17,14 +17,13 @@ async fn extraction_reserves_member_totals_at_open() {
             (volume as u32, path)
         })
         .collect::<std::collections::BTreeMap<_, _>>();
-    let mut archive =
-        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     for (volume, (_, bytes)) in files.iter().enumerate().skip(1) {
         archive
             .add_volume(volume, Box::new(std::io::Cursor::new(bytes.clone())))
             .unwrap();
     }
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -96,7 +95,7 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
     let files = build_multifile_multivolume_rar_set();
 
     let mut good_archive =
-        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     good_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -117,7 +116,7 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
         segment["volume_index"] = serde_json::json!(0);
     }
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
 
@@ -131,7 +130,7 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
         })
         .collect::<std::collections::BTreeMap<_, _>>();
 
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: None,
         restore_owners: false,
@@ -145,7 +144,7 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
             volume_paths: volume_paths.clone(),
             password_candidates: Vec::new(),
             cached_headers: Some(stale_headers.clone()),
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
             requested_members: None,
             already_extracted: None,
@@ -185,7 +184,7 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
             volume_paths: volume_paths.clone(),
             password_candidates: Vec::new(),
             cached_headers: Some(stale_headers),
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::RefreshProvidedVolumes,
             requested_members: None,
             already_extracted: None,
@@ -232,7 +231,7 @@ async fn recompute_rar_set_state_refreshes_cached_span_when_facts_contradict_sna
     }
 
     let mut good_archive =
-        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     good_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -258,7 +257,7 @@ async fn recompute_rar_set_state_refreshes_cached_span_when_facts_contradict_sna
     e01["split_after"] = serde_json::json!(false);
 
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
 
@@ -294,11 +293,9 @@ async fn recompute_rar_set_state_refreshes_cached_span_when_facts_contradict_sna
     let healed_headers = pipeline
         .load_rar_snapshot(job_id, "show")
         .expect("recompute should persist a healed snapshot");
-    let healed_archive = weaver_unrar::RarArchive::deserialize_headers_with_password(
-        &healed_headers,
-        None::<String>,
-    )
-    .unwrap();
+    let healed_archive =
+        unrar_rs::RarArchive::deserialize_headers_with_password(&healed_headers, None::<String>)
+            .unwrap();
     let healed_e01 = healed_archive
         .metadata()
         .members
@@ -314,7 +311,7 @@ fn cached_rar_snapshot_alignment_treats_incomplete_tail_growth_as_staleness() {
     let files = build_multifile_multivolume_rar_set();
 
     let mut cached_archive =
-        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     cached_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -325,7 +322,7 @@ fn cached_rar_snapshot_alignment_treats_incomplete_tail_growth_as_staleness() {
     let mut facts = BTreeMap::new();
     for (volume, (_, bytes)) in files.iter().enumerate() {
         let mut parsed =
-            weaver_unrar::RarArchive::parse_volume_facts(std::io::Cursor::new(bytes.clone()), None)
+            unrar_rs::RarArchive::parse_volume_facts(std::io::Cursor::new(bytes.clone()), None)
                 .unwrap();
         if volume == 3 {
             parsed.more_volumes = true;
@@ -364,7 +361,7 @@ async fn recompute_rar_set_state_rebuilds_from_live_volumes_when_cached_headers_
     }
 
     let mut good_archive =
-        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     good_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -378,7 +375,7 @@ async fn recompute_rar_set_state_rebuilds_from_live_volumes_when_cached_headers_
     let mut cached = serde_json::to_value(good_archive.export_headers()).unwrap();
     cached["members"] = serde_json::json!([]);
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
 
@@ -420,11 +417,9 @@ async fn recompute_rar_set_state_rebuilds_from_live_volumes_when_cached_headers_
     let healed_headers = pipeline
         .load_rar_snapshot(job_id, "show")
         .expect("recompute should persist healed headers");
-    let healed_archive = weaver_unrar::RarArchive::deserialize_headers_with_password(
-        &healed_headers,
-        None::<String>,
-    )
-    .unwrap();
+    let healed_archive =
+        unrar_rs::RarArchive::deserialize_headers_with_password(&healed_headers, None::<String>)
+            .unwrap();
     assert!(
         !healed_archive.metadata().members.is_empty(),
         "healed headers should no longer carry the incoherent empty-member snapshot",
@@ -477,7 +472,7 @@ async fn rar_password_fallback_from_nzb_meta_is_validated_before_remembering_cac
             volume_paths,
             password_candidates: restart_candidates.clone(),
             cached_headers: Some(cached_headers),
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
             requested_members: &[],
             already_extracted: None,
@@ -547,7 +542,7 @@ async fn rar_password_member_encrypted_fallback_from_nzb_meta_is_validated_by_pr
             volume_paths: volume_paths.clone(),
             password_candidates: candidates.clone(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
             requested_members: &requested_members,
             already_extracted: None,
@@ -570,7 +565,7 @@ async fn rar_password_member_encrypted_fallback_from_nzb_meta_is_validated_by_pr
 
     let output_dir = temp_dir.path().join("member-password-fallback");
     std::fs::create_dir_all(&output_dir).unwrap();
-    let options = weaver_unrar::ExtractOptions {
+    let options = unrar_rs::ExtractOptions {
         verify: true,
         password: selection.password.clone(),
         restore_owners: false,
@@ -646,7 +641,7 @@ async fn rar_password_member_encrypted_cached_headers_probe_after_restart() {
             volume_paths,
             password_candidates: candidates.clone(),
             cached_headers: Some(cached_headers),
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             open_mode: crate::pipeline::extraction::RarArchiveOpenMode::AttachOnly,
             requested_members: &requested_members,
             already_extracted: None,
@@ -720,7 +715,7 @@ fn rar_password_candidate_helper_redacts_exhausted_candidates() {
         |_password| {
             attempts += 1;
             Err(RarPasswordAttemptError::Rar(
-                weaver_unrar::RarError::InvalidPassword,
+                unrar_rs::RarError::InvalidPassword,
             ))
         },
     ) {
@@ -2301,19 +2296,19 @@ async fn completed_rar_with_par2_metadata_and_verified_yenc_crc_uses_expected_ha
     let filename = "show.part01.rar";
     let payload = b"verified rar volume";
     let expected_hash = [0xAB; 16];
-    assert_ne!(expected_hash, weaver_par2::checksum::md5(payload));
+    assert_ne!(expected_hash, par2_rs::checksum::md5(payload));
     let spec = rar_job_spec(
         "RAR Expected Hash Fast Path",
         &[(filename.to_string(), payload.to_vec())],
     );
     insert_active_job(&mut pipeline, job_id, spec).await;
 
-    let par2_file_id = weaver_par2::FileId::from_bytes([0x42; 16]);
+    let par2_file_id = par2_rs::FileId::from_bytes([0x42; 16]);
     let mut par2_set = minimal_par2_file_set();
     par2_set.recovery_file_ids.push(par2_file_id);
     par2_set.files.insert(
         par2_file_id,
-        weaver_par2::FileDescription {
+        par2_rs::FileDescription {
             file_id: par2_file_id,
             hash_full: expected_hash,
             hash_16k: [0xCD; 16],
@@ -2335,7 +2330,7 @@ async fn completed_rar_with_par2_metadata_and_verified_yenc_crc_uses_expected_ha
         0,
         payload,
         filename,
-        Some(weaver_par2::checksum::crc32(payload)),
+        Some(par2_rs::checksum::crc32(payload)),
     )
     .await;
 
@@ -2351,19 +2346,19 @@ async fn completed_rar_without_whole_file_crc_uses_expected_hash_when_parts_veri
     let filename = "show.part02.rar";
     let payload = b"verified rar volume without whole crc";
     let expected_hash = [0xBC; 16];
-    assert_ne!(expected_hash, weaver_par2::checksum::md5(payload));
+    assert_ne!(expected_hash, par2_rs::checksum::md5(payload));
     let spec = rar_job_spec(
         "RAR Expected Hash Missing CRC Fast Path",
         &[(filename.to_string(), payload.to_vec())],
     );
     insert_active_job(&mut pipeline, job_id, spec).await;
 
-    let par2_file_id = weaver_par2::FileId::from_bytes([0x43; 16]);
+    let par2_file_id = par2_rs::FileId::from_bytes([0x43; 16]);
     let mut par2_set = minimal_par2_file_set();
     par2_set.recovery_file_ids.push(par2_file_id);
     par2_set.files.insert(
         par2_file_id,
-        weaver_par2::FileDescription {
+        par2_rs::FileDescription {
             file_id: par2_file_id,
             hash_full: expected_hash,
             hash_16k: [0xDE; 16],
@@ -2392,7 +2387,7 @@ async fn completed_rar_without_verified_part_crc_falls_back_to_actual_hash() {
     let filename = "show.part03.rar";
     let payload = b"rar volume without verified part crc";
     let expected_hash = [0xBD; 16];
-    let actual_hash = weaver_par2::checksum::md5(payload);
+    let actual_hash = par2_rs::checksum::md5(payload);
     assert_ne!(expected_hash, actual_hash);
     let spec = rar_job_spec(
         "RAR Expected Hash Missing Part CRC Fallback",
@@ -2400,12 +2395,12 @@ async fn completed_rar_without_verified_part_crc_falls_back_to_actual_hash() {
     );
     insert_active_job(&mut pipeline, job_id, spec).await;
 
-    let par2_file_id = weaver_par2::FileId::from_bytes([0x44; 16]);
+    let par2_file_id = par2_rs::FileId::from_bytes([0x44; 16]);
     let mut par2_set = minimal_par2_file_set();
     par2_set.recovery_file_ids.push(par2_file_id);
     par2_set.files.insert(
         par2_file_id,
-        weaver_par2::FileDescription {
+        par2_rs::FileDescription {
             file_id: par2_file_id,
             hash_full: expected_hash,
             hash_16k: [0xEF; 16],
@@ -2594,8 +2589,8 @@ async fn eager_delete_waits_for_par2_verification_before_removing_rar_sources() 
     );
 
     let par2_set = placement_par2_file_set(&files);
-    let access = weaver_par2::DiskFileAccess::new(working_dir.clone(), &par2_set);
-    let verification = weaver_par2::verify_all(&par2_set, &access);
+    let access = par2_rs::DiskFileAccess::new(working_dir.clone(), &par2_set);
+    let verification = par2_rs::verify_all(&par2_set, &access);
     pipeline.recompute_volume_safety_from_verification(job_id, &verification);
     pipeline.par2_verified.insert(job_id);
     pipeline.try_delete_volumes(job_id, "show");
@@ -4832,8 +4827,7 @@ async fn solid_rar_keeps_later_members_ready_after_earlier_failure() {
     let fixture_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar5/rar5_solid.rar");
     let fixture_bytes = tokio::fs::read(&fixture_path).await.unwrap();
-    let archive =
-        weaver_unrar::RarArchive::open(std::fs::File::open(&fixture_path).unwrap()).unwrap();
+    let archive = unrar_rs::RarArchive::open(std::fs::File::open(&fixture_path).unwrap()).unwrap();
     let member_names = archive.member_names();
     assert!(member_names.len() >= 3);
 
@@ -5219,26 +5213,26 @@ async fn eager_delete_exclusions_do_not_hide_suspect_deleted_rar_damage() {
         .await
         .unwrap();
 
-    let mut verification = weaver_par2::VerificationResult {
+    let mut verification = par2_rs::VerificationResult {
         files: vec![
-            weaver_par2::verify::FileVerification {
-                file_id: weaver_par2::FileId::from_bytes([1; 16]),
+            par2_rs::verify::FileVerification {
+                file_id: par2_rs::FileId::from_bytes([1; 16]),
                 filename: "show.part02.rar".to_string(),
-                status: weaver_par2::verify::FileStatus::Missing,
+                status: par2_rs::verify::FileStatus::Missing,
                 valid_slices: vec![false; 3],
                 missing_slice_count: 3,
             },
-            weaver_par2::verify::FileVerification {
-                file_id: weaver_par2::FileId::from_bytes([2; 16]),
+            par2_rs::verify::FileVerification {
+                file_id: par2_rs::FileId::from_bytes([2; 16]),
                 filename: "show.part04.rar".to_string(),
-                status: weaver_par2::verify::FileStatus::Missing,
+                status: par2_rs::verify::FileStatus::Missing,
                 valid_slices: vec![false; 2],
                 missing_slice_count: 2,
             },
         ],
         recovery_blocks_available: 3,
         total_missing_blocks: 5,
-        repairable: weaver_par2::verify::Repairability::Insufficient {
+        repairable: par2_rs::verify::Repairability::Insufficient {
             blocks_needed: 5,
             blocks_available: 3,
             deficit: 2,
@@ -5253,17 +5247,17 @@ async fn eager_delete_exclusions_do_not_hide_suspect_deleted_rar_damage() {
     assert_eq!(verification.total_missing_blocks, 3);
     assert!(matches!(
         verification.files[0].status,
-        weaver_par2::verify::FileStatus::Missing
+        par2_rs::verify::FileStatus::Missing
     ));
     assert_eq!(verification.files[0].missing_slice_count, 3);
     assert!(matches!(
         verification.files[1].status,
-        weaver_par2::verify::FileStatus::Complete
+        par2_rs::verify::FileStatus::Complete
     ));
     assert_eq!(verification.files[1].missing_slice_count, 0);
     assert!(matches!(
         verification.repairable,
-        weaver_par2::verify::Repairability::Repairable {
+        par2_rs::verify::Repairability::Repairable {
             blocks_needed: 3,
             blocks_available: 3
         }
@@ -6019,7 +6013,7 @@ async fn rar_waiting_for_missing_volumes_without_par2_fails_after_download_compl
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -6092,7 +6086,7 @@ async fn legacy_reconcile_schedules_waiting_rar_completion_check() {
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -6171,7 +6165,7 @@ async fn rar_completion_waiting_for_volumes_does_not_requeue_itself() {
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -6258,7 +6252,7 @@ async fn clean_member_keeps_failed_neighbor_boundary_volume_suspect() {
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: std::collections::HashSet::from([1u32]),
             active_workers: 0,
             in_flight_members: std::collections::HashSet::new(),
@@ -6527,7 +6521,7 @@ async fn ownerless_live_rar_plan_error_requires_named_member_facts() {
             facts: BTreeMap::from([(0u32, stale_named_facts)]),
             volume_files: BTreeMap::from([(0u32, "show.part01.rar".to_string())]),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -6677,7 +6671,7 @@ async fn incoherent_rar_waiting_state_heals_before_reverification() {
     }
 
     let mut good_archive =
-        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     good_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -6691,7 +6685,7 @@ async fn incoherent_rar_waiting_state_heals_before_reverification() {
     let mut cached = serde_json::to_value(good_archive.export_headers()).unwrap();
     cached["members"] = serde_json::json!([]);
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
     let topology = pipeline
@@ -6799,7 +6793,7 @@ async fn retry_archive_extraction_after_verify_or_repair_heals_incoherent_rar_st
         );
 
     let mut good_archive =
-        weaver_unrar::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
+        unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
     good_archive
         .add_volume(1, Box::new(std::io::Cursor::new(files[1].1.clone())))
         .unwrap();
@@ -6813,7 +6807,7 @@ async fn retry_archive_extraction_after_verify_or_repair_heals_incoherent_rar_st
     let mut cached = serde_json::to_value(good_archive.export_headers()).unwrap();
     cached["members"] = serde_json::json!([]);
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
     let topology = pipeline
@@ -7041,7 +7035,7 @@ async fn eager_delete_retains_volume_with_failed_member_claim() {
             facts: std::collections::BTreeMap::from([(1u32, dummy_rar_volume_facts(1))]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: std::collections::HashSet::new(),
             active_workers: 0,
             in_flight_members: std::collections::HashSet::new(),
@@ -8029,7 +8023,7 @@ async fn impossible_rar_state_fails_loudly_after_forced_recompute() {
             facts: std::collections::BTreeMap::from([(0u32, dummy_rar_volume_facts(0))]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: HashSet::new(),
             active_workers: 0,
             in_flight_members: HashSet::new(),
@@ -8454,7 +8448,7 @@ async fn reconcile_job_progress_marks_waiting_for_rar_volumes_without_clobbering
             ]),
             volume_files: std::collections::BTreeMap::new(),
             cached_headers: None,
-            shared_kdf_cache: std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             verified_suspect_volumes: std::collections::HashSet::new(),
             active_workers: 0,
             in_flight_members: std::collections::HashSet::new(),
@@ -8505,7 +8499,7 @@ async fn purge_idle_rar_set_drops_shared_kdf_cache() {
         minimal_job_state(job_id, "purge-job", temp_dir.path().join("purge-job")),
     );
 
-    let shared_kdf_cache = std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new());
+    let shared_kdf_cache = std::sync::Arc::new(unrar_rs::crypto::KdfCache::new());
     let weak_cache = std::sync::Arc::downgrade(&shared_kdf_cache);
 
     pipeline.rar_sets.insert(

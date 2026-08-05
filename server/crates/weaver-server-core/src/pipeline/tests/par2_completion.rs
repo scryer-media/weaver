@@ -311,7 +311,7 @@ async fn par2_set_name_rebind_keeps_encrypted_multivolume_member_span_ready() {
         .load_rar_snapshot(job_id, canonical_set_name)
         .expect("canonical encrypted snapshot should exist after four rebound volumes");
     let mut cached = serde_json::to_value(
-        rmp_serde::from_slice::<weaver_unrar::CachedArchiveHeaders>(&cached_headers).unwrap(),
+        rmp_serde::from_slice::<unrar_rs::CachedArchiveHeaders>(&cached_headers).unwrap(),
     )
     .unwrap();
     let clip = cached["members"]
@@ -329,7 +329,7 @@ async fn par2_set_name_rebind_keeps_encrypted_multivolume_member_span_ready() {
     clip["split_after"] = serde_json::json!(false);
 
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
     pipeline
@@ -742,17 +742,17 @@ async fn par2_verified_complete_archive_refreshes_missing_existing_topology_only
             .commit_segment(0, 128)
             .unwrap();
     }
-    let verification = weaver_par2::VerificationResult {
-        files: vec![weaver_par2::verify::FileVerification {
-            file_id: weaver_par2::FileId::from_bytes([0u8; 16]),
+    let verification = par2_rs::VerificationResult {
+        files: vec![par2_rs::verify::FileVerification {
+            file_id: par2_rs::FileId::from_bytes([0u8; 16]),
             filename: filename.to_string(),
-            status: weaver_par2::verify::FileStatus::Complete,
+            status: par2_rs::verify::FileStatus::Complete,
             valid_slices: Vec::new(),
             missing_slice_count: 0,
         }],
         recovery_blocks_available: 0,
         total_missing_blocks: 0,
-        repairable: weaver_par2::verify::Repairability::NotNeeded,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
     };
 
     assert_eq!(

@@ -101,6 +101,7 @@ impl Pipeline {
         part_crc_verified: bool,
     ) {
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.file_hash.update");
+        self.invalidate_par2_session_for_file_write(file_id);
         if self.file_hash_reread_required.contains(&file_id) {
             return;
         }
@@ -136,6 +137,7 @@ impl Pipeline {
         if total_len == 0 {
             return;
         }
+        self.invalidate_par2_session_for_file_write(file_id);
 
         let expected_offset = self
             .file_hash_states
@@ -165,6 +167,7 @@ impl Pipeline {
         if len == 0 {
             return;
         }
+        self.invalidate_par2_session_for_file_write(file_id);
 
         let expected_offset = self
             .file_hash_states
@@ -447,7 +450,7 @@ impl Pipeline {
                 }
             };
 
-            let part_crc = weaver_par2::checksum::crc32(&bytes);
+            let part_crc = par2_rs::checksum::crc32(&bytes);
             self.note_file_hash_chunk(file_id, expected_offset, &bytes, part_crc, false);
         }
     }
@@ -548,7 +551,7 @@ impl Pipeline {
             if len == 0 {
                 return None;
             }
-            let op = weaver_par2::checksum::Crc32CombineOp::new(len);
+            let op = par2_rs::checksum::Crc32CombineOp::new(len);
             crc32 = op.combine(crc32, range.part_crc);
             all_parts_crc_verified &= range.part_crc_verified;
             bytes_fed = bytes_fed.checked_add(len)?;
@@ -585,6 +588,7 @@ impl Pipeline {
             return Ok(CompletedFileChecksum {
                 md5: None,
                 crc32: streamed.crc32,
+                all_parts_crc_verified: streamed.all_parts_crc_verified,
             });
         }
 
@@ -646,6 +650,7 @@ impl Pipeline {
                         return Ok(CompletedFileChecksum {
                             md5: Some(md5),
                             crc32: streamed.crc32,
+                            all_parts_crc_verified: streamed.all_parts_crc_verified,
                         });
                     }
                     if let Some(md5) = self.expected_par2_hash_for_fast_verified_rar_file(
@@ -662,6 +667,7 @@ impl Pipeline {
                         return Ok(CompletedFileChecksum {
                             md5: Some(md5),
                             crc32: streamed.crc32,
+                            all_parts_crc_verified: streamed.all_parts_crc_verified,
                         });
                     }
                     if expected_file_crc
@@ -675,6 +681,7 @@ impl Pipeline {
                         return Ok(CompletedFileChecksum {
                             md5: None,
                             crc32: streamed.crc32,
+                            all_parts_crc_verified: streamed.all_parts_crc_verified,
                         });
                     }
                     crate::runtime::perf_probe::record(
@@ -1744,6 +1751,10 @@ impl Pipeline {
                     let _ = self
                         .event_tx
                         .send(PipelineEvent::SegmentCommitted { segment_id });
+                    // The normal write completed before this commit path is
+                    // entered. Feed the durable bytes to advisory live PAR2
+                    // verification before hash-mode ownership can move them.
+                    self.note_live_par2_segment(file_id, file_offset, &data);
                 }
 
                 let use_crc_metadata = self.should_use_completed_file_crc_metadata(file_id);
@@ -1840,6 +1851,7 @@ impl Pipeline {
                     // thread, so the fd is released before verification,
                     // repair, or the final move touch this path.
                     crate::pipeline::release_cached_write_handle(file_path);
+                    self.note_live_par2_file_complete(file_id, total_bytes);
 
                     let expected_file_crc = self.expected_file_crcs.get(&file_id).copied();
                     let file_checksum = match self
@@ -1867,6 +1879,7 @@ impl Pipeline {
                             CompletedFileChecksum {
                                 md5: None,
                                 crc32: 0,
+                                all_parts_crc_verified: false,
                             }
                         }
                     };
@@ -1894,6 +1907,9 @@ impl Pipeline {
                         );
                         return;
                     }
+                    self.ensure_par2_runtime(job_id)
+                        .completed_checksums
+                        .insert(file_id, file_checksum);
                     let file_hash = file_checksum.md5;
 
                     if !yenc_name.is_empty() && yenc_name != filename {
@@ -2040,7 +2056,7 @@ impl Pipeline {
 fn checksum_completed_file(path: &std::path::Path) -> io::Result<CompletedFileChecksum> {
     let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.file_hash.reread");
     let mut file = File::open(path)?;
-    let mut md5 = weaver_par2::checksum::FileHashState::new();
+    let mut md5 = par2_rs::checksum::FileHashState::new();
     let mut crc32 = crc32fast::Hasher::new();
     let mut buffer = [0u8; 256 * 1024];
     loop {
@@ -2054,6 +2070,7 @@ fn checksum_completed_file(path: &std::path::Path) -> io::Result<CompletedFileCh
     Ok(CompletedFileChecksum {
         md5: Some(md5.finalize()),
         crc32: crc32.finalize(),
+        all_parts_crc_verified: false,
     })
 }
 

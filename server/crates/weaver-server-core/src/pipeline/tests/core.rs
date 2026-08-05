@@ -232,7 +232,7 @@ async fn final_volume_refresh_heals_encrypted_multivolume_member_span_before_sch
         .load_rar_snapshot(job_id, set_name)
         .expect("partial encrypted snapshot should exist after four volumes");
     let mut cached = serde_json::to_value(
-        rmp_serde::from_slice::<weaver_unrar::CachedArchiveHeaders>(&cached_headers).unwrap(),
+        rmp_serde::from_slice::<unrar_rs::CachedArchiveHeaders>(&cached_headers).unwrap(),
     )
     .unwrap();
     let members = cached["members"].as_array_mut().unwrap();
@@ -249,7 +249,7 @@ async fn final_volume_refresh_heals_encrypted_multivolume_member_span_before_sch
     clip["split_after"] = serde_json::json!(false);
 
     let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<weaver_unrar::CachedArchiveHeaders>(cached).unwrap(),
+        &serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap(),
     )
     .unwrap();
 
