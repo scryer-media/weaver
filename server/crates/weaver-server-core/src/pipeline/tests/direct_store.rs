@@ -12551,3 +12551,117 @@ async fn the_direct_session_refuses_without_live_evidence() {
     );
     let _ = resolution;
 }
+
+/// One whole damaged-direct job, with the retained-session gate forced.
+///
+/// The damage is **posted**, not written afterwards, and that is load-bearing:
+/// a set whose articles all arrive intact extracts, finalizes, and stops
+/// answering through the overlay, so it never reaches the direct pass at all.
+/// Damaged posted bytes keep the set live *and* fully adjudicated — every slice
+/// carries a verdict, one of them bad — which is the window the session arm
+/// serves, and the case phase 6 exists for.
+///
+/// Returns the resolution, whether live verification really adjudicated the set
+/// (read from cumulative metrics, which outlive the per-job state), and how
+/// many times the session produced a direct verdict.
+async fn damaged_direct_run_with_session_gate(
+    job_id: JobId,
+    session_gate: bool,
+) -> (
+    crate::pipeline::direct_store::wiring::DirectPar2Resolution,
+    bool,
+    usize,
+) {
+    let member_name = "Silver.Horizon.S04E02.mkv";
+    let payload: Vec<u8> = (0..3072u32).map(|index| (index % 251) as u8).collect();
+    let pristine = single_member_store_set(member_name, &payload, 3);
+    // PAR2 describes the volumes as posted correctly; the bytes that arrive do
+    // not match it.
+    let par2_bytes = par2_index_over_volumes(&pristine);
+    let mut posted = pristine.clone();
+    posted[1].1[9] ^= 0xFF;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(true);
+    pipeline.stateful_par2_session_forced = Some(session_gate);
+
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &pristine, &par2_bytes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in in_order_arrivals(posted.len()) {
+        submit_volume_article(&mut pipeline, job_id, &posted, file_index, segment_number).await;
+    }
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+    pipeline.settle_live_par2_job(job_id).await;
+
+    let metrics = pipeline.live_par2.metrics();
+    let par2_set = pipeline
+        .par2_set(job_id)
+        .cloned()
+        .expect("the index parsed");
+    let resolution = pipeline
+        .resolve_direct_sets_before_par2_repairer(job_id, par2_set, working_dir)
+        .await;
+    (
+        resolution,
+        metrics.strongly_verified_slices > 0 && metrics.invalid_slices > 0,
+        pipeline.direct_session_pass_calls,
+    )
+}
+
+/// Plan 138, M3. The retained session drives the authoritative pass for direct
+/// sets, and reaches the verdict the read-and-verify pass would have reached.
+///
+/// This is the substitution that matters. An access-backed session reads **no**
+/// source bytes — `analyze()` skips the scan entirely — so it can only stand in
+/// where the live engine adjudicated every described slice in stream. A slice
+/// proven *bad* counts: it is resolved, and resolving it is what the pass was
+/// for. If the two arms could disagree, a direct job's verdict would depend on
+/// a gate, which is precisely what M5 has to be able to flip without changing
+/// behaviour.
+///
+/// The pass runs inside the pipeline's own completion checks, while the job is
+/// still assembling — not at the end. Anything sampled from the live engine
+/// afterwards describes a job whose per-job state has already been retired,
+/// which is why non-vacuity here reads the cumulative metrics instead.
+#[tokio::test]
+async fn the_retained_session_finds_the_same_direct_damage_as_the_pass() {
+    let (gate_off, adjudicated_off, session_passes_off) =
+        damaged_direct_run_with_session_gate(JobId(45203), false).await;
+    let (gate_on, adjudicated_on, session_passes_on) =
+        damaged_direct_run_with_session_gate(JobId(45204), true).await;
+
+    assert!(
+        adjudicated_off && adjudicated_on,
+        "non-vacuity: live verification must really have adjudicated this set \
+         in stream, damage included, or there is no evidence to substitute for"
+    );
+    assert_eq!(
+        session_passes_off, 0,
+        "with the gate off every direct verdict must come from the \
+         read-and-verify pass"
+    );
+    assert!(
+        session_passes_on > 0,
+        "non-vacuity: with the gate on the session must really have produced a \
+         direct verdict, not silently fallen back to the pass"
+    );
+    assert_eq!(
+        gate_on, gate_off,
+        "damage found by reading the volumes and damage reported from live \
+         evidence must be the same damage"
+    );
+}
