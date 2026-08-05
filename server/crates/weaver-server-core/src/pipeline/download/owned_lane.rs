@@ -12,6 +12,8 @@ const HOT_SHARE_YIELD_CHECK_ARTICLES: usize = 4;
 pub(crate) struct OwnedDownloadLanePool {
     senders: Vec<std_mpsc::Sender<OwnedLanePoolCommand>>,
     next: AtomicUsize,
+    #[cfg(test)]
+    reset_calls: AtomicUsize,
 }
 
 struct OwnedLaneRun {
@@ -39,6 +41,8 @@ impl OwnedDownloadLanePool {
         let mut pool = Self {
             senders: Vec::new(),
             next: AtomicUsize::new(0),
+            #[cfg(test)]
+            reset_calls: AtomicUsize::new(0),
         };
         pool.resize(worker_count);
         pool
@@ -58,7 +62,14 @@ impl OwnedDownloadLanePool {
         self.senders.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn reset_calls(&self) -> usize {
+        self.reset_calls.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn reset(&self) {
+        #[cfg(test)]
+        self.reset_calls.fetch_add(1, Ordering::Relaxed);
         for sender in &self.senders {
             let _ = sender.send(OwnedLanePoolCommand::Reset);
         }

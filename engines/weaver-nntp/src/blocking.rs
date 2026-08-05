@@ -2186,6 +2186,59 @@ mod tests {
         (config, handle, ca_path)
     }
 
+    #[cfg(not(windows))]
+    fn spawn_partial_tls_record_proxy(
+        upstream_port: u16,
+        stall: Duration,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut downstream, _) = listener.accept().unwrap();
+            let mut upstream = TcpStream::connect(("127.0.0.1", upstream_port)).unwrap();
+            let mut request_reader = downstream.try_clone().unwrap();
+            let mut request_writer = upstream.try_clone().unwrap();
+            let request_forwarder = std::thread::spawn(move || {
+                let _ = io::copy(&mut request_reader, &mut request_writer);
+            });
+
+            let mut fragmented = false;
+            loop {
+                let mut header = [0u8; 5];
+                if upstream.read_exact(&mut header).is_err() {
+                    break;
+                }
+                let record_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+                let mut payload = vec![0u8; record_len];
+                if upstream.read_exact(&mut payload).is_err() {
+                    break;
+                }
+
+                if header[0] == 0x17 && record_len >= 8 * 1024 {
+                    downstream.write_all(&header).unwrap();
+                    downstream.write_all(&payload[..record_len / 2]).unwrap();
+                    downstream.flush().unwrap();
+                    fragmented = true;
+                    std::thread::sleep(stall);
+                    break;
+                }
+
+                downstream.write_all(&header).unwrap();
+                downstream.write_all(&payload).unwrap();
+                downstream.flush().unwrap();
+            }
+
+            let _ = downstream.shutdown(std::net::Shutdown::Both);
+            let _ = upstream.shutdown(std::net::Shutdown::Both);
+            let _ = request_forwarder.join();
+            assert!(
+                fragmented,
+                "proxy never observed a large TLS application record"
+            );
+        });
+        (port, handle)
+    }
+
     fn test_transfer_control(
         stable_id: u32,
         limit_bytes: u64,
@@ -2635,6 +2688,42 @@ mod tests {
         assert_s2n_socket_timeout_slice(&conn);
         handle.join().unwrap();
         let _ = std::fs::remove_file(ca_path);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn blocking_s2n_partial_tls_record_respects_active_budget() {
+        let _guard = s2n_test_guard();
+        let (mut config, server_handle, ca_path) = spawn_tls_nntp_server(vec![(
+            "<partial-record@test>",
+            TestArticle::Body(vec![b'A'; 256 * 1024]),
+        )]);
+        let (proxy_port, proxy_handle) =
+            spawn_partial_tls_record_proxy(config.port, Duration::from_secs(2));
+        config.port = proxy_port;
+
+        let mut conn = connect_with_backend(&config, NntpTlsBackend::S2n);
+        conn.select_group("alt.test").unwrap();
+        let mut budget = ActiveTransferBudget::new(Duration::from_millis(150));
+        let started = Instant::now();
+        let result =
+            conn.stream_yenc_article_with_active_budget("<partial-record@test>", 0, &mut budget);
+        let elapsed = started.elapsed();
+
+        drop(conn);
+        proxy_handle.join().unwrap();
+        let _ = server_handle.join();
+        let _ = std::fs::remove_file(ca_path);
+
+        let error = result.expect_err("an incomplete TLS record must not produce an article");
+        assert!(matches!(
+            error,
+            FusedYencError::Nntp(NntpError::SoftTimeout(_))
+        ));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "partial TLS record ignored active budget for {elapsed:?}"
+        );
     }
 
     const TLS_DRAIN_RECORD_BYTES: usize = 16 * 1024;

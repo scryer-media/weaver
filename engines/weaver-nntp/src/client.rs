@@ -2107,7 +2107,7 @@ impl NntpClient {
             .eligible
             .into_iter()
             .any(|server| {
-                if self.pool.server_load(server.0).0 == 0 {
+                if self.pool.server_load(server.0).1 == 0 {
                     return false;
                 }
                 let Ok((config, _, _)) = self.pool.blocking_connect_plan(server, &[]) else {
@@ -3337,6 +3337,32 @@ mod tests {
             soft_timeout: Duration::from_secs(15),
         });
         assert!(!saturated.has_blocking_body_lane_candidate(&[]));
+    }
+
+    #[test]
+    fn blocking_body_lane_candidate_survives_temporary_permit_saturation() {
+        let client = NntpClient::new(NntpClientConfig {
+            servers: vec![scripted_blocking_s2n_server(1, 2)],
+            max_idle_age: Duration::from_secs(30),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(15),
+        });
+        let first = client
+            .pool()
+            .try_acquire_blocking_permit(ServerId(0))
+            .unwrap();
+        let second = client
+            .pool()
+            .try_acquire_blocking_permit(ServerId(0))
+            .unwrap();
+
+        assert_eq!(client.pool().server_load(0), (0, 2));
+        assert!(
+            client.has_blocking_body_lane_candidate(&[]),
+            "leased permits can belong to reusable owned-lane caches"
+        );
+
+        drop((first, second));
     }
 
     #[test]
