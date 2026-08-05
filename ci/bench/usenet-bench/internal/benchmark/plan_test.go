@@ -24,7 +24,9 @@ func TestBuildPlanIsBalancedAndDeterministic(t *testing.T) {
 	if !reflect.DeepEqual(first, second) {
 		t.Fatal("same seed did not create the same plan")
 	}
-	if got, want := len(first.Runs), 108; got != want {
+	// The stock 3×3 matrix has nine lanes. Docker adds two separately labelled
+	// Rarpar lanes (SABnzbd and NZBGet), for eleven lanes per tuple.
+	if got, want := len(first.Runs), 132; got != want {
 		t.Fatalf("runs = %d, want %d", got, want)
 	}
 	if got, want := len(first.ExecutionTargets), 3; got != want {
@@ -46,7 +48,7 @@ func TestBuildPlanIsBalancedAndDeterministic(t *testing.T) {
 	}
 }
 
-func TestDefaultPlanCreatesTheThreeByThreeClientPackagingMatrix(t *testing.T) {
+func TestDefaultPlanCreatesStockThreeByThreeMatrixAndDockerRarparLanes(t *testing.T) {
 	plan, err := BuildPlan(PlanOptions{
 		FixtureIDs:  []string{"fixture"},
 		Clients:     []Client{Weaver, SABnzbd, NZBGet},
@@ -57,16 +59,24 @@ func TestDefaultPlanCreatesTheThreeByThreeClientPackagingMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := len(plan.Runs), 9; got != want {
+	if got, want := len(plan.Runs), 11; got != want {
 		t.Fatalf("runs = %d, want %d", got, want)
 	}
 	counts := map[ExecutionTarget]int{}
 	for _, run := range plan.Runs {
 		counts[run.ExecutionTarget]++
 	}
-	for _, target := range DefaultExecutionTargets() {
+	if counts[DockerLinux] != 5 {
+		t.Fatalf("Docker target has %d runs, want three vanilla plus two Rarpar lanes", counts[DockerLinux])
+	}
+	for _, target := range []ExecutionTarget{MacOSNative, WindowsNative} {
 		if counts[target] != 3 {
-			t.Fatalf("target %q has %d client runs, want 3", target, counts[target])
+			t.Fatalf("target %q has %d vanilla client runs, want 3", target, counts[target])
+		}
+	}
+	for _, run := range plan.Runs {
+		if run.ArchiveToolchain == RarparArchiveToolchain && run.ExecutionTarget != DockerLinux {
+			t.Fatalf("Rarpar run escaped the Docker target: %#v", run)
 		}
 	}
 }

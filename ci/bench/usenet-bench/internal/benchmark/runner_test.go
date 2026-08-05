@@ -16,7 +16,7 @@ func TestAdapterCatalogRequiresPlannedClients(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	catalog := AdapterCatalog{SchemaVersion: 2, Adapters: []Adapter{{Client: Weaver, Target: DockerLinux, Command: []string{"weaver-adapter"}}}}
+	catalog := AdapterCatalog{SchemaVersion: 3, Adapters: []Adapter{{Client: Weaver, ArchiveToolchain: VanillaArchiveToolchain, Target: DockerLinux, Command: []string{"weaver-adapter"}}}}
 	if err := catalog.ValidateFor(plan, DockerLinux); err == nil {
 		t.Fatal("catalog missing clients should fail")
 	}
@@ -36,19 +36,21 @@ func TestAdapterResultMustMatchTLSPlanMetadata(t *testing.T) {
 	run := plan.Runs[0]
 	now := time.Now().UTC()
 	result := AdapterResult{
-		SchemaVersion:        3,
-		RunID:                run.ID,
-		Client:               run.Client,
-		ExecutionTarget:      run.ExecutionTarget,
-		Transport:            run.Transport,
-		TLSValidation:        TLSCAVerified,
-		TransportLabel:       "tls-ca-verified",
-		ServerLink:           run.ServerLink,
-		QueuedAt:             now,
-		CompletionAt:         now.Add(time.Second),
-		ClientIdentity:       "sha256:test",
-		ClientVersion:        "test",
-		RenderedConfigSHA256: "0123456789012345678901234567890123456789012345678901234567890123",
+		SchemaVersion:            4,
+		RunID:                    run.ID,
+		Client:                   run.Client,
+		ArchiveToolchain:         run.ArchiveToolchain,
+		ArchiveToolchainIdentity: "stock",
+		ExecutionTarget:          run.ExecutionTarget,
+		Transport:                run.Transport,
+		TLSValidation:            TLSCAVerified,
+		TransportLabel:           "tls-ca-verified",
+		ServerLink:               run.ServerLink,
+		QueuedAt:                 now,
+		CompletionAt:             now.Add(time.Second),
+		ClientIdentity:           "sha256:test",
+		ClientVersion:            "test",
+		RenderedConfigSHA256:     "0123456789012345678901234567890123456789012345678901234567890123",
 		ResourceMetrics: ResourceMetrics{
 			CPUTimeNanoseconds:  UnavailableMeasurement("client_container", "test", "1", "not collected in unit test"),
 			InstructionsRetired: UnavailableMeasurement("client_process", "test", "1", "not collected in unit test"),
@@ -73,19 +75,21 @@ func TestAdapterResultRequiresExplicitResourceCounterOutcomes(t *testing.T) {
 	run := plan.Runs[0]
 	now := time.Now().UTC()
 	result := AdapterResult{
-		SchemaVersion:        3,
-		RunID:                run.ID,
-		Client:               run.Client,
-		ExecutionTarget:      run.ExecutionTarget,
-		Transport:            run.Transport,
-		TLSValidation:        run.TLSValidation,
-		TransportLabel:       run.TransportLabel,
-		ServerLink:           run.ServerLink,
-		QueuedAt:             now,
-		CompletionAt:         now.Add(time.Second),
-		ClientIdentity:       "sha256:test",
-		ClientVersion:        "test",
-		RenderedConfigSHA256: "0123456789012345678901234567890123456789012345678901234567890123",
+		SchemaVersion:            4,
+		RunID:                    run.ID,
+		Client:                   run.Client,
+		ArchiveToolchain:         run.ArchiveToolchain,
+		ArchiveToolchainIdentity: "stock",
+		ExecutionTarget:          run.ExecutionTarget,
+		Transport:                run.Transport,
+		TLSValidation:            run.TLSValidation,
+		TransportLabel:           run.TransportLabel,
+		ServerLink:               run.ServerLink,
+		QueuedAt:                 now,
+		CompletionAt:             now.Add(time.Second),
+		ClientIdentity:           "sha256:test",
+		ClientVersion:            "test",
+		RenderedConfigSHA256:     "0123456789012345678901234567890123456789012345678901234567890123",
 	}
 	if err := result.ValidateFor(run); err == nil {
 		t.Fatal("missing resource measurements should not validate")
@@ -112,7 +116,7 @@ func TestRunConfigRejectsProfileDifferentFromPlan(t *testing.T) {
 	}
 	config := RunConfig{
 		Plan:         plan,
-		Catalog:      AdapterCatalog{SchemaVersion: 2, Adapters: []Adapter{{Client: Weaver, Target: DockerLinux, Command: []string{"weaver-adapter"}}}},
+		Catalog:      AdapterCatalog{SchemaVersion: 3, Adapters: []Adapter{{Client: Weaver, ArchiveToolchain: VanillaArchiveToolchain, Target: DockerLinux, Command: []string{"weaver-adapter"}}}},
 		Target:       DockerLinux,
 		FixtureRoot:  "/fixtures",
 		ArtifactRoot: "/artifacts",

@@ -247,7 +247,10 @@ func (container *runningContainer) cleanup() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if output, err := container.docker.run(ctx, "logs", container.name); err == nil {
-		path := filepath.Join(container.configDir, "client-container.log")
+		// Product entrypoints may chown /config to their runtime UID. The suite
+		// directory itself is never mounted, so it remains writable by the
+		// benchmark controller even after a failed container startup.
+		path := filepath.Join(filepath.Dir(container.configDir), "client-container.log")
 		file, createErr := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if createErr == nil {
 			_, _ = file.WriteString(output + "\n")

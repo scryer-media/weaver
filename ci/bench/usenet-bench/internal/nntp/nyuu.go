@@ -111,6 +111,7 @@ func SeedWithNyuu(ctx context.Context, config NyuuSeedConfig) (SeedResult, error
 
 	args := []string{
 		"run", "--rm", "--platform", config.Platform, "--network", config.Network,
+		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		"--mount", "type=bind,src=" + fixtureDir + ",dst=/work",
 		config.Image,
 		"-h", config.NNTPHost,
@@ -199,9 +200,30 @@ func runCommand(ctx context.Context, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+		return fmt.Errorf("%s: %w\n%s", redactedCommand(name, args), err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func redactedCommand(name string, args []string) string {
+	preview := append([]string(nil), args...)
+	for index, argument := range preview {
+		switch {
+		case argument == "-p" || argument == "--password" || argument == "--nzb-password":
+			if index+1 < len(preview) {
+				preview[index+1] = "<redacted>"
+			}
+		case strings.HasPrefix(argument, "-hp") && len(argument) > len("-hp"):
+			preview[index] = "-hp<redacted>"
+		case strings.HasPrefix(argument, "-p") && len(argument) > len("-p"):
+			preview[index] = "-p<redacted>"
+		case strings.HasPrefix(argument, "--password="):
+			preview[index] = "--password=<redacted>"
+		case strings.HasPrefix(argument, "--nzb-password="):
+			preview[index] = "--nzb-password=<redacted>"
+		}
+	}
+	return name + " " + strings.Join(preview, " ")
 }
 
 func safeID(value string) string {

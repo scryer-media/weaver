@@ -2,8 +2,9 @@
 
 This is a product-neutral benchmark foundation for Weaver, SABnzbd, and
 NZBGet. It intentionally does not infer a “typical Usenet release.” Instead,
-it generates a declared matrix of clean multi-volume RAR fixtures and reports
-which combinations each client handles well.
+it generates a declared matrix of clean and deliberately repairable
+multi-volume RAR fixtures and reports which combinations each client handles
+well.
 
 Generated archives, posted articles, downloaded data, and benchmark results
 are ignored by Git. The checked-in matrix, source-locked toolchains, NZB
@@ -34,6 +35,25 @@ solid archives. The generator accepts
 `--bluray-small-file-bytes` so smoke runs can scale that shape down without
 changing what it represents. These are intentionally synthetic—not a claim
 that they are byte-for-byte Blu-ray images or statistically typical posts.
+
+Fourteen separately declared repair fixtures add deterministic corruption
+without multiplying every clean case. RAR3, RAR4, and RAR5 each receive all
+four profiles; two RAR5 `bluray-disc` cases exercise the heavy profiles:
+
+| Profile | Posted repair material | Deliberate fault |
+| --- | --- | --- |
+| `par2-light` | PAR2 at 10% redundancy | 128 deterministic byte flips in one non-leading RAR volume |
+| `par2-heavy` | PAR2 at 35% redundancy | two complete non-leading RAR volumes absent |
+| `rar-recovery-volume-light` | one RAR recovery volume (`.rev` or legacy equivalent) | one non-leading RAR volume absent |
+| `rar-recovery-volume-heavy` | two RAR recovery volumes | two non-leading RAR volumes absent |
+
+These profiles are compatibility and repair workloads, not a population claim.
+The source-locked `par2cmdline` 0.8.1 image creates PAR2 material from its
+verified source archive. Before a repair fixture is accepted, the generator
+copies its posted input to a temporary verification directory, performs the
+declared repair with the pinned PAR2 or RARLAB tool, and RARLAB-tests the
+reconstructed archive against the original payload oracle. The deliberately
+damaged input is retained; the verification copy is discarded.
 
 `writer_era` is deliberately separate from `rar_format`: RAR 6 and 7 are
 writer releases, not separate RAR6/RAR7 on-disk format names. The old 3.93
@@ -72,9 +92,12 @@ go run ./cmd/fixturegen \
 
 Every generated fixture contains:
 
-- `archive/` — multi-volume RAR data to post;
+- `archive/` — the exact NNTP input to post: RAR volumes plus any PAR2 or
+  RAR recovery-volume files. Deliberately missing RAR volumes are not posted;
+  their pre-corruption digests remain in the manifest.
 - `fixture-manifest.json` — selected RAR flags, source-locked generator,
-  original file sizes, and SHA-256 output oracle.
+  `repair` profile/fault metadata, source and posted-file SHA-256 digests, and
+  the extracted-output SHA-256 oracle.
 
 The temporary source payload is removed after RARLAB successfully tests the
 archive. The manifest is sufficient to validate final client output without
@@ -178,14 +201,15 @@ part of the download measurement.
 ```bash
 go run ./cmd/nntpbench plan \
   --fixtures modern-rar5-normal-solid-headers-compressible,classic-rar4-store-nonsolid-none-incompressible \
+  --archive-toolchains vanilla,rarpar \
   --server-link 10gbit \
   --repetitions 5 \
   --seed 20260802 \
   --output /scratch/nntp-bench-runs/plan.json
 ```
 
-The default plan creates the full 3×3 client-by-packaging matrix for every
-`(fixture, transport, repetition)` tuple:
+The default plan keeps the full **stock** 3×3 client-by-packaging matrix for
+every `(fixture, transport, repetition)` tuple:
 
 | Client | `docker-linux` | `macos-native` | `windows-native` |
 | --- | --- | --- | --- |
@@ -193,28 +217,44 @@ The default plan creates the full 3×3 client-by-packaging matrix for every
 | SABnzbd | pinned Linux image, public API | native distributable, public API | native distributable, public API |
 | NZBGet | pinned Linux image, public API | native executable, JSON-RPC | native executable, JSON-RPC |
 
+It also adds two Docker-only Rarpar lanes, recorded as
+`archive_toolchain=rarpar`: SABnzbd+Rarpar and NZBGet+Rarpar. The Docker
+target therefore has five lanes; macOS and Windows retain three vanilla lanes
+each. This distinction is intentional. The stock native SABnzbd and NZBGet
+distributions bundle or link part of their archive stack and do not expose the
+same replacement points. Repackaging them just to force Rarpar would not be a
+native stock-package comparison.
+
+`archive_toolchain` is a first-class plan, adapter, rendered-config, and result
+field. Never pool `vanilla` and `rarpar` rows. Use
+`--archive-toolchains vanilla` for a stock-only plan; the `vanilla,rarpar`
+default is the side-by-side configuration.
+
 Use `--targets docker-linux` to create a Docker-only plan while iterating.
 Otherwise the saved plan includes all three target IDs; each host later runs
 only its own ID. The plan randomizes target/fixture/transport/repetition
-blocks and the order of Weaver, SABnzbd, and NZBGet within each block. It is
-sequential, so clients never share the server's bandwidth in a timed run. The
-persisted plan is the exact run order, client profile, server-link contract,
-and packaging target used for reporting.
+blocks and client/toolchain lanes within each block. It is sequential, so
+clients never share the server's bandwidth in a timed run. The persisted plan
+is the exact run order, client profile, archive toolchain, server-link
+contract, and packaging target used for reporting.
 
-## Run target-specific adapters
+## Run queue suites (primary measurement)
 
-Build the Docker adapter once. The neutral runner starts it once per selected
-Docker run; it starts a new client container, config directory, queue/cache,
-download directory, and completion directory every time.
+Build the Docker adapter once. `queue` starts one fresh client container per
+client/toolchain/transport/repetition lane, submits every fixture NZB to that
+client before waiting for any completion, and verifies every output under the
+same queue directory. Client lanes remain sequential, so timed competitors do
+not share server bandwidth; fixture jobs within one lane deliberately share
+the client's normal queue, cache, and transition behaviour.
 
 ```bash
 go build -o /scratch/nntp-bench-bin/clientadapter ./cmd/clientadapter
 
-# Copy the catalog, set the binary path and Compose network name, and change
+# Copy the catalog, set the adapter path and Compose network name, and change
 # images only by replacing their full digest. A floating tag is rejected.
 cp configs/adapters.example.json /scratch/nntp-bench-runs/adapters.json
 
-go run ./cmd/nntpbench run \
+go run ./cmd/nntpbench queue \
   --plan /scratch/nntp-bench-runs/plan.json \
   --adapters /scratch/nntp-bench-runs/adapters.json \
   --target docker-linux \
@@ -225,6 +265,44 @@ go run ./cmd/nntpbench run \
   --username "${NNTP_BENCH_USERNAME:-fixture-user}" \
   --password-file "$NNTP_BENCH_PASSWORD_FILE"
 ```
+
+`run` is retained as a separately labelled cold, one-NZB diagnostic. It must
+not be used as the headline queue-throughput result.
+
+### Rarpar-backed Docker lanes
+
+The two `rarpar` catalog entries require a **published**, platform-matching
+Rarpar release binary—not a local source build and not a floating container
+tag. Download the `linux/amd64` Docker-compatible release artifact, retain the
+download and its release checksum with the benchmark inputs, and fill in all
+three fields in the copied catalog:
+
+```json
+"CLIENT_RARPAR_BINARY": "/scratch/rarpar/rarpar-linux-amd64",
+"CLIENT_RARPAR_VERSION": "0.2.5",
+"CLIENT_RARPAR_SHA256": "<lowercase 64-character release digest>"
+```
+
+Before starting a timed run, the adapter checks that executable's SHA-256,
+then copies it into the fresh per-run config directory. The declared release
+version and verified digest become `rarpar <version> sha256:<digest>` in the
+result; this works when the Docker artifact's Linux architecture cannot execute
+on the host. The result deliberately does not retain the host binary path.
+
+SABnzbd discovers its external `unrar` and `par2` commands through `PATH`.
+For the Rarpar lane, the adapter stages a `unrar` compatibility shim and a
+narrow `par2 r` shim that calls `rarpar par repair`; the release binary remains
+named `rarpar`. NZBGet does not provide a `Par2Cmd` setting—its stock PAR2
+engine is linked internally. Its Rarpar lane therefore explicitly disables
+that internal unpack/PAR route and runs a tracked NZBGet post-processing
+extension that performs `rarpar par repair`, then `rarpar rar extract`. This
+is why the lane is labelled `rarpar`, not falsely described as stock NZBGet's
+internal PAR2 implementation.
+
+The base corpus remains clean, while the explicitly named repair fixtures post
+PAR2 sidecars or RAR recovery volumes with declared damage. Report repair rows
+by `repair.profile` and `archive_toolchain`; never pool them with clean
+extraction rows or imply that their mix measures Usenet prevalence.
 
 For native targets, build the host-local launcher and use a separate adapter
 catalog and artifact root for each operating system:
@@ -303,30 +381,31 @@ versions and hashes in the catalog, and use an isolated working directory such
 as `C:\bench` before running the Windows lane.
 
 The Docker adapter renders and saves a product config before starting the
-container.
-Weaver runs its production image in one-shot CLI mode:
-`weaver download … --report … --report-ack …`; it does not start an HTTP
-listener or use GraphQL. SABnzbd receives an `addfile` upload and NZBGet
-receives its documented JSON-RPC `append`. The adapter passes the public
-fixture password only for fixtures whose manifest says encryption requires it;
-no client is given a fixture-specific fast path.
+container. In the primary queue mode all three clients use their public local
+control API: Weaver's local GraphQL service, SABnzbd `addfile`, and NZBGet
+JSON-RPC `append`. The cold diagnostic keeps Weaver's one-shot
+`weaver download … --report … --report-ack …` path. The adapter passes the
+public fixture password only for fixtures whose manifest says encryption
+requires it; no client is given a fixture-specific fast path.
 
 The Docker Weaver catalog must point at an image built after the CLI report
 options in this branch are released. Do not substitute a floating tag or run a
 pre-report image: the adapter will preserve the exact digest and fail rather
 than silently falling back to the HTTP service.
 
-Weaver's immutable CLI report contains the accepted-queue and terminal-complete
-timestamps. Its acknowledgement file holds the already-complete CLI process
-long enough for the adapter to snapshot the same cgroup and `perf` telemetry
-used for the service-based clients, then permits normal cleanup. This is a
-measurement handshake, not a download-path setting, and the full command is
-included in the rendered configuration artifact.
+Queue artifacts record the first successful submission, every per-NZB accepted
+and terminal timestamp, the final client completion, and final independent
+output verification. `queue_wall_clock_nanoseconds` is first submission to
+the final client completion; `verified_wall_clock_nanoseconds` extends that
+same start point through the output oracle for every NZB. The latter is the
+headline end-to-end value. CPU time and retired instructions cover the same
+uninterrupted client process. The cold Weaver CLI report and acknowledgement
+remain a measurement handshake for the diagnostic mode only.
 
 Each client image must use `image@sha256:<digest>`, and its resolved image
-identity/version and the rendered-config SHA-256 appear in the result. The
-adapter keeps the product container log in the run config directory before it
-is removed.
+identity/version, archive-toolchain provenance, and rendered-config SHA-256
+appear in the result. The adapter keeps the product container log in the run
+config directory before it is removed.
 
 The generic runner independently validates completion with:
 
@@ -393,7 +472,7 @@ SABnzbd config and result artifact.
 See [`configs/clients/baseline.json`](configs/clients/baseline.json) for the
 auditable cross-client baseline and
 [`configs/adapters.example.json`](configs/adapters.example.json) for the
-digest-pinned adapter catalog shape.
+digest-pinned adapter catalog shape and its explicit Rarpar release pin.
 
 ## What this does not claim
 

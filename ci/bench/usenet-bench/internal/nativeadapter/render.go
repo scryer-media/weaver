@@ -209,6 +209,8 @@ func renderAuditConfig(cfg Config, spec productSpec) []byte {
 	return []byte(strings.Join([]string{
 		"schema_version=1",
 		"client=" + string(cfg.Client),
+		"archive_toolchain=" + string(cfg.ArchiveToolchain),
+		"archive_toolchain_identity=stock",
 		"execution_target=" + string(cfg.ExecutionTarget),
 		"profile=" + cfg.Profile,
 		"transport=" + string(cfg.Transport),

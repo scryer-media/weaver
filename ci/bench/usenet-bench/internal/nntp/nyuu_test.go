@@ -1,6 +1,9 @@
 package nntp
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNyuuSeedConfigDefaults(t *testing.T) {
 	config := (NyuuSeedConfig{FixtureDir: "fixture", RunID: "run", Network: "bench", Username: "user", Password: "pass"}).withDefaults()
@@ -9,6 +12,17 @@ func TestNyuuSeedConfigDefaults(t *testing.T) {
 	}
 	if err := config.validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
+	}
+}
+
+func TestRedactedCommandDoesNotExposePasswords(t *testing.T) {
+	const secret = "definitely-not-for-output"
+	got := redactedCommand("docker", []string{
+		"run", "-p", secret, "--password=" + secret, "--nzb-password", secret,
+		"-hp" + secret, "-p" + secret,
+	})
+	if strings.Contains(got, secret) {
+		t.Fatalf("password leaked in command preview: %s", got)
 	}
 }
 

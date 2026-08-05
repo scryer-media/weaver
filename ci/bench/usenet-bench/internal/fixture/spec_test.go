@@ -106,3 +106,32 @@ func TestBluRayLayoutDoesNotRequireUniformFileCount(t *testing.T) {
 		t.Fatalf("layout = %q", cases[0].PayloadLayout)
 	}
 }
+
+func TestRepairProfilesAreExplicitFixtureCases(t *testing.T) {
+	matrix := Matrix{SchemaVersion: 1, Sets: []FixtureSet{{
+		ID:                 "repair-rar5",
+		WriterEra:          "RAR 7.23",
+		GeneratorToolchain: "rarlab-7.23",
+		RARFormat:          RAR5,
+		Compressions:       []Compression{Normal},
+		Solid:              []bool{true},
+		Encryptions:        []Encryption{NoEncryption},
+		Payloads:           []PayloadKind{IncompressiblePayload},
+		RepairProfiles:     []RepairProfile{PAR2LightRepairProfile, RARRecoveryVolumeHeavyProfile},
+		FileCount:          4,
+		VolumeSize:         "32m",
+	}}}
+	cases, err := matrix.Expand()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(cases), 2; got != want {
+		t.Fatalf("cases = %d, want %d", got, want)
+	}
+	if got, want := cases[0].ID, "repair-rar5-par2-light-normal-solid-none-incompressible"; got != want {
+		t.Fatalf("case id = %q, want %q", got, want)
+	}
+	if cases[1].RepairProfile != RARRecoveryVolumeHeavyProfile {
+		t.Fatalf("second repair profile = %q", cases[1].RepairProfile)
+	}
+}

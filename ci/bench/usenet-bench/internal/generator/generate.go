@@ -34,6 +34,8 @@ type Config struct {
 	MatrixPath           string
 	ToolchainsPath       string
 	DockerfilePath       string
+	PAR2ToolchainPath    string
+	PAR2DockerfilePath   string
 	OutputDir            string
 	DockerBinary         string
 	BytesPerFile         int64
@@ -53,6 +55,12 @@ func (c Config) withDefaults() Config {
 	}
 	if c.DockerfilePath == "" {
 		c.DockerfilePath = "docker/rarlab/Dockerfile"
+	}
+	if c.PAR2ToolchainPath == "" {
+		c.PAR2ToolchainPath = "docker/par2/toolchain.json"
+	}
+	if c.PAR2DockerfilePath == "" {
+		c.PAR2DockerfilePath = "docker/par2/Dockerfile"
 	}
 	if c.OutputDir == "" {
 		c.OutputDir = "generated"
@@ -108,6 +116,19 @@ func Generate(ctx context.Context, config Config) ([]fixture.GeneratedManifest, 
 	if err != nil {
 		return nil, err
 	}
+	var par2Toolchain *PAR2Toolchain
+	if selectedCasesRequirePAR2(cases, config.CaseIDs) {
+		loaded, err := LoadPAR2Toolchain(config.PAR2ToolchainPath)
+		if err != nil {
+			return nil, err
+		}
+		if config.BuildImages {
+			if err := buildPAR2Image(ctx, config, loaded); err != nil {
+				return nil, err
+			}
+		}
+		par2Toolchain = &loaded
+	}
 
 	if err := os.MkdirAll(config.OutputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create output directory: %w", err)
@@ -128,7 +149,7 @@ func Generate(ctx context.Context, config Config) ([]fixture.GeneratedManifest, 
 			}
 			built[toolchain.ID] = true
 		}
-		manifest, err := generateCase(ctx, config, archiveCase, toolchain)
+		manifest, err := generateCase(ctx, config, archiveCase, toolchain, par2Toolchain)
 		if err != nil {
 			return nil, err
 		}
@@ -156,7 +177,7 @@ func buildImage(ctx context.Context, config Config, toolchain Toolchain) error {
 	return nil
 }
 
-func generateCase(ctx context.Context, config Config, archiveCase fixture.ArchiveCase, toolchain Toolchain) (fixture.GeneratedManifest, error) {
+func generateCase(ctx context.Context, config Config, archiveCase fixture.ArchiveCase, toolchain Toolchain, par2Toolchain *PAR2Toolchain) (fixture.GeneratedManifest, error) {
 	caseDir, err := filepath.Abs(filepath.Join(config.OutputDir, archiveCase.ID))
 	if err != nil {
 		return fixture.GeneratedManifest{}, fmt.Errorf("resolve fixture directory: %w", err)
@@ -202,14 +223,20 @@ func generateCase(ctx context.Context, config Config, archiveCase fixture.Archiv
 	if err := runRAR(ctx, config.DockerBinary, toolchain, caseDir, testArgs...); err != nil {
 		return fixture.GeneratedManifest{}, fmt.Errorf("verify fixture %q with RARLAB: %w", archiveCase.ID, err)
 	}
+	repair, postedFiles, err := applyRepairProfile(ctx, config, archiveCase, toolchain, par2Toolchain, caseDir, archives, firstVolume)
+	if err != nil {
+		return fixture.GeneratedManifest{}, fmt.Errorf("apply repair profile to fixture %q: %w", archiveCase.ID, err)
+	}
 
 	manifest := fixture.GeneratedManifest{
-		SchemaVersion: 3,
-		Case:          archiveCase,
-		Toolchain:     toolchain.ManifestID(),
-		PayloadRecipe: recipe,
-		ExpectedFiles: expected,
-		ArchiveFiles:  archives,
+		SchemaVersion:      4,
+		Case:               archiveCase,
+		Toolchain:          toolchain.ManifestID(),
+		PayloadRecipe:      recipe,
+		ExpectedFiles:      expected,
+		SourceArchiveFiles: archives,
+		ArchiveFiles:       postedFiles,
+		Repair:             repair,
 	}
 	if err := writeManifest(filepath.Join(caseDir, "fixture-manifest.json"), manifest); err != nil {
 		return fixture.GeneratedManifest{}, err
@@ -226,12 +253,17 @@ func generateCase(ctx context.Context, config Config, archiveCase fixture.Archiv
 func runRAR(ctx context.Context, dockerBinary string, toolchain Toolchain, caseDir string, rarArgs ...string) error {
 	args := []string{
 		"run", "--rm", "--platform", toolchain.Platform,
+		"--user", callerDockerUser(),
 		"--mount", "type=bind,src=" + caseDir + ",dst=/work",
 		"--workdir", "/work",
 		toolchain.Image,
 	}
 	args = append(args, rarArgs...)
 	return runCommand(ctx, dockerBinary, args...)
+}
+
+func callerDockerUser() string {
+	return fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
 }
 
 func runCommand(ctx context.Context, name string, args ...string) error {

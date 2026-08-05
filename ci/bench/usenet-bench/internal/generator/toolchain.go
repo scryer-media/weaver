@@ -26,6 +26,17 @@ type Toolchain struct {
 	Binary   string `json:"binary"`
 }
 
+// PAR2Toolchain pins the open-source parity generator used only while
+// materializing repair fixtures. It is not a benchmarked client dependency.
+type PAR2Toolchain struct {
+	SchemaVersion int    `json:"schema_version"`
+	ID            string `json:"id"`
+	Image         string `json:"image"`
+	Platform      string `json:"platform"`
+	URL           string `json:"url"`
+	SHA256        string `json:"sha256"`
+}
+
 func LoadToolchainLock(path string) (ToolchainLock, error) {
 	contents, err := os.ReadFile(path)
 	if err != nil {
@@ -49,6 +60,38 @@ func LoadToolchainLock(path string) (ToolchainLock, error) {
 		ids[toolchain.ID] = true
 	}
 	return lock, nil
+}
+
+func LoadPAR2Toolchain(path string) (PAR2Toolchain, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return PAR2Toolchain{}, fmt.Errorf("read PAR2 toolchain %s: %w", path, err)
+	}
+	var toolchain PAR2Toolchain
+	if err := json.Unmarshal(contents, &toolchain); err != nil {
+		return PAR2Toolchain{}, fmt.Errorf("decode PAR2 toolchain %s: %w", path, err)
+	}
+	if err := toolchain.Validate(); err != nil {
+		return PAR2Toolchain{}, err
+	}
+	return toolchain, nil
+}
+
+func (t PAR2Toolchain) Validate() error {
+	if t.SchemaVersion != 1 {
+		return fmt.Errorf("PAR2 toolchain %q has unsupported schema version %d", t.ID, t.SchemaVersion)
+	}
+	if strings.TrimSpace(t.ID) == "" || strings.TrimSpace(t.Image) == "" || strings.TrimSpace(t.Platform) == "" {
+		return fmt.Errorf("PAR2 toolchain must include id, image, and platform")
+	}
+	parsed, err := url.Parse(t.URL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return fmt.Errorf("PAR2 toolchain %q must use an https URL", t.ID)
+	}
+	if len(t.SHA256) != 64 || strings.Trim(t.SHA256, "0123456789abcdefABCDEF") != "" {
+		return fmt.Errorf("PAR2 toolchain %q has invalid SHA-256", t.ID)
+	}
+	return nil
 }
 
 func (t Toolchain) Validate() error {

@@ -1,6 +1,8 @@
 package clientadapter
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -57,6 +59,43 @@ func TestWeaverUsesOneShotCLIWithTelemetryAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestWeaverQueueUsesServiceAndPreservesControllerOwnership(t *testing.T) {
+	t.Setenv("WEAVER_NNTP_TLS_BACKEND", "s2n")
+	t.Setenv("RUST_LOG", "weaver_nntp=debug")
+	cfg := testConfig(t, benchmark.Weaver, benchmark.Plaintext, benchmark.TLSNotApplicable)
+	cfg.QueueInput = &benchmark.QueueInput{
+		SchemaVersion: 1,
+		SuiteID:       "queue-0001",
+		Jobs: []benchmark.QueueInputJob{{
+			RunID:     cfg.RunID,
+			FixtureID: "fixture",
+			NZBPath:   cfg.NZBPath,
+		}},
+	}
+	spec, err := cfg.RenderProductConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !spec.ExposeAPI || spec.APIPort != 9090 || spec.NeedsNZBMount {
+		t.Fatalf("queue Weaver spec = %#v", spec)
+	}
+	if got, want := strings.Join(spec.Command, " "), "--config /config serve --port 9090"; got != want {
+		t.Fatalf("queue Weaver command = %q, want %q", got, want)
+	}
+	environment := strings.Join(spec.Environment, "\n")
+	for _, key := range []string{"PUID=", "PGID="} {
+		if !strings.Contains(environment, key) {
+			t.Fatalf("queue Weaver environment lacks %s: %s", key, environment)
+		}
+	}
+	if !strings.Contains(environment, "WEAVER_NNTP_TLS_BACKEND=s2n") {
+		t.Fatalf("queue Weaver environment lacks TLS backend override: %s", environment)
+	}
+	if !strings.Contains(environment, "RUST_LOG=weaver_nntp=debug") {
+		t.Fatalf("queue Weaver environment lacks diagnostic log filter: %s", environment)
+	}
+}
+
 func TestVerifiedTLSClientMountsCAAndUsesStrictVerification(t *testing.T) {
 	cfg := testConfig(t, benchmark.NZBGet, benchmark.TLS, benchmark.TLSCAVerified)
 	spec, err := cfg.RenderProductConfig()
@@ -79,6 +118,23 @@ func TestVerifiedTLSClientMountsCAAndUsesStrictVerification(t *testing.T) {
 	}
 }
 
+func TestStockNZBGetKeepsItsBuiltInRepairPathEnabled(t *testing.T) {
+	cfg := testConfig(t, benchmark.NZBGet, benchmark.Plaintext, benchmark.TLSNotApplicable)
+	spec, err := cfg.RenderProductConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(spec.ConfigContent)
+	for _, expected := range []string{"ParCheck=auto", "ParRepair=yes", "UnrarCmd=unrar"} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("stock NZBGet config lacks %q:\n%s", expected, content)
+		}
+	}
+	if strings.Contains(content, "DaemonMode=") {
+		t.Fatalf("current NZBGet image rejects legacy DaemonMode:\n%s", content)
+	}
+}
+
 func TestEquivalentThroughputProfileOnlyChangesDeclaredDirectUnpack(t *testing.T) {
 	cfg := testConfig(t, benchmark.SABnzbd, benchmark.Plaintext, benchmark.TLSNotApplicable)
 	stock, err := cfg.RenderProductConfig()
@@ -98,6 +154,53 @@ func TestEquivalentThroughputProfileOnlyChangesDeclaredDirectUnpack(t *testing.T
 	}
 	if stock.ConfigSHA256 == equivalent.ConfigSHA256 {
 		t.Fatal("rendered config hash must change when profile changes")
+	}
+}
+
+func TestRarparVariantsRenderAnExplicitReplacementPath(t *testing.T) {
+	for _, client := range []benchmark.Client{benchmark.SABnzbd, benchmark.NZBGet} {
+		t.Run(string(client), func(t *testing.T) {
+			cfg := testConfig(t, client, benchmark.Plaintext, benchmark.TLSNotApplicable)
+			configureTestRarpar(t, &cfg)
+			spec, err := cfg.RenderProductConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(spec.Rendered), "archive_toolchain=rarpar") {
+				t.Fatalf("rendered configuration does not record Rarpar:\n%s", spec.Rendered)
+			}
+			if client == benchmark.SABnzbd {
+				if !strings.Contains(strings.Join(spec.Environment, "\n"), "PATH=/config/toolchain:") {
+					t.Fatalf("SAB Rarpar lane does not prepend the staged toolchain to PATH: %#v", spec.Environment)
+				}
+				return
+			}
+			content := string(spec.ConfigContent)
+			for _, expected := range []string{"Unpack=no", "UnrarCmd=/config/toolchain/unrar", "Extensions=rarpar-post.sh"} {
+				if !strings.Contains(content, expected) {
+					t.Fatalf("NZBGet Rarpar config lacks %q:\n%s", expected, content)
+				}
+			}
+			if len(spec.ExtraFiles) != 1 || !strings.Contains(string(spec.ExtraFiles[0].Content), "par repair") || !strings.Contains(string(spec.ExtraFiles[0].Content), "rar extract") {
+				t.Fatalf("NZBGet Rarpar post-process script is incomplete: %#v", spec.ExtraFiles)
+			}
+		})
+	}
+}
+
+func TestRarparToolchainStagesOnlyVerifiedPublishedBinary(t *testing.T) {
+	cfg := testConfig(t, benchmark.SABnzbd, benchmark.Plaintext, benchmark.TLSNotApplicable)
+	configureTestRarpar(t, &cfg)
+	if err := prepareRarparToolchain(cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"rarpar", "unrar", "par2", "archive-passwords"} {
+		if _, err := os.Stat(filepath.Join(cfg.ConfigDir, "toolchain", name)); err != nil {
+			t.Fatalf("staged Rarpar toolchain is missing %s: %v", name, err)
+		}
+	}
+	if got := cfg.archiveToolchainIdentity(); strings.Contains(got, cfg.RarparBinary) || !strings.Contains(got, "sha256:") {
+		t.Fatalf("Rarpar identity leaks a path or omits a digest: %q", got)
 	}
 }
 
@@ -174,31 +277,46 @@ func testConfig(t *testing.T, client benchmark.Client, transport benchmark.Trans
 		}
 	}
 	return Config{
-		RunID:           "run-0001",
-		Client:          client,
-		ExecutionTarget: benchmark.DockerLinux,
-		Transport:       transport,
-		TransportLabel:  label,
-		TLSValidation:   validation,
-		ServerLink:      benchmark.DefaultServerLinkProfile(),
-		FixtureDir:      directory,
-		NZBPath:         nzbPath,
-		OutputDir:       filepath.Join(directory, "complete"),
-		ConfigDir:       filepath.Join(directory, "config"),
-		ResultPath:      filepath.Join(directory, "adapter-result.json"),
-		NNTPHost:        "nntp",
-		NNTPPort:        "563",
-		NNTPUsername:    "user",
-		NNTPPassword:    "password",
-		NNTPUseTLS:      useTLS,
-		NNTPCAFile:      caPath,
-		Connections:     8,
-		Profile:         benchmark.ProfileStock,
-		Image:           "example.test/client@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-		Network:         "nntp-bench",
-		DockerBinary:    "docker",
-		PerfBinary:      "perf",
-		StartupTimeout:  1,
-		PollInterval:    1,
+		RunID:            "run-0001",
+		Client:           client,
+		ArchiveToolchain: benchmark.VanillaArchiveToolchain,
+		ExecutionTarget:  benchmark.DockerLinux,
+		Transport:        transport,
+		TransportLabel:   label,
+		TLSValidation:    validation,
+		ServerLink:       benchmark.DefaultServerLinkProfile(),
+		FixtureDir:       directory,
+		NZBPath:          nzbPath,
+		OutputDir:        filepath.Join(directory, "complete"),
+		ConfigDir:        filepath.Join(directory, "config"),
+		ResultPath:       filepath.Join(directory, "adapter-result.json"),
+		NNTPHost:         "nntp",
+		NNTPPort:         "563",
+		NNTPUsername:     "user",
+		NNTPPassword:     "password",
+		NNTPUseTLS:       useTLS,
+		NNTPCAFile:       caPath,
+		Connections:      8,
+		Profile:          benchmark.ProfileStock,
+		Image:            "example.test/client@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Network:          "nntp-bench",
+		DockerBinary:     "docker",
+		PerfBinary:       "perf",
+		StartupTimeout:   1,
+		PollInterval:     1,
 	}
+}
+
+func configureTestRarpar(t *testing.T, cfg *Config) {
+	t.Helper()
+	binary := filepath.Join(filepath.Dir(cfg.NZBPath), "rarpar")
+	contents := []byte("#!/bin/sh\necho 'rarpar 0.2.5'\n")
+	if err := os.WriteFile(binary, contents, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(contents)
+	cfg.ArchiveToolchain = benchmark.RarparArchiveToolchain
+	cfg.RarparBinary = binary
+	cfg.RarparVersion = "0.2.5"
+	cfg.RarparSHA256 = hex.EncodeToString(digest[:])
 }

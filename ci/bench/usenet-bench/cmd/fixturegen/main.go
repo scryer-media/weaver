@@ -38,6 +38,8 @@ func main() {
 	flag.StringVar(&config.MatrixPath, "matrix", "fixtures/matrix.json", "fixture matrix JSON path")
 	flag.StringVar(&config.ToolchainsPath, "toolchains", "docker/rarlab/toolchains.json", "pinned RARLAB toolchain JSON path")
 	flag.StringVar(&config.DockerfilePath, "dockerfile", "docker/rarlab/Dockerfile", "RARLAB image Dockerfile path")
+	flag.StringVar(&config.PAR2ToolchainPath, "par2-toolchain", "docker/par2/toolchain.json", "source-locked PAR2 generator JSON path")
+	flag.StringVar(&config.PAR2DockerfilePath, "par2-dockerfile", "docker/par2/Dockerfile", "PAR2 generator image Dockerfile path")
 	flag.StringVar(&config.OutputDir, "output", "generated", "directory for generated fixtures (never overwritten)")
 	flag.StringVar(&config.DockerBinary, "docker", "docker", "Docker executable")
 	flag.StringVar(&bytesPerFile, "bytes-per-file", "64MiB", "deterministic payload size per uniform inner file")
@@ -45,7 +47,7 @@ func main() {
 	flag.StringVar(&bluRaySmallFile, "bluray-small-file-bytes", "128KiB", "small metadata-file size for bluray-disc fixtures")
 	flag.IntVar(&config.BluRaySmallFileCount, "bluray-small-file-count", 512, "small metadata files for bluray-disc fixtures")
 	flag.Var(&fixtureIDs, "fixture", "one expanded fixture id to generate (repeatable; defaults to all)")
-	flag.BoolVar(&config.BuildImages, "build-images", true, "build source-locked RARLAB images before generation")
+	flag.BoolVar(&config.BuildImages, "build-images", true, "build source-locked RARLAB and selected PAR2 images before generation")
 	flag.BoolVar(&list, "list", false, "print expanded fixture cases and exit")
 	flag.Parse()
 

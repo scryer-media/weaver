@@ -1,8 +1,9 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "adapters": [
     {
       "client": "weaver",
+      "archive_toolchain": "vanilla",
       "target": "macos-native",
       "command": ["/scratch/nntp-bench-bin/nativeadapter"],
       "environment": {
@@ -12,6 +13,7 @@
     },
     {
       "client": "sabnzbd",
+      "archive_toolchain": "vanilla",
       "target": "macos-native",
       "command": ["/scratch/nntp-bench-bin/nativeadapter"],
       "environment": {
@@ -22,6 +24,7 @@
     },
     {
       "client": "nzbget",
+      "archive_toolchain": "vanilla",
       "target": "macos-native",
       "command": ["/scratch/nntp-bench-bin/nativeadapter"],
       "environment": {

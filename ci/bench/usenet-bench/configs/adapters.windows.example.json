@@ -1,10 +1,11 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "adapters": [
     {
       "client": "weaver",
+      "archive_toolchain": "vanilla",
       "target": "windows-native",
-      "command": ["C:\\Users\\ai\\bench\\bin\\nativeadapter.exe"],
+      "command": ["C:\\bench\\bin\\nativeadapter.exe"],
       "environment": {
         "NATIVE_CLIENT_VERSION": "REPLACE_WITH_WEAVER_VERSION",
         "NATIVE_LAUNCH_COMMAND": "[\"C:\\\\path\\\\to\\\\weaver.exe\",\"--config\",\"{{config_dir}}\",\"download\",\"{{nzb_path}}\"]"
@@ -12,8 +13,9 @@
     },
     {
       "client": "sabnzbd",
+      "archive_toolchain": "vanilla",
       "target": "windows-native",
-      "command": ["C:\\Users\\ai\\bench\\bin\\nativeadapter.exe"],
+      "command": ["C:\\bench\\bin\\nativeadapter.exe"],
       "environment": {
         "NATIVE_CLIENT_VERSION": "REPLACE_WITH_SABNZBD_VERSION",
         "NATIVE_API_ENDPOINT": "http://127.0.0.1:18080",
@@ -22,8 +24,9 @@
     },
     {
       "client": "nzbget",
+      "archive_toolchain": "vanilla",
       "target": "windows-native",
-      "command": ["C:\\Users\\ai\\bench\\bin\\nativeadapter.exe"],
+      "command": ["C:\\bench\\bin\\nativeadapter.exe"],
       "environment": {
         "NATIVE_CLIENT_VERSION": "REPLACE_WITH_NZBGET_VERSION",
         "NATIVE_API_ENDPOINT": "http://127.0.0.1:16789",

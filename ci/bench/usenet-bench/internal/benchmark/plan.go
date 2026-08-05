@@ -47,32 +47,44 @@ type ClientProfile struct {
 	TLSResultLabel string        `json:"tls_result_label"`
 }
 
+// ArchiveToolchain identifies the external RAR/PAR2 implementation used by a
+// product lane. It is separate from Client so vanilla and Rarpar-backed runs
+// can never be grouped as though they were the same configuration.
+type ArchiveToolchain string
+
+const (
+	VanillaArchiveToolchain ArchiveToolchain = "vanilla"
+	RarparArchiveToolchain  ArchiveToolchain = "rarpar"
+)
+
 type PlanOptions struct {
-	FixtureIDs     []string
-	Clients        []Client
-	ClientProfiles []ClientProfile
-	Transports     []Transport
-	Targets        []ExecutionTarget
-	Profile        string
-	ServerLink     ServerLinkProfile
-	Repetitions    int
-	Seed           int64
+	FixtureIDs        []string
+	Clients           []Client
+	ClientProfiles    []ClientProfile
+	ArchiveToolchains []ArchiveToolchain
+	Transports        []Transport
+	Targets           []ExecutionTarget
+	Profile           string
+	ServerLink        ServerLinkProfile
+	Repetitions       int
+	Seed              int64
 }
 
 // Plan is deliberately timestamp-free. A saved plan is the authoritative
 // order of every run, so a later reviewer never has to re-create randomness.
 type Plan struct {
-	SchemaVersion    int               `json:"schema_version"`
-	Seed             int64             `json:"seed"`
-	FixtureIDs       []string          `json:"fixture_ids"`
-	Clients          []Client          `json:"clients"`
-	ClientProfiles   []ClientProfile   `json:"client_profiles"`
-	Transports       []Transport       `json:"transports"`
-	ExecutionTargets []ExecutionTarget `json:"execution_targets"`
-	Profile          string            `json:"profile"`
-	ServerLink       ServerLinkProfile `json:"server_link"`
-	Repetitions      int               `json:"repetitions"`
-	Runs             []Run             `json:"runs"`
+	SchemaVersion     int                `json:"schema_version"`
+	Seed              int64              `json:"seed"`
+	FixtureIDs        []string           `json:"fixture_ids"`
+	Clients           []Client           `json:"clients"`
+	ClientProfiles    []ClientProfile    `json:"client_profiles"`
+	ArchiveToolchains []ArchiveToolchain `json:"archive_toolchains"`
+	Transports        []Transport        `json:"transports"`
+	ExecutionTargets  []ExecutionTarget  `json:"execution_targets"`
+	Profile           string             `json:"profile"`
+	ServerLink        ServerLinkProfile  `json:"server_link"`
+	Repetitions       int                `json:"repetitions"`
+	Runs              []Run              `json:"runs"`
 }
 
 // Run is one cold-state client download. Each client gets a new writable
@@ -82,6 +94,7 @@ type Run struct {
 	Order            int               `json:"order"`
 	FixtureID        string            `json:"fixture_id"`
 	Client           Client            `json:"client"`
+	ArchiveToolchain ArchiveToolchain  `json:"archive_toolchain"`
 	Transport        Transport         `json:"transport"`
 	ExecutionTarget  ExecutionTarget   `json:"execution_target"`
 	TLSValidation    TLSValidation     `json:"tls_validation"`
@@ -103,6 +116,9 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 	if len(options.ClientProfiles) == 0 {
 		options.ClientProfiles = DefaultClientProfiles(options.Clients)
 	}
+	if len(options.ArchiveToolchains) == 0 {
+		options.ArchiveToolchains = DefaultArchiveToolchains()
+	}
 	if len(options.Targets) == 0 {
 		options.Targets = DefaultExecutionTargets()
 	}
@@ -110,16 +126,17 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 		return Plan{}, err
 	}
 	plan := Plan{
-		SchemaVersion:    3,
-		Seed:             options.Seed,
-		FixtureIDs:       append([]string(nil), options.FixtureIDs...),
-		Clients:          append([]Client(nil), options.Clients...),
-		ClientProfiles:   append([]ClientProfile(nil), options.ClientProfiles...),
-		Transports:       append([]Transport(nil), options.Transports...),
-		ExecutionTargets: append([]ExecutionTarget(nil), options.Targets...),
-		Profile:          options.Profile,
-		ServerLink:       options.ServerLink,
-		Repetitions:      options.Repetitions,
+		SchemaVersion:     4,
+		Seed:              options.Seed,
+		FixtureIDs:        append([]string(nil), options.FixtureIDs...),
+		Clients:           append([]Client(nil), options.Clients...),
+		ClientProfiles:    append([]ClientProfile(nil), options.ClientProfiles...),
+		ArchiveToolchains: append([]ArchiveToolchain(nil), options.ArchiveToolchains...),
+		Transports:        append([]Transport(nil), options.Transports...),
+		ExecutionTargets:  append([]ExecutionTarget(nil), options.Targets...),
+		Profile:           options.Profile,
+		ServerLink:        options.ServerLink,
+		Repetitions:       options.Repetitions,
 	}
 	type round struct {
 		fixtureID  string
@@ -140,10 +157,10 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 	random := rand.New(rand.NewSource(options.Seed)) // #nosec G404 -- deterministic schedule, not security.
 	random.Shuffle(len(rounds), func(i, j int) { rounds[i], rounds[j] = rounds[j], rounds[i] })
 	for _, benchmarkRound := range rounds {
-		clients := append([]Client(nil), options.Clients...)
-		random.Shuffle(len(clients), func(i, j int) { clients[i], clients[j] = clients[j], clients[i] })
-		for _, client := range clients {
-			profile := clientProfileFor(options.ClientProfiles, client)
+		lanes := benchmarkLanes(options.Clients, options.ArchiveToolchains, benchmarkRound.target)
+		random.Shuffle(len(lanes), func(i, j int) { lanes[i], lanes[j] = lanes[j], lanes[i] })
+		for _, lane := range lanes {
+			profile := clientProfileFor(options.ClientProfiles, lane.client)
 			validation := TLSNotApplicable
 			transportLabel := string(Plaintext)
 			if benchmarkRound.transport == TLS {
@@ -155,7 +172,8 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 				ID:               fmt.Sprintf("run-%04d", order),
 				Order:            order,
 				FixtureID:        benchmarkRound.fixtureID,
-				Client:           client,
+				Client:           lane.client,
+				ArchiveToolchain: lane.archiveToolchain,
 				Transport:        benchmarkRound.transport,
 				ExecutionTarget:  benchmarkRound.target,
 				TLSValidation:    validation,
@@ -175,30 +193,47 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 }
 
 func (p Plan) Validate() error {
-	if p.SchemaVersion != 3 {
+	if p.SchemaVersion != 4 {
 		return fmt.Errorf("unsupported benchmark plan schema version %d", p.SchemaVersion)
 	}
 	if err := validateOptions(PlanOptions{
-		FixtureIDs:     p.FixtureIDs,
-		Clients:        p.Clients,
-		ClientProfiles: p.ClientProfiles,
-		Transports:     p.Transports,
-		Targets:        p.ExecutionTargets,
-		Profile:        p.Profile,
-		ServerLink:     p.ServerLink,
-		Repetitions:    p.Repetitions,
-		Seed:           p.Seed,
+		FixtureIDs:        p.FixtureIDs,
+		Clients:           p.Clients,
+		ClientProfiles:    p.ClientProfiles,
+		ArchiveToolchains: p.ArchiveToolchains,
+		Transports:        p.Transports,
+		Targets:           p.ExecutionTargets,
+		Profile:           p.Profile,
+		ServerLink:        p.ServerLink,
+		Repetitions:       p.Repetitions,
+		Seed:              p.Seed,
 	}); err != nil {
 		return err
 	}
-	expected := len(p.FixtureIDs) * len(p.Clients) * len(p.Transports) * len(p.ExecutionTargets) * p.Repetitions
+	expected := 0
+	for _, target := range p.ExecutionTargets {
+		expected += len(benchmarkLanes(p.Clients, p.ArchiveToolchains, target))
+	}
+	expected *= len(p.FixtureIDs) * len(p.Transports) * p.Repetitions
 	if len(p.Runs) != expected {
 		return fmt.Errorf("benchmark plan contains %d runs, expected %d", len(p.Runs), expected)
 	}
 	seen := map[string]bool{}
 	targets := map[ExecutionTarget]bool{}
+	fixtures := map[string]bool{}
+	clients := map[Client]bool{}
+	transports := map[Transport]bool{}
 	for _, target := range p.ExecutionTargets {
 		targets[target] = true
+	}
+	for _, fixtureID := range p.FixtureIDs {
+		fixtures[fixtureID] = true
+	}
+	for _, client := range p.Clients {
+		clients[client] = true
+	}
+	for _, transport := range p.Transports {
+		transports[transport] = true
 	}
 	for index, run := range p.Runs {
 		if run.Order != index+1 || run.ID != fmt.Sprintf("run-%04d", index+1) {
@@ -210,6 +245,15 @@ func (p Plan) Validate() error {
 		if !targets[run.ExecutionTarget] {
 			return fmt.Errorf("benchmark plan run %s has an unplanned execution target %q", run.ID, run.ExecutionTarget)
 		}
+		if !fixtures[run.FixtureID] || !clients[run.Client] || !transports[run.Transport] {
+			return fmt.Errorf("benchmark plan run %s has a fixture, client, or transport outside the declared plan", run.ID)
+		}
+		if !archiveToolchainAllowed(run.Client, run.ArchiveToolchain, run.ExecutionTarget) {
+			return fmt.Errorf("benchmark plan run %s has unsupported %s toolchain for %s on %s", run.ID, run.ArchiveToolchain, run.Client, run.ExecutionTarget)
+		}
+		if !containsArchiveToolchain(p.ArchiveToolchains, run.ArchiveToolchain) {
+			return fmt.Errorf("benchmark plan run %s uses archive toolchain %q outside the declared plan", run.ID, run.ArchiveToolchain)
+		}
 		profile := clientProfileFor(p.ClientProfiles, run.Client)
 		if run.Transport == Plaintext {
 			if run.TLSValidation != TLSNotApplicable || run.TransportLabel != string(Plaintext) {
@@ -218,7 +262,7 @@ func (p Plan) Validate() error {
 		} else if run.TLSValidation != profile.TLSValidation || run.TransportLabel != profile.TLSResultLabel {
 			return fmt.Errorf("benchmark plan run %s does not report %s TLS policy for %s", run.ID, profile.TLSValidation, run.Client)
 		}
-		key := strings.Join([]string{run.FixtureID, string(run.Transport), string(run.ExecutionTarget), fmt.Sprint(run.Repetition), string(run.Client)}, "\x00")
+		key := strings.Join([]string{run.FixtureID, string(run.Transport), string(run.ExecutionTarget), fmt.Sprint(run.Repetition), string(run.Client), string(run.ArchiveToolchain)}, "\x00")
 		if seen[key] {
 			return fmt.Errorf("benchmark plan repeats run tuple %q", key)
 		}
@@ -263,8 +307,8 @@ func LoadPlan(path string) (Plan, error) {
 }
 
 func validateOptions(options PlanOptions) error {
-	if len(options.FixtureIDs) == 0 || len(options.Clients) == 0 || len(options.Transports) == 0 || len(options.Targets) == 0 || options.Repetitions < 1 {
-		return fmt.Errorf("fixture ids, clients, transports, execution targets, and a positive repetition count are required")
+	if len(options.FixtureIDs) == 0 || len(options.Clients) == 0 || len(options.ArchiveToolchains) == 0 || len(options.Transports) == 0 || len(options.Targets) == 0 || options.Repetitions < 1 {
+		return fmt.Errorf("fixture ids, clients, archive toolchains, transports, execution targets, and a positive repetition count are required")
 	}
 	if options.Profile != ProfileStock && options.Profile != ProfileEquivalentThroughput {
 		return fmt.Errorf("unsupported benchmark profile %q", options.Profile)
@@ -281,6 +325,9 @@ func validateOptions(options PlanOptions) error {
 	if hasDuplicateClients(options.Clients) {
 		return fmt.Errorf("clients must be unique")
 	}
+	if hasDuplicateArchiveToolchains(options.ArchiveToolchains) {
+		return fmt.Errorf("archive toolchains must be unique")
+	}
 	if hasDuplicateTransports(options.Transports) {
 		return fmt.Errorf("transports must be unique")
 	}
@@ -292,12 +339,54 @@ func validateOptions(options PlanOptions) error {
 			return fmt.Errorf("unsupported benchmark client %q", client)
 		}
 	}
+	for _, toolchain := range options.ArchiveToolchains {
+		if toolchain != VanillaArchiveToolchain && toolchain != RarparArchiveToolchain {
+			return fmt.Errorf("unsupported archive toolchain %q", toolchain)
+		}
+	}
+	if !containsArchiveToolchain(options.ArchiveToolchains, VanillaArchiveToolchain) {
+		return fmt.Errorf("the vanilla archive toolchain is required")
+	}
 	for _, transport := range options.Transports {
 		if transport != Plaintext && transport != TLS {
 			return fmt.Errorf("unsupported benchmark transport %q", transport)
 		}
 	}
 	return nil
+}
+
+// DefaultArchiveToolchains preserves stock clients as the baseline and adds
+// Rarpar-backed Docker lanes for the two clients that can be configured
+// without repackaging their native distributions.
+func DefaultArchiveToolchains() []ArchiveToolchain {
+	return []ArchiveToolchain{VanillaArchiveToolchain, RarparArchiveToolchain}
+}
+
+type benchmarkLane struct {
+	client           Client
+	archiveToolchain ArchiveToolchain
+}
+
+func benchmarkLanes(clients []Client, toolchains []ArchiveToolchain, target ExecutionTarget) []benchmarkLane {
+	lanes := make([]benchmarkLane, 0, len(clients)*len(toolchains))
+	for _, client := range clients {
+		for _, toolchain := range toolchains {
+			if archiveToolchainAllowed(client, toolchain, target) {
+				lanes = append(lanes, benchmarkLane{client: client, archiveToolchain: toolchain})
+			}
+		}
+	}
+	return lanes
+}
+
+func archiveToolchainAllowed(client Client, toolchain ArchiveToolchain, target ExecutionTarget) bool {
+	if toolchain == VanillaArchiveToolchain {
+		return true
+	}
+	// Rarpar integration needs a replaceable tool invocation. The stock native
+	// SABnzbd and NZBGet distributions embed or bundle parts of that toolchain,
+	// so scheduling them as Rarpar-backed would misrepresent what ran.
+	return toolchain == RarparArchiveToolchain && target == DockerLinux && (client == SABnzbd || client == NZBGet)
 }
 
 // DefaultClientProfiles encodes the current isolated-lab policy. SABnzbd's
@@ -384,6 +473,26 @@ func hasDuplicateTransports(values []Transport) bool {
 			return true
 		}
 		seen[value] = true
+	}
+	return false
+}
+
+func hasDuplicateArchiveToolchains(values []ArchiveToolchain) bool {
+	seen := map[ArchiveToolchain]bool{}
+	for _, value := range values {
+		if seen[value] {
+			return true
+		}
+		seen[value] = true
+	}
+	return false
+}
+
+func containsArchiveToolchain(values []ArchiveToolchain, target ArchiveToolchain) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
 	}
 	return false
 }

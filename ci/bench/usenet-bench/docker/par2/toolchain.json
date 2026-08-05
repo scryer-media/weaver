@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "id": "par2cmdline-0.8.1",
+  "image": "weaver-nntp-bench-par2:0.8.1",
+  "platform": "linux/amd64",
+  "url": "https://github.com/Parchive/par2cmdline/archive/refs/tags/v0.8.1.tar.gz",
+  "sha256": "529f85857ec44e501cd8d95b0c8caf47477d7daa5bfb989e422c800bb71b689a"
+}

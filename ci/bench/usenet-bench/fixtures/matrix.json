@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "A declared matrix for multi-volume RAR fixtures. It covers source-locked RARLAB 3.x through 7.x writer eras, the distinct legacy RAR3/RAR4 and modern RAR5 format families, and explicit bluray-disc topologies without claiming a population distribution.",
+  "description": "A declared matrix for multi-volume RAR fixtures. It covers source-locked RARLAB 3.x through 7.x writer eras, the distinct legacy RAR3/RAR4 and modern RAR5 format families, explicit bluray-disc topologies, and bounded PAR2/RAR-recovery corruption profiles without claiming a population distribution.",
   "sets": [
     {
       "id": "legacy-rar3",
@@ -120,6 +120,58 @@
       "encryptions": ["none", "data", "headers"],
       "payloads": ["incompressible"],
       "payload_layout": "bluray-disc",
+      "volume_size": "32m"
+    },
+    {
+      "id": "repair-rar3",
+      "writer_era": "RAR 3.93",
+      "generator_toolchain": "rarlab-3.93",
+      "rar_format": "rar3",
+      "compressions": ["normal"],
+      "solid": [false],
+      "encryptions": ["none"],
+      "payloads": ["incompressible"],
+      "repair_profiles": ["par2-light", "par2-heavy", "rar-recovery-volume-light", "rar-recovery-volume-heavy"],
+      "file_count": 4,
+      "volume_size": "32m"
+    },
+    {
+      "id": "repair-rar4",
+      "writer_era": "RAR 4.20",
+      "generator_toolchain": "rarlab-4.20",
+      "rar_format": "rar4",
+      "compressions": ["normal"],
+      "solid": [true],
+      "encryptions": ["data"],
+      "payloads": ["incompressible"],
+      "repair_profiles": ["par2-light", "par2-heavy", "rar-recovery-volume-light", "rar-recovery-volume-heavy"],
+      "file_count": 4,
+      "volume_size": "32m"
+    },
+    {
+      "id": "repair-rar5",
+      "writer_era": "RAR 7.23",
+      "generator_toolchain": "rarlab-7.23",
+      "rar_format": "rar5",
+      "compressions": ["normal"],
+      "solid": [true],
+      "encryptions": ["headers"],
+      "payloads": ["incompressible"],
+      "repair_profiles": ["par2-light", "par2-heavy", "rar-recovery-volume-light", "rar-recovery-volume-heavy"],
+      "file_count": 4,
+      "volume_size": "32m"
+    },
+    {
+      "id": "repair-rar5-bluray",
+      "writer_era": "RAR 7.23",
+      "generator_toolchain": "rarlab-7.23",
+      "rar_format": "rar5",
+      "compressions": ["normal"],
+      "solid": [true],
+      "encryptions": ["none"],
+      "payloads": ["incompressible"],
+      "payload_layout": "bluray-disc",
+      "repair_profiles": ["par2-heavy", "rar-recovery-volume-heavy"],
       "volume_size": "32m"
     }
   ]

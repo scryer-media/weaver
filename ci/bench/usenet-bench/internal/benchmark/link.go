@@ -36,15 +36,17 @@ func ResolveServerLinkProfile(id string, egressBitsPerSecond, burstBytes uint64)
 		}
 		return DefaultServerLinkProfile(), nil
 	case Link1Gbit:
-		if egressBitsPerSecond != 0 || burstBytes != 0 {
+		profile := ServerLinkProfile{ID: Link1Gbit, Scope: serverAggregateEgressScope, EgressBitsPerSecond: 1_000_000_000, BurstBytes: 1 << 20}
+		if (egressBitsPerSecond != 0 || burstBytes != 0) && (egressBitsPerSecond != profile.EgressBitsPerSecond || burstBytes != profile.BurstBytes) {
 			return ServerLinkProfile{}, fmt.Errorf("1gbit link profile has fixed rate and burst; use custom to override")
 		}
-		return ServerLinkProfile{ID: Link1Gbit, Scope: serverAggregateEgressScope, EgressBitsPerSecond: 1_000_000_000, BurstBytes: 1 << 20}, nil
+		return profile, nil
 	case Link10Gbit:
-		if egressBitsPerSecond != 0 || burstBytes != 0 {
+		profile := ServerLinkProfile{ID: Link10Gbit, Scope: serverAggregateEgressScope, EgressBitsPerSecond: 10_000_000_000, BurstBytes: 1 << 20}
+		if (egressBitsPerSecond != 0 || burstBytes != 0) && (egressBitsPerSecond != profile.EgressBitsPerSecond || burstBytes != profile.BurstBytes) {
 			return ServerLinkProfile{}, fmt.Errorf("10gbit link profile has fixed rate and burst; use custom to override")
 		}
-		return ServerLinkProfile{ID: Link10Gbit, Scope: serverAggregateEgressScope, EgressBitsPerSecond: 10_000_000_000, BurstBytes: 1 << 20}, nil
+		return profile, nil
 	case LinkCustom:
 		if egressBitsPerSecond == 0 || burstBytes == 0 {
 			return ServerLinkProfile{}, fmt.Errorf("custom link profile requires positive egress bits per second and burst bytes")

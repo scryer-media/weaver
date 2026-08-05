@@ -26,33 +26,34 @@ const (
 )
 
 type Config struct {
-	RunID           string
-	Client          benchmark.Client
-	ExecutionTarget benchmark.ExecutionTarget
-	Transport       benchmark.Transport
-	TransportLabel  string
-	TLSValidation   benchmark.TLSValidation
-	ServerLink      benchmark.ServerLinkProfile
-	FixtureDir      string
-	NZBPath         string
-	OutputDir       string
-	ConfigDir       string
-	ResultPath      string
-	NNTPHost        string
-	NNTPPort        string
-	NNTPUsername    string
-	NNTPPassword    string
-	NNTPUseTLS      bool
-	NNTPCAFile      string
-	ArchivePassword string
-	Connections     int
-	Profile         string
-	LaunchCommand   []string
-	APIEndpoint     string
-	ClientVersion   string
-	WorkingDir      string
-	StartupTimeout  time.Duration
-	PollInterval    time.Duration
+	RunID            string
+	Client           benchmark.Client
+	ArchiveToolchain benchmark.ArchiveToolchain
+	ExecutionTarget  benchmark.ExecutionTarget
+	Transport        benchmark.Transport
+	TransportLabel   string
+	TLSValidation    benchmark.TLSValidation
+	ServerLink       benchmark.ServerLinkProfile
+	FixtureDir       string
+	NZBPath          string
+	OutputDir        string
+	ConfigDir        string
+	ResultPath       string
+	NNTPHost         string
+	NNTPPort         string
+	NNTPUsername     string
+	NNTPPassword     string
+	NNTPUseTLS       bool
+	NNTPCAFile       string
+	ArchivePassword  string
+	Connections      int
+	Profile          string
+	LaunchCommand    []string
+	APIEndpoint      string
+	ClientVersion    string
+	WorkingDir       string
+	StartupTimeout   time.Duration
+	PollInterval     time.Duration
 }
 
 func LoadConfigFromEnvironment() (Config, error) {
@@ -96,33 +97,34 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		return Config{}, fmt.Errorf("decode NATIVE_LAUNCH_COMMAND JSON array: %w", err)
 	}
 	cfg := Config{
-		RunID:           required(getenv, "BENCH_RUN_ID"),
-		Client:          benchmark.Client(required(getenv, "BENCH_CLIENT")),
-		ExecutionTarget: benchmark.ExecutionTarget(required(getenv, "BENCH_EXECUTION_TARGET")),
-		Transport:       benchmark.Transport(required(getenv, "BENCH_TRANSPORT")),
-		TransportLabel:  required(getenv, "BENCH_TRANSPORT_LABEL"),
-		TLSValidation:   benchmark.TLSValidation(required(getenv, "BENCH_TLS_VALIDATION")),
-		ServerLink:      link,
-		FixtureDir:      required(getenv, "BENCH_FIXTURE_DIR"),
-		NZBPath:         required(getenv, "BENCH_NZB_PATH"),
-		OutputDir:       required(getenv, "BENCH_OUTPUT_DIR"),
-		ConfigDir:       required(getenv, "BENCH_CONFIG_DIR"),
-		ResultPath:      required(getenv, "BENCH_RESULT_PATH"),
-		NNTPHost:        required(getenv, "BENCH_NNTP_HOST"),
-		NNTPPort:        required(getenv, "BENCH_NNTP_PORT"),
-		NNTPUsername:    required(getenv, "BENCH_NNTP_USERNAME"),
-		NNTPPassword:    getenv("BENCH_NNTP_PASSWORD"),
-		NNTPUseTLS:      nntpTLS,
-		NNTPCAFile:      getenv("BENCH_NNTP_CA_FILE"),
-		ArchivePassword: getenv("BENCH_ARCHIVE_PASSWORD"),
-		Connections:     connections,
-		Profile:         required(getenv, "BENCH_PROFILE"),
-		LaunchCommand:   launchCommand,
-		APIEndpoint:     required(getenv, "NATIVE_API_ENDPOINT"),
-		ClientVersion:   required(getenv, "NATIVE_CLIENT_VERSION"),
-		WorkingDir:      strings.TrimSpace(getenv("NATIVE_WORKING_DIR")),
-		StartupTimeout:  startupTimeout,
-		PollInterval:    pollInterval,
+		RunID:            required(getenv, "BENCH_RUN_ID"),
+		Client:           benchmark.Client(required(getenv, "BENCH_CLIENT")),
+		ArchiveToolchain: benchmark.ArchiveToolchain(required(getenv, "BENCH_ARCHIVE_TOOLCHAIN")),
+		ExecutionTarget:  benchmark.ExecutionTarget(required(getenv, "BENCH_EXECUTION_TARGET")),
+		Transport:        benchmark.Transport(required(getenv, "BENCH_TRANSPORT")),
+		TransportLabel:   required(getenv, "BENCH_TRANSPORT_LABEL"),
+		TLSValidation:    benchmark.TLSValidation(required(getenv, "BENCH_TLS_VALIDATION")),
+		ServerLink:       link,
+		FixtureDir:       required(getenv, "BENCH_FIXTURE_DIR"),
+		NZBPath:          required(getenv, "BENCH_NZB_PATH"),
+		OutputDir:        required(getenv, "BENCH_OUTPUT_DIR"),
+		ConfigDir:        required(getenv, "BENCH_CONFIG_DIR"),
+		ResultPath:       required(getenv, "BENCH_RESULT_PATH"),
+		NNTPHost:         required(getenv, "BENCH_NNTP_HOST"),
+		NNTPPort:         required(getenv, "BENCH_NNTP_PORT"),
+		NNTPUsername:     required(getenv, "BENCH_NNTP_USERNAME"),
+		NNTPPassword:     getenv("BENCH_NNTP_PASSWORD"),
+		NNTPUseTLS:       nntpTLS,
+		NNTPCAFile:       getenv("BENCH_NNTP_CA_FILE"),
+		ArchivePassword:  getenv("BENCH_ARCHIVE_PASSWORD"),
+		Connections:      connections,
+		Profile:          required(getenv, "BENCH_PROFILE"),
+		LaunchCommand:    launchCommand,
+		APIEndpoint:      required(getenv, "NATIVE_API_ENDPOINT"),
+		ClientVersion:    required(getenv, "NATIVE_CLIENT_VERSION"),
+		WorkingDir:       strings.TrimSpace(getenv("NATIVE_WORKING_DIR")),
+		StartupTimeout:   startupTimeout,
+		PollInterval:     pollInterval,
 	}
 	if cfg.Client == benchmark.Weaver {
 		// The one-shot CLI needs no local HTTP port or API identity.
@@ -155,6 +157,9 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 func (c Config) Validate() error {
 	if c.Client != benchmark.Weaver && c.Client != benchmark.SABnzbd && c.Client != benchmark.NZBGet {
 		return fmt.Errorf("unsupported client %q", c.Client)
+	}
+	if c.ArchiveToolchain != benchmark.VanillaArchiveToolchain {
+		return fmt.Errorf("native adapter only supports the vanilla archive toolchain, got %q", c.ArchiveToolchain)
 	}
 	if c.ExecutionTarget != benchmark.MacOSNative && c.ExecutionTarget != benchmark.WindowsNative {
 		return fmt.Errorf("nativeadapter requires macOS-native or Windows-native execution target, got %q", c.ExecutionTarget)

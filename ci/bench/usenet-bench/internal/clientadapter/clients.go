@@ -237,12 +237,16 @@ func (api *nzbgetAPI) waitComplete(ctx context.Context, nzbID string, interval t
 			if nzbgetHistoryFailed(record, status) {
 				return false, fmt.Errorf("NZBGet history status %q", fieldString(record, "Status"))
 			}
-			if status == "SUCCESS" || status == "COMPLETED" || status == "COMPLETE" {
+			if nzbgetHistoryComplete(status) {
 				return true, nil
 			}
 		}
 		return false, nil
 	})
+}
+
+func nzbgetHistoryComplete(status string) bool {
+	return strings.HasPrefix(status, "SUCCESS") || status == "COMPLETED" || status == "COMPLETE"
 }
 
 func (api *nzbgetAPI) rpc(ctx context.Context, method string, params any, target *json.RawMessage) error {

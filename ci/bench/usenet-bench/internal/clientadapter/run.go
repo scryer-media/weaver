@@ -12,12 +12,18 @@ import (
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
 )
 
-// Run starts one clean client container, queues exactly one NZB, and writes an
-// immutable adapter result only after that client reports terminal success.
-// The neutral runner still independently verifies all output hashes.
+// Run starts one clean client container and executes either a single cold NZB
+// or one uninterrupted queue suite. The neutral runner independently verifies
+// all output hashes in both modes.
 func Run(ctx context.Context, cfg Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
+	}
+	if err := prepareRarparToolchain(cfg); err != nil {
+		return err
+	}
+	if cfg.QueueInput != nil {
+		return runQueue(ctx, cfg)
 	}
 	spec, err := cfg.RenderProductConfig()
 	if err != nil {
@@ -95,32 +101,35 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}
 	result := benchmark.AdapterResult{
-		SchemaVersion:        3,
-		RunID:                cfg.RunID,
-		Client:               cfg.Client,
-		ExecutionTarget:      cfg.ExecutionTarget,
-		Transport:            cfg.Transport,
-		TLSValidation:        cfg.TLSValidation,
-		TransportLabel:       cfg.TransportLabel,
-		ServerLink:           cfg.ServerLink,
-		QueuedAt:             queuedAt,
-		CompletionAt:         completionAt,
-		ClientIdentity:       cfg.Image,
-		ClientVersion:        clientVersion,
-		RenderedConfigSHA256: spec.ConfigSHA256,
+		SchemaVersion:            4,
+		RunID:                    cfg.RunID,
+		Client:                   cfg.Client,
+		ArchiveToolchain:         cfg.ArchiveToolchain,
+		ArchiveToolchainIdentity: cfg.archiveToolchainIdentity(),
+		ExecutionTarget:          cfg.ExecutionTarget,
+		Transport:                cfg.Transport,
+		TLSValidation:            cfg.TLSValidation,
+		TransportLabel:           cfg.TransportLabel,
+		ServerLink:               cfg.ServerLink,
+		QueuedAt:                 queuedAt,
+		CompletionAt:             completionAt,
+		ClientIdentity:           cfg.Image,
+		ClientVersion:            clientVersion,
+		RenderedConfigSHA256:     spec.ConfigSHA256,
 		ResourceMetrics: benchmark.ResourceMetrics{
 			CPUTimeNanoseconds:  cpuMeasurement,
 			InstructionsRetired: instructionMeasurement,
 		},
 	}
 	if err := result.ValidateFor(benchmark.Run{
-		ID:              cfg.RunID,
-		Client:          cfg.Client,
-		ExecutionTarget: cfg.ExecutionTarget,
-		Transport:       cfg.Transport,
-		TLSValidation:   cfg.TLSValidation,
-		TransportLabel:  cfg.TransportLabel,
-		ServerLink:      cfg.ServerLink,
+		ID:               cfg.RunID,
+		Client:           cfg.Client,
+		ArchiveToolchain: cfg.ArchiveToolchain,
+		ExecutionTarget:  cfg.ExecutionTarget,
+		Transport:        cfg.Transport,
+		TLSValidation:    cfg.TLSValidation,
+		TransportLabel:   cfg.TransportLabel,
+		ServerLink:       cfg.ServerLink,
 	}); err != nil {
 		return fmt.Errorf("validate adapter result: %w", err)
 	}
@@ -218,6 +227,22 @@ func writeProductFiles(cfg Config, spec ProductSpec) error {
 	if err := writeNewFile(filepath.Join(cfg.ConfigDir, "rendered-config.txt"), spec.Rendered); err != nil {
 		return fmt.Errorf("write rendered client configuration: %w", err)
 	}
+	for _, extra := range spec.ExtraFiles {
+		if filepath.IsAbs(extra.RelativePath) {
+			return fmt.Errorf("client extra file must be relative: %q", extra.RelativePath)
+		}
+		path := filepath.Join(cfg.ConfigDir, extra.RelativePath)
+		relative, err := filepath.Rel(cfg.ConfigDir, path)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("client extra file escapes config directory: %q", extra.RelativePath)
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return fmt.Errorf("create client extra file directory: %w", err)
+		}
+		if err := writeNewFileMode(path, extra.Content, extra.Mode); err != nil {
+			return fmt.Errorf("write client extra file %s: %w", extra.RelativePath, err)
+		}
+	}
 	return nil
 }
 
@@ -234,10 +259,14 @@ func writeResult(path string, result benchmark.AdapterResult) error {
 }
 
 func writeNewFile(path string, contents []byte) error {
+	return writeNewFileMode(path, contents, 0o644)
+}
+
+func writeNewFileMode(path string, contents []byte, mode os.FileMode) error {
 	// LinuxServer images commonly run clients as a non-root UID. The benchmark
 	// network credentials are intentionally limited to the ephemeral lab, and
 	// the rendered configuration must be readable by that client UID.
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return err
 	}
@@ -256,6 +285,36 @@ func waitUntilReady(ctx context.Context, interval time.Duration, api productAPI)
 			return version, nil
 		}
 		lastErr = err
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return "", fmt.Errorf("%w (last readiness error: %v)", ctx.Err(), lastErr)
+		case <-timer.C:
+		}
+	}
+}
+
+func waitUntilContainerReady(ctx context.Context, interval time.Duration, api productAPI, container *runningContainer) (string, error) {
+	var lastErr error
+	for {
+		version, err := api.waitReady(ctx)
+		if err == nil {
+			return version, nil
+		}
+		lastErr = err
+		running, stateErr := container.docker.containerRunning(ctx, container.name)
+		if stateErr != nil {
+			return "", fmt.Errorf("inspect %s client during readiness: %w", container.name, stateErr)
+		}
+		if !running {
+			return "", fmt.Errorf("%s client container exited before readiness: %w", container.name, lastErr)
+		}
 		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():

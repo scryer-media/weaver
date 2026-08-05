@@ -24,31 +24,34 @@ type AdapterCatalog struct {
 }
 
 type Adapter struct {
-	Client      Client            `json:"client"`
-	Target      ExecutionTarget   `json:"target"`
-	Command     []string          `json:"command"`
-	Environment map[string]string `json:"environment,omitempty"`
+	Client           Client            `json:"client"`
+	ArchiveToolchain ArchiveToolchain  `json:"archive_toolchain"`
+	Target           ExecutionTarget   `json:"target"`
+	Command          []string          `json:"command"`
+	Environment      map[string]string `json:"environment,omitempty"`
 }
 
 // AdapterResult is emitted by an adapter at BENCH_RESULT_PATH after it has
 // observed client completion. The generic runner independently verifies the
 // output before accepting CompletionAt as usable-output time.
 type AdapterResult struct {
-	SchemaVersion        int               `json:"schema_version"`
-	RunID                string            `json:"run_id"`
-	Client               Client            `json:"client"`
-	ExecutionTarget      ExecutionTarget   `json:"execution_target"`
-	Transport            Transport         `json:"transport"`
-	TLSValidation        TLSValidation     `json:"tls_validation"`
-	TransportLabel       string            `json:"transport_label"`
-	ServerLink           ServerLinkProfile `json:"server_link"`
-	QueuedAt             time.Time         `json:"queued_at"`
-	FirstArticleAt       *time.Time        `json:"first_article_at,omitempty"`
-	CompletionAt         time.Time         `json:"completion_at"`
-	ClientIdentity       string            `json:"client_identity"`
-	ClientVersion        string            `json:"client_version"`
-	RenderedConfigSHA256 string            `json:"rendered_config_sha256"`
-	ResourceMetrics      ResourceMetrics   `json:"resource_metrics"`
+	SchemaVersion            int               `json:"schema_version"`
+	RunID                    string            `json:"run_id"`
+	Client                   Client            `json:"client"`
+	ArchiveToolchain         ArchiveToolchain  `json:"archive_toolchain"`
+	ArchiveToolchainIdentity string            `json:"archive_toolchain_identity"`
+	ExecutionTarget          ExecutionTarget   `json:"execution_target"`
+	Transport                Transport         `json:"transport"`
+	TLSValidation            TLSValidation     `json:"tls_validation"`
+	TransportLabel           string            `json:"transport_label"`
+	ServerLink               ServerLinkProfile `json:"server_link"`
+	QueuedAt                 time.Time         `json:"queued_at"`
+	FirstArticleAt           *time.Time        `json:"first_article_at,omitempty"`
+	CompletionAt             time.Time         `json:"completion_at"`
+	ClientIdentity           string            `json:"client_identity"`
+	ClientVersion            string            `json:"client_version"`
+	RenderedConfigSHA256     string            `json:"rendered_config_sha256"`
+	ResourceMetrics          ResourceMetrics   `json:"resource_metrics"`
 }
 
 type RunConfig struct {
@@ -69,14 +72,15 @@ type RunConfig struct {
 }
 
 type RunArtifact struct {
-	SchemaVersion        int                 `json:"schema_version"`
-	Run                  Run                 `json:"run"`
-	Status               string              `json:"status"`
-	AdapterResult        *AdapterResult      `json:"adapter_result,omitempty"`
-	Verification         *OutputVerification `json:"verification,omitempty"`
-	UsableOutputAt       *time.Time          `json:"usable_output_at,omitempty"`
-	WallClockNanoseconds int64               `json:"wall_clock_nanoseconds,omitempty"`
-	Error                string              `json:"error,omitempty"`
+	SchemaVersion        int                   `json:"schema_version"`
+	Run                  Run                   `json:"run"`
+	Repair               fixture.RepairDetails `json:"repair"`
+	Status               string                `json:"status"`
+	AdapterResult        *AdapterResult        `json:"adapter_result,omitempty"`
+	Verification         *OutputVerification   `json:"verification,omitempty"`
+	UsableOutputAt       *time.Time            `json:"usable_output_at,omitempty"`
+	WallClockNanoseconds int64                 `json:"wall_clock_nanoseconds,omitempty"`
+	Error                string                `json:"error,omitempty"`
 }
 
 func LoadAdapterCatalog(path string) (AdapterCatalog, error) {
@@ -95,7 +99,7 @@ func LoadAdapterCatalog(path string) (AdapterCatalog, error) {
 }
 
 func (c AdapterCatalog) Validate() error {
-	if c.SchemaVersion != 2 || len(c.Adapters) == 0 {
+	if c.SchemaVersion != 3 || len(c.Adapters) == 0 {
 		return fmt.Errorf("adapter catalog is empty or has unsupported schema")
 	}
 	seen := map[string]bool{}
@@ -106,9 +110,12 @@ func (c AdapterCatalog) Validate() error {
 		if _, err := DescribeExecutionTarget(adapter.Target); err != nil {
 			return fmt.Errorf("adapter %q: %w", adapter.Client, err)
 		}
-		key := string(adapter.Client) + "\x00" + string(adapter.Target)
+		if !archiveToolchainAllowed(adapter.Client, adapter.ArchiveToolchain, adapter.Target) {
+			return fmt.Errorf("adapter %q has unsupported %s archive toolchain on target %q", adapter.Client, adapter.ArchiveToolchain, adapter.Target)
+		}
+		key := string(adapter.Client) + "\x00" + string(adapter.ArchiveToolchain) + "\x00" + string(adapter.Target)
 		if seen[key] {
-			return fmt.Errorf("adapter catalog repeats client %q for target %q", adapter.Client, adapter.Target)
+			return fmt.Errorf("adapter catalog repeats %s/%s for target %q", adapter.Client, adapter.ArchiveToolchain, adapter.Target)
 		}
 		seen[key] = true
 		if len(adapter.Command) == 0 || strings.TrimSpace(adapter.Command[0]) == "" {
@@ -131,16 +138,16 @@ func (c AdapterCatalog) ValidateFor(plan Plan, target ExecutionTarget) error {
 		if run.ExecutionTarget != target {
 			continue
 		}
-		if _, ok := c.For(run.Client, run.ExecutionTarget); !ok {
-			return fmt.Errorf("adapter catalog has no adapter for planned client %q on target %q", run.Client, run.ExecutionTarget)
+		if _, ok := c.For(run.Client, run.ArchiveToolchain, run.ExecutionTarget); !ok {
+			return fmt.Errorf("adapter catalog has no adapter for planned %s/%s on target %q", run.Client, run.ArchiveToolchain, run.ExecutionTarget)
 		}
 	}
 	return nil
 }
 
-func (c AdapterCatalog) For(client Client, target ExecutionTarget) (Adapter, bool) {
+func (c AdapterCatalog) For(client Client, toolchain ArchiveToolchain, target ExecutionTarget) (Adapter, bool) {
 	for _, adapter := range c.Adapters {
-		if adapter.Client == client && adapter.Target == target {
+		if adapter.Client == client && adapter.ArchiveToolchain == toolchain && adapter.Target == target {
 			return adapter, true
 		}
 	}
@@ -246,7 +253,7 @@ func planNeedsVerifiedTLS(plan Plan) bool {
 }
 
 func executeRun(parent context.Context, config RunConfig, run Run) RunArtifact {
-	artifact := RunArtifact{SchemaVersion: 3, Run: run, Status: "failed"}
+	artifact := RunArtifact{SchemaVersion: 5, Run: run, Status: "failed"}
 	runDir := filepath.Join(config.ArtifactRoot, run.ID)
 	if err := os.Mkdir(runDir, 0o755); err != nil {
 		artifact.Error = fmt.Sprintf("create isolated run directory: %v", err)
@@ -264,6 +271,12 @@ func executeRun(parent context.Context, config RunConfig, run Run) RunArtifact {
 		return artifact
 	}
 	fixtureDir := filepath.Join(config.FixtureRoot, run.FixtureID)
+	manifest, err := fixture.LoadGeneratedManifest(filepath.Join(fixtureDir, "fixture-manifest.json"))
+	if err != nil {
+		artifact.Error = err.Error()
+		return artifact
+	}
+	artifact.Repair = manifest.Repair
 	nzbPath, err := fixtureNZBPath(fixtureDir, run.FixtureID)
 	if err != nil {
 		artifact.Error = err.Error()
@@ -274,7 +287,7 @@ func executeRun(parent context.Context, config RunConfig, run Run) RunArtifact {
 		artifact.Error = err.Error()
 		return artifact
 	}
-	adapter, _ := config.Catalog.For(run.Client, run.ExecutionTarget)
+	adapter, _ := config.Catalog.For(run.Client, run.ArchiveToolchain, run.ExecutionTarget)
 	resultPath := filepath.Join(runDir, "adapter-result.json")
 	logPath := filepath.Join(runDir, "adapter.log")
 	if err := invokeAdapter(parent, config, run, adapter, fixtureDir, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath); err != nil {
@@ -305,6 +318,14 @@ func executeRun(parent context.Context, config RunConfig, run Run) RunArtifact {
 }
 
 func invokeAdapter(parent context.Context, config RunConfig, run Run, adapter Adapter, fixtureDir, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath string) error {
+	return invokeAdapterWithExtraEnvironment(parent, config, run, adapter, fixtureDir, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath, nil)
+}
+
+func invokeQueueAdapter(parent context.Context, config RunConfig, run Run, adapter Adapter, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath, queuePath string) error {
+	return invokeAdapterWithExtraEnvironment(parent, config, run, adapter, filepath.Dir(nzbPath), nzbPath, archivePassword, outputDir, configDir, resultPath, logPath, []string{"BENCH_QUEUE_PATH=" + queuePath})
+}
+
+func invokeAdapterWithExtraEnvironment(parent context.Context, config RunConfig, run Run, adapter Adapter, fixtureDir, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath string, extraEnvironment []string) error {
 	ctx, cancel := context.WithTimeout(parent, config.Timeout)
 	defer cancel()
 	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
@@ -321,14 +342,15 @@ func invokeAdapter(parent context.Context, config RunConfig, run Run, adapter Ad
 	command.Stdout = logFile
 	command.Stderr = logFile
 	command.Env = append(os.Environ(), adapterEnvironment(config, run, fixtureDir, nzbPath, archivePassword, outputDir, configDir, resultPath, port)...)
+	command.Env = append(command.Env, extraEnvironment...)
 	for key, value := range adapter.Environment {
 		command.Env = append(command.Env, key+"="+value)
 	}
 	if err := command.Run(); err != nil {
 		if ctx.Err() != nil {
-			return fmt.Errorf("adapter %s exceeded %s (see %s)", run.Client, config.Timeout, logPath)
+			return fmt.Errorf("adapter %s/%s exceeded %s (see %s)", run.Client, run.ArchiveToolchain, config.Timeout, logPath)
 		}
-		return fmt.Errorf("adapter %s failed: %w (see %s)", run.Client, err, logPath)
+		return fmt.Errorf("adapter %s/%s failed: %w (see %s)", run.Client, run.ArchiveToolchain, err, logPath)
 	}
 	return nil
 }
@@ -337,6 +359,7 @@ func adapterEnvironment(config RunConfig, run Run, fixtureDir, nzbPath, archiveP
 	return []string{
 		"BENCH_RUN_ID=" + run.ID,
 		"BENCH_CLIENT=" + string(run.Client),
+		"BENCH_ARCHIVE_TOOLCHAIN=" + string(run.ArchiveToolchain),
 		"BENCH_EXECUTION_TARGET=" + string(run.ExecutionTarget),
 		"BENCH_TRANSPORT=" + string(run.Transport),
 		"BENCH_TRANSPORT_LABEL=" + run.TransportLabel,
@@ -397,7 +420,7 @@ func loadAdapterResult(path string) (AdapterResult, error) {
 }
 
 func (r AdapterResult) ValidateFor(run Run) error {
-	if r.SchemaVersion != 3 || r.RunID != run.ID || r.Client != run.Client || r.ExecutionTarget != run.ExecutionTarget || r.Transport != run.Transport || r.TLSValidation != run.TLSValidation || r.TransportLabel != run.TransportLabel || r.ServerLink != run.ServerLink {
+	if r.SchemaVersion != 4 || r.RunID != run.ID || r.Client != run.Client || r.ArchiveToolchain != run.ArchiveToolchain || r.ExecutionTarget != run.ExecutionTarget || r.Transport != run.Transport || r.TLSValidation != run.TLSValidation || r.TransportLabel != run.TransportLabel || r.ServerLink != run.ServerLink {
 		return fmt.Errorf("adapter result does not match planned run %s", run.ID)
 	}
 	if r.QueuedAt.IsZero() || r.CompletionAt.IsZero() || r.CompletionAt.Before(r.QueuedAt) {
@@ -406,8 +429,8 @@ func (r AdapterResult) ValidateFor(run Run) error {
 	if r.FirstArticleAt != nil && (r.FirstArticleAt.Before(r.QueuedAt) || r.FirstArticleAt.After(r.CompletionAt)) {
 		return fmt.Errorf("adapter result for %s has invalid first article timing", run.ID)
 	}
-	if strings.TrimSpace(r.ClientIdentity) == "" || strings.TrimSpace(r.ClientVersion) == "" || len(r.RenderedConfigSHA256) != 64 {
-		return fmt.Errorf("adapter result for %s lacks client identity, version, or config SHA-256", run.ID)
+	if strings.TrimSpace(r.ClientIdentity) == "" || strings.TrimSpace(r.ClientVersion) == "" || strings.TrimSpace(r.ArchiveToolchainIdentity) == "" || len(r.RenderedConfigSHA256) != 64 {
+		return fmt.Errorf("adapter result for %s lacks client identity, version, archive toolchain provenance, or config SHA-256", run.ID)
 	}
 	return r.ResourceMetrics.Validate()
 }
@@ -424,6 +447,11 @@ func writeArtifact(path string, artifact RunArtifact) error {
 // SortedAdapters is useful for deterministic diagnostic output in adapters.
 func (c AdapterCatalog) SortedAdapters() []Adapter {
 	adapters := append([]Adapter(nil), c.Adapters...)
-	sort.Slice(adapters, func(i, j int) bool { return adapters[i].Client < adapters[j].Client })
+	sort.Slice(adapters, func(i, j int) bool {
+		if adapters[i].Client != adapters[j].Client {
+			return adapters[i].Client < adapters[j].Client
+		}
+		return adapters[i].ArchiveToolchain < adapters[j].ArchiveToolchain
+	})
 	return adapters
 }

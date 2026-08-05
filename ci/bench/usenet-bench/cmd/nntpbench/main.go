@@ -39,6 +39,8 @@ func main() {
 		err = imageBuild(os.Args[3:])
 	case "run":
 		err = run(os.Args[2:])
+	case "queue":
+		err = queue(os.Args[2:])
 	case "preflight":
 		err = preflight(os.Args[2:])
 	case "verify-output":
@@ -105,12 +107,13 @@ func seed(args []string) error {
 func plan(args []string) error {
 	flags := flag.NewFlagSet("plan", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	var fixturesCSV, clientsCSV, transportsCSV, targetsCSV, output, profile, serverLink string
+	var fixturesCSV, clientsCSV, archiveToolchainsCSV, transportsCSV, targetsCSV, output, profile, serverLink string
 	var repetitions int
 	var seed int64
 	var serverEgressBPS, serverBurstBytes uint64
 	flags.StringVar(&fixturesCSV, "fixtures", "", "comma-separated generated fixture ids")
 	flags.StringVar(&clientsCSV, "clients", "weaver,sabnzbd,nzbget", "comma-separated clients")
+	flags.StringVar(&archiveToolchainsCSV, "archive-toolchains", "vanilla,rarpar", "comma-separated archive toolchains: vanilla, rarpar")
 	flags.StringVar(&transportsCSV, "transports", "plaintext,tls", "comma-separated transports")
 	flags.StringVar(&targetsCSV, "targets", "docker-linux,macos-native,windows-native", "comma-separated execution targets: docker-linux, macos-native, windows-native")
 	flags.StringVar(&profile, "profile", benchmark.ProfileEquivalentThroughput, "declared client configuration profile")
@@ -130,6 +133,10 @@ func plan(args []string) error {
 	if err != nil {
 		return err
 	}
+	archiveToolchains, err := parseArchiveToolchains(archiveToolchainsCSV)
+	if err != nil {
+		return err
+	}
 	transports, err := parseTransports(transportsCSV)
 	if err != nil {
 		return err
@@ -143,14 +150,15 @@ func plan(args []string) error {
 		return err
 	}
 	benchmarkPlan, err := benchmark.BuildPlan(benchmark.PlanOptions{
-		FixtureIDs:  splitCSV(fixturesCSV),
-		Clients:     clients,
-		Transports:  transports,
-		Targets:     targets,
-		Profile:     profile,
-		ServerLink:  link,
-		Repetitions: repetitions,
-		Seed:        seed,
+		FixtureIDs:        splitCSV(fixturesCSV),
+		Clients:           clients,
+		ArchiveToolchains: archiveToolchains,
+		Transports:        transports,
+		Targets:           targets,
+		Profile:           profile,
+		ServerLink:        link,
+		Repetitions:       repetitions,
+		Seed:              seed,
 	})
 	if err != nil {
 		return err
@@ -294,7 +302,19 @@ func verifyOutput(args []string) error {
 }
 
 func run(args []string) error {
-	flags := flag.NewFlagSet("run", flag.ContinueOnError)
+	return execute(args, false)
+}
+
+func queue(args []string) error {
+	return execute(args, true)
+}
+
+func execute(args []string, queueMode bool) error {
+	command := "run"
+	if queueMode {
+		command = "queue"
+	}
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	var planPath, adaptersPath, fixturesRoot, artifactsRoot, executionTarget, passwordFile string
 	var config benchmark.RunConfig
@@ -312,7 +332,11 @@ func run(args []string) error {
 	flags.StringVar(&passwordFile, "password-file", "", "file containing the NNTP password")
 	flags.IntVar(&config.Connections, "connections", 8, "identical NNTP connection limit per client")
 	flags.StringVar(&config.Profile, "profile", "", "must match the profile persisted in the plan (defaults to that profile)")
-	flags.DurationVar(&config.Timeout, "timeout", 45*time.Minute, "per-run client timeout")
+	timeoutDescription := "per-run client timeout"
+	if queueMode {
+		timeoutDescription = "per-suite client timeout"
+	}
+	flags.DurationVar(&config.Timeout, "timeout", 45*time.Minute, timeoutDescription)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -337,6 +361,13 @@ func run(args []string) error {
 	config.Target = benchmark.ExecutionTarget(executionTarget)
 	config.FixtureRoot = fixturesRoot
 	config.ArtifactRoot = artifactsRoot
+	if queueMode {
+		artifacts, runErr := benchmark.ExecuteQueuePlan(context.Background(), config)
+		if err := printJSON(artifacts); err != nil {
+			return err
+		}
+		return runErr
+	}
 	artifacts, runErr := benchmark.ExecutePlan(context.Background(), config)
 	if err := printJSON(artifacts); err != nil {
 		return err
@@ -361,6 +392,15 @@ func parseClients(value string) ([]benchmark.Client, error) {
 		clients[index] = benchmark.Client(part)
 	}
 	return clients, nil
+}
+
+func parseArchiveToolchains(value string) ([]benchmark.ArchiveToolchain, error) {
+	parts := splitCSV(value)
+	toolchains := make([]benchmark.ArchiveToolchain, len(parts))
+	for index, part := range parts {
+		toolchains[index] = benchmark.ArchiveToolchain(part)
+	}
+	return toolchains, nil
 }
 
 func parseTransports(value string) ([]benchmark.Transport, error) {
@@ -400,9 +440,10 @@ func usage() {
 Commands:
   seed           Post a generated fixture to an NNTP server and write its NZB
   image build    Build the pinned local e2e-nntp image and save its provenance
-  plan           Write a randomized, balanced cold-state client run plan
+  plan           Write a randomized, balanced benchmark plan
   server-env     Write an immutable server-side egress-shaper environment file
-  run            Execute a plan through isolated client adapters
+  run            Execute cold, one-NZB diagnostic runs through client adapters
+  queue          Execute each client lane as one uninterrupted multi-NZB queue
   preflight      Check target host and native/Docker executable prerequisites
   verify-output  Verify a client completion directory against fixture hashes
 

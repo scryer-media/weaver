@@ -26,34 +26,39 @@ const (
 // the neutral runner; CLIENT_* values are deliberately adapter-local so a
 // catalog can select digest-pinned images without mutating the saved plan.
 type Config struct {
-	RunID           string
-	Client          benchmark.Client
-	ExecutionTarget benchmark.ExecutionTarget
-	Transport       benchmark.Transport
-	TransportLabel  string
-	TLSValidation   benchmark.TLSValidation
-	ServerLink      benchmark.ServerLinkProfile
-	FixtureDir      string
-	NZBPath         string
-	OutputDir       string
-	ConfigDir       string
-	ResultPath      string
-	NNTPHost        string
-	NNTPPort        string
-	NNTPUsername    string
-	NNTPPassword    string
-	NNTPUseTLS      bool
-	NNTPCAFile      string
-	ArchivePassword string
-	Connections     int
-	Profile         string
-	Image           string
-	Network         string
-	DockerBinary    string
-	Platform        string
-	PerfBinary      string
-	StartupTimeout  time.Duration
-	PollInterval    time.Duration
+	RunID            string
+	Client           benchmark.Client
+	ArchiveToolchain benchmark.ArchiveToolchain
+	ExecutionTarget  benchmark.ExecutionTarget
+	Transport        benchmark.Transport
+	TransportLabel   string
+	TLSValidation    benchmark.TLSValidation
+	ServerLink       benchmark.ServerLinkProfile
+	FixtureDir       string
+	NZBPath          string
+	QueueInput       *benchmark.QueueInput
+	OutputDir        string
+	ConfigDir        string
+	ResultPath       string
+	NNTPHost         string
+	NNTPPort         string
+	NNTPUsername     string
+	NNTPPassword     string
+	NNTPUseTLS       bool
+	NNTPCAFile       string
+	ArchivePassword  string
+	Connections      int
+	Profile          string
+	Image            string
+	Network          string
+	DockerBinary     string
+	Platform         string
+	PerfBinary       string
+	RarparBinary     string
+	RarparVersion    string
+	RarparSHA256     string
+	StartupTimeout   time.Duration
+	PollInterval     time.Duration
 }
 
 // ProductSpec is the rendered, client-specific portion of an otherwise
@@ -72,6 +77,13 @@ type ProductSpec struct {
 	Rendered             []byte
 	ConfigSHA256         string
 	NeedsCAMount         bool
+	ExtraFiles           []ProductFile
+}
+
+type ProductFile struct {
+	RelativePath string
+	Content      []byte
+	Mode         os.FileMode
 }
 
 func LoadConfigFromEnvironment() (Config, error) {
@@ -112,21 +124,22 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	cfg := Config{
-		RunID:           required(getenv, "BENCH_RUN_ID"),
-		Client:          benchmark.Client(required(getenv, "BENCH_CLIENT")),
-		ExecutionTarget: benchmark.ExecutionTarget(required(getenv, "BENCH_EXECUTION_TARGET")),
-		Transport:       benchmark.Transport(required(getenv, "BENCH_TRANSPORT")),
-		TransportLabel:  required(getenv, "BENCH_TRANSPORT_LABEL"),
-		TLSValidation:   benchmark.TLSValidation(required(getenv, "BENCH_TLS_VALIDATION")),
-		ServerLink:      link,
-		FixtureDir:      required(getenv, "BENCH_FIXTURE_DIR"),
-		NZBPath:         required(getenv, "BENCH_NZB_PATH"),
-		OutputDir:       required(getenv, "BENCH_OUTPUT_DIR"),
-		ConfigDir:       required(getenv, "BENCH_CONFIG_DIR"),
-		ResultPath:      required(getenv, "BENCH_RESULT_PATH"),
-		NNTPHost:        required(getenv, "BENCH_NNTP_HOST"),
-		NNTPPort:        required(getenv, "BENCH_NNTP_PORT"),
-		NNTPUsername:    required(getenv, "BENCH_NNTP_USERNAME"),
+		RunID:            required(getenv, "BENCH_RUN_ID"),
+		Client:           benchmark.Client(required(getenv, "BENCH_CLIENT")),
+		ArchiveToolchain: benchmark.ArchiveToolchain(required(getenv, "BENCH_ARCHIVE_TOOLCHAIN")),
+		ExecutionTarget:  benchmark.ExecutionTarget(required(getenv, "BENCH_EXECUTION_TARGET")),
+		Transport:        benchmark.Transport(required(getenv, "BENCH_TRANSPORT")),
+		TransportLabel:   required(getenv, "BENCH_TRANSPORT_LABEL"),
+		TLSValidation:    benchmark.TLSValidation(required(getenv, "BENCH_TLS_VALIDATION")),
+		ServerLink:       link,
+		FixtureDir:       required(getenv, "BENCH_FIXTURE_DIR"),
+		NZBPath:          required(getenv, "BENCH_NZB_PATH"),
+		OutputDir:        required(getenv, "BENCH_OUTPUT_DIR"),
+		ConfigDir:        required(getenv, "BENCH_CONFIG_DIR"),
+		ResultPath:       required(getenv, "BENCH_RESULT_PATH"),
+		NNTPHost:         required(getenv, "BENCH_NNTP_HOST"),
+		NNTPPort:         required(getenv, "BENCH_NNTP_PORT"),
+		NNTPUsername:     required(getenv, "BENCH_NNTP_USERNAME"),
 		// Passwords are opaque values; unlike identifiers and paths, leading or
 		// trailing spaces must not be silently rewritten by the adapter.
 		NNTPPassword:    getenv("BENCH_NNTP_PASSWORD"),
@@ -140,16 +153,20 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		DockerBinary:    defaultString(getenv("CLIENT_DOCKER_BINARY"), "docker"),
 		Platform:        strings.TrimSpace(getenv("CLIENT_PLATFORM")),
 		PerfBinary:      defaultString(getenv("CLIENT_PERF_BINARY"), "perf"),
+		RarparBinary:    strings.TrimSpace(getenv("CLIENT_RARPAR_BINARY")),
+		RarparVersion:   strings.TrimSpace(getenv("CLIENT_RARPAR_VERSION")),
+		RarparSHA256:    strings.TrimSpace(getenv("CLIENT_RARPAR_SHA256")),
 		StartupTimeout:  startupTimeout,
 		PollInterval:    pollInterval,
 	}
 	for field, value := range map[string]*string{
-		"BENCH_FIXTURE_DIR":  &cfg.FixtureDir,
-		"BENCH_NZB_PATH":     &cfg.NZBPath,
-		"BENCH_OUTPUT_DIR":   &cfg.OutputDir,
-		"BENCH_CONFIG_DIR":   &cfg.ConfigDir,
-		"BENCH_RESULT_PATH":  &cfg.ResultPath,
-		"BENCH_NNTP_CA_FILE": &cfg.NNTPCAFile,
+		"BENCH_FIXTURE_DIR":    &cfg.FixtureDir,
+		"BENCH_NZB_PATH":       &cfg.NZBPath,
+		"BENCH_OUTPUT_DIR":     &cfg.OutputDir,
+		"BENCH_CONFIG_DIR":     &cfg.ConfigDir,
+		"BENCH_RESULT_PATH":    &cfg.ResultPath,
+		"BENCH_NNTP_CA_FILE":   &cfg.NNTPCAFile,
+		"CLIENT_RARPAR_BINARY": &cfg.RarparBinary,
 	} {
 		if strings.TrimSpace(*value) == "" {
 			continue
@@ -159,6 +176,24 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("resolve %s: %w", field, err)
 		}
 		*value = absolute
+	}
+	if queuePath := strings.TrimSpace(getenv("BENCH_QUEUE_PATH")); queuePath != "" {
+		absolute, err := filepath.Abs(queuePath)
+		if err != nil {
+			return Config{}, fmt.Errorf("resolve BENCH_QUEUE_PATH: %w", err)
+		}
+		input, err := benchmark.LoadQueueInput(absolute)
+		if err != nil {
+			return Config{}, err
+		}
+		for index := range input.Jobs {
+			jobPath, err := filepath.Abs(input.Jobs[index].NZBPath)
+			if err != nil {
+				return Config{}, fmt.Errorf("resolve queue NZB %s: %w", input.Jobs[index].RunID, err)
+			}
+			input.Jobs[index].NZBPath = jobPath
+		}
+		cfg.QueueInput = &input
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -172,6 +207,12 @@ func (c Config) Validate() error {
 	}
 	if c.Client != benchmark.Weaver && c.Client != benchmark.SABnzbd && c.Client != benchmark.NZBGet {
 		return fmt.Errorf("unsupported client %q", c.Client)
+	}
+	if c.ArchiveToolchain != benchmark.VanillaArchiveToolchain && c.ArchiveToolchain != benchmark.RarparArchiveToolchain {
+		return fmt.Errorf("unsupported archive toolchain %q", c.ArchiveToolchain)
+	}
+	if c.ArchiveToolchain == benchmark.RarparArchiveToolchain && (c.Client != benchmark.SABnzbd && c.Client != benchmark.NZBGet) {
+		return fmt.Errorf("Rarpar is only configured for SABnzbd and NZBGet Docker lanes")
 	}
 	if c.ExecutionTarget != benchmark.DockerLinux {
 		return fmt.Errorf("clientadapter only supports execution target %q, got %q", benchmark.DockerLinux, c.ExecutionTarget)
@@ -205,6 +246,16 @@ func (c Config) Validate() error {
 			}
 		}
 	}
+	if c.QueueInput != nil {
+		if err := c.QueueInput.Validate(); err != nil {
+			return err
+		}
+		for _, job := range c.QueueInput.Jobs {
+			if _, err := os.Stat(job.NZBPath); err != nil {
+				return fmt.Errorf("inspect queue NZB %s: %w", job.RunID, err)
+			}
+		}
+	}
 	if c.Profile != benchmark.ProfileStock && c.Profile != benchmark.ProfileEquivalentThroughput {
 		return fmt.Errorf("unsupported benchmark profile %q", c.Profile)
 	}
@@ -213,6 +264,11 @@ func (c Config) Validate() error {
 	}
 	if !digestPinnedImage(c.Image) {
 		return fmt.Errorf("CLIENT_IMAGE must be digest-pinned (image@sha256:<64 hex characters>)")
+	}
+	if c.ArchiveToolchain == benchmark.RarparArchiveToolchain {
+		if err := validateRarparInput(c.RarparBinary, c.RarparVersion, c.RarparSHA256); err != nil {
+			return err
+		}
 	}
 	if _, err := os.Stat(c.NZBPath); err != nil {
 		return fmt.Errorf("inspect NZB: %w", err)
@@ -268,8 +324,31 @@ func renderWeaver(c Config, _ bool) ProductSpec {
 		"WEAVER_SERVER_1_CONNECTIONS=" + strconv.Itoa(c.Connections),
 		"WEAVER_SERVER_1_ACTIVE=true",
 	}
+	// The pinned Weaver image honors PUID/PGID just like the LinuxServer
+	// client images. Keeping its bind mounts owned by the invoking benchmark
+	// user lets the adapter retain logs and immutable telemetry artifacts.
+	env = append(env, linuxServerEnvironment()...)
 	if c.Transport == benchmark.TLS && c.TLSValidation == benchmark.TLSCAVerified {
 		env = append(env, "WEAVER_SERVER_1_TLS_CA_CERT=/benchmark-ca/nntp-ca.pem")
+	}
+	// Keep the selected TLS implementation visible in the rendered product
+	// environment when an operator explicitly supplies one for a diagnostic.
+	// Normal benchmark runs leave this unset and use the product default.
+	if tlsBackend := os.Getenv("WEAVER_NNTP_TLS_BACKEND"); tlsBackend != "" {
+		env = append(env, "WEAVER_NNTP_TLS_BACKEND="+tlsBackend)
+	}
+	if rustLog := os.Getenv("RUST_LOG"); rustLog != "" {
+		env = append(env, "RUST_LOG="+rustLog)
+	}
+	if c.QueueInput != nil {
+		return ProductSpec{
+			APIPort:       9090,
+			ExposeAPI:     true,
+			Command:       []string{"--config", "/config", "serve", "--port", "9090"},
+			ConfigName:    "weaver.env",
+			ConfigContent: []byte(strings.Join(env, "\n") + "\n"),
+			Environment:   env,
+		}
 	}
 	command := []string{
 		"--config", "/config",
@@ -328,7 +407,11 @@ func renderSABnzbd(c Config, directUnpack bool) ProductSpec {
 		"ssl_verify = 0",
 		"",
 	}, "\n")
-	return ProductSpec{APIPort: 8080, ExposeAPI: true, ConfigName: "sabnzbd.ini", ConfigContent: []byte(content), Environment: linuxServerEnvironment()}
+	environment := linuxServerEnvironment()
+	if c.ArchiveToolchain == benchmark.RarparArchiveToolchain {
+		environment = append(environment, "PATH=/config/toolchain:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+	}
+	return ProductSpec{APIPort: 8080, ExposeAPI: true, ConfigName: "sabnzbd.ini", ConfigContent: []byte(content), Environment: environment}
 }
 
 func renderNZBGet(c Config, directUnpack bool) ProductSpec {
@@ -350,6 +433,28 @@ func renderNZBGet(c Config, directUnpack bool) ProductSpec {
 		direct = "yes"
 		directWrite = "yes"
 	}
+	unpack := "yes"
+	parRepair := "yes"
+	extensions := ""
+	unrarCommand := "unrar"
+	var extraFiles []ProductFile
+	if c.ArchiveToolchain == benchmark.RarparArchiveToolchain {
+		// NZBGet links its PAR2 engine internally. This explicit post-processing
+		// extension disables that engine and invokes the published Rarpar binary
+		// for PAR2 repair followed by RAR extraction, so the result does not
+		// imply that an unavailable Par2Cmd setting exists.
+		unpack = "no"
+		parRepair = "no"
+		direct = "no"
+		directWrite = "no"
+		extensions = "rarpar-post.sh"
+		unrarCommand = "/config/toolchain/unrar"
+		extraFiles = []ProductFile{{
+			RelativePath: filepath.Join("scripts", "rarpar-post.sh"),
+			Content:      rarparNZBGetPostScript(),
+			Mode:         0o755,
+		}}
+	}
 	content := strings.Join([]string{
 		"MainDir=/config",
 		"DestDir=/downloads/complete",
@@ -363,14 +468,15 @@ func renderNZBGet(c Config, directUnpack bool) ProductSpec {
 		"ControlPort=6789",
 		"ControlUsername=" + controlUsername,
 		"ControlPassword=" + apiKey,
-		"DaemonMode=yes",
 		"OutputMode=log",
 		"ArticleCache=0",
 		"DirectWrite=" + directWrite,
 		"DirectUnpack=" + direct,
-		"ParCheck=manual",
-		"ParRepair=no",
-		"Unpack=yes",
+		"ParCheck=auto",
+		"ParRepair=" + parRepair,
+		"Unpack=" + unpack,
+		"UnrarCmd=" + unrarCommand,
+		"Extensions=" + extensions,
 		"Server1.Active=yes",
 		"Server1.Name=benchmark",
 		"Server1.Level=0",
@@ -387,7 +493,7 @@ func renderNZBGet(c Config, directUnpack bool) ProductSpec {
 		"CertCheck=" + certCheck,
 		"",
 	}, "\n")
-	return ProductSpec{APIPort: 6789, ExposeAPI: true, ConfigName: "nzbget.conf", ConfigContent: []byte(content), Environment: linuxServerEnvironment()}
+	return ProductSpec{APIPort: 6789, ExposeAPI: true, ConfigName: "nzbget.conf", ConfigContent: []byte(content), Environment: linuxServerEnvironment(), ExtraFiles: extraFiles}
 }
 
 func linuxServerEnvironment() []string {
@@ -413,6 +519,8 @@ func renderAuditConfig(c Config, spec ProductSpec) []byte {
 	return []byte(strings.Join([]string{
 		"schema_version=1",
 		"client=" + string(c.Client),
+		"archive_toolchain=" + string(c.ArchiveToolchain),
+		"archive_toolchain_identity=" + c.archiveToolchainIdentity(),
 		"execution_target=" + string(c.ExecutionTarget),
 		"execution=" + execution,
 		"profile=" + c.Profile,

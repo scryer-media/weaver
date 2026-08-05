@@ -59,6 +59,28 @@ const (
 	BluRayDiscPayloadLayout PayloadLayout = "bluray-disc"
 )
 
+// RepairProfile declares a deliberately damaged corpus member and the
+// independent repair material posted with it. It is a test dimension, not a
+// statement about how frequently any profile appears on Usenet.
+type RepairProfile string
+
+const (
+	CleanRepairProfile            RepairProfile = "clean"
+	PAR2LightRepairProfile        RepairProfile = "par2-light"
+	PAR2HeavyRepairProfile        RepairProfile = "par2-heavy"
+	RARRecoveryVolumeLightProfile RepairProfile = "rar-recovery-volume-light"
+	RARRecoveryVolumeHeavyProfile RepairProfile = "rar-recovery-volume-heavy"
+)
+
+func (p RepairProfile) Valid() bool {
+	switch p {
+	case CleanRepairProfile, PAR2LightRepairProfile, PAR2HeavyRepairProfile, RARRecoveryVolumeLightProfile, RARRecoveryVolumeHeavyProfile:
+		return true
+	default:
+		return false
+	}
+}
+
 // Matrix is the stable source definition. It expands to one ArchiveCase for
 // every useful combination, so reviewers can see which cases exist without
 // committing any large archive data.
@@ -69,17 +91,18 @@ type Matrix struct {
 }
 
 type FixtureSet struct {
-	ID                 string        `json:"id"`
-	WriterEra          string        `json:"writer_era"`
-	GeneratorToolchain string        `json:"generator_toolchain"`
-	RARFormat          RARFormat     `json:"rar_format"`
-	Compressions       []Compression `json:"compressions"`
-	Solid              []bool        `json:"solid"`
-	Encryptions        []Encryption  `json:"encryptions"`
-	Payloads           []PayloadKind `json:"payloads"`
-	PayloadLayout      PayloadLayout `json:"payload_layout,omitempty"`
-	FileCount          int           `json:"file_count"`
-	VolumeSize         string        `json:"volume_size"`
+	ID                 string          `json:"id"`
+	WriterEra          string          `json:"writer_era"`
+	GeneratorToolchain string          `json:"generator_toolchain"`
+	RARFormat          RARFormat       `json:"rar_format"`
+	Compressions       []Compression   `json:"compressions"`
+	Solid              []bool          `json:"solid"`
+	Encryptions        []Encryption    `json:"encryptions"`
+	Payloads           []PayloadKind   `json:"payloads"`
+	PayloadLayout      PayloadLayout   `json:"payload_layout,omitempty"`
+	RepairProfiles     []RepairProfile `json:"repair_profiles,omitempty"`
+	FileCount          int             `json:"file_count"`
+	VolumeSize         string          `json:"volume_size"`
 }
 
 // ArchiveCase is one materialized archive fixture.
@@ -94,6 +117,7 @@ type ArchiveCase struct {
 	Encryption         Encryption    `json:"encryption"`
 	Payload            PayloadKind   `json:"payload"`
 	PayloadLayout      PayloadLayout `json:"payload_layout"`
+	RepairProfile      RepairProfile `json:"repair_profile"`
 	FileCount          int           `json:"file_count"`
 	VolumeSize         string        `json:"volume_size"`
 }
@@ -137,35 +161,48 @@ func (m Matrix) Expand() ([]ArchiveCase, error) {
 		if layout == "" {
 			layout = UniformPayloadLayout
 		}
-		for _, compression := range set.Compressions {
-			for _, solid := range set.Solid {
-				for _, encryption := range set.Encryptions {
-					for _, payload := range set.Payloads {
-						id := strings.Join([]string{
-							set.ID,
-							string(compression),
-							solidID(solid),
-							string(encryption),
-							string(payload),
-						}, "-")
-						if _, exists := ids[id]; exists {
-							return nil, fmt.Errorf("fixture matrix has duplicate case %q", id)
+		profiles := set.RepairProfiles
+		if len(profiles) == 0 {
+			profiles = []RepairProfile{CleanRepairProfile}
+		}
+		for _, profile := range profiles {
+			for _, compression := range set.Compressions {
+				for _, solid := range set.Solid {
+					for _, encryption := range set.Encryptions {
+						for _, payload := range set.Payloads {
+							parts := []string{
+								set.ID,
+							}
+							if profile != CleanRepairProfile {
+								parts = append(parts, string(profile))
+							}
+							parts = append(parts,
+								string(compression),
+								solidID(solid),
+								string(encryption),
+								string(payload),
+							)
+							id := strings.Join(parts, "-")
+							if _, exists := ids[id]; exists {
+								return nil, fmt.Errorf("fixture matrix has duplicate case %q", id)
+							}
+							ids[id] = struct{}{}
+							cases = append(cases, ArchiveCase{
+								ID:                 id,
+								SetID:              set.ID,
+								WriterEra:          set.WriterEra,
+								GeneratorToolchain: set.GeneratorToolchain,
+								RARFormat:          set.RARFormat,
+								Compression:        compression,
+								Solid:              solid,
+								Encryption:         encryption,
+								Payload:            payload,
+								PayloadLayout:      layout,
+								RepairProfile:      profile,
+								FileCount:          set.FileCount,
+								VolumeSize:         set.VolumeSize,
+							})
 						}
-						ids[id] = struct{}{}
-						cases = append(cases, ArchiveCase{
-							ID:                 id,
-							SetID:              set.ID,
-							WriterEra:          set.WriterEra,
-							GeneratorToolchain: set.GeneratorToolchain,
-							RARFormat:          set.RARFormat,
-							Compression:        compression,
-							Solid:              solid,
-							Encryption:         encryption,
-							Payload:            payload,
-							PayloadLayout:      layout,
-							FileCount:          set.FileCount,
-							VolumeSize:         set.VolumeSize,
-						})
 					}
 				}
 			}
@@ -189,6 +226,11 @@ func (s FixtureSet) validate() error {
 	}
 	if len(s.Compressions) == 0 || len(s.Solid) == 0 || len(s.Encryptions) == 0 || len(s.Payloads) == 0 {
 		return fmt.Errorf("fixture set %q must specify every matrix axis", s.ID)
+	}
+	for _, profile := range s.RepairProfiles {
+		if !profile.Valid() {
+			return fmt.Errorf("fixture set %q has unsupported repair_profile %q", s.ID, profile)
+		}
 	}
 	if s.PayloadLayout == "" {
 		s.PayloadLayout = UniformPayloadLayout
