@@ -22,7 +22,55 @@ git diff --cached --no-color --unified=0 --diff-filter=ACMR -- . | awk \
       unix_home_token = "/" "home/"
       windows_users_backslash_token = "C:" "\\" "Users" "\\"
       windows_users_slash_token = "C:/" "Users/"
+
+      # Documentation and test placeholders. A home-directory path only
+      # evidences a leak when the account name belongs to somebody real, and
+      # these are the conventional stand-ins for "your account here". They are
+      # honoured by the generic token check alone: a line naming the committing
+      # user, or their real home directory, is still refused below even when it
+      # also contains one of these.
+      placeholder_count = split("example,user,username,youruser,your-user,someuser,testuser,test-user,alice,bob", placeholder_list, ",")
+      for (i = 1; i <= placeholder_count; i++) {
+        placeholder[placeholder_list[i]] = 1
+      }
     }
+
+    # The path segment immediately after an occurrence of token at or after
+    # from: the account name that home-directory path is claiming.
+    function account_after(line, token, from,   pos, rest, i, ch, seg) {
+      pos = index(substr(line, from), token)
+      if (pos == 0) {
+        return ""
+      }
+      rest = substr(line, from + pos - 1 + length(token))
+      seg = ""
+      for (i = 1; i <= length(rest); i++) {
+        ch = substr(rest, i, 1)
+        if (ch == "/" || ch == "\\" || ch == "\"" || ch == " " || ch == ")" || ch == "," || ch == ";") {
+          break
+        }
+        seg = seg ch
+      }
+      return tolower(seg)
+    }
+
+    # 1 when every occurrence of token in line names a known placeholder. One
+    # unrecognised account name anywhere refuses the whole line.
+    function all_placeholders(line, token,   from, pos, account) {
+      from = 1
+      while (1) {
+        pos = index(substr(line, from), token)
+        if (pos == 0) {
+          return 1
+        }
+        account = account_after(line, token, from)
+        if (!(account in placeholder)) {
+          return 0
+        }
+        from = from + pos - 1 + length(token)
+      }
+    }
+
     /^\+\+\+ b\// {
       current_file = substr($0, 7)
       next
@@ -38,7 +86,20 @@ git diff --cached --no-color --unified=0 --diff-filter=ACMR -- . | awk \
         printf "%s:%s\n", current_file, added_line
         next
       }
-      if (index(added_line, unix_users_token) > 0 || index(added_line, unix_home_token) > 0 || index(added_line, windows_users_backslash_token) > 0 || index(added_line, windows_users_slash_token) > 0) {
+      flagged = 0
+      if (index(added_line, unix_users_token) > 0 && !all_placeholders(added_line, unix_users_token)) {
+        flagged = 1
+      }
+      if (!flagged && index(added_line, unix_home_token) > 0 && !all_placeholders(added_line, unix_home_token)) {
+        flagged = 1
+      }
+      if (!flagged && index(added_line, windows_users_backslash_token) > 0 && !all_placeholders(added_line, windows_users_backslash_token)) {
+        flagged = 1
+      }
+      if (!flagged && index(added_line, windows_users_slash_token) > 0 && !all_placeholders(added_line, windows_users_slash_token)) {
+        flagged = 1
+      }
+      if (flagged) {
         printf "%s:%s\n", current_file, added_line
       }
     }
@@ -48,6 +109,8 @@ if [ -s "$tmp_output" ]; then
   echo "pre-commit blocked: staged changes contain local personal path or username references." >&2
   echo "Remove or generalize these lines before committing:" >&2
   sed 's/^/  - /' "$tmp_output" >&2
+  echo "If a path is a documentation or test placeholder, name the account one of:" >&2
+  echo "  example, user, username, youruser, someuser, testuser, alice, bob" >&2
   exit 1
 fi
 

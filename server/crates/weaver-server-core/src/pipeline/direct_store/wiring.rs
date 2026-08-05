@@ -835,7 +835,7 @@ impl Pipeline {
                     }
                 };
                 lengths.insert(*volume_index, len);
-                bindings.insert(*volume_index, (*file_index, binding.par2_file_id));
+                bindings.insert(*volume_index, (*file_index, binding.0 /* M2-STUB(plan 138): 0.7.9 returns (par2_file_id, len, path, complete) */));
             }
             let set_volumes = match retained {
                 Some(volumes) => volumes.to_vec(),
@@ -1054,7 +1054,7 @@ impl Pipeline {
                     return None;
                 }
                 self.resolve_live_par2_binding(file_id)
-                    .map(|binding| binding.par2_file_id)
+                    .map(|binding| binding.0 /* M2-STUB(plan 138): 0.7.9 returns (par2_file_id, len, path, complete) */)
             })
             .collect();
         if finalized.is_empty() {

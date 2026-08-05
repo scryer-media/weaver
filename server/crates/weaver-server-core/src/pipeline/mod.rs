@@ -1178,15 +1178,28 @@ pub(super) struct Par2FileRuntime {
     pub(super) promoted: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub(super) struct Par2RuntimeState {
     pub(super) set: Option<Arc<Par2FileSet>>,
     pub(super) files: HashMap<u32, Par2FileRuntime>,
-    /// Scan state from the most recent analyze pass, reused by the execute
-    /// pass so a repair does not re-scan sources the analysis just hashed.
-    /// Self-invalidating: the engine re-stats every observed file and falls
-    /// back to a full scan on any drift.
-    pub(super) scan_carry: Option<Arc<par2_rs::ScanCarry>>,
+    /// The on-disk primary PAR2 file used to reopen an evicted retained session.
+    pub(super) primary_path: Option<PathBuf>,
+    /// Recovery files already incorporated into the scheduler view and any
+    /// retained repair session. They are replayed only when a session is
+    /// evicted and reopened.
+    pub(super) merged_recovery_paths: HashSet<PathBuf>,
+    /// Stateful assessment/repair engine. It intentionally owns no open file
+    /// handles, and is invalidated before payload paths are rewritten.
+    pub(super) session: Option<par2_rs::Par2RepairSession>,
+    /// Last time the retained session was taken or restored, for global LRU
+    /// eviction when the shared retained-state budget is exceeded.
+    pub(super) session_last_used: Option<Instant>,
+    /// Completion-time checksums retained only long enough to seed a session
+    /// opened after a payload file finished downloading.
+    pub(super) completed_checksums: HashMap<NzbFileId, CompletedFileChecksum>,
+    /// Completed files whose current identity/checksum evidence was admitted
+    /// to the retained session.
+    pub(super) session_evidence_file_ids: HashSet<NzbFileId>,
 }
 
 pub(super) enum ExtractionDone {
@@ -1281,11 +1294,14 @@ pub(super) enum DecodeDone {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
 pub(super) struct CompletedFileChecksum {
     pub(super) md5: Option<[u8; 16]>,
     pub(super) crc32: u32,
+    pub(super) all_parts_crc_verified: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub(super) struct StreamedCompletedFileChecksum {
     pub(super) md5: Option<[u8; 16]>,
     pub(super) crc32: u32,
@@ -1835,8 +1851,9 @@ pub struct Pipeline {
     pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<BufferedDecodedSegment>>,
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
-    /// In-stream PAR2 block verification state for every live job.
-    pub(super) live_par2: repair::live::LivePar2Registry,
+    /// Advisory in-stream PAR2 evidence. It owns a single partial-boundary
+    /// budget shared by every job and never replaces authoritative repair.
+    pub(super) live_par2: repair::LivePar2Registry,
     /// Direct-store routing state: admitted archive sets, their routers and
     /// their coverage barriers (plan 135, phase 4). Inert while the gate is off.
     pub(super) direct_store: direct_store::wiring::DirectStoreRuntime,

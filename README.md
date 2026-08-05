@@ -40,7 +40,29 @@ Instead of the traditional sequential approach (download everything, then repair
 
 Installation instructions can be found on the [Weaver docs website](https://www.scryer.media/weaver/docs/installation/)
 
-Encryption-at-rest setup is automatic: Weaver creates and reuses an encryption key in macOS Keychain, Windows Credential Manager (including WinGet portable installs), or a mode-`0600` key file in the Linux data directory. Existing `WEAVER_ENCRYPTION_KEY` overrides take precedence.
+### Windows desktop
+
+For Windows, use the x64 or ARM64 MSI from the GitHub release, or install that same MSI through WinGet:
+
+```powershell
+winget install --id ScryerMedia.Weaver --exact
+```
+
+The initial desktop releases are intentionally **unsigned**. Windows may show a browser download warning, then SmartScreen's **More info → Run anyway** prompt, and UAC's **Unknown publisher** prompt for the machine-wide installer. Those prompts are expected for these consumer-only releases; do not install an MSI from anywhere other than the Weaver GitHub release.
+
+Every Windows ZIP and MSI has a SHA-256 entry in `SHA256SUMS` and a GitHub build-provenance attestation. To verify a downloaded MSI, compare `Get-FileHash .\weaver-windows-x86_64.msi -Algorithm SHA256` with the release checksum, then run `gh attestation verify .\weaver-windows-x86_64.msi --repo scryer-media/weaver`.
+
+The MSI installs `weaver.exe` for CLI use and `weaver-tray.exe` for the desktop experience. The tray launches Weaver for the current user, opens a browser after an interactive start, and starts quietly at sign-in. Silent MSI and WinGet installs never start the tray or browser. The portable ZIP remains available for advanced use; launch `weaver-tray.exe` from it for the desktop experience.
+
+If you previously installed the portable `0.7.4` package with WinGet, make this one-time transition explicitly; WinGet otherwise keeps the old installer type when upgrading:
+
+```powershell
+winget upgrade --id ScryerMedia.Weaver --exact --installer-type msi --uninstall-previous
+```
+
+This removes the old portable command link and files, then installs the MSI. It deliberately leaves legacy portable data and credentials untouched.
+
+Encryption-at-rest setup is automatic: macOS uses Keychain, Linux uses a mode-`0600` key file, and the Windows desktop tray stores its key in Credential Manager under `ScryerMedia.Weaver.Desktop.v1` with state in `%LOCALAPPDATA%\ScryerMedia\Weaver`. It never reads or changes legacy portable state, which continues to use its existing Windows Credential Manager entry. Existing `WEAVER_ENCRYPTION_KEY` overrides take precedence.
 
 ## Docker
 

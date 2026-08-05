@@ -261,7 +261,7 @@ pub(super) fn render_prometheus_metrics(
         server_transfers: &[],
         duplicate_admission: &[],
         semantic_duplicate_lifecycle: &[],
-        build_version: env!("CARGO_PKG_VERSION"),
+        build_version: "test-version",
     })
 }
 

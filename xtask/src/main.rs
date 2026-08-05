@@ -66,10 +66,9 @@ const GRAPHQL_SCHEMA_EXPORT_DIR: &str = "target/xtask-release/graphql";
 const WINGET_PACKAGE_IDENTIFIER: &str = "ScryerMedia.Weaver";
 const WINGET_PACKAGE_NAME: &str = "Weaver";
 const WINGET_MONIKER: &str = "weaver-usenet";
-const WINGET_PORTABLE_COMMAND_ALIAS: &str = "weaver";
 const WINGET_MANIFEST_VERSION: &str = "1.12.0";
-const WINGET_WINDOWS_X64_ASSET: &str = "weaver-windows-x86_64.zip";
-const WINGET_WINDOWS_ARM64_ASSET: &str = "weaver-windows-arm64.zip";
+const WINGET_WINDOWS_X64_ASSET: &str = "weaver-windows-x86_64.msi";
+const WINGET_WINDOWS_ARM64_ASSET: &str = "weaver-windows-arm64.msi";
 
 struct ReleaseAuditAllow {
     id: &'static str,
@@ -1391,6 +1390,12 @@ struct WingetArtifact {
     architecture: &'static str,
     installer_url: String,
     installer_sha256: String,
+    product_code: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WingetMsiMetadata {
+    product_code: String,
 }
 
 fn normalize_winget_version(raw: &str) -> Result<Version> {
@@ -1431,9 +1436,21 @@ fn collect_winget_artifacts(
     .into_iter()
     .map(|(architecture, asset_name)| {
         let path = artifacts_dir.join(asset_name);
-        validate_winget_portable_zip(&path)?;
         let bytes =
             fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let metadata_path = artifacts_dir.join(format!("{asset_name}.json"));
+        let metadata: WingetMsiMetadata = serde_json::from_slice(
+            &fs::read(&metadata_path)
+                .with_context(|| format!("failed to read {}", metadata_path.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", metadata_path.display()))?;
+        if !is_windows_product_code(&metadata.product_code) {
+            bail!(
+                "{} contains an invalid MSI ProductCode: {}",
+                metadata_path.display(),
+                metadata.product_code
+            );
+        }
         let installer_sha256 = sha256_hex(&bytes).to_ascii_uppercase();
         let installer_url =
             format!("https://github.com/{repository}/releases/download/{tag_name}/{asset_name}");
@@ -1441,92 +1458,25 @@ fn collect_winget_artifacts(
             architecture,
             installer_url,
             installer_sha256,
+            product_code: metadata.product_code,
         })
     })
     .collect()
 }
 
-fn validate_winget_portable_zip(path: &Path) -> Result<()> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let entries = zip_central_directory_entries(&bytes)
-        .with_context(|| format!("failed to inspect {}", path.display()))?;
-    if entries.iter().any(|entry| entry == "weaver.exe") {
-        Ok(())
-    } else {
-        bail!(
-            "{} must contain weaver.exe at the zip root for WinGet portable install",
-            path.display()
-        )
-    }
-}
-
-fn zip_central_directory_entries(bytes: &[u8]) -> Result<Vec<String>> {
-    const EOCD_SIGNATURE: &[u8; 4] = b"PK\x05\x06";
-    const CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0201_4b50;
-
-    if bytes.len() < 22 {
-        bail!("zip is too short to contain an end-of-central-directory record");
-    }
-
-    let search_start = bytes.len().saturating_sub(22 + u16::MAX as usize);
-    let eocd_offset = (search_start..=bytes.len() - 22)
-        .rev()
-        .find(|offset| bytes.get(*offset..*offset + 4) == Some(EOCD_SIGNATURE.as_slice()))
-        .context("missing zip end-of-central-directory record")?;
-    let central_directory_size = read_le_u32(bytes, eocd_offset + 12)? as usize;
-    let central_directory_offset = read_le_u32(bytes, eocd_offset + 16)? as usize;
-    let central_directory_end = central_directory_offset
-        .checked_add(central_directory_size)
-        .context("zip central directory overflows usize")?;
-    if central_directory_end > bytes.len() {
-        bail!("zip central directory points beyond file length");
-    }
-
-    let mut offset = central_directory_offset;
-    let mut entries = Vec::new();
-    while offset < central_directory_end {
-        let signature = read_le_u32(bytes, offset)?;
-        if signature != CENTRAL_DIRECTORY_SIGNATURE {
-            bail!("invalid zip central directory header at byte {offset}");
-        }
-        let file_name_len = read_le_u16(bytes, offset + 28)? as usize;
-        let extra_len = read_le_u16(bytes, offset + 30)? as usize;
-        let comment_len = read_le_u16(bytes, offset + 32)? as usize;
-        let name_start = offset + 46;
-        let name_end = name_start
-            .checked_add(file_name_len)
-            .context("zip file name length overflows usize")?;
-        let record_end = name_end
-            .checked_add(extra_len)
-            .and_then(|end| end.checked_add(comment_len))
-            .context("zip central directory record length overflows usize")?;
-        if record_end > central_directory_end {
-            bail!("zip central directory record extends beyond declared directory");
-        }
-        let name = std::str::from_utf8(&bytes[name_start..name_end])
-            .context("zip entry name is not utf-8")?;
-        entries.push(name.to_string());
-        offset = record_end;
-    }
-    Ok(entries)
-}
-
-fn read_le_u16(bytes: &[u8], offset: usize) -> Result<u16> {
-    let raw = bytes
-        .get(offset..offset + 2)
-        .ok_or_else(|| anyhow!("unexpected end of zip while reading u16 at byte {offset}"))?;
-    Ok(u16::from_le_bytes(
-        raw.try_into().expect("slice length checked"),
-    ))
-}
-
-fn read_le_u32(bytes: &[u8], offset: usize) -> Result<u32> {
-    let raw = bytes
-        .get(offset..offset + 4)
-        .ok_or_else(|| anyhow!("unexpected end of zip while reading u32 at byte {offset}"))?;
-    Ok(u32::from_le_bytes(
-        raw.try_into().expect("slice length checked"),
-    ))
+fn is_windows_product_code(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 38
+        && bytes[0] == b'{'
+        && bytes[37] == b'}'
+        && [9, 14, 19, 24]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !matches!(index, 0 | 9 | 14 | 19 | 24 | 37))
+            .all(|(_, byte)| byte.is_ascii_hexdigit())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1629,8 +1579,11 @@ fn winget_installer_manifest(
         .iter()
         .map(|artifact| {
             format!(
-                "- Architecture: {}\n  InstallerUrl: {}\n  InstallerSha256: {}",
-                artifact.architecture, artifact.installer_url, artifact.installer_sha256
+                "- Architecture: {}\n  InstallerUrl: {}\n  InstallerSha256: {}\n  ProductCode: {}",
+                artifact.architecture,
+                artifact.installer_url,
+                artifact.installer_sha256,
+                artifact.product_code,
             )
         })
         .collect::<Vec<_>>()
@@ -1639,13 +1592,10 @@ fn winget_installer_manifest(
         "# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.{WINGET_MANIFEST_VERSION}.schema.json\n\n\
 PackageIdentifier: {WINGET_PACKAGE_IDENTIFIER}\n\
 PackageVersion: {version}\n\
-InstallerType: zip\n\
-NestedInstallerType: portable\n\
-NestedInstallerFiles:\n\
-- RelativeFilePath: weaver.exe\n  PortableCommandAlias: {WINGET_PORTABLE_COMMAND_ALIAS}\n\
+InstallerType: msi\n\
 InstallModes:\n\
 - silent\n\
-UpgradeBehavior: install\n\
+UpgradeBehavior: uninstallPrevious\n\
 ReleaseDate: {release_date}\n\
 Installers:\n\
 {installers}\n\
@@ -3050,6 +3000,7 @@ mod tests {
                     "https://github.com/scryer-media/weaver/releases/download/weaver-v0.6.6/{WINGET_WINDOWS_X64_ASSET}"
                 ),
                 installer_sha256: "A".repeat(64),
+                product_code: "{694CA1CE-CB74-486A-BB1A-005D1D2051A2}".to_string(),
             },
             WingetArtifact {
                 architecture: "arm64",
@@ -3057,22 +3008,23 @@ mod tests {
                     "https://github.com/scryer-media/weaver/releases/download/weaver-v0.6.6/{WINGET_WINDOWS_ARM64_ASSET}"
                 ),
                 installer_sha256: "B".repeat(64),
+                product_code: "{AD8E9924-5148-4052-9A91-E4B7B47C9CD7}".to_string(),
             },
         ]
     }
 
     #[test]
-    fn winget_installer_manifest_uses_weaver_portable_zip_contract() {
+    fn winget_installer_manifest_uses_weaver_msi_contract() {
         let version = Version::parse("0.6.6").unwrap();
         let manifest =
             winget_installer_manifest(&version, "2026-06-24", &sample_winget_artifacts());
 
         assert!(manifest.contains("PackageIdentifier: ScryerMedia.Weaver"));
         assert!(manifest.contains("PackageVersion: 0.6.6"));
-        assert!(manifest.contains("InstallerType: zip"));
-        assert!(manifest.contains("NestedInstallerType: portable"));
-        assert!(manifest.contains("RelativeFilePath: weaver.exe"));
-        assert!(manifest.contains("  PortableCommandAlias: weaver"));
+        assert!(manifest.contains("InstallerType: msi"));
+        assert!(manifest.contains("UpgradeBehavior: uninstallPrevious"));
+        assert!(manifest.contains("ProductCode: {694CA1CE-CB74-486A-BB1A-005D1D2051A2}"));
+        assert!(manifest.contains("ProductCode: {AD8E9924-5148-4052-9A91-E4B7B47C9CD7}"));
         assert!(manifest.contains("Architecture: x64"));
         assert!(manifest.contains("Architecture: arm64"));
         assert!(manifest.contains(WINGET_WINDOWS_X64_ASSET));

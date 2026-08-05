@@ -47,7 +47,9 @@ pub fn platform_keystores(_data_dir: Option<PathBuf>) -> Vec<Box<dyn KeyStore>> 
     }
 
     #[cfg(target_os = "windows")]
-    stores.push(Box::new(super::windows::WindowsCredentialManager::new()));
+    stores.push(Box::new(
+        super::windows::WindowsCredentialManager::for_data_dir(_data_dir.as_deref()),
+    ));
 
     #[cfg(target_os = "linux")]
     {

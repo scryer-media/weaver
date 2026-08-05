@@ -115,6 +115,7 @@ impl Pipeline {
         self.db
             .save_file_identity(job_id, &identity)
             .map_err(|error| format!("failed to save file identity: {error}"))?;
+        self.invalidate_par2_session_for_identity_rebind(job_id);
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.file_identities.insert(identity.file_index, identity);
         }

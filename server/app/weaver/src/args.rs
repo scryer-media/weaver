@@ -7,7 +7,11 @@ pub(crate) const DEFAULT_SERVE_PORT: u16 = 9090;
 pub(crate) const DEFAULT_SERVE_BASE_URL: &str = "/";
 
 #[derive(Parser)]
-#[command(name = "weaver", about = "Usenet binary downloader")]
+#[command(
+    name = "weaver",
+    about = "Usenet binary downloader",
+    version = env!("CARGO_PKG_VERSION")
+)]
 pub(crate) struct Cli {
     /// Path to configuration file.
     #[arg(short, long)]
@@ -156,9 +160,20 @@ pub(crate) enum Par2Command {
 mod tests {
     use std::path::PathBuf;
 
-    use clap::Parser;
+    use clap::{Parser, error::ErrorKind};
 
     use super::{Cli, Command, DEFAULT_CONFIG_FILE};
+
+    #[test]
+    fn version_flag_reports_the_package_version() {
+        let error = match Cli::try_parse_from(["weaver", "--version"]) {
+            Err(error) => error,
+            Ok(_) => panic!("version exits"),
+        };
+
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
 
     #[test]
     fn argless_invocation_defaults_to_serve() {
