@@ -74,6 +74,11 @@ pub(crate) struct DirectStoreRuntime {
     settings: Option<DirectStoreSettings>,
     /// Jobs whose spec has already been examined for candidate sets.
     examined: HashSet<JobId>,
+    /// Jobs whose archive-password harvest has already been handed to their
+    /// sets' `-hp` gates (plan 136, E4). Separate from [`Self::examined`]
+    /// because a **restored** job is examined without ever passing through the
+    /// admission seam, and its sets still need candidates.
+    header_candidates_offered: HashSet<JobId>,
     sets: HashMap<JobId, Vec<DirectSet>>,
     /// Destinations already created and marked sparse, per job (B3, D3). A
     /// member stored inside a directory names a partial inside that directory
@@ -149,6 +154,18 @@ impl DirectStoreRuntime {
         self.settings().gate
     }
 
+    /// Test hook: whether the once-per-job `-hp` harvest has already run for
+    /// this job (plan 136, E4).
+    ///
+    /// Only one test reads it, and only to establish the *precondition* of the
+    /// thing it is testing: once this is true the harvest can never run again,
+    /// so a password supplied later has exactly one route left into the `-hp`
+    /// ring — the per-article re-offer in [`Pipeline::refresh_direct_passwords`].
+    #[cfg(test)]
+    pub(crate) fn header_candidates_offered(&self, job_id: JobId) -> bool {
+        self.header_candidates_offered.contains(&job_id)
+    }
+
     /// Test hook: force the gate without going through a config load.
     #[cfg(test)]
     pub(crate) fn set_gate(&mut self, gate: DirectStoreGate) {
@@ -211,6 +228,7 @@ impl DirectStoreRuntime {
     pub(crate) fn clear_job(&mut self, job_id: JobId) {
         self.sets.remove(&job_id);
         self.examined.remove(&job_id);
+        self.header_candidates_offered.remove(&job_id);
         self.prepared_destinations.remove(&job_id);
     }
 
@@ -229,6 +247,7 @@ impl DirectStoreRuntime {
     pub(crate) fn is_empty_for(&self, job_id: JobId) -> bool {
         !self.sets.contains_key(&job_id)
             && !self.examined.contains(&job_id)
+            && !self.header_candidates_offered.contains(&job_id)
             && !self.prepared_destinations.contains_key(&job_id)
     }
 
@@ -519,6 +538,7 @@ impl Pipeline {
     /// takes the set and asks the job's whole candidate list, which is a
     /// superset of this one.
     fn refresh_direct_passwords(&mut self, job_id: JobId) {
+        self.offer_direct_header_passwords(job_id);
         if !self
             .direct_store
             .sets_for(job_id)
@@ -534,8 +554,109 @@ impl Pipeline {
         else {
             return;
         };
+        // Plan 136, E4. `offer_direct_header_passwords` runs **once** per job and
+        // every set wants a header password from creation, so the harvest is
+        // memoized on the job's first article and can never re-run. That is fine
+        // for `NzbMeta` and `FilenameConvention`, which are immutable per job —
+        // and not fine for the spec's password, which is not. This line is its
+        // only route into the `-hp` ring afterwards, and without it a password
+        // supplied mid-download reaches the *file* key and never the archive
+        // one, so a `-hp` set that had a password all along still refuses under
+        // `NoPassword`.
+        //
+        // Normalized the way the harvest normalizes, so a placeholder like
+        // `"yes"` — which `archive_password_candidates_for_job` drops — is not
+        // smuggled past it here and paid for in PBKDF2.
+        //
+        // Labelled `job_spec` rather than `explicit` because that is all that is
+        // known: for a job imported from an NZB, `import.rs` seeds `spec.password`
+        // from the harvest's *first* candidate, which is usually the NZB meta
+        // password or the `{{…}}` filename convention. The label only reaches a
+        // refusal's `sources` field, and a field that says where a candidate came
+        // from should not guess.
+        let offered = crate::ingest::normalize_archive_password_candidate(Some(password.as_str()));
         for set in self.direct_store.sets_mut(job_id) {
             set.router.set_password(Some(password.as_str()));
+            // Offering is a no-op once the ring has verified or refused, and a
+            // string compare against at most three held candidates otherwise.
+            if let Some(value) = offered.as_deref() {
+                set.router.offer_header_password("job_spec", value);
+            }
+        }
+    }
+
+    /// Hands the job's archive-password harvest to every set's `-hp` gate
+    /// (plan 136, E4), once per job.
+    ///
+    /// # Why the whole harvest, and not `spec.password`
+    ///
+    /// `spec.password` is the harvest's *first* candidate, which for a job
+    /// imported from an NZB is the `nzb.meta.password` or the `{{password}}`
+    /// filename convention — so it is usually the right one already. It stops
+    /// being enough the moment an operator supplies an explicit password:
+    /// that one takes priority in the spec, and a set whose archive key is the
+    /// NZB-meta password would then refuse for a password the job was holding
+    /// all along. The list is bounded by construction — `Explicit`, `NzbMeta`,
+    /// `FilenameConvention`, at most one each — so this bounds the `-hp` gate's
+    /// KDF work at three derivations however deep the archive asks for.
+    ///
+    /// # Why here rather than in `ensure_direct_sets`
+    ///
+    /// The harvest reads the job's persisted NZB, so it must not run per
+    /// article; and it must reach **restored** sets, which never go through
+    /// `ensure_direct_sets` at all — `install_restored` marks the job examined
+    /// precisely so the lazy seam does not rediscover them. This runs from the
+    /// one seam both populations pass through, and memoizes on the same job set
+    /// `clear_job` clears.
+    ///
+    /// # Cost
+    ///
+    /// One persisted-NZB read per job that admitted a direct set, ever — the
+    /// `-hp` gate has to hold its candidates *before* the first header parse,
+    /// because that parse is where admission happens, and nothing cheaper than
+    /// the parse itself can say whether a set is `-hp`. That is strictly less
+    /// than the conventional path already pays: `try_update_archive_topology`
+    /// harvests once **per volume parse**.
+    fn offer_direct_header_passwords(&mut self, job_id: JobId) {
+        if self
+            .direct_store
+            .header_candidates_offered
+            .contains(&job_id)
+        {
+            return;
+        }
+        if !self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| set.router.wants_header_password())
+        {
+            return;
+        }
+        // Armed on the harvest having **run**, not on it having run *first*
+        // (E4 review). The NZB half is a database read and a parse, and both
+        // warn-and-continue with an empty list; memoizing before that meant one
+        // transient error at exactly this instant cost the job its `NzbMeta` and
+        // `FilenameConvention` candidates for the rest of its life, with no
+        // second chance — `wants_header_password()` is the only other gate and
+        // it is still true. A harvest that ran and found nothing is a *fact*
+        // about the job and is remembered; one that failed is not.
+        //
+        // Deliberately not "arm only when candidates were found": for the
+        // overwhelming majority of jobs there is no password anywhere, and that
+        // would re-read and re-parse the persisted NZB on **every article**.
+        let (candidates, harvested) = self.harvest_archive_password_candidates(job_id);
+        if harvested {
+            self.direct_store.header_candidates_offered.insert(job_id);
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        for set in self.direct_store.sets_mut(job_id) {
+            for candidate in &candidates {
+                set.router
+                    .offer_header_password(candidate.source().as_str(), candidate.value());
+            }
         }
     }
 

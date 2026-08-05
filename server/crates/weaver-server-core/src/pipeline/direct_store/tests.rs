@@ -2903,12 +2903,14 @@ fn encrypted_member_facts(
 
     let mut crypt = super::router::crypt::MemberCrypt::new(
         super::router::crypt::MemberKeys {
-            key: material.key,
-            hash_key: material.hash_key,
+            key: weaver_unrar::MemberCipherKey::Aes256(material.key),
+            hash_key: Some(material.hash_key),
+            iv: CIPHER_IV,
         },
-        &facts,
+        &weaver_unrar::MemberKeying::Rar5(facts),
     );
     crypt.observe(&weaver_unrar::EncryptedStore {
+        format: weaver_unrar::ArchiveFormat::Rar5,
         crypt: Some(facts),
         rar4_salt: None,
         cipher_size: Some(cipher_len as u64),
@@ -3117,12 +3119,14 @@ fn a_member_whose_tail_padding_is_not_whole_refuses_its_final_block() {
     // article's second half leaves behind.
     let mut crypt = super::router::crypt::MemberCrypt::new(
         super::router::crypt::MemberKeys {
-            key: material.key,
-            hash_key: material.hash_key,
+            key: weaver_unrar::MemberCipherKey::Aes256(material.key),
+            hash_key: Some(material.hash_key),
+            iv: CIPHER_IV,
         },
-        &facts,
+        &weaver_unrar::MemberKeying::Rar5(facts),
     );
     crypt.observe(&weaver_unrar::EncryptedStore {
+        format: weaver_unrar::ArchiveFormat::Rar5,
         crypt: Some(facts),
         rar4_salt: None,
         cipher_size: Some(cipher_len as u64),
@@ -5185,15 +5189,20 @@ fn a_snapshot_round_trips_its_crypt_rows_and_carries_no_password() {
     let blob = super::snapshot::encode(&snapshot).expect("the crypt row encodes");
     assert_eq!(
         u16::from_le_bytes([blob[4], blob[5]]),
-        4,
-        "a blob carrying crypt rows is schema 4"
+        super::snapshot::SNAPSHOT_SCHEMA_VERSION,
+        "a blob carrying crypt rows is written at the current schema"
     );
     let decoded = super::snapshot::decode(&blob).expect("the crypt row decodes");
     assert_eq!(decoded, snapshot);
     assert_eq!(
-        decoded.destinations[0].crypt.as_ref().map(|row| row.iv),
-        Some(CRYPT_IV),
-        "the IV a restore rebuilds a key from must survive the round trip"
+        decoded.destinations[0].crypt.as_ref().map(|row| row.keying),
+        Some(super::router::crypt::MemberCryptKeying::Rar5 {
+            salt: CRYPT_SALT,
+            kdf_count_lg2: CRYPT_KDF_LG2,
+            iv: CRYPT_IV,
+            psw_check_present: false,
+        }),
+        "the keying a restore rebuilds a key from must survive the round trip"
     );
 
     // Non-vacuity, and the whole reason this drives the producer: the blob
@@ -5257,18 +5266,30 @@ fn a_partially_retained_padding_is_not_checkpointed_as_the_members_own_bytes() {
 }
 
 #[test]
-fn a_schema_3_snapshot_is_refused_rather_than_read_as_plaintext_coverage() {
-    // The bump exists because a v3 claim over an encrypted member's destination
-    // describes plaintext while a v3 reader would take it for posted bytes.
-    // Forward- and backward-refusing, as established.
+fn every_older_schema_is_refused_rather_than_read_as_something_it_is_not() {
+    // v3: a claim over an encrypted member's destination describes plaintext
+    // while a v3 reader would take it for posted bytes.
+    // v4: `MemberCryptSnapshot`'s flat RAR5 fields became a discriminant, so a
+    // v4 row is a shorter positional array *and* one that cannot say whether it
+    // describes a RAR4 or a RAR5 member. Refused in both directions, as
+    // established — the codec accepts exactly its own version.
     let blob = super::snapshot::encode(&sample_snapshot()).unwrap();
-    let mut older = blob.clone();
-    older[4..6].copy_from_slice(&3u16.to_le_bytes());
-    assert_eq!(
-        super::snapshot::decode(&older),
-        Err(super::snapshot::SnapshotError::UnsupportedVersion {
-            found: 3,
-            supported: 4,
-        })
-    );
+    for found in [3u16, 4] {
+        let mut older = blob.clone();
+        older[4..6].copy_from_slice(&found.to_le_bytes());
+        assert_eq!(
+            super::snapshot::decode(&older),
+            Err(super::snapshot::SnapshotError::UnsupportedVersion {
+                found,
+                supported: super::snapshot::SNAPSHOT_SCHEMA_VERSION,
+            })
+        );
+    }
+    // And a newer one, so the refusal is not an accident of ordering.
+    let mut newer = blob;
+    newer[4..6].copy_from_slice(&(super::snapshot::SNAPSHOT_SCHEMA_VERSION + 1).to_le_bytes());
+    assert!(matches!(
+        super::snapshot::decode(&newer),
+        Err(super::snapshot::SnapshotError::UnsupportedVersion { .. })
+    ));
 }

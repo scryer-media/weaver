@@ -43,6 +43,23 @@ pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 ///   without re-encrypting the member from its IV. A v3 reader would see a claim
 ///   over plaintext and treat it as posted bytes, which is why this is a version
 ///   bump and not an optional field.
+/// - 5: `MemberCryptSnapshot`'s flat RAR5 crypt fields became the
+///   `MemberCryptKeying` discriminant (plan 136, E3). RAR4 file encryption is
+///   keyed by an 8-byte per-file salt and no KDF count, and its IV is a KDF
+///   output rather than a header field — so it does not fit v4's `salt[16] +
+///   kdf_count_lg2 + iv[16] + psw_check_present` shape, and squeezing it in
+///   (zero-padding the salt, inventing a sentinel count) would let a RAR5 row
+///   and a RAR4 row compare *equal* at restore, which is precisely the
+///   "different archive" case the comparison exists to catch. The body is the
+///   compact **positional** MessagePack form, so a changed field set is a
+///   changed array shape whatever the field names would have said: this is a
+///   bump by the codec's own rule, not by choice.
+///
+///   Operationally it costs nothing. v4 has never shipped — it landed on
+///   `release-0.8.0` after the 0.7 line — so the only rows it can refuse are
+///   ones written by an unreleased build of the same branch, and the refusal
+///   costs exactly one redownload of a set that was mid-flight across a
+///   developer's rebuild. The v3 note below is the one that reaches users.
 ///
 /// # The v3 refusal is a release note (plan 136, E1 review F8)
 ///
@@ -52,7 +69,7 @@ pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 /// redownload per set that was mid-download across the upgrade — but it is
 /// user-visible traffic and belongs in the notes rather than in a support
 /// thread.
-pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 4;
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 5;
 
 const FRAME_HEADER_LEN: usize = 6;
 

@@ -92,10 +92,29 @@ impl Pipeline {
         &self,
         job_id: JobId,
     ) -> Vec<ArchivePasswordCandidate> {
+        self.harvest_archive_password_candidates(job_id).0
+    }
+
+    /// [`Self::archive_password_candidates_for_job`] plus whether the job's
+    /// persisted NZB was actually **read**.
+    ///
+    /// The harvest's two halves fail differently. `spec.password` is already in
+    /// memory and cannot fail; the NZB half is a database read followed by a
+    /// parse, and both of those warn-and-continue with an empty list. So an
+    /// empty result is two different facts — *"this job carries no password
+    /// anywhere"*, which is permanent, and *"the read failed this once"*, which
+    /// is not — and any caller that **memoizes** the harvest has to tell them
+    /// apart. `false` here means the second: nothing about the job was learned,
+    /// so nothing about it may be remembered (plan 136, E4 review).
+    fn harvest_archive_password_candidates(
+        &self,
+        job_id: JobId,
+    ) -> (Vec<ArchivePasswordCandidate>, bool) {
         let spec_password = self
             .jobs
             .get(&job_id)
             .and_then(|state| state.spec.password.as_deref());
+        let mut harvested = true;
         let mut candidates = match self.db.load_active_job_persisted_nzb(job_id) {
             Ok(Some((nzb_path, Some(nzb_zstd)))) => {
                 match crate::ingest::parse_persisted_nzb_bytes(&nzb_zstd) {
@@ -106,6 +125,7 @@ impl Pipeline {
                             error = %error,
                             "failed to parse persisted NZB for password candidates"
                         );
+                        harvested = false;
                         Vec::new()
                     }
                 }
@@ -117,6 +137,7 @@ impl Pipeline {
                     error = %error,
                     "failed to load persisted NZB for password candidates"
                 );
+                harvested = false;
                 Vec::new()
             }
         };
@@ -132,7 +153,7 @@ impl Pipeline {
             );
         }
 
-        candidates
+        (candidates, harvested)
     }
 
     pub(super) fn primary_archive_password_for_job(&self, job_id: JobId) -> Option<String> {

@@ -1363,6 +1363,26 @@ async fn insert_active_job_with_persisted_nzb(
     spec: JobSpec,
     nzb_zstd: Vec<u8>,
 ) -> PathBuf {
+    insert_active_job_with_persisted_nzb_named(pipeline, job_id, spec, nzb_zstd, None).await
+}
+
+/// [`insert_active_job_with_persisted_nzb`] with the persisted NZB's **file
+/// name** chosen by the caller.
+///
+/// The name is not decoration: `nzb_password_candidates` reads a
+/// `{{password}}` convention out of the NZB path's stem, so it is the only way
+/// to exercise that candidate source. `None` keeps the job-id name every other
+/// caller gets.
+async fn insert_active_job_with_persisted_nzb_named(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    spec: JobSpec,
+    nzb_zstd: Vec<u8>,
+    nzb_file_name: Option<&str>,
+) -> PathBuf {
+    let nzb_file_name = nzb_file_name
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{}.nzb", job_id.0));
     let dir_name = crate::jobs::working_dir::sanitize_dirname(&spec.name);
     let candidate = pipeline.intermediate_dir.join(&dir_name);
     let working_dir = if candidate.exists() {
@@ -1384,7 +1404,7 @@ async fn insert_active_job_with_persisted_nzb(
         .create_active_job(&crate::ActiveJob {
             job_id,
             nzb_hash: [0; 32],
-            nzb_path: working_dir.join(format!("{}.nzb", job_id.0)),
+            nzb_path: working_dir.join(&nzb_file_name),
             nzb_zstd,
             output_dir: working_dir.clone(),
             created_at: 0,

@@ -56,7 +56,10 @@ use weaver_unrar::{
 use super::ByteRanges;
 use super::plan::DirectSetPlan;
 use super::sparse::SparseMarking;
-use crypt::{AES_BLOCK, CryptRefusal, KeyRing, MemberCrypt, block_ceil, block_floor};
+use crypt::{
+    AES_BLOCK, CryptRefusal, HeaderCryptRefusal, HeaderKeyRing, KeyRing, MemberCrypt, block_ceil,
+    block_floor,
+};
 
 pub(crate) mod crypt;
 
@@ -143,6 +146,23 @@ pub(crate) enum DemotionReason {
     /// else. A *wrong* password demotes to a conventional path that will fail
     /// the same way, which is the parity this reason keeps.
     EncryptedMemberRefused(CryptRefusal),
+    /// A **header-encrypted** (`-hp`) set whose headers this router may not open
+    /// (plan 136, E4).
+    ///
+    /// `-hp` withholds the *layout*, not the *keying facts*: RAR5's type-4
+    /// record is plaintext, so a password candidate can be proved against the
+    /// archive's own check before a header is decrypted. This is what fires when
+    /// no candidate can be proved — no candidates, none that verify, no check to
+    /// prove them against, RAR4 (which has no check anywhere in the format), or
+    /// key material over the library's KDF ceiling.
+    ///
+    /// A demotion, and the pre-E4 floor exactly: the volume materializes
+    /// byte-exactly and the conventional extractor opens it with the job's whole
+    /// candidate list. It is raised at the **first header parse**, which is what
+    /// stops such a volume from also burning
+    /// [`MAX_HEADER_PREFIX_BYTES`] of staging on its way to
+    /// [`Self::UnparsableVolume`].
+    HeaderEncryptedRefused(HeaderCryptRefusal),
     /// A checkpoint's crypt facts are not the facts the rebuilt layout states,
     /// or a member this run classified encrypted has no crypt row at all (E-D4).
     ///
@@ -347,6 +367,7 @@ impl DemotionReason {
             Self::MemberIneligible(MemberIneligibility::NoChecksum) => "member_no_checksum",
             Self::MemberIneligible(MemberIneligibility::MalformedChain) => "member_malformed_chain",
             Self::EncryptedMemberRefused(refusal) => refusal.metric(),
+            Self::HeaderEncryptedRefused(refusal) => refusal.metric(),
             Self::EncryptedFactsDisagree => "encrypted_facts_disagree",
             Self::EncryptedPostedBytesUnavailable => "encrypted_posted_bytes_unavailable",
             Self::ToleranceBudgetExceeded => "tolerance_budget",
@@ -1441,6 +1462,11 @@ pub(crate) struct DirectSetRouter {
     /// and untouched for a set with no encrypted member — which is every set
     /// plan 135 routed.
     crypt: KeyRing,
+    /// The archive-header key for a `-hp` set (plan 136, E4). Empty and
+    /// untouched for every set whose headers are readable, which is every set
+    /// E1–E3 routed: it is only consulted when a header parse comes back
+    /// `EncryptedArchive`.
+    header_crypt: HeaderKeyRing,
     /// Envelope spans produced by a member **migration** (D1's tolerance),
     /// waiting to be handed to the caller.
     ///
@@ -1529,6 +1555,7 @@ impl DirectSetRouter {
             member_order_stale: false,
             holds_budget: DEFAULT_HOLDS_BUDGET_BYTES,
             crypt: KeyRing::new(),
+            header_crypt: HeaderKeyRing::new(),
             migrated: Vec::new(),
             retired_destinations: Vec::new(),
             member_facts_revision: 0,
@@ -1572,12 +1599,47 @@ impl DirectSetRouter {
     /// first parse, which is why it is `!admitted` rather than "no password
     /// held": see [`crypt::KeyRing::wants_password`].
     pub(crate) fn wants_password(&self) -> bool {
-        self.demoted.is_none() && self.crypt.wants_password()
+        self.demoted.is_none()
+            && (self.crypt.wants_password() || self.header_crypt.wants_password())
     }
 
     /// Binds the job's password. Never persisted, never logged.
+    ///
+    /// A **proved** `-hp` archive key wins over the spec's (plan 136, E4). RAR
+    /// uses one password for headers and file data alike, so a set whose headers
+    /// the archive's own check opened has already established which of the job's
+    /// candidates is the set's password — while `spec.password` is only the
+    /// harvest's first entry and may be an operator's guess that lost to the NZB
+    /// meta password. Letting the spec replace a proved key would open the
+    /// headers and then refuse the members.
     pub(crate) fn set_password(&mut self, password: Option<&str>) {
+        if self.header_crypt.password().is_some() {
+            return;
+        }
         self.crypt.set_password(password);
+    }
+
+    /// Offers one of the job's archive-password candidates to the `-hp` gate
+    /// (plan 136, E4). Never persisted, never logged.
+    ///
+    /// Separate from [`Self::set_password`] because the two rings answer
+    /// different questions from different inputs. `set_password` binds the one
+    /// password the job spec carries and keys *file data*; this offers the whole
+    /// harvest — `Explicit`, `NzbMeta`, `FilenameConvention`, at most one each —
+    /// and keys the *archive headers*. A set whose header key is the NZB-meta
+    /// password while the spec carries an operator's guess would otherwise
+    /// refuse for a password that was already in hand.
+    ///
+    /// Offers are ignored once the ring has verified or refused, so this is
+    /// idempotent and safe to call per article.
+    pub(crate) fn offer_header_password(&mut self, source: &'static str, value: &str) {
+        self.header_crypt.offer(source, value);
+    }
+
+    /// Whether this set is still collecting `-hp` candidates, so the seam knows
+    /// whether re-offering the harvest can still change anything.
+    pub(crate) fn wants_header_password(&self) -> bool {
+        self.demoted.is_none() && self.header_crypt.wants_password()
     }
 
     /// The key ring's own `Debug`, for the test that proves a password cannot
@@ -2410,9 +2472,31 @@ impl DirectSetRouter {
         let Some(image) = self.volume_image(volume_index, VolumeImage::Envelope) else {
             return Ok(false);
         };
-        let Ok(facts) = weaver_unrar::RarArchive::parse_volume_facts(image, None) else {
-            return Ok(false);
-        };
+        let facts =
+            match weaver_unrar::RarArchive::parse_volume_facts(image, self.header_password()) {
+                Ok(facts) => facts,
+                // A restored `-hp` set (plan 136, E4). The archive key is never
+                // persisted, so this run has to prove one of the job's candidates
+                // again before it can read a header — and this is the *first* place
+                // it can, because a restored volume's staged image has a hole from
+                // offset zero and `try_parse_volume` never reaches the record
+                // through it. The envelope holds the headers, so it does.
+                Err(weaver_unrar::RarError::EncryptedArchive)
+                    if self.key_header_encrypted_volume(volume_index, VolumeImage::Envelope)? =>
+                {
+                    let Some(image) = self.volume_image(volume_index, VolumeImage::Envelope) else {
+                        return Ok(false);
+                    };
+                    match weaver_unrar::RarArchive::parse_volume_facts(
+                        image,
+                        self.header_password(),
+                    ) {
+                        Ok(facts) => facts,
+                        Err(_) => return Ok(false),
+                    }
+                }
+                Err(_) => return Ok(false),
+            };
         if facts.members.is_empty() || !self.walk_covered_volume(volume_index, &facts, volume_end) {
             return Ok(false);
         }
@@ -2561,12 +2645,33 @@ impl DirectSetRouter {
         }
 
         let image = SparseImage::from_staged(&staging.chunks, self.scratch.handle());
-        let Ok(facts) = weaver_unrar::RarArchive::parse_volume_facts(image, None) else {
-            // A prefix too short to hold a whole header is normal early on; the
-            // next article retries. A genuinely unparsable volume is caught by
-            // the prefix ceiling above.
-            return Ok(());
-        };
+        let facts =
+            match weaver_unrar::RarArchive::parse_volume_facts(image, self.header_password()) {
+                Ok(facts) => facts,
+                // The one parse failure that is a *fact* rather than a shortage of
+                // bytes (plan 136, E4): the volume's headers are encrypted, so the
+                // layout is withheld until a key exists. Every other failure is a
+                // prefix too short to hold a whole header, which is normal early on
+                // and which the next article retries; a genuinely unparsable volume
+                // is caught by the prefix ceiling above.
+                Err(weaver_unrar::RarError::EncryptedArchive) => {
+                    return if self.key_header_encrypted_volume(volume_index, VolumeImage::Staged)? {
+                        self.try_parse_volume(volume_index)
+                    } else {
+                        Ok(())
+                    };
+                }
+                // The archive's own type-4 record states key material this build
+                // will not derive from. Named here for the same reason: it is a
+                // property of the archive that no amount of further staging changes.
+                Err(
+                    weaver_unrar::RarError::UnsupportedEncryption { .. }
+                    | weaver_unrar::RarError::UnsupportedEncryptionKdf { .. },
+                ) => {
+                    return Err(self.refuse_header_encrypted(HeaderCryptRefusal::Unkeyable));
+                }
+                Err(_) => return Ok(()),
+            };
         if facts.members.is_empty() {
             return Ok(());
         }
@@ -2583,6 +2688,105 @@ impl DirectSetRouter {
             .is_some_and(|staging| staging.source_complete);
         let reached_end = facts.more_volumes || source_complete;
         self.accept_volume_facts(volume_index, facts, reached_end, VolumeImage::Staged)
+    }
+
+    /// Keys a header-encrypted (`-hp`) set, or refuses it by name (plan 136,
+    /// E4).
+    ///
+    /// Reached from the two places a volume's headers are parsed, on the parse
+    /// coming back `EncryptedArchive`. `Ok(true)` means a password is now
+    /// available and the caller should re-run its parse; `Ok(false)` means the
+    /// image has not reached the record yet and the next article will retry.
+    /// Three steps, and the middle one is the whole phase:
+    ///
+    /// 1. **Read the keying facts, which `-hp` does not hide.** RAR5's type-4
+    ///    record is plaintext and sits at the front of the volume, exactly where
+    ///    the header walk already reads — `parse_volume_header_encryption`
+    ///    returns it with no password. RAR4 has no such record and answers
+    ///    `Rar4`.
+    /// 2. **Prove a candidate against the archive's own check, or refuse.** Not
+    ///    "try one and see": see [`HeaderCryptRefusal::Unverifiable`] for why
+    ///    `-hp` demands `Verified` where `-p` accepts `Unverifiable`.
+    /// 3. **Adopt it for the whole set.** RAR uses **one** password for header
+    ///    and file data alike, so the proved candidate is also the file key, and
+    ///    binding it into [`Self::crypt`] here is what stops a set whose spec
+    ///    carries a *different* candidate from opening its headers and then
+    ///    refusing its members.
+    ///
+    /// From there the set is an ordinary encrypted set: nothing downstream is
+    /// `-hp`-shaped, and [`Self::header_password`] keeps every later parse of
+    /// every volume keyed.
+    ///
+    /// # Why the bytes are still here to re-parse
+    ///
+    /// Nothing is discarded while unkeyed. The volume's articles stage exactly
+    /// as they do for any volume whose prefix has not yet yielded a header —
+    /// holds in RAM, paged to the holds scratch under budget pressure (plan
+    /// 135) — and the retry reads the same staged image. The only thing E4
+    /// changes is *when* the set stops waiting: a named refusal at the first
+    /// parse instead of [`DemotionReason::UnparsableVolume`] after
+    /// [`MAX_HEADER_PREFIX_BYTES`] of staging per volume.
+    fn key_header_encrypted_volume(
+        &mut self,
+        volume_index: u32,
+        source: VolumeImage,
+    ) -> Result<bool, DemotionReason> {
+        if let Some(refusal) = self.header_crypt.refusal() {
+            return Err(self.refuse_header_encrypted(refusal));
+        }
+        // A password already proved that still will not open this volume: the
+        // set's volumes disagree about their archive key, which is not a shape a
+        // single `rar -hp` run produces. Also the termination proof for the
+        // caller's retry — a second pass can only reach this arm.
+        if self.header_crypt.password().is_some() {
+            return Err(self.refuse_header_encrypted(HeaderCryptRefusal::NoVerifiedCandidate));
+        }
+        let Some(image) = self.volume_image(volume_index, source) else {
+            return Ok(false);
+        };
+        let encryption = match weaver_unrar::RarArchive::parse_volume_header_encryption(image) {
+            Ok(encryption) => encryption,
+            Err(
+                weaver_unrar::RarError::UnsupportedEncryption { .. }
+                | weaver_unrar::RarError::UnsupportedEncryptionKdf { .. },
+            ) => return Err(self.refuse_header_encrypted(HeaderCryptRefusal::Unkeyable)),
+            // The record is at the front of the volume, so this is an image that
+            // has not reached it yet. The next article retries, and the prefix
+            // ceiling still backstops a volume that never yields one.
+            Err(_) => return Ok(false),
+        };
+        let verified = match self.header_crypt.resolve(&encryption) {
+            Ok(password) => password.to_string(),
+            Err(refusal) => return Err(self.refuse_header_encrypted(refusal)),
+        };
+        self.crypt.set_password(Some(&verified));
+        crate::runtime::perf_probe::record(
+            "direct_store.header_encrypted.keyed",
+            std::time::Duration::from_nanos(1),
+        );
+        Ok(true)
+    }
+
+    /// Records a `-hp` refusal and demotes under it.
+    ///
+    /// Logs which password *sources* were offered and never a value: a password
+    /// in a log is a password on disk.
+    fn refuse_header_encrypted(&mut self, refusal: HeaderCryptRefusal) -> DemotionReason {
+        tracing::debug!(
+            set_name = %self.plan.set_name,
+            reason = refusal.metric(),
+            sources = ?self.header_crypt.offered_sources(),
+            "direct-store refused a header-encrypted set"
+        );
+        self.fail(DemotionReason::HeaderEncryptedRefused(refusal))
+    }
+
+    /// The archive-header password, once one has been proved (plan 136, E4).
+    ///
+    /// `None` for every set whose headers are readable, which is what makes
+    /// every parse on those sets a no-password parse exactly as before.
+    fn header_password(&self) -> Option<&str> {
+        self.header_crypt.password()
     }
 
     /// Files one parse's facts against the layout and drains what they unlock.
@@ -2819,7 +3023,11 @@ impl DirectSetRouter {
         }
         let parsed = weaver_unrar::header::parse_all_headers_with_options(
             &mut image,
-            None,
+            // The archive-header password for a `-hp` set (E4), `None` for every
+            // other. Without it this walk cannot read a `-hp` volume's headers
+            // at all, so a `-hp -qo` set would refuse every parse as
+            // `QuickOpenMismatch` — fail-closed, but for the wrong reason.
+            self.header_password(),
             weaver_unrar::header::HeaderParseOptions {
                 allow_quick_open: false,
             },
@@ -2967,8 +3175,8 @@ impl DirectSetRouter {
                 Err(()) => return Err(self.fail(DemotionReason::UnsafeDestination)),
             };
             let crypt = encrypted.and_then(|facts| {
-                let (member_keys, record) = keys.get(&name)?;
-                let mut crypt = MemberCrypt::new(*member_keys, record);
+                let (member_keys, keying) = keys.get(&name)?;
+                let mut crypt = MemberCrypt::new(*member_keys, keying);
                 crypt.observe(&facts);
                 Some(crypt)
             });
@@ -3021,46 +3229,43 @@ impl DirectSetRouter {
     /// - no password: an encrypted set routes only with one;
     /// - a check present that this password does not reproduce: nothing is
     ///   written on the strength of a refuted password;
-    /// - key material this build cannot derive from — a RAR4 member (file
-    ///   encryption for RAR4/RAR3 is phase E3, and a RAR4 header states no
-    ///   `FHEXTRA_CRYPT` record at all), or a KDF count the crate refuses.
+    /// - key material this build cannot derive from: a RAR5 KDF count over the
+    ///   crate's ceiling.
     ///
     /// A check the header **omits** admits provisionally: nothing can be
     /// concluded before the bytes, and the member's keyed checksum gate is then
     /// the earliest detector — the same position layer 1 is in for a plaintext
     /// member.
+    ///
+    /// # RAR4 (E3)
+    ///
+    /// RAR4 file encryption keys here too, off the header's 8-byte file salt
+    /// rather than a `FHEXTRA_CRYPT` record —
+    /// [`weaver_unrar::MemberKeying`] is the discriminant and it is total, so
+    /// there is no "no record" arm to refuse on any more. A RAR4 member the
+    /// library cannot key (one of the pre-AES ciphers) never becomes an
+    /// `EncryptedStore` at all, so it demotes as an ineligible member and never
+    /// reaches this function. RAR4 carries no password-check value, so every
+    /// RAR4 member takes the provisional path above by construction.
     fn admit_encrypted(
         &mut self,
-    ) -> Result<
-        HashMap<
-            String,
-            (
-                crypt::MemberKeys,
-                weaver_unrar::RarVolumeMemberEncryptionFacts,
-            ),
-        >,
-        DemotionReason,
-    > {
-        let encrypted: Vec<(String, weaver_unrar::EncryptedStore)> = self
+    ) -> Result<HashMap<String, (crypt::MemberKeys, weaver_unrar::MemberKeying)>, DemotionReason>
+    {
+        let encrypted: Vec<(String, weaver_unrar::MemberKeying)> = self
             .layout_members()
             .iter()
             .filter_map(|member| {
                 member
                     .eligibility
                     .encrypted_store()
-                    .map(|facts| (member.name.clone(), facts))
+                    .map(|facts| (member.name.clone(), facts.keying()))
             })
             .collect();
         let mut keys = HashMap::with_capacity(encrypted.len());
-        for (name, facts) in encrypted {
-            let Some(record) = facts.crypt else {
-                return Err(self.fail(DemotionReason::EncryptedMemberRefused(
-                    CryptRefusal::Unkeyable,
-                )));
-            };
-            match self.crypt.admit(&record) {
+        for (name, keying) in encrypted {
+            match self.crypt.admit(&keying) {
                 Ok(member_keys) => {
-                    keys.insert(name, (member_keys, record));
+                    keys.insert(name, (member_keys, keying));
                 }
                 Err(refusal) => {
                     return Err(self.fail(DemotionReason::EncryptedMemberRefused(refusal)));
@@ -4190,12 +4395,12 @@ impl DirectSetRouter {
         if let Some(value) = part_value {
             member.checked_parts.insert(part_position, value);
             if let Some(expected) = packed_crc32 {
-                let composed = member
-                    .crypt
-                    .as_ref()
-                    .map(|crypt| crypt.fold_member_crc(value, packed_uses_mac))
-                    .unwrap_or(value);
-                if expected != composed {
+                let composed = member.crypt.as_ref().map_or(Some(value), |crypt| {
+                    crypt.fold_member_crc(value, packed_uses_mac)
+                });
+                // A fold that refuses to answer is a mismatch: `Some(expected)`
+                // is the only value that passes.
+                if composed != Some(expected) {
                     return Err(self.fail(DemotionReason::PartChecksumMismatch));
                 }
             }
@@ -4321,7 +4526,7 @@ impl DirectSetRouter {
             let Some(composed) = crypt.plain_runs().compose(0, unpacked_size) else {
                 return Ok(());
             };
-            if crypt.fold_member_crc(composed, uses_mac) != expected {
+            if crypt.fold_member_crc(composed, uses_mac) != Some(expected) {
                 return Err(self.fail(DemotionReason::MemberChecksumMismatch));
             }
             if let Some(member) = self.member_mut(member_id) {
