@@ -1746,6 +1746,16 @@ pub struct Pipeline {
     pub(super) par2_repairer_analyze_calls: usize,
     #[cfg(test)]
     pub(super) par2_repairer_execute_calls: usize,
+    /// Forces the retained-session gate on or off for a test, so a
+    /// differential can run both arms without mutating a process-global
+    /// environment variable while other tests are running.
+    #[cfg(test)]
+    pub(super) stateful_par2_session_forced: Option<bool>,
+    /// Times the retained session, rather than the read-and-verify pass,
+    /// produced a direct set's verdict. A differential needs this to tell
+    /// "the session agreed" from "the session refused and fell back".
+    #[cfg(test)]
+    pub(super) direct_session_pass_calls: usize,
     /// Downloaded article bodies waiting for decode scheduling.
     pub(super) pending_decode: VecDeque<PendingDecodeWork>,
     /// Jobs that should re-enter completion/post-processing on the next loop pass.

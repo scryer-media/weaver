@@ -192,6 +192,10 @@ impl Pipeline {
             par2_repairer_analyze_calls: 0,
             #[cfg(test)]
             par2_repairer_execute_calls: 0,
+            #[cfg(test)]
+            stateful_par2_session_forced: None,
+            #[cfg(test)]
+            direct_session_pass_calls: 0,
             pending_decode: VecDeque::new(),
             pending_completion_checks: VecDeque::new(),
             download_done_tx,

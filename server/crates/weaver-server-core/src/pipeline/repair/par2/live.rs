@@ -512,6 +512,30 @@ impl LivePar2Registry {
         &self,
         job_id: JobId,
     ) -> Option<HashMap<NzbFileId, FileId>> {
+        self.bindings_if_strong(job_id, true)
+    }
+
+    /// Bindings whose every slice carries a strong verdict — *including* slices
+    /// proven bad (plan 138, M3).
+    ///
+    /// The difference from [`Self::complete_bindings_if_strong`] is the point:
+    /// that one answers "may this stand in for the pass with a clean verdict",
+    /// so one bad slice disqualifies it. This one answers "has every slice been
+    /// adjudicated at all", which is what an evidence-fed session needs before
+    /// it can report on sources it will never read. A slice proven bad is
+    /// *resolved*; only a slice with no verdict has to be read.
+    pub(crate) fn fully_adjudicated_bindings(
+        &self,
+        job_id: JobId,
+    ) -> Option<HashMap<NzbFileId, FileId>> {
+        self.bindings_if_strong(job_id, false)
+    }
+
+    fn bindings_if_strong(
+        &self,
+        job_id: JobId,
+        require_valid: bool,
+    ) -> Option<HashMap<NzbFileId, FileId>> {
         let job = self.jobs.get(&job_id)?;
         let session = job.session.as_ref()?;
         let set = session.par2_set()?;
@@ -519,7 +543,8 @@ impl LivePar2Registry {
             .slice_evidence()
             .into_iter()
             .filter(|evidence| {
-                evidence.is_valid() && evidence.strength() == SliceEvidenceStrength::Crc32AndMd5
+                (!require_valid || evidence.is_valid())
+                    && evidence.strength() == SliceEvidenceStrength::Crc32AndMd5
             })
             .map(|evidence| (evidence.file_id(), evidence.slice_index()))
             .collect::<HashSet<_>>();

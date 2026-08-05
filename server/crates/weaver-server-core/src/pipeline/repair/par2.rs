@@ -778,20 +778,49 @@ impl Pipeline {
         self.live_par2.complete_bindings_if_strong(job_id)
     }
 
+    /// Whether the retained session is in play. Reads the environment in a
+    /// real build; a test may force either arm so a differential can assert
+    /// the two agree.
+    fn stateful_par2_session_gate(&self) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = self.stateful_par2_session_forced {
+            return forced;
+        }
+        stateful_par2_session_enabled()
+    }
+
     pub(crate) async fn take_or_open_par2_repair_session(
         &mut self,
         job_id: JobId,
         working_dir: std::path::PathBuf,
         memory_limit: usize,
         progress: Option<par2_rs::ProgressCallback>,
+        source_access: Option<std::sync::Arc<dyn par2_rs::FileAccess + Send + Sync>>,
     ) -> Result<Option<(par2_rs::Par2RepairSession, bool)>, String> {
-        if !stateful_par2_session_enabled() {
+        if !self.stateful_par2_session_gate() {
             return Ok(None);
         }
         if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
-            if let Some(session) = runtime.session.take() {
-                runtime.session_last_used = Some(Instant::now());
-                return Ok(Some((session, false)));
+            if let Some(mut session) = runtime.session.take() {
+                // A session is reusable only if it reads sources the way this
+                // caller needs them read. Where both want a handle the retained
+                // one adopts the new handle — the direct overlay snapshots its
+                // coverage, so every pass builds a fresh one and re-pointing is
+                // what keeps one session across many of them (plan 138, M3).
+                // A mismatch in *kind* is not adoptable in either direction, so
+                // that session is dropped and a fresh one opened below.
+                match (&source_access, session.is_access_backed()) {
+                    (Some(access), true) => {
+                        session.set_source_access(std::sync::Arc::clone(access));
+                        runtime.session_last_used = Some(Instant::now());
+                        return Ok(Some((session, false)));
+                    }
+                    (None, false) => {
+                        runtime.session_last_used = Some(Instant::now());
+                        return Ok(Some((session, false)));
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -805,8 +834,14 @@ impl Pipeline {
         };
 
         let session_result = tokio::task::spawn_blocking(move || {
-            let mut options =
-                par2_rs::Par2RepairSessionOptions::new(working_dir, vec![primary_path]);
+            let mut options = match source_access {
+                Some(access) => par2_rs::Par2RepairSessionOptions::with_source_access(
+                    working_dir,
+                    vec![primary_path],
+                    access,
+                ),
+                None => par2_rs::Par2RepairSessionOptions::new(working_dir, vec![primary_path]),
+            };
             options.memory_limit = Some(memory_limit);
             options.progress = progress;
             let mut session = par2_rs::Par2RepairSession::open(options)

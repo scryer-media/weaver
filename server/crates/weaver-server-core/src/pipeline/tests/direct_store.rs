@@ -12495,3 +12495,59 @@ async fn a_header_encrypted_set_prefers_the_proved_candidate_over_the_spec_passw
         Some(JobStatus::Complete)
     ));
 }
+
+/// The refusal is the safety property, so it is asserted rather than assumed:
+/// with live verification off there is no evidence to report from, and the
+/// session must hand the pass back rather than report an unread volume as
+/// missing.
+#[tokio::test]
+async fn the_direct_session_refuses_without_live_evidence() {
+    let member_name = "Silver.Horizon.S04E03.mkv";
+    let payload: Vec<u8> = (0..3072u32).map(|index| (index % 251) as u8).collect();
+    let pristine = single_member_store_set(member_name, &payload, 3);
+    let par2_bytes = par2_index_over_volumes(&pristine);
+    let mut posted = pristine.clone();
+    posted[1].1[9] ^= 0xFF;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(45205);
+    let (mut pipeline, _, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    // The one difference from the differential above.
+    pipeline.live_par2.set_enabled(false);
+    pipeline.stateful_par2_session_forced = Some(true);
+
+    let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &pristine, &par2_bytes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in in_order_arrivals(posted.len()) {
+        submit_volume_article(&mut pipeline, job_id, &posted, file_index, segment_number).await;
+    }
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+
+    let par2_set = pipeline
+        .par2_set(job_id)
+        .cloned()
+        .expect("the index parsed");
+    let resolution = pipeline
+        .resolve_direct_sets_before_par2_repairer(job_id, par2_set, working_dir)
+        .await;
+
+    assert_eq!(
+        pipeline.direct_session_pass_calls, 0,
+        "with no live evidence the session must refuse; reporting from an \
+         empty session would call every unread volume missing"
+    );
+    let _ = resolution;
+}

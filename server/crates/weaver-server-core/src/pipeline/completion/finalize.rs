@@ -62,7 +62,7 @@ pub(crate) enum NestedExtractionDecision {
     PreserveOutputsAtDepthLimit,
 }
 
-mod check;
+pub(crate) mod check;
 mod extract;
 mod nested;
 mod output;

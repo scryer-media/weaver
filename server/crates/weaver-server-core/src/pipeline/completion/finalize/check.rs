@@ -197,7 +197,7 @@ impl DamageAdjustments {
     }
 }
 
-fn configured_par2_repair_memory_limit_bytes() -> usize {
+pub(crate) fn configured_par2_repair_memory_limit_bytes() -> usize {
     parse_par2_repair_memory_limit_bytes(
         std::env::var(PAR2_REPAIR_MEMORY_LIMIT_ENV).ok().as_deref(),
     )
@@ -1126,6 +1126,9 @@ impl Pipeline {
                 working_dir.clone(),
                 memory_limit,
                 session_progress,
+                // By this point the repairer reads and writes real files: any
+                // set still routing here materialized before it arrived.
+                None,
             )
             .await
         {
