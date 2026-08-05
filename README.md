@@ -98,7 +98,7 @@ For hardened deployments, `weaver` supports `--read-only=true` as long as `/conf
 
 ## RAR direct-store (opt-in, off by default)
 
-A store-only RAR release normally costs about twice its size on disk: first the `.rar` volumes, then the extracted files. With direct-store enabled, Weaver writes the payload of unencrypted `Store` members straight to its final destination as the articles arrive, so the volumes never exist as files and the release lands once.
+A store-only RAR release normally costs about twice its size on disk: first the `.rar` volumes, then the extracted files. With direct-store enabled, Weaver writes the payload of `Store` members straight to its final destination as the articles arrive, so the volumes never exist as files and the release lands once. This includes password-protected sets: RAR4/RAR5 file encryption (`-p`) decrypts on the way in given the job's password, and RAR5 header encryption (`-hp`) routes when the password is available at admission — from the job itself, the NZB's password metadata, or the `{{password}}` filename convention — and its stored check verifies it. A set whose password cannot be proven falls back to the ordinary path with a password prompt, exactly as before.
 
 It is **off by default** while it matures. Turn it on with the `direct_store` settings:
 

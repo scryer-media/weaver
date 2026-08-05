@@ -3996,7 +3996,7 @@ impl DirectSetRouter {
 
     /// Routes one encrypted member slice, decrypting on the way in.
     ///
-    /// The nzbdav insight makes this nearly stateless: decrypting cipher block
+    /// CBC's structure makes this nearly stateless: decrypting cipher block
     /// *N* needs only cipher block *N−1*, so a router holding spans out of order
     /// can decrypt each one the moment its predecessor has landed. There is no
     /// chain checkpoint to maintain and no forward-only constraint.
