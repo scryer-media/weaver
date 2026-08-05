@@ -3,6 +3,7 @@ package clientadapter
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -170,21 +171,51 @@ func TestRarparVariantsRenderAnExplicitReplacementPath(t *testing.T) {
 				t.Fatalf("rendered configuration does not record Rarpar:\n%s", spec.Rendered)
 			}
 			if client == benchmark.SABnzbd {
-				if !strings.Contains(strings.Join(spec.Environment, "\n"), "PATH=/config/toolchain:") {
+				if !strings.Contains(strings.Join(spec.Environment, "\n"), "PATH=/config/toolchain:/lsiopy/bin:") {
 					t.Fatalf("SAB Rarpar lane does not prepend the staged toolchain to PATH: %#v", spec.Environment)
 				}
 				return
 			}
 			content := string(spec.ConfigContent)
-			for _, expected := range []string{"Unpack=no", "UnrarCmd=/config/toolchain/unrar", "Extensions=rarpar-post.sh"} {
+			for _, expected := range []string{"Unpack=yes", "ParRepair=yes", "UnrarCmd=/config/toolchain/unrar", "Extensions="} {
 				if !strings.Contains(content, expected) {
 					t.Fatalf("NZBGet Rarpar config lacks %q:\n%s", expected, content)
 				}
 			}
-			if len(spec.ExtraFiles) != 1 || !strings.Contains(string(spec.ExtraFiles[0].Content), "par repair") || !strings.Contains(string(spec.ExtraFiles[0].Content), "rar extract") {
-				t.Fatalf("NZBGet Rarpar post-process script is incomplete: %#v", spec.ExtraFiles)
+			if strings.Contains(content, "rarpar-post") || len(spec.ExtraFiles) != 0 {
+				t.Fatalf("NZBGet Rarpar lane must use its native pipeline, not a post-process script: %#v", spec)
+			}
+			if !strings.Contains(string(spec.Rendered), "UnRAR only; NZBGet built-in PAR2") {
+				t.Fatalf("NZBGet Rarpar provenance must disclose its built-in PAR2 engine:\n%s", spec.Rendered)
 			}
 		})
+	}
+}
+
+func TestNZBGetQueueParametersOnlyProvideTheArchivePassword(t *testing.T) {
+	parameters := nzbgetPPParameters("fixture-password")
+	if len(parameters) != 1 {
+		t.Fatalf("parameters = %#v, want only the archive password", parameters)
+	}
+	if len(parameters[0]) != 1 || parameters[0]["*Unpack:Password"] != "fixture-password" {
+		t.Fatalf("password parameter = %#v", parameters[0])
+	}
+	appendParameters := nzbgetAppendParameters("fixture.nzb", []byte("fixture"), parameters, "SCORE")
+	if len(appendParameters) != 11 {
+		t.Fatalf("append parameters = %#v, want 11 arguments", appendParameters)
+	}
+	if autoCategory, ok := appendParameters[9].(bool); !ok || autoCategory {
+		t.Fatalf("AutoCategory argument = %#v, want false", appendParameters[9])
+	}
+	if got, ok := appendParameters[10].([]nzbgetPPParameter); !ok || len(got) != 1 || got[0]["*Unpack:Password"] != "fixture-password" {
+		t.Fatalf("PPParameters argument = %#v, want %#v", appendParameters[10], parameters)
+	}
+	wire, err := json.Marshal(appendParameters)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wire), `{"*Unpack:Password":"fixture-password"}`) || strings.Contains(string(wire), `rarpar-post`) {
+		t.Fatalf("append wire parameters must contain only the archive password: %s", wire)
 	}
 }
 

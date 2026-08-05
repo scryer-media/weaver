@@ -11,9 +11,9 @@ func TestLoadGeneratedManifestV4RequiresMatchingRepairMetadata(t *testing.T) {
 	manifest := GeneratedManifest{
 		SchemaVersion:      4,
 		Case:               ArchiveCase{ID: "repair", RepairProfile: PAR2LightRepairProfile},
-		ExpectedFiles:      []FileDigest{{Path: "payload.bin", Size: 1, SHA256: "a"}},
-		SourceArchiveFiles: []FileDigest{{Path: "archive/fixture.part01.rar", Size: 1, SHA256: "b"}},
-		ArchiveFiles:       []FileDigest{{Path: "archive/fixture.part01.rar", Size: 1, SHA256: "c"}},
+		ExpectedFiles:      []FileDigest{{Path: "payload.bin", Size: 1, BLAKE3: "a"}},
+		SourceArchiveFiles: []FileDigest{{Path: "archive/fixture.part01.rar", Size: 1, BLAKE3: "b"}},
+		ArchiveFiles:       []FileDigest{{Path: "archive/fixture.part01.rar", Size: 1, BLAKE3: "c"}},
 		Repair: RepairDetails{
 			Profile:               PAR2LightRepairProfile,
 			PAR2RedundancyPercent: 10,
@@ -40,8 +40,8 @@ func TestLoadGeneratedManifestUpgradesLegacyManifestAsClean(t *testing.T) {
 	path := writeTestManifest(t, GeneratedManifest{
 		SchemaVersion: 3,
 		Case:          ArchiveCase{ID: "clean"},
-		ExpectedFiles: []FileDigest{{Path: "payload.bin", Size: 1, SHA256: "a"}},
-		ArchiveFiles:  []FileDigest{{Path: "archive/fixture.part01.rar", Size: 1, SHA256: "b"}},
+		ExpectedFiles: []FileDigest{{Path: "payload.bin", Size: 1, BLAKE3: "a"}},
+		ArchiveFiles:  []FileDigest{{Path: "archive/fixture.part01.rar", Size: 1, BLAKE3: "b"}},
 	})
 	loaded, err := LoadGeneratedManifest(path)
 	if err != nil {

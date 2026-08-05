@@ -68,12 +68,7 @@ func applyRepairProfile(
 		if par2Toolchain == nil {
 			return fixture.RepairDetails{}, nil, fmt.Errorf("PAR2 repair fixture requires a PAR2 toolchain")
 		}
-		redundancy := 10
-		missingVolumes := 0
-		if profile == fixture.PAR2HeavyRepairProfile {
-			redundancy = 35
-			missingVolumes = 2
-		}
+		redundancy, missingVolumes := par2RepairParameters(profile)
 		if err := createPAR2(ctx, config.DockerBinary, *par2Toolchain, caseDir, sourceArchives, redundancy); err != nil {
 			return fixture.RepairDetails{}, nil, err
 		}
@@ -137,6 +132,16 @@ func applyRepairProfile(
 		return fixture.RepairDetails{}, nil, err
 	}
 	return details, posted, nil
+}
+
+func par2RepairParameters(profile fixture.RepairProfile) (redundancy, missingVolumes int) {
+	if profile == fixture.PAR2HeavyRepairProfile {
+		// A 150 MiB movie split into 32 MiB volumes has five volumes. Two
+		// missing volumes exceed 35% recovery capacity, so heavy repair is
+		// one complete missing volume; light repair remains a byte flip.
+		return 35, 1
+	}
+	return 10, 0
 }
 
 func createPAR2(ctx context.Context, dockerBinary string, toolchain PAR2Toolchain, caseDir string, sources []fixture.FileDigest, redundancy int) error {
@@ -345,7 +350,7 @@ func digestPostedFiles(archiveDir, caseDir string) ([]fixture.FileDigest, error)
 		if err != nil {
 			return nil, err
 		}
-		digests = append(digests, fixture.FileDigest{Path: filepath.ToSlash(relative), Size: info.Size(), SHA256: digest})
+		digests = append(digests, fixture.FileDigest{Path: filepath.ToSlash(relative), Size: info.Size(), BLAKE3: digest})
 	}
 	return digests, nil
 }

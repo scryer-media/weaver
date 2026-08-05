@@ -1,7 +1,6 @@
 package benchmark
 
 import (
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -10,6 +9,7 @@ import (
 	"sort"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/fixture"
+	"github.com/zeebo/blake3"
 )
 
 type OutputVerification struct {
@@ -21,7 +21,7 @@ type VerifiedOutputFile struct {
 	ExpectedPath string `json:"expected_path"`
 	ActualPath   string `json:"actual_path"`
 	Size         int64  `json:"size"`
-	SHA256       string `json:"sha256"`
+	BLAKE3       string `json:"blake3"`
 }
 
 // VerifyOutput accepts client-specific completion nesting but requires the
@@ -50,7 +50,7 @@ func VerifyOutput(fixtureDir, outputDir string) (OutputVerification, error) {
 			if err != nil {
 				return OutputVerification{}, err
 			}
-			if digest == expected.SHA256 {
+			if digest == expected.BLAKE3 {
 				candidatePath, err := filepath.Rel(outputDir, candidate.path)
 				if err != nil {
 					return OutputVerification{}, err
@@ -59,7 +59,7 @@ func VerifyOutput(fixtureDir, outputDir string) (OutputVerification, error) {
 					ExpectedPath: expected.Path,
 					ActualPath:   filepath.ToSlash(candidatePath),
 					Size:         expected.Size,
-					SHA256:       digest,
+					BLAKE3:       digest,
 				}
 				break
 			}
@@ -70,6 +70,23 @@ func VerifyOutput(fixtureDir, outputDir string) (OutputVerification, error) {
 		result.Files = append(result.Files, *verified)
 	}
 	return result, nil
+}
+
+// DeleteOutputFiles removes completed download contents while retaining the
+// output root itself. A live Docker bind mount continues to reference that
+// root, so removing the root directory would make subsequent fixture cleanup
+// depend on container-specific mount behaviour.
+func DeleteOutputFiles(outputDir string) error {
+	entries, err := os.ReadDir(outputDir)
+	if err != nil {
+		return fmt.Errorf("read client output %s: %w", outputDir, err)
+	}
+	for _, entry := range entries {
+		if err := os.RemoveAll(filepath.Join(outputDir, entry.Name())); err != nil {
+			return fmt.Errorf("delete client output %s: %w", entry.Name(), err)
+		}
+	}
+	return nil
 }
 
 type discoveredFile struct {
@@ -107,7 +124,7 @@ func hashFile(path string) (string, error) {
 		return "", err
 	}
 	defer file.Close()
-	hash := sha256.New()
+	hash := blake3.New()
 	if _, err := io.Copy(hash, file); err != nil {
 		return "", err
 	}

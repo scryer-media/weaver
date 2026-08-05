@@ -293,11 +293,9 @@ SABnzbd discovers its external `unrar` and `par2` commands through `PATH`.
 For the Rarpar lane, the adapter stages a `unrar` compatibility shim and a
 narrow `par2 r` shim that calls `rarpar par repair`; the release binary remains
 named `rarpar`. NZBGet does not provide a `Par2Cmd` setting—its stock PAR2
-engine is linked internally. Its Rarpar lane therefore explicitly disables
-that internal unpack/PAR route and runs a tracked NZBGet post-processing
-extension that performs `rarpar par repair`, then `rarpar rar extract`. This
-is why the lane is labelled `rarpar`, not falsely described as stock NZBGet's
-internal PAR2 implementation.
+engine is linked internally. Its Rarpar lane keeps NZBGet's normal PAR2 and
+post-processing path enabled and points only `UnrarCmd` at the staged Rarpar
+shim. Its provenance explicitly says `UnRAR only; NZBGet built-in PAR2`.
 
 The base corpus remains clean, while the explicitly named repair fixtures post
 PAR2 sidecars or RAR recovery volumes with declared damage. Report repair rows
@@ -394,13 +392,22 @@ pre-report image: the adapter will preserve the exact digest and fail rather
 than silently falling back to the HTTP service.
 
 Queue artifacts record the first successful submission, every per-NZB accepted
-and terminal timestamp, the final client completion, and final independent
-output verification. `queue_wall_clock_nanoseconds` is first submission to
-the final client completion; `verified_wall_clock_nanoseconds` extends that
-same start point through the output oracle for every NZB. The latter is the
-headline end-to-end value. CPU time and retired instructions cover the same
-uninterrupted client process. The cold Weaver CLI report and acknowledgement
-remain a measurement handshake for the diagnostic mode only.
+timestamp, first observed active-processing timestamp, terminal timestamp, the
+final client completion, and final independent output verification.
+`processing_wall_clock_nanoseconds` is the per-fixture active interval and does
+not include time waiting behind earlier queue entries. Its observation bound is
+recorded as `status_poll_interval_nanoseconds`. The adapter starts one batched
+status observer as soon as the first NZB is accepted; it does not issue one poll
+loop per fixture. A fixture that reaches terminal state before an active state
+is observed invalidates the suite instead of reporting queue latency as active
+work. Client and output-verification failures are retained per fixture; the
+adapter continues observing the rest of the queue and fails the suite only
+after every accepted job reaches a terminal state.
+`queue_wall_clock_nanoseconds` remains first submission to final client
+completion, and `verified_wall_clock_nanoseconds` extends that same start point
+through the output oracle for every NZB. CPU time and retired instructions cover
+the same uninterrupted client process. The cold Weaver CLI report and
+acknowledgement remain a measurement handshake for the diagnostic mode only.
 
 Each client image must use `image@sha256:<digest>`, and its resolved image
 identity/version, archive-toolchain provenance, and rendered-config SHA-256

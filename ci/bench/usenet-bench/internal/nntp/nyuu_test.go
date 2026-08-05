@@ -38,3 +38,14 @@ func TestSafeID(t *testing.T) {
 		t.Fatalf("safeID() = %q, want %q", got, want)
 	}
 }
+
+func TestMessageIDSeparatesFixtures(t *testing.T) {
+	first := messageID("corpus", "rar4-store")
+	second := messageID("corpus", "rar5-store")
+	if first == second {
+		t.Fatalf("fixture message IDs collided: %q", first)
+	}
+	if want := "bench-corpus-rar4-store-{0filenum}-{0part}@nntp-bench"; first != want {
+		t.Fatalf("first message ID = %q, want %q", first, want)
+	}
+}

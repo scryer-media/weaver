@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/fixture"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/nntp"
 )
 
@@ -41,6 +42,10 @@ func main() {
 		err = run(os.Args[2:])
 	case "queue":
 		err = queue(os.Args[2:])
+	case "sequential":
+		err = sequential(os.Args[2:])
+	case "queue-transition":
+		err = queueTransition(os.Args[2:])
 	case "preflight":
 		err = preflight(os.Args[2:])
 	case "verify-output":
@@ -107,13 +112,14 @@ func seed(args []string) error {
 func plan(args []string) error {
 	flags := flag.NewFlagSet("plan", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	var fixturesCSV, clientsCSV, archiveToolchainsCSV, transportsCSV, targetsCSV, output, profile, serverLink string
+	var fixturesCSV, corpusPath, clientsCSV, archiveToolchainsCSV, transportsCSV, targetsCSV, output, profile, serverLink string
 	var repetitions int
 	var seed int64
 	var serverEgressBPS, serverBurstBytes uint64
 	flags.StringVar(&fixturesCSV, "fixtures", "", "comma-separated generated fixture ids")
+	flags.StringVar(&corpusPath, "corpus", "fixtures/corpus.json", "declared corpus JSON used when --fixtures is omitted")
 	flags.StringVar(&clientsCSV, "clients", "weaver,sabnzbd,nzbget", "comma-separated clients")
-	flags.StringVar(&archiveToolchainsCSV, "archive-toolchains", "vanilla,rarpar", "comma-separated archive toolchains: vanilla, rarpar")
+	flags.StringVar(&archiveToolchainsCSV, "archive-toolchains", "vanilla", "comma-separated archive toolchains; rarpar remains available only by explicit opt-in")
 	flags.StringVar(&transportsCSV, "transports", "plaintext,tls", "comma-separated transports")
 	flags.StringVar(&targetsCSV, "targets", "docker-linux,macos-native,windows-native", "comma-separated execution targets: docker-linux, macos-native, windows-native")
 	flags.StringVar(&profile, "profile", benchmark.ProfileEquivalentThroughput, "declared client configuration profile")
@@ -128,6 +134,14 @@ func plan(args []string) error {
 	}
 	if output == "" {
 		return fmt.Errorf("--output is required")
+	}
+	fixtureIDs := splitCSV(fixturesCSV)
+	if len(fixtureIDs) == 0 {
+		corpus, err := fixture.LoadCorpus(corpusPath)
+		if err != nil {
+			return err
+		}
+		fixtureIDs = corpus.FixtureIDs
 	}
 	clients, err := parseClients(clientsCSV)
 	if err != nil {
@@ -150,7 +164,7 @@ func plan(args []string) error {
 		return err
 	}
 	benchmarkPlan, err := benchmark.BuildPlan(benchmark.PlanOptions{
-		FixtureIDs:        splitCSV(fixturesCSV),
+		FixtureIDs:        fixtureIDs,
 		Clients:           clients,
 		ArchiveToolchains: archiveToolchains,
 		Transports:        transports,
@@ -302,18 +316,23 @@ func verifyOutput(args []string) error {
 }
 
 func run(args []string) error {
-	return execute(args, false)
+	return execute(args, "run")
 }
 
 func queue(args []string) error {
-	return execute(args, true)
+	return execute(args, "queue")
 }
 
-func execute(args []string, queueMode bool) error {
-	command := "run"
-	if queueMode {
-		command = "queue"
-	}
+func sequential(args []string) error {
+	return execute(args, "sequential")
+}
+
+func queueTransition(args []string) error {
+	return execute(args, "queue-transition")
+}
+
+func execute(args []string, command string) error {
+	queueMode := command != "run"
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	var planPath, adaptersPath, fixturesRoot, artifactsRoot, executionTarget, passwordFile string
@@ -362,7 +381,18 @@ func execute(args []string, queueMode bool) error {
 	config.FixtureRoot = fixturesRoot
 	config.ArtifactRoot = artifactsRoot
 	if queueMode {
-		artifacts, runErr := benchmark.ExecuteQueuePlan(context.Background(), config)
+		var artifacts []benchmark.QueueArtifact
+		var runErr error
+		switch command {
+		case "queue":
+			artifacts, runErr = benchmark.ExecuteQueuePlan(context.Background(), config)
+		case "sequential":
+			artifacts, runErr = benchmark.ExecuteSequentialPlan(context.Background(), config)
+		case "queue-transition":
+			artifacts, runErr = benchmark.ExecuteQueueTransitionPlan(context.Background(), config)
+		default:
+			return fmt.Errorf("unsupported execution command %q", command)
+		}
 		if err := printJSON(artifacts); err != nil {
 			return err
 		}
@@ -443,7 +473,9 @@ Commands:
   plan           Write a randomized, balanced benchmark plan
   server-env     Write an immutable server-side egress-shaper environment file
   run            Execute cold, one-NZB diagnostic runs through client adapters
-  queue          Execute each client lane as one uninterrupted multi-NZB queue
+  sequential     Run each fixture in isolation through one durable client lane
+  queue           Execute each client lane as one uninterrupted multi-NZB queue (legacy)
+  queue-transition Queue twenty forced duplicates of one direct fixture and report drain time
   preflight      Check target host and native/Docker executable prerequisites
   verify-output  Verify a client completion directory against fixture hashes
 

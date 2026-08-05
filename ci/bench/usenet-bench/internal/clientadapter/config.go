@@ -316,6 +316,9 @@ func renderWeaver(c Config, _ bool) ProductSpec {
 		"WEAVER_INTERMEDIATE_DIR=/downloads/incomplete",
 		"WEAVER_COMPLETE_DIR=/downloads/complete",
 		"WEAVER_CLEANUP_AFTER_EXTRACT=false",
+		// Fix extraction concurrency for comparable benchmark runs rather than
+		// inheriting a host-dependent physical-core default.
+		"WEAVER_MAX_CONCURRENT_EXTRACTIONS=6",
 		"WEAVER_SERVER_1_HOSTNAME=" + c.NNTPHost,
 		"WEAVER_SERVER_1_PORT=" + c.NNTPPort,
 		"WEAVER_SERVER_1_TLS=" + strconv.FormatBool(c.NNTPUseTLS),
@@ -409,7 +412,9 @@ func renderSABnzbd(c Config, directUnpack bool) ProductSpec {
 	}, "\n")
 	environment := linuxServerEnvironment()
 	if c.ArchiveToolchain == benchmark.RarparArchiveToolchain {
-		environment = append(environment, "PATH=/config/toolchain:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+		// Keep LinuxServer's /lsiopy Python environment ahead of the system
+		// interpreter while allowing SABnzbd to discover the Rarpar shims first.
+		environment = append(environment, "PATH=/config/toolchain:/lsiopy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	}
 	return ProductSpec{APIPort: 8080, ExposeAPI: true, ConfigName: "sabnzbd.ini", ConfigContent: []byte(content), Environment: environment}
 }
@@ -435,25 +440,11 @@ func renderNZBGet(c Config, directUnpack bool) ProductSpec {
 	}
 	unpack := "yes"
 	parRepair := "yes"
-	extensions := ""
 	unrarCommand := "unrar"
-	var extraFiles []ProductFile
 	if c.ArchiveToolchain == benchmark.RarparArchiveToolchain {
-		// NZBGet links its PAR2 engine internally. This explicit post-processing
-		// extension disables that engine and invokes the published Rarpar binary
-		// for PAR2 repair followed by RAR extraction, so the result does not
-		// imply that an unavailable Par2Cmd setting exists.
-		unpack = "no"
-		parRepair = "no"
-		direct = "no"
-		directWrite = "no"
-		extensions = "rarpar-post.sh"
+		// NZBGet's PAR2 engine is built in. Keep its normal PAR2 and unpack
+		// pipeline enabled, changing only the externally configurable UnRAR tool.
 		unrarCommand = "/config/toolchain/unrar"
-		extraFiles = []ProductFile{{
-			RelativePath: filepath.Join("scripts", "rarpar-post.sh"),
-			Content:      rarparNZBGetPostScript(),
-			Mode:         0o755,
-		}}
 	}
 	content := strings.Join([]string{
 		"MainDir=/config",
@@ -476,7 +467,7 @@ func renderNZBGet(c Config, directUnpack bool) ProductSpec {
 		"ParRepair=" + parRepair,
 		"Unpack=" + unpack,
 		"UnrarCmd=" + unrarCommand,
-		"Extensions=" + extensions,
+		"Extensions=",
 		"Server1.Active=yes",
 		"Server1.Name=benchmark",
 		"Server1.Level=0",
@@ -493,7 +484,7 @@ func renderNZBGet(c Config, directUnpack bool) ProductSpec {
 		"CertCheck=" + certCheck,
 		"",
 	}, "\n")
-	return ProductSpec{APIPort: 6789, ExposeAPI: true, ConfigName: "nzbget.conf", ConfigContent: []byte(content), Environment: linuxServerEnvironment(), ExtraFiles: extraFiles}
+	return ProductSpec{APIPort: 6789, ExposeAPI: true, ConfigName: "nzbget.conf", ConfigContent: []byte(content), Environment: linuxServerEnvironment()}
 }
 
 func linuxServerEnvironment() []string {

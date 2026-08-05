@@ -35,8 +35,12 @@ func runQueue(ctx context.Context, cfg Config) error {
 	}
 	defer container.cleanup()
 
-	cpu := startCPUSampler(ctx, container.docker, container.name)
-	instructions := startInstructionRecorder(ctx, cfg, container)
+	cpu := cpuSampler{docker: container.docker, name: container.name, reason: "suite-level telemetry is not reported for this submission mode"}
+	instructions := unavailableInstructionRecorder("suite-level retired instructions are not reported for this submission mode")
+	if input.SubmissionMode == benchmark.SubmissionModeQueued {
+		cpu = startCPUSampler(ctx, container.docker, container.name)
+		instructions = startInstructionRecorder(ctx, cfg, container)
+	}
 	metricsCollected := false
 	defer func() {
 		if !metricsCollected {
@@ -62,53 +66,21 @@ func runQueue(ctx context.Context, cfg Config) error {
 		clientVersion = readyVersion
 	}
 
-	jobs := make([]benchmark.QueueJobResult, 0, len(input.Jobs))
-	for _, inputJob := range input.Jobs {
-		jobID, err := api.queue(ctx, inputJob.NZBPath, inputJob.ArchivePassword)
-		if err != nil {
-			return fmt.Errorf("queue %s: %w", inputJob.RunID, err)
-		}
-		jobs = append(jobs, benchmark.QueueJobResult{
-			RunID:    inputJob.RunID,
-			JobID:    jobID,
-			QueuedAt: time.Now().UTC(),
-		})
+	var jobs []benchmark.QueueJobResult
+	if input.SubmissionMode == benchmark.SubmissionModeSequential {
+		jobs, err = runSequentialSubmission(ctx, api, cfg.PollInterval, input.Jobs, cpuSampler{docker: container.docker, name: container.name}, cfg, container)
+	} else {
+		jobs, err = runQueuedSubmission(ctx, api, cfg.PollInterval, input.Jobs)
+	}
+	if err != nil {
+		return err
 	}
 	queueStartedAt := jobs[0].QueuedAt
-
-	type terminalResult struct {
-		index        int
-		completionAt time.Time
-		err          error
-	}
-	waitCtx, cancelWait := context.WithCancel(ctx)
-	defer cancelWait()
-	terminals := make(chan terminalResult, len(jobs))
-	for index := range jobs {
-		job := jobs[index]
-		go func(index int, job benchmark.QueueJobResult) {
-			completionAt, err := api.waitComplete(waitCtx, job.JobID, cfg.PollInterval)
-			terminals <- terminalResult{index: index, completionAt: completionAt, err: err}
-		}(index, job)
-	}
-	var waitErr error
-	var queueCompletedAt time.Time
-	for range jobs {
-		terminal := <-terminals
-		if terminal.err != nil {
-			if waitErr == nil {
-				waitErr = terminal.err
-				cancelWait()
-			}
-			continue
+	queueCompletedAt := jobs[0].CompletionAt
+	for _, job := range jobs[1:] {
+		if job.CompletionAt.After(queueCompletedAt) {
+			queueCompletedAt = job.CompletionAt
 		}
-		jobs[terminal.index].CompletionAt = terminal.completionAt
-		if terminal.completionAt.After(queueCompletedAt) {
-			queueCompletedAt = terminal.completionAt
-		}
-	}
-	if waitErr != nil {
-		return fmt.Errorf("wait for queue terminal state: %w", waitErr)
 	}
 
 	telemetryCtx, cancelTelemetry := context.WithTimeout(context.Background(), 15*time.Second)
@@ -122,8 +94,9 @@ func runQueue(ctx context.Context, cfg Config) error {
 	}
 	metricsCollected = true
 	result := benchmark.QueueAdapterResult{
-		SchemaVersion:            1,
+		SchemaVersion:            3,
 		SuiteID:                  input.SuiteID,
+		SubmissionMode:           input.SubmissionMode,
 		Client:                   cfg.Client,
 		ArchiveToolchain:         cfg.ArchiveToolchain,
 		ArchiveToolchainIdentity: cfg.archiveToolchainIdentity(),
@@ -134,6 +107,7 @@ func runQueue(ctx context.Context, cfg Config) error {
 		ServerLink:               cfg.ServerLink,
 		QueueStartedAt:           queueStartedAt,
 		QueueCompletedAt:         queueCompletedAt,
+		StatusPollIntervalNanos:  cfg.PollInterval.Nanoseconds(),
 		Jobs:                     jobs,
 		ClientIdentity:           cfg.Image,
 		ClientVersion:            clientVersion,
@@ -150,6 +124,218 @@ func runQueue(ctx context.Context, cfg Config) error {
 		return err
 	}
 	return nil
+}
+
+func runQueuedSubmission(ctx context.Context, api productAPI, interval time.Duration, inputJobs []benchmark.QueueInputJob) ([]benchmark.QueueJobResult, error) {
+	monitorCtx, cancelMonitor := context.WithCancel(ctx)
+	defer cancelMonitor()
+	registrations := make(chan queuedJob, len(inputJobs))
+	monitorResult := make(chan queueMonitorResult, 1)
+	go func() {
+		jobs, err := monitorQueue(monitorCtx, api, interval, registrations)
+		monitorResult <- queueMonitorResult{jobs: jobs, err: err}
+	}()
+	for _, inputJob := range inputJobs {
+		jobID, err := api.queue(ctx, inputJob.NZBPath, inputJob.ArchivePassword, queueOptions{
+			submissionName: inputJob.SubmissionName,
+			forceAccept:    inputJob.ForceAccept,
+		})
+		if err != nil {
+			cancelMonitor()
+			return nil, fmt.Errorf("queue %s: %w", inputJob.RunID, err)
+		}
+		registrations <- queuedJob{result: benchmark.QueueJobResult{
+			RunID:    inputJob.RunID,
+			JobID:    jobID,
+			QueuedAt: time.Now().UTC(),
+		}}
+	}
+	close(registrations)
+	monitored := <-monitorResult
+	if monitored.err != nil {
+		return nil, fmt.Errorf("monitor queue lifecycle: %w", monitored.err)
+	}
+	return monitored.jobs, nil
+}
+
+func runSequentialSubmission(ctx context.Context, api productAPI, interval time.Duration, inputJobs []benchmark.QueueInputJob, cpu cpuSampler, cfg Config, container *runningContainer) ([]benchmark.QueueJobResult, error) {
+	jobs := make([]benchmark.QueueJobResult, 0, len(inputJobs))
+	for _, inputJob := range inputJobs {
+		cpuStart, cpuStartErr := cpu.read(ctx)
+		instructions := startInstructionRecorder(ctx, cfg, container)
+		monitorCtx, cancelMonitor := context.WithCancel(ctx)
+		registrations := make(chan queuedJob, 1)
+		monitorResult := make(chan queueMonitorResult, 1)
+		go func() {
+			observed, err := monitorQueue(monitorCtx, api, interval, registrations)
+			monitorResult <- queueMonitorResult{jobs: observed, err: err}
+		}()
+		jobID, err := api.queue(ctx, inputJob.NZBPath, inputJob.ArchivePassword, queueOptions{
+			submissionName: inputJob.SubmissionName,
+			forceAccept:    inputJob.ForceAccept,
+		})
+		if err != nil {
+			cancelMonitor()
+			_ = instructions.finish()
+			return nil, fmt.Errorf("queue %s: %w", inputJob.RunID, err)
+		}
+		registrations <- queuedJob{result: benchmark.QueueJobResult{
+			RunID:    inputJob.RunID,
+			JobID:    jobID,
+			QueuedAt: time.Now().UTC(),
+		}}
+		close(registrations)
+		monitored := <-monitorResult
+		cancelMonitor()
+		instructionMeasurement := instructions.finish()
+		var cpuMeasurement benchmark.CounterMeasurement
+		if cpuStartErr != nil {
+			cpuMeasurement = benchmark.UnavailableMeasurement("client_container", "cgroup-cpu", "unknown", cpuStartErr.Error())
+		} else {
+			telemetryCtx, cancelTelemetry := context.WithTimeout(context.Background(), 15*time.Second)
+			cpuMeasurement = cpu.measureFrom(telemetryCtx, cpuStart)
+			cancelTelemetry()
+		}
+		if monitored.err != nil {
+			return nil, fmt.Errorf("monitor fixture %s lifecycle: %w", inputJob.RunID, monitored.err)
+		}
+		if len(monitored.jobs) != 1 {
+			return nil, fmt.Errorf("monitor fixture %s returned %d jobs", inputJob.RunID, len(monitored.jobs))
+		}
+		metrics := benchmark.ResourceMetrics{
+			CPUTimeNanoseconds:  cpuMeasurement,
+			InstructionsRetired: instructionMeasurement,
+		}
+		if err := metrics.Validate(); err != nil {
+			return nil, fmt.Errorf("validate fixture %s resource metrics: %w", inputJob.RunID, err)
+		}
+		job := monitored.jobs[0]
+		job.ResourceMetrics = &metrics
+		if job.TerminalStatus == "succeeded" {
+			verification, err := benchmark.VerifyOutput(filepath.Dir(inputJob.NZBPath), cfg.OutputDir)
+			if err != nil {
+				return nil, fmt.Errorf("verify fixture %s output: %w", inputJob.RunID, err)
+			}
+			if err := benchmark.DeleteOutputFiles(cfg.OutputDir); err != nil {
+				return nil, fmt.Errorf("delete fixture %s output: %w", inputJob.RunID, err)
+			}
+			job.Verification = &verification
+			job.OutputDeleted = true
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, nil
+}
+
+type queuedJob struct {
+	result benchmark.QueueJobResult
+}
+
+type queueMonitorResult struct {
+	jobs []benchmark.QueueJobResult
+	err  error
+}
+
+type trackedQueueJob struct {
+	result   benchmark.QueueJobResult
+	complete bool
+}
+
+func monitorQueue(
+	ctx context.Context,
+	api productAPI,
+	interval time.Duration,
+	registrations <-chan queuedJob,
+) ([]benchmark.QueueJobResult, error) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var jobs []*trackedQueueJob
+	seenIDs := make(map[string]bool)
+	registrationsOpen := true
+	completed := 0
+
+	for registrationsOpen || completed < len(jobs) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case registration, ok := <-registrations:
+			if !ok {
+				registrationsOpen = false
+				registrations = nil
+				if len(jobs) == 0 {
+					return nil, fmt.Errorf("queue monitor received no jobs")
+				}
+				continue
+			}
+			if seenIDs[registration.result.JobID] {
+				return nil, fmt.Errorf("queue returned duplicate job id %s", registration.result.JobID)
+			}
+			seenIDs[registration.result.JobID] = true
+			jobs = append(jobs, &trackedQueueJob{result: registration.result})
+		case <-ticker.C:
+			pendingIDs := make([]string, 0, len(jobs)-completed)
+			for _, job := range jobs {
+				if !job.complete {
+					pendingIDs = append(pendingIDs, job.result.JobID)
+				}
+			}
+			if len(pendingIDs) == 0 {
+				continue
+			}
+			observations, err := api.observe(ctx, pendingIDs)
+			if err != nil {
+				return nil, err
+			}
+			observedAt := time.Now().UTC()
+			for _, job := range jobs {
+				if job.complete {
+					continue
+				}
+				observation, ok := observations[job.result.JobID]
+				if !ok {
+					continue
+				}
+				switch observation.state {
+				case jobUnknown, jobQueued:
+					continue
+				case jobActive:
+					if job.result.ProcessingStartedAt.IsZero() {
+						job.result.ProcessingStartedAt = observedAt
+					}
+				case jobComplete:
+					job.result.TerminalStatus = "succeeded"
+					job.result.CompletionAt = observedAt
+					job.result.FixtureWallClockNanoseconds = observedAt.Sub(job.result.QueuedAt).Nanoseconds()
+					finishProcessingTiming(&job.result, observedAt, observation.status)
+					job.complete = true
+					completed++
+				case jobFailed:
+					job.result.TerminalStatus = "failed"
+					job.result.TerminalError = observation.status
+					job.result.CompletionAt = observedAt
+					job.result.FixtureWallClockNanoseconds = observedAt.Sub(job.result.QueuedAt).Nanoseconds()
+					finishProcessingTiming(&job.result, observedAt, observation.status)
+					job.complete = true
+					completed++
+				}
+			}
+		}
+	}
+
+	results := make([]benchmark.QueueJobResult, len(jobs))
+	for index, job := range jobs {
+		results[index] = job.result
+	}
+	return results, nil
+}
+
+func finishProcessingTiming(result *benchmark.QueueJobResult, completionAt time.Time, terminalStatus string) {
+	if result.ProcessingStartedAt.IsZero() {
+		result.ProcessingTimingError = fmt.Sprintf("terminal status %q was observed before an active state; reduce CLIENT_POLL_INTERVAL", terminalStatus)
+		return
+	}
+	result.ProcessingTimingAvailable = true
+	result.ProcessingWallClockNanoseconds = completionAt.Sub(result.ProcessingStartedAt).Nanoseconds()
 }
 
 func writeQueueResult(path string, result benchmark.QueueAdapterResult) error {

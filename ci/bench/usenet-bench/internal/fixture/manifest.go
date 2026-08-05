@@ -11,7 +11,7 @@ import (
 type FileDigest struct {
 	Path   string `json:"path"`
 	Size   int64  `json:"size"`
-	SHA256 string `json:"sha256"`
+	BLAKE3 string `json:"blake3"`
 }
 
 // GeneratedManifest is written beside every generated fixture. It is the
@@ -83,7 +83,7 @@ func LoadGeneratedManifest(path string) (GeneratedManifest, error) {
 	if err := json.Unmarshal(contents, &manifest); err != nil {
 		return GeneratedManifest{}, fmt.Errorf("decode fixture manifest %s: %w", path, err)
 	}
-	if manifest.SchemaVersion != 1 && manifest.SchemaVersion != 2 && manifest.SchemaVersion != 3 && manifest.SchemaVersion != 4 {
+	if manifest.SchemaVersion != 1 && manifest.SchemaVersion != 2 && manifest.SchemaVersion != 3 && manifest.SchemaVersion != 4 && manifest.SchemaVersion != 5 {
 		return GeneratedManifest{}, fmt.Errorf("unsupported generated fixture schema version %d", manifest.SchemaVersion)
 	}
 	if manifest.Case.ID == "" || len(manifest.ExpectedFiles) == 0 || len(manifest.ArchiveFiles) == 0 {

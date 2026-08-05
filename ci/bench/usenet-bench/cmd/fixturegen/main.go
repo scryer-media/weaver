@@ -32,8 +32,8 @@ func (values *repeatedFlag) Set(value string) error {
 func main() {
 	var config generator.Config
 	var fixtureIDs repeatedFlag
-	var bytesPerFile, bluRayLargeFile, bluRaySmallFile string
-	var list bool
+	var bytesPerFile, multiVolumeBytesPerFile, bluRayLargeFile, bluRaySmallFile, directMKVBytes string
+	var list, directMKV bool
 
 	flag.StringVar(&config.MatrixPath, "matrix", "fixtures/matrix.json", "fixture matrix JSON path")
 	flag.StringVar(&config.ToolchainsPath, "toolchains", "docker/rarlab/toolchains.json", "pinned RARLAB toolchain JSON path")
@@ -42,14 +42,30 @@ func main() {
 	flag.StringVar(&config.PAR2DockerfilePath, "par2-dockerfile", "docker/par2/Dockerfile", "PAR2 generator image Dockerfile path")
 	flag.StringVar(&config.OutputDir, "output", "generated", "directory for generated fixtures (never overwritten)")
 	flag.StringVar(&config.DockerBinary, "docker", "docker", "Docker executable")
-	flag.StringVar(&bytesPerFile, "bytes-per-file", "64MiB", "deterministic payload size per uniform inner file")
-	flag.StringVar(&bluRayLargeFile, "bluray-large-file-bytes", "1GiB", "large media-stream size for bluray-disc fixtures")
+	flag.StringVar(&bytesPerFile, "bytes-per-file", "150MiB", "target size for each ordinary movie file")
+	flag.StringVar(&multiVolumeBytesPerFile, "multi-volume-bytes-per-file", "48MiB", "target size for each movie in the multi-input fixture")
+	flag.StringVar(&bluRayLargeFile, "bluray-large-file-bytes", "5GiB", "large media-stream size for bluray-disc fixtures")
 	flag.StringVar(&bluRaySmallFile, "bluray-small-file-bytes", "128KiB", "small metadata-file size for bluray-disc fixtures")
 	flag.IntVar(&config.BluRaySmallFileCount, "bluray-small-file-count", 512, "small metadata files for bluray-disc fixtures")
+	flag.BoolVar(&directMKV, "direct-mkv", false, "generate only the direct 200MiB MKV fixture without Docker")
+	flag.StringVar(&directMKVBytes, "direct-mkv-bytes", "200MiB", "payload size for --direct-mkv")
 	flag.Var(&fixtureIDs, "fixture", "one expanded fixture id to generate (repeatable; defaults to all)")
 	flag.BoolVar(&config.BuildImages, "build-images", true, "build source-locked RARLAB and selected PAR2 images before generation")
 	flag.BoolVar(&list, "list", false, "print expanded fixture cases and exit")
 	flag.Parse()
+
+	if directMKV {
+		size, err := parseBytes(directMKVBytes)
+		if err != nil {
+			fatal(fmt.Errorf("parse --direct-mkv-bytes: %w", err))
+		}
+		manifest, err := generator.GenerateDirectMKV(context.Background(), config, size)
+		if err != nil {
+			fatal(err)
+		}
+		fmt.Printf("generated %s (%d direct bytes)\n", manifest.Case.ID, manifest.ArchiveFiles[0].Size)
+		return
+	}
 
 	matrix, err := fixture.LoadMatrix(config.MatrixPath)
 	if err != nil {
@@ -70,6 +86,10 @@ func main() {
 	config.BytesPerFile, err = parseBytes(bytesPerFile)
 	if err != nil {
 		fatal(fmt.Errorf("parse --bytes-per-file: %w", err))
+	}
+	config.MultiVolumeBytesPerFile, err = parseBytes(multiVolumeBytesPerFile)
+	if err != nil {
+		fatal(fmt.Errorf("parse --multi-volume-bytes-per-file: %w", err))
 	}
 	config.BluRayLargeFileBytes, err = parseBytes(bluRayLargeFile)
 	if err != nil {

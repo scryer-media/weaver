@@ -22,8 +22,56 @@ import (
 
 type productAPI interface {
 	waitReady(context.Context) (string, error)
-	queue(context.Context, string, string) (string, error)
+	queue(context.Context, string, string, queueOptions) (string, error)
 	waitComplete(context.Context, string, time.Duration) (time.Time, error)
+	observe(context.Context, []string) (map[string]jobObservation, error)
+}
+
+type queueOptions struct {
+	submissionName string
+	forceAccept    bool
+}
+
+func (options queueOptions) filename(nzbPath string) string {
+	if strings.TrimSpace(options.submissionName) != "" {
+		return options.submissionName
+	}
+	return filepath.Base(nzbPath)
+}
+
+type jobObservationState uint8
+
+const (
+	jobUnknown jobObservationState = iota
+	jobQueued
+	jobActive
+	jobComplete
+	jobFailed
+)
+
+type jobObservation struct {
+	state  jobObservationState
+	status string
+}
+
+func classifyLiveStatus(status string) jobObservation {
+	normalized := strings.ToUpper(strings.TrimSpace(status))
+	switch normalized {
+	case "":
+		return jobObservation{state: jobUnknown}
+	case "QUEUED", "PAUSED":
+		return jobObservation{state: jobQueued, status: status}
+	default:
+		return jobObservation{state: jobActive, status: status}
+	}
+}
+
+func stringSet(values []string) map[string]bool {
+	set := make(map[string]bool, len(values))
+	for _, value := range values {
+		set[value] = true
+	}
+	return set
 }
 
 // API is the product-neutral public-control-plane adapter shared by the
@@ -58,7 +106,7 @@ func (api *API) WaitReady(ctx context.Context) (string, error) {
 }
 
 func (api *API) Queue(ctx context.Context, nzbPath, archivePassword string) (string, error) {
-	return api.product.queue(ctx, nzbPath, archivePassword)
+	return api.product.queue(ctx, nzbPath, archivePassword, queueOptions{})
 }
 
 func (api *API) WaitComplete(ctx context.Context, jobID string, interval time.Duration) (time.Time, error) {
@@ -91,7 +139,7 @@ func (api *sabAPI) waitReady(ctx context.Context) (string, error) {
 	return response.Version, nil
 }
 
-func (api *sabAPI) queue(ctx context.Context, nzbPath, archivePassword string) (string, error) {
+func (api *sabAPI) queue(ctx context.Context, nzbPath, archivePassword string, options queueOptions) (string, error) {
 	file, err := os.Open(nzbPath)
 	if err != nil {
 		return "", fmt.Errorf("open NZB: %w", err)
@@ -99,7 +147,7 @@ func (api *sabAPI) queue(ctx context.Context, nzbPath, archivePassword string) (
 	defer file.Close()
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	part, err := writer.CreateFormFile("name", filepath.Base(nzbPath))
+	part, err := writer.CreateFormFile("name", options.filename(nzbPath))
 	if err != nil {
 		return "", fmt.Errorf("create SABnzbd NZB request: %w", err)
 	}
@@ -110,6 +158,12 @@ func (api *sabAPI) queue(ctx context.Context, nzbPath, archivePassword string) (
 		return "", fmt.Errorf("close SABnzbd NZB request: %w", err)
 	}
 	params := url.Values{"mode": {"addfile"}, "output": {"json"}, "apikey": {apiKey}}
+	if options.forceAccept {
+		// SABnzbd's addfile API has no force-duplicate switch. An explicit NZB
+		// name becomes the job name used by its duplicate matcher, so the twenty
+		// intentionally identical uploads remain distinct queue entries.
+		params.Set("nzbname", strings.TrimSuffix(options.filename(nzbPath), filepath.Ext(options.filename(nzbPath))))
+	}
 	if archivePassword != "" {
 		params.Set("password", archivePassword)
 	}
@@ -157,6 +211,55 @@ func (api *sabAPI) waitComplete(ctx context.Context, nzoID string, interval time
 	})
 }
 
+func (api *sabAPI) observe(ctx context.Context, jobIDs []string) (map[string]jobObservation, error) {
+	wanted := stringSet(jobIDs)
+	observations := make(map[string]jobObservation, len(jobIDs))
+	var queueResponse struct {
+		Queue struct {
+			Slots []map[string]any `json:"slots"`
+		} `json:"queue"`
+	}
+	if err := api.get(ctx, "queue", nil, &queueResponse); err != nil {
+		return nil, fmt.Errorf("observe SABnzbd queue: %w", err)
+	}
+	for _, slot := range queueResponse.Queue.Slots {
+		id := fieldString(slot, "nzo_id")
+		if wanted[id] {
+			observations[id] = classifyLiveStatus(fieldString(slot, "status"))
+		}
+	}
+
+	var historyResponse struct {
+		History struct {
+			Slots []map[string]any `json:"slots"`
+		} `json:"history"`
+	}
+	historyLimit := len(jobIDs)
+	if historyLimit < 100 {
+		historyLimit = 100
+	}
+	if err := api.get(ctx, "history", url.Values{"limit": {strconv.Itoa(historyLimit)}}, &historyResponse); err != nil {
+		return nil, fmt.Errorf("observe SABnzbd history: %w", err)
+	}
+	for _, slot := range historyResponse.History.Slots {
+		id := fieldString(slot, "nzo_id")
+		if !wanted[id] {
+			continue
+		}
+		status := fieldString(slot, "status")
+		normalized := strings.ToLower(status)
+		switch {
+		case strings.Contains(normalized, "complete"), strings.Contains(normalized, "success"):
+			observations[id] = jobObservation{state: jobComplete, status: status}
+		case strings.Contains(normalized, "fail"), strings.Contains(normalized, "delete"), strings.Contains(normalized, "abort"):
+			observations[id] = jobObservation{state: jobFailed, status: status}
+		default:
+			observations[id] = jobObservation{state: jobActive, status: status}
+		}
+	}
+	return observations, nil
+}
+
 func (api *sabAPI) get(ctx context.Context, mode string, extra url.Values, target any) error {
 	params := url.Values{"mode": {mode}, "output": {"json"}, "apikey": {apiKey}}
 	for key, values := range extra {
@@ -178,6 +281,16 @@ type nzbgetAPI struct {
 	client  *http.Client
 }
 
+type nzbgetPPParameter map[string]string
+
+func nzbgetPPParameters(archivePassword string) []nzbgetPPParameter {
+	parameters := make([]nzbgetPPParameter, 0, 1)
+	if archivePassword != "" {
+		parameters = append(parameters, nzbgetPPParameter{"*Unpack:Password": archivePassword})
+	}
+	return parameters
+}
+
 func (api *nzbgetAPI) waitReady(ctx context.Context) (string, error) {
 	var raw json.RawMessage
 	if err := api.rpc(ctx, "version", nil, &raw); err != nil {
@@ -190,20 +303,17 @@ func (api *nzbgetAPI) waitReady(ctx context.Context) (string, error) {
 	return version, nil
 }
 
-func (api *nzbgetAPI) queue(ctx context.Context, nzbPath, archivePassword string) (string, error) {
+func (api *nzbgetAPI) queue(ctx context.Context, nzbPath, archivePassword string, options queueOptions) (string, error) {
 	contents, err := os.ReadFile(nzbPath)
 	if err != nil {
 		return "", fmt.Errorf("read NZB: %w", err)
 	}
-	parameters := []string{}
-	if archivePassword != "" {
-		parameters = append(parameters, "*Unpack:Password", archivePassword)
+	parameters := nzbgetPPParameters(archivePassword)
+	dupeMode := "SCORE"
+	if options.forceAccept {
+		dupeMode = "FORCE"
 	}
-	params := []any{
-		filepath.Base(nzbPath),
-		base64.StdEncoding.EncodeToString(contents),
-		"", 0, false, false, "", 0, "SCORE", parameters,
-	}
+	params := nzbgetAppendParameters(options.filename(nzbPath), contents, parameters, dupeMode)
 	var raw json.RawMessage
 	if err := api.rpc(ctx, "append", params, &raw); err != nil {
 		return "", fmt.Errorf("queue NZB in NZBGet: %w", err)
@@ -217,6 +327,14 @@ func (api *nzbgetAPI) queue(ctx context.Context, nzbPath, archivePassword string
 		return "", fmt.Errorf("NZBGet append returned invalid queue id %q", id.String())
 	}
 	return id.String(), nil
+}
+
+func nzbgetAppendParameters(filename string, contents []byte, parameters []nzbgetPPParameter, dupeMode string) []any {
+	return []any{
+		filename,
+		base64.StdEncoding.EncodeToString(contents),
+		"", 0, false, false, "", 0, dupeMode, false, parameters,
+	}
 }
 
 func (api *nzbgetAPI) waitComplete(ctx context.Context, nzbID string, interval time.Duration) (time.Time, error) {
@@ -243,6 +361,49 @@ func (api *nzbgetAPI) waitComplete(ctx context.Context, nzbID string, interval t
 		}
 		return false, nil
 	})
+}
+
+func (api *nzbgetAPI) observe(ctx context.Context, jobIDs []string) (map[string]jobObservation, error) {
+	wanted := stringSet(jobIDs)
+	observations := make(map[string]jobObservation, len(jobIDs))
+	var raw json.RawMessage
+	if err := api.rpc(ctx, "listgroups", nil, &raw); err != nil {
+		return nil, fmt.Errorf("observe NZBGet queue: %w", err)
+	}
+	var groups []map[string]any
+	if err := json.Unmarshal(raw, &groups); err != nil {
+		return nil, fmt.Errorf("decode NZBGet queue: %w", err)
+	}
+	for _, group := range groups {
+		id := fieldString(group, "NZBID")
+		if wanted[id] {
+			observations[id] = classifyLiveStatus(fieldString(group, "Status"))
+		}
+	}
+
+	if err := api.rpc(ctx, "history", nil, &raw); err != nil {
+		return nil, fmt.Errorf("observe NZBGet history: %w", err)
+	}
+	var records []map[string]any
+	if err := json.Unmarshal(raw, &records); err != nil {
+		return nil, fmt.Errorf("decode NZBGet history: %w", err)
+	}
+	for _, record := range records {
+		id := fieldString(record, "NZBID")
+		if !wanted[id] {
+			continue
+		}
+		status := strings.ToUpper(fieldString(record, "Status"))
+		switch {
+		case nzbgetHistoryFailed(record, status):
+			observations[id] = jobObservation{state: jobFailed, status: fieldString(record, "Status")}
+		case nzbgetHistoryComplete(status):
+			observations[id] = jobObservation{state: jobComplete, status: fieldString(record, "Status")}
+		default:
+			observations[id] = jobObservation{state: jobActive, status: fieldString(record, "Status")}
+		}
+	}
+	return observations, nil
 }
 
 func nzbgetHistoryComplete(status string) bool {
@@ -329,17 +490,20 @@ func (api *weaverAPI) waitReady(ctx context.Context) (string, error) {
 	return "", nil
 }
 
-func (api *weaverAPI) queue(ctx context.Context, nzbPath, archivePassword string) (string, error) {
+func (api *weaverAPI) queue(ctx context.Context, nzbPath, archivePassword string, options queueOptions) (string, error) {
 	contents, err := os.ReadFile(nzbPath)
 	if err != nil {
 		return "", fmt.Errorf("read NZB: %w", err)
 	}
 	input := map[string]any{
 		"nzbBase64": base64.StdEncoding.EncodeToString(contents),
-		"filename":  filepath.Base(nzbPath),
+		"filename":  options.filename(nzbPath),
 	}
 	if archivePassword != "" {
 		input["password"] = archivePassword
+	}
+	if options.forceAccept {
+		input["force"] = true
 	}
 	var data struct {
 		SubmitNZB struct {
@@ -387,6 +551,41 @@ func (api *weaverAPI) waitComplete(ctx context.Context, jobID string, interval t
 			return false, nil
 		}
 	})
+}
+
+func (api *weaverAPI) observe(ctx context.Context, jobIDs []string) (map[string]jobObservation, error) {
+	var query strings.Builder
+	query.WriteString("query {")
+	for index, id := range jobIDs {
+		if _, err := strconv.ParseUint(id, 10, 64); err != nil {
+			return nil, fmt.Errorf("invalid Weaver job id %q", id)
+		}
+		fmt.Fprintf(&query, " j%d: job(id: %s) { status }", index, id)
+	}
+	query.WriteString(" }")
+	var data map[string]*struct {
+		Status string `json:"status"`
+	}
+	if err := api.graphQL(ctx, query.String(), nil, &data); err != nil {
+		return nil, fmt.Errorf("observe Weaver queue: %w", err)
+	}
+	observations := make(map[string]jobObservation, len(jobIDs))
+	for index, id := range jobIDs {
+		job := data[fmt.Sprintf("j%d", index)]
+		if job == nil {
+			continue
+		}
+		status := strings.ToUpper(job.Status)
+		switch {
+		case strings.Contains(status, "COMPLETE"), strings.Contains(status, "SUCCESS"):
+			observations[id] = jobObservation{state: jobComplete, status: job.Status}
+		case strings.Contains(status, "FAIL"), strings.Contains(status, "CANCEL"), strings.Contains(status, "ERROR"):
+			observations[id] = jobObservation{state: jobFailed, status: job.Status}
+		default:
+			observations[id] = classifyLiveStatus(job.Status)
+		}
+	}
+	return observations, nil
 }
 
 func (api *weaverAPI) graphQL(ctx context.Context, query string, variables any, target any) error {

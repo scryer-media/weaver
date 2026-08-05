@@ -51,6 +51,8 @@ func renderWeaver(cfg Config) productSpec {
 		"WEAVER_INTERMEDIATE_DIR=" + filepath.Join(cfg.ConfigDir, "incomplete"),
 		"WEAVER_COMPLETE_DIR=" + cfg.OutputDir,
 		"WEAVER_CLEANUP_AFTER_EXTRACT=false",
+		// Keep native and container measurements on the same extraction limit.
+		"WEAVER_MAX_CONCURRENT_EXTRACTIONS=6",
 		"WEAVER_SERVER_1_HOSTNAME=" + cfg.NNTPHost,
 		"WEAVER_SERVER_1_PORT=" + cfg.NNTPPort,
 		"WEAVER_SERVER_1_TLS=" + strconv.FormatBool(cfg.NNTPUseTLS),

@@ -30,7 +30,11 @@ func validateRarparInput(binary, version, digest string) error {
 
 func (c Config) archiveToolchainIdentity() string {
 	if c.ArchiveToolchain == benchmark.RarparArchiveToolchain {
-		return "rarpar " + c.RarparVersion + " sha256:" + strings.ToLower(c.RarparSHA256)
+		identity := "rarpar " + c.RarparVersion + " sha256:" + strings.ToLower(c.RarparSHA256)
+		if c.Client == benchmark.NZBGet {
+			return identity + " (UnRAR only; NZBGet built-in PAR2)"
+		}
+		return identity
 	}
 	return "stock"
 }
@@ -129,22 +133,5 @@ case "${1:-}" in
     exit 2
     ;;
 esac
-`)
-}
-
-func rarparNZBGetPostScript() []byte {
-	return []byte(`#!/bin/sh
-set -eu
-tool=/config/toolchain/rarpar
-passwords=/config/toolchain/archive-passwords
-workdir="${NZBPP_DIRECTORY:?NZBPP_DIRECTORY is required}"
-output="${NZBPP_FINALDIR:?NZBPP_FINALDIR is required}"
-parfile="$(find "$workdir" -maxdepth 1 -type f -iname '*.par2' -print -quit)"
-if [ -n "$parfile" ]; then
-  "$tool" par repair "$parfile"
-fi
-archive="$(find "$workdir" -maxdepth 1 -type f \( -iname '*.part1.rar' -o -iname '*.part01.rar' -o -iname '*.part001.rar' -o -iname '*.rar' \) -print | sort | head -n 1)"
-test -n "$archive"
-exec "$tool" --password-file "$passwords" rar extract "$archive" "$output"
 `)
 }

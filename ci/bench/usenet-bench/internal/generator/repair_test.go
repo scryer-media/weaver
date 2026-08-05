@@ -69,3 +69,12 @@ func TestSelectedCasesRequirePAR2OnlyForPAR2Profiles(t *testing.T) {
 		t.Fatal("selected PAR2 profile did not require the PAR2 image")
 	}
 }
+
+func TestPAR2HeavyRepairStaysWithinOneVolume(t *testing.T) {
+	if redundancy, missing := par2RepairParameters(fixture.PAR2LightRepairProfile); redundancy != 10 || missing != 0 {
+		t.Fatalf("light PAR2 repair = %d%%, %d missing volumes", redundancy, missing)
+	}
+	if redundancy, missing := par2RepairParameters(fixture.PAR2HeavyRepairProfile); redundancy != 35 || missing != 1 {
+		t.Fatalf("heavy PAR2 repair = %d%%, %d missing volumes", redundancy, missing)
+	}
+}

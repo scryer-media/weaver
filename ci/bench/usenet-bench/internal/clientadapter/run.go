@@ -70,7 +70,7 @@ func Run(ctx context.Context, cfg Config) error {
 		if readyVersion != "" {
 			clientVersion = readyVersion
 		}
-		jobID, err := api.queue(ctx, cfg.NZBPath, cfg.ArchivePassword)
+		jobID, err := api.queue(ctx, cfg.NZBPath, cfg.ArchivePassword, queueOptions{})
 		if err != nil {
 			return err
 		}

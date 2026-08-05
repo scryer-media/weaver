@@ -42,17 +42,21 @@ func (sampler cpuSampler) finish(ctx context.Context) benchmark.CounterMeasureme
 	if sampler.start == nil {
 		return benchmark.UnavailableMeasurement("client_container", "cgroup-cpu", "unknown", sampler.reason)
 	}
+	return sampler.measureFrom(ctx, *sampler.start)
+}
+
+func (sampler cpuSampler) measureFrom(ctx context.Context, start cpuSnapshot) benchmark.CounterMeasurement {
 	end, err := sampler.read(ctx)
 	if err != nil {
-		return benchmark.UnavailableMeasurement("client_container", sampler.start.collector, sampler.start.version, err.Error())
+		return benchmark.UnavailableMeasurement("client_container", start.collector, start.version, err.Error())
 	}
-	if end.collector != sampler.start.collector || end.version != sampler.start.version {
-		return benchmark.UnavailableMeasurement("client_container", sampler.start.collector, sampler.start.version, "CPU accounting source changed during benchmark run")
+	if end.collector != start.collector || end.version != start.version {
+		return benchmark.UnavailableMeasurement("client_container", start.collector, start.version, "CPU accounting source changed during benchmark run")
 	}
-	if end.nanoseconds < sampler.start.nanoseconds {
-		return benchmark.UnavailableMeasurement("client_container", sampler.start.collector, sampler.start.version, "CPU usage counter moved backwards during benchmark run")
+	if end.nanoseconds < start.nanoseconds {
+		return benchmark.UnavailableMeasurement("client_container", start.collector, start.version, "CPU usage counter moved backwards during benchmark run")
 	}
-	return benchmark.MeasuredMeasurement("client_container", end.collector, end.version, end.nanoseconds-sampler.start.nanoseconds)
+	return benchmark.MeasuredMeasurement("client_container", end.collector, end.version, end.nanoseconds-start.nanoseconds)
 }
 
 func (sampler cpuSampler) read(ctx context.Context) (cpuSnapshot, error) {
@@ -108,6 +112,15 @@ type instructionRecorder struct {
 	collector        string
 	collectorVersion string
 	unavailable      string
+}
+
+func unavailableInstructionRecorder(reason string) *instructionRecorder {
+	return &instructionRecorder{
+		scope:            "client_container",
+		collector:        "linux-perf-cgroup",
+		collectorVersion: runtime.GOOS,
+		unavailable:      reason,
+	}
 }
 
 func startInstructionRecorder(ctx context.Context, cfg Config, container *runningContainer) *instructionRecorder {

@@ -313,6 +313,10 @@ func executeRun(parent context.Context, config RunConfig, run Run) RunArtifact {
 	completed := result.CompletionAt
 	artifact.Verification = &verification
 	artifact.UsableOutputAt = &completed
+	if err := DeleteOutputFiles(outputDir); err != nil {
+		artifact.Error = fmt.Sprintf("delete verified output: %v", err)
+		return artifact
+	}
 	artifact.Status = "passed"
 	return artifact
 }

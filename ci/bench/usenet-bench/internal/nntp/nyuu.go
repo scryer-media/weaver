@@ -5,7 +5,6 @@ package nntp
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -17,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/fixture"
+	"github.com/zeebo/blake3"
 )
 
 const defaultSegmentBytes = 750 << 10
@@ -123,7 +123,7 @@ func SeedWithNyuu(ctx context.Context, config NyuuSeedConfig) (SeedResult, error
 		"-g", config.Group,
 		"-f", "nntp-bench@example.invalid",
 		"--keep-message-id",
-		"--message-id", fmt.Sprintf("bench-%s-{0filenum}-{0part}@nntp-bench", safeID(config.RunID)),
+		"--message-id", messageID(config.RunID, manifest.Case.ID),
 		"-o", "/work/" + filepath.ToSlash(relativeNZB),
 		"--check-connections", "0",
 		"-a", strconv.Itoa(config.SegmentBytes),
@@ -242,6 +242,10 @@ func safeID(value string) string {
 	return output.String()
 }
 
+func messageID(runID, fixtureID string) string {
+	return fmt.Sprintf("bench-%s-%s-{0filenum}-{0part}@nntp-bench", safeID(runID), safeID(fixtureID))
+}
+
 func verifyArchiveFiles(fixtureDir string, files []fixture.FileDigest) error {
 	ordered := append([]fixture.FileDigest(nil), files...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Path < ordered[j].Path })
@@ -258,7 +262,7 @@ func verifyArchiveFiles(fixtureDir string, files []fixture.FileDigest) error {
 		if err != nil {
 			return err
 		}
-		if actual != file.SHA256 {
+		if actual != file.BLAKE3 {
 			return fmt.Errorf("fixture archive file %s hash mismatch", file.Path)
 		}
 	}
@@ -271,7 +275,7 @@ func hashFile(path string) (string, error) {
 		return "", err
 	}
 	defer file.Close()
-	hash := sha256.New()
+	hash := blake3.New()
 	if _, err := io.Copy(hash, file); err != nil {
 		return "", err
 	}

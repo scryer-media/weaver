@@ -12,14 +12,29 @@ import (
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/fixture"
 )
 
+// SubmissionMode controls how a durable client handles a suite's NZBs.
+// Sequential is the default benchmark mode: submit one fixture and wait for
+// its terminal state before submitting the next. QueueDrain intentionally
+// submits a duplicate workload as one queue and reports only drain time.
+type SubmissionMode string
+
+const (
+	SubmissionModeQueued     SubmissionMode = "queued"
+	SubmissionModeSequential SubmissionMode = "sequential"
+	SubmissionModeQueueDrain SubmissionMode = "queue-drain"
+)
+
+func (mode SubmissionMode) Valid() bool {
+	return mode == SubmissionModeQueued || mode == SubmissionModeSequential || mode == SubmissionModeQueueDrain
+}
+
 // QueueInput is the immutable job list passed from the neutral runner to one
-// long-lived client adapter. Each listed NZB is accepted before the adapter
-// waits for any terminal state, so product queue behaviour is measured rather
-// than a sequence of isolated single-job launches.
+// long-lived client adapter.
 type QueueInput struct {
-	SchemaVersion int             `json:"schema_version"`
-	SuiteID       string          `json:"suite_id"`
-	Jobs          []QueueInputJob `json:"jobs"`
+	SchemaVersion  int             `json:"schema_version"`
+	SuiteID        string          `json:"suite_id"`
+	SubmissionMode SubmissionMode  `json:"submission_mode,omitempty"`
+	Jobs           []QueueInputJob `json:"jobs"`
 }
 
 type QueueInputJob struct {
@@ -27,6 +42,8 @@ type QueueInputJob struct {
 	FixtureID       string `json:"fixture_id"`
 	NZBPath         string `json:"nzb_path"`
 	ArchivePassword string `json:"archive_password,omitempty"`
+	SubmissionName  string `json:"submission_name,omitempty"`
+	ForceAccept     bool   `json:"force_accept,omitempty"`
 }
 
 func LoadQueueInput(path string) (QueueInput, error) {
@@ -38,6 +55,9 @@ func LoadQueueInput(path string) (QueueInput, error) {
 	if err := json.Unmarshal(contents, &input); err != nil {
 		return QueueInput{}, fmt.Errorf("decode queue input %s: %w", path, err)
 	}
+	if input.SchemaVersion == 1 {
+		input.SubmissionMode = SubmissionModeQueued
+	}
 	if err := input.Validate(); err != nil {
 		return QueueInput{}, err
 	}
@@ -45,8 +65,14 @@ func LoadQueueInput(path string) (QueueInput, error) {
 }
 
 func (q QueueInput) Validate() error {
-	if q.SchemaVersion != 1 || strings.TrimSpace(q.SuiteID) == "" || len(q.Jobs) == 0 {
+	if (q.SchemaVersion != 1 && q.SchemaVersion != 2) || strings.TrimSpace(q.SuiteID) == "" || len(q.Jobs) == 0 {
 		return fmt.Errorf("queue input is empty or has unsupported schema")
+	}
+	if q.SchemaVersion == 1 && q.SubmissionMode != "" && q.SubmissionMode != SubmissionModeQueued {
+		return fmt.Errorf("queue input %s uses submission mode %q with schema 1", q.SuiteID, q.SubmissionMode)
+	}
+	if q.SchemaVersion == 2 && !q.SubmissionMode.Valid() {
+		return fmt.Errorf("queue input %s has invalid submission mode %q", q.SuiteID, q.SubmissionMode)
 	}
 	seen := map[string]bool{}
 	for _, job := range q.Jobs {
@@ -66,6 +92,7 @@ func (q QueueInput) Validate() error {
 type QueueAdapterResult struct {
 	SchemaVersion            int               `json:"schema_version"`
 	SuiteID                  string            `json:"suite_id"`
+	SubmissionMode           SubmissionMode    `json:"submission_mode"`
 	Client                   Client            `json:"client"`
 	ArchiveToolchain         ArchiveToolchain  `json:"archive_toolchain"`
 	ArchiveToolchainIdentity string            `json:"archive_toolchain_identity"`
@@ -76,6 +103,7 @@ type QueueAdapterResult struct {
 	ServerLink               ServerLinkProfile `json:"server_link"`
 	QueueStartedAt           time.Time         `json:"queue_started_at"`
 	QueueCompletedAt         time.Time         `json:"queue_completed_at"`
+	StatusPollIntervalNanos  int64             `json:"status_poll_interval_nanoseconds"`
 	Jobs                     []QueueJobResult  `json:"jobs"`
 	ClientIdentity           string            `json:"client_identity"`
 	ClientVersion            string            `json:"client_version"`
@@ -84,15 +112,26 @@ type QueueAdapterResult struct {
 }
 
 type QueueJobResult struct {
-	RunID        string    `json:"run_id"`
-	JobID        string    `json:"job_id"`
-	QueuedAt     time.Time `json:"queued_at"`
-	CompletionAt time.Time `json:"completion_at"`
+	RunID                          string              `json:"run_id"`
+	JobID                          string              `json:"job_id"`
+	QueuedAt                       time.Time           `json:"queued_at"`
+	FixtureWallClockNanoseconds    int64               `json:"fixture_wall_clock_nanoseconds"`
+	ResourceMetrics                *ResourceMetrics    `json:"resource_metrics,omitempty"`
+	TerminalStatus                 string              `json:"terminal_status"`
+	Verification                   *OutputVerification `json:"verification,omitempty"`
+	OutputDeleted                  bool                `json:"output_deleted,omitempty"`
+	TerminalError                  string              `json:"terminal_error,omitempty"`
+	ProcessingTimingAvailable      bool                `json:"processing_timing_available"`
+	ProcessingTimingError          string              `json:"processing_timing_error,omitempty"`
+	ProcessingStartedAt            time.Time           `json:"processing_started_at"`
+	CompletionAt                   time.Time           `json:"completion_at"`
+	ProcessingWallClockNanoseconds int64               `json:"processing_wall_clock_nanoseconds"`
 }
 
 type QueueArtifact struct {
 	SchemaVersion                int                 `json:"schema_version"`
 	SuiteID                      string              `json:"suite_id"`
+	SubmissionMode               SubmissionMode      `json:"submission_mode"`
 	Runs                         []Run               `json:"runs"`
 	Status                       string              `json:"status"`
 	AdapterResult                *QueueAdapterResult `json:"adapter_result,omitempty"`
@@ -109,6 +148,7 @@ type QueueJobArtifact struct {
 	AdapterResult  QueueJobResult        `json:"adapter_result"`
 	Verification   *OutputVerification   `json:"verification,omitempty"`
 	UsableOutputAt *time.Time            `json:"usable_output_at,omitempty"`
+	Error          string                `json:"error,omitempty"`
 }
 
 type queueSuite struct {
@@ -116,10 +156,24 @@ type queueSuite struct {
 	Runs []Run
 }
 
-// ExecuteQueuePlan executes every lane as one fresh, long-lived client queue.
-// Different client lanes never overlap, but a lane's fixture jobs share client
-// state exactly as a real download queue does.
+// ExecuteQueuePlan retains the original burst-queue benchmark behaviour.
 func ExecuteQueuePlan(ctx context.Context, config RunConfig) ([]QueueArtifact, error) {
+	return executeQueuePlan(ctx, config, SubmissionModeQueued)
+}
+
+// ExecuteSequentialPlan runs every fixture in a lane against one durable
+// client, waiting for completion before submitting the next fixture.
+func ExecuteSequentialPlan(ctx context.Context, config RunConfig) ([]QueueArtifact, error) {
+	return executeQueuePlan(ctx, config, SubmissionModeSequential)
+}
+
+// ExecuteQueueTransitionPlan queues exactly twenty copies of one direct
+// fixture per client lane and reports only the queue-drain wall clock.
+func ExecuteQueueTransitionPlan(ctx context.Context, config RunConfig) ([]QueueArtifact, error) {
+	return executeQueuePlan(ctx, config, SubmissionModeQueueDrain)
+}
+
+func executeQueuePlan(ctx context.Context, config RunConfig, mode SubmissionMode) ([]QueueArtifact, error) {
 	config = config.withDefaults()
 	if err := config.Validate(); err != nil {
 		return nil, err
@@ -127,11 +181,25 @@ func ExecuteQueuePlan(ctx context.Context, config RunConfig) ([]QueueArtifact, e
 	if err := os.MkdirAll(config.ArtifactRoot, 0o755); err != nil {
 		return nil, fmt.Errorf("create artifact root: %w", err)
 	}
-	suites := queueSuites(config.Plan, config.Target)
+	var suites []queueSuite
+	if mode == SubmissionModeQueueDrain {
+		var err error
+		suites, err = queueTransitionSuites(config.Plan, config.Target)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		suites = queueSuites(config.Plan, config.Target)
+		if mode == SubmissionModeSequential {
+			for index := range suites {
+				suites[index].ID = strings.Replace(suites[index].ID, "queue-", "sequential-", 1)
+			}
+		}
+	}
 	artifacts := make([]QueueArtifact, 0, len(suites))
 	var failures []string
 	for _, suite := range suites {
-		artifact := executeQueueSuite(ctx, config, suite)
+		artifact := executeQueueSuite(ctx, config, suite, mode)
 		artifacts = append(artifacts, artifact)
 		if artifact.Status != "passed" {
 			failures = append(failures, fmt.Sprintf("%s: %s", suite.ID, artifact.Error))
@@ -141,6 +209,43 @@ func ExecuteQueuePlan(ctx context.Context, config RunConfig) ([]QueueArtifact, e
 		return artifacts, fmt.Errorf("%d benchmark queue suite(s) failed: %s", len(failures), strings.Join(failures, "; "))
 	}
 	return artifacts, nil
+}
+
+func queueTransitionSuites(plan Plan, target ExecutionTarget) ([]queueSuite, error) {
+	if len(plan.FixtureIDs) != 1 {
+		return nil, fmt.Errorf("queue-transition requires exactly one fixture, got %d", len(plan.FixtureIDs))
+	}
+	type lane struct {
+		client    Client
+		toolchain ArchiveToolchain
+		transport Transport
+		tls       TLSValidation
+		label     string
+	}
+	byLane := map[lane]int{}
+	var suites []queueSuite
+	for _, run := range plan.Runs {
+		if run.ExecutionTarget != target {
+			continue
+		}
+		if run.FixtureID != plan.FixtureIDs[0] {
+			return nil, fmt.Errorf("queue-transition run %s does not use fixture %s", run.ID, plan.FixtureIDs[0])
+		}
+		key := lane{run.Client, run.ArchiveToolchain, run.Transport, run.TLSValidation, run.TransportLabel}
+		index, ok := byLane[key]
+		if !ok {
+			index = len(suites)
+			byLane[key] = index
+			suites = append(suites, queueSuite{ID: fmt.Sprintf("queue-transition-%04d", index+1)})
+		}
+		suites[index].Runs = append(suites[index].Runs, run)
+	}
+	for _, suite := range suites {
+		if len(suite.Runs) != 20 {
+			return nil, fmt.Errorf("%s has %d jobs; queue-transition requires exactly 20", suite.ID, len(suite.Runs))
+		}
+	}
+	return suites, nil
 }
 
 func queueSuites(plan Plan, target ExecutionTarget) []queueSuite {
@@ -170,8 +275,8 @@ func queueSuites(plan Plan, target ExecutionTarget) []queueSuite {
 	return suites
 }
 
-func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuite) QueueArtifact {
-	artifact := QueueArtifact{SchemaVersion: 1, SuiteID: suite.ID, Runs: append([]Run(nil), suite.Runs...), Status: "failed"}
+func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuite, mode SubmissionMode) QueueArtifact {
+	artifact := QueueArtifact{SchemaVersion: 3, SuiteID: suite.ID, SubmissionMode: mode, Runs: append([]Run(nil), suite.Runs...), Status: "failed"}
 	suiteDir := filepath.Join(config.ArtifactRoot, suite.ID)
 	if err := os.Mkdir(suiteDir, 0o755); err != nil {
 		artifact.Error = fmt.Sprintf("create queue suite directory: %v", err)
@@ -188,10 +293,10 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 		artifact.Error = fmt.Sprintf("create queue client config directory: %v", err)
 		return artifact
 	}
-	input := QueueInput{SchemaVersion: 1, SuiteID: suite.ID, Jobs: make([]QueueInputJob, 0, len(suite.Runs))}
+	input := QueueInput{SchemaVersion: 2, SuiteID: suite.ID, SubmissionMode: mode, Jobs: make([]QueueInputJob, 0, len(suite.Runs))}
 	manifests := make(map[string]fixture.GeneratedManifest, len(suite.Runs))
 	fixtureDirs := make(map[string]string, len(suite.Runs))
-	for _, run := range suite.Runs {
+	for index, run := range suite.Runs {
 		fixtureDir := filepath.Join(config.FixtureRoot, run.FixtureID)
 		manifest, err := fixture.LoadGeneratedManifest(filepath.Join(fixtureDir, "fixture-manifest.json"))
 		if err != nil {
@@ -208,7 +313,12 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 			artifact.Error = err.Error()
 			return artifact
 		}
-		input.Jobs = append(input.Jobs, QueueInputJob{RunID: run.ID, FixtureID: run.FixtureID, NZBPath: nzbPath, ArchivePassword: archivePassword})
+		job := QueueInputJob{RunID: run.ID, FixtureID: run.FixtureID, NZBPath: nzbPath, ArchivePassword: archivePassword}
+		if mode == SubmissionModeQueueDrain {
+			job.ForceAccept = true
+			job.SubmissionName = fmt.Sprintf("queue-transition-%02d.nzb", index+1)
+		}
+		input.Jobs = append(input.Jobs, job)
 		manifests[run.ID] = manifest
 		fixtureDirs[run.ID] = fixtureDir
 	}
@@ -230,31 +340,84 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 		artifact.Error = err.Error()
 		return artifact
 	}
-	if err := result.ValidateFor(suite); err != nil {
+	if err := result.ValidateFor(suite, mode); err != nil {
 		artifact.Error = err.Error()
 		return artifact
 	}
 	artifact.AdapterResult = &result
 	artifact.QueueWallClockNanoseconds = result.QueueCompletedAt.Sub(result.QueueStartedAt).Nanoseconds()
+	if mode == SubmissionModeQueueDrain {
+		for _, job := range result.Jobs {
+			if job.TerminalStatus != "succeeded" {
+				artifact.Error = fmt.Sprintf("queue-transition job %s ended %s: %s", job.RunID, job.TerminalStatus, job.TerminalError)
+				return artifact
+			}
+		}
+		if err := DeleteOutputFiles(outputDir); err != nil {
+			artifact.Error = fmt.Sprintf("delete queue-transition outputs: %v", err)
+			return artifact
+		}
+		artifact.Status = "passed"
+		return artifact
+	}
 	jobsByRun := make(map[string]QueueJobResult, len(result.Jobs))
 	for _, job := range result.Jobs {
 		jobsByRun[job.RunID] = job
 	}
 	artifact.Jobs = make([]QueueJobArtifact, 0, len(suite.Runs))
+	var jobFailures []string
 	for _, run := range suite.Runs {
-		verification, err := VerifyOutput(fixtureDirs[run.ID], outputDir)
+		adapterResult := jobsByRun[run.ID]
+		jobArtifact := QueueJobArtifact{
+			Run:           run,
+			Repair:        manifests[run.ID].Repair,
+			AdapterResult: adapterResult,
+		}
+		if adapterResult.TerminalStatus != "succeeded" {
+			jobArtifact.Error = "client terminal failure: " + adapterResult.TerminalError
+			jobFailures = append(jobFailures, fmt.Sprintf("%s: %s", run.ID, jobArtifact.Error))
+			artifact.Jobs = append(artifact.Jobs, jobArtifact)
+			continue
+		}
+		var verification OutputVerification
+		if mode == SubmissionModeSequential {
+			if adapterResult.Verification == nil || !adapterResult.OutputDeleted {
+				jobArtifact.Error = "adapter did not verify and delete the completed fixture output"
+				jobFailures = append(jobFailures, fmt.Sprintf("%s: %s", run.ID, jobArtifact.Error))
+				artifact.Jobs = append(artifact.Jobs, jobArtifact)
+				continue
+			}
+			verification = *adapterResult.Verification
+		} else {
+			verification, err = VerifyOutput(fixtureDirs[run.ID], outputDir)
+		}
 		if err != nil {
-			artifact.Error = err.Error()
-			return artifact
+			if jobArtifact.Error != "" {
+				jobArtifact.Error += "; output verification: " + err.Error()
+			} else {
+				jobArtifact.Error = err.Error()
+			}
+			jobFailures = append(jobFailures, fmt.Sprintf("%s: %s", run.ID, jobArtifact.Error))
+			artifact.Jobs = append(artifact.Jobs, jobArtifact)
+			continue
 		}
 		verifiedAt := time.Now().UTC()
-		artifact.Jobs = append(artifact.Jobs, QueueJobArtifact{
-			Run:            run,
-			Repair:         manifests[run.ID].Repair,
-			AdapterResult:  jobsByRun[run.ID],
-			Verification:   &verification,
-			UsableOutputAt: &verifiedAt,
-		})
+		jobArtifact.Verification = &verification
+		jobArtifact.UsableOutputAt = &verifiedAt
+		artifact.Jobs = append(artifact.Jobs, jobArtifact)
+		if jobArtifact.Error != "" {
+			jobFailures = append(jobFailures, fmt.Sprintf("%s: %s", run.ID, jobArtifact.Error))
+		}
+	}
+	if len(jobFailures) > 0 {
+		artifact.Error = fmt.Sprintf("%d queue job(s) failed: %s", len(jobFailures), strings.Join(jobFailures, "; "))
+		return artifact
+	}
+	if mode != SubmissionModeSequential {
+		if err := DeleteOutputFiles(outputDir); err != nil {
+			artifact.Error = fmt.Sprintf("delete queued outputs: %v", err)
+			return artifact
+		}
 	}
 	verifiedAt := time.Now().UTC()
 	artifact.QueueVerifiedAt = &verifiedAt
@@ -263,8 +426,8 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 	return artifact
 }
 
-func (r QueueAdapterResult) ValidateFor(suite queueSuite) error {
-	if r.SchemaVersion != 1 || r.SuiteID != suite.ID || len(suite.Runs) == 0 {
+func (r QueueAdapterResult) ValidateFor(suite queueSuite, mode SubmissionMode) error {
+	if r.SchemaVersion != 3 || r.SuiteID != suite.ID || r.SubmissionMode != mode || len(suite.Runs) == 0 {
 		return fmt.Errorf("queue adapter result does not match suite %s", suite.ID)
 	}
 	first := suite.Runs[0]
@@ -273,6 +436,9 @@ func (r QueueAdapterResult) ValidateFor(suite queueSuite) error {
 	}
 	if r.QueueStartedAt.IsZero() || r.QueueCompletedAt.IsZero() || r.QueueCompletedAt.Before(r.QueueStartedAt) {
 		return fmt.Errorf("queue adapter result for %s has invalid suite timing", suite.ID)
+	}
+	if r.StatusPollIntervalNanos <= 0 {
+		return fmt.Errorf("queue adapter result for %s lacks status polling precision", suite.ID)
 	}
 	if strings.TrimSpace(r.ClientIdentity) == "" || strings.TrimSpace(r.ClientVersion) == "" || strings.TrimSpace(r.ArchiveToolchainIdentity) == "" || len(r.RenderedConfigSHA256) != 64 {
 		return fmt.Errorf("queue adapter result for %s lacks client identity, version, archive provenance, or config SHA-256", suite.ID)
@@ -288,8 +454,36 @@ func (r QueueAdapterResult) ValidateFor(suite queueSuite) error {
 		return fmt.Errorf("queue adapter result for %s reports %d jobs, expected %d", suite.ID, len(r.Jobs), len(expected))
 	}
 	for _, job := range r.Jobs {
-		if !expected[job.RunID] || strings.TrimSpace(job.JobID) == "" || job.QueuedAt.IsZero() || job.CompletionAt.IsZero() || job.CompletionAt.Before(job.QueuedAt) || job.QueuedAt.Before(r.QueueStartedAt) || job.CompletionAt.After(r.QueueCompletedAt) {
+		fixtureWall := job.CompletionAt.Sub(job.QueuedAt).Nanoseconds()
+		if !expected[job.RunID] || strings.TrimSpace(job.JobID) == "" || job.QueuedAt.IsZero() || job.CompletionAt.IsZero() || job.CompletionAt.Before(job.QueuedAt) || job.QueuedAt.Before(r.QueueStartedAt) || job.CompletionAt.After(r.QueueCompletedAt) || job.FixtureWallClockNanoseconds != fixtureWall {
 			return fmt.Errorf("queue adapter result for %s contains invalid job timing", suite.ID)
+		}
+		if job.TerminalStatus != "succeeded" && job.TerminalStatus != "failed" {
+			return fmt.Errorf("queue adapter result for %s contains invalid terminal status", suite.ID)
+		}
+		if job.TerminalStatus == "failed" && strings.TrimSpace(job.TerminalError) == "" {
+			return fmt.Errorf("queue adapter result for %s omits a terminal failure reason", suite.ID)
+		}
+		if mode == SubmissionModeSequential {
+			if job.ResourceMetrics == nil {
+				return fmt.Errorf("sequential adapter result for %s lacks fixture resource metrics", suite.ID)
+			}
+			if err := job.ResourceMetrics.Validate(); err != nil {
+				return fmt.Errorf("sequential adapter result for %s has invalid fixture resource metrics: %w", suite.ID, err)
+			}
+			if job.TerminalStatus == "succeeded" && (job.Verification == nil || !job.OutputDeleted) {
+				return fmt.Errorf("sequential adapter result for %s did not verify and delete fixture output", suite.ID)
+			}
+		} else if job.ResourceMetrics != nil {
+			return fmt.Errorf("non-sequential adapter result for %s unexpectedly reports fixture resource metrics", suite.ID)
+		}
+		if job.ProcessingTimingAvailable {
+			processingWall := job.CompletionAt.Sub(job.ProcessingStartedAt).Nanoseconds()
+			if job.ProcessingStartedAt.IsZero() || job.ProcessingStartedAt.Before(job.QueuedAt) || job.CompletionAt.Before(job.ProcessingStartedAt) || job.ProcessingWallClockNanoseconds != processingWall || job.ProcessingTimingError != "" {
+				return fmt.Errorf("queue adapter result for %s contains invalid active-processing timing", suite.ID)
+			}
+		} else if !job.ProcessingStartedAt.IsZero() || job.ProcessingWallClockNanoseconds != 0 || strings.TrimSpace(job.ProcessingTimingError) == "" {
+			return fmt.Errorf("queue adapter result for %s lacks a processing-timing failure reason", suite.ID)
 		}
 		delete(expected, job.RunID)
 	}

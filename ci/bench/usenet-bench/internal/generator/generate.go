@@ -4,7 +4,6 @@ package generator
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -19,31 +18,36 @@ import (
 	"time"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/fixture"
+	"github.com/zeebo/blake3"
 )
 
 const (
-	defaultBytesPerFile         int64 = 64 << 20
-	defaultBluRayLargeFile      int64 = 1 << 30
-	defaultBluRaySmallFile      int64 = 128 << 10
-	defaultBluRaySmallFileCount       = 512
+	// Ordinary RAR fixtures contain one substantial movie. The one fixture
+	// with multiple input movies uses the separate 48 MiB size below.
+	defaultBytesPerFile            int64 = 150 << 20
+	defaultMultiVolumeBytesPerFile int64 = 48 << 20
+	defaultBluRayLargeFile         int64 = 5 << 30
+	defaultBluRaySmallFile         int64 = 128 << 10
+	defaultBluRaySmallFileCount          = 512
 )
 
 var canonicalFileTime = time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
 
 type Config struct {
-	MatrixPath           string
-	ToolchainsPath       string
-	DockerfilePath       string
-	PAR2ToolchainPath    string
-	PAR2DockerfilePath   string
-	OutputDir            string
-	DockerBinary         string
-	BytesPerFile         int64
-	BluRayLargeFileBytes int64
-	BluRaySmallFileBytes int64
-	BluRaySmallFileCount int
-	CaseIDs              map[string]bool
-	BuildImages          bool
+	MatrixPath              string
+	ToolchainsPath          string
+	DockerfilePath          string
+	PAR2ToolchainPath       string
+	PAR2DockerfilePath      string
+	OutputDir               string
+	DockerBinary            string
+	BytesPerFile            int64
+	MultiVolumeBytesPerFile int64
+	BluRayLargeFileBytes    int64
+	BluRaySmallFileBytes    int64
+	BluRaySmallFileCount    int
+	CaseIDs                 map[string]bool
+	BuildImages             bool
 }
 
 func (c Config) withDefaults() Config {
@@ -71,6 +75,9 @@ func (c Config) withDefaults() Config {
 	if c.BytesPerFile == 0 {
 		c.BytesPerFile = defaultBytesPerFile
 	}
+	if c.MultiVolumeBytesPerFile == 0 {
+		c.MultiVolumeBytesPerFile = defaultMultiVolumeBytesPerFile
+	}
 	if c.BluRayLargeFileBytes == 0 {
 		c.BluRayLargeFileBytes = defaultBluRayLargeFile
 	}
@@ -84,8 +91,8 @@ func (c Config) withDefaults() Config {
 }
 
 func (c Config) Validate() error {
-	if c.BytesPerFile <= 0 {
-		return fmt.Errorf("bytes per file must be positive, got %d", c.BytesPerFile)
+	if c.BytesPerFile <= 0 || c.MultiVolumeBytesPerFile <= 0 {
+		return fmt.Errorf("movie sizes must be positive")
 	}
 	if c.BluRayLargeFileBytes <= 0 || c.BluRaySmallFileBytes <= 0 || c.BluRaySmallFileCount < 1 {
 		return fmt.Errorf("Blu-ray layout sizes and file count must be positive")
@@ -196,7 +203,7 @@ func generateCase(ctx context.Context, config Config, archiveCase fixture.Archiv
 		return fixture.GeneratedManifest{}, fmt.Errorf("create archive directory: %w", err)
 	}
 
-	expected, inputs, recipe, err := writePayloadFiles(inputDir, archiveCase, config)
+	expected, inputs, recipe, err := writePayloadFiles(ctx, inputDir, caseDir, archiveCase, config, toolchain)
 	if err != nil {
 		return fixture.GeneratedManifest{}, fmt.Errorf("write fixture %q payload: %w", archiveCase.ID, err)
 	}
@@ -212,7 +219,7 @@ func generateCase(ctx context.Context, config Config, archiveCase fixture.Archiv
 	if err != nil {
 		return fixture.GeneratedManifest{}, fmt.Errorf("inspect fixture %q archive: %w", archiveCase.ID, err)
 	}
-	if len(archives) < 2 {
+	if requiresMultiVolumeArchive(archiveCase) && len(archives) < 2 {
 		return fixture.GeneratedManifest{}, fmt.Errorf("fixture %q did not create a multi-volume archive; increase bytes per file or reduce volume size", archiveCase.ID)
 	}
 	testArgs := []string{"t", "-idq", "-y"}
@@ -229,7 +236,7 @@ func generateCase(ctx context.Context, config Config, archiveCase fixture.Archiv
 	}
 
 	manifest := fixture.GeneratedManifest{
-		SchemaVersion:      4,
+		SchemaVersion:      5,
 		Case:               archiveCase,
 		Toolchain:          toolchain.ManifestID(),
 		PayloadRecipe:      recipe,
@@ -248,6 +255,10 @@ func generateCase(ctx context.Context, config Config, archiveCase fixture.Archiv
 		return fixture.GeneratedManifest{}, fmt.Errorf("remove fixture staging input: %w", err)
 	}
 	return manifest, nil
+}
+
+func requiresMultiVolumeArchive(archiveCase fixture.ArchiveCase) bool {
+	return archiveCase.FileCount > 1
 }
 
 func runRAR(ctx context.Context, dockerBinary string, toolchain Toolchain, caseDir string, rarArgs ...string) error {
@@ -275,31 +286,32 @@ func runCommand(ctx context.Context, name string, args ...string) error {
 	return nil
 }
 
-func writePayloadFiles(dir string, archiveCase fixture.ArchiveCase, config Config) ([]fixture.FileDigest, []string, fixture.PayloadRecipe, error) {
+func writePayloadFiles(ctx context.Context, dir, caseDir string, archiveCase fixture.ArchiveCase, config Config, toolchain Toolchain) ([]fixture.FileDigest, []string, fixture.PayloadRecipe, error) {
 	layout := archiveCase.PayloadLayout
 	if layout == "" {
 		layout = fixture.UniformPayloadLayout
 	}
 	switch layout {
 	case fixture.UniformPayloadLayout:
-		return writeUniformPayloadFiles(dir, archiveCase, config.BytesPerFile)
+		return writeUniformPayloadFiles(ctx, caseDir, archiveCase, config, toolchain)
 	case fixture.BluRayDiscPayloadLayout:
-		return writeBluRayDiscPayloadFiles(dir, archiveCase, config)
+		return writeBluRayDiscPayloadFiles(ctx, dir, caseDir, archiveCase, config, toolchain)
 	default:
 		return nil, nil, fixture.PayloadRecipe{}, fmt.Errorf("fixture %q has unsupported payload layout %q", archiveCase.ID, layout)
 	}
 }
 
-func writeUniformPayloadFiles(dir string, archiveCase fixture.ArchiveCase, bytesPerFile int64) ([]fixture.FileDigest, []string, fixture.PayloadRecipe, error) {
+func writeUniformPayloadFiles(ctx context.Context, caseDir string, archiveCase fixture.ArchiveCase, config Config, toolchain Toolchain) ([]fixture.FileDigest, []string, fixture.PayloadRecipe, error) {
+	bytesPerFile := uniformMovieBytes(archiveCase, config)
 	digests := make([]fixture.FileDigest, 0, archiveCase.FileCount)
 	inputs := make([]string, 0, archiveCase.FileCount)
 	for index := 1; index <= archiveCase.FileCount; index++ {
-		name := fmt.Sprintf("payload-%02d.bin", index)
-		digest, err := writePayload(filepath.Join(dir, name), archiveCase.Payload, bytesPerFile, uint64(index))
+		name := fmt.Sprintf("payload-%02d%s", index, videoExtension(archiveCase.Payload))
+		digest, err := renderVideo(ctx, config, toolchain, caseDir, filepath.ToSlash(filepath.Join("input", name)), archiveCase.Payload, bytesPerFile, uint64(index))
 		if err != nil {
 			return nil, nil, fixture.PayloadRecipe{}, err
 		}
-		digests = append(digests, fixture.FileDigest{Path: filepath.ToSlash(name), Size: bytesPerFile, SHA256: digest})
+		digests = append(digests, fixture.FileDigest{Path: filepath.ToSlash(name), Size: digest.Size, BLAKE3: digest.BLAKE3})
 		inputs = append(inputs, filepath.ToSlash(filepath.Join("input", name)))
 	}
 	return digests, inputs, fixture.PayloadRecipe{
@@ -308,27 +320,44 @@ func writeUniformPayloadFiles(dir string, archiveCase fixture.ArchiveCase, bytes
 	}, nil
 }
 
+func uniformMovieBytes(archiveCase fixture.ArchiveCase, config Config) int64 {
+	if archiveCase.FileCount > 1 {
+		return config.MultiVolumeBytesPerFile
+	}
+	return config.BytesPerFile
+}
+
 // writeBluRayDiscPayloadFiles makes an intentionally declared disc-layout
 // workload: one large media stream plus many small playlist, clip-info, and
 // metadata-shaped files. It does not claim to be a byte-for-byte Blu-ray image.
-func writeBluRayDiscPayloadFiles(dir string, archiveCase fixture.ArchiveCase, config Config) ([]fixture.FileDigest, []string, fixture.PayloadRecipe, error) {
+func writeBluRayDiscPayloadFiles(ctx context.Context, dir, caseDir string, archiveCase fixture.ArchiveCase, config Config, toolchain Toolchain) ([]fixture.FileDigest, []string, fixture.PayloadRecipe, error) {
 	digests := make([]fixture.FileDigest, 0, config.BluRaySmallFileCount+1)
 	inputs := make([]string, 0, config.BluRaySmallFileCount+1)
-	for index := 1; index <= config.BluRaySmallFileCount; index++ {
-		relative := bluRaySmallPath(index)
-		digest, err := writePayloadAt(dir, relative, fixture.CompressiblePayload, config.BluRaySmallFileBytes, uint64(10_000+index))
-		if err != nil {
-			return nil, nil, fixture.PayloadRecipe{}, err
-		}
-		digests = append(digests, fixture.FileDigest{Path: relative, Size: config.BluRaySmallFileBytes, SHA256: digest})
-		inputs = append(inputs, filepath.ToSlash(filepath.Join("input", relative)))
-	}
-	largeRelative := "BDMV/STREAM/00000.m2ts"
-	largeDigest, err := writePayloadAt(dir, largeRelative, archiveCase.Payload, config.BluRayLargeFileBytes, 1)
+	smallRelative := bluRaySmallPath(1)
+	smallDigest, err := renderVideo(ctx, config, toolchain, caseDir, filepath.ToSlash(filepath.Join("input", smallRelative)), fixture.CompressiblePayload, config.BluRaySmallFileBytes, 10_001)
 	if err != nil {
 		return nil, nil, fixture.PayloadRecipe{}, err
 	}
-	digests = append(digests, fixture.FileDigest{Path: largeRelative, Size: config.BluRayLargeFileBytes, SHA256: largeDigest})
+	digests = append(digests, fixture.FileDigest{Path: smallRelative, Size: smallDigest.Size, BLAKE3: smallDigest.BLAKE3})
+	inputs = append(inputs, filepath.ToSlash(filepath.Join("input", smallRelative)))
+	for index := 1; index <= config.BluRaySmallFileCount; index++ {
+		if index == 1 {
+			continue
+		}
+		relative := bluRaySmallPath(index)
+		if err := copyVideoFile(filepath.Join(dir, filepath.FromSlash(smallRelative)), filepath.Join(dir, filepath.FromSlash(relative))); err != nil {
+			return nil, nil, fixture.PayloadRecipe{}, err
+		}
+		digest := smallDigest
+		digests = append(digests, fixture.FileDigest{Path: relative, Size: digest.Size, BLAKE3: digest.BLAKE3})
+		inputs = append(inputs, filepath.ToSlash(filepath.Join("input", relative)))
+	}
+	largeRelative := "BDMV/STREAM/00000.m2ts"
+	largeDigest, err := renderVideo(ctx, config, toolchain, caseDir, filepath.ToSlash(filepath.Join("input", largeRelative)), archiveCase.Payload, config.BluRayLargeFileBytes, 1)
+	if err != nil {
+		return nil, nil, fixture.PayloadRecipe{}, err
+	}
+	digests = append(digests, fixture.FileDigest{Path: largeRelative, Size: largeDigest.Size, BLAKE3: largeDigest.BLAKE3})
 	inputs = append(inputs, filepath.ToSlash(filepath.Join("input", largeRelative)))
 	return digests, inputs, fixture.PayloadRecipe{
 		Layout:         fixture.BluRayDiscPayloadLayout,
@@ -339,10 +368,7 @@ func writeBluRayDiscPayloadFiles(dir string, archiveCase fixture.ArchiveCase, co
 }
 
 func bluRaySmallPath(index int) string {
-	directories := []string{"BDMV/PLAYLIST", "BDMV/CLIPINF", "BDMV/JAR", "CERTIFICATE/BACKUP"}
-	extensions := []string{"mpls", "clpi", "bdjo", "bdmv"}
-	slot := (index - 1) % len(directories)
-	return fmt.Sprintf("%s/%06d.%s", directories[slot], index, extensions[slot])
+	return fmt.Sprintf("BDMV/STREAM/%05d.m2ts", 10_000+index)
 }
 
 func writePayloadAt(root, relative string, kind fixture.PayloadKind, size int64, stream uint64) (string, error) {
@@ -358,7 +384,7 @@ func writePayload(path string, kind fixture.PayloadKind, size int64, stream uint
 	if err != nil {
 		return "", err
 	}
-	hash := sha256.New()
+	hash := blake3.New()
 	writer := io.MultiWriter(file, hash)
 	var writeErr error
 	switch kind {
@@ -389,7 +415,7 @@ func writeIncompressible(writer io.Writer, size int64, stream uint64) error {
 		var seed [16]byte
 		binary.BigEndian.PutUint64(seed[:8], stream)
 		binary.BigEndian.PutUint64(seed[8:], counter)
-		block := sha256.Sum256(seed[:])
+		block := blake3.Sum256(seed[:])
 		remaining := size - written
 		chunk := block[:]
 		if int64(len(chunk)) > remaining {
@@ -404,25 +430,33 @@ func writeIncompressible(writer io.Writer, size int64, stream uint64) error {
 	return nil
 }
 
-// writeModeratelyCompressible emits a fresh pseudorandom 32 KiB block followed
-// by an exact copy. It is visibly compressed by RAR while still producing
-// multi-volume fixtures at the default size.
+// writeModeratelyCompressible emits four fresh pseudorandom 32 KiB blocks and
+// repeats one. The resulting 20% redundancy is enough to exercise RAR
+// compression while keeping a 192 MiB fixture near the intended 150–200 MiB
+// on-wire scale.
 func writeModeratelyCompressible(writer io.Writer, size int64, stream uint64) error {
-	const halfBlock = 32 << 10
+	const (
+		blockSize    = 32 << 10
+		uniqueBlocks = 4
+	)
 	var counter uint64
 	var written int64
 	for written < size {
-		block := make([]byte, halfBlock)
-		for offset := 0; offset < len(block); offset += sha256.Size {
-			var seed [16]byte
-			binary.BigEndian.PutUint64(seed[:8], stream)
-			binary.BigEndian.PutUint64(seed[8:], counter)
-			digest := sha256.Sum256(seed[:])
-			copy(block[offset:], digest[:])
-			counter++
+		blocks := make([][]byte, uniqueBlocks)
+		for index := range blocks {
+			block := make([]byte, blockSize)
+			for offset := 0; offset < len(block); offset += 32 {
+				var seed [16]byte
+				binary.BigEndian.PutUint64(seed[:8], stream)
+				binary.BigEndian.PutUint64(seed[8:], counter)
+				digest := blake3.Sum256(seed[:])
+				copy(block[offset:], digest[:])
+				counter++
+			}
+			blocks[index] = block
 		}
-		for repeat := 0; repeat < 2 && written < size; repeat++ {
-			chunk := block
+		for index := 0; index <= uniqueBlocks && written < size; index++ {
+			chunk := blocks[index%uniqueBlocks]
 			if remaining := size - written; int64(len(chunk)) > remaining {
 				chunk = chunk[:remaining]
 			}
@@ -472,7 +506,7 @@ func digestArchiveFiles(archiveDir, caseDir string) ([]fixture.FileDigest, strin
 		digests = append(digests, fixture.FileDigest{
 			Path:   filepath.ToSlash(relative),
 			Size:   info.Size(),
-			SHA256: digest,
+			BLAKE3: digest,
 		})
 	}
 	first, err := filepath.Rel(caseDir, paths[0])
@@ -488,7 +522,7 @@ func hashFile(path string) (string, error) {
 		return "", err
 	}
 	defer file.Close()
-	hash := sha256.New()
+	hash := blake3.New()
 	if _, err := io.Copy(hash, file); err != nil {
 		return "", err
 	}

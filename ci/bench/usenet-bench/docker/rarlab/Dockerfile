@@ -12,7 +12,7 @@ ARG RAR_BINARY=rar
 
 RUN set -eux; \
     apt-get update; \
-    apt-get install --yes --no-install-recommends ca-certificates curl tar; \
+    apt-get install --yes --no-install-recommends ca-certificates curl ffmpeg tar; \
     curl --fail --location --proto '=https' --tlsv1.2 --output /tmp/rar.tar.gz "$RAR_URL"; \
     echo "$RAR_SHA256  /tmp/rar.tar.gz" | sha256sum -c -; \
     case "$RAR_BINARY" in ''|.|..|*/*|*\\*) exit 64;; esac; \
