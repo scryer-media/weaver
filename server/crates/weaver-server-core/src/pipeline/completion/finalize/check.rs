@@ -2448,6 +2448,12 @@ impl Pipeline {
         // cannot tell a file still arriving from a damaged one — but in both
         // of these the wait is for something that is not coming, and the
         // authoritative pass is what says so.
+        // Still conditioned on "not yet verified", unlike 0.7.9's. 0.8 already
+        // re-opens the gate for a verified job whose extraction later fails —
+        // by a different route, and one that depends on `par2_validation_needed`
+        // staying false so the repair-first branch is skipped. Relaxing it here
+        // diverts that flow and the later authoritative pass stops running
+        // (`a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass`).
         let par2_may_still_rule =
             par2_loaded && !par2_bypassed && !self.par2_verified.contains(&job_id);
         let extraction_settled = !self.job_has_active_extraction_tasks(job_id);
@@ -2471,8 +2477,15 @@ impl Pipeline {
                     .jobs
                     .get(&job_id)
                     .is_some_and(|state| state.recovery_queue.has_recovery_work()));
-        let rar_par2_repair_ready =
-            failed_rar_par2_repair_ready || missing_rar_volume_par2_repair_ready;
+        // 0.8 only: a direct set still taking articles has holes where its
+        // outstanding ranges will go, and PAR2 cannot tell a hole from
+        // corruption. Declaring a verdict owed while one is filling walks the
+        // job into the authoritative branch, which then defers on exactly this
+        // condition and returns — so the pass never runs and the escape has
+        // achieved nothing but a later re-check.
+        let rar_par2_repair_ready = (failed_rar_par2_repair_ready
+            || missing_rar_volume_par2_repair_ready)
+            && self.direct_sets_ready_for_authoritative_par2(job_id);
 
         let par2_primary_payload_ready =
             !has_incomplete_data_files || download_pipeline_exhausted || rar_par2_repair_ready;

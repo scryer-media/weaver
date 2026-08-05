@@ -154,16 +154,17 @@ impl Pipeline {
 
     /// Whether PAR2 can still deliver a verdict on this job's archives.
     ///
-    /// Deliberately keyed on a **loaded** set, not on the NZB declaring one.
-    /// A job can declare a `.par2` whose articles never arrive — routine, since
-    /// recovery volumes often sit on a different retention tier — and keying on
-    /// the declaration would latch a failed member out while waiting for a
-    /// verdict that can never come. `par2_verified` is the only release that
-    /// fires in production (`par2_bypassed` has no non-test writer), and it is
-    /// reachable only once the set has loaded, so an unloaded set must not
-    /// engage the latch at all. This is the same signal completion uses for
-    /// `par2_validation_needed`, which keeps the two from disagreeing about
-    /// whether a verdict is owed.
+    /// Keyed on a **loaded** set, not on the NZB declaring one. A job can
+    /// declare a `.par2` whose articles never arrive — routine, since recovery
+    /// volumes often sit on a different retention tier — and keying on the
+    /// declaration would latch a failed member out while waiting for a verdict
+    /// that can never come.
+    ///
+    /// A clean verdict releases it. 0.7.9 drops that clause so a member that
+    /// fails *after* verification stays latched; 0.8 does not need to, because
+    /// it already re-opens the completion gate for that job by another route,
+    /// and holding the latch as well would keep the member out with no verdict
+    /// left to come.
     pub(crate) fn par2_is_authoritative_for_extraction(&self, job_id: JobId) -> bool {
         self.par2_set(job_id).is_some()
             && !self.par2_bypassed.contains(&job_id)
