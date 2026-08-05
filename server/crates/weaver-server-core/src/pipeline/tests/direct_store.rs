@@ -10649,6 +10649,81 @@ fn header_encrypted_store_set(
         .collect()
 }
 
+/// [`header_encrypted_store_set`] plus an unsplit, encrypted, BLAKE2sp-only
+/// member in the closing volume — the shape that puts a **tolerated** member
+/// inside an `-hp` set.
+///
+/// Both members are encrypted, because `-hp` encrypts the data as well as the
+/// headers; what makes the extra one ineligible is that its header states a
+/// BLAKE2sp digest and no CRC32, which `classify_stored_chain` answers with
+/// `Blake2OnlyNoCrc32` on the encrypted path exactly as on the plaintext one.
+/// Unsplit for the reason [`ToleranceExtra::Blake2OnlyStore`] gives: the
+/// classifier only reaches the hash fields once the chain closes, so a split
+/// one would route into a partial before resolving.
+fn header_encrypted_store_set_with_extra_member(
+    member_name: &str,
+    payload: &[u8],
+    extra_name: &str,
+    extra_payload: &[u8],
+    volume_count: usize,
+    password: &'static str,
+    check: HeaderCheck,
+) -> Vec<(String, Vec<u8>)> {
+    let header_key = weaver_unrar::derive_rar5_material(password, &TEST_HP_SALT, TEST_HP_KDF_LG2)
+        .expect("the fixture KDF count is derivable")
+        .key;
+    let member = weaver_unrar::derive_rar5_material(password, &TEST_CRYPT_SALT, TEST_CRYPT_KDF_LG2)
+        .expect("the fixture KDF count is derivable");
+
+    let mut volumes =
+        header_encrypted_store_set(member_name, payload, volume_count, password, check);
+
+    // The extra member's own cipher stream. Same key as the split member — one
+    // salt for the set, which is legal and is what the rest of this fixture
+    // family does — and `align16` padded, because that is the extent
+    // `classify_stored_chain` requires an encrypted chain to sum to.
+    let extra_cipher_len = extra_payload.len().div_ceil(16) * 16;
+    let mut extra_cipher = extra_payload.to_vec();
+    extra_cipher.resize(extra_cipher_len, 0);
+    weaver_unrar::encrypt_cipher_range(&member.key, &TEST_CRYPT_IV, &mut extra_cipher)
+        .expect("the padded payload is block-aligned");
+
+    let mut extra = build_test_rar_crypt_extra(Some(&member.psw_check), false);
+    extra.extend_from_slice(&build_test_rar_blake2_extra(
+        weaver_unrar::crypto::blake2sp_hash(extra_payload),
+    ));
+
+    // Rebuild the closing volume with the extra member spliced in ahead of its
+    // end header. The end header is re-sealed under the next IV index, which is
+    // what keeps the sealed chain contiguous.
+    // Sealing is deterministic in the header's length, so the size of the end
+    // header already on the tail is what has to come off before the extra
+    // member goes on and a fresh one is appended under the next IV index.
+    let last = volume_count - 1;
+    let iv_at = |index: u8| [0x40u8.wrapping_add(index).wrapping_add(last as u8 * 8); 16];
+    let (name, bytes) = volumes[last].clone();
+    let end_header = build_test_rar_end_header(false);
+    let sealed_end_len = seal_test_rar_header(&header_key, &iv_at(2), &end_header).len();
+
+    let mut rebuilt = bytes[..bytes.len() - sealed_end_len].to_vec();
+    rebuilt.extend_from_slice(&seal_test_rar_header(
+        &header_key,
+        &iv_at(2),
+        &build_test_rar_file_header_with_extra(
+            extra_name,
+            0,
+            extra_cipher_len as u64,
+            extra_payload.len() as u64,
+            None,
+            &extra,
+        ),
+    ));
+    rebuilt.extend_from_slice(&extra_cipher);
+    rebuilt.extend_from_slice(&seal_test_rar_header(&header_key, &iv_at(3), &end_header));
+    volumes[last] = (name, rebuilt);
+    volumes
+}
+
 /// A RAR4 `-hp` volume: the archive header's `ENCRYPTED_HEADERS` flag and then
 /// ciphertext.
 ///
@@ -11075,6 +11150,95 @@ async fn a_header_encrypted_set_keyed_from_nzb_meta_matches_the_conventional_ext
         ),
         "a `-hp` set routed direct must be byte-identical to the conventional extractor, in \
          the same directory, with the same job status"
+    );
+}
+
+#[tokio::test]
+async fn a_tolerated_member_of_a_header_encrypted_set_extracts_with_the_proved_password() {
+    // Plan 136, E4 follow-up. D1's tolerance extracts a small ineligible member
+    // through the hybrid provider — and an `-hp` set's *virtual* volumes are as
+    // header-encrypted as the posted ones, so that extraction cannot so much as
+    // open the archive without the key the router proved. It used to open with
+    // no password at all, which failed at the first header and demoted the set
+    // under `ToleratedExtractionFailed`: correct output by way of a full
+    // materialize and a conventional re-extract, for a set that had already
+    // routed every stored byte.
+    //
+    // The extra member is BLAKE2sp-only, which `classify_stored_chain` answers
+    // with `Blake2OnlyNoCrc32` on the encrypted path exactly as on the plaintext
+    // one, and `tolerated_member_names` takes any `Ineligible(_)`.
+    let member_name = "Silver.Horizon.S04E09.mkv";
+    let extra_name = "Silver.Horizon.S04E09.nfo";
+    // The store member has to be at least 100x the extra for the extra to fit
+    // under `min(64 MiB, 1% of packed archive bytes)`.
+    let payload: Vec<u8> = (0..30_000u32).map(|index| (index % 251) as u8).collect();
+    let extra_payload: Vec<u8> = (0..200u32).map(|index| (index % 97) as u8).collect();
+    let volumes = header_encrypted_store_set_with_extra_member(
+        member_name,
+        &payload,
+        extra_name,
+        &extra_payload,
+        4,
+        "moonlit-harbour",
+        HeaderCheck::For("moonlit-harbour"),
+    );
+    // Non-vacuity on the fixture: these volumes state nothing without a
+    // password, so the tolerated extraction genuinely needs one.
+    assert!(
+        weaver_unrar::RarArchive::parse_volume_facts(
+            std::io::Cursor::new(volumes[0].1.clone()),
+            None
+        )
+        .is_err(),
+        "a `-hp` fixture must yield no facts without a password"
+    );
+    let arrivals = in_order_arrivals(volumes.len());
+
+    // Both gates report the *tolerated* member, which is the one under test.
+    let conventional = run_hp_gate(
+        DirectStoreGate::Disabled,
+        JobId(45021),
+        extra_name,
+        &volumes,
+        &arrivals,
+        None,
+        sample_nzb_zstd_with_password("moonlit-harbour"),
+        None,
+    )
+    .await;
+    let direct = run_hp_gate(
+        DirectStoreGate::Enabled,
+        JobId(45022),
+        extra_name,
+        &volumes,
+        &arrivals,
+        None,
+        sample_nzb_zstd_with_password("moonlit-harbour"),
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        conventional.member.as_deref(),
+        Some(extra_payload.as_slice()),
+        "the conventional extractor should reproduce the tolerated member"
+    );
+    // The load-bearing pair. Without the password the tolerated extraction fails
+    // and the set demotes, and a demotion materializes every source volume — so
+    // this assertion is what tells a tolerated extraction that *worked* from one
+    // that was rescued by the fallback.
+    assert!(
+        !direct.volume_file_seen,
+        "the tolerated extraction must succeed in place, not by demoting the set"
+    );
+    assert_eq!(
+        (direct.member, direct.member_location, direct.status),
+        (
+            conventional.member,
+            conventional.member_location,
+            conventional.status
+        ),
+        "a tolerated member of a routed `-hp` set must match the conventional extractor"
     );
 }
 
