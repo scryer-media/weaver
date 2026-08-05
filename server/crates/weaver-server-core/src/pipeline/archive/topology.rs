@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
 
-fn open_rar_volume_file(path: &Path) -> std::io::Result<Box<dyn weaver_unrar::ReadSeek>> {
+fn open_rar_volume_file(path: &Path) -> std::io::Result<Box<dyn unrar_rs::ReadSeek>> {
     #[cfg(test)]
     {
         rar_refresh_open_tracking::open(path)
@@ -31,8 +31,8 @@ mod tests {
         file_header as build_test_rar_file_header, main_header as build_test_rar_main_header,
     };
     use crate::pipeline::rar_state::RarSetState;
+    use par2_rs::checksum;
     use std::io::Cursor;
-    use weaver_par2::checksum;
 
     fn build_many_volume_rar_set(volume_count: usize) -> Vec<(String, Vec<u8>)> {
         assert!(volume_count >= 2);
@@ -77,7 +77,7 @@ mod tests {
         let present = [0usize, 1, 2, 5];
 
         let mut cached_archive =
-            weaver_unrar::RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+            unrar_rs::RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
         for volume in present.iter().copied().skip(1) {
             cached_archive
                 .add_volume(volume, Box::new(Cursor::new(files[volume].1.clone())))
@@ -95,7 +95,7 @@ mod tests {
             volume_paths.insert(volume as u32, path);
             facts.insert(
                 volume as u32,
-                weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None)
+                unrar_rs::RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None)
                     .expect("synthetic RAR volume facts should parse"),
             );
         }
@@ -169,7 +169,7 @@ mod tests {
         for volume in [3usize, 4] {
             input.facts.insert(
                 volume as u32,
-                weaver_unrar::RarArchive::parse_volume_facts(
+                unrar_rs::RarArchive::parse_volume_facts(
                     Cursor::new(files[volume].1.clone()),
                     None,
                 )
@@ -200,7 +200,7 @@ mod tests {
             "show",
             input.cached_headers.as_ref().unwrap(),
             &[],
-            std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+            std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
         )
         .expect("fixture snapshot should deserialize")
         .value;
@@ -293,7 +293,7 @@ mod tests {
         let volume_count = 260usize;
         let files = build_many_volume_rar_set(volume_count);
 
-        let first_archive = weaver_unrar::RarArchive::open(Cursor::new(files[0].1.clone()))
+        let first_archive = unrar_rs::RarArchive::open(Cursor::new(files[0].1.clone()))
             .expect("volume 0 should parse");
         let cached_headers = first_archive.serialize_headers();
 
@@ -307,7 +307,7 @@ mod tests {
             volume_paths.insert(volume as u32, path);
             facts.insert(
                 volume as u32,
-                weaver_unrar::RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None)
+                unrar_rs::RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None)
                     .expect("synthetic RAR volume facts should parse"),
             );
         }
@@ -392,7 +392,7 @@ mod rar_refresh_open_tracking {
         OPENED.with(|opened| opened.borrow().clone())
     }
 
-    pub(super) fn open(path: &Path) -> std::io::Result<Box<dyn weaver_unrar::ReadSeek>> {
+    pub(super) fn open(path: &Path) -> std::io::Result<Box<dyn unrar_rs::ReadSeek>> {
         let file = std::fs::File::open(path)?;
         let counted = ENABLED.with(Cell::get);
         if counted {
@@ -466,8 +466,8 @@ pub(in crate::pipeline) enum CachedRarSnapshotAlignment {
 }
 
 pub(in crate::pipeline) fn cached_rar_snapshot_alignment_with_volume_facts(
-    facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
-    archive: &weaver_unrar::RarArchive,
+    facts: &BTreeMap<u32, unrar_rs::RarVolumeFacts>,
+    archive: &unrar_rs::RarArchive,
 ) -> CachedRarSnapshotAlignment {
     let metadata = archive.metadata();
     let mut saw_stale_growth = false;
@@ -479,7 +479,7 @@ pub(in crate::pipeline) fn cached_rar_snapshot_alignment_with_volume_facts(
                 continue;
             }
 
-            let name = weaver_unrar::sanitize_path(&member.name);
+            let name = unrar_rs::sanitize_path(&member.name);
             let mut observed_last = first_volume;
             let mut observed_complete = false;
             let mut next_volume = first_volume + 1;
@@ -488,7 +488,7 @@ pub(in crate::pipeline) fn cached_rar_snapshot_alignment_with_volume_facts(
                 let Some(next_member) = next_facts.members.iter().find(|candidate| {
                     !candidate.is_directory
                         && candidate.split_before
-                        && weaver_unrar::sanitize_path(&candidate.name) == name
+                        && unrar_rs::sanitize_path(&candidate.name) == name
                 }) else {
                     break;
                 };
@@ -537,7 +537,7 @@ fn cached_rar_plan_is_incoherent(
     plan: &RarDerivedPlan,
     failed: &HashSet<String>,
     worker_active: bool,
-    facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
+    facts: &BTreeMap<u32, unrar_rs::RarVolumeFacts>,
     volume_paths: &BTreeMap<u32, PathBuf>,
 ) -> bool {
     matches!(plan.phase, RarSetPhase::WaitingForVolumes)
@@ -573,7 +573,7 @@ fn cached_rar_plan_is_incoherent(
 /// meaningful again.
 pub(in crate::pipeline) fn ownerless_present_member_volumes(
     plan: &RarDerivedPlan,
-    facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
+    facts: &BTreeMap<u32, unrar_rs::RarVolumeFacts>,
 ) -> Vec<u32> {
     let mut volumes: Vec<u32> = plan
         .delete_decisions
@@ -582,7 +582,7 @@ pub(in crate::pipeline) fn ownerless_present_member_volumes(
             let has_named_member = facts.get(volume).is_some_and(|volume_facts| {
                 volume_facts.members.iter().any(|member| {
                     (!member.is_directory || member.data_size > 0)
-                        && !weaver_unrar::sanitize_path(&member.name).is_empty()
+                        && !unrar_rs::sanitize_path(&member.name).is_empty()
                 })
             });
             (decision.owners.is_empty() && has_named_member).then_some(*volume)
@@ -594,7 +594,7 @@ pub(in crate::pipeline) fn ownerless_present_member_volumes(
 
 fn present_waiting_rar_volumes(
     plan: &RarDerivedPlan,
-    facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
+    facts: &BTreeMap<u32, unrar_rs::RarVolumeFacts>,
     volume_paths: &BTreeMap<u32, PathBuf>,
 ) -> Vec<u32> {
     // Waiting on a volume past the first gap in the header chain is the correct
@@ -638,7 +638,7 @@ struct RarSetComputeInput {
     password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
     extracted: HashSet<String>,
     failed: HashSet<String>,
-    facts: BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
+    facts: BTreeMap<u32, unrar_rs::RarVolumeFacts>,
     verified_suspect_volumes: HashSet<u32>,
     worker_active: bool,
     cached_headers: Option<Vec<u8>>,
@@ -676,7 +676,7 @@ impl Pipeline {
     pub(crate) async fn parse_rar_volume_facts_from_path(
         path: PathBuf,
         password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
-    ) -> Result<weaver_unrar::RarVolumeFacts, String> {
+    ) -> Result<unrar_rs::RarVolumeFacts, String> {
         tokio::task::spawn_blocking(move || {
             let context = format!("failed to parse RAR volume facts from {}", path.display());
             Self::try_rar_password_candidates(&context, &password_candidates, |password| {
@@ -686,7 +686,7 @@ impl Pipeline {
                         path.display()
                     ))
                 })?;
-                weaver_unrar::RarArchive::parse_volume_facts(file, password)
+                unrar_rs::RarArchive::parse_volume_facts(file, password)
                     .map_err(crate::pipeline::RarPasswordAttemptError::from)
             })
             .map(|selection| selection.value)
@@ -701,7 +701,7 @@ impl Pipeline {
         set_name: &str,
         filename: &str,
         observed_volume: Option<u32>,
-        facts: weaver_unrar::RarVolumeFacts,
+        facts: unrar_rs::RarVolumeFacts,
     ) -> Result<bool, String> {
         if let Some(expected_volume) = observed_volume
             && facts.volume_number != expected_volume
@@ -990,7 +990,7 @@ impl Pipeline {
         } = input;
 
         let open_from_volume_zero =
-            || -> Result<crate::pipeline::ArchivePasswordSelection<weaver_unrar::RarArchive>, String> {
+            || -> Result<crate::pipeline::ArchivePasswordSelection<unrar_rs::RarArchive>, String> {
             let first_path = volume_paths.get(&0).ok_or_else(|| {
                 format!(
                     "RAR set '{set_name_owned}' cannot be rebuilt without cached headers or volume 0"
@@ -1000,11 +1000,11 @@ impl Pipeline {
                 &set_name_owned,
                 first_path,
                 &password_candidates,
-                std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+                std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
             )
         };
 
-        let attach_volumes_and_build_plan = |mut archive: weaver_unrar::RarArchive,
+        let attach_volumes_and_build_plan = |mut archive: unrar_rs::RarArchive,
                                              rebuild_source: RarTopologyRebuildSource,
                                              using_cached_headers: bool,
                                              force_refresh_all_volumes: bool|
@@ -1097,7 +1097,7 @@ impl Pipeline {
                     &set_name_owned,
                     &headers,
                     &password_candidates,
-                    std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+                    std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
                 ) {
                     Ok(selection) => selection,
                     Err(error) => {
@@ -1813,7 +1813,7 @@ impl Pipeline {
                         &set_name,
                         &headers,
                         &password_candidates,
-                        std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()),
+                        std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
                     ) {
                         Ok(_) => {
                             self.rar_sets
@@ -1862,7 +1862,7 @@ impl Pipeline {
             state.facts.clear();
             state.volume_files.clear();
             for (volume_index, blob) in facts_rows {
-                match rmp_serde::from_slice::<weaver_unrar::RarVolumeFacts>(&blob) {
+                match rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(&blob) {
                     Ok(facts) => {
                         if facts.volume_number != volume_index {
                             warn!(

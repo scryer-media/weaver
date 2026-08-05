@@ -329,11 +329,11 @@ pub(crate) struct DirectPar2Overlay {
     pub(crate) volumes: Vec<super::par2_access::VirtualPar2Volume>,
     /// Which direct set owns each bound PAR2 file, so damage demotes the set
     /// that produced the bytes rather than every set of the job.
-    sets: HashMap<weaver_par2::FileId, usize>,
+    sets: HashMap<par2_rs::FileId, usize>,
     /// The job file index each bound PAR2 file resolved to. The overlay re-keys
     /// virtual volumes by it, so it is also how phase 6 walks back from a
     /// damaged PAR2 file to the set's own volume index.
-    file_indices: HashMap<weaver_par2::FileId, u32>,
+    file_indices: HashMap<par2_rs::FileId, u32>,
     /// The volume lengths the overlay was built with, so a repair can rebuild
     /// the very same provider without re-deriving them from the assembly.
     lengths: Vec<(usize, std::collections::BTreeMap<u32, u64>)>,
@@ -341,12 +341,12 @@ pub(crate) struct DirectPar2Overlay {
 
 impl DirectPar2Overlay {
     /// The direct set that owns one bound PAR2 file.
-    pub(crate) fn owner_of(&self, file_id: &weaver_par2::FileId) -> Option<usize> {
+    pub(crate) fn owner_of(&self, file_id: &par2_rs::FileId) -> Option<usize> {
         self.sets.get(file_id).copied()
     }
 
     /// The job file index one bound PAR2 file resolved to.
-    pub(crate) fn file_index_of(&self, file_id: &weaver_par2::FileId) -> Option<u32> {
+    pub(crate) fn file_index_of(&self, file_id: &par2_rs::FileId) -> Option<u32> {
         self.file_indices.get(file_id).copied()
     }
 
@@ -1025,12 +1025,12 @@ impl Pipeline {
     pub(crate) fn forgive_finalized_direct_volumes(
         &self,
         job_id: JobId,
-        verification: &mut weaver_par2::VerificationResult,
+        verification: &mut par2_rs::VerificationResult,
     ) -> u32 {
         if self.par2_set(job_id).is_none() {
             return 0;
         }
-        let finalized: HashSet<weaver_par2::FileId> = self
+        let finalized: HashSet<par2_rs::FileId> = self
             .direct_store
             .sets_for(job_id)
             .iter()
@@ -1054,13 +1054,13 @@ impl Pipeline {
 
         let mut forgiven = 0u32;
         for file in &mut verification.files {
-            if !matches!(file.status, weaver_par2::verify::FileStatus::Missing)
+            if !matches!(file.status, par2_rs::verify::FileStatus::Missing)
                 || !finalized.contains(&file.file_id)
             {
                 continue;
             }
             forgiven = forgiven.saturating_add(file.missing_slice_count);
-            file.status = weaver_par2::verify::FileStatus::Complete;
+            file.status = par2_rs::verify::FileStatus::Complete;
             file.valid_slices.fill(true);
             file.missing_slice_count = 0;
         }
@@ -1099,7 +1099,7 @@ impl Pipeline {
     pub(crate) async fn resolve_direct_sets_with_par2_damage(
         &mut self,
         job_id: JobId,
-        verification: &weaver_par2::VerificationResult,
+        verification: &par2_rs::VerificationResult,
     ) -> bool {
         if self
             .repair_direct_sets_with_par2_damage(job_id, verification)
@@ -1132,7 +1132,7 @@ impl Pipeline {
     pub(crate) async fn resolve_direct_sets_before_par2_repairer(
         &mut self,
         job_id: JobId,
-        par2_set: std::sync::Arc<weaver_par2::Par2FileSet>,
+        par2_set: std::sync::Arc<par2_rs::Par2FileSet>,
         working_dir: PathBuf,
     ) -> DirectPar2Resolution {
         if !self
@@ -1182,9 +1182,9 @@ impl Pipeline {
     async fn verify_direct_sets_quietly(
         &self,
         job_id: JobId,
-        par2_set: std::sync::Arc<weaver_par2::Par2FileSet>,
+        par2_set: std::sync::Arc<par2_rs::Par2FileSet>,
         working_dir: PathBuf,
-    ) -> Option<weaver_par2::VerificationResult> {
+    ) -> Option<par2_rs::VerificationResult> {
         let overlay = self.direct_par2_overlay(job_id)?;
         let pp_pool = self.pp_pool.clone();
         let volumes = overlay.volumes.clone();
@@ -1195,18 +1195,17 @@ impl Pipeline {
                 // directory by construction and every other file is at its
                 // declared name, which is the same assumption the repair's own
                 // fallback access makes.
-                let plan = weaver_par2::PlacementPlan {
+                let plan = par2_rs::PlacementPlan {
                     exact: volumes.iter().map(|volume| volume.par2_file_id).collect(),
                     swaps: Vec::new(),
                     renames: Vec::new(),
                     unresolved: Vec::new(),
                     conflicts: Vec::new(),
                 };
-                let inner =
-                    weaver_par2::PlacementFileAccess::from_plan(working_dir, &par2_set, &plan);
+                let inner = par2_rs::PlacementFileAccess::from_plan(working_dir, &par2_set, &plan);
                 let access =
                     super::par2_access::DirectVolumeFileAccess::new(inner, provider, &volumes);
-                weaver_par2::verify_all(&par2_set, &access)
+                par2_rs::verify_all(&par2_set, &access)
             })
         })
         .await
@@ -1229,7 +1228,7 @@ impl Pipeline {
     async fn repair_direct_sets_with_par2_damage(
         &mut self,
         job_id: JobId,
-        verification: &weaver_par2::VerificationResult,
+        verification: &par2_rs::VerificationResult,
     ) -> bool {
         let Some(par2_set) = self.par2_set(job_id).cloned() else {
             return false;
@@ -1248,7 +1247,7 @@ impl Pipeline {
         let payload_settled = !self.job_has_pending_download_pipeline_work(job_id);
         if matches!(
             verification.repairable,
-            weaver_par2::verify::Repairability::NotNeeded
+            par2_rs::verify::Repairability::NotNeeded
         ) {
             return false;
         }
@@ -1341,10 +1340,10 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         set_index: usize,
-        par2_set: &std::sync::Arc<weaver_par2::Par2FileSet>,
-        verification: &weaver_par2::VerificationResult,
+        par2_set: &std::sync::Arc<par2_rs::Par2FileSet>,
+        verification: &par2_rs::VerificationResult,
         overlay: &DirectPar2Overlay,
-        files: &[weaver_par2::FileId],
+        files: &[par2_rs::FileId],
     ) -> Result<(), super::repair::DirectRepairFailure> {
         let slice_size = par2_set.slice_size;
         let Some(set) = self.direct_store.set(job_id, set_index) else {
@@ -1506,14 +1505,14 @@ impl Pipeline {
         // produced the verification already ran and reported no conflicts, and
         // a rename since then would have invalidated the verdict this repair is
         // planned from.
-        let inner_plan = weaver_par2::PlacementPlan {
+        let inner_plan = par2_rs::PlacementPlan {
             exact: Vec::new(),
             swaps: Vec::new(),
             renames: Vec::new(),
             unresolved: Vec::new(),
             conflicts: Vec::new(),
         };
-        let inner = weaver_par2::PlacementFileAccess::from_plan(
+        let inner = par2_rs::PlacementFileAccess::from_plan(
             working_dir.clone(),
             par2_set.as_ref(),
             &inner_plan,
@@ -1916,7 +1915,7 @@ impl Pipeline {
     pub(crate) async fn demote_direct_sets_with_par2_damage(
         &mut self,
         job_id: JobId,
-        verification: &weaver_par2::VerificationResult,
+        verification: &par2_rs::VerificationResult,
     ) -> bool {
         let Some(overlay) = self.direct_par2_overlay(job_id) else {
             return false;
@@ -1933,8 +1932,7 @@ impl Pipeline {
         for file in &verification.files {
             if matches!(
                 file.status,
-                weaver_par2::verify::FileStatus::Complete
-                    | weaver_par2::verify::FileStatus::Renamed(_)
+                par2_rs::verify::FileStatus::Complete | par2_rs::verify::FileStatus::Renamed(_)
             ) {
                 continue;
             }
@@ -3416,8 +3414,8 @@ impl Pipeline {
                 .open(first_volume)
                 .ok_or_else(|| format!("virtual volume {first_volume} is not registered"))?;
             let mut archive = match password.as_deref() {
-                Some(password) => weaver_unrar::RarArchive::open_with_password(reader, password),
-                None => weaver_unrar::RarArchive::open(reader),
+                Some(password) => unrar_rs::RarArchive::open_with_password(reader, password),
+                None => unrar_rs::RarArchive::open(reader),
             }
             .map_err(|error| format!("failed to open the virtual archive: {error}"))?;
             // The same decode ceilings the incremental extractor applies. A
@@ -3434,7 +3432,7 @@ impl Pipeline {
                         format!("failed to add virtual volume {volume_index}: {error}")
                     })?;
             }
-            let options = weaver_unrar::ExtractOptions {
+            let options = unrar_rs::ExtractOptions {
                 verify: true,
                 password: password.clone(),
                 restore_owners: false,

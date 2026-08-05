@@ -48,7 +48,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 
-use weaver_unrar::{
+use unrar_rs::{
     ArchiveFormat, IneligibilityReason, MappedSlice, MemberEligibility, RarVolumeFacts,
     StoredLayoutBuilder, StoredLayoutError,
 };
@@ -444,7 +444,7 @@ impl RoutedSpan {
 }
 
 /// (offset, len, crc32) runs over one contiguous logical space, composed on
-/// demand with [`weaver_par2::checksum::Crc32CombineOp`].
+/// demand with [`par2_rs::checksum::Crc32CombineOp`].
 ///
 /// The runs are kept exactly as they were fed — **never merged** (M3). Phase 5
 /// wave 1's first shape coalesced adjacent neighbours into one value, which
@@ -563,8 +563,7 @@ impl CrcRuns {
             if run_end > end {
                 return None;
             }
-            composed =
-                weaver_par2::checksum::Crc32CombineOp::new(run_len).combine(composed, run_crc);
+            composed = par2_rs::checksum::Crc32CombineOp::new(run_len).combine(composed, run_crc);
             cursor = run_end;
             index += 1;
         }
@@ -2041,7 +2040,7 @@ impl DirectSetRouter {
     }
 
     /// The layout's members, or nothing while the format is still unknown.
-    fn layout_members(&self) -> &[weaver_unrar::StoredMember] {
+    fn layout_members(&self) -> &[unrar_rs::StoredMember] {
         self.layout
             .as_ref()
             .map(StoredLayoutBuilder::members)
@@ -2472,31 +2471,27 @@ impl DirectSetRouter {
         let Some(image) = self.volume_image(volume_index, VolumeImage::Envelope) else {
             return Ok(false);
         };
-        let facts =
-            match weaver_unrar::RarArchive::parse_volume_facts(image, self.header_password()) {
-                Ok(facts) => facts,
-                // A restored `-hp` set (plan 136, E4). The archive key is never
-                // persisted, so this run has to prove one of the job's candidates
-                // again before it can read a header — and this is the *first* place
-                // it can, because a restored volume's staged image has a hole from
-                // offset zero and `try_parse_volume` never reaches the record
-                // through it. The envelope holds the headers, so it does.
-                Err(weaver_unrar::RarError::EncryptedArchive)
-                    if self.key_header_encrypted_volume(volume_index, VolumeImage::Envelope)? =>
-                {
-                    let Some(image) = self.volume_image(volume_index, VolumeImage::Envelope) else {
-                        return Ok(false);
-                    };
-                    match weaver_unrar::RarArchive::parse_volume_facts(
-                        image,
-                        self.header_password(),
-                    ) {
-                        Ok(facts) => facts,
-                        Err(_) => return Ok(false),
-                    }
+        let facts = match unrar_rs::RarArchive::parse_volume_facts(image, self.header_password()) {
+            Ok(facts) => facts,
+            // A restored `-hp` set (plan 136, E4). The archive key is never
+            // persisted, so this run has to prove one of the job's candidates
+            // again before it can read a header — and this is the *first* place
+            // it can, because a restored volume's staged image has a hole from
+            // offset zero and `try_parse_volume` never reaches the record
+            // through it. The envelope holds the headers, so it does.
+            Err(unrar_rs::RarError::EncryptedArchive)
+                if self.key_header_encrypted_volume(volume_index, VolumeImage::Envelope)? =>
+            {
+                let Some(image) = self.volume_image(volume_index, VolumeImage::Envelope) else {
+                    return Ok(false);
+                };
+                match unrar_rs::RarArchive::parse_volume_facts(image, self.header_password()) {
+                    Ok(facts) => facts,
+                    Err(_) => return Ok(false),
                 }
-                Err(_) => return Ok(false),
-            };
+            }
+            Err(_) => return Ok(false),
+        };
         if facts.members.is_empty() || !self.walk_covered_volume(volume_index, &facts, volume_end) {
             return Ok(false);
         }
@@ -2645,33 +2640,32 @@ impl DirectSetRouter {
         }
 
         let image = SparseImage::from_staged(&staging.chunks, self.scratch.handle());
-        let facts =
-            match weaver_unrar::RarArchive::parse_volume_facts(image, self.header_password()) {
-                Ok(facts) => facts,
-                // The one parse failure that is a *fact* rather than a shortage of
-                // bytes (plan 136, E4): the volume's headers are encrypted, so the
-                // layout is withheld until a key exists. Every other failure is a
-                // prefix too short to hold a whole header, which is normal early on
-                // and which the next article retries; a genuinely unparsable volume
-                // is caught by the prefix ceiling above.
-                Err(weaver_unrar::RarError::EncryptedArchive) => {
-                    return if self.key_header_encrypted_volume(volume_index, VolumeImage::Staged)? {
-                        self.try_parse_volume(volume_index)
-                    } else {
-                        Ok(())
-                    };
-                }
-                // The archive's own type-4 record states key material this build
-                // will not derive from. Named here for the same reason: it is a
-                // property of the archive that no amount of further staging changes.
-                Err(
-                    weaver_unrar::RarError::UnsupportedEncryption { .. }
-                    | weaver_unrar::RarError::UnsupportedEncryptionKdf { .. },
-                ) => {
-                    return Err(self.refuse_header_encrypted(HeaderCryptRefusal::Unkeyable));
-                }
-                Err(_) => return Ok(()),
-            };
+        let facts = match unrar_rs::RarArchive::parse_volume_facts(image, self.header_password()) {
+            Ok(facts) => facts,
+            // The one parse failure that is a *fact* rather than a shortage of
+            // bytes (plan 136, E4): the volume's headers are encrypted, so the
+            // layout is withheld until a key exists. Every other failure is a
+            // prefix too short to hold a whole header, which is normal early on
+            // and which the next article retries; a genuinely unparsable volume
+            // is caught by the prefix ceiling above.
+            Err(unrar_rs::RarError::EncryptedArchive) => {
+                return if self.key_header_encrypted_volume(volume_index, VolumeImage::Staged)? {
+                    self.try_parse_volume(volume_index)
+                } else {
+                    Ok(())
+                };
+            }
+            // The archive's own type-4 record states key material this build
+            // will not derive from. Named here for the same reason: it is a
+            // property of the archive that no amount of further staging changes.
+            Err(
+                unrar_rs::RarError::UnsupportedEncryption { .. }
+                | unrar_rs::RarError::UnsupportedEncryptionKdf { .. },
+            ) => {
+                return Err(self.refuse_header_encrypted(HeaderCryptRefusal::Unkeyable));
+            }
+            Err(_) => return Ok(()),
+        };
         if facts.members.is_empty() {
             return Ok(());
         }
@@ -2744,11 +2738,11 @@ impl DirectSetRouter {
         let Some(image) = self.volume_image(volume_index, source) else {
             return Ok(false);
         };
-        let encryption = match weaver_unrar::RarArchive::parse_volume_header_encryption(image) {
+        let encryption = match unrar_rs::RarArchive::parse_volume_header_encryption(image) {
             Ok(encryption) => encryption,
             Err(
-                weaver_unrar::RarError::UnsupportedEncryption { .. }
-                | weaver_unrar::RarError::UnsupportedEncryptionKdf { .. },
+                unrar_rs::RarError::UnsupportedEncryption { .. }
+                | unrar_rs::RarError::UnsupportedEncryptionKdf { .. },
             ) => return Err(self.refuse_header_encrypted(HeaderCryptRefusal::Unkeyable)),
             // The record is at the front of the volume, so this is an image that
             // has not reached it yet. The next article retries, and the prefix
@@ -2797,7 +2791,7 @@ impl DirectSetRouter {
     /// every plaintext extraction a no-password extraction exactly as before.
     ///
     /// This is the one place a password leaves the router as a string. The
-    /// tolerated-member extraction hands it to `weaver-unrar` rather than
+    /// tolerated-member extraction hands it to `unrar-rs` rather than
     /// decrypting anything itself, so it needs the secret and not a key.
     pub(crate) fn archive_password(&self) -> Option<&str> {
         self.header_password().or_else(|| self.crypt.password())
@@ -3032,17 +3026,17 @@ impl DirectSetRouter {
         // The library's own entry point expects a reader positioned just past
         // the signature, and reading it here is what proves this is the RAR5
         // stream the locator belongs to rather than an assumption about it.
-        if weaver_unrar::signature::read_signature(&mut image).ok()? != ArchiveFormat::Rar5 {
+        if unrar_rs::signature::read_signature(&mut image).ok()? != ArchiveFormat::Rar5 {
             return None;
         }
-        let parsed = weaver_unrar::header::parse_all_headers_with_options(
+        let parsed = unrar_rs::header::parse_all_headers_with_options(
             &mut image,
             // The archive-header password for a `-hp` set (E4), `None` for every
             // other. Without it this walk cannot read a `-hp` volume's headers
             // at all, so a `-hp -qo` set would refuse every parse as
             // `QuickOpenMismatch` — fail-closed, but for the wrong reason.
             self.header_password(),
-            weaver_unrar::header::HeaderParseOptions {
+            unrar_rs::header::HeaderParseOptions {
                 allow_quick_open: false,
             },
         )
@@ -3140,7 +3134,7 @@ impl DirectSetRouter {
         // the set demotes here rather than writing anything.
         let keys = self.admit_encrypted()?;
 
-        let routable: Vec<(String, u64, Option<weaver_unrar::EncryptedStore>)> = self
+        let routable: Vec<(String, u64, Option<unrar_rs::EncryptedStore>)> = self
             .layout_members()
             .iter()
             .filter(|member| member.eligibility.routes_direct())
@@ -3255,7 +3249,7 @@ impl DirectSetRouter {
     ///
     /// RAR4 file encryption keys here too, off the header's 8-byte file salt
     /// rather than a `FHEXTRA_CRYPT` record —
-    /// [`weaver_unrar::MemberKeying`] is the discriminant and it is total, so
+    /// [`unrar_rs::MemberKeying`] is the discriminant and it is total, so
     /// there is no "no record" arm to refuse on any more. A RAR4 member the
     /// library cannot key (one of the pre-AES ciphers) never becomes an
     /// `EncryptedStore` at all, so it demotes as an ineligible member and never
@@ -3263,9 +3257,8 @@ impl DirectSetRouter {
     /// RAR4 member takes the provisional path above by construction.
     fn admit_encrypted(
         &mut self,
-    ) -> Result<HashMap<String, (crypt::MemberKeys, weaver_unrar::MemberKeying)>, DemotionReason>
-    {
-        let encrypted: Vec<(String, weaver_unrar::MemberKeying)> = self
+    ) -> Result<HashMap<String, (crypt::MemberKeys, unrar_rs::MemberKeying)>, DemotionReason> {
+        let encrypted: Vec<(String, unrar_rs::MemberKeying)> = self
             .layout_members()
             .iter()
             .filter_map(|member| {
@@ -3924,7 +3917,7 @@ impl DirectSetRouter {
             // Wholly duplicate: never advance a gate twice.
             return Ok(());
         }
-        let crc = weaver_par2::checksum::crc32(bytes);
+        let crc = par2_rs::checksum::crc32(bytes);
         let part_relative = logical_offset.saturating_sub(part_logical_offset);
         if replace {
             let gaps =
@@ -4357,10 +4350,10 @@ impl DirectSetRouter {
         }
         crypt.retain_tail_padding(unpacked_size, cipher_offset, plain);
         let destination_len = unpacked_size.saturating_sub(cipher_offset).min(len);
-        let cipher_crc = weaver_par2::checksum::crc32(cipher);
+        let cipher_crc = par2_rs::checksum::crc32(cipher);
         let part_relative = cipher_offset.saturating_sub(part_logical_offset);
         if destination_len > 0 {
-            let plain_crc = weaver_par2::checksum::crc32(&plain[..destination_len as usize]);
+            let plain_crc = par2_rs::checksum::crc32(&plain[..destination_len as usize]);
             if replace {
                 crypt
                     .plain_runs_mut()
@@ -4554,7 +4547,7 @@ impl DirectSetRouter {
             let Some(value) = member.checked_parts.get(&(position as u32)).copied() else {
                 return Ok(());
             };
-            composed = weaver_par2::checksum::Crc32CombineOp::new(*len).combine(composed, value);
+            composed = par2_rs::checksum::Crc32CombineOp::new(*len).combine(composed, value);
         }
         if composed != expected {
             return Err(self.fail(DemotionReason::MemberChecksumMismatch));
@@ -5285,7 +5278,7 @@ struct ToleratedMemberBudget {
 /// checked, and admitting an unbounded member under a bounded rule would make
 /// the rule decorative.
 fn tolerable_member_budget(
-    member: &weaver_unrar::StoredMember,
+    member: &unrar_rs::StoredMember,
     reason: IneligibilityReason,
 ) -> Option<ToleratedMemberBudget> {
     match reason {
@@ -5399,7 +5392,7 @@ struct MemberIdentity {
 }
 
 impl MemberIdentity {
-    fn of(member: &weaver_unrar::RarVolumeMemberFacts) -> Self {
+    fn of(member: &unrar_rs::RarVolumeMemberFacts) -> Self {
         Self {
             name: member.name.clone(),
             data_offset: member.data_offset,

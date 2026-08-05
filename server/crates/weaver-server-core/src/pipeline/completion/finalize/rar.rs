@@ -234,7 +234,7 @@ impl Pipeline {
     pub(crate) fn apply_eager_delete_exclusions(
         &self,
         job_id: JobId,
-        verification: &mut weaver_par2::VerificationResult,
+        verification: &mut par2_rs::VerificationResult,
     ) -> (u32, u32) {
         let eagerly_deleted_names: HashSet<&str> = self
             .eagerly_deleted
@@ -249,7 +249,7 @@ impl Pipeline {
         for file_verification in &mut verification.files {
             if matches!(
                 file_verification.status,
-                weaver_par2::verify::FileStatus::Missing
+                par2_rs::verify::FileStatus::Missing
             ) && eagerly_deleted_names.contains(file_verification.filename.as_str())
             {
                 let Some(&volume_number) = volume_numbers.get(file_verification.filename.as_str())
@@ -262,7 +262,7 @@ impl Pipeline {
                     continue;
                 }
                 skipped_blocks += file_verification.missing_slice_count;
-                file_verification.status = weaver_par2::verify::FileStatus::Complete;
+                file_verification.status = par2_rs::verify::FileStatus::Complete;
                 file_verification.valid_slices.fill(true);
                 file_verification.missing_slice_count = 0;
             }
@@ -277,7 +277,7 @@ impl Pipeline {
     pub(crate) fn recompute_volume_safety_from_verification(
         &mut self,
         job_id: JobId,
-        verification: &weaver_par2::VerificationResult,
+        verification: &par2_rs::VerificationResult,
     ) {
         let eagerly_deleted_names: HashSet<&str> = self
             .eagerly_deleted
@@ -287,7 +287,7 @@ impl Pipeline {
         let suspect_volumes = self.suspect_rar_volumes_for_job(job_id);
         let volume_numbers = self.rar_volume_numbers_by_filename(job_id);
 
-        let status_by_name: HashMap<&str, &weaver_par2::FileVerification> = verification
+        let status_by_name: HashMap<&str, &par2_rs::FileVerification> = verification
             .files
             .iter()
             .map(|file| (file.filename.as_str(), file))
@@ -306,15 +306,15 @@ impl Pipeline {
                     for (filename, &volume_number) in &topo.volume_map {
                         if let Some(file) = status_by_name.get(filename.as_str()) {
                             match file.status {
-                                weaver_par2::verify::FileStatus::Complete
-                                | weaver_par2::verify::FileStatus::Renamed(_) => {}
-                                weaver_par2::verify::FileStatus::Missing
+                                par2_rs::verify::FileStatus::Complete
+                                | par2_rs::verify::FileStatus::Renamed(_) => {}
+                                par2_rs::verify::FileStatus::Missing
                                     if eagerly_deleted_names.contains(filename.as_str())
                                         && !volume_numbers.get(filename.as_str()).is_some_and(
                                             |number| suspect_volumes.contains(number),
                                         ) => {}
-                                weaver_par2::verify::FileStatus::Missing
-                                | weaver_par2::verify::FileStatus::Damaged(_) => {
+                                par2_rs::verify::FileStatus::Missing
+                                | par2_rs::verify::FileStatus::Damaged(_) => {
                                     suspect.insert(volume_number);
                                 }
                             }
@@ -419,7 +419,7 @@ impl Pipeline {
         })
     }
 
-    fn placement_normalization_map(plan: &weaver_par2::PlacementPlan) -> HashMap<String, String> {
+    fn placement_normalization_map(plan: &par2_rs::PlacementPlan) -> HashMap<String, String> {
         let mut normalized_files = HashMap::new();
         for (left, right) in &plan.swaps {
             normalized_files.insert(left.current_name.clone(), left.correct_name.clone());
@@ -431,7 +431,7 @@ impl Pipeline {
         normalized_files
     }
 
-    fn placement_touched_files(plan: &weaver_par2::PlacementPlan) -> HashSet<String> {
+    fn placement_touched_files(plan: &par2_rs::PlacementPlan) -> HashSet<String> {
         let mut touched = HashSet::new();
         for (left, right) in &plan.swaps {
             touched.insert(left.current_name.clone());
@@ -446,7 +446,7 @@ impl Pipeline {
         touched
     }
 
-    pub(super) fn log_placement_plan(job_id: JobId, plan: &weaver_par2::PlacementPlan) {
+    pub(super) fn log_placement_plan(job_id: JobId, plan: &par2_rs::PlacementPlan) {
         if plan.swaps.is_empty() && plan.renames.is_empty() {
             return;
         }
@@ -479,7 +479,7 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         working_dir: PathBuf,
-        plan: &weaver_par2::PlacementPlan,
+        plan: &par2_rs::PlacementPlan,
     ) -> Result<(), String> {
         if plan.swaps.is_empty() && plan.renames.is_empty() {
             return Ok(());
@@ -490,7 +490,7 @@ impl Pipeline {
         let normalized_files = Self::placement_touched_files(&plan);
         let plan_for_apply = plan.clone();
         let moved = tokio::task::spawn_blocking(move || {
-            weaver_par2::apply_placement_plan(&working_dir, &plan_for_apply)
+            par2_rs::apply_placement_plan(&working_dir, &plan_for_apply)
                 .map_err(|e| format!("placement normalization failed: {e}"))
         })
         .await

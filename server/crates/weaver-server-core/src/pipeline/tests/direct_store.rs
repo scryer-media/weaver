@@ -209,7 +209,7 @@ fn quick_open_store_set(
 /// The member names the library reports for a volume under its **default**
 /// options, which consult the Quick Open cache.
 fn library_default_member_names(volume: &[u8]) -> Vec<String> {
-    weaver_unrar::RarArchive::parse_volume_facts(std::io::Cursor::new(volume.to_vec()), None)
+    unrar_rs::RarArchive::parse_volume_facts(std::io::Cursor::new(volume.to_vec()), None)
         .expect("the fixture volume parses")
         .members
         .into_iter()
@@ -3497,53 +3497,54 @@ fn store_set_with_extra_member(
                     (true, true) => (&extra_payload[extra_split..], 0x0008),
                     (false, _) => (extra_payload, 0),
                 };
-                let header = match extra {
-                    ToleranceExtra::Blake2OnlyStore => build_test_rar_file_header_with_extra(
-                        extra_name,
-                        extra_flags,
-                        extra_part.len() as u64,
-                        extra_payload.len() as u64,
-                        None,
-                        &build_test_rar_blake2_extra(weaver_unrar::crypto::blake2sp_hash(
-                            extra_payload,
-                        )),
-                    ),
-                    // What `rar -m0 -htb` writes for a member split across
-                    // volumes: **no** CRC32 anywhere, a BLAKE2sp packed hash per
-                    // non-final part and the whole-member BLAKE2sp on the last.
-                    // The open chain is what makes it `ProvisionallyDirect` —
-                    // routable, and routed — and the final header is what
-                    // resolves it `Blake2OnlyNoCrc32`.
-                    ToleranceExtra::Blake2OnlySplit => build_test_rar_file_header_with_extra(
-                        extra_name,
-                        extra_flags,
-                        extra_part.len() as u64,
-                        extra_payload.len() as u64,
-                        None,
-                        &build_test_rar_blake2_extra(weaver_unrar::crypto::blake2sp_hash(
-                            if is_last { extra_payload } else { extra_part },
-                        )),
-                    ),
-                    ToleranceExtra::Compressed {
-                        declared_unpacked,
-                        solid,
-                    } => build_test_rar_compressed_file_header(
-                        extra_name,
-                        extra_flags,
-                        extra_part.len() as u64,
-                        declared_unpacked,
-                        Some(checksum::crc32(extra_part)),
-                        test_rar_compression_info(3, solid),
-                    ),
-                    ToleranceExtra::CompressedSplit => build_test_rar_compressed_file_header(
-                        extra_name,
-                        extra_flags,
-                        extra_part.len() as u64,
-                        extra_payload.len() as u64,
-                        Some(checksum::crc32(extra_part)),
-                        test_rar_compression_info(3, false),
-                    ),
-                };
+                let header =
+                    match extra {
+                        ToleranceExtra::Blake2OnlyStore => build_test_rar_file_header_with_extra(
+                            extra_name,
+                            extra_flags,
+                            extra_part.len() as u64,
+                            extra_payload.len() as u64,
+                            None,
+                            &build_test_rar_blake2_extra(unrar_rs::crypto::blake2sp_hash(
+                                extra_payload,
+                            )),
+                        ),
+                        // What `rar -m0 -htb` writes for a member split across
+                        // volumes: **no** CRC32 anywhere, a BLAKE2sp packed hash per
+                        // non-final part and the whole-member BLAKE2sp on the last.
+                        // The open chain is what makes it `ProvisionallyDirect` —
+                        // routable, and routed — and the final header is what
+                        // resolves it `Blake2OnlyNoCrc32`.
+                        ToleranceExtra::Blake2OnlySplit => build_test_rar_file_header_with_extra(
+                            extra_name,
+                            extra_flags,
+                            extra_part.len() as u64,
+                            extra_payload.len() as u64,
+                            None,
+                            &build_test_rar_blake2_extra(unrar_rs::crypto::blake2sp_hash(
+                                if is_last { extra_payload } else { extra_part },
+                            )),
+                        ),
+                        ToleranceExtra::Compressed {
+                            declared_unpacked,
+                            solid,
+                        } => build_test_rar_compressed_file_header(
+                            extra_name,
+                            extra_flags,
+                            extra_part.len() as u64,
+                            declared_unpacked,
+                            Some(checksum::crc32(extra_part)),
+                            test_rar_compression_info(3, solid),
+                        ),
+                        ToleranceExtra::CompressedSplit => build_test_rar_compressed_file_header(
+                            extra_name,
+                            extra_flags,
+                            extra_part.len() as u64,
+                            extra_payload.len() as u64,
+                            Some(checksum::crc32(extra_part)),
+                            test_rar_compression_info(3, false),
+                        ),
+                    };
                 bytes.extend_from_slice(&header);
                 bytes.extend_from_slice(extra_part);
             }
@@ -4214,21 +4215,21 @@ async fn a_mid_download_direct_set_is_neither_verified_against_nor_demoted_for_i
     let overlay = pipeline
         .direct_par2_overlay(job_id)
         .expect("the live set's volumes bind and are served virtually");
-    let verification = weaver_par2::VerificationResult {
+    let verification = par2_rs::VerificationResult {
         files: overlay
             .volumes
             .iter()
-            .map(|volume| weaver_par2::verify::FileVerification {
+            .map(|volume| par2_rs::verify::FileVerification {
                 file_id: volume.par2_file_id,
                 filename: format!("virtual volume {}", volume.volume_index),
-                status: weaver_par2::verify::FileStatus::Missing,
+                status: par2_rs::verify::FileStatus::Missing,
                 valid_slices: vec![false; 4],
                 missing_slice_count: 4,
             })
             .collect(),
         recovery_blocks_available: 0,
         total_missing_blocks: 4 * overlay.volumes.len() as u32,
-        repairable: weaver_par2::verify::Repairability::NotNeeded,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
     };
     assert!(
         !pipeline
@@ -6102,19 +6103,19 @@ fn build_test_par2_with_recovery(
         padded.extend_from_slice(&block);
     }
     let slice_count = padded.len() / slice_size_bytes;
-    let constants = weaver_par2::input_slice_constants(slice_count);
+    let constants = par2_rs::input_slice_constants(slice_count);
 
     for exponent in 0..recovery_block_count as u32 {
         let mut recovery = vec![0u8; slice_size_bytes];
         for (input_index, &constant) in constants.iter().enumerate() {
-            let factor = weaver_par2::gf_pow(constant, exponent);
+            let factor = par2_rs::gf_pow(constant, exponent);
             for word_index in 0..word_count {
                 let at = input_index * slice_size_bytes + word_index * 2;
                 let input_word = u16::from_le_bytes([padded[at], padded[at + 1]]);
-                let contribution = weaver_par2::gf_mul(input_word, factor);
+                let contribution = par2_rs::gf_mul(input_word, factor);
                 let current =
                     u16::from_le_bytes([recovery[word_index * 2], recovery[word_index * 2 + 1]]);
-                let updated = weaver_par2::gf_add(current, contribution).to_le_bytes();
+                let updated = par2_rs::gf_add(current, contribution).to_le_bytes();
                 recovery[word_index * 2] = updated[0];
                 recovery[word_index * 2 + 1] = updated[1];
             }
@@ -6123,7 +6124,7 @@ fn build_test_par2_with_recovery(
         body.extend_from_slice(&exponent.to_le_bytes());
         body.extend_from_slice(&recovery);
         stream.extend_from_slice(&build_test_par2_packet(
-            weaver_par2::packet::header::TYPE_RECOVERY,
+            par2_rs::packet::header::TYPE_RECOVERY,
             &body,
             recovery_set_id,
         ));
@@ -8047,12 +8048,12 @@ fn encrypted_store_set_with_recovery(
     rr_bytes: usize,
 ) -> Vec<(String, Vec<u8>)> {
     let material =
-        weaver_unrar::derive_rar5_material(data_password, &TEST_CRYPT_SALT, TEST_CRYPT_KDF_LG2)
+        unrar_rs::derive_rar5_material(data_password, &TEST_CRYPT_SALT, TEST_CRYPT_KDF_LG2)
             .expect("the fixture KDF count is derivable");
     let key = material.key;
     let hash_key = material.hash_key;
     let psw_check = check_for.map(|password| {
-        weaver_unrar::derive_rar5_material(password, &TEST_CRYPT_SALT, TEST_CRYPT_KDF_LG2)
+        unrar_rs::derive_rar5_material(password, &TEST_CRYPT_SALT, TEST_CRYPT_KDF_LG2)
             .expect("the fixture KDF count is derivable")
             .psw_check
     });
@@ -8060,11 +8061,11 @@ fn encrypted_store_set_with_recovery(
     let cipher_len = payload.len().div_ceil(16) * 16;
     let mut padded = payload.to_vec();
     padded.resize(cipher_len, 0);
-    let cipher = weaver_unrar::test_support::encrypt_aes256_cbc(&key, &TEST_CRYPT_IV, &padded);
+    let cipher = unrar_rs::test_support::encrypt_aes256_cbc(&key, &TEST_CRYPT_IV, &padded);
 
     let member_crc = checksum::crc32(payload);
     let member_crc = if keyed_checksum {
-        weaver_unrar::convert_crc32_to_mac(member_crc, &hash_key)
+        unrar_rs::convert_crc32_to_mac(member_crc, &hash_key)
     } else {
         member_crc
     };
@@ -9883,7 +9884,7 @@ const TEST_RAR4_SALT: [u8; 8] = [0x9B; 8];
 ///
 /// RAR4 has no per-volume number anywhere else — RAR5 carries one in the main
 /// header, RAR4 carries it in `ENDARC` behind the `VOLUME_NUMBER` flag — and
-/// `weaver-unrar` reads `RarVolumeFacts::volume_number` from exactly there. The
+/// `unrar-rs` reads `RarVolumeFacts::volume_number` from exactly there. The
 /// **conventional** path keys its whole per-set volume map by that number
 /// (`persist_rar_volume_facts`), so a set whose volumes all report volume 0
 /// collapses into one entry and never assembles. Direct-store does not care:
@@ -9902,7 +9903,7 @@ fn build_test_rar4_end_header_numbered(more_volumes: bool, volume: u16) -> Vec<u
 /// filename.
 ///
 /// `unpack_version` 29 is what selects "RAR 3.0" encryption — AES-128-CBC. The
-/// three older values select ciphers `weaver-unrar` refuses to classify as an
+/// three older values select ciphers `unrar-rs` refuses to classify as an
 /// encrypted store at all, which is asserted in the library rather than here.
 fn build_test_rar4_encrypted_file_header(
     filename: &str,
@@ -9958,7 +9959,7 @@ fn encrypted_rar4_store_set(
     data_password: &str,
     salt: Option<[u8; 8]>,
 ) -> Vec<(String, Vec<u8>)> {
-    let (key, iv) = weaver_unrar::rar4_derive_key(data_password, salt.as_ref());
+    let (key, iv) = unrar_rs::rar4_derive_key(data_password, salt.as_ref());
 
     let cipher_len = payload.len().div_ceil(16) * 16;
     let mut cipher = payload.to_vec();
@@ -9966,7 +9967,7 @@ fn encrypted_rar4_store_set(
     // The public range API, not a `#[doc(hidden)]` test helper: the posted bytes
     // a fixture claims to have been posted should come from the same surface the
     // overlay re-derives them with.
-    weaver_unrar::encrypt_cipher_range_rar4(&key, &iv, &mut cipher)
+    unrar_rs::encrypt_cipher_range_rar4(&key, &iv, &mut cipher)
         .expect("the padded payload is block-aligned");
 
     let member_crc = checksum::crc32(payload);
@@ -10508,7 +10509,7 @@ enum HeaderCheck {
 /// four bytes of its SHA-256.
 fn build_test_rar_crypt_header(kdf_lg2: u8, check: HeaderCheck) -> Vec<u8> {
     let checked = |password: &str| {
-        weaver_unrar::derive_rar5_material(password, &TEST_HP_SALT, kdf_lg2)
+        unrar_rs::derive_rar5_material(password, &TEST_HP_SALT, kdf_lg2)
             .expect("the fixture KDF count is derivable")
             .psw_check
     };
@@ -10545,7 +10546,7 @@ fn build_test_rar_crypt_header(kdf_lg2: u8, check: HeaderCheck) -> Vec<u8> {
 fn seal_test_rar_header(key: &[u8; 32], iv: &[u8; 16], header: &[u8]) -> Vec<u8> {
     let mut block = header.to_vec();
     block.resize(header.len().div_ceil(16) * 16, 0);
-    weaver_unrar::encrypt_cipher_range(key, iv, &mut block)
+    unrar_rs::encrypt_cipher_range(key, iv, &mut block)
         .expect("the padded header is block-aligned");
     let mut out = iv.to_vec();
     out.extend_from_slice(&block);
@@ -10574,18 +10575,18 @@ fn header_encrypted_store_set(
     password: &'static str,
     check: HeaderCheck,
 ) -> Vec<(String, Vec<u8>)> {
-    let header_key = weaver_unrar::derive_rar5_material(password, &TEST_HP_SALT, TEST_HP_KDF_LG2)
+    let header_key = unrar_rs::derive_rar5_material(password, &TEST_HP_SALT, TEST_HP_KDF_LG2)
         .expect("the fixture KDF count is derivable")
         .key;
-    let member = weaver_unrar::derive_rar5_material(password, &TEST_CRYPT_SALT, TEST_CRYPT_KDF_LG2)
+    let member = unrar_rs::derive_rar5_material(password, &TEST_CRYPT_SALT, TEST_CRYPT_KDF_LG2)
         .expect("the fixture KDF count is derivable");
 
     let cipher_len = payload.len().div_ceil(16) * 16;
     let mut cipher = payload.to_vec();
     cipher.resize(cipher_len, 0);
-    weaver_unrar::encrypt_cipher_range(&member.key, &TEST_CRYPT_IV, &mut cipher)
+    unrar_rs::encrypt_cipher_range(&member.key, &TEST_CRYPT_IV, &mut cipher)
         .expect("the padded payload is block-aligned");
-    let member_crc = weaver_unrar::convert_crc32_to_mac(checksum::crc32(payload), &member.hash_key);
+    let member_crc = unrar_rs::convert_crc32_to_mac(checksum::crc32(payload), &member.hash_key);
 
     let mut offset = 0usize;
     misaligned_parts(cipher_len, volume_count)
@@ -10669,10 +10670,10 @@ fn header_encrypted_store_set_with_extra_member(
     password: &'static str,
     check: HeaderCheck,
 ) -> Vec<(String, Vec<u8>)> {
-    let header_key = weaver_unrar::derive_rar5_material(password, &TEST_HP_SALT, TEST_HP_KDF_LG2)
+    let header_key = unrar_rs::derive_rar5_material(password, &TEST_HP_SALT, TEST_HP_KDF_LG2)
         .expect("the fixture KDF count is derivable")
         .key;
-    let member = weaver_unrar::derive_rar5_material(password, &TEST_CRYPT_SALT, TEST_CRYPT_KDF_LG2)
+    let member = unrar_rs::derive_rar5_material(password, &TEST_CRYPT_SALT, TEST_CRYPT_KDF_LG2)
         .expect("the fixture KDF count is derivable");
 
     let mut volumes =
@@ -10685,12 +10686,12 @@ fn header_encrypted_store_set_with_extra_member(
     let extra_cipher_len = extra_payload.len().div_ceil(16) * 16;
     let mut extra_cipher = extra_payload.to_vec();
     extra_cipher.resize(extra_cipher_len, 0);
-    weaver_unrar::encrypt_cipher_range(&member.key, &TEST_CRYPT_IV, &mut extra_cipher)
+    unrar_rs::encrypt_cipher_range(&member.key, &TEST_CRYPT_IV, &mut extra_cipher)
         .expect("the padded payload is block-aligned");
 
     let mut extra = build_test_rar_crypt_extra(Some(&member.psw_check), false);
     extra.extend_from_slice(&build_test_rar_blake2_extra(
-        weaver_unrar::crypto::blake2sp_hash(extra_payload),
+        unrar_rs::crypto::blake2sp_hash(extra_payload),
     ));
 
     // Rebuild the closing volume with the extra member spliced in ahead of its
@@ -11096,11 +11097,8 @@ async fn a_header_encrypted_set_keyed_from_nzb_meta_matches_the_conventional_ext
     // nothing at all, which is what makes this a `-hp` test rather than a `-p`
     // one with extra steps.
     assert!(
-        weaver_unrar::RarArchive::parse_volume_facts(
-            std::io::Cursor::new(volumes[0].1.clone()),
-            None
-        )
-        .is_err(),
+        unrar_rs::RarArchive::parse_volume_facts(std::io::Cursor::new(volumes[0].1.clone()), None)
+            .is_err(),
         "a `-hp` fixture must yield no facts without a password"
     );
     let arrivals = in_order_arrivals(volumes.len());
@@ -11185,11 +11183,8 @@ async fn a_tolerated_member_of_a_header_encrypted_set_extracts_with_the_proved_p
     // Non-vacuity on the fixture: these volumes state nothing without a
     // password, so the tolerated extraction genuinely needs one.
     assert!(
-        weaver_unrar::RarArchive::parse_volume_facts(
-            std::io::Cursor::new(volumes[0].1.clone()),
-            None
-        )
-        .is_err(),
+        unrar_rs::RarArchive::parse_volume_facts(std::io::Cursor::new(volumes[0].1.clone()), None)
+            .is_err(),
         "a `-hp` fixture must yield no facts without a password"
     );
     let arrivals = in_order_arrivals(volumes.len());
@@ -11675,10 +11670,10 @@ async fn a_rar4_header_encrypted_set_refuses_by_name() {
 async fn a_header_encrypted_set_whose_kdf_count_is_over_the_ceiling_refuses_by_name() {
     // `lg2_count` is the *archive's* claim, so an unbounded one would let a
     // hostile post choose how much PBKDF2 an admission decision costs.
-    // `weaver-unrar` bounds it at `CRYPT5_KDF_LG2_COUNT_MAX` — RAR's own limit —
+    // `unrar-rs` bounds it at `CRYPT5_KDF_LG2_COUNT_MAX` — RAR's own limit —
     // before it even reads the salt, and naming the refusal here is what stops
     // such a volume from also burning `MAX_HEADER_PREFIX_BYTES` of staging.
-    let over = weaver_unrar::CRYPT5_KDF_LG2_COUNT_MAX + 1;
+    let over = unrar_rs::CRYPT5_KDF_LG2_COUNT_MAX + 1;
     let volumes: Vec<(String, Vec<u8>)> = (0..2usize)
         .map(|volume| {
             let mut bytes = Vec::new();

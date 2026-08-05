@@ -258,7 +258,7 @@ impl DirectSetPlan {
     }
 
     /// A raw header name resolved the way the incremental extractor resolves it
-    /// (D3: reuse, don't invent) — `weaver_unrar::sanitize_path` first, then the
+    /// (D3: reuse, don't invent) — `unrar_rs::sanitize_path` first, then the
     /// validator that refuses anything escaping the directory it is joined onto.
     ///
     /// Both steps matter, and phase 4 only had the second: `sanitize_path`
@@ -268,7 +268,7 @@ impl DirectSetPlan {
     /// several members per set that difference is reachable, where a
     /// single-member set could only ever have demoted on it.
     fn resolve_member_path(member_name: &str) -> Result<String, ()> {
-        let sanitized = weaver_unrar::sanitize_path(member_name);
+        let sanitized = unrar_rs::sanitize_path(member_name);
         let safe = crate::pipeline::extraction::validate_sanitized_rar_member_path(&sanitized)
             .map_err(|_| ())?;
         let safe = safe.to_string_lossy().replace('\\', "/");

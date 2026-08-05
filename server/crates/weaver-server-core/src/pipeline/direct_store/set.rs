@@ -188,7 +188,7 @@ impl DirectSet {
     /// checkpoint produces, reached one step earlier.
     pub(crate) fn restore_layout(
         &mut self,
-        facts: &BTreeMap<u32, weaver_unrar::RarVolumeFacts>,
+        facts: &BTreeMap<u32, unrar_rs::RarVolumeFacts>,
     ) -> Result<(), DemotionReason> {
         match self.router.restore_layout(facts) {
             Ok(()) => Ok(()),

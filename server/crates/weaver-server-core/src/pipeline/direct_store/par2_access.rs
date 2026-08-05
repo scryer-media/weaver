@@ -1,4 +1,4 @@
-//! A [`weaver_par2::FileAccess`] over a direct set's virtual volumes
+//! A [`par2_rs::FileAccess`] over a direct set's virtual volumes
 //! (plan 135, D5/D8).
 //!
 //! PAR2 describes **source volumes**: every file id in the recovery set names a
@@ -12,7 +12,7 @@
 //!
 //! Files the set does not own — the PAR2 volumes themselves, and any data file
 //! that is not a direct source volume — fall through to the ordinary
-//! [`weaver_par2::PlacementFileAccess`] unchanged, so a job that mixes direct
+//! [`par2_rs::PlacementFileAccess`] unchanged, so a job that mixes direct
 //! and conventional files verifies both in one pass.
 //!
 //! # A hole is a short file, never zeros
@@ -40,7 +40,7 @@
 //!
 //! So the reader is offered only when the volume's readable image is a prefix
 //! (see [`super::provider::VirtualVolume::readable_prefix`]). Otherwise the
-//! adapter answers `Ok(None)` and weaver-par2 falls back to its ranged path,
+//! adapter answers `Ok(None)` and par2-rs falls back to its ranged path,
 //! which opens at each slice's own offset and therefore seeks past the hole —
 //! damaging exactly the slices that touch it, which is the verdict a physically
 //! sparse volume produces. Clean volumes, the overwhelming majority and the only
@@ -85,7 +85,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use weaver_par2::{FileAccess, FileId, PlacementFileAccess};
+use par2_rs::{FileAccess, FileId, PlacementFileAccess};
 
 use super::provider::{HybridVolumeProvider, VirtualVolumeReader, is_hole};
 

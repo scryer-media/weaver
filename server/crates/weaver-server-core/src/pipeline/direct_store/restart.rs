@@ -825,7 +825,7 @@ impl Pipeline {
     async fn load_direct_volume_facts(
         &self,
         job_id: JobId,
-    ) -> HashMap<String, BTreeMap<u32, weaver_unrar::RarVolumeFacts>> {
+    ) -> HashMap<String, BTreeMap<u32, unrar_rs::RarVolumeFacts>> {
         let rows = match self
             .db_blocking(move |db| db.load_all_rar_volume_facts(job_id))
             .await
@@ -840,11 +840,10 @@ impl Pipeline {
                 return HashMap::new();
             }
         };
-        let mut decoded: HashMap<String, BTreeMap<u32, weaver_unrar::RarVolumeFacts>> =
-            HashMap::new();
+        let mut decoded: HashMap<String, BTreeMap<u32, unrar_rs::RarVolumeFacts>> = HashMap::new();
         for (set_name, volumes) in rows {
             for (volume_index, blob) in volumes {
-                match rmp_serde::from_slice::<weaver_unrar::RarVolumeFacts>(&blob) {
+                match rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(&blob) {
                     Ok(facts) => {
                         decoded
                             .entry(set_name.clone())

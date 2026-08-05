@@ -461,7 +461,7 @@ fn extract_7z_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput, 
 
 fn extract_rar_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput, IntakeError> {
     let first = File::open(path).map_err(transient_io)?;
-    let mut archive = weaver_unrar::RarArchive::open(first)
+    let mut archive = unrar_rs::RarArchive::open(first)
         .map_err(|error| IntakeError::Permanent(format!("failed to read RAR archive: {error}")))?;
     archive.set_limits(rar_limits(limit));
 
@@ -484,7 +484,7 @@ fn extract_rar_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput,
     }
 
     let mut output = IntakeOutput::default();
-    let options = weaver_unrar::ExtractOptions::default();
+    let options = unrar_rs::ExtractOptions::default();
     let metadata = archive.metadata();
     for (idx, member) in metadata.members.iter().enumerate() {
         if member.is_directory || !member.name.to_ascii_lowercase().ends_with(".nzb") {
@@ -548,11 +548,11 @@ fn total_nzb_bytes_limit(per_member_limit: u64) -> u64 {
         .min(MAX_TOTAL_NZB_BYTES_PER_INPUT)
 }
 
-fn rar_limits(per_member_limit: u64) -> weaver_unrar::Limits {
-    weaver_unrar::Limits {
+fn rar_limits(per_member_limit: u64) -> unrar_rs::Limits {
+    unrar_rs::Limits {
         max_data_segment: per_member_limit,
         max_unpacked_size: per_member_limit,
-        ..weaver_unrar::Limits::default()
+        ..unrar_rs::Limits::default()
     }
 }
 
@@ -618,10 +618,10 @@ fn archive_volume_number(role: &FileRole) -> u32 {
     }
 }
 
-fn rar_member_error(error: weaver_unrar::RarError) -> IntakeError {
+fn rar_member_error(error: unrar_rs::RarError) -> IntakeError {
     match error {
-        weaver_unrar::RarError::MissingVolume { .. } => IntakeError::Transient(error.to_string()),
-        weaver_unrar::RarError::Io(error)
+        unrar_rs::RarError::MissingVolume { .. } => IntakeError::Transient(error.to_string()),
+        unrar_rs::RarError::Io(error)
             if matches!(
                 error.kind(),
                 io::ErrorKind::NotFound
@@ -890,14 +890,14 @@ mod tests {
 
     #[test]
     fn rar_member_error_classifies_typed_missing_volume_as_transient() {
-        let error = weaver_unrar::RarError::MissingVolume {
+        let error = unrar_rs::RarError::MissingVolume {
             volume: 2,
             member: "release.nzb".to_string(),
         };
 
         assert!(matches!(rar_member_error(error), IntakeError::Transient(_)));
         assert!(matches!(
-            rar_member_error(weaver_unrar::RarError::ResourceLimit {
+            rar_member_error(unrar_rs::RarError::ResourceLimit {
                 detail: "too large".to_string()
             }),
             IntakeError::Permanent(_)

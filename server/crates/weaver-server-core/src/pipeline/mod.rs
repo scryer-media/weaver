@@ -49,10 +49,10 @@ use crate::{
     JobInfo, JobSpec, JobState, JobStatus, NntpRuntimeActivation, PipelineMetrics, RuntimeTuner,
     SchedulerCommand, SchedulerError, SharedPipelineState, SpilloverDecision, TokenBucket,
 };
-use weaver_nntp::NntpClient;
 #[cfg(test)]
-use weaver_par2::checksum;
-use weaver_par2::par2_set::Par2FileSet;
+use par2_rs::checksum;
+use par2_rs::par2_set::Par2FileSet;
+use weaver_nntp::NntpClient;
 
 use self::archive::rar_state::{RarDerivedPlan, RarSetState};
 use self::download::{
@@ -1124,7 +1124,7 @@ pub(super) struct VerifiedSuspectPersistState {
 }
 
 pub(crate) enum RarPasswordAttemptError {
-    Rar(weaver_unrar::RarError),
+    Rar(unrar_rs::RarError),
     Fatal(String),
 }
 
@@ -1151,8 +1151,8 @@ impl std::fmt::Display for RarPasswordAttemptError {
     }
 }
 
-impl From<weaver_unrar::RarError> for RarPasswordAttemptError {
-    fn from(value: weaver_unrar::RarError) -> Self {
+impl From<unrar_rs::RarError> for RarPasswordAttemptError {
+    fn from(value: unrar_rs::RarError) -> Self {
         Self::Rar(value)
     }
 }
@@ -1186,7 +1186,7 @@ pub(super) struct Par2RuntimeState {
     /// pass so a repair does not re-scan sources the analysis just hashed.
     /// Self-invalidating: the engine re-stats every observed file and falls
     /// back to a full scan on any drift.
-    pub(super) scan_carry: Option<Arc<weaver_par2::ScanCarry>>,
+    pub(super) scan_carry: Option<Arc<par2_rs::ScanCarry>>,
 }
 
 pub(super) enum ExtractionDone {
@@ -1293,9 +1293,9 @@ pub(super) struct StreamedCompletedFileChecksum {
 }
 
 pub(super) struct CompletedFileChecksumState {
-    md5: Option<weaver_par2::checksum::FileHashState>,
+    md5: Option<par2_rs::checksum::FileHashState>,
     crc32: u32,
-    crc32_combine_op: Option<(u64, weaver_par2::checksum::Crc32CombineOp)>,
+    crc32_combine_op: Option<(u64, par2_rs::checksum::Crc32CombineOp)>,
     bytes_fed: u64,
     all_parts_crc_verified: bool,
 }
@@ -1303,7 +1303,7 @@ pub(super) struct CompletedFileChecksumState {
 impl CompletedFileChecksumState {
     pub(super) fn new() -> Self {
         Self {
-            md5: Some(weaver_par2::checksum::FileHashState::new()),
+            md5: Some(par2_rs::checksum::FileHashState::new()),
             crc32: 0,
             crc32_combine_op: None,
             bytes_fed: 0,
@@ -1380,7 +1380,7 @@ impl CompletedFileChecksumState {
         let _cpu_scope =
             crate::runtime::perf_probe::cpu_scope("download.file_hash.update.crc32_combine");
         if !matches!(self.crc32_combine_op.as_ref(), Some((cached_len, _)) if *cached_len == len) {
-            self.crc32_combine_op = Some((len, weaver_par2::checksum::Crc32CombineOp::new(len)));
+            self.crc32_combine_op = Some((len, par2_rs::checksum::Crc32CombineOp::new(len)));
         }
         let op = &self
             .crc32_combine_op
@@ -1409,7 +1409,7 @@ impl CompletedFileChecksumState {
 
     pub(super) fn finalize(self) -> StreamedCompletedFileChecksum {
         StreamedCompletedFileChecksum {
-            md5: self.md5.map(weaver_par2::checksum::FileHashState::finalize),
+            md5: self.md5.map(par2_rs::checksum::FileHashState::finalize),
             crc32: self.crc32,
             all_parts_crc_verified: self.all_parts_crc_verified,
         }

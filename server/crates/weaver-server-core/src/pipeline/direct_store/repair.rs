@@ -16,7 +16,7 @@
 //!
 //! # Which volumes materialize, and why the rest do not have to
 //!
-//! `weaver_par2`'s repairer reads *available* input slices and writes the
+//! `par2_rs`'s repairer reads *available* input slices and writes the
 //! *missing* ones, both through a [`FileAccess`]. Only the write side needs a
 //! real file: a recovered slice has to land somewhere, and a virtual volume's
 //! bytes belong to a member partial and an envelope, neither of which is
@@ -86,7 +86,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use weaver_par2::{FileId, Par2FileSet, VerificationResult};
+use par2_rs::{FileId, Par2FileSet, VerificationResult};
 
 use super::par2_access::{DirectVolumeFileAccess, MaterializedPar2Volume};
 use super::provider::HybridVolumeProvider;
@@ -375,7 +375,7 @@ pub(crate) fn repair_damaged_volumes(
     par2_set: &Par2FileSet,
     verification: &VerificationResult,
     provider: &HybridVolumeProvider,
-    inner: weaver_par2::PlacementFileAccess,
+    inner: par2_rs::PlacementFileAccess,
     virtual_volumes: &[super::par2_access::VirtualPar2Volume],
     damaged: &[DamagedDirectVolume],
     memory_limit: Option<usize>,
@@ -412,18 +412,17 @@ pub(crate) fn repair_damaged_volumes(
     let mut access = DirectVolumeFileAccess::new(inner, provider.clone(), virtual_volumes)
         .with_materialized(materialized);
 
-    let plan =
-        match weaver_par2::plan_repair_with_memory_limit(par2_set, verification, memory_limit) {
-            Ok(plan) => plan,
-            Err(error) => {
-                return Err(cleanup(match &verification.repairable {
-                    weaver_par2::verify::Repairability::Insufficient { .. } => {
-                        DirectRepairFailure::Unrepairable
-                    }
-                    _ => DirectRepairFailure::PlanRefused(error.to_string()),
-                }));
-            }
-        };
+    let plan = match par2_rs::plan_repair_with_memory_limit(par2_set, verification, memory_limit) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Err(cleanup(match &verification.repairable {
+                par2_rs::verify::Repairability::Insufficient { .. } => {
+                    DirectRepairFailure::Unrepairable
+                }
+                _ => DirectRepairFailure::PlanRefused(error.to_string()),
+            }));
+        }
+    };
     // The write targets and the materialization both come from `verification`,
     // so this can only fire if the two drifted. It is checked anyway, because
     // the failure it prevents is a repair writing into a still-virtual volume —
@@ -438,14 +437,14 @@ pub(crate) fn repair_damaged_volumes(
     }
 
     let recovery_blocks_used = plan.recovery_exponents.len();
-    let options = weaver_par2::RepairOptions {
+    let options = par2_rs::RepairOptions {
         memory_limit,
         ..Default::default()
     };
-    if let Err(error) = weaver_par2::execute_repair_with_options(
+    if let Err(error) = par2_rs::execute_repair_with_options(
         &plan,
         par2_set,
-        &mut access as &mut dyn weaver_par2::FileAccess,
+        &mut access as &mut dyn par2_rs::FileAccess,
         &options,
     ) {
         return Err(cleanup(DirectRepairFailure::ExecuteFailed(
@@ -538,8 +537,8 @@ fn read_span_chunked(
             .min(READ_BACK_CHUNK_BYTES);
         file.read_exact(&mut buffer[..want])?;
         let chunk = &buffer[..want];
-        crc32 = weaver_par2::checksum::Crc32CombineOp::new(want as u64)
-            .combine(crc32, weaver_par2::checksum::crc32(chunk));
+        crc32 = par2_rs::checksum::Crc32CombineOp::new(want as u64)
+            .combine(crc32, par2_rs::checksum::crc32(chunk));
         chunks.push((cursor, Arc::from(chunk)));
         cursor = cursor.saturating_add(want as u64);
     }
@@ -568,7 +567,7 @@ pub(crate) fn damaged_files_by_set(
     for file in &verification.files {
         if matches!(
             file.status,
-            weaver_par2::verify::FileStatus::Complete | weaver_par2::verify::FileStatus::Renamed(_)
+            par2_rs::verify::FileStatus::Complete | par2_rs::verify::FileStatus::Renamed(_)
         ) {
             continue;
         }

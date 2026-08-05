@@ -15,25 +15,23 @@ fn payload(len: usize) -> Vec<u8> {
     (0..len).map(|value| (value % 251) as u8).collect()
 }
 
-fn par2_file_id(filename: &str, data: &[u8]) -> weaver_par2::FileId {
+fn par2_file_id(filename: &str, data: &[u8]) -> par2_rs::FileId {
     let mut input = Vec::new();
-    input.extend_from_slice(&weaver_par2::checksum::md5(
-        &data[..data.len().min(16 * 1024)],
-    ));
+    input.extend_from_slice(&par2_rs::checksum::md5(&data[..data.len().min(16 * 1024)]));
     input.extend_from_slice(&(data.len() as u64).to_le_bytes());
     input.extend_from_slice(filename.as_bytes());
-    weaver_par2::FileId::from_bytes(weaver_par2::checksum::md5(&input))
+    par2_rs::FileId::from_bytes(par2_rs::checksum::md5(&input))
 }
 
-fn slice_checksums(data: &[u8], slice_size: u64) -> Vec<weaver_par2::SliceChecksum> {
+fn slice_checksums(data: &[u8], slice_size: u64) -> Vec<par2_rs::SliceChecksum> {
     let mut checksums = Vec::new();
     let mut offset = 0usize;
     while offset < data.len() {
         let end = (offset + slice_size as usize).min(data.len());
-        let mut state = weaver_par2::SliceChecksumState::new();
+        let mut state = par2_rs::SliceChecksumState::new();
         state.update(&data[offset..end]);
         let (crc32, md5) = state.finalize(Some(slice_size));
-        checksums.push(weaver_par2::SliceChecksum { crc32, md5 });
+        checksums.push(par2_rs::SliceChecksum { crc32, md5 });
         offset = end;
     }
     checksums
@@ -50,10 +48,10 @@ fn fixture_set(files: &[(&str, &[u8])], slice_size: u64) -> Arc<Par2FileSet> {
         recovery_file_ids.push(file_id);
         descriptions.insert(
             file_id,
-            weaver_par2::FileDescription {
+            par2_rs::FileDescription {
                 file_id,
-                hash_full: weaver_par2::checksum::md5(data),
-                hash_16k: weaver_par2::checksum::md5(&data[..data.len().min(16 * 1024)]),
+                hash_full: par2_rs::checksum::md5(data),
+                hash_16k: par2_rs::checksum::md5(&data[..data.len().min(16 * 1024)]),
                 length: data.len() as u64,
                 par2_name: (*filename).to_string(),
                 filename: (*filename).to_string(),
@@ -63,7 +61,7 @@ fn fixture_set(files: &[(&str, &[u8])], slice_size: u64) -> Arc<Par2FileSet> {
     }
 
     Arc::new(Par2FileSet {
-        recovery_set_id: weaver_par2::RecoverySetId::from_bytes([7; 16]),
+        recovery_set_id: par2_rs::RecoverySetId::from_bytes([7; 16]),
         slice_size,
         recovery_file_ids,
         non_recovery_file_ids: Vec::new(),

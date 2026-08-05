@@ -668,7 +668,7 @@ impl Pipeline {
             .rar_sets
             .get(&(job_id, set_name.to_string()))
             .map(|state| state.shared_kdf_cache.clone())
-            .unwrap_or_else(|| std::sync::Arc::new(weaver_unrar::crypto::KdfCache::new()));
+            .unwrap_or_else(|| std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()));
         let pp_pool = self.pp_pool.clone();
         let refresh_cached_headers =
             self.rar_volume_paths_need_header_refresh(job_id, set_name, &volume_paths);
@@ -708,7 +708,7 @@ impl Pipeline {
 
                 let meta = archive.metadata();
                 let archive_password_required = meta.is_encrypted;
-                let options = weaver_unrar::ExtractOptions {
+                let options = unrar_rs::ExtractOptions {
                     verify: true,
                     password: selected_password.clone(),
                     restore_owners: false,

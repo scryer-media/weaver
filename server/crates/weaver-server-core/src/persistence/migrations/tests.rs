@@ -91,7 +91,7 @@ fn write_journal_entry(buf: &mut Vec<u8>, entry: &JournalEntry) {
     let len = payload.len() as u32;
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(&payload);
-    let crc = weaver_par2::checksum::crc32(&payload);
+    let crc = par2_rs::checksum::crc32(&payload);
     buf.extend_from_slice(&crc.to_le_bytes());
 }
 

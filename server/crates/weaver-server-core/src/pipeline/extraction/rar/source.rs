@@ -30,7 +30,7 @@ impl BoundedRarSourcePool {
         }
     }
 
-    pub(super) fn reader(&self, path: PathBuf) -> Box<dyn weaver_unrar::ReadSeek> {
+    pub(super) fn reader(&self, path: PathBuf) -> Box<dyn unrar_rs::ReadSeek> {
         let id = {
             let mut inner = self.inner.lock().expect("bounded RAR source pool poisoned");
             inner.allocate_reader_id()

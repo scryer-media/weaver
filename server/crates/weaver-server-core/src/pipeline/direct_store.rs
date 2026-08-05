@@ -52,7 +52,7 @@
 //! remaining narrowings:
 //!
 //! - **PAR2-bearing jobs route.** [`par2_access`] presents each source volume
-//!   to `weaver_par2` as a file, so live verification's settle reads and the
+//!   to `par2_rs` as a file, so live verification's settle reads and the
 //!   authoritative pass both read through [`provider`] instead of against
 //!   volume files that do not exist. A direct set therefore **finalizes only
 //!   once its job's PAR2 verification has concluded** — before then its
@@ -63,7 +63,7 @@
 //!   members are small unencrypted non-solid regular files still routes: their
 //!   packed ranges land in the envelope, and at finalization *only* those
 //!   member indices are extracted through
-//!   `weaver_unrar::RarArchive::extract_member_streaming` over the hybrid
+//!   `unrar_rs::RarArchive::extract_member_streaming` over the hybrid
 //!   provider. Direct `Store` outputs are never re-extracted or overwritten.
 //!
 //! Phase 6 replaces that last demotion with D8's other transition. [`repair`]

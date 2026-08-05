@@ -2105,16 +2105,16 @@ fn settings_resolve_reads_the_config_table() {
 #[test]
 fn crc_runs_compose_neighbours_and_ignore_an_overlapping_re_insert() {
     let payload: Vec<u8> = (0..600u32).map(|index| (index % 251) as u8).collect();
-    let whole = weaver_par2::checksum::crc32(&payload);
+    let whole = par2_rs::checksum::crc32(&payload);
 
     // Fed out of order — the tail, then the head, then the middle that joins
     // them — which is the only order the router ever guarantees.
     let mut runs = CrcRuns::default();
-    runs.insert(400, 200, weaver_par2::checksum::crc32(&payload[400..600]));
+    runs.insert(400, 200, par2_rs::checksum::crc32(&payload[400..600]));
     assert_eq!(runs.compose(0, 600), None, "a gap is not a composition");
-    runs.insert(0, 100, weaver_par2::checksum::crc32(&payload[..100]));
+    runs.insert(0, 100, par2_rs::checksum::crc32(&payload[..100]));
     assert_eq!(runs.compose(0, 600), None);
-    runs.insert(100, 300, weaver_par2::checksum::crc32(&payload[100..400]));
+    runs.insert(100, 300, par2_rs::checksum::crc32(&payload[100..400]));
 
     assert_eq!(
         runs.compose(0, 600),
@@ -2136,7 +2136,7 @@ fn crc_runs_compose_any_sub_range_that_lands_on_run_boundaries() {
         runs.insert(
             start as u64,
             len as u64,
-            weaver_par2::checksum::crc32(&payload[start..start + len]),
+            par2_rs::checksum::crc32(&payload[start..start + len]),
         );
     }
 
@@ -2150,7 +2150,7 @@ fn crc_runs_compose_any_sub_range_that_lands_on_run_boundaries() {
     ] {
         assert_eq!(
             runs.compose(start as u64, len as u64),
-            Some(weaver_par2::checksum::crc32(&payload[start..start + len])),
+            Some(par2_rs::checksum::crc32(&payload[start..start + len])),
             "the sub-range at {start}+{len} lands on run boundaries and must compose"
         );
     }
@@ -2358,7 +2358,7 @@ fn member_partials_keep_their_directory_and_hostile_names_are_refused() {
         Ok("nested/S01E05.mkv.direct.partial".to_string())
     );
 
-    // Wave 1 runs a raw header name through `weaver_unrar::sanitize_path` before
+    // Wave 1 runs a raw header name through `unrar_rs::sanitize_path` before
     // the validator, which is what the incremental extractor does — D3's
     // "sanitize-don't-reject" rule. A traversal is therefore *stripped* rather
     // than refused, exactly as the extractor strips it, and only a name that
@@ -2840,7 +2840,7 @@ fn a_deleted_partial_reads_as_a_hole_not_as_an_infrastructure_failure() {
 
 #[test]
 fn the_volume_provider_trait_refuses_a_volume_the_set_does_not_have() {
-    use weaver_unrar::VolumeProvider;
+    use unrar_rs::VolumeProvider;
 
     let fixture = provider_fixture(whole_volume_covered());
     let provider = super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
@@ -2880,9 +2880,9 @@ fn encrypted_member_facts(
     super::router::crypt::MemberCrypt,
     ByteRanges,
 ) {
-    let material = weaver_unrar::derive_rar5_material("moonlit-harbour", &CIPHER_SALT, CIPHER_LG2)
+    let material = unrar_rs::derive_rar5_material("moonlit-harbour", &CIPHER_SALT, CIPHER_LG2)
         .expect("the fixture KDF count is derivable");
-    let facts = weaver_unrar::RarVolumeMemberEncryptionFacts {
+    let facts = unrar_rs::RarVolumeMemberEncryptionFacts {
         version: 0,
         kdf_count_lg2: CIPHER_LG2,
         salt: CIPHER_SALT,
@@ -2899,18 +2899,18 @@ fn encrypted_member_facts(
     for index in payload_len..cipher_len {
         padded.push(0xE0 | (index % 16) as u8);
     }
-    let posted = weaver_unrar::test_support::encrypt_aes256_cbc(&material.key, &CIPHER_IV, &padded);
+    let posted = unrar_rs::test_support::encrypt_aes256_cbc(&material.key, &CIPHER_IV, &padded);
 
     let mut crypt = super::router::crypt::MemberCrypt::new(
         super::router::crypt::MemberKeys {
-            key: weaver_unrar::MemberCipherKey::Aes256(material.key),
+            key: unrar_rs::MemberCipherKey::Aes256(material.key),
             hash_key: Some(material.hash_key),
             iv: CIPHER_IV,
         },
-        &weaver_unrar::MemberKeying::Rar5(facts),
+        &unrar_rs::MemberKeying::Rar5(facts),
     );
-    crypt.observe(&weaver_unrar::EncryptedStore {
-        format: weaver_unrar::ArchiveFormat::Rar5,
+    crypt.observe(&unrar_rs::EncryptedStore {
+        format: unrar_rs::ArchiveFormat::Rar5,
         crypt: Some(facts),
         rar4_salt: None,
         cipher_size: Some(cipher_len as u64),
@@ -3100,9 +3100,9 @@ fn a_member_whose_tail_padding_is_not_whole_refuses_its_final_block() {
     // block that is not the one that was posted, which PAR2 would report as
     // damage in a byte-perfect volume.
     let dir = tempfile::tempdir().unwrap();
-    let material = weaver_unrar::derive_rar5_material("moonlit-harbour", &CIPHER_SALT, CIPHER_LG2)
+    let material = unrar_rs::derive_rar5_material("moonlit-harbour", &CIPHER_SALT, CIPHER_LG2)
         .expect("derivable");
-    let facts = weaver_unrar::RarVolumeMemberEncryptionFacts {
+    let facts = unrar_rs::RarVolumeMemberEncryptionFacts {
         version: 0,
         kdf_count_lg2: CIPHER_LG2,
         salt: CIPHER_SALT,
@@ -3119,14 +3119,14 @@ fn a_member_whose_tail_padding_is_not_whole_refuses_its_final_block() {
     // article's second half leaves behind.
     let mut crypt = super::router::crypt::MemberCrypt::new(
         super::router::crypt::MemberKeys {
-            key: weaver_unrar::MemberCipherKey::Aes256(material.key),
+            key: unrar_rs::MemberCipherKey::Aes256(material.key),
             hash_key: Some(material.hash_key),
             iv: CIPHER_IV,
         },
-        &weaver_unrar::MemberKeying::Rar5(facts),
+        &unrar_rs::MemberKeying::Rar5(facts),
     );
-    crypt.observe(&weaver_unrar::EncryptedStore {
-        format: weaver_unrar::ArchiveFormat::Rar5,
+    crypt.observe(&unrar_rs::EncryptedStore {
+        format: unrar_rs::ArchiveFormat::Rar5,
         crypt: Some(facts),
         rar4_salt: None,
         cipher_size: Some(cipher_len as u64),
@@ -3217,7 +3217,7 @@ fn provider_article_crcs(conventional: &[u8]) -> CrcRuns {
         runs.insert(
             offset as u64,
             (end - offset) as u64,
-            weaver_par2::checksum::crc32(&conventional[offset..end]),
+            par2_rs::checksum::crc32(&conventional[offset..end]),
         );
         offset = end;
     }
@@ -3394,7 +3394,7 @@ fn a_rebuild_truncates_a_stale_file_already_sitting_at_the_volumes_path() {
 // ---------------------------------------------------------------------------
 
 use super::par2_access::{DirectVolumeFileAccess, VirtualPar2Volume};
-use weaver_par2::FileAccess;
+use par2_rs::FileAccess;
 
 /// A PAR2 set describing one file with **descriptions only** — no IFSC packet,
 /// so no slice checksums.
@@ -3403,19 +3403,19 @@ use weaver_par2::FileAccess;
 /// a whole-file MD5, which is the read that degrades into thousands of ranged
 /// reads across member partials unless the adapter offers a real sequential
 /// reader.
-fn descriptor_only_par2_set(filename: &str, bytes: &[u8]) -> weaver_par2::Par2FileSet {
-    let file_id = weaver_par2::FileId::from_bytes([7u8; 16]);
-    weaver_par2::Par2FileSet {
-        recovery_set_id: weaver_par2::RecoverySetId::from_bytes([3; 16]),
+fn descriptor_only_par2_set(filename: &str, bytes: &[u8]) -> par2_rs::Par2FileSet {
+    let file_id = par2_rs::FileId::from_bytes([7u8; 16]);
+    par2_rs::Par2FileSet {
+        recovery_set_id: par2_rs::RecoverySetId::from_bytes([3; 16]),
         slice_size: 64,
         recovery_file_ids: vec![file_id],
         non_recovery_file_ids: Vec::new(),
         files: HashMap::from([(
             file_id,
-            weaver_par2::FileDescription {
+            par2_rs::FileDescription {
                 file_id,
-                hash_full: weaver_par2::checksum::md5(bytes),
-                hash_16k: weaver_par2::checksum::md5(&bytes[..bytes.len().min(16 * 1024)]),
+                hash_full: par2_rs::checksum::md5(bytes),
+                hash_16k: par2_rs::checksum::md5(&bytes[..bytes.len().min(16 * 1024)]),
                 length: bytes.len() as u64,
                 par2_name: filename.to_string(),
                 filename: filename.to_string(),
@@ -3430,11 +3430,11 @@ fn descriptor_only_par2_set(filename: &str, bytes: &[u8]) -> weaver_par2::Par2Fi
 /// The adapter under test, over the provider fixture's single virtual volume.
 fn virtual_file_access(
     fixture: &ProviderFixture,
-    par2_set: &weaver_par2::Par2FileSet,
+    par2_set: &par2_rs::Par2FileSet,
     base_dir: &Path,
-) -> (DirectVolumeFileAccess, weaver_par2::FileId) {
+) -> (DirectVolumeFileAccess, par2_rs::FileId) {
     let file_id = par2_set.recovery_file_ids[0];
-    let inner = weaver_par2::PlacementFileAccess::new(
+    let inner = par2_rs::PlacementFileAccess::new(
         base_dir.to_path_buf(),
         par2_set,
         std::collections::HashMap::new(),
@@ -3462,7 +3462,7 @@ fn a_no_ifsc_whole_file_md5_streams_through_the_sequential_reader() {
     let counters = access.counters();
 
     assert!(
-        weaver_par2::verify_full_hash(&par2_set, &file_id, &access)
+        par2_rs::verify_full_hash(&par2_set, &file_id, &access)
             .expect("the description names a registered virtual volume"),
         "the whole-file MD5 of a virtual volume must match the volume the \
          conventional gate would have written"
@@ -3496,7 +3496,7 @@ fn an_encrypted_no_ifsc_whole_file_md5_streams_through_the_sequential_reader() {
     let volume = cipher_volume(dir.path(), &plain, facts, plain.len() as u64);
     let par2_set = descriptor_only_par2_set("silver.horizon.part01.rar", &posted[..plain.len()]);
     let file_id = par2_set.recovery_file_ids[0];
-    let inner = weaver_par2::PlacementFileAccess::new(
+    let inner = par2_rs::PlacementFileAccess::new(
         dir.path().to_path_buf(),
         &par2_set,
         std::collections::HashMap::new(),
@@ -3514,7 +3514,7 @@ fn an_encrypted_no_ifsc_whole_file_md5_streams_through_the_sequential_reader() {
     let counters = access.counters();
 
     assert!(
-        weaver_par2::verify_full_hash(&par2_set, &file_id, &access)
+        par2_rs::verify_full_hash(&par2_set, &file_id, &access)
             .expect("the description names a registered virtual volume"),
         "the whole-file MD5 of an encrypted virtual volume must match the volume \
          as it was posted, not as it was decrypted"
@@ -3541,16 +3541,16 @@ fn an_encrypted_no_ifsc_whole_file_md5_streams_through_the_sequential_reader() {
 /// The adapter over one encrypted virtual volume, plus the overlay counters.
 fn encrypted_file_access(
     volume: super::provider::VirtualVolume,
-    par2_set: &weaver_par2::Par2FileSet,
+    par2_set: &par2_rs::Par2FileSet,
     base_dir: &Path,
 ) -> (
     DirectVolumeFileAccess,
-    weaver_par2::FileId,
+    par2_rs::FileId,
     Arc<super::provider::CipherOverlayCounters>,
 ) {
     let file_id = par2_set.recovery_file_ids[0];
     let volume_index = volume.volume_index;
-    let inner = weaver_par2::PlacementFileAccess::new(
+    let inner = par2_rs::PlacementFileAccess::new(
         base_dir.to_path_buf(),
         par2_set,
         std::collections::HashMap::new(),
@@ -3772,7 +3772,7 @@ fn a_hole_reads_as_a_short_file_and_never_as_zeros() {
         "and the bytes it did return must be the volume's"
     );
     assert!(
-        !weaver_par2::verify_full_hash(&par2_set, &file_id, &access).unwrap_or(true),
+        !par2_rs::verify_full_hash(&par2_set, &file_id, &access).unwrap_or(true),
         "a volume with a hole must not verify"
     );
 }
@@ -4006,8 +4006,8 @@ fn member_facts(
     data_offset: u64,
     data_size: u64,
     unpacked_size: u64,
-) -> weaver_unrar::RarVolumeMemberFacts {
-    weaver_unrar::RarVolumeMemberFacts {
+) -> unrar_rs::RarVolumeMemberFacts {
+    unrar_rs::RarVolumeMemberFacts {
         order: 0,
         name: name.to_string(),
         name_raw: None,
@@ -4047,9 +4047,9 @@ fn member_facts(
 fn volume_facts(
     volume_number: u32,
     more_volumes: bool,
-    members: Vec<weaver_unrar::RarVolumeMemberFacts>,
-) -> weaver_unrar::RarVolumeFacts {
-    weaver_unrar::RarVolumeFacts {
+    members: Vec<unrar_rs::RarVolumeMemberFacts>,
+) -> unrar_rs::RarVolumeFacts {
+    unrar_rs::RarVolumeFacts {
         // RAR5.
         format: 5,
         volume_number,
@@ -4276,29 +4276,29 @@ fn a_scratch_that_never_appended_a_byte_leaves_nothing_behind() {
 
 /// A PAR2 set describing one file with **slice checksums**, which is what makes
 /// per-slice damage attribution a question at all.
-fn sliced_par2_set(filename: &str, bytes: &[u8], slice_size: u64) -> weaver_par2::Par2FileSet {
-    let file_id = weaver_par2::FileId::from_bytes([11u8; 16]);
+fn sliced_par2_set(filename: &str, bytes: &[u8], slice_size: u64) -> par2_rs::Par2FileSet {
+    let file_id = par2_rs::FileId::from_bytes([11u8; 16]);
     let mut checksums = Vec::new();
     let mut offset = 0u64;
     while offset < bytes.len() as u64 {
         let end = (offset + slice_size).min(bytes.len() as u64);
-        let mut state = weaver_par2::SliceChecksumState::new();
+        let mut state = par2_rs::SliceChecksumState::new();
         state.update(&bytes[offset as usize..end as usize]);
         let (crc32, md5) = state.finalize((end - offset < slice_size).then_some(slice_size));
-        checksums.push(weaver_par2::SliceChecksum { crc32, md5 });
+        checksums.push(par2_rs::SliceChecksum { crc32, md5 });
         offset = end;
     }
-    weaver_par2::Par2FileSet {
-        recovery_set_id: weaver_par2::RecoverySetId::from_bytes([4; 16]),
+    par2_rs::Par2FileSet {
+        recovery_set_id: par2_rs::RecoverySetId::from_bytes([4; 16]),
         slice_size,
         recovery_file_ids: vec![file_id],
         non_recovery_file_ids: Vec::new(),
         files: HashMap::from([(
             file_id,
-            weaver_par2::FileDescription {
+            par2_rs::FileDescription {
                 file_id,
-                hash_full: weaver_par2::checksum::md5(bytes),
-                hash_16k: weaver_par2::checksum::md5(&bytes[..bytes.len().min(16 * 1024)]),
+                hash_full: par2_rs::checksum::md5(bytes),
+                hash_16k: par2_rs::checksum::md5(&bytes[..bytes.len().min(16 * 1024)]),
                 length: bytes.len() as u64,
                 par2_name: filename.to_string(),
                 filename: filename.to_string(),
@@ -4352,7 +4352,7 @@ fn an_interior_hole_damages_only_the_slices_it_touches() {
     let (access, file_id) = virtual_file_access(&fixture, &par2_set, dir.path());
     let counters = access.counters();
 
-    let valid = weaver_par2::verify_slices(&par2_set, &file_id, &access)
+    let valid = par2_rs::verify_slices(&par2_set, &file_id, &access)
         .expect("the description names a registered virtual volume");
     let damaged = damaged_slice_indices(&valid);
 
@@ -4395,8 +4395,8 @@ fn interior_hole_verdicts_match_a_physically_sparse_volume() {
     let filename = "silver.horizon.part01.rar";
     let par2_set = sliced_par2_set(filename, &fixture.conventional, HOLE_SLICE_SIZE);
     let (access, file_id) = virtual_file_access(&fixture, &par2_set, dir.path());
-    let virtual_valid = weaver_par2::verify_slices(&par2_set, &file_id, &access)
-        .expect("the virtual volume verifies");
+    let virtual_valid =
+        par2_rs::verify_slices(&par2_set, &file_id, &access).expect("the virtual volume verifies");
 
     // The same volume as the conventional path would have left it: written at
     // its offsets, with a filesystem hole where the articles never arrived.
@@ -4411,13 +4411,13 @@ fn interior_hole_verdicts_match_a_physically_sparse_volume() {
         file.write_all(&fixture.conventional[hole.1 as usize..])
             .unwrap();
     }
-    let physical = weaver_par2::PlacementFileAccess::new(
+    let physical = par2_rs::PlacementFileAccess::new(
         physical_dir.path().to_path_buf(),
         &par2_set,
         HashMap::new(),
     );
     let physical_valid =
-        weaver_par2::verify_slices(&par2_set, &file_id, &physical).expect("the file verifies");
+        par2_rs::verify_slices(&par2_set, &file_id, &physical).expect("the file verifies");
 
     assert_eq!(
         virtual_valid, physical_valid,
@@ -4444,7 +4444,7 @@ fn a_truncated_volume_still_takes_the_sequential_path() {
     let (access, file_id) = virtual_file_access(&fixture, &par2_set, dir.path());
     let counters = access.counters();
 
-    let valid = weaver_par2::verify_slices(&par2_set, &file_id, &access)
+    let valid = par2_rs::verify_slices(&par2_set, &file_id, &access)
         .expect("the truncated volume verifies");
     assert_eq!(
         damaged_slice_indices(&valid),
@@ -4519,7 +4519,7 @@ fn overwrite_replaces_a_run_and_reports_no_gap_when_it_lines_up() {
     );
     assert_eq!(
         runs.compose(0, 200),
-        Some(weaver_par2::checksum::Crc32CombineOp::new(100).combine(0x1111_1111, 0x3333_3333)),
+        Some(par2_rs::checksum::Crc32CombineOp::new(100).combine(0x1111_1111, 0x3333_3333)),
         "the composition must carry the repaired value, not the value the \
          damaged bytes produced"
     );
@@ -4550,8 +4550,8 @@ fn overwrite_leaves_the_uncovered_edges_as_stale_gaps() {
     let head = runs.overwrite(0, 40, 0x5555_5555);
     let tail = runs.overwrite(60, 40, 0x6666_6666);
     assert!(head.is_empty() && tail.is_empty());
-    let expected = weaver_par2::checksum::Crc32CombineOp::new(20).combine(0x5555_5555, 0x4444_4444);
-    let expected = weaver_par2::checksum::Crc32CombineOp::new(40).combine(expected, 0x6666_6666);
+    let expected = par2_rs::checksum::Crc32CombineOp::new(20).combine(0x5555_5555, 0x4444_4444);
+    let expected = par2_rs::checksum::Crc32CombineOp::new(40).combine(expected, 0x6666_6666);
     assert_eq!(runs.compose(0, 100), Some(expected));
 }
 
@@ -4600,7 +4600,7 @@ fn straddle_router(member: &[u8], header_bytes: u64) -> (DirectSetRouter, u32) {
             // moment the composition covers it. No packed CRC32: layer 1 would
             // otherwise fire on the *damaged* prefix during the set-up drain and
             // demote before the repair the test is about ever happens.
-            only.data_crc32 = Some(weaver_par2::checksum::crc32(member));
+            only.data_crc32 = Some(par2_rs::checksum::crc32(member));
             vec![only]
         }),
     )]);
@@ -4690,7 +4690,7 @@ fn a_drain_run_straddling_repaired_and_duplicate_bytes_splits_at_the_boundary() 
             member_id,
             0,
             200,
-            weaver_par2::checksum::crc32(&repaired[..200]),
+            par2_rs::checksum::crc32(&repaired[..200]),
         )
         .expect("the re-read closes the gap");
     assert!(
@@ -5034,7 +5034,7 @@ fn encrypted_crypt_router_partial(
     header_bytes: u64,
     staged: usize,
 ) -> (DirectSetRouter, Vec<u8>) {
-    let material = weaver_unrar::derive_rar5_material(CRYPT_PASSWORD, &CRYPT_SALT, CRYPT_KDF_LG2)
+    let material = unrar_rs::derive_rar5_material(CRYPT_PASSWORD, &CRYPT_SALT, CRYPT_KDF_LG2)
         .expect("the fixture KDF count is derivable");
     let cipher_len = plain.len().div_ceil(16) * 16;
     let mut padded = plain.to_vec();
@@ -5044,7 +5044,7 @@ fn encrypted_crypt_router_partial(
     for index in 0..cipher_len - plain.len() {
         padded.push(b'a' + index as u8);
     }
-    let cipher = weaver_unrar::test_support::encrypt_aes256_cbc(&material.key, &CRYPT_IV, &padded);
+    let cipher = unrar_rs::test_support::encrypt_aes256_cbc(&material.key, &CRYPT_IV, &padded);
 
     let plan = DirectSetPlan {
         set_name: SET.to_string(),
@@ -5067,7 +5067,7 @@ fn encrypted_crypt_router_partial(
                 plain.len() as u64,
             );
             only.is_encrypted = true;
-            only.encryption = Some(weaver_unrar::RarVolumeMemberEncryptionFacts {
+            only.encryption = Some(unrar_rs::RarVolumeMemberEncryptionFacts {
                 version: 0,
                 kdf_count_lg2: CRYPT_KDF_LG2,
                 salt: CRYPT_SALT,
@@ -5077,7 +5077,7 @@ fn encrypted_crypt_router_partial(
             });
             // Layer 2's value, over the plaintext: the member verifies, so the
             // drain below routes rather than demoting on its own gate.
-            only.data_crc32 = Some(weaver_par2::checksum::crc32(plain));
+            only.data_crc32 = Some(par2_rs::checksum::crc32(plain));
             vec![only]
         }),
     )]);

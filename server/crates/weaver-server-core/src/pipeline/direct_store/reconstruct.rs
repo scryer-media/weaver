@@ -284,7 +284,7 @@ fn reconstruct_volume(
     // Sequential from zero over the covered runs. Holes are skipped by seeking
     // past them, which is what leaves the volume file sparse in exactly the
     // places the refetch is about to fill.
-    let mut md5 = weaver_par2::checksum::FileHashState::new();
+    let mut md5 = par2_rs::checksum::FileHashState::new();
     let mut contiguous = 0u64;
     let mut written_total = 0u64;
     let mut buffer = vec![0u8; SWEEP_CHUNK_BYTES];

@@ -46,12 +46,12 @@ fn run_repair(args: Par2Args) -> Result<i32, Box<dyn std::error::Error>> {
     print_verification_report(&verification, placement_plan.as_ref(), &par2_set);
 
     match verification.repairable {
-        weaver_par2::Repairability::NotNeeded => {
+        par2_rs::Repairability::NotNeeded => {
             println!("no repair needed");
             println!("repair completed in {:.2?}", started.elapsed());
             return Ok(0);
         }
-        weaver_par2::Repairability::Insufficient {
+        par2_rs::Repairability::Insufficient {
             blocks_needed,
             blocks_available,
             deficit,
@@ -62,39 +62,34 @@ fn run_repair(args: Par2Args) -> Result<i32, Box<dyn std::error::Error>> {
             println!("repair completed in {:.2?}", started.elapsed());
             return Ok(1);
         }
-        weaver_par2::Repairability::ResourceLimited { reason } => {
+        par2_rs::Repairability::ResourceLimited { reason } => {
             println!("repair not possible: verification resource limit exceeded: {reason}");
             println!("repair completed in {:.2?}", started.elapsed());
             return Ok(1);
         }
-        weaver_par2::Repairability::Repairable { .. } => {}
+        par2_rs::Repairability::Repairable { .. } => {}
     }
 
     if let Some(plan) = &placement_plan
         && (!plan.swaps.is_empty() || !plan.renames.is_empty())
     {
-        let moved = weaver_par2::apply_placement_plan(&resolved.primary_dir, plan)?;
+        let moved = par2_rs::apply_placement_plan(&resolved.primary_dir, plan)?;
         println!("normalized file placement before repair: moved {moved} file(s)");
     }
 
-    let repair_plan = weaver_par2::plan_repair(&par2_set, &verification)?;
+    let repair_plan = par2_rs::plan_repair(&par2_set, &verification)?;
     println!(
         "repairing {} slice(s) using {} recovery block(s)",
         repair_plan.missing_slices.len(),
         repair_plan.recovery_exponents.len()
     );
 
-    let options = weaver_par2::RepairOptions::default();
+    let options = par2_rs::RepairOptions::default();
 
     let repair_started = std::time::Instant::now();
-    let mut repair_access: Box<dyn weaver_par2::FileAccess> =
+    let mut repair_access: Box<dyn par2_rs::FileAccess> =
         build_repair_access(&resolved, &par2_set, placement_plan.as_ref());
-    weaver_par2::execute_repair_with_options(
-        &repair_plan,
-        &par2_set,
-        &mut *repair_access,
-        &options,
-    )?;
+    par2_rs::execute_repair_with_options(&repair_plan, &par2_set, &mut *repair_access, &options)?;
     println!("repair pass completed in {:.2?}", repair_started.elapsed());
 
     let post_repair_started = std::time::Instant::now();
@@ -176,9 +171,9 @@ fn collect_par2_paths_from_dir(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::
 }
 
 fn discover_matching_par2_paths(input: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
-    let seed_set = weaver_par2::Par2FileSet::from_paths(&[input])?;
+    let seed_set = par2_rs::Par2FileSet::from_paths(&[input])?;
     let parent = input.parent().unwrap_or_else(|| Path::new("."));
-    let mut par2_paths = weaver_par2::identify_par2_files(parent, &seed_set.recovery_set_id)?;
+    let mut par2_paths = par2_rs::identify_par2_files(parent, &seed_set.recovery_set_id)?;
     if par2_paths.is_empty() {
         par2_paths.push(input.to_path_buf());
     }
@@ -189,83 +184,78 @@ fn discover_matching_par2_paths(input: &Path) -> Result<Vec<PathBuf>, Box<dyn st
 
 fn load_par2_set(
     par2_paths: &[PathBuf],
-) -> Result<weaver_par2::Par2FileSet, Box<dyn std::error::Error>> {
-    Ok(weaver_par2::Par2FileSet::from_paths(par2_paths)?)
+) -> Result<par2_rs::Par2FileSet, Box<dyn std::error::Error>> {
+    Ok(par2_rs::Par2FileSet::from_paths(par2_paths)?)
 }
 
 fn verify_set(
     resolved: &ResolvedPar2Input,
-    par2_set: &weaver_par2::Par2FileSet,
-) -> Result<
-    (
-        weaver_par2::VerificationResult,
-        Option<weaver_par2::PlacementPlan>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+    par2_set: &par2_rs::Par2FileSet,
+) -> Result<(par2_rs::VerificationResult, Option<par2_rs::PlacementPlan>), Box<dyn std::error::Error>>
+{
     if resolved.search_dirs.is_empty() {
-        let placement_plan = weaver_par2::scan_placement(&resolved.primary_dir, par2_set)?;
+        let placement_plan = par2_rs::scan_placement(&resolved.primary_dir, par2_set)?;
         if !placement_plan.conflicts.is_empty() {
             let conflicts = format_conflict_filenames(&placement_plan, par2_set);
             return Err(format!("placement scan found ambiguous matches: {conflicts}").into());
         }
-        let access = weaver_par2::PlacementFileAccess::from_plan(
+        let access = par2_rs::PlacementFileAccess::from_plan(
             resolved.primary_dir.clone(),
             par2_set,
             &placement_plan,
         );
-        let verification = weaver_par2::verify_all(par2_set, &access);
+        let verification = par2_rs::verify_all(par2_set, &access);
         Ok((verification, Some(placement_plan)))
     } else {
-        let access = weaver_par2::MultiDirectoryFileAccess::new(
+        let access = par2_rs::MultiDirectoryFileAccess::new(
             resolved.primary_dir.clone(),
             resolved.search_dirs.clone(),
             par2_set,
         );
-        let verification = weaver_par2::verify_all(par2_set, &access);
+        let verification = par2_rs::verify_all(par2_set, &access);
         Ok((verification, None))
     }
 }
 
 fn verify_after_repair(
     resolved: &ResolvedPar2Input,
-    par2_set: &weaver_par2::Par2FileSet,
-) -> Result<weaver_par2::VerificationResult, Box<dyn std::error::Error>> {
+    par2_set: &par2_rs::Par2FileSet,
+) -> Result<par2_rs::VerificationResult, Box<dyn std::error::Error>> {
     if resolved.search_dirs.is_empty() {
-        let access = weaver_par2::DiskFileAccess::new(resolved.primary_dir.clone(), par2_set);
-        Ok(weaver_par2::verify_all(par2_set, &access))
+        let access = par2_rs::DiskFileAccess::new(resolved.primary_dir.clone(), par2_set);
+        Ok(par2_rs::verify_all(par2_set, &access))
     } else {
-        let access = weaver_par2::MultiDirectoryFileAccess::new(
+        let access = par2_rs::MultiDirectoryFileAccess::new(
             resolved.primary_dir.clone(),
             resolved.search_dirs.clone(),
             par2_set,
         );
-        Ok(weaver_par2::verify_all(par2_set, &access))
+        Ok(par2_rs::verify_all(par2_set, &access))
     }
 }
 
 fn build_repair_access(
     resolved: &ResolvedPar2Input,
-    par2_set: &weaver_par2::Par2FileSet,
-    placement_plan: Option<&weaver_par2::PlacementPlan>,
-) -> Box<dyn weaver_par2::FileAccess> {
+    par2_set: &par2_rs::Par2FileSet,
+    placement_plan: Option<&par2_rs::PlacementPlan>,
+) -> Box<dyn par2_rs::FileAccess> {
     if resolved.search_dirs.is_empty() {
         if let Some(plan) = placement_plan
             && plan.swaps.is_empty()
             && plan.renames.is_empty()
         {
-            return Box::new(weaver_par2::PlacementFileAccess::from_plan(
+            return Box::new(par2_rs::PlacementFileAccess::from_plan(
                 resolved.primary_dir.clone(),
                 par2_set,
                 plan,
             ));
         }
-        Box::new(weaver_par2::DiskFileAccess::new(
+        Box::new(par2_rs::DiskFileAccess::new(
             resolved.primary_dir.clone(),
             par2_set,
         ))
     } else {
-        Box::new(weaver_par2::MultiDirectoryFileAccess::new(
+        Box::new(par2_rs::MultiDirectoryFileAccess::new(
             resolved.primary_dir.clone(),
             resolved.search_dirs.clone(),
             par2_set,
@@ -273,7 +263,7 @@ fn build_repair_access(
     }
 }
 
-fn print_context(action: &str, resolved: &ResolvedPar2Input, par2_set: &weaver_par2::Par2FileSet) {
+fn print_context(action: &str, resolved: &ResolvedPar2Input, par2_set: &par2_rs::Par2FileSet) {
     println!("weaver par2 {action}");
     println!("par2 files: {}", resolved.par2_paths.len());
     for path in &resolved.par2_paths {
@@ -295,9 +285,9 @@ fn print_context(action: &str, resolved: &ResolvedPar2Input, par2_set: &weaver_p
 }
 
 fn print_verification_report(
-    verification: &weaver_par2::VerificationResult,
-    placement_plan: Option<&weaver_par2::PlacementPlan>,
-    par2_set: &weaver_par2::Par2FileSet,
+    verification: &par2_rs::VerificationResult,
+    placement_plan: Option<&par2_rs::PlacementPlan>,
+    par2_set: &par2_rs::Par2FileSet,
 ) {
     if let Some(plan) = placement_plan {
         println!(
@@ -332,19 +322,19 @@ fn print_verification_report(
     let mut missing = 0usize;
     for file in &verification.files {
         match &file.status {
-            weaver_par2::FileStatus::Complete => complete += 1,
-            weaver_par2::FileStatus::Damaged(bad_slices) => {
+            par2_rs::FileStatus::Complete => complete += 1,
+            par2_rs::FileStatus::Damaged(bad_slices) => {
                 damaged += 1;
                 println!("  damaged: {} ({} bad slice(s))", file.filename, bad_slices);
             }
-            weaver_par2::FileStatus::Missing => {
+            par2_rs::FileStatus::Missing => {
                 missing += 1;
                 println!(
                     "  missing: {} ({} slice(s))",
                     file.filename, file.missing_slice_count
                 );
             }
-            weaver_par2::FileStatus::Renamed(path) => {
+            par2_rs::FileStatus::Renamed(path) => {
                 println!("  renamed: {} -> {}", file.filename, path.display());
             }
         }
@@ -359,15 +349,15 @@ fn print_verification_report(
         verification.total_missing_blocks, verification.recovery_blocks_available
     );
     match &verification.repairable {
-        weaver_par2::Repairability::NotNeeded => println!("repairability: not needed"),
-        weaver_par2::Repairability::Repairable {
+        par2_rs::Repairability::NotNeeded => println!("repairability: not needed"),
+        par2_rs::Repairability::Repairable {
             blocks_needed,
             blocks_available,
         } => println!(
             "repairability: repairable (need {}, have {})",
             blocks_needed, blocks_available
         ),
-        weaver_par2::Repairability::Insufficient {
+        par2_rs::Repairability::Insufficient {
             blocks_needed,
             blocks_available,
             deficit,
@@ -375,15 +365,15 @@ fn print_verification_report(
             "repairability: insufficient (need {}, have {}, deficit {})",
             blocks_needed, blocks_available, deficit
         ),
-        weaver_par2::Repairability::ResourceLimited { reason } => {
+        par2_rs::Repairability::ResourceLimited { reason } => {
             println!("repairability: resource-limited ({reason})")
         }
     }
 }
 
 fn format_conflict_filenames(
-    placement_plan: &weaver_par2::PlacementPlan,
-    par2_set: &weaver_par2::Par2FileSet,
+    placement_plan: &par2_rs::PlacementPlan,
+    par2_set: &par2_rs::Par2FileSet,
 ) -> String {
     let names: Vec<String> = placement_plan
         .conflicts

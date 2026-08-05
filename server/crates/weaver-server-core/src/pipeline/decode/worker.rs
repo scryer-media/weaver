@@ -448,7 +448,7 @@ impl Pipeline {
                 }
             };
 
-            let part_crc = weaver_par2::checksum::crc32(&bytes);
+            let part_crc = par2_rs::checksum::crc32(&bytes);
             self.note_file_hash_chunk(file_id, expected_offset, &bytes, part_crc, false);
         }
     }
@@ -549,7 +549,7 @@ impl Pipeline {
             if len == 0 {
                 return None;
             }
-            let op = weaver_par2::checksum::Crc32CombineOp::new(len);
+            let op = par2_rs::checksum::Crc32CombineOp::new(len);
             crc32 = op.combine(crc32, range.part_crc);
             all_parts_crc_verified &= range.part_crc_verified;
             bytes_fed = bytes_fed.checked_add(len)?;
@@ -2232,7 +2232,7 @@ impl Pipeline {
 fn checksum_completed_file(path: &std::path::Path) -> io::Result<CompletedFileChecksum> {
     let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.file_hash.reread");
     let mut file = File::open(path)?;
-    let mut md5 = weaver_par2::checksum::FileHashState::new();
+    let mut md5 = par2_rs::checksum::FileHashState::new();
     let mut crc32 = crc32fast::Hasher::new();
     let mut buffer = [0u8; 256 * 1024];
     loop {

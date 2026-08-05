@@ -14,10 +14,10 @@ weaver-model = { path = "../../../shared/crates/weaver-model", default-features 
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }
 weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
 weaver-yenc = { path = "../../../engines/weaver-yenc", default-features = false }
-weaver-par2 = { workspace = true, features = [
+par2-rs = { workspace = true, features = [
     "native-crypto",
 ] }
-weaver-unrar = { workspace = true, features = [
+unrar-rs = { workspace = true, features = [
     "crypto-aws-lc",
 ] }
 serde = { workspace = true }

@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use weaver_par2::par2_set::Par2FileSet;
+use par2_rs::par2_set::Par2FileSet;
 
 use crate::jobs::ids::{JobId, NzbFileId};
 use crate::pipeline::DecodedChunk;
@@ -75,7 +75,7 @@ pub(crate) struct LiveRead {
 /// Binding of a pipeline file to the PAR2 file description it carries.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LiveBinding {
-    pub(crate) par2_file_id: weaver_par2::FileId,
+    pub(crate) par2_file_id: par2_rs::FileId,
     pub(crate) length: u64,
 }
 
@@ -161,7 +161,7 @@ struct PartialBlock {
 }
 
 struct LiveFile {
-    par2_file_id: weaver_par2::FileId,
+    par2_file_id: par2_rs::FileId,
     length: u64,
     blocks: Vec<BlockState>,
     partials: HashMap<u32, PartialBlock>,
@@ -686,7 +686,7 @@ impl LivePar2Registry {
     pub(crate) fn fully_verified_files(
         &self,
         job_id: JobId,
-    ) -> Option<HashMap<weaver_par2::FileId, NzbFileId>> {
+    ) -> Option<HashMap<par2_rs::FileId, NzbFileId>> {
         if !self.enabled {
             return None;
         }
@@ -831,7 +831,7 @@ fn stage_partial(
     block_offset: u64,
     chunk: &[u8],
     slice_size: u64,
-    expected: &weaver_par2::SliceChecksum,
+    expected: &par2_rs::SliceChecksum,
     budget: &mut PartialBudget<'_>,
     counters: &mut FeedCounters<'_>,
 ) {
@@ -915,15 +915,15 @@ fn stage_partial(
 }
 
 /// Full-strength block check: MD5 **and** CRC32 against the IFSC entry, with
-/// the tail block zero-padded to `slice_size` exactly as `weaver-par2` does.
+/// the tail block zero-padded to `slice_size` exactly as `par2-rs` does.
 /// v1 has no CRC-only fast path — plan 135 D5 leaves that as future work.
 fn verify_block_bytes(
     data: &[u8],
     slice_size: u64,
-    expected: &weaver_par2::SliceChecksum,
+    expected: &par2_rs::SliceChecksum,
 ) -> BlockState {
     let _cpu_scope = crate::runtime::perf_probe::cpu_scope("verify.live_par2.block_hash");
-    let mut state = weaver_par2::SliceChecksumState::new();
+    let mut state = par2_rs::SliceChecksumState::new();
     state.update(data);
     let (crc32, md5) = state.finalize(Some(slice_size));
     if crc32 == expected.crc32 && md5 == expected.md5 {

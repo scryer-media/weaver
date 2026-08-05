@@ -80,7 +80,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use weaver_unrar::{ReadSeek, VolumeProvider, VolumeProviderError};
+use unrar_rs::{ReadSeek, VolumeProvider, VolumeProviderError};
 
 use super::ByteRanges;
 use super::router::MemberExtent;

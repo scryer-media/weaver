@@ -97,7 +97,7 @@
 
 use std::collections::BTreeMap;
 
-use weaver_unrar::{
+use unrar_rs::{
     EncryptedStore, KdfCache, MemberCipherKey, MemberKeying, PasswordCheck, RarResult,
     check_member_password, convert_crc32_to_mac, derive_rar5_material,
 };
@@ -151,7 +151,7 @@ pub(crate) enum CryptRefusal {
     /// the parity this refusal exists to keep.
     WrongPassword,
     /// The headers state key material this build cannot derive from: a RAR5 KDF
-    /// count over `weaver-unrar`'s ceiling.
+    /// count over `unrar-rs`'s ceiling.
     ///
     /// **Not** a RAR4 member any more (E3). RAR4 file encryption is keyed here
     /// now, and a RAR4 member the *library* cannot key — one of the three
@@ -214,7 +214,7 @@ pub(crate) enum HeaderCryptRefusal {
     Rar4Headers,
     /// The archive's type-4 record states key material this build will not
     /// derive from: an encryption version it does not implement, or a KDF count
-    /// over `weaver-unrar`'s [`weaver_unrar::CRYPT5_KDF_LG2_COUNT_MAX`].
+    /// over `unrar-rs`'s [`unrar_rs::CRYPT5_KDF_LG2_COUNT_MAX`].
     ///
     /// The count is the *archive's* claim, so this is the ceiling that keeps a
     /// hostile post from choosing how much PBKDF2 an admission costs. The
@@ -338,7 +338,7 @@ impl HeaderKeyRing {
 
     /// The E4 decision, made **before any header is decrypted**.
     ///
-    /// [`weaver_unrar::PasswordCheck`] has three outcomes and only one of them
+    /// [`unrar_rs::PasswordCheck`] has three outcomes and only one of them
     /// admits:
     ///
     /// - [`PasswordCheck::Verified`] — admit. The archive's own check
@@ -357,7 +357,7 @@ impl HeaderKeyRing {
     /// verify.
     pub(crate) fn resolve(
         &mut self,
-        encryption: &weaver_unrar::RarVolumeHeaderEncryption,
+        encryption: &unrar_rs::RarVolumeHeaderEncryption,
     ) -> Result<&str, HeaderCryptRefusal> {
         if let Some(refusal) = self.refusal {
             return Err(refusal);
@@ -366,15 +366,15 @@ impl HeaderKeyRing {
             return Ok(self.verified.as_deref().expect("just checked"));
         }
         let facts = match encryption {
-            weaver_unrar::RarVolumeHeaderEncryption::Rar5(facts) => facts,
-            weaver_unrar::RarVolumeHeaderEncryption::Rar4 => {
+            unrar_rs::RarVolumeHeaderEncryption::Rar5(facts) => facts,
+            unrar_rs::RarVolumeHeaderEncryption::Rar4 => {
                 return Err(self.refuse(HeaderCryptRefusal::Rar4Headers));
             }
             // Only ever reached by a caller that asked about a volume whose
             // headers are readable, which has no `-hp` decision to make. Treated
             // as unprovable rather than admitted, because "there is no archive
             // key" is not "this password is the archive key".
-            weaver_unrar::RarVolumeHeaderEncryption::None => {
+            unrar_rs::RarVolumeHeaderEncryption::None => {
                 return Err(self.refuse(HeaderCryptRefusal::Unverifiable));
             }
         };
@@ -426,7 +426,7 @@ impl HeaderKeyRing {
     }
 }
 
-/// One member's derived key material. Copied out of `weaver-unrar`'s zeroizing
+/// One member's derived key material. Copied out of `unrar-rs`'s zeroizing
 /// carrier deliberately: the router needs the key for the life of the set, and
 /// the alternative is re-running a 2^n PBKDF2 per span.
 #[derive(Clone, Copy)]
@@ -509,7 +509,7 @@ impl CryptTuple {
 /// password demotes the set by name rather than trying to carry one across.
 pub(crate) struct KeyRing {
     password: Option<String>,
-    /// `weaver-unrar`'s own KDF cache. Two members of one set nearly always
+    /// `unrar-rs`'s own KDF cache. Two members of one set nearly always
     /// share a tuple, and a set with 200 members would otherwise pay 200
     /// PBKDF2 runs at admission.
     cache: KdfCache,
@@ -597,7 +597,7 @@ impl KeyRing {
 
     /// The password this ring is deriving from, for the one consumer that needs
     /// the string rather than a key: the tolerated-member extraction, which
-    /// hands it to `weaver-unrar` instead of decrypting anything itself.
+    /// hands it to `unrar-rs` instead of decrypting anything itself.
     ///
     /// Every other reader wants [`Self::keys_for`]. Nothing may persist or log
     /// this — see the type docs.
@@ -738,7 +738,7 @@ impl KeyRing {
 /// A member's crypt identity as its **headers** state it, in the shape the
 /// coverage snapshot persists (schema 5).
 ///
-/// Deliberately weaver's own type rather than `weaver-unrar`'s
+/// Deliberately weaver's own type rather than `unrar-rs`'s
 /// [`MemberKeying`]: this one is written to a database row, so its field order
 /// is a schema and a library type's is not. [`MemberCryptKeying::of`] is the
 /// one-way bridge, and [`MemberCrypt::restore`] compares whole values — a row
@@ -984,7 +984,7 @@ impl MemberCipher {
     /// were posted.
     ///
     /// The inverse of [`MemberCipherKey::decrypt_range`], and deliberately the
-    /// *same* backend: `weaver-unrar` picks AWS-LC or the pure-Rust cipher per
+    /// *same* backend: `unrar-rs` picks AWS-LC or the pure-Rust cipher per
     /// target and pins the two equal with differential tests — for both widths —
     /// so re-encrypting through it cannot drift from the decrypt weaver already
     /// trusts.
@@ -1382,7 +1382,7 @@ impl MemberCrypt {
     /// `None` is the fourth combination refusing to answer: a header claiming a
     /// keyed checksum on a member with no hash key is a contradiction between
     /// two facts, and there is no value this could return that means anything.
-    /// `weaver-unrar` hard-wires `data_hash_uses_mac = false` on every RAR4
+    /// `unrar-rs` hard-wires `data_hash_uses_mac = false` on every RAR4
     /// facts path, so the combination is unreachable and this is a shape
     /// statement rather than a live guard — but the alternative was returning
     /// the *unfolded* value and trusting it not to collide with the MAC the
@@ -1536,7 +1536,7 @@ impl MemberCrypt {
 
 #[cfg(test)]
 mod tests {
-    use weaver_unrar::RarVolumeMemberEncryptionFacts;
+    use unrar_rs::RarVolumeMemberEncryptionFacts;
 
     use super::*;
 
@@ -1711,7 +1711,7 @@ mod tests {
         let span = (CHECKPOINT_STRIDE * 2 + 8192) as usize;
         let (mut crypt, key) = keyed_crypt(span as u64, 0);
         let plain: Vec<u8> = (0..span).map(|index| (index % 251) as u8).collect();
-        let mut cipher = weaver_unrar::test_support::encrypt_aes256_cbc(&key, &[9u8; 16], &plain);
+        let mut cipher = unrar_rs::test_support::encrypt_aes256_cbc(&key, &[9u8; 16], &plain);
         assert!(crypt.decrypt_range(0, &[9u8; 16], &mut cipher));
         assert_eq!(
             cipher, plain,
@@ -1741,7 +1741,7 @@ mod tests {
         facts
             .encrypt(&seed.preceding, &mut reencrypted)
             .expect("a block-aligned range must not be refused");
-        let posted = weaver_unrar::test_support::encrypt_aes256_cbc(&key, &[9u8; 16], &plain);
+        let posted = unrar_rs::test_support::encrypt_aes256_cbc(&key, &[9u8; 16], &plain);
         assert_eq!(reencrypted, posted[at..at + 4096]);
 
         // An offset below every checkpoint falls back to the member's IV, which
@@ -1757,7 +1757,7 @@ mod tests {
         // dropping them before the overlay reads them.
         let (mut crypt, key) = keyed_crypt(256, 0);
         let plain: Vec<u8> = (0..256u16).map(|index| (index % 251) as u8).collect();
-        let posted = weaver_unrar::test_support::encrypt_aes256_cbc(&key, &[9u8; 16], &plain);
+        let posted = unrar_rs::test_support::encrypt_aes256_cbc(&key, &[9u8; 16], &plain);
         let last_block: [u8; 16] = posted[240..].try_into().expect("one block");
         let mut cipher = posted.clone();
         assert!(crypt.decrypt_range(0, &[9u8; 16], &mut cipher));
@@ -1946,7 +1946,7 @@ mod tests {
         let iv = keys.iv;
         let mut crypt = MemberCrypt::new(keys, &keying);
         crypt.observe(&EncryptedStore {
-            format: weaver_unrar::ArchiveFormat::Rar4,
+            format: unrar_rs::ArchiveFormat::Rar4,
             crypt: None,
             rar4_salt: Some([0x9Bu8; 8]),
             cipher_size: Some(48),
@@ -2041,7 +2041,7 @@ mod tests {
 
     #[test]
     fn a_rar4_members_key_and_iv_are_the_derivation_the_library_states() {
-        // The router's key must be the one `weaver-unrar` derives for the same
+        // The router's key must be the one `unrar-rs` derives for the same
         // password and salt, or every byte it decrypts is garbage that only the
         // member CRC32 would catch. Held against the library surface directly.
         let mut ring = KeyRing::new();
@@ -2050,7 +2050,7 @@ mod tests {
             .admit(&rar4_keying(Some([0x9Bu8; 8])))
             .expect("admitted");
         let (expected_key, expected_iv) =
-            weaver_unrar::rar4_derive_key("moonlit-harbour", Some(&[0x9Bu8; 8]));
+            unrar_rs::rar4_derive_key("moonlit-harbour", Some(&[0x9Bu8; 8]));
         assert_same_key(
             keys.key,
             MemberCipherKey::Aes128(expected_key),
@@ -2071,7 +2071,7 @@ mod tests {
         ring.set_password(Some("moonlit-harbour"));
         let keying = rar4_keying(Some([0x9Bu8; 8]));
         let keys = ring.admit(&keying).expect("admitted");
-        let (raw_key, iv) = weaver_unrar::rar4_derive_key("moonlit-harbour", Some(&[0x9Bu8; 8]));
+        let (raw_key, iv) = unrar_rs::rar4_derive_key("moonlit-harbour", Some(&[0x9Bu8; 8]));
 
         let mut padded: Vec<u8> = (0..PAYLOAD).map(|index| (index % 251) as u8).collect();
         for index in PAYLOAD..cipher_len {
@@ -2081,7 +2081,7 @@ mod tests {
         // fixture's "posted" bytes should come from the same surface the overlay
         // re-derives them with (E2 review's test-support finding).
         let mut posted = padded.clone();
-        weaver_unrar::encrypt_cipher_range_rar4(&raw_key, &iv, &mut posted)
+        unrar_rs::encrypt_cipher_range_rar4(&raw_key, &iv, &mut posted)
             .expect("the padded payload is block-aligned");
 
         let mut crypt = MemberCrypt::new(keys, &keying);

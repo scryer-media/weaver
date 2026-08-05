@@ -231,7 +231,7 @@ impl Pipeline {
     async fn apply_par2_authoritative_identity(
         &mut self,
         job_id: JobId,
-        par2_set: &weaver_par2::Par2FileSet,
+        par2_set: &par2_rs::Par2FileSet,
     ) -> Result<(), String> {
         let Some(state) = self.jobs.get(&job_id) else {
             return Ok(());
@@ -725,7 +725,7 @@ impl Pipeline {
     pub(crate) async fn live_par2_clean_verification(
         &self,
         job_id: JobId,
-    ) -> Option<(weaver_par2::VerificationResult, weaver_par2::PlacementPlan)> {
+    ) -> Option<(par2_rs::VerificationResult, par2_rs::PlacementPlan)> {
         let (verification, placement_plan, length_checks) =
             self.live_par2_clean_verification_shape(job_id)?;
         if !Self::live_par2_lengths_match(job_id, length_checks).await {
@@ -816,8 +816,8 @@ impl Pipeline {
         &self,
         job_id: JobId,
     ) -> Option<(
-        weaver_par2::VerificationResult,
-        weaver_par2::PlacementPlan,
+        par2_rs::VerificationResult,
+        par2_rs::PlacementPlan,
         Vec<LiveLengthCheck>,
     )> {
         let par2_set = self.par2_set(job_id)?;
@@ -862,23 +862,23 @@ impl Pipeline {
             });
 
             let slice_count = par2_set.slice_count_for_file(desc.length) as usize;
-            files.push(weaver_par2::verify::FileVerification {
+            files.push(par2_rs::verify::FileVerification {
                 file_id: *par2_file_id,
                 filename: correct_filename,
-                status: weaver_par2::verify::FileStatus::Complete,
+                status: par2_rs::verify::FileStatus::Complete,
                 valid_slices: vec![true; slice_count],
                 missing_slice_count: 0,
             });
         }
 
         Some((
-            weaver_par2::VerificationResult {
+            par2_rs::VerificationResult {
                 files,
                 recovery_blocks_available: par2_set.recovery_block_count(),
                 total_missing_blocks: 0,
-                repairable: weaver_par2::verify::Repairability::NotNeeded,
+                repairable: par2_rs::verify::Repairability::NotNeeded,
             },
-            weaver_par2::PlacementPlan {
+            par2_rs::PlacementPlan {
                 exact: par2_set.recovery_file_ids.clone(),
                 swaps: Vec::new(),
                 renames: Vec::new(),
@@ -1038,7 +1038,7 @@ impl Pipeline {
 
         let parse_path = file_path.clone();
         let par2_set = match tokio::task::spawn_blocking(move || {
-            weaver_par2::Par2FileSet::from_paths(&[parse_path])
+            par2_rs::Par2FileSet::from_paths(&[parse_path])
         })
         .await
         {
@@ -1122,7 +1122,7 @@ impl Pipeline {
 
         let parse_path = file_path.clone();
         let packet_list = match tokio::task::spawn_blocking(move || {
-            weaver_par2::scan_packets_from_path_with_set_ids(&parse_path).map(|packets| {
+            par2_rs::scan_packets_from_path_with_set_ids(&parse_path).map(|packets| {
                 packets
                     .into_iter()
                     .filter_map(|packet| {

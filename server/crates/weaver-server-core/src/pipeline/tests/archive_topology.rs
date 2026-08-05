@@ -36,7 +36,7 @@ fn started_member_names_excludes_orphan_split_continuations() {
     // Volume 1 is missing: the member's continuation in volume 2 cannot be
     // linked to its base entry, so it surfaces as a second entry with the
     // same path. Path-collision checks must not treat that as a collision.
-    let mut archive = weaver_unrar::RarArchive::open(std::io::Cursor::new(vol0)).unwrap();
+    let mut archive = unrar_rs::RarArchive::open(std::io::Cursor::new(vol0)).unwrap();
     archive
         .add_volume(2, Box::new(std::io::Cursor::new(vol2)))
         .unwrap();
