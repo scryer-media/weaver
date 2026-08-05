@@ -195,6 +195,39 @@ impl LivePar2Registry {
         self.jobs.remove(&job_id);
     }
 
+    /// Whether live verification is running for this job (plan 138, M2).
+    ///
+    /// The adopted engine expresses "active" as holding a verification
+    /// session: `activate` installs one, and the invalidation paths drop it.
+    /// That is the same question 0.8.0 asked of its `JobLive::Active` variant,
+    /// and it is what the retirement tests assert after CRC recovery and after
+    /// an authoritative repair.
+    pub(crate) fn is_active(&self, job_id: JobId) -> bool {
+        self.jobs
+            .get(&job_id)
+            .is_some_and(|job| job.session.is_some())
+    }
+
+    /// Coverage recorded for a file before it was bound to a PAR2 description
+    /// (plan 138, M2).
+    ///
+    /// 0.8.0 read this from its pre-binding buffers; the adopted engine keeps
+    /// the same thing in `pre_metadata_ranges`. Plan 136's encrypted-overlay
+    /// test uses it to prove a direct volume's posted cipher really reached
+    /// live verification, so the answer must stay per-file and non-empty.
+    pub(crate) fn recorded_ranges(&self, file_id: NzbFileId) -> Option<Vec<(u64, u64)>> {
+        self.jobs
+            .get(&file_id.job_id)?
+            .pre_metadata_ranges
+            .get(&file_id)
+            .map(|set| {
+                set.ranges
+                    .iter()
+                    .map(|(start, end)| (*start, *end))
+                    .collect()
+            })
+    }
+
     pub(crate) fn invalidate_job(&mut self, job_id: JobId) {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
@@ -768,4 +801,68 @@ mod tests {
         assert_eq!(registry.metrics.backfill_reads, 1);
         assert_eq!(registry.metrics.disk_read_budget_exhausted, 1);
     }
+}
+
+/// Best-effort ranged read: a short read (truncated or missing file) yields
+/// fewer bytes rather than an error, leaving those blocks `Pending`.
+pub(crate) fn read_range_best_effort(
+    path: &std::path::Path,
+    offset: u64,
+    len: u64,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(len) = usize::try_from(len) else {
+        return Ok(Vec::new());
+    };
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = vec![0u8; len];
+    let mut read = 0usize;
+    while read < len {
+        match file.read(&mut bytes[read..])? {
+            0 => break,
+            n => read += n,
+        }
+    }
+    bytes.truncate(read);
+    Ok(bytes)
+}
+
+/// Same contract, same shape: a range the set never placed comes back short
+/// rather than as an error, so those blocks stay `Pending` and the
+/// authoritative pass owns them. The provider reports a hole as an error, which
+/// is *stronger* than a short read — it distinguishes "not downloaded" from "the
+/// disk is broken" — and this is the one caller that deliberately flattens the
+/// two, because live verification is advisory and neither one is a verdict.
+pub(crate) fn read_virtual_range_best_effort(
+    provider: &crate::pipeline::direct_store::provider::HybridVolumeProvider,
+    volume_index: u32,
+    offset: u64,
+    len: u64,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(len) = usize::try_from(len) else {
+        return Ok(Vec::new());
+    };
+    let mut reader = provider.open(volume_index).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("direct-store volume {volume_index} is not registered"),
+        )
+    })?;
+    reader.seek(SeekFrom::Start(offset))?;
+    let mut bytes = vec![0u8; len];
+    let mut read = 0usize;
+    while read < len {
+        match reader.read(&mut bytes[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(error) if crate::pipeline::direct_store::provider::is_hole(&error) => break,
+            Err(error) => return Err(error),
+        }
+    }
+    bytes.truncate(read);
+    Ok(bytes)
 }

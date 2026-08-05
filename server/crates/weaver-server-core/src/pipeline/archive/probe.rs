@@ -112,10 +112,26 @@ impl Pipeline {
         job_id: JobId,
         identity: ActiveFileIdentity,
     ) -> Result<(), String> {
+        // Only a change of *name* rebinds what live verification bound its
+        // evidence to. Recording an identity for the first time, or re-saving
+        // one whose filename is unchanged, moves no bytes — and with a
+        // retained session (plan 138) invalidating there would discard every
+        // slice verdict the job had accumulated. Compare against the name in
+        // effect now, which falls back to the NZB's own, so a first record
+        // that renames still invalidates.
+        let previous_filename = self.current_filename_for_file_id(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: identity.file_index,
+            },
+        );
         self.db
             .save_file_identity(job_id, &identity)
             .map_err(|error| format!("failed to save file identity: {error}"))?;
-        self.invalidate_par2_session_for_identity_rebind(job_id);
+        if previous_filename.as_deref() != Some(identity.current_filename.as_str()) {
+            self.invalidate_par2_session_for_identity_rebind(job_id);
+        }
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.file_identities.insert(identity.file_index, identity);
         }

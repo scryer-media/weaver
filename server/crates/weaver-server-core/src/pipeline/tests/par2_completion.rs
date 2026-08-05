@@ -3030,9 +3030,9 @@ async fn live_par2_verification_skips_the_full_pass_for_a_clean_job() {
 
     let metrics = pipeline.live_par2.metrics();
     assert_eq!(metrics.full_verify_skips, 1);
-    assert_eq!(metrics.blocks_bad, 0);
-    assert_eq!(metrics.blocks_claimed_in_stream, 2);
-    assert_eq!(metrics.blocks_settled, 0);
+    assert_eq!(metrics.invalid_slices, 0);
+    assert_eq!(metrics.strongly_verified_slices, 2);
+    assert_eq!(metrics.settle_reads, 0);
     assert_eq!(pipeline.par2_repairer_analyze_calls, 0);
     assert_eq!(pipeline.par2_authoritative_verify_calls, 0);
     assert!(pipeline.par2_verified.contains(&job_id));
@@ -3069,7 +3069,7 @@ async fn clean_job_reaches_the_same_status_with_live_par2_disabled() {
 
     let metrics = pipeline.live_par2.metrics();
     assert_eq!(metrics.full_verify_skips, 0);
-    assert_eq!(metrics.blocks_claimed_in_stream, 0);
+    assert_eq!(metrics.strongly_verified_slices, 0);
     assert!(pipeline.par2_verified.contains(&job_id));
 
     pump_pipeline_runtime_queues(&mut pipeline).await;
@@ -3106,8 +3106,8 @@ async fn damaged_job_keeps_the_existing_verify_path_with_live_par2_enabled() {
 
     let metrics = pipeline.live_par2.metrics();
     assert_eq!(metrics.full_verify_skips, 0);
-    assert_eq!(metrics.blocks_bad, 1);
-    assert_eq!(metrics.blocks_claimed_in_stream, 1);
+    assert_eq!(metrics.invalid_slices, 1);
+    assert_eq!(metrics.strongly_verified_slices, 1);
     assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
     assert!(!pipeline.par2_verified.contains(&job_id));
     assert!(matches!(
@@ -3172,14 +3172,18 @@ async fn live_par2_backfills_payload_that_landed_before_the_index() {
     // Payload first: its spans are recorded as coalesced ranges only, then
     // read back from disk when the index installs the set.
     submit_live_par2_payload(&mut pipeline, job_id, payload_filename, &payload).await;
-    assert_eq!(pipeline.live_par2.metrics().blocks_claimed_in_stream, 0);
+    assert_eq!(pipeline.live_par2.metrics().strongly_verified_slices, 0);
 
     submit_live_par2_index(&mut pipeline, job_id, index_filename, &par2_bytes).await;
     drain_live_par2_job(&mut pipeline, job_id).await;
 
     let metrics = pipeline.live_par2.metrics();
-    assert_eq!(metrics.blocks_backfilled, 2);
-    assert_eq!(metrics.blocks_claimed_in_stream, 0);
+    // One read, not one per slice: the session counts read *operations*, and
+    // the payload arrived as a single contiguous span, so both described
+    // slices fall inside one coalesced range. `disk_read_bytes` is what
+    // proves the read spanned the whole description rather than half of it.
+    assert_eq!(metrics.backfill_reads, 1);
+    assert_eq!(metrics.disk_read_bytes, payload.len() as u64);
     assert_eq!(metrics.full_verify_skips, 1);
     assert_eq!(pipeline.par2_authoritative_verify_calls, 0);
     assert_eq!(pipeline.par2_repairer_analyze_calls, 0);
@@ -3219,7 +3223,7 @@ async fn live_par2_refuses_the_short_circuit_when_the_file_name_does_not_match()
     let metrics = pipeline.live_par2.metrics();
     assert_eq!(metrics.full_verify_skips, 0);
     assert_eq!(
-        metrics.blocks_claimed_in_stream, 0,
+        metrics.strongly_verified_slices, 0,
         "a file whose name matches no description must never bind"
     );
     // The existing passes still take the job to a clean verdict, exactly as
@@ -3353,7 +3357,7 @@ async fn live_par2_refuses_a_partially_bound_recovery_set() {
 
     let metrics = pipeline.live_par2.metrics();
     assert_eq!(
-        metrics.blocks_claimed_in_stream, 2,
+        metrics.strongly_verified_slices, 2,
         "the bound file must still verify in stream"
     );
     assert_eq!(metrics.full_verify_skips, 0);
@@ -3481,7 +3485,14 @@ async fn stage_clean_live_par2_verdict(
         build_repairable_par2_set(payload_filename, payload, 64, 0),
         &[],
     );
-    pipeline.activate_live_par2(job_id).await;
+    // M2 (plan 138): the adopted engine seeds its verification session from the
+    // PAR2 packets, so activation takes them and is synchronous. Production
+    // scans them off disk; the test scans the same bytes it just wrote.
+    let live_packets: Vec<par2_rs::Packet> = par2_rs::scan_packets(par2_bytes, 0)
+        .into_iter()
+        .map(|(packet, _)| packet)
+        .collect();
+    pipeline.activate_live_par2(job_id, &live_packets);
     pipeline.note_live_par2_segment(
         NzbFileId {
             job_id,
@@ -3490,7 +3501,7 @@ async fn stage_clean_live_par2_verdict(
         0,
         &DecodedChunk::from(payload.to_vec()),
     );
-    assert_eq!(pipeline.live_par2.metrics().blocks_claimed_in_stream, 2);
+    assert_eq!(pipeline.live_par2.metrics().strongly_verified_slices, 2);
 }
 
 #[tokio::test]
@@ -3593,7 +3604,7 @@ async fn live_par2_refuses_the_short_circuit_while_a_suspect_volume_is_recorded(
     assert_eq!(
         pipeline
             .live_par2
-            .fully_verified_files(job_id)
+            .complete_bindings_if_strong(job_id)
             .map(|verified| verified.len()),
         Some(1),
         "the refusal must come from the gate, not from an unproven file"
@@ -3637,7 +3648,14 @@ async fn par2_repair_execution_retires_live_par2_state() {
             (1, recovery_filename, 1, true),
         ],
     );
-    pipeline.activate_live_par2(job_id).await;
+    // M2 (plan 138): the adopted engine seeds its verification session from the
+    // PAR2 packets, so activation takes them and is synchronous. Production
+    // scans them off disk; the test scans the same bytes it just wrote.
+    let live_packets: Vec<par2_rs::Packet> = par2_rs::scan_packets(&par2_bytes, 0)
+        .into_iter()
+        .map(|(packet, _)| packet)
+        .collect();
+    pipeline.activate_live_par2(job_id, &live_packets);
     pipeline.note_live_par2_segment(
         NzbFileId {
             job_id,
@@ -3708,8 +3726,13 @@ async fn live_par2_refuses_the_short_circuit_when_the_on_disk_length_disagrees()
 
     let metrics = pipeline.live_par2.metrics();
     assert_eq!(
-        metrics.blocks_backfilled, 2,
-        "the described blocks must still have verified clean"
+        metrics.backfill_reads, 1,
+        "the described blocks must still have been read back"
+    );
+    assert_eq!(
+        metrics.disk_read_bytes,
+        payload.len() as u64,
+        "the read covers what PAR2 describes, not the bytes the file grew by"
     );
     assert_eq!(metrics.full_verify_skips, 0);
 }

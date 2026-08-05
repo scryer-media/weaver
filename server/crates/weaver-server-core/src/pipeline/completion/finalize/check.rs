@@ -2679,6 +2679,15 @@ impl Pipeline {
 
             let par2_set = self.par2_set(job_id).cloned();
 
+            // A suspect volume is damage the full pass deliberately keeps:
+            // `apply_eager_delete_exclusions` retains its missing blocks
+            // instead of forgiving them. Live block state says nothing about
+            // that, so any suspect volume refuses every live short-circuit —
+            // both the whole-pass skip below and the quick path's, which the
+            // stateful session (plan 138, M2) also lets stand in for the full
+            // pass.
+            let no_suspect_volumes = self.suspect_rar_volumes_for_job(job_id).is_empty();
+
             // Live in-stream block verification (plan 135, D5). Deliberately
             // conservative: it only applies to a clean, fully downloaded job
             // that is not mid-repair, and only when every recovery-set file is
@@ -2693,11 +2702,7 @@ impl Pipeline {
                 && !extension_repair_requested
                 && !matches!(current_status, JobStatus::Repairing)
                 && clean_par2_integrity_gate_allows_fast_path
-                // A suspect volume is damage the full pass deliberately keeps:
-                // `apply_eager_delete_exclusions` retains its missing blocks
-                // instead of forgiving them. Live block state says nothing
-                // about that, so any suspect volume refuses the short-circuit.
-                && self.suspect_rar_volumes_for_job(job_id).is_empty();
+                && no_suspect_volumes;
             if live_par2_short_circuit_allowed && par2_set.is_some() {
                 self.settle_live_par2_job(job_id).await;
                 if let Some((verification, placement_plan)) =
@@ -2739,7 +2744,14 @@ impl Pipeline {
             if quick_par2_verification_allowed && let Some(par2_set) = par2_set.as_ref() {
                 let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
                 self.settle_live_par2_job(job_id).await;
-                let live_short_circuit = self.live_par2_complete_bindings(job_id).is_some();
+                // What this records is "live evidence stood in for the full
+                // pass", so it takes the same evidence the full short-circuit
+                // above demands — complete bindings alone say nothing about
+                // the length the file actually has on disk. When that check
+                // fails, the quick pass still succeeds on its own persisted
+                // checksums; the credit simply does not belong to live.
+                let live_short_circuit =
+                    no_suspect_volumes && self.live_par2_clean_verification(job_id).await.is_some();
                 Self::trip_par2_verification_started_failpoint();
                 match self
                     .quick_verify_par2_with_placement(

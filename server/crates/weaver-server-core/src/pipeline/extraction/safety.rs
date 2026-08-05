@@ -610,6 +610,14 @@ impl<W> BudgetedWriter<W> {
             member_written: 0,
         }
     }
+
+    /// The wrapped handle, for operations that act on the file itself rather
+    /// than on its contents — preallocation, for one. Reading and writing
+    /// still go through the budgeted `Write` impl, which is where the byte
+    /// accounting lives.
+    pub(crate) fn get_ref(&self) -> &W {
+        &self.inner
+    }
 }
 
 impl<W: Write> Write for BudgetedWriter<W> {

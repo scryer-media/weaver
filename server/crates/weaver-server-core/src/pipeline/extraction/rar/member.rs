@@ -503,12 +503,17 @@ impl Pipeline {
             budget.reject_unsafe_path(format!("RAR partial output escaped staging root: {error}"))
         })?;
         let partial_file = root.create_file(partial_relative, &budget)?;
-        // M2-STUB(plan 138): 0.7.9 preallocated the output file here to avoid
-        // fragmentation, but that takes `&File` and 0.8.0's budget-tracked
-        // `create_file` returns a `BudgetedWriter<File>` with no inner accessor.
-        // Dropping the preallocation loses only an I/O optimisation; the budget
-        // enforcement it would bypass is the load-bearing property. M2 should
-        // either expose the inner handle or preallocate before wrapping.
+        // Reserve the extent up front so a large member does not stream into a
+        // fragmented file. This borrows the capability handle as a plain `File`
+        // view rather than taking ownership of it, and it changes allocation
+        // only — every byte still goes through the budgeted writer.
+        {
+            use cap_std::io_lifetimes::AsFilelike;
+            unrar_rs::RarArchive::preallocate_output_file(
+                &partial_file.get_ref().as_filelike_view::<std::fs::File>(),
+                unpacked_size,
+            );
+        }
         let shared = Rc::new(RefCell::new(SharedOutputFile {
             inner: std::io::BufWriter::with_capacity(8 * 1024 * 1024, partial_file),
         }));

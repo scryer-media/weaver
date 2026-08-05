@@ -812,7 +812,7 @@ impl Pipeline {
                     job_id,
                     file_index: *file_index,
                 };
-                let Some(binding) = self.resolve_live_par2_binding(file_id) else {
+                let Some((par2_file_id, _, _, _)) = self.resolve_live_par2_binding(file_id) else {
                     continue;
                 };
                 // A retained image carries the lengths it was captured with, so
@@ -835,7 +835,7 @@ impl Pipeline {
                     }
                 };
                 lengths.insert(*volume_index, len);
-                bindings.insert(*volume_index, (*file_index, binding.0 /* M2-STUB(plan 138): 0.7.9 returns (par2_file_id, len, path, complete) */));
+                bindings.insert(*volume_index, (*file_index, par2_file_id));
             }
             let set_volumes = match retained {
                 Some(volumes) => volumes.to_vec(),
@@ -1054,7 +1054,7 @@ impl Pipeline {
                     return None;
                 }
                 self.resolve_live_par2_binding(file_id)
-                    .map(|binding| binding.0 /* M2-STUB(plan 138): 0.7.9 returns (par2_file_id, len, path, complete) */)
+                    .map(|(par2_file_id, _, _, _)| par2_file_id)
             })
             .collect();
         if finalized.is_empty() {

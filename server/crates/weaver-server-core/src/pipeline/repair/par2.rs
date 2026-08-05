@@ -602,9 +602,19 @@ impl Pipeline {
             })
             .collect::<Vec<_>>();
         let par2_file_id = unique_live_par2_candidate(&candidates)?;
+        // M2 (plan 138). The binding length is what PAR2 *describes*, never the
+        // NZB's declared total: `<segment bytes=…>` is yEnc-**encoded** size,
+        // around 1.03x the decoded bytes, so a declared total can never equal
+        // `desc.length` for a real post. `bind` refuses on that inequality, so
+        // passing the declared total silently refused every binding — pending
+        // spans then never drained and nothing was ever verified in stream.
+        // The meaningful length check is decoded-vs-described and lives in
+        // `live_par2_clean_verification_shape`, which compares
+        // `file.received_bytes()` against this same `desc.length`.
+        let described_length = set.file_description(&par2_file_id)?.length;
         Some((
             par2_file_id,
-            file.total_bytes(),
+            described_length,
             state.working_dir.join(current_filename),
             file.is_complete(),
         ))
@@ -620,7 +630,7 @@ impl Pipeline {
         }
     }
 
-    fn activate_live_par2(&mut self, job_id: JobId, packets: &[par2_rs::Packet]) {
+    pub(crate) fn activate_live_par2(&mut self, job_id: JobId, packets: &[par2_rs::Packet]) {
         self.live_par2.activate(job_id, packets);
         let file_ids = self
             .jobs
@@ -669,29 +679,46 @@ impl Pipeline {
         if reads.is_empty() {
             return;
         }
+        // M2 (plan 138). The adopted engine settles a read by opening the
+        // binding's path, which is right for every conventional file and
+        // impossible for a direct set: D7 leaves its source volumes with no file
+        // at all, so a path read is dropped and every span stays `Pending`
+        // forever. Ask direct-store first — the hybrid provider serves the same
+        // bytes in the same source-volume coordinate space, assembled from the
+        // envelope plus the routed member partials, and for an encrypted set the
+        // E2 overlay re-derives the posted cipher on the way out. A range
+        // landing on a hole comes back short, exactly as a truncated file would,
+        // and those blocks correctly stay `Pending` for the authoritative pass.
         let reads = reads
             .into_iter()
-            .filter_map(|read| self.live_par2.path_for_read(read).map(|path| (read, path)))
+            .filter_map(|read| {
+                let source = match self.direct_virtual_volume(read.file_id) {
+                    Some((volume_index, _, provider)) => {
+                        LiveReadSource::Virtual(volume_index, provider)
+                    }
+                    None => LiveReadSource::OnDisk(self.live_par2.path_for_read(read)?),
+                };
+                Some((read, source))
+            })
             .collect::<Vec<_>>();
         let started = Instant::now();
         let results = match tokio::task::spawn_blocking(move || {
             reads
                 .into_iter()
-                .map(|(read, path)| {
-                    let result = (|| -> std::io::Result<Vec<u8>> {
-                        let len = usize::try_from(read.len).map_err(|_| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                "live PAR2 read length exceeds address space",
+                .map(|(read, source)| {
+                    let result = match source {
+                        LiveReadSource::OnDisk(path) => {
+                            live::read_range_best_effort(&path, read.offset, read.len)
+                        }
+                        LiveReadSource::Virtual(volume_index, provider) => {
+                            live::read_virtual_range_best_effort(
+                                &provider,
+                                volume_index,
+                                read.offset,
+                                read.len,
                             )
-                        })?;
-                        let mut file = std::fs::File::open(path)?;
-                        use std::io::{Read, Seek, SeekFrom};
-                        file.seek(SeekFrom::Start(read.offset))?;
-                        let mut bytes = vec![0; len];
-                        file.read_exact(&mut bytes)?;
-                        Ok(bytes)
-                    })();
+                        }
+                    };
                     (read, result)
                 })
                 .collect::<Vec<_>>()
@@ -899,18 +926,12 @@ impl Pipeline {
         &self,
         job_id: JobId,
     ) -> Option<(par2_rs::VerificationResult, par2_rs::PlacementPlan)> {
-        // M2-STUB(plan 138): 0.8.0's live-PAR2 short-circuit. It asked the old
-        // engine for `fully_verified_files` and rebuilt a full VerificationResult
-        // plus placement plan from live block state. 0.7.9's adopted engine
-        // expresses the same knowledge through `complete_bindings_if_strong` and
-        // `strong_evidence`, with different shapes, so this cannot be line-ported.
-        //
-        // Returning `None` disables only the optimisation: the caller falls
-        // through to the quick and full verify passes, which are strictly safe
-        // and were the behaviour before this short-circuit existed. Nothing is
-        // trusted that was not verified. M2 re-expresses this against the
-        // adopted engine; the original body is in git at 377254d4.
-        None
+        let (verification, placement_plan, length_checks) =
+            self.live_par2_clean_verification_shape(job_id)?;
+        if !Self::live_par2_lengths_match(job_id, length_checks).await {
+            return None;
+        }
+        Some((verification, placement_plan))
     }
     async fn live_par2_lengths_match(job_id: JobId, checks: Vec<LiveLengthCheck>) -> bool {
         let mut on_disk = Vec::with_capacity(checks.len());
@@ -974,10 +995,83 @@ impl Pipeline {
         par2_rs::PlacementPlan,
         Vec<LiveLengthCheck>,
     )> {
-        // M2-STUB(plan 138): companion to `live_par2_clean_verification`, stubbed
-        // for the same reason — it reads `fully_verified_files`, which the adopted
-        // 0.7.9 engine does not expose. `None` disables the optimisation only.
-        None
+        let par2_set = self.par2_set(job_id)?;
+        if par2_set.recovery_file_ids.is_empty() {
+            return None;
+        }
+        // M2 (plan 138): the adopted engine states this as
+        // NzbFileId -> par2 FileId, keyed the other way round, and gates on
+        // `Crc32AndMd5` slice strength rather than a bare "ok" — strictly
+        // stronger than the map this short-circuit used to read. Inverted here
+        // so the rest of the shape check is unchanged.
+        let verified: HashMap<par2_rs::FileId, NzbFileId> = self
+            .live_par2
+            .complete_bindings_if_strong(job_id)?
+            .into_iter()
+            .map(|(nzb_file_id, par2_file_id)| (par2_file_id, nzb_file_id))
+            .collect();
+        let state = self.jobs.get(&job_id)?;
+
+        let mut files = Vec::with_capacity(par2_set.recovery_file_ids.len());
+        let mut length_checks = Vec::with_capacity(par2_set.recovery_file_ids.len());
+        let mut claimed_files = HashSet::new();
+        for par2_file_id in &par2_set.recovery_file_ids {
+            let file_id = verified.get(par2_file_id).copied()?;
+            if !claimed_files.insert(file_id) {
+                return None;
+            }
+            let file = state.assembly.file(file_id)?;
+            let desc = par2_set.file_description(par2_file_id)?;
+            // `received_bytes` is the decoded length — the space PAR2
+            // describes. The NZB's declared total is yEnc-encoded size and
+            // never equals it.
+            if !file.is_complete() || file.received_bytes() != desc.length {
+                return None;
+            }
+            let correct_filename = sanitize_download_filename(&desc.filename);
+            let current_filename =
+                sanitize_download_filename(&self.current_filename_for_file(job_id, file));
+            if current_filename != correct_filename {
+                return None;
+            }
+            length_checks.push(match self.direct_virtual_volume(file_id) {
+                Some((volume_index, len, _)) => LiveLengthCheck::Virtual {
+                    volume_index,
+                    actual: len,
+                    expected: desc.length,
+                },
+                None => LiveLengthCheck::OnDisk {
+                    path: state.working_dir.join(&current_filename),
+                    expected: desc.length,
+                },
+            });
+
+            let slice_count = par2_set.slice_count_for_file(desc.length) as usize;
+            files.push(par2_rs::verify::FileVerification {
+                file_id: *par2_file_id,
+                filename: correct_filename,
+                status: par2_rs::verify::FileStatus::Complete,
+                valid_slices: vec![true; slice_count],
+                missing_slice_count: 0,
+            });
+        }
+
+        Some((
+            par2_rs::VerificationResult {
+                files,
+                recovery_blocks_available: par2_set.recovery_block_count(),
+                total_missing_blocks: 0,
+                repairable: par2_rs::verify::Repairability::NotNeeded,
+            },
+            par2_rs::PlacementPlan {
+                exact: par2_set.recovery_file_ids.clone(),
+                swaps: Vec::new(),
+                renames: Vec::new(),
+                unresolved: Vec::new(),
+                conflicts: Vec::new(),
+            },
+            length_checks,
+        ))
     }
     pub(crate) fn note_recovery_count_from_yenc_name(
         &mut self,

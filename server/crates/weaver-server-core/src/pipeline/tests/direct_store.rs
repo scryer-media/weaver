@@ -9412,14 +9412,14 @@ async fn live_par2_settles_an_encrypted_direct_volume_through_the_overlay() {
         "non-vacuity: live verification must really be switched on for this job"
     );
     assert_eq!(
-        pipeline.live_par2.metrics().blocks_bad,
+        pipeline.live_par2.metrics().invalid_slices,
         0,
         "not one live block may come back Bad — a read-back that returned \
          plaintext would have failed every block straddling an article boundary"
     );
     let metrics = pipeline.live_par2.metrics();
     assert!(
-        metrics.blocks_backfilled + metrics.blocks_settled > 0,
+        metrics.backfill_reads + metrics.settle_reads > 0,
         "non-vacuity for that: blocks must really have been settled by a
          **read-back** through the virtual volume, which is the half E1 could not
          do at all; got {metrics:?}"
