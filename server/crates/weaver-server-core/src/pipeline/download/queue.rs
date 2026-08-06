@@ -187,6 +187,27 @@ impl DownloadQueue {
             .count()
     }
 
+    /// Removes and returns every queued item matching the predicate, leaving
+    /// the rest queued in place.
+    pub fn extract_matching(
+        &mut self,
+        mut predicate: impl FnMut(&DownloadWork) -> bool,
+    ) -> Vec<DownloadWork> {
+        let items: Vec<_> = self.heap.drain().collect();
+        let mut extracted = Vec::new();
+        for item in items {
+            if predicate(&item.0.work) {
+                extracted.push(item.0.work);
+            } else {
+                self.heap.push(item);
+            }
+        }
+        if !extracted.is_empty() {
+            self.recount_excluded_work();
+        }
+        extracted
+    }
+
     /// Adds every queued segment id to `out`.
     ///
     /// For callers that build work items from a spec rather than from the

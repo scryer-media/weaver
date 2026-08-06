@@ -1192,7 +1192,17 @@ impl Pipeline {
             .and_then(|runtime| runtime.files.get(&file_index))
             .map(|file| file.recovery_blocks)
         {
-            return Some((blocks, RecoveryCountSource::Exact));
+            // Zero from the runtime is not a count — entries are created for
+            // bookkeeping (identity binding, metadata promotion) with the
+            // default of 0 long before any packet is parsed, and treating that
+            // as exact silently disqualifies the volume from targeted
+            // promotion (`candidate.blocks > 0`). A recovery volume with
+            // genuinely zero packets does not exist; only an index is exactly
+            // zero, and the role branch below says so. So a zero falls through
+            // to the role-derived count.
+            if blocks > 0 {
+                return Some((blocks, RecoveryCountSource::Exact));
+            }
         }
 
         let state = self.jobs.get(&job_id)?;
@@ -1780,11 +1790,35 @@ impl Pipeline {
             return 0;
         }
 
+        // Candidates come from every pool an un-promoted recovery segment can
+        // sit in, not just the parked one. Parking is progressive — segments
+        // move to `recovery_queue` at build, on retry, on health re-routing —
+        // so at any given promotion pass some volumes' work is still in the
+        // ordinary download queue. Selecting only from the parked pool made a
+        // wave promote whatever happened to be parked (job 10020: 15 of 30
+        // available blocks, with the one volume that could cover the damage
+        // invisible), and every later pass promoted nothing while the job
+        // waited for blocks it had never asked for.
+        let promoted_files_now: std::collections::HashSet<u32> = self
+            .par2_runtime(job_id)
+            .map(|runtime| {
+                runtime
+                    .files
+                    .iter()
+                    .filter_map(|(&file_index, file)| file.promoted.then_some(file_index))
+                    .collect()
+            })
+            .unwrap_or_default();
         let queued = {
             let Some(state) = self.jobs.get_mut(&job_id) else {
                 return 0;
             };
-            state.recovery_queue.drain_all()
+            let mut pool = state.recovery_queue.drain_all();
+            pool.extend(state.download_queue.extract_matching(|work| {
+                work.is_recovery
+                    && !promoted_files_now.contains(&work.segment_id.file_id.file_index)
+            }));
+            pool
         };
 
         let mut work_by_file: HashMap<u32, Vec<DownloadWork>> = HashMap::new();

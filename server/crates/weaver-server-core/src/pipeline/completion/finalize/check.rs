@@ -2560,20 +2560,36 @@ impl Pipeline {
         // cannot tell a file still arriving from a damaged one — but in both
         // of these the wait is for something that is not coming, and the
         // authoritative pass is what says so.
-        // Still conditioned on "not yet verified", unlike 0.7.9's. 0.8 already
-        // re-opens the gate for a verified job whose extraction later fails —
-        // by a different route, and one that depends on `par2_validation_needed`
-        // staying false so the repair-first branch is skipped. Relaxing it here
-        // diverts that flow and the later authoritative pass stops running
-        // (`a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass`).
         // Hoisted here by the 0.7.9 port: the repair-readiness predicates below
         // need it, and it used to be defined further down at "Step 2".
         let has_crc_failures = self
             .failed_extractions
             .get(&job_id)
             .is_some_and(|failed| !failed.is_empty());
-        let par2_may_still_rule =
-            par2_loaded && !par2_bypassed && !self.par2_verified.contains(&job_id);
+        // A clean PAR2 verdict says the described files hashed correctly. It does
+        // not say the archives open. When extraction fails afterwards *and* the
+        // set is left waiting on a volume, that verdict is stale evidence and
+        // PAR2 has to be allowed to rule again.
+        //
+        // Declining 0.7.9's relaxation outright (2efa19d9) livelocked every PAR2
+        // repair scenario in the corpus. `has_crc_failures` does re-open repair
+        // *evaluation* — which is why the unit suite was satisfied — but every
+        // PAR2 route inside that block is gated on `par2_validation_needed`, so
+        // the check re-entered forever with nothing able to act: 1865 identical
+        // completion checkpoints on one job, no repair, no verdict.
+        //
+        // Narrower than 0.7.9's blanket `!verified`, deliberately. The extra
+        // `job_has_live_rar_waiting_for_missing_volumes` is what keeps a job that
+        // merely finalized its direct sets from re-entering: there the failed
+        // member is conventional and no set is waiting on a volume, so the
+        // verdict stands and the repair-first branch stays skipped
+        // (`a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass`).
+        let par2_verdict_stale_after_failed_extraction = self.par2_verified.contains(&job_id)
+            && has_crc_failures
+            && self.job_has_live_rar_waiting_for_missing_volumes(job_id);
+        let par2_verdict_open = !self.par2_verified.contains(&job_id)
+            || par2_verdict_stale_after_failed_extraction;
+        let par2_may_still_rule = par2_loaded && !par2_bypassed && par2_verdict_open;
         let extraction_settled = !self.job_has_active_extraction_tasks(job_id);
         // One: extraction was attempted and failed. The archives cannot be
         // opened now, and the reason may well be the volume that never came.
@@ -2609,12 +2625,15 @@ impl Pipeline {
             !has_incomplete_data_files || download_pipeline_exhausted || rar_par2_repair_ready;
         let par2_validation_needed = par2_loaded
             && !par2_bypassed
-            // 0.7.9 relaxes this to `(rar_par2_repair_ready || !verified)`. 0.8
-            // must not: it re-opens the gate for a verified job by another
-            // route, one that depends on `par2_validation_needed` staying false
-            // so the repair-first branch is skipped
-            // (a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass).
-            && !self.par2_verified.contains(&job_id)
+            // The other half of the coupled pair above. 0.7.9 relaxes this to
+            // `(rar_par2_repair_ready || !verified)`; this is the same
+            // relaxation narrowed to the state that actually needs it — a
+            // verified job whose extraction failed and whose set is still
+            // waiting on a volume. Moving only one of the two halves does
+            // nothing: `rar_par2_repair_ready` cannot become true while
+            // `par2_may_still_rule` is false, and validation cannot run while
+            // this is false.
+            && par2_verdict_open
             && par2_primary_payload_ready
             // The residuals check reads a job still missing archive pieces as
             // nothing to validate yet. That is the very state a repair-ready
@@ -2869,15 +2888,42 @@ impl Pipeline {
             // analysis is what is expensive, and it has to be skipped *before*
             // it runs — 0.8's `job_has_promoted_recovery_pipeline_work` guard
             // below is too late to prevent the rescan.
+            // Each pass of this analysis is a full, slow PAR2 scan, so the only
+            // question that matters is whether re-running it can learn anything
+            // new. Four e2e runs mapped the edges:
+            //
+            //  - Defer while the *parked* pool (`recovery_queue`) is non-empty
+            //    and the job deadlocks: it is this analysis that promotes parked
+            //    blocks, so the pool never drains (~1800 identical completion
+            //    checkpoints per job, every PAR2-repair scenario in the corpus).
+            //  - Defer on any narrower signal — recovery on the wire, parked
+            //    work after a promotion — and heavy damage storms: the verdict
+            //    keeps changing while the payload is still arriving, so the
+            //    check re-scans on every tick that slips through (30+ slow
+            //    scans, suite starved to 21 of 92).
+            //
+            // The scan can learn something exactly twice: once before any wave
+            // has been promoted (it is the pass that decides what to promote),
+            // and once after everything that could change its answer has
+            // landed. In between — the wave still arriving, or the payload
+            // still filling the very holes being counted — the verdict cannot
+            // move, and the pass is pure cost. `job_has_pending_download_
+            // pipeline_work` deliberately excludes the parked pool, so this
+            // cannot re-create the deadlock above: a job whose only remaining
+            // work is parked recovery is not "pending" here, analyses run, and
+            // promotion drains the pool.
+            let promoted_recovery_state = self.promoted_recovery_pipeline_state(job_id);
             if rar_par2_repair_ready
-                && self
-                    .jobs
-                    .get(&job_id)
-                    .is_some_and(|state| !state.recovery_queue.is_empty())
+                && promoted_recovery_state.promoted_par2_files > 0
+                && (promoted_recovery_state.incomplete_promoted_par2_files > 0
+                    || self.job_has_pending_download_pipeline_work(job_id))
             {
                 debug!(
                     job_id = job_id.0,
-                    "deferring repair evaluation — download pipeline work is pending"
+                    promoted_par2_files = promoted_recovery_state.promoted_par2_files,
+                    incomplete_promoted_par2_files =
+                        promoted_recovery_state.incomplete_promoted_par2_files,
+                    "deferring repair evaluation — promoted recovery or payload is still arriving"
                 );
                 return;
             }

@@ -1876,9 +1876,22 @@ fn sync_release_workspace_lockfile(ctx: &TaskContext) -> Result<()> {
 }
 
 fn run_weaver_release_prep(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
+    run_weaver_release_container_contract_validation(ctx, prefix)?;
     run_weaver_rust_prep_validation(ctx, prefix)?;
     run_weaver_web_validation(ctx, prefix)?;
     run_weaver_release_hygiene_validation(ctx, prefix)
+}
+
+fn run_weaver_release_container_contract_validation(
+    ctx: &TaskContext,
+    prefix: &'static str,
+) -> Result<()> {
+    prefixed_step(prefix, "Checking Docker release publish contract");
+    let mut command = ctx.command_in("sh", &ctx.repo_root);
+    command.arg("docker/validate-release-build-config.sh");
+    run_checked(&mut command)?;
+    prefixed_ok(prefix, "Docker release publish contract passed");
+    Ok(())
 }
 
 fn run_weaver_release_hygiene_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {

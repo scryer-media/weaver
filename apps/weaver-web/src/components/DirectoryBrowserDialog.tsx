@@ -151,13 +151,13 @@ export function DirectoryBrowserDialog({
 
   return (
     <Dialog open={open} onOpenChange={(next) => (!next ? onClose() : undefined)}>
-      <DialogContent className="flex max-h-[85vh] w-[min(96vw,64rem)] flex-col overflow-hidden sm:max-w-4xl">
+      <DialogContent className="flex h-[min(85vh,48rem)] w-[min(96vw,64rem)] flex-col overflow-hidden sm:max-w-4xl">
         <DialogHeader>
           <DialogTitle>{t("categories.directoryBrowserTitle")}</DialogTitle>
           <DialogDescription>{t("categories.directoryBrowserDesc")}</DialogDescription>
         </DialogHeader>
 
-        <div className="min-w-0 space-y-4">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto pr-1">
           <div
             ref={breadcrumbRef}
             className="flex items-center gap-1 overflow-x-auto whitespace-nowrap rounded-xl border border-border/70 bg-background/70 px-2 py-2 text-sm"
@@ -262,7 +262,7 @@ export function DirectoryBrowserDialog({
             </div>
           </div>
 
-          <div className="flex h-[24rem] flex-col overflow-hidden rounded-2xl border border-border/70 bg-background/70">
+          <div className="flex min-h-[10rem] flex-1 flex-col overflow-hidden rounded-2xl border border-border/70 bg-background/70">
             {loading ? (
               <div className="flex flex-1 items-center gap-2 px-3 py-4 text-sm text-muted-foreground">
                 <Loader2 className="size-4 animate-spin" />
@@ -306,7 +306,9 @@ export function DirectoryBrowserDialog({
             )}
           </div>
 
-          <DialogFooter className="min-w-0 gap-2 sm:flex-row sm:items-end sm:justify-between">
+        </div>
+
+        <DialogFooter className="min-w-0 shrink-0 gap-2 border-t border-border/70 pt-4 sm:flex-row sm:items-end sm:justify-between">
             <Button type="button" variant="outline" onClick={onClose}>
               {t("action.cancel")}
             </Button>
@@ -331,8 +333,7 @@ export function DirectoryBrowserDialog({
                 <span>{t("categories.useCurrentFolder")}</span>
               </Button>
             </div>
-          </DialogFooter>
-        </div>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );

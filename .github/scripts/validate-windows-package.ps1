@@ -344,16 +344,16 @@ function Write-WinGetMsiManifest {
   $wingetArchitecture = if ($Architecture -eq "x86_64") { "x64" } else { "arm64" }
 
   @"
-# yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.1.12.0.schema.json
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.1.10.0.schema.json
 PackageIdentifier: ScryerMedia.Weaver
 PackageVersion: $PackageVersion
 DefaultLocale: en-US
 ManifestType: version
-ManifestVersion: 1.12.0
+ManifestVersion: 1.10.0
 "@ | Set-Content -Path (Join-Path $manifestRoot "ScryerMedia.Weaver.yaml") -Encoding utf8
 
   @"
-# yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
 PackageIdentifier: ScryerMedia.Weaver
 PackageVersion: $PackageVersion
 PackageLocale: en-US
@@ -362,11 +362,11 @@ PackageName: Weaver
 License: GPL-3.0
 ShortDescription: High-performance Usenet binary downloader.
 ManifestType: defaultLocale
-ManifestVersion: 1.12.0
+ManifestVersion: 1.10.0
 "@ | Set-Content -Path (Join-Path $manifestRoot "ScryerMedia.Weaver.locale.en-US.yaml") -Encoding utf8
 
   @"
-# yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
 PackageIdentifier: ScryerMedia.Weaver
 PackageVersion: $PackageVersion
 InstallerType: msi
@@ -377,7 +377,7 @@ Installers:
   InstallerSha256: $msiHash
   ProductCode: '$ProductCode'
 ManifestType: installer
-ManifestVersion: 1.12.0
+ManifestVersion: 1.10.0
 "@ | Set-Content -Path (Join-Path $manifestRoot "ScryerMedia.Weaver.installer.yaml") -Encoding utf8
 }
 

@@ -25,6 +25,52 @@ env:
   WEAVER_LFS_SDE_INCLUDE: ci/vendor/intel-sde/**
 
 jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      web: ${{ steps.scope.outputs.web }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - id: scope
+        name: Detect validation scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "web=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          rust=false
+          web=false
+          while IFS= read -r path; do
+            case "$path" in
+              apps/weaver-web/*)
+                web=true
+                ;;
+              .github/*|docs/*|*.md|LICENSE|NOTICE)
+                ;;
+              *)
+                rust=true
+                ;;
+            esac
+          done < <(git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}")
+
+          # Rust binaries embed the web artifact, so every Rust change needs it.
+          if [[ "$rust" == true ]]; then
+            web=true
+          fi
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "web=$web" >> "$GITHUB_OUTPUT"
+
   verify-release-tag:
     name: verify-release-tag
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
@@ -51,6 +97,8 @@ jobs:
 
   web-build:
     name: web-build
+    needs: [changes]
+    if: ${{ needs.changes.outputs.web == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -82,6 +130,8 @@ jobs:
 
   rust-fmt:
     name: rust-fmt
+    needs: [changes]
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -98,6 +148,8 @@ jobs:
 
   rust-audit:
     name: rust-audit
+    needs: [changes]
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -115,9 +167,10 @@ jobs:
 
   rust-clippy:
     name: rust-clippy
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    needs: [web-build]
+    needs: [changes, web-build]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -141,9 +194,10 @@ jobs:
 
   rust-test-build:
     name: rust-test-build
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    needs: [web-build]
+    needs: [changes, web-build]
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
@@ -246,6 +300,8 @@ jobs:
 
   rust-test-arm:
     name: rust-test-arm-yenc
+    needs: [changes]
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
@@ -261,6 +317,8 @@ jobs:
 
   rust-test-sde:
     name: rust-test-sde-yenc-${{ matrix.name }}
+    needs: [changes]
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -360,6 +418,8 @@ jobs:
 
   rust-yenc-simd-targets:
     name: rust-yenc-simd-${{ matrix.name }}
+    needs: [changes]
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -398,7 +458,8 @@ jobs:
     name: rust-package-linux-x86_64-portable
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    needs: [web-build]
+    needs: [changes, web-build]
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -444,7 +505,8 @@ jobs:
     name: rust-package-linux-x86_64-haswell
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    needs: [web-build]
+    needs: [changes, web-build]
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -490,7 +552,8 @@ jobs:
     name: rust-package-linux-arm64-portable
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
-    needs: [web-build]
+    needs: [changes, web-build]
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -536,7 +599,8 @@ jobs:
     name: rust-package-linux-arm64-cortex-a76
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
-    needs: [web-build]
+    needs: [changes, web-build]
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -581,8 +645,9 @@ jobs:
   rust-package-darwin-x86_64-haswell:
     name: rust-package-darwin-x86_64-haswell
     runs-on: macos-26
-    timeout-minutes: 60
-    needs: [web-build]
+    timeout-minutes: 90
+    needs: [changes, web-build]
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -643,8 +708,9 @@ jobs:
   rust-package-darwin-arm64-portable:
     name: rust-package-darwin-arm64-portable
     runs-on: macos-26
-    timeout-minutes: 60
-    needs: [web-build]
+    timeout-minutes: 90
+    needs: [changes, web-build]
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -703,8 +769,9 @@ jobs:
   rust-package-darwin-arm64-apple-m1:
     name: rust-package-darwin-arm64-apple-m1
     runs-on: macos-26
-    timeout-minutes: 60
-    needs: [web-build]
+    timeout-minutes: 90
+    needs: [changes, web-build]
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -763,8 +830,9 @@ jobs:
   rust-package-windows-x86_64:
     name: rust-package-windows-x86_64
     runs-on: windows-2025-vs2026
-    timeout-minutes: 60
-    needs: [web-build]
+    timeout-minutes: 90
+    needs: [changes, web-build]
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     env:
       CARGO_INCREMENTAL: "0"
       # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
@@ -1058,8 +1126,9 @@ jobs:
   rust-package-windows-arm64:
     name: rust-package-windows-arm64
     runs-on: windows-11-arm
-    timeout-minutes: 60
-    needs: [web-build]
+    timeout-minutes: 90
+    needs: [changes, web-build]
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     env:
       CARGO_INCREMENTAL: "0"
       # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
@@ -1601,7 +1670,7 @@ jobs:
           push: true
           tags: ${{ steps.tags.outputs.base }}
           labels: ${{ steps.meta.outputs.labels }}
-          provenance: mode=max,version=1
+          provenance: mode=max
           sbom: true
       - name: Sign published base image
         env:
@@ -1661,10 +1730,26 @@ jobs:
             --certificate-identity-regexp "$IDENTITY" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "$IMAGE@$DIGEST" > /tmp/slsa-provenance.json
-          cosign download sbom "$IMAGE@$DIGEST" > /tmp/weaver.spdx.json
           test -s /tmp/cosign-signature.json
           test -s /tmp/slsa-provenance.json
-          jq -e '.spdxVersion' /tmp/weaver.spdx.json > /dev/null
+          index="$(docker buildx imagetools inspect --raw "$IMAGE@$DIGEST")"
+          for platform in linux/amd64 linux/arm64; do
+            os="${platform%/*}"
+            architecture="${platform#*/}"
+            subject_digest="$(jq -r \
+              --arg os "$os" \
+              --arg architecture "$architecture" \
+              '.manifests[] | select(.platform.os == $os and .platform.architecture == $architecture) | .digest' \
+              <<< "$index")"
+            test -n "$subject_digest" && test "$subject_digest" != null
+            attestation_digest="$(jq -r \
+              --arg subject "$subject_digest" \
+              '.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest" and .annotations["vnd.docker.reference.digest"] == $subject) | .digest' \
+              <<< "$index")"
+            test -n "$attestation_digest" && test "$attestation_digest" != null
+            docker buildx imagetools inspect --raw "$IMAGE@$attestation_digest" |
+              jq -e 'any(.layers[]; .mediaType == "application/vnd.in-toto+json" and .annotations["in-toto.io/predicate-type"] == "https://spdx.dev/Document")' > /dev/null
+          done
 
   github-release:
     name: github-release
@@ -2558,7 +2643,7 @@ jobs:
     needs: [prepare-release-provenance]
     permissions:
       actions: read
-      contents: read
+      contents: write
       id-token: write
     uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
     with:
