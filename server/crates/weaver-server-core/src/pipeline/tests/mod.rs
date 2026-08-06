@@ -1101,7 +1101,7 @@ fn build_test_par2_packet(
     data
 }
 
-fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size: u64) -> Vec<u8> {
+pub(super) fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size: u64) -> Vec<u8> {
     build_test_par2_index_for_files(&[(filename, file_data)], slice_size)
 }
 

@@ -832,6 +832,7 @@ impl Pipeline {
     }
 
     pub(crate) fn clear_par2_runtime_state(&mut self, job_id: JobId) {
+        self.live_par2.remove_job(job_id);
         self.par2_runtime.remove(&job_id);
         self.live_par2.remove_job(job_id);
         self.par2_verified.remove(&job_id);

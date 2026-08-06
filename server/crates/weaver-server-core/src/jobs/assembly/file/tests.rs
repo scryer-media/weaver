@@ -44,6 +44,17 @@ fn duplicate_segment() {
     assert!(!r0.was_duplicate);
     let r1 = asm.commit_segment(0, 500).unwrap();
     assert!(r1.was_duplicate);
+    assert!(asm.has_duplicate_segments());
+}
+
+#[test]
+fn segment_length_mismatch_disqualifies_contiguous_assembly_proof() {
+    let mut asm = make_assembly(vec![500]);
+    asm.commit_segment(0, 499).unwrap();
+    assert!(asm.has_length_mismatch());
+
+    asm.reset();
+    assert!(!asm.has_length_mismatch());
 }
 
 #[test]

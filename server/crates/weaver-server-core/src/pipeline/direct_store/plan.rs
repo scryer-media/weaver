@@ -191,7 +191,10 @@ impl DirectSetPlan {
         // away, and two sets whose names sanitize identically stay two files.
         weaver_model::files::path_component_with_suffix(
             &crate::jobs::working_dir::sanitize_dirname(&self.set_name),
-            &format!(".f{}.vol{volume_index:05}.envelope", self.set_discriminator()),
+            &format!(
+                ".f{}.vol{volume_index:05}.envelope",
+                self.set_discriminator()
+            ),
         )
     }
 

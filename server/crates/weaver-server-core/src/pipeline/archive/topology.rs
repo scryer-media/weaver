@@ -695,7 +695,7 @@ impl Pipeline {
         .map_err(|e| format!("RAR facts parser task panicked: {e}"))?
     }
 
-    pub(in crate::pipeline::archive) fn persist_rar_volume_facts(
+    pub(crate) fn persist_rar_volume_facts(
         &mut self,
         job_id: JobId,
         set_name: &str,

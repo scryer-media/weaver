@@ -5975,6 +5975,264 @@ async fn exhausted_rar_failed_member_skips_lower_bound_recovery_preflight() {
 }
 
 #[tokio::test]
+async fn verified_par2_output_registers_missing_rar_volume_for_retry() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30191);
+    let files = build_multifile_multivolume_rar_set();
+    let present_files = vec![files[0].clone(), files[1].clone(), files[3].clone()];
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("RAR Missing Volume PAR2 Registration", &present_files),
+    )
+    .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in present_files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let (missing_filename, missing_bytes) = &files[2];
+    tokio::fs::write(working_dir.join(missing_filename), missing_bytes)
+        .await
+        .unwrap();
+    let verification = par2_rs::VerificationResult {
+        files: vec![par2_rs::verify::FileVerification {
+            file_id: par2_rs::FileId::from_bytes([0; 16]),
+            filename: missing_filename.clone(),
+            status: par2_rs::verify::FileStatus::Complete,
+            valid_slices: Vec::new(),
+            missing_slice_count: 0,
+        }],
+        recovery_blocks_available: 0,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    };
+
+    assert_eq!(
+        pipeline
+            .register_verified_par2_rar_outputs(job_id, &verification)
+            .await
+            .unwrap(),
+        1
+    );
+    pipeline
+        .recompute_rar_set_state(job_id, "show")
+        .await
+        .unwrap();
+
+    let rar_set = pipeline
+        .rar_sets
+        .get(&(job_id, "show".to_string()))
+        .expect("RAR set should be registered");
+    assert!(rar_set.facts.contains_key(&2));
+    assert!(
+        rar_set
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.waiting_on_volumes.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn failed_rar_member_with_par2_is_not_incrementally_retried() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30192);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR PAR2 Retry Latch", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+    install_test_par2_runtime(&mut pipeline, job_id, placement_par2_file_set(&files), &[]);
+
+    let set_key = (job_id, "show".to_string());
+    let failed_member = "E01.mkv".to_string();
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&set_key)
+            .expect("RAR set should exist after all volumes complete");
+        let plan = set_state
+            .plan
+            .as_mut()
+            .expect("RAR set should have an extraction plan");
+        plan.ready_members = vec![crate::pipeline::rar_state::RarReadyMember {
+            name: failed_member.clone(),
+        }];
+    }
+    pipeline
+        .failed_extractions
+        .insert(job_id, HashSet::from([failed_member]));
+    pipeline.par2_verified.insert(job_id);
+
+    resume_job_downloading_for_test(&mut pipeline, job_id);
+    pipeline.try_rar_extraction(job_id).await;
+
+    let set_state = pipeline
+        .rar_sets
+        .get(&set_key)
+        .expect("RAR set should remain available");
+    assert_eq!(set_state.active_workers, 0);
+    assert!(set_state.in_flight_members.is_empty());
+}
+
+#[tokio::test]
+async fn missing_middle_rar_volume_enters_authoritative_par2_repair() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30193);
+    let missing_filename = "archive.part3.rar";
+    let index_filename = "archive.par2";
+    let recovery_filename = "archive.vol00+01.par2";
+    let missing_bytes: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
+    let index_bytes = build_test_par2_index(missing_filename, &missing_bytes, 64);
+    let files = vec![
+        ("archive.part1.rar".to_string(), vec![0x11; 64]),
+        ("archive.part2.rar".to_string(), vec![0x22; 64]),
+        (missing_filename.to_string(), missing_bytes.clone()),
+        ("archive.part4.rar".to_string(), vec![0x44; 64]),
+        (index_filename.to_string(), index_bytes.clone()),
+        (recovery_filename.to_string(), vec![0xAA; 64]),
+    ];
+    let spec = rar_job_spec("RAR Missing Middle PAR2 Recovery", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for file_index in [0u32, 1, 3] {
+        let (filename, bytes) = &files[file_index as usize];
+        write_and_complete_file(&mut pipeline, job_id, file_index, filename, bytes).await;
+    }
+    write_and_complete_file(&mut pipeline, job_id, 4, index_filename, &index_bytes).await;
+
+    let archive_topology = crate::jobs::assembly::ArchiveTopology {
+        archive_type: crate::jobs::assembly::ArchiveType::Rar,
+        volume_map: HashMap::from([
+            ("archive.part1.rar".to_string(), 0),
+            ("archive.part2.rar".to_string(), 1),
+            ("archive.part4.rar".to_string(), 3),
+        ]),
+        complete_volumes: [0u32, 1, 3].into_iter().collect(),
+        expected_volume_count: Some(4),
+        members: vec![crate::jobs::assembly::ArchiveMember {
+            name: "movie.mkv".to_string(),
+            first_volume: 0,
+            last_volume: 3,
+            unpacked_size: 0,
+        }],
+        unresolved_spans: vec![crate::jobs::assembly::ArchivePendingSpan {
+            first_volume: 2,
+            last_volume: 2,
+        }],
+    };
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+        state.recovery_queue.push(DownloadWork {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 5,
+                },
+                segment_number: 0,
+            },
+            message_id: MessageId::new("missing-middle-recovery@example.com"),
+            groups: vec!["alt.binaries.test".to_string()],
+            priority: 1000,
+            byte_estimate: 64,
+            retry_count: 0,
+            // Optional PAR2 volumes enter the parked recovery queue before the
+            // authoritative analyzer classifies and promotes them.
+            is_recovery: false,
+            exclude_servers: Vec::new(),
+            avoid_server: None,
+        });
+        state.status = JobStatus::Downloading;
+        state.refresh_runtime_lanes_from_status();
+        state
+            .assembly
+            .set_archive_topology("archive".to_string(), archive_topology.clone());
+    }
+    pipeline.rar_sets.insert(
+        (job_id, "archive".to_string()),
+        crate::pipeline::archive::rar_state::RarSetState {
+            plan: Some(crate::pipeline::archive::rar_state::RarDerivedPlan {
+                phase: crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes,
+                is_solid: true,
+                ready_members: Vec::new(),
+                member_names: vec!["movie.mkv".to_string()],
+                member_dependencies: HashMap::new(),
+                waiting_on_volumes: HashSet::from([2u32]),
+                deletion_eligible: HashSet::new(),
+                delete_decisions: std::collections::BTreeMap::new(),
+                topology: archive_topology,
+                fallback_reason: None,
+            }),
+            ..Default::default()
+        },
+    );
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(missing_filename, &missing_bytes, 64, 0),
+        &[
+            (4, index_filename, 0, false),
+            (5, recovery_filename, 2, false),
+        ],
+    );
+    assert!(pipeline.par2_set(job_id).is_some());
+    assert!(!pipeline.par2_bypassed.contains(&job_id));
+    pipeline.par2_verified.insert(job_id);
+    assert!(pipeline.par2_verified.contains(&job_id));
+    assert!(!pipeline.job_has_active_extraction_tasks(job_id));
+    assert!(pipeline.job_has_live_rar_waiting_for_missing_volumes(job_id));
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| !state.recovery_queue.is_empty())
+    );
+
+    while events.try_recv().is_ok() {}
+    pipeline.par2_repairer_analyze_calls = 0;
+    pipeline.check_job_completion(job_id).await;
+
+    let status = pipeline.jobs.get(&job_id).map(|state| state.status.clone());
+    assert_eq!(
+        pipeline.par2_repairer_analyze_calls,
+        1,
+        "missing RAR volume must force authoritative PAR2 verification; status={status:?}, failed={:?}, verified={}",
+        pipeline.failed_extractions.get(&job_id),
+        pipeline.par2_verified.contains(&job_id),
+    );
+    assert_eq!(drain_job_verification_started(&mut events, job_id), 1);
+    assert_eq!(status, Some(JobStatus::Downloading));
+    assert!(pipeline.jobs.get(&job_id).is_some_and(|state| {
+        state
+            .download_queue
+            .count_matching(|work| work.segment_id.file_id.file_index == 5)
+            > 0
+    }));
+    assert_eq!(pipeline.recovery_blocks_available_or_targeted(job_id), 2);
+
+    // Optional PAR2 files preserve the NZB's original classification, so they
+    // are not necessarily marked `is_recovery`. A completion check triggered
+    // by one recovered file must wait for every promoted file, not rescan.
+    pipeline.check_job_completion(job_id).await;
+    assert_eq!(pipeline.par2_repairer_analyze_calls, 1);
+    assert_eq!(drain_job_verification_started(&mut events, job_id), 0);
+    assert!(!pipeline.failed_extractions.contains_key(&job_id));
+}
+
+#[tokio::test]
 async fn rar_waiting_for_missing_volumes_without_par2_fails_after_download_completion() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;

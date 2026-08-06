@@ -14,6 +14,51 @@ pub(crate) mod live;
 pub(crate) const PROMOTED_RECOVERY_PRIORITY: u32 = 2;
 const PAR2_PACKET_ALIGNMENT: u64 = 4;
 const PAR2_RECOVERY_PACKET_OVERHEAD: u64 = 68; // 64-byte header + 4-byte exponent
+const PAR2_RETAINED_SESSION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const STATEFUL_PAR2_SESSION_ENV: &str = "WEAVER_STATEFUL_PAR2_SESSION";
+
+fn parse_stateful_par2_session_enabled(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim),
+        Some("1")
+            | Some("true")
+            | Some("TRUE")
+            | Some("yes")
+            | Some("YES")
+            | Some("on")
+            | Some("ON")
+    )
+}
+
+fn stateful_par2_session_enabled() -> bool {
+    parse_stateful_par2_session_enabled(std::env::var(STATEFUL_PAR2_SESSION_ENV).ok().as_deref())
+}
+
+fn select_par2_session_eviction<I>(sessions: I, protected_job_id: JobId) -> Option<JobId>
+where
+    I: IntoIterator<Item = (JobId, bool, Option<Instant>)>,
+{
+    let mut protected_available = false;
+    let mut oldest_unprotected: Option<(JobId, Option<Instant>)> = None;
+    for (job_id, has_session, last_used) in sessions {
+        if !has_session {
+            continue;
+        }
+        if job_id == protected_job_id {
+            protected_available = true;
+            continue;
+        }
+        if oldest_unprotected
+            .as_ref()
+            .is_none_or(|(_, oldest)| last_used < *oldest)
+        {
+            oldest_unprotected = Some((job_id, last_used));
+        }
+    }
+    oldest_unprotected
+        .map(|(job_id, _)| job_id)
+        .or_else(|| protected_available.then_some(protected_job_id))
+}
 
 /// Where one live-PAR2 read-back gets its bytes.
 ///
@@ -194,6 +239,13 @@ fn select_recovery_file_indices(
                 .map(|candidate| candidate.file_index)
                 .collect()
         })
+}
+
+fn unique_live_par2_candidate(candidates: &[par2_rs::FileId]) -> Option<par2_rs::FileId> {
+    let [candidate] = candidates else {
+        return None;
+    };
+    Some(*candidate)
 }
 
 impl Pipeline {
@@ -515,38 +567,6 @@ impl Pipeline {
         self.par2_runtime.entry(job_id).or_default()
     }
 
-    /// Feed a committed span to live PAR2 verification.
-    ///
-    /// Ordering contract: the caller invokes this only after the segment's
-    /// disk write returned, so the bytes handed here are already on disk and a
-    /// later settle read of the same range observes the same content
-    /// (plan 135, D5).
-    pub(crate) fn note_live_par2_segment(
-        &mut self,
-        file_id: NzbFileId,
-        file_offset: u64,
-        data: &DecodedChunk,
-    ) {
-        if !self.live_par2.enabled() {
-            return;
-        }
-        // Cheapest possible early-out for the common no-PAR2 job: the spec is
-        // consulted once, and the answer is remembered by the registry.
-        if !self.live_par2.knows_job(file_id.job_id) && !self.job_spec_has_par2_file(file_id.job_id)
-        {
-            self.live_par2.skip_job(file_id.job_id);
-            return;
-        }
-        let _profile_scope = crate::runtime::perf_probe::scope("verify.live_par2.note_segment");
-        if self.live_par2.needs_binding(file_id) {
-            let binding = self.resolve_live_par2_binding(file_id);
-            self.live_par2.bind(file_id, binding);
-        }
-        self.live_par2.note_segment(file_id, file_offset, data);
-    }
-
-    /// Whether the job's spec declares any PAR2 file at all. A job without one
-    /// can never activate live verification, so it never records coverage.
     pub(crate) fn job_spec_has_par2_file(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|state| {
             state
@@ -557,170 +577,390 @@ impl Pipeline {
         })
     }
 
-    /// Bind a pipeline file to the PAR2 description it carries.
-    ///
-    /// Identity comes from the same name candidates the completed-file PAR2
-    /// fast path uses, narrowed to the recovery set and required to be unique.
-    /// The block vector is sized from the description's `length`, never from
-    /// the NZB's declared totals: `<segment bytes=…>` is yEnc-encoded size,
-    /// about 3% larger than the decoded bytes PAR2 describes, so no real file
-    /// would ever match a declared-total comparison. A binding alone never
-    /// proves anything: the short-circuit additionally requires the file's
-    /// decoded length to equal `desc.length` and every block to match its IFSC
-    /// checksum, which is what makes the placement scan's content match
-    /// structurally implied rather than assumed.
     pub(crate) fn resolve_live_par2_binding(
         &self,
         file_id: NzbFileId,
-    ) -> Option<live::LiveBinding> {
-        let job_id = file_id.job_id;
-        let par2_set = self.par2_set(job_id)?;
-        let state = self.jobs.get(&job_id)?;
+    ) -> Option<(par2_rs::FileId, u64, std::path::PathBuf, bool)> {
+        let set = self.par2_set(file_id.job_id)?;
+        let state = self.jobs.get(&file_id.job_id)?;
         let file = state.assembly.file(file_id)?;
-
-        let candidates = self.par2_name_candidates_for_file(job_id, file);
-        let mut matched = par2_set.recovery_file_ids.iter().filter(|par2_file_id| {
-            par2_set.file_description(par2_file_id).is_some_and(|desc| {
-                candidates.contains(&sanitize_download_filename(&desc.filename))
-            })
-        });
-        let par2_file_id = *matched.next()?;
-        if matched.next().is_some() {
-            return None;
-        }
-
-        let length = par2_set.file_description(&par2_file_id)?.length;
-        if length == 0 {
-            return None;
-        }
-
-        Some(live::LiveBinding {
-            par2_file_id,
-            length,
-        })
-    }
-
-    fn par2_name_candidates_for_file(
-        &self,
-        job_id: JobId,
-        file: &crate::jobs::assembly::FileAssembly,
-    ) -> HashSet<String> {
-        let file_id = file.file_id();
-        let mut candidates = HashSet::new();
-        candidates.insert(sanitize_download_filename(file.filename()));
-        if let Some(identity) = self.effective_file_identity(job_id, file_id) {
-            candidates.insert(sanitize_download_filename(&identity.source_filename));
-            candidates.insert(sanitize_download_filename(&identity.current_filename));
+        let current_filename = self.current_filename_for_file(file_id.job_id, file);
+        // Sanitized on the way in, because they are matched against sanitized
+        // descriptions below. Comparing a raw posted name to a sanitized one
+        // silently loses the binding — and with it live verification for that
+        // file — for every name that needed sanitizing at all.
+        let mut names = HashSet::from([
+            sanitize_download_filename(&current_filename),
+            sanitize_download_filename(file.filename()),
+        ]);
+        if let Some(identity) = self.effective_file_identity(file_id.job_id, file_id) {
+            names.insert(sanitize_download_filename(&identity.source_filename));
             if let Some(canonical) = identity.canonical_filename.as_ref() {
-                candidates.insert(sanitize_download_filename(canonical));
+                names.insert(sanitize_download_filename(canonical));
             }
         }
-        candidates
+        let candidates = set
+            .files
+            .iter()
+            .filter_map(|(par2_file_id, desc)| {
+                names
+                    .contains(&sanitize_download_filename(&desc.filename))
+                    .then_some(*par2_file_id)
+            })
+            .collect::<Vec<_>>();
+        let par2_file_id = unique_live_par2_candidate(&candidates)?;
+        // M2 (plan 138). The binding length is what PAR2 *describes*, never the
+        // NZB's declared total: `<segment bytes=…>` is yEnc-**encoded** size,
+        // around 1.03x the decoded bytes, so a declared total can never equal
+        // `desc.length` for a real post. `bind` refuses on that inequality, so
+        // passing the declared total silently refused every binding — pending
+        // spans then never drained and nothing was ever verified in stream.
+        // The meaningful length check is decoded-vs-described and lives in
+        // `live_par2_clean_verification_shape`, which compares
+        // `file.received_bytes()` against this same `desc.length`.
+        let described_length = set.file_description(&par2_file_id)?.length;
+        Some((
+            par2_file_id,
+            described_length,
+            state.working_dir.join(current_filename),
+            file.is_complete(),
+        ))
     }
 
-    /// Activate live verification once the set is parsed, binding every file
-    /// whose bytes were recorded before activation and backfilling the blocks
-    /// those coalesced ranges fully cover.
-    pub(crate) async fn activate_live_par2(&mut self, job_id: JobId) {
-        if !self.live_par2.enabled() {
-            return;
-        }
-        let Some(par2_set) = self.par2_set(job_id).cloned() else {
+    fn bind_live_par2_file(&mut self, file_id: NzbFileId) {
+        let Some((par2_file_id, length, path, complete)) = self.resolve_live_par2_binding(file_id)
+        else {
             return;
         };
-        let awaiting = self.live_par2.activate(job_id, par2_set);
-        for file_id in awaiting {
-            let binding = self.resolve_live_par2_binding(file_id);
-            self.live_par2.bind(file_id, binding);
+        if self.live_par2.bind(file_id, par2_file_id, length, path) && complete {
+            // The *received* length, never the described one. This is the
+            // fail-safe for a file whose decoded bytes disagree with what PAR2
+            // describes, and since `bind` was handed `desc.length` as the
+            // binding length, passing it again here would compare a value to
+            // itself: `rejected` could never fire and `completed_bytes` would
+            // always look right.
+            let received_bytes = self
+                .jobs
+                .get(&file_id.job_id)
+                .and_then(|state| state.assembly.file(file_id))
+                .map(|file| file.received_bytes());
+            if let Some(received_bytes) = received_bytes {
+                self.live_par2.note_file_complete(file_id, received_bytes);
+            }
         }
-        let reads = self.live_par2.take_queued_reads(job_id);
-        self.run_live_par2_reads(reads, true).await;
     }
 
-    /// A file finished downloading.
-    ///
-    /// Deliberately allocation-free and I/O-free: this runs on the download
-    /// path, so it only records the fail-safe length verdict. Every read-back
-    /// happens later, in the completion-gate sweep that actually decides
-    /// whether the full pass can be skipped.
+    pub(crate) fn activate_live_par2(&mut self, job_id: JobId, packets: &[par2_rs::Packet]) {
+        self.live_par2.activate(job_id, packets);
+        let file_ids = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                state
+                    .assembly
+                    .files()
+                    .map(|file| file.file_id())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for file_id in file_ids {
+            self.bind_live_par2_file(file_id);
+        }
+    }
+
+    /// Feed bytes after normal assembly made them durable.  We only retain
+    /// lightweight range shape until metadata and identity are both known.
+    pub(crate) fn note_live_par2_segment(
+        &mut self,
+        file_id: NzbFileId,
+        file_offset: u64,
+        data: &crate::pipeline::DecodedChunk,
+    ) {
+        if !self.live_par2.enabled()
+            || (!self.job_spec_has_par2_file(file_id.job_id)
+                && self.par2_set(file_id.job_id).is_none())
+        {
+            return;
+        }
+        self.bind_live_par2_file(file_id);
+        self.live_par2.note_segment(file_id, file_offset, data);
+    }
+
     pub(crate) fn note_live_par2_file_complete(&mut self, file_id: NzbFileId, received_bytes: u64) {
+        self.bind_live_par2_file(file_id);
         self.live_par2.note_file_complete(file_id, received_bytes);
     }
 
-    /// Final settle sweep before the completion seam decides on a short-circuit.
-    pub(crate) async fn settle_live_par2_job(&mut self, job_id: JobId) {
-        if !self.live_par2.enabled() || !self.live_par2.is_active(job_id) {
+    /// Complete the bounded disk backfill/settle phase.  Any I/O error or
+    /// short read simply leaves live verification incomplete and the existing
+    /// authoritative pass remains responsible for the job.
+    pub(crate) async fn run_live_par2_reads(&mut self, job_id: JobId) {
+        let reads = self.live_par2.take_reads(job_id);
+        if reads.is_empty() {
             return;
         }
-        for file_id in self.live_par2.files_needing_settle(job_id) {
-            let reads = self.live_par2.take_settle_reads(file_id);
-            self.run_live_par2_reads(reads, false).await;
-        }
-    }
-
-    async fn run_live_par2_reads(&mut self, reads: Vec<live::LiveRead>, from_backfill: bool) {
-        for read in reads {
-            // A direct set's source volume has no file (D7), so the read goes
-            // through the hybrid virtual-volume provider instead — the same
-            // bytes, in the same source-volume coordinate space, assembled from
-            // the envelope plus the routed member partials. A range that lands
-            // on a hole comes back short, exactly as a truncated file would, and
-            // those blocks stay `Pending` for the authoritative pass.
-            let source = match self.direct_virtual_volume(read.file_id) {
-                Some((volume_index, _, provider)) => {
-                    LiveReadSource::Virtual(volume_index, provider)
-                }
-                None => match self.write_target_for_file(read.file_id) {
-                    Some((_, _, _, file_path)) => LiveReadSource::OnDisk(file_path),
-                    None => continue,
-                },
-            };
-            let bytes = match tokio::task::spawn_blocking(move || {
-                let _cpu_scope =
-                    crate::runtime::perf_probe::cpu_scope("verify.live_par2.range_read");
-                match source {
-                    LiveReadSource::OnDisk(file_path) => {
-                        live::read_range_best_effort(&file_path, read.offset, read.len)
+        // M2 (plan 138). The adopted engine settles a read by opening the
+        // binding's path, which is right for every conventional file and
+        // impossible for a direct set: D7 leaves its source volumes with no file
+        // at all, so a path read is dropped and every span stays `Pending`
+        // forever. Ask direct-store first — the hybrid provider serves the same
+        // bytes in the same source-volume coordinate space, assembled from the
+        // envelope plus the routed member partials, and for an encrypted set the
+        // E2 overlay re-derives the posted cipher on the way out. A range
+        // landing on a hole comes back short, exactly as a truncated file would,
+        // and those blocks correctly stay `Pending` for the authoritative pass.
+        let reads = reads
+            .into_iter()
+            .filter_map(|read| {
+                let source = match self.direct_virtual_volume(read.file_id) {
+                    Some((volume_index, _, provider)) => {
+                        LiveReadSource::Virtual(volume_index, provider)
                     }
-                    LiveReadSource::Virtual(volume_index, provider) => {
-                        live::read_virtual_range_best_effort(
-                            &provider,
-                            volume_index,
-                            read.offset,
-                            read.len,
-                        )
-                    }
-                }
+                    None => LiveReadSource::OnDisk(self.live_par2.path_for_read(read)?),
+                };
+                Some((read, source))
             })
-            .await
-            {
-                Ok(Ok(bytes)) => bytes,
-                Ok(Err(error)) => {
-                    debug!(
-                        file_id = %read.file_id,
-                        offset = read.offset,
-                        len = read.len,
-                        error = %error,
-                        "live PAR2 read-back failed; leaving blocks pending"
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    warn!(
-                        file_id = %read.file_id,
-                        error = %error,
-                        "live PAR2 read-back task panicked; leaving blocks pending"
-                    );
-                    continue;
-                }
-            };
-            self.live_par2
-                .apply_read(read.file_id, read.offset, &bytes, from_backfill);
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let results = match tokio::task::spawn_blocking(move || {
+            reads
+                .into_iter()
+                .map(|(read, source)| {
+                    let result = match source {
+                        LiveReadSource::OnDisk(path) => {
+                            live::read_range_best_effort(&path, read.offset, read.len)
+                        }
+                        LiveReadSource::Virtual(volume_index, provider) => {
+                            live::read_virtual_range_best_effort(
+                                &provider,
+                                volume_index,
+                                read.offset,
+                                read.len,
+                            )
+                        }
+                    };
+                    (read, result)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            Ok(results) => results,
+            Err(error) => {
+                warn!(job_id = job_id.0, error = %error, "live PAR2 disk-read task panicked");
+                return;
+            }
+        };
+        crate::runtime::perf_probe::record("verify.live_par2.disk_reads", started.elapsed());
+        for (read, result) in results {
+            match result {
+                Ok(bytes) => self.live_par2.apply_read(read, &bytes),
+                Err(error) => debug!(
+                    job_id = job_id.0,
+                    file_id = %read.file_id,
+                    offset = read.offset,
+                    len = read.len,
+                    error = %error,
+                    "live PAR2 read unavailable; falling back to authoritative verification"
+                ),
+            }
         }
     }
 
-    /// The clean verification a full PAR2 pass would produce, when live
-    /// results already prove it — plus the length check that pass would have
+    pub(crate) async fn settle_live_par2_job(&mut self, job_id: JobId) {
+        self.live_par2.schedule_settle_reads(job_id);
+        self.run_live_par2_reads(job_id).await;
+        let metrics = self.live_par2.metrics();
+        debug!(
+            job_id = job_id.0,
+            partial_bytes = self.live_par2.partial_bytes(),
+            strong_slices = metrics.strongly_verified_slices,
+            metadata_range_overflows = metrics.metadata_range_overflows,
+            backfill_reads = metrics.backfill_reads,
+            settle_reads = metrics.settle_reads,
+            disk_read_bytes = metrics.disk_read_bytes,
+            disk_read_budget_exhausted = metrics.disk_read_budget_exhausted,
+            "live PAR2 settle diagnostics"
+        );
+    }
+
+    pub(crate) fn live_par2_strong_evidence(
+        &mut self,
+        job_id: JobId,
+    ) -> Vec<(std::path::PathBuf, par2_rs::SliceEvidence)> {
+        self.live_par2.strong_evidence(job_id)
+    }
+
+    pub(crate) fn live_par2_complete_bindings(
+        &self,
+        job_id: JobId,
+    ) -> Option<HashMap<NzbFileId, par2_rs::FileId>> {
+        self.live_par2.complete_bindings_if_strong(job_id)
+    }
+
+    /// Whether the retained session is in play. Reads the environment in a
+    /// real build; a test may force either arm so a differential can assert
+    /// the two agree.
+    fn stateful_par2_session_gate(&self) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = self.stateful_par2_session_forced {
+            return forced;
+        }
+        stateful_par2_session_enabled()
+    }
+
+    pub(crate) async fn take_or_open_par2_repair_session(
+        &mut self,
+        job_id: JobId,
+        working_dir: std::path::PathBuf,
+        memory_limit: usize,
+        progress: Option<par2_rs::ProgressCallback>,
+        source_access: Option<std::sync::Arc<dyn par2_rs::FileAccess + Send + Sync>>,
+    ) -> Result<Option<(par2_rs::Par2RepairSession, bool)>, String> {
+        if !self.stateful_par2_session_gate() {
+            return Ok(None);
+        }
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id)
+            && let Some(mut session) = runtime.session.take()
+        {
+            {
+                // A session is reusable only if it reads sources the way this
+                // caller needs them read. Where both want a handle the retained
+                // one adopts the new handle — the direct overlay snapshots its
+                // coverage, so every pass builds a fresh one and re-pointing is
+                // what keeps one session across many of them (plan 138, M3).
+                // A mismatch in *kind* is not adoptable in either direction, so
+                // that session is dropped and a fresh one opened below.
+                match (&source_access, session.is_access_backed()) {
+                    (Some(access), true) => {
+                        session.set_source_access(std::sync::Arc::clone(access));
+                        runtime.session_last_used = Some(Instant::now());
+                        return Ok(Some((session, false)));
+                    }
+                    (None, false) => {
+                        runtime.session_last_used = Some(Instant::now());
+                        return Ok(Some((session, false)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let Some((primary_path, recovery_paths)) = self.par2_runtime(job_id).and_then(|runtime| {
+            runtime
+                .primary_path
+                .clone()
+                .map(|primary_path| (primary_path, runtime.merged_recovery_paths.clone()))
+        }) else {
+            return Ok(None);
+        };
+
+        let session_result = tokio::task::spawn_blocking(move || {
+            let mut options = match source_access {
+                Some(access) => par2_rs::Par2RepairSessionOptions::with_source_access(
+                    working_dir,
+                    vec![primary_path],
+                    access,
+                ),
+                None => par2_rs::Par2RepairSessionOptions::new(working_dir, vec![primary_path]),
+            };
+            options.memory_limit = Some(memory_limit);
+            options.progress = progress;
+            let mut session = par2_rs::Par2RepairSession::open(options)
+                .map_err(|error| format!("failed to open retained PAR2 session: {error}"))?;
+            if !recovery_paths.is_empty() {
+                session
+                    .merge_recovery_paths(recovery_paths)
+                    .map_err(|error| {
+                        format!("failed to replay retained PAR2 recovery paths: {error}")
+                    })?;
+            }
+            Ok::<_, String>(session)
+        })
+        .await
+        .map_err(|error| format!("retained PAR2 session task panicked: {error}"))??;
+
+        Ok(Some((session_result, true)))
+    }
+
+    pub(crate) fn restore_par2_repair_session(
+        &mut self,
+        job_id: JobId,
+        session: par2_rs::Par2RepairSession,
+    ) {
+        let runtime = self.ensure_par2_runtime(job_id);
+        runtime.session = Some(session);
+        runtime.session_last_used = Some(Instant::now());
+        self.enforce_par2_retained_session_budget(job_id);
+    }
+
+    fn enforce_par2_retained_session_budget(&mut self, protected_job_id: JobId) {
+        loop {
+            let retained_bytes = self
+                .par2_runtime
+                .values()
+                .filter_map(|runtime| runtime.session.as_ref())
+                .map(par2_rs::Par2RepairSession::estimated_retained_bytes)
+                .sum::<usize>();
+            if retained_bytes <= PAR2_RETAINED_SESSION_BUDGET_BYTES {
+                return;
+            }
+
+            let victim = select_par2_session_eviction(
+                self.par2_runtime.iter().map(|(job_id, runtime)| {
+                    (
+                        *job_id,
+                        runtime.session.is_some(),
+                        runtime.session_last_used,
+                    )
+                }),
+                protected_job_id,
+            );
+            let Some(victim) = victim else {
+                return;
+            };
+            let runtime = self
+                .par2_runtime
+                .get_mut(&victim)
+                .expect("PAR2 session eviction target exists");
+            runtime.session = None;
+            runtime.session_last_used = None;
+            runtime.session_evidence_file_ids.clear();
+            info!(
+                job_id = victim.0,
+                retained_bytes,
+                budget_bytes = PAR2_RETAINED_SESSION_BUDGET_BYTES,
+                "evicted retained PAR2 session; it will be reopened and reanalyzed if needed"
+            );
+        }
+    }
+
+    /// A decoded write can replace bytes that were previously committed to a
+    /// retained repair session. Drop source locations before that write is
+    /// allowed to become observable; parsed PAR2 packets remain reusable.
+    pub(crate) fn invalidate_par2_session_for_file_write(&mut self, file_id: NzbFileId) {
+        let Some(runtime) = self.par2_runtime.get_mut(&file_id.job_id) else {
+            return;
+        };
+        runtime.completed_checksums.remove(&file_id);
+        runtime.session_evidence_file_ids.clear();
+        if let Some(session) = runtime.session.as_mut() {
+            session.invalidate_all_sources();
+        }
+    }
+
+    /// Identity changes can rename or rebind a path without changing the
+    /// downloaded bytes. A retained location must nevertheless be discarded:
+    /// repair always derives a fresh location from the current identity.
+    pub(crate) fn invalidate_par2_session_for_identity_rebind(&mut self, job_id: JobId) {
+        self.live_par2.invalidate_job(job_id);
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
+            runtime.session_evidence_file_ids.clear();
+            if let Some(session) = runtime.session.as_mut() {
+                session.invalidate_all_sources();
+            }
+        }
+    }
     /// performed while reading the files.
     pub(crate) async fn live_par2_clean_verification(
         &self,
@@ -733,19 +973,6 @@ impl Pipeline {
         }
         Some((verification, placement_plan))
     }
-
-    /// Mirrors `scan_placement`'s length rejection: a file whose size
-    /// disagrees with its description is not the file that description names,
-    /// whatever its blocks hashed to in stream. A stat that fails at all is a
-    /// refusal too — the existing pass then runs and reports properly.
-    ///
-    /// A **direct set's source volume has no file to stat** (D7), so its check
-    /// is answered from the virtual volume's own length instead — the decoded
-    /// total the download layer tracks, taken to at least the end of the
-    /// coverage map, which is exactly the length the PAR2 `FileAccess` adapter
-    /// reports for the same volume. Those entries cost no I/O and are settled
-    /// before the blocking task is spawned, so a job made only of direct volumes
-    /// short-circuits without touching the filesystem at all.
     async fn live_par2_lengths_match(job_id: JobId, checks: Vec<LiveLengthCheck>) -> bool {
         let mut on_disk = Vec::with_capacity(checks.len());
         for check in checks {
@@ -800,18 +1027,6 @@ impl Pipeline {
             }
         }
     }
-
-    /// The synthesized clean verdict, before the on-disk length check.
-    ///
-    /// Every recovery-set file must be matched, block-complete, decoded to
-    /// exactly the description's length, and already sitting at its correct
-    /// name. Under those conditions `scan_placement` would classify each file
-    /// as `exact` (all of its slices hash to the description's, so its
-    /// full-file MD5 does too) and `verify_all` would return `Complete` with
-    /// every slice valid — which is exactly the shape synthesized here.
-    /// Anything short of that returns `None` and the existing pass runs
-    /// unchanged.
-    #[allow(clippy::type_complexity)]
     fn live_par2_clean_verification_shape(
         &self,
         job_id: JobId,
@@ -824,7 +1039,17 @@ impl Pipeline {
         if par2_set.recovery_file_ids.is_empty() {
             return None;
         }
-        let verified = self.live_par2.fully_verified_files(job_id)?;
+        // M2 (plan 138): the adopted engine states this as
+        // NzbFileId -> par2 FileId, keyed the other way round, and gates on
+        // `Crc32AndMd5` slice strength rather than a bare "ok" — strictly
+        // stronger than the map this short-circuit used to read. Inverted here
+        // so the rest of the shape check is unchanged.
+        let verified: HashMap<par2_rs::FileId, NzbFileId> = self
+            .live_par2
+            .complete_bindings_if_strong(job_id)?
+            .into_iter()
+            .map(|(nzb_file_id, par2_file_id)| (par2_file_id, nzb_file_id))
+            .collect();
         let state = self.jobs.get(&job_id)?;
 
         let mut files = Vec::with_capacity(par2_set.recovery_file_ids.len());
@@ -888,7 +1113,6 @@ impl Pipeline {
             length_checks,
         ))
     }
-
     pub(crate) fn note_recovery_count_from_yenc_name(
         &mut self,
         job_id: JobId,
@@ -981,6 +1205,18 @@ impl Pipeline {
             return Some((0, RecoveryCountSource::Exact));
         }
 
+        // A standard `.volNNN+CCC.par2` name carries the exact packet count.
+        // Prefer it before estimating from the encoded file size: the latter
+        // includes set metadata and can otherwise under- or over-select the
+        // first recovery wave.
+        if let weaver_model::files::FileRole::Par2 {
+            is_index: false,
+            recovery_block_count,
+        } = role
+        {
+            return Some((recovery_block_count, RecoveryCountSource::FilenameFallback));
+        }
+
         if let (Some(packet_size), Some(overhead), Some(total_bytes)) = (
             self.recovery_packet_size(job_id),
             self.recovery_metadata_overhead_bytes(job_id),
@@ -995,16 +1231,7 @@ impl Pipeline {
             return Some((estimated, RecoveryCountSource::Calibrated));
         }
 
-        match role {
-            weaver_model::files::FileRole::Par2 {
-                is_index,
-                recovery_block_count,
-            } => Some((
-                if is_index { 0 } else { recovery_block_count },
-                RecoveryCountSource::FilenameFallback,
-            )),
-            _ => None,
-        }
+        None
     }
 
     /// If the completed file is a PAR2 index, read it from disk, parse it,
@@ -1037,8 +1264,13 @@ impl Pipeline {
         }
 
         let parse_path = file_path.clone();
-        let par2_set = match tokio::task::spawn_blocking(move || {
-            par2_rs::Par2FileSet::from_paths(&[parse_path])
+        let (par2_set, packets) = match tokio::task::spawn_blocking(move || {
+            let packets = par2_rs::scan_packets_from_path(&parse_path)?
+                .into_iter()
+                .map(|(packet, _)| packet)
+                .collect::<Vec<_>>();
+            let set = par2_rs::Par2FileSet::from_packets(packets.clone())?;
+            Ok::<_, par2_rs::Par2Error>((set, packets))
         })
         .await
         {
@@ -1082,8 +1314,13 @@ impl Pipeline {
             "PAR2 metadata loaded"
         );
 
-        self.ensure_par2_runtime(job_id).set = Some(Arc::new(par2_set));
-        self.activate_live_par2(job_id).await;
+        {
+            let runtime = self.ensure_par2_runtime(job_id);
+            runtime.primary_path = Some(file_path);
+            runtime.set = Some(Arc::new(par2_set));
+        }
+        self.activate_live_par2(job_id, &packets);
+        self.run_live_par2_reads(job_id).await;
 
         let _ = self
             .event_tx
@@ -1143,6 +1380,41 @@ impl Pipeline {
                 return;
             }
         };
+
+        self.ensure_par2_runtime(job_id)
+            .merged_recovery_paths
+            .insert(file_path.clone());
+        self.live_par2.merge_packets(job_id, &packet_list);
+        if let Some(mut session) = self
+            .par2_runtime
+            .get_mut(&job_id)
+            .and_then(|runtime| runtime.session.take())
+        {
+            let session_path = file_path.clone();
+            match tokio::task::spawn_blocking(move || {
+                let result = session.merge_recovery_paths([session_path]);
+                (session, result)
+            })
+            .await
+            {
+                Ok((session, Ok(_))) => self.restore_par2_repair_session(job_id, session),
+                Ok((session, Err(error))) => {
+                    self.restore_par2_repair_session(job_id, session);
+                    warn!(
+                        job_id = job_id.0,
+                        filename = %filename,
+                        error = %error,
+                        "failed to merge recovery path into retained PAR2 session"
+                    );
+                }
+                Err(error) => warn!(
+                    job_id = job_id.0,
+                    filename = %filename,
+                    error = %error,
+                    "retained PAR2 recovery merge task panicked; session was evicted"
+                ),
+            }
+        }
 
         let merge_result = {
             let par2_set = Arc::make_mut(self.ensure_par2_runtime(job_id).set.as_mut().unwrap());
@@ -1249,7 +1521,7 @@ impl Pipeline {
         let queued_download = self.jobs.get(&job_id).is_some_and(|state| {
             state
                 .download_queue
-                .count_matching(|work| work.is_recovery && work.segment_id.file_id == file_id)
+                .count_matching(|work| work.segment_id.file_id == file_id)
                 > 0
         });
         let active_download = self.active_downloads_by_file.contains_key(&file_id);

@@ -152,12 +152,73 @@ impl Pipeline {
         })
     }
 
+    /// Whether PAR2 can still deliver a verdict on this job's archives.
+    ///
+    /// Keyed on a **loaded** set, not on the NZB declaring one. A job can
+    /// declare a `.par2` whose articles never arrive — routine, since recovery
+    /// volumes often sit on a different retention tier — and keying on the
+    /// declaration would latch a failed member out while waiting for a verdict
+    /// that can never come.
+    ///
+    /// A clean verdict releases it. 0.7.9 drops that clause so a member that
+    /// fails *after* verification stays latched; 0.8 does not need to, because
+    /// it already re-opens the completion gate for that job by another route,
+    /// and holding the latch as well would keep the member out with no verdict
+    /// left to come.
+    pub(crate) fn par2_is_authoritative_for_extraction(&self, job_id: JobId) -> bool {
+        self.par2_set(job_id).is_some() && !self.par2_bypassed.contains(&job_id)
+    }
+
+    /// Whether a RAR extraction has failed for this job and PAR2 has not yet
+    /// had its say about why.
+    ///
+    /// This is the recovery latch. A member that failed to extract will fail
+    /// the same way against the same bytes, so re-scheduling it before PAR2
+    /// has decided whether those bytes can be repaired is a spin: extract,
+    /// fail, re-schedule, extract. The failed-extraction marker is the only
+    /// state involved — it is already recorded, already persisted, and already
+    /// cleared by the paths that resolve a failure
+    /// ([`Self::clear_failed_extraction_member`] after a repair,
+    /// `replace_failed_extraction_members` when the set is retried).
+    ///
+    /// "No worker still running" matters: while one is, the job's inputs can
+    /// still change under it, and the failure is not settled.
+    pub(crate) fn par2_recovery_evaluation_pending(&self, job_id: JobId) -> bool {
+        if !self.par2_is_authoritative_for_extraction(job_id) {
+            return false;
+        }
+        if self
+            .failed_extractions
+            .get(&job_id)
+            .is_none_or(|members| members.is_empty())
+        {
+            return false;
+        }
+        // The broader check, matching what completion asks: a full-set
+        // extraction in flight can still change this job's inputs just as a
+        // per-member worker can.
+        !self.job_has_active_extraction_tasks(job_id)
+    }
+
     pub(crate) fn rar_ready_member_is_startable_for_batch_extraction(
         &self,
         job_id: JobId,
         set_name: &str,
         member_name: &str,
     ) -> bool {
+        // The recovery latch (see `par2_recovery_evaluation_pending`). A member
+        // that already failed does not go round again until PAR2 has decided
+        // whether its bytes can be repaired — otherwise the failure and the
+        // re-schedule chase each other. Checked per member, so the set's other
+        // members are unaffected.
+        if self
+            .failed_extractions
+            .get(&job_id)
+            .is_some_and(|members| members.contains(member_name))
+            && self.par2_is_authoritative_for_extraction(job_id)
+        {
+            return false;
+        }
         if self
             .inflight_extractions
             .get(&job_id)
@@ -435,6 +496,8 @@ impl Pipeline {
             .get(&job_id)
             .cloned()
             .unwrap_or_default();
+        let par2_repair_authoritative =
+            self.par2_set(job_id).is_some() && !self.par2_bypassed.contains(&job_id);
 
         let mut candidate_sets: Vec<(String, Vec<String>, bool)> = self
             .rar_sets
@@ -469,6 +532,14 @@ impl Pipeline {
                         .extracted_members
                         .get(&job_id)
                         .is_some_and(|extracted| extracted.contains(&ready_member.name))
+                    {
+                        continue;
+                    }
+                    if par2_repair_authoritative
+                        && self
+                            .failed_extractions
+                            .get(&job_id)
+                            .is_some_and(|failed| failed.contains(&ready_member.name))
                     {
                         continue;
                     }
@@ -1351,6 +1422,12 @@ impl Pipeline {
                 let all_downloaded = self.jobs.get(&job_id).is_some_and(|state| {
                     state.assembly.complete_data_file_count() >= state.assembly.data_file_count()
                 });
+                let par2_repair_pending = self.par2_set(job_id).is_some()
+                    && !self.par2_bypassed.contains(&job_id)
+                    && self
+                        .failed_extractions
+                        .get(&job_id)
+                        .is_some_and(|failed| !failed.is_empty());
                 if capacity_retry {
                     self.schedule_rar_capacity_retry(
                         job_id,
@@ -1370,7 +1447,18 @@ impl Pipeline {
                         RarExtractionSettle::RefreshLaunched {
                             allows_extraction: false,
                         } => {}
-                        RarExtractionSettle::Idle if all_downloaded => {
+                        RarExtractionSettle::Idle if all_downloaded || par2_repair_pending => {
+                            self.check_job_completion(job_id).await;
+                        }
+                        // The last worker of a failed batch has settled. The
+                        // job goes to completion for a PAR2 verdict, not back
+                        // to extraction: the member that failed is latched out
+                        // of scheduling until that verdict lands, so calling
+                        // `try_rar_extraction` here would either pick nothing
+                        // or pick a member the same failure is about to cover.
+                        RarExtractionSettle::Idle
+                            if self.par2_recovery_evaluation_pending(job_id) =>
+                        {
                             self.check_job_completion(job_id).await;
                         }
                         RarExtractionSettle::Idle => {

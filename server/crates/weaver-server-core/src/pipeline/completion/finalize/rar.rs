@@ -1015,6 +1015,149 @@ impl Pipeline {
         })
     }
 
+    /// Restore missing RAR data volumes from sibling standalone `.rev` files.
+    ///
+    /// The recovery crate discovers and validates matching recovery volumes from
+    /// the already-known RAR set paths.  Weaver does not infer missing names or
+    /// trust a filename convention here: only a successful, verified recovery
+    /// report is registered back into the set topology.
+    pub(in crate::pipeline) async fn try_restore_rar_recovery_volumes(
+        &mut self,
+        job_id: JobId,
+    ) -> Result<bool, String> {
+        let set_names = self.rar_set_names_for_job(job_id);
+        let mut restored_sets = HashSet::new();
+
+        for set_name in set_names {
+            let volume_paths: Vec<PathBuf> = self
+                .volume_paths_for_rar_set(job_id, &set_name)
+                .into_values()
+                .collect();
+            if volume_paths.is_empty() {
+                continue;
+            }
+
+            let report = match tokio::task::spawn_blocking(move || {
+                unrar_rs::restore_volumes_from_paths(
+                    &volume_paths,
+                    &unrar_rs::RecoveryOptions::default(),
+                )
+            })
+            .await
+            .map_err(|error| format!("RAR recovery worker failed: {error}"))?
+            {
+                Ok(report) => report,
+                Err(error) => {
+                    debug!(
+                        job_id = job_id.0,
+                        set_name = %set_name,
+                        error = %error,
+                        "RAR recovery volumes did not restore a missing volume"
+                    );
+                    continue;
+                }
+            };
+
+            let roots = self
+                .jobs
+                .get(&job_id)
+                .map(|state| (state.working_dir.clone(), state.staging_dir.clone()))
+                .ok_or_else(|| format!("job {job_id:?} not found"))?;
+            let password_candidates = self.archive_password_candidates_for_set(job_id, &set_name);
+            let mut restored = Vec::with_capacity(report.restored_paths.len());
+            for path in report.restored_paths {
+                let relative_path = if let Ok(relative_path) = path.strip_prefix(&roots.0) {
+                    relative_path
+                } else if let Some(staging_dir) = roots.1.as_deref() {
+                    path.strip_prefix(staging_dir).map_err(|_| {
+                        format!(
+                            "RAR recovery restored {} outside job input directories",
+                            path.display()
+                        )
+                    })?
+                } else {
+                    return Err(format!(
+                        "RAR recovery restored {} outside job input directories",
+                        path.display()
+                    ));
+                };
+                let relative_path = relative_path
+                    .to_str()
+                    .ok_or_else(|| {
+                        format!(
+                            "RAR recovery restored non-UTF-8 input path {}",
+                            path.display()
+                        )
+                    })?
+                    .to_string();
+                let facts =
+                    Self::parse_rar_volume_facts_from_path(path, password_candidates.clone())
+                        .await?;
+                restored.push((facts.volume_number, relative_path, facts));
+            }
+
+            if restored.is_empty() {
+                continue;
+            }
+
+            let restored_volumes: Vec<u32> = restored
+                .iter()
+                .map(|(volume_number, _, _)| *volume_number)
+                .collect();
+            for (volume_number, relative_path, facts) in restored {
+                self.persist_rar_volume_facts(
+                    job_id,
+                    &set_name,
+                    &relative_path,
+                    Some(volume_number),
+                    facts,
+                )?;
+            }
+            if let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
+                set_state.cached_headers = None;
+                for volume_number in restored_volumes {
+                    set_state.verified_suspect_volumes.remove(&volume_number);
+                }
+            }
+            self.recompute_rar_set_state(job_id, &set_name).await?;
+            restored_sets.insert(set_name);
+        }
+
+        if restored_sets.is_empty() {
+            return Ok(false);
+        }
+
+        let restored_members: HashSet<String> = restored_sets
+            .iter()
+            .filter_map(|set_name| {
+                self.rar_sets
+                    .get(&(job_id, set_name.clone()))
+                    .and_then(|state| state.plan.as_ref())
+            })
+            .flat_map(|plan| plan.member_names.iter().cloned())
+            .collect();
+        if !restored_members.is_empty() {
+            let remaining_failed = self
+                .failed_extractions
+                .get(&job_id)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|member| !restored_members.contains(member))
+                .collect();
+            self.replace_failed_extraction_members(job_id, remaining_failed);
+        }
+
+        info!(
+            job_id = job_id.0,
+            sets = ?restored_sets,
+            "restored RAR volumes from standalone recovery files"
+        );
+        self.retry_archive_extraction_after_verify_or_repair(job_id)
+            .await;
+        Ok(true)
+    }
+
     pub(in crate::pipeline) async fn retry_archive_extraction_after_verify_or_repair(
         &mut self,
         job_id: JobId,

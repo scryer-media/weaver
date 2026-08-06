@@ -812,7 +812,7 @@ impl Pipeline {
                     job_id,
                     file_index: *file_index,
                 };
-                let Some(binding) = self.resolve_live_par2_binding(file_id) else {
+                let Some((par2_file_id, _, _, _)) = self.resolve_live_par2_binding(file_id) else {
                     continue;
                 };
                 // A retained image carries the lengths it was captured with, so
@@ -835,7 +835,7 @@ impl Pipeline {
                     }
                 };
                 lengths.insert(*volume_index, len);
-                bindings.insert(*volume_index, (*file_index, binding.par2_file_id));
+                bindings.insert(*volume_index, (*file_index, par2_file_id));
             }
             let set_volumes = match retained {
                 Some(volumes) => volumes.to_vec(),
@@ -1054,7 +1054,7 @@ impl Pipeline {
                     return None;
                 }
                 self.resolve_live_par2_binding(file_id)
-                    .map(|binding| binding.par2_file_id)
+                    .map(|(par2_file_id, _, _, _)| par2_file_id)
             })
             .collect();
         if finalized.is_empty() {
@@ -1188,37 +1188,46 @@ impl Pipeline {
     /// a repair's size away from, and a sampled span would re-inflate it. Weaver
     /// sets the flag on no path that can reach here; the pin is in
     /// [`super::repair`]'s module docs.
-    async fn verify_direct_sets_quietly(
-        &self,
+    pub(crate) async fn verify_direct_sets_quietly(
+        &mut self,
         job_id: JobId,
         par2_set: std::sync::Arc<par2_rs::Par2FileSet>,
         working_dir: PathBuf,
     ) -> Option<par2_rs::VerificationResult> {
         let overlay = self.direct_par2_overlay(job_id)?;
-        let pp_pool = self.pp_pool.clone();
         let volumes = overlay.volumes.clone();
         let provider = overlay.provider;
-        let mut verification = tokio::task::spawn_blocking(move || {
-            pp_pool.install(move || {
-                // No placement scan: the direct volumes are absent from the
-                // directory by construction and every other file is at its
-                // declared name, which is the same assumption the repair's own
-                // fallback access makes.
-                let plan = par2_rs::PlacementPlan {
-                    exact: volumes.iter().map(|volume| volume.par2_file_id).collect(),
-                    swaps: Vec::new(),
-                    renames: Vec::new(),
-                    unresolved: Vec::new(),
-                    conflicts: Vec::new(),
-                };
-                let inner = par2_rs::PlacementFileAccess::from_plan(working_dir, &par2_set, &plan);
-                let access =
-                    super::par2_access::DirectVolumeFileAccess::new(inner, provider, &volumes);
-                par2_rs::verify_all(&par2_set, &access)
-            })
-        })
-        .await
-        .ok()?;
+        // No placement scan: the direct volumes are absent from the directory
+        // by construction and every other file is at its declared name, which
+        // is the same assumption the repair's own fallback access makes.
+        let plan = par2_rs::PlacementPlan {
+            exact: volumes.iter().map(|volume| volume.par2_file_id).collect(),
+            swaps: Vec::new(),
+            renames: Vec::new(),
+            unresolved: Vec::new(),
+            conflicts: Vec::new(),
+        };
+        let inner = par2_rs::PlacementFileAccess::from_plan(working_dir.clone(), &par2_set, &plan);
+        let access = std::sync::Arc::new(super::par2_access::DirectVolumeFileAccess::new(
+            inner, provider, &volumes,
+        ));
+
+        let mut verification = match self
+            .verify_direct_sets_through_session(job_id, &par2_set, &working_dir, &access)
+            .await
+        {
+            Some(verification) => verification,
+            None => {
+                let pp_pool = self.pp_pool.clone();
+                let par2_set = std::sync::Arc::clone(&par2_set);
+                let access = std::sync::Arc::clone(&access);
+                tokio::task::spawn_blocking(move || {
+                    pp_pool.install(move || par2_rs::verify_all(&par2_set, access.as_ref()))
+                })
+                .await
+                .ok()?
+            }
+        };
         let adjustments = self.apply_direct_damage_adjustments(job_id, &mut verification);
         if adjustments.any() {
             debug!(
@@ -1229,7 +1238,107 @@ impl Pipeline {
                 "adjusted the quiet direct-set pass before attributing damage"
             );
         }
+        #[cfg(test)]
+        {
+            self.last_direct_verdict = Some(verification.clone());
+        }
         Some(verification)
+    }
+
+    /// The retained session's verdict for a job's direct sets, or `None` to
+    /// fall back to the read-and-verify pass (plan 138, M3).
+    ///
+    /// # Why this can refuse
+    ///
+    /// An access-backed session reads **no** source bytes: `analyze()` skips
+    /// the scan entirely, because `base_dir` holds no sources to find. It
+    /// reports what its evidence established and nothing more. So it can stand
+    /// in for the pass only when every described slice already carries a strong
+    /// verdict — which is what the live engine produces in stream, and what
+    /// `fully_adjudicated_bindings` checks. A slice proven *bad* counts: it is
+    /// resolved, and resolving it is what the pass was for. A slice with no
+    /// verdict does not, and one of those is enough to send the whole job back
+    /// to `verify_all`, which can actually read a virtual volume.
+    ///
+    /// Refusing is therefore ordinary, not exceptional — a job with live
+    /// verification off never takes this path at all.
+    async fn verify_direct_sets_through_session(
+        &mut self,
+        job_id: JobId,
+        par2_set: &std::sync::Arc<par2_rs::Par2FileSet>,
+        working_dir: &std::path::Path,
+        access: &std::sync::Arc<super::par2_access::DirectVolumeFileAccess>,
+    ) -> Option<par2_rs::VerificationResult> {
+        self.live_par2.fully_adjudicated_bindings(job_id)?;
+        let evidence = self.live_par2_strong_evidence(job_id);
+        if evidence.is_empty() {
+            return None;
+        }
+
+        let memory_limit =
+            crate::pipeline::completion::finalize::check::configured_par2_repair_memory_limit_bytes(
+            );
+        let handle: std::sync::Arc<dyn par2_rs::FileAccess + Send + Sync> =
+            std::sync::Arc::clone(access) as std::sync::Arc<dyn par2_rs::FileAccess + Send + Sync>;
+        let (mut session, _) = match self
+            .take_or_open_par2_repair_session(
+                job_id,
+                working_dir.to_path_buf(),
+                memory_limit,
+                None,
+                Some(handle),
+            )
+            .await
+        {
+            Ok(Some(session)) => session,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(job_id = job_id.0, error = %error, "retained PAR2 session unavailable for the direct pass");
+                return None;
+            }
+        };
+
+        let pp_pool = self.pp_pool.clone();
+        let par2_set = std::sync::Arc::clone(par2_set);
+        let joined = tokio::task::spawn_blocking(move || {
+            let outcome = pp_pool.install(|| {
+                for (_, slice) in evidence {
+                    // Keyed by FileId, not by path: a direct volume has no
+                    // path to key on, and the path the live engine captured
+                    // belongs to a file that was never written.
+                    if let Err(error) = session.add_slice_evidence_for_file(slice) {
+                        return Err(format!("failed to seed live slice evidence: {error}"));
+                    }
+                }
+                session
+                    .analyze()
+                    .map_err(|error| format!("direct session analysis failed: {error}"))
+            });
+            (session, outcome, par2_set)
+        })
+        .await;
+
+        let (session, outcome, _) = match joined {
+            Ok(joined) => joined,
+            Err(error) => {
+                warn!(job_id = job_id.0, error = %error, "direct PAR2 session task panicked");
+                return None;
+            }
+        };
+        self.restore_par2_repair_session(job_id, session);
+        match outcome {
+            Ok(outcome) => {
+                #[cfg(test)]
+                {
+                    self.direct_session_pass_calls += 1;
+                }
+                Some(outcome.verification)
+            }
+            Err(error) => {
+                warn!(job_id = job_id.0, error = %error, "falling back to the direct read-and-verify pass");
+                None
+            }
+        }
     }
 
     /// D8's repair-while-direct. `false` means nothing was repaired and the

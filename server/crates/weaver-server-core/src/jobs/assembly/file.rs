@@ -80,6 +80,12 @@ pub struct FileAssembly {
     /// linear pass would cost O(segments) each time — hundreds of microseconds
     /// per article, and hundreds of KiB of memory traffic, on a large file.
     placements: BTreeMap<u32, (u64, u32)>,
+    /// A repeated article leaves no reliable proof that all writes had a
+    /// single, unambiguous source. Keep fast PAR2 evidence conservative.
+    has_duplicate_segments: bool,
+    /// A decoded article whose length differs from the NZB-declared segment
+    /// length cannot prove gap-free, overlap-free file assembly.
+    has_length_mismatch: bool,
 }
 
 /// Result of committing a segment to assembly.
@@ -121,6 +127,8 @@ impl FileAssembly {
             received: bitvec![0; total_segments as usize],
             received_bytes: 0,
             placements: BTreeMap::new(),
+            has_duplicate_segments: false,
+            has_length_mismatch: false,
         }
     }
 
@@ -171,6 +179,7 @@ impl FileAssembly {
 
         // Check for duplicate.
         if self.received[segment_number as usize] {
+            self.has_duplicate_segments = true;
             return Ok(CommitResult {
                 file_complete: self.is_complete(),
                 was_duplicate: true,
@@ -178,6 +187,11 @@ impl FileAssembly {
         }
 
         // Mark as received.
+        let expected_size = self.cumulative_offsets[segment_number as usize + 1]
+            - self.cumulative_offsets[segment_number as usize];
+        if u64::from(decoded_size) != expected_size {
+            self.has_length_mismatch = true;
+        }
         self.received.set(segment_number as usize, true);
         self.received_bytes += decoded_size as u64;
 
@@ -191,6 +205,8 @@ impl FileAssembly {
         self.received.fill(false);
         self.received_bytes = 0;
         self.placements.clear();
+        self.has_duplicate_segments = false;
+        self.has_length_mismatch = false;
     }
 
     pub fn mark_complete(&mut self) {
@@ -282,6 +298,16 @@ impl FileAssembly {
     /// Received bytes so far.
     pub fn received_bytes(&self) -> u64 {
         self.received_bytes
+    }
+
+    /// Whether the assembled file observed any duplicate article.
+    pub fn has_duplicate_segments(&self) -> bool {
+        self.has_duplicate_segments
+    }
+
+    /// Whether any committed article differed from its declared segment size.
+    pub fn has_length_mismatch(&self) -> bool {
+        self.has_length_mismatch
     }
 }
 

@@ -2,6 +2,8 @@ use super::*;
 use crate::pipeline::direct_store::wiring::DirectPar2Resolution;
 use crate::runtime::fs as runtime_fs;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use weaver_model::files::{
     allocate_unique_download_filename, forget_reserved_download_filename,
@@ -15,6 +17,160 @@ const PAR2_REPAIR_MEMORY_LIMIT_ENV: &str = "WEAVER_PAR2_REPAIR_MEMORY_LIMIT_BYTE
 // batched kernels, so the default stays small and repairs coexist with
 // concurrent downloads; the env override remains for tuning.
 const DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone)]
+struct Par2SessionEvidenceCandidate {
+    file_id: NzbFileId,
+    path: std::path::PathBuf,
+    logical_name: String,
+    expected_length: u64,
+    full_md5: Option<[u8; 16]>,
+    crc32: u32,
+    contiguous_assembly_proven: bool,
+    bound_file_id: Option<par2_rs::FileId>,
+}
+
+fn committed_evidence_from_candidate(
+    candidate: &Par2SessionEvidenceCandidate,
+) -> Result<Option<par2_rs::CommittedFileEvidence>, String> {
+    if let Some(md5) = candidate.full_md5 {
+        return par2_rs::CommittedFileEvidence::from_full_md5_path(
+            &candidate.path,
+            &candidate.logical_name,
+            candidate.expected_length,
+            md5,
+            candidate.bound_file_id,
+        )
+        .map(Some)
+        .map_err(|error| format!("failed to capture PAR2 full-MD5 evidence: {error}"));
+    }
+    if !candidate.contiguous_assembly_proven {
+        return Ok(None);
+    }
+
+    let mut first_16k = Vec::with_capacity(16 * 1024);
+    File::open(&candidate.path)
+        .and_then(|file| file.take(16 * 1024).read_to_end(&mut first_16k))
+        .map_err(|error| {
+            format!(
+                "failed to capture first 16 KiB for retained PAR2 evidence {}: {error}",
+                candidate.path.display()
+            )
+        })?;
+    let proof = par2_rs::ContiguousAssemblyProof::try_new(
+        candidate.expected_length,
+        candidate.expected_length,
+        candidate.expected_length,
+        false,
+        false,
+        false,
+        true,
+    )
+    .map_err(|error| format!("invalid contiguous PAR2 assembly proof: {error}"))?;
+    par2_rs::CommittedFileEvidence::from_contiguous_assembly_path(
+        &candidate.path,
+        &candidate.logical_name,
+        candidate.expected_length,
+        candidate.crc32,
+        par2_rs::checksum::md5(&first_16k),
+        proof,
+        candidate.bound_file_id,
+    )
+    .map(Some)
+    .map_err(|error| format!("failed to capture PAR2 contiguous evidence: {error}"))
+}
+
+fn run_retained_par2_session(
+    mut session: par2_rs::Par2RepairSession,
+    candidates: Vec<Par2SessionEvidenceCandidate>,
+    live_evidence: Vec<(std::path::PathBuf, par2_rs::SliceEvidence)>,
+    repair: bool,
+) -> (
+    par2_rs::Par2RepairSession,
+    Result<(par2_rs::Par2RepairOutcome, Vec<NzbFileId>, bool), String>,
+) {
+    for (path, evidence) in live_evidence {
+        match session.add_slice_evidence(path, evidence) {
+            Ok(()) | Err(par2_rs::Par2SessionError::EvidenceDoesNotMatch { .. }) => {}
+            Err(error) => {
+                return (
+                    session,
+                    Err(format!("failed to add live PAR2 slice evidence: {error}")),
+                );
+            }
+        }
+    }
+    let mut admitted_file_ids = Vec::new();
+    for candidate in candidates {
+        let evidence = match committed_evidence_from_candidate(&candidate) {
+            Ok(Some(evidence)) => evidence,
+            Ok(None) | Err(_) => continue,
+        };
+        match session.add_committed_file(evidence) {
+            Ok(()) => admitted_file_ids.push(candidate.file_id),
+            Err(par2_rs::Par2SessionError::EvidenceDoesNotMatch { .. }) => {}
+            Err(error) => {
+                return (
+                    session,
+                    Err(format!("failed to add retained PAR2 evidence: {error}")),
+                );
+            }
+        }
+    }
+
+    let mut retried_source_change = false;
+    let mut result = if repair {
+        if session.assessment().is_err() {
+            session.analyze().and_then(|_| session.repair())
+        } else {
+            session.repair()
+        }
+    } else {
+        session.analyze()
+    };
+    if should_retry_par2_source_change(&result, retried_source_change) {
+        // One retry gets a fresh unresolved-only analysis. A second change is
+        // returned to the caller instead of repeatedly trusting a moving path.
+        retried_source_change = true;
+        admitted_file_ids.clear();
+        session.invalidate_all_sources();
+        result = session.analyze();
+        if result.is_ok() && repair {
+            result = session.repair();
+        }
+    }
+    (
+        session,
+        result
+            .map(|outcome| (outcome, admitted_file_ids, retried_source_change))
+            .map_err(|error| format!("retained PAR2 session failed: {error}")),
+    )
+}
+
+fn should_retry_par2_source_change<T>(
+    result: &Result<T, par2_rs::Par2SessionError>,
+    already_retried: bool,
+) -> bool {
+    !already_retried && matches!(result, Err(par2_rs::Par2SessionError::SourceChanged { .. }))
+}
+
+fn ensure_par2_repair_completed(
+    outcome: &par2_rs::Par2RepairOutcome,
+    repair: bool,
+) -> Result<(), String> {
+    if !repair {
+        return Ok(());
+    }
+    match outcome.status {
+        par2_rs::Par2RepairStatus::Verified | par2_rs::Par2RepairStatus::Repaired => Ok(()),
+        par2_rs::Par2RepairStatus::RepairPossible
+        | par2_rs::Par2RepairStatus::Insufficient
+        | par2_rs::Par2RepairStatus::ResourceLimited => Err(format!(
+            "PAR2 repairer did not complete repair: {:?}",
+            outcome.status
+        )),
+    }
+}
 
 fn default_par2_repair_memory_limit_bytes() -> usize {
     DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES
@@ -41,7 +197,7 @@ impl DamageAdjustments {
     }
 }
 
-fn configured_par2_repair_memory_limit_bytes() -> usize {
+pub(crate) fn configured_par2_repair_memory_limit_bytes() -> usize {
     parse_par2_repair_memory_limit_bytes(
         std::env::var(PAR2_REPAIR_MEMORY_LIMIT_ENV).ok().as_deref(),
     )
@@ -376,13 +532,11 @@ impl Pipeline {
                     state.download_queue.len(),
                     state.download_queue.has_recovery_work(),
                     state.download_queue.count_matching(|work| {
-                        work.is_recovery
-                            && promoted_files.contains(&work.segment_id.file_id.file_index)
+                        promoted_files.contains(&work.segment_id.file_id.file_index)
                     }),
                     state.recovery_queue.len(),
                     state.recovery_queue.count_matching(|work| {
-                        work.is_recovery
-                            && promoted_files.contains(&work.segment_id.file_id.file_index)
+                        promoted_files.contains(&work.segment_id.file_id.file_index)
                     }),
                 )
             })
@@ -655,6 +809,74 @@ impl Pipeline {
             .map_err(|error| format!("failed to load completed-file hashes: {error}"))
     }
 
+    async fn par2_session_evidence_candidates(
+        &self,
+        job_id: JobId,
+        par2_set: &par2_rs::Par2FileSet,
+    ) -> Result<Vec<Par2SessionEvidenceCandidate>, String> {
+        let completed_hashes = self.load_existing_complete_file_hashes(job_id).await?;
+        let Some(runtime) = self.par2_runtime(job_id) else {
+            return Ok(Vec::new());
+        };
+        let completed_checksums = runtime.completed_checksums.clone();
+        let already_seeded = runtime.session_evidence_file_ids.clone();
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Ok(Vec::new());
+        };
+
+        let mut candidates = Vec::new();
+        for file in state.assembly.files() {
+            let file_id = file.file_id();
+            if !file.is_complete() || already_seeded.contains(&file_id) {
+                continue;
+            }
+
+            let current_filename = self
+                .effective_file_identity(job_id, file_id)
+                .map(|identity| identity.current_filename)
+                .unwrap_or_else(|| file.filename().to_string());
+            let expected_length = file.total_bytes();
+            let checksum = completed_checksums.get(&file_id).copied();
+            let full_md5 = checksum
+                .and_then(|checksum| checksum.md5)
+                .or_else(|| completed_hashes.get(&file_id.file_index).copied());
+            let bound_candidates = par2_set
+                .recovery_file_ids
+                .iter()
+                .chain(par2_set.non_recovery_file_ids.iter())
+                .filter_map(|par2_file_id| par2_set.file_description(par2_file_id))
+                .filter(|description| {
+                    description.length == expected_length
+                        && match full_md5 {
+                            Some(md5) => description.hash_full == md5,
+                            None => {
+                                sanitize_download_filename(&description.filename)
+                                    == current_filename
+                            }
+                        }
+                })
+                .map(|description| description.file_id)
+                .collect::<Vec<_>>();
+            let bound_file_id = (bound_candidates.len() == 1).then_some(bound_candidates[0]);
+            candidates.push(Par2SessionEvidenceCandidate {
+                file_id,
+                path: state.working_dir.join(&current_filename),
+                logical_name: current_filename,
+                expected_length,
+                full_md5,
+                crc32: checksum.map_or(0, |checksum| checksum.crc32),
+                contiguous_assembly_proven: checksum.is_some_and(|checksum| {
+                    checksum.all_parts_crc_verified
+                        && file.received_bytes() == expected_length
+                        && !file.has_duplicate_segments()
+                        && !file.has_length_mismatch()
+                }),
+                bound_file_id,
+            });
+        }
+        Ok(candidates)
+    }
+
     fn expected_hash_for_verified_file(
         file_id: NzbFileId,
         existing_hashes: &HashMap<u32, [u8; 16]>,
@@ -875,13 +1097,110 @@ impl Pipeline {
         }
 
         let memory_limit = configured_par2_repair_memory_limit_bytes();
-        // The analyze pass's scan carries into the execute pass so the
-        // repair does not re-scan sources the analysis just hashed. The
-        // engine re-stats every observed file and rescans on any drift.
-        let scan_carry = self
-            .par2_runtime(job_id)
-            .and_then(|runtime| runtime.scan_carry.clone());
         let phase_counters = repair.then(|| self.phase_begin(job_id, JobPhase::Repairing, None));
+        let session_progress = phase_counters.as_ref().map(|counters| {
+            let counters = Arc::clone(counters);
+            Arc::new(move |update: par2_rs::ProgressUpdate| {
+                if !matches!(
+                    update.stage,
+                    par2_rs::ProgressStage::Repairing | par2_rs::ProgressStage::WritingRepaired
+                ) {
+                    return;
+                }
+                counters
+                    .completed_bytes
+                    .fetch_max(update.bytes_processed, Ordering::Relaxed);
+                if let Some(total_bytes) = update.total_bytes {
+                    counters
+                        .total_bytes
+                        .fetch_max(total_bytes, Ordering::Relaxed);
+                }
+            }) as par2_rs::ProgressCallback
+        });
+
+        let retained_session = match self
+            .take_or_open_par2_repair_session(
+                job_id,
+                working_dir.clone(),
+                memory_limit,
+                session_progress,
+                // By this point the repairer reads and writes real files: any
+                // set still routing here materialized before it arrived.
+                None,
+            )
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                warn!(job_id = job_id.0, error = %error, "retained PAR2 session unavailable; using one-shot repairer");
+                None
+            }
+        };
+        if let Some((session, newly_opened)) = retained_session {
+            if newly_opened {
+                self.ensure_par2_runtime(job_id)
+                    .session_evidence_file_ids
+                    .clear();
+            }
+            let candidates = match self
+                .par2_session_evidence_candidates(job_id, &par2_set)
+                .await
+            {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    self.restore_par2_repair_session(job_id, session);
+                    if repair {
+                        self.phase_end(job_id, JobPhase::Repairing);
+                    }
+                    return Err(error);
+                }
+            };
+            self.settle_live_par2_job(job_id).await;
+            let live_evidence = self.live_par2_strong_evidence(job_id);
+            let mut repair_task = tokio::task::spawn_blocking(move || {
+                if repair {
+                    crate::e2e_failpoint::maybe_delay("repair.task_start");
+                }
+                run_retained_par2_session(session, candidates, live_evidence, repair)
+            });
+            let repair_result = if repair {
+                loop {
+                    tokio::select! {
+                        result = &mut repair_task => break result,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                            self.sample_phase_progress();
+                        }
+                    }
+                }
+            } else {
+                repair_task.await
+            };
+            if repair {
+                self.phase_end(job_id, JobPhase::Repairing);
+            }
+            return match repair_result {
+                Ok((session, Ok((outcome, admitted_file_ids, retried_source_change)))) => {
+                    self.restore_par2_repair_session(job_id, session);
+                    let runtime = self.ensure_par2_runtime(job_id);
+                    if repair || retried_source_change {
+                        runtime.session_evidence_file_ids.clear();
+                        if repair && let Some(session) = runtime.session.as_mut() {
+                            session.invalidate_all_sources();
+                        }
+                    } else {
+                        runtime.session_evidence_file_ids.extend(admitted_file_ids);
+                    }
+                    ensure_par2_repair_completed(&outcome, repair)?;
+                    Ok(outcome)
+                }
+                Ok((session, Err(error))) => {
+                    self.restore_par2_repair_session(job_id, session);
+                    Err(error)
+                }
+                Err(error) => Err(format!("retained PAR2 session task panicked: {error}")),
+            };
+        }
+
         let mut repair_task = tokio::task::spawn_blocking(move || {
             if repair {
                 crate::e2e_failpoint::maybe_delay("repair.task_start");
@@ -890,7 +1209,6 @@ impl Pipeline {
             options.file_set = Some((*par2_set).clone());
             options.repair = repair;
             options.memory_limit = Some(memory_limit);
-            options.scan_carry = scan_carry;
             if let Some(counters) = phase_counters {
                 options.progress = Some(Arc::new(move |update: par2_rs::ProgressUpdate| {
                     if !matches!(
@@ -910,23 +1228,11 @@ impl Pipeline {
                 }));
             }
             let repairer = par2_rs::Par2Repairer::new(options);
-            let (outcome, carry) = repairer
+            let (outcome, _) = repairer
                 .verify_or_repair_carrying()
                 .map_err(|e| format!("PAR2 repairer failed: {e}"))?;
-            if repair {
-                match outcome.status {
-                    par2_rs::Par2RepairStatus::Verified | par2_rs::Par2RepairStatus::Repaired => {}
-                    par2_rs::Par2RepairStatus::RepairPossible
-                    | par2_rs::Par2RepairStatus::Insufficient
-                    | par2_rs::Par2RepairStatus::ResourceLimited => {
-                        return Err(format!(
-                            "PAR2 repairer did not complete repair: {:?}",
-                            outcome.status
-                        ));
-                    }
-                }
-            }
-            Ok((outcome, carry))
+            ensure_par2_repair_completed(&outcome, repair)?;
+            Ok(outcome)
         });
         let repair_result = if repair {
             loop {
@@ -946,12 +1252,7 @@ impl Pipeline {
         }
 
         match repair_result {
-            Ok(Ok((outcome, carry))) => {
-                // Keep the analyze pass's scan for the execute pass; after a
-                // repair the files just changed, so drop any stored carry.
-                self.ensure_par2_runtime(job_id).scan_carry = if repair { None } else { carry };
-                Ok(outcome)
-            }
+            Ok(Ok(outcome)) => Ok(outcome),
             Ok(Err(error)) => Err(error),
             Err(error) => Err(format!("repair task panicked: {error}")),
         }
@@ -1268,20 +1569,45 @@ impl Pipeline {
         };
 
         let mut current_hashes_by_name = HashMap::<String, [u8; 16]>::new();
+        // Live evidence may stand in for persisted whole-file hashes only
+        // when it proves every described slice with CRC32+MD5 and a stable,
+        // complete assembly identity. Any incomplete/ambiguous live state is
+        // ignored and the existing persisted-MD5 quick path remains intact.
+        let live_bindings = self.live_par2_complete_bindings(job_id);
+        let mut live_matches_by_name = HashMap::<String, (par2_rs::FileId, String)>::new();
         for file in state.assembly.files() {
             if !file.is_complete() {
                 continue;
             }
 
             let file_id = file.file_id();
-            let Some(file_hash) = completed_hashes.get(&file_id.file_index).copied() else {
-                return Ok(None);
-            };
             let identity = self.effective_file_identity(job_id, file_id);
             let current_filename = identity
                 .as_ref()
                 .map(|value| value.current_filename.as_str())
                 .unwrap_or_else(|| file.filename());
+            if let Some(par2_file_id) = live_bindings
+                .as_ref()
+                .and_then(|bindings| bindings.get(&file_id))
+                .copied()
+            {
+                let Some(desc) = par2_set.file_description(&par2_file_id) else {
+                    return Ok(None);
+                };
+                live_matches_by_name.insert(
+                    current_filename.to_string(),
+                    (par2_file_id, sanitize_download_filename(&desc.filename)),
+                );
+                continue;
+            }
+            if live_bindings.is_some() {
+                // The live eligibility proof already covered every described
+                // file. This is an auxiliary NZB file, not a PAR2 source.
+                continue;
+            }
+            let Some(file_hash) = completed_hashes.get(&file_id.file_index).copied() else {
+                return Ok(None);
+            };
             current_hashes_by_name.insert(current_filename.to_string(), file_hash);
         }
 
@@ -1305,8 +1631,11 @@ impl Pipeline {
                 .push((*file_id, sanitize_download_filename(&desc.filename)));
         }
 
-        let mut matches = HashMap::<String, (par2_rs::FileId, String)>::new();
+        let mut matches = live_matches_by_name;
         let mut match_counts = HashMap::<par2_rs::FileId, u32>::new();
+        for (file_id, _) in matches.values() {
+            *match_counts.entry(*file_id).or_default() += 1;
+        }
         for (current_name, file_hash) in current_hashes_by_name {
             let Some(candidates) = hash_lookup.get(&file_hash) else {
                 continue;
@@ -1450,6 +1779,19 @@ impl Pipeline {
             return;
         }
         self.retry_par2_authoritative_identity(job_id).await;
+        // Before refreshing topologies, adopt any RAR volume PAR2 rebuilt that
+        // the NZB never carried. 0.7.9 calls this at each of its repair exits;
+        // 0.8 funnels them through here, so one call covers them all. Without
+        // it a repaired interior volume sits on disk under a name the assembly
+        // has never heard of, extraction goes on waiting for it, and the repair
+        // that just succeeded changes nothing.
+        if let Err(error) = self
+            .register_verified_par2_rar_outputs(job_id, &verification)
+            .await
+        {
+            self.fail_job(job_id, error);
+            return;
+        }
         self.refresh_verified_complete_archive_topologies(job_id, &verification)
             .await;
         if let Err(error) = self
@@ -1667,6 +2009,107 @@ impl Pipeline {
                 .await;
         }
         file_ids.len()
+    }
+
+    /// Register RAR volumes that PAR2 *rebuilt* and that the NZB never carried.
+    ///
+    /// Ported from release-0.7.9. A missing interior volume repaired from
+    /// recovery blocks lands on disk under a name the job's assembly has never
+    /// heard of, so extraction goes on believing the volume is absent and the
+    /// repair achieves nothing. This walks a clean verification result, keeps
+    /// the entries that are RAR volumes the job does not already know, and
+    /// persists their parsed facts against the set.
+    ///
+    /// Paths are checked before use: a PAR2 description names its own file, so
+    /// an absolute path or one containing `..` is refused rather than resolved.
+    pub(crate) async fn register_verified_par2_rar_outputs(
+        &mut self,
+        job_id: JobId,
+        verification: &par2_rs::VerificationResult,
+    ) -> Result<usize, String> {
+        let registered_filenames = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                state
+                    .assembly
+                    .files()
+                    .map(|file| file.filename().to_string())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+
+        let mut registered = 0;
+        for file in &verification.files {
+            if !matches!(file.status, par2_rs::verify::FileStatus::Complete)
+                || registered_filenames.contains(&file.filename)
+            {
+                continue;
+            }
+
+            let path = Path::new(&file.filename);
+            if file.filename.is_empty()
+                || !path.is_relative()
+                || !path
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(format!(
+                    "refusing unsafe PAR2-verified RAR output path {:?}",
+                    file.filename
+                ));
+            }
+
+            let role = weaver_model::files::FileRole::from_filename(&file.filename);
+            let weaver_model::files::FileRole::RarVolume { volume_number } = role else {
+                continue;
+            };
+            let Some(set_name) = weaver_model::files::archive_base_name(&file.filename, &role)
+            else {
+                continue;
+            };
+            let path = self
+                .resolve_job_input_path(job_id, &file.filename)
+                .ok_or_else(|| {
+                    format!(
+                        "PAR2 verified RAR output {} has no active job directory",
+                        file.filename
+                    )
+                })?;
+            if !path.is_file() {
+                return Err(format!(
+                    "PAR2 verified RAR output {} is missing from staging",
+                    path.display()
+                ));
+            }
+
+            let password_candidates = self.archive_password_candidates_for_set(job_id, &set_name);
+            let facts = Self::parse_rar_volume_facts_from_path(path, password_candidates)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to parse PAR2-verified RAR output {}: {error}",
+                        file.filename
+                    )
+                })?;
+            if self.persist_rar_volume_facts(
+                job_id,
+                &set_name,
+                &file.filename,
+                Some(volume_number),
+                facts,
+            )? {
+                registered += 1;
+            }
+        }
+
+        if registered > 0 {
+            info!(
+                job_id = job_id.0,
+                registered, "registered PAR2-verified RAR outputs absent from the NZB"
+            );
+        }
+        Ok(registered)
     }
 
     pub(crate) fn verified_complete_archive_file_ids_needing_refresh(
@@ -2110,12 +2553,74 @@ impl Pipeline {
             self.emit_download_pipeline_drained_if_pending(job_id);
         }
         let only_rar_archives = self.job_has_only_rar_archives(job_id);
-        let par2_primary_payload_ready = !has_incomplete_data_files || download_pipeline_exhausted;
+
+        // A RAR set that PAR2 owes a verdict on, in the two shapes that reach
+        // this while the downloads have not drained. Ordinarily an incomplete
+        // data file defers validation until they do, which is right — PAR2
+        // cannot tell a file still arriving from a damaged one — but in both
+        // of these the wait is for something that is not coming, and the
+        // authoritative pass is what says so.
+        // Still conditioned on "not yet verified", unlike 0.7.9's. 0.8 already
+        // re-opens the gate for a verified job whose extraction later fails —
+        // by a different route, and one that depends on `par2_validation_needed`
+        // staying false so the repair-first branch is skipped. Relaxing it here
+        // diverts that flow and the later authoritative pass stops running
+        // (`a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass`).
+        // Hoisted here by the 0.7.9 port: the repair-readiness predicates below
+        // need it, and it used to be defined further down at "Step 2".
+        let has_crc_failures = self
+            .failed_extractions
+            .get(&job_id)
+            .is_some_and(|failed| !failed.is_empty());
+        let par2_may_still_rule =
+            par2_loaded && !par2_bypassed && !self.par2_verified.contains(&job_id);
+        let extraction_settled = !self.job_has_active_extraction_tasks(job_id);
+        // One: extraction was attempted and failed. The archives cannot be
+        // opened now, and the reason may well be the volume that never came.
+        // This is the same question the scheduler asks before it latches the
+        // failed member out, and it is asked through the same predicate so the
+        // two cannot answer differently — a latch with no verdict coming is a
+        // stalled job.
+        let failed_rar_par2_repair_ready = self.par2_recovery_evaluation_pending(job_id);
+        // Two: extraction was never attempted, because a volume is missing.
+        // Nothing lands in `failed_extractions` for this shape — there was no
+        // failure, only an absence — so it needs naming separately or a job
+        // whose interior volume never posted waits forever with the recovery
+        // blocks that would rebuild it sitting right there.
+        let missing_rar_volume_par2_repair_ready = par2_may_still_rule
+            && extraction_settled
+            && self.job_has_live_rar_waiting_for_missing_volumes(job_id)
+            && (self.recovery_blocks_available_or_targeted(job_id) > 0
+                || self
+                    .jobs
+                    .get(&job_id)
+                    .is_some_and(|state| state.recovery_queue.has_recovery_work()));
+        // 0.8 only: a direct set still taking articles has holes where its
+        // outstanding ranges will go, and PAR2 cannot tell a hole from
+        // corruption. Declaring a verdict owed while one is filling walks the
+        // job into the authoritative branch, which then defers on exactly this
+        // condition and returns — so the pass never runs and the escape has
+        // achieved nothing but a later re-check.
+        let rar_par2_repair_ready = (failed_rar_par2_repair_ready
+            || missing_rar_volume_par2_repair_ready)
+            && self.direct_sets_ready_for_authoritative_par2(job_id);
+
+        let par2_primary_payload_ready =
+            !has_incomplete_data_files || download_pipeline_exhausted || rar_par2_repair_ready;
         let par2_validation_needed = par2_loaded
             && !par2_bypassed
+            // 0.7.9 relaxes this to `(rar_par2_repair_ready || !verified)`. 0.8
+            // must not: it re-opens the gate for a verified job by another
+            // route, one that depends on `par2_validation_needed` staying false
+            // so the repair-first branch is skipped
+            // (a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass).
             && !self.par2_verified.contains(&job_id)
             && par2_primary_payload_ready
-            && !self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id);
+            // The residuals check reads a job still missing archive pieces as
+            // nothing to validate yet. That is the very state a repair-ready
+            // RAR set is in, so it cannot be what turns validation away.
+            && (rar_par2_repair_ready
+                || !self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id));
         let rar_waiting_for_missing_volumes = download_pipeline_exhausted
             && only_rar_archives
             && self.job_has_live_rar_waiting_for_missing_volumes(job_id);
@@ -2124,10 +2629,6 @@ impl Pipeline {
             && self.job_has_pending_rar_refresh_for_current_sets(job_id);
 
         // Step 2: Check for CRC failures that need PAR2 repair.
-        let has_crc_failures = self
-            .failed_extractions
-            .get(&job_id)
-            .is_some_and(|f| !f.is_empty());
         let clean_par2_integrity_gate = self.clean_par2_integrity_gate(job_id);
         let archive_extraction_applicable = self.extraction_readiness_for_job(job_id)
             != ExtractionReadiness::NotApplicable
@@ -2136,7 +2637,8 @@ impl Pipeline {
             .post_processing_repair_return_to_terminal
             .contains(&job_id);
         let authoritative_par2_verification_needed = par2_validation_needed
-            && (has_crc_failures
+            && (rar_par2_repair_ready
+                || has_crc_failures
                 || (has_incomplete_data_files && download_pipeline_exhausted)
                 || rar_waiting_for_missing_volumes
                 || matches!(current_status, JobStatus::Repairing)
@@ -2157,6 +2659,16 @@ impl Pipeline {
         let quick_par2_verification_allowed = par2_validation_needed
             && !matches!(current_status, JobStatus::Repairing)
             && !extension_repair_requested
+            // A set waiting on a volume that never posted needs the
+            // *authoritative* analyzer: only that names the exact missing
+            // blocks a recovery promotion has to target, and the quick pass has
+            // nothing to answer from — those bytes are absent, not wrong.
+            //
+            // Narrower than 0.7.9's, deliberately. A *failed* extraction whose
+            // files are all present is a case 0.8's quick pass settles on its
+            // own — swap correction, and the eager-delete retry frontier — and
+            // forcing the authoritative pass there loses both.
+            && !missing_rar_volume_par2_repair_ready
             && (!has_incomplete_data_files || !download_pipeline_exhausted)
             && clean_par2_integrity_gate_allows_fast_path;
         let needs_completion_repair_evaluation = has_crc_failures
@@ -2241,6 +2753,10 @@ impl Pipeline {
         if has_incomplete_data_files
             && !download_pipeline_exhausted
             && !self.job_has_active_extraction_tasks(job_id)
+            // ...unless PAR2 owes this job's RAR sets a verdict. Waiting for
+            // downloads that are not coming is how such a job stalls, and this
+            // return is what keeps PAR2 from ever being asked.
+            && !rar_par2_repair_ready
         {
             return;
         }
@@ -2251,6 +2767,22 @@ impl Pipeline {
                 "deferring completion — RAR topology refresh pending"
             );
             return;
+        }
+
+        if download_pipeline_exhausted
+            && only_rar_archives
+            && has_crc_failures
+            && !self.job_has_active_extraction_tasks(job_id)
+        {
+            match self.try_restore_rar_recovery_volumes(job_id).await {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "RAR recovery-volume restore failed; continuing with normal repair evaluation"
+                ),
+            }
         }
 
         // Don't finalize while concatenation is still pending.
@@ -2330,6 +2862,14 @@ impl Pipeline {
         }
 
         if needs_completion_repair_evaluation && !par2_bypassed {
+            // 0.7.9 defers repair evaluation here whenever a repair is owed and
+            // download work is pending. 0.8 must not: a direct set legitimately
+            // has pipeline work outstanding while its own authoritative pass is
+            // due, and deferring on that alone stops the pass ever running
+            // (a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass,
+            // clean_verify_retries_non_rar_full_set_extraction). The guard 0.8
+            // already carries for this is direct_sets_ready_for_authoritative_par2,
+            // folded into rar_par2_repair_ready above.
             if self.job_has_promoted_recovery_pipeline_work(job_id, "verify") {
                 return;
             }
@@ -2349,6 +2889,15 @@ impl Pipeline {
 
             let par2_set = self.par2_set(job_id).cloned();
 
+            // A suspect volume is damage the full pass deliberately keeps:
+            // `apply_eager_delete_exclusions` retains its missing blocks
+            // instead of forgiving them. Live block state says nothing about
+            // that, so any suspect volume refuses every live short-circuit —
+            // both the whole-pass skip below and the quick path's, which the
+            // stateful session (plan 138, M2) also lets stand in for the full
+            // pass.
+            let no_suspect_volumes = self.suspect_rar_volumes_for_job(job_id).is_empty();
+
             // Live in-stream block verification (plan 135, D5). Deliberately
             // conservative: it only applies to a clean, fully downloaded job
             // that is not mid-repair, and only when every recovery-set file is
@@ -2363,11 +2912,7 @@ impl Pipeline {
                 && !extension_repair_requested
                 && !matches!(current_status, JobStatus::Repairing)
                 && clean_par2_integrity_gate_allows_fast_path
-                // A suspect volume is damage the full pass deliberately keeps:
-                // `apply_eager_delete_exclusions` retains its missing blocks
-                // instead of forgiving them. Live block state says nothing
-                // about that, so any suspect volume refuses the short-circuit.
-                && self.suspect_rar_volumes_for_job(job_id).is_empty();
+                && no_suspect_volumes;
             if live_par2_short_circuit_allowed && par2_set.is_some() {
                 self.settle_live_par2_job(job_id).await;
                 if let Some((verification, placement_plan)) =
@@ -2380,11 +2925,11 @@ impl Pipeline {
                     info!(
                         job_id = job_id.0,
                         files = verification.files.len(),
-                        blocks_in_stream = live_metrics.blocks_claimed_in_stream,
-                        blocks_backfilled = live_metrics.blocks_backfilled,
-                        blocks_settled = live_metrics.blocks_settled,
-                        partials_abandoned = live_metrics.partials_abandoned,
-                        partial_bytes_peak = live_metrics.partial_bytes_peak,
+                        blocks_in_stream = live_metrics.strongly_verified_slices,
+                        blocks_backfilled = live_metrics.backfill_reads,
+                        blocks_settled = live_metrics.settle_reads,
+                        partials_abandoned = live_metrics.partial_fallbacks,
+                        partial_bytes_peak = live_metrics.disk_read_bytes,
                         "live PAR2 block verification proved the set clean — skipping the full verify pass"
                     );
                     self.finish_clean_par2_verification(
@@ -2408,6 +2953,15 @@ impl Pipeline {
 
             if quick_par2_verification_allowed && let Some(par2_set) = par2_set.as_ref() {
                 let working_dir = self.jobs.get(&job_id).unwrap().working_dir.clone();
+                self.settle_live_par2_job(job_id).await;
+                // What this records is "live evidence stood in for the full
+                // pass", so it takes the same evidence the full short-circuit
+                // above demands — complete bindings alone say nothing about
+                // the length the file actually has on disk. When that check
+                // fails, the quick pass still succeeds on its own persisted
+                // checksums; the credit simply does not belong to live.
+                let live_short_circuit =
+                    no_suspect_volumes && self.live_par2_clean_verification(job_id).await.is_some();
                 Self::trip_par2_verification_started_failpoint();
                 match self
                     .quick_verify_par2_with_placement(
@@ -2418,6 +2972,9 @@ impl Pipeline {
                     .await
                 {
                     Ok(Some((verification, placement_plan))) => {
+                        if live_short_circuit {
+                            self.live_par2.note_full_verify_skip();
+                        }
                         info!(
                             job_id = job_id.0,
                             "quick PAR2 verification passed for clean exhausted job"
@@ -2792,6 +3349,13 @@ impl Pipeline {
                             });
 
                             self.retry_par2_authoritative_identity(job_id).await;
+                            if let Err(error) = self
+                                .register_verified_par2_rar_outputs(job_id, &outcome.verification)
+                                .await
+                            {
+                                self.fail_job(job_id, error);
+                                return;
+                            }
                             self.refresh_verified_complete_archive_topologies(
                                 job_id,
                                 &outcome.verification,
@@ -2832,7 +3396,15 @@ impl Pipeline {
                                         cleared, "cleared failed extractions for post-repair retry"
                                     );
                                 }
+                            }
 
+                            // A repaired interior RAR volume is only visible to the
+                            // incremental scheduler after its synchronous refresh.
+                            // Do that before scheduling another completion check, or a
+                            // stale WaitingForVolumes plan can re-enter PAR2 forever.
+                            if has_crc_failures
+                                || self.job_has_live_rar_waiting_for_missing_volumes(job_id)
+                            {
                                 self.retry_archive_extraction_after_verify_or_repair(job_id)
                                     .await;
                                 return;
@@ -3185,6 +3757,16 @@ impl Pipeline {
                                 return;
                             }
                             self.retry_par2_authoritative_identity(job_id).await;
+                            if let Err(error) = self
+                                .register_verified_par2_rar_outputs(
+                                    job_id,
+                                    &post_repair_verification,
+                                )
+                                .await
+                            {
+                                self.fail_job(job_id, error);
+                                return;
+                            }
                             self.refresh_verified_complete_archive_topologies(
                                 job_id,
                                 &post_repair_verification,
@@ -3225,7 +3807,15 @@ impl Pipeline {
                                         cleared, "cleared failed extractions for post-repair retry"
                                     );
                                 }
+                            }
 
+                            // A repaired interior RAR volume is only visible to the
+                            // incremental scheduler after its synchronous refresh.
+                            // Do that before scheduling another completion check, or a
+                            // stale WaitingForVolumes plan can re-enter PAR2 forever.
+                            if has_crc_failures
+                                || self.job_has_live_rar_waiting_for_missing_volumes(job_id)
+                            {
                                 self.retry_archive_extraction_after_verify_or_repair(job_id)
                                     .await;
                                 return;
@@ -3606,6 +4196,69 @@ mod tests {
             parse_par2_repair_memory_limit_bytes(Some("0")),
             default_bytes
         );
+    }
+
+    #[test]
+    fn quick_proof_uses_crc_verified_contiguous_assembly() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("payload.bin");
+        let bytes = b"crc-verified-contiguous-payload";
+        std::fs::write(&path, bytes).unwrap();
+        let candidate = Par2SessionEvidenceCandidate {
+            file_id: NzbFileId {
+                job_id: JobId(1),
+                file_index: 0,
+            },
+            path,
+            logical_name: "payload.bin".to_string(),
+            expected_length: bytes.len() as u64,
+            full_md5: None,
+            crc32: par2_rs::checksum::crc32(bytes),
+            contiguous_assembly_proven: true,
+            bound_file_id: None,
+        };
+
+        let evidence = committed_evidence_from_candidate(&candidate)
+            .unwrap()
+            .expect("contiguous CRC-verified assembly should be quick-proved");
+        assert!(evidence.assembly_proof().is_some());
+        assert_eq!(evidence.assembly_crc32(), Some(candidate.crc32));
+    }
+
+    #[test]
+    fn quick_proof_refuses_unproven_assembly() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("payload.bin");
+        std::fs::write(&path, b"payload").unwrap();
+        let candidate = Par2SessionEvidenceCandidate {
+            file_id: NzbFileId {
+                job_id: JobId(1),
+                file_index: 0,
+            },
+            path,
+            logical_name: "payload.bin".to_string(),
+            expected_length: 7,
+            full_md5: None,
+            crc32: 0,
+            contiguous_assembly_proven: false,
+            bound_file_id: None,
+        };
+
+        assert!(
+            committed_evidence_from_candidate(&candidate)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn source_changed_retry_is_limited_to_one_fresh_analysis() {
+        let changed: Result<(), par2_rs::Par2SessionError> =
+            Err(par2_rs::Par2SessionError::SourceChanged {
+                path: std::path::PathBuf::from("payload.bin"),
+            });
+        assert!(should_retry_par2_source_change(&changed, false));
+        assert!(!should_retry_par2_source_change(&changed, true));
     }
 
     #[test]

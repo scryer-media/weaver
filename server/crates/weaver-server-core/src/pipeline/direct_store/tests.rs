@@ -549,7 +549,8 @@ fn snapshot_decode_refuses_a_destination_path_that_escapes_the_working_directory
     }
 
     let mut snapshot = sample_snapshot();
-    snapshot.destinations[0].relative_path = "nested/dir/silver-horizon.mkv.f0.direct.partial".into();
+    snapshot.destinations[0].relative_path =
+        "nested/dir/silver-horizon.mkv.f0.direct.partial".into();
     let blob = encode(&snapshot).unwrap();
     assert!(
         decode(&blob).is_ok(),
@@ -1447,7 +1448,11 @@ async fn restart_accepts_a_valid_row_and_yields_floors() {
 #[tokio::test]
 async fn restart_accepts_a_destination_longer_than_the_claim() {
     let temp_dir = tempfile::tempdir().unwrap();
-    write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 4_096);
+    write_destination(
+        temp_dir.path(),
+        "silver-horizon.mkv.f0.direct.partial",
+        4_096,
+    );
     let blob = encode(&sample_snapshot()).unwrap();
 
     assert!(
@@ -2298,7 +2303,12 @@ fn two_sets_of_one_job_never_share_a_derived_path() {
     // Restart derives the same discriminator from the same spec: it is the
     // minimum file index, not arrival order, so it cannot move between runs.
     second.volumes = [(1u32, 3u32), (0, 2)].into_iter().collect();
-    assert!(second.member_partial_path("x.mkv").unwrap().contains(".f2."));
+    assert!(
+        second
+            .member_partial_path("x.mkv")
+            .unwrap()
+            .contains(".f2.")
+    );
 }
 
 /// Envelope v2 replaces phase 4's `envelope_offsets_split_each_volume_slot…`
@@ -2617,13 +2627,17 @@ fn provider_fixture_with_extents(covered: ByteRanges, with_extents: bool) -> Pro
     }
     drop(file);
 
-    let partial_a = dir.path().join("Silver.Horizon.S01E01.mkv.f0.direct.partial");
+    let partial_a = dir
+        .path()
+        .join("Silver.Horizon.S01E01.mkv.f0.direct.partial");
     std::fs::write(
         &partial_a,
         &conventional[member_a_at..member_a_at + PROVIDER_MEMBER_A],
     )
     .unwrap();
-    let partial_b = dir.path().join("Silver.Horizon.S01E01.nfo.f0.direct.partial");
+    let partial_b = dir
+        .path()
+        .join("Silver.Horizon.S01E01.nfo.f0.direct.partial");
     std::fs::write(
         &partial_b,
         &conventional[member_b_at..member_b_at + PROVIDER_MEMBER_B],
@@ -4944,7 +4958,9 @@ fn creating_a_sparse_file_over_an_existing_one_keeps_its_bytes() {
     use super::sparse::{SparseMarking, create_sparse};
 
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("Silver.Horizon.S01E01.mkv.f0.direct.partial");
+    let path = dir
+        .path()
+        .join("Silver.Horizon.S01E01.mkv.f0.direct.partial");
     std::fs::write(&path, b"already routed").unwrap();
 
     create_sparse(&path, &SparseMarking::Platform).expect("re-marking is allowed");

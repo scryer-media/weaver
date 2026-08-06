@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.7.7"
+version = "0.7.8"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
@@ -93,7 +93,7 @@ security-framework-sys = { version = "2", default-features = false }
 keyring = { version = "4", default-features = false, features = ["v1"] }
 keyring-core = { version = "1", default-features = false }
 windows-sys = { version = "0.61", default-features = false }
-par2-rs = { version = "0.2.4", default-features = false, features = ["metal", "native-crypto"] }
+par2-rs = { version = "0.3", default-features = false, features = ["metal", "native-crypto"] }
 unrar-rs = { version = "0.3.1", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.12.0", default-features = false }
 
@@ -108,3 +108,13 @@ panic = "abort"
 # an unpublished rarpar change, add a `[patch.crates-io]` block pointing at the
 # sibling checkout — and remember the crate *directories* there still carry the
 # old `weaver-*` names; the rename deliberately left them in place.
+
+# LOCAL ONLY — remove before merging. `par2-rs` 0.3 is not published yet, and
+# plan 138's M3 needs its session-from-parsed-set seam. All three are patched
+# together on purpose: patching only `par2-rs` would leave weaver's own
+# `unrar-rs` coming from the registry while `par2-rs` pulled the sibling one,
+# and two copies of a crate whose types cross that boundary do not unify.
+[patch.crates-io]
+par2-rs = { path = "../rarpar/crates/weaver-par2" }
+unrar-rs = { path = "../rarpar/crates/weaver-unrar" }
+reedsolomon-rs = { path = "../rarpar/crates/weaver-reed-solomon" }
