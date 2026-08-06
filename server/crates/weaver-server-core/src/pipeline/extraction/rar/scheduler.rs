@@ -166,9 +166,7 @@ impl Pipeline {
     /// and holding the latch as well would keep the member out with no verdict
     /// left to come.
     pub(crate) fn par2_is_authoritative_for_extraction(&self, job_id: JobId) -> bool {
-        self.par2_set(job_id).is_some()
-            && !self.par2_bypassed.contains(&job_id)
-            && !self.par2_verified.contains(&job_id)
+        self.par2_set(job_id).is_some() && !self.par2_bypassed.contains(&job_id)
     }
 
     /// Whether a RAR extraction has failed for this job and PAR2 has not yet

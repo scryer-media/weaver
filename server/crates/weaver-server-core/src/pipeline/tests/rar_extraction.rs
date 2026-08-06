@@ -8581,3 +8581,50 @@ async fn verified_par2_output_registers_missing_rar_volume_for_retry() {
             .is_some_and(|plan| plan.waiting_on_volumes.is_empty())
     );
 }
+
+#[tokio::test]
+async fn failed_rar_member_with_par2_is_not_incrementally_retried() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30192);
+    let files = build_multifile_multivolume_rar_set();
+    let spec = rar_job_spec("RAR PAR2 Retry Latch", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+    install_test_par2_runtime(&mut pipeline, job_id, placement_par2_file_set(&files), &[]);
+
+    let set_key = (job_id, "show".to_string());
+    let failed_member = "E01.mkv".to_string();
+    {
+        let set_state = pipeline
+            .rar_sets
+            .get_mut(&set_key)
+            .expect("RAR set should exist after all volumes complete");
+        let plan = set_state
+            .plan
+            .as_mut()
+            .expect("RAR set should have an extraction plan");
+        plan.ready_members = vec![crate::pipeline::rar_state::RarReadyMember {
+            name: failed_member.clone(),
+        }];
+    }
+    pipeline
+        .failed_extractions
+        .insert(job_id, HashSet::from([failed_member]));
+    pipeline.par2_verified.insert(job_id);
+
+    resume_job_downloading_for_test(&mut pipeline, job_id);
+    pipeline.try_rar_extraction(job_id).await;
+
+    let set_state = pipeline
+        .rar_sets
+        .get(&set_key)
+        .expect("RAR set should remain available");
+    assert_eq!(set_state.active_workers, 0);
+    assert!(set_state.in_flight_members.is_empty());
+}
