@@ -2862,14 +2862,25 @@ impl Pipeline {
         }
 
         if needs_completion_repair_evaluation && !par2_bypassed {
-            // 0.7.9 defers repair evaluation here whenever a repair is owed and
-            // download work is pending. 0.8 must not: a direct set legitimately
-            // has pipeline work outstanding while its own authoritative pass is
-            // due, and deferring on that alone stops the pass ever running
-            // (a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass,
-            // clean_verify_retries_non_rar_full_set_extraction). The guard 0.8
-            // already carries for this is direct_sets_ready_for_authoritative_par2,
-            // folded into rar_par2_repair_ready above.
+            // Restored from 0.7.9 after an e2e run showed the cost of removing
+            // it: one job re-ran `par2 damaged-path analysis` 21 times while
+            // waiting for its promoted recovery to arrive, at ~64 slow par2
+            // file scans, starving 75 other jobs into harness timeouts. The
+            // analysis is what is expensive, and it has to be skipped *before*
+            // it runs — 0.8's `job_has_promoted_recovery_pipeline_work` guard
+            // below is too late to prevent the rescan.
+            if rar_par2_repair_ready
+                && self
+                    .jobs
+                    .get(&job_id)
+                    .is_some_and(|state| !state.recovery_queue.is_empty())
+            {
+                debug!(
+                    job_id = job_id.0,
+                    "deferring repair evaluation — download pipeline work is pending"
+                );
+                return;
+            }
             if self.job_has_promoted_recovery_pipeline_work(job_id, "verify") {
                 return;
             }
