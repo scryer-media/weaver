@@ -8520,3 +8520,64 @@ async fn purge_idle_rar_set_drops_shared_kdf_cache() {
     assert!(!pipeline.rar_sets.contains_key(&(job_id, set_name.clone())));
     assert!(weak_cache.upgrade().is_none());
 }
+#[tokio::test]
+async fn verified_par2_output_registers_missing_rar_volume_for_retry() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30191);
+    let files = build_multifile_multivolume_rar_set();
+    let present_files = vec![files[0].clone(), files[1].clone(), files[3].clone()];
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("RAR Missing Volume PAR2 Registration", &present_files),
+    )
+    .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in present_files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
+            .await;
+    }
+
+    let (missing_filename, missing_bytes) = &files[2];
+    tokio::fs::write(working_dir.join(missing_filename), missing_bytes)
+        .await
+        .unwrap();
+    let verification = par2_rs::VerificationResult {
+        files: vec![par2_rs::verify::FileVerification {
+            file_id: par2_rs::FileId::from_bytes([0; 16]),
+            filename: missing_filename.clone(),
+            status: par2_rs::verify::FileStatus::Complete,
+            valid_slices: Vec::new(),
+            missing_slice_count: 0,
+        }],
+        recovery_blocks_available: 0,
+        total_missing_blocks: 0,
+        repairable: par2_rs::verify::Repairability::NotNeeded,
+    };
+
+    assert_eq!(
+        pipeline
+            .register_verified_par2_rar_outputs(job_id, &verification)
+            .await
+            .unwrap(),
+        1
+    );
+    pipeline
+        .recompute_rar_set_state(job_id, "show")
+        .await
+        .unwrap();
+
+    let rar_set = pipeline
+        .rar_sets
+        .get(&(job_id, "show".to_string()))
+        .expect("RAR set should be registered");
+    assert!(rar_set.facts.contains_key(&2));
+    assert!(
+        rar_set
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.waiting_on_volumes.is_empty())
+    );
+}

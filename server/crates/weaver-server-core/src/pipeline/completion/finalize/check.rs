@@ -1781,6 +1781,19 @@ impl Pipeline {
             return;
         }
         self.retry_par2_authoritative_identity(job_id).await;
+        // Before refreshing topologies, adopt any RAR volume PAR2 rebuilt that
+        // the NZB never carried. 0.7.9 calls this at each of its repair exits;
+        // 0.8 funnels them through here, so one call covers them all. Without
+        // it a repaired interior volume sits on disk under a name the assembly
+        // has never heard of, extraction goes on waiting for it, and the repair
+        // that just succeeded changes nothing.
+        if let Err(error) = self
+            .register_verified_par2_rar_outputs(job_id, &verification)
+            .await
+        {
+            self.fail_job(job_id, error);
+            return;
+        }
         self.refresh_verified_complete_archive_topologies(job_id, &verification)
             .await;
         if let Err(error) = self
@@ -1998,6 +2011,107 @@ impl Pipeline {
                 .await;
         }
         file_ids.len()
+    }
+
+    /// Register RAR volumes that PAR2 *rebuilt* and that the NZB never carried.
+    ///
+    /// Ported from release-0.7.9. A missing interior volume repaired from
+    /// recovery blocks lands on disk under a name the job's assembly has never
+    /// heard of, so extraction goes on believing the volume is absent and the
+    /// repair achieves nothing. This walks a clean verification result, keeps
+    /// the entries that are RAR volumes the job does not already know, and
+    /// persists their parsed facts against the set.
+    ///
+    /// Paths are checked before use: a PAR2 description names its own file, so
+    /// an absolute path or one containing `..` is refused rather than resolved.
+    pub(crate) async fn register_verified_par2_rar_outputs(
+        &mut self,
+        job_id: JobId,
+        verification: &par2_rs::VerificationResult,
+    ) -> Result<usize, String> {
+        let registered_filenames = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                state
+                    .assembly
+                    .files()
+                    .map(|file| file.filename().to_string())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+
+        let mut registered = 0;
+        for file in &verification.files {
+            if !matches!(file.status, par2_rs::verify::FileStatus::Complete)
+                || registered_filenames.contains(&file.filename)
+            {
+                continue;
+            }
+
+            let path = Path::new(&file.filename);
+            if file.filename.is_empty()
+                || !path.is_relative()
+                || !path
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(format!(
+                    "refusing unsafe PAR2-verified RAR output path {:?}",
+                    file.filename
+                ));
+            }
+
+            let role = weaver_model::files::FileRole::from_filename(&file.filename);
+            let weaver_model::files::FileRole::RarVolume { volume_number } = role else {
+                continue;
+            };
+            let Some(set_name) = weaver_model::files::archive_base_name(&file.filename, &role)
+            else {
+                continue;
+            };
+            let path = self
+                .resolve_job_input_path(job_id, &file.filename)
+                .ok_or_else(|| {
+                    format!(
+                        "PAR2 verified RAR output {} has no active job directory",
+                        file.filename
+                    )
+                })?;
+            if !path.is_file() {
+                return Err(format!(
+                    "PAR2 verified RAR output {} is missing from staging",
+                    path.display()
+                ));
+            }
+
+            let password_candidates = self.archive_password_candidates_for_set(job_id, &set_name);
+            let facts = Self::parse_rar_volume_facts_from_path(path, password_candidates)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to parse PAR2-verified RAR output {}: {error}",
+                        file.filename
+                    )
+                })?;
+            if self.persist_rar_volume_facts(
+                job_id,
+                &set_name,
+                &file.filename,
+                Some(volume_number),
+                facts,
+            )? {
+                registered += 1;
+            }
+        }
+
+        if registered > 0 {
+            info!(
+                job_id = job_id.0,
+                registered, "registered PAR2-verified RAR outputs absent from the NZB"
+            );
+        }
+        Ok(registered)
     }
 
     pub(crate) fn verified_complete_archive_file_ids_needing_refresh(
