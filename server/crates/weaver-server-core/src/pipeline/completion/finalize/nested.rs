@@ -573,6 +573,17 @@ impl Pipeline {
 
         self.clear_job_extraction_runtime(job_id);
         self.clear_job_rar_runtime(job_id);
+        // Direct-store bookkeeping is part of the outer world being discarded
+        // here, and leaving it behind is not inert: the rebuilt assembly
+        // assigns nested archives file indices from 0, and a *finalized* set —
+        // finalized is not demoted — still claims its source volume indices
+        // through `is_direct_source_file`. That guard (plan 135, D7) then eats
+        // the `refresh_archive_state_for_completed_file` call for the colliding
+        // nested index, no scheduler state is ever registered, and the nested
+        // extraction fails with "had no scheduler state after topology
+        // refresh". The set already delivered everything it was for — its
+        // members are the very bytes being rebuilt over.
+        self.direct_store.clear_job(job_id);
         self.replace_failed_extraction_members(job_id, HashSet::new());
         self.clear_persisted_extracted_members(job_id).await;
 

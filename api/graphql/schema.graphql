@@ -623,6 +623,28 @@ type Metrics {
 	writeBufferedBytes: Int!
 	writeBufferedSegments: Int!
 	directWriteEvictions: Int!
+	"""
+	Lifetime count of archive sets direct-store admitted. Together with
+	the two below this is the external answer to "did direct routing carry
+	this work, or quietly fall back?" — output bytes are identical either
+	way.
+	"""
+	directSetsAdmitted: Int!
+	"""
+	Lifetime count of sets that left direct routing (demoted); per-reason
+	detail is in the server logs.
+	"""
+	directSetsDemoted: Int!
+	"""
+	Lifetime count of sets that completed without ever writing a source
+	volume to disk — direct-store's success case.
+	"""
+	directSetsFinalizedDirect: Int!
+	"""
+	Lifetime count of sets repaired in place without leaving direct
+	routing.
+	"""
+	directSetsRepairedWhileDirect: Int!
 	decodePressureSoftLimitBytes: Int!
 	decodePressureHardLimitBytes: Int!
 	writePressureSoftLimitBytes: Int!

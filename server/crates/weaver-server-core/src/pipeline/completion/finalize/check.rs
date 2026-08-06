@@ -423,6 +423,80 @@ impl Pipeline {
             })
     }
 
+    /// Like [`Self::job_has_live_rar_waiting_for_missing_volumes`], but true
+    /// only when the wait can no longer be answered by anything except
+    /// recovery data — the distinction PAR2 repair-readiness needs and the
+    /// phase alone cannot make.
+    ///
+    /// `WaitingForVolumes` is reported for two different situations. A volume
+    /// that is genuinely absent — no parsed facts, no file on disk — is the
+    /// repair case: nothing but recovery blocks can produce it. But a set mid
+    /// swap-correction waits on volume *numbers* while every actual volume is
+    /// present (the topology parsed them under mismatched numbering), and
+    /// that wait is answered by the cached-header retry, not by PAR2. Treating
+    /// the second as the first sent a swap job into damaged-path analysis,
+    /// promoted 12 recovery blocks it had no use for, and emitted verification
+    /// events its fixture forbids — phantom damage, wasted downloads, and a
+    /// repair-first detour on a job the retry frontier was already fixing.
+    ///
+    /// So `WaitingForVolumes` qualifies only when some waited volume is truly
+    /// absent *and* no waited volume is present — a non-empty
+    /// [`present_waiting_rar_volumes`] means the volume-0 retry is still owed
+    /// its chance to relink them — *and* the download pipeline is quiet.
+    /// Absence only means "not coming" once nothing is en route: mid-download,
+    /// a waited volume is absent simply because it has not arrived yet, and a
+    /// just-demoted direct set is absent because its refetch was queued
+    /// milliseconds ago. Both fired this predicate 10 seconds into a job and
+    /// sent it through damaged-path analysis — phantom damage, 12 promoted
+    /// recovery blocks with no use, and verification events the fixture
+    /// forbids. The arm's design case — an interior volume the NZB never
+    /// carried — is only *observable* at pipeline-quiet anyway, so the
+    /// condition costs it nothing. (`job_has_pending_download_pipeline_work`
+    /// deliberately excludes the parked recovery pool, so a job whose only
+    /// remaining work is parked recovery still qualifies — that pool drains
+    /// only through the promotion this predicate gates.)
+    ///
+    /// `AwaitingRepair` qualifies unconditionally: there the extraction
+    /// machinery itself has concluded only repair moves the set forward, and
+    /// its waiting list is legitimately empty.
+    pub(crate) fn job_has_live_rar_waiting_for_absent_volumes(&self, job_id: JobId) -> bool {
+        let current_set_names = self.current_rar_set_names_for_job(job_id);
+
+        self.rar_sets
+            .iter()
+            .any(|((rar_job_id, set_name), set_state)| {
+                if *rar_job_id != job_id
+                    || !(current_set_names.is_empty() || current_set_names.contains(set_name))
+                {
+                    return false;
+                }
+                let Some(plan) = set_state.plan.as_ref() else {
+                    return false;
+                };
+                match plan.phase {
+                    crate::pipeline::archive::rar_state::RarSetPhase::AwaitingRepair => true,
+                    crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes => {
+                        if self.job_has_pending_download_pipeline_work(job_id) {
+                            return false;
+                        }
+                        let volume_paths = self.volume_paths_for_rar_set(job_id, set_name);
+                        let some_volume_absent = plan.waiting_on_volumes.iter().any(|volume| {
+                            !set_state.facts.contains_key(volume)
+                                && !volume_paths.contains_key(volume)
+                        });
+                        some_volume_absent
+                            && crate::pipeline::archive::topology::present_waiting_rar_volumes(
+                                plan,
+                                &set_state.facts,
+                                &volume_paths,
+                            )
+                            .is_empty()
+                    }
+                    _ => false,
+                }
+            })
+    }
+
     pub(crate) fn job_has_pending_rar_refresh_for_current_sets(&self, job_id: JobId) -> bool {
         let current_set_names = self.current_rar_set_names_for_job(job_id);
 
@@ -2578,15 +2652,17 @@ impl Pipeline {
         // the check re-entered forever with nothing able to act: 1865 identical
         // completion checkpoints on one job, no repair, no verdict.
         //
-        // Narrower than 0.7.9's blanket `!verified`, deliberately. The extra
-        // `job_has_live_rar_waiting_for_missing_volumes` is what keeps a job that
-        // merely finalized its direct sets from re-entering: there the failed
-        // member is conventional and no set is waiting on a volume, so the
-        // verdict stands and the repair-first branch stays skipped
-        // (`a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass`).
+        // Narrower than 0.7.9's blanket `!verified`, deliberately, and on the
+        // *absent*-volumes predicate rather than the waiting phase: a job that
+        // merely finalized its direct sets has a conventional failed member and
+        // no set waiting on anything, so its verdict stands and the
+        // repair-first branch stays skipped
+        // (`a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass`),
+        // and a swap-corrected set whose volumes are all present is left to the
+        // retry frontier rather than dragged back through PAR2.
         let par2_verdict_stale_after_failed_extraction = self.par2_verified.contains(&job_id)
             && has_crc_failures
-            && self.job_has_live_rar_waiting_for_missing_volumes(job_id);
+            && self.job_has_live_rar_waiting_for_absent_volumes(job_id);
         let par2_verdict_open = !self.par2_verified.contains(&job_id)
             || par2_verdict_stale_after_failed_extraction;
         let par2_may_still_rule = par2_loaded && !par2_bypassed && par2_verdict_open;
@@ -2605,7 +2681,7 @@ impl Pipeline {
         // blocks that would rebuild it sitting right there.
         let missing_rar_volume_par2_repair_ready = par2_may_still_rule
             && extraction_settled
-            && self.job_has_live_rar_waiting_for_missing_volumes(job_id)
+            && self.job_has_live_rar_waiting_for_absent_volumes(job_id)
             && (self.recovery_blocks_available_or_targeted(job_id) > 0
                 || self
                     .jobs

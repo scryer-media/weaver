@@ -287,6 +287,20 @@ pub struct PipelineMetrics {
     pub write_buffered_bytes: AtomicU64,
     pub write_buffered_segments: AtomicUsize,
     pub direct_write_evictions: AtomicU64,
+    /// Direct-store engagement, as lifetime counters. These four exist so an
+    /// external observer — the e2e harness, or someone staring at a production
+    /// box — can tell whether direct routing actually carried a job or quietly
+    /// fell back to the conventional path: the output bytes are identical
+    /// either way, so nothing downstream can answer that. Admitted says the
+    /// gate engaged; finalized-direct says a set completed without ever
+    /// writing a source volume; demoted says one left direct routing (the
+    /// per-reason breakdown stays in the logs and the `direct_store.demoted.*`
+    /// perf-probe keys); repaired-while-direct says damage was repaired
+    /// without leaving.
+    pub direct_sets_admitted: AtomicU64,
+    pub direct_sets_demoted: AtomicU64,
+    pub direct_sets_finalized_direct: AtomicU64,
+    pub direct_sets_repaired_while_direct: AtomicU64,
     pub decode_pressure_soft_limit_bytes: AtomicU64,
     pub decode_pressure_hard_limit_bytes: AtomicU64,
     pub write_pressure_soft_limit_bytes: AtomicU64,
@@ -430,6 +444,10 @@ impl PipelineMetrics {
             write_buffered_bytes: AtomicU64::new(0),
             write_buffered_segments: AtomicUsize::new(0),
             direct_write_evictions: AtomicU64::new(0),
+            direct_sets_admitted: AtomicU64::new(0),
+            direct_sets_demoted: AtomicU64::new(0),
+            direct_sets_finalized_direct: AtomicU64::new(0),
+            direct_sets_repaired_while_direct: AtomicU64::new(0),
             decode_pressure_soft_limit_bytes: AtomicU64::new(0),
             decode_pressure_hard_limit_bytes: AtomicU64::new(0),
             write_pressure_soft_limit_bytes: AtomicU64::new(0),
@@ -679,6 +697,14 @@ impl PipelineMetrics {
             write_buffered_bytes: self.write_buffered_bytes.load(Ordering::Relaxed),
             write_buffered_segments: self.write_buffered_segments.load(Ordering::Relaxed),
             direct_write_evictions: self.direct_write_evictions.load(Ordering::Relaxed),
+            direct_sets_admitted: self.direct_sets_admitted.load(Ordering::Relaxed),
+            direct_sets_demoted: self.direct_sets_demoted.load(Ordering::Relaxed),
+            direct_sets_finalized_direct: self
+                .direct_sets_finalized_direct
+                .load(Ordering::Relaxed),
+            direct_sets_repaired_while_direct: self
+                .direct_sets_repaired_while_direct
+                .load(Ordering::Relaxed),
             decode_pressure_soft_limit_bytes: self
                 .decode_pressure_soft_limit_bytes
                 .load(Ordering::Relaxed),
@@ -991,6 +1017,10 @@ pub struct MetricsSnapshot {
     pub write_buffered_bytes: u64,
     pub write_buffered_segments: usize,
     pub direct_write_evictions: u64,
+    pub direct_sets_admitted: u64,
+    pub direct_sets_demoted: u64,
+    pub direct_sets_finalized_direct: u64,
+    pub direct_sets_repaired_while_direct: u64,
     pub decode_pressure_soft_limit_bytes: u64,
     pub decode_pressure_hard_limit_bytes: u64,
     pub write_pressure_soft_limit_bytes: u64,

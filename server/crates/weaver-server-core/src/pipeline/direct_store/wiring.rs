@@ -491,6 +491,9 @@ impl Pipeline {
                     "direct_store.admitted.volumes",
                     plan.volumes.len() as u64,
                 );
+                self.metrics
+                    .direct_sets_admitted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 info!(
                     job_id = job_id.0,
                     set_name = %plan.set_name,
@@ -1762,6 +1765,9 @@ impl Pipeline {
             "direct_store.repaired_while_direct",
             std::time::Duration::from_nanos(1),
         );
+        self.metrics
+            .direct_sets_repaired_while_direct
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -3268,6 +3274,9 @@ impl Pipeline {
             "direct_store.set.finalized",
             std::time::Duration::from_nanos(1),
         );
+        self.metrics
+            .direct_sets_finalized_direct
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         info!(
             job_id = job_id.0,
             set_name = %set_name,
@@ -3670,6 +3679,12 @@ impl Pipeline {
             format!("direct_store.demoted.{}", reason.metric()),
             std::time::Duration::from_nanos(1),
         );
+        // Guarded by `claim_demotion` above, so this counts each set exactly
+        // once; the per-reason breakdown lives in the perf-probe key and the
+        // warn line.
+        self.metrics
+            .direct_sets_demoted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         warn!(
             job_id = job_id.0,
             set_name = %set_name,

@@ -3760,3 +3760,147 @@ async fn live_par2_refuses_the_short_circuit_when_the_on_disk_length_disagrees()
     );
     assert_eq!(metrics.full_verify_skips, 0);
 }
+
+#[tokio::test]
+async fn waiting_on_present_volumes_is_not_repair_ready_until_a_volume_is_truly_absent() {
+    // `WaitingForVolumes` covers two different situations, and PAR2
+    // repair-readiness must only fire for one of them. A set mid
+    // swap-correction waits on volume *numbers* while every actual volume sits
+    // parsed on disk under mismatched numbering — that wait is answered by the
+    // cached-header retry, and treating it as missing-volume repair readiness
+    // sent a swap job into damaged-path analysis, promoted recovery blocks it
+    // had no use for, and emitted verification events its fixture forbids. A
+    // volume that is genuinely absent — no facts, no file — is the shape where
+    // PAR2 really is the only move.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30031);
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "RAR Swap Waiting",
+            &[
+                ("show.part1.rar".to_string(), 512),
+                ("show.part2.rar".to_string(), 512),
+                ("show.part3.rar".to_string(), 512),
+            ],
+        ),
+    )
+    .await;
+    for filename in ["show.part1.rar", "show.part2.rar", "show.part3.rar"] {
+        tokio::fs::write(working_dir.join(filename), b"volume-bytes")
+            .await
+            .unwrap();
+    }
+
+    let set_key = (job_id, "show".to_string());
+    pipeline.rar_sets.insert(
+        set_key.clone(),
+        crate::pipeline::archive::rar_state::RarSetState {
+            facts: [
+                (0u32, dummy_rar_volume_facts(0)),
+                (1u32, dummy_rar_volume_facts(1)),
+                (2u32, dummy_rar_volume_facts(2)),
+            ]
+            .into_iter()
+            .collect(),
+            volume_files: [
+                (0u32, "show.part1.rar".to_string()),
+                (1u32, "show.part2.rar".to_string()),
+                (2u32, "show.part3.rar".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            plan: Some(crate::pipeline::archive::rar_state::RarDerivedPlan {
+                phase: crate::pipeline::archive::rar_state::RarSetPhase::WaitingForVolumes,
+                is_solid: false,
+                ready_members: Vec::new(),
+                member_names: Vec::new(),
+                member_dependencies: Default::default(),
+                // The swap transient: waiting on 1..=3 while parsed volumes are
+                // 0..=2 — the waited numbers that exist are all present, and 3
+                // is a phantom of the mislabeling.
+                waiting_on_volumes: [1, 2, 3].into_iter().collect(),
+                deletion_eligible: Default::default(),
+                delete_decisions: Default::default(),
+                topology: crate::jobs::assembly::ArchiveTopology {
+                    archive_type: crate::jobs::assembly::ArchiveType::Rar,
+                    volume_map: Default::default(),
+                    complete_volumes: Default::default(),
+                    expected_volume_count: None,
+                    members: Vec::new(),
+                    unresolved_spans: Vec::new(),
+                },
+                fallback_reason: None,
+            }),
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        pipeline.job_has_live_rar_waiting_for_missing_volumes(job_id),
+        "the broad phase-based predicate must still read this as waiting"
+    );
+    // `insert_active_job` queued the spec's segments, so the pipeline still
+    // owes this job payload work — and mid-download, an absent volume is just
+    // a volume that has not arrived yet. Nothing in `WaitingForVolumes` may
+    // qualify while anything is en route (the demotion-refetch and swap
+    // transients both fired the predicate 10 seconds into a job this way).
+    assert!(
+        !pipeline.job_has_live_rar_waiting_for_absent_volumes(job_id),
+        "pending download work means absence proves nothing yet"
+    );
+
+    // Quiet the pipeline; the rest of the contract is about exhaustion.
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
+    }
+    assert!(
+        !pipeline.job_has_live_rar_waiting_for_absent_volumes(job_id),
+        "present waiting volumes mean the volume-0 retry is owed its chance — \
+         not PAR2"
+    );
+
+    // Same set once the wait is only on a volume nothing can produce — the
+    // missing-middle shape. Now readiness must fire.
+    if let Some(plan) = pipeline
+        .rar_sets
+        .get_mut(&set_key)
+        .and_then(|set_state| set_state.plan.as_mut())
+    {
+        plan.waiting_on_volumes = [3].into_iter().collect();
+    }
+    assert!(
+        pipeline.job_has_live_rar_waiting_for_absent_volumes(job_id),
+        "a wait no retry can answer is exactly the repair-readiness shape"
+    );
+
+    // And the same missing-middle shape stops qualifying the moment any
+    // pipeline work reappears — `health_probing` here stands in for any of
+    // the pending-work arms.
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.health_probing = true;
+    }
+    assert!(
+        !pipeline.job_has_live_rar_waiting_for_absent_volumes(job_id),
+        "absence while anything is en route is not absence"
+    );
+
+    // AwaitingRepair qualifies with an empty waiting list — the livelocked
+    // small-repair family sits exactly there — and it stays unconditional:
+    // the extraction machinery itself concluded only repair moves the set,
+    // pending work or not.
+    if let Some(plan) = pipeline
+        .rar_sets
+        .get_mut(&set_key)
+        .and_then(|set_state| set_state.plan.as_mut())
+    {
+        plan.phase = crate::pipeline::archive::rar_state::RarSetPhase::AwaitingRepair;
+        plan.waiting_on_volumes = Default::default();
+    }
+    assert!(
+        pipeline.job_has_live_rar_waiting_for_absent_volumes(job_id),
+        "AwaitingRepair is unconditional — even while the pipeline is busy"
+    );
+}

@@ -592,7 +592,7 @@ pub(in crate::pipeline) fn ownerless_present_member_volumes(
     volumes
 }
 
-fn present_waiting_rar_volumes(
+pub(in crate::pipeline) fn present_waiting_rar_volumes(
     plan: &RarDerivedPlan,
     facts: &BTreeMap<u32, unrar_rs::RarVolumeFacts>,
     volume_paths: &BTreeMap<u32, PathBuf>,
