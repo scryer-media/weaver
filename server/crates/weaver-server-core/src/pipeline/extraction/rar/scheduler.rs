@@ -496,6 +496,8 @@ impl Pipeline {
             .get(&job_id)
             .cloned()
             .unwrap_or_default();
+        let par2_repair_authoritative =
+            self.par2_set(job_id).is_some() && !self.par2_bypassed.contains(&job_id);
 
         let mut candidate_sets: Vec<(String, Vec<String>, bool)> = self
             .rar_sets
@@ -530,6 +532,14 @@ impl Pipeline {
                         .extracted_members
                         .get(&job_id)
                         .is_some_and(|extracted| extracted.contains(&ready_member.name))
+                    {
+                        continue;
+                    }
+                    if par2_repair_authoritative
+                        && self
+                            .failed_extractions
+                            .get(&job_id)
+                            .is_some_and(|failed| failed.contains(&ready_member.name))
                     {
                         continue;
                     }
@@ -1412,6 +1422,12 @@ impl Pipeline {
                 let all_downloaded = self.jobs.get(&job_id).is_some_and(|state| {
                     state.assembly.complete_data_file_count() >= state.assembly.data_file_count()
                 });
+                let par2_repair_pending = self.par2_set(job_id).is_some()
+                    && !self.par2_bypassed.contains(&job_id)
+                    && self
+                        .failed_extractions
+                        .get(&job_id)
+                        .is_some_and(|failed| !failed.is_empty());
                 if capacity_retry {
                     self.schedule_rar_capacity_retry(
                         job_id,
@@ -1431,7 +1447,7 @@ impl Pipeline {
                         RarExtractionSettle::RefreshLaunched {
                             allows_extraction: false,
                         } => {}
-                        RarExtractionSettle::Idle if all_downloaded => {
+                        RarExtractionSettle::Idle if all_downloaded || par2_repair_pending => {
                             self.check_job_completion(job_id).await;
                         }
                         // The last worker of a failed batch has settled. The

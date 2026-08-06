@@ -532,13 +532,11 @@ impl Pipeline {
                     state.download_queue.len(),
                     state.download_queue.has_recovery_work(),
                     state.download_queue.count_matching(|work| {
-                        work.is_recovery
-                            && promoted_files.contains(&work.segment_id.file_id.file_index)
+                        promoted_files.contains(&work.segment_id.file_id.file_index)
                     }),
                     state.recovery_queue.len(),
                     state.recovery_queue.count_matching(|work| {
-                        work.is_recovery
-                            && promoted_files.contains(&work.segment_id.file_id.file_index)
+                        promoted_files.contains(&work.segment_id.file_id.file_index)
                     }),
                 )
             })
@@ -2568,6 +2566,12 @@ impl Pipeline {
         // staying false so the repair-first branch is skipped. Relaxing it here
         // diverts that flow and the later authoritative pass stops running
         // (`a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass`).
+        // Hoisted here by the 0.7.9 port: the repair-readiness predicates below
+        // need it, and it used to be defined further down at "Step 2".
+        let has_crc_failures = self
+            .failed_extractions
+            .get(&job_id)
+            .is_some_and(|failed| !failed.is_empty());
         let par2_may_still_rule =
             par2_loaded && !par2_bypassed && !self.par2_verified.contains(&job_id);
         let extraction_settled = !self.job_has_active_extraction_tasks(job_id);
@@ -2605,6 +2609,11 @@ impl Pipeline {
             !has_incomplete_data_files || download_pipeline_exhausted || rar_par2_repair_ready;
         let par2_validation_needed = par2_loaded
             && !par2_bypassed
+            // 0.7.9 relaxes this to `(rar_par2_repair_ready || !verified)`. 0.8
+            // must not: it re-opens the gate for a verified job by another
+            // route, one that depends on `par2_validation_needed` staying false
+            // so the repair-first branch is skipped
+            // (a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass).
             && !self.par2_verified.contains(&job_id)
             && par2_primary_payload_ready
             // The residuals check reads a job still missing archive pieces as
@@ -2620,10 +2629,6 @@ impl Pipeline {
             && self.job_has_pending_rar_refresh_for_current_sets(job_id);
 
         // Step 2: Check for CRC failures that need PAR2 repair.
-        let has_crc_failures = self
-            .failed_extractions
-            .get(&job_id)
-            .is_some_and(|f| !f.is_empty());
         let clean_par2_integrity_gate = self.clean_par2_integrity_gate(job_id);
         let archive_extraction_applicable = self.extraction_readiness_for_job(job_id)
             != ExtractionReadiness::NotApplicable
@@ -2764,6 +2769,22 @@ impl Pipeline {
             return;
         }
 
+        if download_pipeline_exhausted
+            && only_rar_archives
+            && has_crc_failures
+            && !self.job_has_active_extraction_tasks(job_id)
+        {
+            match self.try_restore_rar_recovery_volumes(job_id).await {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "RAR recovery-volume restore failed; continuing with normal repair evaluation"
+                ),
+            }
+        }
+
         // Don't finalize while concatenation is still pending.
         if self
             .pending_concat
@@ -2841,6 +2862,14 @@ impl Pipeline {
         }
 
         if needs_completion_repair_evaluation && !par2_bypassed {
+            // 0.7.9 defers repair evaluation here whenever a repair is owed and
+            // download work is pending. 0.8 must not: a direct set legitimately
+            // has pipeline work outstanding while its own authoritative pass is
+            // due, and deferring on that alone stops the pass ever running
+            // (a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass,
+            // clean_verify_retries_non_rar_full_set_extraction). The guard 0.8
+            // already carries for this is direct_sets_ready_for_authoritative_par2,
+            // folded into rar_par2_repair_ready above.
             if self.job_has_promoted_recovery_pipeline_work(job_id, "verify") {
                 return;
             }
@@ -3320,6 +3349,13 @@ impl Pipeline {
                             });
 
                             self.retry_par2_authoritative_identity(job_id).await;
+                            if let Err(error) = self
+                                .register_verified_par2_rar_outputs(job_id, &outcome.verification)
+                                .await
+                            {
+                                self.fail_job(job_id, error);
+                                return;
+                            }
                             self.refresh_verified_complete_archive_topologies(
                                 job_id,
                                 &outcome.verification,
@@ -3360,7 +3396,15 @@ impl Pipeline {
                                         cleared, "cleared failed extractions for post-repair retry"
                                     );
                                 }
+                            }
 
+                            // A repaired interior RAR volume is only visible to the
+                            // incremental scheduler after its synchronous refresh.
+                            // Do that before scheduling another completion check, or a
+                            // stale WaitingForVolumes plan can re-enter PAR2 forever.
+                            if has_crc_failures
+                                || self.job_has_live_rar_waiting_for_missing_volumes(job_id)
+                            {
                                 self.retry_archive_extraction_after_verify_or_repair(job_id)
                                     .await;
                                 return;
@@ -3713,6 +3757,16 @@ impl Pipeline {
                                 return;
                             }
                             self.retry_par2_authoritative_identity(job_id).await;
+                            if let Err(error) = self
+                                .register_verified_par2_rar_outputs(
+                                    job_id,
+                                    &post_repair_verification,
+                                )
+                                .await
+                            {
+                                self.fail_job(job_id, error);
+                                return;
+                            }
                             self.refresh_verified_complete_archive_topologies(
                                 job_id,
                                 &post_repair_verification,
@@ -3753,7 +3807,15 @@ impl Pipeline {
                                         cleared, "cleared failed extractions for post-repair retry"
                                     );
                                 }
+                            }
 
+                            // A repaired interior RAR volume is only visible to the
+                            // incremental scheduler after its synchronous refresh.
+                            // Do that before scheduling another completion check, or a
+                            // stale WaitingForVolumes plan can re-enter PAR2 forever.
+                            if has_crc_failures
+                                || self.job_has_live_rar_waiting_for_missing_volumes(job_id)
+                            {
                                 self.retry_archive_extraction_after_verify_or_repair(job_id)
                                     .await;
                                 return;

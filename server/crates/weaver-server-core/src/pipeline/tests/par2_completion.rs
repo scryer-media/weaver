@@ -1750,13 +1750,32 @@ async fn promoted_recovery_wait_does_not_reverify_until_recovery_finishes() {
             .is_some_and(|state| state.download_queue.has_recovery_work())
     );
 
+    let queued_recovery = {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue.drain_all()
+    };
+    assert_eq!(queued_recovery.len(), 1);
+    pipeline
+        .pending_released_download_results_by_job
+        .insert(job_id, 1);
     pipeline.check_job_completion(job_id).await;
-
     assert_eq!(drain_job_verification_started(&mut events, job_id), 0);
     assert_eq!(
         job_status_for_assert(&pipeline, job_id),
         Some(JobStatus::Downloading)
     );
+
+    pipeline
+        .pending_released_download_results_by_job
+        .remove(&job_id);
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        for work in queued_recovery {
+            state.download_queue.push(work);
+        }
+    }
+    pipeline.check_job_completion(job_id).await;
+    assert_eq!(drain_job_verification_started(&mut events, job_id), 0);
 
     let queued_recovery = {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();

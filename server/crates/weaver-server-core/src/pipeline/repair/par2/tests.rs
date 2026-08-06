@@ -155,6 +155,50 @@ fn targeted_selection_prefers_minimum_bytes_then_file_count() {
 }
 
 #[test]
+fn targeted_selection_uses_standard_par2_volume_capacities() {
+    // These are the exact counts declared by `.volNNN+CCC.par2` names.  A
+    // missing 320-slice source must choose 335 packets in the first wave,
+    // rather than an encoded-size estimate that can leave it short.
+    let selected = select_recovery_file_indices(
+        &[
+            RecoveryCandidate {
+                file_index: 8,
+                blocks: 16,
+                total_bytes: 16,
+                source: RecoveryCountSource::FilenameFallback,
+            },
+            RecoveryCandidate {
+                file_index: 9,
+                blocks: 32,
+                total_bytes: 32,
+                source: RecoveryCountSource::FilenameFallback,
+            },
+            RecoveryCandidate {
+                file_index: 10,
+                blocks: 64,
+                total_bytes: 64,
+                source: RecoveryCountSource::FilenameFallback,
+            },
+            RecoveryCandidate {
+                file_index: 11,
+                blocks: 128,
+                total_bytes: 128,
+                source: RecoveryCountSource::FilenameFallback,
+            },
+            RecoveryCandidate {
+                file_index: 12,
+                blocks: 127,
+                total_bytes: 127,
+                source: RecoveryCountSource::FilenameFallback,
+            },
+        ],
+        320,
+    );
+
+    assert_eq!(selected, vec![8, 10, 12, 11]);
+}
+
+#[test]
 fn targeted_selection_returns_empty_when_covered() {
     let selected = select_recovery_file_indices(&[], 0);
     assert!(selected.is_empty());

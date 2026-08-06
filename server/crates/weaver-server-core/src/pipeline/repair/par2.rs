@@ -1205,6 +1205,18 @@ impl Pipeline {
             return Some((0, RecoveryCountSource::Exact));
         }
 
+        // A standard `.volNNN+CCC.par2` name carries the exact packet count.
+        // Prefer it before estimating from the encoded file size: the latter
+        // includes set metadata and can otherwise under- or over-select the
+        // first recovery wave.
+        if let weaver_model::files::FileRole::Par2 {
+            is_index: false,
+            recovery_block_count,
+        } = role
+        {
+            return Some((recovery_block_count, RecoveryCountSource::FilenameFallback));
+        }
+
         if let (Some(packet_size), Some(overhead), Some(total_bytes)) = (
             self.recovery_packet_size(job_id),
             self.recovery_metadata_overhead_bytes(job_id),
@@ -1219,16 +1231,7 @@ impl Pipeline {
             return Some((estimated, RecoveryCountSource::Calibrated));
         }
 
-        match role {
-            weaver_model::files::FileRole::Par2 {
-                is_index,
-                recovery_block_count,
-            } => Some((
-                if is_index { 0 } else { recovery_block_count },
-                RecoveryCountSource::FilenameFallback,
-            )),
-            _ => None,
-        }
+        None
     }
 
     /// If the completed file is a PAR2 index, read it from disk, parse it,
@@ -1518,7 +1521,7 @@ impl Pipeline {
         let queued_download = self.jobs.get(&job_id).is_some_and(|state| {
             state
                 .download_queue
-                .count_matching(|work| work.is_recovery && work.segment_id.file_id == file_id)
+                .count_matching(|work| work.segment_id.file_id == file_id)
                 > 0
         });
         let active_download = self.active_downloads_by_file.contains_key(&file_id);
