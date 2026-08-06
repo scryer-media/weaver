@@ -47,6 +47,7 @@ func main() {
 	flag.StringVar(&bluRayLargeFile, "bluray-large-file-bytes", "5GiB", "large media-stream size for bluray-disc fixtures")
 	flag.StringVar(&bluRaySmallFile, "bluray-small-file-bytes", "128KiB", "small metadata-file size for bluray-disc fixtures")
 	flag.IntVar(&config.BluRaySmallFileCount, "bluray-small-file-count", 512, "small metadata files for bluray-disc fixtures")
+	flag.IntVar(&config.Workers, "workers", 4, "independent fixtures to generate concurrently")
 	flag.BoolVar(&directMKV, "direct-mkv", false, "generate only the direct 200MiB MKV fixture without Docker")
 	flag.StringVar(&directMKVBytes, "direct-mkv-bytes", "200MiB", "payload size for --direct-mkv")
 	flag.Var(&fixtureIDs, "fixture", "one expanded fixture id to generate (repeatable; defaults to all)")

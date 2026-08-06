@@ -24,8 +24,11 @@ type VerifiedOutputFile struct {
 	BLAKE3       string `json:"blake3"`
 }
 
-// VerifyOutput accepts client-specific completion nesting but requires the
-// exact expected basename, byte count, and SHA-256 for every generated file.
+// VerifyOutput accepts client-specific completion nesting and filename
+// deobfuscation. It prefers an exact expected basename, then falls back to a
+// unique byte-count and BLAKE3 match. An output file can satisfy only one
+// expected member, so a flattened-name collision remains a verification
+// failure rather than being hidden by content matching.
 func VerifyOutput(fixtureDir, outputDir string) (OutputVerification, error) {
 	manifest, err := fixture.LoadGeneratedManifest(filepath.Join(fixtureDir, "fixture-manifest.json"))
 	if err != nil {
@@ -35,41 +38,63 @@ func VerifyOutput(fixtureDir, outputDir string) (OutputVerification, error) {
 	if err != nil {
 		return OutputVerification{}, err
 	}
+	allCandidates := make([]discoveredFile, 0)
+	for _, byName := range actual {
+		allCandidates = append(allCandidates, byName...)
+	}
+	sort.Slice(allCandidates, func(i, j int) bool { return allCandidates[i].path < allCandidates[j].path })
 	result := OutputVerification{FixtureID: manifest.Case.ID, Files: make([]VerifiedOutputFile, 0, len(manifest.ExpectedFiles))}
+	used := make(map[string]bool, len(manifest.ExpectedFiles))
+	digests := make(map[string]string)
 	for _, expected := range manifest.ExpectedFiles {
-		candidates := actual[filepath.Base(expected.Path)]
-		if len(candidates) == 0 {
-			return OutputVerification{}, fmt.Errorf("missing expected output file %s", expected.Path)
+		verified, err := verifyExpectedFile(expected, actual[filepath.Base(expected.Path)], used, digests, outputDir)
+		if err != nil {
+			return OutputVerification{}, err
 		}
-		var verified *VerifiedOutputFile
-		for _, candidate := range candidates {
-			if candidate.size != expected.Size {
-				continue
-			}
-			digest, err := hashFile(candidate.path)
+		if verified == nil {
+			verified, err = verifyExpectedFile(expected, allCandidates, used, digests, outputDir)
 			if err != nil {
 				return OutputVerification{}, err
 			}
-			if digest == expected.BLAKE3 {
-				candidatePath, err := filepath.Rel(outputDir, candidate.path)
-				if err != nil {
-					return OutputVerification{}, err
-				}
-				verified = &VerifiedOutputFile{
-					ExpectedPath: expected.Path,
-					ActualPath:   filepath.ToSlash(candidatePath),
-					Size:         expected.Size,
-					BLAKE3:       digest,
-				}
-				break
-			}
 		}
 		if verified == nil {
-			return OutputVerification{}, fmt.Errorf("no output file matching %s passed size and SHA-256 verification", expected.Path)
+			return OutputVerification{}, fmt.Errorf("no unused output file matching %s passed size and BLAKE3 verification", expected.Path)
 		}
+		used[filepath.Clean(filepath.Join(outputDir, filepath.FromSlash(verified.ActualPath)))] = true
 		result.Files = append(result.Files, *verified)
 	}
 	return result, nil
+}
+
+func verifyExpectedFile(expected fixture.FileDigest, candidates []discoveredFile, used map[string]bool, digests map[string]string, outputDir string) (*VerifiedOutputFile, error) {
+	for _, candidate := range candidates {
+		if used[candidate.path] || candidate.size != expected.Size {
+			continue
+		}
+		digest, ok := digests[candidate.path]
+		if !ok {
+			var err error
+			digest, err = hashFile(candidate.path)
+			if err != nil {
+				return nil, err
+			}
+			digests[candidate.path] = digest
+		}
+		if digest != expected.BLAKE3 {
+			continue
+		}
+		candidatePath, err := filepath.Rel(outputDir, candidate.path)
+		if err != nil {
+			return nil, err
+		}
+		return &VerifiedOutputFile{
+			ExpectedPath: expected.Path,
+			ActualPath:   filepath.ToSlash(candidatePath),
+			Size:         expected.Size,
+			BLAKE3:       digest,
+		}, nil
+	}
+	return nil, nil
 }
 
 // DeleteOutputFiles removes completed download contents while retaining the

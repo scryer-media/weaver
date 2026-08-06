@@ -116,9 +116,12 @@ type QueueJobResult struct {
 	JobID                          string              `json:"job_id"`
 	QueuedAt                       time.Time           `json:"queued_at"`
 	FixtureWallClockNanoseconds    int64               `json:"fixture_wall_clock_nanoseconds"`
+	UsableOutputAt                 time.Time           `json:"usable_output_at,omitempty"`
+	UsableWallClockNanoseconds     int64               `json:"usable_wall_clock_nanoseconds,omitempty"`
 	ResourceMetrics                *ResourceMetrics    `json:"resource_metrics,omitempty"`
 	TerminalStatus                 string              `json:"terminal_status"`
 	Verification                   *OutputVerification `json:"verification,omitempty"`
+	OutputVerificationError        string              `json:"output_verification_error,omitempty"`
 	OutputDeleted                  bool                `json:"output_deleted,omitempty"`
 	TerminalError                  string              `json:"terminal_error,omitempty"`
 	ProcessingTimingAvailable      bool                `json:"processing_timing_available"`
@@ -146,9 +149,17 @@ type QueueJobArtifact struct {
 	Run            Run                   `json:"run"`
 	Repair         fixture.RepairDetails `json:"repair"`
 	AdapterResult  QueueJobResult        `json:"adapter_result"`
+	Outcome        string                `json:"outcome"`
 	Verification   *OutputVerification   `json:"verification,omitempty"`
 	UsableOutputAt *time.Time            `json:"usable_output_at,omitempty"`
 	Error          string                `json:"error,omitempty"`
+}
+
+func queueJobOutcome(result QueueJobResult) string {
+	if result.TerminalStatus != "succeeded" || result.OutputVerificationError != "" {
+		return "dnf"
+	}
+	return "completed"
 }
 
 type queueSuite struct {
@@ -201,7 +212,7 @@ func executeQueuePlan(ctx context.Context, config RunConfig, mode SubmissionMode
 	for _, suite := range suites {
 		artifact := executeQueueSuite(ctx, config, suite, mode)
 		artifacts = append(artifacts, artifact)
-		if artifact.Status != "passed" {
+		if artifact.Status == "failed" {
 			failures = append(failures, fmt.Sprintf("%s: %s", suite.ID, artifact.Error))
 		}
 	}
@@ -276,7 +287,7 @@ func queueSuites(plan Plan, target ExecutionTarget) []queueSuite {
 }
 
 func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuite, mode SubmissionMode) QueueArtifact {
-	artifact := QueueArtifact{SchemaVersion: 3, SuiteID: suite.ID, SubmissionMode: mode, Runs: append([]Run(nil), suite.Runs...), Status: "failed"}
+	artifact := QueueArtifact{SchemaVersion: 5, SuiteID: suite.ID, SubmissionMode: mode, Runs: append([]Run(nil), suite.Runs...), Status: "failed"}
 	suiteDir := filepath.Join(config.ArtifactRoot, suite.ID)
 	if err := os.Mkdir(suiteDir, 0o755); err != nil {
 		artifact.Error = fmt.Sprintf("create queue suite directory: %v", err)
@@ -372,6 +383,7 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 			Run:           run,
 			Repair:        manifests[run.ID].Repair,
 			AdapterResult: adapterResult,
+			Outcome:       queueJobOutcome(adapterResult),
 		}
 		if adapterResult.TerminalStatus != "succeeded" {
 			jobArtifact.Error = "client terminal failure: " + adapterResult.TerminalError
@@ -381,13 +393,21 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 		}
 		var verification OutputVerification
 		if mode == SubmissionModeSequential {
-			if adapterResult.Verification == nil || !adapterResult.OutputDeleted {
-				jobArtifact.Error = "adapter did not verify and delete the completed fixture output"
+			if adapterResult.OutputVerificationError != "" {
+				jobArtifact.Error = "output verification: " + adapterResult.OutputVerificationError
+				jobFailures = append(jobFailures, fmt.Sprintf("%s: %s", run.ID, jobArtifact.Error))
+				artifact.Jobs = append(artifact.Jobs, jobArtifact)
+				continue
+			}
+			if adapterResult.Verification == nil || !adapterResult.OutputDeleted || adapterResult.UsableOutputAt.IsZero() || adapterResult.UsableOutputAt.Before(adapterResult.CompletionAt) {
+				jobArtifact.Error = "adapter did not report verified usable output after completion"
 				jobFailures = append(jobFailures, fmt.Sprintf("%s: %s", run.ID, jobArtifact.Error))
 				artifact.Jobs = append(artifact.Jobs, jobArtifact)
 				continue
 			}
 			verification = *adapterResult.Verification
+			usableAt := adapterResult.UsableOutputAt
+			jobArtifact.UsableOutputAt = &usableAt
 		} else {
 			verification, err = VerifyOutput(fixtureDirs[run.ID], outputDir)
 		}
@@ -401,16 +421,19 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 			artifact.Jobs = append(artifact.Jobs, jobArtifact)
 			continue
 		}
-		verifiedAt := time.Now().UTC()
 		jobArtifact.Verification = &verification
-		jobArtifact.UsableOutputAt = &verifiedAt
+		if mode != SubmissionModeSequential {
+			verifiedAt := time.Now().UTC()
+			jobArtifact.UsableOutputAt = &verifiedAt
+		}
 		artifact.Jobs = append(artifact.Jobs, jobArtifact)
 		if jobArtifact.Error != "" {
 			jobFailures = append(jobFailures, fmt.Sprintf("%s: %s", run.ID, jobArtifact.Error))
 		}
 	}
 	if len(jobFailures) > 0 {
-		artifact.Error = fmt.Sprintf("%d queue job(s) failed: %s", len(jobFailures), strings.Join(jobFailures, "; "))
+		artifact.Status = "completed_with_dnf"
+		artifact.Error = fmt.Sprintf("%d queue job(s) did not finish: %s", len(jobFailures), strings.Join(jobFailures, "; "))
 		return artifact
 	}
 	if mode != SubmissionModeSequential {
@@ -427,7 +450,7 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 }
 
 func (r QueueAdapterResult) ValidateFor(suite queueSuite, mode SubmissionMode) error {
-	if r.SchemaVersion != 3 || r.SuiteID != suite.ID || r.SubmissionMode != mode || len(suite.Runs) == 0 {
+	if r.SchemaVersion != 4 || r.SuiteID != suite.ID || r.SubmissionMode != mode || len(suite.Runs) == 0 {
 		return fmt.Errorf("queue adapter result does not match suite %s", suite.ID)
 	}
 	first := suite.Runs[0]
@@ -471,8 +494,17 @@ func (r QueueAdapterResult) ValidateFor(suite queueSuite, mode SubmissionMode) e
 			if err := job.ResourceMetrics.Validate(); err != nil {
 				return fmt.Errorf("sequential adapter result for %s has invalid fixture resource metrics: %w", suite.ID, err)
 			}
-			if job.TerminalStatus == "succeeded" && (job.Verification == nil || !job.OutputDeleted) {
-				return fmt.Errorf("sequential adapter result for %s did not verify and delete fixture output", suite.ID)
+			if job.TerminalStatus == "succeeded" {
+				if job.OutputVerificationError != "" {
+					if job.Verification != nil || !job.OutputDeleted || !job.UsableOutputAt.IsZero() || job.UsableWallClockNanoseconds != 0 {
+						return fmt.Errorf("sequential adapter result for %s has invalid failed output verification", suite.ID)
+					}
+				} else {
+					usableWall := job.UsableOutputAt.Sub(job.QueuedAt).Nanoseconds()
+					if job.Verification == nil || !job.OutputDeleted || job.UsableOutputAt.IsZero() || job.UsableOutputAt.Before(job.CompletionAt) || job.UsableWallClockNanoseconds != usableWall {
+						return fmt.Errorf("sequential adapter result for %s did not record verified usable fixture output", suite.ID)
+					}
+				}
 			}
 		} else if job.ResourceMetrics != nil {
 			return fmt.Errorf("non-sequential adapter result for %s unexpectedly reports fixture resource metrics", suite.ID)

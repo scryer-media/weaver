@@ -31,7 +31,7 @@ services:
         aliases: [nntp-upstream]
 
   nntp-shaper:
-    image: weaver-nntp-bench-shaper:dev
+    image: ${NNTP_SHAPER_IMAGE:-weaver-nntp-bench-shaper:dev}
     build:
       context: ../..
       dockerfile: docker/nntp-shaper/Dockerfile
@@ -49,8 +49,8 @@ services:
     # NNTP_PUBLIC_BIND_ADDR to the benchmark host's LAN address only when a
     # native Windows client must reach this shaper remotely.
     ports:
-      - "${NNTP_PUBLIC_BIND_ADDR:-127.0.0.1}:119:119"
-      - "${NNTP_PUBLIC_BIND_ADDR:-127.0.0.1}:563:563"
+      - "${NNTP_PUBLIC_BIND_ADDR:-127.0.0.1}:${NNTP_PUBLIC_PLAINTEXT_PORT:-119}:119"
+      - "${NNTP_PUBLIC_BIND_ADDR:-127.0.0.1}:${NNTP_PUBLIC_TLS_PORT:-563}:563"
     networks:
       nntp_upstream: {}
       benchmark:

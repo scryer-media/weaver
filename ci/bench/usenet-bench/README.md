@@ -13,32 +13,39 @@ reproducibility record.
 
 ## What the initial matrix covers
 
-The base cases each have four inner files and are split into 32 MiB RAR
-volumes. They cover the source-locked RARLAB 3.x–7.x writer eras and their
-declared archive families across:
+The corpus is a declared compatibility and repair coverage set, not a model of
+Usenet posting frequency. Ordinary cases contain one 150 MiB real video file
+and are split into 32 MiB RAR volumes. One multi-input case contains four
+48 MiB videos. Together they cover source-locked RARLAB 3.x–7.x writer eras
+and their declared archive families across:
 
 | Axis | Values |
 | --- | --- |
 | Writer era | RAR 3.93, 4.20, 5.00, 6.24, 7.23 |
 | Archive lane | RAR3, RAR4, or RAR5; RAR 6/7 writers emit the RAR5 family |
-| Compression | store (`-m0`), normal (`-m5`) |
+| Compression | store (`-m0`), or release-oriented normal compression (`-m5`) |
 | Solidity | non-solid, solid |
 | Encryption | none, data encryption, encrypted headers |
 | Input data | incompressible, moderately compressible |
 
-That is 120 generic fixtures. Fifteen additional `bluray-disc` fixtures
-exercise every writer-era/encryption combination with a
-declared disc-shaped file topology: one 1 GiB `BDMV/STREAM/00000.m2ts` file,
-512 128 KiB playlist/clip-info/metadata-shaped files, normal compression, and
-solid archives. The generator accepts
+There are 18 clean RAR fixtures: five data-encrypted solid normal-compression
+lanes, five header-encrypted solid normal-compression lanes, three clear
+normal-compression lanes, and five clear store (`-m0`) lanes. This includes
+RAR3, RAR4, and RAR5 families; the newer RAR5 writer lanes preserve the
+separate 5.00, 6.24, and 7.23 producer eras.
+
+One additional `bluray-disc` fixture exercises a deliberately declared
+disc-shaped topology: one 5 GiB `BDMV/STREAM/00000.m2ts` file, four small
+menu/extra `.m2ts` streams, and 508 tiny `.mpls`, `.clpi`, `.bdjo`, `.bdmv`,
+PNG, JAR, font, certificate, XML, and text members. It is one normally
+compressed solid RAR5 archive, not a mixture of raw and RAR data. The generator accepts
 `--bluray-large-file-bytes`, `--bluray-small-file-count`, and
 `--bluray-small-file-bytes` so smoke runs can scale that shape down without
 changing what it represents. These are intentionally synthetic—not a claim
 that they are byte-for-byte Blu-ray images or statistically typical posts.
 
-Fourteen separately declared repair fixtures add deterministic corruption
-without multiplying every clean case. RAR3, RAR4, and RAR5 each receive all
-four profiles; two RAR5 `bluray-disc` cases exercise the heavy profiles:
+Four separately declared repair fixtures add deterministic corruption without
+duplicating the clean compatibility cases:
 
 | Profile | Posted repair material | Deliberate fault |
 | --- | --- | --- |
@@ -48,7 +55,7 @@ four profiles; two RAR5 `bluray-disc` cases exercise the heavy profiles:
 | `rar-recovery-volume-heavy` | two RAR recovery volumes | two non-leading RAR volumes absent |
 
 These profiles are compatibility and repair workloads, not a population claim.
-The source-locked `par2cmdline` 0.8.1 image creates PAR2 material from its
+The source-locked `par2cmdline-turbo` 1.4.0 image creates PAR2 material from its
 verified source archive. Before a repair fixture is accepted, the generator
 copies its posted input to a temporary verification directory, performs the
 declared repair with the pinned PAR2 or RARLAB tool, and RARLAB-tests the
@@ -60,6 +67,13 @@ writer releases, not separate RAR6/RAR7 on-disk format names. The old 3.93
 and 4.20 RARLAB Docker images use their native legacy defaults; RAR 5.00,
 6.24, and 7.23 receive the explicit `-ma5` selector. This is a compatibility
 matrix, not a claim to model exotic compressors or every historical quirk.
+
+Normal-compression fixtures model upload-size-oriented packaging: solid mode
+where declared, maximum compression, RAR4's 4 MiB maximum dictionary, RAR5's
+256 MiB dictionary, and RAR5 quick-open metadata disabled. No RAR recovery
+record is added; the separately declared PAR2 and recovery-volume profiles
+are the repair mechanisms. The non-solid/store lanes remain explicit controls,
+not release-frequency claims.
 
 The source lock uses official RARLAB Linux releases 3.93, 4.20, 5.00, 6.24,
 and 7.23. Their SHA-256 values are verified inside the Docker build; the old
@@ -76,17 +90,21 @@ Run from this directory:
 ```bash
 go run ./cmd/fixturegen --list
 
-# A real benchmark-sized case (four 64 MiB files by default).
+# A real benchmark-sized one-movie RAR case (150 MiB by default).
 go run ./cmd/fixturegen \
-  --fixture modern-rar5-normal-solid-headers-compressible \
+  --fixture rar5-7-headers-normal-solid-headers-compressible \
   --output /scratch/nntp-bench-fixtures
 
 # A disc-topology smoke case at a deliberately reduced scale.
 go run ./cmd/fixturegen \
-  --fixture modern-rar5-bluray-normal-solid-headers-incompressible \
+  --fixture rar5-7-bluray-normal-solid-none-incompressible \
   --bluray-large-file-bytes 256MiB \
   --bluray-small-file-count 64 \
   --bluray-small-file-bytes 32KiB \
+  --output /scratch/nntp-bench-fixtures
+
+# The separate raw-download fixture used by the queue-transition benchmark.
+go run ./cmd/fixturegen --direct-mkv \
   --output /scratch/nntp-bench-fixtures
 ```
 
@@ -96,8 +114,8 @@ Every generated fixture contains:
   RAR recovery-volume files. Deliberately missing RAR volumes are not posted;
   their pre-corruption digests remain in the manifest.
 - `fixture-manifest.json` — selected RAR flags, source-locked generator,
-  `repair` profile/fault metadata, source and posted-file SHA-256 digests, and
-  the extracted-output SHA-256 oracle.
+  `repair` profile/fault metadata, source and posted-file BLAKE3 digests, and
+  the extracted-output BLAKE3 oracle.
 
 The temporary source payload is removed after RARLAB successfully tests the
 archive. The manifest is sufficient to validate final client output without
@@ -132,7 +150,9 @@ Choose one of the two source modes; the provenance path deliberately refuses
 to overwrite an earlier record. Never commit that JSON or a local source path.
 The Compose topology uses `pull_policy: never`, so it can only start the tag
 built by this command. If using a tag other than `e2e-nntp:local`, export it
-as `E2E_NNTP_IMAGE` before running Compose.
+as `E2E_NNTP_IMAGE` before running Compose. Set `NNTP_SHAPER_IMAGE` to a
+run-specific local tag when preserving another stack that used the default
+`weaver-nntp-bench-shaper:dev` tag.
 
 ## Post with Nyuu
 
@@ -142,7 +162,7 @@ network so corpus setup is never routed through the bandwidth shaper.
 
 ```bash
 go run ./cmd/nntpbench seed \
-  --fixture-dir /scratch/nntp-bench-fixtures/modern-rar5-normal-solid-headers-compressible \
+  --fixture-dir /scratch/nntp-bench-fixtures/rar5-7-headers-normal-solid-headers-compressible \
   --run-id 2026-08-02-a \
   --network nntp-bench_nntp_upstream \
   --nntp-host nntp-upstream \
@@ -200,8 +220,8 @@ part of the download measurement.
 
 ```bash
 go run ./cmd/nntpbench plan \
-  --fixtures modern-rar5-normal-solid-headers-compressible,classic-rar4-store-nonsolid-none-incompressible \
-  --archive-toolchains vanilla,rarpar \
+  --fixtures rar5-7-headers-normal-solid-headers-compressible,rar4-store-store-nonsolid-none-incompressible \
+  --archive-toolchains vanilla \
   --server-link 10gbit \
   --repetitions 5 \
   --seed 20260802 \
@@ -217,18 +237,12 @@ every `(fixture, transport, repetition)` tuple:
 | SABnzbd | pinned Linux image, public API | native distributable, public API | native distributable, public API |
 | NZBGet | pinned Linux image, public API | native executable, JSON-RPC | native executable, JSON-RPC |
 
-It also adds two Docker-only Rarpar lanes, recorded as
-`archive_toolchain=rarpar`: SABnzbd+Rarpar and NZBGet+Rarpar. The Docker
-target therefore has five lanes; macOS and Windows retain three vanilla lanes
-each. This distinction is intentional. The stock native SABnzbd and NZBGet
-distributions bundle or link part of their archive stack and do not expose the
-same replacement points. Repackaging them just to force Rarpar would not be a
-native stock-package comparison.
-
 `archive_toolchain` is a first-class plan, adapter, rendered-config, and result
 field. Never pool `vanilla` and `rarpar` rows. Use
-`--archive-toolchains vanilla` for a stock-only plan; the `vanilla,rarpar`
-default is the side-by-side configuration.
+`--archive-toolchains vanilla` for the current stock-only benchmark. The
+optional Docker-only Rarpar entries remain in the catalog for a later,
+separately labelled comparison, but are intentionally not part of this corpus
+run while its CLI is changing.
 
 Use `--targets docker-linux` to create a Docker-only plan while iterating.
 Otherwise the saved plan includes all three target IDs; each host later runs
@@ -238,14 +252,14 @@ clients never share the server's bandwidth in a timed run. The persisted plan
 is the exact run order, client profile, archive toolchain, server-link
 contract, and packaging target used for reporting.
 
-## Run queue suites (primary measurement)
+## Run sequential fixture suites (primary measurement)
 
-Build the Docker adapter once. `queue` starts one fresh client container per
-client/toolchain/transport/repetition lane, submits every fixture NZB to that
-client before waiting for any completion, and verifies every output under the
-same queue directory. Client lanes remain sequential, so timed competitors do
-not share server bandwidth; fixture jobs within one lane deliberately share
-the client's normal queue, cache, and transition behaviour.
+Build the Docker adapter once. `sequential` starts one fresh durable client
+container per client/toolchain/transport/repetition lane, submits one fixture,
+waits for its terminal state and independent BLAKE3 output verification,
+deletes that fixture's completed output, then submits the next fixture. Client
+lanes remain sequential, so timed competitors do not share server bandwidth.
+This is the primary per-fixture measurement.
 
 ```bash
 go build -o /scratch/nntp-bench-bin/clientadapter ./cmd/clientadapter
@@ -254,7 +268,7 @@ go build -o /scratch/nntp-bench-bin/clientadapter ./cmd/clientadapter
 # images only by replacing their full digest. A floating tag is rejected.
 cp configs/adapters.example.json /scratch/nntp-bench-runs/adapters.json
 
-go run ./cmd/nntpbench queue \
+go run ./cmd/nntpbench sequential \
   --plan /scratch/nntp-bench-runs/plan.json \
   --adapters /scratch/nntp-bench-runs/adapters.json \
   --target docker-linux \
@@ -267,7 +281,16 @@ go run ./cmd/nntpbench queue \
 ```
 
 `run` is retained as a separately labelled cold, one-NZB diagnostic. It must
-not be used as the headline queue-throughput result.
+not be used as the headline result.
+
+### Queue-transition measurement
+
+Generate and seed `direct-mkv-200mb`, create a plan containing **only** that
+fixture with 20 runs per client/transport lane, and invoke `queue-transition`.
+The adapter force-accepts each duplicate NZB, keeps all completed output until
+the queue drains, then deletes it as one cleanup. This mode records only the
+first-submission-to-last-terminal wall clock; it deliberately does not report
+per-job timings or resource counters as independent fixture scores.
 
 ### Rarpar-backed Docker lanes
 
@@ -370,7 +393,10 @@ The example Compose topology publishes the shaper only on `127.0.0.1` by
 default. For the remote Windows lane, set `NNTP_PUBLIC_BIND_ADDR` to the
 benchmark server's specific LAN address, restrict it with the host firewall to
 the Windows benchmark host, and map the verified DNS name there. Do not expose
-the synthetic service broadly.
+the synthetic service broadly. `NNTP_PUBLIC_PLAINTEXT_PORT` and
+`NNTP_PUBLIC_TLS_PORT` default to 119 and 563; set both to unused host ports
+when preserving another local benchmark stack. Docker clients continue to use
+the fixed internal `nntp:119` and `nntp:563` endpoints.
 
 The configured Windows benchmark host currently has Git/Rust available but no
 SABnzbd or NZBGet executable on `PATH`; the suite deliberately does not
@@ -379,7 +405,7 @@ versions and hashes in the catalog, and use an isolated working directory such
 as `C:\bench` before running the Windows lane.
 
 The Docker adapter renders and saves a product config before starting the
-container. In the primary queue mode all three clients use their public local
+container. In the primary sequential mode all three clients use their public local
 control API: Weaver's local GraphQL service, SABnzbd `addfile`, and NZBGet
 JSON-RPC `append`. The cold diagnostic keeps Weaver's one-shot
 `weaver download … --report … --report-ack …` path. The adapter passes the
@@ -391,23 +417,23 @@ options in this branch are released. Do not substitute a floating tag or run a
 pre-report image: the adapter will preserve the exact digest and fail rather
 than silently falling back to the HTTP service.
 
-Queue artifacts record the first successful submission, every per-NZB accepted
-timestamp, first observed active-processing timestamp, terminal timestamp, the
-final client completion, and final independent output verification.
+Sequential-suite artifacts record every per-NZB accepted timestamp, first
+observed active-processing timestamp, terminal timestamp, and independent
+output verification before that fixture's completed output is deleted.
 `processing_wall_clock_nanoseconds` is the per-fixture active interval and does
 not include time waiting behind earlier queue entries. Its observation bound is
 recorded as `status_poll_interval_nanoseconds`. The adapter starts one batched
-status observer as soon as the first NZB is accepted; it does not issue one poll
+status observer as soon as a fixture is accepted; it does not issue one poll
 loop per fixture. A fixture that reaches terminal state before an active state
 is observed invalidates the suite instead of reporting queue latency as active
-work. Client and output-verification failures are retained per fixture; the
-adapter continues observing the rest of the queue and fails the suite only
-after every accepted job reaches a terminal state.
-`queue_wall_clock_nanoseconds` remains first submission to final client
-completion, and `verified_wall_clock_nanoseconds` extends that same start point
-through the output oracle for every NZB. CPU time and retired instructions cover
-the same uninterrupted client process. The cold Weaver CLI report and
-acknowledgement remain a measurement handshake for the diagnostic mode only.
+work. Client and output-verification failures are retained per fixture and
+make the suite fail; every submitted fixture still reaches a terminal state.
+`queue_wall_clock_nanoseconds` remains available for the separately labelled
+queue-transition mode only; it is first submission to final client completion.
+CPU time and retired instructions are recorded per sequential fixture and
+cover the same uninterrupted client process interval. The cold Weaver CLI
+report and acknowledgement remain a measurement handshake for the diagnostic
+mode only.
 
 Each client image must use `image@sha256:<digest>`, and its resolved image
 identity/version, archive-toolchain provenance, and rendered-config SHA-256
@@ -418,12 +444,12 @@ The generic runner independently validates completion with:
 
 ```bash
 go run ./cmd/nntpbench verify-output \
-  --fixture-dir /scratch/nntp-bench-fixtures/modern-rar5-normal-solid-headers-compressible \
+  --fixture-dir /scratch/nntp-bench-fixtures/rar5-7-headers-normal-solid-headers-compressible \
   --output-dir /scratch/nntp-bench-runs/run-0001/complete
 ```
 
 The primary timing is **usable output**: all expected unpacked files must pass
-size and SHA-256 verification. The adapter records wall time from successful
+size and BLAKE3 verification. The adapter records wall time from successful
 queue acceptance to the client's terminal completion observation (the Weaver
 CLI report or the SABnzbd/NZBGet API). The runner accepts that endpoint only
 after the output oracle succeeds; download-only time cannot replace this

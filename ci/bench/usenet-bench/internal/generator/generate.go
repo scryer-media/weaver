@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/fixture"
@@ -29,6 +30,7 @@ const (
 	defaultBluRayLargeFile         int64 = 5 << 30
 	defaultBluRaySmallFile         int64 = 128 << 10
 	defaultBluRaySmallFileCount          = 512
+	defaultGenerationWorkers             = 4
 )
 
 var canonicalFileTime = time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
@@ -46,6 +48,7 @@ type Config struct {
 	BluRayLargeFileBytes    int64
 	BluRaySmallFileBytes    int64
 	BluRaySmallFileCount    int
+	Workers                 int
 	CaseIDs                 map[string]bool
 	BuildImages             bool
 }
@@ -87,6 +90,9 @@ func (c Config) withDefaults() Config {
 	if c.BluRaySmallFileCount == 0 {
 		c.BluRaySmallFileCount = defaultBluRaySmallFileCount
 	}
+	if c.Workers == 0 {
+		c.Workers = defaultGenerationWorkers
+	}
 	return c
 }
 
@@ -96,6 +102,9 @@ func (c Config) Validate() error {
 	}
 	if c.BluRayLargeFileBytes <= 0 || c.BluRaySmallFileBytes <= 0 || c.BluRaySmallFileCount < 1 {
 		return fmt.Errorf("Blu-ray layout sizes and file count must be positive")
+	}
+	if c.Workers < 1 {
+		return fmt.Errorf("generator workers must be positive")
 	}
 	if strings.TrimSpace(c.OutputDir) == "" {
 		return fmt.Errorf("output directory is required")
@@ -140,8 +149,12 @@ func Generate(ctx context.Context, config Config) ([]fixture.GeneratedManifest, 
 	if err := os.MkdirAll(config.OutputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create output directory: %w", err)
 	}
-	built := map[string]bool{}
-	manifests := make([]fixture.GeneratedManifest, 0, len(cases))
+	type generationJob struct {
+		index       int
+		archiveCase fixture.ArchiveCase
+		toolchain   Toolchain
+	}
+	jobs := make([]generationJob, 0, len(cases))
 	for _, archiveCase := range cases {
 		if len(config.CaseIDs) > 0 && !config.CaseIDs[archiveCase.ID] {
 			continue
@@ -150,22 +163,69 @@ func Generate(ctx context.Context, config Config) ([]fixture.GeneratedManifest, 
 		if !ok {
 			return nil, fmt.Errorf("fixture %q references unknown toolchain %q", archiveCase.ID, archiveCase.GeneratorToolchain)
 		}
-		if config.BuildImages && !built[toolchain.ID] {
-			if err := buildImage(ctx, config, toolchain); err != nil {
-				return nil, err
-			}
-			built[toolchain.ID] = true
-		}
-		manifest, err := generateCase(ctx, config, archiveCase, toolchain, par2Toolchain)
-		if err != nil {
-			return nil, err
-		}
-		manifests = append(manifests, manifest)
+		jobs = append(jobs, generationJob{index: len(jobs), archiveCase: archiveCase, toolchain: toolchain})
 	}
-	if len(manifests) == 0 {
+	if len(jobs) == 0 {
 		return nil, fmt.Errorf("fixture selection did not match any cases")
 	}
-	return manifests, nil
+	if config.BuildImages {
+		built := make(map[string]bool)
+		for _, job := range jobs {
+			if built[job.toolchain.ID] {
+				continue
+			}
+			if err := buildImage(ctx, config, job.toolchain); err != nil {
+				return nil, err
+			}
+			built[job.toolchain.ID] = true
+		}
+	}
+
+	workers := config.Workers
+	if workers > len(jobs) {
+		workers = len(jobs)
+	}
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	queue := make(chan generationJob)
+	results := make([]fixture.GeneratedManifest, len(jobs))
+	errs := make(chan error, 1)
+	var workerGroup sync.WaitGroup
+	worker := func() {
+		defer workerGroup.Done()
+		for job := range queue {
+			manifest, err := generateCase(workCtx, config, job.archiveCase, job.toolchain, par2Toolchain)
+			if err != nil {
+				select {
+				case errs <- fmt.Errorf("generate fixture %q: %w", job.archiveCase.ID, err):
+					cancel()
+				default:
+				}
+				return
+			}
+			results[job.index] = manifest
+		}
+	}
+	workerGroup.Add(workers)
+	for range workers {
+		go worker()
+	}
+enqueue:
+	for _, job := range jobs {
+		select {
+		case queue <- job:
+		case <-workCtx.Done():
+			break enqueue
+		}
+	}
+	close(queue)
+	workerGroup.Wait()
+	select {
+	case err := <-errs:
+		return nil, err
+	default:
+	}
+	return results, nil
 }
 
 func buildImage(ctx context.Context, config Config, toolchain Toolchain) error {
@@ -328,29 +388,37 @@ func uniformMovieBytes(archiveCase fixture.ArchiveCase, config Config) int64 {
 }
 
 // writeBluRayDiscPayloadFiles makes an intentionally declared disc-layout
-// workload: one large media stream plus many small playlist, clip-info, and
-// metadata-shaped files. It does not claim to be a byte-for-byte Blu-ray image.
+// workload: one large media stream, a few small menu/extra streams, and many
+// tiny playlist, clip-info, BD-J, and presentation members. It does not claim
+// to be a byte-for-byte authored Blu-ray image.
 func writeBluRayDiscPayloadFiles(ctx context.Context, dir, caseDir string, archiveCase fixture.ArchiveCase, config Config, toolchain Toolchain) ([]fixture.FileDigest, []string, fixture.PayloadRecipe, error) {
 	digests := make([]fixture.FileDigest, 0, config.BluRaySmallFileCount+1)
-	inputs := make([]string, 0, config.BluRaySmallFileCount+1)
-	smallRelative := bluRaySmallPath(1)
-	smallDigest, err := renderVideo(ctx, config, toolchain, caseDir, filepath.ToSlash(filepath.Join("input", smallRelative)), fixture.CompressiblePayload, config.BluRaySmallFileBytes, 10_001)
-	if err != nil {
-		return nil, nil, fixture.PayloadRecipe{}, err
-	}
-	digests = append(digests, fixture.FileDigest{Path: smallRelative, Size: smallDigest.Size, BLAKE3: smallDigest.BLAKE3})
-	inputs = append(inputs, filepath.ToSlash(filepath.Join("input", smallRelative)))
+	var smallStream fixture.FileDigest
 	for index := 1; index <= config.BluRaySmallFileCount; index++ {
-		if index == 1 {
+		relative := bluRaySmallPath(index)
+		if isTransportStream(relative) {
+			if smallStream.Path == "" {
+				digest, err := renderVideo(ctx, config, toolchain, caseDir, filepath.ToSlash(filepath.Join("input", relative)), fixture.CompressiblePayload, config.BluRaySmallFileBytes, 10_001)
+				if err != nil {
+					return nil, nil, fixture.PayloadRecipe{}, err
+				}
+				smallStream = fixture.FileDigest{Path: relative, Size: digest.Size, BLAKE3: digest.BLAKE3}
+			} else if err := copyVideoFile(filepath.Join(dir, filepath.FromSlash(smallStream.Path)), filepath.Join(dir, filepath.FromSlash(relative))); err != nil {
+				return nil, nil, fixture.PayloadRecipe{}, err
+			}
+			digest := smallStream
+			digest.Path = relative
+			digests = append(digests, digest)
 			continue
 		}
-		relative := bluRaySmallPath(index)
-		if err := copyVideoFile(filepath.Join(dir, filepath.FromSlash(smallRelative)), filepath.Join(dir, filepath.FromSlash(relative))); err != nil {
+		if _, err := writePayloadAt(dir, relative, fixture.CompressiblePayload, bluRayMetadataBytes(relative, config.BluRaySmallFileBytes), uint64(index)); err != nil {
 			return nil, nil, fixture.PayloadRecipe{}, err
 		}
-		digest := smallDigest
-		digests = append(digests, fixture.FileDigest{Path: relative, Size: digest.Size, BLAKE3: digest.BLAKE3})
-		inputs = append(inputs, filepath.ToSlash(filepath.Join("input", relative)))
+		digest, err := digestFile(relative, filepath.Join(dir, filepath.FromSlash(relative)))
+		if err != nil {
+			return nil, nil, fixture.PayloadRecipe{}, err
+		}
+		digests = append(digests, digest)
 	}
 	largeRelative := "BDMV/STREAM/00000.m2ts"
 	largeDigest, err := renderVideo(ctx, config, toolchain, caseDir, filepath.ToSlash(filepath.Join("input", largeRelative)), archiveCase.Payload, config.BluRayLargeFileBytes, 1)
@@ -358,8 +426,7 @@ func writeBluRayDiscPayloadFiles(ctx context.Context, dir, caseDir string, archi
 		return nil, nil, fixture.PayloadRecipe{}, err
 	}
 	digests = append(digests, fixture.FileDigest{Path: largeRelative, Size: largeDigest.Size, BLAKE3: largeDigest.BLAKE3})
-	inputs = append(inputs, filepath.ToSlash(filepath.Join("input", largeRelative)))
-	return digests, inputs, fixture.PayloadRecipe{
+	return digests, bluRayArchiveInputRoots(), fixture.PayloadRecipe{
 		Layout:         fixture.BluRayDiscPayloadLayout,
 		LargeFileBytes: config.BluRayLargeFileBytes,
 		SmallFileCount: config.BluRaySmallFileCount,
@@ -367,8 +434,65 @@ func writeBluRayDiscPayloadFiles(ctx context.Context, dir, caseDir string, archi
 	}, nil
 }
 
+// bluRayArchiveInputRoots preserves the archive's disc tree. RAR's -ep1
+// removes the input/ prefix while retaining BDMV/ and CERTIFICATE/ beneath
+// these roots. Passing individual nested files would instead flatten each
+// file to its basename and make duplicate legitimate member names collide.
+func bluRayArchiveInputRoots() []string {
+	return []string{"input/BDMV", "input/CERTIFICATE"}
+}
+
 func bluRaySmallPath(index int) string {
-	return fmt.Sprintf("BDMV/STREAM/%05d.m2ts", 10_000+index)
+	switch {
+	case index <= 4:
+		return fmt.Sprintf("BDMV/STREAM/%05d.m2ts", index)
+	case index <= 164:
+		return fmt.Sprintf("BDMV/PLAYLIST/%05d.mpls", index-5)
+	case index <= 324:
+		return fmt.Sprintf("BDMV/CLIPINF/%05d.clpi", index-165)
+	case index <= 388:
+		return fmt.Sprintf("BDMV/BDJO/%05d.bdjo", index-325)
+	case index <= 452:
+		return fmt.Sprintf("BDMV/META/DL/Composite%03d_BT2020_HDR.png", index-389)
+	case index <= 484:
+		return fmt.Sprintf("BDMV/META/DL/metadata-%03d.xml", index-453)
+	case index == 485:
+		return "BDMV/index.bdmv"
+	case index == 486:
+		return "BDMV/MovieObject.bdmv"
+	case index == 487:
+		return "BDMV/JAR/00000.jar"
+	case index == 488:
+		return "BDMV/AUXDATA/00000.otf"
+	case index == 489:
+		return "CERTIFICATE/id.bdmv"
+	case index == 490:
+		return "CERTIFICATE/BACKUP/id.bdmv"
+	case index == 491:
+		return "CERTIFICATE/backup/00000.cer"
+	default:
+		return fmt.Sprintf("BDMV/META/DL/locale-%03d.txt", index-492)
+	}
+}
+
+func bluRayMetadataBytes(relative string, limit int64) int64 {
+	requested := int64(8 << 10)
+	switch {
+	case strings.HasSuffix(relative, ".clpi"):
+		requested = 16 << 10
+	case strings.HasSuffix(relative, ".bdjo"):
+		requested = 24 << 10
+	case strings.HasSuffix(relative, ".png"):
+		requested = 48 << 10
+	case strings.HasSuffix(relative, ".jar"):
+		requested = 64 << 10
+	case strings.HasSuffix(relative, ".otf"):
+		requested = 96 << 10
+	}
+	if requested > limit {
+		return limit
+	}
+	return requested
 }
 
 func writePayloadAt(root, relative string, kind fixture.PayloadKind, size int64, stream uint64) (string, error) {

@@ -94,7 +94,7 @@ func runQueue(ctx context.Context, cfg Config) error {
 	}
 	metricsCollected = true
 	result := benchmark.QueueAdapterResult{
-		SchemaVersion:            3,
+		SchemaVersion:            4,
 		SuiteID:                  input.SuiteID,
 		SubmissionMode:           input.SubmissionMode,
 		Client:                   cfg.Client,
@@ -214,14 +214,17 @@ func runSequentialSubmission(ctx context.Context, api productAPI, interval time.
 		if job.TerminalStatus == "succeeded" {
 			verification, err := benchmark.VerifyOutput(filepath.Dir(inputJob.NZBPath), cfg.OutputDir)
 			if err != nil {
-				return nil, fmt.Errorf("verify fixture %s output: %w", inputJob.RunID, err)
+				job.OutputVerificationError = err.Error()
+			} else {
+				job.Verification = &verification
+				job.UsableOutputAt = time.Now().UTC()
+				job.UsableWallClockNanoseconds = job.UsableOutputAt.Sub(job.QueuedAt).Nanoseconds()
 			}
-			if err := benchmark.DeleteOutputFiles(cfg.OutputDir); err != nil {
-				return nil, fmt.Errorf("delete fixture %s output: %w", inputJob.RunID, err)
-			}
-			job.Verification = &verification
-			job.OutputDeleted = true
 		}
+		if err := benchmark.DeleteOutputFiles(cfg.OutputDir); err != nil {
+			return nil, fmt.Errorf("delete fixture %s output: %w", inputJob.RunID, err)
+		}
+		job.OutputDeleted = true
 		jobs = append(jobs, job)
 	}
 	return jobs, nil

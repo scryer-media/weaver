@@ -56,9 +56,11 @@ func ffmpegRenderArgs(kind fixture.PayloadKind, targetBytes int64, stream uint64
 	seed := stream % 65_535
 	args := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-y"}
 	if isTransportStream(output) {
-		// The disc-layout fixture uses real MPEG transport streams, including
-		// each tiny stream, so every archived payload remains video data.
-		filter := fmt.Sprintf("testsrc2=size=1280x720:rate=30,hue=h=%d:s=1", seed%360)
+		// Keep the large disc stream high entropy. MPEG-TS mux-rate padding is
+		// mostly null packets and RAR compresses it dramatically, which would
+		// turn a 5 GiB extracted stream into a much smaller download workload.
+		// Noisy H.264 carries the requested bitrate in real media payload.
+		filter := fmt.Sprintf("testsrc2=size=1280x720:rate=30,noise=all_seed=%d:all_strength=20:all_flags=t", seed)
 		bitrate := int64(200_192_000)
 		if targetBytes <= 1<<20 {
 			bitrate = 2_192_000
@@ -67,9 +69,10 @@ func ffmpegRenderArgs(kind fixture.PayloadKind, targetBytes int64, stream uint64
 			"-f", "lavfi", "-i", filter,
 			"-f", "lavfi", "-i", fmt.Sprintf("sine=frequency=%d:sample_rate=48000", 440+seed%440),
 			"-map", "0:v:0", "-map", "1:a:0",
-			"-c:v", "mpeg2video", "-pix_fmt", "yuv420p",
+			"-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
 			"-b:v", strconv.FormatInt(bitrate-192_000, 10), "-minrate", strconv.FormatInt(bitrate-192_000, 10), "-maxrate", strconv.FormatInt(bitrate-192_000, 10), "-bufsize", strconv.FormatInt(bitrate-192_000, 10),
-			"-c:a", "mp2", "-b:a", "192k", "-f", "mpegts",
+			"-x264-params", "nal-hrd=cbr:force-cfr=1",
+			"-c:a", "aac", "-b:a", "192k", "-f", "mpegts",
 		)
 		return append(args, "-t", mediaDuration(targetBytes, bitrate), output)
 	}

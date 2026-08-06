@@ -284,7 +284,9 @@ func (c ArchiveCase) RARArgs(archive string, inputs []string) ([]string, error) 
 		// The source-locked 3.x and 4.x writers predate the -ma selector;
 		// their default archive format is the explicitly selected legacy lane.
 	case RAR5:
-		args = append(args, "-ma5")
+		// Quick-open data speeds listing, but adds bytes to every upload and
+		// is not needed by the download/extract clients under test.
+		args = append(args, "-ma5", "-qo-")
 	default:
 		return nil, fmt.Errorf("fixture %q has unsupported rar_format %q", c.ID, c.RARFormat)
 	}
@@ -292,7 +294,17 @@ func (c ArchiveCase) RARArgs(archive string, inputs []string) ([]string, error) 
 	case Store:
 		args = append(args, "-m0")
 	case Normal:
+		// The release-shaped lanes use maximal compression with an explicit
+		// dictionary. RAR4's 4 MiB setting is its largest supported dictionary;
+		// 256 MiB is a practical large RAR5 dictionary across the locked 5.x-
+		// 7.x writers. Store lanes remain intentional controls.
 		args = append(args, "-m5")
+		switch c.RARFormat {
+		case RAR4:
+			args = append(args, "-md4096")
+		case RAR5:
+			args = append(args, "-md256m")
+		}
 	default:
 		return nil, fmt.Errorf("fixture %q has unsupported compression %q", c.ID, c.Compression)
 	}

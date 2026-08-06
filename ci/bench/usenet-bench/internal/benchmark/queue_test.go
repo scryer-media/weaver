@@ -1,6 +1,10 @@
 package benchmark
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"time"
+)
 
 func TestQueueSuitesKeepEveryFixtureInOneClientQueue(t *testing.T) {
 	plan, err := BuildPlan(PlanOptions{
@@ -97,5 +101,94 @@ func TestQueueTransitionRejectsNonDuplicatePlan(t *testing.T) {
 	}
 	if _, err := queueTransitionSuites(plan, DockerLinux); err == nil {
 		t.Fatal("queue-transition accepted a multi-fixture plan")
+	}
+}
+
+func TestSequentialQueueResultRequiresImmediateUsableOutputTiming(t *testing.T) {
+	plan, err := BuildPlan(PlanOptions{
+		FixtureIDs:  []string{"fixture-a"},
+		Clients:     []Client{Weaver},
+		Transports:  []Transport{Plaintext},
+		Targets:     []ExecutionTarget{DockerLinux},
+		Repetitions: 1,
+		Seed:        17,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	suite := queueSuites(plan, DockerLinux)[0]
+	run := suite.Runs[0]
+	queuedAt := time.Now().UTC()
+	completedAt := queuedAt.Add(time.Second)
+	resourceMetrics := ResourceMetrics{
+		CPUTimeNanoseconds:  MeasuredMeasurement("client_container", "test", "1", 1),
+		InstructionsRetired: UnavailableMeasurement("client_container", "test", "1", "not collected"),
+	}
+	result := QueueAdapterResult{
+		SchemaVersion:            4,
+		SuiteID:                  suite.ID,
+		SubmissionMode:           SubmissionModeSequential,
+		Client:                   run.Client,
+		ArchiveToolchain:         run.ArchiveToolchain,
+		ArchiveToolchainIdentity: "stock",
+		ExecutionTarget:          run.ExecutionTarget,
+		Transport:                run.Transport,
+		TLSValidation:            run.TLSValidation,
+		TransportLabel:           run.TransportLabel,
+		ServerLink:               run.ServerLink,
+		QueueStartedAt:           queuedAt,
+		QueueCompletedAt:         completedAt,
+		StatusPollIntervalNanos:  time.Millisecond.Nanoseconds(),
+		ClientIdentity:           "test-client",
+		ClientVersion:            "test-version",
+		RenderedConfigSHA256:     strings.Repeat("a", 64),
+		ResourceMetrics:          resourceMetrics,
+		Jobs: []QueueJobResult{{
+			RunID:                       run.ID,
+			JobID:                       "1",
+			QueuedAt:                    queuedAt,
+			FixtureWallClockNanoseconds: completedAt.Sub(queuedAt).Nanoseconds(),
+			ResourceMetrics:             &resourceMetrics,
+			TerminalStatus:              "succeeded",
+			Verification:                &OutputVerification{FixtureID: run.FixtureID},
+			OutputDeleted:               true,
+			ProcessingTimingError:       "terminal status was observed before active state",
+			CompletionAt:                completedAt,
+		}},
+	}
+	if err := result.ValidateFor(suite, SubmissionModeSequential); err == nil {
+		t.Fatal("sequential result without verified usable timing was accepted")
+	}
+	usableAt := completedAt.Add(time.Millisecond)
+	result.Jobs[0].UsableOutputAt = usableAt
+	result.Jobs[0].UsableWallClockNanoseconds = usableAt.Sub(queuedAt).Nanoseconds()
+	result.QueueCompletedAt = usableAt
+	if err := result.ValidateFor(suite, SubmissionModeSequential); err != nil {
+		t.Fatalf("sequential result with verified usable timing was rejected: %v", err)
+	}
+
+	result.Jobs[0].Verification = nil
+	result.Jobs[0].UsableOutputAt = time.Time{}
+	result.Jobs[0].UsableWallClockNanoseconds = 0
+	result.Jobs[0].OutputVerificationError = "missing expected output file"
+	result.QueueCompletedAt = completedAt
+	if err := result.ValidateFor(suite, SubmissionModeSequential); err != nil {
+		t.Fatalf("sequential result with a recorded output verification failure was rejected: %v", err)
+	}
+}
+
+func TestQueueJobOutcome(t *testing.T) {
+	for name, result := range map[string]QueueJobResult{
+		"completed":            {TerminalStatus: "succeeded"},
+		"terminal failure":     {TerminalStatus: "failed", TerminalError: "Failed"},
+		"verification failure": {TerminalStatus: "succeeded", OutputVerificationError: "missing expected output file"},
+	} {
+		want := "completed"
+		if name != "completed" {
+			want = "dnf"
+		}
+		if got := queueJobOutcome(result); got != want {
+			t.Errorf("%s outcome = %q, want %q", name, got, want)
+		}
 	}
 }

@@ -87,8 +87,9 @@ type Plan struct {
 	Runs              []Run              `json:"runs"`
 }
 
-// Run is one cold-state client download. Each client gets a new writable
-// state/configuration/output directory for every run.
+// Run is one planned fixture submission. Execution modes decide whether
+// submissions share the durable client lane; every lane begins with a fresh
+// writable state/configuration/output directory.
 type Run struct {
 	ID               string            `json:"id"`
 	Order            int               `json:"order"`

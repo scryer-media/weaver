@@ -51,10 +51,34 @@ func TestRARArgsAreExplicit(t *testing.T) {
 		t.Fatalf("RARArgs() error = %v", err)
 	}
 	joined := strings.Join(args, " ")
-	for _, want := range []string{"-ma5", "-m5", "-s", "-hp" + FixturePassword, "-v32m"} {
+	for _, want := range []string{"-ma5", "-qo-", "-m5", "-md256m", "-s", "-hp" + FixturePassword, "-v32m"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("RARArgs() = %q, missing %q", joined, want)
 		}
+	}
+}
+
+func TestRAR4ReleaseCompressionUsesItsMaximumDictionary(t *testing.T) {
+	c := ArchiveCase{
+		ID:          "rar4-release",
+		RARFormat:   RAR4,
+		Compression: Normal,
+		Solid:       true,
+		Encryption:  NoEncryption,
+		VolumeSize:  "32m",
+	}
+	args, err := c.RARArgs("archive/fixture.rar", []string{"input/one.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"-m5", "-md4096", "-s"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("RAR4 args = %q, missing %q", joined, want)
+		}
+	}
+	if strings.Contains(joined, "-qo-") {
+		t.Fatalf("RAR4 args must not use RAR5-only quick-open control: %q", joined)
 	}
 }
 
