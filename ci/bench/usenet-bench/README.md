@@ -517,4 +517,5 @@ digest-pinned adapter catalog shape and its explicit Rarpar release pin.
 - It does not report a client result without the exact fixture manifest,
   client version/image digest, effective configuration, plan, and output hash
   record.
-- It does not include NZBFast in the client matrix.
+- It does not claim the client matrix is exhaustive of Usenet downloaders;
+  clients outside the documented catalog are simply not measured.

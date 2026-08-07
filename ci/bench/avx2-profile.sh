@@ -5,8 +5,9 @@
 #
 # Target box: an AMD Zen 2/Zen 3 instance (AWS c5a / c6a) — AVX2-native, NO
 # AVX-512, so weaver naturally dispatches decode_kernel_avx2 (the tier we must
-# get within 5% of rapidyenc). Zen 2 == the SYLIX Windows target's uarch, so
-# numbers transfer directly. (Intel would dispatch VBMI2 — wrong tier here.)
+# get within 5% of rapidyenc). Zen 2 is also the uarch of the Windows AVX2
+# target we care about, so numbers transfer directly. (Intel would dispatch
+# VBMI2 — wrong tier here.)
 #
 # Why this exists: the Windows uProf "time-based hotspots" view is misleading on
 # an out-of-order core — it attributes samples to where retirement STALLS (the

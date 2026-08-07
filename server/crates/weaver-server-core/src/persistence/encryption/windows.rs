@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn desktop_profile_uses_isolated_credential_namespace() {
         let store = WindowsCredentialManager::for_data_dir(Some(Path::new(
-            r"C:\\Users\\ai\\AppData\\Local\\ScryerMedia\\Weaver",
+            r"C:\\Users\\example\\AppData\\Local\\ScryerMedia\\Weaver",
         )));
 
         assert_eq!(store.service, DESKTOP_SERVICE);

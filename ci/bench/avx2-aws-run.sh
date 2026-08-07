@@ -25,7 +25,7 @@ set -euo pipefail
 S3_BUCKET="${S3_BUCKET:?set S3_BUCKET to an S3 bucket you own}"
 S3_PREFIX="${S3_PREFIX:-weaver-avx2}"
 INSTANCE_PROFILE="${INSTANCE_PROFILE:?set INSTANCE_PROFILE to an EC2 instance profile that can access the bucket (see header)}"
-INSTANCE_TYPE="${INSTANCE_TYPE:-c5a.2xlarge}"     # AMD Zen 2 = SYLIX uarch, AVX2-native
+INSTANCE_TYPE="${INSTANCE_TYPE:-c5a.2xlarge}"     # AMD Zen 2 = Windows AVX2 target uarch
 AWS_REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo us-east-1)}"
 KEY_NAME="${KEY_NAME:-}"                          # optional, only for SSH debugging
 SECURITY_GROUP_ID="${SECURITY_GROUP_ID:-}"       # optional; default VPC SG if empty

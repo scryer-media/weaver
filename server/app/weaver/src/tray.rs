@@ -799,8 +799,8 @@ mod windows {
         #[test]
         fn tray_mutex_is_global_but_scoped_to_one_windows_user() {
             assert_eq!(
-                tray_mutex_name_for_user("SYLIX", "ai"),
-                "Global\\ScryerMedia.Weaver.Desktop.v1.Tray.00530059004C00490058005C00610069"
+                tray_mutex_name_for_user("EXAMPLE-PC", "example"),
+                "Global\\ScryerMedia.Weaver.Desktop.v1.Tray.004500580041004D0050004C0045002D00500043005C006500780061006D0070006C0065"
             );
         }
     }

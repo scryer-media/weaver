@@ -24,7 +24,7 @@ None of our existing hardware has this combination on real silicon:
 
 | Box | uarch | AVX-512 | VBMI2 | GFNI | VPCLMULQDQ |
 |-----|-------|---------|-------|------|------------|
-| SYLIX | Ryzen 5 3600 (Zen 2) | no | no | no | no |
+| Windows AVX2 box | Ryzen 5 3600 (Zen 2) | no | no | no | no |
 | x86 bench box | Core Ultra 9 285H (Arrow Lake-H) | **no** | no | yes | yes |
 | Mac | Apple Silicon | n/a (ARM/NEON) | n/a | n/a | n/a |
 | **c7a.xlarge** | **EPYC Zen 4** | **yes** | **yes** | **yes** | **yes** |
@@ -129,7 +129,7 @@ discovery env var**:
 - Per-fixture it first **asserts byte parity** (`:205-210`) before timing, then emits
   Criterion benches `parity_weaver_decode_<fixture>` and
   `parity_rapidyenc_decode_<fixture>` (`:217-226`), plus CRC benches
-  `parity_crc32fast_decoded` / `parity_rapidyenc_crc_decoded` (`:234-245`).
+  `parity_crc_fast_decoded` / `parity_rapidyenc_crc_decoded` (`:234-245`).
 - If `WEAVER_RAPIDYENC_LIB` is unset the bench registers nothing and prints a skip
   (`:178-184`).
 - **Must be the GNU target, not musl.** Static musl binaries can't `dlopen` a shared
@@ -256,9 +256,8 @@ cargo bench -p weaver-unrar --bench archive_hotspots --target x86_64-unknown-lin
 `$WEAVER_DIR`.)
 
 **External A/B (par2cmdline-turbo, unrar 7.x)** — the head-to-head comparisons
-referenced in `scryer-docs/plans/124-weaver-yenc-x86-decode-inline-plan.md` and
-`scryer-docs/weaver_comp_.md` are **not driven by a repo bench target I could ground
-to an exact command**. `TODO(verify on box)`: locate the external-A/B harness (the
+quoted in our comparison write-ups are **not driven by a repo bench target I
+could ground to an exact command**. `TODO(verify on box)`: locate the external-A/B harness (the
 par2cmdline-turbo / unrar-7.x oracles live in local supporting checkouts) and add
 its concrete invocation here before running — do not invent flags. The internal
 Criterion benches above are the grounded, safe-to-run stretch coverage.
@@ -296,7 +295,7 @@ the box.
    | crlf_only | _fill_ | _fill_ | _fill_ |
    | esc_only | _fill_ | _fill_ | _fill_ |
    | dots_body | _fill_ | _fill_ | _fill_ |
-   | crc (realshape) | _fill_ (crc32fast) | _fill_ (rapidyenc_crc) | _fill_ |
+   | crc (realshape) | _fill_ (crc-fast) | _fill_ (rapidyenc_crc) | _fill_ |
 
    The bench also prints `rapidyenc kernels: decode=<n> crc=<n>`
    (`benches/rapidyenc_parity.rs:185-188`) — on c7a the decode kernel id should be
