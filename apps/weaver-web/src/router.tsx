@@ -2,18 +2,31 @@ import type { ComponentType } from "react";
 import { createBrowserRouter, Navigate } from "react-router";
 import { Layout } from "@/components/Layout";
 import { RouteErrorPage } from "@/components/RouteErrorPage";
+import { RouteFallback } from "@/components/RouteFallback";
 
 const basename = window.__WEAVER_BASE__ || "/";
 
+/**
+ * Every lazy route ships a `HydrateFallback`. React Router renders nothing at all
+ * during the initial load when the matched chain has a pending `lazy` module and
+ * no route declares a fallback - it truncates the matches to the root route and
+ * renders `null` (plus a "No `HydrateFallback` element provided" warning), which
+ * left `#root` empty until the first route module resolved. With the fallback on
+ * the lazy route, the root `Layout` shell paints immediately and only the outlet
+ * region shows the placeholder.
+ */
 function lazyNamedRoute<TModule extends Record<string, unknown>, TKey extends keyof TModule>(
   importer: () => Promise<TModule>,
   exportName: TKey,
 ) {
-  return async () => {
-    const module = await importer();
-    return {
-      Component: module[exportName] as ComponentType,
-    };
+  return {
+    HydrateFallback: RouteFallback,
+    lazy: async () => {
+      const module = await importer();
+      return {
+        Component: module[exportName] as ComponentType,
+      };
+    },
   };
 }
 
@@ -22,19 +35,22 @@ function lazyEmbeddedRoute<TModule extends Record<string, unknown>, TKey extends
   exportName: TKey,
   props: Record<string, unknown>,
 ) {
-  return async () => {
-    const module = await importer();
-    const BaseComponent = module[exportName] as ComponentType<Record<string, unknown>>;
+  return {
+    HydrateFallback: RouteFallback,
+    lazy: async () => {
+      const module = await importer();
+      const BaseComponent = module[exportName] as ComponentType<Record<string, unknown>>;
 
-    function EmbeddedRouteComponent() {
-      return <BaseComponent {...props} />;
-    }
+      function EmbeddedRouteComponent() {
+        return <BaseComponent {...props} />;
+      }
 
-    EmbeddedRouteComponent.displayName = `${String(exportName)}EmbeddedRoute`;
+      EmbeddedRouteComponent.displayName = `${String(exportName)}EmbeddedRoute`;
 
-    return {
-      Component: EmbeddedRouteComponent,
-    };
+      return {
+        Component: EmbeddedRouteComponent,
+      };
+    },
   };
 }
 
@@ -45,94 +61,94 @@ export const router = createBrowserRouter([
     children: [
       {
         index: true,
-        lazy: lazyNamedRoute(() => import("@/pages/JobList"), "JobList"),
+        ...lazyNamedRoute(() => import("@/pages/JobList"), "JobList"),
       },
       {
         path: "jobs/:id",
-        lazy: lazyNamedRoute(() => import("@/pages/JobDetail"), "JobDetail"),
+        ...lazyNamedRoute(() => import("@/pages/JobDetail"), "JobDetail"),
       },
       {
         path: "upload",
-        lazy: lazyNamedRoute(() => import("@/pages/Upload"), "Upload"),
+        ...lazyNamedRoute(() => import("@/pages/Upload"), "Upload"),
       },
       {
         path: "monitoring",
-        lazy: lazyNamedRoute(() => import("@/pages/MetricsPage"), "MetricsPage"),
+        ...lazyNamedRoute(() => import("@/pages/MetricsPage"), "MetricsPage"),
       },
       {
         path: "history",
-        lazy: lazyNamedRoute(() => import("@/pages/History"), "History"),
+        ...lazyNamedRoute(() => import("@/pages/History"), "History"),
       },
       {
         path: "logs",
-        lazy: lazyNamedRoute(() => import("@/pages/LogViewerPage"), "LogViewerPage"),
+        ...lazyNamedRoute(() => import("@/pages/LogViewerPage"), "LogViewerPage"),
       },
       { path: "servers", element: <Navigate to="/settings/servers" replace /> },
       { path: "categories", element: <Navigate to="/settings/categories" replace /> },
       {
         path: "settings",
-        lazy: lazyNamedRoute(() => import("@/pages/settings/SettingsLayout"), "SettingsLayout"),
+        ...lazyNamedRoute(() => import("@/pages/settings/SettingsLayout"), "SettingsLayout"),
         children: [
           { index: true, element: <Navigate to="general" replace /> },
           {
             path: "general",
-            lazy: lazyNamedRoute(
+            ...lazyNamedRoute(
               () => import("@/pages/settings/GeneralSettingsPage"),
               "GeneralSettingsPage",
             ),
           },
           {
             path: "bandwidth",
-            lazy: lazyNamedRoute(
+            ...lazyNamedRoute(
               () => import("@/pages/settings/BandwidthCapSettingsPage"),
               "BandwidthCapSettingsPage",
             ),
           },
           {
             path: "security",
-            lazy: lazyNamedRoute(
+            ...lazyNamedRoute(
               () => import("@/pages/settings/SecuritySettingsPage"),
               "SecuritySettingsPage",
             ),
           },
           {
             path: "backup",
-            lazy: lazyNamedRoute(
+            ...lazyNamedRoute(
               () => import("@/pages/settings/BackupSettingsPage"),
               "BackupSettingsPage",
             ),
           },
           {
             path: "rss",
-            lazy: lazyNamedRoute(
+            ...lazyNamedRoute(
               () => import("@/pages/settings/RssSettingsPage"),
               "RssSettingsPage",
             ),
           },
           {
             path: "watch-folder",
-            lazy: lazyNamedRoute(
+            ...lazyNamedRoute(
               () => import("@/pages/settings/WatchFolderSettingsPage"),
               "WatchFolderSettingsPage",
             ),
           },
           {
             path: "post-processing",
-            lazy: lazyNamedRoute(
+            ...lazyNamedRoute(
               () => import("@/pages/settings/PostProcessingSettingsPage"),
               "PostProcessingSettingsPage",
             ),
           },
           {
             path: "schedules",
-            lazy: lazyNamedRoute(
+            ...lazyNamedRoute(
               () => import("@/pages/settings/ScheduleSettingsPage"),
               "ScheduleSettingsPage",
             ),
           },
           {
             path: "categories",
-            lazy: lazyEmbeddedRoute(
+            ...lazyEmbeddedRoute(
               () => import("@/pages/Categories"),
               "Categories",
               { embedded: true },
@@ -140,7 +156,7 @@ export const router = createBrowserRouter([
           },
           {
             path: "servers",
-            lazy: lazyEmbeddedRoute(
+            ...lazyEmbeddedRoute(
               () => import("@/pages/Servers"),
               "Servers",
               { embedded: true },
