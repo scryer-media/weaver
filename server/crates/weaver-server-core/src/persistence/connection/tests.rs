@@ -2299,7 +2299,7 @@ async fn postgres_runtime_smoke_when_configured() {
     admin_pool.close().await;
 }
 
-/// Plan 135, D6: the direct-store coverage checkpoint is one replaced row per
+/// The direct-store coverage checkpoint is one replaced row per
 /// archive set. This is the Postgres twin of the sqlite roundtrip in
 /// `jobs::repository::tests`, so both engines are proven to upsert, read back
 /// and delete through the same three statements.

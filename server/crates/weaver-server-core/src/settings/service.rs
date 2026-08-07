@@ -166,9 +166,9 @@ impl Database {
             }
         };
 
-        // Plan 135, phase 7. Absent keys mean "defaults", and a partially
-        // configured table is normal: an operator who only ever flips `enabled`
-        // should not have to restate the scratch ceiling.
+        // Absent keys mean "defaults", and a partially configured table is
+        // normal: an operator who only ever flips `enabled` should not have to
+        // restate the scratch ceiling.
         let direct_store = {
             let enabled = settings
                 .get("direct_store.enabled")

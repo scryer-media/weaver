@@ -105,7 +105,7 @@ impl Pipeline {
     /// anywhere"*, which is permanent, and *"the read failed this once"*, which
     /// is not — and any caller that **memoizes** the harvest has to tell them
     /// apart. `false` here means the second: nothing about the job was learned,
-    /// so nothing about it may be remembered (plan 136, E4 review).
+    /// so nothing about it may be remembered.
     fn harvest_archive_password_candidates(
         &self,
         job_id: JobId,
@@ -1871,7 +1871,7 @@ pub struct Pipeline {
     /// budget shared by every job and never replaces authoritative repair.
     pub(super) live_par2: repair::LivePar2Registry,
     /// Direct-store routing state: admitted archive sets, their routers and
-    /// their coverage barriers (plan 135, phase 4). Inert while the gate is off.
+    /// their coverage barriers. Inert while the gate is off.
     pub(super) direct_store: direct_store::wiring::DirectStoreRuntime,
     /// RAR members already extracted per job (for incremental RAR extraction).
     pub(super) extracted_members: HashMap<JobId, HashSet<String>>,

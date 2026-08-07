@@ -1,4 +1,4 @@
-//! The per-set coverage barrier (plan 135, D6).
+//! The per-set coverage barrier.
 //!
 //! Between barriers nothing durable happens: successfully written bytes
 //! accumulate as coalesced source ranges in memory. A barrier converts that
@@ -62,10 +62,10 @@ fn failure_backoff(consecutive_failures: u32) -> Duration {
 
 /// Why the caller is demanding a barrier. The caller decides when these happen;
 /// the controller only records which one it served.
-// `Demotion` still has no caller: D8's demotion *deletes* the row rather than
-// checkpointing it, so the demand exists in the vocabulary the seam is specified
-// in without a path that raises it. `Pause` and `PhaseChange` are wired in wave
-// 3 — the command seam and the set's last volume respectively.
+// `Demotion` still has no caller: demotion by reconstruction *deletes* the row
+// rather than checkpointing it, so the demand exists in the vocabulary the seam
+// is specified in without a path that raises it. `Pause` and `PhaseChange` are
+// wired at the command seam and the set's last volume respectively.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BarrierDemand {
@@ -74,7 +74,7 @@ pub(crate) enum BarrierDemand {
     PhaseChange,
     Demotion,
     Finalization,
-    /// A PAR2 repair rewrote bytes the deleted row used to claim (plan 135, D8).
+    /// A PAR2 repair rewrote bytes the deleted row used to claim.
     /// Demanded immediately after the repaired spans are routed, so the window
     /// where the set has no durable coverage at all is as short as the code can
     /// make it rather than one 5 s timer.
@@ -175,7 +175,7 @@ pub(crate) trait CoveragePersist {
 
     /// Retires the set's checkpoint. Repair over checkpoint-covered output
     /// deletes the row and lets the next barrier recreate coverage from
-    /// scratch (D8).
+    /// scratch.
     fn delete(&mut self, job_id: JobId, set_name: &str) -> Result<(), String>;
 }
 
@@ -334,9 +334,8 @@ pub(crate) struct CoverageBarrier {
     /// While set, the age trigger is suppressed. Byte-threshold and demanded
     /// barriers ignore it.
     cooldown_until: Option<Instant>,
-    /// The crypt rows the next checkpoint carries, by member index (plan 136,
-    /// E-D4). Empty for every set with no encrypted member, which is every set
-    /// plan 135 routed.
+    /// The crypt rows the next checkpoint carries, by member index. Empty for
+    /// every set with no encrypted member, which is every unencrypted set.
     member_crypt: BTreeMap<u32, super::router::crypt::MemberCryptSnapshot>,
 }
 
@@ -360,8 +359,7 @@ impl CoverageBarrier {
         }
     }
 
-    /// Hands the barrier the crypt rows its next checkpoint must carry (plan
-    /// 136, E-D4).
+    /// Hands the barrier the crypt rows its next checkpoint must carry.
     ///
     /// Pushed rather than pulled because the barrier owns no router: the set
     /// reads them off the router immediately before every run, so a checkpoint
@@ -375,7 +373,7 @@ impl CoverageBarrier {
     }
 
     /// Points the next snapshot at the plan the set is **currently** routing
-    /// against (D6).
+    /// against.
     ///
     /// # Why this is pushed at all
     ///
@@ -418,10 +416,10 @@ impl CoverageBarrier {
     /// `create(true)`, so the barrier either fsyncs an unlinked inode or puts an
     /// empty `.direct.partial` back beside the member it just migrated.
     ///
-    /// The entry is **removed**, not emptied. Phase 5's rule is that a claim
-    /// over zero bytes is not a claim and is omitted from the blob, and a
-    /// destination that is gone must land in the same place rather than becoming
-    /// a zero-byte claim on a path restart would then probe.
+    /// The entry is **removed**, not emptied. The rule is that a claim over
+    /// zero bytes is not a claim and is omitted from the blob, and a
+    /// destination that is gone must land in the same place rather than
+    /// becoming a zero-byte claim on a path restart would then probe.
     ///
     /// The path is checked, not just the key: member ids are in-run counters,
     /// and retiring a live destination because an id was reused would drop
@@ -485,8 +483,8 @@ impl CoverageBarrier {
         barrier
     }
 
-    /// Reporting accessors the barrier publishes for a health surface phase 4
-    /// does not wire; exercised by this module's own tests.
+    /// Reporting accessors the barrier publishes for a health surface the
+    /// wiring does not wire; exercised by this module's own tests.
     #[allow(dead_code)]
     pub(crate) fn generation(&self) -> u64 {
         self.committed_generation
@@ -521,9 +519,9 @@ impl CoverageBarrier {
     /// volume: the published floor, plus the coalesced ranges above it that
     /// have been written but not yet checkpointed.
     ///
-    /// This is the truth demotion-by-reconstruction reads (D8). Deliberately
-    /// *this* rather than the router's own routed map: the controller is only
-    /// told about writes whose every destination returned, so a span whose write
+    /// This is the truth demotion-by-reconstruction reads. Deliberately *this*
+    /// rather than the router's own routed map: the controller is only told
+    /// about writes whose every destination returned, so a span whose write
     /// failed is absent here and will be refetched rather than read back from a
     /// file that never received it.
     pub(crate) fn volume_coverage(&self, volume_index: u32) -> Option<ByteRanges> {
@@ -540,13 +538,13 @@ impl CoverageBarrier {
 
     /// Everything durably placed in **one destination's own space**.
     ///
-    /// Unlike [`Self::volume_coverage`] these ranges are never trimmed against a
-    /// floor, because a destination's claim is what restart re-probes and what
-    /// the hybrid provider reads back: a floor describes a *source volume*'s
-    /// refetch point and says nothing about which file holds a byte. For a
-    /// volume's envelope the destination space **is** the physical space, so
-    /// this is the exact answer to "did the envelope ever receive this offset"
-    /// (B1).
+    /// Unlike [`Self::volume_coverage`] these ranges are never trimmed against
+    /// a floor, because a destination's claim is what restart re-probes and
+    /// what the hybrid provider reads back: a floor describes a *source
+    /// volume*'s refetch point and says nothing about which file holds a byte.
+    /// For a volume's envelope the destination space **is** the physical space,
+    /// so this is the exact answer to "did the envelope ever receive this
+    /// offset".
     pub(crate) fn destination_coverage(&self, member_index: u32) -> Option<&ByteRanges> {
         self.destinations
             .get(&member_index)
@@ -618,7 +616,7 @@ impl CoverageBarrier {
     }
 
     /// [`Self::record_write`] without the debug assertion, so this module's own
-    /// tests can exercise the refusal path that phase 4's wiring must never
+    /// tests can exercise the refusal path that the original wiring must never
     /// reach.
     pub(super) fn try_record_write(
         &mut self,
@@ -873,17 +871,16 @@ impl CoverageBarrier {
         })
     }
 
-    /// Deletes the durable row and **keeps** the in-memory controller
-    /// (plan 135, D8's repair-while-direct).
+    /// Deletes the durable row and **keeps** the in-memory controller.
     ///
-    /// The difference from [`Self::retire`] is the whole of D8's distinction
+    /// The difference from [`Self::retire`] is the whole of the distinction
     /// between its two transitions. A demotion is leaving: the destinations are
-    /// about to be deleted, so every extent and floor is meaningless and keeping
-    /// one would let the next barrier write a checkpoint strictly worse than
-    /// none. A repair is *staying*: the destinations keep existing, at the same
-    /// offsets, holding better bytes than before — so the controller's account of
-    /// what is on disk is still exactly right, and it is also what the hybrid
-    /// provider reads to answer the re-verify.
+    /// about to be deleted, so every extent and floor is meaningless and
+    /// keeping one would let the next barrier write a checkpoint strictly worse
+    /// than none. A repair is *staying*: the destinations keep existing, at the
+    /// same offsets, holding better bytes than before — so the controller's
+    /// account of what is on disk is still exactly right, and it is also what
+    /// the hybrid provider reads to answer the re-verify.
     ///
     /// What must not survive is the **row**, because a crash mid-repair would
     /// otherwise leave floors claiming bytes that are half-rewritten. Clearing
@@ -901,7 +898,7 @@ impl CoverageBarrier {
     }
 
     /// Deletes the set's checkpoint row **and retires the controller with it**.
-    /// Demotion's half of D8's pair; [`Self::delete_committed_row`] is the
+    /// Demotion's half of the pair; [`Self::delete_committed_row`] is the
     /// repair's.
     ///
     /// The controller is reset to a fresh one, not merely un-generationed.

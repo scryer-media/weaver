@@ -115,7 +115,7 @@ impl Pipeline {
         // Only a change of *name* rebinds what live verification bound its
         // evidence to. Recording an identity for the first time, or re-saving
         // one whose filename is unchanged, moves no bytes — and with a
-        // retained session (plan 138) invalidating there would discard every
+        // retained session invalidating there would discard every
         // slice verdict the job had accumulated. Compare against the name in
         // effect now, which falls back to the NZB's own, so a first record
         // that renames still invalidates.
@@ -167,7 +167,7 @@ impl Pipeline {
         file_id: NzbFileId,
         allow_probe: bool,
     ) {
-        // Plan 135, D7. A direct set's source volume has no file: classifying
+        // A direct set's source volume has no file: classifying
         // it probes a path that does not exist, and the topology update it
         // feeds would then dispatch incremental extraction over volumes nobody
         // ever wrote. The routing seam suppresses its own call, but this

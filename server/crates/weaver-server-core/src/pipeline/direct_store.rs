@@ -1,4 +1,4 @@
-//! Direct-store coverage checkpoint — the coarse durability model (plan 135, D6).
+//! Direct-store coverage checkpoint — the coarse durability model.
 //!
 //! Weaver's durable state goes through a DB engine, so article-proportional
 //! bookkeeping is unacceptable regardless of whether it fsyncs. This subsystem
@@ -25,31 +25,29 @@
 //!   integrity re-arm belongs to the verifier that must touch those bytes
 //!   anyway, not to startup. A probe that cannot run is a refusal, not a pass.
 //!
-//! # Scope of this phase
+//! # What is wired in
 //!
-//! Phase 4 wired the rest in: [`router`] splits every decoded source span
-//! across its destinations, [`plan`] admits sets and names those destinations,
-//! and [`set`] joins a router to its [`barrier::CoverageBarrier`] so a routed
-//! write becomes durable coverage. The [`DirectStoreGate`] still defaults
-//! **off**.
+//! [`router`] splits every decoded source span across its destinations,
+//! [`plan`] admits sets and names those destinations, and [`set`] joins a router
+//! to its [`barrier::CoverageBarrier`] so a routed write becomes durable
+//! coverage. The [`DirectStoreGate`] still defaults **off**.
 //!
-//! Phase 5 wave 1 adds three things on top:
+//! Three things sit on top of that:
 //!
 //! - **Envelope v2.** Each source volume gets its own sparse envelope file
-//!   holding every non-member byte at its true physical offset, replacing phase
-//!   4's fixed 64 KiB half-slots in one per-set file. Unbounded by construction,
-//!   restart-stable by construction, and the reason `-rr` and `-qo` sets route
-//!   at all — the slot ceiling demoted every one of them.
+//!   holding every non-member byte at its true physical offset, replacing the
+//!   fixed 64 KiB half-slots of one per-set file that came before it. Unbounded
+//!   by construction, restart-stable by construction, and the reason `-rr` and
+//!   `-qo` sets route at all — the slot ceiling demoted every one of them.
 //! - **Multi-member sets.** Admission, routing, the per-member gates,
 //!   finalization (in archive order) and demotion all carry several members per
 //!   set.
 //! - [`provider`] and [`reconstruct`] — the hybrid virtual-volume provider that
 //!   answers reads over partials plus envelopes as if the volume existed, and
-//!   D8's demotion by byte-exact reconstruction, which materializes a demoting
-//!   set's volumes from its own routed bytes instead of refetching them.
+//!   demotion by byte-exact reconstruction, which materializes a demoting set's
+//!   volumes from its own routed bytes instead of refetching them.
 //!
-//! Phase 5 wave 2 puts the provider to work, which is what lifts wave 1's two
-//! remaining narrowings:
+//! Putting the provider to work is what lifts the two narrowings that remained:
 //!
 //! - **PAR2-bearing jobs route.** [`par2_access`] presents each source volume
 //!   to `par2_rs` as a file, so live verification's settle reads and the
@@ -57,32 +55,33 @@
 //!   volume files that do not exist. A direct set therefore **finalizes only
 //!   once its job's PAR2 verification has concluded** — before then its
 //!   envelopes and partials are the only copy of the volume image, and the
-//!   verifier needs them. Wave 2 produced verification **verdicts** only, and a
-//!   damaged direct set demoted whole.
-//! - **D1's bounded small-member tolerance.** A set whose only ineligible
+//!   verifier needs them. At first that produced verification **verdicts** only,
+//!   and a damaged direct set demoted whole.
+//! - **The bounded small-member tolerance.** A set whose only ineligible
 //!   members are small unencrypted non-solid regular files still routes: their
 //!   packed ranges land in the envelope, and at finalization *only* those
 //!   member indices are extracted through
-//!   `unrar_rs::RarArchive::extract_member_streaming` over the hybrid
-//!   provider. Direct `Store` outputs are never re-extracted or overwritten.
+//!   `unrar_rs::RarArchive::extract_member_streaming` over the hybrid provider.
+//!   Direct `Store` outputs are never re-extracted or overwritten.
 //!
-//! Phase 6 replaces that last demotion with D8's other transition. [`repair`]
-//! materializes **only the damaged volumes** into scratch files, repairs them
-//! with every clean volume still read virtually, routes the repaired spans back
-//! through the router with replacement semantics — destination bytes overwrite,
-//! and so does the CRC composition — re-verifies through the same gates, and
-//! deletes the scratch. Clean volumes never materialize, the set stays direct,
-//! and no direct output is deleted. Two consequences worth naming:
+//! Repair-while-direct replaces that last demotion with the other transition.
+//! [`repair`] materializes **only the damaged volumes** into scratch files,
+//! repairs them with every clean volume still read virtually, routes the
+//! repaired spans back through the router with replacement semantics —
+//! destination bytes overwrite, and so does the CRC composition — re-verifies
+//! through the same gates, and deletes the scratch. Clean volumes never
+//! materialize, the set stays direct, and no direct output is deleted. Two
+//! consequences worth naming:
 //!
 //! - the set's checkpoint row is **deleted before** anything the row claims is
 //!   rewritten, and the next barrier recreates coverage from scratch. That is
 //!   deliberately lossy — a crash in that window costs a full redownload of the
 //!   set — and it is far simpler than selectively lowering per-volume floors to
-//!   expose the repaired ranges (D8);
-//! - every refusal along the way falls back to wave 2's whole-set demotion,
-//!   which is always correct, under its own metric.
+//!   expose the repaired ranges;
+//! - every refusal along the way falls back to the whole-set demotion, which is
+//!   always correct, under its own metric.
 //!
-//! Phase 7 is the hardening pass, and it lands four things:
+//! The hardening pass lands four more things:
 //!
 //! - **Windows sparse marking.** [`sparse`] marks every file this subsystem
 //!   creates with holes in it — member partials, envelopes, repair and holds
@@ -92,15 +91,15 @@
 //!   volume in NTFS-allocated zeros.
 //! - **A real config surface.** [`DirectStoreSettings`] resolves the gate and
 //!   the per-set scratch ceiling from `Config`, with the `WEAVER_*` variables
-//!   overriding it in both directions for incident response — plan 135's open
-//!   question 1, answered as config *and* env rather than either alone. The
-//!   gate still defaults **off**; flipping that default is a release decision.
-//! - **Quick Open, dropped.** D2 permitted QO priming behind mandatory
-//!   physical-header confirmation and said to delete it if the confirmation
-//!   erased the benefit. It does — see the decision recorded at
-//!   [`router::DirectSetRouter::try_parse_volume`] — so there is no QO code
+//!   overriding it in both directions for incident response: config *and* env
+//!   rather than either alone. The gate still defaults **off**; flipping that
+//!   default is a release decision.
+//! - **Quick Open, dropped.** QO priming was permitted behind mandatory
+//!   physical-header confirmation, on the understanding that it would be deleted
+//!   if the confirmation erased the benefit. It does — see the decision recorded
+//!   at [`router::DirectSetRouter::try_parse_volume`] — so there is no QO code
 //!   here.
-//! - **The metric families** the plan enumerates, under `direct_store.*`.
+//! - **The metric families** this subsystem publishes, under `direct_store.*`.
 //!
 //! # Two checkpoint systems
 //!
@@ -136,10 +135,9 @@ mod tests;
 /// it to an off word forces the gate off no matter what the database says;
 /// setting it to an on word forces it on. Leaving it unset defers to config.
 ///
-/// Answering plan 135's open question 1 this way — config *and* env, config as
-/// the durable operator surface and env as the override — is phase 7's
-/// decision. Phase 2's `WEAVER_LIVE_PAR2` remains env-only; it guards a
-/// different feature and moving it is not this phase's business.
+/// Config *and* env — config as the durable operator surface and env as the
+/// override — is the settled answer. `WEAVER_LIVE_PAR2` remains env-only; it
+/// guards a different feature and moving it is out of scope here.
 pub(crate) const DIRECT_STORE_ENV: &str = "WEAVER_RAR_DIRECT_STORE";
 
 /// Env override for the per-set holds-scratch ceiling, in **bytes**.
@@ -184,7 +182,7 @@ fn parse_enabled(raw: Option<&str>) -> Option<bool> {
 }
 
 /// Everything direct-store reads out of configuration, resolved once at
-/// pipeline construction (plan 135, phase 7 — Risks, and open question 1).
+/// pipeline construction.
 ///
 /// Precedence, for both fields: **environment, then config, then default.**
 /// Resolving it here rather than at each read point is what keeps the gate

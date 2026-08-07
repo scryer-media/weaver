@@ -52,7 +52,7 @@ pub struct Config {
     /// Duplicate admission handling policy.
     #[serde(default)]
     pub duplicate_policy: DuplicatePolicy,
-    /// RAR direct-store routing (plan 135). Absent means "every default".
+    /// RAR direct-store routing. Absent means "every default".
     #[serde(default)]
     pub direct_store: Option<DirectStoreOverrides>,
     /// Path to the config file on disk. Not serialized to TOML.
@@ -171,7 +171,7 @@ impl Config {
     }
 }
 
-/// Operator-facing switches for RAR direct-store routing (plan 135, phase 7).
+/// Operator-facing switches for RAR direct-store routing.
 ///
 /// These answer the plan's open question 1 — config, not env-only — while
 /// keeping an env override for incident response. Precedence is

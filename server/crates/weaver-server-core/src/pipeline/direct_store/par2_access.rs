@@ -1,5 +1,4 @@
-//! A [`par2_rs::FileAccess`] over a direct set's virtual volumes
-//! (plan 135, D5/D8).
+//! A [`par2_rs::FileAccess`] over a direct set's virtual volumes.
 //!
 //! PAR2 describes **source volumes**: every file id in the recovery set names a
 //! `.partNN.rar`, and every slice checksum is defined at an offset inside it. A
@@ -27,7 +26,7 @@
 //! volume, which is what keeps direct and conventional verdicts the same shape.
 //! No byte is ever fabricated: a stopped read yields fewer bytes, not zeros.
 //!
-//! # An interior hole refuses the sequential path (phase 6)
+//! # An interior hole refuses the sequential path
 //!
 //! That short-read contract is exact for a **truncated** volume and wrong for a
 //! volume with an interior hole. `verify_slices_batched_md5` and
@@ -40,13 +39,14 @@
 //!
 //! So the reader is offered only when the volume's readable image is a prefix
 //! (see [`super::provider::VirtualVolume::readable_prefix`]). Otherwise the
-//! adapter answers `Ok(None)` and par2-rs falls back to its ranged path,
-//! which opens at each slice's own offset and therefore seeks past the hole —
+//! adapter answers `Ok(None)` and par2-rs falls back to its ranged path, which
+//! opens at each slice's own offset and therefore seeks past the hole —
 //! damaging exactly the slices that touch it, which is the verdict a physically
-//! sparse volume produces. Clean volumes, the overwhelming majority and the only
-//! ones where D5's whole-file-MD5 cost argument bites, keep the sequential path.
+//! sparse volume produces. Clean volumes, the overwhelming majority and the
+//! only ones where the whole-file-MD5 cost argument bites, keep the sequential
+//! path.
 //!
-//! # One reader per volume, kept across ranged reads (plan 136, E2 review F2)
+//! # One reader per volume, kept across ranged reads
 //!
 //! The ranged path is the one an encrypted set pays for. A
 //! [`super::provider::VirtualVolumeReader`] carries a per-member CBC frontier
@@ -54,8 +54,8 @@
 //! every byte exactly once; open a fresh reader per call and that frontier
 //! starts empty every time, and each slice re-seeds from the nearest retained
 //! checkpoint — up to [`super::router::crypt::CHECKPOINT_STRIDE`] of plaintext
-//! re-encrypted and thrown away *per slice*. Measured on E2's own fixture that
-//! was 51,487 delivered bytes against 125,828,800 chained.
+//! re-encrypted and thrown away *per slice*. Measured on the overlay's own
+//! fixture that was 51,487 delivered bytes against 125,828,800 chained.
 //!
 //! So the reader is cached per volume and reused. It is taken out of the map
 //! for the duration of a read and put back after, which keeps concurrent reads
@@ -70,14 +70,14 @@
 //!
 //! # Writes: refused for virtual, allowed for materialized
 //!
-//! A virtual volume still has nowhere to put a repaired slice — the member bytes
-//! belong to a member and the envelope holds the rest — so
+//! A virtual volume still has nowhere to put a repaired slice — the member
+//! bytes belong to a member and the envelope holds the rest — so
 //! [`FileAccess::write_file_range`] fails loudly for one rather than silently
-//! writing into a file the set does not own. D8's repair-while-direct is what
-//! makes that survivable: it materializes *only the damaged volumes* into
+//! writing into a file the set does not own. Repair-while-direct is what makes
+//! that survivable: it materializes *only the damaged volumes* into
 //! [`super::plan::DirectSetPlan::repair_path`] scratch files and registers them
-//! here as [`MaterializedPar2Volume`]s, so the repairer reads every clean volume
-//! virtually and writes only into files that really exist.
+//! here as [`MaterializedPar2Volume`]s, so the repairer reads every clean
+//! volume virtually and writes only into files that really exist.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -97,7 +97,7 @@ pub(crate) struct VirtualPar2Volume {
 }
 
 /// One damaged direct source volume that has been materialized to a real file
-/// so a repair has somewhere to write (plan 135, D8).
+/// so a repair has somewhere to write.
 ///
 /// `len` is the volume's decoded length, which is what PAR2 describes; the file
 /// is created at exactly that length with holes wherever the set never placed a
@@ -112,8 +112,8 @@ pub(crate) struct MaterializedPar2Volume {
 
 /// Which read path the pass actually took.
 ///
-/// D5 requires the sequential path to exist, because whole-file MD5 for a set
-/// with no IFSC packets — and the batched slice sweep — otherwise degrade into
+/// The sequential path has to exist, because whole-file MD5 for a set with no
+/// IFSC packets — and the batched slice sweep — otherwise degrade into
 /// thousands of ranged reads across member partials, and the "no worse than
 /// today" claim fails. Counting all three is what lets a test prove which one
 /// ran, including the phase-6 refusal that trades the fast path for an accurate
@@ -152,7 +152,7 @@ pub(crate) struct DirectVolumeFileAccess {
     /// materialized reads and writes through the real file.
     materialized: HashMap<FileId, MaterializedPar2Volume>,
     /// One reader per virtual volume, kept across ranged reads so a slice sweep
-    /// carries its CBC chain instead of re-seeding every read (E2 review F2).
+    /// carries its CBC chain instead of re-seeding every read.
     ///
     /// Behind a lock only because [`FileAccess`]'s reads take `&self`; the lock
     /// is never held across a read, since the reader is removed for the call and
@@ -181,7 +181,7 @@ impl DirectVolumeFileAccess {
     }
 
     /// Registers materialized damaged volumes, which take precedence over the
-    /// virtual answer for the same file id (D8).
+    /// virtual answer for the same file id.
     pub(crate) fn with_materialized(mut self, volumes: Vec<MaterializedPar2Volume>) -> Self {
         self.materialized = volumes
             .into_iter()
@@ -232,7 +232,7 @@ impl DirectVolumeFileAccess {
     }
 
     /// A positioned read of a virtual volume, through the volume's **cached**
-    /// reader (E2 review F2).
+    /// reader.
     ///
     /// Reusing the reader is what makes an ascending sweep — which is what a
     /// PAR2 slice pass issues — carry its CBC chain from one slice to the next.
@@ -410,8 +410,8 @@ impl FileAccess for DirectVolumeFileAccess {
             return self.inner.write_file_range(file_id, offset, data);
         };
         Err(io::Error::other(format!(
-            "direct-store volume {volume_index} is virtual and cannot be written; D8 \
-             materializes a damaged volume before repairing it"
+            "direct-store volume {volume_index} is virtual and cannot be written; a damaged \
+             volume is materialized before it is repaired"
         )))
     }
 }

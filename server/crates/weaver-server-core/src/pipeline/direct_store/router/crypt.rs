@@ -1,8 +1,8 @@
-//! Encrypted direct-store — plan 136, E-D1/E-D2/E-D3.
+//! Encrypted direct-store.
 //!
 //! An encrypted `Store` member's packed bytes are its plaintext as one
 //! AES-256-CBC stream, so cipher offset and member-logical offset are the same
-//! number and **every range answer plan 135 computes is unchanged**. What
+//! number and **every range answer the router computes is unchanged**. What
 //! changes is that the bytes on the wire are not the bytes that belong in the
 //! destination: they pass through one transform on the way in.
 //!
@@ -19,31 +19,31 @@
 //!   *ending* at a covered run's frontier ([`MemberCrypt::checkpoints`]) and the
 //!   plaintext of a block only part of which has been emitted
 //!   ([`MemberCrypt::edge_plain`]).
-//! - **The keyed folds** (E-D3). A RAR5 writer may key a member's checksums with
-//!   the KDF's hash key, which turns the whole-member CRC32 into the real
+//! - **The keyed folds**. A RAR5 writer may key a member's checksums with the
+//!   KDF's hash key, which turns the whole-member CRC32 into the real
 //!   wrong-password backstop: layer 1's per-part packed hashes cover *cipher*
-//!   bytes and pass whatever the password was, so they detect a bad password not
-//!   at all.
+//!   bytes and pass whatever the password was, so they detect a bad password
+//!   not at all.
 //!
 //! # Why the padding is retained
 //!
-//! `cipher_size` is `align16(unpacked_size)`, so the final block's plaintext can
-//! run up to 15 bytes past the member's end. Those bytes are never destination
-//! bytes — but byte-exact re-encryption of the last block (E2, and every
-//! posted-byte consumer with it) needs them, and they cannot be recovered from
-//! the destination file because they are not in it. They are kept per member and
-//! carried in the coverage snapshot.
+//! `cipher_size` is `align16(unpacked_size)`, so the final block's plaintext
+//! can run up to 15 bytes past the member's end. Those bytes are never
+//! destination bytes — but byte-exact re-encryption of the last block — and
+//! every posted-byte consumer with it — needs them, and they cannot be
+//! recovered from the destination file because they are not in it. They are
+//! kept per member and carried in the coverage snapshot.
 //!
-//! # The read side (E2): posted bytes are re-derived, never stored
+//! # The read side: posted bytes are re-derived, never stored
 //!
-//! Everything above is the write side. Phase E2 adds the inverse — every
+//! Everything above is the write side. The read side adds the inverse — every
 //! consumer that needs the bytes as they were **posted** gets cipher, which
 //! nothing on disk holds any more. AES-CBC encryption is deterministic given
 //! key, IV and plaintext, so the posted stream is always reproducible: the
-//! provider overlay reads a member's plaintext back out of its `.direct.partial`
-//! and re-encrypts it. [`MemberCipher`] is the read-side facts that makes that
-//! possible, and [`MemberCrypt::cipher_facts`] is where the write side hands
-//! them over.
+//! provider overlay reads a member's plaintext back out of its
+//! `.direct.partial` and re-encrypts it. [`MemberCipher`] is the read-side
+//! facts that makes that possible, and [`MemberCrypt::cipher_facts`] is where
+//! the write side hands them over.
 //!
 //! Two things are not re-derivable and are therefore kept:
 //!
@@ -56,7 +56,7 @@
 //!   contiguous decrypted run's frontier, and additionally every
 //!   [`CHECKPOINT_STRIDE`] bytes inside one.
 //!
-//! The stride is E2's answer to plan 136's open question 1. A run frontier alone
+//! The stride is why interior checkpoints are kept at all. A run frontier alone
 //! is the wrong shape for a *ranged* read: an ordinary in-order download keeps
 //! exactly one checkpoint and it sits at the download frontier, which is past
 //! every interior offset a verifier or a repair ever asks about — so every
@@ -65,7 +65,7 @@
 //! stride's worth of AES, costs 24 bytes per stride per member in memory and in
 //! the snapshot, and needs no second in-memory tier on top.
 //!
-//! # The one precondition the overlay must not assume (E1 review F6)
+//! # The one precondition the overlay must not assume
 //!
 //! [`MemberCrypt::edge_plain`] and [`MemberCrypt::checkpoints`] are only ever
 //! valid for the bytes that produced them. A **repair** rewrites a span in
@@ -73,27 +73,29 @@
 //! takes the repaired plaintext, and the composition is overwritten — but a
 //! cached edge block covering the same offsets still holds the plaintext of the
 //! *damaged* bytes, and a checkpoint at that frontier still holds the damaged
-//! cipher. E1 was correct without touching them because nothing read either one
-//! afterwards: the destination is the only consumer of a decrypted edge block,
-//! and it has already been written.
+//! cipher. The write side alone was correct without touching them because
+//! nothing read either one afterwards: the destination is the only consumer of
+//! a decrypted edge block, and it has already been written.
 //!
-//! E2 reads both, so it may not carry that assumption over. Re-encrypting a
-//! repaired edge block from `edge_plain`, or chaining a re-encryption from a
-//! `checkpoints` entry a repair has invalidated, would emit cipher for bytes the
-//! volume no longer holds — silently, because the values stay structurally
-//! well-formed. [`MemberCrypt::invalidate_repaired`] is the discharge of that
-//! requirement, and [`super::DirectSetRouter::route_encrypted_slice`] calls it
-//! on every `replace` span **before** a byte of that span is resolved.
+//! The read side reads both, so it may not carry that assumption over.
+//! Re-encrypting a repaired edge block from `edge_plain`, or chaining a
+//! re-encryption from a `checkpoints` entry a repair has invalidated, would
+//! emit cipher for bytes the volume no longer holds — silently, because the
+//! values stay structurally well-formed. [`MemberCrypt::invalidate_repaired`]
+//! is the discharge of that requirement, and
+//! [`super::DirectSetRouter::route_encrypted_slice`] calls it on every
+//! `replace` span **before** a byte of that span is resolved.
 //!
 //! # Privacy note: the retained padding is the user's plaintext
 //!
 //! Those ≤15 bytes are **decrypted content**, and the coverage snapshot is a
-//! row in weaver's database. Nothing else the snapshot carries is: the salt, the
-//! IV and the KDF count are what the archive states in the clear, and the cipher
-//! checkpoints are ciphertext. The password itself is never written anywhere.
-//! The padding is the one deliberate exception, it is bounded at 15 bytes per
-//! member, and it exists because E2's byte-exact re-encryption of the final
-//! block has no other source for it. See [`MemberCryptSnapshot::tail_plain`].
+//! row in weaver's database. Nothing else the snapshot carries is: the salt,
+//! the IV and the KDF count are what the archive states in the clear, and the
+//! cipher checkpoints are ciphertext. The password itself is never written
+//! anywhere. The padding is the one deliberate exception, it is bounded at 15
+//! bytes per member, and it exists because byte-exact re-encryption of the
+//! final block has no other source for it. See
+//! [`MemberCryptSnapshot::tail_plain`].
 
 use std::collections::BTreeMap;
 
@@ -109,12 +111,12 @@ use crate::pipeline::direct_store::ByteRanges;
 pub(crate) const AES_BLOCK: u64 = 16;
 
 /// How far apart the cipher checkpoints a ranged re-encryption can seed from are
-/// kept inside one contiguous decrypted run (E2, plan 136 open question 1).
+/// kept inside one contiguous decrypted run.
 ///
-/// The run *frontier* checkpoint E1 keeps answers the write side's question —
-/// "where does the next arriving span chain from" — and answers the read side's
-/// not at all: an in-order download holds exactly one, at the download frontier,
-/// which is past every interior offset a verifier or a repair asks about. Every
+/// The run *frontier* checkpoint answers the write side's question — "where
+/// does the next arriving span chain from" — and answers the read side's not at
+/// all: an in-order download holds exactly one, at the download frontier, which
+/// is past every interior offset a verifier or a repair asks about. Every
 /// ranged read would then chain from the member's start, and a slice-by-slice
 /// sweep of an *n*-byte member would re-encrypt O(n²) bytes.
 ///
@@ -153,9 +155,9 @@ pub(crate) enum CryptRefusal {
     /// The headers state key material this build cannot derive from: a RAR5 KDF
     /// count over `unrar-rs`'s ceiling.
     ///
-    /// **Not** a RAR4 member any more (E3). RAR4 file encryption is keyed here
-    /// now, and a RAR4 member the *library* cannot key — one of the three
-    /// pre-AES ciphers — never reaches admission at all: it classifies as
+    /// **Not** a RAR4 member any more. RAR4 file encryption is keyed here now,
+    /// and a RAR4 member the *library* cannot key — one of the three pre-AES
+    /// ciphers — never reaches admission at all: it classifies as
     /// `Ineligible(Encrypted)` and demotes under `MemberIneligible` instead,
     /// which is the honest place for it, since nothing about it is a crypt
     /// decision this router made.
@@ -172,9 +174,9 @@ impl CryptRefusal {
     }
 }
 
-/// Why a **header-encrypted** (`-hp`) set may not route (plan 136, E4). Every
-/// variant demotes, and demoting is the pre-E4 floor: the volume materializes
-/// byte-exactly and the conventional extractor opens it with a password prompt.
+/// Why a **header-encrypted** (`-hp`) set may not route. Every variant demotes,
+/// and demoting is the older floor: the volume materializes byte-exactly and
+/// the conventional extractor opens it with a password prompt.
 ///
 /// Deliberately separate from [`CryptRefusal`], which is about a *member's*
 /// file-data key. These are about the *archive's* header key, and the two fail
@@ -196,15 +198,15 @@ pub(crate) enum HeaderCryptRefusal {
     /// use — the writer omitted it, or the value's own SHA-256 tag did not
     /// validate, which refutes nothing for any password.
     ///
-    /// **This is the E4 decision that differs from `-p`.** For file-data
-    /// encryption, admitting on `Unverifiable` is fine because a wrong key only
-    /// corrupts *data*, and the whole-member CRC32 catches it downstream. Here a
-    /// wrong key corrupts the **header parse itself**: the layout — which member
-    /// lives where, how long it is, what its checksum is — would be derived from
-    /// garbage and routed on. The only thing standing between that and the
-    /// user's disk would be "garbage will not parse", which is the same 2⁻³²
-    /// argument this arc has already rejected once. So an unprovable `-hp` set
-    /// refuses.
+    /// **This is the header-encryption decision that differs from `-p`.** For
+    /// file-data encryption, admitting on `Unverifiable` is fine because a
+    /// wrong key only corrupts *data*, and the whole-member CRC32 catches it
+    /// downstream. Here a wrong key corrupts the **header parse itself**: the
+    /// layout — which member lives where, how long it is, what its checksum is
+    /// — would be derived from garbage and routed on. The only thing standing
+    /// between that and the user's disk would be "garbage will not parse",
+    /// which is the same 2⁻³² argument this arc has already rejected once. So
+    /// an unprovable `-hp` set refuses.
     Unverifiable,
     /// RAR4/RAR3 `-hp`. Permanent, and not a gap to be filled later:
     /// `parse_rar4_encrypted_headers` derives a fresh key per header from that
@@ -237,7 +239,7 @@ impl HeaderCryptRefusal {
 }
 
 /// The `-hp` admission gate: prove one of the job's password candidates against
-/// the archive's own type-4 check, before a single header is decrypted (E4).
+/// the archive's own type-4 check, before a single header is decrypted.
 ///
 /// # Why this is a candidate *list* and not the one password `KeyRing` holds
 ///
@@ -336,7 +338,7 @@ impl HeaderKeyRing {
         self.verified.is_none() && self.refusal.is_none()
     }
 
-    /// The E4 decision, made **before any header is decrypted**.
+    /// The header-encryption decision, made **before any header is decrypted**.
     ///
     /// [`unrar_rs::PasswordCheck`] has three outcomes and only one of them
     /// admits:
@@ -434,7 +436,7 @@ pub(crate) struct MemberKeys {
     /// The cipher and its key: AES-256 for RAR5, AES-128 for RAR4. Carrying the
     /// width in the value is what lets every transform below be written once.
     pub(crate) key: MemberCipherKey,
-    /// The KDF's hash key, for the keyed checksum folds (E-D3).
+    /// The KDF's hash key, for the keyed checksum folds.
     ///
     /// `None` for RAR4, and that is a statement rather than an omission: RAR4
     /// has no hash-MAC flag, so a RAR4 header's checksums are *always* bare
@@ -500,7 +502,7 @@ impl CryptTuple {
 }
 
 /// The set's password and the keys derived from it, one derivation per KDF
-/// tuple (E-D1).
+/// tuple.
 ///
 /// # The password is never persisted
 ///
@@ -559,12 +561,12 @@ impl KeyRing {
     /// seam re-reads it while this is true.
     ///
     /// It stays true while a password is merely *held*, and goes false the
-    /// moment one is **admitted** (E1 review F5). The narrower "held" test this
-    /// replaces made [`Self::set_password`]'s changed-password branch dead code:
-    /// a job added with the wrong password and corrected before its first header
-    /// parsed would never see the correction, because the seam stopped asking
-    /// the instant any password existed. Costs one map lookup per article for a
-    /// job with no password — which is every conventional job — and one short
+    /// moment one is **admitted**. The narrower "held" test this replaces made
+    /// [`Self::set_password`]'s changed-password branch dead code: a job added
+    /// with the wrong password and corrected before its first header parsed
+    /// would never see the correction, because the seam stopped asking the
+    /// instant any password existed. Costs one map lookup per article for a job
+    /// with no password — which is every conventional job — and one short
     /// `String` clone per article for one that has one, until admission.
     pub(crate) fn wants_password(&self) -> bool {
         !self.admitted && self.refusal.is_none()
@@ -609,16 +611,16 @@ impl KeyRing {
         self.refusal
     }
 
-    /// The E-D1 decision for one encrypted member, made **before any byte of it
-    /// routes**.
+    /// The routing decision for one encrypted member, made **before any byte of
+    /// it routes**.
     ///
-    /// A PAR2-bearing job used to be refused outright here (E1 review F1),
-    /// because an encrypted set's destinations hold plaintext where PAR2
-    /// describes the posted cipher and nothing could turn one back into the
-    /// other. E2's re-encrypting overlay is what retires that refusal: the
-    /// authoritative pass, live verification, repair and reconstruction all read
-    /// posted bytes through it now, so a recovery set is no longer a reason to
-    /// leave direct mode.
+    /// A PAR2-bearing job used to be refused outright here, because an
+    /// encrypted set's destinations hold plaintext where PAR2 describes the
+    /// posted cipher and nothing could turn one back into the other. The
+    /// re-encrypting overlay is what retires that refusal: the authoritative
+    /// pass, live verification, repair and reconstruction all read posted bytes
+    /// through it now, so a recovery set is no longer a reason to leave direct
+    /// mode.
     ///
     /// - No password: refuse. An encrypted set routes only with one.
     /// - [`PasswordCheck::Wrong`]: refuse. The header states a value this
@@ -635,7 +637,7 @@ impl KeyRing {
     ///   gate is the authority either way, which is why this is an admission
     ///   test and never a reason to skip that gate.
     ///
-    /// # RAR4 has no third outcome, only the middle one (E3)
+    /// # RAR4 has no third outcome, only the middle one
     ///
     /// A RAR4 header carries no password-check value at all — the format has no
     /// such field — so every RAR4 member admits on the `Unverifiable` path and
@@ -786,7 +788,7 @@ impl MemberCryptKeying {
 
 /// The crypt facts a restore needs to rebuild a member's keys without
 /// re-parsing a header, plus the state that cannot be re-derived from the
-/// destination file (E-D4, snapshot schema 5).
+/// destination file (snapshot schema 5).
 ///
 /// The password is **not** here and never will be. What is here is what the
 /// headers already state in the clear plus two things this process computed:
@@ -805,12 +807,12 @@ pub(crate) struct MemberCryptSnapshot {
     pub(crate) tail_padding: u8,
     /// The ≤15 plaintext bytes past `unpacked_size`.
     ///
-    /// Either empty or exactly `tail_padding` long, and never a partially filled
-    /// buffer: a row is written only once every one of those bytes has really
-    /// arrived (E1 review F4). A padding that is half in hand at checkpoint time
-    /// is simply not carried, which costs nothing — the other half of its cipher
-    /// block is still outstanding, so the article carrying it comes back and the
-    /// whole block is retained in one piece on the resumed run.
+    /// Either empty or exactly `tail_padding` long, and never a partially
+    /// filled buffer: a row is written only once every one of those bytes has
+    /// really arrived. A padding that is half in hand at checkpoint time is
+    /// simply not carried, which costs nothing — the other half of its cipher
+    /// block is still outstanding, so the article carrying it comes back and
+    /// the whole block is retained in one piece on the resumed run.
     ///
     /// **This is decrypted user content in weaver's database.** Bounded at 15
     /// bytes per member, and the only such field: see the module docs for why it
@@ -854,7 +856,7 @@ impl std::fmt::Debug for MemberCryptSnapshot {
 
 /// One encrypted member's **read-side** facts: everything the provider overlay
 /// needs to turn the plaintext in a `.direct.partial` back into the bytes that
-/// were posted (E-D4, phase E2).
+/// were posted.
 ///
 /// A snapshot of the write side, taken whenever a provider is assembled, and
 /// deliberately not a handle on it: the overlay runs on the blocking pool, often
@@ -989,15 +991,15 @@ impl MemberCipher {
     /// so re-encrypting through it cannot drift from the decrypt weaver already
     /// trusts.
     ///
-    /// In place, and **fallible**, for two reasons the review named (E2, F5 and
-    /// the test-support note). In place because the overlay's caller already
-    /// owns a buffer the plaintext was read into, and returning a fresh `Vec`
-    /// meant copying every re-encrypted byte twice. Fallible because the caller
-    /// is a reader on the blocking pool: a violated length contract has to come
-    /// back as a hole it can report as unavailable bytes, never as a panic
-    /// inside a `spawn_blocking` task. The contract holds by construction —
-    /// `cipher_size` is `align16` and every range here is block-derived — so
-    /// what is at stake is the failure *mode*, not a live failure.
+    /// In place, and **fallible**, for two reasons the review named. In place
+    /// because the overlay's caller already owns a buffer the plaintext was
+    /// read into, and returning a fresh `Vec` meant copying every re-encrypted
+    /// byte twice. Fallible because the caller is a reader on the blocking
+    /// pool: a violated length contract has to come back as a hole it can
+    /// report as unavailable bytes, never as a panic inside a `spawn_blocking`
+    /// task. The contract holds by construction — `cipher_size` is `align16`
+    /// and every range here is block-derived — so what is at stake is the
+    /// failure *mode*, not a live failure.
     pub(crate) fn encrypt(&self, preceding: &[u8; 16], buffer: &mut [u8]) -> RarResult<()> {
         self.key.encrypt_range(preceding, buffer)
     }
@@ -1013,7 +1015,7 @@ pub(crate) enum CryptRestoreError {
     Malformed,
 }
 
-/// One encrypted member's write-side transform state (E-D2).
+/// One encrypted member's write-side transform state.
 ///
 /// Its `Debug` is hand-written and withholds three things — see [`Self::fmt`].
 pub(crate) struct MemberCrypt {
@@ -1064,7 +1066,7 @@ pub(crate) struct MemberCrypt {
     /// question to answer — and could not use part boundaries anyway, since an
     /// encrypted member's parts are not block-aligned.
     plain_runs: CrcRuns,
-    /// The ≤15 plaintext bytes past `unpacked_size` (E-D2). Never written to the
+    /// The ≤15 plaintext bytes past `unpacked_size`. Never written to the
     /// destination; retained because re-encrypting the final block needs them.
     ///
     /// **Decrypted user content**, and the only such state this module keeps —
@@ -1076,7 +1078,7 @@ pub(crate) struct MemberCrypt {
     /// arrival, so its length says nothing about how much of it is real, and
     /// [`Self::tail_padding_retained`] is a **verification precondition** —
     /// answering it off a zero-filled buffer would let a member verify against
-    /// padding it never saw (E1 review F4).
+    /// padding it never saw.
     tail_filled: u16,
 }
 
@@ -1091,7 +1093,8 @@ impl std::fmt::Debug for MemberCrypt {
     /// password-check value should not gain a password verifier from weaver.
     /// Leaving them in a derived `Debug` would hand one back. `edge_plain` and
     /// `tail_plain` are the user's plaintext, held here only until it has been
-    /// emitted (or, for the padding, only because E2 cannot re-derive it).
+    /// emitted (or, for the padding, only because the overlay cannot re-derive
+    /// it).
     ///
     /// What is printed is shape: how far the cipher stream runs, how much of it
     /// this member is holding, and whether the padding is whole — the questions
@@ -1161,8 +1164,8 @@ impl MemberCrypt {
     }
 
     /// The retained padding, for the assertions that pin it. Not a routing
-    /// input: the router writes these bytes nowhere, and E2 reads them off the
-    /// snapshot row rather than out of here.
+    /// input: the router writes these bytes nowhere, and the read side reads
+    /// them off the snapshot row rather than out of here.
     #[cfg(test)]
     pub(crate) fn tail_plain(&self) -> &[u8] {
         &self.tail_plain
@@ -1184,7 +1187,7 @@ impl MemberCrypt {
         self.edge_plain.get(&block_start).copied()
     }
 
-    /// Decrypts one block-aligned cipher range in place (E-D2).
+    /// Decrypts one block-aligned cipher range in place.
     ///
     /// `start` and `cipher.len()` are both multiples of 16 — cipher offset and
     /// member-logical offset are the same number for a stored member — and
@@ -1206,11 +1209,11 @@ impl MemberCrypt {
         debug_assert_eq!(len % AES_BLOCK, 0);
         let mut trailing = [0u8; 16];
         trailing.copy_from_slice(&cipher[cipher.len() - 16..]);
-        // Taken before the decrypt, which is the only moment this cipher exists:
-        // the run's frontier block (the write side's seed) plus one block per
-        // stride boundary the range crosses (the read side's, E2). Both are
-        // stored under "the cipher offset the block ends at", so a lookup keyed
-        // by a block start finds the predecessor it needs.
+        // Taken before the decrypt, which is the only moment this cipher
+        // exists: the run's frontier block (the write side's seed) plus one
+        // block per stride boundary the range crosses (the read side's). Both
+        // are stored under "the cipher offset the block ends at", so a lookup
+        // keyed by a block start finds the predecessor it needs.
         let mut strided: Vec<(u64, [u8; 16])> = Vec::new();
         let first = start
             .div_ceil(CHECKPOINT_STRIDE)
@@ -1236,7 +1239,7 @@ impl MemberCrypt {
         true
     }
 
-    /// Discharges E1 review F6: forgets every cached edge block and every
+    /// Invalidates the caches: forgets every cached edge block and every
     /// checkpoint a repaired span's cipher range touches.
     ///
     /// Both caches describe the bytes that produced them, and a `replace` span
@@ -1313,18 +1316,18 @@ impl MemberCrypt {
     /// and after a restart — and a member that is destination-complete without
     /// it is a member whose final block was never decrypted.
     ///
-    /// Answered off the filled mask, not off `tail_plain.len()` (E1 review F4):
+    /// Answered off the filled mask, not off `tail_plain.len()`:
     /// [`Self::retain_tail_padding`] resizes the buffer to the whole padding on
     /// the *first* byte, so its length is true from the first arrival onwards
     /// and would report a split arrival retained while the gaps were still
-    /// zeros — and `snapshot` would then persist those zeros as if they were the
-    /// member's own bytes.
+    /// zeros — and `snapshot` would then persist those zeros as if they were
+    /// the member's own bytes.
     pub(crate) fn tail_padding_retained(&self) -> bool {
         self.tail_filled == self.tail_mask()
     }
 
-    /// Seeds cipher coverage a previous run emitted (E-D4). Purely a duplicate
-    /// filter: it carries no claim that anything was verified, which is what
+    /// Seeds cipher coverage a previous run emitted. Purely a duplicate filter:
+    /// it carries no claim that anything was verified, which is what
     /// `restart_seeded` is for.
     pub(crate) fn seed_emitted(&mut self, start: u64, len: u64) {
         self.emitted.insert(start, len);
@@ -1365,7 +1368,7 @@ impl MemberCrypt {
         }
     }
 
-    /// Layer 2's comparison (E-D3): the composed plain CRC32 over the member's
+    /// Layer 2's comparison: the composed plain CRC32 over the member's
     /// plaintext, folded with the KDF hash key when the header keys it.
     ///
     /// This is the **real wrong-password backstop**. Layer 1's packed hashes are
@@ -1397,12 +1400,12 @@ impl MemberCrypt {
         }
     }
 
-    /// The snapshot row for this member (E-D4).
+    /// The snapshot row for this member.
     ///
-    /// The padding is carried **only** once every byte of it has arrived (E1
-    /// review F4). A half-filled buffer is zeros in the gaps, and a row of zeros
-    /// is worse than no row: the resumed run would take it for the member's own
-    /// bytes and E2 would re-encrypt the final block from them. Dropping it
+    /// The padding is carried **only** once every byte of it has arrived. A
+    /// half-filled buffer is zeros in the gaps, and a row of zeros is worse
+    /// than no row: the resumed run would take it for the member's own bytes
+    /// and the overlay would re-encrypt the final block from them. Dropping it
     /// costs nothing, because a padding that is not whole means the rest of its
     /// cipher block never arrived, so that article is still outstanding and
     /// brings the whole block back in one piece.
@@ -1424,7 +1427,7 @@ impl MemberCrypt {
         })
     }
 
-    /// The read-side facts for this member (E2), or `None` when it cannot serve
+    /// The read-side facts for this member, or `None` when it cannot serve
     /// posted bytes at all.
     ///
     /// `None` on a member whose headers have not yet declared a size: nothing
@@ -1457,7 +1460,7 @@ impl MemberCrypt {
         })
     }
 
-    /// Seeds a restored member (E-D4).
+    /// Seeds a restored member.
     ///
     /// Refuses when the row disagrees with what the rebuilt layout states: the
     /// facts are re-derived from the cached headers on every restart, so a
@@ -1478,9 +1481,9 @@ impl MemberCrypt {
         {
             return Err(CryptRestoreError::FactsDisagree);
         }
-        // A stored padding is all or nothing (E1 review F4): the writer only
-        // emits one it has whole, so a short-but-non-empty row is a torn or
-        // hand-made one and cannot be told from a real partial.
+        // A stored padding is all or nothing: the writer only emits one it has
+        // whole, so a short-but-non-empty row is a torn or hand-made one and
+        // cannot be told from a real partial.
         if u64::from(stored.tail_padding) >= AES_BLOCK
             || !stored.cipher_size.is_multiple_of(AES_BLOCK)
             || (!stored.tail_plain.is_empty()
@@ -1510,7 +1513,7 @@ impl MemberCrypt {
 
     /// Keeps one checkpoint per contiguous decrypted run — the frontier a
     /// resumed span will start at — plus one per [`CHECKPOINT_STRIDE`] inside a
-    /// run, which is what a ranged re-encryption seeds from (E2).
+    /// run, which is what a ranged re-encryption seeds from.
     ///
     /// Without the first rule a long download would retain 16 bytes per article
     /// for the life of the set; without the second, every ranged read would
@@ -1619,11 +1622,11 @@ mod tests {
 
     #[test]
     fn a_password_corrected_before_admission_replaces_the_one_it_was_added_with() {
-        // E1 review F5. `set_password`'s changed-password branch was dead: the
-        // seam that calls it stopped asking the moment *any* password was held,
-        // so a job added with the wrong one and corrected before its first
-        // header parsed admitted with the stale one and then failed the keyed
-        // member gate several gigabytes later.
+        // The dead-branch finding. `set_password`'s changed-password branch was
+        // dead: the seam that calls it stopped asking the moment *any* password
+        // was held, so a job added with the wrong one and corrected before its
+        // first header parsed admitted with the stale one and then failed the
+        // keyed member gate several gigabytes later.
         let keying = keying(Some(password_check_for("right", &[7u8; 16], 4)));
         let mut ring = KeyRing::new();
         ring.set_password(Some("wrong"));
@@ -1704,7 +1707,7 @@ mod tests {
 
     #[test]
     fn checkpoints_are_kept_every_stride_so_a_ranged_read_never_chains_from_zero() {
-        // Plan 136 open question 1, answered in the state that produces it. An
+        // Interior checkpoints, asserted in the state that produces them. An
         // in-order download decrypts one long run, and the frontier rule alone
         // would leave exactly one checkpoint — at the frontier, past every
         // interior offset a verifier asks about.
@@ -1752,9 +1755,9 @@ mod tests {
 
     #[test]
     fn a_repaired_span_invalidates_the_edge_block_and_checkpoint_it_overwrites() {
-        // E1 review F6, now due. Both caches stay structurally valid across a
-        // repair — a 16-byte block is a 16-byte block — so the only defence is
-        // dropping them before the overlay reads them.
+        // The cache-invalidation guard, now due. Both caches stay structurally
+        // valid across a repair — a 16-byte block is a 16-byte block — so the
+        // only defence is dropping them before the overlay reads them.
         let (mut crypt, key) = keyed_crypt(256, 0);
         let plain: Vec<u8> = (0..256u16).map(|index| (index % 251) as u8).collect();
         let posted = unrar_rs::test_support::encrypt_aes256_cbc(&key, &[9u8; 16], &plain);
@@ -1811,10 +1814,11 @@ mod tests {
 
     #[test]
     fn a_split_arrival_padding_is_not_retained_until_every_byte_of_it_is_real() {
-        // E1 review F4. `retain_tail_padding` zero-fills the whole padding on
-        // the *first* byte, so a length test reports a half-arrived padding
-        // retained — and `snapshot` then persists the zeros as if the member had
-        // produced them. That is exactly E2's byte-exact final-block input.
+        // The padding finding. `retain_tail_padding` zero-fills the whole
+        // padding on the *first* byte, so a length test reports a half-arrived
+        // padding retained — and `snapshot` then persists the zeros as if the
+        // member had produced them. That is exactly the byte-exact final-block
+        // input the overlay needs.
         let mut crypt = MemberCrypt::new(rar5_keys([1u8; 32], [2u8; 32]), &keying(None));
         crypt.cipher_size = Some(48);
         crypt.tail_padding = 5;
@@ -1849,8 +1853,9 @@ mod tests {
 
     #[test]
     fn a_restored_row_with_a_short_padding_is_refused_rather_than_half_trusted() {
-        // The restore side of F4: the writer emits the padding whole or not at
-        // all, so a short-but-non-empty row cannot be told from a torn one.
+        // The restore side of the padding finding: the writer emits the padding
+        // whole or not at all, so a short-but-non-empty row cannot be told from
+        // a torn one.
         let mut crypt = MemberCrypt::new(rar5_keys([1u8; 32], [2u8; 32]), &keying(None));
         crypt.cipher_size = Some(48);
         crypt.tail_padding = 5;
@@ -1918,7 +1923,7 @@ mod tests {
             Err(CryptRestoreError::Malformed)
         );
 
-        // Plan 136 E3: a RAR4 row over a RAR5 member is the "different archive"
+        // A RAR4 row over a RAR5 member is the "different archive"
         // case the comparison exists for, and the discriminant is what catches
         // it. Under v4's flat shape there was no field that could disagree —
         // which is why RAR4 is a schema bump rather than an optional field.
@@ -1932,13 +1937,13 @@ mod tests {
 
     #[test]
     fn a_member_crypts_debug_withholds_its_key_material_and_its_plaintext() {
-        // Plan 136 E3 review. Nothing formats a `MemberCrypt` today, so this
-        // pins a latent path rather than a live leak — but the state it holds
-        // is the reason the pattern exists: a **RAR4** member's IV is a KDF
-        // output, and `MemberCryptKeying` refuses to persist one precisely
-        // because a format with no password-check value must not gain a
-        // password verifier from weaver. A derived `Debug` would hand those
-        // same 16 bytes back, alongside the member's decrypted tail padding.
+        // Nothing formats a `MemberCrypt` today, so this pins a latent path
+        // rather than a live leak — but the state it holds is the reason the
+        // pattern exists: a **RAR4** member's IV is a KDF output, and
+        // `MemberCryptKeying` refuses to persist one precisely because a
+        // format with no password-check value must not gain a password
+        // verifier from weaver. A derived `Debug` would hand those same 16
+        // bytes back, alongside the member's decrypted tail padding.
         let mut ring = KeyRing::new();
         ring.set_password(Some("moonlit-harbour"));
         let keying = rar4_keying(Some([0x9Bu8; 8]));
@@ -1999,7 +2004,7 @@ mod tests {
 
     #[test]
     fn a_rar4_member_admits_provisionally_because_there_is_nothing_to_refute() {
-        // Plan 136 E3. RAR4 carries no password-check value at all, so a wrong
+        // RAR4 carries no password-check value at all, so a wrong
         // password reaches the bytes and the member gate is the only detector —
         // exactly the position a RAR5 member with an omitted check is in.
         let mut ring = KeyRing::new();
@@ -2061,7 +2066,7 @@ mod tests {
 
     #[test]
     fn a_rar4_member_decrypts_and_re_encrypts_through_the_same_state_machine() {
-        // E1's write transform and E2's read side over AES-128, asserting that
+        // The write transform and the read side over AES-128, asserting that
         // nothing about either is RAR5-shaped: one `MemberCrypt`, decrypted in
         // out-of-order pieces, whose `cipher_facts` re-encrypt back to the
         // posted bytes from a checkpoint seed.
@@ -2078,8 +2083,8 @@ mod tests {
             padded.push(0xE0 | (index % 16) as u8);
         }
         // The public range API rather than a `#[doc(hidden)]` test helper: the
-        // fixture's "posted" bytes should come from the same surface the overlay
-        // re-derives them with (E2 review's test-support finding).
+        // fixture's "posted" bytes should come from the same surface the
+        // overlay re-derives them with.
         let mut posted = padded.clone();
         unrar_rs::encrypt_cipher_range_rar4(&raw_key, &iv, &mut posted)
             .expect("the padded payload is block-aligned");
@@ -2088,8 +2093,8 @@ mod tests {
         crypt.cipher_size = Some(cipher_len as u64);
         crypt.tail_padding = (cipher_len - PAYLOAD) as u8;
 
-        // Decrypt in 256-byte pieces, each seeded by its own predecessor block —
-        // the E-D2 property, over RAR4.
+        // Decrypt in 256-byte pieces, each seeded by its own predecessor block
+        // — the cipher-block hold property, over RAR4.
         let mut covered = ByteRanges::new();
         let mut at = 0usize;
         while at < cipher_len {

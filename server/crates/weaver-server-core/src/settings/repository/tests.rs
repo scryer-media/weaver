@@ -166,7 +166,7 @@ fn config_roundtrip() {
         Some("/media/movies".to_string())
     );
     assert_eq!(loaded.categories[0].aliases, "movie*, film*");
-    // Plan 135, phase 7: direct-store's switches are ordinary settings rows, so
+    // Direct-store's switches are ordinary settings rows, so
     // they survive a save/load like everything else here.
     let direct_store = loaded
         .direct_store

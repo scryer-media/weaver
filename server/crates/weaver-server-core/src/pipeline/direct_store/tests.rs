@@ -1,4 +1,4 @@
-//! Tests for the direct-store coverage checkpoint (plan 135, D6).
+//! Tests for the direct-store coverage checkpoint.
 //!
 //! Fixture names are invented throughout — never real media titles.
 
@@ -529,7 +529,7 @@ fn snapshot_decode_refuses_trailing_bytes_after_the_body() {
 #[test]
 fn snapshot_decode_refuses_a_destination_path_that_escapes_the_working_directory() {
     // Every claimed path is joined onto the working directory at restart, so a
-    // path that escapes it would have restart probing — and phase 4 writing —
+    // path that escapes it would have restart probing — and the writer —
     // outside the job.
     for path in [
         "../../../../etc/hosts",
@@ -1322,8 +1322,8 @@ fn a_retired_destination_is_dropped_from_the_next_snapshot_and_stays_dropped() {
         "and it must not fsync it either — the sync step opens with create(true), and a \
          failure there fails the whole barrier"
     );
-    // Phase 5's rule, not a zero-byte claim: a destination that is gone is
-    // omitted exactly as one that never received a byte is.
+    // The rule, not a zero-byte claim: a destination that is gone is omitted
+    // exactly as one that never received a byte is.
     assert!(
         snapshot
             .destinations
@@ -2130,11 +2130,11 @@ fn crc_runs_compose_neighbours_and_ignore_an_overlapping_re_insert() {
 
 #[test]
 fn crc_runs_compose_any_sub_range_that_lands_on_run_boundaries() {
-    // M3: a merged-only composition could answer for the whole space and
-    // nothing else, so a covered range that stopped short of it — a held tail,
-    // a volume that stopped mid-download — was reconstructed with no reference
-    // value at all. Every prefix and interior span a coverage map can name for
-    // wholly routed articles has to compose.
+    // A merged-only composition could answer for the whole space and nothing
+    // else, so a covered range that stopped short of it — a held tail, a volume
+    // that stopped mid-download — was reconstructed with no reference value at
+    // all. Every prefix and interior span a coverage map can name for wholly
+    // routed articles has to compose.
     let payload: Vec<u8> = (0..600u32).map(|index| (index % 251) as u8).collect();
     let mut runs = CrcRuns::default();
     for (start, len) in [(0usize, 100usize), (100, 300), (400, 200)] {
@@ -2311,10 +2311,11 @@ fn two_sets_of_one_job_never_share_a_derived_path() {
     );
 }
 
-/// Envelope v2 replaces phase 4's `envelope_offsets_split_each_volume_slot…`
-/// test, which asserted a 64 KiB half-slot layout that no longer exists: there
-/// is no slot arithmetic to overflow, because a byte's envelope offset *is* its
-/// physical offset in the volume.
+/// Envelope v2 replaces the first shape's
+/// `envelope_offsets_split_each_volume_slot…` test, which asserted a 64 KiB
+/// half-slot layout that no longer exists: there is no slot arithmetic to
+/// overflow, because a byte's envelope offset *is* its physical offset in the
+/// volume.
 #[test]
 fn each_volume_owns_a_separate_sparse_envelope_file() {
     let plan = envelope_plan();
@@ -2421,12 +2422,13 @@ fn member_partials_keep_their_directory_and_hostile_names_are_refused() {
         Ok("nested/S01E05.mkv.f0.direct.partial".to_string())
     );
 
-    // Wave 1 runs a raw header name through `unrar_rs::sanitize_path` before
-    // the validator, which is what the incremental extractor does — D3's
+    // The router runs a raw header name through `unrar_rs::sanitize_path`
+    // before the validator, which is what the incremental extractor does — the
     // "sanitize-don't-reject" rule. A traversal is therefore *stripped* rather
     // than refused, exactly as the extractor strips it, and only a name that
-    // sanitizes to nothing at all has no destination. The invariant that matters
-    // is unchanged: whatever comes out is confined to the working directory.
+    // sanitizes to nothing at all has no destination. The invariant that
+    // matters is unchanged: whatever comes out is confined to the working
+    // directory.
     for hostile in ["../escape.mkv", "/absolute.mkv", "a/../../escape.mkv"] {
         let resolved = plan
             .member_partial_path(hostile)
@@ -2511,7 +2513,7 @@ fn retiring_a_set_that_never_built_a_barrier_still_deletes_its_row() {
     // demote before its layout names a member again — `FormatMismatch` and
     // `UnparsableVolume` both land there. That is exactly the case where the
     // row exists and the in-memory controller does not, so the delete cannot be
-    // conditional on the controller (M1).
+    // conditional on the controller.
     let mut set = super::set::DirectSet::new(JOB, envelope_plan());
     let recorder = Recorder::default();
     let mut persist = recorder.clone();
@@ -2531,7 +2533,7 @@ fn retiring_a_set_that_never_built_a_barrier_still_deletes_its_row() {
 fn a_finalized_set_refuses_to_be_demoted() {
     // The two terminal states are mutually exclusive, and finalization is the
     // one that already renamed members onto their destinations. Demoting after
-    // it would delete completed output (B5).
+    // it would delete completed output.
     let mut set = super::set::DirectSet::new(JOB, envelope_plan());
     set.mark_finalized();
     set.demote(super::router::DemotionReason::HoldsBudgetExceeded);
@@ -2541,7 +2543,7 @@ fn a_finalized_set_refuses_to_be_demoted() {
 }
 
 // ---------------------------------------------------------------------------
-// The hybrid virtual-volume provider (plan 135, phase 5 wave 1)
+// The hybrid virtual-volume provider
 // ---------------------------------------------------------------------------
 
 /// A hand-built virtual volume over one envelope and two member partials.
@@ -2676,7 +2678,7 @@ fn provider_fixture_with_extents(covered: ByteRanges, with_extents: bool) -> Pro
             envelope_covered,
             len: total as u64,
             // No encrypted member: the re-encrypting overlay is off, which is
-            // the shape every plan 135 assertion below was written against.
+            // the shape every assertion below was written against.
             ciphers: std::sync::Arc::default(),
         },
         _dir: dir,
@@ -2766,7 +2768,7 @@ fn a_virtual_volume_seeks_the_way_a_file_does() {
 fn a_virtual_volume_reports_a_hole_rather_than_inventing_zeros() {
     use std::io::{Read, Seek, SeekFrom};
 
-    // The failure this is named for, constructed exactly (B1): every byte of the
+    // The failure this is named for, constructed exactly: every byte of the
     // volume is covered, the member partials hold their bytes, and the extent
     // list that says which file owns them is **empty** — the shape the provider
     // was handed once a routed member's eligibility flipped at chain close and
@@ -2921,7 +2923,7 @@ fn the_volume_provider_trait_refuses_a_volume_the_set_does_not_have() {
 }
 
 // ---------------------------------------------------------------------------
-// The re-encrypting overlay (plan 136, E-D4)
+// The re-encrypting overlay
 // ---------------------------------------------------------------------------
 
 const CIPHER_SALT: [u8; 16] = [0x2B; 16];
@@ -3040,10 +3042,10 @@ fn cipher_volume(
 fn the_overlay_reads_an_encrypted_member_back_as_it_was_posted() {
     use std::io::Read;
 
-    // The whole point of E-D4 in one assertion: what is on disk is plaintext,
-    // and what comes out of the provider is the cipher that was posted —
-    // including the final block, whose plaintext runs past the member's end into
-    // the retained tail padding.
+    // The whole point of the crypt-state restore in one assertion: what is on
+    // disk is plaintext, and what comes out of the provider is the cipher that
+    // was posted — including the final block, whose plaintext runs past the
+    // member's end into the retained tail padding.
     let dir = tempfile::tempdir().unwrap();
     let (posted, plain, crypt, covered) = encrypted_member_facts(3000, 256);
     assert_ne!(posted[..plain.len()], plain[..], "the fixture must encrypt");
@@ -3073,7 +3075,7 @@ fn the_overlay_reads_an_encrypted_member_back_as_it_was_posted() {
 
 #[test]
 fn a_ranged_read_across_every_checkpoint_boundary_reproduces_the_posted_bytes() {
-    // The checkpoint risk plan 136 names: a stale or wrong 16-byte seed corrupts
+    // The checkpoint risk in one line: a stale or wrong 16-byte seed corrupts
     // exactly the first block of a read and leaves the rest correct, which no
     // checksum downstream could attribute. So every window that starts and ends
     // on either side of a boundary is read on its own, through a *fresh* reader
@@ -3145,10 +3147,10 @@ fn a_ranged_read_across_every_checkpoint_boundary_reproduces_the_posted_bytes() 
         "and the no-reachable-checkpoint case must really have taken the \
          sequential fallback"
     );
-    // The bound the stride exists for, and the answer to plan 136's open
-    // question 1: a read below the first checkpoint chains from the member's
-    // start, and every other one chains at most one stride — never the whole
-    // member, which is what a frontier-only checkpoint map would have cost.
+    // The bound the stride exists for: a read below the first checkpoint chains
+    // from the member's start, and every other one chains at most one stride —
+    // never the whole member, which is what a frontier-only checkpoint map would
+    // have cost.
     assert!(
         counters.chained_bytes() <= reads * super::router::crypt::CHECKPOINT_STRIDE,
         "checkpoint misses must stay bounded by the stride: {} chained over {reads} reads",
@@ -3160,7 +3162,7 @@ fn a_ranged_read_across_every_checkpoint_boundary_reproduces_the_posted_bytes() 
 fn a_member_whose_tail_padding_is_not_whole_refuses_its_final_block() {
     use std::io::Read;
 
-    // Plan 136 E-D2/F4, read from the other end. The final cipher block covers
+    // The tail padding, read from the other end. The final cipher block covers
     // bytes past `unpacked_size` that no destination holds, so without them it
     // cannot be re-encrypted — and neither can the destination bytes *inside*
     // it. Fabricating a padding would produce a structurally perfect cipher
@@ -3271,7 +3273,7 @@ fn the_overlay_refuses_a_member_whose_plaintext_has_a_hole_below_the_read() {
 }
 
 // ---------------------------------------------------------------------------
-// D8's reconstruction sweep, and the verification that gates it
+// The reconstruction sweep, and the verification that gates it
 // ---------------------------------------------------------------------------
 
 /// One article per 100 bytes of the fixture volume, which is the granularity the
@@ -3309,7 +3311,7 @@ fn reconstruction_target(
 
 #[test]
 fn a_partially_covered_volume_is_rebuilt_and_verified_run_by_run() {
-    // M3: the composition is over the runs it was fed, so a covered prefix that
+    // The composition is over the runs it was fed, so a covered prefix that
     // stops short of the whole volume still has a reference value. Before that,
     // only a range exactly equal to a merged run had one — which a partial
     // volume never is — and the sweep wrote it with nothing checking it.
@@ -3358,10 +3360,10 @@ fn a_partially_covered_volume_is_rebuilt_and_verified_run_by_run() {
 
 #[test]
 fn a_covered_run_with_no_composed_reference_refuses_to_be_rebuilt() {
-    // B1(c): "verify where available" is the wrong default for a sweep that
-    // reads through sparse files. A run with no reference value is refused, and
-    // the fallback refetches — which is always correct — rather than putting
-    // bytes nothing checked under a published floor.
+    // "Verify where available" is the wrong default for a sweep that reads
+    // through sparse files. A run with no reference value is refused, and the
+    // fallback refetches — which is always correct — rather than putting bytes
+    // nothing checked under a published floor.
     let fixture = provider_fixture(whole_volume_covered());
     let crcs = provider_article_crcs(&fixture.conventional);
     let dir = tempfile::tempdir().unwrap();
@@ -3457,7 +3459,7 @@ fn a_rebuild_truncates_a_stale_file_already_sitting_at_the_volumes_path() {
 }
 
 // ---------------------------------------------------------------------------
-// The PAR2 `FileAccess` adapter over virtual volumes (D5)
+// The PAR2 `FileAccess` adapter over virtual volumes
 // ---------------------------------------------------------------------------
 
 use super::par2_access::{DirectVolumeFileAccess, VirtualPar2Volume};
@@ -3466,10 +3468,10 @@ use par2_rs::FileAccess;
 /// A PAR2 set describing one file with **descriptions only** — no IFSC packet,
 /// so no slice checksums.
 ///
-/// That is the shape D5 names: with no per-slice data the verifier falls back to
-/// a whole-file MD5, which is the read that degrades into thousands of ranged
-/// reads across member partials unless the adapter offers a real sequential
-/// reader.
+/// That is the shape that argument names: with no per-slice data the verifier
+/// falls back to a whole-file MD5, which is the read that degrades into
+/// thousands of ranged reads across member partials unless the adapter offers a
+/// real sequential reader.
 fn descriptor_only_par2_set(filename: &str, bytes: &[u8]) -> par2_rs::Par2FileSet {
     let file_id = par2_rs::FileId::from_bytes([7u8; 16]);
     par2_rs::Par2FileSet {
@@ -3548,13 +3550,12 @@ fn a_no_ifsc_whole_file_md5_streams_through_the_sequential_reader() {
 
 #[test]
 fn an_encrypted_no_ifsc_whole_file_md5_streams_through_the_sequential_reader() {
-    // D5's cost argument, over cipher (plan 136, E2). A set with no IFSC packets
-    // is verified by whole-file MD5, and the MD5 it has to match is the
-    // **posted** volume's — so this is both the strongest byte-for-byte
-    // statement about the overlay and the one place its read *shape* matters:
-    // degrade into ranged reads here and every no-IFSC encrypted set pays a seek
-    // per slice across the member partials, which is the "no worse than today"
-    // claim failing.
+    // The cost argument, over cipher. A set with no IFSC packets is verified by
+    // whole-file MD5, and the MD5 it has to match is the **posted** volume's —
+    // so this is both the strongest byte-for-byte statement about the overlay
+    // and the one place its read *shape* matters: degrade into ranged reads
+    // here and every no-IFSC encrypted set pays a seek per slice across the
+    // member partials, which is the "no worse than today" claim failing.
     let dir = tempfile::tempdir().unwrap();
     let (posted, plain, crypt, covered) = encrypted_member_facts(3000, 256);
     let facts = crypt
@@ -3640,12 +3641,12 @@ fn encrypted_file_access(
 
 #[test]
 fn an_ascending_ranged_sweep_reuses_one_reader_instead_of_re_seeding_every_slice() {
-    // Plan 136, E2 review F2. `read_file_range_into` used to open a reader per
-    // call, so `VirtualVolumeReader::chains` started empty every time and every
-    // PAR2 slice of an encrypted volume re-seeded from the nearest retained
+    // `read_file_range_into` used to open a reader per call, so
+    // `VirtualVolumeReader::chains` started empty every time and every PAR2
+    // slice of an encrypted volume re-seeded from the nearest retained
     // checkpoint — re-encrypting everything between it and the slice, and
-    // throwing all of it away. On E2's own fixture that was 51,487 bytes
-    // delivered against 125,828,800 chained.
+    // throwing all of it away. On the overlay's own fixture that was 51,487
+    // bytes delivered against 125,828,800 chained.
     //
     // Both halves are measured here rather than asserted from a constant: the
     // baseline sweep opens a reader per read exactly as the adapter used to, and
@@ -3730,13 +3731,13 @@ fn an_ascending_ranged_sweep_reuses_one_reader_instead_of_re_seeding_every_slice
 
 #[test]
 fn a_descending_or_gapped_ranged_sequence_reads_the_same_bytes_through_the_cached_reader() {
-    // The other half of E2 review F2. A kept frontier is only ever accepted on
-    // an exact predecessor match or a strictly forward one that beats the
-    // checkpoint, so a read *below* the frontier — or one that skips over a
-    // stretch the reader never produced — falls back to the checkpoint rather
-    // than carrying a predecessor that belongs to some other block. If that ever
-    // stopped holding, the first block of each such read would be wrong and
-    // nothing downstream could attribute it.
+    // The other half of the frontier finding. A kept frontier is only ever
+    // accepted on an exact predecessor match or a strictly forward one that
+    // beats the checkpoint, so a read *below* the frontier — or one that skips
+    // over a stretch the reader never produced — falls back to the checkpoint
+    // rather than carrying a predecessor that belongs to some other block. If
+    // that ever stopped holding, the first block of each such read would be
+    // wrong and nothing downstream could attribute it.
     let dir = tempfile::tempdir().unwrap();
     let (posted, plain, crypt, covered) = encrypted_member_facts(32 * 1024, 4096);
     let facts = crypt
@@ -3877,14 +3878,15 @@ fn an_interior_hole_refuses_the_sequential_reader_rather_than_lying_through_it()
         "the sequential sweep stops at the first hole; it cannot skip it"
     );
 
-    // Which is why the adapter does not offer one. Wave 2 did, and every sweep
-    // that consumed it — the no-IFSC whole-file MD5, PAR2's batched slice pass —
-    // saw a file ending at the first hole and reported every slice after an
-    // interior gap damaged, intact bytes included. Wave 2 only produced a
-    // verdict, so the cost was a demotion that refetched slightly more than it
-    // had to; phase 6 sizes a *repair* from that same count, and a repair sized
-    // from "damaged" rather than "absent" spends recovery blocks rebuilding good
-    // slices — enough of them and a repairable set reads as unrepairable.
+    // Which is why the adapter does not offer one. An earlier shape did, and
+    // every sweep that consumed it — the no-IFSC whole-file MD5, PAR2's batched
+    // slice pass — saw a file ending at the first hole and reported every slice
+    // after an interior gap damaged, intact bytes included. The earlier shape
+    // only produced a verdict, so the cost was a demotion that refetched
+    // slightly more than it had to; repair sizes itself from that same count,
+    // and a repair sized from "damaged" rather than "absent" spends recovery
+    // blocks rebuilding good slices — enough of them and a repairable set reads
+    // as unrepairable.
     assert!(
         access
             .open_sequential_reader(&file_id)
@@ -3920,8 +3922,9 @@ fn a_write_to_a_virtual_volume_is_refused() {
     let par2_set = descriptor_only_par2_set("silver.horizon.part01.rar", &fixture.conventional);
     let (mut access, file_id) = virtual_file_access(&fixture, &par2_set, dir.path());
 
-    // Repair over a virtual volume is phase 6. Wave 2 must fail loudly rather
-    // than write a recovered slice into a file the set does not own.
+    // Repair over a virtual volume is what repair-while-direct adds. It must
+    // fail loudly rather than write a recovered slice into a file the set does
+    // not own.
     let error = access
         .write_file_range(&file_id, 0, b"repaired")
         .expect_err("a virtual volume has nowhere to put a repaired slice");
@@ -3932,9 +3935,9 @@ fn a_write_to_a_virtual_volume_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// Restart primitives (plan 135, D6) — the pieces the end-to-end restart tests
-// exercise only in combination, where a wrong answer in one can be masked by
-// another. B1 and B2 both hid here.
+// Restart primitives — the pieces the end-to-end restart tests exercise only in
+// combination, where a wrong answer in one can be masked by another. Two
+// defects both hid here.
 // ---------------------------------------------------------------------------
 
 fn floor_entry(volume_index: u32, file_index: u32, floor: u64, complete: bool) -> VolumeFloor {
@@ -3993,9 +3996,9 @@ fn coverage_skip_plan_skips_every_segment_of_a_complete_file() {
         "and its progress is the file's whole declared size"
     );
 
-    // Without the bit the very same floor skips only what it covers. This is the
-    // difference B1 turned into a zombie: the bit is worth three segments here
-    // and worth the whole job's correctness when it is wrong.
+    // Without the bit the very same floor skips only what it covers. This is
+    // the difference that turned into a zombie: the bit is worth three segments
+    // here and worth the whole job's correctness when it is wrong.
     let plan = coverage_skip_plan(JOB, &spec, &HashMap::from([(0u32, 30u64)]), &HashSet::new());
     assert_eq!(plan.skip.len(), 2);
 }
@@ -4006,9 +4009,9 @@ async fn restart_refuses_a_row_claiming_a_volume_the_layout_has_no_facts_for() {
     write_destination(temp_dir.path(), "silver-horizon.mkv.f0.direct.partial", 60);
     let blob = encode(&sample_snapshot()).unwrap();
 
-    // M5. The layout rebuild is tolerant of a missing volume — it contributes no
-    // member, so the plan digest is unchanged and every other check passes — and
-    // the set then cannot classify a byte of it.
+    // The layout rebuild is tolerant of a missing volume — it contributes no
+    // member, so the plan digest is unchanged and every other check passes —
+    // and the set then cannot classify a byte of it.
     let expected = ExpectedSet {
         fact_volumes: HashSet::new(),
         ..sample_expected()
@@ -4050,9 +4053,9 @@ fn a_restored_volume_is_confirmed_only_by_a_proof_it_actually_has() {
     // front of us is contiguous to its whole decoded length.
     assert!(restored_volume_is_confirmed(&whole, Some(1_000), false));
 
-    // The claim is checked, not taken. A row whose `complete` bit disagrees with
-    // its own coverage — a pre-B1 writer's latched bit, a torn row — proves
-    // nothing.
+    // The claim is checked, not taken. A row whose `complete` bit disagrees
+    // with its own coverage — an older writer's latched bit, a torn row —
+    // proves nothing.
     assert!(!restored_volume_is_confirmed(&short, Some(1_000), false));
     assert!(!restored_volume_is_confirmed(&gapped, Some(1_000), false));
 
@@ -4208,8 +4211,8 @@ fn the_restart_read_plan_splits_a_members_coverage_at_its_part_boundaries() {
 fn a_rearm_run_the_layout_cannot_place_demotes_instead_of_failing_open() {
     let mut router = rearm_router();
 
-    // M4. A member id the layout does not have. Returning `Ok(())` here — which
-    // it used to — leaves the seeded range in place, so `try_verify_member`
+    // A member id the layout does not have. Returning `Ok(())` here — which it
+    // used to — leaves the seeded range in place, so `try_verify_member`
     // refuses the member forever while the completion gate re-reads it on every
     // check: a set that neither finalizes nor demotes.
     assert_eq!(
@@ -4255,7 +4258,7 @@ fn a_rearm_run_that_matches_clears_its_seeded_range() {
 }
 
 // ---------------------------------------------------------------------------
-// The holds scratch and its region index (D2)
+// The holds scratch and its region index
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4338,7 +4341,7 @@ fn a_scratch_that_never_appended_a_byte_leaves_nothing_behind() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 6: damage accounting over an interior hole (D8's opening note)
+// Damage accounting over an interior hole
 // ---------------------------------------------------------------------------
 
 /// A PAR2 set describing one file with **slice checksums**, which is what makes
@@ -4496,8 +4499,8 @@ fn interior_hole_verdicts_match_a_physically_sparse_volume() {
 #[test]
 fn a_truncated_volume_still_takes_the_sequential_path() {
     // The refusal is scoped to *interior* holes on purpose. A volume covered
-    // from zero and stopping short reads exactly like a truncated file, which is
-    // what a sequential sweep already reports correctly — so the fast path D5
+    // from zero and stopping short reads exactly like a truncated file, which
+    // is what a sequential sweep already reports correctly — so the fast path
     // requires survives for every shape except the one that lies.
     let dir = tempfile::tempdir().unwrap();
     let mut covered = ByteRanges::new();
@@ -4541,7 +4544,7 @@ fn readable_prefix_reports_the_shape_the_reader_can_answer() {
     assert!(holed.volume.has_interior_hole());
 
     // Covered, but by no source that holds the bytes: the extents that said the
-    // members owned them are gone (B1's ineligible-member case), so those ranges
+    // members owned them are gone (the ineligible-member case), so those ranges
     // are holes however loudly the volume-level map claims coverage.
     let unbacked = provider_fixture_with_extents(whole_volume_covered(), false);
     let member_a_at = PROVIDER_HEADER as u64;
@@ -4570,7 +4573,7 @@ fn readable_prefix_reports_the_shape_the_reader_can_answer() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 6: CRC composition under repair (D3/D4)
+// CRC composition under repair
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4624,7 +4627,7 @@ fn overwrite_leaves_the_uncovered_edges_as_stale_gaps() {
 
 #[test]
 fn insert_still_clips_a_duplicate_after_a_repair_overwrote_the_same_run() {
-    // The distinction phase 6 turns on. A repair moved the bytes, so the
+    // The distinction repair turns on. A repair moved the bytes, so the
     // composition moved with them; a duplicate article carrying the *old* bytes
     // must not move it back, and `insert`'s overlap refusal is what stops it.
     let mut runs = CrcRuns::default();
@@ -4684,7 +4687,7 @@ const STRADDLE_MEMBER: &str = "Silver.Horizon.S01E25.mkv";
 
 #[test]
 fn a_drain_run_straddling_repaired_and_duplicate_bytes_splits_at_the_boundary() {
-    // F4, the load-bearing gap. The drain's `replace` flag is all-or-nothing per
+    // The load-bearing gap. The drain's `replace` flag is all-or-nothing per
     // emitted run, and the two things that fix a run's extent do it for
     // unrelated reasons: `map_physical_range` splits at member boundaries, and
     // `pending` coalesces everything that abuts. So a repair routinely produces
@@ -4773,18 +4776,18 @@ fn a_drain_run_straddling_repaired_and_duplicate_bytes_splits_at_the_boundary() 
 }
 
 // ---------------------------------------------------------------------------
-// Phase 6: D8's ordering, and what a crash in its window costs
+// The ordering rule, and what a crash in its window costs
 // ---------------------------------------------------------------------------
 
 #[test]
 fn deleting_the_row_before_a_repair_keeps_the_coverage_the_provider_reads() {
-    // D8's ordering rule, and the distinction that makes it survivable. The row
+    // The ordering rule, and the distinction that makes it survivable. The row
     // has to go *before* a repair rewrites the bytes it claims — otherwise a
-    // crash mid-repair leaves floors over half-rewritten data. What must **not**
-    // go with it is the controller: a repair leaves every destination in place,
-    // at the same offsets, holding better bytes, so its account of what is on
-    // disk is still exactly right — and it is also what the hybrid provider
-    // reads to answer the re-verify that follows.
+    // crash mid-repair leaves floors over half-rewritten data. What must
+    // **not** go with it is the controller: a repair leaves every destination
+    // in place, at the same offsets, holding better bytes, so its account of
+    // what is on disk is still exactly right — and it is also what the hybrid
+    // provider reads to answer the re-verify that follows.
     let recorder = Recorder::default();
     let mut barrier = sample_barrier();
     barrier.register_volume(0, 0);
@@ -4840,9 +4843,9 @@ fn deleting_the_row_before_a_repair_keeps_the_coverage_the_provider_reads() {
 fn a_crash_between_the_row_delete_and_the_next_barrier_leaves_nothing_to_trust() {
     // The deliberately lossy half, stated as a test. Between the delete and the
     // barrier that recreates coverage there is no row at all, so a restart in
-    // that window finds nothing, claims nothing, and redownloads the set — which
-    // is the bounded cost D8 accepts in exchange for not having to selectively
-    // lower per-volume floors around the repaired ranges.
+    // that window finds nothing, claims nothing, and redownloads the set —
+    // which is the bounded cost reconstruction accepts in exchange for not
+    // having to selectively lower per-volume floors around the repaired ranges.
     let recorder = Recorder::default();
     let mut barrier = sample_barrier();
     barrier.register_volume(0, 0);
@@ -4867,7 +4870,7 @@ fn a_crash_between_the_row_delete_and_the_next_barrier_leaves_nothing_to_trust()
 }
 
 // ---------------------------------------------------------------------------
-// Phase 6: what the repair is sized from (D8)
+// What the repair is sized from
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4927,7 +4930,7 @@ fn a_rewrite_widens_to_whole_articles_so_the_volume_composition_stays_exact() {
 }
 
 // ---------------------------------------------------------------------------
-// Sparse marking (D3, phase 7)
+// Sparse marking
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -5027,7 +5030,7 @@ fn the_platform_marker_reports_success_where_holes_are_free() {
 fn every_reconstruction_failure_has_its_own_metric_label() {
     use super::reconstruct::ReconstructionFailure;
 
-    // `sparse_mark_failed` is phase 7's addition, and a duplicate label would
+    // `sparse_mark_failed` is a later addition, and a duplicate label would
     // silently merge two very different diagnoses in the demotion counters.
     let labels = [
         ReconstructionFailure::NoLayout.metric(),
@@ -5063,7 +5066,7 @@ fn every_reconstruction_failure_has_its_own_metric_label() {
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot schema 4: the crypt row (plan 136, E-D4)
+// Snapshot schema 4: the crypt row
 // ---------------------------------------------------------------------------
 
 /// Deliberately all under `0x80`: MessagePack encodes those as one-byte
@@ -5161,12 +5164,12 @@ fn encrypted_crypt_router_partial(
 
 #[test]
 fn the_member_cipher_snapshot_is_shared_until_a_member_moves() {
-    // Plan 136, E2 review F4. `member_ciphers` deep-cloned every member's
-    // checkpoint map and coverage on every call, and its callers call it per
-    // provider — which live PAR2 assembles per read-back, one per straddling
-    // block. E1 kept one checkpoint per member, so the copy was small; E2 keeps
-    // one per `CHECKPOINT_STRIDE`, which for a 50 GiB member is some 12,800
-    // `BTreeMap` nodes copied to answer a question whose answer had not changed.
+    // `member_ciphers` deep-cloned every member's checkpoint map and coverage
+    // on every call, and its callers call it per provider — which live PAR2
+    // assembles per read-back, one per straddling block. The first shape kept
+    // one checkpoint per member, so the copy was small; It now keeps one per
+    // `CHECKPOINT_STRIDE`, which for a 50 GiB member is some 12,800 `BTreeMap`
+    // nodes copied to answer a question whose answer had not changed.
     //
     // Two things are asserted, and the second is the one that matters: reads
     // share the snapshot, and a mutation really does drop it — a cache that
@@ -5310,9 +5313,10 @@ fn a_snapshot_round_trips_its_crypt_rows_and_carries_no_password() {
 
 #[test]
 fn a_partially_retained_padding_is_not_checkpointed_as_the_members_own_bytes() {
-    // E1 review F4, through the producer: the router's snapshot carries the
-    // padding only when every byte of it has arrived. `MemberCrypt`'s own tests
-    // pin the split arrival; this pins that the row the barrier writes agrees.
+    // The padding finding, through the producer: the router's snapshot carries
+    // the padding only when every byte of it has arrived. `MemberCrypt`'s own
+    // tests pin the split arrival; this pins that the row the barrier writes
+    // agrees.
     let plain: Vec<u8> = (0..600u32).map(|index| (index % 251) as u8).collect();
     let router = encrypted_crypt_router(&plain, 64);
     let row = router

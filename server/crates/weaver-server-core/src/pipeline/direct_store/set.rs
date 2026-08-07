@@ -1,5 +1,5 @@
 //! One live direct set: its router, its coverage barrier, and the bookkeeping
-//! that keeps the two agreeing (plan 135, D3/D6).
+//! that keeps the two agreeing.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Instant;
@@ -66,7 +66,7 @@ pub(crate) struct DirectSet {
     /// evaluate the second half against a length. Replaying a completion into a
     /// freshly built barrier (see [`Self::ensure_registered`]) needs it too.
     complete_volumes: BTreeMap<u32, u64>,
-    /// Per-volume yEnc part-CRC32 composition over *source* space (M4).
+    /// Per-volume yEnc part-CRC32 composition over *source* space.
     ///
     /// A physical volume is checked against its `=yend crc32` trailer at
     /// file-complete time; a direct volume has no file to re-read, but the
@@ -93,7 +93,7 @@ pub(crate) struct DirectSet {
     /// and the router's own routed map is not an answer to that question: it
     /// records what routing handed over, including spans whose write later
     /// failed. Claiming those would have the demotion sweep read bytes back out
-    /// of a file that never received them (B1).
+    /// of a file that never received them.
     placed: BTreeMap<u32, ByteRanges>,
     placed_envelope: BTreeMap<u32, ByteRanges>,
     /// Coverage restored from a checkpoint, applied when the barrier is built.
@@ -108,8 +108,7 @@ pub(crate) struct DirectSet {
     /// set already reads as demoted.
     demotion_cleaned_up: bool,
     /// A repair-while-direct has already been carried out for this set, so a
-    /// second damage verdict demotes instead of repairing again (phase 6
-    /// review).
+    /// second damage verdict demotes instead of repairing again.
     ///
     /// The bound is a **once-latch**, the same shape the completion gate's
     /// `normalization_retried` uses, and it is load-bearing rather than
@@ -121,13 +120,13 @@ pub(crate) struct DirectSet {
     /// then the whole-set demotion that is always correct.
     repair_attempted: bool,
     /// Latched reporting bits: never cleared, so a set that started fast and
-    /// later demoted reads as "partly on disk" — that is what happened (D1).
+    /// later demoted reads as "partly on disk" — that is what happened.
     pub(crate) latched_direct: bool,
     pub(crate) latched_materialized: bool,
     pub(crate) status: DirectSetStatus,
     /// The set's virtual volume image, captured at finalization and kept alive
-    /// past it so a **neighbour's** PAR2 repair can still read this set's source
-    /// volumes (phase 6 review, F2 follow-up).
+    /// past it so a **neighbour's** PAR2 repair can still read this set's
+    /// source volumes.
     ///
     /// Captured rather than re-derived, for two reasons that are both fatal
     /// otherwise: finalization calls [`Self::retire`], which resets the coverage
@@ -179,7 +178,7 @@ impl DirectSet {
         }
     }
 
-    /// Rebuilds the set's layout from its cached volume facts (D6).
+    /// Rebuilds the set's layout from its cached volume facts.
     ///
     /// Runs **before** the checkpoint is validated, because validating it needs
     /// the plan digest and the digest binds the member destinations, which only
@@ -248,7 +247,7 @@ impl DirectSet {
             });
         rekeyed.destinations.sort_by_key(|claim| claim.member_index);
 
-        // Plan 136, E-D4. The crypt rows go in **before** any coverage does, so
+        // The crypt rows go in **before** any coverage does, so
         // a row that disagrees with the rebuilt headers demotes a set that has
         // seeded nothing rather than one half-seeded. Refusing here costs a
         // materialization from bytes already on disk; trusting a mismatched row
@@ -317,15 +316,15 @@ impl DirectSet {
     ///
     /// For a volume restored from a checkpoint it is **wrong and too large**.
     /// Restore commits the skipped segments into the assembly with the spec's
-    /// `<segment bytes>`, which is the yEnc-*encoded* size, about 3% larger than
-    /// the payload. Presenting a virtual volume at that length hands PAR2 a file
-    /// 3% longer than the one its descriptions cover, and the verifier reports
-    /// damage on a set that is byte-perfect — which is a demotion, a full
-    /// materialization and a redownload, for arithmetic. The coverage map is in
-    /// decoded space throughout, so for those volumes it is the only honest
-    /// answer: exact once the volume is complete, a lower bound while it is not,
-    /// and a mid-download set is neither verified against nor demoted for its
-    /// holes anyway (H3).
+    /// `<segment bytes>`, which is the yEnc-*encoded* size, about 3% larger
+    /// than the payload. Presenting a virtual volume at that length hands PAR2
+    /// a file 3% longer than the one its descriptions cover, and the verifier
+    /// reports damage on a set that is byte-perfect — which is a demotion, a
+    /// full materialization and a redownload, for arithmetic. The coverage map
+    /// is in decoded space throughout, so for those volumes it is the only
+    /// honest answer: exact once the volume is complete, a lower bound while it
+    /// is not, and a mid-download set is neither verified against nor demoted
+    /// for its holes anyway.
     pub(crate) fn virtual_volume_len(&self, volume_index: u32, received_bytes: u64) -> u64 {
         let covered_end = self.volume_coverage(volume_index).end();
         if self.restart_seeded_volumes.contains(&volume_index) {
@@ -388,7 +387,7 @@ impl DirectSet {
     /// direction: a demotion is idempotent, and a **finalized** set has already
     /// renamed its members to their destinations and been marked extracted, so
     /// demoting it would delete completed output and refetch volumes nobody is
-    /// waiting for. Defence in depth — the callers check too (D1).
+    /// waiting for. Defence in depth — the callers check too.
     pub(crate) fn demote(&mut self, reason: DemotionReason) {
         if self.is_demoted() || self.is_finalized() {
             return;
@@ -416,7 +415,7 @@ impl DirectSet {
         true
     }
 
-    /// Feeds one article's yEnc part CRC32 into its volume's composition (M4).
+    /// Feeds one article's yEnc part CRC32 into its volume's composition.
     /// Overlapping runs are ignored by [`CrcRuns`], so a duplicate article
     /// never advances the composition twice.
     pub(crate) fn note_volume_part_crc(
@@ -441,9 +440,9 @@ impl DirectSet {
     /// The composed CRC32 of one exact source run of a volume, when the yEnc
     /// part composition happens to have coalesced into precisely that run.
     ///
-    /// Deliberately exact rather than "the value covering this range": a run the
-    /// composition can only bound is no reference value at all, and D8 asks for
-    /// verification *where available*.
+    /// Deliberately exact rather than "the value covering this range": a run
+    /// the composition can only bound is no reference value at all, and
+    /// reconstruction asks for verification *where available*.
     pub(crate) fn volume_crc_run(&self, volume_index: u32, start: u64, len: u64) -> Option<u32> {
         self.volume_crcs
             .get(&volume_index)
@@ -451,7 +450,7 @@ impl DirectSet {
     }
 
     /// The whole yEnc part composition for one volume, for a caller that has to
-    /// ask about several sub-ranges of it (D8's reconstruction sweep).
+    /// ask about several sub-ranges of it (the reconstruction sweep).
     pub(crate) fn volume_crc_runs(&self, volume_index: u32) -> CrcRuns {
         self.volume_crcs
             .get(&volume_index)
@@ -460,7 +459,7 @@ impl DirectSet {
     }
 
     /// Rewrites one volume's yEnc composition over a span a PAR2 repair
-    /// changed (plan 135, D4).
+    /// changed.
     ///
     /// `insert` would be wrong here for the same reason it is wrong for a
     /// member: the bytes on disk moved, so a composition that kept the old value
@@ -515,14 +514,14 @@ impl DirectSet {
         self.repair_attempted = true;
     }
 
-    /// The RAM ceiling this set's holds are bounded by (D2), which is also what
-    /// a repair's rewrite is sized against before it is planned: every repaired
+    /// The RAM ceiling this set's holds are bounded by, which is also what a
+    /// repair's rewrite is sized against before it is planned: every repaired
     /// byte re-enters the router as a hold.
     pub(crate) fn holds_budget(&self) -> u64 {
         self.router.holds_budget()
     }
 
-    /// Routes one repaired span back through the router with D3's replacement
+    /// Routes one repaired span back through the router with replacement
     /// semantics. A refusal demotes the set, exactly as [`Self::route`] does.
     pub(crate) fn route_repaired(
         &mut self,
@@ -588,7 +587,7 @@ impl DirectSet {
     /// verdict over a set that is still receiving articles reads its not-yet
     /// downloaded ranges as holes, and a hole is indistinguishable from damage
     /// at that layer. Callers that must not confuse "not here yet" with
-    /// "corrupt" ask this first (H3).
+    /// "corrupt" ask this first.
     pub(crate) fn all_volumes_complete(&self) -> bool {
         self.complete_volumes.len() == self.router.plan().volumes.len()
     }
@@ -870,7 +869,7 @@ impl DirectSet {
         if self.barrier.is_some() {
             self.ensure_registered();
         }
-        // Read off the router immediately before the run (plan 136, E-D4), so a
+        // Read off the router immediately before the run, so a
         // checkpoint's crypt rows are never older than the coverage beside them:
         // the retained tail padding and the cipher checkpoints are both produced
         // by the same routing call that produced the bytes being claimed.
@@ -880,9 +879,9 @@ impl DirectSet {
         Some(barrier.barrier(trigger, now, drain, sync, persist))
     }
 
-    /// Deletes the set's checkpoint row and keeps everything else (D8's
-    /// repair-while-direct), so the coverage the hybrid provider reads survives
-    /// a repair that only rewrote bytes in place.
+    /// Deletes the set's checkpoint row and keeps everything else (repair while
+    /// still direct), so the coverage the hybrid provider reads survives a
+    /// repair that only rewrote bytes in place.
     ///
     /// [`Self::retire`] is the demotion form and it is not interchangeable: it
     /// resets the controller, which is right when the destinations are about to
@@ -901,8 +900,8 @@ impl DirectSet {
         }
     }
 
-    /// Deletes the set's checkpoint row **and** retires the controller (D8).
-    /// Used on demotion, where the destinations it describes are about to go.
+    /// Deletes the set's checkpoint row **and** retires the controller. Used on
+    /// demotion, where the destinations it describes are about to go.
     ///
     /// The delete runs even with no barrier built. A set can be resumed from a
     /// checkpoint written before a restart and then demote before its layout
@@ -934,12 +933,12 @@ impl DirectSet {
     ///
     /// The barrier is authoritative: it only learns about writes whose every
     /// destination returned. Before the first member registers there is no
-    /// barrier at all — a set that demotes that early has written envelope bytes
-    /// and nothing else — and the fallback is [`Self::placed`], which is fed by
-    /// the same call and under the same rule. Deliberately **not** the router's
-    /// routed map: that records what routing emitted, including spans whose
-    /// write failed, and claiming one of those would send the demotion sweep to
-    /// read a byte back out of a file that never received it (B1).
+    /// barrier at all — a set that demotes that early has written envelope
+    /// bytes and nothing else — and the fallback is [`Self::placed`], which is
+    /// fed by the same call and under the same rule. Deliberately **not** the
+    /// router's routed map: that records what routing emitted, including spans
+    /// whose write failed, and claiming one of those would send the demotion
+    /// sweep to read a byte back out of a file that never received it.
     pub(crate) fn volume_coverage(&self, volume_index: u32) -> ByteRanges {
         self.barrier
             .as_ref()
@@ -1007,11 +1006,11 @@ impl DirectSet {
                     .map(|(member_id, _, partial)| (member_id, working_dir.join(partial)))
                     .collect(),
             );
-        // Plan 136, E-D4. Shared for the same reason the paths are, and empty
-        // for every set with no encrypted member — which is what leaves the
-        // provider's read path exactly as plan 135 built it. The router hands
-        // back its own snapshot rather than a fresh copy of it, which is what
-        // keeps a per-read provider off the checkpoint map (E2 review F4).
+        // Shared for the same reason the paths are, and empty for every set
+        // with no encrypted member — which is what leaves the provider's read
+        // path exactly as it is for an unencrypted set. The router hands back
+        // its own snapshot rather than a fresh copy of it, which is what keeps
+        // a per-read provider off the checkpoint map.
         let ciphers = self.router.member_ciphers();
         volume_lengths
             .iter()
@@ -1053,7 +1052,7 @@ impl DirectSet {
     }
 
     /// Captures the set's virtual volume image so it survives finalization, and
-    /// reports whether it is worth keeping (phase 6 review, F2 follow-up).
+    /// reports whether it is worth keeping.
     ///
     /// Must be called **before** [`Self::retire`] and **after** the members have
     /// been renamed to their destinations: the first because retiring resets the
@@ -1077,7 +1076,7 @@ impl DirectSet {
         };
         // The committed member file is byte-for-byte the partial — a commit is a
         // rename — so an encrypted set's retained image re-encrypts out of it
-        // exactly as the live one did (plan 136, E2).
+        // exactly as the live one did.
         let ciphers = self.router.member_ciphers();
         let volumes: Vec<VirtualVolume> = volume_lengths
             .iter()
@@ -1116,7 +1115,7 @@ impl DirectSet {
         self.retained = None;
     }
 
-    /// The two checkpoint systems must never both own a member (D6 risk list).
+    /// The two checkpoint systems must never both own a member (the risk list).
     /// A direct set is marked extracted at finalization without ever entering
     /// the incremental extractor, so an extraction checkpoint naming one of its
     /// members means routing and extraction both claimed it.

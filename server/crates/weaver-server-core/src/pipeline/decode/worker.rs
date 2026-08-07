@@ -1499,10 +1499,10 @@ impl Pipeline {
                 state.downloaded_bytes += decoded_size as u64;
             }
 
-            // Plan 135, D3: a direct set's source volume never becomes a file,
-            // so its bytes leave the conventional path here — before the write
-            // reorder buffer, before `write_segments_to_disk`, and therefore
-            // before any legacy progress floor or completed-file row (D7).
+            // A direct set's source volume never becomes a file, so its bytes
+            // leave the conventional path here — before the write reorder
+            // buffer, before `write_segments_to_disk`, and therefore before any
+            // legacy progress floor or completed-file row.
             match self.direct_route_target(file_id) {
                 Some(DirectFileTarget::Route {
                     set_index,
@@ -1517,7 +1517,7 @@ impl Pipeline {
                             file_offset,
                         )
                         .await;
-                    // D1's per-article half of `sets == direct + materialized`:
+                    // The per-article half of `sets == direct + materialized`:
                     // an article either reached a destination or handed its
                     // volume back, and the two counts must add up to the
                     // articles that entered the seam.
@@ -1906,7 +1906,7 @@ impl Pipeline {
                 // Ordering contract: this seam runs only after
                 // `write_segments_to_disk` returned for this segment, so these
                 // bytes are already on disk and a later live-PAR2 settle read
-                // of the same range sees exactly them (plan 135, D5).
+                // of the same range sees exactly them.
                 //
                 // A duplicate is fed here on purpose, unlike the file hash
                 // below. Live PAR2 is positional, not sequential: a whole-block
@@ -2249,7 +2249,7 @@ fn checksum_completed_file(path: &std::path::Path) -> io::Result<CompletedFileCh
     let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.file_hash.reread");
     let mut file = File::open(path)?;
     let mut md5 = par2_rs::checksum::FileHashState::new();
-    let mut crc32 = crc32fast::Hasher::new();
+    let mut crc32 = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
     let mut buffer = [0u8; 256 * 1024];
     loop {
         let bytes_read = file.read(&mut buffer)?;
@@ -2261,7 +2261,7 @@ fn checksum_completed_file(path: &std::path::Path) -> io::Result<CompletedFileCh
     }
     Ok(CompletedFileChecksum {
         md5: Some(md5.finalize()),
-        crc32: crc32.finalize(),
+        crc32: crc32.finalize() as u32,
         all_parts_crc_verified: false,
     })
 }

@@ -195,7 +195,7 @@ impl LivePar2Registry {
         self.jobs.remove(&job_id);
     }
 
-    /// Whether live verification is running for this job (plan 138, M2).
+    /// Whether live verification is running for this job.
     ///
     /// The adopted engine expresses "active" as holding a verification
     /// session: `activate` installs one, and the invalidation paths drop it.
@@ -209,11 +209,10 @@ impl LivePar2Registry {
             .is_some_and(|job| job.session.is_some())
     }
 
-    /// Coverage recorded for a file before it was bound to a PAR2 description
-    /// (plan 138, M2).
+    /// Coverage recorded for a file before it was bound to a PAR2 description.
     ///
     /// 0.8.0 read this from its pre-binding buffers; the adopted engine keeps
-    /// the same thing in `pre_metadata_ranges`. Plan 136's encrypted-overlay
+    /// the same thing in `pre_metadata_ranges`. The encrypted-overlay
     /// test uses it to prove a direct volume's posted cipher really reached
     /// live verification, so the answer must stay per-file and non-empty.
     #[cfg(test)]
@@ -518,7 +517,7 @@ impl LivePar2Registry {
     }
 
     /// Bindings whose every slice carries a strong verdict — *including* slices
-    /// proven bad (plan 138, M3).
+    /// proven bad.
     ///
     /// The difference from [`Self::complete_bindings_if_strong`] is the point:
     /// that one answers "may this stand in for the pass with a clean verdict",

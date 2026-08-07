@@ -1,4 +1,4 @@
-//! The range router — plan 135 phase 4, D2/D3/D4.
+//! The range router.
 //!
 //! One [`DirectSetRouter`] owns one archive set. It learns the set's stored
 //! layout from [`StoredLayoutBuilder`] as each volume's headers become
@@ -28,14 +28,15 @@
 //! - **Provisional**, as soon as offset 0 is contiguously staged: normally the
 //!   volume's first article. It yields the members whose headers precede the
 //!   payload, and routing starts.
-//! - **Confirming**, once the volume's trailing bytes have arrived: the walk now
-//!   reaches the end-of-archive record. If it finds a member the provisional
-//!   parse did not, that member is **adopted** — the layout is rebuilt from every
-//!   volume's newest facts, because [`StoredLayoutBuilder::add_volume`] refuses a
-//!   differing re-add and has no removal API. Phase 4 demoted here instead, which
-//!   was safe (the file was not lost, it was refetched) but cost the whole set.
-//!   A parse whose members are *not* an extension of the previous one is a real
-//!   disagreement and still demotes.
+//! - **Confirming**, once the volume's trailing bytes have arrived: the walk
+//!   now reaches the end-of-archive record. If it finds a member the
+//!   provisional parse did not, that member is **adopted** — the layout is
+//!   rebuilt from every volume's newest facts, because
+//!   [`StoredLayoutBuilder::add_volume`] refuses a differing re-add and has no
+//!   removal API. The first shape demoted here instead, which was safe (the
+//!   file was not lost, it was refetched) but cost the whole set. A parse whose
+//!   members are *not* an extension of the previous one is a real disagreement
+//!   and still demotes.
 //!
 //! A volume stops re-parsing only on **proof** that no further header can
 //! appear: either `more_volumes` (which the library sets from a parsed
@@ -64,10 +65,10 @@ use crypt::{
 pub(crate) mod crypt;
 
 /// Default RAM ceiling for holds across one set. A breach pages to the set's
-/// holds scratch (D2); only a paging failure demotes.
+/// holds scratch; only a paging failure demotes.
 pub(crate) const DEFAULT_HOLDS_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
-/// D2's **explicit** scratch ceiling, counted against the disk acceptance target
+/// The **explicit** scratch ceiling, counted against the disk acceptance target
 /// rather than derived from RAM the way the oracle's auto 4×-RAM rule is.
 ///
 /// **Per archive set, not per job or per process.** Each set owns one scratch
@@ -80,24 +81,24 @@ pub(crate) const DEFAULT_HOLDS_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 /// set does when another set is using the budget. If the aggregate ever needs
 /// bounding, that is the design, not a smaller constant.
 ///
-/// A `const` for now, deliberately: plan 135's open question 1 (config vs env
-/// for direct-store's own switch) is unresolved, and adding a second operator
-/// surface before that is settled would have to be undone. Phase 7 moves both
+/// A `const` for now, deliberately: how direct-store's own switch is exposed
+/// (config vs env) was unsettled when this was written, and adding a second
+/// operator surface before that was decided would have to be undone. Both move
 /// together.
 pub(crate) const HOLDS_SCRATCH_CEILING_BYTES: u64 = 512 * 1024 * 1024;
 
-/// D1's absolute packed ceiling for the bounded small-member tolerance. The
+/// The absolute packed ceiling for the bounded small-member tolerance. The
 /// effective ceiling is `min(this, 1% of the archive's packed bytes)`; the
 /// relative half can only be applied once the archive's packed total is final,
 /// so this one is the guard that holds from the first tolerated byte.
 pub(crate) const TOLERANCE_PACKED_CEILING_BYTES: u64 = 64 * 1024 * 1024;
 
-/// D1's unpacked ceiling. Read from the headers' declared unpacked size, which
+/// The unpacked ceiling. Read from the headers' declared unpacked size, which
 /// is stated up front rather than accumulated, so this one is checkable the
 /// moment a member turns ineligible.
 pub(crate) const TOLERANCE_UNPACKED_CEILING_BYTES: u64 = 256 * 1024 * 1024;
 
-/// The "1% of packed archive bytes" half of D1's packed ceiling, as a divisor.
+/// The "1% of packed archive bytes" half of the packed ceiling, as a divisor.
 const TOLERANCE_ARCHIVE_PERCENT: u64 = 100;
 
 /// How much of a migrated member one envelope span carries. The whole migration
@@ -106,19 +107,29 @@ const TOLERANCE_ARCHIVE_PERCENT: u64 = 100;
 /// threads the way ordinary routing does.
 const MIGRATION_SPAN_BYTES: u64 = 4 * 1024 * 1024;
 
-/// How far into a volume the provisional header parse may stage bytes before
-/// the set is declared unroutable. Real RAR headers are a few hundred bytes;
-/// this only exists so a set whose first article is entirely payload (a
-/// corrupted or non-RAR file that reached us classified as a volume) demotes
-/// instead of holding forever.
+/// How much genuine **prefix** — contiguous coverage from offset zero, the
+/// only bytes the header walk can consume — a volume may accumulate without a
+/// successful provisional parse before the set is declared unroutable. Real
+/// RAR headers are a few hundred bytes; this only exists so a set whose first
+/// article is entirely payload (a corrupted or non-RAR file that reached us
+/// classified as a volume) demotes instead of holding forever.
+///
+/// Measured against the zero-prefix, **never** against total staged bytes. A
+/// 12-connection download delivers a volume's articles in whatever order they
+/// complete, so several mid-file articles routinely land before the one
+/// carrying offset zero — and judging their sum declared real sets unparsable
+/// with their headers still unread: every large volume whose first article
+/// arrived after ~6 siblings demoted `unparsable_volume`, which mislabeled
+/// compressed sets and would demote a store-method set direct routing exists
+/// to carry.
 pub(crate) const MAX_HEADER_PREFIX_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Why a set left direct mode. Every variant is its own metric bucket (D1).
+/// Why a set left direct mode. Every variant is its own metric bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DemotionReason {
-    /// A member the layout classified `Ineligible` for a reason D1's tolerance
-    /// does not cover — including a provisional member that resolved ineligible
-    /// when its chain closed (revision 6).
+    /// A member the layout classified `Ineligible` for a reason the
+    /// small-member tolerance does not cover — including a provisional member
+    /// that resolved ineligible when its chain closed.
     ///
     /// Solid, directory, redirection and malformed-chain members always land
     /// here: the tolerance extracts its members with
@@ -128,7 +139,7 @@ pub(crate) enum DemotionReason {
     /// member instead rides [`Self::ToleranceBudgetExceeded`]'s budget.
     ///
     /// **Encrypted** members land here only when their encryption is not the
-    /// one shape direct-store can route (plan 136). `classify` sends a member
+    /// one shape direct-store can route. `classify` sends a member
     /// whose parts are all `Store` and all state the same key material to
     /// [`MemberEligibility::EncryptedStore`] and the stored-chain path, and
     /// reserves `Ineligible(Encrypted)` for encrypted **and** compressed,
@@ -138,7 +149,7 @@ pub(crate) enum DemotionReason {
     MemberIneligible(MemberIneligibility),
     /// An encrypted `Store` member the set may not route: no password reached
     /// it, the password its header states a check for is wrong, or its key
-    /// material is one this build cannot derive from (E-D1).
+    /// material is one this build cannot derive from.
     ///
     /// Always a demotion, never a job failure: the conventional extractor asks
     /// the job's whole password-candidate list, which is a superset of what
@@ -146,8 +157,7 @@ pub(crate) enum DemotionReason {
     /// else. A *wrong* password demotes to a conventional path that will fail
     /// the same way, which is the parity this reason keeps.
     EncryptedMemberRefused(CryptRefusal),
-    /// A **header-encrypted** (`-hp`) set whose headers this router may not open
-    /// (plan 136, E4).
+    /// A **header-encrypted** (`-hp`) set whose headers this router may not open.
     ///
     /// `-hp` withholds the *layout*, not the *keying facts*: RAR5's type-4
     /// record is plaintext, so a password candidate can be proved against the
@@ -156,15 +166,15 @@ pub(crate) enum DemotionReason {
     /// prove them against, RAR4 (which has no check anywhere in the format), or
     /// key material over the library's KDF ceiling.
     ///
-    /// A demotion, and the pre-E4 floor exactly: the volume materializes
-    /// byte-exactly and the conventional extractor opens it with the job's whole
-    /// candidate list. It is raised at the **first header parse**, which is what
-    /// stops such a volume from also burning
+    /// A demotion, and the older floor exactly: the volume materializes
+    /// byte-exactly and the conventional extractor opens it with the job's
+    /// whole candidate list. It is raised at the **first header parse**, which
+    /// is what stops such a volume from also burning
     /// [`MAX_HEADER_PREFIX_BYTES`] of staging on its way to
     /// [`Self::UnparsableVolume`].
     HeaderEncryptedRefused(HeaderCryptRefusal),
     /// A checkpoint's crypt facts are not the facts the rebuilt layout states,
-    /// or a member this run classified encrypted has no crypt row at all (E-D4).
+    /// or a member this run classified encrypted has no crypt row at all.
     ///
     /// Fail-closed by construction: the alternative is rebuilding a key from a
     /// row describing a different archive, which decrypts to garbage while every
@@ -172,12 +182,12 @@ pub(crate) enum DemotionReason {
     /// and says nothing about what they decrypt to.
     EncryptedFactsDisagree,
     /// An encrypted set that cannot reproduce its own posted bytes is about to
-    /// be read as if it could (plan 136, E2).
+    /// be read as if it could.
     ///
-    /// E1 demoted **every** encrypted set in a PAR2-bearing job under this name,
-    /// because nothing could turn a decrypted destination back into what was
-    /// posted. E2's re-encrypting overlay retires that, and this reason narrows
-    /// to the residual the overlay itself refuses:
+    /// An earlier shape demoted **every** encrypted set in a PAR2-bearing job
+    /// under this name, because nothing could turn a decrypted destination back
+    /// into what was posted. The re-encrypting overlay retires that, and this
+    /// reason narrows to the residual the overlay itself refuses:
     /// [`DirectSetRouter::posted_bytes_unavailable`] — an encrypted member with
     /// routed extents whose declared cipher size never arrived, or whose tail
     /// padding is not whole, so its final block has no byte-exact source.
@@ -189,8 +199,8 @@ pub(crate) enum DemotionReason {
     /// damage that is not there and hand the repairer a volume nobody can write.
     EncryptedPostedBytesUnavailable,
     /// The ineligible members are individually tolerable but collectively over
-    /// D1's budget: `min(64 MiB, 1% of the archive's packed bytes)` packed, or
-    /// 256 MiB unpacked.
+    /// the tolerance budget: `min(64 MiB, 1% of the archive's packed bytes)`
+    /// packed, or 256 MiB unpacked.
     ///
     /// Distinct from [`Self::MemberIneligible`] on purpose — "this set has one
     /// small compressed extra" and "this set is half compressed" are different
@@ -199,35 +209,36 @@ pub(crate) enum DemotionReason {
     ToleranceBudgetExceeded,
     /// PAR2 verification found damage on one of the set's virtual volumes.
     ///
-    /// Wave 2 produces verification **verdicts** only: repairing a virtual
+    /// Verification alone produces **verdicts** only: repairing a virtual
     /// volume means writing a repaired slice into a file that does not exist,
-    /// which is phase 6. Demoting materializes the volumes from the set's own
-    /// routed bytes and hands them to the conventional repair path, which is
-    /// exactly the shape a job with no direct set would have taken.
+    /// which is what repair-while-direct does. Demoting materializes the
+    /// volumes from the set's own routed bytes and hands them to the
+    /// conventional repair path, which is exactly the shape a job with no
+    /// direct set would have taken.
     Par2Damaged,
     /// One of the set's source volumes could not be bound, unambiguously, to a
     /// PAR2 description in the job's recovery set.
     ///
     /// An unbound volume cannot be served through the virtual-volume overlay —
     /// the overlay is keyed by PAR2 file id — so the authoritative pass would
-    /// read it off a disk it is not on, report it missing, and hand the repairer
-    /// a file to write into that does not exist. Demoting before the pass runs
-    /// is what keeps that pass looking at either a *fully* bound virtual set or
-    /// at real files, never at a half-bound one (B2).
+    /// read it off a disk it is not on, report it missing, and hand the
+    /// repairer a file to write into that does not exist. Demoting before the
+    /// pass runs is what keeps that pass looking at either a *fully* bound
+    /// virtual set or at real files, never at a half-bound one.
     Par2Unbindable,
-    /// A member riding D1's tolerance could not be extracted from the virtual
-    /// volumes at finalization. The stored members are correct; the tolerated
-    /// one is not produced, so the set is rebuilt the ordinary way.
+    /// A member riding the small-member tolerance could not be extracted from
+    /// the virtual volumes at finalization. The stored members are correct; the
+    /// tolerated one is not produced, so the set is rebuilt the ordinary way.
     ToleratedExtractionFailed,
     /// Holds exceeded the RAM budget and paging could not bring it back — every
     /// pageable run is already in scratch and RAM is still over, which means one
     /// staged run is larger than the whole budget.
     HoldsBudgetExceeded,
-    /// The holds scratch file could not be created, written or read (D2).
+    /// The holds scratch file could not be created, written or read.
     HoldsScratchFailed,
-    /// Paging would push the holds scratch past its configured ceiling (D2).
-    /// Counted separately from the RAM budget because they say different things:
-    /// this one is the *disk* claim direct-store makes against its own 1.05×
+    /// Paging would push the holds scratch past its configured ceiling. Counted
+    /// separately from the RAM budget because they say different things: this
+    /// one is the *disk* claim direct-store makes against its own 1.05×
     /// acceptance target.
     HoldsScratchCeiling,
     /// A confirming parse disagreed with the provisional one, or a volume was
@@ -235,7 +246,7 @@ pub(crate) enum DemotionReason {
     ConflictingVolumeFacts,
     /// A volume's headers, as the library reported them, are not the headers a
     /// **physical** walk of the same image finds — so they came, wholly or
-    /// partly, from the archive's Quick Open cache (D2).
+    /// partly, from the archive's Quick Open cache.
     ///
     /// The cache is a listing optimization the RAR spec explicitly says can be
     /// crafted to disagree with the real archive, and direct-store's parse is a
@@ -244,7 +255,7 @@ pub(crate) enum DemotionReason {
     /// because nothing in the format says which one is true.
     QuickOpenMismatch,
     /// A volume restored from a checkpoint finished downloading without ever
-    /// being confirmed, so its trailing region could never be classified (B2).
+    /// being confirmed, so its trailing region could never be classified.
     ///
     /// Its pre-restart bytes live on disk rather than in the staged image, so
     /// the confirming parse has a hole from offset zero and cannot succeed. The
@@ -254,7 +265,7 @@ pub(crate) enum DemotionReason {
     /// disk.
     UnconfirmedRestoredVolume,
     /// A restart-seeded run could not be placed back into the layout it was
-    /// planned against, so its member gate can never be re-armed (M4).
+    /// planned against, so its member gate can never be re-armed.
     ///
     /// Failing open here is the one thing that must not happen: the seeded range
     /// stays, the member stays unverifiable, and the set is neither finalizable
@@ -268,7 +279,7 @@ pub(crate) enum DemotionReason {
     /// changed under a validated checkpoint — a different operational story and a
     /// different metric.
     RestartRereadFailed,
-    /// A PAR2-repaired span could not be routed back into the set (D8/D3).
+    /// A PAR2-repaired span could not be routed back into the set.
     ///
     /// The repair itself succeeded — the materialized volume is correct — but
     /// the router could not place its bytes: the layout maps part of the span
@@ -278,7 +289,7 @@ pub(crate) enum DemotionReason {
     /// reconstruction rebuilds the repaired volume rather than the damaged one.
     RepairRerouteFailed,
     /// A stale composition gap left by a repair could not be re-read from the
-    /// partial that holds it (D4).
+    /// partial that holds it.
     ///
     /// A gap is bytes nothing currently vouches for, so leaving the member
     /// "verified" over one would pass a member on the strength of a value that
@@ -293,7 +304,8 @@ pub(crate) enum DemotionReason {
     MemberChecksumMismatch,
     /// Two volumes of the set disagree about the archive format.
     FormatMismatch,
-    /// The set's signature names a format phase 4 does not route (RAR 1.4).
+    /// The set's signature names a format direct-store does not route (RAR
+    /// 1.4).
     UnsupportedFormat,
     /// A destination path the RAR path validator refuses.
     UnsafeDestination,
@@ -312,7 +324,7 @@ pub(crate) enum DemotionReason {
     /// writes the same bytes to a different file, so this is a demotion rather
     /// than a job failure.
     DestinationWriteFailed,
-    /// One of the set's destinations could not be marked sparse (D3). Raised
+    /// One of the set's destinations could not be marked sparse. Raised
     /// **before** the file holds a hole, so demoting here is what keeps a
     /// Windows filesystem from allocating a whole volume's worth of zeros
     /// behind a member partial whose first routed byte lands near its end.
@@ -323,9 +335,9 @@ pub(crate) enum DemotionReason {
     FinalizationFailed,
 }
 
-/// The ineligibility reasons phase 4 distinguishes in metrics. The library's
-/// [`IneligibilityReason`] carries byte counts that only phase 5's tolerance
-/// budget needs, so this collapses it to the label.
+/// The ineligibility reasons this module distinguishes in metrics. The
+/// library's [`IneligibilityReason`] carries byte counts that only the
+/// tolerance budget needs, so this collapses it to the label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemberIneligibility {
     Compressed,
@@ -355,7 +367,7 @@ impl From<IneligibilityReason> for MemberIneligibility {
 
 impl DemotionReason {
     /// Stable metric label. `sets == direct + materialized + mixed` is worth
-    /// asserting against these (D1).
+    /// asserting against these.
     pub(crate) fn metric(self) -> &'static str {
         match self {
             Self::MemberIneligible(MemberIneligibility::Compressed) => "member_compressed",
@@ -446,15 +458,15 @@ impl RoutedSpan {
 /// (offset, len, crc32) runs over one contiguous logical space, composed on
 /// demand with [`par2_rs::checksum::Crc32CombineOp`].
 ///
-/// The runs are kept exactly as they were fed — **never merged** (M3). Phase 5
-/// wave 1's first shape coalesced adjacent neighbours into one value, which
-/// answered "is this whole space composed" in one comparison and answered
-/// nothing else: a covered range that stopped short of a merged run's end — a
-/// held tail, a volume whose last article never came, a prefix under a
-/// reconstruction floor — had no reference value at all and was written
-/// unverified. Keeping the atoms means any sub-range that starts and ends on an
-/// atom boundary can be composed, which is every range the coverage map can
-/// name for an article that was wholly routed.
+/// The runs are kept exactly as they were fed — **never merged**. The first
+/// shape coalesced adjacent neighbours into one value, which answered "is this
+/// whole space composed" in one comparison and answered nothing else: a covered
+/// range that stopped short of a merged run's end — a held tail, a volume whose
+/// last article never came, a prefix under a reconstruction floor — had no
+/// reference value at all and was written unverified. Keeping the atoms means
+/// any sub-range that starts and ends on an atom boundary can be composed,
+/// which is every range the coverage map can name for an article that was
+/// wholly routed.
 ///
 /// The cost is a `Vec` entry per article rather than per gap. That is bounded
 /// by the articles of one volume (or one member part), which is the same order
@@ -466,7 +478,7 @@ pub(crate) struct CrcRuns {
 
 impl CrcRuns {
     /// Inserts one run. Overlapping an existing run is ignored — a duplicate
-    /// article must not advance the composition twice (D3).
+    /// article must not advance the composition twice.
     pub(crate) fn insert(&mut self, start: u64, len: u64, crc: u32) {
         if len == 0 {
             return;
@@ -492,7 +504,7 @@ impl CrcRuns {
 
     /// Replaces every run overlapping `[start, start + len)` with a single run
     /// for the rewritten span, and returns the sub-ranges of the discarded runs
-    /// that fall **outside** it — the stale gaps (plan 135, D3/D4).
+    /// that fall **outside** it — the stale gaps.
     ///
     /// This is what a PAR2 repair needs and what [`Self::insert`] must never do.
     /// A duplicate article clips: its bytes are the same bytes, and advancing
@@ -540,8 +552,8 @@ impl CrcRuns {
     ///
     /// `None` means "no reference value", which every caller treats as *refuse*
     /// rather than *pass*: a range the composition can only bound is not a
-    /// checksum, and D8's verification is what stands between a rebuilt volume
-    /// and a published floor over bytes nothing checked.
+    /// checksum, and the reconstruction's verification is what stands between a
+    /// rebuilt volume and a published floor over bytes nothing checked.
     pub(crate) fn compose(&self, start: u64, len: u64) -> Option<u32> {
         if len == 0 {
             return None;
@@ -571,14 +583,14 @@ impl CrcRuns {
     }
 }
 
-/// One staged run, in RAM or paged out to the set's holds scratch (D2).
+/// One staged run, in RAM or paged out to the set's holds scratch.
 ///
 /// A scratch region is **write-once and append-only** for the life of the set,
 /// so an offset handed out here is valid until the set closes — which is what
 /// makes reading one back a single positioned read with no locking and no
 /// re-validation. Nothing is ever reclaimed or compacted: the file's high-water
-/// is bounded by the total bytes the set ever held, and phase 7 revisits that if
-/// measurement says the bound is too loose in practice.
+/// is bounded by the total bytes the set ever held, and a later pass revisits
+/// that if measurement says the bound is too loose in practice.
 #[derive(Debug, Clone)]
 enum StagedChunk {
     Memory(std::sync::Arc<[u8]>),
@@ -669,7 +681,7 @@ fn write_at(file: &std::fs::File, offset: u64, bytes: &[u8]) -> std::io::Result<
     }
 }
 
-/// The per-set holds scratch file (plan 135, D2).
+/// The per-set holds scratch file.
 ///
 /// Append-only, write-once, with an in-memory index that lives in the staging
 /// map: a paged chunk *is* its `(offset, len)`. There is no free list and no
@@ -687,10 +699,10 @@ pub(crate) struct HoldsScratch {
     /// Append cursor, and the file's length.
     len: u64,
     ceiling: u64,
-    /// D3's sparse marker. The scratch is append-only so it holds no hole of
-    /// its own, but it is a direct-store-created file in the working directory
-    /// and it inherits the same rule: marked at creation, before a byte is
-    /// written, and a marking failure demotes rather than proceeding.
+    /// The sparse marker. The scratch is append-only so it holds no hole of its
+    /// own, but it is a direct-store-created file in the working directory and
+    /// it inherits the same rule: marked at creation, before a byte is written,
+    /// and a marking failure demotes rather than proceeding.
     sparse: SparseMarking,
 }
 
@@ -725,10 +737,10 @@ impl HoldsScratch {
             return Err(DemotionReason::HoldsScratchCeiling);
         }
         if self.file.is_none() {
-            // Marked sparse before the first `write_at` (D3). A killed run's
-            // scratch is swept at restart, so an existing file here is not
-            // state to preserve — truncating it is what keeps the append cursor
-            // (`len`, reset to zero by `discard`) agreeing with the file.
+            // Marked sparse before the first `write_at`. A killed run's scratch
+            // is swept at restart, so an existing file here is not state to
+            // preserve — truncating it is what keeps the append cursor (`len`,
+            // reset to zero by `discard`) agreeing with the file.
             let file = super::sparse::create_sparse(&self.path, &self.sparse)
                 .map_err(|_| DemotionReason::HoldsScratchFailed)?;
             file.set_len(0)
@@ -795,13 +807,13 @@ impl ImageRun {
 /// Reads inside a staged run return real bytes; reads anywhere else return
 /// `Ok(0)`, which `read_exact` turns into `UnexpectedEof` and the RAR header
 /// walk turns into a clean stop. Seeks always succeed — the walk seeks over
-/// data areas it never reads.
-/// Constructing one is **O(chunks) pointer copies, not O(bytes)** (M2). The
-/// first shape cloned every staged chunk on every article, so a `-rr` volume
-/// paid a whole-image `memcpy` per article until it was confirmed. The parser
-/// is handed a reader by value and the library's entry point requires
-/// `'static`, so a plain borrow is not available; sharing the chunks is the
-/// same zero-copy with an ownership story that outlives the borrow.
+/// data areas it never reads. Constructing one is **O(chunks) pointer copies,
+/// not O(bytes)**. The first shape cloned every staged chunk on every article,
+/// so a `-rr` volume paid a whole-image `memcpy` per article until it was
+/// confirmed. The parser is handed a reader by value and the library's entry
+/// point requires `'static`, so a plain borrow is not available; sharing the
+/// chunks is the same zero-copy with an ownership story that outlives the
+/// borrow.
 ///
 /// [`Self::over_envelope`] keeps that property against a file: it adds runs the
 /// envelope backs, and each one is read only if and when the walk asks for it —
@@ -836,13 +848,13 @@ impl SparseImage {
     }
 
     /// [`Self::from_staged`] plus the bytes the volume's envelope file already
-    /// holds — the image a **restored** volume's confirming parse needs (B2).
+    /// holds — the image a **restored** volume's confirming parse needs.
     ///
     /// `envelope_ranges` are the physical ranges the envelope is known to hold:
     /// the volume's routed coverage minus every member extent the routing
-    /// history claims (B1). Anything outside them stays a hole, so a byte that
-    /// went to a `.direct.partial` — or one a failed write never placed — is
-    /// never served out of the sparse hole standing in for it.
+    /// history claims. Anything outside them stays a hole, so a byte that went
+    /// to a `.direct.partial` — or one a failed write never placed — is never
+    /// served out of the sparse hole standing in for it.
     fn over_envelope(
         chunks: &BTreeMap<u64, StagedChunk>,
         scratch: Option<std::sync::Arc<std::fs::File>>,
@@ -985,7 +997,7 @@ impl Seek for SparseImage {
 /// volume off its scratch file can hand each bounded chunk **straight** into
 /// staging. The first shape read every rewrite span whole into an owned `Vec`
 /// and let `stage_repaired` copy it, so a repair peaked at twice the repaired
-/// bytes with nothing bounding either term (phase 6 review, F3).
+/// bytes with nothing bounding either term.
 pub(crate) type RepairedChunk = (u64, std::sync::Arc<[u8]>);
 
 /// Per-volume staging: the bytes the router still needs, and what it has
@@ -993,8 +1005,8 @@ pub(crate) type RepairedChunk = (u64, std::sync::Arc<[u8]>);
 #[derive(Debug, Default)]
 pub(super) struct VolumeStaging {
     /// Non-overlapping byte runs, keyed by physical offset. Shared rather than
-    /// owned so the header parser's image is a pointer copy (M2), and each one
-    /// either RAM-resident or paged out to the set's holds scratch (D2).
+    /// owned so the header parser's image is a pointer copy, and each one
+    /// either RAM-resident or paged out to the set's holds scratch.
     chunks: BTreeMap<u64, StagedChunk>,
     /// Physical ranges already routed to a destination.
     routed: ByteRanges,
@@ -1019,7 +1031,7 @@ pub(super) struct VolumeStaging {
     /// and a volume that reaches completion still unconfirmed demotes rather
     /// than holding its trailing region for the life of the set.
     restored: bool,
-    /// Physical ranges force-staged by a PAR2 repair (plan 135, D3/D8).
+    /// Physical ranges force-staged by a PAR2 repair.
     ///
     /// The **repair marker**. A repaired span re-enters the router over bytes
     /// the volume already routed, so without a mark the drain cannot tell it
@@ -1108,7 +1120,7 @@ impl VolumeStaging {
     }
 
     /// Stores `[offset, offset + data.len())` **unconditionally**, replacing
-    /// whatever was staged there and re-opening it for routing (D8).
+    /// whatever was staged there and re-opening it for routing.
     ///
     /// [`Self::stage`] deliberately refuses a range that is already routed —
     /// that is the duplicate-article rule. A repaired span is the one case
@@ -1123,7 +1135,7 @@ impl VolumeStaging {
     /// an already-routed range, marked as an ordinary duplicate.
     ///
     /// Two callers, and both need the *absence* of the mark. A repair's cipher
-    /// lead-in (plan 136, E2) restages bytes that did not change, purely so an
+    /// lead-in restages bytes that did not change, purely so an
     /// encrypted member's drain can rebuild the CBC chain into the span above
     /// them: marking them repaired would have them overwrite a composition they
     /// did not change and would put them under `route_repaired`'s "every
@@ -1180,9 +1192,9 @@ impl VolumeStaging {
 
     /// Every byte this volume is still holding in RAM, routed or not.
     ///
-    /// Deliberately the chunk map rather than [`Self::pending`] (M1). Envelope
-    /// bytes are *routed* — they leave `pending` the moment they are emitted —
-    /// but [`DirectSetRouter::trim_volume`] retains them until the volume is
+    /// Deliberately the chunk map rather than [`Self::pending`]. Envelope bytes
+    /// are *routed* — they leave `pending` the moment they are emitted — but
+    /// [`DirectSetRouter::trim_volume`] retains them until the volume is
     /// confirmed, because the header walk has to seek through them to reach the
     /// end-of-archive record. With envelope v2 that retained region is a `-rr`
     /// set's recovery record, which is a percentage of the volume, per volume:
@@ -1194,9 +1206,30 @@ impl VolumeStaging {
             .fold(0u64, |total, chunk| total.saturating_add(chunk.len()))
     }
 
-    /// The RAM half of [`Self::staged_bytes`] — what the holds budget bounds.
-    /// A paged chunk still costs a scratch region, which the ceiling bounds
-    /// separately (D2).
+    /// Contiguous coverage from offset zero across everything the volume
+    /// holds, routed or pending — the bytes the header walk can actually
+    /// consume, and therefore the only measure the unparsable ceiling may
+    /// judge (see [`MAX_HEADER_PREFIX_BYTES`]). The two range sets partition
+    /// the volume's coverage and a prefix can alternate between them (routed
+    /// bytes drain out of `pending`), so this walks their union to a fixed
+    /// point rather than reading either alone.
+    fn parse_prefix_len(&self) -> u64 {
+        let mut prefix = 0u64;
+        loop {
+            let extended = self
+                .pending
+                .contiguous_from(prefix)
+                .max(self.routed.contiguous_from(prefix));
+            if extended == prefix {
+                return prefix;
+            }
+            prefix = extended;
+        }
+    }
+
+    /// The RAM half of [`Self::staged_bytes`] — what the holds budget bounds. A
+    /// paged chunk still costs a scratch region, which the ceiling bounds
+    /// separately.
     fn resident_bytes(&self) -> u64 {
         self.chunks.values().fold(0u64, |total, chunk| {
             total.saturating_add(chunk.resident_len())
@@ -1271,16 +1304,15 @@ impl VolumeStaging {
     /// Splits `[start, end)` at every [`Self::repaired`] boundary inside it, so
     /// each sub-range is **wholly** repaired or wholly not.
     ///
-    /// The drain's `replace` flag is all-or-nothing per emitted run, and the two
-    /// things that decide a run's extent decide it for unrelated reasons:
+    /// The drain's `replace` flag is all-or-nothing per emitted run, and the
+    /// two things that decide a run's extent decide it for unrelated reasons:
     /// `map_physical_range` splits at member and envelope boundaries, and
     /// `pending` coalesces every staged range that abuts another. A repair
     /// therefore routinely produces one member run covering repaired *and*
     /// unrepaired bytes, and that run took `replace = false` — so
     /// `CrcRuns::insert` refused it as overlapping, the wire-damaged value
     /// survived the repair, and the member failed its gate on bytes that are
-    /// correct on disk. Splitting here first is what makes the flag exact
-    /// (phase 6 review, F4).
+    /// correct on disk. Splitting here first is what makes the flag exact.
     ///
     /// A volume with no repair in flight — every volume, nearly always — returns
     /// the range unchanged and costs one `is_empty` check.
@@ -1359,17 +1391,18 @@ struct MemberRouting {
     checked_parts: BTreeMap<u32, u32>,
     /// Logical ranges this run did **not** write: they were claimed by a
     /// checkpoint a previous run committed, and restart seeded them into
-    /// [`Self::covered`] so they are not refetched (D6).
+    /// [`Self::covered`] so they are not refetched.
     ///
     /// `CrcRuns` never survives a restart, so these bytes are covered and
     /// **unverified** — the gates stay disarmed over them until the bytes are
     /// re-read from disk. Non-empty is therefore a hard refusal in
     /// [`DirectSetRouter::try_verify_member`], not merely an absence of runs:
     /// composing around a seeded range would pass a member on the strength of
-    /// what a previous process claimed to have written rather than on what is on
-    /// disk now, which is exactly the assurance D6 refuses to trade away.
+    /// what a previous process claimed to have written rather than on what is
+    /// on disk now, which is exactly the assurance the re-arm refuses to trade
+    /// away.
     restart_seeded: ByteRanges,
-    /// Logical ranges whose composed value a **repair** discarded (D4).
+    /// Logical ranges whose composed value a **repair** discarded.
     ///
     /// A repaired span is slice-shaped and the runs are article-shaped, so
     /// [`CrcRuns::overwrite`] drops the articles it straddles and the bytes on
@@ -1383,7 +1416,7 @@ struct MemberRouting {
     /// The whole-member gate has passed.
     verified: bool,
     /// Present exactly for a [`MemberEligibility::EncryptedStore`] member the
-    /// set admitted (plan 136). Its presence is what makes the drain decrypt at
+    /// set admitted. Its presence is what makes the drain decrypt at
     /// write time, and its absence is what makes an encrypted member's bytes
     /// unroutable — the two can never disagree, because the member is only
     /// adopted at all once admission has returned keys.
@@ -1411,14 +1444,15 @@ pub(crate) struct DirectSetRouter {
     /// *extension* (fine, rebuild) from a genuine *disagreement* (demote).
     volume_facts: BTreeMap<u32, RarVolumeFacts>,
     /// Volumes whose facts this run has accepted and the caller has not yet
-    /// cached (D6's restart input).
+    /// cached (the restart input).
     ///
-    /// A direct set never writes a volume file, so `try_update_archive_topology`
-    /// — the only thing that normally fills `active_rar_volume_facts` — has
-    /// nothing to parse and D7 suppresses it anyway. The router's own parse is
-    /// therefore the **only** producer of these facts, and without caching them
-    /// a restart has no way to rebuild the layout: the header bytes sit below the
-    /// published floors and are never refetched.
+    /// A direct set never writes a volume file, so
+    /// `try_update_archive_topology` — the only thing that normally fills
+    /// `active_rar_volume_facts` — has nothing to parse and it is suppressed
+    /// anyway. The router's own parse is therefore the **only** producer of
+    /// these facts, and without caching them a restart has no way to rebuild
+    /// the layout: the header bytes sit below the published floors and are
+    /// never refetched.
     dirty_facts: std::collections::BTreeSet<u32>,
     staging: BTreeMap<u32, VolumeStaging>,
     /// Routing state by stable member id.
@@ -1427,7 +1461,7 @@ pub(crate) struct DirectSetRouter {
     member_ids: HashMap<String, u32>,
     next_member_id: u32,
     /// Every member extent the router has ever **routed bytes for**, per source
-    /// volume, coalesced and in physical order (B1).
+    /// volume, coalesced and in physical order.
     ///
     /// The layout's current classification cannot answer this. Eligibility is a
     /// running verdict: a `ProvisionallyDirect` member whose chain closes
@@ -1453,21 +1487,20 @@ pub(crate) struct DirectSetRouter {
     /// per volume — where the read is per span.
     member_order_stale: bool,
     holds_budget: u64,
-    /// D2's paging destination. Opened on the first breach and never before, so
+    /// The paging destination. Opened on the first breach and never before, so
     /// a set that stays inside its RAM budget — which is nearly all of them —
     /// touches the filesystem for it exactly zero times.
     scratch: HoldsScratch,
-    /// The set's password and the keys derived from it (plan 136, E-D1). Empty
-    /// and untouched for a set with no encrypted member — which is every set
-    /// plan 135 routed.
+    /// The set's password and the keys derived from it. Empty and untouched
+    /// for a set with no encrypted member — which is every unencrypted set.
     crypt: KeyRing,
-    /// The archive-header key for a `-hp` set (plan 136, E4). Empty and
-    /// untouched for every set whose headers are readable, which is every set
-    /// E1–E3 routed: it is only consulted when a header parse comes back
+    /// The archive-header key for a `-hp` set. Empty and untouched for every
+    /// set whose headers are readable, which is every set with readable
+    /// headers: it is only consulted when a header parse comes back
     /// `EncryptedArchive`.
     header_crypt: HeaderKeyRing,
-    /// Envelope spans produced by a member **migration** (D1's tolerance),
-    /// waiting to be handed to the caller.
+    /// Envelope spans produced by a member **migration** (the small-member
+    /// tolerance), waiting to be handed to the caller.
     ///
     /// A migration is decided inside `check_eligibility`, which runs from the
     /// middle of a parse and has no way to return bytes. The spans are parked
@@ -1495,14 +1528,15 @@ pub(crate) struct DirectSetRouter {
     /// blake3 for every span of a 2 000-volume set is real work to conclude
     /// nothing happened.
     member_facts_revision: u64,
-    /// Cached [`Self::member_ciphers`] (plan 136, E2 review F4).
+    /// Cached [`Self::member_ciphers`].
     ///
-    /// The read is per **PAR2 read-back**: live verification issues one read per
-    /// straddling block, each of which assembles a provider, and E2 made the
-    /// value it copies ~1000× bigger than E1's — one checkpoint per member
-    /// became one per [`crypt::CHECKPOINT_STRIDE`], so a 50 GiB member is some
-    /// 12,800 `BTreeMap` nodes plus a coverage map, deep-cloned per call. The
-    /// facts change per *decrypt*, which for the same read is nothing at all.
+    /// The read is per **PAR2 read-back**: live verification issues one read
+    /// per straddling block, each of which assembles a provider, and The
+    /// overlay made the value it copies ~1000× bigger than the old one — one
+    /// checkpoint per member became one per [`crypt::CHECKPOINT_STRIDE`], so a
+    /// 50 GiB member is some 12,800 `BTreeMap` nodes plus a coverage map,
+    /// deep-cloned per call. The facts change per *decrypt*, which for the same
+    /// read is nothing at all.
     ///
     /// Behind a lock because the read path takes `&self`; dropped by
     /// [`Self::member_mut`], which every mutable path to a member goes through.
@@ -1512,10 +1546,10 @@ pub(crate) struct DirectSetRouter {
     #[cfg(test)]
     member_ciphers_builds: std::sync::atomic::AtomicU64,
     /// How many times the drain has held a cipher block because the other half
-    /// of it had not arrived (E-D2). The production account of this is the
+    /// of it had not arrived. The production account of this is the
     /// `direct_store.encrypted.block_held` probe; this is the same fact in a
     /// form a test can assert on, because byte-identical output cannot tell a
-    /// set that held from one that never had to (E1 review F11).
+    /// set that held from one that never had to.
     #[cfg(test)]
     blocks_held: u64,
     demoted: Option<DemotionReason>,
@@ -1568,20 +1602,20 @@ impl DirectSetRouter {
     }
 
     /// Cipher blocks the drain has held for a missing predecessor or a missing
-    /// other half (E-D2). Test-only; see the field.
+    /// other half. Test-only; see the field.
     #[cfg(test)]
     pub(crate) fn blocks_held(&self) -> u64 {
         self.blocks_held
     }
 
-    /// Whether the set would still take a job password (plan 136, E-D1).
+    /// Whether the set would still take a job password.
     ///
     /// The seam re-reads the live job spec while this is true, because a
     /// password can arrive **after** the job was added: `setJobPassword` and the
     /// NZBGet facade's `*Unpack:Password` both mutate the spec in place. It goes
     /// false once a password is *admitted*, or once the set leaves direct mode.
     ///
-    /// # The window is pre-first-article, and only that (E1 review F5)
+    /// # The window is pre-first-article, and only that
     ///
     /// Admission runs from the first successful header parse, which is the first
     /// article of the set's first volume — seconds into the download. A password
@@ -1604,7 +1638,7 @@ impl DirectSetRouter {
 
     /// Binds the job's password. Never persisted, never logged.
     ///
-    /// A **proved** `-hp` archive key wins over the spec's (plan 136, E4). RAR
+    /// A **proved** `-hp` archive key wins over the spec's. RAR
     /// uses one password for headers and file data alike, so a set whose headers
     /// the archive's own check opened has already established which of the job's
     /// candidates is the set's password — while `spec.password` is only the
@@ -1618,8 +1652,8 @@ impl DirectSetRouter {
         self.crypt.set_password(password);
     }
 
-    /// Offers one of the job's archive-password candidates to the `-hp` gate
-    /// (plan 136, E4). Never persisted, never logged.
+    /// Offers one of the job's archive-password candidates to the `-hp` gate.
+    /// Never persisted, never logged.
     ///
     /// Separate from [`Self::set_password`] because the two rings answer
     /// different questions from different inputs. `set_password` binds the one
@@ -1653,17 +1687,18 @@ impl DirectSetRouter {
     /// Whether this set has admitted an encrypted member, i.e. whether any of
     /// its bytes are being decrypted on the way to their destination.
     ///
-    /// In E1 this was the refusal every consumer of **posted** bytes read, since
-    /// nothing could turn a decrypted destination back into what was posted. E2
-    /// makes it a statement of fact instead: [`Self::member_ciphers`] is how
-    /// those consumers get posted bytes now, and the question they ask before
-    /// trusting one is [`Self::posted_bytes_unavailable`].
+    /// This was once the refusal every consumer of **posted** bytes read, since
+    /// nothing could turn a decrypted destination back into what was posted.
+    /// The overlay makes it a statement of fact instead:
+    /// [`Self::member_ciphers`] is how those consumers get posted bytes now,
+    /// and the question they ask before trusting one is
+    /// [`Self::posted_bytes_unavailable`].
     pub(crate) fn routes_encrypted(&self) -> bool {
         self.crypt.admitted()
     }
 
     /// The read-side crypt facts for every encrypted member the set has routed
-    /// bytes for, keyed by stable member id (E2).
+    /// bytes for, keyed by stable member id.
     ///
     /// This is what makes a virtual volume answer in **cipher** space: the
     /// provider overlay resolves a physical byte to a member extent exactly as
@@ -1671,9 +1706,9 @@ impl DirectSetRouter {
     /// partial. Empty for every unencrypted set, which is the overlay switched
     /// off by construction.
     ///
-    /// Shared rather than rebuilt (E2 review F4): every caller wraps the result
-    /// in an `Arc` and hands it to a provider, and the facts only move when a
-    /// member's crypt state or coverage does — see [`Self::member_ciphers_cache`].
+    /// Shared rather than rebuilt: every caller wraps the result in an `Arc`
+    /// and hands it to a provider, and the facts only move when a member's
+    /// crypt state or coverage does — see [`Self::member_ciphers_cache`].
     pub(crate) fn member_ciphers(&self) -> std::sync::Arc<HashMap<u32, crypt::MemberCipher>> {
         let Ok(mut slot) = self.member_ciphers_cache.lock() else {
             return std::sync::Arc::new(self.build_member_ciphers());
@@ -1713,12 +1748,12 @@ impl DirectSetRouter {
     /// One member, for mutation.
     ///
     /// **Every** `&mut` path to a member goes through here, and that is what
-    /// keeps [`Self::member_ciphers`]' snapshot honest (E2 review F4): the
-    /// snapshot copies each member's checkpoints, retained padding and coverage,
-    /// and nothing about handing out a `&mut MemberRouting` says which of those
-    /// the caller is about to move. Dropping the snapshot on every mutable
-    /// access costs one rebuild per batch of routing and cannot be forgotten the
-    /// way a list of "the mutations that matter" can.
+    /// keeps [`Self::member_ciphers`]' snapshot honest: the snapshot copies
+    /// each member's checkpoints, retained padding and coverage, and nothing
+    /// about handing out a `&mut MemberRouting` says which of those the caller
+    /// is about to move. Dropping the snapshot on every mutable access costs
+    /// one rebuild per batch of routing and cannot be forgotten the way a list
+    /// of "the mutations that matter" can.
     fn member_mut(&mut self, member_id: u32) -> Option<&mut MemberRouting> {
         self.invalidate_member_ciphers();
         self.members.get_mut(&member_id)
@@ -1733,7 +1768,7 @@ impl DirectSetRouter {
     }
 
     /// Posted cipher bytes in **other** volumes that a repair of `volume_index`
-    /// needs staged beside it (plan 136, E2).
+    /// needs staged beside it.
     ///
     /// A member's cipher blocks do not respect volume boundaries: a split
     /// member's part ends wherever the volume filled up, so the block at each
@@ -1745,16 +1780,16 @@ impl DirectSetRouter {
     /// repaired byte finds a destination" rule then demotes the whole set.
     ///
     /// The **low** edge is a block wider than the block that straddles it, and
-    /// that block is why (E2 review F1). Decrypting the extent's first block
-    /// needs its CBC predecessor as well as its own 16 bytes — exactly what the
-    /// same-volume lead-in spends its 32 bytes on — and for a non-first volume
-    /// that predecessor is in the neighbour too.
-    /// Reading only `[block_floor(low), low)` left it out, so damage in the
-    /// first article of any non-first volume of a split encrypted member could
-    /// not be re-routed at all: no checkpoint survives at `block_floor(low)`
-    /// once the two volumes' decrypted runs coalesce, `member_cipher` has
-    /// nothing staged below the extent, the span holds, and the whole set
-    /// demotes under `RepairRerouteFailed` into a full refetch.
+    /// that block is why. Decrypting the extent's first block needs its CBC
+    /// predecessor as well as its own 16 bytes — exactly what the same-volume
+    /// lead-in spends its 32 bytes on — and for a non-first volume that
+    /// predecessor is in the neighbour too. Reading only `[block_floor(low),
+    /// low)` left it out, so damage in the first article of any non-first
+    /// volume of a split encrypted member could not be re-routed at all: no
+    /// checkpoint survives at `block_floor(low)` once the two volumes'
+    /// decrypted runs coalesce, `member_cipher` has nothing staged below the
+    /// extent, the span holds, and the whole set demotes under
+    /// `RepairRerouteFailed` into a full refetch.
     ///
     /// Returns `(volume, physical offset, length)` reads — at most 31 bytes at a
     /// low edge and 15 at a high one — that the caller answers **through the
@@ -1774,9 +1809,9 @@ impl DirectSetRouter {
             let high = extent.logical_offset.saturating_add(extent.len);
             for (from, to) in [
                 // One block below the straddling block: that block's own CBC
-                // predecessor, without which it cannot be decrypted (F1). At
-                // offset 0 this collapses to an empty read, which is right —
-                // block 0's predecessor is the member's IV.
+                // predecessor, without which it cannot be decrypted. At offset
+                // 0 this collapses to an empty read, which is right — block 0's
+                // predecessor is the member's IV.
                 (block_floor(low).saturating_sub(AES_BLOCK), low),
                 (high, block_ceil(high).min(cipher_size)),
             ] {
@@ -1794,9 +1829,9 @@ impl DirectSetRouter {
     /// `(volume, physical offset, length)` per volume it crosses.
     ///
     /// Read off the **routed extent history** rather than the layout's part
-    /// table, for B1's reason: the history is what the destinations actually
-    /// are, and a member that turned ineligible after routing would otherwise
-    /// map its own bytes to the envelope.
+    /// table, for the same reason: the history is what the destinations
+    /// actually are, and a member that turned ineligible after routing would
+    /// otherwise map its own bytes to the envelope.
     fn locate_member_cipher(
         &self,
         member_id: u32,
@@ -1826,7 +1861,7 @@ impl DirectSetRouter {
     }
 
     /// Whether some encrypted member this set has **routed bytes for** cannot
-    /// reproduce them (E2).
+    /// reproduce them.
     ///
     /// The fail-closed question behind every posted-byte consumer, and the
     /// residual the `EncryptedPar2Unsupported` demotion now names. Two shapes
@@ -1849,7 +1884,7 @@ impl DirectSetRouter {
     /// braces — but it is the difference between a narrow refusal and one that
     /// fires on every non-block-aligned member mid-flight.
     ///
-    /// # What it does not ask (E2 review F3)
+    /// # What it does not ask
     ///
     /// It never asks whether every routed byte is *reachable*. A ranged
     /// re-encryption seeds at the nearest checkpoint at or below its offset and
@@ -1900,20 +1935,20 @@ impl DirectSetRouter {
         })
     }
 
-    /// Sets the per-set scratch ceiling (D2). Configured, with the env override
+    /// Sets the per-set scratch ceiling. Configured, with the env override
     /// winning; the tests lower it so a breach is reachable without paging
     /// gigabytes.
     pub(crate) fn set_holds_scratch_ceiling(&mut self, bytes: u64) {
         self.scratch.ceiling = bytes;
     }
 
-    /// Sets the sparse marker every file this set creates goes through (D3).
+    /// Sets the sparse marker every file this set creates goes through.
     pub(crate) fn set_sparse_marking(&mut self, marking: SparseMarking) {
         self.scratch.sparse = marking;
     }
 
-    /// Bytes currently paged out to the set's holds scratch (D2), counted
-    /// separately from RAM so the two ceilings stay legible in metrics.
+    /// Bytes currently paged out to the set's holds scratch, counted separately
+    /// from RAM so the two ceilings stay legible in metrics.
     pub(crate) fn scratch_bytes(&self) -> u64 {
         self.scratch.bytes()
     }
@@ -1925,7 +1960,7 @@ impl DirectSetRouter {
     }
 
     /// Pages RAM-resident staged runs out to scratch until the holds budget is
-    /// satisfied (D2).
+    /// satisfied.
     ///
     /// Largest chunks first, across every volume: the goal is to get back under
     /// the ceiling in as few writes as possible, and a big run is exactly the
@@ -1992,9 +2027,9 @@ impl DirectSetRouter {
         self.holds_budget = bytes;
     }
 
-    /// The RAM ceiling this set's holds are bounded by (D2). Read by the repair
-    /// seam, which must size its rewrite against it *before* reading a byte back
-    /// — every repaired byte re-enters the router as a hold.
+    /// The RAM ceiling this set's holds are bounded by. Read by the repair
+    /// seam, which must size its rewrite against it *before* reading a byte
+    /// back — every repaired byte re-enters the router as a hold.
     pub(crate) fn holds_budget(&self) -> u64 {
         self.holds_budget
     }
@@ -2064,7 +2099,7 @@ impl DirectSetRouter {
 
     /// Total bytes the set is currently holding, RAM and scratch together: the
     /// holds proper, plus the envelope-classified bytes retained for the header
-    /// walk (M1).
+    /// walk.
     ///
     /// The *RAM* half is [`Self::resident_bytes`], which is what the holds
     /// budget bounds and what a breach pages down; the paged half is
@@ -2103,7 +2138,7 @@ impl DirectSetRouter {
     /// first-seen index — volumes arrive out of order, and finalization commits
     /// members to their sanitized destinations in archive order so that two
     /// members sanitizing to the same path collide exactly the way the
-    /// incremental extractor makes them collide (D3).
+    /// incremental extractor makes them collide.
     pub(crate) fn member_partials(&self) -> Vec<(u32, &str, &str)> {
         self.member_order
             .iter()
@@ -2119,7 +2154,7 @@ impl DirectSetRouter {
     }
 
     /// `(raw name, declared unpacked size)` per member, in archive order — what
-    /// the checkpoint's plan digest binds (D6).
+    /// the checkpoint's plan digest binds.
     ///
     /// The size is carried because it is stable in the facts and it is the one
     /// thing that changes when a claimed extent's underlying header changes
@@ -2223,7 +2258,7 @@ impl DirectSetRouter {
             spans.extend(self.drain_volume(volume)?);
         }
 
-        // D2: a breach pages rather than demoting. Demotion is what is left when
+        // A breach pages rather than demoting. Demotion is what is left when
         // paging itself fails — a scratch I/O error, or the ceiling.
         if self.resident_bytes() > self.holds_budget
             && let Err(reason) = self.page_holds_to_scratch()
@@ -2233,7 +2268,7 @@ impl DirectSetRouter {
         Ok(spans)
     }
 
-    /// Re-enters the router with a span a PAR2 repair rebuilt (plan 135, D3/D8).
+    /// Re-enters the router with a span a PAR2 repair rebuilt.
     ///
     /// A repaired span is late-arriving article data with one difference that
     /// changes everything downstream: the bytes it carries are **not** the bytes
@@ -2284,7 +2319,7 @@ impl DirectSetRouter {
                 staged = true;
             }
         }
-        // Plan 136, E2. Posted bytes an encrypted member's drain needs beside the
+        // Posted bytes an encrypted member's drain needs beside the
         // repaired span: the ones just below it, so the block its first byte
         // lands in and that block's CBC predecessor can be assembled, and the
         // ≤46 in a *neighbouring volume* that complete an edge block of a member
@@ -2308,7 +2343,7 @@ impl DirectSetRouter {
 
         self.try_parse_volume(volume_index)?;
         // The repaired volume drains **first**, and only then does every staged
-        // volume drain in the usual ascending order (E2 review F1).
+        // volume drain in the usual ascending order.
         //
         // A low-edge lead-in is staged in the neighbour *below* the repaired
         // volume, which in ascending order drains before it — and that drain
@@ -2374,7 +2409,7 @@ impl DirectSetRouter {
             .or_default()
             .source_complete = true;
         self.try_parse_volume(volume_index)?;
-        // B2. A restored volume the parse above could not confirm will never be
+        // A restored volume the parse above could not confirm will never be
         // confirmed by a parse of the **staged** image: its pre-restart bytes
         // are on disk rather than in `chunks`, so that image has a hole from
         // offset zero and every later attempt fails the same silent way.
@@ -2410,8 +2445,9 @@ impl DirectSetRouter {
         Ok(spans)
     }
 
-    /// The expensive arm of B2: re-parse a restored volume's headers out of its
-    /// **envelope file**, so the confirming walk can actually run.
+    /// The expensive arm of the confirming parse: re-parse a restored volume's
+    /// headers out of its **envelope file**, so the confirming walk can
+    /// actually run.
     ///
     /// [`restored_volume_completes_confirmed`](Self::restored_volume_completes_confirmed)
     /// covers the volume whose last member splits into the next one — the middle
@@ -2427,14 +2463,14 @@ impl DirectSetRouter {
     /// reader the live path parses through, and the ordinary confirming parse
     /// runs over that.
     ///
-    /// # It produces wave 1's proof, it does not bypass it
+    /// # It produces the confirmation proof, it does not bypass it
     ///
-    /// Wave 1's rule is that a volume is `confirmed` only on a parsed end block
-    /// or a byte-complete image. `source_complete` alone cannot be that proof
-    /// here: the envelope-backed image has holes exactly where member data was
-    /// routed away, and a hole the walk needs to *read* stops it silently — at
-    /// which point "every article arrived" would confirm a volume whose walk
-    /// ended in the middle. So two things are checked instead:
+    /// The rule is that a volume is `confirmed` only on a parsed end block or a
+    /// byte-complete image. `source_complete` alone cannot be that proof here:
+    /// the envelope-backed image has holes exactly where member data was routed
+    /// away, and a hole the walk needs to *read* stops it silently — at which
+    /// point "every article arrived" would confirm a volume whose walk ended in
+    /// the middle. So two things are checked instead:
     ///
     /// 1. **Every byte of the volume is accounted for** (condition 1 of the
     ///    structural proof, reused): routed plus staged is one run from zero, so
@@ -2473,7 +2509,7 @@ impl DirectSetRouter {
         };
         let facts = match unrar_rs::RarArchive::parse_volume_facts(image, self.header_password()) {
             Ok(facts) => facts,
-            // A restored `-hp` set (plan 136, E4). The archive key is never
+            // A restored `-hp` set. The archive key is never
             // persisted, so this run has to prove one of the job's candidates
             // again before it can read a header — and this is the *first* place
             // it can, because a restored volume's staged image has a hole from
@@ -2497,7 +2533,7 @@ impl DirectSetRouter {
         }
 
         // `reached_end` is `true` on the strength of the tiling check above:
-        // this walk saw every byte it could have needed, which is wave 1's
+        // this walk saw every byte it could have needed, which is the
         // byte-complete image. A disagreement with the cached facts is still a
         // demotion, and a member the walk found in the tail is still adopted —
         // both through the one seam the live path uses.
@@ -2530,7 +2566,7 @@ impl DirectSetRouter {
     }
 
     /// Whether a **restored** volume that has just finished downloading may be
-    /// confirmed without the parse it can no longer run (B2).
+    /// confirmed without the parse it can no longer run.
     ///
     /// Two conditions, both necessary:
     ///
@@ -2586,13 +2622,14 @@ impl DirectSetRouter {
     /// Parses the volume's headers out of its staged image, provisionally the
     /// first time and confirmingly once the walk reaches the archive end.
     ///
-    /// # Quick Open is dropped, not implemented (plan 135, D2 — phase 7)
+    /// # Quick Open is dropped, not implemented
     ///
-    /// D2 allowed RAR5 Quick Open records to *prime* the layout, under one hard
-    /// condition: no byte routes on QO evidence alone, so the corresponding
-    /// physical header must be parsed and confirmed identical first. It also
-    /// said, in the same breath, that if the confirmation erases the benefit the
-    /// feature should be deleted rather than weakened. It does, and it is:
+    /// An earlier revision allowed RAR5 Quick Open records to *prime* the
+    /// layout, under one hard condition: no byte routes on QO evidence alone,
+    /// so the corresponding physical header must be parsed and confirmed
+    /// identical first. It also said, in the same breath, that if the
+    /// confirmation erases the benefit the feature should be deleted rather
+    /// than weakened. It does, and it is:
     ///
     /// - **The fetch saving QO exists for is already banked.** QO's purpose is
     ///   avoiding a seek-and-read walk across a large archive. This router never
@@ -2635,15 +2672,11 @@ impl DirectSetRouter {
         {
             return Ok(());
         }
-        if !staging.provisional && staging.staged_bytes() > MAX_HEADER_PREFIX_BYTES {
-            return Err(self.fail(DemotionReason::UnparsableVolume));
-        }
-
         let image = SparseImage::from_staged(&staging.chunks, self.scratch.handle());
         let facts = match unrar_rs::RarArchive::parse_volume_facts(image, self.header_password()) {
             Ok(facts) => facts,
             // The one parse failure that is a *fact* rather than a shortage of
-            // bytes (plan 136, E4): the volume's headers are encrypted, so the
+            // bytes: the volume's headers are encrypted, so the
             // layout is withheld until a key exists. Every other failure is a
             // prefix too short to hold a whole header, which is normal early on
             // and which the next article retries; a genuinely unparsable volume
@@ -2664,10 +2697,10 @@ impl DirectSetRouter {
             ) => {
                 return Err(self.refuse_header_encrypted(HeaderCryptRefusal::Unkeyable));
             }
-            Err(_) => return Ok(()),
+            Err(_) => return self.judge_unparsed_prefix(volume_index),
         };
         if facts.members.is_empty() {
-            return Ok(());
+            return self.judge_unparsed_prefix(volume_index);
         }
         // Two proofs, and only two. `more_volumes` can only be true when the
         // library parsed an end-of-archive record, which is the last header a
@@ -2684,8 +2717,42 @@ impl DirectSetRouter {
         self.accept_volume_facts(volume_index, facts, reached_end, VolumeImage::Staged)
     }
 
-    /// Keys a header-encrypted (`-hp`) set, or refuses it by name (plan 136,
-    /// E4).
+    /// A parse attempt over the volume's current image produced no member —
+    /// decide whether that is still patience or already a verdict.
+    ///
+    /// Producing nothing is normal early on: the staged prefix may simply not
+    /// reach the first file header yet, and the next article retries. It stops
+    /// being normal once the walk has been *shown*
+    /// [`MAX_HEADER_PREFIX_BYTES`] of genuine prefix — contiguous coverage
+    /// from offset zero, the only bytes the walk can consume — and still found
+    /// nothing; real RAR headers live in the first few hundred bytes, so such
+    /// a volume never will.
+    ///
+    /// Two properties of that sentence carry the correctness, and both were
+    /// learned from a live failure:
+    ///
+    /// - **Judged on the zero-prefix, never on total staged bytes.** A
+    ///   12-connection download delivers articles in completion order, so
+    ///   several mid-file articles routinely stage before the one carrying
+    ///   offset zero. Their sum says nothing about whether headers parse:
+    ///   judging it demoted store-method sets `unparsable_volume` — 23 of 44
+    ///   demotions in one functional-direct run — with their headers unread.
+    /// - **Judged only after a parse attempt over that prefix, never before
+    ///   one.** The moment the zero article completes a previously tail-only
+    ///   volume, the whole volume is contiguous and the prefix legitimately
+    ///   dwarfs the ceiling; a pre-parse check reads that as unparsable one
+    ///   line before the parse that would have adopted the set.
+    fn judge_unparsed_prefix(&mut self, volume_index: u32) -> Result<(), DemotionReason> {
+        let over_ceiling = self.staging.get(&volume_index).is_some_and(|staging| {
+            !staging.provisional && staging.parse_prefix_len() > MAX_HEADER_PREFIX_BYTES
+        });
+        if over_ceiling {
+            return Err(self.fail(DemotionReason::UnparsableVolume));
+        }
+        Ok(())
+    }
+
+    /// Keys a header-encrypted (`-hp`) set, or refuses it by name.
     ///
     /// Reached from the two places a volume's headers are parsed, on the parse
     /// coming back `EncryptedArchive`. `Ok(true)` means a password is now
@@ -2716,9 +2783,9 @@ impl DirectSetRouter {
     /// Nothing is discarded while unkeyed. The volume's articles stage exactly
     /// as they do for any volume whose prefix has not yet yielded a header —
     /// holds in RAM, paged to the holds scratch under budget pressure (plan
-    /// 135) — and the retry reads the same staged image. The only thing E4
-    /// changes is *when* the set stops waiting: a named refusal at the first
-    /// parse instead of [`DemotionReason::UnparsableVolume`] after
+    /// 135) — and the retry reads the same staged image. The only thing the
+    /// named refusal changes is *when* the set stops waiting: a named refusal
+    /// at the first parse instead of [`DemotionReason::UnparsableVolume`] after
     /// [`MAX_HEADER_PREFIX_BYTES`] of staging per volume.
     fn key_header_encrypted_volume(
         &mut self,
@@ -2775,7 +2842,7 @@ impl DirectSetRouter {
         self.fail(DemotionReason::HeaderEncryptedRefused(refusal))
     }
 
-    /// The archive-header password, once one has been proved (plan 136, E4).
+    /// The archive-header password, once one has been proved.
     ///
     /// `None` for every set whose headers are readable, which is what makes
     /// every parse on those sets a no-password parse exactly as before.
@@ -2790,14 +2857,14 @@ impl DirectSetRouter {
     /// keeps its own in the file ring.
     ///
     /// **`None` for a plaintext set**, and the `admitted()` gate is what makes
-    /// that true rather than merely intended (E4 review F3). `set_password` runs
-    /// for *every* admitted set in a job that carries one — from the NZB meta,
-    /// the filename convention or the operator — and [`KeyRing::password`] holds
-    /// that string whether or not any encrypted member ever admitted against it.
-    /// Reading it unconditionally handed a password to plaintext sets, which
-    /// `unrar-rs` ignores for want of an encryption record, so nothing broke and
-    /// nothing would have: the reason to gate it is that a doc comment claiming
-    /// a property the code does not have is how the next person gets caught.
+    /// that true rather than merely intended. `set_password` runs for *every*
+    /// admitted set in a job that carries one — from the NZB meta, the filename
+    /// convention or the operator — and [`KeyRing::password`] holds that string
+    /// whether or not any encrypted member ever admitted against it. Reading it
+    /// unconditionally handed a password to plaintext sets, which `unrar-rs`
+    /// ignores for want of an encryption record, so nothing broke and nothing
+    /// would have: the reason to gate it is that a doc comment claiming a
+    /// property the code does not have is how the next person gets caught.
     ///
     /// This is the one place a password leaves the router as a string. The
     /// tolerated-member extraction hands it to `unrar-rs` rather than
@@ -2824,7 +2891,7 @@ impl DirectSetRouter {
     ) -> Result<(), DemotionReason> {
         // Before anything is adopted: the library may have answered this parse
         // out of the archive's Quick Open cache, which is not authoritative and
-        // is craftable (D2). Nothing may enter the layout on that evidence.
+        // is craftable. Nothing may enter the layout on that evidence.
         self.refuse_quick_open_derived_facts(volume_index, &facts, source)?;
 
         if self.layout.is_none() {
@@ -2894,12 +2961,12 @@ impl DirectSetRouter {
 
         self.sync_members()?;
         // A member can become verifiable from a *parse* rather than from a
-        // routed byte. A zero-length stored member has no byte to route at all
-        // (B2), and a chain whose closing header arrives after its last byte
-        // was already placed has nothing left to trigger the gate. Either one
-        // would otherwise stay unverified for the life of the job: the set
-        // never finalizes, never demotes, and its D7 suppressions stay armed
-        // over files that will never exist.
+        // routed byte. A zero-length stored member has no byte to route at all,
+        // and a chain whose closing header arrives after its last byte was
+        // already placed has nothing left to trigger the gate. Either one would
+        // otherwise stay unverified for the life of the job: the set never
+        // finalizes, never demotes, and its suppressions stay armed over files
+        // that will never exist.
         let member_ids: Vec<u32> = self.members.keys().copied().collect();
         for member_id in member_ids {
             self.try_verify_member(member_id)?;
@@ -2932,9 +2999,9 @@ impl DirectSetRouter {
         }
     }
 
-    /// The physical ranges of one volume its **envelope file** holds: everything
-    /// the router routed, minus every member extent the routing history claims
-    /// (B1).
+    /// The physical ranges of one volume its **envelope file** holds:
+    /// everything the router routed, minus every member extent the routing
+    /// history claims.
     ///
     /// Derived from the history rather than from the layout's current answer for
     /// the same reason [`Self::volume_member_extents`] is: a member that turned
@@ -2971,7 +3038,7 @@ impl DirectSetRouter {
     }
 
     /// Refuses a parse whose headers may have come from the archive's Quick Open
-    /// cache rather than from the physical header walk (plan 135, D2).
+    /// cache rather than from the physical header walk.
     ///
     /// # Why this is a direct-store decision and not a library default
     ///
@@ -3041,7 +3108,7 @@ impl DirectSetRouter {
         }
         let parsed = unrar_rs::header::parse_all_headers_with_options(
             &mut image,
-            // The archive-header password for a `-hp` set (E4), `None` for every
+            // The archive-header password for a `-hp` set, `None` for every
             // other. Without it this walk cannot read a `-hp` volume's headers
             // at all, so a `-hp -qo` set would refuse every parse as
             // `QuickOpenMismatch` — fail-closed, but for the wrong reason.
@@ -3095,20 +3162,21 @@ impl DirectSetRouter {
 
     /// Adopts every direct-routable member the layout now knows about.
     ///
-    /// Phase 4 demoted a set the moment a second routable member appeared. There
-    /// is nothing in the router that needs one member — the layout already maps
-    /// several members' extents inside one volume, per-member state is a map,
-    /// and every gate is per member. What the restriction bought was the
-    /// finalization and demotion bookkeeping being trivially per-set; wave 1
-    /// pays for those properly instead.
+    /// The first shape demoted a set the moment a second routable member
+    /// appeared. There is nothing in the router that needs one member — the
+    /// layout already maps several members' extents inside one volume,
+    /// per-member state is a map, and every gate is per member. What the
+    /// restriction bought was the finalization and demotion bookkeeping being
+    /// trivially per-set; the router pays for those properly instead.
     fn sync_members(&mut self) -> Result<(), DemotionReason> {
         // Collisions are decided over **every member the layout has started**,
         // not just the routable ones, and not pairwise as members are adopted:
         // the second member of a colliding pair may be the one that arrives
-        // first, and wave 2's small-member tolerance will keep an ineligible
-        // member's bytes inside the set rather than demoting on sight — at which
-        // point an ineligible member colliding with a routed one is a member
-        // silently overwriting another, exactly what the extractor refuses.
+        // first, and the small-member tolerance will keep an ineligible
+        // member's bytes inside the set rather than demoting on sight — at
+        // which point an ineligible member colliding with a routed one is a
+        // member silently overwriting another, exactly what the extractor
+        // refuses.
         let started: Vec<String> = self
             .layout_members()
             .iter()
@@ -3134,14 +3202,14 @@ impl DirectSetRouter {
             }
         }
 
-        // Plan 136 E1 checklist site 1. `routes_direct()` is now true for an
-        // encrypted store member, so this filter admits ciphertext — and would
-        // create a `.direct.partial` for it, size every extent off the
-        // *plaintext* `unpacked_size` while the cipher stream runs to
-        // `align16(unpacked_size)`, and route the bytes unchanged. Admission is
-        // therefore decided **first**, before a single destination exists: no
-        // password, a refuted one, or key material this build cannot use, and
-        // the set demotes here rather than writing anything.
+        // `routes_direct()` is now true for an encrypted store member, so this
+        // filter admits ciphertext — and would create a `.direct.partial` for
+        // it, size every extent off the *plaintext* `unpacked_size` while the
+        // cipher stream runs to `align16(unpacked_size)`, and route the bytes
+        // unchanged. Admission is therefore decided **first**, before a single
+        // destination exists: no password, a refuted one, or key material this
+        // build cannot use, and the set demotes here rather than writing
+        // anything.
         let keys = self.admit_encrypted()?;
 
         let routable: Vec<(String, u64, Option<unrar_rs::EncryptedStore>)> = self
@@ -3166,7 +3234,7 @@ impl DirectSetRouter {
             if let Some(member_id) = self.member_ids.get(&name).copied() {
                 // Recorded and applied after the member borrow ends: the member
                 // accessor borrows the whole router, because dropping the crypt
-                // snapshot is part of what it does (E2 review F4).
+                // snapshot is part of what it does.
                 let mut size_moved = false;
                 if let Some(existing) = self.member_mut(member_id) {
                     // A size that actually moved is a digest fact that moved:
@@ -3227,7 +3295,7 @@ impl DirectSetRouter {
         Ok(())
     }
 
-    /// The encrypted-store admission decision (plan 136, E-D1).
+    /// The encrypted-store admission decision.
     ///
     /// Runs at every parse, before [`Self::sync_members`] creates anything, and
     /// answers one question per encrypted member: is there a password that may
@@ -3237,13 +3305,13 @@ impl DirectSetRouter {
     ///
     /// Four refusals, all of them demotions:
     ///
-    /// - the job's spec declares a PAR2 file (E1 review F1). An encrypted set's
-    ///   destinations hold plaintext where PAR2 describes the posted cipher, and
-    ///   the guard that catches this behind the authoritative pass cannot run
-    ///   until the whole set has downloaded — at which point demoting costs a
-    ///   full refetch, because plaintext partials cannot reconstruct posted
-    ///   bytes. Refusing here is the pre-plan-136 behaviour exactly: one hard
-    ///   demotion on the first header parse, one article back on the wire;
+    /// - the job's spec declares a PAR2 file. An encrypted set's destinations
+    ///   hold plaintext where PAR2 describes the posted cipher, and the guard
+    ///   that catches this behind the authoritative pass cannot run until the
+    ///   whole set has downloaded — at which point demoting costs a full
+    ///   refetch, because plaintext partials cannot reconstruct posted bytes.
+    ///   Refusing here is the pre-plan-136 behaviour exactly: one hard demotion
+    ///   on the first header parse, one article back on the wire;
     /// - no password: an encrypted set routes only with one;
     /// - a check present that this password does not reproduce: nothing is
     ///   written on the strength of a refuted password;
@@ -3255,7 +3323,7 @@ impl DirectSetRouter {
     /// the earliest detector — the same position layer 1 is in for a plaintext
     /// member.
     ///
-    /// # RAR4 (E3)
+    /// # RAR4
     ///
     /// RAR4 file encryption keys here too, off the header's 8-byte file salt
     /// rather than a `FHEXTRA_CRYPT` record —
@@ -3292,9 +3360,9 @@ impl DirectSetRouter {
         Ok(keys)
     }
 
-    /// Revision 6 amendment 1: a provisional member that resolves `Ineligible`
-    /// at chain close demotes the group at that transition — **unless** it fits
-    /// inside D1's bounded small-member tolerance.
+    /// A provisional member that resolves `Ineligible` at chain close demotes
+    /// the group at that transition — **unless** it fits inside the bounded
+    /// small-member tolerance.
     ///
     /// The tolerance is a deliberate weaver extension over the oracle, and it is
     /// bounded three ways, each of which demotes on breach:
@@ -3304,8 +3372,9 @@ impl DirectSetRouter {
     ///    redirection → encrypted → solid → compressed) means a `Compressed`
     ///    verdict already proves the member is an unencrypted, non-solid,
     ///    per-member regular file with a well-formed chain, which is exactly
-    ///    D1's precondition — so the precondition is read off the reason rather
-    ///    than re-derived from flags weaver would have to trust separately.
+    ///    the tolerance's precondition — so the precondition is read off the
+    ///    reason rather than re-derived from flags weaver would have to trust
+    ///    separately.
     /// 2. **By size**, aggregated over every tolerated member:
     ///    `min(64 MiB, 1% of the archive's packed bytes)` packed and 256 MiB
     ///    unpacked.
@@ -3340,15 +3409,14 @@ impl DirectSetRouter {
                     routable += 1;
                     continue;
                 }
-                // Plan 136 E1 checklist site 2. The `let ... else` this replaces
-                // counted **every** non-`Ineligible` member routable, and
-                // `EncryptedStore` is not `Ineligible` — so an all-encrypted set
-                // with no password would have sailed past the `routable == 0`
-                // demotion below with nothing to route and no reason to stop,
-                // silently deleting the hard demotion this path has always
-                // guaranteed. Routable means *decryptable*: a member the key
-                // ring admitted counts, and one it did not is the set's own
-                // reason to leave direct mode.
+                // The `let ... else` this replaces counted **every**
+                // non-`Ineligible` member routable, and `EncryptedStore` is not
+                // `Ineligible` — so an all-encrypted set with no password would
+                // have sailed past the `routable == 0` demotion below with
+                // nothing to route and no reason to stop, silently deleting the
+                // hard demotion this path has always guaranteed. Routable means
+                // *decryptable*: a member the key ring admitted counts, and one
+                // it did not is the set's own reason to leave direct mode.
                 MemberEligibility::EncryptedStore(_) => {
                     if self.crypt.admitted() {
                         routable += 1;
@@ -3370,13 +3438,13 @@ impl DirectSetRouter {
             // is not the volume the archive describes, and finalization would
             // additionally commit the partial as if it were a stored member's.
             //
-            // Wave 2 demoted the whole set on sight for that. It no longer has
-            // to: the bytes are moved back into the envelope at their true
-            // physical offsets, the member is un-adopted, and it is extracted
-            // conventionally at finalization exactly like a member that was
-            // never adopted at all. The migration is deferred until the budget
-            // below has passed, because a member that cannot ride the tolerance
-            // must not have been half-moved to find that out.
+            // An earlier shape demoted the whole set on sight for that. It no
+            // longer has to: the bytes are moved back into the envelope at
+            // their true physical offsets, the member is un-adopted, and it is
+            // extracted conventionally at finalization exactly like a member
+            // that was never adopted at all. The migration is deferred until
+            // the budget below has passed, because a member that cannot ride
+            // the tolerance must not have been half-moved to find that out.
             if let Some(member_id) = self.member_ids.get(&member.name).copied() {
                 migrating.push((member_id, reason));
             }
@@ -3411,13 +3479,13 @@ impl DirectSetRouter {
                 && packed > self.archive_packed_bytes().unwrap_or(u64::MAX)
                     / TOLERANCE_ARCHIVE_PERCENT);
         if over_budget {
-            // An **adopted** member over the budget keeps wave 2's answer, byte
-            // for byte: its own ineligibility is what ends its routing, and the
-            // tolerance ceiling was only ever the permission slip for moving its
-            // bytes. Reporting a budget breach for it instead would rename a
-            // population — "this set has one small compressed extra" is what
-            // `ToleranceBudgetExceeded` means, and a set whose *routed* member
-            // turned out unverifiable is not that.
+            // An **adopted** member over the budget keeps the previous answer,
+            // byte for byte: its own ineligibility is what ends its routing,
+            // and the tolerance ceiling was only ever the permission slip for
+            // moving its bytes. Reporting a budget breach for it instead would
+            // rename a population — "this set has one small compressed extra"
+            // is what `ToleranceBudgetExceeded` means, and a set whose *routed*
+            // member turned out unverifiable is not that.
             if let Some((_, reason)) = migrating.first() {
                 return Err(self.fail(DemotionReason::MemberIneligible((*reason).into())));
             }
@@ -3431,19 +3499,20 @@ impl DirectSetRouter {
 
     /// Moves an already-adopted member's routed bytes out of its
     /// `.direct.partial` and into the envelopes, then un-adopts it, so it can
-    /// ride D1's tolerance instead of demoting the set.
+    /// ride the small-member tolerance instead of demoting the set.
     ///
     /// # What has to move, and what has to stop claiming
     ///
     /// The bytes are read back from the partial at the logical offsets the
     /// **routing history** records for them and re-emitted as envelope spans at
-    /// their physical offsets (B1). The history is the right source and the
-    /// layout is not: by the time this runs the member is `Ineligible`, so
+    /// their physical offsets. The history is the right source and the layout
+    /// is not: by the time this runs the member is `Ineligible`, so
     /// `map_physical_range` already calls its packed range envelope, and the
     /// history is the only record of where the bytes actually went. It is then
     /// dropped for this member — the whole point, since a migrated member's
-    /// extents must stop claiming member space or the hybrid provider would keep
-    /// answering those offsets out of a partial that is about to disappear.
+    /// extents must stop claiming member space or the hybrid provider would
+    /// keep answering those offsets out of a partial that is about to
+    /// disappear.
     ///
     /// The member's routing state goes with it: coverage, per-part `CrcRuns`,
     /// checked parts, restart seeds and stale gaps. None of it survives, and
@@ -3540,8 +3609,8 @@ impl DirectSetRouter {
             }
         }
 
-        // Nothing above this line has changed any state, so every refusal so far
-        // left the set exactly as wave 2 would have.
+        // Nothing above this line has changed any state, so every refusal so
+        // far left the set exactly as an earlier shape would have.
         for (volume_index, extent) in &extents {
             if let Some(held) = self.routed_extents.get_mut(volume_index) {
                 held.retain(|candidate| candidate.member_id != extent.member_id);
@@ -3575,7 +3644,8 @@ impl DirectSetRouter {
         Ok(())
     }
 
-    /// Hands the caller whatever a migration parked (D1's tolerance).
+    /// Hands the caller whatever a migration parked (the small-member
+    /// tolerance).
     fn take_migrated_spans(&mut self) -> Vec<RoutedSpan> {
         std::mem::take(&mut self.migrated)
     }
@@ -3614,13 +3684,14 @@ impl DirectSetRouter {
         Some(total)
     }
 
-    /// Members riding D1's tolerance, by raw header name, in archive order.
+    /// Members riding the small-member tolerance, by raw header name, in
+    /// archive order.
     ///
     /// Finalization extracts exactly these and nothing else: the direct-routed
     /// members are already at their destinations, and re-extracting one would
     /// overwrite verified output with a second decode of the same bytes.
     ///
-    /// # Plan 136 E1 checklist site 3
+    /// # Why `Ineligible(_)` is not the whole predicate
     ///
     /// `Ineligible(_)` stopped spanning "every member finalization must extract"
     /// the moment `EncryptedStore` existed: it is not `Ineligible`, so the old
@@ -3743,9 +3814,9 @@ impl DirectSetRouter {
                             continue;
                         };
                         let staging = self.staging.get(&volume_index);
-                        // The repair marker (D3): read before the slice, from
-                        // the same staging entry, so the decision is made on
-                        // the range that is about to drain rather than on a
+                        // The repair marker: read before the slice, from the
+                        // same staging entry, so the decision is made on the
+                        // range that is about to drain rather than on a
                         // router-wide mode a concurrent duplicate could ride.
                         let replace =
                             staging.is_some_and(|staging| staging.is_repaired(cursor, len));
@@ -3762,7 +3833,7 @@ impl DirectSetRouter {
                             // Recorded here, at the moment a member destination
                             // is chosen, and never revisited: this is the only
                             // account of where the bytes went that survives the
-                            // member turning ineligible (B1).
+                            // member turning ineligible.
                             self.record_routed_extent(
                                 volume_index,
                                 MemberExtent {
@@ -3783,14 +3854,14 @@ impl DirectSetRouter {
                         }
                         cursor = cursor.saturating_add(len);
                     }
-                    // Plan 136, E-D2. Cipher bytes: a routing decision of their
+                    // Cipher bytes: a routing decision of their
                     // own, never a copy of the `Member` arm above — writing them
                     // where that arm writes would put ciphertext in the
                     // destination, which is the whole reason the layout gives
                     // them their own variant. What they share is the
                     // *coordinates*: cipher offset and member-logical offset are
                     // the same number for a stored member, so every range answer
-                    // plan 135 computes is unchanged and only the bytes differ.
+                    // the router computes is unchanged and only the bytes differ.
                     MappedSlice::EncryptedMember {
                         member_index,
                         logical_offset,
@@ -3897,13 +3968,13 @@ impl DirectSetRouter {
         }
     }
 
-    /// Feeds one routed member run into the integrity gates (D4 layers 1 and 2).
+    /// Feeds one routed member run into the integrity gates.
     ///
-    /// `replace` is D3's repair marker. Without it a run whose bytes the
+    /// `replace` is the repair marker. Without it a run whose bytes the
     /// coverage map already claims is a duplicate and contributes nothing; with
     /// it the run is a PAR2 repair of those very bytes, so the composition is
-    /// **overwritten** and whatever the rewrite half-covered becomes a stale gap
-    /// the caller must re-read.
+    /// **overwritten** and whatever the rewrite half-covered becomes a stale
+    /// gap the caller must re-read.
     fn note_member_bytes(
         &mut self,
         member_id: u32,
@@ -3966,8 +4037,8 @@ impl DirectSetRouter {
         //
         // Guarded by the coverage map rather than attempted every time: the
         // composition now walks the runs it was fed instead of reading one
-        // merged value (M3), so asking before the part is whole would be a scan
-        // per span for an answer that cannot exist yet.
+        // merged value, so asking before the part is whole would be a scan per
+        // span for an answer that cannot exist yet.
         let part_complete = member
             .covered
             .missing(part_logical_offset, part_len)
@@ -3992,7 +4063,7 @@ impl DirectSetRouter {
         self.try_verify_member(member_id)
     }
 
-    // ---- Encrypted members: decrypt at write (plan 136, E-D2) --------------
+    // ---- Encrypted members: decrypt at write -------------------------------
 
     /// Routes one encrypted member slice, decrypting on the way in.
     ///
@@ -4073,13 +4144,13 @@ impl DirectSetRouter {
         let slice_end = logical_offset.saturating_add(len);
         debug_assert!(slice_end <= cipher_size);
 
-        // E1 review F6, discharged before a byte of this span is resolved. A
-        // `replace` span is a PAR2 repair of these very cipher bytes, and both
-        // write-side caches still describe the damaged ones: `encrypted_block_plain`
-        // below would hand back the *damaged* plaintext for an edge block, and a
-        // checkpoint over the rewrite would seed E2's overlay from cipher the
-        // volume no longer holds. Neither goes structurally invalid, so nothing
-        // downstream could notice.
+        // The cache-invalidation guard, discharged before a byte of this span
+        // is resolved. A `replace` span is a PAR2 repair of these very cipher
+        // bytes, and both write-side caches still describe the damaged ones:
+        // `encrypted_block_plain` below would hand back the *damaged* plaintext
+        // for an edge block, and a checkpoint over the rewrite would seed the
+        // overlay from cipher the volume no longer holds. Neither goes
+        // structurally invalid, so nothing downstream could notice.
         if replace
             && let Some(crypt) = self
                 .member_mut(member_id)
@@ -4146,10 +4217,10 @@ impl DirectSetRouter {
             {
                 self.blocks_held = self.blocks_held.saturating_add(1);
             }
-            // The one new hold shape E-D2 introduces: a cipher block whose other
-            // half has not arrived. Bounded by one article per member per gap,
-            // so a large count here says the set is arriving badly out of order,
-            // not that the transform is leaking.
+            // The one new hold shape encryption introduces: a cipher block
+            // whose other half has not arrived. Bounded by one article per
+            // member per gap, so a large count here says the set is arriving
+            // badly out of order, not that the transform is leaking.
             crate::runtime::perf_probe::record(
                 "direct_store.encrypted.block_held",
                 std::time::Duration::from_nanos(1),
@@ -4189,13 +4260,13 @@ impl DirectSetRouter {
                     bytes: plain[..destination_len as usize].to_vec(),
                 });
             }
-            // The tail padding's **source** bytes (E-D2). Their plaintext is
-            // never a destination byte, but they are real posted bytes with a
-            // real physical offset, and leaving them unrouted would stall the
+            // The tail padding's **source** bytes. Their plaintext is never a
+            // destination byte, but they are real posted bytes with a real
+            // physical offset, and leaving them unrouted would stall the
             // volume's coverage floor forever — 0–15 bytes short, at the end of
             // the last part, for the life of the job. They go to the envelope,
-            // which is a sparse image of the volume at true physical offsets, so
-            // what lands there is exactly what was posted: the one place the
+            // which is a sparse image of the volume at true physical offsets,
+            // so what lands there is exactly what was posted: the one place the
             // last cipher block still exists once the plaintext is on disk.
             if piece_len > destination_len {
                 spans.push(RoutedSpan {
@@ -4305,7 +4376,7 @@ impl DirectSetRouter {
             .and_then(|staging| staging.slice(offset, len, &self.scratch))
     }
 
-    /// Feeds one decrypted run into the integrity gates (plan 136, E-D3).
+    /// Feeds one decrypted run into the integrity gates.
     ///
     /// Two layers, two byte spaces, and that split is the whole point:
     ///
@@ -4479,15 +4550,15 @@ impl DirectSetRouter {
         {
             return Ok(());
         }
-        // D6's re-arm rule, stated as a refusal. A member carrying restart-seeded
-        // coverage has bytes on disk that no `CrcRuns` in this process ever saw,
-        // so there is no composed value for them — and there must not be one
-        // until they are re-read. The composition below would already stall on
-        // the missing `checked_parts` entry in every shape this can take; saying
-        // it here means a future part-granularity change cannot quietly turn
-        // "unverifiable" into "verified".
+        // The re-arm rule, stated as a refusal. A member carrying
+        // restart-seeded coverage has bytes on disk that no `CrcRuns` in this
+        // process ever saw, so there is no composed value for them — and there
+        // must not be one until they are re-read. The composition below would
+        // already stall on the missing `checked_parts` entry in every shape
+        // this can take; saying it here means a future part-granularity change
+        // cannot quietly turn "unverifiable" into "verified".
         //
-        // D4 says the same thing about a repair's stale gaps, and for the same
+        // The same is true about a repair's stale gaps, and for the same
         // reason: they are covered bytes whose composed value a rewrite threw
         // away, so composing around them would pass the member on the strength
         // of runs that describe a *different* span than the one on disk.
@@ -4497,11 +4568,11 @@ impl DirectSetRouter {
             return Ok(());
         }
         if unpacked_size == 0 {
-            // A zero-length stored member (B2). Nothing will ever be routed for
-            // it, so the byte-driven gate below can never fire: the first shape
+            // A zero-length stored member. Nothing will ever be routed for it,
+            // so the byte-driven gate below can never fire: the first shape
             // returned here and left `verified` false for the life of the job,
             // which is a set that never finalizes, never demotes and keeps its
-            // D7 suppressions armed — a permanent zombie.
+            // suppressions armed — a permanent zombie.
             //
             // The CRC32 of no bytes is `0x00000000`, which is exactly what RAR
             // writes into an empty member's header, so the same gate closes it:
@@ -4522,9 +4593,9 @@ impl DirectSetRouter {
             return Ok(());
         }
 
-        // Layer 2 for an encrypted member (plan 136, E-D3). Composed over
-        // **plaintext**, member-wide rather than per part, then folded with the
-        // KDF hash key when the header keys the checksum.
+        // Layer 2 for an encrypted member. Composed over **plaintext**,
+        // member-wide rather than per part, then folded with the KDF hash key
+        // when the header keys the checksum.
         //
         // This is the real wrong-password gate. Layer 1 above cannot be one: its
         // packed hashes cover cipher bytes and are plain CRC32s on the non-final
@@ -4568,7 +4639,7 @@ impl DirectSetRouter {
         Ok(())
     }
 
-    // ---- Restart (plan 135, D6) -------------------------------------------
+    // ---- Restart ----------------------------------------------------------
     //
     // A restarted set rebuilds its layout from the **cached volume facts**, not
     // from bytes: the header bytes sit below the published floors, so they are
@@ -4712,7 +4783,7 @@ impl DirectSetRouter {
     ///   volume is offset zero, so without this a restart would hold the whole
     ///   volume and demote on the holds budget;
     /// - the routed-extent history is what the hybrid provider reads a virtual
-    ///   volume through, and it is a **history**, not a classification (B1).
+    ///   volume through, and it is a **history**, not a classification.
     ///
     /// The history is re-derived by mapping the covered physical ranges through
     /// the rebuilt layout and clipping each member slice to that member's own
@@ -4770,17 +4841,17 @@ impl DirectSetRouter {
         for (start, end) in ranges {
             let mut cursor = start;
             for slice in self.map_physical_range(volume_index, start, end - start) {
-                // Plan 136 E1 checklist site 4. This was a refutable `let ...
-                // else` on `MappedSlice::Member`, which `EncryptedMember` slid
-                // straight past — silently, and *permanently* silently once
-                // `slice_len` grew an `EncryptedMember` arm, since that
-                // exhaustiveness was the only thing keeping this site loud. The
-                // effect was not a lost byte but a lost **record**:
-                // `record_routed_extent` never ran, so the routed-extent history
-                // (B1) had no claim on those offsets and the post-restart
-                // provider answered them out of the envelope — where they are a
-                // sparse hole inside its length, which is to say zeros, in a
-                // volume whose floor says the bytes are durable.
+                // This was a refutable `let ... else` on `MappedSlice::Member`,
+                // which `EncryptedMember` slid straight past — silently, and
+                // *permanently* silently once `slice_len` grew an
+                // `EncryptedMember` arm, since that exhaustiveness was the only
+                // thing keeping this site loud. The effect was not a lost byte
+                // but a lost **record**: `record_routed_extent` never ran, so
+                // the routed-extent history had no claim on those offsets and
+                // the post-restart provider answered them out of the envelope —
+                // where they are a sparse hole inside its length, which is to
+                // say zeros, in a volume whose floor says the bytes are
+                // durable.
                 //
                 // An encrypted member's bytes are at exactly the same
                 // coordinates (cipher offset and member-logical offset coincide
@@ -4847,8 +4918,8 @@ impl DirectSetRouter {
         }
     }
 
-    /// The crypt rows the next checkpoint must carry, by member id (plan 136,
-    /// E-D4). Empty for a set with no encrypted member.
+    /// The crypt rows the next checkpoint must carry, by member id. Empty for
+    /// a set with no encrypted member.
     pub(crate) fn member_crypt_snapshots(&self) -> BTreeMap<u32, crypt::MemberCryptSnapshot> {
         let mut rows = BTreeMap::new();
         for (member_id, member) in &self.members {
@@ -4866,8 +4937,7 @@ impl DirectSetRouter {
         rows
     }
 
-    /// Seeds one restored member's crypt state from its checkpoint row (plan
-    /// 136, E-D4).
+    /// Seeds one restored member's crypt state from its checkpoint row.
     ///
     /// Both directions are a refusal, because both are the same mistake seen
     /// from opposite sides: a row with facts the rebuilt layout does not state
@@ -4908,8 +4978,8 @@ impl DirectSetRouter {
     }
 
     /// The volumes the router holds parsed facts for — the volumes whose bytes
-    /// it can classify. The restore seam validates a checkpoint's claims against
-    /// this (M5).
+    /// it can classify. The restore seam validates a checkpoint's claims
+    /// against this.
     pub(crate) fn fact_volumes(&self) -> std::collections::HashSet<u32> {
         self.volume_facts.keys().copied().collect()
     }
@@ -4922,7 +4992,7 @@ impl DirectSetRouter {
     }
 
     /// The runs of member partials that must be re-read from disk before the
-    /// whole-member gates can compose (D6's "PAR2 absent" arm).
+    /// whole-member gates can compose (the "PAR2 absent" arm).
     ///
     /// Split at part boundaries, because the composition is per part, and
     /// returned in `(member, ascending offset)` order so the caller's read is one
@@ -4931,7 +5001,7 @@ impl DirectSetRouter {
         self.reread_plan(|member| &member.restart_seeded)
     }
 
-    /// Whether any member is carrying a repair's stale composition gaps (D4).
+    /// Whether any member is carrying a repair's stale composition gaps.
     pub(crate) fn has_stale_gaps(&self) -> bool {
         self.members
             .values()
@@ -5005,7 +5075,7 @@ impl DirectSetRouter {
     /// so corruption introduced while the process was down fails the member gate
     /// exactly as a bad article would have.
     ///
-    /// # Cannot-locate demotes (M4)
+    /// # Cannot-locate demotes
     ///
     /// A run whose part the layout cannot place — the member is gone from the
     /// layout, no part covers the offset, the member's routing state has been
@@ -5049,13 +5119,13 @@ impl DirectSetRouter {
         let Some(member) = self.member_mut(member_id) else {
             return Err(self.fail(DemotionReason::RestartRearmUnplaceable));
         };
-        // An encrypted member's re-read produces **plaintext** — that is what is
-        // in the partial — so it feeds layer 2's member-wide composition and
-        // nothing else (plan 136, E-D3). It must not touch `parts`, whose values
-        // are cipher CRCs, and it must not be compared against the part's packed
-        // hash, which describes cipher bytes this process no longer has. The
-        // keyed member fold is what re-verifies the run, exactly as D6 intends:
-        // the value comes from the bytes on disk now.
+        // An encrypted member's re-read produces **plaintext** — that is what
+        // is in the partial — so it feeds layer 2's member-wide composition and
+        // nothing else. It must not touch `parts`, whose values are cipher
+        // CRCs, and it must not be compared against the part's packed hash,
+        // which describes cipher bytes this process no longer has. The keyed
+        // member fold is what re-verifies the run, exactly as the re-arm
+        // intends: the value comes from the bytes on disk now.
         if let Some(crypt) = member.crypt.as_mut() {
             crypt.plain_runs_mut().overwrite(logical_offset, len, crc);
             member.restart_seeded = subtract(&member.restart_seeded, logical_offset, len);
@@ -5095,7 +5165,7 @@ impl DirectSetRouter {
     }
 
     /// Files one emitted member extent into the volume's routing history,
-    /// coalescing it with the extent it continues (B1).
+    /// coalescing it with the extent it continues.
     ///
     /// A physical byte is routed at most once *by ordinary routing* —
     /// [`VolumeStaging::stage`] never re-stages a routed range — but a PAR2
@@ -5109,9 +5179,9 @@ impl DirectSetRouter {
     /// runs once per emitted member run for the whole life of every set and the
     /// overlapping case is only ever a repair: without the gate, every ordinary
     /// article paid a `Vec` the length of the volume's extent history for a
-    /// subtraction that removes nothing (phase 6 review, F7). The history is
-    /// sorted by physical offset and disjoint, so its ends are monotonic too and
-    /// one `partition_point` finds the first extent that could overlap.
+    /// subtraction that removes nothing. The history is sorted by physical
+    /// offset and disjoint, so its ends are monotonic too and one
+    /// `partition_point` finds the first extent that could overlap.
     fn record_routed_extent(&mut self, volume_index: u32, extent: MemberExtent) {
         if extent.len == 0 {
             return;
@@ -5242,16 +5312,16 @@ impl DirectSetRouter {
     /// member's partial.
     ///
     /// Read off the routing history, deliberately **not** off
-    /// [`StoredLayoutBuilder::map_physical_range`]'s current answer (B1). The
-    /// layout maps a member's packed range to the member only while
-    /// `routes_direct()` holds, and that is a running verdict: a
-    /// `ProvisionallyDirect` member whose chain closes with a BLAKE2sp digest
-    /// and no CRC32 becomes `Ineligible` in the same call that demotes the set,
-    /// and every byte already sitting in its `.direct.partial` would suddenly
-    /// map to the envelope — where it is a hole inside the file's length, which
-    /// a plain `read` answers with zeros. Demotion runs reconstruction, so those
-    /// zeros would be written into the volume file under a published floor and
-    /// never fetched again.
+    /// [`StoredLayoutBuilder::map_physical_range`]'s current answer. The layout
+    /// maps a member's packed range to the member only while `routes_direct()`
+    /// holds, and that is a running verdict: a `ProvisionallyDirect` member
+    /// whose chain closes with a BLAKE2sp digest and no CRC32 becomes
+    /// `Ineligible` in the same call that demotes the set, and every byte
+    /// already sitting in its `.direct.partial` would suddenly map to the
+    /// envelope — where it is a hole inside the file's length, which a plain
+    /// `read` answers with zeros. Demotion runs reconstruction, so those zeros
+    /// would be written into the volume file under a published floor and never
+    /// fetched again.
     ///
     /// The history is what the partials themselves are, so the two cannot
     /// disagree: an extent is here exactly when bytes were written for it.
@@ -5264,13 +5334,13 @@ impl DirectSetRouter {
 
     // There is deliberately no accessor for the router's own routed map. It
     // records what routing *emitted*, spans whose write later failed included,
-    // and reading it as coverage is what let a demotion sweep try to read a byte
-    // back out of a file that never received it (B1). Everything that needs to
+    // and reading it as coverage is what let a demotion sweep try to read a
+    // byte back out of a file that never received it. Everything that needs to
     // know what reached disk asks `DirectSet`, which is told only about writes
     // that returned.
 }
 
-/// What one ineligible member costs D1's tolerance budget.
+/// What one ineligible member costs the tolerance budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ToleratedMemberBudget {
     /// Packed bytes: the member's total when the chain has closed, a lower
@@ -5314,9 +5384,9 @@ fn tolerable_member_budget(
             unpacked_bytes: unpacked_bytes?,
         }),
         // A stored member with a BLAKE2sp digest and no CRC32. Out-of-order
-        // routing cannot verify it (D4), but `extract_member_streaming` feeds
-        // the codec in order and checks BLAKE2sp natively — which is exactly
-        // why D4 scopes its whole-member-CRC32 requirement to *direct-routed*
+        // routing cannot verify it, but `extract_member_streaming` feeds the
+        // codec in order and checks BLAKE2sp natively — which is exactly why
+        // the gate scopes its whole-member-CRC32 requirement to *direct-routed*
         // members and sends this one through the tolerance instead.
         IneligibilityReason::Blake2OnlyNoCrc32 => {
             let mut packed_bytes = 0u64;
@@ -5351,7 +5421,7 @@ fn continues(held: MemberExtent, next: MemberExtent) -> bool {
 }
 
 /// One run of a member's `.direct.partial` that restart seeded and the
-/// finalization re-read must recompute (D6).
+/// finalization re-read must recompute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RestartReadRun {
     pub(crate) member_id: u32,
@@ -5362,12 +5432,12 @@ pub(crate) struct RestartReadRun {
 
 /// The byte length of any mapped slice, whatever it maps to.
 ///
-/// Its exhaustiveness was, until plan 136 E1, the *only* compile-time guard over
-/// [`DirectSetRouter::restore_volume_coverage`]'s refutable `let ... else`: add
-/// an arm here and that site went quiet forever. The restore now walks an
-/// exhaustive match of its own and no longer depends on it — it still calls this
-/// for the arms it skips, deliberately, so a future variant lands as an error in
-/// both places rather than one.
+/// Its exhaustiveness was, until encrypted members existed, the *only*
+/// compile-time guard over [`DirectSetRouter::restore_volume_coverage`]'s
+/// refutable `let ... else`: add an arm here and that site went quiet forever.
+/// The restore now walks an exhaustive match of its own and no longer depends on
+/// it — it still calls this for the arms it skips, deliberately, so a future
+/// variant lands as an error in both places rather than one.
 fn slice_len(slice: &MappedSlice) -> u64 {
     match slice {
         MappedSlice::Member { len, .. }
@@ -5385,7 +5455,7 @@ enum VolumeImage {
     Staged,
     /// The staged bytes **plus** the volume's envelope file, read back at true
     /// physical offsets — the image a restored volume's headers live in, since
-    /// its pre-restart bytes were written out and dropped from RAM (B2).
+    /// its pre-restart bytes were written out and dropped from RAM.
     Envelope,
 }
 

@@ -1,4 +1,4 @@
-//! Direct-store routing, phase 4 (plan 135).
+//! Direct-store routing.
 //!
 //! The spine is differential: the identical job gate is run with routing on and
 //! off, and the outputs must be byte-identical. With routing on, no source
@@ -23,7 +23,7 @@ fn yenc_declared_bytes(decoded_len: u32) -> u32 {
 ///
 /// Non-final parts carry the packed CRC32 of *their* bytes (the RAR5 spec's
 /// rule for split files); the final part carries the whole-member CRC32. That
-/// is exactly what D4's two layers read.
+/// is exactly what the two integrity layers read.
 fn single_member_store_set(
     member_name: &str,
     payload: &[u8],
@@ -127,8 +127,9 @@ const QOPEN_OFFSET: u64 = 512;
 ///
 /// `forged_name` is the whole point. `None` builds an honest cache that echoes
 /// exactly the header the physical walk finds. `Some(name)` appends a second
-/// cached file header that no physical header describes — the shape the RAR spec
-/// warns can be crafted, and the one D2 forbids routing a byte on.
+/// cached file header that no physical header describes — the shape the RAR
+/// spec warns can be crafted, and the one direct-store forbids routing a byte
+/// on.
 fn quick_open_store_set(
     member_name: &str,
     payload: &[u8],
@@ -277,8 +278,7 @@ async fn an_honest_quick_open_cache_still_routes() {
 }
 
 /// The decoded extent of one article, for a volume cut into `articles` equal
-/// pieces. At `articles == 2` this is the head/tail split every phase 4 fixture
-/// uses.
+/// pieces. At `articles == 2` this is the head/tail split every fixture uses.
 fn article_extent(volume_len: usize, segment_number: u32, articles: usize) -> (usize, usize) {
     let chunk = volume_len.div_ceil(articles);
     let start = (segment_number as usize * chunk).min(volume_len);
@@ -458,9 +458,9 @@ async fn run_direct_store_gate_with_ceilings(
     .await
 }
 
-/// The gate runner with plan 136's one extra input: the job's password.
+/// The gate runner with one extra input: the job's password.
 ///
-/// Everything else is the phase 4 harness unchanged, deliberately — the whole
+/// Everything else is the original harness unchanged, deliberately — the whole
 /// point of the encrypted differentials is that turning the gate off with the
 /// *same* password reproduces the same bytes, so both sides must run through
 /// exactly the same code.
@@ -692,7 +692,7 @@ async fn direct_store_demotes_and_still_completes_when_the_member_checksum_is_wr
 }
 
 // ---------------------------------------------------------------------------
-// The confirming parse (B1)
+// The confirming parse
 // ---------------------------------------------------------------------------
 
 /// A store set whose **last** volume carries a second, small member.
@@ -751,13 +751,15 @@ fn store_set_with_a_member_hidden_past_the_first(
     ]
 }
 
-/// Phase 4's `direct_store_refuses_a_set_whose_last_volume_hides_a_second_member`,
+/// The first shape's
+/// `direct_store_refuses_a_set_whose_last_volume_hides_a_second_member`,
 /// upgraded: the hidden member is now **adopted** rather than demoting the set.
 ///
-/// Phase 4 had two reasons to demote here — the layout refused the re-add, and
-/// even if it had not, a second routable member was out of scope. Wave 1 removes
-/// both: the router rebuilds its layout from every volume's newest facts when a
-/// longer prefix reveals a header, and routes as many members as the archive has.
+/// The first shape had two reasons to demote here — the layout refused the
+/// re-add, and even if it had not, a second routable member was out of scope.
+/// Both are gone now: the router rebuilds its layout from every volume's newest
+/// facts when a longer prefix reveals a header, and routes as many members as
+/// the archive has.
 #[tokio::test]
 async fn a_member_hiding_past_the_first_is_adopted_and_routes_direct() {
     let member_name = "Silver.Horizon.S01E07.mkv";
@@ -831,7 +833,7 @@ async fn a_member_hiding_past_the_first_is_adopted_and_routes_direct() {
 }
 
 // ---------------------------------------------------------------------------
-// PAR2 over virtual volumes (plan 135 phase 5 wave 2, D5)
+// PAR2 over virtual volumes
 // ---------------------------------------------------------------------------
 
 /// Slice size for the PAR2 fixtures. Small enough that every volume carries
@@ -919,7 +921,7 @@ async fn run_par2_direct_gate(
     run_par2_direct_gate_with_password(gate, live_par2, job_id, member_name, volumes, None).await
 }
 
-/// [`run_par2_direct_gate`] with plan 136's one extra input, so an encrypted
+/// [`run_par2_direct_gate`] with one extra input, so an encrypted
 /// set's par2-bearing differential runs through exactly the same code the
 /// plaintext one does.
 async fn run_par2_direct_gate_with_password(
@@ -1007,12 +1009,13 @@ async fn run_par2_direct_gate_with_password(
 
 #[tokio::test]
 async fn a_par2_bearing_direct_job_completes_byte_identically_and_never_writes_a_volume() {
-    // Wave 1 refused this job at admission (`direct_store.refused.par2_present`)
-    // because every PAR2 path read the volume files routing never creates. Wave
-    // 2's `FileAccess` adapter answers those reads out of the envelope plus the
-    // routed member bytes, so the refusal is gone and this test states the new
-    // behaviour: the set routes, the job verifies against *virtual* volumes, and
-    // the output is what the conventional extractor would have produced.
+    // An earlier shape refused this job at admission
+    // (`direct_store.refused.par2_present`) because every PAR2 path read the
+    // volume files routing never creates. The `FileAccess` adapter answers
+    // those reads out of the envelope plus the routed member bytes, so the
+    // refusal is gone and this test states the new behaviour: the set routes,
+    // the job verifies against *virtual* volumes, and the output is what the
+    // conventional extractor would have produced.
     let member_name = "Silver.Horizon.S01E08.mkv";
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 199) as u8).collect();
     let volumes = single_member_store_set(member_name, &payload, 3);
@@ -1078,7 +1081,7 @@ async fn a_par2_bearing_direct_job_completes_byte_identically_and_never_writes_a
         "the set should have finalized once verification cleared it, got {}",
         direct.demotions
     );
-    // The point of D5: verification finishes with the download. Either the live
+    // The point: verification finishes with the download. Either the live
     // short-circuit fired, or the authoritative pass ran and did so entirely
     // against virtual volumes — both are wave-2 behaviour, and a job that did
     // neither would have failed the byte comparison above against zero files.
@@ -1121,8 +1124,8 @@ struct DamagedGateOutcome {
     /// byte for byte or the reconstruction fabricated something.
     volume_files: Vec<Option<Vec<u8>>>,
     /// Whether the gate re-armed its own completion check on the way out of the
-    /// demotion, sampled before anything else drives the job (M5). Without it
-    /// the job's next move waits on the 30 s reconcile sweep.
+    /// demotion, sampled before anything else drives the job. Without it the
+    /// job's next move waits on the 30 s reconcile sweep.
     rearmed_after_demotion: bool,
 }
 
@@ -1304,16 +1307,17 @@ async fn par2_damage_a_direct_set_cannot_see_demotes_it_and_ends_where_the_conve
         direct.status
     );
     // Job *status* is deliberately not compared. This fixture's PAR2 carries
-    // descriptions and slice checksums but no recovery blocks — the test harness
-    // has no builder for a parseable multi-file recovery stream — so neither gate
-    // can repair, and the two reach that dead end through different waits (the
-    // direct gate through its demotion, the conventional one through the
-    // targeted-recovery wait). What wave 2 owns is the verdict and the bytes,
-    // and both are asserted above; repair-to-success is phase 6's differential.
+    // descriptions and slice checksums but no recovery blocks — the test
+    // harness has no builder for a parseable multi-file recovery stream — so
+    // neither gate can repair, and the two reach that dead end through
+    // different waits (the direct gate through its demotion, the conventional
+    // one through the targeted-recovery wait). What verification owns is the
+    // verdict and the bytes, and both are asserted above; repair-to-success is
+    // the repair differential.
 }
 
 // ---------------------------------------------------------------------------
-// Destinations, finalization and demotion accounting (B3/B4/B5)
+// Destinations, finalization and demotion accounting
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1503,9 +1507,9 @@ async fn a_demoted_set_materializes_its_covered_volumes_instead_of_refetching_th
     let (mut pipeline, working_dir, other_file_bytes) =
         demote_mid_download(&temp_dir, job_id, &volumes, |_, _| {}).await;
 
-    // D8: volume 0 was covered end to end, so it is rebuilt byte-exactly from
-    // its envelope plus the member partial — the whole point of reconstruction
-    // is that those two articles never touch the network again.
+    // Volume 0 was covered end to end, so it is rebuilt byte-exactly from its
+    // envelope plus the member partial — the whole point of reconstruction is
+    // that those two articles never touch the network again.
     assert_eq!(
         std::fs::read(working_dir.join(&volumes[0].0))
             .ok()
@@ -1552,7 +1556,7 @@ async fn a_demoted_set_materializes_its_covered_volumes_instead_of_refetching_th
         );
     }
 
-    // Reconciliation persisted legacy state in D8's order and shape: a whole
+    // Reconciliation persisted legacy state in that order and shape: a whole
     // volume becomes a completed-file row, a partial one a contiguous floor,
     // and the direct coverage row is retired behind both.
     let (floors, complete) = pipeline.db.load_active_file_runtime(job_id).unwrap();
@@ -1578,9 +1582,9 @@ async fn a_demoted_set_materializes_its_covered_volumes_instead_of_refetching_th
 #[tokio::test]
 async fn a_demotion_falls_back_to_refetching_when_its_envelope_is_gone() {
     // Reconstruction is an optimisation; every one of its failure modes has to
-    // land on phase 4's always-correct refetch rather than on a half-written
-    // volume. Deleting the envelope out from under the sweep is the bluntest of
-    // them: the header bytes it needs are simply not there any more.
+    // land on the always-correct refetch rather than on a half-written volume.
+    // Deleting the envelope out from under the sweep is the bluntest of them:
+    // the header bytes it needs are simply not there any more.
     let member_name = "Silver.Horizon.S01E20.mkv";
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
     let volumes = single_member_store_set(member_name, &payload, 3);
@@ -1623,11 +1627,11 @@ fn payload_before_header_arrivals(volume_count: usize) -> Vec<(u32, u32)> {
     arrivals
 }
 
-/// D2's paging, at the seam the RAM budget used to demote at.
+/// Paging, at the seam the RAM budget used to demote at.
 ///
-/// The first article is pure payload with no header yet, so it has nowhere to go
-/// and is held; the budget is far below it. Wave 3 pages it to the set's scratch
-/// file instead of demoting, and the set stays live.
+/// The first article is pure payload with no header yet, so it has nowhere to
+/// go and is held; the budget is far below it. The router pages it to the set's
+/// scratch file instead of demoting, and the set stays live.
 #[tokio::test]
 async fn direct_store_pages_held_bytes_to_scratch_instead_of_demoting() {
     let member_name = "Silver.Horizon.S01E12.mkv";
@@ -1832,7 +1836,7 @@ async fn a_demoted_set_completes_byte_identically_to_the_conventional_gate() {
 }
 
 // ---------------------------------------------------------------------------
-// Chain-close eligibility (revision 6 amendment 1)
+// Chain-close eligibility
 // ---------------------------------------------------------------------------
 
 /// A store set whose closing header states a BLAKE2sp digest and no CRC32.
@@ -1911,12 +1915,12 @@ async fn direct_store_demotes_when_the_chain_closes_with_a_blake2_only_member() 
         "the demotion deletes the bytes routed while the member was provisional"
     );
 
-    // The label is not the outcome (B1). The demotion runs reconstruction, and
-    // the member whose eligibility just flipped is the one holding most of every
-    // volume's bytes: a sweep that asked the *current* classification where they
-    // live would be told "the envelope", read a sparse hole, and write zeros
-    // into a volume file under a published floor. Whatever the demotion decides
-    // to do, what lands on disk has to be the volume.
+    // The label is not the outcome. The demotion runs reconstruction, and the
+    // member whose eligibility just flipped is the one holding most of every
+    // volume's bytes: a sweep that asked the *current* classification where
+    // they live would be told "the envelope", read a sparse hole, and write
+    // zeros into a volume file under a published floor. Whatever the demotion
+    // decides to do, what lands on disk has to be the volume.
     assert_volumes_are_never_fabricated(&working_dir, &volumes);
     for volume_index in [0usize, 1] {
         let (filename, bytes) = &volumes[volume_index];
@@ -1956,7 +1960,7 @@ fn assert_volumes_are_never_fabricated(
 }
 
 // ---------------------------------------------------------------------------
-// The yEnc whole-volume gate (M4)
+// The yEnc whole-volume gate
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -2027,7 +2031,7 @@ async fn direct_store_demotes_a_volume_whose_yenc_whole_file_crc_disagrees() {
 }
 
 // ---------------------------------------------------------------------------
-// D7 suppression and runtime lifetime (H3/H5)
+// Suppression and runtime lifetime
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -2125,13 +2129,13 @@ async fn removing_a_job_prunes_the_direct_store_runtime() {
 }
 
 // ---------------------------------------------------------------------------
-// Format detection (H1)
+// Format detection
 // ---------------------------------------------------------------------------
 
 /// The RAR4 twin of [`single_member_store_set`].
 ///
 /// RAR4 states the whole-member CRC32 in the *last* part's header and each
-/// earlier part's own packed CRC32 in its own — the same two layers D4 reads,
+/// earlier part's own packed CRC32 in its own — the same two integrity layers,
 /// in a completely different container.
 fn single_member_rar4_store_set(
     member_name: &str,
@@ -2240,7 +2244,7 @@ async fn a_rar4_set_routes_directly_because_the_format_is_read_not_assumed() {
 }
 
 // ---------------------------------------------------------------------------
-// Multi-member sets (phase 5 wave 1)
+// Multi-member sets
 // ---------------------------------------------------------------------------
 
 /// A store set carrying several members, split across `volume_count` volumes.
@@ -2249,8 +2253,8 @@ async fn a_rar4_set_routes_directly_because_the_format_is_read_not_assumed() {
 /// volume payloads, so member boundaries and volume boundaries deliberately do
 /// **not** line up: members start mid-volume, at least one is split across
 /// volumes, and one volume carries the tail of one member and the head of the
-/// next. That is the shape a season pack posts as, and the shape phase 4
-/// demoted on sight.
+/// next. That is the shape a season pack posts as, and the shape the first
+/// shape demoted on sight.
 fn multi_member_store_set(
     members: &[(&str, Vec<u8>)],
     volume_count: usize,
@@ -2298,9 +2302,9 @@ fn multi_member_store_set(
                 if split_after {
                     split_flags |= 0x0010;
                 }
-                // The RAR5 rule D4 layer 1 reads: a non-final part states the
-                // CRC32 of *its own* packed bytes, the final part the whole
-                // member's.
+                // The RAR5 rule the per-part layer reads: a non-final part
+                // states the CRC32 of *its own* packed bytes, the final part
+                // the whole member's.
                 let data_crc = if split_after {
                     checksum::crc32(part)
                 } else {
@@ -2544,13 +2548,13 @@ async fn two_members_that_sanitize_to_one_destination_demote_the_set() {
 }
 
 // ---------------------------------------------------------------------------
-// Envelope v2: recovery records route (phase 5 wave 1)
+// Envelope v2: recovery records route
 // ---------------------------------------------------------------------------
 
 /// A store set whose volumes each carry a recovery record after the payload.
 ///
 /// The RR is a service header plus a data area belonging to no member, so every
-/// byte of it is envelope. At `rr_bytes` well over phase 4's 32 KiB half-slot
+/// byte of it is envelope. At `rr_bytes` well over the old 32 KiB half-slot
 /// this set could not route at all before envelope v2 — it demoted with
 /// `EnvelopeTooLarge`, which is why every `-rr` post did.
 fn recovery_record_store_set(
@@ -2614,8 +2618,9 @@ async fn a_recovery_record_set_routes_direct_and_its_envelopes_carry_the_recover
     let arrivals = in_order_arrivals(volumes.len());
 
     // Non-vacuity: the recovery record alone is bigger than the whole 64 KiB
-    // slot phase 4 gave a volume, let alone the 32 KiB half it addressed the
-    // head from. This set could not have routed a byte before envelope v2.
+    // slot the first shape gave a volume, let alone the 32 KiB half it
+    // addressed the head from. This set could not have routed a byte before
+    // envelope v2.
     const { assert!(RR_BYTES > 32 * 1024) };
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2697,7 +2702,7 @@ fn find_recovery_offset(volume: &[u8], rr_bytes: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// The hybrid virtual-volume provider, differentially (phase 5 wave 1)
+// The hybrid virtual-volume provider, differentially
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -2784,7 +2789,7 @@ async fn a_virtual_volume_reads_back_the_volume_the_conventional_gate_would_have
 }
 
 // ---------------------------------------------------------------------------
-// The classification frontier (phase 5 wave 1)
+// The classification frontier
 // ---------------------------------------------------------------------------
 
 /// A two-volume store set whose second volume carries a second member after the
@@ -2928,7 +2933,7 @@ async fn payload_past_the_last_known_header_is_held_until_the_walk_proves_what_i
 }
 
 // ---------------------------------------------------------------------------
-// Demotion after a routed member turns ineligible (B1)
+// Demotion after a routed member turns ineligible
 // ---------------------------------------------------------------------------
 
 /// Three volumes, each carrying a recovery record, whose split member's chain
@@ -3065,11 +3070,11 @@ async fn a_member_that_turns_ineligible_after_routing_never_materializes_fabrica
 
 #[tokio::test]
 async fn a_partially_covered_volume_is_verified_before_it_is_materialized() {
-    // M3 plus B1(c): a volume covered only as far as its first article still has
-    // a composed reference for that prefix, and the sweep checks it. Corrupting
-    // the member partial under the covered prefix is what a partial that came
-    // back wrong looks like — and it has to end in the refetch, not in a volume
-    // file nothing verified.
+    // Per-run composition plus the no-reference refusal: a volume covered only
+    // as far as its first article still has a composed reference for that
+    // prefix, and the sweep checks it. Corrupting the member partial under the
+    // covered prefix is what a partial that came back wrong looks like — and it
+    // has to end in the refetch, not in a volume file nothing verified.
     let member_name = "Silver.Horizon.S01E24.mkv";
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
     let volumes = single_member_store_set(member_name, &payload, 3);
@@ -3115,7 +3120,7 @@ async fn a_partially_covered_volume_is_verified_before_it_is_materialized() {
 }
 
 // ---------------------------------------------------------------------------
-// The staged-bytes budget (M1)
+// The staged-bytes budget
 // ---------------------------------------------------------------------------
 
 /// A two-volume set whose **last** volume carries a recovery record between the
@@ -3245,10 +3250,10 @@ async fn retained_envelope_bytes_count_against_the_staged_budget() {
     );
 
     // Part three: the same sequence under a budget smaller than the retained
-    // region pages it out (D2). Counting only unrouted holds — as the first
-    // shape did — would have found nothing to count at all, so nothing would
-    // have breached and nothing would have paged; the retained recovery record
-    // is what proves the accounting reaches the term RSS actually pays for.
+    // region pages it out. Counting only unrouted holds — as the first shape
+    // did — would have found nothing to count at all, so nothing would have
+    // breached and nothing would have paged; the retained recovery record is
+    // what proves the accounting reaches the term RSS actually pays for.
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
@@ -3289,7 +3294,7 @@ async fn retained_envelope_bytes_count_against_the_staged_budget() {
 }
 
 // ---------------------------------------------------------------------------
-// Zero-length stored members (B2)
+// Zero-length stored members
 // ---------------------------------------------------------------------------
 
 /// A two-volume store set whose last volume declares a zero-length member after
@@ -3345,12 +3350,12 @@ fn store_set_with_an_empty_member(
 
 #[tokio::test]
 async fn a_zero_length_member_finalizes_with_its_empty_file_present() {
-    // B2: nothing is ever routed for a zero-length member, so the byte-driven
+    // Nothing is ever routed for a zero-length member, so the byte-driven
     // whole-member gate can never fire for it. The first shape left it
     // unverified for the life of the job: the set never finalized, never
-    // demoted, and kept its D7 suppressions armed over files that would never
-    // exist. It verifies trivially instead — CRC32 of no bytes is zero, which is
-    // what the header states — and finalization creates the file.
+    // demoted, and kept its suppressions armed over files that would never
+    // exist. It verifies trivially instead — CRC32 of no bytes is zero, which
+    // is what the header states — and finalization creates the file.
     let episode = "Silver.Horizon.S01E26.mkv";
     let empty = "Silver.Horizon.S01E26.nfo";
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 251) as u8).collect();
@@ -3396,7 +3401,7 @@ async fn a_zero_length_member_finalizes_with_its_empty_file_present() {
 }
 
 // ---------------------------------------------------------------------------
-// D1's bounded small-member tolerance (plan 135 phase 5 wave 2)
+// The bounded small-member tolerance
 // ---------------------------------------------------------------------------
 
 /// What the extra, ineligible member of a tolerance fixture looks like.
@@ -3405,12 +3410,13 @@ enum ToleranceExtra {
     /// An **unsplit** stored member whose header carries a real BLAKE2sp digest
     /// and no CRC32.
     ///
-    /// Unsplit is load-bearing: the classifier only reaches the hash fields once
-    /// the chain is complete, so a *split* BLAKE2sp-only member is
-    /// `ProvisionallyDirect` — and routes into a partial — until its last header
-    /// lands. An unsplit one is `Ineligible` from its single header, so every
-    /// byte of it goes to the envelope, which is the shape D1's tolerance
-    /// describes and the one the extraction can read back.
+    /// Unsplit is load-bearing: the classifier only reaches the hash fields
+    /// once the chain is complete, so a *split* BLAKE2sp-only member is
+    /// `ProvisionallyDirect` — and routes into a partial — until its last
+    /// header lands. An unsplit one is `Ineligible` from its single header, so
+    /// every byte of it goes to the envelope, which is the shape the
+    /// small-member tolerance describes and the one the extraction can read
+    /// back.
     Blake2OnlyStore,
     /// A stored member with a real BLAKE2sp digest and no CRC32, **split**
     /// across the last two volumes.
@@ -3616,9 +3622,9 @@ async fn a_small_blake2_only_member_rides_the_tolerance_and_both_members_match_t
     );
 }
 
-/// The case wave 2 could only demote: a BLAKE2sp-only member the router adopted
-/// while its chain was open, whose routed bytes are migrated out of its partial
-/// and into the envelope so it can ride the tolerance after all.
+/// The case an earlier shape could only demote: a BLAKE2sp-only member the
+/// router adopted while its chain was open, whose routed bytes are migrated out
+/// of its partial and into the envelope so it can ride the tolerance after all.
 #[tokio::test]
 async fn a_split_blake2_only_member_migrates_to_the_envelope_and_matches_the_extractor() {
     let store_name = "Silver.Horizon.S01E51.mkv";
@@ -3658,9 +3664,9 @@ async fn a_split_blake2_only_member_migrates_to_the_envelope_and_matches_the_ext
         conventional.volume_file_seen,
         "the conventional gate should have written source volumes"
     );
-    // Non-vacuity, and the whole point: wave 2 demoted this set, and a demotion
-    // materializes every volume. A run with no volume on disk is a run that
-    // stayed direct through the chain close.
+    // Non-vacuity, and the whole point: an earlier shape demoted this set, and
+    // a demotion materializes every volume. A run with no volume on disk is a
+    // run that stayed direct through the chain close.
     assert!(
         !direct.volume_file_seen,
         "the migration must keep the set direct: no source volume may appear on disk"
@@ -3918,9 +3924,8 @@ async fn a_solid_ineligible_member_demotes_rather_than_riding_the_tolerance() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 5 wave 2 review fixes: what a *later* PAR2 pass sees (B1), what an
-// unbindable volume does (B2), and what a mid-download set is protected from
-// (H3).
+// Review fixes: what a *later* PAR2 pass sees, what an unbindable volume does,
+// and what a mid-download set is protected from.
 // ---------------------------------------------------------------------------
 
 /// Runs a par2-bearing direct job up to its verification verdict and hands the
@@ -3970,7 +3975,7 @@ fn no_volume_file(working_dir: &std::path::Path, volumes: &[(String, Vec<u8>)]) 
 
 #[tokio::test]
 async fn a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass() {
-    // B1. Finalization is what makes a direct set's source volumes permanently
+    // Finalization is what makes a direct set's source volumes permanently
     // absent: the partials are renamed to their destinations and the envelopes
     // are deleted. Every *later* pass over the same job — and one conventional
     // member failing extraction after the direct set finalized is enough to
@@ -4035,10 +4040,10 @@ async fn a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass() 
 
 #[tokio::test]
 async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pass() {
-    // B2. The overlay is keyed by PAR2 file id, so a volume whose identity does
-    // not resolve to exactly one description can neither be served virtually nor
-    // be blamed for the damage the pass then reports about it. Before this fix
-    // the set stayed direct and the repairer was handed a virtual volume.
+    // The overlay is keyed by PAR2 file id, so a volume whose identity does not
+    // resolve to exactly one description can neither be served virtually nor be
+    // blamed for the damage the pass then reports about it. Before this fix the
+    // set stayed direct and the repairer was handed a virtual volume.
     let member_name = "Silver.Horizon.S01E22.mkv";
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 193) as u8).collect();
     let volumes = single_member_store_set(member_name, &payload, 3);
@@ -4162,7 +4167,7 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
 
 #[tokio::test]
 async fn a_mid_download_direct_set_is_neither_verified_against_nor_demoted_for_its_holes() {
-    // H3. A set that is still receiving articles has holes where the rest of its
+    // A set that is still receiving articles has holes where the rest of its
     // payload will go, and PAR2 cannot tell a hole from corruption. Both guards
     // are asserted: the completion gate's readiness predicate, and the demotion
     // helper that must not act on such a verdict even if one reaches it.
@@ -4271,7 +4276,7 @@ async fn a_mid_download_direct_set_is_neither_verified_against_nor_demoted_for_i
 
 #[tokio::test]
 async fn a_tolerated_member_sharing_a_volume_with_a_routed_extent_extracts_before_the_commit() {
-    // M4. The tolerated extraction reads the *virtual volumes*: the envelopes
+    // The tolerated extraction reads the *virtual volumes*: the envelopes
     // overlaid with each direct-routed member's `.direct.partial`. The commit
     // loop renames those partials to their destinations, so running the
     // extraction afterwards pointed the provider's map at paths that no longer
@@ -4342,7 +4347,7 @@ async fn a_tolerated_member_sharing_a_volume_with_a_routed_extent_extracts_befor
 }
 
 // ---------------------------------------------------------------------------
-// Restart (plan 135, D6) — wave 3
+// Restart
 // ---------------------------------------------------------------------------
 
 use crate::pipeline::direct_store::barrier::BarrierDemand;
@@ -4364,7 +4369,7 @@ async fn direct_store_before_restart(
         .await
 }
 
-/// [`direct_store_before_restart`] with plan 136's extra input. The password is
+/// [`direct_store_before_restart`] with one extra input. The password is
 /// never persisted, so the "after" half has to be handed one of its own.
 async fn direct_store_before_restart_with_password(
     temp_dir: &TempDir,
@@ -4451,10 +4456,10 @@ async fn dispatch_and_submit(
 /// The "after" half: a fresh pipeline over the same database and working
 /// directory, with the job restored through the real restore seam.
 ///
-/// `complete_files` and `file_progress` are deliberately **empty**. D7 keeps
-/// both of them empty for a direct set's source volumes — no legacy floor, no
-/// completed-file row — so a restore that skips anything at all is skipping it
-/// on the strength of the direct checkpoint and nothing else.
+/// `complete_files` and `file_progress` are deliberately **empty**. Suppression
+/// keeps both of them empty for a direct set's source volumes — no legacy
+/// floor, no completed-file row — so a restore that skips anything at all is
+/// skipping it on the strength of the direct checkpoint and nothing else.
 async fn direct_store_after_restart(
     temp_dir: &TempDir,
     gate: DirectStoreGate,
@@ -4581,12 +4586,12 @@ async fn a_mid_download_restart_honours_its_floors_and_completes_byte_identicall
         set.has_restart_seeded_coverage(),
         "coverage restored from a checkpoint is seeded and unverified until it is re-read"
     );
-    // D7 re-armed: a restored set's source volumes are still direct, so no
-    // legacy floor, completed-file row or archive re-probe may be written for
-    // them. The restore itself relies on the same thing in the other direction —
-    // no completed-file row exists for a direct volume by construction, so the
-    // legacy skip plan contributes nothing and the coverage row is the only
-    // reason anything is skipped at all.
+    // Suppression re-armed: a restored set's source volumes are still direct,
+    // so no legacy floor, completed-file row or archive re-probe may be written
+    // for them. The restore itself relies on the same thing in the other
+    // direction — no completed-file row exists for a direct volume by
+    // construction, so the legacy skip plan contributes nothing and the
+    // coverage row is the only reason anything is skipped at all.
     assert!(
         (0..volumes.len() as u32)
             .all(|file_index| pipeline.is_direct_source_file(NzbFileId { job_id, file_index })),
@@ -4708,8 +4713,8 @@ async fn a_mid_download_restart_honours_its_floors_and_completes_byte_identicall
     );
 }
 
-/// A byte corrupted on disk while the process was down is caught by the re-read,
-/// not committed (D6).
+/// A byte corrupted on disk while the process was down is caught by the
+/// re-read, not committed.
 #[tokio::test]
 async fn a_byte_corrupted_while_the_process_was_down_fails_the_member_gate() {
     const ARTICLES: usize = 2;
@@ -5295,9 +5300,9 @@ async fn restart_sweeps_stale_holds_scratch() {
     }
 }
 
-/// A restart inside the PAR2 finalization wait — the common case since wave 2,
-/// because a par2-bearing set stays byte-complete-but-uncommitted for the whole
-/// PAR2 download and verify.
+/// A restart inside the PAR2 finalization wait — the common case now, because a
+/// par2-bearing set stays byte-complete-but-uncommitted for the whole PAR2
+/// download and verify.
 ///
 /// Nothing of the set may be refetched: only the PAR2 index is still owed.
 #[tokio::test]
@@ -5409,14 +5414,14 @@ async fn a_restart_during_the_par2_wait_refetches_nothing_of_the_set() {
     //
     // The gate that used to break this is upstream of direct-store:
     // `clean_par2_integrity_gate` was computed from the job's **archive
-    // topology**, which a direct set never enters by construction (D7). While
-    // the job is live that never showed, because live PAR2 (phase 2) verifies
-    // from the decode buffer and short-circuits the authoritative pass — rev 9's
-    // "live PAR2 is load-bearing". After a restart there is no decode buffer: no
-    // article of the set arrives, live PAR2 has nothing to hash, the gate read
-    // `None`, and the completion gate took its repair branch — which materializes
-    // every still-routing set and redownloads a set that was already perfect.
-    // Direct RAR sets now contribute `StrongDecode` themselves.
+    // topology**, which a direct set never enters by construction. While the
+    // job is live that never showed, because live PAR2 verifies from the decode
+    // buffer and short-circuits the authoritative pass — rev 9's "live PAR2 is
+    // load-bearing". After a restart there is no decode buffer: no article of
+    // the set arrives, live PAR2 has nothing to hash, the gate read `None`, and
+    // the completion gate took its repair branch — which materializes every
+    // still-routing set and redownloads a set that was already perfect. Direct
+    // RAR sets now contribute `StrongDecode` themselves.
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
         !shape.contains("Demoted"),
@@ -5629,7 +5634,7 @@ async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritati
         })
         .await
         .unwrap();
-    // The contribution is only earned once D6's gate re-arm has re-read the
+    // The contribution is only earned once the gate re-arm has re-read the
     // restored bytes — that is the third predicate — and the re-arm runs at the
     // download/verify boundary, which for a byte-complete set is here.
     assert!(
@@ -5654,7 +5659,7 @@ async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritati
     );
 }
 
-/// D2's last failure mode: the scratch file cannot be opened at all.
+/// The last holds failure mode: the scratch file cannot be opened at all.
 #[tokio::test]
 async fn a_scratch_io_failure_demotes_the_set() {
     let member_name = "Silver.Horizon.S01E36.mkv";
@@ -5683,7 +5688,7 @@ async fn a_scratch_io_failure_demotes_the_set() {
     );
 }
 
-/// D6's pause demand, driven through the command seam it is wired at.
+/// The pause demand, driven through the command seam it is wired at.
 #[tokio::test]
 async fn pausing_a_job_with_dirty_direct_coverage_demands_a_barrier() {
     let member_name = "Silver.Horizon.S01E37.mkv";
@@ -5754,7 +5759,7 @@ fn coverage_snapshot_of(
     crate::pipeline::direct_store::snapshot::decode(blob).expect("the row must decode")
 }
 
-/// B1: the checkpoint's per-volume `complete` bit means *all bytes durable*, and
+/// The checkpoint's per-volume `complete` bit means *all bytes durable*, and
 /// restart skips every segment of the file on the strength of it.
 ///
 /// A volume can finish downloading while every one of its bytes is still held —
@@ -5855,9 +5860,9 @@ async fn a_volume_completing_into_held_bytes_is_not_checkpointed_complete() {
 /// A restart mid-download of a set's **last** volume.
 ///
 /// The one shape the structural proof cannot reach: the cached facts stopped
-/// short of the end-of-archive record, and the volume *closes* the member chain,
-/// so `split_after` says nothing about whether a second member's header sits past
-/// the first's data area. Wave 3 demoted here by design.
+/// short of the end-of-archive record, and the volume *closes* the member
+/// chain, so `split_after` says nothing about whether a second member's header
+/// sits past the first's data area. An earlier shape demoted here by design.
 ///
 /// The expensive arm does the only thing that actually answers the question: it
 /// rebuilds the walk's reader out of the volume's **envelope**, which holds every
@@ -5951,7 +5956,7 @@ async fn a_restored_last_volume_reconfirms_from_its_envelope_and_finalizes() {
 ///
 /// With the restored volume's envelope gone, the walk's reader has a hole where
 /// the headers were — nothing can prove the tail holds no undiscovered member —
-/// and the volume must demote under its own name exactly as wave 3 had it. What
+/// and the volume must demote under its own name exactly as it always has. What
 /// must not happen is confirming on the strength of "every article arrived",
 /// which would file an unproven region into an envelope that finalization
 /// deletes.
@@ -6053,19 +6058,19 @@ async fn a_restored_last_volume_whose_envelope_is_gone_still_demotes_by_name() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 6 — repair while still direct (plan 135, D8)
+// Repair while still direct
 // ---------------------------------------------------------------------------
 
 /// A PAR2 index over the set's decoded volume bytes that also carries
 /// **recovery blocks**, so the damage it describes can actually be repaired.
 ///
 /// `build_test_par2_index_for_files` stops at descriptions and slice checksums,
-/// which is why every damaged-set test before phase 6 could only assert a
+/// which is why every damaged-set test before repair landed could only assert a
 /// verdict: with no recovery stream neither gate can repair, so "repairs while
 /// direct" had nothing to compare against. The blocks are computed over the
-/// global input-slice ordering PAR2 defines — files in main-packet order, slices
-/// in order within each file, each padded to `slice_size` — which is the same
-/// ordering `plan_repair` reconstructs from the parsed set.
+/// global input-slice ordering PAR2 defines — files in main-packet order,
+/// slices in order within each file, each padded to `slice_size` — which is the
+/// same ordering `plan_repair` reconstructs from the parsed set.
 fn build_test_par2_with_recovery(
     files: &[(&str, &[u8])],
     slice_size: u64,
@@ -6288,9 +6293,9 @@ async fn run_repairable_par2_gate_at(
 /// One article per volume is not a corner case — a volume small enough to post
 /// whole is ordinary — and it is the only shape in which a repair's rewrite,
 /// which is widened to whole articles, reaches a volume's **first** byte and
-/// therefore the first cipher block of a member extent that starts there (E2
-/// review F1). With two articles the damaged one is always bounded away from at
-/// least one of the extent's edges.
+/// therefore the first cipher block of a member extent that starts there. With
+/// two articles the damaged one is always bounded away from at least one of the
+/// extent's edges.
 #[allow(clippy::too_many_arguments)]
 async fn run_repairable_par2_gate_with_articles(
     gate: DirectStoreGate,
@@ -6410,12 +6415,12 @@ async fn run_repairable_par2_gate_with_articles(
 
 #[tokio::test]
 async fn par2_damage_in_the_envelope_repairs_while_the_set_stays_direct() {
-    // D8's first transition, end to end. The damaged byte is in a recovery
+    // The first transition, end to end. The damaged byte is in a recovery
     // record's data area: outside every member's packed range, so neither the
     // per-part packed CRC32 nor the whole-member CRC32 covers it, and inside a
     // service block's data rather than a header, so the walk still parses and
     // the volume still confirms. PAR2 is the only layer that can see it — which
-    // is exactly the set-up wave 2 could only demote on.
+    // is exactly the set-up an earlier shape could only demote on.
     let member_name = "Silver.Horizon.S01E21.mkv";
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 211) as u8).collect();
     let rr_bytes = 512;
@@ -6498,14 +6503,14 @@ async fn par2_damage_in_the_envelope_repairs_while_the_set_stays_direct() {
 
 #[tokio::test]
 async fn a_repair_reads_its_sources_by_file_index_when_the_par2_index_leads_the_nzb() {
-    // The index-space regression, and the reason every other phase 6 fixture is
+    // The index-space regression, and the reason every other repair fixture is
     // blind to it. A repair materializes its damaged volumes through the hybrid
-    // provider, and that provider is keyed by **job file index** so one instance
-    // can answer for every set of a job. The reconstruction plan was built with
-    // the set's own **volume index**. The two are the same number exactly when a
-    // set's volumes are NZB files `0..n-1` — true whenever the PAR2 is appended
-    // last, which is every fixture and most real NZBs, and false the moment a
-    // `.par2` or `.nfo` leads or a job carries two sets.
+    // provider, and that provider is keyed by **job file index** so one
+    // instance can answer for every set of a job. The reconstruction plan was
+    // built with the set's own **volume index**. The two are the same number
+    // exactly when a set's volumes are NZB files `0..n-1` — true whenever the
+    // PAR2 is appended last, which is every fixture and most real NZBs, and
+    // false the moment a `.par2` or `.nfo` leads or a job carries two sets.
     //
     // When they differ the sweep reads a *different volume's* bytes: volume 1
     // asks for file index 1 and is handed volume 0, fails its composed CRC32,
@@ -6570,7 +6575,7 @@ async fn a_repair_reads_its_sources_by_file_index_when_the_par2_index_leads_the_
 #[tokio::test]
 async fn an_unrepairable_direct_set_still_demotes_whole() {
     // The fallback, unchanged: with no recovery blocks the damage cannot be
-    // repaired, so phase 6 refuses before it materializes anything and wave 2's
+    // repaired, so repair refuses before it materializes anything and the
     // whole-set demotion answers instead. Same fixture, same damage, one
     // difference — the recovery stream.
     let member_name = "Silver.Horizon.S01E22.mkv";
@@ -6613,7 +6618,7 @@ async fn an_unrepairable_direct_set_still_demotes_whole() {
 
 /// A par2-bearing direct job driven to the point where its one set is live and
 /// carries repairable PAR2 damage, with the live pipeline handed back so a test
-/// can drive phase 6's seam itself and watch what it refuses.
+/// can drive the repair seam itself and watch what it refuses.
 async fn live_damaged_direct_job(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -6647,7 +6652,7 @@ async fn live_damaged_direct_job(
     )
     .await;
     // The harness delivers articles without dequeuing them, so without this the
-    // download pipeline never looks exhausted and H3's settle guard defers every
+    // download pipeline never looks exhausted and the settle guard defers every
     // verdict.
     if let Some(state) = pipeline.jobs.get_mut(&job_id) {
         state.download_queue = crate::DownloadQueue::new();
@@ -6656,9 +6661,9 @@ async fn live_damaged_direct_job(
     (pipeline, working_dir)
 }
 
-/// The envelope-damage fixture every phase 6 repair test is built on: three
-/// volumes carrying one stored member and a recovery record, with the record's
-/// data area damaged in the middle volume.
+/// The envelope-damage fixture every repair test is built on: three volumes
+/// carrying one stored member and a recovery record, with the record's data
+/// area damaged in the middle volume.
 fn repairable_envelope_damage(
     member_name: &str,
     payload: &[u8],
@@ -6673,17 +6678,17 @@ fn repairable_envelope_damage(
 
 #[tokio::test]
 async fn a_rewrite_over_the_holds_budget_demotes_before_it_materializes_anything() {
-    // F3. Every repaired byte re-enters the router as a hold, so a rewrite is
+    // Every repaired byte re-enters the router as a hold, so a rewrite is
     // charged against the same RAM ceiling ordinary staging is — and the first
     // shape never checked: it read every rewrite span of every damaged volume
     // whole, then let the router copy them into staging, so a missing-volume
     // repair of a large set peaked at about twice the repaired bytes with
     // nothing bounding either term.
     //
-    // The A/B is the budget and nothing else. Phase 7 revisits the bound itself
-    // — routing a repaired volume in budget-sized instalments lifts it — but
-    // until then an over-budget rewrite demotes, and it must do so before the
-    // checkpoint delete, so finding out costs the set nothing.
+    // The A/B is the budget and nothing else. A later pass revisits the bound
+    // itself — routing a repaired volume in budget-sized instalments lifts it —
+    // but until then an over-budget rewrite demotes, and it must do so before
+    // the checkpoint delete, so finding out costs the set nothing.
     let member_name = "Silver.Horizon.S01E28.mkv";
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 211) as u8).collect();
     let (volumes, par2_bytes) = repairable_envelope_damage(member_name, &payload);
@@ -6735,7 +6740,7 @@ async fn a_rewrite_over_the_holds_budget_demotes_before_it_materializes_anything
 
 #[tokio::test]
 async fn a_second_damage_verdict_after_a_repair_demotes_instead_of_repairing_again() {
-    // F8. Nothing else terminates the loop. A set that is damaged again after a
+    // Nothing else terminates the loop. A set that is damaged again after a
     // completed repair produces the same verdict on every completion check, and
     // without a bound each one materializes, repairs, re-routes and re-verifies
     // — forever. One attempt, then the whole-set demotion.
@@ -6938,7 +6943,7 @@ struct TwoSetPar2Fixture {
     lost: (u32, u32),
 }
 
-/// Builds the F2 fixture.
+/// Builds the quiet-pass fixture.
 ///
 /// Set A is clean and gate-passed. Set B loses the second half of its middle
 /// volume — member payload, recovery record and end-of-archive record together —
@@ -6970,9 +6975,9 @@ fn two_set_par2_fixture(
     }
 }
 
-/// Drives the F2 fixture to the state the capability lives in: every article but
-/// the lost one delivered, the PAR2 index parsed, the download pipeline drained,
-/// and set A finalized while set B is still live and damaged.
+/// Drives the quiet-pass fixture to the state the capability lives in: every
+/// article but the lost one delivered, the PAR2 index parsed, the download
+/// pipeline drained, and set A finalized while set B is still live and damaged.
 ///
 /// Reaching the state directly, because it is a *state*, not a sequence: a job
 /// whose PAR2 already read clean once released its ready sets, and one of them
@@ -7046,10 +7051,10 @@ async fn direct_job_with_one_finalized_neighbour(
 
 #[tokio::test]
 async fn a_finalized_set_does_not_stop_its_live_neighbour_repairing_while_direct() {
-    // F2, second round: the capability itself, where the first round could only
+    // Second round: the capability itself, where the first round could only
     // assert the absence of the bug it fixed.
     //
-    // Round one fixed the **attribution**. The quiet pass phase 6 runs in front
+    // Round one fixed the **attribution**. The quiet pass repair runs in front
     // of the repairer was a bare `verify_all`, without the two damage
     // adjustments the authoritative pass applies to its own verdict, so a
     // finalized set's absent volumes all read `Missing`, `damaged_files_by_set`
@@ -7231,10 +7236,10 @@ async fn a_finalized_set_does_not_stop_its_live_neighbour_repairing_while_direct
 async fn a_job_that_dies_inside_the_retention_window_sweeps_its_envelopes_on_restart() {
     // Retention is in-memory bookkeeping over files on disk, and nothing about
     // it is persisted — deliberately, because there is nothing a restart could
-    // do with it. A finalized set retires its checkpoint row, so restore rebuilds
-    // it fresh, claims none of its envelopes, and phase 5's orphan sweep takes
-    // every one of them. The point of the test is that deferring the delete did
-    // not quietly move an envelope out of the sweep's reach.
+    // do with it. A finalized set retires its checkpoint row, so restore
+    // rebuilds it fresh, claims none of its envelopes, and the orphan sweep
+    // takes every one of them. The point of the test is that deferring the
+    // delete did not quietly move an envelope out of the sweep's reach.
     let finalized_member = "Silver.Horizon.S01E28.mkv";
     let live_member = "Amber.Trail.S01E02.mkv";
     let finalized_payload: Vec<u8> = (0..2400u32).map(|index| (index % 193) as u8).collect();
@@ -7320,7 +7325,7 @@ async fn a_job_that_dies_inside_the_retention_window_sweeps_its_envelopes_on_res
 
 #[tokio::test]
 async fn an_encrypted_finalized_set_keeps_a_retained_image_that_reads_back_as_posted() {
-    // Plan 136, E2, read against the retention path. E1 refused an encrypted set
+    // The retention path, over cipher. Encrypted sets were once refused
     // a retained image outright: its destinations hold **plaintext** while PAR2
     // describes the posted **cipher**, so an image assembled from the committed
     // members answered every read that crossed a member with the wrong bytes.
@@ -7461,13 +7466,14 @@ async fn an_encrypted_finalized_set_keeps_a_retained_image_that_reads_back_as_po
 
 /// [`run_repairable_par2_gate`] with an article that never arrives.
 ///
-/// A **lost article** is the only shape member-payload damage can reach PAR2 in.
-/// Corrupted member bytes are caught far earlier and far more cheaply by D4's
-/// own gates — the per-part packed CRC32 at part completion, the whole-member
-/// CRC32 at member completion — which demote the set during the download, before
-/// a PAR2 index has even been parsed. What those gates cannot do is *manufacture*
-/// bytes that never came, so a hole in a member's packed range survives to the
-/// PAR2 pass, and repairing it is exactly what phase 6 is for.
+/// A **lost article** is the only shape member-payload damage can reach PAR2
+/// in. Corrupted member bytes are caught far earlier and far more cheaply by
+/// direct-store's own gates — the per-part packed CRC32 at part completion, the
+/// whole-member CRC32 at member completion — which demote the set during the
+/// download, before a PAR2 index has even been parsed. What those gates cannot
+/// do is *manufacture* bytes that never came, so a hole in a member's packed
+/// range survives to the PAR2 pass, and repairing it is exactly what repair is
+/// for.
 async fn run_lost_article_gate(
     gate: DirectStoreGate,
     job_id: JobId,
@@ -7646,8 +7652,8 @@ async fn a_lost_article_inside_a_member_repairs_and_reconfirms_the_volume() {
 #[tokio::test]
 async fn a_lost_article_inside_an_encrypted_member_demotes_instead_of_repairing() {
     // The encrypted twin of `a_lost_article_inside_a_member_repairs_and_
-    // reconfirms_the_volume`, whose absence let this hide through E1-E4 (E4
-    // review F1). It pins a **known limit**, not the behaviour anyone wants.
+    // reconfirms_the_volume`, whose absence let this hide for so long. It pins
+    // a **known limit**, not the behaviour anyone wants.
     //
     // The plaintext twin above repairs the hole in place and never demotes. The
     // same shape over an encrypted set cannot, and it fails over roughly eight
@@ -7768,13 +7774,13 @@ fn par2_bearing_job_spec_with_articles(
 
 #[tokio::test]
 async fn an_interior_hole_sizes_the_repair_by_the_slices_it_actually_touches() {
-    // The wave-2 review note, priced. The middle article of the middle volume is
-    // lost, so the volume has an interior hole with healthy bytes on both sides.
-    // Before phase 6 the verifier's sequential sweep stopped at that hole and
-    // called every slice after it damaged; a repair sized from that count spends
-    // a recovery block per slice, and the ones past the hole are blocks spent
-    // rebuilding bytes that were never broken. Enough of them and a repairable
-    // set reads as unrepairable.
+    // The wave-2 review note, priced. The middle article of the middle volume
+    // is lost, so the volume has an interior hole with healthy bytes on both
+    // sides. Before repair landed the verifier's sequential sweep stopped at
+    // that hole and called every slice after it damaged; a repair sized from
+    // that count spends a recovery block per slice, and the ones past the hole
+    // are blocks spent rebuilding bytes that were never broken. Enough of them
+    // and a repairable set reads as unrepairable.
     const ARTICLES: usize = 3;
     let member_name = "Silver.Horizon.S01E24.mkv";
     let payload: Vec<u8> = (0..6000u32).map(|index| (index % 229) as u8).collect();
@@ -7888,14 +7894,14 @@ async fn an_interior_hole_sizes_the_repair_by_the_slices_it_actually_touches() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 7: the config surface, and D3's sparse marking
+// The config surface, and sparse marking
 // ---------------------------------------------------------------------------
 
 /// Every other test here reaches for `set_gate`. This one comes through
-/// configuration, which is what phase 7 made the operator surface: the
+/// configuration, which is what the operator surface exposes: the
 /// `[direct_store]` table turns routing on, and turning it **off** at startup
 /// makes a restart ignore and sweep the mid-flight direct state and redownload
-/// the job conventionally (plan 135, Risks — kill switch).
+/// the job conventionally.
 #[tokio::test]
 async fn the_config_gate_routes_and_a_config_off_restart_sweeps_and_redownloads() {
     use crate::settings::DirectStoreOverrides;
@@ -7916,8 +7922,9 @@ async fn the_config_gate_routes_and_a_config_off_restart_sweeps_and_redownloads(
     let job_id = JobId(41090);
     let arrivals: Vec<(u32, u32)> = vec![(0, 0), (0, 1), (1, 0)];
 
-    // Phase 1: config on. The job routes, so partials, envelopes and a coverage
-    // row exist — the non-vacuity the sweep assertions below depend on.
+    // First run: config on. The job routes, so partials, envelopes and a
+    // coverage row exist — the non-vacuity the sweep assertions below depend
+    // on.
     let working_dir = {
         let (mut pipeline, _, _) = new_config_gated_direct_pipeline(
             &temp_dir,
@@ -7960,7 +7967,8 @@ async fn the_config_gate_routes_and_a_config_off_restart_sweeps_and_redownloads(
         "and a config-gated direct job writes no source volume either"
     );
 
-    // Phase 2: config off. Same working directory, same spec, a fresh pipeline.
+    // Second run: config off. Same working directory, same spec, a fresh
+    // pipeline.
     let (mut pipeline, _, _) = new_config_gated_direct_pipeline(
         &temp_dir,
         DirectStoreOverrides {
@@ -8020,9 +8028,9 @@ async fn the_config_gate_routes_and_a_config_off_restart_sweeps_and_redownloads(
     );
 }
 
-/// D3: a destination that cannot be marked sparse demotes the set, and the
-/// refusal happens before the file holds a hole — so nothing it created is left
-/// on disk.
+/// A destination that cannot be marked sparse demotes the set, and the refusal
+/// happens before the file holds a hole — so nothing it created is left on
+/// disk.
 #[tokio::test]
 async fn a_destination_that_cannot_be_marked_sparse_demotes_before_it_holds_a_hole() {
     use crate::pipeline::direct_store::sparse::SparseMarking;
@@ -8107,13 +8115,13 @@ async fn a_holds_scratch_that_cannot_be_marked_sparse_demotes_the_set() {
 }
 
 // ---------------------------------------------------------------------------
-// Encrypted direct-store (plan 136, phase E1)
+// Encrypted direct-store
 //
-// The spine is the same differential phase 4 established, with one input added:
-// the identical job is run with routing on and off *with the same password*, and
-// the outputs must be byte-identical. With routing on, no source volume may ever
-// appear on disk — which for an encrypted set also means the ciphertext never
-// does.
+// The spine is the same differential established earlier, with one input added:
+// the identical job is run with routing on and off *with the same password*,
+// and the outputs must be byte-identical. With routing on, no source volume may
+// ever appear on disk — which for an encrypted set also means the ciphertext
+// never does.
 // ---------------------------------------------------------------------------
 
 /// The KDF tuple every encrypted fixture here shares. `lg2 = 4` is 16 PBKDF2
@@ -8160,7 +8168,7 @@ fn build_test_rar_crypt_extra(psw_check: Option<&[u8; 8]>, keyed_checksum: bool)
 /// A real `rar -v` split lands wherever the volume filled up, and an encrypted
 /// member's parts are not individually block-aligned — only the member's total
 /// is. Aligned fixtures would never exercise the straddling block, which is the
-/// one shape E-D2's holds exist for.
+/// one shape the cipher-block holds exist for.
 fn misaligned_parts(total: usize, count: usize) -> Vec<usize> {
     assert!(count >= 1 && total >= count);
     let base = total / count;
@@ -8508,8 +8516,8 @@ async fn a_wrong_password_with_no_check_routes_until_the_keyed_member_gate_catch
     // materialization is the demotion machinery's own — already pinned by
     // `a_demoted_set_materializes_its_covered_volumes_instead_of_refetching_them`.
 
-    // Non-vacuity, and the E-D3 claim itself: the identical fixture with the
-    // right password verifies through the same keyed fold and completes.
+    // Non-vacuity, and the keyed-fold claim itself: the identical fixture with
+    // the right password verifies through the same keyed fold and completes.
     let clean = run_gate_with_password(
         DirectStoreGate::Enabled,
         None,
@@ -8595,11 +8603,11 @@ async fn an_encrypted_span_that_arrives_before_its_predecessor_block_is_held_the
     .await;
 
     // The direct side is driven inline rather than through the gate helper, for
-    // one assertion the helper cannot make (E1 review F11): byte-identical
-    // output proves the drain produced the right bytes, but it cannot tell a set
-    // that *held* a straddling block from one whose arrival order never made it
-    // hold. The counter is that difference, and without it this test would pass
-    // just as happily against a build that had deleted the edge-hold path.
+    // one assertion the helper cannot make: byte-identical output proves the
+    // drain produced the right bytes, but it cannot tell a set that *held* a
+    // straddling block from one whose arrival order never made it hold. The
+    // counter is that difference, and without it this test would pass just as
+    // happily against a build that had deleted the edge-hold path.
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
@@ -8660,7 +8668,7 @@ async fn an_encrypted_span_that_arrives_before_its_predecessor_block_is_held_the
 
 #[tokio::test]
 async fn a_forged_password_check_admits_and_the_keyed_member_gate_catches_it_anyway() {
-    // Plan 136's Risks section, as a test. The RAR5 password check is 8
+    // The forgeable-check risk, as a test. The RAR5 password check is 8
     // unauthenticated bytes a writer chooses, so a hostile archive can carry the
     // check for a password that does **not** decrypt its data and have admission
     // report `Verified`. That is why the check is an admission *test* and never a
@@ -8784,12 +8792,11 @@ async fn an_encrypted_member_whose_size_is_block_aligned_carries_no_padding() {
 
 #[tokio::test]
 async fn a_password_that_arrives_before_the_first_article_still_admits_the_set() {
-    // Plan 136's open question 2, answered — and named for what it actually
-    // proves (E1 review F5). weaver *does* support setting a password after add
-    // (`setJobPassword`, and the NZBGet facade's `*Unpack:Password`), both of
-    // which mutate the live job spec, and the direct sets are built once per job
-    // and memoized, so the seam re-reads the spec while any set is still willing
-    // to take one.
+    // Named for what it actually proves. weaver *does* support setting a
+    // password after add (`setJobPassword`, and the NZBGet facade's
+    // `*Unpack:Password`), both of which mutate the live job spec, and the
+    // direct sets are built once per job and memoized, so the seam re-reads the
+    // spec while any set is still willing to take one.
     //
     // The window is **pre-first-article**, not "any time during the download":
     // admission runs from the first successful header parse, and its
@@ -8867,12 +8874,12 @@ async fn a_password_that_arrives_before_the_first_article_still_admits_the_set()
 
 #[tokio::test]
 async fn a_password_corrected_before_the_first_article_admits_with_the_correction() {
-    // E1 review F5's dead branch, end to end. `KeyRing::set_password` has always
-    // handled a password *changing* while nothing is admitted — but the seam
-    // that calls it stopped asking the moment any password was held, so a job
-    // added with the wrong one and corrected before its first header parsed
-    // derived keys from the stale one, admitted on the header's check, and
-    // failed the keyed member gate a whole download later.
+    // The dead branch, end to end. `KeyRing::set_password` has always handled a
+    // password *changing* while nothing is admitted — but the seam that calls
+    // it stopped asking the moment any password was held, so a job added with
+    // the wrong one and corrected before its first header parsed derived keys
+    // from the stale one, admitted on the header's check, and failed the keyed
+    // member gate a whole download later.
     let member_name = "Silver.Horizon.S02E16.mkv";
     let payload: Vec<u8> = (0..1700u32).map(|index| (index % 157) as u8).collect();
     let volumes = encrypted_store_set(
@@ -9115,8 +9122,8 @@ async fn an_encrypted_set_restarted_without_its_password_demotes_by_name() {
 }
 
 // ---------------------------------------------------------------------------
-// E-D5: the machinery plan 136 changes nothing about, asserted rather than
-// assumed. Each of these is the encrypted twin of a plan 135 guarantee.
+// The machinery encryption changes nothing about, asserted rather than
+// assumed. Each of these is the encrypted twin of a plaintext guarantee.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -9142,7 +9149,7 @@ async fn encrypted_routing_leaves_the_plan_135_guarantees_untouched() {
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
     // Payload before headers, so the holds machinery carries cipher bytes the
-    // layout cannot place yet — the same hold plan 135 uses, over ciphertext.
+    // layout cannot place yet — the same hold a plaintext set uses, over cipher.
     let mut arrivals: Vec<(u32, u32)> = (0..volumes.len() as u32).map(|index| (index, 1)).collect();
     arrivals.extend((0..volumes.len() as u32).map(|index| (index, 0)));
     for (file_index, segment_number) in &arrivals {
@@ -9156,8 +9163,8 @@ async fn encrypted_routing_leaves_the_plan_135_guarantees_untouched() {
         .await;
     }
 
-    // D7 suppression: an encrypted set's source volumes are direct volumes, so
-    // no legacy floor, completed-file row or archive re-probe may be written.
+    // Suppression: an encrypted set's source volumes are direct volumes, so no
+    // legacy floor, completed-file row or archive re-probe may be written.
     assert!(
         (0..volumes.len() as u32)
             .all(|file_index| pipeline.is_direct_source_file(NzbFileId { job_id, file_index })),
@@ -9183,7 +9190,7 @@ async fn encrypted_routing_leaves_the_plan_135_guarantees_untouched() {
         .expect("the encrypted set must still be routing");
     assert!(!set.is_demoted(), "no gate here may demote a clean set");
     // Non-vacuity for everything below: this set really is decrypting at write
-    // time, so these are the encrypted twins of the plan 135 guarantees rather
+    // time, so these are the encrypted twins of the plaintext guarantees rather
     // than the plaintext originals under a new name.
     assert!(
         set.router.routes_encrypted(),
@@ -9212,11 +9219,12 @@ async fn encrypted_routing_leaves_the_plan_135_guarantees_untouched() {
 
 #[tokio::test]
 async fn a_par2_bearing_encrypted_job_routes_direct_and_completes_byte_identically() {
-    // E2's headline differential, and the one the phase exists for. E1 refused
-    // this job at admission (`EncryptedMemberRefused(Par2Declared)`) because an
-    // encrypted set's destinations hold plaintext while PAR2 describes the
-    // posted cipher — and nearly every encrypted release carries PAR2, so that
-    // refusal reached almost every set the feature was built for.
+    // The headline differential, and the one the overlay exists for. An earlier
+    // shape refused this job at admission
+    // (`EncryptedMemberRefused(Par2Declared)`) because an encrypted set's
+    // destinations hold plaintext while PAR2 describes the posted cipher — and
+    // nearly every encrypted release carries PAR2, so that refusal reached
+    // almost every set the feature was built for.
     //
     // The re-encrypting overlay retires it: the pass reads the set's source
     // volumes virtually, the overlay turns the member ranges back into what was
@@ -9301,10 +9309,10 @@ async fn a_par2_bearing_encrypted_job_routes_direct_and_completes_byte_identical
         "the set should have finalized once verification cleared it, got {}",
         direct.demotions
     );
-    // D5's point, unchanged by encryption: verification finishes with the
+    // The point, unchanged by encryption: verification finishes with the
     // download. The live short-circuit is what settles a clean set, and it can
-    // only settle one whose straddling blocks come back from a read that answers
-    // in posted space — which is the overlay.
+    // only settle one whose straddling blocks come back from a read that
+    // answers in posted space — which is the overlay.
     assert!(
         direct.full_verify_skips > 0,
         "the clean encrypted set must take the live short-circuit; skips={} \
@@ -9316,12 +9324,13 @@ async fn a_par2_bearing_encrypted_job_routes_direct_and_completes_byte_identical
 
 #[tokio::test]
 async fn live_par2_settles_an_encrypted_direct_volume_through_the_overlay() {
-    // E1 review F3, inverted by E2. Live verification's in-stream feed was
-    // always honest — those are the posted cipher bytes, taken before the write
-    // transform — but a block straddling an article boundary is only ever
-    // settled by a *read-back*, and in E1 that read-back resolved through the
-    // virtual volume to the member's plaintext `.direct.partial`. Every boundary
-    // block would have come back `Bad`, so both halves refused.
+    // The in-stream-feed finding, inverted by the overlay. Live verification's
+    // in-stream feed was always honest — those are the posted cipher bytes,
+    // taken before the write transform — but a block straddling an article
+    // boundary is only ever settled by a *read-back*, and that read-back once
+    // resolved through the virtual volume to the member's plaintext
+    // `.direct.partial`. Every boundary block would have come back `Bad`, so
+    // both halves refused.
     //
     // The overlay makes the read-back answer in posted space, so both halves are
     // live again. The assertion is the strong one: coverage is recorded, blocks
@@ -9437,12 +9446,12 @@ async fn live_par2_settles_an_encrypted_direct_volume_through_the_overlay() {
 
 #[tokio::test]
 async fn a_recovery_set_the_spec_never_declared_no_longer_demotes_an_encrypted_set() {
-    // The E1 belt, and what E2 leaves of it. A PAR2 file the job's spec did
-    // **not** classify as one — a deobfuscated or renamed file — can make a
+    // The belt, and what the overlay leaves of it. A PAR2 file the job's spec
+    // did **not** classify as one — a deobfuscated or renamed file — can make a
     // recovery set real mid-job, long after an encrypted set started routing.
-    // E1 had to demote such a set before the authoritative pass, because the
-    // pass would otherwise have read plaintext where cipher belongs; the whole
-    // set's volumes then came back off the wire.
+    // An earlier shape had to demote such a set before the authoritative pass,
+    // because the pass would otherwise have read plaintext where cipher
+    // belongs; the whole set's volumes then came back off the wire.
     //
     // With the overlay the pass reads posted bytes, so the belt no longer fires
     // on "encrypted" at all. It fires only on
@@ -9557,7 +9566,7 @@ async fn a_recovery_set_the_spec_never_declared_no_longer_demotes_an_encrypted_s
 
 #[tokio::test]
 async fn par2_damage_in_an_encrypted_sets_envelope_repairs_while_the_set_stays_direct() {
-    // D8's first transition, over cipher. The damaged byte is in a recovery
+    // The first transition, over cipher. The damaged byte is in a recovery
     // record's data area — outside the member's packed range, so neither the
     // per-part packed CRC32 over cipher nor the keyed whole-member fold over
     // plaintext covers it, and inside a service block's data rather than a
@@ -9568,8 +9577,8 @@ async fn par2_damage_in_an_encrypted_sets_envelope_repairs_while_the_set_stays_d
     // volume is **materialized** out of the set's own bytes, which for an
     // encrypted set means re-encrypting every member range it covers, and the
     // repaired spans re-enter the router with `replace` set, which is the path
-    // E1 review F6's cache invalidation guards. Held to the same standard as
-    // the plaintext version: the gate-off run with the same password.
+    // The cache-invalidation guards. Held to the same standard as the plaintext
+    // version: the gate-off run with the same password.
     let member_name = "Silver.Horizon.S02E21.mkv";
     // Not a multiple of 16, so the member carries tail padding and the
     // materialization has to re-encrypt a final block out of it.
@@ -9657,12 +9666,13 @@ async fn par2_damage_in_an_encrypted_sets_envelope_repairs_while_the_set_stays_d
 #[tokio::test]
 async fn par2_damage_in_a_split_encrypted_members_first_article_repairs_while_the_set_stays_direct()
 {
-    // E2 review F1, and the coverage gap that hid it: every other repair test in
-    // this file damages a *recovery record* in a volume's **last** article, so
-    // the rewrite it provokes never reaches a member extent's first cipher
-    // block. Here the damaged volume is posted as a single article, so the
-    // rewrite — widened to whole articles — starts at physical zero and the
-    // whole of volume 1's member extent is re-routed, first block included.
+    // The drain-order finding, and the coverage gap that hid it: every other
+    // repair test in this file damages a *recovery record* in a volume's
+    // **last** article, so the rewrite it provokes never reaches a member
+    // extent's first cipher block. Here the damaged volume is posted as a
+    // single article, so the rewrite — widened to whole articles — starts at
+    // physical zero and the whole of volume 1's member extent is re-routed,
+    // first block included.
     //
     // That block straddles the volume boundary: part of it was posted in volume
     // 0, and its CBC predecessor lies wholly in volume 0. Both were routed and
@@ -9761,10 +9771,11 @@ async fn par2_damage_in_a_split_encrypted_members_first_article_repairs_while_th
 
 #[tokio::test]
 async fn an_encrypted_set_that_demotes_rebuilds_byte_exact_posted_volumes() {
-    // D8's *other* transition, over cipher. E1 refused reconstruction for an
-    // encrypted set outright (`ReconstructionFailure::EncryptedPostedBytes`) and
-    // refetched every article instead, because the member partials hold
-    // plaintext where the volume holds cipher.
+    // The *other* transition, over cipher. An earlier shape refused
+    // reconstruction for an encrypted set outright
+    // (`ReconstructionFailure::EncryptedPostedBytes`) and refetched every
+    // article instead, because the member partials hold plaintext where the
+    // volume holds cipher.
     //
     // The overlay makes the sweep read posted bytes, so a demoting encrypted set
     // materializes its volumes out of its own routed bytes like any other — and
@@ -9849,7 +9860,7 @@ async fn an_encrypted_set_that_demotes_rebuilds_byte_exact_posted_volumes() {
              was decrypted"
         );
     }
-    // And not one volume article came back off the wire — E1's refusal here
+    // And not one volume article came back off the wire — That refusal
     // refetched every one of them, which is exactly what the sweep exists to
     // avoid. The PAR2 index is still outstanding because it was never posted.
     let queued = peek_queued_segments(&mut pipeline, job_id);
@@ -9865,7 +9876,7 @@ async fn an_encrypted_set_that_demotes_rebuilds_byte_exact_posted_volumes() {
 #[tokio::test]
 async fn a_par2_bearing_encrypted_set_restarted_mid_download_verifies_and_completes_byte_identically()
  {
-    // E2's restart differential, and the shape E1 could not reach: a
+    // The restart differential, and the shape the write side could not reach: a
     // par2-bearing job was refused encrypted admission outright, so nothing
     // encrypted ever survived a restart *and* faced a verifier.
     //
@@ -10047,15 +10058,16 @@ async fn a_par2_bearing_encrypted_set_restarted_mid_download_verifies_and_comple
 }
 
 // ---------------------------------------------------------------------------
-// RAR4/RAR3 file encryption (plan 136, E3)
+// RAR4/RAR3 file encryption
 //
-// The same three E-D2/E-D3/E-D4 mechanisms over the other format. Nothing in
-// the router, the holds, the gates, the overlay or the snapshot is
-// RAR5-specific; the only differences the format brings are the cipher width
-// (AES-128), where the key and IV come from (both out of the KDF, over an
-// 8-byte per-file salt the header states), and the two things RAR4 does not
-// have — a password-check value, and a tweaked-checksum flag. Those two absences
-// are the subject of the tests below as much as the presence of the cipher is.
+// The same three cipher-hold, keyed-fold and crypt-restore mechanisms over the
+// other format. Nothing in the router, the holds, the gates, the overlay or the
+// snapshot is RAR5-specific; the only differences the format brings are the
+// cipher width (AES-128), where the key and IV come from (both out of the KDF,
+// over an 8-byte per-file salt the header states), and the two things RAR4 does
+// not have — a password-check value, and a tweaked-checksum flag. Those two
+// absences are the subject of the tests below as much as the presence of the
+// cipher is.
 // ---------------------------------------------------------------------------
 
 /// The corpus-wide RAR4 fixture salt. RAR salts each *file* rather than the
@@ -10135,7 +10147,7 @@ fn build_test_rar4_encrypted_file_header(
 ///   parameter exists here and admission can never refute a password.
 /// - **no keyed checksum.** RAR4 has no hash-MAC flag, so the whole-member
 ///   CRC32 below is the bare plaintext CRC32 and `convert_crc32_to_mac` is not
-///   applied to it. That is the E0 finding stated as a fixture.
+///   applied to it. That is that finding stated as a fixture.
 fn encrypted_rar4_store_set(
     member_name: &str,
     payload: &[u8],
@@ -10305,11 +10317,12 @@ async fn a_saltless_rar4_header_keys_off_the_password_alone_and_still_routes() {
 
 #[tokio::test]
 async fn a_wrong_password_on_a_rar4_set_is_caught_by_the_member_gate_and_nothing_earlier() {
-    // The E-D3 claim for RAR4, and the one place the format differs in a way
-    // that matters: there is **no** password-check value, so `WrongPassword`
-    // cannot fire at admission however wrong the password is. Every RAR4 member
-    // routes provisionally and the whole-member CRC32 is the only detector —
-    // a *plain* CRC32, not a keyed fold, because RAR4 has no hash-MAC flag.
+    // The keyed-fold claim for RAR4, and the one place the format differs in a
+    // way that matters: there is **no** password-check value, so
+    // `WrongPassword` cannot fire at admission however wrong the password is.
+    // Every RAR4 member routes provisionally and the whole-member CRC32 is the
+    // only detector — a *plain* CRC32, not a keyed fold, because RAR4 has no
+    // hash-MAC flag.
     let member_name = "Silver.Horizon.S03E03.mkv";
     let payload: Vec<u8> = (0..2100u32).map(|index| (index % 211) as u8).collect();
     let volumes = encrypted_rar4_store_set(
@@ -10385,11 +10398,12 @@ async fn an_encrypted_rar4_set_with_no_password_demotes_instead_of_routing_ciphe
 
 #[tokio::test]
 async fn a_par2_bearing_encrypted_rar4_job_routes_direct_and_completes_byte_identically() {
-    // E2's re-encrypting overlay, over AES-128: the destinations hold plaintext
+    // The re-encrypting overlay, over AES-128: the destinations hold plaintext
     // while PAR2 describes the posted cipher, so every block the authoritative
-    // pass reads has to be re-derived through `MemberCipher::encrypt` — which is
-    // now a dispatch rather than a fixed width. If that dispatch were wrong the
-    // pass would report damage in a byte-perfect volume and the set would demote.
+    // pass reads has to be re-derived through `MemberCipher::encrypt` — which
+    // is now a dispatch rather than a fixed width. If that dispatch were wrong
+    // the pass would report damage in a byte-perfect volume and the set would
+    // demote.
     let member_name = "Silver.Horizon.S03E05.mkv";
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 199) as u8).collect();
     let volumes = encrypted_rar4_store_set(
@@ -10451,13 +10465,13 @@ async fn a_par2_bearing_encrypted_rar4_job_routes_direct_and_completes_byte_iden
 
 #[tokio::test]
 async fn an_encrypted_rar4_set_restarted_mid_download_completes_byte_identically() {
-    // E-D4 over RAR4. What a restart has to rebuild here is *not* what it
-    // rebuilds for RAR5: the snapshot row carries the 8-byte file salt and no
-    // IV, because RAR4's IV is a KDF output and persisting one would put a
-    // password verifier in the database that the archive itself does not have.
-    // The resumed run re-derives both key and IV from the live password, and the
-    // checkpointed cipher blocks are what let it decrypt at the coverage
-    // frontier rather than from the member's start.
+    // Crypt-state restore over RAR4. What a restart has to rebuild here is
+    // *not* what it rebuilds for RAR5: the snapshot row carries the 8-byte file
+    // salt and no IV, because RAR4's IV is a KDF output and persisting one
+    // would put a password verifier in the database that the archive itself
+    // does not have. The resumed run re-derives both key and IV from the live
+    // password, and the checkpointed cipher blocks are what let it decrypt at
+    // the coverage frontier rather than from the member's start.
     const ARTICLES: usize = 4;
     let member_name = "Silver.Horizon.S03E06.mkv";
     let payload: Vec<u8> = (0..8000u32).map(|index| (index % 251) as u8).collect();
@@ -10641,7 +10655,7 @@ async fn an_encrypted_rar4_set_restarted_without_its_password_demotes_by_name() 
 }
 
 // ---------------------------------------------------------------------------
-// E4: `-hp`, header encryption (plan 136)
+// Header-encrypted (`-hp`) sets
 //
 // `-hp` withholds the *layout*, not the *keying facts*: RAR5's type-4 record is
 // plaintext and states the salt, the KDF count and — by default — a password
@@ -10654,7 +10668,7 @@ async fn an_encrypted_rar4_set_restarted_without_its_password_demotes_by_name() 
 // parse**, so the layout itself would come out of garbage — and "garbage will
 // not parse" is a 2^-32 argument, not a gate. `-hp` therefore admits on
 // `Verified` and on nothing else, and every other outcome is a named refusal
-// back to the pre-E4 floor: materialize the volume, extract conventionally.
+// back to the older floor: materialize the volume, extract conventionally.
 // ---------------------------------------------------------------------------
 
 /// The archive-level KDF tuple every `-hp` fixture here shares. `lg2 = 4` for
@@ -10750,8 +10764,8 @@ fn seal_test_rar_header(key: &[u8; 32], iv: &[u8; 16], header: &[u8]) -> Vec<u8>
 /// - `password` keys everything: the headers, the file data, and the checks.
 /// - `check` is what the *archive-level* record claims, which is what `-hp`
 ///   admission is decided on. The member-level check is always this password's,
-///   because a member that refuted it would be testing E1's gate rather than
-///   this one.
+///   because a member that refuted it would be testing the admission gate
+///   rather than this one.
 fn header_encrypted_store_set(
     member_name: &str,
     payload: &[u8],
@@ -10946,9 +10960,9 @@ fn header_encrypted_rar4_set(volume_count: usize, body_bytes: usize) -> Vec<(Str
 /// `nzb_zstd` is the job's persisted NZB, which is where `nzb.meta.password`
 /// comes from, and `nzb_file_name` is the path whose stem carries a
 /// `{{password}}` convention. Both are read by
-/// `archive_password_candidates_for_job`, which is the harvest E4 keys from —
-/// so a fixture that sets neither is a job with only whatever `spec.password`
-/// holds.
+/// `archive_password_candidates_for_job`, which is the harvest the header key
+/// is derived from — so a fixture that sets neither is a job with only whatever
+/// `spec.password` holds.
 #[allow(clippy::too_many_arguments)]
 async fn run_hp_gate(
     gate: DirectStoreGate,
@@ -11007,12 +11021,13 @@ async fn run_hp_gate(
 ///
 /// It stops at the demotion because that is where its caller's claim ends, and
 /// **not** because a refused set has nowhere to go: it very much does, and
-/// [`hp_fallback_outcome`] is where that is proved. Every refusal reason E4 can
-/// reach hands the set back to the conventional path with its articles
-/// re-queued, and for a job that holds the password the conventional path then
-/// opens the archive and produces the member. Anything asserting *that* has to
-/// use the other helper; this one would report a job still `Downloading`,
-/// because nothing here ever re-feeds the refetch the demotion asked for.
+/// [`hp_fallback_outcome`] is where that is proved. Every header-encryption
+/// refusal reason the set can reach hands the set back to the conventional path
+/// with its articles re-queued, and for a job that holds the password the
+/// conventional path then opens the archive and produces the member. Anything
+/// asserting *that* has to use the other helper; this one would report a job
+/// still `Downloading`, because nothing here ever re-feeds the refetch the
+/// demotion asked for.
 async fn hp_routing_outcome_named(
     job_id: JobId,
     volumes: &[(String, Vec<u8>)],
@@ -11265,9 +11280,9 @@ async fn hp_fallback_outcome(
 
 #[tokio::test]
 async fn a_header_encrypted_set_keyed_from_nzb_meta_matches_the_conventional_extractor() {
-    // The E4 spine. The password is in the NZB's `<meta type="password">` and
-    // nowhere else — no operator ever typed it — and the set routes from its
-    // first article.
+    // The header-encryption spine. The password is in the NZB's `<meta
+    // type="password">` and nowhere else — no operator ever typed it — and the
+    // set routes from its first article.
     let member_name = "Silver.Horizon.S04E01.mkv";
     let payload: Vec<u8> = (0..3000u32).map(|index| (index % 251) as u8).collect();
     let volumes = header_encrypted_store_set(
@@ -11337,8 +11352,8 @@ async fn a_header_encrypted_set_keyed_from_nzb_meta_matches_the_conventional_ext
 
 #[tokio::test]
 async fn a_tolerated_member_of_a_header_encrypted_set_extracts_with_the_proved_password() {
-    // Plan 136, E4 follow-up. D1's tolerance extracts a small ineligible member
-    // through the hybrid provider — and an `-hp` set's *virtual* volumes are as
+    // The small-member tolerance extracts a small ineligible member through the
+    // hybrid provider — and an `-hp` set's *virtual* volumes are as
     // header-encrypted as the posted ones, so that extraction cannot so much as
     // open the archive without the key the router proved. It used to open with
     // no password at all, which failed at the first header and demoted the set
@@ -11583,12 +11598,12 @@ async fn a_header_encrypted_set_with_no_password_demotes_by_name() {
     )
     .await;
 
-    // Named, and named *at the first parse*. Before E4 this volume's articles
-    // simply staged: `parse_volume_facts` failed, the router read that as "the
-    // prefix is too short", and the set sat un-demoted until it had burned
-    // `MAX_HEADER_PREFIX_BYTES`. So an assertion on the name is also an
-    // assertion that the parse failure was recognised rather than swallowed —
-    // the old code reaches no `Demoted(...)` here at all.
+    // Named, and named *at the first parse*. Before the named refusal this
+    // volume's articles simply staged: `parse_volume_facts` failed, the router
+    // read that as "the prefix is too short", and the set sat un-demoted until
+    // it had burned `MAX_HEADER_PREFIX_BYTES`. So an assertion on the name is
+    // also an assertion that the parse failure was recognised rather than
+    // swallowed — the old code reaches no `Demoted(...)` here at all.
     assert!(
         outcome
             .routing
@@ -12030,11 +12045,11 @@ async fn a_par2_bearing_header_encrypted_job_verifies_and_completes_byte_identic
     // without: nearly every encrypted release carries PAR2, and both `-hp`
     // helpers switch live verification off.
     //
-    // Nothing about `-hp` should reach the verifier — the archive key is used to
-    // read *headers*, and PAR2 describes the posted volume image, which is
+    // Nothing about `-hp` should reach the verifier — the archive key is used
+    // to read *headers*, and PAR2 describes the posted volume image, which is
     // ciphertext either way. That is precisely the claim worth a test, because
     // it is the sort of claim that stays true only until something reads a
-    // plaintext byte where a posted one belongs. The E2 overlay answers the
+    // plaintext byte where a posted one belongs. The overlay answers the
     // verifier out of the routed member partials re-encrypted, and this asserts
     // that a `-hp` set stays in that arrangement all the way through
     // verification: it admits, it never writes a source volume, it reaches a
@@ -12585,10 +12600,10 @@ fn direct_verdict_summary(verification: &par2_rs::VerificationResult) -> DirectV
 ///
 /// The damage is **posted**, not written afterwards, and that is load-bearing:
 /// a set whose articles all arrive intact extracts, finalizes, and stops
-/// answering through the overlay, so it never reaches this pass at all.
-/// Damaged posted bytes keep the set live *and* fully adjudicated — every
-/// slice carries a verdict, one of them bad — which is the window the session
-/// arm serves, and the case phase 6 exists for.
+/// answering through the overlay, so it never reaches this pass at all. Damaged
+/// posted bytes keep the set live *and* fully adjudicated — every slice carries
+/// a verdict, one of them bad — which is the window the session arm serves, and
+/// the case repair exists for.
 ///
 /// The pass is observed where the pipeline runs it, mid-assembly, rather than
 /// invoked afterwards: by the time a job settles, its live state has been
@@ -12644,7 +12659,7 @@ async fn damaged_direct_verdict_with_session_gate(
     )
 }
 
-/// Plan 138, M3. The retained session drives the authoritative pass for direct
+/// The retained session drives the authoritative pass for direct
 /// sets, and reaches the verdict the read-and-verify pass would have reached —
 /// the same files, the same per-slice validity, the same missing-block count,
 /// the same repairability.
@@ -12654,8 +12669,8 @@ async fn damaged_direct_verdict_with_session_gate(
 /// where the live engine adjudicated every described slice in stream. A slice
 /// proven *bad* counts: it is resolved, and resolving it is what the pass was
 /// for. If the two arms could disagree, a direct job's verdict would depend on
-/// a gate, which is precisely what M5 has to be able to flip without changing
-/// behaviour.
+/// a gate, which is precisely what the gate has to be able to flip without
+/// changing behaviour.
 #[tokio::test]
 async fn the_retained_session_finds_the_same_direct_damage_as_the_pass() {
     let (gate_off, adjudicated_off, session_calls_off) =
@@ -12702,4 +12717,64 @@ async fn the_retained_session_finds_the_same_direct_damage_as_the_pass() {
         repairable_on, repairable_off,
         "and the repairability verdict"
     );
+}
+
+/// A volume's articles arrive in whatever order twelve connections finish
+/// them, so several mid-file articles routinely land before the one carrying
+/// offset zero. The unparsable ceiling must judge the prefix the header walk
+/// can actually consume — not the sum of tail chunks the walk cannot reach.
+/// Before the fix this exact sequence demoted a store-method set
+/// `UnparsableVolume` with its headers never read: six tail articles staged
+/// ~4.2 MiB, segment zero arrived seventh, and the ceiling fired before the
+/// first parse ever ran. (Witnessed live as 23 of 44 demotions in one
+/// functional-direct run, mislabeling compressed sets and falsely demoting
+/// the store sets direct routing exists to carry.)
+#[tokio::test]
+async fn out_of_order_arrival_does_not_trip_the_header_prefix_ceiling() {
+    // Payload comfortably past MAX_HEADER_PREFIX_BYTES so the tail articles
+    // alone exceed the ceiling the old measure judged.
+    let payload: Vec<u8> = (0..(6 * 1024 * 1024) as u32)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let volumes = single_member_store_set("Silver.Horizon.S01E07.mkv", &payload, 1);
+    let articles = 9usize;
+    let job_id = JobId(41077);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(false);
+
+    let spec = direct_store_job_spec_with_articles(
+        "Out-of-order store set",
+        &volumes,
+        articles,
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let (_, volume_bytes) = &volumes[0];
+    // Segments 1.. land first; segment zero arrives last.
+    let order: Vec<u32> = (1..articles as u32).chain(std::iter::once(0)).collect();
+    for segment in order {
+        let (start, end) = article_extent(volume_bytes.len(), segment, articles);
+        submit_decoded_segment(
+            &mut pipeline,
+            NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment,
+            start as u64,
+            &volume_bytes[start..end],
+            &volumes[0].0,
+            None,
+        )
+        .await;
+        let state = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+        assert!(
+            !state.contains("Demoted"),
+            "the set must never demote on arrival order alone; after segment \
+             {segment}: {state}"
+        );
+    }
 }

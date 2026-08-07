@@ -327,8 +327,7 @@ async fn new_direct_pipeline_with_buffers(
     new_direct_pipeline_with(temp_dir, buffer_config, total_connections, None).await
 }
 
-/// [`new_direct_pipeline_with_buffers`], plus the `[direct_store]` config table
-/// (plan 135, phase 7).
+/// [`new_direct_pipeline_with_buffers`], plus the `[direct_store]` config table.
 ///
 /// Everything else in this module reaches for `set_gate`, which bypasses
 /// configuration entirely. The tests that exist to prove the *config* is the

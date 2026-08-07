@@ -1,13 +1,13 @@
-//! Repair while still direct (plan 135, D8's first transition).
+//! Repair while still direct.
 //!
-//! D8 draws a line between two things revision 2 ran together. **Archive-group
-//! demotion** ends direct mode: every volume materializes, the partial outputs
-//! are deleted and the conventional path takes the set. **Repair while still
-//! direct** does none of that — it materializes *only the damaged volumes*,
-//! repairs them, routes the repaired spans back through the router, and throws
-//! the temporaries away. Clean volumes stay virtual, the set stays direct, and
-//! no direct output is deleted. A set with a handful of bad articles is the
-//! common case, and it must not cost a demotion.
+//! Repair draws a line between two things an earlier revision ran together.
+//! **Archive-group demotion** ends direct mode: every volume materializes, the
+//! partial outputs are deleted and the conventional path takes the set.
+//! **Repair while still direct** does none of that — it materializes *only the
+//! damaged volumes*, repairs them, routes the repaired spans back through the
+//! router, and throws the temporaries away. Clean volumes stay virtual, the set
+//! stays direct, and no direct output is deleted. A set with a handful of bad
+//! articles is the common case, and it must not cost a demotion.
 //!
 //! This module owns the blocking half: materialize, repair, read the repaired
 //! spans back. Everything that touches pipeline state — the checkpoint delete
@@ -26,7 +26,7 @@
 //! volume the plan reads as a *source* is answered by the hybrid virtual-volume
 //! provider exactly as verification answers it.
 //!
-//! That is stronger than D8's "expand to more volumes only if the repair plan
+//! That is stronger than the "expand to more volumes only if the repair plan
 //! requires them as read sources": through this seam a read source never
 //! requires materialization at all, so the expansion set is empty by
 //! construction. [`super::par2_access::DirectVolumeFileAccess`] keeps refusing
@@ -54,12 +54,12 @@
 //! deleted at the end of this call, and what survives is the *re-route*, which
 //! is checked by strictly more than a slice hash would be.
 //!
-//! - Every repaired span re-enters the router, so D4's layers fire over it: the
-//!   per-part packed CRC32 at part completion and the whole-member CRC32 at
-//!   member completion, both from the archive's own headers. A repair that
-//!   produced wrong bytes fails those gates and demotes the set, which is the
-//!   same answer a failed readback would reach and it reaches it over the bytes
-//!   that were actually written to the destinations rather than over a
+//! - Every repaired span re-enters the router, so the integrity layers fire
+//!   over it: the per-part packed CRC32 at part completion and the whole-member
+//!   CRC32 at member completion, both from the archive's own headers. A repair
+//!   that produced wrong bytes fails those gates and demotes the set, which is
+//!   the same answer a failed readback would reach and it reaches it over the
+//!   bytes that were actually written to the destinations rather than over a
 //!   temporary.
 //! - The composition gaps the rewrite left are re-read **from the destination
 //!   files** and fed back, so the value each gate composes comes off disk after
@@ -76,11 +76,11 @@
 //! checks a span per slice rather than the whole slice, and the accounting it
 //! produces is per-slice, so a repaired volume re-verified that way would have
 //! its per-slice damage counted from a sampled span — re-inflating exactly the
-//! accounting phase 6 narrowed to the slices a hole actually touches. Weaver
+//! accounting repair narrowed to the slices a hole actually touches. Weaver
 //! never sets the flag on any path that can reach a direct set (see the pin at
 //! [`super::wiring::Pipeline::verify_direct_sets_quietly`]), so the residual is
-//! recorded rather than handled; if that ever changes, the repaired volumes need
-//! a full pass of their own before this reasoning holds again.
+//! recorded rather than handled; if that ever changes, the repaired volumes
+//! need a full pass of their own before this reasoning holds again.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -107,12 +107,12 @@ pub(crate) struct DamagedDirectVolume {
     /// Widening is not cosmetic. The composition runs are article-shaped and a
     /// PAR2 slice is not, so a span that stops mid-article discards that
     /// article's composed value and leaves the bytes on either side vouched for
-    /// by nothing — D4's stale gaps, each one a bounded read to close. Reading
-    /// back whole articles instead means the volume-space composition is
-    /// rewritten run for run and leaves no gap at all; the member-space
-    /// composition still can, because a member run spans as many articles as one
-    /// drain happened to coalesce, and that is what the stale-gap machinery is
-    /// for.
+    /// by nothing — the stale composition gaps, each one a bounded read to
+    /// close. Reading back whole articles instead means the volume-space
+    /// composition is rewritten run for run and leaves no gap at all; the
+    /// member-space composition still can, because a member run spans as many
+    /// articles as one drain happened to coalesce, and that is what the
+    /// stale-gap machinery is for.
     pub(crate) rewrite: Vec<(u64, u64)>,
     /// Everything needed to materialize the volume from the set's own bytes.
     pub(crate) reconstruction: VolumeReconstruction,
@@ -146,7 +146,7 @@ pub(crate) struct RepairedSpan {
     /// rewritten without hashing the span a second time.
     pub(crate) crc32: u32,
     /// Up to [`CIPHER_LEAD_IN_BYTES`] posted bytes immediately **below**
-    /// `source_offset`, for an encrypted set's re-route (plan 136, E2).
+    /// `source_offset`, for an encrypted set's re-route.
     ///
     /// Deliberately not part of `chunks`, `len` or `crc32`: these bytes did not
     /// change, they are staged only so the drain can decrypt the span above
@@ -164,7 +164,7 @@ pub(crate) struct RepairedSpan {
 /// and dropped again. The first shape read every rewrite span of every damaged
 /// volume into this struct and let the router copy them again on the way in, so
 /// a three-volume repair of 500 MiB volumes peaked at about 3 GiB twice over,
-/// bounded by nothing (phase 6 review, F3).
+/// bounded by nothing.
 #[derive(Debug)]
 pub(crate) struct DirectRepairOutcome {
     /// Scratch files to delete once the spans are routed — or immediately, if
@@ -179,7 +179,7 @@ pub(crate) struct DirectRepairOutcome {
 }
 
 /// Why a set could not be repaired while direct. Each is a metric bucket, and
-/// each falls back to the whole-set demotion phase 5 shipped.
+/// each falls back to the whole-set demotion shipped earlier.
 #[derive(Debug, Clone)]
 pub(crate) enum DirectRepairFailure {
     /// PAR2 says the damage cannot be repaired with the recovery on hand.
@@ -195,10 +195,10 @@ pub(crate) enum DirectRepairFailure {
     /// put more bytes into staging than the ceiling that exists to bound them.
     ///
     /// Checked before anything is materialized, so an over-budget repair costs
-    /// the set nothing at all — not even the checkpoint delete. **Phase 7
+    /// the set nothing at all — not even the checkpoint delete. **A later pass
     /// revisits this**: the bound is the honest one for a repair that re-enters
-    /// the router in one pass, and lifting it means routing a repaired volume in
-    /// budget-sized instalments, each drained and written before the next is
+    /// the router in one pass, and lifting it means routing a repaired volume
+    /// in budget-sized instalments, each drained and written before the next is
     /// read. Until then a whole-volume repair of a large set demotes, which is
     /// slower but always correct.
     RewriteOverBudget { bytes: u64, budget: u64 },
@@ -342,7 +342,7 @@ pub(crate) fn widen_to_articles(
 }
 
 /// How many posted bytes are read back below a repaired span so an **encrypted**
-/// member's re-route has its CBC predecessor (plan 136, E2).
+/// member's re-route has its CBC predecessor.
 ///
 /// A repaired span decrypts on the way in, which needs the whole of the cipher
 /// block its first byte lands in **and** the 16 bytes before that block. During
@@ -362,11 +362,11 @@ const CIPHER_LEAD_IN_BYTES: u64 = 32;
 ///
 /// The repaired bytes are **not** read back here. That is
 /// [`read_repaired_spans`], called per volume immediately before that volume's
-/// spans are routed, so only one volume's rewrite is ever resident (F3).
+/// spans are routed, so only one volume's rewrite is ever resident.
 ///
-/// The caller must already have deleted the set's checkpoint row (D8): the
-/// re-route this produces overwrites bytes the row claims, and a row that
-/// survived it would let a restart trust floors over bytes that changed.
+/// The caller must already have deleted the set's checkpoint row: the re-route
+/// this produces overwrites bytes the row claims, and a row that survived it
+/// would let a restart trust floors over bytes that changed.
 // Every argument is an independent input the blocking half genuinely needs, and
 // they cross a `spawn_blocking` boundary — bundling them into a struct would
 // mean a type that exists only to be destructured on the other side.
@@ -464,8 +464,8 @@ pub(crate) fn repair_damaged_volumes(
 ///
 /// Called per volume rather than for the whole set, and its result routed and
 /// dropped before the next volume is read, so a repair's resident cost is one
-/// volume's rewrite plus one chunk — never the whole set's, and never twice over
-/// (F3). Taking a *whole volume* at a time is not incidental either: the router
+/// volume's rewrite plus one chunk — never the whole set's, and never twice
+/// over. Taking a *whole volume* at a time is not incidental either: the router
 /// needs all of one volume's spans in a single `route_repaired` call, or a span
 /// staged before its volume's end record would be held rather than routed.
 pub(crate) fn read_repaired_spans(

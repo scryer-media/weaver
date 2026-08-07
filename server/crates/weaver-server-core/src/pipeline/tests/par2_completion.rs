@@ -3504,7 +3504,7 @@ async fn stage_clean_live_par2_verdict(
         build_repairable_par2_set(payload_filename, payload, 64, 0),
         &[],
     );
-    // M2 (plan 138): the adopted engine seeds its verification session from the
+    // The adopted engine seeds its verification session from the
     // PAR2 packets, so activation takes them and is synchronous. Production
     // scans them off disk; the test scans the same bytes it just wrote.
     let live_packets: Vec<par2_rs::Packet> = par2_rs::scan_packets(par2_bytes, 0)
@@ -3667,7 +3667,7 @@ async fn par2_repair_execution_retires_live_par2_state() {
             (1, recovery_filename, 1, true),
         ],
     );
-    // M2 (plan 138): the adopted engine seeds its verification session from the
+    // The adopted engine seeds its verification session from the
     // PAR2 packets, so activation takes them and is synchronous. Production
     // scans them off disk; the test scans the same bytes it just wrote.
     let live_packets: Vec<par2_rs::Packet> = par2_rs::scan_packets(&par2_bytes, 0)

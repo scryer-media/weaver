@@ -1,4 +1,4 @@
-//! The hybrid virtual-volume provider (plan 135, D5/D8).
+//! The hybrid virtual-volume provider.
 //!
 //! A direct set has no volume files, and several things downstream of routing
 //! insist on reading one: PAR2 verification and repair, `extract_member_streaming`
@@ -32,23 +32,24 @@
 //! stops cleanly, while this one is read by callers that must never mistake a
 //! hole for the end of the data.
 //!
-//! Coverage is therefore tracked **per source, not per volume** (B1). Knowing
-//! that a physical byte was placed says nothing about *which* file received it,
-//! and the envelope is a sparse file: a read at an offset the envelope never
-//! received returns the filesystem's zeros, indistinguishable from real data, as
-//! long as some later offset made the file that long. So the envelope answers
-//! only for [`VirtualVolume::envelope_covered`] — the ranges an envelope write
-//! actually recorded — and a member extent answers only inside itself. A byte
-//! the volume-level map calls covered but no source claims is a hole, which is
-//! the invariant this module's title states, held unconditionally rather than as
-//! a consequence of the extent list happening to be right.
+//! Coverage is therefore tracked **per source, not per volume**. Knowing that a
+//! physical byte was placed says nothing about *which* file received it, and
+//! the envelope is a sparse file: a read at an offset the envelope never
+//! received returns the filesystem's zeros, indistinguishable from real data,
+//! as long as some later offset made the file that long. So the envelope
+//! answers only for [`VirtualVolume::envelope_covered`] — the ranges an
+//! envelope write actually recorded — and a member extent answers only inside
+//! itself. A byte the volume-level map calls covered but no source claims is a
+//! hole, which is the invariant this module's title states, held
+//! unconditionally rather than as a consequence of the extent list happening to
+//! be right.
 //!
-//! # The re-encrypting overlay (plan 136, E-D4)
+//! # The re-encrypting overlay
 //!
 //! For an **encrypted** set the two images no longer agree with the volume they
 //! describe. The envelope still holds what was posted — headers, service
 //! records, and the last cipher block's tail padding — but a routed member's
-//! `.direct.partial` holds its *plaintext*, because plan 136 decrypts at write
+//! `.direct.partial` holds its *plaintext*, because direct-store decrypts at write
 //! time so the payload lands once. Every caller of this module wants posted
 //! bytes: PAR2 checksums them, reconstruction writes them into a volume file, a
 //! repair reads them as Reed–Solomon inputs.
@@ -171,8 +172,8 @@ pub(crate) struct VirtualVolume {
     /// Logical length of the volume: what a `SeekFrom::End` means and where
     /// reads stop returning bytes.
     pub(crate) len: u64,
-    /// Read-side crypt facts per member id, for the re-encrypting overlay
-    /// (plan 136, E-D4). Empty for every unencrypted set, which is the overlay
+    /// Read-side crypt facts per member id, for the re-encrypting overlay.
+    /// Empty for every unencrypted set, which is the overlay
     /// switched off by construction.
     ///
     /// Shared with the partial paths and for the same reason: every volume of a
@@ -182,8 +183,7 @@ pub(crate) struct VirtualVolume {
 }
 
 /// What the re-encrypting overlay did, so a test can prove which path a read
-/// took rather than only that it produced the right bytes (plan 136 open
-/// question 1).
+/// took rather than only that it produced the right bytes.
 #[derive(Debug, Default)]
 pub(crate) struct CipherOverlayCounters {
     reencrypted_bytes: AtomicU64,
@@ -264,7 +264,7 @@ impl VirtualVolume {
     /// reads exactly like a whole or truncated file — and `None` when an
     /// **interior hole** sits below readable bytes.
     ///
-    /// The distinction is the one D5's `FileAccess` adapter turns on, and it is
+    /// The distinction is the one the `FileAccess` adapter turns on, and it is
     /// a damage-accounting fact rather than a performance one. A sequential
     /// reader has no way to say "these bytes are unknown, the next ones are
     /// fine": it stops at the hole, and every PAR2 slice after it reads zero
@@ -317,7 +317,7 @@ impl HybridVolumeProvider {
         Arc::clone(&self.cipher_counters)
     }
 
-    /// The registered shape of one virtual volume. Wave 2's PAR2 adapter reads
+    /// The registered shape of one virtual volume. The PAR2 adapter reads
     /// existence and length off it: a `FileAccess` has to answer both without
     /// touching the filesystem, because for a direct volume there is nothing
     /// there to `stat`.
@@ -373,7 +373,7 @@ pub(crate) struct VirtualVolumeReader {
     envelope_handle: Option<File>,
     partial_handles: HashMap<u32, File>,
     /// Per-member CBC frontier: the cipher offset the last re-encryption ended
-    /// at and the 16 cipher bytes ending there (plan 136, E-D4).
+    /// at and the 16 cipher bytes ending there.
     ///
     /// This is what makes a sequential sweep of an encrypted volume linear:
     /// every `read` continues the previous one's chain instead of seeding
@@ -529,7 +529,7 @@ impl VirtualVolumeReader {
     fn read_from(&mut self, source: Source, out: &mut [u8]) -> std::io::Result<usize> {
         match source {
             Source::Member { member_id, offset } => {
-                // Plan 136, E-D4. An encrypted member's partial holds plaintext
+                // An encrypted member's partial holds plaintext
                 // and this reader answers in *posted* space, so the bytes are
                 // re-encrypted on the way out. Every other member reads through
                 // unchanged, which is what keeps the overlay off for a set that
@@ -580,7 +580,7 @@ impl VirtualVolumeReader {
         file.read(out)
     }
 
-    // ---- The re-encrypting overlay (plan 136, E-D4) ------------------------
+    // ---- The re-encrypting overlay -----------------------------------------
 
     /// One encrypted member's **posted** bytes for `[offset, offset + out.len())`.
     ///
@@ -593,7 +593,7 @@ impl VirtualVolumeReader {
     /// A read whose window *is* those blocks — which is what an aligned slice
     /// sweep asks for — reads its plaintext straight into the caller's buffer
     /// and encrypts it there, so the bytes are touched once instead of copied
-    /// out of a scratch `Vec` afterwards (E2 review).
+    /// out of a scratch `Vec` afterwards.
     fn read_member_cipher(
         &mut self,
         member_id: u32,

@@ -1,5 +1,4 @@
-//! Sparse marking for the files direct-store creates with holes in them
-//! (plan 135, D3 — phase 7).
+//! Sparse marking for the files direct-store creates with holes in them.
 //!
 //! Three populations are sparse by construction, and all three are created by
 //! this subsystem rather than by the extractor:
@@ -25,10 +24,10 @@
 //! The control code applies to the file, not to a write, so it must be issued
 //! **immediately after creation and before any `set_len` or write** — marking a
 //! file that already spans a hole does not reclaim what NTFS already allocated.
-//! That gives the rule D3 states: a marking failure demotes the set *before any
-//! long-lived hole exists*, so the worst case is a set that pays the
-//! conventional path's disk cost, never one that quietly pays 1× per volume in
-//! allocated zeros.
+//! That gives the rule this module states: a marking failure demotes the set
+//! *before any long-lived hole exists*, so the worst case is a set that pays
+//! the conventional path's disk cost, never one that quietly pays 1× per volume
+//! in allocated zeros.
 //!
 //! [`create_sparse`] is therefore the only way this subsystem creates one of
 //! those files: it creates, marks, and on a marking failure **removes the file
@@ -83,10 +82,10 @@ impl SparseMarker for SparseMarking {
 ///
 /// `Open` is an ordinary filesystem failure — a missing directory, a full disk,
 /// a permission problem — and it is what would have happened at the first write
-/// anyway, so callers report it as a destination failure. `Mark` is the one D3
-/// cares about: the file exists and is writable, but this filesystem will not
-/// give it the sparse attribute. Merging them would have made every ENOSPC read
-/// as a Windows-sparseness problem in the metrics.
+/// anyway, so callers report it as a destination failure. `Mark` is the one
+/// this rule cares about: the file exists and is writable, but this filesystem
+/// will not give it the sparse attribute. Merging them would have made every
+/// ENOSPC read as a Windows-sparseness problem in the metrics.
 #[derive(Debug)]
 pub(crate) enum SparseCreateError {
     Open(io::Error),

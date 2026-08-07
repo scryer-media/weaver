@@ -1,4 +1,4 @@
-//! Set admission and destination naming (plan 135, D1/D3/D6).
+//! Set admission and destination naming.
 //!
 //! A direct set is admitted from the **job spec alone**, before a byte lands:
 //! every candidate volume is an NZB file whose role already says it is a RAR
@@ -13,8 +13,8 @@ use weaver_model::files::{FileRole, archive_base_name};
 
 use crate::jobs::model::JobSpec;
 
-/// Why a candidate set was not admitted. Reported as a metric so
-/// `sets == direct + materialized` stays checkable (D1).
+/// Why a candidate set was not admitted. Reported as a metric so `sets ==
+/// direct + materialized` stays checkable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdmissionRefusal {
     /// Two NZB files claim the same volume index.
@@ -25,7 +25,7 @@ pub(crate) enum AdmissionRefusal {
     Empty,
 }
 
-/// Extension of a damaged volume's repair scratch (plan 135, D8). Matched as a
+/// Extension of a damaged volume's repair scratch. Matched as a
 /// suffix by the restart sweep, exactly as `.envelope` is.
 pub(crate) const REPAIR_SUFFIX: &str = ".repair";
 
@@ -84,10 +84,10 @@ impl DirectSetPlan {
                 .push((volume_number, file_index as u32));
         }
 
-        // Phase 4 refused the whole job here when its spec carried a PAR2 file:
-        // every PAR2 path reads the *volume files* the descriptions name, and a
-        // direct set has none. Wave 2's `par2_access` adapter answers those
-        // reads out of the envelope plus the routed member bytes, so the
+        // The first shape refused the whole job here when its spec carried a
+        // PAR2 file: every PAR2 path reads the *volume files* the descriptions
+        // name, and a direct set has none. The `par2_access` adapter answers
+        // those reads out of the envelope plus the routed member bytes, so the
         // refusal is gone — a par2-bearing set routes, and its finalization
         // waits for the job's verification to conclude (see the module docs).
         let mut admitted = Vec::new();
@@ -144,13 +144,14 @@ impl DirectSetPlan {
     }
 
     /// Working-directory-relative envelope file for **one source volume**
-    /// (envelope v2, plan 135 D3's "sparse envelope files", plural).
+    /// (envelope v2 — "sparse envelope files", plural).
     ///
-    /// Phase 4 packed every volume's envelope into fixed 64 KiB half-slots of a
-    /// single per-set file. That ceiling is what demoted every `-rr` and `-qo`
-    /// set, and it was a phase-4 narrowing, not a design. Envelope v2 gives each
-    /// volume its own file holding every non-member byte **at its true physical
-    /// offset**, with holes where member data was routed away:
+    /// The first shape packed every volume's envelope into fixed 64 KiB
+    /// half-slots of a single per-set file. That ceiling is what demoted every
+    /// `-rr` and `-qo` set, and it was a phase-4 narrowing, not a design.
+    /// Envelope v2 gives each volume its own file holding every non-member byte
+    /// **at its true physical offset**, with holes where member data was routed
+    /// away:
     ///
     /// - unbounded by construction — recovery records, quick-open blocks and
     ///   ineligible members' packed ranges fit because the file *is* the volume;
@@ -203,7 +204,7 @@ impl DirectSetPlan {
             .join(self.envelope_relative_path(volume_index))
     }
 
-    /// Working-directory-relative holds scratch file for this set (D2).
+    /// Working-directory-relative holds scratch file for this set.
     ///
     /// One file per set, at the top level, named from the set so the restart
     /// sweep can recognise it by prefix and so two sets of one job never share a
@@ -238,11 +239,10 @@ impl DirectSetPlan {
         self.working_dir.join(self.holds_scratch_relative_path())
     }
 
-    /// Working-directory-relative **repair scratch** for one source volume
-    /// (plan 135, D8's *repair while still direct*).
+    /// Working-directory-relative **repair scratch** for one source volume.
     ///
     /// A PAR2 repair needs a file to write recovered slices into, and a virtual
-    /// volume is not one. Phase 6 materializes *only the damaged volumes* into
+    /// volume is not one. Repair materializes *only the damaged volumes* into
     /// these files, repairs them there, routes the repaired spans back through
     /// the router, and deletes them again — clean volumes stay virtual and no
     /// direct output is deleted.
@@ -283,15 +283,17 @@ impl DirectSetPlan {
     }
 
     /// A raw header name resolved the way the incremental extractor resolves it
-    /// (D3: reuse, don't invent) — `unrar_rs::sanitize_path` first, then the
-    /// validator that refuses anything escaping the directory it is joined onto.
+    /// (reuse, don't invent) — `unrar_rs::sanitize_path` first, then the
+    /// validator that refuses anything escaping the directory it is joined
+    /// onto.
     ///
-    /// Both steps matter, and phase 4 only had the second: `sanitize_path`
-    /// normalizes separators and strips a drive or root prefix, so a name the
-    /// extractor would have written to `Silver.Horizon/S01E01.mkv` and one that
-    /// direct routing would otherwise have refused now resolve identically. With
-    /// several members per set that difference is reachable, where a
-    /// single-member set could only ever have demoted on it.
+    /// Both steps matter, and the first shape only had the second:
+    /// `sanitize_path` normalizes separators and strips a drive or root prefix,
+    /// so a name the extractor would have written to
+    /// `Silver.Horizon/S01E01.mkv` and one that direct routing would otherwise
+    /// have refused now resolve identically. With several members per set that
+    /// difference is reachable, where a single-member set could only ever have
+    /// demoted on it.
     fn resolve_member_path(member_name: &str) -> Result<String, ()> {
         let sanitized = unrar_rs::sanitize_path(member_name);
         let safe = crate::pipeline::extraction::validate_sanitized_rar_member_path(&sanitized)
@@ -337,7 +339,7 @@ impl DirectSetPlan {
         Ok(crate::pipeline::Pipeline::member_output_paths(&self.working_dir, &safe).0)
     }
 
-    /// Digest of the layout plan the coverage is produced against (D6).
+    /// Digest of the layout plan the coverage is produced against.
     ///
     /// Deliberately **stable as volumes arrive**: it binds the set identity, the
     /// volume-to-file mapping and the member destinations, and excludes the

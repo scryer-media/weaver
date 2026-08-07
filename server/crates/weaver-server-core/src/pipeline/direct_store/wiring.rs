@@ -1,4 +1,4 @@
-//! Where direct-store meets the download pipeline (plan 135, D3/D7).
+//! Where direct-store meets the download pipeline.
 //!
 //! Three seams, and nothing else:
 //!
@@ -12,12 +12,12 @@
 //!    records coverage, feeds live PAR2 and commits the segment.
 //! 3. **Finalization / demotion** — a set whose members all pass the
 //!    whole-member gate commits its partials to the extractor's destinations in
-//!    archive order and is marked extracted; a set that demotes materializes its
-//!    volumes from its own routed bytes (D8), persists the legacy state that
+//!    archive order and is marked extracted; a set that demotes materializes
+//!    its volumes from its own routed bytes, persists the legacy state that
 //!    replaces its coverage, and hands them to the conventional path — falling
 //!    back to refetching everything only when reconstruction is impossible.
 //!
-//! # D7, stated as suppression points
+//! # Suppression points
 //!
 //! The routing seam returns before `persist_ready_segments`, so for a direct
 //! source volume there is no physical write, **no `active_file_progress` floor
@@ -75,20 +75,20 @@ pub(crate) struct DirectStoreRuntime {
     /// Jobs whose spec has already been examined for candidate sets.
     examined: HashSet<JobId>,
     /// Jobs whose archive-password harvest has already been handed to their
-    /// sets' `-hp` gates (plan 136, E4). Separate from [`Self::examined`]
+    /// sets' `-hp` gates. Separate from [`Self::examined`]
     /// because a **restored** job is examined without ever passing through the
     /// admission seam, and its sets still need candidates.
     header_candidates_offered: HashSet<JobId>,
     sets: HashMap<JobId, Vec<DirectSet>>,
-    /// Destinations already created and marked sparse, per job (B3, D3). A
-    /// member stored inside a directory names a partial inside that directory
-    /// and nothing else creates it, and every destination has to carry the
-    /// sparse attribute before its first routed byte.
+    /// Destinations already created and marked sparse, per job. A member stored
+    /// inside a directory names a partial inside that directory and nothing
+    /// else creates it, and every destination has to carry the sparse attribute
+    /// before its first routed byte.
     prepared_destinations: HashMap<JobId, HashSet<PathBuf>>,
     /// Member names **direct finalization** wrote into `extracted_members`, per
     /// job. `extracted_members` blends two sources — the incremental extractor
-    /// and direct sets — and the D6 claim assertions need them apart: two sets
-    /// of one job may legitimately finalize the same member *name* (last rename
+    /// and direct sets — and the claim assertions need them apart: two sets of
+    /// one job may legitimately finalize the same member *name* (last rename
     /// wins, as two conventionally extracted archives resolve), and without
     /// this record a sibling's finalized name is indistinguishable from an
     /// extraction checkpoint claiming ours.
@@ -96,14 +96,14 @@ pub(crate) struct DirectStoreRuntime {
     /// Test-only holds ceiling applied to every set this runtime admits.
     #[cfg(test)]
     holds_budget_override: Option<u64>,
-    /// Test-only scratch ceiling (D2), which shortcuts the configured one so a
+    /// Test-only scratch ceiling, which shortcuts the configured one so a
     /// breach is reachable without paging half a gigabyte.
     #[cfg(test)]
     holds_scratch_ceiling_override: Option<u64>,
-    /// Sparse marker for every file this runtime's sets create (D3). Only the
-    /// tests that drive the marking-failure demotion ever change it.
+    /// Sparse marker for every file this runtime's sets create. Only the tests
+    /// that drive the marking-failure demotion ever change it.
     sparse: SparseMarking,
-    /// Source volumes a repair has materialized over this pipeline's life (D8).
+    /// Source volumes a repair has materialized over this pipeline's life.
     ///
     /// Counted because "only the damaged volumes materialize" is the claim
     /// repair-while-direct rests on, and no artefact survives to prove it
@@ -116,7 +116,7 @@ pub(crate) struct DirectStoreRuntime {
     #[cfg(test)]
     pub(crate) finalized_sets: usize,
     /// Repairs that got as far as the checkpoint delete — the one irreversible
-    /// step — over this pipeline's life (phase 6 review, F8).
+    /// step — over this pipeline's life.
     ///
     /// The repair once-latch is only observable as a *count*. Every other trace
     /// a second attempt leaves is one a first attempt leaves too, and an attempt
@@ -163,7 +163,7 @@ impl DirectStoreRuntime {
     }
 
     /// Test hook: whether the once-per-job `-hp` harvest has already run for
-    /// this job (plan 136, E4).
+    /// this job.
     ///
     /// Only one test reads it, and only to establish the *precondition* of the
     /// thing it is testing: once this is true the harvest can never run again,
@@ -197,7 +197,8 @@ impl DirectStoreRuntime {
     }
 
     /// Test hook: make every sparse marking attempt fail, which is the only way
-    /// to reach D3's demotion arm on a platform whose marker cannot fail.
+    /// to reach the sparse-marking demotion arm on a platform whose marker
+    /// cannot fail.
     #[cfg(test)]
     pub(crate) fn set_sparse_marking(&mut self, marking: SparseMarking) {
         self.sparse = marking;
@@ -210,11 +211,12 @@ impl DirectStoreRuntime {
     /// Applies this runtime's configured ceilings and sparse marker to a set it
     /// is about to own.
     ///
-    /// Every path that builds a `DirectSet` goes through here, restore included.
-    /// Restore used to skip it, so a restart test could set a budget and then
-    /// watch the restored set quietly use the 64 MiB / 512 MiB defaults — which
-    /// makes every budget assertion about a restored set vacuous, and those are
-    /// exactly the assertions D2's ceilings need after a restart.
+    /// Every path that builds a `DirectSet` goes through here, restore
+    /// included. Restore used to skip it, so a restart test could set a budget
+    /// and then watch the restored set quietly use the 64 MiB / 512 MiB
+    /// defaults — which makes every budget assertion about a restored set
+    /// vacuous, and those are exactly the assertions the holds ceilings need
+    /// after a restart.
     pub(crate) fn apply_ceilings(&self, set: &mut DirectSet) {
         set.router
             .set_holds_scratch_ceiling(self.settings().holds_scratch_ceiling_bytes);
@@ -326,7 +328,7 @@ impl DestinationSync for PreSyncedDestinations {
 }
 
 /// Everything the authoritative PAR2 pass needs to read a job's direct sets
-/// virtually (plan 135, D5).
+/// virtually.
 ///
 /// The provider is keyed by **NZB file index**, not by volume index: one job can
 /// carry several direct sets and every set numbers its volumes from zero, so the
@@ -340,7 +342,7 @@ pub(crate) struct DirectPar2Overlay {
     /// that produced the bytes rather than every set of the job.
     sets: HashMap<par2_rs::FileId, usize>,
     /// The job file index each bound PAR2 file resolved to. The overlay re-keys
-    /// virtual volumes by it, so it is also how phase 6 walks back from a
+    /// virtual volumes by it, so it is also how repair walks back from a
     /// damaged PAR2 file to the set's own volume index.
     file_indices: HashMap<par2_rs::FileId, u32>,
     /// The volume lengths the overlay was built with, so a repair can rebuild
@@ -400,7 +402,7 @@ impl DirectPar2Overlay {
 }
 
 /// What a live direct set turned out to need, just before the completion gate
-/// would have handed the job to `Par2Repairer` (plan 135, D8).
+/// would have handed the job to `Par2Repairer`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectPar2Resolution {
     /// Damage was found and repaired in place. The job goes round again and
@@ -415,7 +417,7 @@ pub(crate) enum DirectPar2Resolution {
     /// virtually, record the same verdict this pass just reached.
     Clean,
     /// Neither: no live set, no verdict, or a repair that refused. The caller
-    /// falls back to demoting for the repairer, which is phase 5's behaviour.
+    /// falls back to demoting for the repairer, which is the earlier behaviour.
     Unresolved,
 }
 
@@ -437,8 +439,8 @@ pub(crate) enum DirectFileTarget {
     /// A **finalized** set's source volume. The set's members are already at
     /// their destinations and the volume was never a file, so a late duplicate
     /// has nowhere to go: routing it would write through stale partial paths,
-    /// and writing it conventionally would materialize a volume the whole
-    /// point was never to create. It is dropped (B5).
+    /// and writing it conventionally would materialize a volume the whole point
+    /// was never to create. It is dropped.
     Discard,
 }
 
@@ -502,10 +504,10 @@ impl Pipeline {
                 );
                 // No format is chosen here: the router reads it from the first
                 // volume's signature, so a RAR4 set routes as RAR4 rather than
-                // demoting on its first header (H1).
+                // demoting on its first header.
                 let mut set = DirectSet::new(job_id, plan);
                 self.direct_store.apply_ceilings(&mut set);
-                // Plan 136, E-D1. The winning password the job was submitted
+                // The winning password the job was submitted
                 // with, if any; `refresh_direct_passwords` picks up one that
                 // arrives later. Held in memory only.
                 set.router.set_password(password.as_deref());
@@ -515,20 +517,18 @@ impl Pipeline {
         self.direct_store.sets.insert(job_id, sets);
     }
 
-    /// Re-reads the job's password into every set still willing to take one
-    /// (plan 136, E-D1).
+    /// Re-reads the job's password into every set still willing to take one.
     ///
-    /// This is the answer to plan 136's open question 2 written as code:
-    /// **weaver does support setting a password after add** — the GraphQL
-    /// `setJobPassword` mutation and the NZBGet facade's `editqueue` /
-    /// `GroupSetParameter *Unpack:Password` both mutate the live `JobSpec` in
-    /// place — and [`Self::ensure_direct_sets`] is memoized per job, so a set
-    /// built before the password arrived would never see it. Re-reading it here
-    /// costs one map lookup per article and stops the moment a set **admits** a
-    /// password or leaves direct mode, which for every set with no encrypted
-    /// member is the first parse.
+    /// The reason this exists at all: **weaver does support setting a password
+    /// after add** — the GraphQL `setJobPassword` mutation and the NZBGet
+    /// facade's `editqueue` / `GroupSetParameter *Unpack:Password` both mutate
+    /// the live `JobSpec` in place — and [`Self::ensure_direct_sets`] is
+    /// memoized per job, so a set built before the password arrived would never
+    /// see it. Re-reading it here costs one map lookup per article and stops
+    /// the moment a set **admits** a password or leaves direct mode, which for
+    /// every set with no encrypted member is the first parse.
     ///
-    /// # The window closes at the first header parse (E1 review F5)
+    /// # The window closes at the first header parse
     ///
     /// Admission runs from the first successful header parse, so "after the job
     /// was added" means *before the first article of the first volume*, not any
@@ -566,7 +566,7 @@ impl Pipeline {
         else {
             return;
         };
-        // Plan 136, E4. `offer_direct_header_passwords` runs **once** per job and
+        // `offer_direct_header_passwords` runs **once** per job and
         // every set wants a header password from creation, so the harvest is
         // memoized on the job's first article and can never re-run. That is fine
         // for `NzbMeta` and `FilenameConvention`, which are immutable per job —
@@ -597,8 +597,8 @@ impl Pipeline {
         }
     }
 
-    /// Hands the job's archive-password harvest to every set's `-hp` gate
-    /// (plan 136, E4), once per job.
+    /// Hands the job's archive-password harvest to every set's `-hp` gate,
+    /// once per job.
     ///
     /// # Why the whole harvest, and not `spec.password`
     ///
@@ -645,11 +645,11 @@ impl Pipeline {
         {
             return;
         }
-        // Armed on the harvest having **run**, not on it having run *first*
-        // (E4 review). The NZB half is a database read and a parse, and both
+        // Armed on the harvest having **run**, not on it having run *first*.
+        // The NZB half is a database read and a parse, and both
         // warn-and-continue with an empty list; memoizing before that meant one
-        // transient error at exactly this instant cost the job its `NzbMeta` and
-        // `FilenameConvention` candidates for the rest of its life, with no
+        // transient error at exactly this instant cost the job its `NzbMeta`
+        // and `FilenameConvention` candidates for the rest of its life, with no
         // second chance — `wants_header_password()` is the only other gate and
         // it is still true. A harvest that ran and found nothing is a *fact*
         // about the job and is remembered; one that failed is not.
@@ -700,10 +700,10 @@ impl Pipeline {
             })
     }
 
-    /// D7: whether this file's bytes are a direct set's source volume, so no
-    /// legacy floor, completed-file row or archive re-probe may be written for
-    /// it. `&self`, because the suppression checks sit inside paths that
-    /// already hold the pipeline immutably.
+    /// Whether this file's bytes are a direct set's source volume, so no legacy
+    /// floor, completed-file row or archive re-probe may be written for it.
+    /// `&self`, because the suppression checks sit inside paths that already
+    /// hold the pipeline immutably.
     ///
     /// Deliberately **not** narrowed to still-routing sets the way
     /// [`Self::direct_route_target`] is: a finalized set's source volumes were
@@ -720,7 +720,7 @@ impl Pipeline {
     }
 
     /// The virtual volume behind one direct source file, as a **one-volume**
-    /// provider plus its logical length (plan 135, D5).
+    /// provider plus its logical length.
     ///
     /// Live PAR2's settle and backfill reads are defined in source-volume space,
     /// which is exactly the space a virtual volume answers in — but they arrive
@@ -733,10 +733,10 @@ impl Pipeline {
     /// including a demoted set's — whose volumes are materializing or being
     /// refetched, and are read from disk like any other file.
     ///
-    /// An **encrypted** set answers here like any other since E2 (it was `None`
-    /// in E1, review F3): the provider re-encrypts the member ranges it reads
-    /// out of the partials, so what comes back is the posted bytes the caller
-    /// asked for rather than the plaintext sitting on disk.
+    /// An **encrypted** set answers here like any other since the overlay
+    /// landed: the provider re-encrypts the member ranges it reads out of the
+    /// partials, so what comes back is the posted bytes the caller asked for
+    /// rather than the plaintext sitting on disk.
     pub(crate) fn direct_virtual_volume(
         &self,
         file_id: NzbFileId,
@@ -775,10 +775,10 @@ impl Pipeline {
     /// disk they are not on and report them missing, and
     /// [`Self::demote_direct_sets_with_par2_damage`] could not even attribute
     /// that damage back to the set, because attribution is keyed by the very
-    /// binding that failed. The net is
-    /// [`Self::demote_unbindable_direct_sets`], which runs *before* the pass and
-    /// demotes any live set with an unbindable volume outright, so what reaches
-    /// here is either a fully bound set or no set at all (B2).
+    /// binding that failed. The net is [`Self::demote_unbindable_direct_sets`],
+    /// which runs *before* the pass and demotes any live set with an unbindable
+    /// volume outright, so what reaches here is either a fully bound set or no
+    /// set at all.
     pub(crate) fn direct_par2_overlay(&self, job_id: JobId) -> Option<DirectPar2Overlay> {
         let mut volumes = Vec::new();
         let mut virtual_volumes = Vec::new();
@@ -791,14 +791,14 @@ impl Pipeline {
             if set.is_demoted() {
                 continue;
             }
-            // A **finalized** set has renamed its partials to their destinations
-            // and — unless it was asked to keep them for a live neighbour —
-            // deleted its envelopes, so nothing answers for its source volumes
-            // and serving it would report damage that is not there. One that
-            // *did* keep them serves the very same image out of the committed
-            // members instead, which is what lets a neighbour's repair read the
-            // surviving input slices Reed–Solomon needs from every file the
-            // recovery set describes (F2 follow-up). Either way it is never a
+            // A **finalized** set has renamed its partials to their
+            // destinations and — unless it was asked to keep them for a live
+            // neighbour — deleted its envelopes, so nothing answers for its
+            // source volumes and serving it would report damage that is not
+            // there. One that *did* keep them serves the very same image out of
+            // the committed members instead, which is what lets a neighbour's
+            // repair read the surviving input slices Reed–Solomon needs from
+            // every file the recovery set describes. Either way it is never a
             // repair *target*: `repair_direct_sets_with_par2_damage` skips a
             // finalized set, and `forgive_finalized_direct_volumes` still
             // excuses one whose image was not kept.
@@ -878,7 +878,7 @@ impl Pipeline {
     }
 
     /// Whether the authoritative PAR2 pass may run over `job_id`'s direct sets
-    /// yet, or has to wait for their payload (plan 135, D5; H3).
+    /// yet, or has to wait for their payload.
     ///
     /// Deliberately the same shape as the completion gate's own
     /// `par2_primary_payload_ready`: **every live set's volumes have finished
@@ -902,7 +902,7 @@ impl Pipeline {
     }
 
     /// Demotes every live direct set of `job_id` holding a source volume that
-    /// cannot be bound, unambiguously, to a PAR2 description (B2).
+    /// cannot be bound, unambiguously, to a PAR2 description.
     ///
     /// The overlay is keyed by PAR2 file id, so an unbound volume is one the
     /// pass cannot be told about *and* one whose verdict cannot be attributed
@@ -923,7 +923,7 @@ impl Pipeline {
         if self.par2_set(job_id).is_none() {
             return false;
         }
-        // Plan 136, E2. An encrypted set is served to the pass through the
+        // An encrypted set is served to the pass through the
         // re-encrypting overlay like any other — but only while the overlay can
         // really reproduce what was posted. The residual it cannot is a routed
         // encrypted member with no declared cipher size, or one whose tail
@@ -994,7 +994,7 @@ impl Pipeline {
     }
 
     /// Rewrites `Missing` to `Complete` for every source volume of a
-    /// **finalized** direct set, before the caller counts damage (B1).
+    /// **finalized** direct set, before the caller counts damage.
     ///
     /// Exactly the eager-delete precedent, and for exactly the same reason: the
     /// bytes were verified and the file is legitimately absent. A finalized set
@@ -1085,16 +1085,15 @@ impl Pipeline {
         forgiven
     }
 
-    /// Answers PAR2 damage on a job's direct sets (plan 135, D8).
+    /// Answers PAR2 damage on a job's direct sets.
     ///
-    /// Phase 6's entry point, and the whole of D8's *repair while still direct*
-    /// transition seen from the pipeline. It tries the repair first and falls
-    /// back to wave 2's whole-set demotion on any refusal, so the caller's
-    /// contract is unchanged: `true` means the job's next move is a fresh
-    /// completion check, over either repaired virtual volumes or materialized
-    /// physical ones.
+    /// The entry point, and the whole of *repair while still direct* transition
+    /// seen from the pipeline. It tries the repair first and falls back to the
+    /// whole-set demotion on any refusal, so the caller's contract is
+    /// unchanged: `true` means the job's next move is a fresh completion check,
+    /// over either repaired virtual volumes or materialized physical ones.
     ///
-    /// Ordering is D8's, and it is normative:
+    /// The ordering is normative:
     ///
     /// 1. the set's **checkpoint row is deleted first**, because everything
     ///    below rewrites bytes the row claims. The next barrier recreates
@@ -1123,17 +1122,17 @@ impl Pipeline {
             .await
     }
 
-    /// Phase 6's chance for a live direct set, taken **before** the completion
-    /// gate hands the job to `Par2Repairer` (plan 135, D8).
+    /// The repair chance for a live direct set, taken **before** the completion
+    /// gate hands the job to `Par2Repairer`.
     ///
     /// That branch exists for jobs the fast paths could not clear, and a live
-    /// direct set reaches it routinely: it contributes nothing to the clean-PAR2
-    /// integrity gate — a direct set never enters the archive topology — so a
-    /// damaged one always arrives here rather than at the verify branch. The
-    /// repairer is filesystem-bound, so today's answer is
-    /// [`Self::demote_live_direct_sets_for_par2_repair`]: materialize everything
-    /// and let it work over real files. This is what phase 6 puts in front of
-    /// that, and `false` means the demotion is still the answer.
+    /// direct set reaches it routinely: it contributes nothing to the
+    /// clean-PAR2 integrity gate — a direct set never enters the archive
+    /// topology — so a damaged one always arrives here rather than at the
+    /// verify branch. The repairer is filesystem-bound, so today's answer is
+    /// [`Self::demote_live_direct_sets_for_par2_repair`]: materialize
+    /// everything and let it work over real files. This is what repair puts in
+    /// front of that, and `false` means the demotion is still the answer.
     ///
     /// The verdict is computed here rather than borrowed, because the branch has
     /// none yet. It is deliberately a **quiet** pass — no status transition, no
@@ -1179,17 +1178,17 @@ impl Pipeline {
     /// The verdict is **adjusted before it is returned**, by exactly the two
     /// rules the authoritative pass applies to its own
     /// ([`Pipeline::apply_direct_damage_adjustments`]). Skipping them was not a
-    /// small omission: a job with a *finalized* direct set beside a live damaged
-    /// one reads every finalized volume as `Missing` here, `damaged_files_by_set`
-    /// finds no live owner for them and refuses the whole attempt with
-    /// `DamageOutsideDirectSets` — so the live set demotes for damage that
-    /// belongs to files the job legitimately finished without, which is precisely
-    /// the case phase 6 exists to repair (phase 6 review, F2).
+    /// small omission: a job with a *finalized* direct set beside a live
+    /// damaged one reads every finalized volume as `Missing` here,
+    /// `damaged_files_by_set` finds no live owner for them and refuses the
+    /// whole attempt with `DamageOutsideDirectSets` — so the live set demotes
+    /// for damage that belongs to files the job legitimately finished without,
+    /// which is precisely the case repair exists for.
     ///
     /// Deliberately a **full** `verify_all`, never `WEAVER_PAR2_FAST_VERIFY`'s
-    /// sampled form: fast-verify's per-slice accounting is what phase 6 narrowed
-    /// a repair's size away from, and a sampled span would re-inflate it. Weaver
-    /// sets the flag on no path that can reach here; the pin is in
+    /// sampled form: fast-verify's per-slice accounting is what repair narrowed
+    /// a repair's size away from, and a sampled span would re-inflate it.
+    /// Weaver sets the flag on no path that can reach here; the pin is in
     /// [`super::repair`]'s module docs.
     pub(crate) async fn verify_direct_sets_quietly(
         &mut self,
@@ -1249,7 +1248,7 @@ impl Pipeline {
     }
 
     /// The retained session's verdict for a job's direct sets, or `None` to
-    /// fall back to the read-and-verify pass (plan 138, M3).
+    /// fall back to the read-and-verify pass.
     ///
     /// # Why this can refuse
     ///
@@ -1344,8 +1343,8 @@ impl Pipeline {
         }
     }
 
-    /// D8's repair-while-direct. `false` means nothing was repaired and the
-    /// caller should fall back to demotion.
+    /// Repair-while-direct. `false` means nothing was repaired and the caller
+    /// should fall back to demotion.
     async fn repair_direct_sets_with_par2_damage(
         &mut self,
         job_id: JobId,
@@ -1357,11 +1356,11 @@ impl Pipeline {
         let Some(overlay) = self.direct_par2_overlay(job_id) else {
             return false;
         };
-        // The same settle guard the demotion path carries, in the same shape
-        // (H3): while articles are in flight a set's outstanding ranges read as
+        // The same settle guard the demotion path carries, in the same shape:
+        // while articles are in flight a set's outstanding ranges read as
         // holes, and PAR2 cannot tell a hole from corruption. Repairing on that
-        // verdict would spend recovery blocks rebuilding bytes that are still on
-        // their way. A set whose volumes have all finished downloading is
+        // verdict would spend recovery blocks rebuilding bytes that are still
+        // on their way. A set whose volumes have all finished downloading is
         // settled whatever the rest of the job is doing, which is what keeps a
         // job with one slow conventional file from blocking its RAR set's
         // repair.
@@ -1557,11 +1556,11 @@ impl Pipeline {
             return Err(super::repair::DirectRepairFailure::DamageOutsideDirectSets);
         }
         // Sized **before** anything is materialized, read or deleted, so an
-        // over-budget repair costs the set nothing and demotes with a name (F3).
+        // over-budget repair costs the set nothing and demotes with a name.
         // Every repaired byte re-enters the router as a hold, so the holds
-        // budget is the ceiling it is charged against; reading first and finding
-        // out afterwards is what let a three-volume rewrite of a large set peak
-        // at gigabytes with nothing bounding it.
+        // budget is the ceiling it is charged against; reading first and
+        // finding out afterwards is what let a three-volume rewrite of a large
+        // set peak at gigabytes with nothing bounding it.
         let rewrite_bytes: u64 = damaged
             .iter()
             .flat_map(|volume| volume.rewrite.iter())
@@ -1574,11 +1573,11 @@ impl Pipeline {
             });
         }
 
-        // D8, step 1: the row goes **before** any byte the row claims changes.
-        // The materialization writes only scratch, but the re-route below
-        // rewrites member partials and envelopes at offsets the checkpoint's
-        // floors cover, and a row that outlived that would let a restart trust
-        // floors over bytes that moved underneath them.
+        // Step 1: the row goes **before** any byte the row claims changes. The
+        // materialization writes only scratch, but the re-route below rewrites
+        // member partials and envelopes at offsets the checkpoint's floors
+        // cover, and a row that outlived that would let a restart trust floors
+        // over bytes that moved underneath them.
         //
         // The repair once-latch is burned in the same statement, because this is
         // the first step that cannot be undone: everything above refuses for
@@ -1751,7 +1750,7 @@ impl Pipeline {
             }
         }
         self.reread_direct_stale_gaps(job_id, set_index).await;
-        // D8's other half: the row was deleted before anything moved, so the set
+        // The other half: the row was deleted before anything moved, so the set
         // has no durable coverage at all until a barrier writes one. Demanding
         // it here rather than waiting for the 5 s timer is what keeps the
         // deliberately-lossy window to the length of this call.
@@ -1771,8 +1770,8 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Reads each repaired volume's spans back and feeds them through the router
-    /// and out to every destination they touch (D3's replacement semantics).
+    /// Reads each repaired volume's spans back and feeds them through the
+    /// router and out to every destination they touch (replacement semantics).
     ///
     /// **One volume at a time, read then routed then dropped.** Both halves of
     /// that are load-bearing and they pull in opposite directions:
@@ -1782,7 +1781,7 @@ impl Pipeline {
     ///   staged would be held rather than routed, and the repair would refuse;
     /// - never more than one volume, because the spans are bytes, and holding
     ///   every damaged volume's rewrite so the last one could be staged put the
-    ///   set's whole repair in RAM twice over with nothing bounding it (F3).
+    ///   set's whole repair in RAM twice over with nothing bounding it.
     async fn route_repaired_volumes(
         &mut self,
         job_id: JobId,
@@ -1790,7 +1789,7 @@ impl Pipeline {
         damaged: &[super::repair::DamagedDirectVolume],
         lengths: &std::collections::BTreeMap<u32, u64>,
     ) -> bool {
-        // Plan 136, E2: an encrypted member's repaired span decrypts on the way
+        // An encrypted member's repaired span decrypts on the way
         // in, and every byte its CBC chain needs was dropped from staging when
         // the original article was routed. Two sources put them back, and
         // neither of them changes a byte: the ones just below the span come off
@@ -1889,14 +1888,14 @@ impl Pipeline {
     }
 
     /// The few posted bytes per member-extent edge that live in a
-    /// **neighbouring** volume of the same set (plan 136, E2).
+    /// **neighbouring** volume of the same set.
     ///
     /// Read through the set's own virtual provider, which re-encrypts them out
     /// of the neighbour's destination — those bytes did not change, so what
     /// comes back is exactly what was posted there. Blocking work, but bounded
     /// at 46 bytes per member extent of one volume — ≤31 below it, which is the
-    /// straddling block plus its CBC predecessor (E2 review F1), and ≤15 above
-    /// — so it is done inline rather than on the pool.
+    /// straddling block plus its CBC predecessor, and ≤15 above — so it is done
+    /// inline rather than on the pool.
     fn read_cipher_edges(
         &self,
         job_id: JobId,
@@ -1930,13 +1929,13 @@ impl Pipeline {
     }
 
     /// Closes the composition gaps a repair's rewrite left, with one bounded
-    /// read of the partials that hold them (D4).
+    /// read of the partials that hold them.
     ///
-    /// The shape is deliberately D6's restart re-arm: the same plan, the same
+    /// The shape is deliberately the restart re-arm: the same plan, the same
     /// reader, the same "a run that will not read demotes rather than passes"
-    /// rule. What differs is only why the value is missing — a rewrite discarded
-    /// it rather than a restart losing it — and that difference has no bearing
-    /// on what it costs to recover.
+    /// rule. What differs is only why the value is missing — a rewrite
+    /// discarded it rather than a restart losing it — and that difference has
+    /// no bearing on what it costs to recover.
     async fn reread_direct_stale_gaps(&mut self, job_id: JobId, set_index: usize) {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
@@ -2009,10 +2008,9 @@ impl Pipeline {
                 .await;
             return;
         }
-        // Same terminating condition as the restart re-arm (M4): the pass read
-        // every run the plan named, so a gap that survives it is one no plan
-        // reached, and re-running would reach the same place. One pass, then a
-        // verdict.
+        // Same terminating condition as the restart re-arm: the pass read every
+        // run the plan named, so a gap that survives it is one no plan reached,
+        // and re-running would reach the same place. One pass, then a verdict.
         if self
             .direct_store
             .set(job_id, set_index)
@@ -2029,13 +2027,13 @@ impl Pipeline {
     }
 
     /// Demotes every direct set the PAR2 pass found damage on, and reports
-    /// whether any did (plan 135, D5/D8).
+    /// whether any did.
     ///
-    /// Phase 6's fallback, and phase 5's whole answer. A demoted set
-    /// materializes its volumes from its own routed bytes, refetches whatever
-    /// reconstruction could not verify, and hands the job to the conventional
-    /// repair path — which is exactly the shape the same job would have had with
-    /// the gate off.
+    /// The fallback, and the earlier whole answer. A demoted set materializes
+    /// its volumes from its own routed bytes, refetches whatever reconstruction
+    /// could not verify, and hands the job to the conventional repair path —
+    /// which is exactly the shape the same job would have had with the gate
+    /// off.
     pub(crate) async fn demote_direct_sets_with_par2_damage(
         &mut self,
         job_id: JobId,
@@ -2044,13 +2042,13 @@ impl Pipeline {
         let Some(overlay) = self.direct_par2_overlay(job_id) else {
             return false;
         };
-        // H3's second guard, paired with
-        // [`Self::direct_sets_ready_for_authoritative_par2`]: while articles are
-        // still arriving, a set's outstanding ranges read as holes and PAR2
-        // calls them damage. The caller is supposed to have deferred already, so
-        // this is the belt to that braces — and it is scoped the same way, so a
-        // set whose bytes are genuinely never coming still demotes and still
-        // gets materialized for the conventional repair path.
+        // The second settle guard, paired with
+        // [`Self::direct_sets_ready_for_authoritative_par2`]: while articles
+        // are still arriving, a set's outstanding ranges read as holes and PAR2
+        // calls them damage. The caller is supposed to have deferred already,
+        // so this is the belt to that braces — and it is scoped the same way,
+        // so a set whose bytes are genuinely never coming still demotes and
+        // still gets materialized for the conventional repair path.
         let payload_settled = !self.job_has_pending_download_pipeline_work(job_id);
         let mut damaged: Vec<(usize, String)> = Vec::new();
         for file in &verification.files {
@@ -2149,7 +2147,7 @@ impl Pipeline {
         let bytes = contiguous_bytes(&segment.data);
         // The article the seam is holding: if the set demotes here it is
         // dropped without ever reaching the assembly, so nothing else would
-        // ever ask for it again (B4).
+        // ever ask for it again.
         let dropped = Some((segment_id, u64::from(decoded_size)));
 
         let routed = {
@@ -2158,8 +2156,8 @@ impl Pipeline {
             };
             set.note_volume_part_crc(volume_index, file_offset, u64::from(decoded_size), part_crc);
             // The decoded geometry of this article, which only the decoder
-            // knows: demotion-by-reconstruction uses it to decide which articles
-            // it does *not* have to fetch again (D8).
+            // knows: demotion-by-reconstruction uses it to decide which
+            // articles it does *not* have to fetch again.
             set.note_segment_extent(
                 volume_index,
                 segment_id.segment_number,
@@ -2178,9 +2176,9 @@ impl Pipeline {
         };
 
         // Before the writes, so a fact can never be newer on disk than in the
-        // cache the restart reader rebuilds from (D6). Cheap when nothing
-        // parsed: a set parses a volume once provisionally and once
-        // confirmingly, so this is two writes per volume for the life of the job.
+        // cache the restart reader rebuilds from. Cheap when nothing parsed: a
+        // set parses a volume once provisionally and once confirmingly, so this
+        // is two writes per volume for the life of the job.
         self.cache_direct_volume_facts(job_id, set_index).await;
 
         if !self
@@ -2190,24 +2188,26 @@ impl Pipeline {
             return DirectRouteOutcome::Demoted;
         }
 
-        // Ordering contract (D5): every routed destination write for this span
-        // has returned, so a later settle read of the same range sees exactly
-        // these bytes. Live PAR2 is defined in *source volume* space, which is
-        // what `file_offset` already is.
+        // Ordering contract: every routed destination write for this span has
+        // returned, so a later settle read of the same range sees exactly these
+        // bytes. Live PAR2 is defined in *source volume* space, which is what
+        // `file_offset` already is.
         //
-        // With par2-bearing jobs refused at admission (B2), this only ever runs
-        // for a job whose spec declares no PAR2 file, where the registry's
-        // first call answers `skip_job` and every later one is a set lookup.
-        // The call stays because the refusal is phase 4's, not the seam's:
-        // phase 5 admits those jobs and this is where their coverage comes from.
+        // With par2-bearing jobs refused at admission, this only ever runs for
+        // a job whose spec declares no PAR2 file, where the registry's first
+        // call answers `skip_job` and every later one is a set lookup. The call
+        // stays because the refusal belonged to an earlier shape, not to the
+        // seam: those jobs are admitted now and this is where their coverage
+        // comes from.
         //
-        // Plan 136: an **encrypted** set is fed here too, since E2. The feed half
-        // was always correct — `segment.data` is the posted cipher, taken before
-        // the write transform — and E1 suppressed it only because the other half
-        // could not settle a straddling block: the read-back went through
+        // An **encrypted** set is fed here too. The feed half was always
+        // correct — `segment.data` is the posted cipher, taken before the write
+        // transform — and the write side suppressed it only because the other
+        // half could not settle a straddling block: the read-back went through
         // `direct_virtual_volume` to the member's plaintext partial, so every
-        // boundary block came back `Bad`. The re-encrypting overlay is what makes
-        // that read-back answer in posted space, so both halves are live again.
+        // boundary block came back `Bad`. The re-encrypting overlay is what
+        // makes that read-back answer in posted space, so both halves are live
+        // again.
         self.note_live_par2_segment(file_id, file_offset, &segment.data);
         drop(bytes);
 
@@ -2236,9 +2236,9 @@ impl Pipeline {
         }
         let batches = self.direct_write_batches(job_id, set_index, spans);
         if let Err(path) = self.prepare_direct_destinations(job_id, &batches).await {
-            // D3: a destination that could not be marked sparse is refused
-            // *before* it holds a hole, so nothing has been allocated for it
-            // yet. Demote and let the conventional path own the bytes.
+            // A destination that could not be marked sparse is refused *before*
+            // it holds a hole, so nothing has been allocated for it yet. Demote
+            // and let the conventional path own the bytes.
             warn!(
                 job_id = job_id.0,
                 path = %path.display(),
@@ -2251,7 +2251,7 @@ impl Pipeline {
         if let Err(error) = crate::pipeline::orchestrator::write_direct_batches(batches).await {
             // A destination write failure is a demotion, not a job failure: the
             // conventional path writes the same bytes to a different file, and
-            // only if *that* also fails is the job genuinely unfinishable (M6).
+            // only if *that* also fails is the job genuinely unfinishable.
             warn!(
                 job_id = job_id.0,
                 error = %error,
@@ -2279,12 +2279,11 @@ impl Pipeline {
             }
             return false;
         }
-        // Where the bytes went, split by destination kind (plan 135,
-        // Observability). Two counters answer the question the disk acceptance
-        // target is stated in: how much of a set landed at its final offset
-        // versus how much rode the envelope as service data. Summed over the
-        // spans already in hand, and `record_value` is a no-op unless the
-        // profiler is on.
+        // Where the bytes went, split by destination kind. Two counters answer
+        // the question the disk acceptance target is stated in: how much of
+        // a set landed at its final offset versus how much rode the envelope
+        // as service data. Summed over the spans already in hand, and
+        // `record_value` is a no-op unless the profiler is on.
         let (member_bytes, envelope_bytes) =
             spans.iter().fold((0u64, 0u64), |(member, envelope), span| {
                 let len = span.bytes.len() as u64;
@@ -2306,13 +2305,13 @@ impl Pipeline {
     }
 
     /// Caches whatever volume facts the set's parse just accepted, so a restart
-    /// can rebuild its layout (D6).
+    /// can rebuild its layout.
     ///
     /// The rows go into `active_rar_volume_facts` — the same table, keyed the
     /// same way, that the conventional path fills from a parsed volume file.
-    /// There is no writer conflict: `try_update_archive_topology` needs a file to
-    /// parse and D7 suppresses it for direct volumes, so for a live direct set
-    /// this is the only writer, and after a demotion the conventional path
+    /// There is no writer conflict: `try_update_archive_topology` needs a file
+    /// to parse and it is suppressed for direct volumes, so for a live direct
+    /// set this is the only writer, and after a demotion the conventional path
     /// upserts the same facts over the materialized volumes.
     async fn cache_direct_volume_facts(&mut self, job_id: JobId, set_index: usize) {
         let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
@@ -2358,21 +2357,21 @@ impl Pipeline {
         }
     }
 
-    /// D6's gate re-arm: recomputes the member CRC for every restart-seeded
+    /// The gate re-arm: recomputes the member CRC for every restart-seeded
     /// range with **one sequential read** of the partials that hold them.
     ///
     /// `CrcRuns` does not survive a restart, so the bytes a previous run wrote
     /// are covered and unverified; the whole-member gate refuses to compose over
-    /// them until they are re-read. This is D6's "PAR2 absent" arm — the direct
+    /// them until they are re-read. This is the "PAR2 absent" arm — the direct
     /// analogue of `checksum_completed_file`'s fallback for physical files, at
     /// the same cost and the same assurance. It deliberately verifies what is on
     /// **disk now**, so a byte corrupted while the process was down fails the
     /// member gate and demotes the set instead of being committed.
     ///
     /// Runs **once** per set: every run it reads leaves the seeded set, so a
-    /// second call finds nothing to do — and if anything is still seeded after a
-    /// full pass, the set demotes rather than being re-read on every completion
-    /// check for the life of the job (M4).
+    /// second call finds nothing to do — and if anything is still seeded after
+    /// a full pass, the set demotes rather than being re-read on every
+    /// completion check for the life of the job.
     async fn rearm_restart_seeded_gates(&mut self, job_id: JobId, set_index: usize) {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
@@ -2463,12 +2462,12 @@ impl Pipeline {
             return;
         }
 
-        // M4's terminating condition. The pass above read every run the plan
-        // named, so nothing may still be seeded — a range that survives it is one
-        // no plan reached, and re-running the pass would read the same runs and
-        // reach the same place. Left alone, `try_verify_member` refuses that
-        // member forever while the completion gate calls this back on every
-        // check: a zombie that costs I/O. One pass, then a verdict.
+        // The terminating condition. The pass above read every run the plan
+        // named, so nothing may still be seeded — a range that survives it is
+        // one no plan reached, and re-running the pass would read the same runs
+        // and reach the same place. Left alone, `try_verify_member` refuses
+        // that member forever while the completion gate calls this back on
+        // every check: a zombie that costs I/O. One pass, then a verdict.
         if self
             .direct_store
             .set(job_id, set_index)
@@ -2518,8 +2517,8 @@ impl Pipeline {
                 // offsets. The owner thread seeks to the offset and writes, so
                 // the gaps member routing carried away are ordinary filesystem
                 // holes on every platform that gives them for free. Windows
-                // needs `FSCTL_SET_SPARSE` at creation to get the same, which is
-                // phase 7.
+                // needs `FSCTL_SET_SPARSE` at creation to get the same, which a
+                // later pass adds.
                 DirectDestination::Envelope { volume_index } => {
                     set.plan().envelope_relative_path(volume_index)
                 }
@@ -2541,8 +2540,8 @@ impl Pipeline {
     }
 
     /// Creates the parent directory of every destination that needs one, and
-    /// creates the destination file itself **marked sparse**, once per job
-    /// (B3, and D3's Windows rule).
+    /// creates the destination file itself **marked sparse**, once per job (the
+    /// Windows sparse rule).
     ///
     /// A member stored inside a directory — `Silver.Horizon/S01E06.mkv` — names
     /// a partial inside that directory, and the disk owner thread opens
@@ -2561,7 +2560,7 @@ impl Pipeline {
     ///
     /// Records a member name that **direct** finalization produced, in both the
     /// job-wide `extracted_members` (which completion reads) and the runtime's
-    /// direct-only mirror (which the D6 claim assertions subtract).
+    /// direct-only mirror (which the claim assertions subtract).
     fn record_direct_extracted(&mut self, job_id: JobId, name: String) {
         self.direct_store
             .direct_extracted_members
@@ -2574,11 +2573,11 @@ impl Pipeline {
             .insert(name);
     }
 
-    /// Member names the **incremental extractor** owns for this job: the blended
-    /// `extracted_members` minus everything direct finalization put there. The
-    /// D6 assertions compare against this, not the blend — a sibling direct set
-    /// finalizing the same member name is last-writer-wins by design, not a
-    /// second checkpoint system claiming the member.
+    /// Member names the **incremental extractor** owns for this job: the
+    /// blended `extracted_members` minus everything direct finalization put
+    /// there. The claim assertions compare against this, not the blend — a
+    /// sibling direct set finalizing the same member name is last-writer-wins
+    /// by design, not a second checkpoint system claiming the member.
     fn extraction_claimed_members(&self, job_id: JobId) -> HashSet<String> {
         let mut claimed = self
             .extracted_members
@@ -2677,7 +2676,7 @@ impl Pipeline {
         Ok(())
     }
 
-    /// The D7-suppressed twin of `commit_persisted_segment`.
+    /// The suppressed twin of `commit_persisted_segment`.
     async fn commit_direct_segment(
         &mut self,
         segment_id: SegmentId,
@@ -2705,7 +2704,7 @@ impl Pipeline {
         };
         let (file_complete, was_duplicate) = commit;
         if was_duplicate {
-            // D3: a duplicate must not advance CRC composition, coverage or
+            // A duplicate must not advance CRC composition, coverage or
             // progress twice. Counted because a run where this is *never* zero
             // is a server or retry problem, and because the counter is what
             // makes "the duplicate did nothing" observable rather than assumed.
@@ -2748,18 +2747,18 @@ impl Pipeline {
             total_bytes,
         });
 
-        // D5: the live verifier's fail-safe length verdict, which the
-        // conventional file-complete path feeds at exactly this point. A direct
-        // volume has no file to `stat`, but `received_bytes` is the decoded
-        // length — the space PAR2 describes — so the check is the same one, from
-        // the same number, and a volume whose decoded length disagrees with its
+        // The live verifier's fail-safe length verdict, which the conventional
+        // file-complete path feeds at exactly this point. A direct volume has
+        // no file to `stat`, but `received_bytes` is the decoded length — the
+        // space PAR2 describes — so the check is the same one, from the same
+        // number, and a volume whose decoded length disagrees with its
         // description retires its live state instead of short-circuiting on
         // blocks that hashed clean against the wrong file.
         self.note_live_par2_file_complete(file_id, total_bytes);
 
-        // The file-complete state a physical volume drops here (M5/M7). Every
-        // one of these is keyed by a file that will never exist, so leaving
-        // them behind leaks for the life of the job and, worse, leaves
+        // The file-complete state a physical volume drops here. Every one of
+        // these is keyed by a file that will never exist, so leaving them
+        // behind leaks for the life of the job and, worse, leaves
         // `unverified_segments` naming articles a whole-file CRC recovery would
         // try to replace by rewriting a file that is not there.
         let expected_file_crc = self.expected_file_crcs.remove(&file_id);
@@ -2771,14 +2770,14 @@ impl Pipeline {
         self.unavailable_promoted_recovery_segments
             .retain(|segment_id| segment_id.file_id != file_id);
 
-        // M4: the yEnc whole-volume gate, composed rather than re-read.
+        // The yEnc whole-volume gate, composed rather than re-read.
         //
         // A physical volume is checked against its `=yend crc32` trailer when
         // the file completes; the per-article part CRC32s compose into exactly
         // that value, so the gate survives with no file to read. A mismatch
         // demotes: `schedule_file_crc_recovery` is deliberately *not* wired
         // here, because it replaces segments by rewriting a physical file, and
-        // phase 5's provider is what gives a direct volume one.
+        // the provider is what gives a direct volume one.
         if let Some(expected) = expected_file_crc
             && let Some(composed) = self
                 .direct_store
@@ -2829,7 +2828,7 @@ impl Pipeline {
             None => return,
         }
 
-        // D6's phase-change demand. The set's download phase ends exactly here,
+        // The phase-change demand. The set's download phase ends exactly here,
         // at its last volume, and for a par2-bearing job the next thing that
         // happens is a verification wait that can run for the whole PAR2
         // download — which is precisely the window a restart is most likely to
@@ -2859,12 +2858,12 @@ impl Pipeline {
         if self.direct_store.sets_for(job_id).is_empty() {
             return;
         }
-        // D6's gate re-arm, and deliberately **before** the PAR2 wait: the
-        // re-read is about the member gates, not about verification, and running
-        // it at the download/verify boundary means a par2-bearing set is already
-        // gate-passed the moment its job's verification concludes. A set still
-        // receiving articles is skipped — its unwritten ranges are holes, not
-        // coverage to verify.
+        // The gate re-arm, and deliberately **before** the PAR2 wait: the
+        // re-read is about the member gates, not about verification, and
+        // running it at the download/verify boundary means a par2-bearing set
+        // is already gate-passed the moment its job's verification concludes. A
+        // set still receiving articles is skipped — its unwritten ranges are
+        // holes, not coverage to verify.
         let seeded: Vec<usize> = self
             .direct_store
             .sets_for(job_id)
@@ -2896,7 +2895,7 @@ impl Pipeline {
     }
 
     /// Whether a direct set must keep its envelopes and partials because the
-    /// job's PAR2 verification has not concluded (plan 135, D5).
+    /// job's PAR2 verification has not concluded.
     ///
     /// Finalization renames the partials to their destinations and deletes the
     /// envelopes, which together *are* the virtual volume image: after it,
@@ -2991,9 +2990,10 @@ impl Pipeline {
         let working_dir = set.plan().working_dir.clone();
         // Read before the barrier runs, which resets it. Two numbers, because
         // the interesting one is the second: the barrier's 256 MiB trigger is
-        // checked per routed batch, so anything above it is the overshoot D6
-        // bounds to "one decoded write batch" — and an overshoot that starts
-        // tracking set size instead is the shape that regression looks like.
+        // checked per routed batch, so anything above it is the overshoot the
+        // barrier bounds to "one decoded write batch" — and an overshoot that
+        // starts tracking set size instead is the shape that regression looks
+        // like.
         let dirty_bytes = set.dirty_bytes();
         let touched: Vec<String> = set
             .touched_paths()
@@ -3006,11 +3006,11 @@ impl Pipeline {
             .collect();
 
         // Every sync is queued to its owner thread before any of them is
-        // awaited (M4). Envelope v2 made this set `members + volumes` rather
-        // than two, and one `await` per destination serialized that many
-        // independent fsyncs on the pipeline task; the barrier's contract only
-        // asks that they have all completed before it persists, not that they
-        // happened one after another.
+        // awaited. Envelope v2 made this set `members + volumes` rather than
+        // two, and one `await` per destination serialized that many independent
+        // fsyncs on the pipeline task; the barrier's contract only asks that
+        // they have all completed before it persists, not that they happened
+        // one after another.
         let paths: Vec<PathBuf> = touched
             .iter()
             .map(|relative| working_dir.join(relative))
@@ -3069,13 +3069,12 @@ impl Pipeline {
     ///
     /// There is nothing left to extract here — the payload has been at its
     /// destination since the articles arrived — so `Extracting` completes
-    /// immediately and may not be visible at all. Plan 135's open question 2
-    /// settles what to do about that: **document it, add no synthetic delay,
-    /// and change no GraphQL surface.** The README carries the user-facing
-    /// wording; the rule for this function is that it must not slow down, and
-    /// must not emit a phase it did not really run, to make the UI look more
-    /// familiar. A set that demotes reports a real extraction phase because it
-    /// really runs one.
+    /// immediately and may not be visible at all. The settled answer to that:
+    /// **document it, add no synthetic delay, and change no GraphQL surface.**
+    /// The README carries the user-facing wording; the rule for this function
+    /// is that it must not slow down, and must not emit a phase it did not
+    /// really run, to make the UI look more familiar. A set that demotes
+    /// reports a real extraction phase because it really runs one.
     async fn finalize_direct_set(&mut self, job_id: JobId, set_index: usize) {
         self.run_direct_barrier(
             job_id,
@@ -3101,7 +3100,7 @@ impl Pipeline {
         // offset)` — and the commit loop below walks it in that order, so two
         // members whose names sanitize to the same destination overwrite each
         // other exactly the way the incremental extractor makes them overwrite
-        // each other: last one in the archive wins (D3).
+        // each other: last one in the archive wins.
         let unpacked_sizes: HashMap<String, u64> =
             set.router.member_digest_entries().into_iter().collect();
         let members: Vec<(String, u64, PathBuf, PathBuf)> = set
@@ -3124,15 +3123,16 @@ impl Pipeline {
         let extraction_claimed = self.extraction_claimed_members(job_id);
         set.assert_not_extraction_owned(&extraction_claimed);
 
-        // D1's tolerance, and strictly **before** the commit loop below (M4).
-        // The extraction reads the *virtual volumes*, which are the envelopes
-        // overlaid with the members' `.direct.partial`s — so every one of those
-        // files has to still be where the provider says it is. Running it after
-        // the renames pointed the provider's partial map at paths that had just
-        // been renamed away, turning every stored member's extent into a hole:
-        // it happened to work only while a tolerated member's header walk and
-        // decode never read through a stored extent, and its failure mode was a
-        // demotion that could no longer reconstruct, i.e. a full redownload.
+        // The small-member tolerance, and strictly **before** the commit loop
+        // below. The extraction reads the *virtual volumes*, which are the
+        // envelopes overlaid with the members' `.direct.partial`s — so every
+        // one of those files has to still be where the provider says it is.
+        // Running it after the renames pointed the provider's partial map at
+        // paths that had just been renamed away, turning every stored member's
+        // extent into a hole: it happened to work only while a tolerated
+        // member's header walk and decode never read through a stored extent,
+        // and its failure mode was a demotion that could no longer reconstruct,
+        // i.e. a full redownload.
         //
         // Nothing here needs the commit to have happened: the overwrite refusal
         // compares `plan().member_output_path` against the tolerated
@@ -3192,7 +3192,7 @@ impl Pipeline {
             // A zero-length stored member never had a byte routed for it, so it
             // has no partial to rename — but the archive declares the file and
             // the conventional extractor creates it, so finalization does too,
-            // in the same archive order as every other member (B2).
+            // in the same archive order as every other member.
             let committed = match tokio::fs::rename(partial, destination).await {
                 Err(error)
                     if *unpacked_size == 0 && error.kind() == std::io::ErrorKind::NotFound =>
@@ -3235,7 +3235,7 @@ impl Pipeline {
                 let _ = tokio::fs::remove_file(envelope).await;
             }
         }
-        // D2: the scratch dies with the set, and its high-water is reported
+        // The scratch dies with the set, and its high-water is reported
         // separately from RAM so the disk claim stays legible against the 1.05×
         // acceptance target.
         if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
@@ -3285,9 +3285,8 @@ impl Pipeline {
         );
     }
 
-    /// Keeps a finalizing set's virtual volume image alive past its own
-    /// commit, when the job's PAR2 story can still need it (phase 6 review, F2
-    /// follow-up).
+    /// Keeps a finalizing set's virtual volume image alive past its own commit,
+    /// when the job's PAR2 story can still need it.
     ///
     /// # The gap this closes
     ///
@@ -3312,8 +3311,8 @@ impl Pipeline {
     /// - a job with no PAR2 file: there is no repair to serve;
     /// - a set with no **live** neighbour: nothing left in this job can ask, and
     ///   the release sweep below deletes what the last one held;
-    /// - an **encrypted** set that cannot reproduce its posted bytes (plan 136,
-    ///   E2). One that can is retained like any other: a commit is a rename, so
+    /// - an **encrypted** set that cannot reproduce its posted bytes. One that
+    ///   can is retained like any other: a commit is a rename, so
     ///   the overlay re-encrypts out of the committed member exactly as it did
     ///   out of the partial;
     /// - an image with a hole in it — see
@@ -3435,7 +3434,7 @@ impl Pipeline {
         }
     }
 
-    /// D1's bounded small-member tolerance: extracts **only** the tolerated
+    /// The bounded small-member tolerance: extracts **only** the tolerated
     /// member indices, through the hybrid virtual-volume provider, straight to
     /// their destinations.
     ///
@@ -3459,7 +3458,7 @@ impl Pipeline {
             return Ok(Vec::new());
         }
         let set_name = set.set_name().to_string();
-        // Plan 136, E4. An `-hp` set's virtual volumes are as header-encrypted as
+        // An `-hp` set's virtual volumes are as header-encrypted as
         // the posted ones, so this extraction cannot even *open* the archive
         // without the key the router proved — and for a `-p` set a tolerated
         // member's data is encrypted too. `None` for a plaintext set, which is
@@ -3467,9 +3466,9 @@ impl Pipeline {
         let password = set.router.archive_password().map(str::to_string);
 
         // The ordering invariant this extraction depends on, stated where it is
-        // depended on (M4). The provider serves every stored member's extent out
-        // of its `.direct.partial`; the commit loop renames those away and
-        // records the member in `extracted_members` as it goes. Running after it
+        // depended on. The provider serves every stored member's extent out of
+        // its `.direct.partial`; the commit loop renames those away and records
+        // the member in `extracted_members` as it goes. Running after it
         // therefore hands the header walk and the decode a volume whose stored
         // extents are all holes, and the failure path costs a full redownload.
         debug_assert!(
@@ -3491,7 +3490,7 @@ impl Pipeline {
         // sanitize onto one path, which is exactly the collision that would let
         // a tolerated member overwrite verified direct output. Derived from the
         // layout, not from the filesystem, which is what lets this run before
-        // the commit loop renames anything (M4).
+        // the commit loop renames anything.
         let mut stored_outputs: HashSet<PathBuf> = HashSet::new();
         for (_, name, _) in set.router.member_partials() {
             if let Ok(destination) = set.plan().member_output_path(name) {
@@ -3606,8 +3605,8 @@ impl Pipeline {
                 // The tolerated half of the byte account: everything else a
                 // direct set produces is counted at the router as
                 // `direct_store.bytes.member`, and a set whose tolerated bytes
-                // start rivalling its stored ones is one the D1 budget is no
-                // longer holding.
+                // start rivalling its stored ones is one the tolerance budget
+                // is no longer holding.
                 if let Ok(metadata) = file.metadata() {
                     crate::runtime::perf_probe::record_value(
                         "direct_store.bytes.tolerated",
@@ -3629,12 +3628,12 @@ impl Pipeline {
             job_id = job_id.0,
             set_name = %set_name,
             members = extracted.len(),
-            "extracted D1-tolerated members from the virtual volumes"
+            "extracted tolerated small members from the virtual volumes"
         );
         Ok(extracted)
     }
 
-    /// Abandons direct output for a set and hands its volumes back (D8's
+    /// Abandons direct output for a set and hands its volumes back (the
     /// **archive-group demotion**, the transition that ends direct mode).
     ///
     /// Two shapes, and the first one is tried first:
@@ -3644,7 +3643,7 @@ impl Pipeline {
     ///    the yEnc part-CRC composition, and only then are legacy floors and
     ///    completed-file rows persisted, the coverage row retired, and the
     ///    partials and envelopes deleted. Covered bytes are never refetched.
-    /// 2. **Refetch** — phase 4's conservative form, kept as the fallback for
+    /// 2. **Refetch** — the conservative form, kept as the fallback for
     ///    everything reconstruction cannot do: a deleted envelope, a truncated
     ///    partial, a covered run whose CRC32 disagrees. The routed bytes are
     ///    thrown away and every article comes back off the wire.
@@ -3669,7 +3668,7 @@ impl Pipeline {
         // guard read `is_demoted() && is_finalized()`, which two mutually
         // exclusive states can never both satisfy, so a finalized set could be
         // flipped to `Demoted` and have its committed members deleted out from
-        // under a job that had already counted them (B5).
+        // under a job that had already counted them.
         if !set.claim_demotion(reason) {
             return;
         }
@@ -3701,7 +3700,7 @@ impl Pipeline {
                     "direct_store.demoted.reconstructed",
                     std::time::Duration::from_nanos(1),
                 );
-                // The other half of D8's materialization account: a whole-set
+                // The other half of the materialization account: a whole-set
                 // demotion materializes *every* volume of the group, and this
                 // is how many that was. Read against
                 // `direct_store.repair.materialized_volumes`, whose whole point
@@ -3738,7 +3737,7 @@ impl Pipeline {
         self.release_retained_direct_volumes(job_id).await;
     }
 
-    /// D8's reconstruction path. `Ok(n)` when `n` volumes were materialized.
+    /// The reconstruction path. `Ok(n)` when `n` volumes were materialized.
     async fn reconstruct_demoted_set(
         &mut self,
         job_id: JobId,
@@ -3755,7 +3754,7 @@ impl Pipeline {
             return Err(ReconstructionFailure::NoLayout);
         }
         if set.router.posted_bytes_unavailable() {
-            // Plan 136, E2. The member partials hold **plaintext**; the volume
+            // The member partials hold **plaintext**; the volume
             // being rebuilt holds cipher, and the overlay is what turns one into
             // the other on the way out. This is the residual it cannot do — a
             // routed encrypted member with no declared cipher size, or one whose
@@ -3837,8 +3836,9 @@ impl Pipeline {
         })??;
 
         // Everything above is read-only against the job; from here the
-        // reconciliation mutates durable state, in D8's order: legacy floors and
-        // completed-file rows, then the coverage row, then the direct outputs.
+        // reconciliation mutates durable state, in that order: legacy floors
+        // and completed-file rows, then the coverage row, then the direct
+        // outputs.
         let mut materialized = 0usize;
         let mut keep: HashMap<u32, Vec<u32>> = HashMap::new();
         for (outcome, (volume_index, file_index, filename, plan)) in
@@ -3880,10 +3880,10 @@ impl Pipeline {
                 }
             } else if floor > 0 {
                 // A partial volume persists only a contiguous, segment-aligned
-                // floor (D8). `note_file_progress_floor` suppresses direct source
-                // files, and this one still is one until the set's status is read
-                // again — so the upsert goes straight to the batch the flush
-                // drains, which is the same row `coverage_skip_plan` and
+                // floor. `note_file_progress_floor` suppresses direct source
+                // files, and this one still is one until the set's status is
+                // read again — so the upsert goes straight to the batch the
+                // flush drains, which is the same row `coverage_skip_plan` and
                 // `segments_covered_by_floor` read back at restart.
                 self.pending_file_progress.insert(file_id, floor);
             }
@@ -3910,8 +3910,8 @@ impl Pipeline {
         Ok(materialized)
     }
 
-    /// Phase 4's demotion, kept as the fallback: throw the routed bytes away and
-    /// hand every article back to the download queue.
+    /// The first shape's demotion, kept as the fallback: throw the routed bytes
+    /// away and hand every article back to the download queue.
     async fn refetch_demoted_set(
         &mut self,
         job_id: JobId,
@@ -3923,10 +3923,10 @@ impl Pipeline {
         };
         let volumes: Vec<u32> = set.plan().volumes.values().copied().collect();
 
-        // D8: on this path the checkpoint row goes first, because everything it
-        // claims is about to be deleted and nothing replaces it. A crash between
-        // here and the refetch costs a redownload, which is what the fallback is
-        // doing anyway.
+        // On this path the checkpoint row goes first, because everything it
+        // claims is about to be deleted and nothing replaces it. A crash
+        // between here and the refetch costs a redownload, which is what the
+        // fallback is doing anyway.
         let mut persist = DatabaseCoveragePersist::new(self.db.clone());
         if let Some(set) = self.direct_store.set_mut(job_id, set_index)
             && let Err(error) = set.retire(&mut persist)
@@ -3940,8 +3940,8 @@ impl Pipeline {
 
     /// Deletes a set's partial members, envelope files and holds scratch.
     ///
-    /// A sparse half-written output would masquerade as finished work (D1), and
-    /// the envelopes and the scratch are scratch by construction.
+    /// A sparse half-written output would masquerade as finished work, and the
+    /// envelopes and the scratch are scratch by construction.
     async fn delete_direct_outputs(&mut self, job_id: JobId, set_index: usize) {
         if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
             set.router.discard_scratch();
@@ -3957,10 +3957,11 @@ impl Pipeline {
             .map(|(_, _, partial)| working_dir.join(partial))
             .collect();
         doomed.extend(set.plan().envelope_paths());
-        // Repair scratch (D8). Normally deleted the moment its spans are routed,
-        // so this only ever finds one a demotion interrupted — but a leftover
+        // Repair scratch. Normally deleted the moment its spans are routed, so
+        // this only ever finds one a demotion interrupted — but a leftover
         // would sit in the working directory for the life of the job, and the
-        // reconstruction sweep is about to write the real volume files beside it.
+        // reconstruction sweep is about to write the real volume files beside
+        // it.
         doomed.extend(set.plan().repair_paths());
         for path in doomed {
             crate::pipeline::release_cached_write_handle(&path);
@@ -3971,13 +3972,13 @@ impl Pipeline {
     /// Hands a reconstructed set back to the conventional path, keeping the
     /// articles that are now genuinely on disk.
     ///
-    /// This is the difference between D8's demotion and phase 4's: `keep` names,
-    /// per NZB file, the articles whose decoded extents lie wholly below the
-    /// contiguous prefix the sweep rebuilt. Those stay committed in the assembly
-    /// and are never fetched again. Everything else — an article held in RAM and
-    /// never written, an article above a coverage hole, the one article the
-    /// routing seam dropped — comes back, exactly as the refetch path would have
-    /// brought it back.
+    /// This is the difference between demotion by reconstruction and the first
+    /// shape's: `keep` names, per NZB file, the articles whose decoded extents
+    /// lie wholly below the contiguous prefix the sweep rebuilt. Those stay
+    /// committed in the assembly and are never fetched again. Everything else —
+    /// an article held in RAM and never written, an article above a coverage
+    /// hole, the one article the routing seam dropped — comes back, exactly as
+    /// the refetch path would have brought it back.
     ///
     /// A file with nothing kept takes the full refetch treatment, including
     /// `mark_file_incomplete`: there is no reconstructed state to protect.
@@ -4269,7 +4270,7 @@ fn read_restart_seeded_runs(
             }
         };
         file.seek(SeekFrom::Start(run.logical_offset))?;
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
         let mut remaining = run.len;
         while remaining > 0 {
             let want = (remaining.min(buffer.len() as u64)) as usize;
@@ -4280,7 +4281,7 @@ fn read_restart_seeded_runs(
             hasher.update(&buffer[..want]);
             remaining -= want as u64;
         }
-        checksums.push(hasher.finalize());
+        checksums.push(hasher.finalize() as u32);
     }
     Ok(checksums)
 }

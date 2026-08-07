@@ -1,16 +1,16 @@
-//! Byte-exact volume reconstruction for archive-group demotion (plan 135, D8).
+//! Byte-exact volume reconstruction for archive-group demotion.
 //!
-//! Phase 4's demotion was the conservative form: throw the routed bytes away and
-//! refetch every article of every volume. That is correct and it is expensive —
-//! a set that demotes at 90% has already paid for 90% of its own download and
-//! then pays again.
+//! The first shape's demotion was the conservative form: throw the routed bytes
+//! away and refetch every article of every volume. That is correct and it is
+//! expensive — a set that demotes at 90% has already paid for 90% of its own
+//! download and then pays again.
 //!
-//! D8 says what should happen instead: *"reconstruct byte-exact source volumes
-//! for every volume the group needs from envelope plus member extents, verify
-//! the reconstructed covered ranges, sync, atomically persist legacy floors and
-//! completed-file rows for the now-physical volumes, retire the direct coverage
-//! row, delete the group's partial direct outputs … and hand the whole group to
-//! the existing repair/extraction scheduler."*
+//! Reconstruction says what should happen instead: *"reconstruct byte-exact
+//! source volumes for every volume the group needs from envelope plus member
+//! extents, verify the reconstructed covered ranges, sync, atomically persist
+//! legacy floors and completed-file rows for the now-physical volumes, retire
+//! the direct coverage row, delete the group's partial direct outputs … and
+//! hand the whole group to the existing repair/extraction scheduler."*
 //!
 //! This module owns the first two steps — the sweep and its verification. It
 //! runs entirely on the blocking pool: every read goes through the hybrid
@@ -30,25 +30,25 @@
 //!
 //! Reconstruction is an optimisation over refetching. Every failure mode — a
 //! deleted envelope, a truncated partial, a covered range whose composed CRC32
-//! disagrees with what came back off disk — falls back to phase 4's refetch,
-//! which is always correct. What it must never do is *half* succeed and then let
-//! the caller persist a floor over bytes it did not actually rebuild, so the
-//! floor a volume reports is the contiguous prefix it verifiably wrote and
-//! nothing beyond it.
+//! disagrees with what came back off disk — falls back to the conservative
+//! refetch, which is always correct. What it must never do is *half* succeed
+//! and then let the caller persist a floor over bytes it did not actually
+//! rebuild, so the floor a volume reports is the contiguous prefix it
+//! verifiably wrote and nothing beyond it.
 //!
 //! # Verification fails closed
 //!
 //! An earlier shape wrote a covered run **unverified** whenever the yEnc part
-//! composition had no reference value for it, on the grounds that D8 asks for
-//! verification "where available". That is the wrong default here: this sweep
-//! reads through an overlay of two sparse files, and the failure it exists to
-//! survive — a source that silently answers with zeros — produces bytes that
-//! look like data and pass nothing. So a covered run the composition cannot
-//! vouch for is [`ReconstructionFailure::UnverifiableRun`], which falls back to
-//! refetching. [`CrcRuns::compose`] is what keeps that rare: it composes a
-//! reference for any sub-range that starts and ends on an article boundary, so a
-//! held tail or a volume that stops mid-download still verifies the prefix it
-//! does have.
+//! composition had no reference value for it, on the grounds that
+//! reconstruction asks for verification "where available". That is the wrong
+//! default here: this sweep reads through an overlay of two sparse files, and
+//! the failure it exists to survive — a source that silently answers with zeros
+//! — produces bytes that look like data and pass nothing. So a covered run the
+//! composition cannot vouch for is [`ReconstructionFailure::UnverifiableRun`],
+//! which falls back to refetching. [`CrcRuns::compose`] is what keeps that
+//! rare: it composes a reference for any sub-range that starts and ends on an
+//! article boundary, so a held tail or a volume that stops mid-download still
+//! verifies the prefix it does have.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -126,12 +126,12 @@ pub(crate) enum ReconstructionFailure {
     UnverifiableRun { volume_index: u32, offset: u64 },
     /// The volume file could not be written.
     WriteFailed { volume_index: u32, error: String },
-    /// The volume file could not be marked sparse (D3). Refused **before**
-    /// `set_len` opens a hole, so on Windows nothing has been allocated yet and
-    /// the refetch pays only what the conventional path always pays.
+    /// The volume file could not be marked sparse. Refused **before** `set_len`
+    /// opens a hole, so on Windows nothing has been allocated yet and the
+    /// refetch pays only what the conventional path always pays.
     SparseMarkFailed { volume_index: u32, error: String },
     /// The set routed an **encrypted** member whose posted bytes the provider
-    /// overlay cannot reproduce (plan 136, E2).
+    /// overlay cannot reproduce.
     ///
     /// Reconstruction reads posted bytes back out of destinations that hold
     /// plaintext, and the overlay re-encrypts them on the way — so an encrypted
@@ -249,14 +249,14 @@ fn reconstruct_volume(
     let mut reader = provider
         .open(volume.volume_index)
         .ok_or(ReconstructionFailure::NoLayout)?;
-    // Marked sparse at creation and **before** the `set_len` below (D3): the
-    // sweep seeks past every hole, so on Windows an unmarked file would have
-    // NTFS allocate and zero-fill the whole volume the moment the length is
-    // set. A marking failure is refused here, with no hole yet in existence.
+    // Marked sparse at creation and **before** the `set_len` below: the sweep
+    // seeks past every hole, so on Windows an unmarked file would have NTFS
+    // allocate and zero-fill the whole volume the moment the length is set. A
+    // marking failure is refused here, with no hole yet in existence.
     let mut file =
         super::sparse::create_sparse(&volume.path, &sparse).map_err(|error| match error {
             // An ordinary create failure is the write failure it has always
-            // been; only a refused *marking* is D3's own bucket.
+            // been; only a refused *marking* is its own bucket.
             super::sparse::SparseCreateError::Open(error) => ReconstructionFailure::WriteFailed {
                 volume_index: volume.volume_index,
                 error: error.to_string(),
@@ -316,7 +316,7 @@ fn reconstruct_volume(
                 error: error.to_string(),
             })?;
 
-        let mut run_crc = crc32fast::Hasher::new();
+        let mut run_crc = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
         let mut cursor = start;
         while cursor < end {
             let want = ((end - cursor) as usize).min(buffer.len());
@@ -357,11 +357,11 @@ fn reconstruct_volume(
             written_total = written_total.saturating_add(read as u64);
         }
 
-        // D8: verify every reconstructed covered range. The composition is over
+        // Verify every reconstructed covered range. The composition is over
         // yEnc part CRC32s in source space, so it checks the bytes that came
         // back off the partials and envelope against what the wire delivered —
         // end to end, through both hops.
-        if run_crc.finalize() != reference {
+        if run_crc.finalize() as u32 != reference {
             return Err(ReconstructionFailure::ChecksumMismatch {
                 volume_index: volume.volume_index,
                 offset: start,

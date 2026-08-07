@@ -47,8 +47,7 @@ pub(crate) struct FloorCoveredSegments {
 /// Clamping belongs to the caller. `build_restore_skip_plan` clamps its floor
 /// to the declared file size and the partial file's on-disk length before
 /// calling. Direct-store coverage floors deliberately do not: for a direct set
-/// the source volume has no file at all, and file length never implies coverage
-/// (plan 135, D6).
+/// the source volume has no file at all, and file length never implies coverage.
 pub(crate) fn segments_covered_by_floor(
     file_id: NzbFileId,
     segments: &[crate::jobs::model::SegmentSpec],
@@ -1434,12 +1433,12 @@ impl Pipeline {
             &working_dir,
         )
         .await;
-        // Plan 135, D6. A direct set's source volumes have no legacy floor and
-        // no completed-file row by construction (D7), so everything above comes
-        // back empty for them; their coverage lives in the direct checkpoint and
+        // A direct set's source volumes have no legacy floor and no
+        // completed-file row by construction, so everything above comes back
+        // empty for them; their coverage lives in the direct checkpoint and
         // feeds exactly the same skip set. Merged before the assembly is built,
-        // because the assembly is what turns a skipped segment into work the job
-        // does not queue.
+        // because the assembly is what turns a skipped segment into work the
+        // job does not queue.
         let direct_restore = self
             .restore_direct_store_coverage(job_id, &spec, &working_dir)
             .await;

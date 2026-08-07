@@ -63,8 +63,8 @@ where
 /// Where one live-PAR2 read-back gets its bytes.
 ///
 /// A conventional file is re-read from disk; a direct set's source volume has
-/// no file, so it is read through the hybrid virtual-volume provider (plan 135,
-/// D5). Both are owned values so the read can move onto the blocking pool.
+/// no file, so it is read through the hybrid virtual-volume provider. Both are
+/// owned values so the read can move onto the blocking pool.
 enum LiveReadSource {
     OnDisk(std::path::PathBuf),
     Virtual(
@@ -609,7 +609,7 @@ impl Pipeline {
             })
             .collect::<Vec<_>>();
         let par2_file_id = unique_live_par2_candidate(&candidates)?;
-        // M2 (plan 138). The binding length is what PAR2 *describes*, never the
+        // The binding length is what PAR2 *describes*, never the
         // NZB's declared total: `<segment bytes=…>` is yEnc-**encoded** size,
         // around 1.03x the decoded bytes, so a declared total can never equal
         // `desc.length` for a real post. `bind` refuses on that inequality, so
@@ -699,16 +699,17 @@ impl Pipeline {
         if reads.is_empty() {
             return;
         }
-        // M2 (plan 138). The adopted engine settles a read by opening the
-        // binding's path, which is right for every conventional file and
-        // impossible for a direct set: D7 leaves its source volumes with no file
-        // at all, so a path read is dropped and every span stays `Pending`
+        // The adopted engine settles a read by opening the binding's path,
+        // which is right for every conventional file and impossible for a
+        // direct set: suppression leaves its source volumes with no file at
+        // all, so a path read is dropped and every span stays `Pending`
         // forever. Ask direct-store first — the hybrid provider serves the same
         // bytes in the same source-volume coordinate space, assembled from the
-        // envelope plus the routed member partials, and for an encrypted set the
-        // E2 overlay re-derives the posted cipher on the way out. A range
-        // landing on a hole comes back short, exactly as a truncated file would,
-        // and those blocks correctly stay `Pending` for the authoritative pass.
+        // envelope plus the routed member partials, and for an encrypted set
+        // the overlay re-derives the posted cipher on the way out. A range
+        // landing on a hole comes back short, exactly as a truncated file
+        // would, and those blocks correctly stay `Pending` for the
+        // authoritative pass.
         let reads = reads
             .into_iter()
             .filter_map(|read| {
@@ -828,7 +829,7 @@ impl Pipeline {
                 // caller needs them read. Where both want a handle the retained
                 // one adopts the new handle — the direct overlay snapshots its
                 // coverage, so every pass builds a fresh one and re-pointing is
-                // what keeps one session across many of them (plan 138, M3).
+                // what keeps one session across many of them.
                 // A mismatch in *kind* is not adoptable in either direction, so
                 // that session is dropped and a fresh one opened below.
                 match (&source_access, session.is_access_backed()) {
@@ -1039,11 +1040,11 @@ impl Pipeline {
         if par2_set.recovery_file_ids.is_empty() {
             return None;
         }
-        // M2 (plan 138): the adopted engine states this as
-        // NzbFileId -> par2 FileId, keyed the other way round, and gates on
-        // `Crc32AndMd5` slice strength rather than a bare "ok" — strictly
-        // stronger than the map this short-circuit used to read. Inverted here
-        // so the rest of the shape check is unchanged.
+        // The adopted engine states this as NzbFileId -> par2 FileId, keyed
+        // the other way round, and gates on `Crc32AndMd5` slice strength
+        // rather than a bare "ok" — strictly stronger than the map this
+        // short-circuit used to read. Inverted here so the rest of the shape
+        // check is unchanged.
         let verified: HashMap<par2_rs::FileId, NzbFileId> = self
             .live_par2
             .complete_bindings_if_strong(job_id)?

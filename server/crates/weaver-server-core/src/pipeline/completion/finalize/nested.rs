@@ -577,7 +577,7 @@ impl Pipeline {
         // here, and leaving it behind is not inert: the rebuilt assembly
         // assigns nested archives file indices from 0, and a *finalized* set —
         // finalized is not demoted — still claims its source volume indices
-        // through `is_direct_source_file`. That guard (plan 135, D7) then eats
+        // through `is_direct_source_file`. That guard then eats
         // the `refresh_archive_state_for_completed_file` call for the colliding
         // nested index, no scheduler state is ever registered, and the nested
         // extraction fails with "had no scheduler state after topology

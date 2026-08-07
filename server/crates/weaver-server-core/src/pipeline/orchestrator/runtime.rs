@@ -43,7 +43,7 @@ impl Pipeline {
             (
                 cfg.isp_bandwidth_cap.clone(),
                 cfg.ip_replacement_trial_extra_connections(),
-                // Plan 135, phase 7: config, with `WEAVER_RAR_DIRECT_STORE`
+                // Config, with `WEAVER_RAR_DIRECT_STORE`
                 // overriding it. Resolved once here and held for the life of
                 // the pipeline — a set admitted under an enabled gate must not
                 // find it disabled at finalization, and the kill switch's
@@ -499,7 +499,7 @@ impl Pipeline {
         contiguous_bytes_written: u64,
         force_flush: bool,
     ) {
-        // Plan 135, D7: a direct set's source volume has no file, so its legacy
+        // A direct set's source volume has no file, so its legacy
         // floor stays at zero — an older binary then sees no coverage and
         // redownloads instead of trusting bytes that were never written there.
         // The routing seam already returns before this is reached; the guard is
@@ -598,7 +598,7 @@ impl Pipeline {
             .retain(|file_id, _| file_id.job_id != job_id);
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
-        // Plan 135: the direct-store runtime is per-job state like every map
+        // The direct-store runtime is per-job state like every map
         // above it. Left behind, its sets keep a removed job "active" and the
         // barrier poll keeps demanding checkpoints for a working directory that
         // is being deleted.
@@ -762,7 +762,7 @@ impl Pipeline {
             }
 
             self.dispatch_downloads();
-            // Plan 135, D6: the byte and age triggers are polled on the loop's
+            // The byte and age triggers are polled on the loop's
             // existing periodic seam rather than on a timer of their own, so an
             // idle set still checkpoints and a busy one is never checked more
             // often than the pipeline turns.
@@ -993,7 +993,7 @@ impl Pipeline {
         info!("pipeline stopped");
     }
 
-    /// D6's pause demand, at the command seam.
+    /// The pause demand, at the command seam.
     ///
     /// A paused job stops feeding the byte trigger and its sets go quiet, so
     /// without this the last interval's coverage would sit uncheckpointed for
@@ -1366,7 +1366,7 @@ enum DiskWriteCommand {
             Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError>,
         >,
     },
-    /// One direct-store destination's share of a routed article (plan 135, D3).
+    /// One direct-store destination's share of a routed article.
     ///
     /// Raw bytes rather than a `BufferedDecodedSegment`, because a routed run is
     /// a *fragment* of an article: one decoded span is split across a member
@@ -1378,7 +1378,7 @@ enum DiskWriteCommand {
         response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
     },
     /// Durably syncs one destination, on the thread that owns its handle so the
-    /// sync is ordered behind every batch queued before it (D6 step 2).
+    /// sync is ordered behind every batch queued before it.
     SyncPath {
         path: std::path::PathBuf,
         response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
@@ -1805,7 +1805,7 @@ pub(crate) type DirectWriteBatches = Vec<(std::path::PathBuf, Vec<(u64, Vec<u8>)
 
 /// Writes one routed article's fragments to **every** destination it touches,
 /// fanning the per-path sub-batches out to their owner threads and joining them
-/// all (plan 135, D3).
+/// all.
 ///
 /// The article counts as placed only when every destination write returned;
 /// a partial failure is reported as an error and leaves orphan bytes, which is

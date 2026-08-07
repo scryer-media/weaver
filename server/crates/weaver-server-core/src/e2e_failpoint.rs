@@ -7,7 +7,7 @@ pub const STATUS_ENTER_REPAIRING: &str = "status.enter_repairing";
 pub const STATUS_ENTER_QUEUED_REPAIR: &str = "status.enter_queued_repair";
 pub const STATUS_ENTER_QUEUED_EXTRACT: &str = "status.enter_queued_extract";
 
-// Direct-store coverage barrier step boundaries (plan 135, D6). One name per
+// Direct-store coverage barrier step boundaries. One name per
 // step so a container crash test can budget exactly one run each and assert
 // that floors are published only after the checkpoint is durable. The sync hook
 // trips *after* a destination is synced, so it reproduces a mid-sync crash —

@@ -2633,8 +2633,7 @@ impl Database {
         })
     }
 
-    /// Replaces the direct-store coverage checkpoint for one archive set
-    /// (plan 135, D6).
+    /// Replaces the direct-store coverage checkpoint for one archive set.
     ///
     /// One statement, one row, one encoded blob — the whole checkpoint,
     /// including every per-volume floor. A barrier must cost the same number of
@@ -2701,7 +2700,7 @@ impl Database {
 
     /// Retires one archive set's direct-store coverage checkpoint. Repair over
     /// checkpoint-covered output deletes the row and lets the next barrier
-    /// recreate coverage from scratch (plan 135, D8).
+    /// recreate coverage from scratch.
     pub fn delete_direct_coverage(&self, job_id: JobId, set_name: &str) -> Result<(), StateError> {
         let datastore = self.datastore();
         let set_name = set_name.to_string();

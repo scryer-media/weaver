@@ -615,7 +615,7 @@ impl Database {
     }
 
     /// Reads every direct-store coverage checkpoint for a job, keyed by archive
-    /// set name (plan 135, D6). One statement, one row per set — restart never
+    /// set name. One statement, one row per set — restart never
     /// pays a per-volume round trip.
     pub fn load_direct_coverage(
         &self,

@@ -1,4 +1,4 @@
-//! Restart-side validation of direct-store coverage (plan 135, D6).
+//! Restart-side validation of direct-store coverage.
 //!
 //! Synchronous restart is bounded and **reads zero destination bytes**. The
 //! barrier ordered data sync → checkpoint commit → floor publish, so a committed
@@ -9,11 +9,11 @@
 //! 2. confirm every claimed destination exists;
 //! 3. confirm each is at least as long as its claimed extents.
 //!
-//! No byte verification and no destination reads beyond fs metadata. Revision 4's
-//! "verify at most 64 MiB of destination tails" was dropped because the blob
-//! stores no tail digests, so the check had no reference value; the integrity
-//! gates re-arm in the background, from the verifier that must touch those bytes
-//! anyway — never synchronously at startup, and never twice.
+//! No byte verification and no destination reads beyond fs metadata. An earlier
+//! revision's "verify at most 64 MiB of destination tails" was dropped because
+//! the blob stores no tail digests, so the check had no reference value; the
+//! integrity gates re-arm in the background, from the verifier that must touch
+//! those bytes anyway — never synchronously at startup, and never twice.
 //!
 //! File length never implies coverage. A **longer** destination than the claim
 //! is expected and is not truncated; a **shorter** one means the claim outran
@@ -27,11 +27,11 @@
 //! read is the target's. That is deliberate and it is not this module's stance
 //! to make — restart only reads metadata, and reading a symlinked file's length
 //! discloses nothing and writes nothing. The stance that matters belongs to the
-//! phase 4 writer, which opens these paths for writing: it owns whether a
-//! destination may be a symlink at all (`O_NOFOLLOW`, or an `is_symlink` refusal
-//! before the open), and once it refuses to write through one, no checkpoint can
-//! come to claim one either. Snapshot decoding independently refuses paths that
-//! escape the working directory lexically, so the probe is only ever handed
+//! writer, which opens these paths for writing: it owns whether a destination
+//! may be a symlink at all (`O_NOFOLLOW`, or an `is_symlink` refusal before the
+//! open), and once it refuses to write through one, no checkpoint can come to
+//! claim one either. Snapshot decoding independently refuses paths that escape
+//! the working directory lexically, so the probe is only ever handed
 //! job-relative paths.
 //!
 //! A probe that cannot be completed is **not** a pass. "Could not check" is a
@@ -109,8 +109,9 @@ pub(crate) enum CoverageRejection {
     ProbeFailed {
         error: String,
     },
-    /// The row claims coverage in a volume the rebuilt layout has no cached facts
-    /// for, so nothing it restores for that volume could ever be classified (M5).
+    /// The row claims coverage in a volume the rebuilt layout has no cached
+    /// facts for, so nothing it restores for that volume could ever be
+    /// classified.
     UnclassifiableVolume {
         volume_index: u32,
     },
@@ -183,18 +184,19 @@ pub(crate) struct ExpectedSet {
     /// its own copy so a row is self-describing, but only the plan decides
     /// which file a volume's floor is a floor *of*.
     pub(crate) volume_files: HashMap<u32, u32>,
-    /// The volumes the rebuilt layout actually has cached facts for (M5).
+    /// The volumes the rebuilt layout actually has cached facts for.
     ///
     /// Not the same question as `volume_files`, which is what the *plan* has. A
-    /// set's facts are cached per volume and any subset of them can be missing —
-    /// a volume that never finished its confirming parse, a row that failed to
-    /// decode — and the layout rebuild happily proceeds without them, because a
-    /// volume that contributed no member changes nothing the plan digest covers.
-    /// The digest therefore still matches, and the row is accepted for a set with
-    /// a volume the router cannot classify a byte of: its restored coverage can
-    /// never be mapped, so its bytes are held for the life of the set and it
-    /// wedges exactly the way B1 and B2 do. A row claiming coverage in a volume
-    /// that is not in here is refused instead.
+    /// set's facts are cached per volume and any subset of them can be missing
+    /// — a volume that never finished its confirming parse, a row that failed
+    /// to decode — and the layout rebuild happily proceeds without them,
+    /// because a volume that contributed no member changes nothing the plan
+    /// digest covers. The digest therefore still matches, and the row is
+    /// accepted for a set with a volume the router cannot classify a byte of:
+    /// its restored coverage can never be mapped, so its bytes are held for the
+    /// life of the set and it wedges exactly the way the other
+    /// unclassifiable-volume cases do. A row claiming coverage in a volume that
+    /// is not in here is refused instead.
     pub(crate) fact_volumes: HashSet<u32>,
 }
 
@@ -286,13 +288,13 @@ where
                 found: entry.file_index,
             });
         }
-        // M5. The layout rebuild is per volume and tolerant: a volume whose
-        // cached facts did not come back simply contributes no member, which
-        // changes neither the plan digest nor the member destinations the digest
-        // binds — so the row sails through every check above and is accepted for
-        // a set that cannot classify a byte of that volume. Its restored
-        // coverage then maps to nothing, its refetched articles are held rather
-        // than routed, and the set neither finalizes nor demotes.
+        // The layout rebuild is per volume and tolerant: a volume whose cached
+        // facts did not come back simply contributes no member, which changes
+        // neither the plan digest nor the member destinations the digest binds
+        // — so the row sails through every check above and is accepted for a
+        // set that cannot classify a byte of that volume. Its restored coverage
+        // then maps to nothing, its refetched articles are held rather than
+        // routed, and the set neither finalizes nor demotes.
         //
         // Only a volume the row actually claims matters: a floor of zero with no
         // completion claims nothing, and refusing on it would retire perfectly
@@ -532,8 +534,8 @@ pub(crate) struct DirectRestore {
 /// an extracted member can legitimately carry. See
 /// [`sweep_orphan_direct_files`].
 const DIRECT_PARTIAL_SUFFIX: &str = ".direct.partial";
-/// Prefix of the holds scratch files (D2). Matched as a prefix rather than a
-/// suffix because the set name is the tail of the component.
+/// Prefix of the holds scratch files. Matched as a prefix rather than a suffix
+/// because the set name is the tail of the component.
 pub(crate) const HOLDS_SCRATCH_PREFIX: &str = ".weaver-holds.";
 
 /// How deep the sweep walks below the working directory. Member partials live
@@ -544,7 +546,7 @@ const SWEEP_MAX_DEPTH: usize = 8;
 
 impl Pipeline {
     /// Restores a job's direct-store sets and the segments their coverage lets
-    /// the job skip (plan 135, D6).
+    /// the job skip.
     ///
     /// Called from `restore_job` before the assembly is built. It never inserts
     /// anything into the pipeline itself — the job state does not exist yet — so
@@ -623,7 +625,7 @@ impl Pipeline {
             let set_name = plan.set_name.clone();
             let mut set = DirectSet::new(job_id, plan.clone());
             self.direct_store.apply_ceilings(&mut set);
-            // Plan 136, E-D1. Bound **before** the layout is rebuilt, because
+            // Bound **before** the layout is rebuilt, because
             // rebuilding it runs the same encrypted-store admission the live
             // parse does: a restore with no password reaches it, refuses, and
             // the set redownloads conventionally under a named reason. The
@@ -763,11 +765,11 @@ impl Pipeline {
             owned.insert(plan.holds_scratch_path());
             for volume_index in plan.volumes.keys() {
                 owned.insert(plan.envelope_path(*volume_index));
-                // Repair scratch (D8), owned but never *claimed*: a repair that
-                // was interrupted mid-flight left a materialized volume whose
-                // spans were never routed back, and the coverage row it would
-                // have been read against was deleted before the repair started.
-                // The bytes are meaningless without it, so the file is swept and
+                // Repair scratch, owned but never *claimed*: a repair that was
+                // interrupted mid-flight left a materialized volume whose spans
+                // were never routed back, and the coverage row it would have
+                // been read against was deleted before the repair started. The
+                // bytes are meaningless without it, so the file is swept and
                 // the set repairs again from its own routed bytes if the damage
                 // is still there.
                 owned.insert(plan.repair_path(*volume_index));
@@ -800,11 +802,10 @@ impl Pipeline {
         }
 
         // The restart ledger, in the four numbers that separate "resumed" from
-        // "rolled back" (plan 135, Observability). `rejected` already has its
-        // own counter above; these are the three that were only ever visible as
-        // a log line, plus the segments the accepted floors actually saved —
-        // without which "restart discarded a barrier interval" is unfalsifiable
-        // in production.
+        // "rolled back". `rejected` already has its own counter above; these
+        // are the three that were only ever visible as a log line, plus the
+        // segments the accepted floors actually saved — without which "restart
+        // discarded a barrier interval" is unfalsifiable in production.
         crate::runtime::perf_probe::record_value(
             "direct_store.restart.accepted_sets",
             result.accepted as u64,
@@ -866,15 +867,15 @@ impl Pipeline {
     }
 }
 
-/// Deletes every direct-store file in the working directory that no restored set
-/// claims (revision 8's wave-3 requirement).
+/// Deletes every direct-store file in the working directory that no restored
+/// set claims.
 ///
 /// Three populations end up here and all three are dead weight:
 ///
 /// - a set whose checkpoint was refused, whose partials and envelopes hold bytes
 ///   nothing may read and which is about to redownload over them;
 /// - a set that was killed before its first barrier, so no row exists at all;
-/// - holds scratch (D2) from a killed run, which is append-only and meaningless
+/// - holds scratch from a killed run, which is append-only and meaningless
 ///   without the in-memory index that named its regions.
 ///
 /// With the gate **off** nothing is claimed, so everything direct-store owns is

@@ -1,4 +1,4 @@
-//! The direct-store coverage snapshot blob (plan 135, D6).
+//! The direct-store coverage snapshot blob.
 //!
 //! One compact encoded blob per archive set, holding everything the checkpoint
 //! knows: schema version, generation counter, the exact layout-plan digest,
@@ -35,7 +35,7 @@ pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 ///   held, and a v3 reader trusting that bit would skip every segment of a
 ///   volume no byte of which exists. Refusing the row costs one redownload;
 ///   trusting it wedges the set permanently.
-/// - 4: `DestinationClaim::crypt` added (plan 136, E-D4). An encrypted member's
+/// - 4: `DestinationClaim::crypt` added. An encrypted member's
 ///   destination holds **plaintext**, so the claim alone no longer describes
 ///   what a resumed run needs: the crypt facts to rebuild a key without
 ///   re-parsing, the ≤15 tail-padding bytes that exist nowhere on disk, and the
@@ -44,7 +44,7 @@ pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 ///   over plaintext and treat it as posted bytes, which is why this is a version
 ///   bump and not an optional field.
 /// - 5: `MemberCryptSnapshot`'s flat RAR5 crypt fields became the
-///   `MemberCryptKeying` discriminant (plan 136, E3). RAR4 file encryption is
+///   `MemberCryptKeying` discriminant. RAR4 file encryption is
 ///   keyed by an 8-byte per-file salt and no KDF count, and its IV is a KDF
 ///   output rather than a header field — so it does not fit v4's `salt[16] +
 ///   kdf_count_lg2 + iv[16] + psw_check_present` shape, and squeezing it in
@@ -61,7 +61,7 @@ pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 ///   costs exactly one redownload of a set that was mid-flight across a
 ///   developer's rebuild. The v3 note below is the one that reaches users.
 ///
-/// # The v3 refusal is a release note (plan 136, E1 review F8)
+/// # The v3 refusal is a release note
 ///
 /// Refusing rather than upgrading means **a direct-store set checkpointed by a
 /// pre-0.8.0 build re-downloads its volumes once on the first start after the
@@ -89,7 +89,7 @@ impl DestinationExtent {
 /// A destination file the set claims coverage in.
 ///
 /// Keyed by **member identity**, not by the final sanitized path: sanitized
-/// destinations are only committed in archive order at finalization (D3), so the
+/// destinations are only committed in archive order at finalization, so the
 /// path here is the working-directory-relative partial and the member index is
 /// the stable identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,7 +99,7 @@ pub(crate) struct DestinationClaim {
     /// Sorted, disjoint, coalesced.
     pub(crate) extents: Vec<DestinationExtent>,
     /// Present exactly for an encrypted member direct-store decrypted at write
-    /// time (plan 136, E-D4). `None` for every plaintext member and for every
+    /// time. `None` for every plaintext member and for every
     /// envelope destination.
     ///
     /// It carries no password and never will: what is here is what the headers
@@ -137,12 +137,13 @@ pub(crate) struct VolumeFloor {
     /// Carried explicitly because the floor **cannot** say it. A floor counts
     /// *decoded* source bytes, while an NZB's `<segment bytes>` is the
     /// yEnc-**encoded** size — about 3% larger — so walking the spec's segments
-    /// against a decoded floor always stops one article short of the truth. That
-    /// is safe (it refetches), but for a byte-complete volume it means refetching
-    /// the last article of every volume of a set that is entirely on disk, which
-    /// is precisely the restart the PAR2 finalization wait makes common. This
-    /// flag is the one bit that closes the gap, and it is a bit **per volume**,
-    /// not per segment, so it costs nothing the D6 shape objects to.
+    /// against a decoded floor always stops one article short of the truth.
+    /// That is safe (it refetches), but for a byte-complete volume it means
+    /// refetching the last article of every volume of a set that is entirely on
+    /// disk, which is precisely the restart the PAR2 finalization wait makes
+    /// common. This flag is the one bit that closes the gap, and it is a bit
+    /// **per volume**, not per segment, so it costs nothing the checkpoint
+    /// shape objects to.
     ///
     /// # It is a conjunction, not a latch
     ///
@@ -323,10 +324,10 @@ fn validate(snapshot: &CoverageSnapshot) -> Result<(), SnapshotError> {
         previous_member = Some(claim.member_index);
         // A claimed path is joined onto the working directory at restart, so a
         // row that escaped the working directory — or that a hostile blob wrote
-        // deliberately — would have restart probing, and phase 4 writing,
-        // outside the job. The house validator is the same one RAR extraction
-        // gates member paths with: no absolute paths, no `..`, no root or
-        // prefix components, no embedded NUL, never empty.
+        // deliberately — would have restart probing, and the writer, outside
+        // the job. The house validator is the same one RAR extraction gates
+        // member paths with: no absolute paths, no `..`, no root or prefix
+        // components, no embedded NUL, never empty.
         if let Err(error) = validate_sanitized_rar_member_path(&claim.relative_path) {
             return Err(SnapshotError::Malformed(format!(
                 "destination claim has an unsafe path ({error})"

@@ -1,4 +1,4 @@
--- Direct-store coverage checkpoint (plan 135, D6).
+-- Direct-store coverage checkpoint.
 --
 -- Exactly one row per archive set, transactionally replaced at every barrier.
 -- No history and no per-volume rows: a 2 000-volume set at ~400 barriers would
