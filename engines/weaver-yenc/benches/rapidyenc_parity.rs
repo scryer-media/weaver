@@ -234,7 +234,7 @@ fn benches(c: &mut Criterion) {
     let mut weaver_out = vec![0u8; realshape.len() + 64];
     let written = decode_rapidyenc(realshape, &mut weaver_out).unwrap();
     let decoded = &weaver_out[..written];
-    c.bench_function("parity_crc32fast_decoded", |b| {
+    c.bench_function("parity_crc_fast_decoded", |b| {
         b.iter(|| {
             let mut hasher = Crc32::new();
             hasher.update(black_box(decoded));

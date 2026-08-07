@@ -1,13 +1,13 @@
-/// Thin wrapper around `crc32fast::Hasher` for streaming CRC32 computation
+/// Thin wrapper around `crc-fast` for streaming CRC32 computation
 /// during yEnc decode.
 ///
 /// On x86_64 CPUs with AVX2 + VPCLMULQDQ, large updates may be folded with a
 /// 256-bit carry-less multiply path derived from rapidyenc's zlib-ng based CRC
-/// folding implementation. `crc32fast` remains the resident state and the
+/// folding implementation. `crc-fast` remains the resident state and the
 /// fallback/head-tail path, so externally visible CRC semantics stay identical.
 #[derive(Clone)]
 pub struct Crc32 {
-    hasher: crc32fast::Hasher,
+    hasher: crc_fast::Digest,
     #[cfg(target_arch = "x86_64")]
     use_vpclmul: bool,
 }
@@ -19,7 +19,7 @@ impl Crc32 {
     /// Create a new CRC32 hasher.
     pub fn new() -> Self {
         Self {
-            hasher: crc32fast::Hasher::new(),
+            hasher: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc),
             #[cfg(target_arch = "x86_64")]
             use_vpclmul: x86_vpclmul::available(),
         }
@@ -30,9 +30,12 @@ impl Crc32 {
     pub fn update(&mut self, data: &[u8]) {
         #[cfg(target_arch = "x86_64")]
         if self.use_vpclmul && data.len() >= Self::VPCLMUL_MIN_UPDATE {
-            let init = self.hasher.clone().finalize();
+            let init = self.hasher.finalize() as u32;
             let crc = unsafe { x86_vpclmul::update(init, data) };
-            self.hasher = crc32fast::Hasher::new_with_initial(crc);
+            self.hasher = crc_fast::Digest::new_with_init_state(
+                crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+                u64::from(!crc),
+            );
             return;
         }
 
@@ -41,12 +44,12 @@ impl Crc32 {
 
     /// Finalize and return the CRC32 value. Consumes the hasher.
     pub fn finalize(self) -> u32 {
-        self.hasher.finalize()
+        self.hasher.finalize() as u32
     }
 
     /// Get the current CRC32 value without consuming this wrapper.
     pub fn current(&self) -> u32 {
-        self.hasher.clone().finalize()
+        self.hasher.finalize() as u32
     }
 }
 
@@ -305,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn crc32_matches_crc32fast_across_splits() {
+    fn crc32_matches_crc_fast_across_splits() {
         let mut data = Vec::with_capacity(8192);
         let mut seed = 0x1234_5678u32;
         for _ in 0..8192 {
@@ -317,7 +320,7 @@ mod tests {
             0usize, 1, 2, 7, 31, 32, 63, 64, 127, 128, 255, 256, 257, 511, 512, 1024, 4095, 8192,
         ] {
             let input = &data[..len];
-            let expected = crc32fast::hash(input);
+            let expected = crc_fast::crc32_iso_hdlc(input);
 
             let mut one_shot = Crc32::new();
             one_shot.update(input);
@@ -335,7 +338,7 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn crc32_forced_vpclmul_matches_crc32fast() {
+    fn crc32_forced_vpclmul_matches_crc_fast() {
         let mut data = Vec::with_capacity(8192 + 31);
         for idx in 0..data.capacity() {
             data.push(((idx * 31 + 17) & 0xff) as u8);
@@ -351,7 +354,11 @@ mod tests {
                 let Some(actual) = x86_vpclmul::test_update_forced(0, input) else {
                     return;
                 };
-                assert_eq!(actual, crc32fast::hash(input), "offset {offset} len {len}");
+                assert_eq!(
+                    actual,
+                    crc_fast::crc32_iso_hdlc(input),
+                    "offset {offset} len {len}"
+                );
             }
         }
     }

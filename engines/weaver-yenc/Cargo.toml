@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
-crc32fast = { workspace = true }
+crc-fast = { workspace = true }
 memchr = { workspace = true }
 
 [build-dependencies]

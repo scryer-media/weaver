@@ -27,7 +27,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 bytes = { version = "1", default-features = false, features = ["std"] }
 http = { version = "1", default-features = false }
 async-graphql = { version = "7.2", default-features = false, features = ["chrono"] }
-crc32fast = { version = "1.5", default-features = false, features = ["std"] }
+crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 md-5 = { version = "0.11", default-features = false, features = ["alloc"] }
 blake3 = { version = "1.8", default-features = false, features = ["std"] }
 blake2s_simd = { version = "1.0", default-features = false, features = ["std"] }
@@ -94,7 +94,7 @@ keyring = { version = "4", default-features = false, features = ["v1"] }
 keyring-core = { version = "1", default-features = false }
 windows-sys = { version = "0.61", default-features = false }
 par2-rs = { version = "0.3", default-features = false, features = ["metal", "native-crypto"] }
-unrar-rs = { version = "0.3.1", default-features = false, features = ["crypto-aws-lc"] }
+unrar-rs = { version = "0.4", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.12.0", default-features = false }
 
 [profile.release]
@@ -110,7 +110,7 @@ panic = "abort"
 # old `weaver-*` names; the rename deliberately left them in place.
 
 # LOCAL ONLY — remove before merging. `par2-rs` 0.3 is not published yet, and
-# plan 138's M3 needs its session-from-parsed-set seam. All three are patched
+# weaver needs its session-from-parsed-set seam. All three are patched
 # together on purpose: patching only `par2-rs` would leave weaver's own
 # `unrar-rs` coming from the registry while `par2-rs` pulled the sibling one,
 # and two copies of a crate whose types cross that boundary do not unify.

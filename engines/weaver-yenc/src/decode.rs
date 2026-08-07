@@ -592,7 +592,7 @@ fn decode_body_with_line_length(
     )?;
 
     // CRC is updated once at the end for better hardware utilization
-    // (crc32fast's PCLMULQDQ path needs >= 128 bytes).
+    // (the accelerated CRC path benefits from larger updates).
     if written > 0 {
         crc.update(&output[..written]);
     }
@@ -1175,7 +1175,7 @@ mod tests {
         let original = b"Hello, yEnc World!";
         let encoded_data = encode_raw(original);
 
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crate::crc::Crc32::new();
         hasher.update(original);
         let crc_val = hasher.finalize();
         let crc_hex = format!("{:08x}", crc_val);
@@ -1227,7 +1227,7 @@ mod tests {
     fn decode_multipart_checks_pcrc32_and_carries_file_crc32() {
         let original = b"Test data";
         let encoded_data = encode_raw(original);
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crate::crc::Crc32::new();
         hasher.update(original);
         let part_crc = hasher.finalize();
 
