@@ -294,6 +294,15 @@ impl DirectSetPlan {
     /// have refused now resolve identically. With several members per set that
     /// difference is reachable, where a single-member set could only ever have
     /// demoted on it.
+    /// The member name as it exists *relative to the job's working directory*
+    /// once written — the same sanitization the destination path is derived
+    /// through, so a caller recording what direct finalization produced records
+    /// a name completion can resolve back to a file. `Err` for a name that
+    /// sanitizes away entirely, which never reaches a destination either.
+    pub(crate) fn destination_relative_name(member_name: &str) -> Result<String, ()> {
+        Self::resolve_member_path(member_name)
+    }
+
     fn resolve_member_path(member_name: &str) -> Result<String, ()> {
         let sanitized = unrar_rs::sanitize_path(member_name);
         let safe = crate::pipeline::extraction::validate_sanitized_rar_member_path(&sanitized)

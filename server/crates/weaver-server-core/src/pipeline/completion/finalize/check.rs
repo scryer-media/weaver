@@ -1,5 +1,5 @@
 use super::*;
-use crate::pipeline::direct_store::wiring::DirectPar2Resolution;
+use crate::pipeline::direct_store::wiring::{DirectDamageResolution, DirectPar2Resolution};
 use crate::runtime::fs as runtime_fs;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -701,7 +701,19 @@ impl Pipeline {
         }
     }
 
-    fn job_has_promoted_recovery_pipeline_work(&self, job_id: JobId, action: &'static str) -> bool {
+    /// Whether a wave of promoted PAR2 recovery is still moving through the
+    /// pipeline for this job.
+    ///
+    /// `pub(crate)` because the direct-store seam asks the same question before
+    /// it decides whether a damaged set should wait for recovery or demote, and
+    /// "recovery is still coming" must mean exactly one thing across the two —
+    /// a second, near-identical predicate is how one of them ends up waiting for
+    /// work the other has already given up on.
+    pub(crate) fn job_has_promoted_recovery_pipeline_work(
+        &self,
+        job_id: JobId,
+        action: &'static str,
+    ) -> bool {
         let promoted_recovery = self.promoted_recovery_pipeline_state(job_id);
         if promoted_recovery.has_pending_work() {
             debug!(
@@ -2663,8 +2675,8 @@ impl Pipeline {
         let par2_verdict_stale_after_failed_extraction = self.par2_verified.contains(&job_id)
             && has_crc_failures
             && self.job_has_live_rar_waiting_for_absent_volumes(job_id);
-        let par2_verdict_open = !self.par2_verified.contains(&job_id)
-            || par2_verdict_stale_after_failed_extraction;
+        let par2_verdict_open =
+            !self.par2_verified.contains(&job_id) || par2_verdict_stale_after_failed_extraction;
         let par2_may_still_rule = par2_loaded && !par2_bypassed && par2_verdict_open;
         let extraction_settled = !self.job_has_active_extraction_tasks(job_id);
         // One: extraction was attempted and failed. The archives cannot be
@@ -3225,6 +3237,26 @@ impl Pipeline {
                             return;
                         }
                         DirectPar2Resolution::Clean => run_par2_repairer = false,
+                        DirectPar2Resolution::Deferred => {
+                            // The same wait the analysis below performs when it
+                            // promotes recovery, reported the same way: the job
+                            // is downloading again, because that is literally
+                            // what it is doing.
+                            //
+                            // Deliberately *not* re-armed. Nothing this gate can
+                            // do moves the answer — the sets are waiting on
+                            // articles — and each lap costs a full PAR2 scan.
+                            // The re-arm comes from the recovery itself: a
+                            // completing PAR2 file merges its slices and checks
+                            // the job, which is the one event that changes the
+                            // verdict.
+                            self.transition_postprocessing_status(
+                                job_id,
+                                JobStatus::Downloading,
+                                Some("downloading"),
+                            );
+                            return;
+                        }
                         DirectPar2Resolution::Unresolved => {}
                     }
                 }
@@ -3591,16 +3623,36 @@ impl Pipeline {
                 // materializes everything and hands the job to the conventional
                 // repair path. Either way the job's next move is this gate
                 // again, over bytes that changed.
-                if self
+                match self
                     .resolve_direct_sets_with_par2_damage(job_id, &verification)
                     .await
                 {
-                    // Re-armed rather than left to the 30 s reconcile sweep:
-                    // the repaired bytes are already in the partials, or the
-                    // demotion has already materialized (or queued the refetch
-                    // of) the volumes, so the next pass can run immediately.
-                    self.schedule_job_completion_check(job_id);
-                    return;
+                    DirectDamageResolution::Resolved => {
+                        // Re-armed rather than left to the 30 s reconcile sweep:
+                        // the repaired bytes are already in the partials, or the
+                        // demotion has already materialized (or queued the
+                        // refetch of) the volumes, so the next pass can run
+                        // immediately.
+                        self.schedule_job_completion_check(job_id);
+                        return;
+                    }
+                    DirectDamageResolution::Deferred => {
+                        // Damage the merged recovery cannot cover but the
+                        // recovery *set* can. The sets keep their outputs and
+                        // their virtual volumes while the targeted recovery
+                        // downloads; the job is reported as what it is doing.
+                        // No re-arm — the completing recovery file merges its
+                        // slices and checks the job itself, and a lap of this
+                        // gate in the meantime is a slow scan that cannot reach
+                        // a different answer.
+                        self.transition_postprocessing_status(
+                            job_id,
+                            JobStatus::Downloading,
+                            Some("downloading"),
+                        );
+                        return;
+                    }
+                    DirectDamageResolution::Unresolved => {}
                 }
                 let damaged = verification.total_missing_blocks;
                 let recovery_now = verification.recovery_blocks_available;

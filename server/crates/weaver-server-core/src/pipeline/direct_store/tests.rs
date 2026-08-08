@@ -5366,3 +5366,38 @@ fn every_older_schema_is_refused_rather_than_read_as_something_it_is_not() {
         Err(super::snapshot::SnapshotError::UnsupportedVersion { .. })
     ));
 }
+
+/// A member name direct finalization records must be one completion can resolve
+/// back to a file on disk.
+///
+/// RAR4 writes paths with `\` separators. The destination is derived through
+/// `resolve_member_path`, which rewrites those to `/`, so recording the raw
+/// archive name left the two disagreeing: completion looked for
+/// `work\sample.mkv` under the working directory, found nothing, treated the
+/// member as a stale extracted record and re-ran conventional extraction, which
+/// failed with "no on-disk RAR volumes" — direct finalization having correctly
+/// never written any. Only a member with a directory component shows it; a flat
+/// name has no separator to disagree about, which is why one RAR4 fixture failed
+/// while its multi-member sibling passed.
+#[test]
+fn a_rar4_member_name_records_under_the_path_it_was_written_to() {
+    let raw = r"work\sample.mkv";
+    let recorded = super::plan::DirectSetPlan::destination_relative_name(raw)
+        .expect("a RAR4 member path resolves");
+    assert_eq!(
+        recorded, "work/sample.mkv",
+        "the recorded name must use the separator the destination was written with"
+    );
+    assert!(
+        !recorded.contains('\\'),
+        "no archive-native separator may survive into the extracted-member record"
+    );
+
+    // A name already in destination form is unchanged, so the RAR5 path that
+    // was always correct keeps recording exactly what it recorded before.
+    assert_eq!(
+        super::plan::DirectSetPlan::destination_relative_name("work/sample.mkv")
+            .expect("a RAR5 member path resolves"),
+        "work/sample.mkv"
+    );
+}

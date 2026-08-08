@@ -2403,10 +2403,12 @@ jobs:
       - name: Install the published x64 MSI through WinGet
         shell: pwsh
         run: |
-          tar -xzf winget-submission/weaver-winget-manifests.tar.gz -C winget-submission
+          $manifestRoot = ".\\winget-manifests"
+          New-Item -ItemType Directory -Force -Path $manifestRoot | Out-Null
+          tar -xzf winget-submission/weaver-winget-manifests.tar.gz -C $manifestRoot
           $version = "${{ github.ref_name }}".Replace("weaver-v", "")
           .\.github\scripts\validate-published-winget-install.ps1 `
-            -ManifestRoot .\winget-submission `
+            -ManifestRoot $manifestRoot `
             -ExpectedVersion $version
 
   winget-submit:

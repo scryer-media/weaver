@@ -93,6 +93,18 @@ pub(crate) struct DirectStoreRuntime {
     /// this record a sibling's finalized name is indistinguishable from an
     /// extraction checkpoint claiming ours.
     direct_extracted_members: HashMap<JobId, HashSet<String>>,
+    /// Waves of targeted recovery a job's direct sets have waited for rather
+    /// than demoting, per job.
+    ///
+    /// The termination budget for the defer, and nothing else. The structural
+    /// bound is already there — the first wave asks for every block the verdict
+    /// needs, so a second one only happens if the first arrived and still did
+    /// not cover the damage — but "already promoted" is derived state, and a
+    /// derivation that goes wrong here waits forever. Counting the waves makes
+    /// the bound arithmetic instead. Deliberately **not** persisted: after a
+    /// restart the damage is re-detected from scratch and the defer re-derives
+    /// itself, so a stale count would only shorten a fresh job's budget.
+    repair_defer_waves: HashMap<JobId, u32>,
     /// Test-only holds ceiling applied to every set this runtime admits.
     #[cfg(test)]
     holds_budget_override: Option<u64>,
@@ -133,6 +145,15 @@ pub(crate) struct DirectStoreRuntime {
     /// never broken.
     #[cfg(test)]
     pub(crate) repair_recovery_blocks_used: usize,
+    /// Damage verdicts that were answered by waiting for targeted recovery
+    /// instead of repairing or demoting, over this pipeline's life.
+    ///
+    /// Counted for the same reason [`Self::repair_attempts`] is: a defer leaves
+    /// no artefact. Nothing is materialized, nothing is deleted, the set is
+    /// exactly as it was — which is the whole point, and which makes a defer
+    /// indistinguishable from a pass that found nothing to do.
+    #[cfg(test)]
+    pub(crate) repair_defers: usize,
 }
 
 impl std::fmt::Debug for DirectStoreRuntime {
@@ -196,6 +217,13 @@ impl DirectStoreRuntime {
         self.holds_scratch_ceiling_override = Some(bytes);
     }
 
+    /// Test hook: pre-spend the defer budget, so the exhausted arm is reachable
+    /// without actually downloading three waves of recovery.
+    #[cfg(test)]
+    pub(crate) fn set_repair_defer_waves(&mut self, job_id: JobId, waves: u32) {
+        self.repair_defer_waves.insert(job_id, waves);
+    }
+
     /// Test hook: make every sparse marking attempt fail, which is the only way
     /// to reach the sparse-marking demotion arm on a platform whose marker
     /// cannot fail.
@@ -241,6 +269,15 @@ impl DirectStoreRuntime {
         self.header_candidates_offered.remove(&job_id);
         self.prepared_destinations.remove(&job_id);
         self.direct_extracted_members.remove(&job_id);
+        self.repair_defer_waves.remove(&job_id);
+    }
+
+    /// Whether this job has a repair defer outstanding — a wave of targeted
+    /// recovery was promoted for a set that is still direct and still waiting.
+    fn repair_defer_pending(&self, job_id: JobId) -> bool {
+        self.repair_defer_waves
+            .get(&job_id)
+            .is_some_and(|waves| *waves > 0)
     }
 
     /// Installs the sets a job restore rebuilt, and marks the job examined so
@@ -416,10 +453,58 @@ pub(crate) enum DirectPar2Resolution {
     /// skips the repairer and lets the ordinary verify path, which reads them
     /// virtually, record the same verdict this pass just reached.
     Clean,
+    /// Damage was found that the recovery *merged so far* cannot cover, but the
+    /// recovery set as a whole can. Targeted recovery has been asked for and the
+    /// sets stay direct until it lands. The caller must not run the repairer and
+    /// must not demote: doing either throws away the direct outputs the wait
+    /// exists to keep.
+    Deferred,
     /// Neither: no live set, no verdict, or a repair that refused. The caller
     /// falls back to demoting for the repairer, which is the earlier behaviour.
     Unresolved,
 }
+
+/// What the verify branch's direct-aware seam settled on.
+///
+/// The bool this replaced could say "act on it" or "fall through", and the
+/// third answer — *wait* — is neither: bytes have not changed, so there is
+/// nothing to re-verify, but the sets must not be handed on either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectDamageResolution {
+    /// Repaired in place, or demoted. Either way bytes moved and the job's next
+    /// move is a fresh pass over them.
+    Resolved,
+    /// Waiting for targeted recovery, still direct. The job's next move comes
+    /// from the recovery arriving, not from this pass.
+    Deferred,
+    /// Nothing here answered the damage; the caller carries on.
+    Unresolved,
+}
+
+/// What the repair seam did with a damaged live direct set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectRepairAnswer {
+    /// A repair ran, or a refusal partway through one had already demoted the
+    /// set. Both leave the job with changed bytes to re-read.
+    Acted,
+    /// The damage is repairable out of the recovery set but not out of the
+    /// slices merged today, so the missing recovery was promoted and the set
+    /// was left alone to wait for it.
+    Deferred,
+    /// Nothing was done, and waiting cannot help. The caller demotes.
+    Declined,
+}
+
+/// How many waves of targeted recovery one job's direct sets may wait through
+/// before demoting instead.
+///
+/// Three, because one is what the design predicts and two is what a bad article
+/// costs. The first wave asks for every block the verdict needs, so a second
+/// exists only because some of the first wave's articles turned out unavailable
+/// and the re-verdict still comes up short; a third is the same thing happening
+/// twice. Past that the recovery stream is not delivering, and the conventional
+/// path — which has its own, better-instrumented dead end — should get the job.
+pub(crate) const MAX_DIRECT_REPAIR_DEFER_WAVES: u32 = 3;
 
 /// What the routing seam did with an article.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1089,9 +1174,16 @@ impl Pipeline {
     ///
     /// The entry point, and the whole of *repair while still direct* transition
     /// seen from the pipeline. It tries the repair first and falls back to the
-    /// whole-set demotion on any refusal, so the caller's contract is
-    /// unchanged: `true` means the job's next move is a fresh completion check,
-    /// over either repaired virtual volumes or materialized physical ones.
+    /// whole-set demotion on any refusal, so `Resolved` means the job's next
+    /// move is a fresh completion check, over either repaired virtual volumes
+    /// or materialized physical ones.
+    ///
+    /// `Deferred` is the third answer and it is not a refusal: the damage is
+    /// coverable by the recovery set, just not by the slices merged so far, so
+    /// the missing recovery has been asked for and the sets are staying direct
+    /// until it arrives. Falling through to the demotion there would materialize
+    /// every volume moments before the blocks that would have repaired them in
+    /// place land.
     ///
     /// The ordering is normative:
     ///
@@ -1111,15 +1203,23 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         verification: &par2_rs::VerificationResult,
-    ) -> bool {
-        if self
+    ) -> DirectDamageResolution {
+        match self
             .repair_direct_sets_with_par2_damage(job_id, verification)
             .await
         {
-            return true;
+            DirectRepairAnswer::Acted => return DirectDamageResolution::Resolved,
+            DirectRepairAnswer::Deferred => return DirectDamageResolution::Deferred,
+            DirectRepairAnswer::Declined => {}
         }
-        self.demote_direct_sets_with_par2_damage(job_id, verification)
+        if self
+            .demote_direct_sets_with_par2_damage(job_id, verification)
             .await
+        {
+            DirectDamageResolution::Resolved
+        } else {
+            DirectDamageResolution::Unresolved
+        }
     }
 
     /// The repair chance for a live direct set, taken **before** the completion
@@ -1132,7 +1232,7 @@ impl Pipeline {
     /// verify branch. The repairer is filesystem-bound, so today's answer is
     /// [`Self::demote_live_direct_sets_for_par2_repair`]: materialize
     /// everything and let it work over real files. This is what repair puts in
-    /// front of that, and `false` means the demotion is still the answer.
+    /// front of that, and `Unresolved` means the demotion is still the answer.
     ///
     /// The verdict is computed here rather than borrowed, because the branch has
     /// none yet. It is deliberately a **quiet** pass — no status transition, no
@@ -1154,6 +1254,19 @@ impl Pipeline {
         {
             return DirectPar2Resolution::Unresolved;
         }
+        // A job already waiting on a promoted recovery wave answers without
+        // verifying anything. The pass below is a full PAR2 scan, the gate ticks
+        // on every article that completes, and until the wave has merged the
+        // scan can only reach the verdict that started the wait — so re-running
+        // it is the repeated-scan storm this branch has already paid for once,
+        // at ~64 slow scans on a single job while 75 others starved. When the
+        // wave has drained the fast path lapses and the pass runs, which is
+        // exactly the one moment it can learn something new.
+        if self.direct_store.repair_defer_pending(job_id)
+            && self.job_has_promoted_recovery_pipeline_work(job_id, "direct repair defer")
+        {
+            return DirectPar2Resolution::Deferred;
+        }
         let Some(verification) = self
             .verify_direct_sets_quietly(job_id, par2_set, working_dir)
             .await
@@ -1167,8 +1280,9 @@ impl Pipeline {
             .repair_direct_sets_with_par2_damage(job_id, &verification)
             .await
         {
-            true => DirectPar2Resolution::Repaired,
-            false => DirectPar2Resolution::Unresolved,
+            DirectRepairAnswer::Acted => DirectPar2Resolution::Repaired,
+            DirectRepairAnswer::Deferred => DirectPar2Resolution::Deferred,
+            DirectRepairAnswer::Declined => DirectPar2Resolution::Unresolved,
         }
     }
 
@@ -1343,18 +1457,20 @@ impl Pipeline {
         }
     }
 
-    /// Repair-while-direct. `false` means nothing was repaired and the caller
-    /// should fall back to demotion.
+    /// Repair-while-direct. [`DirectRepairAnswer::Declined`] means nothing was
+    /// repaired and the caller should fall back to demotion;
+    /// [`DirectRepairAnswer::Deferred`] means the sets are waiting for recovery
+    /// that has been asked for, and the caller must leave them alone.
     async fn repair_direct_sets_with_par2_damage(
         &mut self,
         job_id: JobId,
         verification: &par2_rs::VerificationResult,
-    ) -> bool {
+    ) -> DirectRepairAnswer {
         let Some(par2_set) = self.par2_set(job_id).cloned() else {
-            return false;
+            return DirectRepairAnswer::Declined;
         };
         let Some(overlay) = self.direct_par2_overlay(job_id) else {
-            return false;
+            return DirectRepairAnswer::Declined;
         };
         // The same settle guard the demotion path carries, in the same shape:
         // while articles are in flight a set's outstanding ranges read as
@@ -1369,7 +1485,7 @@ impl Pipeline {
             verification.repairable,
             par2_rs::verify::Repairability::NotNeeded
         ) {
-            return false;
+            return DirectRepairAnswer::Declined;
         }
 
         let by_set = match super::repair::damaged_files_by_set(verification, |file_id| {
@@ -1378,12 +1494,92 @@ impl Pipeline {
             Ok(by_set) => by_set,
             Err(failure) => {
                 Self::record_direct_repair_failure(job_id, &failure);
-                return false;
+                return DirectRepairAnswer::Declined;
             }
         };
         if by_set.is_empty() {
-            return false;
+            return DirectRepairAnswer::Declined;
         }
+
+        // The wait, decided **before** the first attempt.
+        //
+        // `blocks_available` counts recovery slices that have been *merged*, and
+        // recovery volumes are only fetched once damage is known — so the first
+        // damage verdict of a job's life always reads zero, and any damage at
+        // all exceeds zero. Attempting the repair anyway is not free: the
+        // attempt burns the set's one-shot latch, deletes its checkpoint row and
+        // retires its live-PAR2 state before the planner gets far enough to say
+        // it has nothing to repair with. So the set would arrive at its own
+        // retry already latched, and demote for a verdict the arriving recovery
+        // was about to answer.
+        //
+        // Deciding here instead costs the set nothing — the same reasoning the
+        // over-budget pre-check is built on — and leaves the deferred pass as
+        // the set's *first* real attempt, which is what the latch is for.
+        if let par2_rs::verify::Repairability::Insufficient { blocks_needed, .. } =
+            verification.repairable
+        {
+            // Waiting is only ever right for a set that could act on the
+            // recovery when it arrives. A demoted or finalized set has left,
+            // an unsettled one's "damage" may be bytes in flight — promoting
+            // recovery to rebuild those would spend the bandwidth the deferred
+            // fetch exists to save — and a latched one will refuse the retry
+            // with `AlreadyRepaired` however much recovery lands.
+            let any_set_could_use_it = by_set.keys().any(|set_index| {
+                self.direct_store
+                    .set(job_id, *set_index)
+                    .is_some_and(|set| {
+                        !set.is_demoted()
+                            && !set.is_finalized()
+                            && (payload_settled || set.all_volumes_complete())
+                            && !set.repair_attempted()
+                    })
+            });
+            if blocks_needed > 0
+                && any_set_could_use_it
+                && self.defer_direct_repair_for_recovery(
+                    job_id,
+                    blocks_needed,
+                    verification.recovery_blocks_available,
+                )
+            {
+                return DirectRepairAnswer::Deferred;
+            }
+            // Not waiting, and not attempting either: the planner refuses an
+            // insufficient verdict outright, so the attempt below could only
+            // burn the latch, the checkpoint row and the live-PAR2 state on
+            // its way to the same refusal — and the set would then face its
+            // retry already latched. Declining from here costs the sets
+            // nothing, and the demotion answers exactly as it always did. The
+            // wave budget goes with it: it belongs to the wait that just
+            // ended, and the next damage verdict starts its own.
+            self.direct_store.repair_defer_waves.remove(&job_id);
+            let any_live_settled = by_set.keys().any(|set_index| {
+                self.direct_store
+                    .set(job_id, *set_index)
+                    .is_some_and(|set| {
+                        !set.is_demoted()
+                            && !set.is_finalized()
+                            && (payload_settled || set.all_volumes_complete())
+                    })
+            });
+            if any_live_settled {
+                Self::record_direct_repair_failure(
+                    job_id,
+                    &super::repair::DirectRepairFailure::Unrepairable,
+                );
+                warn!(
+                    job_id = job_id.0,
+                    failure = %super::repair::DirectRepairFailure::Unrepairable,
+                    "repairing a direct set in place was not possible; demoting it"
+                );
+            }
+            return DirectRepairAnswer::Declined;
+        }
+        // Any wave the job was waiting through has delivered: the verdict no
+        // longer reads Insufficient, and the attempt below is the wait's
+        // conclusion whichever way it goes.
+        self.direct_store.repair_defer_waves.remove(&job_id);
 
         let mut repaired_any = false;
         for (set_index, files) in by_set {
@@ -1440,11 +1636,109 @@ impl Pipeline {
                         .direct_store
                         .set(job_id, set_index)
                         .is_some_and(DirectSet::is_demoted);
-                    return repaired_any || already_demoted;
+                    return if repaired_any || already_demoted {
+                        DirectRepairAnswer::Acted
+                    } else {
+                        DirectRepairAnswer::Declined
+                    };
                 }
             }
         }
-        repaired_any
+        if repaired_any {
+            DirectRepairAnswer::Acted
+        } else {
+            DirectRepairAnswer::Declined
+        }
+    }
+
+    /// Asks for the recovery the verdict needs and says whether the sets should
+    /// wait for it instead of demoting.
+    ///
+    /// Three questions, in the order that makes each one cheap:
+    ///
+    /// 1. **Can the recovery set cover this at all?** `blocks_available` is what
+    ///    is merged; the NZB's advertised recovery is the ceiling. If the damage
+    ///    exceeds even that, no amount of downloading helps, and the demotion
+    ///    has to be immediate — the conventional path reaches the same dead end
+    ///    with better diagnostics, and delaying it helps nobody.
+    /// 2. **Has this job spent its waves?** The budget below.
+    /// 3. **Is recovery actually coming?** Either this call promoted some, or a
+    ///    previous wave is still on the wire. Neither, and there is nothing to
+    ///    wait for: waiting on recovery that cannot arrive is how this branch
+    ///    livelocked before, so the exhausted case demotes rather than parks.
+    pub(crate) fn defer_direct_repair_for_recovery(
+        &mut self,
+        job_id: JobId,
+        blocks_needed: u32,
+        recovery_merged_now: u32,
+    ) -> bool {
+        let total_capacity = self.total_recovery_block_capacity(job_id);
+        if total_capacity < blocks_needed {
+            debug!(
+                job_id = job_id.0,
+                blocks_needed,
+                total_capacity,
+                "not waiting for recovery on a direct set: the damage exceeds every \
+                 recovery block the NZB advertises"
+            );
+            return false;
+        }
+
+        let waves = self
+            .direct_store
+            .repair_defer_waves
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0);
+        // A new wave is only started while the budget lasts. Spent, the sets
+        // still see out whatever is already on the wire — that wave was paid
+        // for, and throwing it away one article short is the same waste the
+        // whole defer exists to avoid — but nothing new is asked for, so the
+        // next verdict with a quiet pipeline demotes.
+        let promoted = if waves < MAX_DIRECT_REPAIR_DEFER_WAVES {
+            self.promote_recovery_targeted(job_id, blocks_needed)
+        } else {
+            0
+        };
+        if promoted == 0 && !self.job_has_promoted_recovery_pipeline_work(job_id, "direct repair") {
+            debug!(
+                job_id = job_id.0,
+                blocks_needed,
+                waves,
+                "not waiting for recovery on a direct set: none was promoted and none \
+                 is still arriving"
+            );
+            return false;
+        }
+        if promoted > 0 {
+            // Counted only for a genuinely new wave. The gate ticks many times
+            // while one wave downloads and each tick re-reaches this point with
+            // nothing left to promote; charging those against the budget would
+            // spend it on the waiting itself.
+            self.direct_store
+                .repair_defer_waves
+                .insert(job_id, waves + 1);
+        }
+
+        crate::runtime::perf_probe::record(
+            "direct_store.repair_deferred",
+            std::time::Duration::from_nanos(1),
+        );
+        #[cfg(test)]
+        {
+            self.direct_store.repair_defers += 1;
+        }
+        info!(
+            job_id = job_id.0,
+            blocks_needed,
+            recovery_merged_now,
+            promoted_blocks = promoted,
+            total_capacity,
+            wave = if promoted > 0 { waves + 1 } else { waves },
+            "a direct set's damage needs recovery that has not been downloaded yet; \
+             staying direct while the targeted recovery arrives"
+        );
+        true
     }
 
     fn record_direct_repair_failure(job_id: JobId, failure: &super::repair::DirectRepairFailure) {
@@ -1609,6 +1903,21 @@ impl Pipeline {
         // blocks, so its state for this job is retired rather than trusted —
         // the same stance `run_par2_repairer` takes for a conventional repair.
         self.live_par2.remove_job(job_id);
+        // Announced from here rather than from a status transition: the set
+        // never enters `JobStatus::Repairing` — that status carries the repair
+        // concurrency queue, and this repair holds no slot in it — so the event
+        // stream is the only public record that a repair ran. Consumers derive
+        // the repair stage from the `RepairStarted`/`RepairComplete` pair, and
+        // a job whose history shows a repair it never announced would read as
+        // one that was never damaged. Sent at the first irreversible step for
+        // the same reason the latch burns here: everything above refuses for
+        // free and unannounced, everything below is a repair in progress. A
+        // refusal past this point sends no terminal — the demotion hands the
+        // job to the conventional repairer, whose own pair records how the
+        // repair actually ended.
+        let _ = self
+            .event_tx
+            .send(PipelineEvent::RepairStarted { job_id });
 
         let working_dir = self
             .jobs
@@ -1767,6 +2076,10 @@ impl Pipeline {
         self.metrics
             .direct_sets_repaired_while_direct
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.event_tx.send(PipelineEvent::RepairComplete {
+            job_id,
+            slices_repaired: u32::try_from(outcome.recovery_blocks_used).unwrap_or(u32::MAX),
+        });
         Ok(())
     }
 
@@ -2561,7 +2874,18 @@ impl Pipeline {
     /// Records a member name that **direct** finalization produced, in both the
     /// job-wide `extracted_members` (which completion reads) and the runtime's
     /// direct-only mirror (which the claim assertions subtract).
+    ///
+    /// Recorded under the *destination-relative* name, not the archive's own.
+    /// RAR4 stores paths with `\` separators, and the destination is derived
+    /// through `resolve_member_path`, which rewrites them to `/`. Recording the
+    /// raw name left the two disagreeing for any RAR4 member with a directory
+    /// component: completion resolved `work\sample.mkv` against the working
+    /// directory, found nothing on disk, declared the member a stale extracted
+    /// record and re-ran conventional extraction — which then failed with "no
+    /// on-disk RAR volumes", because direct finalization had deliberately never
+    /// written any. A flat RAR4 member has no separator and so never showed it.
     fn record_direct_extracted(&mut self, job_id: JobId, name: String) {
+        let name = DirectSetPlan::destination_relative_name(&name).unwrap_or(name);
         self.direct_store
             .direct_extracted_members
             .entry(job_id)

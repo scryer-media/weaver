@@ -10,6 +10,7 @@ use std::path::Path;
 
 use crate::pipeline::direct_store::DirectStoreGate;
 use crate::pipeline::direct_store::router::DemotionReason;
+use crate::pipeline::direct_store::wiring::MAX_DIRECT_REPAIR_DEFER_WAVES;
 
 /// A real NZB's `<segment bytes=…>` is the yEnc-**encoded** article size, about
 /// 3% larger than the decoded payload. Every fixture here declares inflated
@@ -6817,6 +6818,665 @@ async fn a_second_damage_verdict_after_a_repair_demotes_instead_of_repairing_aga
     );
 }
 
+// ---------------------------------------------------------------------------
+// Waiting for targeted recovery instead of demoting
+// ---------------------------------------------------------------------------
+
+/// The same envelope damage, with the recovery split out of the index and into
+/// a **separate recovery volume** — which is where recovery actually lives.
+///
+/// This is the shape every real damaged job has and no earlier fixture did.
+/// `recovery_blocks_available` counts slices that have been *merged*, and a
+/// recovery volume is only fetched once damage is known, so at the moment the
+/// first damage verdict is reached the merged count is structurally zero. Every
+/// fixture that baked the recovery into the index handed the repair blocks it
+/// would never have had in the field.
+fn recovery_in_a_separate_volume(
+    member_name: &str,
+    payload: &[u8],
+    recovery_blocks: usize,
+    damaged_volumes: &[usize],
+) -> (Vec<(String, Vec<u8>)>, Vec<u8>, Vec<u8>) {
+    let rr_bytes = 512;
+    let clean = recovery_record_store_set(member_name, payload, 3, rr_bytes);
+    // The index describes the set and carries no recovery of its own; the
+    // volume carries the same description *plus* the blocks, which is how a
+    // real `.volNNN+CC.par2` is laid out.
+    let index_bytes = repairable_par2_index(&clean, 0);
+    let recovery_bytes = repairable_par2_index(&clean, recovery_blocks);
+    let mut volumes = clean;
+    for volume in damaged_volumes {
+        damage_recovery_record(&mut volumes, *volume, rr_bytes);
+    }
+    (volumes, index_bytes, recovery_bytes)
+}
+
+/// Appends a PAR2 **recovery volume** to a spec as one more downloadable file,
+/// and returns its NZB index.
+///
+/// The name is the payload: `recovery_block_count` is parsed straight out of
+/// `.volNNN+CC.par2`, and that parse is the whole of the job's advertised
+/// recovery capacity before a single recovery byte has been fetched. Nothing
+/// delivers this file — that is the point of the fixture.
+fn append_par2_recovery_volume(spec: &mut JobSpec, filename: &str, bytes: &[u8]) -> u32 {
+    let file_index = spec.files.len() as u32;
+    spec.total_bytes += u64::from(yenc_declared_bytes(bytes.len() as u32));
+    spec.files.push(FileSpec {
+        role: FileRole::from_filename(filename),
+        filename: filename.to_string(),
+        groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
+        segments: vec![segment_spec! {
+            number: 0,
+            bytes: yenc_declared_bytes(bytes.len() as u32),
+            message_id: "direct-par2-recovery@example.com".to_string(),
+        }],
+    });
+    file_index
+}
+
+const RECOVERY_VOLUME_NAME: &str = "silver.horizon.vol000+04.par2";
+
+/// A live, damaged direct job whose recovery is advertised in the NZB and has
+/// **not** been downloaded — the state every damaged direct set is really in
+/// when its first verdict lands.
+///
+/// Returns the pipeline, the working directory, and the two PAR2 file indices —
+/// the index, which each test delivers itself because delivering it *is* the
+/// moment the damage verdict happens, and the recovery volume, which is what the
+/// wait is waiting for.
+///
+/// Stops one step short of the verdict on purpose. Every test here is about what
+/// happens at that instant, and half of them need to change the job's state
+/// first: empty the recovery pool, spend the defer budget, leave the payload in
+/// flight.
+async fn direct_job_with_undownloaded_recovery(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    index_bytes: &[u8],
+    recovery_volume_name: &str,
+    recovery_volume_bytes: &[u8],
+) -> (Pipeline, PathBuf, u32, u32) {
+    let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(true);
+
+    let (mut spec, index_file_index) =
+        par2_bearing_job_spec("Silver Horizon", volumes, index_bytes);
+    let recovery_file_index =
+        append_par2_recovery_volume(&mut spec, recovery_volume_name, recovery_volume_bytes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article(&mut pipeline, job_id, volumes, file_index, segment_number).await;
+    }
+    // The harness delivers articles without ever dequeuing them, so the payload
+    // would otherwise never look settled and the settle guard would defer every
+    // verdict. Only the ordinary queue is cleared: the *parked* recovery pool is
+    // what targeted promotion selects from, it is deliberately excluded from
+    // "pending download work", and emptying it here would quietly turn every
+    // test below into the exhausted case.
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
+    }
+    (pipeline, working_dir, index_file_index, recovery_file_index)
+}
+
+/// Delivers the PAR2 index, which is what produces the damage verdict and drives
+/// the completion gate into the direct-aware seam. Nothing here is a test hook:
+/// this is the ordinary decode path a real index arrives on.
+async fn deliver_par2_index(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    index_file_index: u32,
+    index_bytes: &[u8],
+) {
+    submit_decoded_segment(
+        pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        index_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+}
+
+/// What the quiet direct pass concluded, as `(blocks_needed, blocks_available)`.
+fn insufficient_verdict(pipeline: &Pipeline) -> Option<(u32, u32)> {
+    match pipeline.last_direct_verdict.as_ref()?.repairable {
+        par2_rs::verify::Repairability::Insufficient {
+            blocks_needed,
+            blocks_available,
+            ..
+        } => Some((blocks_needed, blocks_available)),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn damage_needing_undownloaded_recovery_waits_instead_of_demoting() {
+    // The bug this whole path was written around, in one assertion. Recovery is
+    // fetched only once damage is known, so the first damage verdict of a job's
+    // life always reads zero merged recovery blocks — and any damage at all
+    // exceeds zero. The set therefore declined, demoted, materialized every
+    // volume, and the recovery it was about to receive repaired physical files
+    // instead. No fixture could reach the in-place repair, because the input it
+    // needs is guaranteed absent at the only moment it was consulted.
+    //
+    // So the verdict is answered by *waiting*: ask for the recovery the damage
+    // needs and stay direct until it lands.
+    let member_name = "Silver.Horizon.S02E01.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
+    let (volumes, index_bytes, recovery_bytes) =
+        recovery_in_a_separate_volume(member_name, &payload, 4, &[1]);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41111);
+    let (mut pipeline, working_dir, index_file_index, recovery_file_index) =
+        direct_job_with_undownloaded_recovery(
+            &temp_dir,
+            job_id,
+            &volumes,
+            &index_bytes,
+            RECOVERY_VOLUME_NAME,
+            &recovery_bytes,
+        )
+        .await;
+
+    // Demanded rather than waited for: the checkpoint row is written on a timer,
+    // and the claim below — that waiting costs the set nothing durable — is
+    // vacuous if there was no row to keep.
+    pipeline
+        .demand_direct_store_barriers(job_id, BarrierDemand::PhaseChange)
+        .await;
+    let coverage_before = pipeline.db.load_direct_coverage(job_id).unwrap();
+    assert!(
+        !coverage_before.is_empty(),
+        "non-vacuity: the live set must hold a checkpoint row before the verdict, \
+         or 'the row survives' proves nothing"
+    );
+
+    deliver_par2_index(&mut pipeline, job_id, index_file_index, &index_bytes).await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert_eq!(
+        insufficient_verdict(&pipeline),
+        Some((1, 0)),
+        "non-vacuity: the pass must reach the verdict this exists for — damage \
+         that needs blocks, with none merged yet; sets = {sets}"
+    );
+    assert_eq!(
+        pipeline.direct_store.repair_defers, 1,
+        "the set must wait for the recovery rather than answer with what it has; \
+         sets = {sets}"
+    );
+    assert!(
+        !sets.contains("Demoted"),
+        "and it must still be direct while it waits — a demotion here throws \
+         away the outputs the wait exists to keep; got {sets}"
+    );
+    assert!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .all(|set| !set.repair_attempted()),
+        "the once-latch must be intact: the deferred pass has to be the set's \
+         *first* real attempt, or the retry refuses with AlreadyRepaired and \
+         demotes for the verdict the recovery was about to answer; got {sets}"
+    );
+    assert_eq!(
+        pipeline.direct_store.repair_attempts, 0,
+        "nothing irreversible may have run — no checkpoint delete, no \
+         materialization; sets = {sets}"
+    );
+    assert_eq!(
+        pipeline.db.load_direct_coverage(job_id).unwrap(),
+        coverage_before,
+        "the checkpoint row is deleted by an attempt, and no attempt was made"
+    );
+    assert_eq!(
+        direct_scratch_left(&working_dir),
+        0,
+        "no scratch: nothing was materialized"
+    );
+    assert!(
+        pipeline.is_promoted_recovery_file(job_id, recovery_file_index),
+        "and the wait must have asked for something — the recovery volume that \
+         covers the damage is now promoted"
+    );
+    assert!(
+        pipeline.job_has_promoted_recovery_pipeline_work(job_id, "test"),
+        "with its work on the wire, which is what makes the wait bounded"
+    );
+
+    // Every later tick of the gate while that work is on the wire has to answer
+    // without verifying anything. The pass is a full PAR2 scan, the gate ticks
+    // on every completing article, and until the wave merges the scan can only
+    // reach the verdict that started the wait.
+    let par2_set = pipeline
+        .par2_set(job_id)
+        .cloned()
+        .expect("the index parsed");
+    let before = pipeline.direct_session_pass_calls;
+    let resolution = pipeline
+        .resolve_direct_sets_before_par2_repairer(job_id, par2_set, working_dir.clone())
+        .await;
+    assert_eq!(
+        resolution,
+        crate::pipeline::direct_store::wiring::DirectPar2Resolution::Deferred,
+        "a job already waiting stays waiting"
+    );
+    assert_eq!(
+        pipeline.direct_session_pass_calls, before,
+        "and does not re-verify to find that out"
+    );
+}
+
+#[tokio::test]
+async fn a_deferred_direct_set_repairs_in_place_once_its_recovery_lands() {
+    // The other half, and the only one that proves the feature reachable: the
+    // wait has to end in an in-place repair. A completing PAR2 file already
+    // merges its slices and re-checks the job, so nothing new re-arms the gate —
+    // the set simply has to still be direct when that happens.
+    let member_name = "Silver.Horizon.S02E02.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 179) as u8).collect();
+    let (volumes, index_bytes, recovery_bytes) =
+        recovery_in_a_separate_volume(member_name, &payload, 4, &[1]);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41112);
+    let (mut pipeline, working_dir, index_file_index, recovery_file_index) =
+        direct_job_with_undownloaded_recovery(
+            &temp_dir,
+            job_id,
+            &volumes,
+            &index_bytes,
+            RECOVERY_VOLUME_NAME,
+            &recovery_bytes,
+        )
+        .await;
+
+    deliver_par2_index(&mut pipeline, job_id, index_file_index, &index_bytes).await;
+    assert_eq!(
+        pipeline.direct_store.repair_defers, 1,
+        "non-vacuity: act one has to be the wait, or act two proves nothing"
+    );
+    assert_eq!(
+        pipeline.direct_store.repair_attempts, 0,
+        "and the set must arrive at act two with its attempt unspent"
+    );
+
+    // The promoted work leaves the queue as it is picked up, which the harness
+    // does not model — it delivers articles without ever dequeuing them. Left
+    // in, the wave reads as permanently in flight and the gate rightly refuses
+    // to re-verify while it is.
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue = crate::DownloadQueue::new();
+    }
+
+    // Act two: the promoted recovery volume arrives. This is the production
+    // re-arm and nothing else — the decode seam merges the slices and runs the
+    // completion gate, which is where the repair now finds non-zero recovery.
+    let mut repair_events = pipeline.event_tx.subscribe();
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: recovery_file_index,
+        },
+        0,
+        0,
+        &recovery_bytes,
+        RECOVERY_VOLUME_NAME,
+        None,
+    )
+    .await;
+
+    // The repair never enters `JobStatus::Repairing`, so the event pair is the
+    // only public record it ran — a consumer reading this job's history must
+    // see a repair, not a job that was never damaged.
+    let announced = drain_job_events(&mut repair_events, job_id);
+    assert_eq!(
+        announced
+            .iter()
+            .filter(|event| matches!(event, PipelineEvent::RepairStarted { .. }))
+            .count(),
+        1,
+        "the in-place repair must announce itself; got {announced:?}"
+    );
+    assert_eq!(
+        announced
+            .iter()
+            .filter(|event| matches!(
+                event,
+                PipelineEvent::RepairComplete {
+                    slices_repaired: 1,
+                    ..
+                }
+            ))
+            .count(),
+        1,
+        "and must report completion with the one slice it rebuilt; got {announced:?}"
+    );
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert_eq!(
+        (
+            pipeline.direct_store.repair_attempts,
+            pipeline.direct_store.repair_materialized_volumes
+        ),
+        (1, 1),
+        "the set must repair in place once the blocks are merged, materializing \
+         only the damaged volume; sets = {sets}"
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .direct_sets_repaired_while_direct
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "and the lifetime counter — which had never read non-zero — must count \
+         it; sets = {sets}"
+    );
+    assert!(
+        !sets.contains("Demoted"),
+        "the set stays direct throughout; got {sets}"
+    );
+    assert!(
+        pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| !set.is_demoted() && set.repair_attempted()),
+        "with its one attempt now spent, which is what bounds a set that comes \
+         back damaged; got {sets}"
+    );
+    assert!(
+        !volumes
+            .iter()
+            .any(|(filename, _)| working_dir.join(filename).exists()),
+        "and no source volume may exist under its own name — the repair reads \
+         every clean volume virtually"
+    );
+    assert_eq!(
+        direct_scratch_left(&working_dir),
+        0,
+        "the scratch is deleted once its spans are routed"
+    );
+}
+
+#[tokio::test]
+async fn a_direct_set_demotes_when_the_recovery_it_needs_cannot_arrive() {
+    // The livelock guard, and the reason the wait is decided rather than
+    // assumed. Waiting is only correct while recovery is actually coming: with
+    // the recovery articles gone there is nothing to promote and nothing on the
+    // wire, so the answer has to be the immediate demotion it always was. This
+    // branch has produced two livelocks already; an unbounded wait would be the
+    // third.
+    let member_name = "Silver.Horizon.S02E03.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 181) as u8).collect();
+    let (volumes, index_bytes, recovery_bytes) =
+        recovery_in_a_separate_volume(member_name, &payload, 4, &[1]);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41113);
+    let (mut pipeline, _working_dir, index_file_index, recovery_file_index) =
+        direct_job_with_undownloaded_recovery(
+            &temp_dir,
+            job_id,
+            &volumes,
+            &index_bytes,
+            RECOVERY_VOLUME_NAME,
+            &recovery_bytes,
+        )
+        .await;
+    // The one difference from the deferring run: the recovery work is gone, as
+    // it is for a job whose recovery articles came back unavailable. The blocks
+    // are still advertised in the NZB, so capacity still covers the damage — the
+    // only thing missing is any way to fetch them.
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.recovery_queue = crate::DownloadQueue::new();
+    }
+
+    deliver_par2_index(&mut pipeline, job_id, index_file_index, &index_bytes).await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        pipeline.total_recovery_block_capacity(job_id) >= 1,
+        "non-vacuity: the NZB still advertises enough recovery, so the demotion \
+         below is about the recovery being unreachable and nothing else"
+    );
+    assert_eq!(
+        pipeline.direct_store.repair_defers, 0,
+        "the damage must be answered by demoting rather than waiting; sets = {sets}"
+    );
+    assert_eq!(
+        pipeline.direct_store.repair_attempts, 0,
+        "and decided before any attempt: an insufficient verdict is one the \
+         planner refuses outright, so an attempt could only burn the latch and \
+         the checkpoint row on its way to the same refusal; sets = {sets}"
+    );
+    assert!(
+        !pipeline.is_promoted_recovery_file(job_id, recovery_file_index),
+        "there was nothing left to promote, which is exactly why it demotes"
+    );
+    assert!(
+        sets.contains("Demoted(Par2Damaged)"),
+        "the set materializes for the conventional path, which reaches the same \
+         dead end with better diagnostics; got {sets}"
+    );
+}
+
+#[tokio::test]
+async fn the_defer_budget_bounds_a_job_that_keeps_coming_back_short() {
+    // The arithmetic bound behind the structural one. The first wave asks for
+    // every block the verdict needs, so a second only happens if the first
+    // arrived and still fell short — but "already promoted" is derived state,
+    // and a derivation that goes wrong here waits forever. Budget spent, the
+    // next short verdict demotes even with recovery still parked and ready to
+    // promote.
+    let member_name = "Silver.Horizon.S02E04.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 193) as u8).collect();
+    let (volumes, index_bytes, recovery_bytes) =
+        recovery_in_a_separate_volume(member_name, &payload, 4, &[1]);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41114);
+    let (mut pipeline, _working_dir, index_file_index, recovery_file_index) =
+        direct_job_with_undownloaded_recovery(
+            &temp_dir,
+            job_id,
+            &volumes,
+            &index_bytes,
+            RECOVERY_VOLUME_NAME,
+            &recovery_bytes,
+        )
+        .await;
+    // Three waves already spent. Everything else is exactly the run that waits.
+    pipeline
+        .direct_store
+        .set_repair_defer_waves(job_id, MAX_DIRECT_REPAIR_DEFER_WAVES);
+
+    deliver_par2_index(&mut pipeline, job_id, index_file_index, &index_bytes).await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert_eq!(
+        pipeline.direct_store.repair_defers, 0,
+        "a job past its budget must not start another wait; sets = {sets}"
+    );
+    assert_eq!(
+        pipeline.direct_store.repair_attempts, 0,
+        "and the demotion is decided without spending an attempt on a verdict \
+         the planner would refuse; sets = {sets}"
+    );
+    assert!(
+        !pipeline.is_promoted_recovery_file(job_id, recovery_file_index),
+        "and must not promote another wave of recovery to wait for"
+    );
+    assert!(
+        sets.contains("Demoted(Par2Damaged)"),
+        "it demotes instead; got {sets}"
+    );
+}
+
+#[tokio::test]
+async fn damage_beyond_every_advertised_recovery_block_never_waits() {
+    // Waiting can only ever help damage the recovery *set* could cover.
+    // `blocks_available` is what has merged; the NZB's advertised total is the
+    // ceiling, and past it no amount of downloading changes the answer. Delaying
+    // the conventional path there helps nobody: it reaches the same dead end,
+    // with the diagnostics that name it.
+    //
+    // Driven at the decision itself rather than through a fixture, because the
+    // damage a small fixture can produce cannot outrun the advertised capacity
+    // the same fixture implies — and this contract is about one comparison, not
+    // about how damage is reached. The call is the production one; only the
+    // block count is chosen.
+    let member_name = "Silver.Horizon.S02E05.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 197) as u8).collect();
+    let (volumes, index_bytes, recovery_bytes) =
+        recovery_in_a_separate_volume(member_name, &payload, 4, &[1]);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41115);
+    let (mut pipeline, _working_dir, _index_file_index, recovery_file_index) =
+        direct_job_with_undownloaded_recovery(
+            &temp_dir,
+            job_id,
+            &volumes,
+            &index_bytes,
+            RECOVERY_VOLUME_NAME,
+            &recovery_bytes,
+        )
+        .await;
+
+    let capacity = pipeline.total_recovery_block_capacity(job_id);
+    assert!(
+        capacity > 0,
+        "non-vacuity: the job must advertise recovery, so the refusal below is \
+         about the comparison and not about there being nothing to ask for"
+    );
+
+    assert!(
+        !pipeline.defer_direct_repair_for_recovery(job_id, capacity + 1, 0),
+        "one block past everything the NZB advertises, and no download can close \
+         the gap: the answer has to be the immediate demotion"
+    );
+    assert_eq!(pipeline.direct_store.repair_defers, 0, "nothing waited");
+    assert!(
+        !pipeline.is_promoted_recovery_file(job_id, recovery_file_index),
+        "and nothing was fetched for a wait that could never end — a refusal here \
+         must cost no bandwidth at all"
+    );
+
+    // The A/B, on the same job: one block fewer is inside the advertised
+    // capacity, and that alone flips the answer.
+    assert!(
+        pipeline.defer_direct_repair_for_recovery(job_id, capacity, 0),
+        "non-vacuity: at the ceiling the same call waits, so the ceiling is the \
+         only thing under test"
+    );
+    assert!(
+        pipeline.is_promoted_recovery_file(job_id, recovery_file_index),
+        "and asks for the recovery it means to wait for"
+    );
+}
+
+#[tokio::test]
+async fn a_direct_set_still_receiving_articles_neither_repairs_nor_waits_nor_demotes() {
+    // The settle guard, unchanged and now load-bearing twice over. A set with
+    // articles outstanding has holes where its missing ranges will go, and PAR2
+    // cannot tell a hole from corruption. Repairing there spends recovery blocks
+    // rebuilding bytes already on their way — and *waiting* there is worse,
+    // because it fetches those blocks first. The verdict is not yet evidence of
+    // anything, so nothing acts on it.
+    let member_name = "Silver.Horizon.S02E06.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 199) as u8).collect();
+    let (volumes, index_bytes, recovery_bytes) =
+        recovery_in_a_separate_volume(member_name, &payload, 4, &[1]);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41116);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.live_par2.set_enabled(true);
+
+    let (mut spec, index_file_index) =
+        par2_bearing_job_spec("Silver Horizon", &volumes, &index_bytes);
+    let recovery_file_index =
+        append_par2_recovery_volume(&mut spec, RECOVERY_VOLUME_NAME, &recovery_bytes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    // Every article but the last volume's tail. The set is live, damaged where
+    // the fixture damaged it, and genuinely incomplete everywhere else — and the
+    // ordinary download queue is left alone, so the job reads as still
+    // downloading, which is the truth.
+    let mut arrivals = in_order_arrivals(volumes.len());
+    arrivals.pop();
+    for (file_index, segment_number) in arrivals {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &index_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+
+    let par2_set = pipeline
+        .par2_set(job_id)
+        .cloned()
+        .expect("the index parsed");
+    let verification = pipeline
+        .verify_direct_sets_quietly(job_id, par2_set, working_dir.clone())
+        .await
+        .expect("the quiet pass reached a verdict");
+    assert!(
+        verification.needs_repair(),
+        "non-vacuity: the pass must see damage, or every guard below is trivially \
+         satisfied"
+    );
+    let resolution = pipeline
+        .resolve_direct_sets_with_par2_damage(job_id, &verification)
+        .await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert_eq!(
+        resolution,
+        crate::pipeline::direct_store::wiring::DirectDamageResolution::Unresolved,
+        "an unsettled set answers nothing; sets = {sets}"
+    );
+    assert_eq!(
+        (
+            pipeline.direct_store.repair_attempts,
+            pipeline.direct_store.repair_defers
+        ),
+        (0, 0),
+        "it neither repairs nor waits; sets = {sets}"
+    );
+    assert!(
+        !sets.contains("Demoted"),
+        "nor demotes — the bytes it is missing are on their way; got {sets}"
+    );
+    assert!(
+        !pipeline.is_promoted_recovery_file(job_id, recovery_file_index),
+        "and no recovery is promoted to rebuild bytes that are already coming, \
+         which is the bandwidth the deferred recovery fetch exists to save"
+    );
+}
+
 /// Renames a generated set's volume files onto a different archive base name,
 /// so one job can carry two direct sets.
 ///
@@ -12745,11 +13405,7 @@ async fn out_of_order_arrival_does_not_trip_the_header_prefix_ceiling() {
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     pipeline.live_par2.set_enabled(false);
 
-    let spec = direct_store_job_spec_with_articles(
-        "Out-of-order store set",
-        &volumes,
-        articles,
-    );
+    let spec = direct_store_job_spec_with_articles("Out-of-order store set", &volumes, articles);
     insert_active_job(&mut pipeline, job_id, spec).await;
 
     let (_, volume_bytes) = &volumes[0];
