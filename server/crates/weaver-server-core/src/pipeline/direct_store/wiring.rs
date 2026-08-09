@@ -1915,9 +1915,7 @@ impl Pipeline {
         // refusal past this point sends no terminal — the demotion hands the
         // job to the conventional repairer, whose own pair records how the
         // repair actually ended.
-        let _ = self
-            .event_tx
-            .send(PipelineEvent::RepairStarted { job_id });
+        let _ = self.event_tx.send(PipelineEvent::RepairStarted { job_id });
 
         let working_dir = self
             .jobs

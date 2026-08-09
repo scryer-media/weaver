@@ -790,9 +790,15 @@ mod windows {
 
         #[test]
         fn desktop_profile_is_isolated_from_legacy_portable_state() {
+            let local_app_data = Path::new(r"C:\\")
+                .join("Users")
+                .join("example")
+                .join("AppData")
+                .join("Local");
+
             assert_eq!(
-                desktop_profile_dir_from(Path::new(r"C:\Users\example\AppData\Local")),
-                Path::new(r"C:\Users\example\AppData\Local\ScryerMedia\Weaver")
+                desktop_profile_dir_from(&local_app_data),
+                local_app_data.join("ScryerMedia").join("Weaver")
             );
         }
 

@@ -699,9 +699,7 @@ impl PipelineMetrics {
             direct_write_evictions: self.direct_write_evictions.load(Ordering::Relaxed),
             direct_sets_admitted: self.direct_sets_admitted.load(Ordering::Relaxed),
             direct_sets_demoted: self.direct_sets_demoted.load(Ordering::Relaxed),
-            direct_sets_finalized_direct: self
-                .direct_sets_finalized_direct
-                .load(Ordering::Relaxed),
+            direct_sets_finalized_direct: self.direct_sets_finalized_direct.load(Ordering::Relaxed),
             direct_sets_repaired_while_direct: self
                 .direct_sets_repaired_while_direct
                 .load(Ordering::Relaxed),
