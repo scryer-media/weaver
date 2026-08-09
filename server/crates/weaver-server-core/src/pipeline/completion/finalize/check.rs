@@ -30,6 +30,9 @@ struct Par2SessionEvidenceCandidate {
     bound_file_id: Option<par2_rs::FileId>,
 }
 
+type RetainedPar2SessionOutcome = (par2_rs::Par2RepairOutcome, Vec<NzbFileId>, bool);
+type RetainedPar2SessionResult = Result<RetainedPar2SessionOutcome, String>;
+
 fn committed_evidence_from_candidate(
     candidate: &Par2SessionEvidenceCandidate,
 ) -> Result<Option<par2_rs::CommittedFileEvidence>, String> {
@@ -85,10 +88,7 @@ fn run_retained_par2_session(
     candidates: Vec<Par2SessionEvidenceCandidate>,
     live_evidence: Vec<(std::path::PathBuf, par2_rs::SliceEvidence)>,
     repair: bool,
-) -> (
-    par2_rs::Par2RepairSession,
-    Result<(par2_rs::Par2RepairOutcome, Vec<NzbFileId>, bool), String>,
-) {
+) -> (par2_rs::Par2RepairSession, RetainedPar2SessionResult) {
     for (path, evidence) in live_evidence {
         match session.add_slice_evidence(path, evidence) {
             Ok(()) | Err(par2_rs::Par2SessionError::EvidenceDoesNotMatch { .. }) => {}

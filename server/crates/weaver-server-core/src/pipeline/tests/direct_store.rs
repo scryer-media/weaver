@@ -6831,12 +6831,14 @@ async fn a_second_damage_verdict_after_a_repair_demotes_instead_of_repairing_aga
 /// first damage verdict is reached the merged count is structurally zero. Every
 /// fixture that baked the recovery into the index handed the repair blocks it
 /// would never have had in the field.
+type RecoveryVolumeFixture = (Vec<(String, Vec<u8>)>, Vec<u8>, Vec<u8>);
+
 fn recovery_in_a_separate_volume(
     member_name: &str,
     payload: &[u8],
     recovery_blocks: usize,
     damaged_volumes: &[usize],
-) -> (Vec<(String, Vec<u8>)>, Vec<u8>, Vec<u8>) {
+) -> RecoveryVolumeFixture {
     let rr_bytes = 512;
     let clean = recovery_record_store_set(member_name, payload, 3, rr_bytes);
     // The index describes the set and carries no recovery of its own; the

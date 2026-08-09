@@ -1190,16 +1190,7 @@ impl VolumeStaging {
         }
     }
 
-    /// Every byte this volume is still holding in RAM, routed or not.
-    ///
-    /// Deliberately the chunk map rather than [`Self::pending`]. Envelope bytes
-    /// are *routed* — they leave `pending` the moment they are emitted — but
-    /// [`DirectSetRouter::trim_volume`] retains them until the volume is
-    /// confirmed, because the header walk has to seek through them to reach the
-    /// end-of-archive record. With envelope v2 that retained region is a `-rr`
-    /// set's recovery record, which is a percentage of the volume, per volume:
-    /// counting only `pending` left the largest term in the set's RSS outside
-    /// the budget that exists to bound it.
+    #[cfg(test)]
     fn staged_bytes(&self) -> u64 {
         self.chunks
             .values()
