@@ -3232,6 +3232,8 @@ dependencies = [
 [[package]]
 name = "par2-rs"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "733369573db019e66ef543bc5851ae66be4583d5ab576a31275f11d177854270"
 dependencies = [
  "aws-lc-sys 0.42.0",
  "bytes",
@@ -3753,6 +3755,8 @@ dependencies = [
 [[package]]
 name = "reedsolomon-rs"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4cf471b31535b1867081c0a687ca08bceff32ef8e8d8791ea09110647b83fc6"
 dependencies = [
  "memmap2",
  "objc2",
@@ -5269,6 +5273,8 @@ dependencies = [
 [[package]]
 name = "unrar-rs"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e403a397946233bd9cc2181ed7b6cf1fd0466562218236f886709cc956bd3c84"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys 0.42.0",
