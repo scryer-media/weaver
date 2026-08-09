@@ -87,9 +87,30 @@ function Invoke-MsiExec {
 
 function Test-InteractiveDesktop {
   $currentSession = (Get-Process -Id $PID).SessionId
-  return $null -ne (Get-Process explorer -ErrorAction SilentlyContinue |
+  $explorer = Get-Process explorer -ErrorAction SilentlyContinue |
     Where-Object { $_.SessionId -eq $currentSession } |
-    Select-Object -First 1)
+    Select-Object -First 1
+  if ($null -eq $explorer) {
+    return $false
+  }
+
+  # Some hosted Windows ARM runners start explorer.exe without a taskbar. That
+  # is not a usable GUI session: the tray icon cannot be created and the tray
+  # process never reaches server startup. Require the actual notification-area
+  # owner before running the GUI-only smoke.
+  if (-not ("WeaverNativeWindow" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class WeaverNativeWindow {
+  [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern IntPtr FindWindow(string className, string windowName);
+}
+'@
+  }
+
+  return [WeaverNativeWindow]::FindWindow("Shell_TrayWnd", $null) -ne [IntPtr]::Zero
 }
 
 function Get-MpCmdRun {
