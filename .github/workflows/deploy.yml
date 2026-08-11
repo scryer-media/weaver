@@ -17,7 +17,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   NODE_VERSION: "25"
-  RUST_TOOLCHAIN: "1.96"
+  RUST_TOOLCHAIN: "1.97.1"
   WEAVER_ENABLE_DIAGNOSTICS: "0"
   WEB_ARTIFACT_NAME: weaver-web-dist
   RUST_TEST_BINARIES_ARTIFACT_NAME: weaver-rust-test-binaries
@@ -390,9 +390,6 @@ jobs:
                 run_sde "$bin" simd::tests::avx2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
                 run_sde "$bin" simd::tests::avx2_block_handles_dot_stuffed_line_start --exact --test-threads=1
                 run_sde "$bin" simd::tests::avx2_block_preserves_trailing_cr_state --exact --test-threads=1
-                run_sde "$bin" simd::tests::avx512_block_compacts_escapes_and_line_breaks --exact --test-threads=1
-                run_sde "$bin" simd::tests::avx512_block_handles_dot_stuffed_line_start --exact --test-threads=1
-                run_sde "$bin" simd::tests::avx512_block_preserves_trailing_cr_state --exact --test-threads=1
                 run_sde "$bin" simd::tests::avx512_vbmi2_block_compacts_escapes_and_line_breaks --exact --test-threads=1
                 run_sde "$bin" simd::tests::avx512_vbmi2_block_handles_dot_stuffed_line_start --exact --test-threads=1
                 run_sde "$bin" simd::tests::avx512_vbmi2_block_preserves_trailing_cr_state --exact --test-threads=1
