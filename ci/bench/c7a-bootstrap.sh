@@ -3,13 +3,21 @@
 # differential + parity bench (and the rarpar GFNI/AVX-512 GF16 phase) on an AWS
 # c7a.xlarge (AMD Zen 4) Ubuntu 24.04 box.
 #
-# Installs: system build deps, rustup + the repo-pinned toolchain (1.97.1 via
-# rust-toolchain.toml), then clones + cmake-builds the rapidyenc reference, and
-# asserts the CPU actually exposes the AVX-512/VBMI2/GFNI feature set. Prints a
-# READY banner on success. Safe to re-run.
+# Installs: system build deps, the ECR corpus image (source delivery), rustup +
+# the repo-pinned toolchain (1.97.1 via rust-toolchain.toml), then cmake-builds
+# the rapidyenc reference, and asserts the CPU actually exposes the
+# AVX-512/VBMI2/GFNI feature set. Prints a READY banner on success. Safe to
+# re-run.
 #
-# Makes NO AWS API calls. Provisioning and teardown are the operator's, by hand
-# (see ci/bench/c7a-avx512-diffbench.md §11).
+# AWS RUNS ONLY. Source delivery is the pre-pushed ECR corpus image (§7a).
+# Local-box runs (SYLIX / codex-x86) keep their own rsync recipes and are not
+# affected by anything in this script.
+#
+# The only AWS calls made here are `ecr:GetAuthorizationToken` (via
+# `aws ecr get-login-password`) and the layer reads `docker pull` performs.
+# Instance provisioning and teardown remain the operator's, by hand
+# (see ci/bench/c7a-avx512-diffbench.md §11). No IAM is created or modified —
+# the pull permissions are a PROVISIONING PREREQUISITE, documented in §7a.
 #
 # Grounding (see ci/bench/c7a-avx512-diffbench.md):
 #   - toolchain 1.97.1          : rust-toolchain.toml:2  (rarpar pins the same)
@@ -62,13 +70,21 @@ arm_deadman() {
 arm_deadman
 
 # ── Config (all overridable) ─────────────────────────────────────────────────
-WEAVER_DIR="${WEAVER_DIR:-$HOME/weaver}"
-RARPAR_DIR="${RARPAR_DIR:-$HOME/rarpar}"
-RAPIDYENC_ROOT="${RAPIDYENC_ROOT:-$HOME/rapidyenc}"
-RAPIDYENC_GIT="${RAPIDYENC_GIT:-https://github.com/animetosho/rapidyenc.git}"
+# The corpus image extracts /corpus/. into $CORPUS_DEST, which yields
+# $CORPUS_DEST/{weaver,rarpar,rapidyenc} — hence the defaults below.
+CORPUS_DEST="${CORPUS_DEST:-$HOME}"
+CORPUS_IMAGE="${CORPUS_IMAGE:-651588424025.dkr.ecr.us-east-1.amazonaws.com/weaver-bench-corpus:latest}"
+CORPUS_REGION="${CORPUS_REGION:-us-east-1}"
+CORPUS_REGISTRY="${CORPUS_IMAGE%%/*}"
+CORPUS_FORCE="${CORPUS_FORCE:-0}"   # 1 = re-pull and re-extract even if the trees are present
+
+WEAVER_DIR="${WEAVER_DIR:-$CORPUS_DEST/weaver}"
+RARPAR_DIR="${RARPAR_DIR:-$CORPUS_DEST/rarpar}"
+RAPIDYENC_ROOT="${RAPIDYENC_ROOT:-$CORPUS_DEST/rapidyenc}"
 WEAVER_RAPIDYENC_LIB="${WEAVER_RAPIDYENC_LIB:-$RAPIDYENC_ROOT/build/librapidyenc.so}"
 TARGET="${TARGET:-x86_64-unknown-linux-gnu}"
 RUST_TOOLCHAIN_FALLBACK="${RUST_TOOLCHAIN_FALLBACK:-1.97.1}"  # only if rust-toolchain.toml is absent
+DOCKER=""   # resolved by resolve_docker()
 
 log()  { printf '\033[1;34m[bootstrap]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[bootstrap:warn]\033[0m %s\n' "$*" >&2; }
@@ -106,9 +122,11 @@ assert_cpu_features() {
 # nasm + cmake are required by aws-lc-sys, which is in BOTH workspaces' build
 # graphs (weaver via the TLS stack, rarpar via unrar-rs feature crypto-aws-lc).
 # g++/cc build the §3a source-compiled rapidyenc oracle and rapidyenc itself.
+# jq builds $RESULTS_DIR/summary.json + metadata.json from the criterion trees
+# (doc §9g) — the raw material for later SVG generation.
 install_system_deps() {
   log "Installing system build dependencies (apt)…"
-  local pkgs="build-essential cmake nasm pkg-config git curl ca-certificates"
+  local pkgs="build-essential cmake nasm pkg-config git curl ca-certificates jq"
   if command -v apt-get >/dev/null 2>&1; then
     local SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
     $SUDO DEBIAN_FRONTEND=noninteractive apt-get update -y
@@ -117,10 +135,111 @@ install_system_deps() {
   else
     warn "apt-get not found; ensure these are installed manually: $pkgs"
   fi
-  for bin in cc c++ cmake nasm git curl; do
+  for bin in cc c++ cmake nasm git curl jq tar; do
     command -v "$bin" >/dev/null 2>&1 || die "required tool '$bin' still missing after install"
   done
-  log "System deps OK (cc, c++, cmake, nasm, git, curl present)."
+  log "System deps OK (cc, c++, cmake, nasm, git, curl, jq, tar present)."
+}
+
+# ── Corpus delivery: pre-pushed ECR image ────────────────────────────────────
+#
+# `.git` does NOT ship in the image, so every tree carries its own REVISION.json
+# ({repo, rev, dirty_files, staged_at_utc}) and provenance is read from that
+# rather than from git. weaver ships as WORKING-TREE state (uncommitted
+# increments included), rarpar with its LFS fixtures already hydrated, and
+# rapidyenc as a clean tree pinned at 27f435a — which is exactly why the image
+# exists: a `git clone` on the box would miss the in-flight weaver work and turn
+# rarpar's LFS fixtures into pointer files.
+revision_field() {   # <tree-dir> <field> [default]
+  local f="$1/REVISION.json" out=""
+  if [ -f "$f" ] && command -v jq >/dev/null 2>&1; then
+    out="$(jq -r --arg k "$2" '.[$k] // empty' "$f" 2>/dev/null || true)"
+  fi
+  printf '%s' "${out:-${3:-unknown}}"
+}
+
+resolve_docker() {
+  if docker info >/dev/null 2>&1; then
+    DOCKER="docker"
+  elif sudo docker info >/dev/null 2>&1; then
+    # Fresh docker.io installs leave the login shell outside the `docker` group
+    # until it is re-established; sudo sidesteps that without a re-login.
+    DOCKER="sudo docker"
+  else
+    die "docker daemon unreachable (tried 'docker' and 'sudo docker'). Is docker.io installed and running?"
+  fi
+  log "docker command: $DOCKER"
+}
+
+install_ecr_tooling() {
+  local want=""
+  command -v docker >/dev/null 2>&1 || want="$want docker.io"
+  command -v aws    >/dev/null 2>&1 || want="$want awscli"
+  if [ -n "$want" ]; then
+    log "Installing corpus-delivery tooling (apt):$want"
+    if command -v apt-get >/dev/null 2>&1; then
+      local SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+      $SUDO DEBIAN_FRONTEND=noninteractive apt-get update -y
+      # shellcheck disable=SC2086
+      $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y $want
+    else
+      warn "apt-get not found; install manually:$want"
+    fi
+  else
+    log "docker + aws CLI already present."
+  fi
+  command -v docker >/dev/null 2>&1 || die "docker still missing after install"
+  command -v aws    >/dev/null 2>&1 || die "aws CLI still missing after install (needed for 'aws ecr get-login-password')"
+  resolve_docker
+}
+
+corpus_is_extracted() {
+  [ -f "$WEAVER_DIR/REVISION.json" ] &&
+  [ -f "$RARPAR_DIR/REVISION.json" ] &&
+  [ -f "$RAPIDYENC_ROOT/REVISION.json" ]
+}
+
+# Pull + extract WITHOUT ever running the image: `docker create` materializes a
+# container's filesystem but starts nothing, `docker cp` reads it out, `docker
+# rm` discards it. No process from the image is ever executed on this box.
+fetch_corpus() {
+  if corpus_is_extracted && [ "$CORPUS_FORCE" != "1" ]; then
+    log "corpus already extracted under $CORPUS_DEST (set CORPUS_FORCE=1 to re-pull)."
+    return 0
+  fi
+
+  install_ecr_tooling
+
+  log "Logging in to $CORPUS_REGISTRY (region $CORPUS_REGION)…"
+  # Needs ecr:GetAuthorizationToken on the instance role / env credentials.
+  aws ecr get-login-password --region "$CORPUS_REGION" \
+    | $DOCKER login --username AWS --password-stdin "$CORPUS_REGISTRY" \
+    || die "ECR login failed.
+     This is a PROVISIONING PREREQUISITE, not something this script fixes:
+     the instance needs an IAM role (or env credentials) granting
+       ecr:GetAuthorizationToken, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer
+     on $CORPUS_IMAGE. Attach the role and re-run. This script never
+     creates or modifies IAM."
+
+  log "Pulling $CORPUS_IMAGE …"
+  $DOCKER pull "$CORPUS_IMAGE" || die "docker pull failed — check ecr:BatchGetImage / ecr:GetDownloadUrlForLayer"
+
+  log "Extracting /corpus/. -> $CORPUS_DEST/ (container is created, never run)"
+  local cid rc=0
+  cid="$($DOCKER create "$CORPUS_IMAGE")" || die "docker create failed"
+  $DOCKER cp "$cid:/corpus/." "$CORPUS_DEST/" || rc=$?
+  $DOCKER rm -v "$cid" >/dev/null 2>&1 || warn "could not remove scratch container $cid"
+  [ "$rc" -eq 0 ] || die "docker cp of /corpus/. failed (rc=$rc)"
+
+  corpus_is_extracted || die "extraction finished but REVISION.json is missing from one or more trees
+     expected: $WEAVER_DIR, $RARPAR_DIR, $RAPIDYENC_ROOT
+     (is the image's /corpus layout what this runbook expects?)"
+
+  local t
+  for t in "$WEAVER_DIR" "$RARPAR_DIR" "$RAPIDYENC_ROOT"; do
+    log "  $(revision_field "$t" repo "$(basename "$t")"): rev=$(revision_field "$t" rev) dirty_files=$(revision_field "$t" dirty_files 0) staged_at_utc=$(revision_field "$t" staged_at_utc)"
+  done
+  log "Corpus extracted."
 }
 
 # ── Rust toolchain via rustup (pinned by rust-toolchain.toml:2 -> 1.97.1) ────
@@ -169,16 +288,14 @@ install_rust() {
 
 # ── rapidyenc reference: source (for §3a diff test) + shared lib (for §3b bench)
 build_rapidyenc() {
-  if [ -d "$RAPIDYENC_ROOT/.git" ]; then
-    log "rapidyenc checkout already at $RAPIDYENC_ROOT (leaving revision as-is)."
-  else
-    log "Cloning rapidyenc -> $RAPIDYENC_ROOT"
-    git clone "$RAPIDYENC_GIT" "$RAPIDYENC_ROOT"
-  fi
-  ( cd "$RAPIDYENC_ROOT" && git submodule update --init --recursive || \
-      warn "git submodule update failed (crcutil may be vendored already; continuing)" )
-  log "rapidyenc revision: $(git -C "$RAPIDYENC_ROOT" describe --tags --always 2>/dev/null || echo '?')"
-  log "  (dev-mac reference numbers were taken against 27f435a = v1.1.1-10-g27f435a)"
+  # No clone: rapidyenc arrives pre-pinned in the corpus image (§7a), so there
+  # is no network fetch and no revision drift between runs. crcutil-1.0/ is
+  # vendored in-tree upstream (no .gitmodules), so nothing needs initializing
+  # either — which is just as well, since .git does not ship.
+  [ -d "$RAPIDYENC_ROOT" ] || die "rapidyenc tree missing at $RAPIDYENC_ROOT — re-extract the corpus image (CORPUS_FORCE=1)"
+  log "rapidyenc revision (REVISION.json): $(revision_field "$RAPIDYENC_ROOT" rev)"
+  log "  expected 27f435a = v1.1.1-10-g27f435a — the rev every prior weaver-vs-rapidyenc number was taken against"
+  [ -d "$RAPIDYENC_ROOT/crcutil-1.0" ] || warn "crcutil-1.0/ absent from $RAPIDYENC_ROOT — the cmake build may fail"
 
   # Sanity: the source-compiled differential oracle needs these two files present
   # (tests/rapidyenc_decode_diff.rs:435).
@@ -210,39 +327,40 @@ EOF
 # ── rarpar presence (mandatory phase; warn here, hard-fail in c7a-run.sh) ────
 check_rarpar() {
   if [ -d "$RARPAR_DIR" ]; then
-    log "rarpar checkout present at $RARPAR_DIR"
-    # The archive_hotspots fixtures are git-LFS. rsync from the dev mac carries
-    # hydrated bytes; a plain `git clone` leaves ~130-byte pointer files and the
-    # bench dies on a malformed archive. Cheap smoke test.
+    log "rarpar tree present at $RARPAR_DIR (rev $(revision_field "$RARPAR_DIR" rev))"
+    # The archive_hotspots fixtures are git-LFS upstream. The image build
+    # hydrates them, so this is a cheap check that the image really did — an
+    # unhydrated fixture is a ~130-byte pointer file and the bench dies on a
+    # malformed archive rather than on anything informative.
     local fx="$RARPAR_DIR/crates/weaver-unrar/tests/fixtures/rar5/rar5_lz.rar"
     if [ -f "$fx" ]; then
       if head -c 5 "$fx" | grep -q 'Rar!'; then
-        log "  unrar fixtures look hydrated (rar5_lz.rar has a real RAR signature)."
+        log "  unrar fixtures hydrated (rar5_lz.rar has a real RAR signature)."
       else
-        warn "  $fx is NOT a real RAR (git-LFS pointer?) — rsync rarpar from the dev mac, do not git clone"
+        warn "  $fx is NOT a real RAR (git-LFS pointer?) — the corpus image was built without hydrated LFS; re-pull with CORPUS_FORCE=1, and if it persists the image needs rebuilding"
       fi
     else
       warn "  $fx missing — the archive_hotspots bench will fail"
     fi
   else
-    warn "rarpar checkout NOT found at $RARPAR_DIR.
+    warn "rarpar tree NOT found at $RARPAR_DIR.
      The rarpar phase is MANDATORY and c7a-run.sh will ABORT without it.
-     rsync it from the dev machine before running (doc §7a) — from inside your
-     weaver checkout, with RARPAR_LOCAL defaulting to a sibling checkout:
-       RARPAR_LOCAL=\"\${RARPAR_LOCAL:-\$(git rev-parse --show-toplevel)/../rarpar}\"
-       rsync -az --exclude 'target/' --exclude '.git/' \\
-         \"\$RARPAR_LOCAL/\" \"\$BOX:~/rarpar/\"
-     rsync, not git clone: the unrar bench fixtures are git-LFS."
+     Re-pull and re-extract the corpus image (doc §7a):
+       CORPUS_FORCE=1 ./ci/bench/c7a-bootstrap.sh"
   fi
 }
 
 main() {
+  log "CORPUS_IMAGE=$CORPUS_IMAGE"
+  log "CORPUS_DEST=$CORPUS_DEST"
   log "WEAVER_DIR=$WEAVER_DIR"
   log "RARPAR_DIR=$RARPAR_DIR"
   log "RAPIDYENC_ROOT=$RAPIDYENC_ROOT"
-  [ -d "$WEAVER_DIR" ] || die "WEAVER_DIR '$WEAVER_DIR' not found — rsync weaver there first (doc §7a)."
   assert_cpu_features
+  # jq first: fetch_corpus reads REVISION.json, and every later step wants it.
   install_system_deps
+  fetch_corpus
+  [ -d "$WEAVER_DIR" ] || die "WEAVER_DIR '$WEAVER_DIR' not found even after corpus extraction (doc §7a)."
   install_rust
   build_rapidyenc
   check_rarpar
@@ -254,10 +372,11 @@ main() {
 ------------------------------------------------------------
   - dead-man shutdown armed (see DEADMAN_MINUTES)
   - CPU AVX-512 VBMI2 + GFNI feature gate: PASSED
-  - system deps (cc/c++/cmake/nasm): installed
+  - system deps (cc/c++/cmake/nasm/jq): installed
+  - corpus image: pulled + extracted (weaver/rarpar/rapidyenc)
   - rust toolchain (rust-toolchain.toml pin): installed
-  - rapidyenc: source tree + librapidyenc.so built
-  - rarpar checkout: see log above (MANDATORY for the run)
+  - rapidyenc: pre-pinned tree + librapidyenc.so built
+  - rarpar tree: see log above (MANDATORY for the run)
   Next:  ./ci/bench/c7a-run.sh
 ============================================================
 BANNER

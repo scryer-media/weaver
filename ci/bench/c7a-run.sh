@@ -20,7 +20,15 @@
 #   (e) weaver benches: steady-state wait, DISCARDED warm pass, then the
 #       recorded pass TWICE, then a drift check (>DRIFT_PCT warns)
 #   (f) rarpar phase (MANDATORY): tests, then the same bench protocol
-#   (g) summary + teardown checklist
+#   (g) preserve the raw data: criterion trees tarred, metadata.json,
+#       summary.json (doc §9g) — the input for later SVG generation
+#   (h) summary + teardown checklist
+#
+# FULL SUITES, NO FILTERS. Every `cargo bench` below is invoked with a bench
+# target and nothing else — no trailing criterion filter argument anywhere, so
+# each binary runs its complete lane set. The one suite with an *environment*
+# filter (par2_repair / WEAVER_PAR2_BENCH_SCENARIOS) has it explicitly unset in
+# rarpar_phase so an inherited value cannot silently narrow the run.
 #
 # Must be the GNU target, not musl: the parity bench dlopens a shared lib.
 set -euo pipefail
@@ -244,9 +252,39 @@ run_bench_protocol() {
       "$outdir/${label}-pass1.lanes" "$outdir/${label}-pass2.lanes"
   } | tee "$outdir/${label}-drift.txt"
 
+  # Full-suite check: a filter (criterion arg, or an inherited env filter) shows
+  # up here as a short lane list. Zero lanes is a hard failure; fewer than the
+  # documented expectation is a warning, because a corpus change is legitimate.
+  local got expect
+  got="$(wc -l < "$outdir/${label}-pass1.lanes" | tr -d ' ')"
+  expect="$(expected_lane_count "$label")"
+  if [ "$got" -eq 0 ]; then
+    gate_fail "$label produced ZERO criterion lanes — bench skipped, or a filter narrowed it to nothing"
+  elif [ "$expect" -gt 0 ] && [ "$got" -lt "$expect" ]; then
+    warn "[$label] $got lane(s), expected >= $expect — a filter may have narrowed the suite (doc §9g)"
+  else
+    log "[$label] full suite: $got lane(s) recorded (expected >= ${expect})"
+  fi
+
   BENCH_STATUS="${BENCH_STATUS}
-  $label: pass1=$rc1 pass2=$rc2  ($(grep -c '^  DRIFT' "$outdir/${label}-drift.txt" || true) lane(s) over ${DRIFT_PCT}%)"
+  $label: pass1=$rc1 pass2=$rc2  lanes=$got/${expect}  ($(grep -c '^  DRIFT' "$outdir/${label}-drift.txt" || true) lane(s) over ${DRIFT_PCT}%)"
   [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ] || gate_fail "$label bench exited non-zero (pass1=$rc1 pass2=$rc2)"
+}
+
+# Unconditional lane counts per bench target, verified against the sources:
+#   rapidyenc-parity : 5 fixtures x 2 engines + 2 CRC lanes = 12
+#                      (benches/rapidyenc_parity.rs:190-196, :230-239, :247-258)
+#   decode-simd      : 11 (benches/decode_simd.rs:440-488). The three
+#                      WEAVER_YENC_REAL_ARTICLE lanes (:352-400) are NOT counted
+#                      — that gate is env-provided and absent by design here.
+#   par2-repair / archive-hotspots : scenario- and fixture-driven, so no fixed
+#                      expectation; 0 is still a hard failure above.
+expected_lane_count() {
+  case "$1" in
+    rapidyenc-parity) printf '12' ;;
+    decode-simd)      printf '11' ;;
+    *)                printf '0'  ;;
+  esac
 }
 
 # ── (d) Proof greps ──────────────────────────────────────────────────────────
@@ -416,11 +454,212 @@ rarpar_phase() {
   #   archive_hotspots : rarpar/crates/weaver-unrar/Cargo.toml:111-113
   # Do not substitute ppmd_compare or gf16_gpu_vs_cpu — out of scope, and the
   # latter wants a GPU this instance does not have.
+
+  # FULL SCENARIO SET. par2_repair filters its scenarios from the environment
+  # (crates/weaver-par2/benches/par2_repair.rs:20 -> select_scenarios, empty
+  # filter == run everything). An inherited WEAVER_PAR2_BENCH_SCENARIOS would
+  # narrow the run silently and the log would still read green, so clear it
+  # here rather than trusting the caller's environment.
+  if [ -n "${WEAVER_PAR2_BENCH_SCENARIOS:-}" ]; then
+    warn "clearing inherited WEAVER_PAR2_BENCH_SCENARIOS='$WEAVER_PAR2_BENCH_SCENARIOS' — this run records the FULL scenario set"
+  fi
+  unset WEAVER_PAR2_BENCH_SCENARIOS
+
   run_bench_protocol "par2-repair" "$outdir" "$RARPAR_DIR" "$RARPAR_BENCH_RUSTFLAGS" -- \
     cargo bench --locked -p par2-rs --bench par2_repair --target "$TARGET"
 
   run_bench_protocol "archive-hotspots" "$outdir" "$RARPAR_DIR" "$RARPAR_BENCH_RUSTFLAGS" -- \
     cargo bench --locked -p unrar-rs --bench archive_hotspots --target "$TARGET"
+}
+
+# ── (g) Data preservation for later SVG generation (doc §9g) ────────────────
+#
+# Criterion's two-pass bookkeeping is what makes this worth keeping: on every
+# run the previous `new/` is rotated into `base/`. Our per-binary sequence is
+# warm -> pass1 -> pass2, so the shipped tree ends with
+#     base/ = recorded pass 1,  new/ = recorded pass 2
+# (the discarded warm pass has already been rotated out). Both recorded passes
+# therefore survive, with estimates.json + sample.json intact per lane.
+
+git_rev()   { git -C "$1" rev-parse HEAD 2>/dev/null || printf 'unknown'; }
+git_dirty() { { git -C "$1" status --porcelain 2>/dev/null || true; } | wc -l | tr -d ' '; }
+
+# Link-local IMDS only — not an AWS API call, no credentials, 2s timeouts so
+# this is a fast no-op anywhere that is not an EC2 instance.
+detect_instance_type() {
+  local token="" itype=""
+  token="$(curl -s --max-time 2 -X PUT 'http://169.254.169.254/latest/api/token' \
+    -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null || true)"
+  if [ -n "$token" ]; then
+    itype="$(curl -s --max-time 2 -H "X-aws-ec2-metadata-token: $token" \
+      'http://169.254.169.254/latest/meta-data/instance-type' 2>/dev/null || true)"
+  fi
+  [ -n "$itype" ] || itype="$(curl -s --max-time 2 \
+    'http://169.254.169.254/latest/meta-data/instance-type' 2>/dev/null || true)"
+  [ -n "$itype" ] || itype="${METADATA_INSTANCE_TYPE:-}"
+  printf '%s' "${itype:-unknown}"
+}
+
+# RYKERN_* ids from rapidyenc/rapidyenc.h:24-42, as decimal.
+rykern_name() {
+  case "${1:-}" in
+    0)    printf 'GENERIC' ;;
+    256)  printf 'SSE2' ;;
+    512)  printf 'SSSE3' ;;
+    897)  printf 'AVX' ;;
+    1027) printf 'AVX2' ;;
+    1539) printf 'VBMI2' ;;
+    832)  printf 'PCLMUL' ;;
+    1088) printf 'VPCLMUL' ;;
+    4096) printf 'NEON' ;;
+    -1)   printf 'unavailable' ;;
+    *)    printf 'unknown' ;;
+  esac
+}
+
+archive_criterion_trees() {
+  local repo root out
+  for repo in weaver rarpar; do
+    case "$repo" in
+      weaver) root="$WEAVER_DIR/target/criterion" ;;
+      rarpar) root="$RARPAR_DIR/target/criterion" ;;
+      *)      continue ;;
+    esac
+    out="$RESULTS_DIR/criterion-$repo.tar.gz"
+    if [ -d "$root" ]; then
+      # -C the parent so the archive unpacks as ./criterion/…
+      if tar -czf "$out" -C "$(dirname "$root")" criterion; then
+        log "archived $root -> $out ($(du -h "$out" | cut -f1 | tr -d ' '))"
+      else
+        gate_fail "failed to archive $root"
+      fi
+    else
+      gate_fail "criterion tree missing: $root — benches produced no persisted data"
+    fi
+  done
+}
+
+write_metadata_json() {
+  local out="$RESULTS_DIR/metadata.json"
+  command -v jq >/dev/null 2>&1 || { gate_fail "jq missing — cannot write metadata.json (recoverable later from the tarballs)"; return 0; }
+
+  local kernels dec_id="" crc_id=""
+  kernels="$(grep -h -m1 'rapidyenc kernels:' \
+    "$RESULTS_DIR"/weaver/rapidyenc-parity-pass1.log 2>/dev/null || true)"
+  if [ -n "$kernels" ]; then
+    dec_id="$(printf '%s' "$kernels" | sed -n 's/.*decode=\(-\{0,1\}[0-9]\{1,\}\).*/\1/p')"
+    crc_id="$(printf '%s' "$kernels" | sed -n 's/.*crc=\(-\{0,1\}[0-9]\{1,\}\).*/\1/p')"
+  fi
+
+  jq -n \
+    --arg timestamp_utc  "$STAMP" \
+    --arg instance_type  "$(detect_instance_type)" \
+    --arg cpu_model      "$(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//' || true)" \
+    --arg cpu_flags      "$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//' || true)" \
+    --arg cpu_cores      "$(nproc 2>/dev/null || echo 0)" \
+    --arg kernel         "$(uname -sr 2>/dev/null || echo unknown)" \
+    --arg rustc          "$(rustc -V 2>/dev/null || echo unknown)" \
+    --arg target         "$TARGET" \
+    --arg bench_rustflags        "$BENCH_RUSTFLAGS" \
+    --arg rarpar_bench_rustflags "$RARPAR_BENCH_RUSTFLAGS" \
+    --arg weaver_rev     "$(git_rev "$WEAVER_DIR")" \
+    --arg weaver_dirty   "$(git_dirty "$WEAVER_DIR")" \
+    --arg rarpar_rev     "$(git_rev "$RARPAR_DIR")" \
+    --arg rarpar_dirty   "$(git_dirty "$RARPAR_DIR")" \
+    --arg rapidyenc_rev  "$(git_rev "$RAPIDYENC_ROOT")" \
+    --arg rapidyenc_dirty "$(git_dirty "$RAPIDYENC_ROOT")" \
+    --arg dec_id "${dec_id:-}" --arg dec_name "$(rykern_name "${dec_id:-}")" \
+    --arg crc_id "${crc_id:-}" --arg crc_name "$(rykern_name "${crc_id:-}")" \
+    '{
+      timestamp_utc: $timestamp_utc,
+      instance_type: $instance_type,
+      cpu: { model: $cpu_model, cores: ($cpu_cores | tonumber? // 0), flags: $cpu_flags },
+      kernel: $kernel,
+      rustc: $rustc,
+      target: $target,
+      rustflags: { weaver_bench: $bench_rustflags, rarpar_bench: $rarpar_bench_rustflags },
+      revisions: {
+        weaver:    { rev: $weaver_rev,    dirty_files: ($weaver_dirty    | tonumber? // 0) },
+        rarpar:    { rev: $rarpar_rev,    dirty_files: ($rarpar_dirty    | tonumber? // 0) },
+        rapidyenc: { rev: $rapidyenc_rev, dirty_files: ($rapidyenc_dirty | tonumber? // 0) }
+      },
+      rapidyenc_kernels: {
+        decode_id:   ($dec_id | tonumber? // null), decode_name: $dec_name,
+        crc_id:      ($crc_id | tonumber? // null), crc_name:    $crc_name
+      },
+      criterion_pass_convention: {
+        base: "recorded pass 1",
+        new:  "recorded pass 2",
+        note: "the discarded warm pass was rotated out before pass 1 landed in base/"
+      }
+    }' > "$out" \
+    && log "wrote $out" \
+    || gate_fail "could not write $out"
+}
+
+# Flat array of every criterion estimate, both passes, both repos.
+# `change/` subdirs are skipped on purpose: their estimates.json is a
+# ratio schema (mean/median only), not a timing schema.
+write_summary_json() {
+  local out="$RESULTS_DIR/summary.json"
+  command -v jq >/dev/null 2>&1 || { gate_fail "jq missing — cannot write summary.json (recoverable later from the tarballs)"; return 0; }
+
+  # lane -> bench-target map, taken from the lane lists the parser already
+  # produced per binary, so nothing has to be guessed from lane-name prefixes.
+  local map="$RESULTS_DIR/lane-to-bench.tsv"
+  : > "$map"
+  local f label
+  for f in "$RESULTS_DIR"/weaver/*-pass1.lanes "$RESULTS_DIR"/rarpar/*-pass1.lanes; do
+    [ -f "$f" ] || continue
+    label="$(basename "$f" -pass1.lanes)"
+    awk -F'\t' -v b="$label" 'NF { print $1 "\t" b }' "$f" >> "$map"
+  done
+
+  local ndjson="$RESULTS_DIR/summary.ndjson"
+  : > "$ndjson"
+  local repo root est pass lane bench sample
+  for repo in weaver rarpar; do
+    case "$repo" in
+      weaver) root="$WEAVER_DIR/target/criterion" ;;
+      rarpar) root="$RARPAR_DIR/target/criterion" ;;
+      *)      continue ;;
+    esac
+    [ -d "$root" ] || continue
+    while IFS= read -r est; do
+      pass="$(basename "$(dirname "$est")")"
+      case "$pass" in base|new) : ;; *) continue ;; esac
+      lane="$(dirname "$(dirname "$est")")"
+      lane="${lane#"$root"/}"
+      bench="$(awk -F'\t' -v l="$lane" '$1 == l { print $2; exit }' "$map" || true)"
+      [ -n "$bench" ] || bench="unknown"
+      sample="$(dirname "$est")/sample.json"
+      jq -c -n \
+        --arg repo "$repo" --arg bench "$bench" --arg lane "$lane" --arg pass "$pass" \
+        --argjson est "$(cat "$est" 2>/dev/null || echo '{}')" \
+        --argjson smp "$(cat "$sample" 2>/dev/null || echo '{}')" \
+        '{
+          repo: $repo, bench: $bench, lane: $lane, pass: $pass,
+          mean_ns:      ($est.mean.point_estimate?    // null),
+          median_ns:    ($est.median.point_estimate?  // null),
+          std_dev_ns:   ($est.std_dev.point_estimate? // null),
+          sample_count: (($smp.times? // []) | length)
+        }' >> "$ndjson" || warn "could not parse $est"
+    done < <(find "$root" -type f -name estimates.json | sort)
+  done
+
+  if jq -s '.' "$ndjson" > "$out"; then
+    log "wrote $out ($(jq 'length' "$out") estimate rows across both repos)"
+    rm -f "$ndjson"
+  else
+    gate_fail "could not assemble $out"
+  fi
+}
+
+preserve_data() {
+  log "Preserving raw bench data for later SVG generation (doc §9g)…"
+  archive_criterion_trees
+  write_metadata_json
+  write_summary_json
 }
 
 print_summary() {
@@ -495,6 +734,22 @@ print_summary() {
     done
     echo
 
+    echo "----- preserved data (doc §9g) -----"
+    for l in criterion-weaver.tar.gz criterion-rarpar.tar.gz metadata.json summary.json; do
+      if [ -s "$RESULTS_DIR/$l" ]; then
+        printf '  OK      %-26s %s\n' "$l" "$(du -h "$RESULTS_DIR/$l" | cut -f1 | tr -d ' ')"
+      else
+        printf '  MISSING %-26s\n' "$l"
+      fi
+    done
+    if [ -s "$RESULTS_DIR/summary.json" ] && command -v jq >/dev/null 2>&1; then
+      echo "  summary.json rows: $(jq 'length' "$RESULTS_DIR/summary.json" 2>/dev/null || echo '?')"
+      echo "  rows per repo/pass:"
+      jq -r 'group_by(.repo + "/" + .pass) | .[] | "    \(.[0].repo)/\(.[0].pass): \(length)"' \
+        "$RESULTS_DIR/summary.json" 2>/dev/null || true
+    fi
+    echo
+
     echo "gate failures: $GATE_FAILURES"
     echo "results dir  : $RESULTS_DIR"
     echo "=========================================================="
@@ -509,7 +764,18 @@ print_teardown_checklist() {
 ------------------------------------------------------------
   1. COPY RESULTS OFF-BOX FIRST, before touching the instance:
        scp -r <box>:$RESULTS_DIR ./
-  2. VERIFY locally that these exist and are non-empty:
+  2. VERIFY locally that these FOUR arrived and are non-empty. They are
+     the raw material for later SVG generation and CANNOT be
+     reconstructed once the instance is gone:
+       (a) criterion-weaver.tar.gz   full weaver criterion tree
+       (b) criterion-rarpar.tar.gz   full rarpar criterion tree
+       (c) metadata.json             instance/cpu/kernel/rustc/revisions
+       (d) summary.json              flat per-lane estimates, both passes
+     Spot-check them locally before terminating:
+       tar -tzf criterion-weaver.tar.gz | head
+       jq '.instance_type, .rapidyenc_kernels' metadata.json
+       jq 'length' summary.json
+  3. VERIFY the rest of the run also arrived:
        summary.txt, revisions.txt, proof-gates.txt,
        weaver-yenc-tests-debug.log, weaver-yenc-tests-release.log,
        weaver/*-pass1.log, weaver/*-pass2.log, weaver/*-drift.txt,
@@ -566,6 +832,7 @@ main() {
   weaver_tests
   weaver_benches
   rarpar_phase
+  preserve_data
 
   print_summary
   print_teardown_checklist

@@ -42,7 +42,7 @@ Three consequences, and they are the whole reason for the run:
 1. weaver's **AVX-512 VBMI2 decode kernel has only ever executed under Intel SDE
    emulation**, never on physical silicon. The CI lane that covers it is
    `rust-test-sde` / matrix leg `spr-gfni-avx512`, which runs a hand-listed set of
-   kernel tests under `sde64 -spr` (`.github/workflows/deploy.yml:318-417`; matrix
+   kernel tests under `sde64 -spr` (`.github/workflows/deploy.yml:318-414`; matrix
    leg at `:331-333`, SDE wrapper at `:365-373`). SDE is a functional emulator: it
    can hide real-silicon issues (micro-arch corner cases, real masking/permute
    behavior, alignment/store faults) and tells us nothing about performance.
@@ -112,7 +112,7 @@ coverage regardless of what dispatch picks:
   `:243-288`, without-dot arm `:290-307`).
 - The per-block unit tests `avx512_vbmi2_block_*`
   (`engines/weaver-yenc/src/simd/tests.rs:1016,1042,1064`; invoked in the SDE
-  lane at `.github/workflows/deploy.yml:396-398`) run the VBMI2 block path
+  lane at `.github/workflows/deploy.yml:393-395`) run the VBMI2 block path
   directly.
 
 ### 2a. Why the test pass must run **debug and release**
@@ -137,7 +137,7 @@ Neither pass subsumes the other. `c7a-run.sh` runs both.
 > Note the SDE lane does **not** invoke
 > `forced_tier_kernels_match_scalar_in_production_shape` (its hand-listed test
 > names stop at `forced_tier_kernels_match_scalar_with_line_hints`,
-> `.github/workflows/deploy.yml:400`), and the ordinary
+> `.github/workflows/deploy.yml:397`), and the ordinary
 > `rust-test-regular` runner has no AVX-512, so that test's VBMI2 leg self-skips
 > there. c7a is therefore the **only** place it has ever run, emulated or not.
 > (CI gap, not fixed here — `.github` is out of scope for this change.)
@@ -217,7 +217,7 @@ discovery env var**. A third env var exists for an in-process static link.
   (`:178-184`).
 - **Must be the GNU target, not musl.** Static musl binaries can't `dlopen` a
   shared library. (The x86_64 musl release lanes at
-  `.github/workflows/deploy.yml:457-549` are for shipping, not for this bench.)
+  `.github/workflows/deploy.yml:454-546` are for shipping, not for this bench.)
 
 The bench also prints `rapidyenc kernels: decode=<n> crc=<n>`
 (`benches/rapidyenc_parity.rs:185-188`) as **decimal** `RYKERN_*` ids
@@ -321,13 +321,14 @@ hand-off behavior was validated on codex-x86 (ADL) where `available()` is true.
 c7a proves the *gate*, ADL proves the *path*. Record both facts together or the
 CRC story reads as half-tested.
 
-**Precondition — the box must run a rev that contains all of this.** As of
-2026-08-11 the C1 gate, the skip `eprintln!`, and the §3b CRC parity assert are
-**uncommitted** in the dev-mac working tree (`engines/weaver-yenc/src/crc.rs`,
-`engines/weaver-yenc/benches/rapidyenc_parity.rs`). Either commit them first, or
-sync the working tree with rsync (§7 — the sanctioned path). `c7a-run.sh`
-grep-checks the *source on the box* for all three markers before it runs anything
-and aborts with a clear message if the tree is stale.
+**Precondition — the box must run a rev that contains all of this.** The C1 gate,
+the skip `eprintln!`, and the §3b CRC parity assert landed in **`a3e3f68d`**
+("yenc updates, CI fixes"); they were uncommitted while this runbook was being
+written, so any checkout older than that cannot prove a thing here and will still
+report a cheerful green. `c7a-run.sh` grep-checks the *source on the box* for all
+of these markers before it runs anything and aborts if the tree is stale — keep
+that gate even though the markers are now committed, because the box is populated
+by rsync (§7a) and an rsync can be run from the wrong directory.
 
 ---
 
@@ -379,11 +380,9 @@ Grounded in `rust-toolchain.toml` + `.github/workflows/deploy.yml`:
   pin. rarpar pins the same **1.97.1** (`rarpar/rust-toolchain.toml:2`,
   `rust-version = "1.97.1"` at `rarpar/Cargo.toml:14`), so one toolchain serves
   both phases.
-  > **Stale elsewhere, flagged not fixed:** `.github/workflows/deploy.yml:20`
-  > still sets `RUST_TOOLCHAIN: "1.96"`. CI's `dtolnay/rust-toolchain` step
-  > installs 1.96 and then the `rust-toolchain.toml` pin pulls 1.97.1 anyway.
-  > Harmless for this run (the box obeys the pin), but do not copy "1.96" out of
-  > the workflow.
+  CI agrees as of `491dff03` ("toolchain fix"):
+  `.github/workflows/deploy.yml:20` now sets `RUST_TOOLCHAIN: "1.97.1"`. It read
+  `"1.96"` until that commit; ignore any older note claiming a divergence.
 - **`nasm` is required** — `aws-lc-sys` (v0.42.0, in both workspaces' build
   graphs) needs it. CI installs it in every native build lane, e.g.
   `.github/workflows/deploy.yml:183` (clippy), `:215` (rust-test-build) and
@@ -420,7 +419,8 @@ Assume **Ubuntu 24.04**. System packages installed by the bootstrap:
 
 Both phases must test the *working tree*, not a remote branch:
 
-- weaver's C1 gate / skip line / CRC parity assert are uncommitted (§4);
+- weaver's C1 gate / skip line / CRC parity assert only exist from `a3e3f68d`
+  onward (§4), and any local work in flight is by definition not yet pushed;
 - rarpar's `archive_hotspots` fixtures are **git-LFS** (`rarpar/.gitattributes`:
   `crates/weaver-unrar/tests/fixtures/**/*.rar filter=lfs …`). A plain `git clone`
   on the box yields LFS *pointer* files and the bench dies on a malformed archive.
@@ -500,7 +500,8 @@ Env overrides (both scripts, all have defaults):
 | `DEADMAN_MINUTES` | `240` | bootstrap's `shutdown -h +N`; set `0` to skip |
 | `RUST_TOOLCHAIN_FALLBACK` | `1.97.1` | bootstrap only, used if `rust-toolchain.toml` is missing |
 | `CXX` | `c++` | compiler for the §3a source oracle (`rapidyenc_decode_diff.rs:146`) |
-| `WEAVER_PAR2_BENCH_SCENARIOS` | *(unset ⇒ all)* | comma-separated substring filter for the rarpar par2 bench (`crates/weaver-par2/benches/par2_repair.rs:20`) |
+| `WEAVER_PAR2_BENCH_SCENARIOS` | **force-unset by the run script** | scenario filter for the rarpar par2 bench (`crates/weaver-par2/benches/par2_repair.rs:20`). `c7a-run.sh` clears it before benching (warning if it was set) so an inherited value cannot narrow the recorded suite — see §9g |
+| `METADATA_INSTANCE_TYPE` | *(unset ⇒ IMDS)* | fallback instance type for `metadata.json` when IMDS is unreachable (§9g) |
 
 Neither script makes an AWS API call. Provisioning and teardown are the
 operator's, by hand.
@@ -714,6 +715,97 @@ the CRC change (§4) moves the `body(+CRC)` lanes on this part specifically.
 | `par2_repair` scenarios | _fill_ | vs the AVX2+GFNI tier on 285H if a comparable run exists |
 | `archive_hotspots` | _fill_ | mostly non-GF16; a control lane for box speed |
 
+### 9g. Preserved data for SVG generation
+
+The tables above are the human summary. The **machine-readable record is the
+deliverable** — charts get generated from it later, long after the instance is
+gone, so it has to leave the box complete on the first try.
+
+**Full suites, no filters.** Every `cargo bench` in `c7a-run.sh` is invoked with a
+bench target and nothing else — no trailing Criterion filter argument anywhere —
+so each binary runs its complete lane set:
+
+| bench target | lanes recorded | note |
+|---|---|---|
+| `rapidyenc_parity` | **12** | 5 fixtures × 2 engines + 2 CRC lanes |
+| `decode_simd` | **11** | every lane at `benches/decode_simd.rs:440-488` |
+| `par2_repair` | all scenarios | `WEAVER_PAR2_BENCH_SCENARIOS` is **force-unset** by the run script |
+| `archive_hotspots` | all fixtures | fixture-driven, no filter |
+
+`par2_repair` is the one suite whose filter is an *environment* variable rather
+than an argument, so trusting the caller's environment is not good enough — the
+script clears it (warning if it was set) before benching. The run script asserts
+the lane count per binary: **zero lanes is a hard gate failure**, fewer than the
+expected count above is a warning (a corpus change is legitimate; a silent filter
+is not).
+
+**Expected skip — not a failure.** `decode_simd` also defines three lanes gated on
+`WEAVER_YENC_REAL_ARTICLE` (`benches/decode_simd.rs:352-400`):
+`yenc_decode_real_article_body`, `yenc_decode_real_article_macro_chunks`,
+`yenc_decode_real_article_macro_input_360k`. That gate wants a path to a real
+Usenet article file, which this run does not supply, so `bench_real_article_if_configured`
+returns immediately (`:353-355`) and those three lanes are **absent by design**.
+11 `decode_simd` lanes is the correct full-suite number here, not 14.
+
+**`base/` and `new/` are both recorded passes.** Criterion rotates the previous
+`new/` into `base/` on every run. The per-binary sequence is
+warm → pass 1 → pass 2, so the discarded warm pass has already been rotated out by
+the time the tree ships and what survives is:
+
+| criterion dir | contents |
+|---|---|
+| `<lane>/base/` | **recorded pass 1** |
+| `<lane>/new/` | **recorded pass 2** |
+| `<lane>/change/` | pass-2-vs-pass-1 ratios — *not* timings, and skipped by `summary.json` |
+
+Both passes therefore ship with `estimates.json` (mean / median / std_dev /
+median_abs_dev / slope point estimates + confidence intervals) and `sample.json`
+(`iters` + `times`, 100 samples) intact. That is the raw material: error bars,
+distributions, and the drift check are all reconstructable offline.
+
+**`$RESULTS_DIR` layout:**
+
+```
+<UTC-timestamp>/
+  criterion-weaver.tar.gz      # complete $WEAVER_DIR/target/criterion tree
+  criterion-rarpar.tar.gz      # complete $RARPAR_DIR/target/criterion tree
+  metadata.json                # provenance for the whole run (below)
+  summary.json                 # flat per-lane estimates, both passes, both repos
+  summary.txt                  # human summary
+  revisions.txt                # rev + dirty count per repo
+  proof-gates.txt              # C1 proof + differential case counts
+  lane-to-bench.tsv            # lane -> bench-target map used to build summary.json
+  cpu-features.log
+  weaver-yenc-tests-debug.log
+  weaver-yenc-tests-release.log
+  weaver/   <label>-{warm-DISCARDED,pass1,pass2}.log
+            <label>-{pass1,pass2}.lanes   <label>-drift.txt
+  rarpar/   rarpar-tests.log  README-phase.txt  (+ the same per-label files)
+```
+
+`metadata.json` carries instance type (IMDSv2, falling back to IMDSv1 then
+`METADATA_INSTANCE_TYPE`), CPU model / core count / full flags line, kernel,
+`rustc -V`, target, both RUSTFLAGS settings, `rev` + `dirty_files` for
+weaver / rarpar / rapidyenc (trees arrive by rsync and may legitimately be dirty,
+so the dirty count is recorded rather than assumed zero), the UTC run stamp, and
+the decoded `RYKERN_*` decode/crc kernel ids parsed out of the parity bench
+output — e.g. `{"decode_id": 1539, "decode_name": "VBMI2", "crc_id": 1088,
+"crc_name": "VPCLMUL"}`.
+
+`summary.json` is one flat array, built by walking both criterion trees with `jq`:
+
+```json
+[ { "repo": "weaver", "bench": "rapidyenc-parity",
+    "lane": "parity_weaver_decode_realshape", "pass": "base",
+    "mean_ns": 546290.1, "median_ns": 545880.3,
+    "std_dev_ns": 1811.4, "sample_count": 100 } ]
+```
+
+`repo` is `weaver` | `rarpar`; `pass` is `base` | `new` per the table above;
+`bench` comes from the lane→target map the run script records, not from guessing
+at lane-name prefixes. Sanity check after copying it back: row count should be
+`2 × (total lanes)` — for weaver alone that is `2 × 23 = 46`.
+
 ---
 
 ## 10. Triage: a differential FAILS on real silicon but passed under SDE
@@ -755,7 +847,7 @@ test fails on c7a while the SDE lane is green, capture the first divergent byte:
 
 - Cross-check the same input under SDE to confirm SDE-vs-silicon divergence:
   rebuild the test binary and run the failing test name under
-  `sde64 -spr -- <bin> <test>` exactly as `.github/workflows/deploy.yml:365-405`
+  `sde64 -spr -- <bin> <test>` exactly as `.github/workflows/deploy.yml:365-402`
   does. Same failure under SDE ⇒ ordinary logic bug; **passes under SDE, fails on
   c7a ⇒ genuine VBMI2 real-silicon bug** — file it with the `DIVERGE` dump.
 
@@ -773,12 +865,25 @@ script's copy is the one that gets skipped when someone Ctrl-Cs.
 1. **`scp` the results directory off-box and open it locally** before touching the
    instance. `RESULTS_DIR` defaults to
    `$WEAVER_DIR/ci/bench/results/<UTC-timestamp>`.
-2. Confirm `summary.txt`, both recorded bench passes and the drift report are
-   present and non-empty locally.
-3. **Terminate** the instance (root volume is `DeleteOnTermination`).
-4. Delete the **session security group**.
-5. Delete the **ephemeral keypair**.
-6. Confirm in the console that no c7a instance, SG or keypair from this session
+2. **Confirm these four arrived and are non-empty.** They are the raw material
+   for SVG generation (§9g) and cannot be reconstructed once the instance is gone:
+   - `criterion-weaver.tar.gz`
+   - `criterion-rarpar.tar.gz`
+   - `metadata.json`
+   - `summary.json`
+
+   Spot-check locally before going further:
+   ```sh
+   tar -tzf criterion-weaver.tar.gz | head
+   jq '.instance_type, .rapidyenc_kernels' metadata.json
+   jq 'length' summary.json      # expect 2 x total lanes
+   ```
+3. Confirm `summary.txt`, `proof-gates.txt`, both recorded bench passes and the
+   drift reports are present and non-empty locally.
+4. **Terminate** the instance (root volume is `DeleteOnTermination`).
+5. Delete the **session security group**.
+6. Delete the **ephemeral keypair**.
+7. Confirm in the console that no c7a instance, SG or keypair from this session
    remains.
 
 The bootstrap's dead-man `shutdown -h +240` only helps if the instance's
