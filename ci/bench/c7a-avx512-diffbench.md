@@ -328,7 +328,9 @@ written, so any checkout older than that cannot prove a thing here and will stil
 report a cheerful green. `c7a-run.sh` grep-checks the *source on the box* for all
 of these markers before it runs anything and aborts if the tree is stale — keep
 that gate even though the markers are now committed, because the box is populated
-by rsync (§7a) and an rsync can be run from the wrong directory.
+from the corpus image (§7a) and an image built before an increment landed would
+otherwise sail through green. Cross-check against `REVISION.json` in
+`revisions.txt`.
 
 ---
 
@@ -351,23 +353,17 @@ The checkout vendors `crcutil-1.0/`; the bootstrap runs
 `git submodule update --init --recursive` after clone to be safe, and globs for
 the emitted lib in case the name is versioned (`librapidyenc.so.1`).
 
-Revision: the bootstrap clones upstream master. The **dev-machine reference
-checkout** — call it `$RAPIDYENC_LOCAL`, defaulting to a sibling of your weaver
-checkout (`$(git rev-parse --show-toplevel)/../rapidyenc`); set it explicitly if
-your local rapidyenc lives elsewhere — is at **`27f435a`** ("Add build options to
-skip building tool/shared components"), i.e. rapidyenc v1.1.1-10-g27f435a. That
-is the rev all prior weaver-vs-rapidyenc numbers were taken against. Confirm it
-before running:
+Revision: **there is no clone step.** rapidyenc arrives in the corpus image
+(§7a) as a clean tree pinned at **`27f435a`** ("Add build options to skip
+building tool/shared components"), i.e. rapidyenc v1.1.1-10-g27f435a — the rev
+every prior weaver-vs-rapidyenc number was taken against. Pinning it in the
+image is what keeps the c7a numbers comparable to the M5/ADL/Zen2 baselines in
+§9 instead of drifting with upstream master.
 
-```sh
-RAPIDYENC_LOCAL="${RAPIDYENC_LOCAL:-$(git rev-parse --show-toplevel)/../rapidyenc}"
-git -C "$RAPIDYENC_LOCAL" describe --tags --always   # expect v1.1.1-10-g27f435a
-```
-
-If upstream master has moved, check out `27f435a` on the box manually before
-running the bootstrap (the bootstrap leaves an existing checkout's revision
-alone), so the c7a numbers stay comparable to the M5/ADL/Zen2 baselines in §9.
-The bootstrap prints whatever revision it ended up with.
+`crcutil-1.0/` is vendored in-tree upstream (no `.gitmodules`), so nothing needs
+initializing either — which matters, because `.git` does not ship. The bootstrap
+prints the rev it found from `REVISION.json` and warns if `crcutil-1.0/` is
+absent; confirm it reads `27f435a` before trusting any A/B number.
 
 ---
 
@@ -415,54 +411,102 @@ Assume **Ubuntu 24.04**. System packages installed by the bootstrap:
 
 ## 7. How to run
 
-### 7a. Get both repos onto the box — **rsync, not clone**
+### 7a. Get the sources onto the box — **pre-pushed ECR corpus image**
 
-Both phases must test the *working tree*, not a remote branch:
+> **AWS runs only.** This section describes source delivery for the c7a run.
+> Local-box runs (SYLIX, codex-x86) keep their own rsync recipes and are
+> completely unaffected by anything here.
 
-- weaver's C1 gate / skip line / CRC parity assert only exist from `a3e3f68d`
-  onward (§4), and any local work in flight is by definition not yet pushed;
-- rarpar's `archive_hotspots` fixtures are **git-LFS** (`rarpar/.gitattributes`:
-  `crates/weaver-unrar/tests/fixtures/**/*.rar filter=lfs …`). A plain `git clone`
-  on the box yields LFS *pointer* files and the bench dies on a malformed archive.
-  rsync carries the hydrated bytes.
+Source delivery is a single pre-built image:
 
-Run this **from inside your weaver checkout** so the defaults resolve. `$BOX` is
-`<user>@<public-dns>` for the instance.
-
-```sh
-WEAVER_LOCAL="${WEAVER_LOCAL:-$(git rev-parse --show-toplevel)}"
-RARPAR_LOCAL="${RARPAR_LOCAL:-$WEAVER_LOCAL/../rarpar}"
-
-rsync -az --info=progress2 \
-  --exclude 'target/' --exclude '.git/' --exclude 'tmp/' \
-  "$WEAVER_LOCAL/" "$BOX:~/weaver/"
-
-rsync -az --info=progress2 \
-  --exclude 'target/' --exclude '.git/' \
-  "$RARPAR_LOCAL/" "$BOX:~/rarpar/"
+```
+651588424025.dkr.ecr.us-east-1.amazonaws.com/weaver-bench-corpus:latest
 ```
 
-`RARPAR_LOCAL` defaults to a **sibling checkout** of weaver; set it explicitly if
-your rarpar checkout lives elsewhere. These two are *dev-machine* variables for
-the sync step only — they are not read by either on-box script (whose own
-variables are `WEAVER_DIR` / `RARPAR_DIR`, table in §7b).
+It carries `/corpus/weaver`, `/corpus/rarpar` and `/corpus/rapidyenc`, each with
+its own `REVISION.json` (`{repo, rev, dirty_files, staged_at_utc}`).
 
-Payloads with those excludes: weaver ≈ **0.7 GB**, rarpar ≈ **1.6 GB** (of which
-~0.9 GB is the unrar/par2 LFS fixture corpus). Excluding `target/` is what keeps
-this from being an 80 GB transfer; excluding `.git/` is what keeps LFS out of the
-picture entirely.
+**Why an image and not a clone** — the same two reasons that used to make rsync
+mandatory, now handled once at image-build time instead of on every run:
+
+- weaver must be tested as **working-tree state**. Its C1 gate / skip line / CRC
+  parity assert only exist from `a3e3f68d` onward (§4), and any increment in
+  flight is by definition not yet pushed. The image stages the working tree,
+  uncommitted work included — hence `dirty_files` in `REVISION.json`, which is
+  recorded rather than assumed to be zero.
+- rarpar's `archive_hotspots` fixtures are **git-LFS**
+  (`rarpar/.gitattributes`: `crates/weaver-unrar/tests/fixtures/**/*.rar filter=lfs …`).
+  A `git clone` on the box yields LFS *pointer* files and the bench dies on a
+  malformed archive. The image build hydrates them.
+
+rapidyenc ships **pre-pinned at `27f435a`** (§5), so there is no clone step, no
+network fetch, and no revision drift between runs.
+
+**`.git` does not ship.** Provenance therefore comes from `REVISION.json`, never
+from `git rev-parse` — which is what `metadata.json` and `revisions.txt` read
+(§9g).
+
+#### Provisioning prerequisite — IAM (do this at launch, not here)
+
+The instance needs an IAM role (or environment credentials) granting, on that
+repository:
+
+| action | why |
+|---|---|
+| `ecr:GetAuthorizationToken` | `aws ecr get-login-password` |
+| `ecr:BatchGetImage` | manifest read |
+| `ecr:GetDownloadUrlForLayer` | layer download |
+
+**Neither script creates or modifies IAM.** Attach the role when you launch the
+instance; the bootstrap fails with this list if login is refused.
+
+#### Pull and extract
+
+```sh
+CORPUS_IMAGE="651588424025.dkr.ecr.us-east-1.amazonaws.com/weaver-bench-corpus:latest"
+CORPUS_REGISTRY="${CORPUS_IMAGE%%/*}"
+
+sudo apt-get update -y && sudo apt-get install -y docker.io awscli
+
+aws ecr get-login-password --region us-east-1 \
+  | sudo docker login --username AWS --password-stdin "$CORPUS_REGISTRY"
+
+sudo docker pull "$CORPUS_IMAGE"
+
+# Extract WITHOUT running anything from the image.
+cid="$(sudo docker create "$CORPUS_IMAGE")"
+sudo docker cp "$cid:/corpus/." ~/
+sudo docker rm -v "$cid"
+```
+
+That leaves `~/weaver`, `~/rarpar` and `~/rapidyenc` — the defaults
+`WEAVER_DIR` / `RARPAR_DIR` / `RAPIDYENC_ROOT` already expect.
+
+**No container is ever started.** `docker create` materializes a container's
+filesystem without running it, `docker cp` reads bytes out, `docker rm` discards
+it — no process from the image executes on the box. Keep it that way; the image
+is a delivery vehicle, not a runtime.
+
+`c7a-bootstrap.sh` performs this same pull-and-extract itself when any tree is
+missing, so in practice you only need enough of it by hand to get the weaver
+tree (which contains the scripts). It is a no-op once all three trees carry a
+`REVISION.json`; pass `CORPUS_FORCE=1` to re-pull deliberately.
 
 ### 7b. Bootstrap, then run
 
 ```sh
-# 1. bootstrap: dead-man shutdown + CPU gate + system deps + rustup(1.97.1)
-#    + rapidyenc source & .so
+# 1. bootstrap: dead-man shutdown + CPU gate + system deps + corpus image
+#    (pull/extract, no-op if already extracted) + rustup(1.97.1) + librapidyenc.so
 cd ~/weaver
 ./ci/bench/c7a-bootstrap.sh
 
 # 2. run: everything, teed and summarized, weaver-yenc then rarpar
 ./ci/bench/c7a-run.sh
 ```
+
+The bootstrap re-runs the §7a pull-and-extract for any tree that is missing, so
+by hand you only need enough of §7a to land `~/weaver` (which is where these
+scripts live); the bootstrap fetches the rest.
 
 `c7a-run.sh` sequence:
 
@@ -485,10 +529,13 @@ Env overrides (both scripts, all have defaults):
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `WEAVER_DIR` | `~/weaver` | weaver checkout (rsync'd, §7a) |
-| `RARPAR_DIR` | `~/rarpar` | rarpar checkout (rsync'd) — **run aborts if absent** |
-| `RAPIDYENC_ROOT` | `~/rapidyenc` | rapidyenc source tree (§3a) + cmake build dir |
-| `RAPIDYENC_GIT` | `https://github.com/animetosho/rapidyenc.git` | clone URL (bootstrap) |
+| `CORPUS_IMAGE` | `651588424025.dkr.ecr.us-east-1.amazonaws.com/weaver-bench-corpus:latest` | ECR corpus image (§7a); recorded in `metadata.json` |
+| `CORPUS_DEST` | `~` | where `/corpus/.` is extracted; the three tree defaults derive from it |
+| `CORPUS_REGION` | `us-east-1` | region for `aws ecr get-login-password` (bootstrap) |
+| `CORPUS_FORCE` | `0` | `1` re-pulls and re-extracts even when the trees are present (bootstrap) |
+| `WEAVER_DIR` | `$CORPUS_DEST/weaver` | weaver tree from the corpus image |
+| `RARPAR_DIR` | `$CORPUS_DEST/rarpar` | rarpar tree — **run aborts if absent** |
+| `RAPIDYENC_ROOT` | `$CORPUS_DEST/rapidyenc` | rapidyenc tree, pinned at `27f435a` (§3a) + cmake build dir |
 | `WEAVER_RAPIDYENC_LIB` | `$RAPIDYENC_ROOT/build/librapidyenc.so` | dlopen target (§3b) |
 | `TARGET` | `x86_64-unknown-linux-gnu` | cargo target |
 | `BENCH_RUSTFLAGS` | `-C target-cpu=native` | RUSTFLAGS for the **weaver** perf benches only |
@@ -511,9 +558,9 @@ operator's, by hand.
 ## 8. rarpar phase — PAR2 GFNI + AVX-512 GF16 on Zen 4 (mandatory)
 
 > Promoted from "stretch / optional" to a required phase. rarpar is a **separate
-> repo** (`$RARPAR_LOCAL`, by default a sibling checkout of weaver), rsync'd to
-> `$RARPAR_DIR` on the box alongside weaver (§7a). `c7a-run.sh` **hard-fails** if
-> `$RARPAR_DIR` is missing.
+> repo**, delivered as `/corpus/rarpar` in the same ECR image as weaver and
+> extracted to `$RARPAR_DIR` (§7a). `c7a-run.sh` **hard-fails** if `$RARPAR_DIR`
+> is missing.
 
 rarpar carries GF16 / Reed-Solomon tiers that gate on **GFNI + AVX-512**:
 
@@ -572,7 +619,7 @@ Prerequisites, all already satisfied by §6/§7:
 - **Toolchain** — rarpar pins the same 1.97.1, so nothing extra to install.
 - **Fixtures** — `crates/weaver-unrar/tests/fixtures` (~797 MB) and
   `crates/weaver-par2/tests/fixtures` (~114 MB) must be the real LFS-hydrated
-  bytes; rsync from the dev mac guarantees that (§7a). `archive_hotspots` reads
+  bytes; the corpus image build hydrates them (§7a). `archive_hotspots` reads
   them directly via `CARGO_MANIFEST_DIR` (`benches/archive_hotspots.rs:3-8`);
   `par2_repair` stages a scenario into a tempdir per run
   (`crates/weaver-par2/tests/support/benchmark_support.rs:125-135`) and asserts
@@ -772,7 +819,7 @@ distributions, and the drift check are all reconstructable offline.
   metadata.json                # provenance for the whole run (below)
   summary.json                 # flat per-lane estimates, both passes, both repos
   summary.txt                  # human summary
-  revisions.txt                # rev + dirty count per repo
+  revisions.txt                # REVISION.json provenance per tree
   proof-gates.txt              # C1 proof + differential case counts
   lane-to-bench.tsv            # lane -> bench-target map used to build summary.json
   cpu-features.log
@@ -786,8 +833,10 @@ distributions, and the drift check are all reconstructable offline.
 `metadata.json` carries instance type (IMDSv2, falling back to IMDSv1 then
 `METADATA_INSTANCE_TYPE`), CPU model / core count / full flags line, kernel,
 `rustc -V`, target, both RUSTFLAGS settings, `rev` + `dirty_files` for
-weaver / rarpar / rapidyenc (trees arrive by rsync and may legitimately be dirty,
-so the dirty count is recorded rather than assumed zero), the UTC run stamp, and
+weaver / rarpar / rapidyenc — read from each tree's `REVISION.json`, **not** from
+git, because the corpus image ships no `.git`; weaver deliberately ships with
+uncommitted increments, so `dirty_files` is recorded rather than assumed zero —
+plus `staged_at_utc`, the `corpus_image` reference, the UTC run stamp, and
 the decoded `RYKERN_*` decode/crc kernel ids parsed out of the parity bench
 output — e.g. `{"decode_id": 1539, "decode_name": "VBMI2", "crc_id": 1088,
 "crc_name": "VPCLMUL"}`.

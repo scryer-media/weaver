@@ -34,9 +34,14 @@
 set -euo pipefail
 
 # ── Config (all overridable; keep in sync with the doc §7b table) ────────────
-WEAVER_DIR="${WEAVER_DIR:-$HOME/weaver}"
-RARPAR_DIR="${RARPAR_DIR:-$HOME/rarpar}"
-RAPIDYENC_ROOT="${RAPIDYENC_ROOT:-$HOME/rapidyenc}"
+# Source delivery is the ECR corpus image (doc §7a); it extracts /corpus/. into
+# $CORPUS_DEST, giving $CORPUS_DEST/{weaver,rarpar,rapidyenc}. CORPUS_IMAGE is
+# recorded in metadata.json so a chart can always be traced back to its input.
+CORPUS_DEST="${CORPUS_DEST:-$HOME}"
+CORPUS_IMAGE="${CORPUS_IMAGE:-651588424025.dkr.ecr.us-east-1.amazonaws.com/weaver-bench-corpus:latest}"
+WEAVER_DIR="${WEAVER_DIR:-$CORPUS_DEST/weaver}"
+RARPAR_DIR="${RARPAR_DIR:-$CORPUS_DEST/rarpar}"
+RAPIDYENC_ROOT="${RAPIDYENC_ROOT:-$CORPUS_DEST/rapidyenc}"
 WEAVER_RAPIDYENC_LIB="${WEAVER_RAPIDYENC_LIB:-$RAPIDYENC_ROOT/build/librapidyenc.so}"
 TARGET="${TARGET:-x86_64-unknown-linux-gnu}"
 # Perf bench only: let weaver's non-intrinsic driver code use Zen4 for a fair A/B
@@ -79,10 +84,11 @@ assert_cpu_features() {
 }
 
 # ── (b) Source preconditions ─────────────────────────────────────────────────
-# These four markers are what the run is FOR. As of 2026-08-11 the first three
-# were uncommitted on the dev mac, so a box populated by `git clone` instead of
-# the rsync recipe (doc §7a) would run a tree that cannot prove any of them —
-# and would report a cheerful green. Fail loudly and early instead.
+# These markers are what the run is FOR. The corpus image ships weaver as
+# working-tree state precisely so they are present, but a STALE image — built
+# before an increment landed — would run a tree that cannot prove any of them
+# and would still report a cheerful green. Fail loudly and early instead, and
+# cross-check the result against REVISION.json in revisions.txt.
 assert_source_preconditions() {
   log "Asserting the weaver tree on this box carries the markers under test…"
   local crc="$WEAVER_DIR/engines/weaver-yenc/src/crc.rs"
@@ -114,14 +120,16 @@ record_revisions() {
   local d
   {
     echo "stamp: $STAMP"
+    echo "corpus image: ${CORPUS_IMAGE:-unknown}"
     for d in "$WEAVER_DIR" "$RARPAR_DIR" "$RAPIDYENC_ROOT"; do
       echo "--- $d ---"
-      if [ -d "$d/.git" ]; then
-        echo "  rev:   $(git -C "$d" rev-parse HEAD 2>/dev/null || echo '?')"
-        echo "  desc:  $(git -C "$d" describe --tags --always --dirty 2>/dev/null || echo '?')"
-        echo "  dirty: $(git -C "$d" status --porcelain 2>/dev/null | wc -l | tr -d ' ') file(s)"
+      if [ -f "$d/REVISION.json" ]; then
+        echo "  repo:      $(revision_field "$d" repo "$(basename "$d")")"
+        echo "  rev:       $(revision_field "$d" rev)"
+        echo "  dirty:     $(revision_field "$d" dirty_files 0) file(s) at image-build time"
+        echo "  staged_at: $(revision_field "$d" staged_at_utc)"
       else
-        echo "  (no .git — rsync'd working tree, which is the sanctioned path; doc §7a)"
+        echo "  NO REVISION.json — this tree did not come from the corpus image (doc §7a)"
       fi
     done
     echo "--- toolchain ---"
@@ -412,12 +420,13 @@ weaver_benches() {
 # `-p weaver-par2` fails with "package not found". Do not "fix" these back.
 rarpar_phase() {
   [ -d "$RARPAR_DIR" ] || die "RARPAR_DIR '$RARPAR_DIR' not found.
-     The rarpar phase is MANDATORY (doc §8). rsync it from the dev machine —
-     run this from inside your weaver checkout (doc §7a):
-       RARPAR_LOCAL=\"\${RARPAR_LOCAL:-\$(git rev-parse --show-toplevel)/../rarpar}\"
-       rsync -az --exclude 'target/' --exclude '.git/' \\
-         \"\$RARPAR_LOCAL/\" \"\$BOX:~/rarpar/\"
-     (rsync, not git clone: the unrar bench fixtures are git-LFS.)"
+     The rarpar phase is MANDATORY (doc §8). rarpar ships in the corpus image
+     alongside weaver, so a missing tree means the pull or the extraction did
+     not complete. Re-pull and re-extract (doc §7a):
+       CORPUS_FORCE=1 ./ci/bench/c7a-bootstrap.sh
+     If it is still absent, the image itself is missing /corpus/rarpar and
+     needs rebuilding — do not fall back to a git clone, the unrar bench
+     fixtures are git-LFS and would arrive as pointer files."
 
   local outdir="$RESULTS_DIR/rarpar"
   mkdir -p "$outdir"
@@ -481,8 +490,18 @@ rarpar_phase() {
 # (the discarded warm pass has already been rotated out). Both recorded passes
 # therefore survive, with estimates.json + sample.json intact per lane.
 
-git_rev()   { git -C "$1" rev-parse HEAD 2>/dev/null || printf 'unknown'; }
-git_dirty() { { git -C "$1" status --porcelain 2>/dev/null || true; } | wc -l | tr -d ' '; }
+# Provenance comes from each tree's REVISION.json, NOT from git: the corpus
+# image ships working-tree state without `.git`, so `git rev-parse` would fail
+# on every tree. Schema: {repo, rev, dirty_files, staged_at_utc}. `dirty_files`
+# is recorded rather than assumed zero — weaver deliberately ships with
+# uncommitted increments staged into the image.
+revision_field() {   # <tree-dir> <field> [default]
+  local f="$1/REVISION.json" out=""
+  if [ -f "$f" ] && command -v jq >/dev/null 2>&1; then
+    out="$(jq -r --arg k "$2" '.[$k] // empty' "$f" 2>/dev/null || true)"
+  fi
+  printf '%s' "${out:-${3:-unknown}}"
+}
 
 # Link-local IMDS only — not an AWS API call, no credentials, 2s timeouts so
 # this is a fast no-op anywhere that is not an EC2 instance.
@@ -562,12 +581,16 @@ write_metadata_json() {
     --arg target         "$TARGET" \
     --arg bench_rustflags        "$BENCH_RUSTFLAGS" \
     --arg rarpar_bench_rustflags "$RARPAR_BENCH_RUSTFLAGS" \
-    --arg weaver_rev     "$(git_rev "$WEAVER_DIR")" \
-    --arg weaver_dirty   "$(git_dirty "$WEAVER_DIR")" \
-    --arg rarpar_rev     "$(git_rev "$RARPAR_DIR")" \
-    --arg rarpar_dirty   "$(git_dirty "$RARPAR_DIR")" \
-    --arg rapidyenc_rev  "$(git_rev "$RAPIDYENC_ROOT")" \
-    --arg rapidyenc_dirty "$(git_dirty "$RAPIDYENC_ROOT")" \
+    --arg corpus_image   "${CORPUS_IMAGE:-unknown}" \
+    --arg weaver_rev     "$(revision_field "$WEAVER_DIR" rev)" \
+    --arg weaver_dirty   "$(revision_field "$WEAVER_DIR" dirty_files 0)" \
+    --arg weaver_staged  "$(revision_field "$WEAVER_DIR" staged_at_utc)" \
+    --arg rarpar_rev     "$(revision_field "$RARPAR_DIR" rev)" \
+    --arg rarpar_dirty   "$(revision_field "$RARPAR_DIR" dirty_files 0)" \
+    --arg rarpar_staged  "$(revision_field "$RARPAR_DIR" staged_at_utc)" \
+    --arg rapidyenc_rev  "$(revision_field "$RAPIDYENC_ROOT" rev)" \
+    --arg rapidyenc_dirty "$(revision_field "$RAPIDYENC_ROOT" dirty_files 0)" \
+    --arg rapidyenc_staged "$(revision_field "$RAPIDYENC_ROOT" staged_at_utc)" \
     --arg dec_id "${dec_id:-}" --arg dec_name "$(rykern_name "${dec_id:-}")" \
     --arg crc_id "${crc_id:-}" --arg crc_name "$(rykern_name "${crc_id:-}")" \
     '{
@@ -578,10 +601,12 @@ write_metadata_json() {
       rustc: $rustc,
       target: $target,
       rustflags: { weaver_bench: $bench_rustflags, rarpar_bench: $rarpar_bench_rustflags },
+      corpus_image: $corpus_image,
+      revision_source: "REVISION.json per tree (corpus image ships no .git)",
       revisions: {
-        weaver:    { rev: $weaver_rev,    dirty_files: ($weaver_dirty    | tonumber? // 0) },
-        rarpar:    { rev: $rarpar_rev,    dirty_files: ($rarpar_dirty    | tonumber? // 0) },
-        rapidyenc: { rev: $rapidyenc_rev, dirty_files: ($rapidyenc_dirty | tonumber? // 0) }
+        weaver:    { rev: $weaver_rev,    dirty_files: ($weaver_dirty    | tonumber? // 0), staged_at_utc: $weaver_staged },
+        rarpar:    { rev: $rarpar_rev,    dirty_files: ($rarpar_dirty    | tonumber? // 0), staged_at_utc: $rarpar_staged },
+        rapidyenc: { rev: $rapidyenc_rev, dirty_files: ($rapidyenc_dirty | tonumber? // 0), staged_at_utc: $rapidyenc_staged }
       },
       rapidyenc_kernels: {
         decode_id:   ($dec_id | tonumber? // null), decode_name: $dec_name,

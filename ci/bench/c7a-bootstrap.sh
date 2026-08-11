@@ -226,7 +226,10 @@ fetch_corpus() {
 
   log "Extracting /corpus/. -> $CORPUS_DEST/ (container is created, never run)"
   local cid rc=0
-  cid="$($DOCKER create "$CORPUS_IMAGE")" || die "docker create failed"
+  # The dummy argv is REQUIRED: the corpus image is FROM scratch with no CMD,
+  # so a bare `docker create` fails with "no command specified". The container
+  # is never started; /bin/true need not exist in the image.
+  cid="$($DOCKER create "$CORPUS_IMAGE" /bin/true)" || die "docker create failed"
   $DOCKER cp "$cid:/corpus/." "$CORPUS_DEST/" || rc=$?
   $DOCKER rm -v "$cid" >/dev/null 2>&1 || warn "could not remove scratch container $cid"
   [ "$rc" -eq 0 ] || die "docker cp of /corpus/. failed (rc=$rc)"
