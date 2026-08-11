@@ -1743,3 +1743,448 @@ fn dispatch_kernel_matches_scalar_on_hinted_encoded_streams() {
         }
     }
 }
+
+/// Line-structured, special-free payload for the NEON search-end differentials:
+/// `line_length` columns of data separated by raw `\r\n`, containing no `=`,
+/// `.`, `\r` or `\n` outside those breaks, so any terminator in a case body is
+/// exactly the one the test spliced in.
+#[cfg(target_arch = "aarch64")]
+fn search_end_body(len: usize, line_length: usize) -> Vec<u8> {
+    let mut body = Vec::with_capacity(len + 2);
+    let mut col = 0usize;
+    let mut i = 0usize;
+    while body.len() < len {
+        if col == line_length {
+            body.extend_from_slice(b"\r\n");
+            col = 0;
+            continue;
+        }
+        body.push(b'A' + (i % 26) as u8);
+        col += 1;
+        i += 1;
+    }
+    body.truncate(len);
+    body
+}
+
+#[cfg(target_arch = "aarch64")]
+fn splice_at(body: &[u8], at: usize, seq: &[u8]) -> Vec<u8> {
+    let mut out = body.to_vec();
+    out[at..at + seq.len()].copy_from_slice(seq);
+    out
+}
+
+/// Decode `input` as exactly two chunks split at `split`, carrying state
+/// across the boundary (the shape that drives the search-end head resolution).
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::type_complexity)]
+fn run_kernel_split_once(
+    input: &[u8],
+    split: usize,
+    scalar: bool,
+) -> (Vec<u8>, usize, RapidyencDecodeEnd, KernelState) {
+    let mut output = vec![0u8; input.len() + 64];
+    let mut state = KernelState::body_with_line_length(None);
+    let mut consumed = 0usize;
+    let mut written = 0usize;
+    let mut end = RapidyencDecodeEnd::None;
+    for (start, stop) in [(0usize, split), (split, input.len())] {
+        if end != RapidyencDecodeEnd::None {
+            break;
+        }
+        let outcome = if scalar {
+            decode_kernel_scalar(
+                &input[start..stop],
+                &mut output[written..],
+                &mut state,
+                true,
+                true,
+                true,
+            )
+        } else {
+            decode_kernel(
+                &input[start..stop],
+                &mut output[written..],
+                &mut state,
+                true,
+                true,
+                true,
+            )
+        }
+        .expect("chunked decode with preserve_pending cannot error");
+        written += outcome.written;
+        consumed = start + outcome.consumed;
+        end = outcome.end;
+    }
+    output.truncate(written);
+    (output, consumed, end, state)
+}
+
+/// The search-end flat kernel must agree with the scalar oracle for a
+/// terminator/control sequence placed anywhere around a 64-byte window edge.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn neon_search_end_matches_scalar_around_window_boundaries() {
+    let base = search_end_body(4096, 128);
+    let cases: [(&[u8], RapidyencDecodeEnd); 3] = [
+        (b"\r\n=y", RapidyencDecodeEnd::Control),
+        (b"\r\n.\r\n", RapidyencDecodeEnd::Article),
+        (b"\r\n.=y", RapidyencDecodeEnd::Control),
+    ];
+    for (seq, expected_end) in cases {
+        for boundary in [64usize, 128, 256, 1024, 2048, 3968] {
+            for delta in -4i64..=4 {
+                let at = (boundary as i64 + delta) as usize;
+                let input = splice_at(&base, at, seq);
+                let simd = run_kernel_whole(&input, true, true, true, false, None).unwrap();
+                let reference = run_kernel_whole(&input, true, true, true, true, None).unwrap();
+                assert_eq!(
+                    reference.2, expected_end,
+                    "reference end for seq={seq:?} boundary={boundary} delta={delta}"
+                );
+                assert_eq!(
+                    simd, reference,
+                    "seq={seq:?} boundary={boundary} delta={delta}"
+                );
+            }
+        }
+    }
+}
+
+/// `=y` inside a data line is an escaped `y`, never a control boundary: the
+/// in-kernel probe must not fire without a preceding `\r\n`.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn neon_search_end_ignores_mid_line_eq_y() {
+    let base = search_end_body(4096, 128);
+    for boundary in [64usize, 128, 256, 1024, 2048, 3968] {
+        for delta in -4i64..=4 {
+            let at = (boundary as i64 + delta) as usize;
+            // The two leading data bytes guarantee the `=` is not at a line
+            // start whatever the surrounding structure is.
+            let input = splice_at(&base, at, b"QQ=yQQ");
+            let simd = run_kernel_whole(&input, true, true, true, false, None).unwrap();
+            let reference = run_kernel_whole(&input, true, true, true, true, None).unwrap();
+            assert_eq!(
+                reference.2,
+                RapidyencDecodeEnd::None,
+                "mid-line `=y` must not end at boundary={boundary} delta={delta}"
+            );
+            assert_eq!(simd, reference, "boundary={boundary} delta={delta}");
+        }
+    }
+}
+
+/// An escape at the last byte of a window carries `escFirst` into the window
+/// the probe aborts; the break state must be `Eq` so the scalar rescan
+/// unescapes the terminator's `\r` before resolving the boundary.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn neon_search_end_handles_escape_at_window_edge() {
+    let base = search_end_body(4096, 128);
+    let cases: [(&[u8], RapidyencDecodeEnd); 3] = [
+        (b"\r\n=y", RapidyencDecodeEnd::Control),
+        (b"\r\n.\r\n", RapidyencDecodeEnd::Article),
+        (b"\r\n.=y", RapidyencDecodeEnd::Control),
+    ];
+    for (seq, expected_end) in cases {
+        for boundary in [128usize, 256, 1024, 2048] {
+            let mut input = splice_at(&base, boundary, seq);
+            input[boundary - 1] = b'=';
+            let simd = run_kernel_whole(&input, true, true, true, false, None).unwrap();
+            let reference = run_kernel_whole(&input, true, true, true, true, None).unwrap();
+            assert_eq!(
+                reference.2, expected_end,
+                "reference end for seq={seq:?} boundary={boundary}"
+            );
+            assert_eq!(simd, reference, "seq={seq:?} boundary={boundary}");
+        }
+    }
+}
+
+/// Terminator sequences straddling a chunk entry: the leading `\r\n` lands in
+/// chunk 1, so only the head resolution can see it. Covers chunk-1 tails of
+/// `\r`, `\r\n`, `\r\n.`, `\r\n=` and `\r\n.\r`.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn neon_search_end_head_resolution_matches_scalar_across_chunk_entry() {
+    let base = search_end_body(4096, 128);
+    let cases: [(&[u8], RapidyencDecodeEnd); 4] = [
+        (b"\r\n=y", RapidyencDecodeEnd::Control),
+        (b"\r\n.\r\n", RapidyencDecodeEnd::Article),
+        (b"\r\n.=y", RapidyencDecodeEnd::Control),
+        (b"\r\n.data", RapidyencDecodeEnd::None),
+    ];
+    for (seq, expected_end) in cases {
+        for at in [1024usize, 1088, 1091] {
+            let input = splice_at(&base, at, seq);
+            for cut in 1..=seq.len() {
+                let split = at + cut;
+                let simd = run_kernel_split_once(&input, split, false);
+                let reference = run_kernel_split_once(&input, split, true);
+                assert_eq!(
+                    reference.2, expected_end,
+                    "reference end for seq={seq:?} at={at} cut={cut}"
+                );
+                assert_eq!(simd, reference, "seq={seq:?} at={at} cut={cut}");
+            }
+        }
+    }
+}
+
+/// Special-free, line-structured body for the production-shape forced-tier
+/// differential: `columns` data bytes per line separated by `\r\n`, with no
+/// `=`, `.`, CR or LF outside those breaks, so the only escape or terminator in
+/// a body is the one the case splices in.
+///
+/// Deliberately a crate-local restatement of the SIMD-reaching shapes in
+/// `tests/rapidyenc_decode_diff.rs`: an integration test cannot be imported
+/// from inside the crate, and this one must also build on x86_64, where
+/// `search_end_body` above is `cfg`-ed out.
+fn production_line_body(len: usize, columns: usize) -> Vec<u8> {
+    const DATA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-*";
+    let mut body = Vec::with_capacity(len + 2);
+    let mut col = 0usize;
+    let mut idx = 0usize;
+    while body.len() < len {
+        if col == columns {
+            body.extend_from_slice(b"\r\n");
+            col = 0;
+            continue;
+        }
+        body.push(DATA[idx % DATA.len()]);
+        col += 1;
+        idx += 1;
+    }
+    body.truncate(len);
+    body
+}
+
+fn production_splice_at(body: &[u8], at: usize, seq: &[u8]) -> Vec<u8> {
+    assert!(at + seq.len() <= body.len(), "splice past end of body");
+    let mut out = body.to_vec();
+    out[at..at + seq.len()].copy_from_slice(seq);
+    out
+}
+
+/// Bodies for the production-shape forced-tier differential: no-end bodies,
+/// each end/control form swept across a 64-byte window edge (bytes 62..=66 of
+/// the window starting at 192), a mid-line `=y` that must NOT end, dot-stuffed
+/// line starts, escapes at the window edge and dense escape runs. Every body
+/// clears the 128-byte flat-kernel gate.
+fn production_shape_bodies() -> Vec<(String, Vec<u8>)> {
+    const WINDOW_EDGE: [usize; 5] = [254, 255, 256, 257, 258];
+    let base = production_line_body(1024, 128);
+    let mut bodies: Vec<(String, Vec<u8>)> = Vec::new();
+
+    // Realistic escape-bearing article bodies, with and without a trailer.
+    let payload: Vec<u8> = (0..4096)
+        .map(|idx| ((idx * 31 + 17) & 0xff) as u8)
+        .collect();
+    let encoded = encoded_body_for(&payload, 128);
+    bodies.push(("encoded-no-end".to_string(), encoded.clone()));
+    let mut with_trailer = encoded;
+    with_trailer.extend_from_slice(b"\r\n=yend size=4096 part=1 pcrc32=deadbeef");
+    bodies.push(("encoded-yend-trailer".to_string(), with_trailer));
+    bodies.push(("clean-no-end".to_string(), base.clone()));
+
+    // Control terminator, article end and the dot-stuffed control form, each
+    // swept across the window edge.
+    for seq in [b"\r\n=y".as_slice(), b"\r\n.\r\n", b"\r\n.=y"] {
+        for at in WINDOW_EDGE {
+            bodies.push((
+                format!("end{seq:?}@{at}"),
+                production_splice_at(&base, at, seq),
+            ));
+        }
+    }
+
+    // `=y` inside a data line is an escaped `y`, never a boundary.
+    for at in WINDOW_EDGE {
+        bodies.push((
+            format!("mid-line-eq-y@{at}"),
+            production_splice_at(&base, at, b"QQ=yQQ"),
+        ));
+    }
+
+    // Escape as the last byte of a window with the terminator opening the next.
+    for seq in [b"\r\n=y".as_slice(), b"\r\n.\r\n", b"\r\n.=y"] {
+        for boundary in [256usize, 320, 512] {
+            let mut body = production_splice_at(&base, boundary, seq);
+            body[boundary - 1] = b'=';
+            bodies.push((format!("esc-edge{seq:?}@{boundary}"), body));
+        }
+    }
+
+    // Dot-stuffed line starts, on and off the window edge.
+    for at in [128usize, 190, 254, 255, 256, 257] {
+        bodies.push((
+            format!("dot-stuffed@{at}"),
+            production_splice_at(&base, at, b"\r\n..x"),
+        ));
+    }
+
+    // Dense escape runs straddling the window edge.
+    for at in [60usize, 250, 254, 255, 256] {
+        bodies.push((
+            format!("escape-run@{at}"),
+            production_splice_at(&base, at, b"========"),
+        ));
+    }
+
+    bodies
+}
+
+type TierKernelFn = unsafe fn(
+    &[u8],
+    &mut [u8],
+    &mut KernelState,
+    bool,
+    bool,
+    bool,
+) -> Result<KernelOutcome, YencError>;
+
+/// Every tier kernel the dispatcher can select on this target, with its
+/// runtime availability gate. Tiers whose features are missing self-skip, so
+/// the x86 legs compile (and stay meaningful under SDE/Rosetta/CI) on a machine
+/// that can only run the NEON leg, and vice versa.
+fn forced_tier_kernels() -> Vec<(&'static str, bool, TierKernelFn)> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        vec![
+            (
+                "sse2",
+                is_x86_feature_detected!("sse2"),
+                decode_kernel_sse2 as TierKernelFn,
+            ),
+            (
+                "ssse3",
+                is_x86_feature_detected!("ssse3"),
+                decode_kernel_ssse3 as TierKernelFn,
+            ),
+            (
+                "sse4.1",
+                is_x86_feature_detected!("sse4.1") && is_x86_feature_detected!("ssse3"),
+                decode_kernel_sse41 as TierKernelFn,
+            ),
+            (
+                "avx",
+                is_x86_feature_detected!("avx")
+                    && is_x86_feature_detected!("popcnt")
+                    && is_x86_feature_detected!("sse4.1")
+                    && is_x86_feature_detected!("ssse3"),
+                decode_kernel_avx as TierKernelFn,
+            ),
+            (
+                "avx2",
+                is_x86_feature_detected!("avx2"),
+                decode_kernel_avx2 as TierKernelFn,
+            ),
+            (
+                "avx512-vbmi2",
+                is_x86_feature_detected!("avx512vbmi2")
+                    && is_x86_feature_detected!("avx512vl")
+                    && is_x86_feature_detected!("avx512bw")
+                    && is_x86_feature_detected!("avx512f")
+                    && is_x86_feature_detected!("avx2"),
+                decode_kernel_avx512_vbmi2 as TierKernelFn,
+            ),
+        ]
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        vec![("neon", true, decode_kernel_neon as TierKernelFn)]
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        Vec::new()
+    }
+}
+
+/// Every tier kernel against the scalar oracle in the PRODUCTION decode shape
+/// — `dot_unstuffing`, `preserve_pending` and `search_end` all set, which is
+/// exactly what `decode_rapidyenc_incremental_into` drives — plus the
+/// `search_end=false` leg of the same preserving shape.
+///
+/// `forced_tier_kernels_match_scalar_with_line_hints` only ever drives
+/// `(dot=true, preserve=false, search_end=false)`, so no tier's end-detecting
+/// path had per-tier differential coverage before this.
+#[test]
+fn forced_tier_kernels_match_scalar_in_production_shape() {
+    let tiers = forced_tier_kernels();
+    let bodies = production_shape_bodies();
+
+    for (label, body) in &bodies {
+        for &hint in &[None, Some(128u32), Some(64)] {
+            for &(dot, preserve, search_end) in &[(true, true, true), (true, true, false)] {
+                let mut reference = vec![0u8; body.len() + 64];
+                let mut reference_state = KernelState::body_with_line_length(hint);
+                let reference_outcome = decode_kernel_scalar(
+                    body.as_slice(),
+                    &mut reference,
+                    &mut reference_state,
+                    dot,
+                    preserve,
+                    search_end,
+                )
+                .unwrap();
+                reference.truncate(reference_outcome.written);
+                let mut reference_decode_state = DecodeState::new();
+                reference_state.write_back(&mut reference_decode_state);
+
+                for &(name, available, kernel) in &tiers {
+                    if !available {
+                        continue;
+                    }
+                    let mut output = vec![0u8; body.len() + 64];
+                    let mut state = KernelState::body_with_line_length(hint);
+                    let outcome = unsafe {
+                        kernel(
+                            body.as_slice(),
+                            &mut output,
+                            &mut state,
+                            dot,
+                            preserve,
+                            search_end,
+                        )
+                    }
+                    .unwrap();
+                    output.truncate(outcome.written);
+
+                    assert_eq!(
+                        (output, outcome.consumed, outcome.end, state),
+                        (
+                            reference.clone(),
+                            reference_outcome.consumed,
+                            reference_outcome.end,
+                            reference_state,
+                        ),
+                        "tier {name} body {label} hint={hint:?} dot={dot} \
+                             preserve={preserve} search_end={search_end}"
+                    );
+
+                    let mut decode_state = DecodeState::new();
+                    state.write_back(&mut decode_state);
+                    assert_eq!(
+                        (
+                            decode_state.escape_pending,
+                            decode_state.at_line_start,
+                            decode_state.dot_pending,
+                            decode_state.cr_pending,
+                            decode_state.line_length_hint,
+                        ),
+                        (
+                            reference_decode_state.escape_pending,
+                            reference_decode_state.at_line_start,
+                            reference_decode_state.dot_pending,
+                            reference_decode_state.cr_pending,
+                            reference_decode_state.line_length_hint,
+                        ),
+                        "tier {name} DecodeState body {label} hint={hint:?} dot={dot} \
+                             preserve={preserve} search_end={search_end}"
+                    );
+                }
+            }
+        }
+    }
+}

@@ -13,6 +13,16 @@ use crate::error::YencError;
 #[cfg(target_arch = "x86_64")]
 type DecodeRunFn = fn(&[u8], usize, &mut [u8], usize) -> (usize, usize);
 
+#[cfg(target_arch = "x86_64")]
+type DecodeKernelFn = unsafe fn(
+    &[u8],
+    &mut [u8],
+    &mut KernelState,
+    bool,
+    bool,
+    bool,
+) -> Result<KernelOutcome, YencError>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecoderState {
     CrLf,
@@ -287,94 +297,19 @@ fn decode_kernel(
         );
     }
 
+    // Exactly one of the three blocks below survives `cfg` on any given target,
+    // and it is this function's tail expression there.
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512vbmi2")
-            && is_x86_feature_detected!("avx512vl")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx2")
-        {
-            return unsafe {
-                decode_kernel_avx512_vbmi2(
-                    input,
-                    output,
-                    state,
-                    dot_unstuffing,
-                    preserve_pending,
-                    search_end,
-                )
-            };
-        }
-        if is_x86_feature_detected!("avx2") {
-            return unsafe {
-                decode_kernel_avx2(
-                    input,
-                    output,
-                    state,
-                    dot_unstuffing,
-                    preserve_pending,
-                    search_end,
-                )
-            };
-        }
-        if is_x86_feature_detected!("avx")
-            && is_x86_feature_detected!("popcnt")
-            && is_x86_feature_detected!("sse4.1")
-            && is_x86_feature_detected!("ssse3")
-            && !x86_prefers_ssse3_over_sse41()
-            && !x86_prefers_sse2_over_ssse3()
-        {
-            return unsafe {
-                decode_kernel_avx(
-                    input,
-                    output,
-                    state,
-                    dot_unstuffing,
-                    preserve_pending,
-                    search_end,
-                )
-            };
-        }
-        if is_x86_feature_detected!("sse4.1")
-            && is_x86_feature_detected!("ssse3")
-            && !x86_prefers_ssse3_over_sse41()
-            && !x86_prefers_sse2_over_ssse3()
-        {
-            return unsafe {
-                decode_kernel_sse41(
-                    input,
-                    output,
-                    state,
-                    dot_unstuffing,
-                    preserve_pending,
-                    search_end,
-                )
-            };
-        }
-        if is_x86_feature_detected!("ssse3") && !x86_prefers_sse2_over_ssse3() {
-            return unsafe {
-                decode_kernel_ssse3(
-                    input,
-                    output,
-                    state,
-                    dot_unstuffing,
-                    preserve_pending,
-                    search_end,
-                )
-            };
-        }
-        if is_x86_feature_detected!("sse2") {
-            return unsafe {
-                decode_kernel_sse2(
-                    input,
-                    output,
-                    state,
-                    dot_unstuffing,
-                    preserve_pending,
-                    search_end,
-                )
-            };
+        unsafe {
+            dispatch_x86_decode_kernel()(
+                input,
+                output,
+                state,
+                dot_unstuffing,
+                preserve_pending,
+                search_end,
+            )
         }
     }
 
@@ -392,7 +327,7 @@ fn decode_kernel(
         }
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         decode_kernel_scalar(
             input,
@@ -403,6 +338,58 @@ fn decode_kernel(
             search_end,
         )
     }
+}
+
+/// Resolve the x86 decode tier once per process, not once per call.
+///
+/// The `is_x86_feature_detected!` chain is cheap but not free (an atomic load
+/// plus mask tests per feature), and the two guardrail helpers each issue a raw
+/// `CPUID` — a serializing instruction, and on some hypervisors a VM exit. That
+/// whole chain used to run on EVERY `decode_kernel` call, i.e. once per decoded
+/// chunk. Memoized behind a `OnceLock` (same shape as
+/// [`dispatch_x86_decode_normal_run`]), it runs once and the steady state is a
+/// single acquire load plus an indirect call.
+///
+/// Argument-dependent routing (the compact-output scalar fallback) stays at the
+/// call site — only the CPU-feature decision is cached here.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn dispatch_x86_decode_kernel() -> DecodeKernelFn {
+    use std::sync::OnceLock;
+
+    static DISPATCH: OnceLock<DecodeKernelFn> = OnceLock::new();
+    *DISPATCH.get_or_init(|| {
+        if is_x86_feature_detected!("avx512vbmi2")
+            && is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx2")
+        {
+            decode_kernel_avx512_vbmi2 as DecodeKernelFn
+        } else if is_x86_feature_detected!("avx2") {
+            decode_kernel_avx2 as DecodeKernelFn
+        } else if is_x86_feature_detected!("avx")
+            && is_x86_feature_detected!("popcnt")
+            && is_x86_feature_detected!("sse4.1")
+            && is_x86_feature_detected!("ssse3")
+            && !x86_prefers_ssse3_over_sse41()
+            && !x86_prefers_sse2_over_ssse3()
+        {
+            decode_kernel_avx as DecodeKernelFn
+        } else if is_x86_feature_detected!("sse4.1")
+            && is_x86_feature_detected!("ssse3")
+            && !x86_prefers_ssse3_over_sse41()
+            && !x86_prefers_sse2_over_ssse3()
+        {
+            decode_kernel_sse41 as DecodeKernelFn
+        } else if is_x86_feature_detected!("ssse3") && !x86_prefers_sse2_over_ssse3() {
+            decode_kernel_ssse3 as DecodeKernelFn
+        } else if is_x86_feature_detected!("sse2") {
+            decode_kernel_sse2 as DecodeKernelFn
+        } else {
+            decode_kernel_scalar as DecodeKernelFn
+        }
+    })
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

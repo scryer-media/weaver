@@ -13,7 +13,7 @@ use super::*;
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn decode_kernel_avx2_raw(
+unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
     input: &[u8],
     output: &mut [u8],
     state: &mut KernelState,
@@ -24,6 +24,10 @@ unsafe fn decode_kernel_avx2_raw(
 
     let mut src = 0usize;
     let mut dst = 0usize;
+    // Oracle `lenBuffer` for `isRaw && searchEnd` is `width-1 + 3 + 1`
+    // (decoder_common.h:44-46) == this 67; the widest lookahead is the lane-B
+    // `+4` view, ending at `src + WIDTH + 3`, and the loop bound
+    // (`src + WIDTH <= len - tail`) leaves a further WIDTH bytes of slack.
     let tail = WIDTH - 1 + 4;
     let simd_limit = input.len().saturating_sub(tail);
 
@@ -32,6 +36,8 @@ unsafe fn decode_kernel_avx2_raw(
     let eq_needle = _mm256_set1_epi8(b'=' as i8);
     let cr = _mm256_set1_epi8(b'\r' as i8);
     let lf = _mm256_set1_epi8(b'\n' as i8);
+    let y_needle = _mm256_set1_epi8(b'y' as i8);
+    let eq_y = _mm256_set1_epi16(0x793d); // "=y", u16-aligned
     let esc_off = _mm256_set1_epi8(-106);
     let table = compact_table_16();
     let special_lut = _mm256_set_epi8(
@@ -124,6 +130,11 @@ unsafe fn decode_kernel_avx2_raw(
         dot
     };
 
+    // Set when the SEARCH_END probe aborts a window (oracle `len += i; break;`):
+    // the window is left unconsumed and the exit state comes from the
+    // no-backtrack rule instead of the trailing-bytes lookback.
+    let mut broke = false;
+
     if input.len() > WIDTH * 2 {
         while src + WIDTH <= simd_limit {
             let a = _mm256_loadu_si256(input.as_ptr().add(src) as *const __m256i);
@@ -147,6 +158,17 @@ unsafe fn decode_kernel_avx2_raw(
                 if mask != mask_eq {
                     let tmp2a = _mm256_loadu_si256(input.as_ptr().add(src + 2) as *const __m256i);
                     let tmp2b = _mm256_loadu_si256(input.as_ptr().add(src + 34) as *const __m256i);
+                    // `=` at lane+2 (oracle decoder_avx2_base.h:153-156). The
+                    // oracle's alignr alternative for this view is its `#if 0`
+                    // experiment; the plain loadu view is the live arm.
+                    let (match2_eq_a, match2_eq_b) = if SEARCH_END {
+                        (
+                            _mm256_cmpeq_epi8(eq_needle, tmp2a),
+                            _mm256_cmpeq_epi8(eq_needle, tmp2b),
+                        )
+                    } else {
+                        (_mm256_setzero_si256(), _mm256_setzero_si256())
+                    };
                     let m2cr_a =
                         _mm256_and_si256(_mm256_cmpeq_epi8(a, cr), _mm256_cmpeq_epi8(tmp2a, dot));
                     let m2cr_b =
@@ -165,6 +187,68 @@ unsafe fn decode_kernel_avx2_raw(
                         let m1nl_b = _mm256_and_si256(m1lf_b, _mm256_cmpeq_epi8(b, cr));
                         let m2nldot_a = _mm256_and_si256(m2cr_a, m1nl_a);
                         let m2nldot_b = _mm256_and_si256(m2cr_b, m1nl_b);
+
+                        // Terminator probe with a stuffed dot in the window
+                        // (oracle decoder_avx2_base.h:222-327, the non-AVX512
+                        // arm): `\r\n.\r\n`, `\r\n.=y` and `\r\n=y`. Runs BEFORE
+                        // the `mask` merge, so an aborted window reports the
+                        // pre-merge mask to the no-backtrack exit rule.
+                        if SEARCH_END {
+                            let tmp3a =
+                                _mm256_loadu_si256(input.as_ptr().add(src + 3) as *const __m256i);
+                            let tmp3b =
+                                _mm256_loadu_si256(input.as_ptr().add(src + 35) as *const __m256i);
+                            let tmp4a =
+                                _mm256_loadu_si256(input.as_ptr().add(src + 4) as *const __m256i);
+                            let tmp4b =
+                                _mm256_loadu_si256(input.as_ptr().add(src + 36) as *const __m256i);
+
+                            let m3cr_a = _mm256_cmpeq_epi8(cr, tmp3a);
+                            let m3cr_b = _mm256_cmpeq_epi8(cr, tmp3b);
+                            let m4lf_a = _mm256_cmpeq_epi8(tmp4a, lf);
+                            let m4lf_b = _mm256_cmpeq_epi8(tmp4b, lf);
+                            // `=y` at lane+3 for ODD lanes: the u16-aligned pair
+                            // (lane+3, lane+4) of the `+4` view, kept in the high
+                            // byte of its u16 by the `slli` (oracle :294-295).
+                            let m4eqy_a = _mm256_slli_epi16::<8>(_mm256_cmpeq_epi16(tmp4a, eq_y));
+                            let m4eqy_b = _mm256_slli_epi16::<8>(_mm256_cmpeq_epi16(tmp4b, eq_y));
+                            // `=y` at lane+2.
+                            let m3eqy_a =
+                                _mm256_and_si256(match2_eq_a, _mm256_cmpeq_epi8(y_needle, tmp3a));
+                            let m3eqy_b =
+                                _mm256_and_si256(match2_eq_b, _mm256_cmpeq_epi8(y_needle, tmp3b));
+                            // `srli_epi16(m3eqy, 8)` moves each odd lane's "`=y`
+                            // at lane+2" down to the even lane below it, where it
+                            // reads "`=y` at lane+3" — the even-lane half of the
+                            // same predicate (oracle :299-306).
+                            let m4end_a = _mm256_and_si256(
+                                _mm256_or_si256(
+                                    _mm256_and_si256(m3cr_a, m4lf_a),
+                                    _mm256_or_si256(m4eqy_a, _mm256_srli_epi16::<8>(m3eqy_a)),
+                                ),
+                                m2nldot_a,
+                            );
+                            let m4end_b = _mm256_and_si256(
+                                _mm256_or_si256(
+                                    _mm256_and_si256(m3cr_b, m4lf_b),
+                                    _mm256_or_si256(m4eqy_b, _mm256_srli_epi16::<8>(m3eqy_b)),
+                                ),
+                                m2nldot_b,
+                            );
+                            // `\r\n=y`.
+                            let m3end_a = _mm256_and_si256(m3eqy_a, m1nl_a);
+                            let m3end_b = _mm256_and_si256(m3eqy_b, m1nl_b);
+                            let any_end = _mm256_movemask_epi8(_mm256_or_si256(
+                                _mm256_or_si256(m4end_a, m3end_a),
+                                _mm256_or_si256(m4end_b, m3end_b),
+                            ));
+                            if any_end != 0 {
+                                state.state = x86_break_state(input, src, mask, esc_first);
+                                broke = true;
+                                break;
+                            }
+                        }
+
                         mask |= (_mm256_movemask_epi8(m2nldot_a) as u32 as u64) << 2;
                         mask |= (_mm256_movemask_epi8(m2nldot_b) as u32 as u64) << 34;
                         let shifted = _mm256_zextsi128_si256(_mm_srli_si128::<14>(
@@ -172,6 +256,48 @@ unsafe fn decode_kernel_avx2_raw(
                         ));
                         min_mask = _mm256_subs_epu8(dot, shifted);
                     } else {
+                        // Terminator probe without a stuffed dot in the window
+                        // (oracle decoder_avx2_base.h:344-421): only `\r\n=y` is
+                        // reachable — any `\r\n.` shape would have set `partial`.
+                        if SEARCH_END {
+                            let tmp3a =
+                                _mm256_loadu_si256(input.as_ptr().add(src + 3) as *const __m256i);
+                            let tmp3b =
+                                _mm256_loadu_si256(input.as_ptr().add(src + 35) as *const __m256i);
+                            let m3eqy_a =
+                                _mm256_and_si256(match2_eq_a, _mm256_cmpeq_epi8(y_needle, tmp3a));
+                            let m3eqy_b =
+                                _mm256_and_si256(match2_eq_b, _mm256_cmpeq_epi8(y_needle, tmp3b));
+                            if _mm256_movemask_epi8(_mm256_or_si256(m3eqy_a, m3eqy_b)) != 0 {
+                                let m1lf_a = _mm256_cmpeq_epi8(
+                                    lf,
+                                    _mm256_loadu_si256(
+                                        input.as_ptr().add(src + 1) as *const __m256i
+                                    ),
+                                );
+                                let m1lf_b = _mm256_cmpeq_epi8(
+                                    lf,
+                                    _mm256_loadu_si256(
+                                        input.as_ptr().add(src + 33) as *const __m256i
+                                    ),
+                                );
+                                let end_found = _mm256_movemask_epi8(_mm256_or_si256(
+                                    _mm256_and_si256(
+                                        m3eqy_a,
+                                        _mm256_and_si256(m1lf_a, _mm256_cmpeq_epi8(a, cr)),
+                                    ),
+                                    _mm256_and_si256(
+                                        m3eqy_b,
+                                        _mm256_and_si256(m1lf_b, _mm256_cmpeq_epi8(b, cr)),
+                                    ),
+                                ));
+                                if end_found != 0 {
+                                    state.state = x86_break_state(input, src, mask, esc_first);
+                                    broke = true;
+                                    break;
+                                }
+                            }
+                        }
                         min_mask = dot;
                     }
                 } else {
@@ -277,7 +403,9 @@ unsafe fn decode_kernel_avx2_raw(
     // < WIDTH), `src` is still 0 and the entry state MUST survive untouched for
     // the scalar epilogue — otherwise a carried Cr/CrLf line-start (with a
     // pending stuffed dot) would be clobbered to None and mis-decoded.
-    if src > 0 {
+    // A SEARCH_END break already set the state from the no-backtrack rule over
+    // the unconsumed window, so the (backtracking) lookback must not run.
+    if !broke && src > 0 {
         let out_next_mask: u16 = if src >= 2 && src + 1 < input.len() {
             if input[src - 2] == b'\r' && input[src - 1] == b'\n' && input[src] == b'.' {
                 1
@@ -341,21 +469,48 @@ pub(super) unsafe fn decode_kernel_avx2(
         search_end,
     };
 
-    // Hot path: faithful rapidyenc do_decode_avx2 port (raw dot-unstuffing, no
-    // end-search). The other combos keep the general kernel below.
-    if dot_unstuffing
-        && !search_end
+    // Head resolution (search_end only): a terminator/control sequence whose
+    // `\r\n` sits in the PREVIOUS chunk is invisible to the flat raw loop, so
+    // resolve those entry shapes with the scalar machine first. Gated on the
+    // same length as the raw path, so short inputs keep today's routing exactly.
+    let mut head_src = 0usize;
+    let mut head_dst = 0usize;
+    if search_end
+        && dot_unstuffing
         && input.len() > WIDTH * 2
+        && x86_search_end_head(input, output, state, mode, &mut head_src, &mut head_dst)?
+    {
+        return Ok(KernelOutcome {
+            consumed: head_src,
+            written: head_dst,
+            end: state.end.into(),
+        });
+    }
+
+    // Hot path: faithful rapidyenc do_decode_avx2 port (raw dot-unstuffing),
+    // both `searchEnd` instantiations. The other combos keep the general kernel
+    // below.
+    if dot_unstuffing
+        && input.len() - head_src > WIDTH * 2
         && matches!(
             state.state,
             DecoderState::None | DecoderState::Eq | DecoderState::Cr | DecoderState::CrLf
         )
     {
-        return decode_kernel_avx2_raw(input, output, state, mode);
+        // `head_src`/`head_dst` are 0 unless the head loop ran, so the
+        // `::<false>` instantiation always sees the untouched full buffers.
+        let outcome = if search_end {
+            decode_kernel_avx2_raw::<true>(&input[head_src..], &mut output[head_dst..], state, mode)
+        } else {
+            decode_kernel_avx2_raw::<false>(input, output, state, mode)
+        };
+        return x86_fold_head(outcome, head_src, head_dst);
     }
 
-    let mut src = 0usize;
-    let mut dst = 0usize;
+    // The general kernel below indexes `input`/`output` absolutely, so it just
+    // resumes at the head-resolved cursors (0 unless the head loop ran).
+    let mut src = head_src;
+    let mut dst = head_dst;
 
     // Trailing bytes kept for the scalar epilogue so cross-window CRLF, dot,
     // and escape sequences stay exact.

@@ -19,20 +19,78 @@ pub(super) unsafe fn decode_kernel_neon(
         search_end,
     };
 
-    // Hot path: faithful port of rapidyenc `do_decode_neon<isRaw=true,
-    // searchEnd=false>` (decoder_neon64.cc) — the flat, register-carried decode
-    // loop, mirroring `decode_kernel_avx2_raw` / `decode_kernel_avx512_raw`.
-    // Other combos (search_end, non-raw, or an entry state the head-switch
-    // doesn't cover) keep the general scaffolding driver below.
+    // Head resolution (search_end only), the analogue of the oracle's
+    // `_do_decode_simd` entry switch (decoder_common.h:52-121). A
+    // terminator/control sequence that straddles the chunk entry has its
+    // `\r\n` in the PREVIOUS chunk, so the flat loop below — which only ever
+    // matches raw bytes inside its own window — cannot see it. Resolve those
+    // entry shapes with the verified scalar machine first; it runs once per
+    // chunk and costs a handful of steps at most.
+    if search_end && dot_unstuffing {
+        while src < input.len() && state.end == DecodeEnd::None {
+            let byte = input[src];
+            let needs_scalar = match state.state {
+                DecoderState::CrLfDot | DecoderState::CrLfDotCr | DecoderState::CrLfEq => true,
+                // `\r\n` + `.`(`\r`|`\n`|`=`) → terminator/control candidate;
+                // `\r\n=` → `=y` control candidate.
+                DecoderState::CrLf => {
+                    (byte == b'.' && matches!(input.get(src + 1), Some(b'\r' | b'\n' | b'=')))
+                        || byte == b'='
+                }
+                // `\r` + `\n`(`.`|`=`) re-enters the two cases above one byte in.
+                DecoderState::Cr => {
+                    byte == b'\n' && matches!(input.get(src + 1), Some(b'.' | b'='))
+                }
+                _ => false,
+            };
+            if !needs_scalar {
+                break;
+            }
+            if !decode_scalar_step(input, &mut src, output, &mut dst, state, mode)? {
+                break;
+            }
+        }
+        if state.end != DecodeEnd::None {
+            return Ok(KernelOutcome {
+                consumed: src,
+                written: dst,
+                end: state.end.into(),
+            });
+        }
+    }
+
+    // Hot path: faithful port of rapidyenc `do_decode_neon<isRaw=true>`
+    // (decoder_neon64.cc) — the flat, register-carried decode loop, mirroring
+    // `decode_kernel_avx2_raw` / `decode_kernel_avx512_raw`. Both `searchEnd`
+    // instantiations live there; only non-raw, short, or (search_end aside) an
+    // entry state the head resolution doesn't cover keep the general
+    // scaffolding driver below.
     if dot_unstuffing
-        && !search_end
-        && input.len() > WIDTH * 2
+        && input.len() - src > WIDTH * 2
         && matches!(
             state.state,
             DecoderState::None | DecoderState::Eq | DecoderState::Cr | DecoderState::CrLf
         )
     {
-        return unsafe { decode_kernel_neon64_raw(input, output, state, mode) };
+        // `src`/`dst` are always 0 here unless the search_end head loop ran, so
+        // the `::<false>` instantiation sees the untouched full buffers.
+        let outcome = if search_end {
+            unsafe {
+                decode_kernel_neon64_raw::<true>(&input[src..], &mut output[dst..], state, mode)
+            }
+        } else {
+            unsafe { decode_kernel_neon64_raw::<false>(input, output, state, mode) }
+        }
+        .map_err(|err| match err {
+            // Offsets reported by the sliced kernel are chunk-relative.
+            YencError::MalformedEscape(at) => YencError::MalformedEscape(at + src),
+            other => other,
+        })?;
+        return Ok(KernelOutcome {
+            consumed: src + outcome.consumed,
+            written: dst + outcome.written,
+            end: outcome.end,
+        });
     }
 
     // Long-span shape on AArch64: set up constants once,
@@ -103,7 +161,7 @@ pub(super) unsafe fn decode_kernel_neon(
     })
 }
 
-/// Faithful port of rapidyenc `do_decode_neon<isRaw=true, searchEnd=false>`
+/// Faithful port of rapidyenc `do_decode_neon<isRaw=true, searchEnd=SEARCH_END>`
 /// (decoder_neon64.cc): the flat, register-carried decode loop over 64-byte
 /// windows (4× `uint8x16`). Structurally a 1:1 clone of
 /// [`decode_kernel_avx2_raw`](super::x86_avx2) / `decode_kernel_avx512_raw`,
@@ -120,9 +178,16 @@ pub(super) unsafe fn decode_kernel_neon(
 ///   specials LUT and injects a line-start dot by OR-ing `next_mask_mix` into
 ///   `cmp_a` after the `vqtbx1q` merge (oracle line 96). It is consumed exactly
 ///   once per window and recomputed (or zeroed) inside the `\r\n.` sub-branch.
+///
+/// With `SEARCH_END`, the `\r\n.` sub-branch additionally runs the oracle's
+/// terminator probe (decoder_neon64.cc:126-290) for `\r\n.\r\n`, `\r\n.=y` and
+/// `\r\n=y`. On a hit the window is NOT consumed: the exit state is set from
+/// the no-backtrack `decoder_set_nextMask` rule (decoder_common.h:129-132,
+/// :190-199) and the scalar drain re-scans the window as the authority on the
+/// exact `end`/`consumed` split — the oracle's `len += i; break;` epilogue.
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn decode_kernel_neon64_raw(
+unsafe fn decode_kernel_neon64_raw<const SEARCH_END: bool>(
     input: &[u8],
     output: &mut [u8],
     state: &mut KernelState,
@@ -167,6 +232,11 @@ unsafe fn decode_kernel_neon64_raw(
         _ => zero,
     };
 
+    // Set when the SEARCH_END probe aborts a window (oracle `len += i; break;`):
+    // the window is left unconsumed and the exit state comes from the
+    // no-backtrack rule instead of the trailing-bytes lookback.
+    let mut broke = false;
+
     if input.len() > WIDTH * 2 {
         while src + WIDTH <= simd_limit {
             let a = vld1q_u8(input.as_ptr().add(src));
@@ -192,7 +262,7 @@ unsafe fn decode_kernel_neon64_raw(
             cmp_a = vorrq_u8(cmp_a, next_mask_mix);
 
             let any = vorrq_u8(vorrq_u8(cmp_a, cmp_b), vorrq_u8(cmp_c, cmp_d));
-            if vmaxvq_u8(any) != 0 {
+            if neon64_any(any) {
                 // Fused bit-weight reduction: lane 0 → specials mask, lane 1 →
                 // `=` mask (oracle lines 102-125).
                 let merged = vpaddq_u8(
@@ -226,7 +296,19 @@ unsafe fn decode_kernel_neon64_raw(
                 // carry is consumed and reset — the invariant that keeps a stale
                 // carry from double-stripping a dot.
                 if mask != mask_eq {
-                    let tmp2 = vld1q_u8(input.as_ptr().add(src + 50));
+                    // SEARCH_END needs bytes past the window for the 3/4-byte
+                    // terminator views, so it loads the next window once and
+                    // derives every lookahead from it (oracle lines 130-137).
+                    let next_data = if SEARCH_END {
+                        vld1q_u8(input.as_ptr().add(src + WIDTH))
+                    } else {
+                        zero
+                    };
+                    let tmp2 = if SEARCH_END {
+                        vextq_u8::<2>(d, next_data)
+                    } else {
+                        vld1q_u8(input.as_ptr().add(src + 50))
+                    };
                     let cr_a = vceqq_u8(a, constants.cr);
                     let cr_b = vceqq_u8(b, constants.cr);
                     let cr_c = vceqq_u8(c, constants.cr);
@@ -236,15 +318,108 @@ unsafe fn decode_kernel_neon64_raw(
                     let m2cr_c = vandq_u8(cr_c, vceqq_u8(vextq_u8::<2>(c, d), constants.dot));
                     let m2cr_d = vandq_u8(cr_d, vceqq_u8(tmp2, constants.dot));
                     let m2cr_any = vorrq_u8(vorrq_u8(m2cr_a, m2cr_b), vorrq_u8(m2cr_c, m2cr_d));
-                    if vmaxvq_u8(m2cr_any) != 0 {
+                    if neon64_any(m2cr_any) {
                         let lf_a = vceqq_u8(vextq_u8::<1>(a, b), constants.lf);
                         let lf_b = vceqq_u8(vextq_u8::<1>(b, c), constants.lf);
                         let lf_c = vceqq_u8(vextq_u8::<1>(c, d), constants.lf);
-                        let lf_d = vceqq_u8(vld1q_u8(input.as_ptr().add(src + 49)), constants.lf);
+                        let lf_d = if SEARCH_END {
+                            vceqq_u8(vextq_u8::<1>(d, next_data), constants.lf)
+                        } else {
+                            vceqq_u8(vld1q_u8(input.as_ptr().add(src + 49)), constants.lf)
+                        };
                         let m2nldot_a = vandq_u8(m2cr_a, lf_a);
                         let m2nldot_b = vandq_u8(m2cr_b, lf_b);
                         let m2nldot_c = vandq_u8(m2cr_c, lf_c);
                         let m2nldot_d = vandq_u8(m2cr_d, lf_d);
+
+                        // Terminator probe with a stuffed dot in the window
+                        // (oracle lines 174-236): `\r\n.\r\n`, `\r\n.=y` and
+                        // `\r\n=y`.
+                        if SEARCH_END {
+                            let y = vdupq_n_u8(b'y');
+                            let eq_y = vdupq_n_u16(0x793d);
+
+                            // `\r\n` at lane i.
+                            let m1nl_a = vandq_u8(lf_a, cr_a);
+                            let m1nl_b = vandq_u8(lf_b, cr_b);
+                            let m1nl_c = vandq_u8(lf_c, cr_c);
+                            let m1nl_d = vandq_u8(lf_d, cr_d);
+
+                            let tmp3 = vextq_u8::<3>(d, next_data);
+                            let tmp4 = vextq_u8::<4>(d, next_data);
+
+                            // `\r\n` at lane i+3 (closing an article terminator).
+                            let m4nl_a = vextq_u8::<3>(m1nl_a, m1nl_b);
+                            let m4nl_b = vextq_u8::<3>(m1nl_b, m1nl_c);
+                            let m4nl_c = vextq_u8::<3>(m1nl_c, m1nl_d);
+                            let m4nl_d = vandq_u8(
+                                vceqq_u8(tmp3, constants.cr),
+                                vceqq_u8(tmp4, constants.lf),
+                            );
+
+                            // `=y` at lane i+4, u16-aligned (even lanes only).
+                            let m4eqy_a = vreinterpretq_u8_u16(vceqq_u16(
+                                vreinterpretq_u16_u8(vextq_u8::<4>(a, b)),
+                                eq_y,
+                            ));
+                            let m4eqy_b = vreinterpretq_u8_u16(vceqq_u16(
+                                vreinterpretq_u16_u8(vextq_u8::<4>(b, c)),
+                                eq_y,
+                            ));
+                            let m4eqy_c = vreinterpretq_u8_u16(vceqq_u16(
+                                vreinterpretq_u16_u8(vextq_u8::<4>(c, d)),
+                                eq_y,
+                            ));
+                            let m4eqy_d =
+                                vreinterpretq_u8_u16(vceqq_u16(vreinterpretq_u16_u8(tmp4), eq_y));
+
+                            // `=y` at lane i+2.
+                            let m2eq_a = vextq_u8::<2>(eq_a, eq_b);
+                            let m2eq_b = vextq_u8::<2>(eq_b, eq_c);
+                            let m2eq_c = vextq_u8::<2>(eq_c, eq_d);
+                            let m2eq_d = vceqq_u8(tmp2, constants.eq);
+                            let m3eqy_a = vandq_u8(vceqq_u8(vextq_u8::<3>(a, b), y), m2eq_a);
+                            let m3eqy_b = vandq_u8(vceqq_u8(vextq_u8::<3>(b, c), y), m2eq_b);
+                            let m3eqy_c = vandq_u8(vceqq_u8(vextq_u8::<3>(c, d), y), m2eq_c);
+                            let m3eqy_d = vandq_u8(vceqq_u8(tmp3, y), m2eq_d);
+
+                            // `vsri`(m4eqy, m3eqy, 8) reads "`=y` at lane i+3"
+                            // at every lane: odd lanes take the u16-aligned
+                            // i+4 match, even lanes take the i+2 match of lane
+                            // i+1 shifted down a byte (oracle lines 218-221).
+                            let end4_a = vandq_u8(
+                                vorrq_u8(m4nl_a, neon64_sri8(m4eqy_a, m3eqy_a)),
+                                m2nldot_a,
+                            );
+                            let end4_b = vandq_u8(
+                                vorrq_u8(m4nl_b, neon64_sri8(m4eqy_b, m3eqy_b)),
+                                m2nldot_b,
+                            );
+                            let end4_c = vandq_u8(
+                                vorrq_u8(m4nl_c, neon64_sri8(m4eqy_c, m3eqy_c)),
+                                m2nldot_c,
+                            );
+                            let end4_d = vandq_u8(
+                                vorrq_u8(m4nl_d, neon64_sri8(m4eqy_d, m3eqy_d)),
+                                m2nldot_d,
+                            );
+                            // `\r\n=y`.
+                            let end3_a = vandq_u8(m3eqy_a, m1nl_a);
+                            let end3_b = vandq_u8(m3eqy_b, m1nl_b);
+                            let end3_c = vandq_u8(m3eqy_c, m1nl_c);
+                            let end3_d = vandq_u8(m3eqy_d, m1nl_d);
+
+                            let any_end = vorrq_u8(
+                                vorrq_u8(vorrq_u8(end4_a, end4_b), vorrq_u8(end4_c, end4_d)),
+                                vorrq_u8(vorrq_u8(end3_a, end3_b), vorrq_u8(end3_c, end3_d)),
+                            );
+                            if neon64_any(any_end) {
+                                state.state = neon64_break_state(input, src, mask, esc_first);
+                                broke = true;
+                                break;
+                            }
+                        }
+
                         // Reduce the `\r\n.` matches to a u64 and strip the
                         // stuffed dot (which sits 2 bytes after the `\r`).
                         let kill_dots = neon64_compare_mask64(
@@ -256,6 +431,44 @@ unsafe fn decode_kernel_neon64_raw(
                         // window's byte 0/1 (oracle line 252).
                         next_mask_mix = vextq_u8::<14>(m2nldot_d, zero);
                     } else {
+                        // Terminator probe without a stuffed dot in the window
+                        // (oracle lines 253-287): only `\r\n=y` is reachable —
+                        // any `\r\n.` shape would have set `m2cr_any`.
+                        if SEARCH_END {
+                            let y = vdupq_n_u8(b'y');
+                            let m2eq_a = vextq_u8::<2>(eq_a, eq_b);
+                            let m2eq_b = vextq_u8::<2>(eq_b, eq_c);
+                            let m2eq_c = vextq_u8::<2>(eq_c, eq_d);
+                            let m2eq_d = vceqq_u8(tmp2, constants.eq);
+                            let m3eqy_a = vandq_u8(m2eq_a, vceqq_u8(vextq_u8::<3>(a, b), y));
+                            let m3eqy_b = vandq_u8(m2eq_b, vceqq_u8(vextq_u8::<3>(b, c), y));
+                            let m3eqy_c = vandq_u8(m2eq_c, vceqq_u8(vextq_u8::<3>(c, d), y));
+                            let m3eqy_d =
+                                vandq_u8(m2eq_d, vceqq_u8(vextq_u8::<3>(d, next_data), y));
+                            let any_eqy =
+                                vorrq_u8(vorrq_u8(m3eqy_a, m3eqy_b), vorrq_u8(m3eqy_c, m3eqy_d));
+                            if neon64_any(any_eqy) {
+                                let lf_a = vceqq_u8(vextq_u8::<1>(a, b), constants.lf);
+                                let lf_b = vceqq_u8(vextq_u8::<1>(b, c), constants.lf);
+                                let lf_c = vceqq_u8(vextq_u8::<1>(c, d), constants.lf);
+                                let lf_d = vceqq_u8(vextq_u8::<1>(d, next_data), constants.lf);
+                                let match_end = vorrq_u8(
+                                    vorrq_u8(
+                                        vandq_u8(m3eqy_a, vandq_u8(lf_a, cr_a)),
+                                        vandq_u8(m3eqy_b, vandq_u8(lf_b, cr_b)),
+                                    ),
+                                    vorrq_u8(
+                                        vandq_u8(m3eqy_c, vandq_u8(lf_c, cr_c)),
+                                        vandq_u8(m3eqy_d, vandq_u8(lf_d, cr_d)),
+                                    ),
+                                );
+                                if neon64_any(match_end) {
+                                    state.state = neon64_break_state(input, src, mask, esc_first);
+                                    broke = true;
+                                    break;
+                                }
+                            }
+                        }
                         // `\r\n` present but no stuffed dot: reset the carry.
                         next_mask_mix = zero;
                     }
@@ -390,7 +603,9 @@ unsafe fn decode_kernel_neon64_raw(
     // {129,130} => simd_limit < WIDTH), `src` is still 0 and the entry state
     // MUST survive untouched for the scalar epilogue, else a carried Cr/CrLf
     // line-start (pending stuffed dot) is clobbered to None and mis-decoded.
-    if src > 0 {
+    // A SEARCH_END break already set the state from the no-backtrack rule over
+    // the unconsumed window, so the (backtracking) lookback must not run.
+    if !broke && src > 0 {
         let out_next_mask: u16 = if src >= 2 && src + 1 < input.len() {
             if input[src - 2] == b'\r' && input[src - 1] == b'\n' && input[src] == b'.' {
                 1
@@ -425,6 +640,66 @@ unsafe fn decode_kernel_neon64_raw(
         written: dst,
         end: state.end.into(),
     })
+}
+
+/// "Is any lane of `v` nonzero?" — the oracle's `neon_vect_is_nonzero`
+/// (decoder_neon64.cc:33-35), byte for byte.
+///
+/// The obvious spelling, `vmaxvq_u8(v) != 0`, lowers to `umaxv` — a full
+/// cross-lane horizontal max whose latency dominates the dependent branch. The
+/// oracle instead narrows the 2×u64 view saturating to 2×u32 (`uqxtn`, which is
+/// nonzero iff some source lane was) and reads the resulting 64-bit D register
+/// out with one `fmov`. Same predicate, materially cheaper: saturating
+/// narrowing keeps a nonzero u64 half nonzero (it clamps to `u32::MAX`, never
+/// to 0), so the packed pair is zero exactly when `v` is.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn neon64_any(v: std::arch::aarch64::uint8x16_t) -> bool {
+    use std::arch::aarch64::*;
+
+    unsafe { vget_lane_u64::<0>(vreinterpret_u64_u32(vqmovn_u64(vreinterpretq_u64_u8(v)))) != 0 }
+}
+
+/// `vsriq_n_u16::<8>` on byte vectors: per 16-bit lane, keep `hi`'s high byte
+/// and take `lo`'s high byte as the low byte (oracle decoder_neon64.cc:220).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn neon64_sri8(
+    hi: std::arch::aarch64::uint8x16_t,
+    lo: std::arch::aarch64::uint8x16_t,
+) -> std::arch::aarch64::uint8x16_t {
+    use std::arch::aarch64::*;
+
+    unsafe {
+        vreinterpretq_u8_u16(vsriq_n_u16::<8>(
+            vreinterpretq_u16_u8(hi),
+            vreinterpretq_u16_u8(lo),
+        ))
+    }
+}
+
+/// Exit state for a window the SEARCH_END probe aborted, via the oracle's
+/// no-backtrack `decoder_set_nextMask` (decoder_common.h:190-199) plus the
+/// driver's `escFirst`-wins mapping (decoder_common.h:129-132). `esc_first` is
+/// the PRE-window carry: the aborted window is never consumed, so its own
+/// escape bookkeeping has not run yet.
+///
+/// `src + 1 < input.len()` is guaranteed by the loop bound (`src + 131 <=
+/// input.len()`).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn neon64_break_state(input: &[u8], src: usize, mask: u64, esc_first: u64) -> DecoderState {
+    if esc_first != 0 {
+        return DecoderState::Eq;
+    }
+    if input[src] == b'.' {
+        if mask & 1 != 0 {
+            return DecoderState::CrLf;
+        }
+    } else if input[src + 1] == b'.' && mask & 2 != 0 {
+        return DecoderState::Cr;
+    }
+    DecoderState::None
 }
 
 #[cfg(target_arch = "aarch64")]
