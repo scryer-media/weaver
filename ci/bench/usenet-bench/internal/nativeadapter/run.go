@@ -10,73 +10,89 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/clientadapter"
 )
 
-// Run executes one native product process and writes the same immutable
-// AdapterResult schema as the Docker adapter. The execution target makes
-// platform-specific counter availability explicit instead of mixing it with
-// Docker/Linux results.
+// Run executes a native product through its public control API. Sequential
+// queue input intentionally starts one fresh native process per fixture so
+// native lanes retain the cold-run lifecycle of the direct benchmark path.
 func Run(ctx context.Context, cfg Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	spec, err := renderProduct(cfg)
+	if cfg.QueueInput != nil {
+		return runSequentialQueue(ctx, cfg)
+	}
+	nativeRun, err := runSingle(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	if err := writeProductFiles(cfg, spec); err != nil {
+	if err := writeResult(cfg.ResultPath, nativeRun.result); err != nil {
 		return err
+	}
+	return nil
+}
+
+type nativeRun struct {
+	result              benchmark.AdapterResult
+	jobID               string
+	submissionStartedAt time.Time
+	acceptedAt          time.Time
+	terminal            clientadapter.TerminalObservation
+}
+
+func runSingle(ctx context.Context, cfg Config) (nativeRun, error) {
+	spec, err := renderProduct(cfg)
+	if err != nil {
+		return nativeRun{}, err
+	}
+	if err := writeProductFiles(cfg, spec); err != nil {
+		return nativeRun{}, err
 	}
 	identity, err := commandIdentity(spec.Command[0])
 	if err != nil {
-		return err
+		return nativeRun{}, err
 	}
 	process, err := startProcess(ctx, cfg, spec)
 	if err != nil {
-		return err
+		return nativeRun{}, err
 	}
 	defer process.ensureStopped()
 
-	var queuedAt, completionAt time.Time
-	if cfg.Client == benchmark.Weaver {
-		queuedAt, completionAt, err = waitForWeaverReport(ctx, cfg.PollInterval, spec.ReportPath, process)
-		if err == nil {
-			err = writeNewFile(spec.AckPath, nil)
-		}
-		if err == nil {
-			err = process.wait(ctx)
-		}
+	var queueTiming clientadapter.QueueTiming
+	var completion clientadapter.TerminalObservation
+	api, apiErr := clientadapter.NewAPI(cfg.Client, cfg.APIEndpoint)
+	if apiErr != nil {
+		err = apiErr
 	} else {
-		api, apiErr := clientadapter.NewAPI(cfg.Client, cfg.APIEndpoint)
-		if apiErr != nil {
-			err = apiErr
-		} else {
-			startupCtx, cancelStartup := context.WithTimeout(ctx, cfg.StartupTimeout)
-			_, err = waitUntilReady(startupCtx, cfg.PollInterval, api, process)
-			cancelStartup()
+		startupCtx, cancelStartup := context.WithTimeout(ctx, cfg.StartupTimeout)
+		actualVersion, readyErr := waitUntilReady(startupCtx, cfg.PollInterval, api, process)
+		cancelStartup()
+		if readyErr != nil {
+			err = readyErr
+		} else if err = reconcileAPIVersion(cfg.ClientVersion, actualVersion); err == nil {
+			cfg.ClientVersion = recordedAPIVersion(cfg.ClientVersion, actualVersion)
 		}
+	}
+	if err == nil {
+		queueTiming, err = api.QueueWithTiming(ctx, cfg.NZBPath, cfg.ArchivePassword)
 		if err == nil {
-			var jobID string
-			jobID, err = api.Queue(ctx, cfg.NZBPath, cfg.ArchivePassword)
-			queuedAt = time.Now().UTC()
-			if err == nil {
-				completionAt, err = api.WaitComplete(ctx, jobID, cfg.PollInterval)
-			}
+			completion, err = api.WaitCompleteWithObservation(ctx, queueTiming.JobID, cfg.PollInterval, queueTiming.AcceptedAt)
 		}
-		stopErr := process.stop()
-		if err == nil && stopErr != nil {
-			err = stopErr
-		}
+	}
+	stopErr := process.stop()
+	if err == nil && stopErr != nil {
+		err = stopErr
 	}
 	if err != nil {
-		return err
+		return nativeRun{}, err
 	}
 	result := benchmark.AdapterResult{
-		SchemaVersion:            4,
+		SchemaVersion:            5,
 		RunID:                    cfg.RunID,
 		Client:                   cfg.Client,
 		ArchiveToolchain:         cfg.ArchiveToolchain,
@@ -86,8 +102,8 @@ func Run(ctx context.Context, cfg Config) error {
 		TLSValidation:            cfg.TLSValidation,
 		TransportLabel:           cfg.TransportLabel,
 		ServerLink:               cfg.ServerLink,
-		QueuedAt:                 queuedAt,
-		CompletionAt:             completionAt,
+		QueuedAt:                 queueTiming.AcceptedAt,
+		CompletionAt:             completion.ObservedAt,
 		ClientIdentity:           identity,
 		ClientVersion:            cfg.ClientVersion,
 		RenderedConfigSHA256:     spec.ConfigSHA256,
@@ -106,12 +122,131 @@ func Run(ctx context.Context, cfg Config) error {
 		TransportLabel:   cfg.TransportLabel,
 		ServerLink:       cfg.ServerLink,
 	}); err != nil {
-		return fmt.Errorf("validate adapter result: %w", err)
+		return nativeRun{}, fmt.Errorf("validate adapter result: %w", err)
 	}
-	if err := writeResult(cfg.ResultPath, result); err != nil {
+	return nativeRun{
+		result:              result,
+		jobID:               queueTiming.JobID,
+		submissionStartedAt: queueTiming.SubmissionStartedAt,
+		acceptedAt:          queueTiming.AcceptedAt,
+		terminal:            completion,
+	}, nil
+}
+
+func runSequentialQueue(ctx context.Context, cfg Config) error {
+	input := cfg.QueueInput
+	if input == nil {
+		return fmt.Errorf("native sequential queue requires queue input")
+	}
+	jobs := make([]benchmark.QueueJobResult, 0, len(input.Jobs))
+	var clientIdentity, clientVersion, renderedConfigSHA256 string
+	var suiteMetrics benchmark.ResourceMetrics
+	var queueStartedAt, queueCompletedAt time.Time
+	for index, inputJob := range input.Jobs {
+		jobCfg := cfg
+		jobCfg.QueueInput = nil
+		jobCfg.RunID = inputJob.RunID
+		jobCfg.NZBPath = inputJob.NZBPath
+		jobCfg.ArchivePassword = inputJob.ArchivePassword
+		jobCfg.ConfigDir = filepath.Join(cfg.ConfigDir, fmt.Sprintf("job-%03d", index+1))
+		jobCfg.ResultPath = filepath.Join(jobCfg.ConfigDir, "adapter-result.json")
+		nativeRun, err := runSingle(ctx, jobCfg)
+		if err != nil {
+			return fmt.Errorf("run native sequential job %s: %w", inputJob.RunID, err)
+		}
+		clientIdentity, clientVersion, renderedConfigSHA256 = nativeRun.result.ClientIdentity, nativeRun.result.ClientVersion, nativeRun.result.RenderedConfigSHA256
+		suiteMetrics = nativeRun.result.ResourceMetrics
+		if queueStartedAt.IsZero() {
+			queueStartedAt = nativeRun.submissionStartedAt
+		}
+		queueCompletedAt = nativeRun.terminal.ObservedAt
+		job := benchmark.QueueJobResult{
+			RunID:                           inputJob.RunID,
+			JobID:                           nativeRun.jobID,
+			SubmissionStartedAt:             nativeRun.submissionStartedAt,
+			AcceptedAt:                      nativeRun.acceptedAt,
+			QueuedAt:                        nativeRun.acceptedAt,
+			CompletionAt:                    nativeRun.terminal.ObservedAt,
+			FixtureWallClockNanoseconds:     nativeRun.terminal.ObservedAt.Sub(nativeRun.acceptedAt).Nanoseconds(),
+			TerminalStatus:                  "succeeded",
+			ProcessingTimingError:           "native public API does not expose active-processing transitions",
+			ResourceMetrics:                 &nativeRun.result.ResourceMetrics,
+			TerminalObservationLowerBound:   nativeRun.terminal.LowerBound,
+			TerminalObservedAt:              nativeRun.terminal.ObservedAt,
+			TerminalObservationUncertainty:  nativeRun.terminal.ObservedAt.Sub(nativeRun.terminal.LowerBound).Nanoseconds(),
+			SubmissionToTerminalNanoseconds: nativeRun.terminal.ObservedAt.Sub(nativeRun.submissionStartedAt).Nanoseconds(),
+		}
+		jobs = append(jobs, job)
+	}
+	result := benchmark.QueueAdapterResult{
+		SchemaVersion:            5,
+		SuiteID:                  input.SuiteID,
+		SubmissionMode:           input.SubmissionMode,
+		Client:                   cfg.Client,
+		ArchiveToolchain:         cfg.ArchiveToolchain,
+		ArchiveToolchainIdentity: "stock",
+		ExecutionTarget:          cfg.ExecutionTarget,
+		Transport:                cfg.Transport,
+		TLSValidation:            cfg.TLSValidation,
+		TransportLabel:           cfg.TransportLabel,
+		ServerLink:               cfg.ServerLink,
+		QueueStartedAt:           queueStartedAt,
+		QueueCompletedAt:         queueCompletedAt,
+		StatusPollIntervalNanos:  cfg.PollInterval.Nanoseconds(),
+		Jobs:                     jobs,
+		ClientIdentity:           clientIdentity,
+		ClientVersion:            clientVersion,
+		RenderedConfigSHA256:     renderedConfigSHA256,
+		ResourceMetrics:          suiteMetrics,
+	}
+	if err := validateNativeSequentialQueueResult(result); err != nil {
 		return err
 	}
+	return writeQueueResult(cfg.ResultPath, result)
+}
+
+func reconcileAPIVersion(declared, actual string) error {
+	declared, actual = strings.TrimSpace(declared), strings.TrimSpace(actual)
+	if actual != "" && declared != actual {
+		return fmt.Errorf("NATIVE_CLIENT_VERSION %q does not match client API version %q", declared, actual)
+	}
 	return nil
+}
+
+func validateNativeSequentialQueueResult(result benchmark.QueueAdapterResult) error {
+	if result.SubmissionMode != benchmark.SubmissionModeSequential || len(result.Jobs) != 1 {
+		return fmt.Errorf("native sequential result must contain exactly one sequential job")
+	}
+	if result.QueueStartedAt.IsZero() || result.QueueCompletedAt.IsZero() || result.QueueCompletedAt.Before(result.QueueStartedAt) {
+		return fmt.Errorf("native sequential result has invalid suite timing")
+	}
+	if err := result.ResourceMetrics.Validate(); err != nil {
+		return fmt.Errorf("validate native queue resource metrics: %w", err)
+	}
+	job := result.Jobs[0]
+	if job.SubmissionStartedAt.IsZero() || job.AcceptedAt.IsZero() || !job.AcceptedAt.Equal(job.QueuedAt) || job.AcceptedAt.Before(job.SubmissionStartedAt) || !result.QueueStartedAt.Equal(job.SubmissionStartedAt) || job.TerminalObservationLowerBound.IsZero() || job.TerminalObservedAt.IsZero() || !job.TerminalObservedAt.Equal(job.CompletionAt) || job.TerminalObservationLowerBound.Before(job.QueuedAt) || job.CompletionAt.Before(job.TerminalObservationLowerBound) {
+		return fmt.Errorf("native sequential result has invalid public API timing")
+	}
+	if job.FixtureWallClockNanoseconds != job.CompletionAt.Sub(job.QueuedAt).Nanoseconds() || job.SubmissionToTerminalNanoseconds != job.TerminalObservedAt.Sub(job.SubmissionStartedAt).Nanoseconds() || job.TerminalObservationUncertainty != job.TerminalObservedAt.Sub(job.TerminalObservationLowerBound).Nanoseconds() {
+		return fmt.Errorf("native sequential result has inconsistent timing durations")
+	}
+	if job.SubmissionToTerminalNanoseconds <= 0 || job.TerminalObservationUncertainty > job.SubmissionToTerminalNanoseconds/100 {
+		return fmt.Errorf("native sequential result has terminal observation uncertainty above 1%%")
+	}
+	if job.ResourceMetrics == nil {
+		return fmt.Errorf("native sequential result lacks fixture resource metrics")
+	}
+	if err := job.ResourceMetrics.Validate(); err != nil {
+		return fmt.Errorf("validate native fixture resource metrics: %w", err)
+	}
+	return nil
+}
+
+func recordedAPIVersion(declared, actual string) string {
+	if actual = strings.TrimSpace(actual); actual != "" {
+		return actual
+	}
+	return strings.TrimSpace(declared)
 }
 
 type nativeProcess struct {
@@ -328,6 +463,18 @@ func writeResult(path string, result benchmark.AdapterResult) error {
 	contents = append(contents, '\n')
 	if err := writeNewFile(path, contents); err != nil {
 		return fmt.Errorf("write adapter result: %w", err)
+	}
+	return nil
+}
+
+func writeQueueResult(path string, result benchmark.QueueAdapterResult) error {
+	contents, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode native queue adapter result: %w", err)
+	}
+	contents = append(contents, '\n')
+	if err := writeNewFile(path, contents); err != nil {
+		return fmt.Errorf("write native queue adapter result: %w", err)
 	}
 	return nil
 }

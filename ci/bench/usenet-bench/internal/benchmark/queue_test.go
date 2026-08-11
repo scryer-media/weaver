@@ -1,12 +1,17 @@
 package benchmark
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/fixture"
 )
 
-func TestQueueSuitesKeepEveryFixtureInOneClientQueue(t *testing.T) {
+func TestQueueSuitesFollowPersistedPlanOrderWithFreshSingleRunSuites(t *testing.T) {
 	plan, err := BuildPlan(PlanOptions{
 		FixtureIDs:  []string{"fixture-a", "fixture-b", "fixture-c"},
 		Clients:     []Client{Weaver, SABnzbd, NZBGet},
@@ -19,34 +24,24 @@ func TestQueueSuitesKeepEveryFixtureInOneClientQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	suites := queueSuites(plan, DockerLinux)
-	if want := 20; len(suites) != want {
+	if want := len(plan.Runs); len(suites) != want {
 		t.Fatalf("queue suite count = %d, want %d", len(suites), want)
 	}
-	seenRuns := map[string]bool{}
-	for _, suite := range suites {
-		if got, want := len(suite.Runs), len(plan.FixtureIDs); got != want {
-			t.Fatalf("%s contains %d jobs, want %d", suite.ID, got, want)
+	for index, suite := range suites {
+		if got := len(suite.Runs); got != 1 {
+			t.Fatalf("%s contains %d jobs, want one fresh client invocation", suite.ID, got)
 		}
-		first := suite.Runs[0]
-		for _, run := range suite.Runs {
-			if run.Client != first.Client || run.ArchiveToolchain != first.ArchiveToolchain || run.Transport != first.Transport || run.TLSValidation != first.TLSValidation || run.Repetition != first.Repetition {
-				t.Fatalf("%s mixes queue lanes: %#v versus %#v", suite.ID, first, run)
-			}
-			if seenRuns[run.ID] {
-				t.Fatalf("run %s appears in more than one queue suite", run.ID)
-			}
-			seenRuns[run.ID] = true
+		if got, want := suite.Runs[0], plan.Runs[index]; got != want {
+			t.Fatalf("suite %d run = %#v, want persisted plan run %#v", index, got, want)
 		}
-	}
-	if got, want := len(seenRuns), len(plan.Runs); got != want {
-		t.Fatalf("queued runs = %d, planned runs = %d", got, want)
 	}
 }
 
 func TestQueueInputRejectsRepeatedRun(t *testing.T) {
 	input := QueueInput{
-		SchemaVersion: 1,
-		SuiteID:       "queue-0001",
+		SchemaVersion:  3,
+		SuiteID:        "queue-0001",
+		SubmissionMode: SubmissionModeQueued,
 		Jobs: []QueueInputJob{
 			{RunID: "run-0001", FixtureID: "fixture-a", NZBPath: "/fixtures/a.nzb"},
 			{RunID: "run-0001", FixtureID: "fixture-b", NZBPath: "/fixtures/b.nzb"},
@@ -54,6 +49,18 @@ func TestQueueInputRejectsRepeatedRun(t *testing.T) {
 	}
 	if err := input.Validate(); err == nil {
 		t.Fatal("repeated queue run should be rejected")
+	}
+}
+
+func TestQueueInputRejectsInvalidSubmissionMode(t *testing.T) {
+	input := QueueInput{
+		SchemaVersion:  3,
+		SuiteID:        "queue-0001",
+		SubmissionMode: "bogus",
+		Jobs:           []QueueInputJob{{RunID: "run-0001", FixtureID: "fixture", NZBPath: "fixture.nzb"}},
+	}
+	if err := input.Validate(); err == nil {
+		t.Fatal("schema-3 queue input accepted an invalid submission mode")
 	}
 }
 
@@ -104,7 +111,93 @@ func TestQueueTransitionRejectsNonDuplicatePlan(t *testing.T) {
 	}
 }
 
-func TestSequentialQueueResultRequiresImmediateUsableOutputTiming(t *testing.T) {
+func TestVerifyQueueTransitionOutputsRequiresTwentyDistinctCopies(t *testing.T) {
+	fixtureDir, outputDir, contents := writeQueueTransitionVerificationFixture(t)
+	for index := 0; index < 20; index++ {
+		writeQueueTransitionOutputCopy(t, outputDir, index, contents)
+	}
+	verifications, failedIndex, err := verifyQueueTransitionOutputs(fixtureDir, outputDir, 20)
+	if err != nil || failedIndex != -1 || len(verifications) != 20 {
+		t.Fatalf("queue transition verification = (%d instances, failed %d, %v), want 20 verified instances", len(verifications), failedIndex, err)
+	}
+}
+
+func TestVerifyQueueTransitionOutputsRejectsMissingOrCorruptCopy(t *testing.T) {
+	for name, mutate := range map[string]func(t *testing.T, outputDir string, contents []byte){
+		"missing": func(t *testing.T, outputDir string, _ []byte) {
+			if err := os.Remove(filepath.Join(outputDir, "copy-19", "payload.mkv")); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"corrupt": func(t *testing.T, outputDir string, contents []byte) {
+			if err := os.WriteFile(filepath.Join(outputDir, "copy-19", "payload.mkv"), []byte(strings.Repeat("x", len(contents))), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixtureDir, outputDir, contents := writeQueueTransitionVerificationFixture(t)
+			for index := 0; index < 20; index++ {
+				writeQueueTransitionOutputCopy(t, outputDir, index, contents)
+			}
+			mutate(t, outputDir, contents)
+			if _, failedIndex, err := verifyQueueTransitionOutputs(fixtureDir, outputDir, 20); err == nil || failedIndex != 19 {
+				t.Fatalf("queue transition verification = (failed %d, %v), want failure for copy 20", failedIndex, err)
+			}
+		})
+	}
+}
+
+func TestVerifyQueueTransitionOutputsRejectsUnexpectedFile(t *testing.T) {
+	fixtureDir, outputDir, contents := writeQueueTransitionVerificationFixture(t)
+	for index := 0; index < 20; index++ {
+		writeQueueTransitionOutputCopy(t, outputDir, index, contents)
+	}
+	if err := os.MkdirAll(filepath.Join(outputDir, "copy-20"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outputDir, "copy-20", "unexpected.txt"), []byte("extra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, failedIndex, err := verifyQueueTransitionOutputs(fixtureDir, outputDir, 20); err == nil || failedIndex != 19 || !strings.Contains(err.Error(), "unexpected unconsumed output") {
+		t.Fatalf("queue transition verification = (failed %d, %v), want unexpected-file failure for copy 20", failedIndex, err)
+	}
+}
+
+func writeQueueTransitionVerificationFixture(t *testing.T) (string, string, []byte) {
+	t.Helper()
+	fixtureDir := t.TempDir()
+	outputDir := t.TempDir()
+	contents := []byte("movie payload")
+	digest, err := hashFile(writeQueueTransitionOutputFile(t, outputDir, "source", contents))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(outputDir, "source")); err != nil {
+		t.Fatal(err)
+	}
+	writeVerificationManifest(t, fixtureDir, []fixture.FileDigest{{Path: "payload.mkv", Size: int64(len(contents)), BLAKE3: digest}})
+	return fixtureDir, outputDir, contents
+}
+
+func writeQueueTransitionOutputCopy(t *testing.T, outputDir string, index int, contents []byte) {
+	t.Helper()
+	writeQueueTransitionOutputFile(t, outputDir, fmt.Sprintf("copy-%02d", index), contents)
+}
+
+func writeQueueTransitionOutputFile(t *testing.T, outputDir, directory string, contents []byte) string {
+	t.Helper()
+	path := filepath.Join(outputDir, directory, "payload.mkv")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, contents, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestSequentialQueueResultLeavesOutputForNeutralVerification(t *testing.T) {
 	plan, err := BuildPlan(PlanOptions{
 		FixtureIDs:  []string{"fixture-a"},
 		Clients:     []Client{Weaver},
@@ -118,14 +211,14 @@ func TestSequentialQueueResultRequiresImmediateUsableOutputTiming(t *testing.T) 
 	}
 	suite := queueSuites(plan, DockerLinux)[0]
 	run := suite.Runs[0]
-	queuedAt := time.Now().UTC()
+	queuedAt := time.Now()
 	completedAt := queuedAt.Add(time.Second)
 	resourceMetrics := ResourceMetrics{
 		CPUTimeNanoseconds:  MeasuredMeasurement("client_container", "test", "1", 1),
 		InstructionsRetired: UnavailableMeasurement("client_container", "test", "1", "not collected"),
 	}
 	result := QueueAdapterResult{
-		SchemaVersion:            4,
+		SchemaVersion:            5,
 		SuiteID:                  suite.ID,
 		SubmissionMode:           SubmissionModeSequential,
 		Client:                   run.Client,
@@ -144,44 +237,41 @@ func TestSequentialQueueResultRequiresImmediateUsableOutputTiming(t *testing.T) 
 		RenderedConfigSHA256:     strings.Repeat("a", 64),
 		ResourceMetrics:          resourceMetrics,
 		Jobs: []QueueJobResult{{
-			RunID:                       run.ID,
-			JobID:                       "1",
-			QueuedAt:                    queuedAt,
-			FixtureWallClockNanoseconds: completedAt.Sub(queuedAt).Nanoseconds(),
-			ResourceMetrics:             &resourceMetrics,
-			TerminalStatus:              "succeeded",
-			Verification:                &OutputVerification{FixtureID: run.FixtureID},
-			OutputDeleted:               true,
-			ProcessingTimingError:       "terminal status was observed before active state",
-			CompletionAt:                completedAt,
+			RunID:                           run.ID,
+			JobID:                           "1",
+			SubmissionStartedAt:             queuedAt.Add(-time.Second),
+			AcceptedAt:                      queuedAt,
+			QueuedAt:                        queuedAt,
+			FixtureWallClockNanoseconds:     completedAt.Sub(queuedAt).Nanoseconds(),
+			ResourceMetrics:                 &resourceMetrics,
+			TerminalStatus:                  "succeeded",
+			ProcessingTimingError:           "terminal status was observed before active state",
+			CompletionAt:                    completedAt,
+			TerminalObservationLowerBound:   completedAt.Add(-time.Millisecond),
+			TerminalObservedAt:              completedAt,
+			TerminalObservationUncertainty:  time.Millisecond.Nanoseconds(),
+			SubmissionToTerminalNanoseconds: completedAt.Sub(queuedAt.Add(-time.Second)).Nanoseconds(),
 		}},
 	}
+	if err := result.ValidateFor(suite, SubmissionModeSequential); err != nil {
+		t.Fatalf("sequential result that leaves output for neutral verification was rejected: %v", err)
+	}
+	result.Jobs[0].TerminalObservationLowerBound = completedAt.Add(-20 * time.Millisecond)
+	result.Jobs[0].TerminalObservationUncertainty = (20 * time.Millisecond).Nanoseconds()
+	if err := result.ValidateFor(suite, SubmissionModeSequential); err != nil {
+		t.Fatalf("sequential result at the 1%% observation uncertainty boundary was rejected: %v", err)
+	}
+	result.Jobs[0].TerminalObservationLowerBound = completedAt.Add(-20*time.Millisecond - time.Nanosecond)
+	result.Jobs[0].TerminalObservationUncertainty = (20*time.Millisecond + time.Nanosecond).Nanoseconds()
 	if err := result.ValidateFor(suite, SubmissionModeSequential); err == nil {
-		t.Fatal("sequential result without verified usable timing was accepted")
-	}
-	usableAt := completedAt.Add(time.Millisecond)
-	result.Jobs[0].UsableOutputAt = usableAt
-	result.Jobs[0].UsableWallClockNanoseconds = usableAt.Sub(queuedAt).Nanoseconds()
-	result.QueueCompletedAt = usableAt
-	if err := result.ValidateFor(suite, SubmissionModeSequential); err != nil {
-		t.Fatalf("sequential result with verified usable timing was rejected: %v", err)
-	}
-
-	result.Jobs[0].Verification = nil
-	result.Jobs[0].UsableOutputAt = time.Time{}
-	result.Jobs[0].UsableWallClockNanoseconds = 0
-	result.Jobs[0].OutputVerificationError = "missing expected output file"
-	result.QueueCompletedAt = completedAt
-	if err := result.ValidateFor(suite, SubmissionModeSequential); err != nil {
-		t.Fatalf("sequential result with a recorded output verification failure was rejected: %v", err)
+		t.Fatal("sequential result above the 1% observation uncertainty boundary was accepted")
 	}
 }
 
 func TestQueueJobOutcome(t *testing.T) {
 	for name, result := range map[string]QueueJobResult{
-		"completed":            {TerminalStatus: "succeeded"},
-		"terminal failure":     {TerminalStatus: "failed", TerminalError: "Failed"},
-		"verification failure": {TerminalStatus: "succeeded", OutputVerificationError: "missing expected output file"},
+		"completed":        {TerminalStatus: "succeeded"},
+		"terminal failure": {TerminalStatus: "failed", TerminalError: "Failed"},
 	} {
 		want := "completed"
 		if name != "completed" {
@@ -190,5 +280,22 @@ func TestQueueJobOutcome(t *testing.T) {
 		if got := queueJobOutcome(result); got != want {
 			t.Errorf("%s outcome = %q, want %q", name, got, want)
 		}
+	}
+}
+
+func TestQueueArtifactDNFFailsTopLevelExecution(t *testing.T) {
+	if !queueArtifactFailed(QueueArtifact{Status: "completed_with_dnf"}) {
+		t.Fatal("completed_with_dnf must fail the top-level command")
+	}
+	if queueArtifactFailed(QueueArtifact{Status: "passed"}) {
+		t.Fatal("passed artifact must not fail the top-level command")
+	}
+}
+
+func TestQueueArtifactWriteFailurePropagates(t *testing.T) {
+	artifact := QueueArtifact{Status: "passed"}
+	persistQueueArtifact(t.TempDir(), &artifact)
+	if artifact.Status != "failed" || !strings.Contains(artifact.Error, "write queue artifact") {
+		t.Fatalf("artifact write failure was not propagated: %#v", artifact)
 	}
 }

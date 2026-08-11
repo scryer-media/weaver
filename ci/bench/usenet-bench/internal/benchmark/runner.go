@@ -55,32 +55,37 @@ type AdapterResult struct {
 }
 
 type RunConfig struct {
-	Plan          Plan
-	Catalog       AdapterCatalog
-	Target        ExecutionTarget
-	FixtureRoot   string
-	ArtifactRoot  string
-	NNTPHost      string
-	PlaintextPort string
-	TLSPort       string
-	TLSCAFile     string
-	NNTPUsername  string
-	NNTPPassword  string
-	Connections   int
-	Profile       string
-	Timeout       time.Duration
+	Plan             Plan
+	Catalog          AdapterCatalog
+	Target           ExecutionTarget
+	FixtureRoot      string
+	ArtifactRoot     string
+	NNTPHost         string
+	PlaintextPort    string
+	TLSPort          string
+	TLSCAFile        string
+	ShaperControlURL string
+	NNTPUsername     string
+	NNTPPassword     string
+	Connections      int
+	Profile          string
+	Timeout          time.Duration
 }
 
 type RunArtifact struct {
-	SchemaVersion        int                   `json:"schema_version"`
-	Run                  Run                   `json:"run"`
-	Repair               fixture.RepairDetails `json:"repair"`
-	Status               string                `json:"status"`
-	AdapterResult        *AdapterResult        `json:"adapter_result,omitempty"`
-	Verification         *OutputVerification   `json:"verification,omitempty"`
-	UsableOutputAt       *time.Time            `json:"usable_output_at,omitempty"`
-	WallClockNanoseconds int64                 `json:"wall_clock_nanoseconds,omitempty"`
-	Error                string                `json:"error,omitempty"`
+	SchemaVersion                    int                   `json:"schema_version"`
+	Run                              Run                   `json:"run"`
+	Repair                           fixture.RepairDetails `json:"repair"`
+	Status                           string                `json:"status"`
+	AdapterResult                    *AdapterResult        `json:"adapter_result,omitempty"`
+	ShaperBefore                     *ShaperSnapshot       `json:"shaper_before,omitempty"`
+	ShaperAfter                      *ShaperSnapshot       `json:"shaper_after,omitempty"`
+	ShaperDownstreamBytes            uint64                `json:"shaper_downstream_bytes,omitempty"`
+	Verification                     *OutputVerification   `json:"verification,omitempty"`
+	VerificationWallClockNanoseconds int64                 `json:"verification_wall_clock_nanoseconds,omitempty"`
+	UsableOutputAt                   *time.Time            `json:"usable_output_at,omitempty"`
+	WallClockNanoseconds             int64                 `json:"wall_clock_nanoseconds,omitempty"`
+	Error                            string                `json:"error,omitempty"`
 }
 
 func LoadAdapterCatalog(path string) (AdapterCatalog, error) {
@@ -99,7 +104,7 @@ func LoadAdapterCatalog(path string) (AdapterCatalog, error) {
 }
 
 func (c AdapterCatalog) Validate() error {
-	if c.SchemaVersion != 3 || len(c.Adapters) == 0 {
+	if c.SchemaVersion != 4 || len(c.Adapters) == 0 {
 		return fmt.Errorf("adapter catalog is empty or has unsupported schema")
 	}
 	seen := map[string]bool{}
@@ -237,6 +242,14 @@ func (c RunConfig) Validate() error {
 	if c.Profile != c.Plan.Profile {
 		return fmt.Errorf("run profile %q does not match persisted plan profile %q", c.Profile, c.Plan.Profile)
 	}
+	if c.Plan.ServerLink.EgressBitsPerSecond > 0 && c.ShaperControlURL == "" {
+		return fmt.Errorf("shaper control URL is required for shaped benchmark plans")
+	}
+	if c.ShaperControlURL != "" {
+		if err := ValidateShaperControlURL(c.ShaperControlURL); err != nil {
+			return err
+		}
+	}
 	if planNeedsVerifiedTLS(c.Plan) && c.TLSCAFile == "" {
 		return fmt.Errorf("TLS CA file is required because the plan contains CA-verified TLS runs")
 	}
@@ -252,14 +265,16 @@ func planNeedsVerifiedTLS(plan Plan) bool {
 	return false
 }
 
-func executeRun(parent context.Context, config RunConfig, run Run) RunArtifact {
-	artifact := RunArtifact{SchemaVersion: 5, Run: run, Status: "failed"}
+func executeRun(parent context.Context, config RunConfig, run Run) (artifact RunArtifact) {
+	artifact = RunArtifact{SchemaVersion: 6, Run: run, Status: "failed"}
 	runDir := filepath.Join(config.ArtifactRoot, run.ID)
 	if err := os.Mkdir(runDir, 0o755); err != nil {
 		artifact.Error = fmt.Sprintf("create isolated run directory: %v", err)
 		return artifact
 	}
-	defer func() { _ = writeArtifact(filepath.Join(runDir, "run.json"), artifact) }()
+	defer func() {
+		persistRunArtifact(filepath.Join(runDir, "run.json"), &artifact)
+	}()
 	outputDir := filepath.Join(runDir, "complete")
 	configDir := filepath.Join(runDir, "config")
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
@@ -287,9 +302,39 @@ func executeRun(parent context.Context, config RunConfig, run Run) RunArtifact {
 		artifact.Error = err.Error()
 		return artifact
 	}
-	adapter, _ := config.Catalog.For(run.Client, run.ArchiveToolchain, run.ExecutionTarget)
+	adapter, ok := config.Catalog.For(run.Client, run.ArchiveToolchain, run.ExecutionTarget)
+	if !ok {
+		artifact.Error = fmt.Sprintf("adapter catalog has no entry for %s/%s/%s", run.Client, run.ArchiveToolchain, run.ExecutionTarget)
+		return artifact
+	}
 	resultPath := filepath.Join(runDir, "adapter-result.json")
 	logPath := filepath.Join(runDir, "adapter.log")
+	if config.ShaperControlURL != "" {
+		leaseID, err := NewShaperExecutionLeaseID()
+		if err != nil {
+			artifact.Error = err.Error()
+			return artifact
+		}
+		shaperBefore, err := AcquireShaperExecutionLease(parent, nil, config.ShaperControlURL, leaseID)
+		if err != nil {
+			artifact.Error = err.Error()
+			return artifact
+		}
+		defer func() {
+			if err := releaseShaperExecutionLeaseAfterRun(config.ShaperControlURL, leaseID); err != nil {
+				if artifact.Error != "" {
+					artifact.Error += "; "
+				}
+				artifact.Error += "release shaper execution lease: " + err.Error()
+				artifact.Status = "failed"
+			}
+		}()
+		if err := shaperBefore.ValidateFor(run.ServerLink); err != nil {
+			artifact.Error = err.Error()
+			return artifact
+		}
+		artifact.ShaperBefore = &shaperBefore
+	}
 	if err := invokeAdapter(parent, config, run, adapter, fixtureDir, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath); err != nil {
 		artifact.Error = err.Error()
 		return artifact
@@ -303,16 +348,40 @@ func executeRun(parent context.Context, config RunConfig, run Run) RunArtifact {
 		artifact.Error = err.Error()
 		return artifact
 	}
+	if artifact.ShaperBefore != nil {
+		shaperAfter, err := FetchShaperSnapshot(parent, nil, config.ShaperControlURL)
+		if err != nil {
+			artifact.Error = err.Error()
+			return artifact
+		}
+		if err := shaperAfter.ValidateFor(run.ServerLink); err != nil {
+			artifact.Error = err.Error()
+			return artifact
+		}
+		delivered, err := ValidateShaperSnapshotPair(*artifact.ShaperBefore, shaperAfter)
+		if err != nil {
+			artifact.Error = err.Error()
+			return artifact
+		}
+		if delivered == 0 {
+			artifact.Error = "shaper reported zero downstream bytes for the measured client run"
+			return artifact
+		}
+		artifact.ShaperAfter = &shaperAfter
+		artifact.ShaperDownstreamBytes = delivered
+	}
 	artifact.AdapterResult = &result
 	artifact.WallClockNanoseconds = result.CompletionAt.Sub(result.QueuedAt).Nanoseconds()
+	verificationStartedAt := time.Now()
 	verification, err := VerifyOutput(fixtureDir, outputDir)
+	artifact.VerificationWallClockNanoseconds = time.Since(verificationStartedAt).Nanoseconds()
 	if err != nil {
 		artifact.Error = err.Error()
 		return artifact
 	}
-	completed := result.CompletionAt
+	verifiedAt := time.Now()
 	artifact.Verification = &verification
-	artifact.UsableOutputAt = &completed
+	artifact.UsableOutputAt = &verifiedAt
 	if err := DeleteOutputFiles(outputDir); err != nil {
 		artifact.Error = fmt.Sprintf("delete verified output: %v", err)
 		return artifact
@@ -424,7 +493,7 @@ func loadAdapterResult(path string) (AdapterResult, error) {
 }
 
 func (r AdapterResult) ValidateFor(run Run) error {
-	if r.SchemaVersion != 4 || r.RunID != run.ID || r.Client != run.Client || r.ArchiveToolchain != run.ArchiveToolchain || r.ExecutionTarget != run.ExecutionTarget || r.Transport != run.Transport || r.TLSValidation != run.TLSValidation || r.TransportLabel != run.TransportLabel || r.ServerLink != run.ServerLink {
+	if r.SchemaVersion != 5 || r.RunID != run.ID || r.Client != run.Client || r.ArchiveToolchain != run.ArchiveToolchain || r.ExecutionTarget != run.ExecutionTarget || r.Transport != run.Transport || r.TLSValidation != run.TLSValidation || r.TransportLabel != run.TransportLabel || r.ServerLink != run.ServerLink {
 		return fmt.Errorf("adapter result does not match planned run %s", run.ID)
 	}
 	if r.QueuedAt.IsZero() || r.CompletionAt.IsZero() || r.CompletionAt.Before(r.QueuedAt) {
@@ -446,6 +515,16 @@ func writeArtifact(path string, artifact RunArtifact) error {
 	}
 	contents = append(contents, '\n')
 	return os.WriteFile(path, contents, 0o644)
+}
+
+func persistRunArtifact(path string, artifact *RunArtifact) {
+	if err := writeArtifact(path, *artifact); err != nil {
+		artifact.Status = "failed"
+		if artifact.Error != "" {
+			artifact.Error += "; "
+		}
+		artifact.Error += fmt.Sprintf("write run artifact: %v", err)
+	}
 }
 
 // SortedAdapters is useful for deterministic diagnostic output in adapters.

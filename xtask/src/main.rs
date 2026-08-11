@@ -66,7 +66,7 @@ const GRAPHQL_SCHEMA_EXPORT_DIR: &str = "target/xtask-release/graphql";
 const WINGET_PACKAGE_IDENTIFIER: &str = "ScryerMedia.Weaver";
 const WINGET_PACKAGE_NAME: &str = "Weaver";
 const WINGET_MONIKER: &str = "weaver-usenet";
-const WINGET_MANIFEST_VERSION: &str = "1.12.0";
+const WINGET_MANIFEST_VERSION: &str = "1.10.0";
 const WINGET_WINDOWS_X64_ASSET: &str = "weaver-windows-x86_64.msi";
 const WINGET_WINDOWS_ARM64_ASSET: &str = "weaver-windows-arm64.msi";
 
@@ -3088,6 +3088,15 @@ mod tests {
                 .join("ScryerMedia.Weaver.locale.en-US.yaml")
                 .is_file()
         );
+        for manifest in [
+            "ScryerMedia.Weaver.yaml",
+            "ScryerMedia.Weaver.installer.yaml",
+            "ScryerMedia.Weaver.locale.en-US.yaml",
+        ] {
+            let content = fs::read_to_string(manifest_dir.join(manifest)).unwrap();
+            assert!(content.contains("$schema=https://aka.ms/winget-manifest."));
+            assert!(content.contains(".1.10.0.schema.json"));
+        }
     }
 
     #[test]

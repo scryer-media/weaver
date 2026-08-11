@@ -119,7 +119,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	pollInterval, err := parseDurationDefault(getenv("CLIENT_POLL_INTERVAL"), 500*time.Millisecond, "CLIENT_POLL_INTERVAL")
+	pollInterval, err := parseDurationDefault(getenv("CLIENT_POLL_INTERVAL"), 10*time.Millisecond, "CLIENT_POLL_INTERVAL")
 	if err != nil {
 		return Config{}, err
 	}
@@ -316,9 +316,6 @@ func renderWeaver(c Config, _ bool) ProductSpec {
 		"WEAVER_INTERMEDIATE_DIR=/downloads/incomplete",
 		"WEAVER_COMPLETE_DIR=/downloads/complete",
 		"WEAVER_CLEANUP_AFTER_EXTRACT=false",
-		// Fix extraction concurrency for comparable benchmark runs rather than
-		// inheriting a host-dependent physical-core default.
-		"WEAVER_MAX_CONCURRENT_EXTRACTIONS=6",
 		"WEAVER_SERVER_1_HOSTNAME=" + c.NNTPHost,
 		"WEAVER_SERVER_1_PORT=" + c.NNTPPort,
 		"WEAVER_SERVER_1_TLS=" + strconv.FormatBool(c.NNTPUseTLS),
@@ -394,7 +391,6 @@ func renderSABnzbd(c Config, directUnpack bool) ProductSpec {
 		"direct_unpack = " + direct,
 		"pre_check = 0",
 		"pause_on_post_processing = 0",
-		"auto_disconnect = 0",
 		"",
 		"[servers]",
 		"[[benchmark]]",
@@ -460,7 +456,6 @@ func renderNZBGet(c Config, directUnpack bool) ProductSpec {
 		"ControlUsername=" + controlUsername,
 		"ControlPassword=" + apiKey,
 		"OutputMode=log",
-		"ArticleCache=0",
 		"DirectWrite=" + directWrite,
 		"DirectUnpack=" + direct,
 		"ParCheck=auto",

@@ -43,16 +43,12 @@ func renderProduct(cfg Config) (productSpec, error) {
 }
 
 func renderWeaver(cfg Config) productSpec {
-	reportPath := filepath.Join(cfg.ConfigDir, reportName)
-	ackPath := filepath.Join(cfg.ConfigDir, reportAckName)
 	env := []string{
 		"WEAVER_HTTP_BIND_ADDRESS=127.0.0.1",
 		"WEAVER_DATA_DIR=" + filepath.Join(cfg.ConfigDir, "data"),
 		"WEAVER_INTERMEDIATE_DIR=" + filepath.Join(cfg.ConfigDir, "incomplete"),
 		"WEAVER_COMPLETE_DIR=" + cfg.OutputDir,
 		"WEAVER_CLEANUP_AFTER_EXTRACT=false",
-		// Keep native and container measurements on the same extraction limit.
-		"WEAVER_MAX_CONCURRENT_EXTRACTIONS=6",
 		"WEAVER_SERVER_1_HOSTNAME=" + cfg.NNTPHost,
 		"WEAVER_SERVER_1_PORT=" + cfg.NNTPPort,
 		"WEAVER_SERVER_1_TLS=" + strconv.FormatBool(cfg.NNTPUseTLS),
@@ -64,17 +60,11 @@ func renderWeaver(cfg Config) productSpec {
 	if cfg.Transport == benchmark.TLS && cfg.TLSValidation == benchmark.TLSCAVerified {
 		env = append(env, "WEAVER_SERVER_1_TLS_CA_CERT="+cfg.NNTPCAFile)
 	}
-	command := append(expandCommand(cfg.LaunchCommand, cfg, reportPath, ackPath), "--report", reportPath, "--report-ack", ackPath)
-	if cfg.ArchivePassword != "" {
-		command = append(command, "--password", cfg.ArchivePassword)
-	}
 	return productSpec{
 		ConfigName:  "weaver.env",
 		Content:     []byte(strings.Join(env, "\n") + "\n"),
 		Environment: env,
-		Command:     command,
-		ReportPath:  reportPath,
-		AckPath:     ackPath,
+		Command:     expandCommand(cfg.LaunchCommand, cfg, "", ""),
 	}
 }
 
@@ -99,7 +89,6 @@ func renderSABnzbd(cfg Config, directUnpack bool) productSpec {
 		"direct_unpack = " + direct,
 		"pre_check = 0",
 		"pause_on_post_processing = 0",
-		"auto_disconnect = 0",
 		"",
 		"[servers]",
 		"[[benchmark]]",
@@ -156,11 +145,10 @@ func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 		"ControlPassword=" + apiKey,
 		"DaemonMode=no",
 		"OutputMode=log",
-		"ArticleCache=0",
 		"DirectWrite=" + directWrite,
 		"DirectUnpack=" + direct,
-		"ParCheck=manual",
-		"ParRepair=no",
+		"ParCheck=auto",
+		"ParRepair=yes",
 		"Unpack=yes",
 		"Server1.Active=yes",
 		"Server1.Name=benchmark",
@@ -186,6 +174,7 @@ func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 }
 
 func expandCommand(command []string, cfg Config, reportPath, ackPath string) []string {
+	_, apiPort, _ := nativeAPIAddress(cfg.APIEndpoint)
 	replacements := map[string]string{
 		"{{config_dir}}":  cfg.ConfigDir,
 		"{{fixture_dir}}": cfg.FixtureDir,
@@ -193,6 +182,7 @@ func expandCommand(command []string, cfg Config, reportPath, ackPath string) []s
 		"{{output_dir}}":  cfg.OutputDir,
 		"{{report_path}}": reportPath,
 		"{{report_ack}}":  ackPath,
+		"{{api_port}}":    strconv.Itoa(apiPort),
 	}
 	expanded := make([]string, len(command))
 	for index, argument := range command {
@@ -224,6 +214,7 @@ func renderAuditConfig(cfg Config, spec productSpec) []byte {
 		"server_link_egress_bits_per_second=" + strconv.FormatUint(cfg.ServerLink.EgressBitsPerSecond, 10),
 		"server_link_burst_bytes=" + strconv.FormatUint(cfg.ServerLink.BurstBytes, 10),
 		"api_endpoint=" + cfg.APIEndpoint,
+		"execution=api_service",
 		"archive_password=" + cfg.ArchivePassword,
 		"launch_command=" + string(command),
 		"--- product environment ---",

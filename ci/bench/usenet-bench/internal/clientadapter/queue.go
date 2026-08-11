@@ -94,7 +94,7 @@ func runQueue(ctx context.Context, cfg Config) error {
 	}
 	metricsCollected = true
 	result := benchmark.QueueAdapterResult{
-		SchemaVersion:            4,
+		SchemaVersion:            5,
 		SuiteID:                  input.SuiteID,
 		SubmissionMode:           input.SubmissionMode,
 		Client:                   cfg.Client,
@@ -136,6 +136,7 @@ func runQueuedSubmission(ctx context.Context, api productAPI, interval time.Dura
 		monitorResult <- queueMonitorResult{jobs: jobs, err: err}
 	}()
 	for _, inputJob := range inputJobs {
+		submissionStartedAt := time.Now()
 		jobID, err := api.queue(ctx, inputJob.NZBPath, inputJob.ArchivePassword, queueOptions{
 			submissionName: inputJob.SubmissionName,
 			forceAccept:    inputJob.ForceAccept,
@@ -144,10 +145,13 @@ func runQueuedSubmission(ctx context.Context, api productAPI, interval time.Dura
 			cancelMonitor()
 			return nil, fmt.Errorf("queue %s: %w", inputJob.RunID, err)
 		}
+		acceptedAt := time.Now()
 		registrations <- queuedJob{result: benchmark.QueueJobResult{
-			RunID:    inputJob.RunID,
-			JobID:    jobID,
-			QueuedAt: time.Now().UTC(),
+			RunID:               inputJob.RunID,
+			JobID:               jobID,
+			SubmissionStartedAt: submissionStartedAt,
+			AcceptedAt:          acceptedAt,
+			QueuedAt:            acceptedAt,
 		}}
 	}
 	close(registrations)
@@ -170,6 +174,7 @@ func runSequentialSubmission(ctx context.Context, api productAPI, interval time.
 			observed, err := monitorQueue(monitorCtx, api, interval, registrations)
 			monitorResult <- queueMonitorResult{jobs: observed, err: err}
 		}()
+		submissionStartedAt := time.Now()
 		jobID, err := api.queue(ctx, inputJob.NZBPath, inputJob.ArchivePassword, queueOptions{
 			submissionName: inputJob.SubmissionName,
 			forceAccept:    inputJob.ForceAccept,
@@ -179,10 +184,13 @@ func runSequentialSubmission(ctx context.Context, api productAPI, interval time.
 			_ = instructions.finish()
 			return nil, fmt.Errorf("queue %s: %w", inputJob.RunID, err)
 		}
+		acceptedAt := time.Now()
 		registrations <- queuedJob{result: benchmark.QueueJobResult{
-			RunID:    inputJob.RunID,
-			JobID:    jobID,
-			QueuedAt: time.Now().UTC(),
+			RunID:               inputJob.RunID,
+			JobID:               jobID,
+			SubmissionStartedAt: submissionStartedAt,
+			AcceptedAt:          acceptedAt,
+			QueuedAt:            acceptedAt,
 		}}
 		close(registrations)
 		monitored := <-monitorResult
@@ -211,20 +219,6 @@ func runSequentialSubmission(ctx context.Context, api productAPI, interval time.
 		}
 		job := monitored.jobs[0]
 		job.ResourceMetrics = &metrics
-		if job.TerminalStatus == "succeeded" {
-			verification, err := benchmark.VerifyOutput(filepath.Dir(inputJob.NZBPath), cfg.OutputDir)
-			if err != nil {
-				job.OutputVerificationError = err.Error()
-			} else {
-				job.Verification = &verification
-				job.UsableOutputAt = time.Now().UTC()
-				job.UsableWallClockNanoseconds = job.UsableOutputAt.Sub(job.QueuedAt).Nanoseconds()
-			}
-		}
-		if err := benchmark.DeleteOutputFiles(cfg.OutputDir); err != nil {
-			return nil, fmt.Errorf("delete fixture %s output: %w", inputJob.RunID, err)
-		}
-		job.OutputDeleted = true
 		jobs = append(jobs, job)
 	}
 	return jobs, nil
@@ -240,8 +234,9 @@ type queueMonitorResult struct {
 }
 
 type trackedQueueJob struct {
-	result   benchmark.QueueJobResult
-	complete bool
+	result         benchmark.QueueJobResult
+	lastObservedAt time.Time
+	complete       bool
 }
 
 func monitorQueue(
@@ -274,7 +269,7 @@ func monitorQueue(
 				return nil, fmt.Errorf("queue returned duplicate job id %s", registration.result.JobID)
 			}
 			seenIDs[registration.result.JobID] = true
-			jobs = append(jobs, &trackedQueueJob{result: registration.result})
+			jobs = append(jobs, &trackedQueueJob{result: registration.result, lastObservedAt: registration.result.AcceptedAt})
 		case <-ticker.C:
 			pendingIDs := make([]string, 0, len(jobs)-completed)
 			for _, job := range jobs {
@@ -289,7 +284,7 @@ func monitorQueue(
 			if err != nil {
 				return nil, err
 			}
-			observedAt := time.Now().UTC()
+			observedAt := time.Now()
 			for _, job := range jobs {
 				if job.complete {
 					continue
@@ -299,15 +294,22 @@ func monitorQueue(
 					continue
 				}
 				switch observation.state {
-				case jobUnknown, jobQueued:
+				case jobUnknown:
 					continue
+				case jobQueued:
+					job.lastObservedAt = observedAt
 				case jobActive:
 					if job.result.ProcessingStartedAt.IsZero() {
 						job.result.ProcessingStartedAt = observedAt
 					}
+					job.lastObservedAt = observedAt
 				case jobComplete:
 					job.result.TerminalStatus = "succeeded"
 					job.result.CompletionAt = observedAt
+					job.result.TerminalObservationLowerBound = job.lastObservedAt
+					job.result.TerminalObservedAt = observedAt
+					job.result.TerminalObservationUncertainty = observedAt.Sub(job.lastObservedAt).Nanoseconds()
+					job.result.SubmissionToTerminalNanoseconds = observedAt.Sub(job.result.SubmissionStartedAt).Nanoseconds()
 					job.result.FixtureWallClockNanoseconds = observedAt.Sub(job.result.QueuedAt).Nanoseconds()
 					finishProcessingTiming(&job.result, observedAt, observation.status)
 					job.complete = true
@@ -316,6 +318,10 @@ func monitorQueue(
 					job.result.TerminalStatus = "failed"
 					job.result.TerminalError = observation.status
 					job.result.CompletionAt = observedAt
+					job.result.TerminalObservationLowerBound = job.lastObservedAt
+					job.result.TerminalObservedAt = observedAt
+					job.result.TerminalObservationUncertainty = observedAt.Sub(job.lastObservedAt).Nanoseconds()
+					job.result.SubmissionToTerminalNanoseconds = observedAt.Sub(job.result.SubmissionStartedAt).Nanoseconds()
 					job.result.FixtureWallClockNanoseconds = observedAt.Sub(job.result.QueuedAt).Nanoseconds()
 					finishProcessingTiming(&job.result, observedAt, observation.status)
 					job.complete = true

@@ -109,6 +109,72 @@ func (api *API) Queue(ctx context.Context, nzbPath, archivePassword string) (str
 	return api.product.queue(ctx, nzbPath, archivePassword, queueOptions{})
 }
 
+// QueueTiming bounds a public API submission with timestamps captured by the
+// launcher immediately before the request and after the accepted response.
+type QueueTiming struct {
+	JobID               string
+	SubmissionStartedAt time.Time
+	AcceptedAt          time.Time
+}
+
+// QueueWithTiming queues one NZB and records the actual public API submission
+// interval. It is intended for adapters that must preserve queue-acceptance
+// timing rather than infer it from a later poll.
+func (api *API) QueueWithTiming(ctx context.Context, nzbPath, archivePassword string) (QueueTiming, error) {
+	timing := QueueTiming{SubmissionStartedAt: time.Now()}
+	jobID, err := api.Queue(ctx, nzbPath, archivePassword)
+	timing.AcceptedAt = time.Now()
+	if err != nil {
+		return QueueTiming{}, err
+	}
+	timing.JobID = jobID
+	return timing, nil
+}
+
+// TerminalObservation records the honest interval in which terminal status
+// first became observable through the public client API.
+type TerminalObservation struct {
+	LowerBound time.Time
+	ObservedAt time.Time
+}
+
+// WaitCompleteWithObservation polls the public API and retains the previous
+// confirmed non-terminal observation as the terminal lower bound. Callers can
+// therefore report uncertainty without substituting a nominal poll interval.
+func (api *API) WaitCompleteWithObservation(ctx context.Context, jobID string, interval time.Duration, acceptedAt time.Time) (TerminalObservation, error) {
+	lowerBound := acceptedAt
+	for {
+		observations, err := api.product.observe(ctx, []string{jobID})
+		observedAt := time.Now()
+		if err != nil {
+			return TerminalObservation{}, err
+		}
+		observation, found := observations[jobID]
+		if found {
+			switch observation.state {
+			case jobComplete:
+				return TerminalObservation{LowerBound: lowerBound, ObservedAt: observedAt}, nil
+			case jobFailed:
+				return TerminalObservation{}, fmt.Errorf("client job %s terminal status %q", jobID, observation.status)
+			case jobQueued, jobActive:
+				lowerBound = observedAt
+			}
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return TerminalObservation{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 func (api *API) WaitComplete(ctx context.Context, jobID string, interval time.Duration) (time.Time, error) {
 	return api.product.waitComplete(ctx, jobID, interval)
 }

@@ -1111,6 +1111,8 @@ jobs:
             weaver-windows-x86_64-defender-scan.log
             weaver-windows-x86_64-attachment-services.log
             weaver-windows-x86_64-noarg-startup.log
+            weaver-windows-x86_64-tray-stdout.log
+            weaver-windows-x86_64-tray-stderr.log
             weaver-windows-x86_64-winget-install.log
             weaver-windows-x86_64-msi-install.log
             weaver-windows-x86_64-sccache-stats.txt
@@ -1393,6 +1395,8 @@ jobs:
             weaver-windows-arm64-defender-scan.log
             weaver-windows-arm64-attachment-services.log
             weaver-windows-arm64-noarg-startup.log
+            weaver-windows-arm64-tray-stdout.log
+            weaver-windows-arm64-tray-stderr.log
             weaver-windows-arm64-winget-install.log
             weaver-windows-arm64-msi-install.log
             weaver-windows-arm64-sccache-stats.txt

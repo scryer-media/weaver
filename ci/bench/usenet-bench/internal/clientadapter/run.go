@@ -101,7 +101,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}
 	result := benchmark.AdapterResult{
-		SchemaVersion:            4,
+		SchemaVersion:            5,
 		RunID:                    cfg.RunID,
 		Client:                   cfg.Client,
 		ArchiveToolchain:         cfg.ArchiveToolchain,

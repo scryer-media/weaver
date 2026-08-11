@@ -30,6 +30,9 @@ func NewAggregateLimiter(egressBitsPerSecond uint64, burstBytes uint64) (*Aggreg
 	if burstBytes == 0 {
 		return nil, fmt.Errorf("positive burst bytes are required when egress shaping is enabled")
 	}
+	if burstBytes > uint64(^uint(0)>>1) {
+		return nil, fmt.Errorf("egress shaper burst size %d exceeds platform int range", burstBytes)
+	}
 	return &AggregateLimiter{
 		rateBytesPerSecond: float64(egressBitsPerSecond) / 8,
 		burstBytes:         int(burstBytes),
@@ -67,20 +70,11 @@ func (l *AggregateLimiter) WaitN(ctx context.Context, n int) error {
 }
 
 func (l *AggregateLimiter) waitChunk(ctx context.Context, n int) error {
-	duration := time.Duration(float64(n) / l.rateBytesPerSecond * float64(time.Second))
 	now := time.Now()
-	l.mu.Lock()
-	// An idle link earns at most burstBytes of credit. Represent that credit by
-	// placing the next reservation up to one burst duration in the past.
-	creditStart := now.Add(-time.Duration(float64(l.burstBytes) / l.rateBytesPerSecond * float64(time.Second)))
-	if l.next.Before(creditStart) {
-		l.next = creditStart
-	}
-	start := l.next
-	l.next = l.next.Add(duration)
-	l.mu.Unlock()
+	start := l.reserveChunkAt(now, n)
+	finish := start.Add(l.durationFor(n))
 
-	if wait := time.Until(start); wait > 0 {
+	if wait := finish.Sub(now); wait > 0 {
 		timer := time.NewTimer(wait)
 		defer timer.Stop()
 		select {
@@ -90,4 +84,26 @@ func (l *AggregateLimiter) waitChunk(ctx context.Context, n int) error {
 		}
 	}
 	return nil
+}
+
+// reserveChunkAt reserves one paced chunk against a caller-supplied clock.
+// Keeping this calculation separate from sleeping makes the rate contract
+// directly testable at link speeds where wall-clock tests would be flaky.
+func (l *AggregateLimiter) reserveChunkAt(now time.Time, n int) time.Time {
+	duration := l.durationFor(n)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// An idle link earns at most burstBytes of credit. Represent that credit by
+	// placing the next reservation up to one burst duration in the past.
+	creditStart := now.Add(-time.Duration(float64(l.burstBytes) / l.rateBytesPerSecond * float64(time.Second)))
+	if l.next.Before(creditStart) {
+		l.next = creditStart
+	}
+	start := l.next
+	l.next = l.next.Add(duration)
+	return start
+}
+
+func (l *AggregateLimiter) durationFor(n int) time.Duration {
+	return time.Duration(float64(n) / l.rateBytesPerSecond * float64(time.Second))
 }

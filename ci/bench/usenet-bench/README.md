@@ -22,7 +22,7 @@ and their declared archive families across:
 | Axis | Values |
 | --- | --- |
 | Writer era | RAR 3.93, 4.20, 5.00, 6.24, 7.23 |
-| Archive lane | RAR3, RAR4, or RAR5; RAR 6/7 writers emit the RAR5 family |
+| Archive lane | legacy RAR4 (RARLAB 3.93/4.20 writers), or RAR5 (RARLAB 5.00/6.24/7.23 writers) |
 | Compression | store (`-m0`), or release-oriented normal compression (`-m5`) |
 | Solidity | non-solid, solid |
 | Encryption | none, data encryption, encrypted headers |
@@ -50,7 +50,7 @@ duplicating the clean compatibility cases:
 | Profile | Posted repair material | Deliberate fault |
 | --- | --- | --- |
 | `par2-light` | PAR2 at 10% redundancy | 128 deterministic byte flips in one non-leading RAR volume |
-| `par2-heavy` | PAR2 at 35% redundancy | two complete non-leading RAR volumes absent |
+| `par2-heavy` | PAR2 at 35% redundancy | one complete non-leading RAR volume absent |
 | `rar-recovery-volume-light` | one RAR recovery volume (`.rev` or legacy equivalent) | one non-leading RAR volume absent |
 | `rar-recovery-volume-heavy` | two RAR recovery volumes | two non-leading RAR volumes absent |
 
@@ -63,8 +63,8 @@ reconstructed archive against the original payload oracle. The deliberately
 damaged input is retained; the verification copy is discarded.
 
 `writer_era` is deliberately separate from `rar_format`: RAR 6 and 7 are
-writer releases, not separate RAR6/RAR7 on-disk format names. The old 3.93
-and 4.20 RARLAB Docker images use their native legacy defaults; RAR 5.00,
+writer releases, not separate RAR6/RAR7 on-disk format names. The 3.93 and
+4.20 RARLAB images are explicit legacy RAR4 writer cases; RAR 5.00,
 6.24, and 7.23 receive the explicit `-ma5` selector. This is a compatibility
 matrix, not a claim to model exotic compressors or every historical quirk.
 
@@ -86,6 +86,10 @@ the source of truth for its archive capabilities.
 ## Generate fixtures
 
 Run from this directory:
+
+`fixturegen` builds and runs the pinned RARLAB/PAR2 Docker images by default,
+and `--direct-mkv` also uses the RARLAB image for its deterministic FFmpeg
+payload path. Docker is therefore required for every fixturegen invocation.
 
 ```bash
 go run ./cmd/fixturegen --list
@@ -216,27 +220,47 @@ link profile is persisted in the plan, every run, and the adapter result. Use
 the upstream network for Nyuu corpus setup so posting is never accidentally
 part of the download measurement.
 
+For every shaped run the runner captures strict control-plane snapshots before
+and after the client under a cryptographically random exclusive execution
+lease. The shaper rejects traffic outside the active lease window and binds
+that window to the first downstream source. The runner verifies the configured
+rate/burst, executable digest, lease identity, counter continuity, zero active
+connections at both
+boundaries, a nonzero byte delta, and source-attributed connection/byte
+counters. A second lease or downstream source fails instead of silently
+contaminating the run.
+
+The NNTP data plane cannot carry the HTTP lease token through implicit TLS, so
+traffic sharing that exact source IP/NAT during an active lease is not
+cryptographically distinguishable. Treat a dedicated benchmark host/network
+namespace with no other NNTP clients as a publication prerequisite; the lease
+and source counters enforce the boundary between cooperating harness runs and
+detect every differently sourced connection.
+
 ## Build a fair client schedule
 
 ```bash
 go run ./cmd/nntpbench plan \
   --fixtures rar5-7-headers-normal-solid-headers-compressible,rar4-store-store-nonsolid-none-incompressible \
   --archive-toolchains vanilla \
+  --profile stock \
   --server-link 10gbit \
-  --repetitions 5 \
+  --repetitions 20 \
   --seed 20260802 \
   --output /scratch/nntp-bench-runs/plan.json
 ```
 
-The default plan keeps the full **stock** 3×3 client-by-packaging matrix for
+Both co-primary profiles keep the full 3×3 client-by-packaging matrix for
 every `(fixture, transport, repetition)` tuple:
 
 | Client | `docker-linux` | `macos-native` | `windows-native` |
 | --- | --- | --- | --- |
-| Weaver | pinned Linux image, one-shot CLI | local production CLI | local production CLI |
+| Weaver | pinned Linux image, public service API | local production service API | local production service API |
 | SABnzbd | pinned Linux image, public API | native distributable, public API | native distributable, public API |
 | NZBGet | pinned Linux image, public API | native executable, JSON-RPC | native executable, JSON-RPC |
 
+Select `--profile stock` or `--profile equivalent-throughput` explicitly and
+report them separately; neither profile is a hidden fallback for the other.
 `archive_toolchain` is a first-class plan, adapter, rendered-config, and result
 field. Never pool `vanilla` and `rarpar` rows. Use
 `--archive-toolchains vanilla` for the current stock-only benchmark. The
@@ -254,12 +278,20 @@ contract, and packaging target used for reporting.
 
 ## Run sequential fixture suites (primary measurement)
 
-Build the Docker adapter once. `sequential` starts one fresh durable client
-container per client/toolchain/transport/repetition lane, submits one fixture,
-waits for its terminal state and independent BLAKE3 output verification,
-deletes that fixture's completed output, then submits the next fixture. Client
-lanes remain sequential, so timed competitors do not share server bandwidth.
-This is the primary per-fixture measurement.
+Build the Docker adapter once. `sequential` follows the saved plan literally:
+every persisted run gets fresh client state and a fresh client process or
+container, then exactly one fixture is submitted. The harness waits for the
+terminal state, verifies the completed output independently with BLAKE3, and
+only then deletes it. Runs remain sequential, so timed competitors do not share
+server bandwidth. This is the primary per-fixture measurement; startup occurs
+before the primary wall-clock interval but remains visible in the separately
+scoped client CPU counters.
+
+`CLIENT_POLL_INTERVAL` and `NATIVE_POLL_INTERVAL` default to `10ms`. Keep any
+override explicit in the adapter catalog or saved run environment because it
+sets the terminal-observation precision recorded in sequential artifacts. A
+run is excluded unless its terminal-observation interval is at most 1% of its
+submission-to-terminal duration.
 
 ```bash
 go build -o /scratch/nntp-bench-bin/clientadapter ./cmd/clientadapter
@@ -275,10 +307,17 @@ go run ./cmd/nntpbench sequential \
   --fixtures-root /scratch/nntp-bench-fixtures \
   --artifacts /scratch/nntp-bench-runs/artifacts \
   --nntp-host nntp \
+  --shaper-control-url http://nntp-shaper:8080 \
   --tls-ca-file /scratch/nntp-bench-runs/nntp-ca.pem \
   --username "${NNTP_BENCH_USERNAME:-fixture-user}" \
   --password-file "$NNTP_BENCH_PASSWORD_FILE"
 ```
+
+The artifact root is reserved only after configuration validation. It contains
+an immutable `execution-manifest.json`, exact plan and adapter-catalog
+snapshots, their SHA-256 digests, the harness-executable digest, a host
+fingerprint, and secret-redacted arguments. Use a new artifact root for every
+invocation; the harness never overwrites this provenance.
 
 `run` is retained as a separately labelled cold, one-NZB diagnostic. It must
 not be used as the headline result.
@@ -367,8 +406,8 @@ go run ./cmd/nntpbench preflight \
 for native macOS runs. It intentionally leaves the Weaver and NZBGet paths as
 explicit replacements. The Windows catalog likewise uses explicit executable
 paths. `NATIVE_LAUNCH_COMMAND` is a JSON argv array, never a shell string; it
-may use `{{config_dir}}`, `{{nzb_path}}`, `{{output_dir}}`, and
-`{{fixture_dir}}` placeholders. Native SABnzbd/NZBGet commands must stay in
+may use `{{config_dir}}`, `{{nzb_path}}`, `{{output_dir}}`, `{{fixture_dir}}`,
+and `{{api_port}}` placeholders. Native commands must stay in
 the foreground so the launcher can collect their process CPU time and cleanly
 stop them after terminal completion.
 
@@ -404,18 +443,18 @@ install products implicitly. Stage pinned native installers, record their
 versions and hashes in the catalog, and use an isolated working directory such
 as `C:\bench` before running the Windows lane.
 
-The Docker adapter renders and saves a product config before starting the
-container. In the primary sequential mode all three clients use their public local
-control API: Weaver's local GraphQL service, SABnzbd `addfile`, and NZBGet
-JSON-RPC `append`. The cold diagnostic keeps Weaver's one-shot
-`weaver download … --report … --report-ack …` path. The adapter passes the
+The Docker and native adapters render and save a product config before starting
+each client process. In the primary sequential mode all three clients use their
+public local control API: Weaver's local GraphQL service, SABnzbd `addfile`,
+and NZBGet JSON-RPC `append`. Native sequential suites start a fresh service
+process for each fixture. The separately labelled cold diagnostic may use
+Weaver's one-shot `weaver download … --report … --report-ack …` path. The adapter passes the
 public fixture password only for fixtures whose manifest says encryption
 requires it; no client is given a fixture-specific fast path.
 
-The Docker Weaver catalog must point at an image built after the CLI report
-options in this branch are released. Do not substitute a floating tag or run a
-pre-report image: the adapter will preserve the exact digest and fail rather
-than silently falling back to the HTTP service.
+The Docker Weaver catalog must use a digest-pinned released image. Do not
+substitute a floating tag: the adapter preserves the exact digest and uses the
+same public service API as the native lanes.
 
 Sequential-suite artifacts record every per-NZB accepted timestamp, first
 observed active-processing timestamp, terminal timestamp, and independent
@@ -431,9 +470,9 @@ make the suite fail; every submitted fixture still reaches a terminal state.
 `queue_wall_clock_nanoseconds` remains available for the separately labelled
 queue-transition mode only; it is first submission to final client completion.
 CPU time and retired instructions are recorded per sequential fixture and
-cover the same uninterrupted client process interval. The cold Weaver CLI
-report and acknowledgement remain a measurement handshake for the diagnostic
-mode only.
+cover the corresponding fresh client-process or client-container interval.
+The cold Weaver CLI report and acknowledgement remain a measurement handshake
+for the diagnostic mode only.
 
 Each client image must use `image@sha256:<digest>`, and its resolved image
 identity/version, archive-toolchain provenance, and rendered-config SHA-256
@@ -448,12 +487,14 @@ go run ./cmd/nntpbench verify-output \
   --output-dir /scratch/nntp-bench-runs/run-0001/complete
 ```
 
-The primary timing is **usable output**: all expected unpacked files must pass
-size and BLAKE3 verification. The adapter records wall time from successful
-queue acceptance to the client's terminal completion observation (the Weaver
-CLI report or the SABnzbd/NZBGet API). The runner accepts that endpoint only
-after the output oracle succeeds; download-only time cannot replace this
-outcome.
+The primary timing is `submission_to_terminal_nanoseconds`, from immediately
+before the public API submission through the client's terminal completion
+observation. `fixture_wall_clock_nanoseconds` retains acceptance-to-terminal as
+a secondary diagnostic. The output oracle runs after both timestamps and is
+not charged to either product, but the run is eligible only when every expected
+unpacked file passes size and BLAKE3 verification. The artifact records the
+verification duration separately; download-only time and unverified output
+cannot replace this outcome.
 
 ## CPU time and retired instructions
 
@@ -463,8 +504,10 @@ unavailability reason:
 
 - `cpu_time_nanoseconds` is sampled from the client container's cgroup CPU
   counter immediately after fresh-container creation and at terminal
-  completion. It deliberately includes cold client startup for every product,
-  but never the Go benchmark controller.
+  completion. It includes cold client startup even though the primary
+  wall-clock interval starts at submission, but never includes the Go benchmark
+  controller. Do not derive CPU utilization by dividing this cold-scope counter
+  by the narrower primary wall-clock duration.
 - `instructions_retired` is collected over that same cold-container-to-terminal
   interval with native-Linux cgroup `perf stat -a -G … -e instructions` when
   permission and hardware counters allow it. Its scope is
@@ -506,6 +549,28 @@ See [`configs/clients/baseline.json`](configs/clients/baseline.json) for the
 auditable cross-client baseline and
 [`configs/adapters.example.json`](configs/adapters.example.json) for the
 digest-pinned adapter catalog shape and its explicit Rarpar release pin.
+
+## Statistical summary
+
+Generate comparisons only from verified, passed sequential artifacts:
+
+```bash
+go run ./cmd/nntpbench summarize \
+  --artifacts /scratch/nntp-bench-runs/artifacts \
+  --baseline sabnzbd \
+  --candidate weaver \
+  --minimum-blocks 20
+```
+
+The summary pairs clients within the same randomized repetition block and
+keeps fixture, profile, target, transport/TLS validation, archive toolchain,
+and server-link configuration as separate strata. It reports each client's raw
+median and coefficient of variation plus the paired geometric-mean ratio and a
+deterministic 10,000-resample bootstrap 95% interval on the log ratio. It
+performs no outlier deletion and emits no
+pooled universal score. A missing, failed, or unverified run, an incomplete
+pair, fewer than 20 complete blocks, or terminal-observation uncertainty above
+1% makes the summary fail closed.
 
 ## What this does not claim
 

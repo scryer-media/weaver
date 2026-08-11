@@ -38,6 +38,7 @@ services:
     environment:
       UPSTREAM_ADDR: nntp-upstream:119
       TLS_UPSTREAM_ADDR: nntp-upstream:563
+      CONTROL_LISTEN_ADDR: "0.0.0.0:8080"
       # Supply an immutable file from `nntpbench server-env`. 0/0 means
       # unlimited; named profiles are serialized into every run artifact.
       NNTP_EGRESS_BITS_PER_SECOND: "${NNTP_EGRESS_BITS_PER_SECOND:?run nntpbench server-env first}"
@@ -51,6 +52,12 @@ services:
     ports:
       - "${NNTP_PUBLIC_BIND_ADDR:-127.0.0.1}:${NNTP_PUBLIC_PLAINTEXT_PORT:-119}:119"
       - "${NNTP_PUBLIC_BIND_ADDR:-127.0.0.1}:${NNTP_PUBLIC_TLS_PORT:-563}:563"
+      - "${NNTP_CONTROL_BIND_ADDR:-127.0.0.1}:${NNTP_CONTROL_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "/nntpshaper", "health", "--addr", "127.0.0.1:8080"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
     networks:
       nntp_upstream: {}
       benchmark:

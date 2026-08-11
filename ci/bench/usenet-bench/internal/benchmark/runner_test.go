@@ -1,6 +1,7 @@
 package benchmark
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -16,7 +17,7 @@ func TestAdapterCatalogRequiresPlannedClients(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	catalog := AdapterCatalog{SchemaVersion: 3, Adapters: []Adapter{{Client: Weaver, ArchiveToolchain: VanillaArchiveToolchain, Target: DockerLinux, Command: []string{"weaver-adapter"}}}}
+	catalog := AdapterCatalog{SchemaVersion: 4, Adapters: []Adapter{{Client: Weaver, ArchiveToolchain: VanillaArchiveToolchain, Target: DockerLinux, Command: []string{"weaver-adapter"}}}}
 	if err := catalog.ValidateFor(plan, DockerLinux); err == nil {
 		t.Fatal("catalog missing clients should fail")
 	}
@@ -36,7 +37,7 @@ func TestAdapterResultMustMatchTLSPlanMetadata(t *testing.T) {
 	run := plan.Runs[0]
 	now := time.Now().UTC()
 	result := AdapterResult{
-		SchemaVersion:            4,
+		SchemaVersion:            5,
 		RunID:                    run.ID,
 		Client:                   run.Client,
 		ArchiveToolchain:         run.ArchiveToolchain,
@@ -75,7 +76,7 @@ func TestAdapterResultRequiresExplicitResourceCounterOutcomes(t *testing.T) {
 	run := plan.Runs[0]
 	now := time.Now().UTC()
 	result := AdapterResult{
-		SchemaVersion:            4,
+		SchemaVersion:            5,
 		RunID:                    run.ID,
 		Client:                   run.Client,
 		ArchiveToolchain:         run.ArchiveToolchain,
@@ -116,7 +117,7 @@ func TestRunConfigRejectsProfileDifferentFromPlan(t *testing.T) {
 	}
 	config := RunConfig{
 		Plan:         plan,
-		Catalog:      AdapterCatalog{SchemaVersion: 3, Adapters: []Adapter{{Client: Weaver, ArchiveToolchain: VanillaArchiveToolchain, Target: DockerLinux, Command: []string{"weaver-adapter"}}}},
+		Catalog:      AdapterCatalog{SchemaVersion: 4, Adapters: []Adapter{{Client: Weaver, ArchiveToolchain: VanillaArchiveToolchain, Target: DockerLinux, Command: []string{"weaver-adapter"}}}},
 		Target:       DockerLinux,
 		FixtureRoot:  "/fixtures",
 		ArtifactRoot: "/artifacts",
@@ -129,5 +130,13 @@ func TestRunConfigRejectsProfileDifferentFromPlan(t *testing.T) {
 	}
 	if err := config.Validate(); err == nil {
 		t.Fatal("profile mismatch should not validate")
+	}
+}
+
+func TestRunArtifactWriteFailurePropagates(t *testing.T) {
+	artifact := RunArtifact{Status: "passed"}
+	persistRunArtifact(t.TempDir(), &artifact)
+	if artifact.Status != "failed" || !strings.Contains(artifact.Error, "write run artifact") {
+		t.Fatalf("artifact write failure was not propagated: %#v", artifact)
 	}
 }

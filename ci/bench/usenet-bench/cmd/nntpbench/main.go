@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
 	"strings"
 	"time"
@@ -46,6 +47,8 @@ func main() {
 		err = sequential(os.Args[2:])
 	case "queue-transition":
 		err = queueTransition(os.Args[2:])
+	case "summarize":
+		err = summarize(os.Args[2:])
 	case "preflight":
 		err = preflight(os.Args[2:])
 	case "verify-output":
@@ -122,11 +125,11 @@ func plan(args []string) error {
 	flags.StringVar(&archiveToolchainsCSV, "archive-toolchains", "vanilla", "comma-separated archive toolchains; rarpar remains available only by explicit opt-in")
 	flags.StringVar(&transportsCSV, "transports", "plaintext,tls", "comma-separated transports")
 	flags.StringVar(&targetsCSV, "targets", "docker-linux,macos-native,windows-native", "comma-separated execution targets: docker-linux, macos-native, windows-native")
-	flags.StringVar(&profile, "profile", benchmark.ProfileEquivalentThroughput, "declared client configuration profile")
+	flags.StringVar(&profile, "profile", "", "required client profile: stock or equivalent-throughput; create a separate plan for each")
 	flags.StringVar(&serverLink, "server-link", benchmark.LinkUnlimited, "NNTP server aggregate egress profile: unlimited, 1gbit, 10gbit, or custom")
 	flags.Uint64Var(&serverEgressBPS, "server-egress-bps", 0, "required custom server-link egress rate in bits per second")
 	flags.Uint64Var(&serverBurstBytes, "server-burst-bytes", 0, "required custom server-link aggregate burst in bytes")
-	flags.IntVar(&repetitions, "repetitions", 5, "cold-state repetitions per fixture/client/transport")
+	flags.IntVar(&repetitions, "repetitions", 20, "measured randomized blocks per fixture/client/transport")
 	flags.Int64Var(&seed, "seed", 20260802, "deterministic scheduling seed")
 	flags.StringVar(&output, "output", "", "plan JSON output path")
 	if err := flags.Parse(args); err != nil {
@@ -134,6 +137,9 @@ func plan(args []string) error {
 	}
 	if output == "" {
 		return fmt.Errorf("--output is required")
+	}
+	if profile == "" {
+		return fmt.Errorf("--profile is required; create separate stock and equivalent-throughput plans")
 	}
 	fixtureIDs := splitCSV(fixturesCSV)
 	if len(fixtureIDs) == 0 {
@@ -332,6 +338,9 @@ func queueTransition(args []string) error {
 }
 
 func execute(args []string, command string) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
 	queueMode := command != "run"
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
@@ -346,6 +355,7 @@ func execute(args []string, command string) error {
 	flags.StringVar(&config.PlaintextPort, "nntp-port", "119", "plaintext NNTP port")
 	flags.StringVar(&config.TLSPort, "nntp-tls-port", "563", "implicit TLS NNTP port")
 	flags.StringVar(&config.TLSCAFile, "tls-ca-file", "", "PEM CA file mounted by verified-TLS adapters")
+	flags.StringVar(&config.ShaperControlURL, "shaper-control-url", "", "nntpshaper control-plane base URL; required by shaped plans")
 	flags.StringVar(&config.NNTPUsername, "username", "", "NNTP username")
 	flags.StringVar(&config.NNTPPassword, "password", "", "NNTP password")
 	flags.StringVar(&passwordFile, "password-file", "", "file containing the NNTP password")
@@ -367,11 +377,7 @@ func execute(args []string, command string) error {
 	if planPath == "" || adaptersPath == "" || fixturesRoot == "" || artifactsRoot == "" {
 		return fmt.Errorf("--plan, --adapters, --fixtures-root, and --artifacts are required")
 	}
-	plan, err := benchmark.LoadPlan(planPath)
-	if err != nil {
-		return err
-	}
-	catalog, err := benchmark.LoadAdapterCatalog(adaptersPath)
+	plan, catalog, planContents, adapterContents, err := loadExecutionInputs(planPath, adaptersPath)
 	if err != nil {
 		return err
 	}
@@ -380,16 +386,28 @@ func execute(args []string, command string) error {
 	config.Target = benchmark.ExecutionTarget(executionTarget)
 	config.FixtureRoot = fixturesRoot
 	config.ArtifactRoot = artifactsRoot
+	if config.Profile == "" {
+		config.Profile = plan.Profile
+	}
+	if config.Target == "" && len(plan.ExecutionTargets) == 1 {
+		config.Target = plan.ExecutionTargets[0]
+	}
+	if err := config.Validate(); err != nil {
+		return err
+	}
+	if err := writeExecutionManifest(artifactsRoot, command, planPath, adaptersPath, string(config.Target), config.Profile, args, planContents, adapterContents); err != nil {
+		return err
+	}
 	if queueMode {
 		var artifacts []benchmark.QueueArtifact
 		var runErr error
 		switch command {
 		case "queue":
-			artifacts, runErr = benchmark.ExecuteQueuePlan(context.Background(), config)
+			artifacts, runErr = benchmark.ExecuteQueuePlan(ctx, config)
 		case "sequential":
-			artifacts, runErr = benchmark.ExecuteSequentialPlan(context.Background(), config)
+			artifacts, runErr = benchmark.ExecuteSequentialPlan(ctx, config)
 		case "queue-transition":
-			artifacts, runErr = benchmark.ExecuteQueueTransitionPlan(context.Background(), config)
+			artifacts, runErr = benchmark.ExecuteQueueTransitionPlan(ctx, config)
 		default:
 			return fmt.Errorf("unsupported execution command %q", command)
 		}
@@ -398,7 +416,7 @@ func execute(args []string, command string) error {
 		}
 		return runErr
 	}
-	artifacts, runErr := benchmark.ExecutePlan(context.Background(), config)
+	artifacts, runErr := benchmark.ExecutePlan(ctx, config)
 	if err := printJSON(artifacts); err != nil {
 		return err
 	}
@@ -473,9 +491,10 @@ Commands:
   plan           Write a randomized, balanced benchmark plan
   server-env     Write an immutable server-side egress-shaper environment file
   run            Execute cold, one-NZB diagnostic runs through client adapters
-  sequential     Run each fixture in isolation through one durable client lane
+  sequential     Run each persisted plan entry through a fresh isolated client
   queue           Execute each client lane as one uninterrupted multi-NZB queue (legacy)
   queue-transition Queue twenty forced duplicates of one direct fixture and report drain time
+  summarize      Produce paired per-stratum statistics from verified sequential artifacts
   preflight      Check target host and native/Docker executable prerequisites
   verify-output  Verify a client completion directory against fixture hashes
 

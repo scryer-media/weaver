@@ -75,6 +75,9 @@ func TestMonitorQueueRecordsProcessingWallInsteadOfQueueWait(t *testing.T) {
 		if job.ProcessingStartedAt.IsZero() || job.CompletionAt.IsZero() {
 			t.Fatalf("job %s lacks processing timestamps: %#v", job.RunID, job)
 		}
+		if job.TerminalObservationLowerBound.IsZero() || job.TerminalObservedAt.IsZero() || !job.TerminalObservedAt.Equal(job.CompletionAt) || job.TerminalObservationUncertainty != job.TerminalObservedAt.Sub(job.TerminalObservationLowerBound).Nanoseconds() {
+			t.Fatalf("job %s lacks bounded terminal observation timing: %#v", job.RunID, job)
+		}
 		if got := job.CompletionAt.Sub(job.ProcessingStartedAt).Nanoseconds(); got != job.ProcessingWallClockNanoseconds {
 			t.Fatalf("job %s processing wall = %d, want %d", job.RunID, job.ProcessingWallClockNanoseconds, got)
 		}

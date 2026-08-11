@@ -36,6 +36,7 @@ type Config struct {
 	ServerLink       benchmark.ServerLinkProfile
 	FixtureDir       string
 	NZBPath          string
+	QueueInput       *benchmark.QueueInput
 	OutputDir        string
 	ConfigDir        string
 	ResultPath       string
@@ -88,7 +89,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	pollInterval, err := parseDurationDefault(getenv("NATIVE_POLL_INTERVAL"), 500*time.Millisecond, "NATIVE_POLL_INTERVAL")
+	pollInterval, err := parseDurationDefault(getenv("NATIVE_POLL_INTERVAL"), 10*time.Millisecond, "NATIVE_POLL_INTERVAL")
 	if err != nil {
 		return Config{}, err
 	}
@@ -126,10 +127,6 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		StartupTimeout:   startupTimeout,
 		PollInterval:     pollInterval,
 	}
-	if cfg.Client == benchmark.Weaver {
-		// The one-shot CLI needs no local HTTP port or API identity.
-		cfg.APIEndpoint = ""
-	}
 	for field, value := range map[string]*string{
 		"BENCH_FIXTURE_DIR":  &cfg.FixtureDir,
 		"BENCH_NZB_PATH":     &cfg.NZBPath,
@@ -147,6 +144,24 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("resolve %s: %w", field, err)
 		}
 		*value = absolute
+	}
+	if queuePath := strings.TrimSpace(getenv("BENCH_QUEUE_PATH")); queuePath != "" {
+		absolute, err := filepath.Abs(queuePath)
+		if err != nil {
+			return Config{}, fmt.Errorf("resolve BENCH_QUEUE_PATH: %w", err)
+		}
+		input, err := benchmark.LoadQueueInput(absolute)
+		if err != nil {
+			return Config{}, err
+		}
+		for index := range input.Jobs {
+			jobPath, err := filepath.Abs(input.Jobs[index].NZBPath)
+			if err != nil {
+				return Config{}, fmt.Errorf("resolve queue NZB %s: %w", input.Jobs[index].RunID, err)
+			}
+			input.Jobs[index].NZBPath = jobPath
+		}
+		cfg.QueueInput = &input
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -211,9 +226,23 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.ClientVersion) == "" {
 		return fmt.Errorf("NATIVE_CLIENT_VERSION is required")
 	}
-	if c.Client != benchmark.Weaver {
-		if _, _, err := nativeAPIAddress(c.APIEndpoint); err != nil {
+	if _, _, err := nativeAPIAddress(c.APIEndpoint); err != nil {
+		return err
+	}
+	if c.QueueInput != nil {
+		if err := c.QueueInput.Validate(); err != nil {
 			return err
+		}
+		if c.QueueInput.SubmissionMode != benchmark.SubmissionModeSequential {
+			return fmt.Errorf("native adapter only supports sequential queue input, got %q", c.QueueInput.SubmissionMode)
+		}
+		if len(c.QueueInput.Jobs) != 1 {
+			return fmt.Errorf("native sequential queue input must contain exactly one job, got %d", len(c.QueueInput.Jobs))
+		}
+		for _, job := range c.QueueInput.Jobs {
+			if _, err := os.Stat(job.NZBPath); err != nil {
+				return fmt.Errorf("inspect queue NZB %s: %w", job.RunID, err)
+			}
 		}
 	}
 	if _, err := os.Stat(c.NZBPath); err != nil {

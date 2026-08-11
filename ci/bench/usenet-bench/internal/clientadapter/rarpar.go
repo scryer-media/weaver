@@ -68,7 +68,10 @@ func prepareRarparToolchain(c Config) error {
 	if err := writeToolchainFile(filepath.Join(dir, "unrar"), rarparUnrarShim(), 0o755); err != nil {
 		return err
 	}
-	if err := writeToolchainFile(filepath.Join(dir, "par2"), rarparPar2Shim(), 0o755); err != nil {
+	// SABnzbd discovers its PAR2 executable by name. Stage the verified Rarpar
+	// binary itself at that entry point so SAB's original argv reaches Rarpar's
+	// native par2cmdline compatibility dispatcher without a translation wrapper.
+	if err := writeToolchainFile(filepath.Join(dir, "par2"), contents, 0o755); err != nil {
 		return err
 	}
 	passwords := []byte(c.ArchivePassword)
@@ -95,43 +98,4 @@ func writeToolchainFile(path string, contents []byte, mode os.FileMode) error {
 
 func rarparUnrarShim() []byte {
 	return []byte("#!/bin/sh\nexec \"$(dirname \"$0\")/rarpar\" \"$@\"\n")
-}
-
-// SABnzbd invokes par2cmdline as `par2 r <par-file> <glob>`. Rarpar exposes a
-// deliberately different native CLI, so this thin audited shim translates the
-// operation without pretending Rarpar ships a binary named par2.
-func rarparPar2Shim() []byte {
-	return []byte(`#!/bin/sh
-set -eu
-tool="$(dirname "$0")/rarpar"
-case "${1:-}" in
-  -h|--help)
-    exit 0
-    ;;
-  -V|--version)
-    exec "$tool" --version
-    ;;
-  r|repair)
-    shift
-    parfile=""
-    for arg in "$@"; do
-      case "$arg" in
-        -*) ;;
-        *) parfile="$arg"; break ;;
-      esac
-    done
-    test -n "$parfile"
-    if "$tool" par repair "$parfile"; then
-      echo "All files are correct"
-      exit 0
-    fi
-    echo "Repair Failed."
-    exit 1
-    ;;
-  *)
-    echo "Unsupported par2cmdline operation: ${1:-}" >&2
-    exit 2
-    ;;
-esac
-`)
 }

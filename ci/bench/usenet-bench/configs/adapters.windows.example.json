@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "adapters": [
     {
       "client": "weaver",
@@ -8,7 +8,8 @@
       "command": ["C:\\bench\\bin\\nativeadapter.exe"],
       "environment": {
         "NATIVE_CLIENT_VERSION": "REPLACE_WITH_WEAVER_VERSION",
-        "NATIVE_LAUNCH_COMMAND": "[\"C:\\\\path\\\\to\\\\weaver.exe\",\"--config\",\"{{config_dir}}\",\"download\",\"{{nzb_path}}\"]"
+        "NATIVE_API_ENDPOINT": "http://127.0.0.1:19090",
+        "NATIVE_LAUNCH_COMMAND": "[\"C:\\\\path\\\\to\\\\weaver.exe\",\"--config\",\"{{config_dir}}\",\"serve\",\"--port\",\"{{api_port}}\"]"
       }
     },
     {

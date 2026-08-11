@@ -82,10 +82,10 @@ func TestRAR4ReleaseCompressionUsesItsMaximumDictionary(t *testing.T) {
 	}
 }
 
-func TestRAR3ArgsUseTheLockedLegacyWriterDefault(t *testing.T) {
+func TestLegacyRAR4ArgsUseTheLockedWriterDefault(t *testing.T) {
 	c := ArchiveCase{
 		ID:          "legacy-case",
-		RARFormat:   RAR3,
+		RARFormat:   RAR4,
 		Compression: Store,
 		Solid:       false,
 		Encryption:  DataEncryption,
@@ -97,11 +97,11 @@ func TestRAR3ArgsUseTheLockedLegacyWriterDefault(t *testing.T) {
 	}
 	joined := strings.Join(args, " ")
 	if strings.Contains(joined, "-ma") {
-		t.Fatalf("RAR3 must not claim a newer -ma format selector: %q", joined)
+		t.Fatalf("legacy RAR4 must not claim a newer -ma format selector: %q", joined)
 	}
 	for _, want := range []string{"-m0", "-s-", "-p" + FixturePassword, "-v32m"} {
 		if !strings.Contains(joined, want) {
-			t.Errorf("RAR3 args = %q, missing %q", joined, want)
+			t.Errorf("legacy RAR4 args = %q, missing %q", joined, want)
 		}
 	}
 }

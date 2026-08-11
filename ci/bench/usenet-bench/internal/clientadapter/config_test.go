@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -232,6 +234,84 @@ func TestRarparToolchainStagesOnlyVerifiedPublishedBinary(t *testing.T) {
 	}
 	if got := cfg.archiveToolchainIdentity(); strings.Contains(got, cfg.RarparBinary) || !strings.Contains(got, "sha256:") {
 		t.Fatalf("Rarpar identity leaks a path or omits a digest: %q", got)
+	}
+	staged, err := os.ReadFile(filepath.Join(cfg.ConfigDir, "toolchain", "rarpar"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual := sha256.Sum256(staged)
+	if got := hex.EncodeToString(actual[:]); got != cfg.RarparSHA256 {
+		t.Fatalf("staged Rarpar hash = %s, want %s", got, cfg.RarparSHA256)
+	}
+}
+
+func TestRarparUnrarShimExecutesOnlyTheStagedTool(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Rarpar shims are exercised only by Docker/Linux lanes")
+	}
+	cfg := testConfig(t, benchmark.SABnzbd, benchmark.Plaintext, benchmark.TLSNotApplicable)
+	configureTestRarpar(t, &cfg)
+	if err := prepareRarparToolchain(cfg); err != nil {
+		t.Fatal(err)
+	}
+	shim := filepath.Join(cfg.ConfigDir, "toolchain", "unrar")
+	output, err := exec.Command(shim, "x", "archive.rar").CombinedOutput()
+	if err != nil {
+		t.Fatalf("run unrar shim: %v: %s", err, output)
+	}
+	if got := string(output); !strings.Contains(got, "rarpar 0.2.5") {
+		t.Fatalf("unrar shim did not execute staged Rarpar: %q", got)
+	}
+}
+
+func TestRarparPAR2EntryPointIsVerifiedBinaryAndPreservesSABArguments(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Rarpar entry points are exercised only by Docker/Linux lanes")
+	}
+	cfg := testConfig(t, benchmark.SABnzbd, benchmark.Plaintext, benchmark.TLSNotApplicable)
+	binary := filepath.Join(filepath.Dir(cfg.NZBPath), "rarpar")
+	contents := []byte("#!/bin/sh\nprintf 'rarpar args:'\nprintf ' <%s>' \"$@\"\nprintf '\\n'\n")
+	if err := os.WriteFile(binary, contents, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(contents)
+	cfg.ArchiveToolchain = benchmark.RarparArchiveToolchain
+	cfg.RarparBinary = binary
+	cfg.RarparVersion = "0.2.5"
+	cfg.RarparSHA256 = hex.EncodeToString(digest[:])
+	if err := prepareRarparToolchain(cfg); err != nil {
+		t.Fatal(err)
+	}
+	entryPoint := filepath.Join(cfg.ConfigDir, "toolchain", "par2")
+	staged, err := os.ReadFile(entryPoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual := sha256.Sum256(staged); actual != digest {
+		t.Fatalf("SAB PAR2 entry point is not the verified Rarpar binary: got %x, want %x", actual, digest)
+	}
+	output, err := exec.Command(entryPoint, "r", "-B", "/downloads/incomplete/job", "repair.par2", "files/*.rar").CombinedOutput()
+	if err != nil {
+		t.Fatalf("run staged Rarpar PAR2 entry point: %v: %s", err, output)
+	}
+	if got, want := string(output), "rarpar args: <r> <-B> </downloads/incomplete/job> <repair.par2> <files/*.rar>\n"; got != want {
+		t.Fatalf("SAB arguments changed before reaching Rarpar: got %q, want %q", got, want)
+	}
+}
+
+func TestRarparConfigPathsKeepNZBGetBuiltInPAR2Explicit(t *testing.T) {
+	cfg := testConfig(t, benchmark.NZBGet, benchmark.Plaintext, benchmark.TLSNotApplicable)
+	configureTestRarpar(t, &cfg)
+	spec, err := cfg.RenderProductConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(spec.ConfigContent)
+	if !strings.Contains(content, "UnrarCmd=/config/toolchain/unrar") || strings.Contains(content, "/config/toolchain/par2") {
+		t.Fatalf("NZBGet must replace only UnRAR, retaining built-in PAR2:\n%s", content)
+	}
+	if !strings.Contains(string(spec.Rendered), "UnRAR only; NZBGet built-in PAR2") {
+		t.Fatalf("rendered Rarpar provenance must identify NZBGet's built-in PAR2:\n%s", spec.Rendered)
 	}
 }
 

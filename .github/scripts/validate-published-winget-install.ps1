@@ -69,10 +69,42 @@ function Install-PublishedMsiWithWinGet {
   }
 }
 
-function Remove-WeaverPackage {
+function Get-ManifestMsiProductCode {
+  $installerManifests = @(Get-ChildItem -LiteralPath $ManifestRoot -Recurse -File -Filter "$packageId.installer.yaml")
+  if ($installerManifests.Count -ne 1) {
+    throw "Expected exactly one $packageId installer manifest beneath $ManifestRoot, found $($installerManifests.Count)."
+  }
+
+  $productCodeLines = @(Select-String -LiteralPath $installerManifests[0].FullName -Pattern '^ProductCode:\s*(.+?)\s*$')
+  if ($productCodeLines.Count -ne 1) {
+    throw "Expected exactly one ProductCode in $($installerManifests[0].FullName), found $($productCodeLines.Count)."
+  }
+
+  return $productCodeLines[0].Matches[0].Groups[1].Value.Trim()
+}
+
+function Remove-WeaverMsi {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$ProductCode
+  )
+
+  $msiExec = Join-Path $env:SystemRoot "System32\msiexec.exe"
+  $process = Start-Process -FilePath $msiExec -ArgumentList @("/x", $ProductCode, "/qn", "/norestart") -PassThru -Wait
+  if ($process.ExitCode -notin @(0, 3010)) {
+    throw "MSI cleanup for $ProductCode failed with exit code $($process.ExitCode)."
+  }
+
+  $installDir = Join-Path (Get-ProgramFiles64) "Scryer Media\Weaver"
+  if (Test-Path $installDir) {
+    throw "MSI cleanup for $ProductCode left $installDir behind."
+  }
+}
+
+function Remove-WeaverPortablePackage {
   & $winget uninstall --id $packageId --exact --silent --accept-source-agreements --disable-interactivity
   if ($LASTEXITCODE -ne 0) {
-    throw "winget cleanup failed with exit code $LASTEXITCODE."
+    throw "winget portable cleanup failed with exit code $LASTEXITCODE."
   }
 }
 
@@ -92,6 +124,7 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) {
   throw "Published winget manifest validation failed with exit code $LASTEXITCODE."
 }
+$msiProductCode = Get-ManifestMsiProductCode
 
 $directInstallCompleted = $false
 try {
@@ -100,7 +133,10 @@ try {
   Assert-PublishedMsiInstallation -Context "winget install"
 } finally {
   if ($directInstallCompleted) {
-    Remove-WeaverPackage
+    # Local-manifest installations are not registered under the catalog source,
+    # so `winget uninstall --id` cannot reliably find them. The manifest's MSI
+    # ProductCode is the installation identity WinGet just used.
+    Remove-WeaverMsi -ProductCode $msiProductCode
   }
 }
 
@@ -138,8 +174,10 @@ try {
     throw "winget portable-to-MSI upgrade removed legacy user data at $legacyMarker"
   }
 } finally {
-  if ($transitionCompleted -or $legacyInstallCompleted) {
-    Remove-WeaverPackage
+  if ($transitionCompleted) {
+    Remove-WeaverMsi -ProductCode $msiProductCode
+  } elseif ($legacyInstallCompleted) {
+    Remove-WeaverPortablePackage
   }
   Remove-Item -LiteralPath $legacyProfile -Recurse -Force -ErrorAction SilentlyContinue
 }

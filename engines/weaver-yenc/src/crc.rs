@@ -1,15 +1,27 @@
 /// Thin wrapper around `crc-fast` for streaming CRC32 computation
 /// during yEnc decode.
 ///
-/// On x86_64 CPUs with AVX2 + VPCLMULQDQ, large updates may be folded with a
-/// 256-bit carry-less multiply path derived from rapidyenc's zlib-ng based CRC
-/// folding implementation. `crc-fast` remains the resident state and the
-/// fallback/head-tail path, so externally visible CRC semantics stay identical.
+/// On x86_64 CPUs with AVX2 + VPCLMULQDQ but no AVX512VL, large updates may be
+/// folded with a 256-bit carry-less multiply path derived from rapidyenc's
+/// zlib-ng based CRC folding implementation. `crc-fast` remains the fallback and
+/// small-update path, so externally visible CRC semantics stay identical.
+///
+/// While the folding path is running the authoritative value is the plain `u32`
+/// in `folded` (finalized/post-xor domain) and `hasher` is stale; it is
+/// materialized back into a `crc_fast::Digest` only when a non-folded update
+/// arrives. Consequently `hasher`'s internal byte counter is not a valid total
+/// once `folded` has been used, so `crc_fast::Digest::get_amount`/`combine` must
+/// not be surfaced through this wrapper without first tracking the folded bytes
+/// here.
 #[derive(Clone)]
 pub struct Crc32 {
     hasher: crc_fast::Digest,
     #[cfg(target_arch = "x86_64")]
     use_vpclmul: bool,
+    /// Carried CRC value in the finalized (post-xor) domain. `Some` means
+    /// `hasher` is stale and this is the live state.
+    #[cfg(target_arch = "x86_64")]
+    folded: Option<u32>,
 }
 
 impl Crc32 {
@@ -22,6 +34,8 @@ impl Crc32 {
             hasher: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc),
             #[cfg(target_arch = "x86_64")]
             use_vpclmul: x86_vpclmul::available(),
+            #[cfg(target_arch = "x86_64")]
+            folded: None,
         }
     }
 
@@ -29,14 +43,28 @@ impl Crc32 {
     #[inline]
     pub fn update(&mut self, data: &[u8]) {
         #[cfg(target_arch = "x86_64")]
-        if self.use_vpclmul && data.len() >= Self::VPCLMUL_MIN_UPDATE {
-            let init = self.hasher.finalize() as u32;
-            let crc = unsafe { x86_vpclmul::update(init, data) };
-            self.hasher = crc_fast::Digest::new_with_init_state(
-                crc_fast::CrcAlgorithm::Crc32IsoHdlc,
-                u64::from(!crc),
-            );
-            return;
+        {
+            if self.use_vpclmul && data.len() >= Self::VPCLMUL_MIN_UPDATE {
+                // The kernel consumes and produces the finalized domain, so
+                // consecutive folded updates just carry a `u32` — no digest is
+                // touched at all in the dominant "few large updates then
+                // finalize" pattern.
+                let init = match self.folded {
+                    Some(crc) => crc,
+                    None => self.hasher.finalize() as u32,
+                };
+                self.folded = Some(unsafe { x86_vpclmul::update(init, data) });
+                return;
+            }
+
+            // Leaving the folding path: materialize the carried value into the
+            // resident digest exactly once, not once per update.
+            if let Some(crc) = self.folded.take() {
+                self.hasher = crc_fast::Digest::new_with_init_state(
+                    crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+                    u64::from(!crc),
+                );
+            }
         }
 
         self.hasher.update(data);
@@ -44,11 +72,16 @@ impl Crc32 {
 
     /// Finalize and return the CRC32 value. Consumes the hasher.
     pub fn finalize(self) -> u32 {
-        self.hasher.finalize() as u32
+        self.current()
     }
 
     /// Get the current CRC32 value without consuming this wrapper.
     pub fn current(&self) -> u32 {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(crc) = self.folded {
+            return crc;
+        }
+
         self.hasher.finalize() as u32
     }
 }
@@ -79,6 +112,15 @@ mod x86_vpclmul {
                 && is_x86_feature_detected!("pclmulqdq")
                 && is_x86_feature_detected!("sse4.1")
                 && is_x86_feature_detected!("vpclmulqdq")
+                // Tier logic: crc-fast only enables its own VPCLMULQDQ kernel when
+                // AVX512VL is present as well (`has_vpclmulqdq = has_avx512vl &&
+                // is_x86_feature_detected!("vpclmulqdq")`), and that kernel is a
+                // 4x512-bit ZMM fold (256 B/iter, ternary-logic XOR3) which beats this
+                // 2x256-bit port. Standing aside on those parts (Zen 4/5, AVX512 Intel
+                // server) leaves the faster kernel in place. This port exists solely to
+                // cover VPCLMULQDQ-without-AVX512VL CPUs (Alder Lake -> Arrow Lake),
+                // where crc-fast drops all the way to its 128-bit SSE tier.
+                && !is_x86_feature_detected!("avx512vl")
         })
     }
 
@@ -336,6 +378,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn crc32_mixed_size_interleaved_updates() {
+        const LEN: usize = 32 * 1024;
+        let mut data = Vec::with_capacity(LEN);
+        let mut seed = 0x9e37_79b9u32;
+        for _ in 0..LEN {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            data.push((seed >> 24) as u8);
+        }
+
+        // Sizes straddle VPCLMUL_MIN_UPDATE (256) in both directions, so each
+        // sequence bounces between the carried-u32 folding path and the crc-fast
+        // digest path, pinning the hand-off in both directions plus the exact
+        // threshold boundary (255/256).
+        let sequences: [&[usize]; 6] = [
+            &[1, 64, 255, 256, 300, 4096, 7],
+            &[4096, 7, 256, 1, 300, 255, 64],
+            &[256, 256, 256, 1, 1, 1, 4096],
+            &[7, 7, 7, 300, 7, 4096, 255, 256],
+            &[300, 1, 4096, 64, 256, 255, 7, 256],
+            &[4096, 4096, 1, 4096, 255, 300, 256],
+        ];
+
+        for seq in sequences {
+            let total: usize = seq.iter().sum();
+            assert!(total <= LEN, "sequence {seq:?} exceeds fixture");
+
+            let mut crc = Crc32::new();
+            let mut offset = 0usize;
+            for &len in seq {
+                crc.update(&data[offset..offset + len]);
+                offset += len;
+                // Every prefix must match a one-shot reference, so a bad carry
+                // is caught at the update that introduced it.
+                assert_eq!(
+                    crc.current(),
+                    crc_fast::crc32_iso_hdlc(&data[..offset]),
+                    "sequence {seq:?} prefix {offset}"
+                );
+            }
+
+            assert_eq!(
+                crc.finalize(),
+                crc_fast::crc32_iso_hdlc(&data[..total]),
+                "sequence {seq:?}"
+            );
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn crc32_forced_vpclmul_matches_crc_fast() {
@@ -352,6 +443,13 @@ mod tests {
                     continue;
                 };
                 let Some(actual) = x86_vpclmul::test_update_forced(0, input) else {
+                    // Visible skip: without this line a host where `available()`
+                    // is false (no vpclmulqdq, or avx512vl present so the
+                    // crc-fast ZMM tier wins) reports `ok` while executing
+                    // nothing — indistinguishable from real coverage in logs.
+                    eprintln!(
+                        "skipping crc32_forced_vpclmul_matches_crc_fast: VPCLMUL port unavailable on this CPU"
+                    );
                     return;
                 };
                 assert_eq!(

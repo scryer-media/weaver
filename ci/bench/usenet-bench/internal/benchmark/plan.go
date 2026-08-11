@@ -18,6 +18,8 @@ const (
 	NZBGet  Client = "nzbget"
 )
 
+const PrimaryMetric = "submission_to_terminal_verified_output"
+
 type Transport string
 
 const (
@@ -87,9 +89,8 @@ type Plan struct {
 	Runs              []Run              `json:"runs"`
 }
 
-// Run is one planned fixture submission. Execution modes decide whether
-// submissions share the durable client lane; every lane begins with a fresh
-// writable state/configuration/output directory.
+// Run is one planned fixture submission. Primary execution gives every run a
+// fresh client process and writable state/configuration/output directory.
 type Run struct {
 	ID               string            `json:"id"`
 	Order            int               `json:"order"`
@@ -127,7 +128,7 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 		return Plan{}, err
 	}
 	plan := Plan{
-		SchemaVersion:     4,
+		SchemaVersion:     5,
 		Seed:              options.Seed,
 		FixtureIDs:        append([]string(nil), options.FixtureIDs...),
 		Clients:           append([]Client(nil), options.Clients...),
@@ -183,7 +184,7 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 				ServerLink:       plan.ServerLink,
 				Repetition:       benchmarkRound.repetition,
 				FreshClientState: true,
-				Metric:           "usable_output",
+				Metric:           PrimaryMetric,
 			})
 		}
 	}
@@ -194,7 +195,7 @@ func BuildPlan(options PlanOptions) (Plan, error) {
 }
 
 func (p Plan) Validate() error {
-	if p.SchemaVersion != 4 {
+	if p.SchemaVersion != 5 {
 		return fmt.Errorf("unsupported benchmark plan schema version %d", p.SchemaVersion)
 	}
 	if err := validateOptions(PlanOptions{
@@ -240,8 +241,8 @@ func (p Plan) Validate() error {
 		if run.Order != index+1 || run.ID != fmt.Sprintf("run-%04d", index+1) {
 			return fmt.Errorf("benchmark plan has non-canonical run ordering at position %d", index+1)
 		}
-		if !run.FreshClientState || run.Metric != "usable_output" || run.Profile != p.Profile || run.ServerLink != p.ServerLink {
-			return fmt.Errorf("benchmark plan run %s does not use the required cold-state usable-output metric", run.ID)
+		if !run.FreshClientState || run.Metric != PrimaryMetric || run.Profile != p.Profile || run.ServerLink != p.ServerLink {
+			return fmt.Errorf("benchmark plan run %s does not use the required verified submission-to-terminal metric", run.ID)
 		}
 		if !targets[run.ExecutionTarget] {
 			return fmt.Errorf("benchmark plan run %s has an unplanned execution target %q", run.ID, run.ExecutionTarget)
@@ -285,9 +286,11 @@ func WritePlan(path string, plan Plan) error {
 	if err != nil {
 		return fmt.Errorf("create benchmark plan %s: %w", path, err)
 	}
-	defer file.Close()
 	if _, err := file.Write(contents); err != nil {
 		return fmt.Errorf("write benchmark plan %s: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close benchmark plan %s: %w", path, err)
 	}
 	return nil
 }

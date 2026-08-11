@@ -211,8 +211,18 @@ fn benches(c: &mut Criterion) {
             &rapid_out[..rapid_written],
             "{name} decoded byte parity"
         );
+        // Per-fixture CRC gate: the timing lanes below only measure the two CRC
+        // implementations, they never compare them, so the actual equality claim
+        // is made here over the decoded bytes.
+        let weaver_crc = {
+            let mut hasher = Crc32::new();
+            hasher.update(&weaver_out[..weaver_written]);
+            hasher.finalize()
+        };
+        let rapid_crc = rapidyenc.crc(&rapid_out[..rapid_written]);
+        assert_eq!(weaver_crc, rapid_crc, "{name} decoded CRC parity");
         eprintln!(
-            "parity ok [{name}]: {} encoded -> {} decoded",
+            "parity ok [{name}]: {} encoded -> {} decoded, crc={weaver_crc:#010x}",
             input.len(),
             weaver_written
         );

@@ -24,6 +24,8 @@ $prefix = "weaver-windows-$Architecture"
 $defenderLog = "$prefix-defender-scan.log"
 $attachmentLog = "$prefix-attachment-services.log"
 $startupLog = "$prefix-noarg-startup.log"
+$trayStdoutLog = "$prefix-tray-stdout.log"
+$trayStderrLog = "$prefix-tray-stderr.log"
 $wingetLog = "$prefix-winget-install.log"
 $validationTempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [System.IO.Path]::GetTempPath() }
 $validationRoot = Join-Path $validationTempRoot "weaver-package-validation-$Architecture"
@@ -440,6 +442,8 @@ New-Item -ItemType Directory -Force -Path $validationRoot | Out-Null
 "" | Set-Content $defenderLog
 "" | Set-Content $attachmentLog
 "" | Set-Content $startupLog
+"" | Set-Content $trayStdoutLog
+"" | Set-Content $trayStderrLog
 "" | Set-Content $wingetLog
 
 $zipCopy = Join-Path $validationRoot (Split-Path $ZipPath -Leaf)
@@ -540,11 +544,20 @@ if ($LASTEXITCODE -ne 0) {
 
 if (Test-InteractiveDesktop) {
   $tray = $null
+  $oldTrayEncryptionKey = $env:WEAVER_ENCRYPTION_KEY
   try {
-  $tray = Start-Process -FilePath $installedTray -ArgumentList "--login-start" -PassThru
+  # GitHub-hosted Windows runners do not provide Credential Manager to this
+  # session. Match the no-argument smoke and keep the tray server in the
+  # deterministic CI-only key path.
+  $env:WEAVER_ENCRYPTION_KEY = $validationEncryptionKey
+  $tray = Start-Process -FilePath $installedTray -ArgumentList "--login-start" -PassThru `
+    -RedirectStandardOutput $trayStdoutLog -RedirectStandardError $trayStderrLog
   $deadline = (Get-Date).AddSeconds(30)
   $trayReady = $false
   while ((Get-Date) -lt $deadline) {
+    if ($tray.HasExited) {
+      throw "Tray exited before Weaver became ready (exit code $($tray.ExitCode)). See $trayStdoutLog and $trayStderrLog."
+    }
     try {
       $response = Invoke-WebRequest -Uri "http://127.0.0.1:9090/" -TimeoutSec 2 -UseBasicParsing
       if ($response.StatusCode -eq 200) {
@@ -556,7 +569,7 @@ if (Test-InteractiveDesktop) {
     }
   }
   if (-not $trayReady) {
-    throw "Tray did not make Weaver ready within 30 seconds. See $msiLog."
+    throw "Tray did not make Weaver ready within 30 seconds. See $trayStdoutLog and $trayStderrLog."
   }
   if (-not (Test-Path (Join-Path $desktopProfile "weaver.db"))) {
     throw "Tray launch did not create the isolated desktop profile at $desktopProfile."
@@ -571,6 +584,7 @@ if (Test-InteractiveDesktop) {
       & $installedTray --shutdown *>> $msiLog
       try { Wait-Process -Id $tray.Id -Timeout 15 -ErrorAction Stop } catch { Stop-Process -Id $tray.Id -Force -ErrorAction SilentlyContinue }
     }
+    Restore-EnvVar -Name "WEAVER_ENCRYPTION_KEY" -Value $oldTrayEncryptionKey
   }
 } else {
   Write-Log $msiLog "Skipping GUI tray startup smoke: no interactive desktop exists for this process session."

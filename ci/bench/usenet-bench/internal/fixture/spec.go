@@ -17,11 +17,8 @@ const FixturePassword = "nntp-bench-fixture-password"
 type RARFormat string
 
 const (
-	// RAR3 is the legacy format emitted by the source-locked 3.x writer.
-	// It intentionally has its own corpus lane instead of being represented by
-	// a newer writer's RAR4 compatibility switch.
-	RAR3 RARFormat = "rar3"
-	// RAR4 is the classic pre-RAR5 family emitted by the 4.x writer.
+	// RAR4 is the legacy pre-RAR5 family emitted by the source-locked 3.93
+	// and 4.20 writers.
 	RAR4 RARFormat = "rar4"
 	// RAR5 is the on-wire format introduced by RAR 5.x and used by 5.x-7.x.
 	RAR5 RARFormat = "rar5"
@@ -221,7 +218,7 @@ func (s FixtureSet) validate() error {
 	if strings.TrimSpace(s.GeneratorToolchain) == "" {
 		return fmt.Errorf("fixture set %q has an empty generator_toolchain", s.ID)
 	}
-	if s.RARFormat != RAR3 && s.RARFormat != RAR4 && s.RARFormat != RAR5 {
+	if s.RARFormat != RAR4 && s.RARFormat != RAR5 {
 		return fmt.Errorf("fixture set %q has unsupported rar_format %q", s.ID, s.RARFormat)
 	}
 	if len(s.Compressions) == 0 || len(s.Solid) == 0 || len(s.Encryptions) == 0 || len(s.Payloads) == 0 {
@@ -280,7 +277,7 @@ func (c ArchiveCase) RARArgs(archive string, inputs []string) ([]string, error) 
 	}
 	args := []string{"a", "-idq", "-y", "-ep1"}
 	switch c.RARFormat {
-	case RAR3, RAR4:
+	case RAR4:
 		// The source-locked 3.x and 4.x writers predate the -ma selector;
 		// their default archive format is the explicitly selected legacy lane.
 	case RAR5:
