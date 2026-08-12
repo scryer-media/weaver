@@ -80,6 +80,19 @@ log()  { printf '\033[1;34m[run]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[run:warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[run:FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# True when one rev is a prefix of the other and the shorter side is ≥7 chars
+# (REVISION.json carries full 40-char revs; BUILDINFO the short form).
+revs_agree() {
+  local a="$1" b="$2" short
+  [ -n "$a" ] && [ -n "$b" ] || return 1
+  if [ "${#a}" -le "${#b}" ]; then
+    short="$a"; case "$b" in "$a"*) : ;; *) return 1 ;; esac
+  else
+    short="$b"; case "$a" in "$b"*) : ;; *) return 1 ;; esac
+  fi
+  [ "${#short}" -ge 7 ]
+}
+
 GATE_FAILURES=0
 gate_fail() { printf '\033[1;31m[run:GATE]\033[0m %s\n' "$*" >&2; GATE_FAILURES=$((GATE_FAILURES + 1)); }
 
@@ -168,7 +181,8 @@ assert_bundle_present() {
     name="${pair%%:*}"; tree="${pair##*:}"
     field="$(printf '%s' "$pair" | cut -d: -f2)"
     bi="$(buildinfo_field "$field")"; tr="$(revision_field "$tree" rev)"
-    [ "$bi" = "$tr" ] || die "STALE BUNDLE: $name built from $bi but tree is $tr — re-run c7a-bootstrap.sh (doc §6)"
+    # Prefix-tolerant (short vs full rev forms), ≥7 chars — mirrors bootstrap.
+    revs_agree "$bi" "$tr" || die "STALE BUNDLE: $name built from $bi but tree is $tr — re-run c7a-bootstrap.sh (doc §6)"
   done
   log "Prebuilt bundle present; BUILDINFO revs match all three trees."
 }
@@ -181,6 +195,9 @@ assert_cpu_features() {
   local flags missing="" f
   flags="$(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2- || true)"
   [ -n "$flags" ] || die "could not read CPU flags"
+  # Linux spells VBMI2 as avx512_vbmi2 in /proc/cpuinfo — normalize (see
+  # c7a-bootstrap.sh assert_cpu_features).
+  case " $flags " in *" avx512_vbmi2 "*) flags="$flags avx512vbmi2" ;; esac
   for f in $REQUIRED_FEATURES; do
     case " $flags " in *" $f "*) : ;; *) missing="$missing $f" ;; esac
   done
@@ -954,7 +971,11 @@ rarpar_bench_suite() {
   #        linux-i5-1240p/rar5-perf-6cc9c523
   rev8="$(revision_field "$RARPAR_DIR" rev)"; rev8="${rev8:0:8}"
   evidence_root="$RESULTS_DIR/rarpar-bench/evidence/$MACHINE_LABEL"
-  evidence_dir="$evidence_root/rar-${rev8}-c7a"
+  # rar5-perf- prefix per the existing convention (linux-i5-1240p/rar5-perf-*)
+  # AND to keep this label DISTINCT from the full-corpus suite's rar-<rev8>-c7a:
+  # identical labels caused a silent merge/overwrite during evidence
+  # relocation on 2026-08-12 that destroyed the full-corpus raw evidence.
+  evidence_dir="$evidence_root/rar5-perf-${rev8}-c7a"
   mkdir -p "$evidence_root"
   plan_out="$RESULTS_DIR/rarpar-bench/plan.json"
   log_file="$RESULTS_DIR/rarpar-bench/harness.log"

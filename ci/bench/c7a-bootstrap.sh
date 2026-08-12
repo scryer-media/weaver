@@ -93,6 +93,19 @@ log()  { printf '\033[1;34m[bootstrap]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[bootstrap:warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[bootstrap:FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# True when one rev is a prefix of the other and the shorter side is ≥7 chars
+# (REVISION.json carries full 40-char revs; BUILDINFO the short form).
+revs_agree() {
+  local a="$1" b="$2" short
+  [ -n "$a" ] && [ -n "$b" ] || return 1
+  if [ "${#a}" -le "${#b}" ]; then
+    short="$a"; case "$b" in "$a"*) : ;; *) return 1 ;; esac
+  else
+    short="$b"; case "$a" in "$b"*) : ;; *) return 1 ;; esac
+  fi
+  [ "${#short}" -ge 7 ]
+}
+
 # ── CPU feature assertion (the precondition that makes this run meaningful) ──
 # avx512vl is load-bearing twice over: it selects the VBMI2 decode kernel
 # (simd/mod.rs:362-368) AND it is the feature that DISABLES weaver's own VPCLMUL
@@ -104,6 +117,10 @@ assert_cpu_features() {
   local flags missing=""
   flags="$(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2- || true)"
   [ -n "$flags" ] || die "could not read CPU flags from /proc/cpuinfo"
+  # Linux spells VBMI2 with an underscore in /proc/cpuinfo (avx512_vbmi2, vs
+  # avx512vbmi for VBMI1). Normalize so the canonical token below matches on
+  # real hardware; a CPU without VBMI2 reports neither spelling and still fails.
+  case " $flags " in *" avx512_vbmi2 "*) flags="$flags avx512vbmi2" ;; esac
   local f
   for f in $REQUIRED_FEATURES; do
     case " $flags " in
@@ -198,21 +215,32 @@ resolve_docker() {
 }
 
 install_ecr_tooling() {
+  local SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+  # NOTE: `awscli` is NOT in the Ubuntu 24.04 (noble) archive, and listing it
+  # in the same apt transaction as docker.io makes the WHOLE install fail
+  # atomically — docker never gets installed either. docker.io comes from apt;
+  # the AWS CLI comes from the official v2 bundle below (needs unzip).
   local want=""
   command -v docker >/dev/null 2>&1 || want="$want docker.io"
-  command -v aws    >/dev/null 2>&1 || want="$want awscli"
+  command -v unzip  >/dev/null 2>&1 || want="$want unzip"
   if [ -n "$want" ]; then
     log "Installing corpus-delivery tooling (apt):$want"
     if command -v apt-get >/dev/null 2>&1; then
-      local SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
       $SUDO DEBIAN_FRONTEND=noninteractive apt-get update -y
       # shellcheck disable=SC2086
       $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y $want
     else
       warn "apt-get not found; install manually:$want"
     fi
-  else
-    log "docker + aws CLI already present."
+  fi
+  if ! command -v aws >/dev/null 2>&1; then
+    log "Installing AWS CLI v2 (awscli has no installation candidate on noble)…"
+    local tmpd; tmpd="$(mktemp -d)"
+    ( curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+        -o "$tmpd/awscliv2.zip" \
+      && cd "$tmpd" && unzip -q awscliv2.zip && $SUDO ./aws/install ) \
+      || { rm -rf "$tmpd"; die "AWS CLI v2 install failed"; }
+    rm -rf "$tmpd"
   fi
   command -v docker >/dev/null 2>&1 || die "docker still missing after install"
   command -v aws    >/dev/null 2>&1 || die "aws CLI still missing after install (needed for 'aws ecr get-login-password')"
@@ -253,10 +281,21 @@ fetch_corpus() {
 
   log "Extracting /corpus/. -> $CORPUS_DEST/ (container is created, never run)"
   local cid rc=0
-  cid="$($DOCKER create "$CORPUS_IMAGE")" || die "docker create failed"
+  # The dummy argv is REQUIRED: the corpus image is FROM scratch with no CMD,
+  # so a bare `docker create` fails with "no command specified". The container
+  # is never started; /bin/true need not exist in the image.
+  cid="$($DOCKER create "$CORPUS_IMAGE" /bin/true)" || die "docker create failed"
   $DOCKER cp "$cid:/corpus/." "$CORPUS_DEST/" || rc=$?
   $DOCKER rm -v "$cid" >/dev/null 2>&1 || warn "could not remove scratch container $cid"
   [ "$rc" -eq 0 ] || die "docker cp of /corpus/. failed (rc=$rc)"
+
+  # docker cp preserves in-image ownership (root). Reclaim the trees or the run
+  # user cannot write RESULTS_DIR, generate the corpus in-tree, or build
+  # rapidyenc oracles into it.
+  local SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+  $SUDO chown -R "$(id -un):$(id -gn)" \
+      "$WEAVER_DIR" "$RARPAR_DIR" "$RAPIDYENC_ROOT" "$PREBUILT_DIR" 2>/dev/null \
+    || warn "chown of extracted trees failed — expect permission errors in the run"
 
   corpus_is_extracted || die "extraction finished but the expected layout is incomplete.
      wanted REVISION.json in each of: $WEAVER_DIR, $RARPAR_DIR, $RAPIDYENC_ROOT
@@ -346,7 +385,11 @@ EOF
     if [ "$binfo_rev" = "unknown" ] || [ "$tree_rev" = "unknown" ]; then
       die "cannot compare $name revisions (BUILDINFO='$binfo_rev' REVISION.json='$tree_rev') — refusing to run a bundle of unknown provenance"
     fi
-    if [ "$binfo_rev" != "$tree_rev" ]; then
+    # Prefix-tolerant compare: REVISION.json records full 40-char revs while
+    # BUILDINFO records the short form. Either may prefix the other, but a
+    # match needs at least 7 chars — strict equality here bricked run #2
+    # (every tree "stale" despite identical commits).
+    if ! revs_agree "$binfo_rev" "$tree_rev"; then
       die "STALE BUNDLE: $name binaries were built from $binfo_rev but the shipped tree is $tree_rev.
      The prebuilt executables do not correspond to the source in this image.
      Rebuild the bundle and re-push the corpus image; do not 'work around' this."
