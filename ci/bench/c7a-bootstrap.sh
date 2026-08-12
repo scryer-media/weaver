@@ -43,9 +43,10 @@ set -euo pipefail
 # (as ci/bench/avx2-aws-run.sh:94 does for the AVX2 box). Without it this only
 # STOPS the instance and the EBS root volume keeps billing.
 #
-# With prebuilt binaries the whole session is ~35-45 min, so the default 120 is
-# already generous headroom. Set DEADMAN_MINUTES=0 to skip (e.g. re-running on
-# an already-armed box).
+# This is a safety net, not a schedule — no estimates anywhere in this runbook
+# by standing rule; c7a-run.sh MEASURES each phase and records the numbers in
+# metadata.json. Raise DEADMAN_MINUTES if a run ever approaches it; set 0 to
+# skip (e.g. re-running on an already-armed box).
 DEADMAN_MINUTES="${DEADMAN_MINUTES:-120}"
 
 arm_deadman() {
@@ -311,6 +312,30 @@ EOF
   [ "$bad" -eq 0 ] || die "$bad of $n manifest binaries are missing or not executable under $PREBUILT_DIR/bin"
   log "  $n manifest binaries present and executable."
 
+  # Ids the run script names explicitly. Everything else is discovered by
+  # iterating the manifest, but these must exist or a whole phase silently
+  # disappears — the rarpar-bench suite is the headline of the run (doc §8a).
+  #   rarpar-cli            -> `run --candidate`
+  #   rarpar-bench-harness  -> the Go harness itself
+  #   oracle-unrar-723      -> `run --reference-rar`
+  #   oracle-par2-turbo-140 -> `run --reference-par2`
+  # BOTH references are mandatory, not one: internal/bench/run.go:59-64 hard
+  # errors with "a comparative corpus run requires both reference RAR and
+  # reference PAR2 binaries" the moment either is supplied without the other.
+  # The par2 arm is timed at run.go:248-258 and labelled "par2cmdline-turbo" in
+  # report.go:83-88. oracle-unrar-624 is the ONLY optional spare.
+  local want missing_req=""
+  for want in rarpar-cli rarpar-bench-harness oracle-unrar-723 oracle-par2-turbo-140; do
+    if [ ! -x "$PREBUILT_DIR/bin/$want" ]; then missing_req="$missing_req $want"; fi
+  done
+  [ -z "$missing_req" ] || die "required binaries absent from the bundle:${missing_req}
+     These are named directly by c7a-run.sh; without them the rarpar-bench
+     phase cannot run. Rebuild the bundle with them included."
+  log "  required ids present: rarpar-cli, rarpar-bench-harness, oracle-unrar-723, oracle-par2-turbo-140"
+  # oracle-unrar-624 is the only optional spare (a second UnRAR major for
+  # ad-hoc comparison; the harness takes exactly one --reference-rar).
+  [ -x "$PREBUILT_DIR/bin/oracle-unrar-624" ] && log "  optional spare also present: oracle-unrar-624"
+
   # BUILDINFO revs must match the source trees shipped alongside them.
   local pair name binfo_rev tree_rev tree
   for pair in "weaver:weaver_rev:$WEAVER_DIR" "rarpar:rarpar_rev:$RARPAR_DIR" "rapidyenc:rapidyenc_rev:$RAPIDYENC_ROOT"; do
@@ -343,6 +368,41 @@ EOF
   log "  builder: $(buildinfo_field builder)   built_at_utc: $(buildinfo_field built_at_utc)"
   log "  rustc:   $(buildinfo_field rustc_verbose "$(buildinfo_field rustc)")"
   log "  rustflags: '$(buildinfo_field rustflags '')' (empty on purpose — runtime dispatch, no target-cpu pinning)"
+}
+
+# ── rarpar-bench corpus cache ────────────────────────────────────────────────
+# The Go harness reads a pre-generated, digest-addressed corpus from
+#   <rarpar>/bench/rarpar-bench/.cache/corpora/<digest>/corpus/
+# (verified layout: that directory holds corpus.json plus one directory per
+# case). The cache ships inside the image and merges into the extracted rarpar
+# tree. Its presence is what keeps Docker out of this run: corpus GENERATION is
+# the only Docker-dependent path in the harness (internal/bench/corpus.go:113+,
+# internal/bench/toolchain.go:67+), and we never call it.
+RARPAR_BENCH_DIR="${RARPAR_BENCH_DIR:-$RARPAR_DIR/bench/rarpar-bench}"
+assert_corpus_cache() {
+  local cache="$RARPAR_BENCH_DIR/.cache/corpora"
+  log "Verifying the rarpar-bench corpus cache…"
+  [ -d "$cache" ] || die "corpus cache missing: $cache
+     The rarpar-bench suite is the headline phase of this run and it cannot
+     generate its own corpus here — generation needs Docker plus the pinned
+     toolchain images (doc §8a). The cache must ship in the corpus image and
+     merge into the extracted rarpar tree. Re-pull with CORPUS_FORCE=1; if it
+     is still absent the image needs rebuilding with the .cache layer."
+  local roots n=0 root
+  roots="$(find "$cache" -mindepth 2 -maxdepth 2 -type d -name corpus 2>/dev/null | sort || true)"
+  [ -n "$roots" ] || die "no <digest>/corpus directory under $cache — the cache is present but empty"
+  while IFS= read -r root; do
+    [ -n "$root" ] || continue
+    n=$((n + 1))
+    if [ -f "$root/corpus.json" ]; then
+      log "  corpus digest $(basename "$(dirname "$root")") — $(jq -r '.case_count // "?"' "$root/corpus.json" 2>/dev/null) case(s)"
+    else
+      die "corpus root $root has no corpus.json — cache is malformed"
+    fi
+  done <<EOF
+$roots
+EOF
+  log "  $n cached corpus root(s) present."
 }
 
 assert_prebuilt_rapidyenc_lib() {
@@ -468,6 +528,7 @@ write_env_file() {
 export PREBUILT_DIR="$PREBUILT_DIR"
 export RAPIDYENC_ROOT="$RAPIDYENC_ROOT"
 export WEAVER_RAPIDYENC_LIB="$WEAVER_RAPIDYENC_LIB"
+export RARPAR_BENCH_DIR="$RARPAR_BENCH_DIR"
 EOF
   log "Wrote $PREBUILT_DIR/weaver-bench.env"
 }
@@ -486,6 +547,7 @@ main() {
   [ -d "$WEAVER_DIR" ] || die "WEAVER_DIR '$WEAVER_DIR' not found even after corpus extraction (doc §7a)."
   assert_prebuilt_bundle
   assert_prebuilt_rapidyenc_lib
+  assert_corpus_cache
   link_baked_manifest_roots
   check_rarpar
   write_env_file
@@ -502,6 +564,7 @@ main() {
   - corpus image: pulled + extracted (weaver/rarpar/rapidyenc/prebuilt)
   - prebuilt bundle: manifest + BUILDINFO verified, revs match
   - librapidyenc.so: present and ldd-resolved
+  - rarpar-bench corpus cache: present (no Docker needed)
   - rarpar tree: see log above (MANDATORY for the run)
   Next:  ./ci/bench/c7a-run.sh
 ============================================================

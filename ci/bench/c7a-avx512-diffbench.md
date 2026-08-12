@@ -9,12 +9,12 @@ for correctness and performance on **real** AMD Zen 4 silicon, against the
 > verified against the working tree on 2026-08-11. Anything not verifiable from
 > the repo is marked `TODO(verify on box)`.
 
-Session estimate: **~35–45 min** on one `c7a.xlarge` on-demand (~$0.21/hr), i.e.
-**~$0.15–0.20 all-in**. Nothing is compiled from Rust on the box — every
-executable ships prebuilt in the corpus image (§6) — so the old multi-hour
-build cost is gone. The bootstrap arms a dead-man `shutdown -h +120`, capping a
-forgotten session at ~$0.42, provided the instance's shutdown-behavior is
-`terminate`.
+**No time or cost estimates appear in this runbook — by standing rule.** The run
+*measures* its own wall time per phase and records it in
+`metadata.json.phase_timings_seconds`, and `summary.txt` prints the same table.
+Use those numbers; do not predict them. The bootstrap arms a dead-man
+`shutdown -h +120` as a safety net, not as a schedule — it only terminates if
+the instance's shutdown-behavior is `terminate` (§11).
 
 ---
 
@@ -34,9 +34,8 @@ forgotten session at ~$0.42, provided the instance's shutdown-behavior is
 >   `c7a.xlarge` is **4 vCPU**, so a single instance fits with plenty of
 >   headroom — but it also means a careless jump to, say, `c7a.8xlarge`
 >   (32 vCPU) would be *refused by the quota*, not merely expensive.
-> - **Cost**: ~$0.21/hr, and the session is now ~35–45 min (§6), so ~$0.15–0.20.
->   There is no performance argument for a bigger box: every bench lane here is
->   single-threaded, and more vCPUs would only add noise.
+> - **No performance argument for a bigger box**: the bench lanes here are
+>   single-threaded, so extra vCPUs would add noise, not throughput.
 
 
 `c7a` = AWS instances on **AMD EPYC 4th gen (Zen 4, "Genoa")**. On real silicon a
@@ -423,9 +422,9 @@ Why this is safe — and why it is *better* than building on the box:
   have decided at build time what this run exists to measure on real silicon.
   The builder has no AVX-512 of its own, and that does not matter for the same
   reason the SDE lane can build once and run every tier (§2).
-- It removes the dominant cost and the dominant failure surface. Building
-  weaver's release test binary on-box meant `lto = "fat"` + `codegen-units = 1`
-  (`weaver/Cargo.toml:100-104`) — the single slowest step of the old runbook.
+- It removes a whole failure surface. Building weaver's release test binary
+  on-box meant `lto = "fat"` + `codegen-units = 1`
+  (`weaver/Cargo.toml:100-104`); that step is simply gone.
 
 ### 6a. Bundle layout
 
@@ -705,7 +704,175 @@ operator's, by hand.
 
 ---
 
-## 8. rarpar phase — PAR2 GFNI + AVX-512 GF16 on Zen 4 (mandatory)
+## 8. rarpar phases
+
+### 8a. HEADLINE — the FULL 31-case corpus, generated on the box
+
+`config/corpus.json` defines **31 cases** — the `rar-*` evidence family. That
+corpus is **not** pre-shipped; it is generated here, which is how the Windows
+evidence was produced, and digest-keying keeps the two comparable.
+
+**Toolchain images actually required**, enumerated from the config rather than
+assumed (`[.cases[].writer] | group_by(.)` over `config/corpus.json`):
+
+| writer | cases |
+|---|---|
+| `rarlab-3.93` | 5 |
+| `rarlab-4.20` | 8 |
+| `rarlab-5.00` | 10 |
+| `rarlab-6.24` | 1 |
+| `rarlab-7.23` | 7 |
+| **total** | **31** |
+
+…plus the **PAR2 generator**, because 5 cases carry `par2: true` and
+`ToolchainIDs` (`internal/bench/toolchain.go:118-125`) adds the par2 generator
+for exactly those. So all five writers *and* par2 are genuinely needed — the
+enumeration justifies the build rather than rubber-stamping it. Note also that
+`toolchains build` has **no subsetting flag**: `BuildToolchains`
+(`toolchain.go:67-91`) loops every writer then par2, and `main.go:83-84` passes
+no filter. Building all six is correct here, not lazy.
+
+#### Tarball integrity is the harness's own — no script-side check added
+
+Verified, so the run script deliberately adds no redundant hashing:
+
+| control | source |
+|---|---|
+| every writer/par2 `sha256` must be 64 hex chars, platform `linux/amd64` | `toolchain.go:40`, `:52` (`ToolchainLock.Validate`) |
+| the pin is passed into the build as `RAR_SHA256` / `PAR2_SHA256` | `toolchain.go:75`, `:86` |
+| **the download is verified against it** | `docker/rarlab/Dockerfile:12` and `docker/par2/Dockerfile:12`, both `… \| sha256sum -c -` under `set -eux` |
+| base image pinned by digest | `toolchain.go:94-106` (`verifyDockerfiles`) |
+
+A mismatch fails the image build, which fails the phase.
+
+#### Run-time external dependency
+
+This phase is the **only** part of the run that needs the public internet. The
+image builds `curl` from:
+
+- **`www.rarlab.com`** — the five `rarlinux-*.tar.gz` writer tarballs;
+- **`github.com`** — `par2cmdline-turbo` v1.4.0.
+
+**Failure mode:** if either host is unreachable, or a pin no longer matches what
+is served, the toolchain build fails and this phase stops. Per the containment
+rule (§8d) that is *contained* — the perf-corpus suite and the criterion phases
+still run, and anything already generated stays on disk.
+
+#### Phase shape
+
+`toolchains validate` → `toolchains build` → `corpus generate --out DIR`
+(`main.go:109-121`) → `corpus verify` → `plan create` → `run` → `report` →
+`render`. The generated corpus lands in the extracted tree's `.cache/corpora`
+alongside the shipped perf digest; the harness picks the digest, so the script
+**discovers** it afterwards rather than predicting it, and records digest +
+case count in `rarpar-bench-full/run-parameters.txt`. Evidence uses the same
+`<machine-label>/rar-<rev8>-c7a` convention.
+
+### 8b. The pre-cached 4-case perf corpus
+
+
+The centrepiece of the c7a run: the Go harness at `rarpar/bench/rarpar-bench`
+driving the **rarpar CLI against the reference unrar** over the digest-cached
+corpus. Everything else in this document is supporting evidence around it.
+
+Everything below is grounded in a read of the harness sources, not inferred:
+
+| fact | source |
+|---|---|
+| subcommands `toolchains \| corpus \| plan \| preflight \| run \| report \| render` | `cmd/rarpar-bench/main.go:25-45` |
+| `plan create --corpus --out [--seed] [--lane] [--family] [--par2-placement] [--warmups] [--repeats]` | `main.go:53`, `:127-151` |
+| `run --corpus --plan --candidate --out [--reference-rar --reference-par2] [--candidate-label --reference-label] [--machine] [--perf]` | `main.go:55`, `:168-201` |
+| `corpus verify --root DIR` | `main.go:104-108` |
+| `report --input raw.json --out FILE`; `render --input report.json --out DIR` | `main.go:56-57`, `:204-246` |
+| `run` reads `<corpus>/corpus.json` for the digest, and `LoadPlan` validates the plan against it | `main.go:189-199`, `internal/bench/plan.go:90` |
+| `Run` writes `raw.json` into `--out` | `internal/bench/run.go:123` |
+| lanes are `cpu`, `metal`, `docker-cpu` | `internal/bench/plan.go:13-14` |
+
+**Corpus layout** (verified against the local cache): the harness reads a
+digest-addressed tree at
+`<rarpar>/bench/rarpar-bench/.cache/corpora/<digest>/corpus/`, containing
+`corpus.json` (`{digest, case_count, schema_version}`) plus one directory per
+case. The cache ships inside the image and merges into the extracted rarpar
+tree; the bootstrap hard-fails if it is missing or empty.
+
+**Evidence naming** follows the convention already in the repo's
+`.cache/evidence`: `<machine-label>/<family>-<rev8>-<variant>` — observed
+examples `windows-ryzen5-3600/rar-6cc9c523-current-v2` and
+`linux-i5-1240p/rar5-perf-6cc9c523`. This run writes
+`<machine-label>/rar-<rev8>-c7a`, with `<rev8>` taken from rarpar's
+`REVISION.json` and `machine-label` defaulting to `linux-c7a-xlarge-zen4`.
+
+The phase runs `corpus verify` → `plan create` → `run` → `report` → `render`,
+and the evidence directory lands under `$RESULTS_DIR` in the same shape as the
+repo's existing evidence entries (`plan.json`, `raw.json`, `report.json`,
+`charts/`). **That directory is the SVG source data** and is archived to
+`rarpar-bench-evidence.tar.gz` (§9g).
+
+#### Docker is NOT required — verified
+
+This was the explicit blocker check, and the answer is clean. Docker appears in
+exactly three places in the harness:
+
+| site | path | reached here? |
+|---|---|---|
+| corpus **generation** | `internal/bench/corpus.go:113-237`, `:444-481` | **no** — the corpus ships pre-generated |
+| **toolchain image builds** | `internal/bench/toolchain.go:67-92` | **no** — never invoked |
+| `docker version` probe | `internal/bench/host.go:32` | yes, but harmless |
+
+The third goes through `commandLine()` (`host.go:77-83`), which **swallows the
+error and returns `""`** — a Docker-less box simply records an empty
+`docker_version`. `corpus verify` (`corpus.go:546+`) is pure filesystem and
+digest checking.
+
+Two things must stay true for that to hold, and the run script enforces both:
+
+- **Never call `rarpar-bench preflight`.** It hard-requires Docker *and* Go
+  (`host.go:85-96`, *"Docker is required for corpus generation"*) and would fail
+  on this box for no useful reason.
+- **Lane stays `cpu`.** `docker-cpu` is a legal lane string (`plan.go:13-14`)
+  and is the one way to drag Docker back in.
+
+#### Also deliberately not passed: `--source-manifest` / `--source-target`
+
+That path shells out to `cargo run -p xtask -- feature-audit` and requires a Git
+checkout — `run.go:859-875` errors with *"source benchmark must run from a Git
+checkout"*. The corpus image ships **no `.git` and no cargo**, so passing it
+would hard-fail. Provenance comes from `REVISION.json` instead (§9g). The
+`source_target` field in `config/hosts.example.json` is therefore *not* wired.
+
+#### Findings from reading the harness
+
+1. **Both references are mandatory — not just unrar.** `run.go:59-64` hard
+   errors with *"a comparative corpus run requires both reference RAR and
+   reference PAR2 binaries"* the moment one is supplied without the other. The
+   par2 arm is timed at `run.go:248-258` and labelled `par2cmdline-turbo` in
+   `report.go:83-88`. So every `run` invocation here passes **both**
+   `--reference-rar oracle-unrar-723` and `--reference-par2
+   oracle-par2-turbo-140`, unconditionally, and the bundle gate treats both as
+   required. `oracle-unrar-624` is the only optional spare.
+2. **The harness binary does not read a hosts config.** There is no `--hosts`
+   flag and no Go code that loads it: `grep` for `LoadHosts|HostConfig|hosts.json`
+   across the harness returns nothing, and `internal/bench/host.go` is machine
+   *metadata* collection (`CollectMachine`) plus `Preflight` — not config
+   parsing. `config/hosts.example.json` is an input for an **external SSH
+   driver** (`docs/benchmarking.md` walks an operator through copying it to
+   `hosts.local.json`), and that doc still refers to the harness by its old
+   `bench/ln` path. So writing a c7a `hosts.json` would be inert. This run
+   therefore passes `--candidate` / `--reference-rar` / `--corpus` / `--plan` /
+   `--out` directly, which is what the harness actually consumes. The
+   `reference_rar` *concept* from that schema maps to the `--reference-rar`
+   flag, and that is the only part of it that matters here.
+2. **Two corpora, and only one of them ships.** `config/corpus.json` defines
+   **31** cases (the `rar-*` evidence family); `config/perf-corpus.json` defines
+   **4** (`rar5-perf-normal-binary`, `rar5-perf-normal-text`,
+   `rar5-perf-solid-binary`, `rar5-perf-solid-text`). The pre-shipped cache is
+   the 4-case perf corpus. The 31-case corpus is therefore **generated on the
+   box** (§8a) — precedent: the Windows evidence was produced the same way, and
+   digest-keying keeps the runs comparable. Both suites run; each records its
+   digest and case count in its own `run-parameters.txt`.
+
+### 8c. rarpar criterion micro-benches (secondary)
+
 
 > Promoted from "stretch / optional" to a required phase. rarpar is a **separate
 > repo**, delivered as `/corpus/rarpar` in the same ECR image as weaver and
@@ -786,6 +953,32 @@ flags. The internal Criterion benches above are the grounded, in-scope coverage.
 
 ---
 
+### 8d. Failure containment — save partials, resume don't restart
+
+Standing order, and it shapes the whole run script:
+
+- **Every suite phase is independently failable.** `run_phase` never propagates
+  a non-zero status; it records the outcome, then returns 0 so the run
+  continues. If full-corpus generation or its `run` fails, the perf-corpus
+  suite and both criterion phases still execute. `summary.txt` prints a
+  per-phase outcome table, and any failure is still counted as a gate failure
+  so the run's exit status is non-zero.
+- **Outputs land incrementally.** Evidence directories, harness logs, criterion
+  trees, lane files and `run-parameters.txt` are written directly under
+  `$RESULTS_DIR` as they are produced. Nothing is staged elsewhere and copied at
+  the end — a run killed mid-flight leaves everything it had finished. The
+  end-of-run tarballs are convenience archives of data already in place, and a
+  failed suite still gets whatever it produced archived.
+- **Resume, don't restart.** Each successful phase writes
+  `$RESULTS_DIR/.phase-<name>.ok`. Re-invoking with `RESUME=1` and the *same*
+  `RESULTS_DIR` skips completed phases and retries only what failed:
+
+  ```sh
+  RESUME=1 RESULTS_DIR=<previous-results-dir> ./ci/bench/c7a-run.sh
+  ```
+
+  Phase timings append rather than truncate under `RESUME=1`.
+
 ## 9. What a PASS looks like
 
 ### 9a. Gates
@@ -815,11 +1008,19 @@ flags. The internal Criterion benches above are the grounded, in-scope coverage.
    appears in the test log, and `crc32_mixed_size_interleaved_updates` passes.
 6. **Parity bench pre-timing asserts pass** for all five fixtures — length, bytes
    **and CRC** — with a `parity ok [<fixture>] … crc=0x…` line each.
-7. **rarpar tests green** — all 12 prebuilt test binaries run; the
+7. **FULL-corpus suite green** (§8a, the headline): toolchain images build
+   (sha256-verified downloads), `corpus generate` emits a 31-case corpus that
+   passes `corpus verify`, then `plan create` / `run` / `report` / `render` all
+   exit 0 with `raw.json` + `report.json` present. Needs the public internet.
+8. **Perf-corpus suite green** (§8b): same chain over the pre-shipped 4-case
+   cache; needs no internet and no Docker.
+   A failure in either suite is contained (§8d) — the run continues and exits
+   non-zero at the end.
+9. **rarpar tests green** — all 12 prebuilt test binaries run; the
    slow-tests-gated ones reporting `running 0 tests` and exiting 0 are
    **gated-empty**, which is a pass. The run logs the gated-empty count; expect
    **4**. Then both rarpar benches complete.
-8. **Inter-pass drift** below `DRIFT_PCT` on every lane. A lane over threshold
+10. **Inter-pass drift** below `DRIFT_PCT` on every lane. A lane over threshold
    means the box was noisy; re-run that bench rather than recording the number.
 
 ### 9b. Record: rapidyenc kernel ids
@@ -974,7 +1175,16 @@ distributions, and the drift check are all reconstructable offline.
 
 ```
 <UTC-timestamp>/
-  criterion-weaver.tar.gz      # complete $WEAVER_DIR/target/criterion tree
+  rarpar-bench-full-evidence.tar.gz  # HEADLINE: 31-case corpus evidence (§8a)
+  rarpar-bench-evidence.tar.gz       # perf corpus evidence (§8b)
+  rarpar-bench-full/           # live: harness.log, plan.json, evidence/,
+                               #   toolchains-required.txt, toolchains-build.txt,
+                               #   run-parameters.txt (digest, writers, lane,
+                               #   seed, warmups/repeats, candidate, both refs)
+  rarpar-bench/                # same shape for the perf suite
+  .phase-<name>.ok             # per-phase completion markers (RESUME=1)
+  phase-timings.tsv            # MEASURED wall time per phase
+  criterion-weaver.tar.gz      # complete weaver criterion tree
   criterion-rarpar.tar.gz      # complete $RARPAR_DIR/target/criterion tree
   metadata.json                # provenance for the whole run (below)
   summary.json                 # flat per-lane estimates, both passes, both repos
@@ -1001,7 +1211,9 @@ ask. Plus `rev` + `dirty_files` for
 weaver / rarpar / rapidyenc — read from each tree's `REVISION.json`, **not** from
 git, because the corpus image ships no `.git`; weaver deliberately ships with
 uncommitted increments, so `dirty_files` is recorded rather than assumed zero —
-plus `staged_at_utc`, the `corpus_image` reference, the UTC run stamp, and
+plus `staged_at_utc`, the `corpus_image` reference, the UTC run stamp,
+**`phase_timings_seconds`** (measured, never estimated — one entry per phase),
+and
 the decoded `RYKERN_*` decode/crc kernel ids parsed out of the parity bench
 output — e.g. `{"decode_id": 1539, "decode_name": "VBMI2", "crc_id": 1088,
 "crc_name": "VPCLMUL"}`.
@@ -1079,8 +1291,10 @@ script's copy is the one that gets skipped when someone Ctrl-Cs.
 1. **`scp` the results directory off-box and open it locally** before touching the
    instance. `RESULTS_DIR` defaults to
    `$WEAVER_DIR/ci/bench/results/<UTC-timestamp>`.
-2. **Confirm these four arrived and are non-empty.** They are the raw material
+2. **Confirm these six arrived and are non-empty.** They are the raw material
    for SVG generation (§9g) and cannot be reconstructed once the instance is gone:
+   - `rarpar-bench-full-evidence.tar.gz` ← headline, 31-case corpus (§8a)
+   - `rarpar-bench-evidence.tar.gz` ← perf corpus (§8b)
    - `criterion-weaver.tar.gz`
    - `criterion-rarpar.tar.gz`
    - `metadata.json`
@@ -1088,8 +1302,10 @@ script's copy is the one that gets skipped when someone Ctrl-Cs.
 
    Spot-check locally before going further:
    ```sh
+   tar -tzf rarpar-bench-full-evidence.tar.gz | head
+   tar -tzf rarpar-bench-evidence.tar.gz | head
    tar -tzf criterion-weaver.tar.gz | head
-   jq '.instance_type, .rapidyenc_kernels' metadata.json
+   jq '.instance_type, .phase_timings_seconds' metadata.json
    jq 'length' summary.json      # expect 2 x total lanes
    ```
 3. Confirm `summary.txt`, `proof-gates.txt`, both recorded bench passes and the

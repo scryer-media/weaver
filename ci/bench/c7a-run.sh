@@ -451,6 +451,70 @@ assert_differential_counts() {
   fi
 }
 
+# ── Failure containment (standing order: save partials, resume-not-restart) ──
+#
+# Every suite phase is independently resumable and independently failable. A
+# phase that dies must not take the rest of the run with it: if full-corpus
+# generation or its run fails, the perf suite and the criterion phases still
+# execute, and whatever the failed phase managed to produce stays on disk.
+#
+# Two mechanisms:
+#   * `run_phase <name> <fn>` never propagates a non-zero status. It records the
+#     outcome, writes a per-phase marker, and returns 0 so main() continues.
+#   * With RESUME=1 and an explicit RESULTS_DIR pointing at a previous run, a
+#     phase whose .ok marker exists is SKIPPED rather than redone.
+#
+# All phase outputs are written directly under $RESULTS_DIR as they are
+# produced — evidence dirs, harness logs, criterion trees, lane files. Nothing
+# is staged elsewhere and copied at the end; the end-of-run tarballs are
+# convenience archives of data that is already in place, so a run killed
+# mid-flight still leaves everything it had finished.
+RESUME="${RESUME:-0}"
+PHASE_RESULTS=""
+
+run_phase() {   # <name> <function>
+  local name="$1" fn="$2" marker="$RESULTS_DIR/.phase-${1}.ok" rc=0
+  if [ "$RESUME" = "1" ] && [ -f "$marker" ]; then
+    log "───── phase SKIPPED (already complete, RESUME=1): $name"
+    PHASE_RESULTS="${PHASE_RESULTS}
+  $name: skipped (resumed)"
+    return 0
+  fi
+  phase_begin "$name"
+  set +e
+  "$fn"
+  rc=$?
+  set -e
+  phase_end
+  if [ "$rc" -eq 0 ]; then
+    : > "$marker"
+    PHASE_RESULTS="${PHASE_RESULTS}
+  $name: ok"
+  else
+    rm -f "$marker"
+    PHASE_RESULTS="${PHASE_RESULTS}
+  $name: FAILED (rc=$rc) — run continued"
+    warn "phase '$name' failed (rc=$rc); continuing with the remaining phases (partials kept under $RESULTS_DIR)"
+  fi
+  return 0
+}
+
+# ── Phase timing ─────────────────────────────────────────────────────────────
+# No estimates anywhere in this runbook — the run MEASURES its own phases and
+# records them in metadata.json. Wall time is an output, never a prediction.
+PHASE_TSV="$RESULTS_DIR/phase-timings.tsv"
+PHASE_NAME=""; PHASE_T0=0
+phase_begin() {
+  PHASE_NAME="$1"; PHASE_T0="$(date +%s)"
+  log "───── phase start: $PHASE_NAME"
+}
+phase_end() {
+  local t1 dt
+  t1="$(date +%s)"; dt=$((t1 - PHASE_T0))
+  printf '%s\t%s\t%s\n' "$PHASE_NAME" "$PHASE_T0" "$dt" >> "$PHASE_TSV"
+  log "───── phase end:   $PHASE_NAME (${dt}s)"
+}
+
 # ── Phases ───────────────────────────────────────────────────────────────────
 BENCH_STATUS=""
 TEST_RC_DEBUG=0
@@ -491,7 +555,7 @@ weaver_tests() {
   log "weaver-yenc DEBUG aggregate exit: $TEST_RC_DEBUG"
 
   # RELEASE: the codegen shape production ships. With prebuilt binaries this is
-  # no longer the slow pole of the run — it is just another exec.
+  # no longer a build at all — it is just another exec.
   log "weaver-yenc tests — RELEASE -> $release_log"
   TEST_RC_RELEASE=0
   run_test_bin weaver-yenc-lib-release  "$release_log" || TEST_RC_RELEASE=1
@@ -543,7 +607,7 @@ weaver_benches() {
 #     crates/weaver-par2         -> par2-rs
 #     crates/weaver-unrar        -> unrar-rs
 # `-p weaver-par2` fails with "package not found". Do not "fix" these back.
-rarpar_phase() {
+rarpar_tests_only() {
   [ -d "$RARPAR_DIR" ] || die "RARPAR_DIR '$RARPAR_DIR' not found.
      The rarpar phase is MANDATORY (doc §8). rarpar ships in the corpus image
      alongside weaver, so a missing tree means the pull or the extraction did
@@ -616,6 +680,14 @@ EOF
   log "rarpar tests: $ran binaries, $empty gated-empty, aggregate exit $rc"
   [ "$rc" -eq 0 ] || gate_fail "rarpar test suite FAILED (see $test_log) — the gfni+avx512 GF16 arms are the prime suspect"
 
+}
+
+# rarpar criterion micro-benches — SECONDARY to the rarpar-bench corpus suite
+# (doc §8a), which is the headline. Kept because they isolate the GF16 and
+# unrar hot paths that the corpus suite only exercises end-to-end.
+rarpar_criterion() {
+  local outdir="$RESULTS_DIR/rarpar" bin
+  mkdir -p "$outdir"
   # Same warm/2x/drift protocol as the weaver benches. These two targets are the
   # doc §8-grounded ones:
   #   par2_repair      : rarpar/crates/weaver-par2/Cargo.toml:72-75
@@ -642,6 +714,313 @@ EOF
     run_bench_protocol "archive-hotspots" "$outdir" "$RARPAR_DIR" "$RARPAR_CRIT_DIR" -- \
       "$bin" --bench
   fi
+}
+
+# ── HEADLINE PHASE: the rarpar-bench corpus suite (doc §8a) ──────────────────
+#
+# Everything below is grounded in a read of the harness, not in guesswork:
+#   cmd/rarpar-bench/main.go:25-45      subcommands: toolchains|corpus|plan|
+#                                       preflight|run|report|render
+#   main.go:53                          plan create --corpus --out [--seed]
+#                                       [--lane] [--family] [--par2-placement]
+#                                       [--warmups] [--repeats]
+#   main.go:55,168-201                  run --corpus --plan --candidate --out
+#                                       [--reference-rar --reference-par2]
+#                                       [--candidate-label --reference-label]
+#                                       [--machine] [--perf]
+#   main.go:104-108                     corpus verify --root DIR
+#   main.go:56-57                       report --input raw.json --out FILE
+#                                       render --input report.json --out DIR
+#   main.go:189-199                     run reads <corpus>/corpus.json for the
+#                                       digest and LoadPlan validates the plan
+#                                       against it — so plan and corpus cannot
+#                                       drift apart silently
+#   internal/bench/run.go:123           Run writes raw.json into --out
+#
+# WHY NO DOCKER IS NEEDED HERE (the explicit blocker check):
+#   Docker appears in exactly three places in the harness —
+#     internal/bench/corpus.go:113-237,444-481  corpus GENERATION
+#     internal/bench/toolchain.go:67-92         toolchain image builds
+#     internal/bench/host.go:32                 `docker version` probe
+#   The first two are the `corpus generate` / `toolchains build` paths, which
+#   this run never invokes because the corpus ships pre-generated and
+#   digest-addressed. The third is inside CollectMachine and goes through
+#   commandLine() (host.go:77-83), which SWALLOWS the error and returns "" — so
+#   a Docker-less box merely records an empty docker_version.
+#   `corpus verify` (corpus.go:546+) is pure filesystem + digest checking.
+#   NOTE: `rarpar-bench preflight` DOES hard-require Docker *and* Go
+#   (host.go:85-96, "Docker is required for corpus generation"). We never call
+#   it — calling it would fail on this box for no useful reason.
+#   Lane must stay `cpu`; `docker-cpu` is a valid lane string (plan.go:13-14)
+#   and would be the one way to drag Docker back in.
+#
+# ALSO DELIBERATELY NOT PASSED: --source-manifest / --source-target. That path
+# shells out to `cargo run -p xtask` and requires a Git checkout
+# (run.go:859-875, "source benchmark must run from a Git checkout"). The corpus
+# image ships no .git and no cargo, so passing it would hard-fail. Provenance
+# comes from REVISION.json instead (§9g).
+RARPAR_BENCH_DIR="${RARPAR_BENCH_DIR:-$RARPAR_DIR/bench/rarpar-bench}"
+MACHINE_LABEL="${MACHINE_LABEL:-linux-c7a-xlarge-zen4}"
+BENCH_LANE="${BENCH_LANE:-cpu}"
+BENCH_SEED="${BENCH_SEED:-rarpar-benchmark-plan-v1}"
+BENCH_PAR2_PLACEMENT="${BENCH_PAR2_PLACEMENT:-canonical}"
+BENCH_WARMUPS="${BENCH_WARMUPS:-1}"
+BENCH_REPEATS="${BENCH_REPEATS:-5}"
+
+# ── FULL-CORPUS phase: generate the 31-case corpus on the box, then run it ───
+#
+# The perf corpus ships pre-generated; the FULL corpus (config/corpus.json, 31
+# cases — the rar-* evidence family) is generated here. Precedent: the Windows
+# evidence was produced the same way, and digest-keying keeps runs comparable.
+#
+# Writer images actually required, enumerated from config/corpus.json rather
+# than assumed — `[.cases[].writer] | group_by(.)` gives:
+#     rarlab-3.93  x5     rarlab-4.20  x8     rarlab-5.00 x10
+#     rarlab-6.24  x1     rarlab-7.23  x7                      (= 31)
+# plus the PAR2 generator, because 5 cases carry `par2: true`
+# (ToolchainIDs, internal/bench/toolchain.go:118-125, adds the par2 generator
+# for exactly those). So all five writers AND par2 are genuinely needed — and
+# `toolchains build` has no subsetting flag anyway (toolchain.go:67-91 loops
+# every writer then par2; main.go:83-84 passes no filter). Building all six is
+# therefore correct here, not lazy.
+#
+# TARBALL INTEGRITY IS THE HARNESS'S OWN — no script-side check is added:
+#   * ToolchainLock.Validate (toolchain.go:40,52) rejects any writer or par2
+#     entry whose sha256 is not 64 hex chars, or whose platform is not
+#     linux/amd64;
+#   * BuildToolchains passes the pin in as a build-arg (toolchain.go:75,86);
+#   * the Dockerfiles verify the DOWNLOAD against it —
+#       docker/rarlab/Dockerfile:12  echo "$RAR_SHA256  /tmp/rar.tar.gz"  | sha256sum -c -
+#       docker/par2/Dockerfile:12    echo "$PAR2_SHA256 /tmp/par2.tar.gz" | sha256sum -c -
+#     under `set -eux`, so a mismatch fails the build;
+#   * verifyDockerfiles (toolchain.go:94-106) additionally pins the base image
+#     by digest.
+#
+# RUN-TIME EXTERNAL DEPENDENCY: the image builds curl from www.rarlab.com (the
+# five rar tarballs) and github.com (par2cmdline-turbo v1.4.0). This phase is
+# therefore the one part of the run that needs the public internet. If either
+# host is unreachable, or a pin no longer matches what is served, this phase
+# fails — and per the containment rule that is contained: the perf suite and
+# the criterion phases still run, and whatever was generated stays on disk.
+FULL_CORPUS_RC=0
+full_corpus_suite() {
+  local harness candidate reference_rar reference_par2 rc=0
+  local outdir="$RESULTS_DIR/rarpar-bench-full"
+  mkdir -p "$outdir"
+  local log_file="$outdir/harness.log"; : > "$log_file"
+
+  harness="$(resolve_bin rarpar-bench-harness)"         || { FULL_CORPUS_RC=1; return 1; }
+  candidate="$(resolve_bin rarpar-cli)"                 || { FULL_CORPUS_RC=1; return 1; }
+  reference_rar="$(resolve_bin oracle-unrar-723)"       || { FULL_CORPUS_RC=1; return 1; }
+  reference_par2="$(resolve_bin oracle-par2-turbo-140)" || { FULL_CORPUS_RC=1; return 1; }
+
+  _hf() {   # harness subcommand, tee'd into the full-corpus log
+    local what="$1"; shift
+    log "  harness $what"
+    set +e
+    ( cd "$RARPAR_BENCH_DIR" && "$harness" "$@" ) 2>&1 | tee -a "$log_file"
+    local r=${PIPESTATUS[0]}
+    set -e
+    [ "$r" -eq 0 ] || warn "  harness $what exited $r"
+    return "$r"
+  }
+
+  # (a) toolchain images. Docker is already on the box from the corpus pull.
+  local writers
+  writers="$(jq -r '[.cases[].writer]|unique|join(", ")' "$RARPAR_BENCH_DIR/config/corpus.json" 2>/dev/null || echo '?')"
+  local par2_cases
+  par2_cases="$(jq -r '[.cases[]|select(.par2)]|length' "$RARPAR_BENCH_DIR/config/corpus.json" 2>/dev/null || echo '?')"
+  log "full corpus needs writers: $writers  (+ par2 generator; $par2_cases case(s) set par2:true)"
+  {
+    echo "writers_required: $writers"
+    echo "par2_cases: $par2_cases"
+  } > "$outdir/toolchains-required.txt"
+
+  if _hf "toolchains validate" toolchains validate; then
+    log "  toolchain lock valid (sha256 pins well-formed, base digest-pinned)"
+  else
+    rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    log "  building toolchain images — downloads from www.rarlab.com + github.com"
+    _hf "toolchains build" toolchains build || rc=1
+    {
+      echo "toolchains_build_rc: $rc"
+      echo "note: sha256 of each tarball is verified inside the image build"
+      echo "      (docker/rarlab/Dockerfile:12, docker/par2/Dockerfile:12)"
+    } > "$outdir/toolchains-build.txt"
+  fi
+  [ "$rc" -eq 0 ] || { gate_fail "toolchain image build FAILED — full-corpus generation cannot proceed (network to rarlab.com/github.com, or a pin no longer matches). Remaining phases still run."; FULL_CORPUS_RC=1; return 1; }
+
+  # (b) generate the full corpus INTO the shipped cache, alongside the perf
+  #     digest. `corpus generate --out DIR` (main.go:109-121); the digest is
+  #     chosen by the harness, so discover it afterwards rather than guessing.
+  local gen_root="$RARPAR_BENCH_DIR/.cache/corpora/full-$STAMP"
+  _hf "corpus generate" corpus generate --out "$gen_root" || rc=1
+  [ "$rc" -eq 0 ] || { gate_fail "corpus generate FAILED — remaining phases still run"; FULL_CORPUS_RC=1; return 1; }
+
+  local corpus_root digest cases
+  corpus_root="$(find "$gen_root" -mindepth 0 -maxdepth 2 -type f -name corpus.json 2>/dev/null | head -1 || true)"
+  corpus_root="${corpus_root%/corpus.json}"
+  if [ -z "$corpus_root" ] || [ ! -f "$corpus_root/corpus.json" ]; then
+    gate_fail "corpus generate produced no corpus.json under $gen_root"
+    FULL_CORPUS_RC=1; return 1
+  fi
+  digest="$(jq -r '.digest // "unknown"' "$corpus_root/corpus.json" 2>/dev/null || echo unknown)"
+  cases="$(jq -r '.case_count // 0' "$corpus_root/corpus.json" 2>/dev/null || echo 0)"
+  log "generated full corpus: digest ${digest:0:16}… , $cases case(s)"
+
+  _hf "corpus verify" corpus verify --root "$corpus_root" || rc=1
+  [ "$rc" -eq 0 ] || { gate_fail "generated corpus failed verification"; FULL_CORPUS_RC=1; return 1; }
+
+  # (c) plan -> run -> report -> render, same binaries and naming convention.
+  local rev8 evidence_dir plan_out
+  rev8="$(revision_field "$RARPAR_DIR" rev)"; rev8="${rev8:0:8}"
+  evidence_dir="$RESULTS_DIR/rarpar-bench-full/evidence/$MACHINE_LABEL/rar-${rev8}-c7a"
+  plan_out="$outdir/plan.json"
+  mkdir -p "$(dirname "$evidence_dir")"
+  rm -rf "$evidence_dir"
+
+  _hf "plan create" plan create --corpus "$corpus_root" --out "$plan_out" \
+    --seed "$BENCH_SEED" --lane "$BENCH_LANE" \
+    --par2-placement "$BENCH_PAR2_PLACEMENT" \
+    --warmups "$BENCH_WARMUPS" --repeats "$BENCH_REPEATS" || rc=1
+  if [ "$rc" -eq 0 ]; then
+    _hf "run" run --corpus "$corpus_root" --plan "$plan_out" \
+      --candidate "$candidate" --candidate-label rarpar \
+      --reference-rar "$reference_rar" --reference-par2 "$reference_par2" \
+      --reference-label reference \
+      --out "$evidence_dir" --machine "$MACHINE_LABEL" || rc=1
+  fi
+  if [ "$rc" -eq 0 ] && [ -f "$evidence_dir/raw.json" ]; then
+    _hf "report" report --input "$evidence_dir/raw.json" --out "$evidence_dir/report.json" || rc=1
+    [ "$rc" -eq 0 ] && [ -f "$evidence_dir/report.json" ] && \
+      { _hf "render" render --input "$evidence_dir/report.json" --out "$evidence_dir/charts" || rc=1; }
+  fi
+  cp -p "$plan_out" "$evidence_dir/plan.json" 2>/dev/null || true
+
+  {
+    echo "suite: full-corpus (config/corpus.json)"
+    echo "corpus_root: $corpus_root"
+    echo "corpus_digest: $digest"
+    echo "corpus_case_count: $cases"
+    echo "writers_required: $writers"
+    echo "par2_cases: $par2_cases"
+    echo "machine_label: $MACHINE_LABEL"
+    echo "lane: $BENCH_LANE   seed: $BENCH_SEED   placement: $BENCH_PAR2_PLACEMENT"
+    echo "warmups: $BENCH_WARMUPS   repeats: $BENCH_REPEATS"
+    echo "candidate: $candidate"
+    echo "reference_rar: $reference_rar"
+    echo "reference_par2: $reference_par2"
+    echo "evidence_dir: $evidence_dir"
+  } > "$outdir/run-parameters.txt"
+
+  FULL_CORPUS_RC=$rc
+  [ "$rc" -eq 0 ] || gate_fail "full-corpus suite FAILED (see $log_file) — partials kept, remaining phases still run"
+  log "full-corpus suite exit: $rc  (evidence: $evidence_dir)"
+  return "$rc"
+}
+
+RARPAR_BENCH_RC=0
+rarpar_bench_suite() {
+  local harness corpus_root plan_out evidence_root evidence_dir rev8 log_file rc
+
+  harness="$(resolve_bin rarpar-bench-harness)" || { RARPAR_BENCH_RC=1; return 0; }
+  local candidate reference_rar reference_par2
+  candidate="$(resolve_bin rarpar-cli)"             || { RARPAR_BENCH_RC=1; return 1; }
+  reference_rar="$(resolve_bin oracle-unrar-723)"   || { RARPAR_BENCH_RC=1; return 1; }
+  # BOTH references or neither — run.go:59-64 hard errors otherwise. Never
+  # conditional: the par2 arm is timed (run.go:248-258) and reported as
+  # "par2cmdline-turbo" (report.go:83-88).
+  reference_par2="$(resolve_bin oracle-par2-turbo-140)" || { RARPAR_BENCH_RC=1; return 1; }
+
+  # Corpus root: .cache/corpora/<digest>/corpus (verified layout — that
+  # directory holds corpus.json plus one directory per case).
+  corpus_root="$(find "$RARPAR_BENCH_DIR/.cache/corpora" -mindepth 2 -maxdepth 2 -type d -name corpus 2>/dev/null | sort | head -1 || true)"
+  if [ -z "$corpus_root" ] || [ ! -f "$corpus_root/corpus.json" ]; then
+    gate_fail "no cached corpus under $RARPAR_BENCH_DIR/.cache/corpora — bootstrap's corpus gate should have caught this"
+    RARPAR_BENCH_RC=1; return 0
+  fi
+
+  local digest cases
+  digest="$(jq -r '.digest // "unknown"' "$corpus_root/corpus.json" 2>/dev/null || echo unknown)"
+  cases="$(jq -r '.case_count // 0' "$corpus_root/corpus.json" 2>/dev/null || echo 0)"
+  log "corpus root : $corpus_root"
+  log "corpus      : digest ${digest:0:16}… , $cases case(s)"
+
+  # Evidence naming follows the existing convention observed in the repo's
+  # .cache/evidence: <machine-label>/<family>-<rev8>-<variant>
+  #   e.g. windows-ryzen5-3600/rar-6cc9c523-current-v2
+  #        linux-i5-1240p/rar5-perf-6cc9c523
+  rev8="$(revision_field "$RARPAR_DIR" rev)"; rev8="${rev8:0:8}"
+  evidence_root="$RESULTS_DIR/rarpar-bench/evidence/$MACHINE_LABEL"
+  evidence_dir="$evidence_root/rar-${rev8}-c7a"
+  mkdir -p "$evidence_root"
+  plan_out="$RESULTS_DIR/rarpar-bench/plan.json"
+  log_file="$RESULTS_DIR/rarpar-bench/harness.log"
+  mkdir -p "$RESULTS_DIR/rarpar-bench"
+  : > "$log_file"
+
+  # `run` wants a FRESH --out directory, so it is NOT pre-created here.
+  rm -rf "$evidence_dir"
+
+  _h() {   # run a harness subcommand, tee'd, returning its status
+    local what="$1"; shift
+    log "  harness $what"
+    set +e
+    ( cd "$RARPAR_BENCH_DIR" && "$harness" "$@" ) 2>&1 | tee -a "$log_file"
+    local r=${PIPESTATUS[0]}
+    set -e
+    [ "$r" -eq 0 ] || warn "  harness $what exited $r"
+    return "$r"
+  }
+
+  rc=0
+  _h "corpus verify" corpus verify --root "$corpus_root" || rc=1
+  if [ "$rc" -eq 0 ]; then
+    _h "plan create" plan create \
+      --corpus "$corpus_root" --out "$plan_out" \
+      --seed "$BENCH_SEED" --lane "$BENCH_LANE" \
+      --par2-placement "$BENCH_PAR2_PLACEMENT" \
+      --warmups "$BENCH_WARMUPS" --repeats "$BENCH_REPEATS" || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    _h "run" run --corpus "$corpus_root" --plan "$plan_out" \
+      --candidate "$candidate" --candidate-label rarpar \
+      --reference-rar "$reference_rar" --reference-par2 "$reference_par2" \
+      --reference-label reference \
+      --out "$evidence_dir" --machine "$MACHINE_LABEL" || rc=1
+  fi
+  if [ "$rc" -eq 0 ] && [ -f "$evidence_dir/raw.json" ]; then
+    _h "report" report --input "$evidence_dir/raw.json" --out "$evidence_dir/report.json" || rc=1
+    if [ "$rc" -eq 0 ] && [ -f "$evidence_dir/report.json" ]; then
+      _h "render" render --input "$evidence_dir/report.json" --out "$evidence_dir/charts" || rc=1
+    fi
+  elif [ "$rc" -eq 0 ]; then
+    gate_fail "harness run produced no raw.json in $evidence_dir"
+    rc=1
+  fi
+
+  # The evidence directory IS the SVG source data, in the same shape as the
+  # repo's .cache/evidence entries (plan.json + report.json + charts).
+  cp -p "$plan_out" "$evidence_dir/plan.json" 2>/dev/null || true
+  {
+    echo "corpus_root: $corpus_root"
+    echo "corpus_digest: $digest"
+    echo "corpus_case_count: $cases"
+    echo "machine_label: $MACHINE_LABEL"
+    echo "lane: $BENCH_LANE   seed: $BENCH_SEED   placement: $BENCH_PAR2_PLACEMENT"
+    echo "warmups: $BENCH_WARMUPS   repeats: $BENCH_REPEATS"
+    echo "candidate: $candidate"
+    echo "reference_rar: $reference_rar"
+    echo "reference_par2: $reference_par2"
+    echo "evidence_dir: $evidence_dir"
+  } > "$RESULTS_DIR/rarpar-bench/run-parameters.txt"
+
+  RARPAR_BENCH_RC=$rc
+  [ "$rc" -eq 0 ] || gate_fail "rarpar-bench perf suite FAILED (see $log_file) — partials kept, remaining phases still run"
+  log "rarpar-bench perf suite exit: $rc  (evidence: $evidence_dir)"
+  return "$rc"
 }
 
 # ── (g) Data preservation for later SVG generation (doc §9g) ────────────────
@@ -758,6 +1137,7 @@ write_metadata_json() {
     --arg rapidyenc_rev  "$(revision_field "$RAPIDYENC_ROOT" rev)" \
     --arg rapidyenc_dirty "$(revision_field "$RAPIDYENC_ROOT" dirty_files 0)" \
     --arg rapidyenc_staged "$(revision_field "$RAPIDYENC_ROOT" staged_at_utc)" \
+    --argjson phase_timings "$(awk -F'\t' 'BEGIN{printf "{"} {printf "%s\"%s\":%s", (n++?",":""), $1, $3} END{printf "}"}' "$PHASE_TSV" 2>/dev/null || echo '{}')" \
     --arg dec_id "${dec_id:-}" --arg dec_name "$(rykern_name "${dec_id:-}")" \
     --arg crc_id "${crc_id:-}" --arg crc_name "$(rykern_name "${crc_id:-}")" \
     '{
@@ -788,6 +1168,7 @@ write_metadata_json() {
         decode_id:   ($dec_id | tonumber? // null), decode_name: $dec_name,
         crc_id:      ($crc_id | tonumber? // null), crc_name:    $crc_name
       },
+      phase_timings_seconds: $phase_timings,
       criterion_pass_convention: {
         base: "recorded pass 1",
         new:  "recorded pass 2",
@@ -856,8 +1237,31 @@ write_summary_json() {
   fi
 }
 
+archive_rarpar_bench_evidence() {
+  # Both corpus suites. A failed suite still gets whatever it produced archived
+  # — partials are the point of the containment rule.
+  local suite root out
+  for suite in full perf; do
+    case "$suite" in
+      full) root="$RESULTS_DIR/rarpar-bench-full"; out="$RESULTS_DIR/rarpar-bench-full-evidence.tar.gz" ;;
+      perf) root="$RESULTS_DIR/rarpar-bench";      out="$RESULTS_DIR/rarpar-bench-evidence.tar.gz" ;;
+      *)    continue ;;
+    esac
+    if [ -d "$root/evidence" ]; then
+      if tar -czf "$out" -C "$root" evidence; then
+        log "archived $root/evidence -> $out ($(du -h "$out" | cut -f1 | tr -d ' '))"
+      else
+        gate_fail "failed to archive the $suite-corpus evidence"
+      fi
+    else
+      warn "no $suite-corpus evidence at $root/evidence (that phase produced nothing)"
+    fi
+  done
+}
+
 preserve_data() {
   log "Preserving raw bench data for later SVG generation (doc §9g)…"
+  archive_rarpar_bench_evidence
   archive_criterion_trees
   write_metadata_json
   write_summary_json
@@ -917,6 +1321,37 @@ print_summary() {
     fi
     echo
 
+    echo "----- phase outcomes (failures are contained, not fatal) -----"
+    printf '%s\n' "${PHASE_RESULTS:-  (none)}"
+    echo
+
+    echo "----- FULL-corpus suite (HEADLINE, doc §8a) -----"
+    echo "  exit: $FULL_CORPUS_RC"
+    if [ -f "$RESULTS_DIR/rarpar-bench-full/run-parameters.txt" ]; then
+      sed 's/^/  /' "$RESULTS_DIR/rarpar-bench-full/run-parameters.txt"
+    else
+      echo "  (no run-parameters.txt — suite did not start or failed before generation)"
+    fi
+    echo
+
+    echo "----- perf-corpus suite (pre-cached, doc §8b) -----"
+    echo "  exit: $RARPAR_BENCH_RC"
+    if [ -f "$RESULTS_DIR/rarpar-bench/run-parameters.txt" ]; then
+      sed 's/^/  /' "$RESULTS_DIR/rarpar-bench/run-parameters.txt"
+    else
+      echo "  (no run-parameters.txt — suite did not start)"
+    fi
+    echo
+
+    echo "----- measured phase wall time (seconds) -----"
+    if [ -s "$PHASE_TSV" ]; then
+      awk -F'\t' '{ printf "  %-22s %6ds\n", $1, $3; total += $3 }
+                   END { printf "  %-22s %6ds\n", "TOTAL", total }' "$PHASE_TSV"
+    else
+      echo "  (none recorded)"
+    fi
+    echo
+
     echo "----- bench passes (label: exit codes, drifting lanes) -----"
     printf '%s\n' "${BENCH_STATUS:-  (none run)}"
     echo
@@ -937,7 +1372,7 @@ print_summary() {
     echo
 
     echo "----- preserved data (doc §9g) -----"
-    for l in criterion-weaver.tar.gz criterion-rarpar.tar.gz metadata.json summary.json; do
+    for l in rarpar-bench-full-evidence.tar.gz rarpar-bench-evidence.tar.gz criterion-weaver.tar.gz criterion-rarpar.tar.gz metadata.json summary.json; do
       if [ -s "$RESULTS_DIR/$l" ]; then
         printf '  OK      %-26s %s\n' "$l" "$(du -h "$RESULTS_DIR/$l" | cut -f1 | tr -d ' ')"
       else
@@ -969,10 +1404,12 @@ print_teardown_checklist() {
   2. VERIFY locally that these FOUR arrived and are non-empty. They are
      the raw material for later SVG generation and CANNOT be
      reconstructed once the instance is gone:
-       (a) criterion-weaver.tar.gz   full weaver criterion tree
-       (b) criterion-rarpar.tar.gz   full rarpar criterion tree
-       (c) metadata.json             instance/cpu/kernel/rustc/revisions
-       (d) summary.json              flat per-lane estimates, both passes
+       (a) rarpar-bench-full-evidence.tar.gz  HEADLINE 31-case corpus (8a)
+       (a2) rarpar-bench-evidence.tar.gz      perf corpus evidence (8b)
+       (b) criterion-weaver.tar.gz   full weaver criterion tree
+       (c) criterion-rarpar.tar.gz   full rarpar criterion tree
+       (d) metadata.json             instance/cpu/kernel/provenance/timings
+       (e) summary.json              flat per-lane estimates, both passes
      Spot-check them locally before terminating:
        tar -tzf criterion-weaver.tar.gz | head
        jq '.instance_type, .rapidyenc_kernels' metadata.json
@@ -1034,10 +1471,18 @@ main() {
   [ -e "$WEAVER_RAPIDYENC_LIB" ]  || warn "WEAVER_RAPIDYENC_LIB=$WEAVER_RAPIDYENC_LIB missing — parity bench will SKIP"
   [ -d "$RARPAR_DIR" ]            || warn "RARPAR_DIR=$RARPAR_DIR missing — the mandatory rarpar phase will ABORT"
 
-  weaver_tests
-  weaver_benches
-  rarpar_phase
-  preserve_data
+  [ "$RESUME" = "1" ] || : > "$PHASE_TSV"
+  # Every phase is independently failable and independently resumable
+  # (run_phase never propagates a failure). Order: correctness, then the
+  # generated FULL corpus, then the pre-cached perf corpus, then the secondary
+  # criterion micro-benches.
+  run_phase weaver-tests       weaver_tests
+  run_phase rarpar-tests       rarpar_tests_only
+  run_phase full-corpus-suite  full_corpus_suite
+  run_phase perf-corpus-suite  rarpar_bench_suite
+  run_phase weaver-criterion   weaver_benches
+  run_phase rarpar-criterion   rarpar_criterion
+  run_phase preserve-data      preserve_data
 
   print_summary
   print_teardown_checklist
