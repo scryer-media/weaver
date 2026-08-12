@@ -11,26 +11,40 @@
 #   (b) assert the SOURCE ON THE BOX carries the markers this run exists to
 #       prove (C1 gate, skip line, CRC parity assert, production-shape test) —
 #       they were uncommitted on the dev mac, so a `git clone` box is stale
-#   (c) weaver-yenc tests FIRST, DEBUG then RELEASE, with RAPIDYENC_ROOT set so
-#       the source-compiled rapidyenc differential tests RUN (not skip), and
-#       `-- --nocapture` so their case counts and the C1 skip line reach the log.
-#       debug != release here: the VBMI2 searchEnd probe carries a
-#       `debug_assert_eq!` (simd/x86_avx512.rs:272) compiled out in release.
+#   (c) weaver-yenc tests FIRST, DEBUG then RELEASE, with RAPIDYENC_ROOT + CXX
+#       set so the runtime-compiled rapidyenc differential oracle RUNS (not
+#       skips), and `--nocapture` so their case counts and the C1 skip line
+#       reach the log. debug != release here: the VBMI2 searchEnd probe carries
+#       a `debug_assert_eq!` (simd/x86_avx512.rs:272) compiled out in release.
 #   (d) grep-assert the C1 proof line and non-zero differential case counts
 #   (e) weaver benches: steady-state wait, DISCARDED warm pass, then the
 #       recorded pass TWICE, then a drift check (>DRIFT_PCT warns)
-#   (f) rarpar phase (MANDATORY): tests, then the same bench protocol
+#   (f) rarpar phase (MANDATORY): EVERY manifest test binary for repo=rarpar
+#       (12 of them; slow-tests-gated ones report 0 tests and pass as
+#       'gated-empty'), then the same bench protocol
 #   (g) preserve the raw data: criterion trees tarred, metadata.json,
 #       summary.json (doc §9g) — the input for later SVG generation
 #   (h) summary + teardown checklist
 #
-# FULL SUITES, NO FILTERS. Every `cargo bench` below is invoked with a bench
-# target and nothing else — no trailing criterion filter argument anywhere, so
-# each binary runs its complete lane set. The one suite with an *environment*
-# filter (par2_repair / WEAVER_PAR2_BENCH_SCENARIOS) has it explicitly unset in
-# rarpar_phase so an inherited value cannot silently narrow the run.
+# PREBUILT-BINARY MODEL (plan v2). There is NO cargo and NO Rust toolchain on
+# this box. Every test and bench executable is resolved from the prebuilt
+# bundle's manifest.json ($PREBUILT_DIR/bin/<id>) and invoked directly:
+#   * libtest binaries take `--nocapture` as a direct argument (no `--`
+#     separator, because there is no cargo in front to split against);
+#   * criterion bench binaries are harness=false, so they need `--bench` to
+#     enter benchmarking mode instead of libtest mode — that is exactly the
+#     flag `cargo bench` used to pass for us.
+# Criterion resolves its output directory from CARGO_TARGET_DIR, so each repo
+# gets one under the results area and preserve_data archives those.
 #
-# Must be the GNU target, not musl: the parity bench dlopens a shared lib.
+# FULL SUITES, NO FILTERS. No bench binary is given a criterion filter
+# argument, so each runs its complete lane set. The one suite with an
+# *environment* filter (par2_repair / WEAVER_PAR2_BENCH_SCENARIOS) has it
+# explicitly unset in rarpar_phase so an inherited value cannot narrow the run.
+#
+# The binaries are plain x86_64-unknown-linux-gnu with NO target-cpu flags, so
+# every kernel tier is compiled in and selected by runtime dispatch — which is
+# the whole point: pinning would have decided the answer at build time.
 set -euo pipefail
 
 # ── Config (all overridable; keep in sync with the doc §7b table) ────────────
@@ -42,20 +56,25 @@ CORPUS_IMAGE="${CORPUS_IMAGE:-651588424025.dkr.ecr.us-east-1.amazonaws.com/weave
 WEAVER_DIR="${WEAVER_DIR:-$CORPUS_DEST/weaver}"
 RARPAR_DIR="${RARPAR_DIR:-$CORPUS_DEST/rarpar}"
 RAPIDYENC_ROOT="${RAPIDYENC_ROOT:-$CORPUS_DEST/rapidyenc}"
-WEAVER_RAPIDYENC_LIB="${WEAVER_RAPIDYENC_LIB:-$RAPIDYENC_ROOT/build/librapidyenc.so}"
-TARGET="${TARGET:-x86_64-unknown-linux-gnu}"
-# Perf bench only: let weaver's non-intrinsic driver code use Zen4 for a fair A/B
-# vs cmake-Release rapidyenc. Correctness tests run WITHOUT extra rustflags.
-BENCH_RUSTFLAGS="${BENCH_RUSTFLAGS:--C target-cpu=native}"
-# Deliberately EMPTY: rarpar's GF16 tiers are #[target_feature] + runtime
-# dispatch (crates/weaver-reed-solomon/src/gf_simd.rs:232-234,436-438), so
-# pinning target-cpu would only obscure which tier actually ran.
-RARPAR_BENCH_RUSTFLAGS="${RARPAR_BENCH_RUSTFLAGS:-}"
+PREBUILT_DIR="${PREBUILT_DIR:-$CORPUS_DEST/prebuilt}"
+MANIFEST_JSON="$PREBUILT_DIR/manifest.json"
+BUILDINFO_JSON="$PREBUILT_DIR/BUILDINFO.json"
+# The parity bench dlopens the PREBUILT .so (benches/rapidyenc_parity.rs:34-35).
+WEAVER_RAPIDYENC_LIB="${WEAVER_RAPIDYENC_LIB:-$PREBUILT_DIR/lib/librapidyenc.so}"
+# The differential test binaries compile their C oracle at RUNTIME
+# (tests/rapidyenc_decode_diff.rs:146-159), so a C++ compiler is still needed.
+CXX="${CXX:-g++}"
+TARGET="${TARGET:-x86_64-unknown-linux-gnu}"   # informational: what the bundle was built for
 LOAD_THRESHOLD="${LOAD_THRESHOLD:-0.2}"
 STEADY_TIMEOUT="${STEADY_TIMEOUT:-300}"
 DRIFT_PCT="${DRIFT_PCT:-2.0}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULTS_DIR="${RESULTS_DIR:-$WEAVER_DIR/ci/bench/results/$STAMP}"
+# Criterion picks its output dir from CARGO_TARGET_DIR and writes <dir>/criterion.
+# One per repo, under the results area, so the data lands where preserve_data
+# archives it instead of inside a source tree.
+WEAVER_CRIT_DIR="$RESULTS_DIR/criterion/weaver"
+RARPAR_CRIT_DIR="$RESULTS_DIR/criterion/rarpar"
 
 log()  { printf '\033[1;34m[run]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[run:warn]\033[0m %s\n' "$*" >&2; }
@@ -64,9 +83,95 @@ die()  { printf '\033[1;31m[run:FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 GATE_FAILURES=0
 gate_fail() { printf '\033[1;31m[run:GATE]\033[0m %s\n' "$*" >&2; GATE_FAILURES=$((GATE_FAILURES + 1)); }
 
-# shellcheck disable=SC1090,SC1091
-[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
-export PATH="$HOME/.cargo/bin:$PATH"
+# ── Retired knobs ────────────────────────────────────────────────────────────
+# BENCH_RUSTFLAGS used to default to `-C target-cpu=native` so weaver's driver
+# code was tuned for the host in the parity A/B. v2 deletes the idea outright:
+# both sides of that A/B are now prebuilt with plain flags (weaver via the
+# bundle, rapidyenc via a generic cmake Release .so), and the AVX-512 kernels
+# are `#[target_feature]`-compiled regardless of tuning — so native tuning would
+# only bias one side. There is also no cargo here to rebuild with. Warn and
+# ignore rather than silently implying it did something.
+for _rf in BENCH_RUSTFLAGS RARPAR_BENCH_RUSTFLAGS RUSTFLAGS; do
+  if [ -n "${!_rf:-}" ]; then
+    warn "$_rf is set ('${!_rf}') but IGNORED — v2 runs prebuilt binaries; nothing is compiled on this box (doc §6)"
+  fi
+done
+unset _rf
+
+# ── Prebuilt bundle: manifest-driven binary resolution ───────────────────────
+# Schema per entry: {id, kind: test|bench, repo, crate, profile, orig_name,
+# needs_env}. Tolerates a bare top-level array or a {binaries|bins:[…]} wrapper.
+manifest_ids() {
+  jq -r '(if type=="array" then . elif type=="object" then (.binaries // .bins // []) else [] end) | .[].id' \
+    "$MANIFEST_JSON" 2>/dev/null || true
+}
+manifest_field() {   # <id> <field>
+  jq -r --arg id "$1" --arg k "$2" \
+    '(if type=="array" then . elif type=="object" then (.binaries // .bins // []) else [] end)
+     | map(select(.id == $id)) | .[0][$k] // empty' \
+    "$MANIFEST_JSON" 2>/dev/null || true
+}
+manifest_ids_where() {   # <kind> <repo> -> newline-separated ids
+  jq -r --arg k "$1" --arg r "$2" \
+    '(if type=="array" then . elif type=="object" then (.binaries // .bins // []) else [] end)
+     | map(select(.kind == $k and .repo == $r)) | .[].id' \
+    "$MANIFEST_JSON" 2>/dev/null || true
+}
+manifest_needs_env() {   # <id> -> newline-separated env var names
+  jq -r --arg id "$1" \
+    '(if type=="array" then . elif type=="object" then (.binaries // .bins // []) else [] end)
+     | map(select(.id == $id)) | .[0].needs_env // [] | .[]' \
+    "$MANIFEST_JSON" 2>/dev/null || true
+}
+buildinfo_field() {  # <field> [default]
+  local out=""
+  if [ -f "$BUILDINFO_JSON" ]; then
+    out="$(jq -r --arg k "$1" '.[$k] // empty' "$BUILDINFO_JSON" 2>/dev/null || true)"
+  fi
+  printf '%s' "${out:-${2:-unknown}}"
+}
+
+# Resolve <id> to an executable path, verifying the manifest's needs_env are
+# actually set. An unset needs_env entry is exactly how a "green" run ends up
+# proving nothing (RAPIDYENC_ROOT missing => the diff tests skip silently), so
+# it is a gate, not a warning.
+resolve_bin() {   # <id> -> prints path, non-zero on failure
+  local id="$1" bin need missing=""
+  bin="$PREBUILT_DIR/bin/$id"
+  if [ ! -x "$bin" ]; then
+    gate_fail "prebuilt binary '$id' missing or not executable at $bin"
+    return 1
+  fi
+  while IFS= read -r need; do
+    [ -n "$need" ] || continue
+    if [ -z "${!need:-}" ]; then missing="$missing $need"; fi
+  done <<EOF
+$(manifest_needs_env "$id")
+EOF
+  if [ -n "$missing" ]; then
+    gate_fail "binary '$id' declares needs_env:${missing} but they are unset — it would skip its real work and still exit 0"
+    return 1
+  fi
+  printf '%s' "$bin"
+}
+
+assert_bundle_present() {
+  command -v jq >/dev/null 2>&1 || die "jq is required to read the prebuilt manifest"
+  [ -f "$MANIFEST_JSON" ]  || die "missing $MANIFEST_JSON — run ./ci/bench/c7a-bootstrap.sh first (doc §7b)"
+  [ -f "$BUILDINFO_JSON" ] || die "missing $BUILDINFO_JSON"
+  jq -e . "$MANIFEST_JSON" >/dev/null 2>&1 || die "$MANIFEST_JSON is not valid JSON"
+  # Cheap re-check of the bootstrap's hard gate: this script can be run on its
+  # own, and a re-extracted corpus without a re-bootstrap would otherwise slip
+  # a stale bundle past every downstream gate while reporting green.
+  local pair name field tree bi tr
+  for pair in "weaver:weaver_rev:$WEAVER_DIR" "rarpar:rarpar_rev:$RARPAR_DIR" "rapidyenc:rapidyenc_rev:$RAPIDYENC_ROOT"; do
+    name="${pair%%:*}"; tree="${pair##*:}"
+    field="$(printf '%s' "$pair" | cut -d: -f2)"
+    bi="$(buildinfo_field "$field")"; tr="$(revision_field "$tree" rev)"
+    [ "$bi" = "$tr" ] || die "STALE BUNDLE: $name built from $bi but tree is $tr — re-run c7a-bootstrap.sh (doc §6)"
+  done
+  log "Prebuilt bundle present; BUILDINFO revs match all three trees."
+}
 
 # ── (a) CPU feature assertion ────────────────────────────────────────────────
 REQUIRED_FEATURES="avx512f avx512bw avx512vl avx512vbmi avx512vbmi2 gfni vpclmulqdq vaes"
@@ -132,9 +237,12 @@ record_revisions() {
         echo "  NO REVISION.json — this tree did not come from the corpus image (doc §7a)"
       fi
     done
-    echo "--- toolchain ---"
-    echo "  $(rustc --version 2>/dev/null || echo '?')"
-    echo "  $(cargo --version 2>/dev/null || echo '?')"
+    echo "--- prebuilt bundle (no toolchain on this host) ---"
+    echo "  builder:      $(buildinfo_field builder)"
+    echo "  built_at_utc: $(buildinfo_field built_at_utc)"
+    echo "  rustc:        $(buildinfo_field rustc_verbose "$(buildinfo_field rustc)")"
+    echo "  rustflags:    '$(buildinfo_field rustflags '')'"
+    echo "  glibc build:  $(buildinfo_field glibc)   host: $(ldd --version 2>/dev/null | head -1 | awk '{print $NF}' || echo '?')"
   } | tee "$out"
 }
 
@@ -210,13 +318,19 @@ END {
 '
 
 # ── Bench protocol: steady wait, discarded warm pass, recorded x2, drift ─────
-# usage: run_bench_protocol <label> <outdir> <workdir> <rustflags> -- <argv…>
+# usage: run_bench_protocol <label> <outdir> <workdir> <criterion-target-dir> -- <argv…>
+#
+# The 4th argument is CARGO_TARGET_DIR, which is how criterion (running
+# standalone, with no cargo anywhere) decides where to keep its data: it writes
+# <dir>/criterion/<lane>/{base,new,change}. Standalone mode maintains the same
+# base/new rotation cargo-driven runs get, so warm -> pass1 -> pass2 still
+# leaves base=pass1 and new=pass2.
 run_bench_protocol() {
-  local label="$1" outdir="$2" workdir="$3" rustflags="$4"
+  local label="$1" outdir="$2" workdir="$3" critdir="$4"
   shift 4
   [ "${1:-}" = "--" ] && shift
 
-  mkdir -p "$outdir"
+  mkdir -p "$outdir" "$critdir"
   local warm="$outdir/${label}-warm-DISCARDED.log"
   local p1="$outdir/${label}-pass1.log"
   local p2="$outdir/${label}-pass2.log"
@@ -225,29 +339,16 @@ run_bench_protocol() {
   wait_for_steady_state
 
   log "[$label] DISCARDED warm pass (output kept only for triage) -> $warm"
-  if [ -n "$rustflags" ]; then
-    ( cd "$workdir" && RUSTFLAGS="$rustflags" "$@" ) >"$warm" 2>&1 \
-      || warn "[$label] warm pass exited non-zero (see $warm)"
-  else
-    ( cd "$workdir" && "$@" ) >"$warm" 2>&1 \
-      || warn "[$label] warm pass exited non-zero (see $warm)"
-  fi
+  ( cd "$workdir" && CARGO_TARGET_DIR="$critdir" "$@" ) >"$warm" 2>&1 \
+    || warn "[$label] warm pass exited non-zero (see $warm)"
 
   log "[$label] recorded pass 1 -> $p1"
   set +e
-  if [ -n "$rustflags" ]; then
-    ( cd "$workdir" && RUSTFLAGS="$rustflags" "$@" ) 2>&1 | tee "$p1"
-  else
-    ( cd "$workdir" && "$@" ) 2>&1 | tee "$p1"
-  fi
+  ( cd "$workdir" && CARGO_TARGET_DIR="$critdir" "$@" ) 2>&1 | tee "$p1"
   rc1=${PIPESTATUS[0]}
 
   log "[$label] recorded pass 2 (back-to-back, no cooldown) -> $p2"
-  if [ -n "$rustflags" ]; then
-    ( cd "$workdir" && RUSTFLAGS="$rustflags" "$@" ) 2>&1 | tee "$p2"
-  else
-    ( cd "$workdir" && "$@" ) 2>&1 | tee "$p2"
-  fi
+  ( cd "$workdir" && CARGO_TARGET_DIR="$critdir" "$@" ) 2>&1 | tee "$p2"
   rc2=${PIPESTATUS[0]}
   set -e
   log "[$label] recorded exit codes: pass1=$rc1 pass2=$rc2"
@@ -297,9 +398,9 @@ expected_lane_count() {
 
 # ── (d) Proof greps ──────────────────────────────────────────────────────────
 # The C1 proof and the differential case counts are printed by eprintln! from
-# PASSING tests, so they only exist in the log because every cargo test
-# invocation below passes `-- --nocapture`. Without that flag libtest swallows
-# them and this whole section silently reports "not found".
+# PASSING tests, so they only exist in the log because every test binary below
+# is invoked with `--nocapture`. Without that flag libtest swallows them and
+# this whole section silently reports "not found".
 C1_SKIP_LINE='skipping crc32_forced_vpclmul_matches_crc_fast: VPCLMUL port unavailable on this CPU'
 
 assert_c1_proof() {
@@ -355,34 +456,49 @@ BENCH_STATUS=""
 TEST_RC_DEBUG=0
 TEST_RC_RELEASE=0
 
+# Run one prebuilt libtest binary, appending to <log>. libtest takes
+# `--nocapture` directly — there is no cargo in front to separate against.
+run_test_bin() {   # <id> <log>  -> sets RUN_TEST_RC
+  local id="$1" log="$2" bin
+  RUN_TEST_RC=1
+  bin="$(resolve_bin "$id")" || return 1
+  log "  test binary $id  ($(manifest_field "$id" crate), profile $(manifest_field "$id" profile))"
+  set +e
+  ( cd "$WEAVER_DIR" && \
+      RAPIDYENC_ROOT="$RAPIDYENC_ROOT" CXX="$CXX" \
+      WEAVER_RAPIDYENC_LIB="$WEAVER_RAPIDYENC_LIB" \
+      "$bin" --nocapture ) 2>&1 | tee -a "$log"
+  RUN_TEST_RC=${PIPESTATUS[0]}
+  set -e
+  log "  $id exit code: $RUN_TEST_RC"
+  return 0
+}
+
 weaver_tests() {
   local debug_log="$RESULTS_DIR/weaver-yenc-tests-debug.log"
   local release_log="$RESULTS_DIR/weaver-yenc-tests-release.log"
+  : > "$debug_log"; : > "$release_log"
 
   # DEBUG: the only pass where the VBMI2 searchEnd probe's bit-identity
   # debug_assert_eq! (simd/x86_avx512.rs:272) is live.
-  log "weaver-yenc tests — DEBUG (target=$TARGET) -> $debug_log"
-  log "  RAPIDYENC_ROOT=$RAPIDYENC_ROOT (enables the source-compiled differential tests)"
-  set +e
-  ( cd "$WEAVER_DIR" && RAPIDYENC_ROOT="$RAPIDYENC_ROOT" \
-      cargo test -p weaver-yenc --locked --no-fail-fast --target "$TARGET" \
-      -- --nocapture ) 2>&1 | tee "$debug_log"
-  TEST_RC_DEBUG=${PIPESTATUS[0]}
-  set -e
-  log "weaver-yenc DEBUG tests exit code: $TEST_RC_DEBUG"
+  log "weaver-yenc tests — DEBUG -> $debug_log"
+  log "  RAPIDYENC_ROOT=$RAPIDYENC_ROOT  CXX=$CXX (the diff oracle is compiled at runtime)"
+  TEST_RC_DEBUG=0
+  run_test_bin weaver-yenc-lib-debug  "$debug_log" || TEST_RC_DEBUG=1
+  [ "${RUN_TEST_RC:-1}" -eq 0 ] || TEST_RC_DEBUG=1
+  run_test_bin weaver-yenc-diff-debug "$debug_log" || TEST_RC_DEBUG=1
+  [ "${RUN_TEST_RC:-1}" -eq 0 ] || TEST_RC_DEBUG=1
+  log "weaver-yenc DEBUG aggregate exit: $TEST_RC_DEBUG"
 
-  # RELEASE: the codegen shape production ships (fat LTO, codegen-units=1 —
-  # weaver/Cargo.toml:100-104). Slowest build of the run by a wide margin.
-  # `panic = "abort"` at :104 is ignored by cargo for test targets; the warning
-  # it prints is expected.
-  log "weaver-yenc tests — RELEASE (target=$TARGET) -> $release_log"
-  set +e
-  ( cd "$WEAVER_DIR" && RAPIDYENC_ROOT="$RAPIDYENC_ROOT" \
-      cargo test -p weaver-yenc --release --locked --no-fail-fast --target "$TARGET" \
-      -- --nocapture ) 2>&1 | tee "$release_log"
-  TEST_RC_RELEASE=${PIPESTATUS[0]}
-  set -e
-  log "weaver-yenc RELEASE tests exit code: $TEST_RC_RELEASE"
+  # RELEASE: the codegen shape production ships. With prebuilt binaries this is
+  # no longer the slow pole of the run — it is just another exec.
+  log "weaver-yenc tests — RELEASE -> $release_log"
+  TEST_RC_RELEASE=0
+  run_test_bin weaver-yenc-lib-release  "$release_log" || TEST_RC_RELEASE=1
+  [ "${RUN_TEST_RC:-1}" -eq 0 ] || TEST_RC_RELEASE=1
+  run_test_bin weaver-yenc-diff-release "$release_log" || TEST_RC_RELEASE=1
+  [ "${RUN_TEST_RC:-1}" -eq 0 ] || TEST_RC_RELEASE=1
+  log "weaver-yenc RELEASE aggregate exit: $TEST_RC_RELEASE"
 
   [ "$TEST_RC_DEBUG" -eq 0 ]   || gate_fail "weaver-yenc DEBUG test suite FAILED (see $debug_log) — doc §10 triage"
   [ "$TEST_RC_RELEASE" -eq 0 ] || gate_fail "weaver-yenc RELEASE test suite FAILED (see $release_log) — doc §10 triage"
@@ -398,15 +514,24 @@ weaver_tests() {
 }
 
 weaver_benches() {
-  local outdir="$RESULTS_DIR/weaver"
+  local outdir="$RESULTS_DIR/weaver" bin
+  # `--bench` puts a harness=false criterion binary into benchmarking mode;
+  # without it the binary runs libtest-style and measures nothing. No filter
+  # argument follows it, so the full lane set runs.
+  #
   # §3b — VBMI2-vs-VBMI2 A/B against the dlopen'd librapidyenc.so.
-  # WEAVER_RAPIDYENC_LIB is already exported by main(); no per-call prefix.
-  run_bench_protocol "rapidyenc-parity" "$outdir" "$WEAVER_DIR" "$BENCH_RUSTFLAGS" -- \
-    cargo bench -p weaver-yenc --locked --bench rapidyenc_parity --target "$TARGET"
+  # WEAVER_RAPIDYENC_LIB is exported by main(); resolve_bin gates on it via the
+  # manifest's needs_env.
+  if bin="$(resolve_bin weaver-yenc-bench-parity)"; then
+    run_bench_protocol "rapidyenc-parity" "$outdir" "$WEAVER_DIR" "$WEAVER_CRIT_DIR" -- \
+      "$bin" --bench
+  fi
 
   # §9e — production-shape lanes (decode_only vs until_control family gap).
-  run_bench_protocol "decode-simd" "$outdir" "$WEAVER_DIR" "$BENCH_RUSTFLAGS" -- \
-    cargo bench -p weaver-yenc --locked --bench decode_simd --target "$TARGET"
+  if bin="$(resolve_bin weaver-yenc-bench-decode-simd)"; then
+    run_bench_protocol "decode-simd" "$outdir" "$WEAVER_DIR" "$WEAVER_CRIT_DIR" -- \
+      "$bin" --bench
+  fi
 }
 
 # rarpar phase — MANDATORY (doc §8).
@@ -447,14 +572,48 @@ rarpar_phase() {
     echo "=========================================================="
   } | tee "$outdir/README-phase.txt"
 
-  log "rarpar tests (reedsolomon-rs + par2-rs, target=$TARGET) -> $test_log"
-  set +e
-  ( cd "$RARPAR_DIR" && \
-      cargo test --locked -p reedsolomon-rs -p par2-rs --target "$TARGET" \
-      -- --nocapture ) 2>&1 | tee "$test_log"
-  rc=${PIPESTATUS[0]}
-  set -e
-  log "rarpar tests exit code: $rc"
+  # EVERY rarpar test binary in the bundle, not a hardcoded pair. The `-p`
+  # build produces one binary per test target, so par2 alone contributes ~10
+  # integration binaries beyond the two headline ids; their manifest ids follow
+  # orig_name and are not worth enumerating here. Iterate the manifest instead,
+  # so a bundle that gains or loses a test target needs no edit to this script.
+  local ids id bin one empty=0 ran=0
+  ids="$(manifest_ids_where test rarpar)"
+  [ -n "$ids" ] || { gate_fail "manifest lists no rarpar test binaries"; return 0; }
+  log "rarpar tests: $(printf '%s\n' "$ids" | grep -c . ) prebuilt binaries -> $test_log"
+  : > "$test_log"
+  rc=0
+  local per="$outdir/.per-bin.log"
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if ! bin="$(resolve_bin "$id")"; then rc=1; continue; fi
+    log "  test binary $id  ($(manifest_field "$id" crate), profile $(manifest_field "$id" profile))"
+    set +e
+    ( cd "$RARPAR_DIR" && "$bin" --nocapture ) >"$per" 2>&1
+    one=$?
+    set -e
+    {
+      echo "===== $id ($(manifest_field "$id" orig_name)) ====="
+      cat "$per"
+      echo
+    } >> "$test_log"
+    ran=$((ran + 1))
+    # A binary reporting 0 tests is EXPECTED for the slow-tests-gated targets:
+    # under default features they compile to an empty suite. Exiting 0 with no
+    # tests is a gated-empty pass, not a failure — but count and surface it so
+    # "everything ran" can never be inferred from a wall of zeros.
+    if [ "$one" -eq 0 ] && grep -q '^running 0 tests' "$per"; then
+      empty=$((empty + 1))
+      log "    gated-empty (0 tests under default features) — OK"
+    else
+      log "    exit $one  $(grep -m1 '^test result:' "$per" || true)"
+    fi
+    [ "$one" -eq 0 ] || rc=1
+  done <<EOF
+$ids
+EOF
+  rm -f "$per"
+  log "rarpar tests: $ran binaries, $empty gated-empty, aggregate exit $rc"
   [ "$rc" -eq 0 ] || gate_fail "rarpar test suite FAILED (see $test_log) — the gfni+avx512 GF16 arms are the prime suspect"
 
   # Same warm/2x/drift protocol as the weaver benches. These two targets are the
@@ -474,11 +633,15 @@ rarpar_phase() {
   fi
   unset WEAVER_PAR2_BENCH_SCENARIOS
 
-  run_bench_protocol "par2-repair" "$outdir" "$RARPAR_DIR" "$RARPAR_BENCH_RUSTFLAGS" -- \
-    cargo bench --locked -p par2-rs --bench par2_repair --target "$TARGET"
+  if bin="$(resolve_bin rarpar-bench-par2-repair)"; then
+    run_bench_protocol "par2-repair" "$outdir" "$RARPAR_DIR" "$RARPAR_CRIT_DIR" -- \
+      "$bin" --bench
+  fi
 
-  run_bench_protocol "archive-hotspots" "$outdir" "$RARPAR_DIR" "$RARPAR_BENCH_RUSTFLAGS" -- \
-    cargo bench --locked -p unrar-rs --bench archive_hotspots --target "$TARGET"
+  if bin="$(resolve_bin rarpar-bench-archive-hotspots)"; then
+    run_bench_protocol "archive-hotspots" "$outdir" "$RARPAR_DIR" "$RARPAR_CRIT_DIR" -- \
+      "$bin" --bench
+  fi
 }
 
 # ── (g) Data preservation for later SVG generation (doc §9g) ────────────────
@@ -540,8 +703,8 @@ archive_criterion_trees() {
   local repo root out
   for repo in weaver rarpar; do
     case "$repo" in
-      weaver) root="$WEAVER_DIR/target/criterion" ;;
-      rarpar) root="$RARPAR_DIR/target/criterion" ;;
+      weaver) root="$WEAVER_CRIT_DIR/criterion" ;;
+      rarpar) root="$RARPAR_CRIT_DIR/criterion" ;;
       *)      continue ;;
     esac
     out="$RESULTS_DIR/criterion-$repo.tar.gz"
@@ -577,10 +740,14 @@ write_metadata_json() {
     --arg cpu_flags      "$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//' || true)" \
     --arg cpu_cores      "$(nproc 2>/dev/null || echo 0)" \
     --arg kernel         "$(uname -sr 2>/dev/null || echo unknown)" \
-    --arg rustc          "$(rustc -V 2>/dev/null || echo unknown)" \
+    --arg rustc          "$(buildinfo_field rustc_verbose "$(buildinfo_field rustc)")" \
+    --argjson toolchains "$(jq -c '.toolchains // null' "$BUILDINFO_JSON" 2>/dev/null || echo null)" \
+    --arg builder        "$(buildinfo_field builder)" \
+    --arg build_glibc    "$(buildinfo_field glibc)" \
+    --arg host_glibc     "$(ldd --version 2>/dev/null | head -1 | awk '{print $NF}' || true)" \
+    --arg built_at_utc   "$(buildinfo_field built_at_utc)" \
+    --arg build_rustflags "$(buildinfo_field rustflags '')" \
     --arg target         "$TARGET" \
-    --arg bench_rustflags        "$BENCH_RUSTFLAGS" \
-    --arg rarpar_bench_rustflags "$RARPAR_BENCH_RUSTFLAGS" \
     --arg corpus_image   "${CORPUS_IMAGE:-unknown}" \
     --arg weaver_rev     "$(revision_field "$WEAVER_DIR" rev)" \
     --arg weaver_dirty   "$(revision_field "$WEAVER_DIR" dirty_files 0)" \
@@ -600,8 +767,17 @@ write_metadata_json() {
       kernel: $kernel,
       rustc: $rustc,
       target: $target,
-      rustflags: { weaver_bench: $bench_rustflags, rarpar_bench: $rarpar_bench_rustflags },
       corpus_image: $corpus_image,
+      provenance: {
+        binaries: "prebuilt",
+        note: "no Rust toolchain on the bench host; every test and bench executable was built on the builder below and shipped in the corpus image at /corpus/prebuilt",
+        builder: $builder,
+        built_at_utc: $built_at_utc,
+        toolchains: $toolchains,
+        rustflags: $build_rustflags,
+        rustflags_note: "empty on purpose: plain x86_64-unknown-linux-gnu with no target-cpu pinning, so every kernel tier is compiled in and chosen by runtime dispatch",
+        glibc: { build: $build_glibc, host: $host_glibc }
+      },
       revision_source: "REVISION.json per tree (corpus image ships no .git)",
       revisions: {
         weaver:    { rev: $weaver_rev,    dirty_files: ($weaver_dirty    | tonumber? // 0), staged_at_utc: $weaver_staged },
@@ -645,8 +821,8 @@ write_summary_json() {
   local repo root est pass lane bench sample
   for repo in weaver rarpar; do
     case "$repo" in
-      weaver) root="$WEAVER_DIR/target/criterion" ;;
-      rarpar) root="$RARPAR_DIR/target/criterion" ;;
+      weaver) root="$WEAVER_CRIT_DIR/criterion" ;;
+      rarpar) root="$RARPAR_CRIT_DIR/criterion" ;;
       *)      continue ;;
     esac
     [ -d "$root" ] || continue
@@ -699,8 +875,9 @@ print_summary() {
     echo "RARPAR_DIR           : $RARPAR_DIR"
     echo "RAPIDYENC_ROOT       : $RAPIDYENC_ROOT"
     echo "WEAVER_RAPIDYENC_LIB : $WEAVER_RAPIDYENC_LIB"
-    echo "weaver bench RUSTFLAGS: $BENCH_RUSTFLAGS"
-    echo "rarpar bench RUSTFLAGS: ${RARPAR_BENCH_RUSTFLAGS:-<none>}"
+    echo "PREBUILT_DIR         : $PREBUILT_DIR"
+    echo "binaries             : prebuilt (builder $(buildinfo_field builder), $(buildinfo_field built_at_utc))"
+    echo "build rustflags      : '$(buildinfo_field rustflags '')' (no target-cpu pinning)"
     echo "steady state         : loadavg1 < $LOAD_THRESHOLD (timeout ${STEADY_TIMEOUT}s)"
     echo "drift threshold      : ${DRIFT_PCT}%"
     echo
@@ -827,12 +1004,14 @@ EOF
 main() {
   [ -d "$WEAVER_DIR" ] || die "WEAVER_DIR '$WEAVER_DIR' not found"
 
-  # Prefer the env file the bootstrap wrote (resolves versioned .so names).
-  if [ -f "$RAPIDYENC_ROOT/weaver-bench.env" ]; then
+  # Prefer the env file the bootstrap wrote.
+  if [ -f "$PREBUILT_DIR/weaver-bench.env" ]; then
     # shellcheck disable=SC1091
-    . "$RAPIDYENC_ROOT/weaver-bench.env"
+    . "$PREBUILT_DIR/weaver-bench.env"
   fi
-  export RAPIDYENC_ROOT WEAVER_RAPIDYENC_LIB
+  # Exported so the prebuilt binaries see them; the manifest's needs_env is
+  # checked against these in resolve_bin.
+  export RAPIDYENC_ROOT WEAVER_RAPIDYENC_LIB CXX
   # Deliberately NOT set: it would statically link rapidyenc into weaver via
   # build.rs:15 and change weaver's own codegen (doc §3c).
   unset WEAVER_RAPIDYENC_SRC 2>/dev/null || true
@@ -846,6 +1025,7 @@ main() {
     echo "flags: $(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2-)"
   } >> "$RESULTS_DIR/cpu-features.log"
 
+  assert_bundle_present
   assert_source_preconditions
   record_revisions
 

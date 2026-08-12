@@ -9,14 +9,35 @@ for correctness and performance on **real** AMD Zen 4 silicon, against the
 > verified against the working tree on 2026-08-11. Anything not verifiable from
 > the repo is marked `TODO(verify on box)`.
 
-Session estimate: **~2.5–3 h** on one `c7a.xlarge` on-demand (~$0.21/hr), i.e.
-~$0.55–0.65 all-in. The bootstrap arms a dead-man `shutdown -h +240`, so a
-forgotten session caps at 4 h (~$0.85) provided the instance's
-shutdown-behavior is `terminate`.
+Session estimate: **~35–45 min** on one `c7a.xlarge` on-demand (~$0.21/hr), i.e.
+**~$0.15–0.20 all-in**. Nothing is compiled from Rust on the box — every
+executable ships prebuilt in the corpus image (§6) — so the old multi-hour
+build cost is gone. The bootstrap arms a dead-man `shutdown -h +120`, capping a
+forgotten session at ~$0.42, provided the instance's shutdown-behavior is
+`terminate`.
 
 ---
 
 ## 1. Why c7a.xlarge
+
+> ### Instance type is LOCKED to `c7a.xlarge`
+>
+> **Changing the instance size requires the project owner's explicit permission.**
+> Not the
+> family, not the size, not "just this once for a faster build" — the build is
+> not on the box any more anyway (§6). Both scripts assume it and the CPU gate
+> aborts on anything that is not a real Zen 4.
+>
+> Two supporting facts, both checked:
+>
+> - **Account vCPU quota**: the Standard on-demand limit is **16 vCPU**.
+>   `c7a.xlarge` is **4 vCPU**, so a single instance fits with plenty of
+>   headroom — but it also means a careless jump to, say, `c7a.8xlarge`
+>   (32 vCPU) would be *refused by the quota*, not merely expensive.
+> - **Cost**: ~$0.21/hr, and the session is now ~35–45 min (§6), so ~$0.15–0.20.
+>   There is no performance argument for a bigger box: every bench lane here is
+>   single-threaded, and more vCPUs would only add noise.
+
 
 `c7a` = AWS instances on **AMD EPYC 4th gen (Zen 4, "Genoa")**. On real silicon a
 Zen 4 core exposes, all at once:
@@ -218,6 +239,18 @@ discovery env var**. A third env var exists for an in-process static link.
 - **Must be the GNU target, not musl.** Static musl binaries can't `dlopen` a
   shared library. (The x86_64 musl release lanes at
   `.github/workflows/deploy.yml:454-546` are for shipping, not for this bench.)
+- **No host tuning on either side — by design.** Earlier revisions of this
+  runbook built the weaver bench with `-C target-cpu=native` (`BENCH_RUSTFLAGS`)
+  and argued it made for a fairer A/B against a cmake-`Release` rapidyenc. **That
+  is gone in v2 and should not come back.** Both sides are now prebuilt with
+  plain flags: weaver from the bundle (`rustflags: ""`), rapidyenc as a generic
+  cmake `Release` `.so`. Tuning only weaver would bias the comparison, and it
+  would buy nothing where it matters anyway — the AVX-512 kernels are
+  `#[target_feature]`-compiled and runtime-dispatched regardless of `target-cpu`
+  (§2, §6). There is also no cargo on the box to rebuild with. If
+  `BENCH_RUSTFLAGS` / `RARPAR_BENCH_RUSTFLAGS` / `RUSTFLAGS` are set in the
+  environment the run script **warns and ignores them** rather than pretending
+  they took effect.
 
 The bench also prints `rapidyenc kernels: decode=<n> crc=<n>`
 (`benches/rapidyenc_parity.rs:185-188`) as **decimal** `RYKERN_*` ids
@@ -343,15 +376,19 @@ Reference: `https://github.com/animetosho/rapidyenc`.
 (`:271`) → on Linux the artifact is **`build/librapidyenc.so`** (the dev mac
 produced an unversioned `build/librapidyenc.dylib`, confirmed present).
 
+**This build no longer happens on the c7a box.** `librapidyenc.so` is produced on
+the builder and ships at `/corpus/prebuilt/lib/librapidyenc.so` (§6a); the
+bootstrap only checks that it exists and that `ldd` resolves it cleanly. The
+recipe is recorded here because it is what the *builder* runs:
+
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
-# => $RAPIDYENC_ROOT/build/librapidyenc.so
+# => build/librapidyenc.so
 ```
 
-The checkout vendors `crcutil-1.0/`; the bootstrap runs
-`git submodule update --init --recursive` after clone to be safe, and globs for
-the emitted lib in case the name is versioned (`librapidyenc.so.1`).
+The checkout vendors `crcutil-1.0/` in-tree (no `.gitmodules`), so no submodule
+initialization is needed — which matters, because `.git` does not ship.
 
 Revision: **there is no clone step.** rapidyenc arrives in the corpus image
 (§7a) as a clean tree pinned at **`27f435a`** ("Add build options to skip
@@ -367,45 +404,135 @@ absent; confirm it reads `27f435a` before trusting any A/B number.
 
 ---
 
-## 6. Toolchain / build recipe (mirrors CI, drops SDE)
+## 6. Build model — prebuilt binaries, no toolchain on the box
 
-Grounded in `rust-toolchain.toml` + `.github/workflows/deploy.yml`:
+**Nothing is compiled from Rust on the c7a instance.** No rustup, no cargo, no
+`rust-toolchain.toml` resolution, no `aws-lc-sys`, no rapidyenc cmake build. All
+executables are produced ahead of time on the local Linux builder and ship in
+the corpus image as `/corpus/prebuilt/`.
 
-- Rust toolchain **1.97.1**, pinned in `rust-toolchain.toml:2`. rustup
-  auto-installs it on first `cargo` invocation inside `$WEAVER_DIR` because of the
-  pin. rarpar pins the same **1.97.1** (`rarpar/rust-toolchain.toml:2`,
-  `rust-version = "1.97.1"` at `rarpar/Cargo.toml:14`), so one toolchain serves
-  both phases.
-  CI agrees as of `491dff03` ("toolchain fix"):
-  `.github/workflows/deploy.yml:20` now sets `RUST_TOOLCHAIN: "1.97.1"`. It read
-  `"1.96"` until that commit; ignore any older note claiming a divergence.
-- **`nasm` is required** — `aws-lc-sys` (v0.42.0, in both workspaces' build
-  graphs) needs it. CI installs it in every native build lane, e.g.
-  `.github/workflows/deploy.yml:183` (clippy), `:215` (rust-test-build) and
-  `:346` (SDE lane). The bootstrap's package list includes it (§7).
-- Build/test target: **`x86_64-unknown-linux-gnu`** (the SDE lane builds with
-  `--target x86_64-unknown-linux-gnu`, `.github/workflows/deploy.yml:362`). This
-  is also the native host target on the instance.
-- `--locked` everywhere (matches CI).
-- The SDE lane sets `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS` to force
-  target-features *only so older default CPUs can build/emulate the intrinsics*
-  (`.github/workflows/deploy.yml:332,359`). **On c7a we omit those** — the
-  `#[target_feature]` kernels compile on the plain target and dispatch at runtime
-  (§2). The weaver perf bench uses `-C target-cpu=native` for a fair A/B vs
-  cmake-`Release` rapidyenc (`BENCH_RUSTFLAGS`); the correctness passes use no
-  extra rustflags.
-- **Expect two full builds of weaver-yenc's dep graph.** The correctness passes
-  (no RUSTFLAGS) and the bench passes (`-C target-cpu=native`) have different
-  fingerprints, so cargo rebuilds between them. On top of that the release test
-  pass inherits `[profile.release] lto = "fat"`, `codegen-units = 1`
-  (`weaver/Cargo.toml:100-104`) and is the single slowest step of the run. Budget
-  accordingly; this is why the session estimate is ~2.5–3 h and not 1 h.
-  (`panic = "abort"` at `:104` is ignored by cargo for test targets — the release
-  test pass builds fine; cargo prints a warning about it.)
+Why this is safe — and why it is *better* than building on the box:
 
-Assume **Ubuntu 24.04**. System packages installed by the bootstrap:
-`build-essential` (g++ for the §3a oracle + cc), `cmake`, `nasm`, `pkg-config`,
-`git`, `curl`, `ca-certificates`.
+- The builder (**codex-x86-2**, Ubuntu 24.04) matches the AMI's glibc, so the
+  binaries load unmodified. The bootstrap compares `BUILDINFO.json`'s `glibc`
+  against the host's and warns if that assumption ever breaks.
+- The build uses the plain `x86_64-unknown-linux-gnu` target with
+  **`rustflags: ""` — no `target-cpu`, no `target-feature`**. Every kernel tier
+  is therefore compiled in and selected by *runtime dispatch*
+  (`simd/mod.rs:357-393`), which is the entire point of the run: pinning would
+  have decided at build time what this run exists to measure on real silicon.
+  The builder has no AVX-512 of its own, and that does not matter for the same
+  reason the SDE lane can build once and run every tier (§2).
+- It removes the dominant cost and the dominant failure surface. Building
+  weaver's release test binary on-box meant `lto = "fat"` + `codegen-units = 1`
+  (`weaver/Cargo.toml:100-104`) — the single slowest step of the old runbook.
+
+### 6a. Bundle layout
+
+```
+/corpus/prebuilt/
+  bin/<id>            one executable per manifest entry
+  lib/librapidyenc.so the parity bench's dlopen target (§3b)
+  manifest.json       [{id, kind, repo, crate, profile, orig_name, needs_env}, …]
+  BUILDINFO.json      {rustc, toolchains, builder, glibc, weaver_rev,
+                       rarpar_rev, rapidyenc_rev, rustflags:"", built_at_utc,
+                       builder_rarpar_root}
+```
+
+The ten binary ids:
+
+| id | kind | repo | notes |
+|---|---|---|---|
+| `weaver-yenc-lib-debug` / `-release` | test | weaver | the `simd::tests` + `crc::tests` suites |
+| `weaver-yenc-diff-debug` / `-release` | test | weaver | the four §3a differential families |
+| `weaver-yenc-bench-parity` | bench | weaver | §3b, 12 lanes |
+| `weaver-yenc-bench-decode-simd` | bench | weaver | §9e, 11 lanes |
+| `rarpar-reedsolomon-test` | test | rarpar | GF16 tiers (§8) |
+| `rarpar-par2-test` | test | rarpar | |
+| *(~10 more par2 integration test binaries)* | test | rarpar | ids follow `orig_name`; **not** enumerated — see below |
+| `rarpar-bench-par2-repair` | bench | rarpar | |
+| `rarpar-bench-archive-hotspots` | bench | rarpar | |
+
+Both debug **and** release weaver binaries ship because they are not
+interchangeable — see §2a: the VBMI2 `searchEnd` probe's `debug_assert_eq!`
+(`simd/x86_avx512.rs:272`) exists only in the debug one.
+
+**The rarpar test binaries are not a fixed pair.** A `-p`-scoped build emits one
+binary per test target, so par2 alone contributes about ten integration binaries
+beyond the two headline ids, and the bundle carries **12 rarpar test binaries**
+in total. The run script therefore *iterates every manifest entry with
+`kind == "test"` and `repo == "rarpar"`* rather than naming ids — a bundle that
+gains or loses a test target needs no script edit. Four of those binaries
+legitimately report **0 tests** under default features (they are slow-tests
+gated); a 0-test binary that exits 0 is logged as **gated-empty** and counted,
+never treated as a failure. The summary prints the gated-empty count precisely so
+a wall of zeros can never be mistaken for "everything ran".
+
+**Two copies of the rapidyenc oracle source ship.** The canonical one is the
+corpus tree at `$RAPIDYENC_ROOT` (`~/rapidyenc`) — that is what `RAPIDYENC_ROOT`
+points at and what the §3a diff binaries actually compile against at runtime. The
+bundle contains a second copy purely as a builder-side sanity artifact. Do not
+point `RAPIDYENC_ROOT` at the bundle copy; the run must exercise the same tree
+whose `REVISION.json` is recorded in `metadata.json`.
+
+**Prebuilt binaries cannot run doctests.** `cargo test` would also compile and run
+the crate's documentation examples; a bare libtest binary has no such stage. Test
+totals here are therefore *expected* to differ from a full `cargo test` on a dev
+box — that is the model working as intended, not missing coverage. Expected for
+the weaver lib suite: **156 passed / 0 failed / 2 ignored per profile** (the 2
+ignored are the `#[ignore]` diagnostics, §10).
+
+### 6b. What the box still needs a compiler for
+
+`g++`. Not for Rust — the §3a differential test binaries compile their C oracle
+at **runtime** via `$CXX` (`tests/rapidyenc_decode_diff.rs:146-159`). That is why
+`build-essential` remains in the bootstrap's package list, and why the run script
+exports `CXX=g++`. The full on-box package list is now just
+`build-essential jq tar curl ca-certificates` (plus `docker.io` + `awscli` for
+the corpus pull). Gone: `cmake`, `nasm`, `pkg-config`, `git`, rustup.
+
+### 6c. Staleness is a hard failure
+
+The prebuilt model's one real hazard is a bundle built from a different revision
+than the source shipped beside it — every downstream gate would then be
+measuring something other than what the operator believes, and would report
+green. So the bootstrap **hard-fails** when `BUILDINFO.json`'s `weaver_rev` /
+`rarpar_rev` / `rapidyenc_rev` do not each equal the corresponding tree's
+`REVISION.json` `rev`. The run script re-checks the same thing, because it can
+be invoked on its own. Do not work around this — rebuild the bundle.
+
+### 6d. Caveat the bundle build must satisfy — baked fixture paths
+
+rarpar's test and bench sources resolve fixtures through
+`env!("CARGO_MANIFEST_DIR")`, which is a **compile-time** constant:
+`crates/weaver-unrar/benches/archive_hotspots.rs:4`,
+`crates/weaver-par2/tests/support/benchmark_support.rs:217`, and ~15 more across
+those two crates. A binary built elsewhere therefore looks for its fixtures at
+the *builder's* absolute path.
+
+weaver-yenc is unaffected — it has no `env!("CARGO_MANIFEST_DIR")` anywhere in
+`src/`, `tests/` or `benches/`, so its binaries are genuinely relocatable.
+
+Cleanest fix is at build time: build rarpar at the same absolute path the corpus
+extracts to (`$CORPUS_DEST/rarpar`, i.e. `~/rarpar`). Failing that, the bootstrap
+recovers automatically by symlinking the builder's root to the extracted tree —
+one symlink repairs every lookup at once — resolving that root in two steps:
+
+1. **`BUILDINFO.json`'s `builder_rarpar_root`**, which the bundle build now
+   records. This is authoritative and is used whenever present.
+2. **Fallback string scan**, only if that field is absent. This is filtered
+   hard, because the binaries are full of paths that merely *look* like
+   candidates: a weaver bench binary alone carries ~123 dependency panic-path
+   literals under the builder's Cargo registry. The scan therefore considers
+   only binaries whose manifest `repo` is `rarpar`, **rejects any path
+   containing `/.cargo/registry/`**, and accepts a candidate only when it sits
+   under `…/rarpar/crates/` and the derived root ends in `/rarpar`. On a
+   representative binary that reduces 125 raw regex matches to the 1 correct
+   root.
+
+If it cannot create the path it aborts, rather than letting the rarpar phase fail
+obscurely on "malformed archive".
+
 
 ---
 
@@ -423,8 +550,9 @@ Source delivery is a single pre-built image:
 651588424025.dkr.ecr.us-east-1.amazonaws.com/weaver-bench-corpus:latest
 ```
 
-It carries `/corpus/weaver`, `/corpus/rarpar` and `/corpus/rapidyenc`, each with
-its own `REVISION.json` (`{repo, rev, dirty_files, staged_at_utc}`).
+It carries `/corpus/weaver`, `/corpus/rarpar` and `/corpus/rapidyenc` — each with
+its own `REVISION.json` (`{repo, rev, dirty_files, staged_at_utc}`) — plus
+`/corpus/prebuilt`, the executable bundle described in §6a.
 
 **Why an image and not a clone** — the same two reasons that used to make rsync
 mandatory, now handled once at image-build time instead of on every run:
@@ -479,8 +607,8 @@ sudo docker cp "$cid:/corpus/." ~/
 sudo docker rm -v "$cid"
 ```
 
-That leaves `~/weaver`, `~/rarpar` and `~/rapidyenc` — the defaults
-`WEAVER_DIR` / `RARPAR_DIR` / `RAPIDYENC_ROOT` already expect.
+That leaves `~/weaver`, `~/rarpar`, `~/rapidyenc` and `~/prebuilt` — the defaults
+`WEAVER_DIR` / `RARPAR_DIR` / `RAPIDYENC_ROOT` / `PREBUILT_DIR` already expect.
 
 **No container is ever started.** `docker create` materializes a container's
 filesystem without running it, `docker cp` reads bytes out, `docker rm` discards
@@ -492,11 +620,32 @@ missing, so in practice you only need enough of it by hand to get the weaver
 tree (which contains the scripts). It is a no-op once all three trees carry a
 `REVISION.json`; pass `CORPUS_FORCE=1` to re-pull deliberately.
 
+#### SSH: multiplex, with a SHORT control path
+
+A fresh box has been observed to time out during the SSH banner exchange on the
+first connection, and this runbook opens many short-lived sessions. Use
+`ControlMaster` so they share one connection — but **the socket path must be
+short**: a UNIX domain socket is capped at ~104 bytes, and a scratchpad-style
+path blows straight past it. Keep it in `/tmp`:
+
+```sh
+ssh -o ControlMaster=auto \
+    -o ControlPath=/tmp/cm-%r@%h \
+    -o ControlPersist=10m \
+    -o ConnectTimeout=15 \
+    -o ServerAliveInterval=30 \
+    "$BOX"
+```
+
+`/tmp/cm-%r@%h` expands to something like `/tmp/cm-ubuntu@ec2-…`, comfortably
+inside the limit. If the first connection still times out on a just-booted
+instance, retry — sshd is up before the banner is.
+
 ### 7b. Bootstrap, then run
 
 ```sh
-# 1. bootstrap: dead-man shutdown + CPU gate + system deps + corpus image
-#    (pull/extract, no-op if already extracted) + rustup(1.97.1) + librapidyenc.so
+# 1. bootstrap: dead-man shutdown + CPU gate + system deps (NO rust) + corpus
+#    image (pull/extract, no-op if already extracted) + prebuilt-bundle gate
 cd ~/weaver
 ./ci/bench/c7a-bootstrap.sh
 
@@ -511,11 +660,14 @@ scripts live); the bootstrap fetches the rest.
 `c7a-run.sh` sequence:
 
 1. CPU feature gate (abort if not a real Zen 4).
-2. Source-precondition check (§4) — the box's tree must carry the C1 gate, the
-   skip line, the CRC parity assert and the production-shape forced-tier test.
-3. **Tests first**: weaver-yenc **debug**, then **release**, both with
-   `RAPIDYENC_ROOT` set and `-- --nocapture` so the §3a case counts and the §4
-   skip line reach the log.
+2. Prebuilt-bundle check — manifest parses, `BUILDINFO.json` revs match all
+   three trees (§6c), then source-precondition check (§4): the box's tree must
+   carry the C1 gate, the skip line, the CRC parity assert and the
+   production-shape forced-tier test.
+3. **Tests first**, straight from `$PREBUILT_DIR/bin`: weaver-yenc **debug**
+   (`weaver-yenc-lib-debug`, `weaver-yenc-diff-debug`), then **release**, all
+   with `RAPIDYENC_ROOT` + `CXX` set and `--nocapture` so the §3a case counts and
+   the §4 skip line reach the log.
 4. Grep-asserts: the C1 skip line is present; all four differential case counts
    are present and non-zero.
 5. Steady-state wait (1-min loadavg below `LOAD_THRESHOLD`, or `STEADY_TIMEOUT`).
@@ -538,15 +690,13 @@ Env overrides (both scripts, all have defaults):
 | `RAPIDYENC_ROOT` | `$CORPUS_DEST/rapidyenc` | rapidyenc tree, pinned at `27f435a` (§3a) + cmake build dir |
 | `WEAVER_RAPIDYENC_LIB` | `$RAPIDYENC_ROOT/build/librapidyenc.so` | dlopen target (§3b) |
 | `TARGET` | `x86_64-unknown-linux-gnu` | cargo target |
-| `BENCH_RUSTFLAGS` | `-C target-cpu=native` | RUSTFLAGS for the **weaver** perf benches only |
-| `RARPAR_BENCH_RUSTFLAGS` | *(empty)* | RUSTFLAGS for the rarpar benches; empty on purpose — rarpar's GF16 tiers are `#[target_feature]` + runtime dispatch (`crates/weaver-reed-solomon/src/gf_simd.rs:232-234,436-438`), so pinning would only obscure which tier ran |
+| `PREBUILT_DIR` | `$CORPUS_DEST/prebuilt` | the executable bundle (§6a) — manifest, BUILDINFO, `bin/`, `lib/` |
+| `CXX` | `g++` | compiler the §3a diff binaries invoke at **runtime** to build their C oracle (`rapidyenc_decode_diff.rs:146`) |
 | `RESULTS_DIR` | `$WEAVER_DIR/ci/bench/results/<UTC-timestamp>` | output dir (run script) |
 | `LOAD_THRESHOLD` | `0.2` | 1-min loadavg the box must fall below before timing |
 | `STEADY_TIMEOUT` | `300` | seconds to wait for that before proceeding anyway |
 | `DRIFT_PCT` | `2.0` | inter-pass drift percentage that triggers a warning |
-| `DEADMAN_MINUTES` | `240` | bootstrap's `shutdown -h +N`; set `0` to skip |
-| `RUST_TOOLCHAIN_FALLBACK` | `1.97.1` | bootstrap only, used if `rust-toolchain.toml` is missing |
-| `CXX` | `c++` | compiler for the §3a source oracle (`rapidyenc_decode_diff.rs:146`) |
+| `DEADMAN_MINUTES` | `120` | bootstrap's `shutdown -h +N`; set `0` to skip |
 | `WEAVER_PAR2_BENCH_SCENARIOS` | **force-unset by the run script** | scenario filter for the rarpar par2 bench (`crates/weaver-par2/benches/par2_repair.rs:20`). `c7a-run.sh` clears it before benching (warning if it was set) so an inherited value cannot narrow the recorded suite — see §9g |
 | `METADATA_INSTANCE_TYPE` | *(unset ⇒ IMDS)* | fallback instance type for `metadata.json` when IMDS is unreachable (§9g) |
 
@@ -591,10 +741,11 @@ first time — which is why the **tests run before the benches** in this phase.
 > "package not found". Verified via `cargo metadata --no-deps`.
 
 ```sh
-cd "$RARPAR_DIR"
-
-# (a) correctness first — first real-silicon run of the gfni+avx512 GF16 arms
-cargo test --locked -p reedsolomon-rs -p par2-rs --target x86_64-unknown-linux-gnu
+# (a) correctness first — first real-silicon run of the gfni+avx512 GF16 arms.
+#     The run script executes EVERY prebuilt test binary whose manifest entry
+#     has kind=test and repo=rarpar (12 of them), not a hardcoded pair.
+#     For reference, the equivalent cargo invocation on a dev box would be:
+#       cargo test --locked -p reedsolomon-rs -p par2-rs --target x86_64-unknown-linux-gnu
 
 # (b) benches, same warm/2x/drift protocol as the weaver ones.
 #     par2_repair  : rarpar/crates/weaver-par2/Cargo.toml:72-75  (harness = false)
@@ -664,7 +815,10 @@ flags. The internal Criterion benches above are the grounded, in-scope coverage.
    appears in the test log, and `crc32_mixed_size_interleaved_updates` passes.
 6. **Parity bench pre-timing asserts pass** for all five fixtures — length, bytes
    **and CRC** — with a `parity ok [<fixture>] … crc=0x…` line each.
-7. **rarpar tests green**, then both rarpar benches complete.
+7. **rarpar tests green** — all 12 prebuilt test binaries run; the
+   slow-tests-gated ones reporting `running 0 tests` and exiting 0 are
+   **gated-empty**, which is a pass. The run logs the gated-empty count; expect
+   **4**. Then both rarpar benches complete.
 8. **Inter-pass drift** below `DRIFT_PCT` on every lane. A lane over threshold
    means the box was noisy; re-run that bench rather than recording the number.
 
@@ -794,6 +948,12 @@ Usenet article file, which this run does not supply, so `bench_real_article_if_c
 returns immediately (`:353-355`) and those three lanes are **absent by design**.
 11 `decode_simd` lanes is the correct full-suite number here, not 14.
 
+**Where criterion writes.** With no cargo on the box, criterion resolves its
+output directory from `CARGO_TARGET_DIR`, which the run script sets per repo to
+`$RESULTS_DIR/criterion/{weaver,rarpar}` — so the data lands inside the results
+area (and inside the scp) instead of in a source tree. Standalone criterion keeps
+the same `base`/`new` rotation as a cargo-driven run.
+
 **`base/` and `new/` are both recorded passes.** Criterion rotates the previous
 `new/` into `base/` on every run. The per-binary sequence is
 warm → pass 1 → pass 2, so the discarded warm pass has already been rotated out by
@@ -825,6 +985,8 @@ distributions, and the drift check are all reconstructable offline.
   cpu-features.log
   weaver-yenc-tests-debug.log
   weaver-yenc-tests-release.log
+  criterion/weaver/criterion/   live criterion tree (CARGO_TARGET_DIR)
+  criterion/rarpar/criterion/   live criterion tree (CARGO_TARGET_DIR)
   weaver/   <label>-{warm-DISCARDED,pass1,pass2}.log
             <label>-{pass1,pass2}.lanes   <label>-drift.txt
   rarpar/   rarpar-tests.log  README-phase.txt  (+ the same per-label files)
@@ -832,7 +994,10 @@ distributions, and the drift check are all reconstructable offline.
 
 `metadata.json` carries instance type (IMDSv2, falling back to IMDSv1 then
 `METADATA_INSTANCE_TYPE`), CPU model / core count / full flags line, kernel,
-`rustc -V`, target, both RUSTFLAGS settings, `rev` + `dirty_files` for
+target, and a **`provenance`** object recording that the binaries are prebuilt —
+builder, `built_at_utc`, toolchains, the empty build `rustflags`, and build-vs-host
+glibc — all read from `BUILDINFO.json`, since there is no `rustc` on the box to
+ask. Plus `rev` + `dirty_files` for
 weaver / rarpar / rapidyenc — read from each tree's `REVISION.json`, **not** from
 git, because the corpus image ships no `.git`; weaver deliberately ships with
 uncommitted increments, so `dirty_files` is recorded rather than assumed zero —
@@ -935,7 +1100,7 @@ script's copy is the one that gets skipped when someone Ctrl-Cs.
 7. Confirm in the console that no c7a instance, SG or keypair from this session
    remains.
 
-The bootstrap's dead-man `shutdown -h +240` only helps if the instance's
+The bootstrap's dead-man `shutdown -h +120` only helps if the instance's
 `--instance-initiated-shutdown-behavior` is `terminate` (as
 `ci/bench/avx2-aws-run.sh:94` sets for the AVX2 box). Verify that at launch;
 otherwise the timer stops the instance and EBS keeps billing.
