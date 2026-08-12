@@ -46,3 +46,12 @@ apps/weaver-web/.vite
 
 # Local agent skills (machine-specific only)
 .agents/skills/claude-context/
+
+# bench results: raw data stays local, only final records are tracked
+ci/bench/results/**
+!ci/bench/results/**/
+!ci/bench/results/**/report.json
+!ci/bench/results/**/proof-gates.txt
+!ci/bench/results/**/phase-timings.tsv
+!ci/bench/results/**/metadata.json
+!ci/bench/results/**/revisions.txt
